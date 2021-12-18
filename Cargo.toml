@@ -1,0 +1,44 @@
+[package]
+name = "shoes"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = ["tls-rustls"]
+tls-native = ["openssl", "tokio-native-tls", "native-tls"]
+tls-rustls = ["rustls", "rustls-pemfile", "tokio-rustls", "webpki-roots"]
+
+[dependencies]
+aes = "*"
+async-trait = "*"
+base64 = "*"
+cfb-mode = "*"
+digest = "*"
+env_logger = "*"
+futures = "*"
+generic-array = "*"
+hmac = "*"
+json = "*"
+log = "*"
+md-5 = "*"
+memchr = "*"
+native-tls = { version = "*", optional = true }
+openssl = { version = "*", optional = true }
+parking_lot = "*"
+percent-encoding = "*"
+rand = "*"
+ring = "*"
+rustls = { version = "*", features = ["dangerous_configuration"], optional = true }
+rustls-pemfile = { version = "*", optional = true }
+sha1 = "*"
+sha2 = "*"
+sha3 = "*"
+tokio = { version = "*", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-native-tls = { version = "*", optional = true }
+tokio-rustls = { version = "*", features = ["dangerous_configuration"], optional = true }
+url = "*"
+webpki-roots = { version = "*", optional = true }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
