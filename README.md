@@ -33,9 +33,8 @@ shoes is a multi-protocol proxy server written in Rust.
 
 All supported protocols can be combined with the following features:
 
-- **TLS support with SNI based forwarding**
-- **Websocket obfs (Shadowsocks SIP003)** for all supported TCP protocols
-  - Multi-path support: for example, run a single websocket server on a single port that serves Vmess at one path, and Shadowsocks at another path.
+- **TLS support** with SNI based forwarding
+- **Websocket obfs** (Shadowsocks SIP003)
 - **Upstream proxy support**: route connections through other proxy servers
 - **Forwarding rules (allowlists/blocklists)**: Block or redirect connections based on IP or hostname
 - **Hot reloading**: Updated configs are automatically reloaded
@@ -44,7 +43,7 @@ All supported protocols can be combined with the following features:
 
 ## Examples
 
-Here's an example of running a WSS (websocket over TLS) server, with vmess and shadowsocks available at different paths:
+Here's an example of running a WSS vmess and shadowsocks server, with all requests routed through a SOCKS proxy:
 
 ```yaml
 # Listen on all IPv4 interfaces, port 443 (HTTPS)
@@ -79,8 +78,13 @@ Here's an example of running a WSS (websocket over TLS) server, with vmess and s
     # Allow clients to connect to all IPs
     - mask: 0.0.0.0/0
       action: allow
-      # Direct connection, don't forward requests through another proxy.
-      client_proxy: direct
+      # Forward all requests through a local SOCKS server.
+      client_proxy:
+        address: 127.0.0.1:5000
+        protocol:
+          type: socks
+          username: socksuser
+          password: secretpass
 ```
 
 For other YAML config examples, see the [examples](./examples) directory.
@@ -102,3 +106,8 @@ OPTIONS:
 ## Config format
 
 Sorry, formal documentation for the YAML config format have not yet been written. You can refer to the [examples](./examples), or open an issue if you need help.
+
+## Roadmap
+
+- Proxy client chaining
+- SOCKS and Shadowsocks UDP support

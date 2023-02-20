@@ -1,0 +1,12 @@
+# Simple vmess server, supporting TCP and UDP-over-TCP.
+- address: 127.0.0.1:55555
+  transport: tcp
+  protocol:
+    type: vmess
+    cipher: any
+    user_id: b0e80a62-8a51-47f0-91f1-f0f7faf8d9d4
+  rules:
+    - mask: 0.0.0.0/0
+      action: allow
+      # Direct connection, don't forward requests through another proxy.
+      client_proxy: direct

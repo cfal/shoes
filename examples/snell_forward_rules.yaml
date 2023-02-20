@@ -1,0 +1,21 @@
+# Snell server that only allows requests to certain hostnames and IPs.
+- address: 127.0.0.1:55555
+  transport: tcp
+  protocol:
+    type: snell
+    cipher: any
+    password: secretpass
+  rules:
+    # Clients trying to connect to hello.com on port 80 are allowed, but instead forwarded to
+    # a local server on port 55556.
+    - mask: hello.com:80
+      action: allow
+      override_address: 127.0.0.1:55556
+      client_proxy: direct
+    # Clients can access 10.x addresses.
+    - mask: 10.0.0.0/8
+      action: allow
+      client_proxy: direct
+    # Block all other addresses.
+    - mask: 0.0.0.0/0
+      action: block

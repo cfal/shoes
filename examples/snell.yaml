@@ -1,0 +1,12 @@
+# Simple snell v3 server, supporting TCP and UDP-over-TCP.
+- address: 127.0.0.1:55555
+  transport: tcp
+  protocol:
+    type: snell
+    cipher: any
+    password: secretpass
+  rules:
+    - mask: 0.0.0.0/0
+      action: allow
+      # Direct connection, don't forward requests through another proxy.
+      client_proxy: direct

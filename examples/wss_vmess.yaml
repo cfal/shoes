@@ -1,0 +1,28 @@
+# Listen on all IPv4 interfaces, port 443 (HTTPS)
+- address: 0.0.0.0:443
+  transport: tcp
+  # Use TLS as the first protocol layer
+  protocol:
+    type: tls
+    # Set a default target, for any (or no) SNI
+    default_target:
+      cert: cert.pem
+      key: key.pem
+      # ..which goes to a websocket server
+      protocol:
+        type: ws
+        # .. where we have different supported proxy protocols, based on HTTP request path and headers.
+        targets:
+          - matching_path: /vmess
+            matching_headers:
+              X-Secret-Key: "secret"
+            protocol:
+              type: vmess
+              # allow any cipher, which means: none, aes-128-gcm, or chacha20-poly1305.
+              cipher: any
+              user_id: b0e80a62-8a51-47f0-91f1-f0f7faf8d9d4
+  rules:
+    - mask: 0.0.0.0/0
+      action: allow
+      # Direct connection, don't forward requests through another proxy.
+      client_proxy: direct

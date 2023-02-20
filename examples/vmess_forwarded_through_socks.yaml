@@ -1,0 +1,16 @@
+- address: 127.0.0.1:55555
+  transport: tcp
+  protocol:
+    type: vmess
+    cipher: any
+    user_id: b0e80a62-8a51-47f0-91f1-f0f7faf8d9d4
+  rules:
+    # allow connections to all ips
+    - mask: 0.0.0.0/0
+      action: allow
+      client_proxy:
+        - address: 1.2.3.4:6666
+          protocol:
+            type: socks
+            username: socksuser
+            password: secretpass

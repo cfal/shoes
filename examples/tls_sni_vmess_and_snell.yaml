@@ -1,0 +1,28 @@
+# A TLS vmess and snell server, forwarded to different protocols by SNI.
+- address: 127.0.0.1:55555
+  transport: tcp
+  protocol:
+    type: tls
+    sni_targets:
+      # Clients requesting SNI google.com will get forwarded to the vmess server
+      google.com:
+        cert: cert.pem
+        key: key.pem
+        protocol:
+          type: vmess
+          cipher: any
+          user_id: b0e80a62-8a51-47f0-91f1-f0f7faf8d9d4
+      # Clients requesting SNI yahoo.com will get forwarded to the snell server
+      yahoo.com:
+        cert: cert.pem
+        key: key.com
+        protocol:
+          type: snell
+          cipher: any
+          password: secretpass
+  rules:
+    # Allow connections to any IP.
+    - mask: 0.0.0.0/0
+      action: allow
+      # Direct connection, don't forward requests through another proxy.
+      client_proxy: direct
