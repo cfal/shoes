@@ -3,41 +3,39 @@ name = "shoes"
 version = "0.1.0"
 edition = "2021"
 
-[features]
-default = ["tls-rustls"]
-tls-native = ["openssl", "tokio-native-tls", "native-tls"]
-tls-rustls = ["rustls", "rustls-pemfile", "tokio-rustls", "webpki-roots"]
-
 [dependencies]
-aes = "*"
+aes = "0.7.5"
+argon2 = "*"
 async-trait = "*"
 base64 = "*"
-cfb-mode = "*"
+blake3 = "*"
+cfb-mode = "0.7.1"
 digest = "*"
 env_logger = "*"
 futures = "*"
 generic-array = "*"
 hmac = "*"
-json = "*"
 log = "*"
 md-5 = "*"
 memchr = "*"
-native-tls = { version = "*", optional = true }
-openssl = { version = "*", optional = true }
+notify = "5.0.0-pre.15"
+once_cell = "*"
 parking_lot = "*"
 percent-encoding = "*"
+quinn = "*"
 rand = "*"
 ring = "*"
-rustls = { version = "*", features = ["dangerous_configuration"], optional = true }
-rustls-pemfile = { version = "*", optional = true }
-sha1 = "*"
+rustls = { version = "*", features = ["dangerous_configuration"] }
+rustls-pemfile = { version = "*" }
+sha1 = "0.6.0"
 sha2 = "*"
 sha3 = "*"
+serde = { version = "*", features = ["derive", "std"] }
+serde_yaml = "*"
 tokio = { version = "*", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
-tokio-native-tls = { version = "*", optional = true }
-tokio-rustls = { version = "*", features = ["dangerous_configuration"], optional = true }
+tokio-rustls = { version = "*", features = ["dangerous_configuration"] }
 url = "*"
-webpki-roots = { version = "*", optional = true }
+webpki-roots = { version = "*" }
 
 [profile.release]
 opt-level = 3

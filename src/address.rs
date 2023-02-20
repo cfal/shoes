@@ -8,6 +8,8 @@ pub enum Address {
 }
 
 impl Address {
+    pub const UNSPECIFIED: Self = Address::Ipv4(Ipv4Addr::UNSPECIFIED);
+
     pub fn from(s: &str) -> std::io::Result<Self> {
         let mut dots = 0;
         let mut possible_ipv4 = true;
@@ -73,15 +75,31 @@ impl Address {
     }
 }
 
+impl std::fmt::Display for Address {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            Address::Ipv4(i) => write!(f, "{}", i),
+            Address::Ipv6(i) => write!(f, "{}", i),
+            Address::Hostname(h) => write!(f, "{}", h),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
-pub struct Location {
+pub struct NetLocation {
     address: Address,
     port: u16,
 }
 
-impl Location {
-    pub fn new(address: Address, port: u16) -> Self {
+impl NetLocation {
+    pub const UNSPECIFIED: Self = NetLocation::new(Address::UNSPECIFIED, 0);
+
+    pub const fn new(address: Address, port: u16) -> Self {
         Self { address, port }
+    }
+
+    pub fn is_unspecified(&self) -> bool {
+        self == &Self::UNSPECIFIED
     }
 
     pub fn from_str(s: &str, default_port: Option<u16>) -> std::io::Result<Self> {
@@ -145,6 +163,20 @@ impl Location {
                 .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "Lookup failed")),
         }
     }
+
+    pub fn to_socket_addr_nonblocking(&self) -> Option<SocketAddr> {
+        match self.address {
+            Address::Ipv6(ref addr) => Some(SocketAddr::new(IpAddr::V6(*addr), self.port)),
+            Address::Ipv4(ref addr) => Some(SocketAddr::new(IpAddr::V4(*addr), self.port)),
+            Address::Hostname(ref d) => None,
+        }
+    }
+}
+
+impl std::fmt::Display for NetLocation {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{}:{}", self.address, self.port)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -154,40 +186,90 @@ pub struct AddressMask {
 }
 
 impl AddressMask {
+    pub const ANY: Self = AddressMask {
+        address: Address::UNSPECIFIED,
+        netmask: 0,
+    };
+
     pub fn from(s: &str) -> std::io::Result<Self> {
-        let (address_str, netmask) = match s.rfind('/') {
+        let (address_str, num_bits) = match s.rfind('/') {
             Some(i) => {
-                let wanted_bits = s[i + 1..].parse::<u8>().map_err(|e| {
+                let num_bits = s[i + 1..].parse::<u8>().map_err(|e| {
                     std::io::Error::new(
                         std::io::ErrorKind::Other,
                         format!("Failed to parse netmask: {}", e),
                     )
                 })?;
-                if wanted_bits == 0 || wanted_bits > 128 {
+                (&s[0..i], Some(num_bits))
+            }
+            None => (s, None),
+        };
+        let address = Address::from(address_str)?;
+        let keep_bits = match address {
+            Address::Ipv4(_) => {
+                let num_bits = num_bits.unwrap_or(32);
+                if num_bits > 32 {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::Other,
-                        format!("Invalid netmask: {}", s),
+                        format!("Invalid number of bits for ipv4 address: {}", num_bits),
                     ));
                 }
-                (&s[0..i], (u128::MAX >> wanted_bits) << wanted_bits)
+                if num_bits == 0 {
+                    // We make an exception when 0 is specified, because even if it's IPv6, we
+                    // want this rule to match it.
+                    0
+                } else {
+                    96 + num_bits
+                }
             }
-            None => (s, u128::MAX),
+            Address::Ipv6(_) => {
+                let num_bits = num_bits.unwrap_or(128);
+                if num_bits > 128 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("Invalid number of bits for ipv4 address: {}", num_bits),
+                    ));
+                }
+                num_bits
+            }
+            Address::Hostname(ref hostname) => {
+                if num_bits.is_some() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!(
+                            "Cannot specify number of number of netmask bits for hostnames: {}",
+                            hostname
+                        ),
+                    ));
+                }
+                128
+            }
+        };
+        let clear_bits = 128 - keep_bits;
+
+        // rust complains if you shift away all the bits.
+        let netmask = if clear_bits == 128 {
+            0
+        } else {
+            (u128::MAX >> clear_bits) << clear_bits
         };
 
-        Ok(Self {
-            address: Address::from(address_str)?,
-            netmask,
-        })
+        Ok(Self { address, netmask })
     }
 }
 
 #[derive(Debug, Clone)]
-pub struct LocationMask {
+pub struct NetLocationMask {
     pub address_mask: AddressMask,
     pub port: u16,
 }
 
-impl LocationMask {
+impl NetLocationMask {
+    pub const ANY: Self = NetLocationMask {
+        address_mask: AddressMask::ANY,
+        port: 0,
+    };
+
     pub fn from(s: &str) -> std::io::Result<Self> {
         let (address_mask_str, port) = match s.find(':') {
             Some(i) => {

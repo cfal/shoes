@@ -1,11 +1,3 @@
-// Forked from tokio's copy.rs and copy_bidirectional.rs.
-//
-// Changes:
-// - Customizable buffer size
-// - Don't bother initializing buffer
-// - Read and write whenever there's a space
-// - Circular buffer
-
 use futures::ready;
 use tokio::io::ReadBuf;
 
@@ -13,32 +5,32 @@ use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::Instant;
 
-use crate::async_stream::AsyncStream;
-use crate::util::allocate_vec;
+use crate::async_stream::AsyncMessageStream;
+
+// Informed by https://stackoverflow.com/questions/14856639/udp-hole-punching-timeout
+pub const DEFAULT_ASSOCIATION_TIMEOUT_SECS: u32 = 200;
 
 #[derive(Debug)]
 struct CopyBuffer {
     read_done: bool,
     need_flush: bool,
     need_write_ping: bool,
-    start_index: usize,
     cache_length: usize,
-    size: usize,
-    buf: Box<[u8]>,
+    buf: [u8; 65535],
+    read_count: usize,
 }
 
 impl CopyBuffer {
-    pub fn new(size: usize, need_initial_flush: bool) -> Self {
-        let buf = allocate_vec(size);
+    pub fn new() -> Self {
         Self {
             read_done: false,
-            need_flush: need_initial_flush,
+            need_flush: false,
             need_write_ping: false,
-            start_index: 0,
             cache_length: 0,
-            size,
-            buf: buf.into_boxed_slice(),
+            buf: [0u8; 65535],
+            read_count: 0,
         }
     }
 
@@ -49,107 +41,87 @@ impl CopyBuffer {
         mut writer: Pin<&mut W>,
     ) -> Poll<io::Result<()>>
     where
-        R: AsyncStream + ?Sized,
-        W: AsyncStream + ?Sized,
+        R: AsyncMessageStream + ?Sized,
+        W: AsyncMessageStream + ?Sized,
     {
         loop {
+            // Make sure we flush any existing messages first.
+            // We don't want to read fast else bandwidth estimators will think we are able
+            // to handle all the messages and start sending even better quality.
+            //if self.need_flush {
+            //ready!(writer.as_mut().poll_flush_message(cx))?;
+            //self.need_flush = false;
+            //}
+
+            let mut did_read = false;
+            let mut did_write = false;
             let mut read_pending = false;
             let mut write_pending = false;
 
-            // Read as much as possible before writing. Some AsyncStream implementations
-            // packetize each poll_write call individually, so this reduces the overhead.
-            // Other AsyncStream implementations cache on poll_write, and
-            // packetize/write to the stream on poll_flush - and this also ends up being
-            // beneficial since we are calling poll_flush each external loop iteration.
-            while !self.read_done && self.cache_length < self.size {
-                let unused_start_index = (self.start_index + self.cache_length) % self.size;
-                let unused_end_index_exclusive = if unused_start_index < self.start_index {
-                    self.start_index
-                } else {
-                    self.size
-                };
-
+            if !self.read_done && self.cache_length == 0 {
                 let me = &mut *self;
-                let mut buf =
-                    ReadBuf::new(&mut me.buf[unused_start_index..unused_end_index_exclusive]);
-                match reader.as_mut().poll_read(cx, &mut buf) {
+                let mut buf = ReadBuf::new(&mut me.buf);
+                match reader.as_mut().poll_read_message(cx, &mut buf) {
                     Poll::Ready(val) => {
                         val?;
                         let n = buf.filled().len();
                         if n == 0 {
                             self.read_done = true;
                         } else {
-                            self.cache_length += n;
+                            self.cache_length = n;
+                            did_read = true;
+                            self.read_count = self.read_count.wrapping_add(n);
                         }
                     }
                     Poll::Pending => {
                         read_pending = true;
-                        break;
                     }
                 }
             }
 
-            if self.need_write_ping {
-                // if we just read data and we are going to write anyway, no need for a ping
-                if self.cache_length == 0 {
-                    match writer.as_mut().poll_write_ping(cx) {
-                        Poll::Ready(val) => {
-                            let written = val?;
-                            self.need_write_ping = false;
-                            if written {
-                                self.need_flush = true;
-                            }
-                        }
-                        Poll::Pending => {
-                            write_pending = true;
-                        }
-                    }
-                } else {
-                    self.need_write_ping = false;
-                }
-            }
-
-            // If our buffer has some data, let's write it out!
-            // Loop and try to write out as much as possible to minimize forwarding
-            // latency, and so that we increase the chance we have an optimal read
-            // with start_index at zero.
-            while self.cache_length > 0 {
-                let used_start_index = self.start_index;
-                let used_end_index_exclusive =
-                    std::cmp::min(self.start_index + self.cache_length, self.size);
-
+            if self.cache_length > 0 {
                 let me = &mut *self;
                 match writer
                     .as_mut()
-                    .poll_write(cx, &me.buf[used_start_index..used_end_index_exclusive])
+                    .poll_write_message(cx, &me.buf[0..me.cache_length])
                 {
                     Poll::Ready(val) => {
+                        val?;
+                        self.cache_length = 0;
+                        self.need_flush = true;
+                        // Don't bother writing ping, since we just wrote.
+                        self.need_write_ping = false;
+                        did_write = true;
+                    }
+                    Poll::Pending => {
+                        write_pending = true;
+                    }
+                }
+            }
+
+            if !write_pending && self.need_write_ping {
+                match writer.as_mut().poll_write_ping(cx) {
+                    Poll::Ready(val) => {
                         let written = val?;
-                        if written == 0 {
-                            return Poll::Ready(Err(io::Error::new(
-                                io::ErrorKind::WriteZero,
-                                "write zero byte into writer",
-                            )));
-                        } else {
-                            self.cache_length -= written;
-                            if self.cache_length == 0 {
-                                self.start_index = 0;
-                            } else {
-                                self.start_index = (self.start_index + written) % self.size;
-                            }
+                        self.need_write_ping = false;
+                        if written {
                             self.need_flush = true;
                         }
                     }
                     Poll::Pending => {
                         write_pending = true;
-                        break;
                     }
                 }
             }
 
+            if did_read && did_write && !read_pending && !write_pending {
+                continue;
+            }
+
             if self.need_flush {
-                ready!(writer.as_mut().poll_flush(cx))?;
+                ready!(writer.as_mut().poll_flush_message(cx))?;
                 self.need_flush = false;
+                continue;
             }
 
             // If we've written all the data and we've seen EOF, finish the transfer.
@@ -183,7 +155,8 @@ struct CopyBidirectional<'a, A: ?Sized, B: ?Sized> {
     b_buf: CopyBuffer,
     a_to_b: TransferState,
     b_to_a: TransferState,
-    sleep_future: Option<Pin<Box<tokio::time::Sleep>>>,
+    sleep_future: Pin<Box<tokio::time::Sleep>>,
+    last_active: Instant,
 }
 
 fn transfer_one_direction<A, B>(
@@ -194,8 +167,8 @@ fn transfer_one_direction<A, B>(
     w: &mut B,
 ) -> Poll<io::Result<()>>
 where
-    A: AsyncStream + ?Sized,
-    B: AsyncStream + ?Sized,
+    A: AsyncMessageStream + ?Sized,
+    B: AsyncMessageStream + ?Sized,
 {
     let mut r = Pin::new(r);
     let mut w = Pin::new(w);
@@ -207,7 +180,7 @@ where
                 *state = TransferState::ShuttingDown;
             }
             TransferState::ShuttingDown => {
-                ready!(w.as_mut().poll_shutdown(cx))?;
+                ready!(w.as_mut().poll_shutdown_message(cx))?;
                 *state = TransferState::Done;
             }
             TransferState::Done => return Poll::Ready(Ok(())),
@@ -217,8 +190,8 @@ where
 
 impl<'a, A, B> Future for CopyBidirectional<'a, A, B>
 where
-    A: AsyncStream + ?Sized,
-    B: AsyncStream + ?Sized,
+    A: AsyncMessageStream + ?Sized,
+    B: AsyncMessageStream + ?Sized,
 {
     type Output = io::Result<()>;
 
@@ -232,23 +205,33 @@ where
             a_to_b,
             b_to_a,
             sleep_future,
+            last_active,
         } = &mut *self;
 
-        if let Some(ref mut sleep) = sleep_future {
-            let ping_fired = sleep.as_mut().poll(cx).is_ready();
-            if ping_fired {
-                // a_buf writes to b - so we need to check if b supports ping, and similarly
-                // for b_buf.
-                a_buf.need_write_ping = b.supports_ping();
-                b_buf.need_write_ping = a.supports_ping();
-                sleep
-                    .as_mut()
-                    .reset(tokio::time::Instant::now() + std::time::Duration::from_secs(60));
-            }
+        let ping_fired = sleep_future.as_mut().poll(cx).is_ready();
+        if ping_fired {
+            // a_buf writes to b - so we need to check if b supports ping, and similarly
+            // for b_buf.
+            a_buf.need_write_ping = b.supports_ping();
+            b_buf.need_write_ping = a.supports_ping();
+            sleep_future
+                .as_mut()
+                .reset(tokio::time::Instant::now() + std::time::Duration::from_secs(60));
         }
+
+        let a_count = a_buf.read_count;
+        let b_count = b_buf.read_count;
 
         let a_to_b = transfer_one_direction(cx, a_to_b, &mut *a_buf, &mut *a, &mut *b);
         let b_to_a = transfer_one_direction(cx, b_to_a, &mut *b_buf, &mut *b, &mut *a);
+
+        if a_buf.read_count != a_count || b_buf.read_count != b_count {
+            *last_active = Instant::now();
+        } else {
+            if last_active.elapsed().as_secs() >= DEFAULT_ASSOCIATION_TIMEOUT_SECS.into() {
+                return Poll::Ready(Ok(()));
+            }
+        }
 
         if a_to_b.is_ready() {
             return a_to_b;
@@ -287,23 +270,14 @@ where
 /// # Return value
 ///
 /// Returns a tuple of bytes copied `a` to `b` and bytes copied `b` to `a`.
-pub async fn copy_bidirectional<A, B>(
-    a: &mut A,
-    b: &mut B,
-    a_need_initial_flush: bool,
-    b_need_initial_flush: bool,
-) -> Result<(), std::io::Error>
+pub async fn copy_bidirectional_message<A, B>(a: &mut A, b: &mut B) -> Result<(), std::io::Error>
 where
-    A: AsyncStream + ?Sized,
-    B: AsyncStream + ?Sized,
+    A: AsyncMessageStream + ?Sized,
+    B: AsyncMessageStream + ?Sized,
 {
-    let sleep_future = if a.supports_ping() || b.supports_ping() {
-        Some(Box::pin(tokio::time::sleep(
-            std::time::Duration::from_secs(60),
-        )))
-    } else {
-        None
-    };
+    // Unlike tcp copy_bidirectional, we always run a sleep future so that we can expire
+    // connections.
+    let sleep_future = Box::pin(tokio::time::sleep(std::time::Duration::from_secs(60)));
 
     CopyBidirectional {
         a,
@@ -311,11 +285,12 @@ where
         // this is correctly reversed - CopyBuffer will copy from a (reader) to b (writer) using
         // a_buf, which means that the need_flush signal is for the writer (b), and vice versa for
         // b_buf.
-        a_buf: CopyBuffer::new(16384, b_need_initial_flush),
-        b_buf: CopyBuffer::new(16384, a_need_initial_flush),
+        a_buf: CopyBuffer::new(),
+        b_buf: CopyBuffer::new(),
         a_to_b: TransferState::Running,
         b_to_a: TransferState::Running,
         sleep_future,
+        last_active: Instant::now(),
     }
     .await
 }

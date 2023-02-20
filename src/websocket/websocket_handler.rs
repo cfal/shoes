@@ -5,23 +5,27 @@ use async_trait::async_trait;
 use tokio::io::AsyncWriteExt;
 
 use super::websocket_stream::WebsocketStream;
-use crate::address::Location;
+use crate::address::NetLocation;
 use crate::async_stream::AsyncStream;
-use crate::client_proxy_provider::ClientProxyProvider;
-use crate::config::{WebsocketClientConfig, WebsocketServerConfig};
+use crate::client_proxy_selector::ClientProxySelector;
+use crate::config::WebsocketPingType;
 use crate::line_reader::LineReader;
-use crate::protocol_handler::{
-    ClientSetupResult, ServerSetupResult, TcpClientHandler, TcpServerHandler,
+use crate::option_util::NoneOrOne;
+use crate::tcp_client_connector::TcpClientConnector;
+use crate::tcp_handler::{
+    TcpClientHandler, TcpClientSetupResult, TcpServerHandler, TcpServerSetupResult,
 };
-use crate::tls_factory::get_tls_factory;
 
+#[derive(Debug)]
 pub struct WebsocketServerTarget {
     pub matching_path: Option<String>,
     pub matching_headers: Option<HashMap<String, String>>,
+    pub ping_type: WebsocketPingType,
     pub handler: Box<dyn TcpServerHandler>,
-    pub override_proxy_provider: Option<Arc<ClientProxyProvider>>,
+    pub override_proxy_provider: NoneOrOne<Arc<ClientProxySelector<TcpClientConnector>>>,
 }
 
+#[derive(Debug)]
 pub struct WebsocketTcpServerHandler {
     server_targets: Vec<WebsocketServerTarget>,
 }
@@ -37,7 +41,7 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
     async fn setup_server_stream(
         &self,
         mut server_stream: Box<dyn AsyncStream>,
-    ) -> std::io::Result<ServerSetupResult> {
+    ) -> std::io::Result<TcpServerSetupResult> {
         let ParsedHttpData {
             mut first_line,
             headers: mut request_headers,
@@ -69,10 +73,11 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
             std::io::Error::new(std::io::ErrorKind::Other, "missing websocket key header")
         })?;
 
-        for server_target in self.server_targets.iter() {
+        'outer: for server_target in self.server_targets.iter() {
             let WebsocketServerTarget {
                 matching_path,
                 matching_headers,
+                ping_type,
                 handler,
                 override_proxy_provider,
             } = server_target;
@@ -86,7 +91,7 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
             if let Some(headers) = matching_headers {
                 for (header_key, header_val) in headers {
                     if request_headers.get(header_key) != Some(header_val) {
-                        continue;
+                        continue 'outer;
                     }
                 }
             }
@@ -122,15 +127,22 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
             let websocket_stream = Box::new(WebsocketStream::new(
                 server_stream,
                 false,
+                ping_type.clone(),
                 line_reader.unparsed_data(),
             ));
 
             let mut target_setup_result = handler.setup_server_stream(websocket_stream).await;
-            if override_proxy_provider.is_some() {
-                if let Ok(mut result) = target_setup_result.as_mut() {
-                    if result.override_proxy_provider.is_none() {
-                        result.override_proxy_provider = override_proxy_provider.clone();
-                    }
+            if let Ok(TcpServerSetupResult::TcpForward {
+                ref mut need_initial_flush,
+                override_proxy_provider: ref mut inner_override_proxy_provider,
+                ..
+            }) = target_setup_result.as_mut()
+            {
+                *need_initial_flush = true;
+                if inner_override_proxy_provider.is_unspecified()
+                    && !override_proxy_provider.is_unspecified()
+                {
+                    *inner_override_proxy_provider = override_proxy_provider.clone();
                 }
             }
 
@@ -144,19 +156,27 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
     }
 }
 
-pub struct WebsocketClientTarget {
-    pub matching_path: Option<String>,
-    pub matching_headers: Option<HashMap<String, String>>,
-    pub handler: Box<dyn TcpClientHandler>,
-}
-
+#[derive(Debug)]
 pub struct WebsocketTcpClientHandler {
-    client_target: WebsocketClientTarget,
+    matching_path: Option<String>,
+    matching_headers: Option<HashMap<String, String>>,
+    ping_type: WebsocketPingType,
+    handler: Box<dyn TcpClientHandler>,
 }
 
 impl WebsocketTcpClientHandler {
-    pub fn new(client_target: WebsocketClientTarget) -> Self {
-        Self { client_target }
+    pub fn new(
+        matching_path: Option<String>,
+        matching_headers: Option<HashMap<String, String>>,
+        ping_type: WebsocketPingType,
+        handler: Box<dyn TcpClientHandler>,
+    ) -> Self {
+        Self {
+            matching_path,
+            matching_headers,
+            ping_type,
+            handler,
+        }
     }
 }
 
@@ -166,15 +186,13 @@ impl TcpClientHandler for WebsocketTcpClientHandler {
         &self,
         server_stream: &mut Box<dyn AsyncStream>,
         mut client_stream: Box<dyn AsyncStream>,
-        remote_location: Location,
-    ) -> std::io::Result<ClientSetupResult> {
-        let WebsocketClientTarget {
-            matching_path,
-            matching_headers,
-            handler,
-        } = &self.client_target;
-
-        let request_path = matching_path.as_ref().map(String::as_str).unwrap_or("/");
+        remote_location: NetLocation,
+    ) -> std::io::Result<TcpClientSetupResult> {
+        let request_path = self
+            .matching_path
+            .as_ref()
+            .map(String::as_str)
+            .unwrap_or("/");
 
         let websocket_key = create_websocket_key();
         let mut http_request = String::with_capacity(1024);
@@ -183,7 +201,7 @@ impl TcpClientHandler for WebsocketTcpClientHandler {
         http_request.push_str(" HTTP/1.1\r\n");
         http_request.push_str(concat!("Connection: Upgrade\r\n", "Upgrade: websocket\r\n",));
 
-        if let Some(ref headers) = matching_headers {
+        if let Some(ref headers) = self.matching_headers {
             for (header_key, header_val) in headers {
                 http_request.push_str(header_key);
                 http_request.push_str(": ");
@@ -239,9 +257,10 @@ impl TcpClientHandler for WebsocketTcpClientHandler {
         let websocket_stream = Box::new(WebsocketStream::new(
             client_stream,
             true,
+            self.ping_type.clone(),
             line_reader.unparsed_data(),
         ));
-        handler
+        self.handler
             .setup_client_stream(server_stream, websocket_stream, remote_location)
             .await
     }
@@ -318,50 +337,4 @@ fn create_websocket_key_response(mut key: String) -> String {
     key.push_str("258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
     let hash = sha1::Sha1::from(key.into_bytes()).digest().bytes();
     base64::encode(hash)
-}
-
-impl From<WebsocketServerConfig> for WebsocketServerTarget {
-    fn from(websocket_server_config: WebsocketServerConfig) -> Self {
-        let WebsocketServerConfig {
-            matching_path,
-            matching_headers,
-            target_config,
-            override_proxies,
-            override_rules,
-        } = websocket_server_config;
-
-        let override_proxy_provider = if override_proxies.is_some() || override_rules.is_some() {
-            let proxies = override_proxies.unwrap_or(vec![]);
-            let rules = override_rules.unwrap_or(vec![]);
-            Some(Arc::new(ClientProxyProvider::new(
-                proxies,
-                rules,
-                &get_tls_factory(),
-            )))
-        } else {
-            None
-        };
-
-        WebsocketServerTarget {
-            matching_path,
-            matching_headers,
-            handler: target_config.into(),
-            override_proxy_provider,
-        }
-    }
-}
-
-impl From<Box<WebsocketClientConfig>> for WebsocketClientTarget {
-    fn from(websocket_client_config: Box<WebsocketClientConfig>) -> Self {
-        let WebsocketClientConfig {
-            matching_path,
-            matching_headers,
-            target_config,
-        } = *websocket_client_config;
-        WebsocketClientTarget {
-            matching_path,
-            matching_headers,
-            handler: target_config.into(),
-        }
-    }
 }

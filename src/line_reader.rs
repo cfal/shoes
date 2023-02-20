@@ -53,9 +53,7 @@ impl LineReader {
                     return Ok(line);
                 }
                 None => {
-                    // There are no more newlines. Clear the offset so there's space
-                    // for the next line.
-                    self.reset_buf_offset();
+                    // There are no more newlines.
                     self.read(stream).await?;
                 }
             }
@@ -86,6 +84,7 @@ impl LineReader {
             ));
         }
 
+        // Clear the offset so there's space for the next line.
         self.reset_buf_offset();
 
         loop {
@@ -99,16 +98,7 @@ impl LineReader {
                         ));
                     }
                     self.end_offset += len;
-                    if self.end_offset == BUFFER_SIZE {
-                        // We did reset_buf_offset before the read, so checking
-                        // end_offset is enough to know that cache is full.
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::ConnectionAborted,
-                            "cache is full",
-                        ));
-                    } else {
-                        return Ok(());
-                    }
+                    return Ok(());
                 }
                 Err(e) => {
                     if e.kind() == std::io::ErrorKind::Interrupted {

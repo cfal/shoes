@@ -1,12 +1,14 @@
+use once_cell::sync::OnceCell;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use async_trait::async_trait;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::address::{Address, Location};
+use crate::address::{Address, NetLocation};
 use crate::async_stream::AsyncStream;
-use crate::protocol_handler::{
-    ClientSetupResult, ServerSetupResult, TcpClientHandler, TcpServerHandler,
+use crate::option_util::NoneOrOne;
+use crate::tcp_handler::{
+    TcpClientHandler, TcpClientSetupResult, TcpServerHandler, TcpServerSetupResult,
 };
 use crate::util::allocate_vec;
 
@@ -26,6 +28,7 @@ pub const RESULT_SUCCESS: u8 = 0x0;
 pub const CMD_CONNECT: u8 = 0x01;
 pub const CMD_UDP_ASSOCIATE: u8 = 0x03;
 
+#[derive(Debug)]
 pub struct SocksTcpServerHandler {
     auth_info: Option<(String, String)>,
 }
@@ -41,7 +44,7 @@ impl TcpServerHandler for SocksTcpServerHandler {
     async fn setup_server_stream(
         &self,
         mut server_stream: Box<dyn AsyncStream>,
-    ) -> std::io::Result<ServerSetupResult> {
+    ) -> std::io::Result<TcpServerSetupResult> {
         let mut data = [0u8; 2];
         server_stream.read_exact(&mut data).await?;
 
@@ -179,32 +182,34 @@ impl TcpServerHandler for SocksTcpServerHandler {
             ));
         }
 
-        // Normally, the location is read first before we reply with success
-        // and the bind location.
-        connection_request[1] = RESULT_SUCCESS;
-        server_stream.write_all(&connection_request).await?;
+        static SUCCESS_RESPONSE: OnceCell<Box<[u8]>> = OnceCell::new();
 
-        // Because we only return the location to the caller, we don't get a chance to populate it
-        // with the correct bound address.
-        // TODO: Consider amending the TcpHandler trait to allow returning a vector to
-        // write to the server stream after connection to the remote location is successful.
-        write_location(
-            &mut server_stream,
-            &Location::new(Address::Ipv4(Ipv4Addr::new(127, 0, 0, 1)), 65535),
-        )
-        .await?;
+        let connection_success_response = SUCCESS_RESPONSE.get_or_init(|| {
+            let mut response_bytes = vec![VER_SOCKS5, RESULT_SUCCESS, 0];
+            let mut location_vec = write_location_to_vec(&NetLocation::new(
+                Address::Ipv4(Ipv4Addr::new(127, 0, 0, 1)),
+                65535,
+            ));
+            response_bytes.append(&mut location_vec);
+            response_bytes.into_boxed_slice()
+        });
 
         let location = read_location(&mut server_stream).await?;
 
-        Ok(ServerSetupResult {
-            server_stream,
+        Ok(TcpServerSetupResult::TcpForward {
             remote_location: location,
-            override_proxy_provider: None,
+            stream: server_stream,
+            need_initial_flush: true,
+            connection_success_response: Some(
+                connection_success_response.to_vec().into_boxed_slice(),
+            ),
             initial_remote_data: None,
+            override_proxy_provider: NoneOrOne::Unspecified,
         })
     }
 }
 
+#[derive(Debug)]
 pub struct SocksTcpClientHandler {
     prefix_data: Vec<u8>,
     has_auth: bool,
@@ -246,8 +251,8 @@ impl TcpClientHandler for SocksTcpClientHandler {
         &self,
         _server_stream: &mut Box<dyn AsyncStream>,
         mut client_stream: Box<dyn AsyncStream>,
-        remote_location: Location,
-    ) -> std::io::Result<ClientSetupResult> {
+        remote_location: NetLocation,
+    ) -> std::io::Result<TcpClientSetupResult> {
         client_stream.write_all(&self.prefix_data).await?;
         write_location(&mut client_stream, &remote_location).await?;
         client_stream.flush().await?;
@@ -291,11 +296,11 @@ impl TcpClientHandler for SocksTcpClientHandler {
         // Read the final location part of the connect response.
         read_location(&mut client_stream).await?;
 
-        Ok(ClientSetupResult { client_stream })
+        Ok(TcpClientSetupResult { client_stream })
     }
 }
 
-pub async fn read_location(stream: &mut Box<dyn AsyncStream>) -> std::io::Result<Location> {
+pub async fn read_location(stream: &mut Box<dyn AsyncStream>) -> std::io::Result<NetLocation> {
     let mut data = [0u8; 1];
 
     stream.read_exact(&mut data).await?;
@@ -316,7 +321,7 @@ pub async fn read_location(stream: &mut Box<dyn AsyncStream>) -> std::io::Result
 
             let port = u16::from_be_bytes(address_bytes[4..6].try_into().unwrap());
 
-            Ok(Location::new(Address::Ipv4(v4addr), port))
+            Ok(NetLocation::new(Address::Ipv4(v4addr), port))
         }
         ADDR_TYPE_IPV6 => {
             let mut address_bytes = [0u8; 18];
@@ -335,7 +340,7 @@ pub async fn read_location(stream: &mut Box<dyn AsyncStream>) -> std::io::Result
 
             let port = u16::from_be_bytes(address_bytes[16..18].try_into().unwrap());
 
-            Ok(Location::new(Address::Ipv6(v6addr), port))
+            Ok(NetLocation::new(Address::Ipv6(v6addr), port))
         }
         ADDR_TYPE_DOMAIN_NAME => {
             stream.read_exact(&mut data).await?;
@@ -363,7 +368,7 @@ pub async fn read_location(stream: &mut Box<dyn AsyncStream>) -> std::io::Result
             // Although this is supposed to be a hostname, some clients will pass
             // ipv4 and ipv6 addresses as well, so parse it rather than directly
             // using Address:Hostname enum.
-            Ok(Location::new(Address::from(address_str)?, port))
+            Ok(NetLocation::new(Address::from(address_str)?, port))
         }
 
         _ => Err(std::io::Error::new(
@@ -375,7 +380,7 @@ pub async fn read_location(stream: &mut Box<dyn AsyncStream>) -> std::io::Result
 
 pub async fn write_location(
     stream: &mut Box<dyn AsyncStream>,
-    location: &Location,
+    location: &NetLocation,
 ) -> std::io::Result<()> {
     let (address, port) = location.components();
     let mut data = [0u8; 1];
@@ -407,61 +412,32 @@ pub async fn write_location(
     Ok(())
 }
 
-pub fn read_location_from_vec(data: &[u8]) -> std::io::Result<(Location, usize)> {
-    let address_type = data[0];
-
-    match address_type {
-        ADDR_TYPE_IPV4 => {
-            let v4addr = Ipv4Addr::new(data[1], data[2], data[3], data[4]);
-
-            let port = u16::from_be_bytes(data[5..7].try_into().unwrap());
-
-            Ok((Location::new(Address::Ipv4(v4addr), port), 1 + 4 + 2))
+pub fn write_location_to_vec(location: &NetLocation) -> Vec<u8> {
+    let (address, port) = location.components();
+    let mut vec = match address {
+        Address::Ipv4(v4addr) => {
+            let mut vec = Vec::with_capacity(7);
+            vec.push(ADDR_TYPE_IPV4);
+            vec.extend_from_slice(&v4addr.octets());
+            vec
         }
-        ADDR_TYPE_IPV6 => {
-            let v6addr = Ipv6Addr::new(
-                u16::from_be_bytes(data[1..3].try_into().unwrap()),
-                u16::from_be_bytes(data[3..5].try_into().unwrap()),
-                u16::from_be_bytes(data[5..7].try_into().unwrap()),
-                u16::from_be_bytes(data[7..9].try_into().unwrap()),
-                u16::from_be_bytes(data[9..11].try_into().unwrap()),
-                u16::from_be_bytes(data[11..13].try_into().unwrap()),
-                u16::from_be_bytes(data[13..15].try_into().unwrap()),
-                u16::from_be_bytes(data[15..17].try_into().unwrap()),
-            );
-
-            let port = u16::from_be_bytes(data[17..19].try_into().unwrap());
-
-            Ok((Location::new(Address::Ipv6(v6addr), port), 1 + 16 + 2))
+        Address::Ipv6(v6addr) => {
+            let mut vec = Vec::with_capacity(19);
+            vec.push(ADDR_TYPE_IPV6);
+            vec.extend_from_slice(&v6addr.octets());
+            vec
         }
-        ADDR_TYPE_DOMAIN_NAME => {
-            let address_len = data[1] as usize;
-
-            let address_str = match std::str::from_utf8(&data[2..address_len + 2]) {
-                Ok(s) => s,
-                Err(e) => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!("Failed to decode address: {}", e),
-                    ));
-                }
-            };
-
-            let port =
-                u16::from_be_bytes(data[address_len + 2..address_len + 4].try_into().unwrap());
-
-            // Although this is supposed to be a hostname, some clients will pass
-            // ipv4 and ipv6 addresses as well, so parse it rather than directly
-            // using Address:Hostname enum.
-            Ok((
-                Location::new(Address::from(address_str)?, port),
-                1 + 1 + address_len + 2,
-            ))
+        Address::Hostname(domain_name) => {
+            let domain_name_bytes = domain_name.as_bytes();
+            let mut vec = Vec::with_capacity(4 + domain_name_bytes.len());
+            vec.push(ADDR_TYPE_DOMAIN_NAME);
+            vec.push(domain_name_bytes.len() as u8);
+            vec.extend_from_slice(domain_name_bytes);
+            vec
         }
+    };
 
-        _ => Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("Unknown address type: {}", address_type),
-        )),
-    }
+    vec.push((port >> 8) as u8);
+    vec.push((port & 0xff) as u8);
+    vec
 }

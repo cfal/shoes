@@ -1,21 +1,28 @@
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use sha2::{Digest, Sha224};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::address::Location;
+use crate::address::NetLocation;
 use crate::async_stream::AsyncStream;
 use crate::config::ShadowsocksConfig;
-use crate::protocol_handler::{
-    ClientSetupResult, ServerSetupResult, TcpClientHandler, TcpServerHandler,
+use crate::option_util::NoneOrOne;
+use crate::shadowsocks::{
+    DefaultKey, ShadowsocksCipher, ShadowsocksKey, ShadowsocksStream, ShadowsocksStreamType,
 };
-use crate::shadowsocks::ShadowsocksCipher;
 use crate::socks_handler::{read_location, write_location, CMD_CONNECT, CMD_UDP_ASSOCIATE};
+use crate::tcp_handler::{
+    TcpClientHandler, TcpClientSetupResult, TcpServerHandler, TcpServerSetupResult,
+};
 
+#[derive(Debug)]
 struct ShadowsocksData {
     cipher: ShadowsocksCipher,
-    key_bytes: Box<[u8]>,
+    key: Arc<Box<dyn ShadowsocksKey>>,
 }
 
+#[derive(Debug)]
 pub struct TrojanTcpHandler {
     password_hash: Box<[u8]>,
     shadowsocks_data: Option<ShadowsocksData>,
@@ -26,12 +33,15 @@ impl TrojanTcpHandler {
         let password_hash = create_password_hash(&password);
         let shadowsocks_data = shadowsocks_config.as_ref().map(|config| {
             let ShadowsocksConfig {
-                cipher_name,
+                cipher,
                 password: shadowsocks_password,
             } = config;
-            let cipher: ShadowsocksCipher = cipher_name.as_str().into();
-            let key_bytes = cipher.get_key_bytes(&shadowsocks_password);
-            ShadowsocksData { cipher, key_bytes }
+            let cipher: ShadowsocksCipher = cipher.as_str().into();
+            let key: Arc<Box<dyn ShadowsocksKey>> = Arc::new(Box::new(DefaultKey::new(
+                shadowsocks_password,
+                cipher.algorithm().key_len(),
+            )));
+            ShadowsocksData { cipher, key }
         });
 
         Self {
@@ -46,13 +56,20 @@ impl TcpServerHandler for TrojanTcpHandler {
     async fn setup_server_stream(
         &self,
         mut server_stream: Box<dyn AsyncStream>,
-    ) -> std::io::Result<ServerSetupResult> {
+    ) -> std::io::Result<TcpServerSetupResult> {
         if let Some(ShadowsocksData {
             ref cipher,
-            ref key_bytes,
+            ref key,
         }) = self.shadowsocks_data
         {
-            server_stream = cipher.create_cipher_stream(key_bytes, server_stream);
+            server_stream = Box::new(ShadowsocksStream::new(
+                server_stream,
+                ShadowsocksStreamType::AEAD,
+                cipher.algorithm(),
+                cipher.salt_len(),
+                key.clone(),
+                None,
+            ));
         }
 
         let mut received_hash = [0u8; 56];
@@ -105,11 +122,13 @@ impl TcpServerHandler for TrojanTcpHandler {
             ));
         }
 
-        Ok(ServerSetupResult {
-            server_stream,
+        Ok(TcpServerSetupResult::TcpForward {
             remote_location,
-            override_proxy_provider: None,
+            stream: server_stream,
+            need_initial_flush: false,
+            connection_success_response: None,
             initial_remote_data: None,
+            override_proxy_provider: NoneOrOne::Unspecified,
         })
     }
 }
@@ -122,14 +141,21 @@ impl TcpClientHandler for TrojanTcpHandler {
         &self,
         _server_stream: &mut Box<dyn AsyncStream>,
         mut client_stream: Box<dyn AsyncStream>,
-        remote_location: Location,
-    ) -> std::io::Result<ClientSetupResult> {
+        remote_location: NetLocation,
+    ) -> std::io::Result<TcpClientSetupResult> {
         if let Some(ShadowsocksData {
             ref cipher,
-            ref key_bytes,
+            ref key,
         }) = self.shadowsocks_data
         {
-            client_stream = cipher.create_cipher_stream(&key_bytes, client_stream);
+            client_stream = Box::new(ShadowsocksStream::new(
+                client_stream,
+                ShadowsocksStreamType::AEAD,
+                cipher.algorithm(),
+                cipher.salt_len(),
+                key.clone(),
+                None,
+            ));
         }
 
         client_stream.write_all(&self.password_hash).await?;
@@ -138,7 +164,7 @@ impl TcpClientHandler for TrojanTcpHandler {
         write_location(&mut client_stream, &remote_location).await?;
         client_stream.write_all(&CRLF_BYTES).await?;
         client_stream.flush().await?;
-        Ok(ClientSetupResult { client_stream })
+        Ok(TcpClientSetupResult { client_stream })
     }
 }
 

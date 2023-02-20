@@ -1,7 +1,7 @@
 // Copied and modified from rust-snappy
 #![allow(dead_code)]
 
-use std::lazy::SyncOnceCell;
+use once_cell::sync::OnceCell;
 
 const POLY: u32 = 0xEDB88320;
 
@@ -14,8 +14,8 @@ pub fn crc32c(buf: &[u8]) -> u32 {
 
 /// Returns the CRC32 checksum of `buf` using the Castagnoli polynomial.
 fn crc32c_slice8(mut buf: &[u8], initial_crc: u32) -> u32 {
-    static TABLE: SyncOnceCell<[u32; 256]> = SyncOnceCell::new();
-    static TABLE16: SyncOnceCell<[[u32; 256]; 16]> = SyncOnceCell::new();
+    static TABLE: OnceCell<[u32; 256]> = OnceCell::new();
+    static TABLE16: OnceCell<[[u32; 256]; 16]> = OnceCell::new();
 
     let tab = TABLE.get_or_init(|| make_table(POLY));
     let tab8 = &TABLE16.get_or_init(|| {
@@ -33,7 +33,7 @@ fn crc32c_slice8(mut buf: &[u8], initial_crc: u32) -> u32 {
 
     let mut crc: u32 = initial_crc;
     while buf.len() >= 8 {
-        crc ^= read_u32_le(&buf[0..4]);
+        crc ^= u32::from_le_bytes(buf[0..4].try_into().unwrap());
         crc = tab8[0][buf[7] as usize]
             ^ tab8[1][buf[6] as usize]
             ^ tab8[2][buf[5] as usize]
@@ -48,10 +48,6 @@ fn crc32c_slice8(mut buf: &[u8], initial_crc: u32) -> u32 {
         crc = tab[((crc as u8) ^ b) as usize] ^ (crc >> 8);
     }
     crc
-}
-
-fn read_u32_le(data: &[u8]) -> u32 {
-    ((data[3] as u32) << 24) | ((data[2] as u32) << 16) | ((data[1] as u32) << 8) | (data[0] as u32)
 }
 
 fn make_table(poly: u32) -> [u32; 256] {

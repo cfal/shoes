@@ -2,206 +2,103 @@
 
 shoes is a multi-protocol proxy server written in Rust.
 
-- Supported TCP protocols
-  - **HTTP/HTTPS**
-  - **SOCKS5**
-  - **Shadowsocks**
-    - Supported ciphers: aes-128-gcm, aes-256-gcm, chacha20-ietf-poly1305
-  - **Vmess**
-    - Supported ciphers: aes-128-gcm, chacha20-poly1305
-    - AEAD mode support
-  - **Trojan**
-    - Optional Shadowsocks cipher support
-- Supported UDP protocols
-  - **Shadowsocks**
+## Supported protocols
+
+- **Vmess**
+  - TCP and UDP-over-TCP
+  - AEAD and Legacy modes
+  - Supported ciphers:
+    - aes-128-gcm
+    - chacha20-poly1305
+- **Snell** v3
+  - TCP and UDP-over-TCP
+  - Supported ciphers:
+    - aes-128-gcm
+    - chacha20-poly1305
+- **Shadowsocks**
+  - TCP only
+  - Supported ciphers:
+    - aes-128-gcm
+    - aes-256-gcm
+    - chacha20-ietf-poly1305
+    - 2022-blake3-aes-256-gcm
+    - 2022-blake3-chacha20-ietf-poly1305
+- **HTTP/HTTPS**
+- **SOCKS5**
+  - TCP only
+- **Vless**
+- **Trojan**
 
 ## Features
 
-- **TLS support**: use TLS/SSL with any supported TCP proxy protocol
+All supported protocols can be combined with the following features:
+
+- **TLS support with SNI based forwarding**
 - **Websocket obfs (Shadowsocks SIP003)** for all supported TCP protocols
   - Multi-path support: for example, run a single websocket server on a single port that serves Vmess at one path, and Shadowsocks at another path.
-- **Upstream proxy support**: route connections through other proxy servers in a round-robin fashion
-- **Forwarding rules**: Block or redirect connections based on IP or hostname
+- **Upstream proxy support**: route connections through other proxy servers
+- **Forwarding rules (allowlists/blocklists)**: Block or redirect connections based on IP or hostname
+- **Hot reloading**: Updated configs are automatically reloaded
+- **Unix domain socket**: Bind to an interface, or listen on a UNIX domain socket
+- **Netmask and proxy groups**
+
+## Examples
+
+Here's an example of running a WSS (websocket over TLS) server, with vmess and shadowsocks available at different paths:
+
+```yaml
+# Listen on all IPv4 interfaces, port 443 (HTTPS)
+- address: 0.0.0.0:443
+  transport: tcp
+  # Use TLS as the first protocol layer
+  protocol:
+    type: tls
+    # Set a default target, for any (or no) SNI
+    default_target:
+      cert: cert.pem
+      key: key.pem
+      # ..which goes to a websocket server
+      protocol:
+        type: ws
+        # .. where we have different supported proxy protocols, based on HTTP request path and headers.
+        targets:
+          - matching_path: /vmess
+            matching_headers:
+              X-Secret-Key: "secret"
+            protocol:
+              type: vmess
+              # allow any cipher, which means: none, aes-128-gcm, or chacha20-poly1305.
+              cipher: any
+              user_id: b0e80a62-8a51-47f0-91f1-f0f7faf8d9d4
+          - matching_path: /shadowsocks
+            protocol:
+              type: shadowsocks
+              cipher: 2022-blake3-aes-256-gcm
+              password: Hax8btYlNao5qcaN/l/NUl9JgbwapfqG5QyAtH+aKPg=
+  rules:
+    # Allow clients to connect to all IPs
+    - mask: 0.0.0.0/0
+      action: allow
+      # Direct connection, don't forward requests through another proxy.
+      client_proxy: direct
+```
+
+For other YAML config examples, see the [examples](./examples) directory.
 
 ## Usage
 
-`shoes <JSON config file or URL> [JSON config file or URL] [..]`
-
-## Configuration format
-
-Single line comments starting with `//` are supported in JSON config files.
-
-Configuration can be provided in URL or JSON format, or a combination of both. For example, the following configs are all equivalent:
-
 ```
-"ss://chacha20-ietf-poly1305:hello@0.0.0.0:62813/?tls=true&cert=cert.pem&key=key.pem"
-```
+shoes [OPTIONS] <YAML CONFIG PATH> [YAML CONFIG PATH] [..]
 
-```js
-{
-  "scheme": "shadowsocks",
-  "cipher": "chacha20-ietf-poly1305",
-  "password": "hello",
-  "address": "0.0.0.0:62813",
-  "tls": "true",
-  "cert": "cert.pem",
-  "key": "key.pem"
-}
+OPTIONS:
+
+    -t, --threads NUM
+        Set the number of worker threads. This usually defaults to the number of CPUs.
+
+    -d, --dry-run
+        Parse the config and exit.
 ```
 
-```js
-{
-  "url": "ss://chacha20-ietf-poly1305:hello@0.0.0.0:62813",
-  "tls": "true",
-  "cert": "cert.pem",
-  "key": "key.pem"
-}
-```
+## Config format
 
-## Websocket obfs (SIP003) configuration
-
-Websocket obfs configuration is different from other proxy servers. They are configured as websocket servers that can provide different proxy protocols. See some of the example configs below.
-
-## Example configs
-
-[Multiple servers with one process](#multiple-servers-with-one-process)
-
-[SOCKS5 TLS server with upstream proxies](#socks5-tls-server-with-upstream-proxies)
-
-[SOCKS5 server that connects using a Vmess proxy](#socks5-server-that-connects-using-a-vmess-proxy)
-
-[Trojan server that connects using a Vmess proxy server over websocket obfs](#trojan-server-that-connects-using-a-vmess-proxy-server-over-websocket-obfs-sip003)
-
-[Websocket (SIP033 obfs) server with Vmess and Shadowsocks](#websocket-sip033-obfs-server-with-vmess-and-shadowsocks)
-
-
-### Multiple servers with one process
-
-```js
-[
-  // run a shadowsocks server with aes-256-gcm encryption (password hello) on port 10000.
-  {
-    "url": "ss://aes-256-gcm:hello@0.0.0.0:10000"
-  },
-  // run a socks5 server with authentication on port 20000.
-  {
-    "url": "socks5://user:pass@0.0.0.0:20000"
-  },
-  // run a vmess server on port 30000.
-  {
-    "url": "vmess://c63425cc-3dca-439f-a323-832d03cd0658:chacha20-poly1305@0.0.0.0:30000"
-  }
-]
-```
-
-### SOCKS5 TLS server with upstream proxies
-
-```js
-{
-  // Run a SOCKS5 server on port 5000.
-  "url": "socks5://username:password@0.0.0.0:5000",
-
-  // Note that the 'tls' field is optional. When 'cert' and 'key' are provided, it is
-  // assumed that TLS needs to be enabled.
-  "tls": true,
-
-  "cert": "cert.pem",
-  "key": "keyfile.pem",
-
-  // Connections to the SOCKS5 server will be routed through these proxies, in
-  // round-robin fashion.
-  "proxies": [
-    // Connect using a HTTP proxy
-    "http://1.2.3.4:5555",
-    // .. and a trojan proxy
-    "trojan://password@5.6.7.8:9999",
-    // .. and another SOCKS5 TLS proxy.
-    "socks5://username:password@4.3.2.1:32145/?tls=true"
-  ]
-}
-```
-
-### SOCKS5 server that connects using a Vmess proxy
-
-```js
-{
-  "url": "socks5://username:password@0.0.0.0:5000",
-  "proxies": [
-    "vmess://c63425cc-3dca-439f-a323-832d03cd0658:chacha20-poly1305@0.0.0.0:30000"
-  ]
-}
-```
-
-### Trojan server that connects using a Vmess proxy server over websocket obfs (SIP003)
-
-```js
-{
-  // Run a trojan server on port 6000 with password 'abcd1234'.
-  "url": "trojan://abcd1234@0.0.0.0:6000",
-  "proxies": [
-    {
-      // Connect using a websocket server that provides vmess support, which can be
-      // accessed using path '/ws', with host header 'example.com'
-      //
-      // in other words: 'vmess server with websocket obfs, obfs path /ws and obfs host example.com'
-      "url": "wss://2.3.4.5:443",
-      "target": {
-        "matching_headers": {
-          "host": "example.com"
-        },
-        "matching_path": "/ws",
-        "scheme": "vmess",
-        "user_id": "e05b95db-a229-4f64-b2b3-b6073b4eb6c4",
-        "cipher": "chacha20-poly1305"
-      }
-    }
-  ]
-}
-```
-
-### Websocket (SIP033 obfs) server with Vmess and Shadowsocks
-
-```js
-{
-  // Run a websocket server over TLS (wss) on port 443.
-  "url": "wss://0.0.0.0:443",
-
-  // TLS configuration
-  "cert": "cert.pem",
-  "key": "keyfile.pem",
-
-  "targets": [
-    // Serve shadowsocks at obfs path /ss, obfs host example.com
-    {
-      "matching_path": "/ss",
-      "matching_headers": {
-        "host": "example.com"
-      },
-      "scheme": "shadowsocks",
-      "cipher": "aes-256-gcm",
-      "password": "hello",
-    },
-
-    // Serve shadowsocks at obfs path /ss2, where requests are routed through a HTTPS proxy.
-    // Any obfs host can be provided, since we do not specify it.
-    {
-      // Targets can also be specified using URL format, but note that the address is unused.
-      "matching_path": "/ss2",
-      "url": "shadowsocks://aes-256-gcm:hello@unused-address.com",
-      "proxies": [
-        "https://username:password@1.2.3.4:8080"
-      ]
-    },
-
-    // Serve vmess at obfs path /vmess, obfs host 'hello.com', when the user-agent is 'secret-client-v1.0'
-    {
-      "matching_path": "/vmess",
-      "matching_headers": {
-        "host": "hello.com",
-        "user-agent": "secret-client-v1.0"
-      },
-      "url": "vmess://3f4c7cb7-54fa-4965-b4f7-255047554831:chacha20-poly1305@unused-address.com"
-    }
-  ]
-}
-```
+Sorry, formal documentation for the YAML config format have not yet been written. You can refer to the [examples](./examples), or open an issue if you need help.

@@ -1,135 +1,110 @@
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use log::{debug, error, warn};
-use tokio::io::AsyncWriteExt;
+use tokio::fs::File;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
-use crate::address::NetLocation;
 use crate::async_stream::AsyncStream;
 use crate::client_proxy_selector::{ClientProxySelector, ConnectDecision};
-use crate::config::{BindLocation, ConfigSelection, ServerConfig, TcpConfig};
+use crate::config::{BindLocation, ConfigSelection, ServerConfig, ServerQuicConfig};
 use crate::copy_bidirectional::copy_bidirectional;
 use crate::copy_bidirectional_message::copy_bidirectional_message;
 use crate::copy_multidirectional_message::copy_multidirectional_message;
+use crate::quic_stream::QuicStream;
 use crate::resolver::{resolve_single_address, NativeResolver, Resolver};
+use crate::rustls_util::create_server_config;
 use crate::tcp_client_connector::TcpClientConnector;
 use crate::tcp_handler::{TcpServerHandler, TcpServerSetupResult};
 use crate::tcp_handler_util::{create_tcp_client_proxy_selector, create_tcp_server_handler};
+use crate::tcp_server::setup_client_stream;
 use crate::udp_direct_message_stream::UdpDirectMessageStream;
 
-async fn run_tcp_server(
+async fn run_quic_server(
     bind_address: SocketAddr,
-    tcp_config: TcpConfig,
-    client_proxy_selector: Arc<ClientProxySelector<TcpClientConnector>>,
-    server_handler: Arc<Box<dyn TcpServerHandler>>,
-) -> std::io::Result<()> {
-    let TcpConfig { no_delay } = tcp_config;
-
-    let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
-
-    let listener = tokio::net::TcpListener::bind(bind_address).await.unwrap();
-
-    loop {
-        let (stream, addr) = match listener.accept().await {
-            Ok(v) => v,
-            Err(e) => {
-                error!("Accept failed: {}", e);
-                continue;
-            }
-        };
-
-        if no_delay {
-            if let Err(e) = stream.set_nodelay(true) {
-                error!("Failed to set TCP nodelay: {}", e);
-            }
-        }
-
-        // TODO: allow this be to Option<Arc<ClientProxySelector<..>>> when
-        // there are no rules or proxies specified.
-        let cloned_provider = client_proxy_selector.clone();
-        let cloned_cache = resolver.clone();
-        let cloned_handler = server_handler.clone();
-        tokio::spawn(async move {
-            if let Err(e) =
-                process_stream(stream, cloned_handler, cloned_provider, cloned_cache).await
-            {
-                error!("{}:{} finished with error: {:?}", addr.ip(), addr.port(), e);
-            } else {
-                debug!("{}:{} finished successfully", addr.ip(), addr.port());
-            }
-        });
-    }
-}
-
-#[cfg(target_family = "unix")]
-async fn run_unix_server(
-    path_buf: PathBuf,
+    server_config: Arc<rustls::ServerConfig>,
     client_proxy_selector: Arc<ClientProxySelector<TcpClientConnector>>,
     server_handler: Arc<Box<dyn TcpServerHandler>>,
 ) -> std::io::Result<()> {
     let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
 
-    if tokio::fs::symlink_metadata(&path_buf).await.is_ok() {
-        println!(
-            "WARNING: replacing file at socket path {}",
-            path_buf.display()
-        );
-        let _ = tokio::fs::remove_file(&path_buf).await;
-    }
+    let mut server_config = quinn::ServerConfig::with_crypto(server_config);
+    Arc::get_mut(&mut server_config.transport)
+        .unwrap()
+        .max_concurrent_bidi_streams(1024_u32.into())
+        .max_concurrent_uni_streams(0_u8.into())
+        .keep_alive_interval(Some(std::time::Duration::from_secs(15).try_into().unwrap()))
+        .max_idle_timeout(Some(std::time::Duration::from_secs(30).try_into().unwrap()));
 
-    let listener = tokio::net::UnixListener::bind(path_buf).unwrap();
+    let endpoint = quinn::Endpoint::server(server_config, bind_address)?;
 
-    loop {
-        let (stream, addr) = match listener.accept().await {
-            Ok(v) => v,
-            Err(e) => {
-                error!("Accept failed: {:?}", e);
-                continue;
-            }
-        };
-
-        let cloned_provider = client_proxy_selector.clone();
-        let cloned_cache = resolver.clone();
+    while let Some(conn) = endpoint.accept().await {
+        let cloned_selector = client_proxy_selector.clone();
+        let cloned_resolver = resolver.clone();
         let cloned_handler = server_handler.clone();
         tokio::spawn(async move {
             if let Err(e) =
-                process_stream(stream, cloned_handler, cloned_provider, cloned_cache).await
+                process_connection(cloned_selector, cloned_resolver, cloned_handler, conn).await
             {
-                error!("{:?} finished with error: {:?}", addr, e);
-            } else {
-                debug!("{:?} finished successfully", addr);
+                error!("Connection ended with error: {}", e);
             }
         });
     }
+
+    Ok(())
 }
 
-async fn setup_server_stream<AS>(
-    stream: AS,
-    server_handler: Arc<Box<dyn TcpServerHandler>>,
-) -> std::io::Result<TcpServerSetupResult>
-where
-    AS: AsyncStream + 'static,
-{
-    let server_stream = Box::new(stream);
-    server_handler.setup_server_stream(server_stream).await
-}
-
-async fn process_stream<AS>(
-    stream: AS,
-    server_handler: Arc<Box<dyn TcpServerHandler>>,
+async fn process_connection(
     client_proxy_selector: Arc<ClientProxySelector<TcpClientConnector>>,
     resolver: Arc<dyn Resolver>,
-) -> std::io::Result<()>
-where
-    AS: AsyncStream + 'static,
-{
+    server_handler: Arc<Box<dyn TcpServerHandler>>,
+    conn: quinn::Connecting,
+) -> std::io::Result<()> {
+    let connection = conn.await?;
+
+    loop {
+        let stream = match connection.accept_bi().await {
+            Err(quinn::ConnectionError::ApplicationClosed { .. }) => {
+                debug!("Connection closed");
+                break;
+            }
+            Err(e) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("quic connection error: {}", e),
+                ));
+            }
+            Ok(s) => s,
+        };
+        let cloned_selector = client_proxy_selector.clone();
+        let cloned_resolver = resolver.clone();
+        let cloned_handler = server_handler.clone();
+        tokio::spawn(async move {
+            if let Err(e) =
+                process_streams(cloned_selector, cloned_resolver, cloned_handler, stream).await
+            {
+                error!("Failed to process streams: {}", e);
+            }
+        });
+    }
+
+    Ok(())
+}
+
+async fn process_streams(
+    client_proxy_selector: Arc<ClientProxySelector<TcpClientConnector>>,
+    resolver: Arc<dyn Resolver>,
+    server_handler: Arc<Box<dyn TcpServerHandler>>,
+    (send, recv): (quinn::SendStream, quinn::RecvStream),
+) -> std::io::Result<()> {
+    let quic_stream: Box<dyn AsyncStream> = Box::new(QuicStream::from(send, recv));
+
     let setup_server_stream_future = timeout(
-        Duration::from_secs(30),
-        setup_server_stream(stream, server_handler),
+        Duration::from_secs(60),
+        server_handler.setup_server_stream(quic_stream),
     );
 
     let setup_result = match setup_server_stream_future.await {
@@ -164,7 +139,7 @@ where
             };
 
             let setup_client_stream_future = timeout(
-                Duration::from_secs(30),
+                Duration::from_secs(60),
                 setup_client_stream(
                     &mut server_stream,
                     selected_proxy_provider,
@@ -297,46 +272,48 @@ where
     }
 }
 
-pub async fn setup_client_stream(
-    server_stream: &mut Box<dyn AsyncStream>,
-    client_proxy_selector: Arc<ClientProxySelector<TcpClientConnector>>,
-    resolver: Arc<dyn Resolver>,
-    remote_location: NetLocation,
-) -> std::io::Result<Option<Box<dyn AsyncStream>>> {
-    let action = client_proxy_selector
-        .judge(remote_location, &resolver)
-        .await?;
-
-    match action {
-        ConnectDecision::Allow {
-            client_proxy,
-            remote_location,
-        } => {
-            let client_stream = client_proxy
-                .connect(server_stream, remote_location, &resolver)
-                .await?;
-            Ok(Some(client_stream))
-        }
-        ConnectDecision::Block => Ok(None),
-    }
-}
-
-pub async fn start_tcp_server(config: ServerConfig) -> std::io::Result<Option<JoinHandle<()>>> {
+pub async fn start_quic_server(config: ServerConfig) -> std::io::Result<Option<JoinHandle<()>>> {
     let ServerConfig {
         bind_location,
-        tcp_settings,
+        quic_settings,
         protocol,
         rules,
         ..
     } = config;
 
-    println!("Starting {} TCP server at {}", &protocol, &bind_location);
+    println!("Starting {} QUIC server at {}", &protocol, &bind_location);
 
     let rules = rules.map(ConfigSelection::unwrap_config).into_vec();
     // We should always have a direct entry.
     assert!(!rules.is_empty());
 
-    let tcp_config = tcp_settings.unwrap_or_else(TcpConfig::default);
+    let bind_address = match bind_location {
+        // TODO: switch to non-blocking resolve?
+        BindLocation::Address(a) => a.to_socket_addr()?,
+        BindLocation::Path(_) => {
+            panic!("Cannot listen on path, QUIC does not have unix domain socket support");
+        }
+    };
+
+    let ServerQuicConfig {
+        cert,
+        key,
+        alpn_protocols,
+    } = quic_settings.unwrap();
+
+    let mut cert_file = File::open(&cert).await?;
+    let mut cert_bytes = vec![];
+    cert_file.read_to_end(&mut cert_bytes).await?;
+
+    let mut key_file = File::open(&key).await?;
+    let mut key_bytes = vec![];
+    key_file.read_to_end(&mut key_bytes).await?;
+
+    let server_config = Arc::new(create_server_config(
+        &cert_bytes,
+        &key_bytes,
+        &alpn_protocols.into_vec(),
+    ));
 
     let client_proxy_selector = Arc::new(create_tcp_client_proxy_selector(rules.clone()));
 
@@ -346,26 +323,13 @@ pub async fn start_tcp_server(config: ServerConfig) -> std::io::Result<Option<Jo
     debug!("TCP handler: {:?}", tcp_handler);
 
     Ok(Some(tokio::spawn(async move {
-        match bind_location {
-            BindLocation::Address(a) => {
-                // TODO: make this non-blocking?
-                let socket_addr = a.to_socket_addr().unwrap();
-                run_tcp_server(socket_addr, tcp_config, client_proxy_selector, tcp_handler)
-                    .await
-                    .unwrap();
-            }
-            BindLocation::Path(path_buf) => {
-                #[cfg(target_family = "unix")]
-                {
-                    run_unix_server(path_buf, client_proxy_selector, tcp_handler)
-                        .await
-                        .unwrap();
-                }
-                #[cfg(not(target_family = "unix"))]
-                {
-                    panic!("Unix sockets are not supported on non-unix OSes.");
-                }
-            }
-        }
+        run_quic_server(
+            bind_address,
+            server_config,
+            client_proxy_selector,
+            tcp_handler,
+        )
+        .await
+        .unwrap();
     })))
 }

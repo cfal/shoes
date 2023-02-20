@@ -1,36 +1,17 @@
-use std::net::{IpAddr, SocketAddr};
+use std::future::Future;
+use std::net::SocketAddr;
+use std::pin::Pin;
+use std::sync::Arc;
 
-use async_trait::async_trait;
+use log::debug;
 
-use crate::address::{Address, Location};
+use crate::address::NetLocation;
 
-#[async_trait]
 pub trait Resolver: Send + Sync {
-    async fn resolve_host(&self, host: &str) -> std::io::Result<Vec<IpAddr>>;
-
-    async fn resolve_single_address(&self, address: &Address) -> std::io::Result<IpAddr> {
-        match address {
-            Address::Ipv6(addr) => Ok(IpAddr::V6(*addr)),
-            Address::Ipv4(addr) => Ok(IpAddr::V4(*addr)),
-            Address::Hostname(hostname) => Ok(self.resolve_host(&hostname).await?[0]),
-        }
-    }
-
-    async fn resolve_address(&self, address: &Address) -> std::io::Result<Vec<IpAddr>> {
-        match address {
-            Address::Ipv6(addr) => Ok(vec![IpAddr::V6(*addr)]),
-            Address::Ipv4(addr) => Ok(vec![IpAddr::V4(*addr)]),
-            Address::Hostname(hostname) => self.resolve_host(&hostname).await,
-        }
-    }
-
-    async fn resolve_location(&self, location: &Location) -> std::io::Result<SocketAddr> {
-        let (address, port) = location.components();
-        Ok(SocketAddr::new(
-            self.resolve_single_address(address).await?,
-            port,
-        ))
-    }
+    fn resolve_location(
+        &self,
+        location: &NetLocation,
+    ) -> Pin<Box<dyn Future<Output = std::io::Result<Vec<SocketAddr>>> + Send>>;
 }
 
 pub struct NativeResolver;
@@ -41,12 +22,34 @@ impl NativeResolver {
     }
 }
 
-#[async_trait]
 impl Resolver for NativeResolver {
-    async fn resolve_host(&self, host: &str) -> std::io::Result<Vec<IpAddr>> {
-        Ok(tokio::net::lookup_host((host, 80u16))
-            .await?
-            .map(|s| s.ip())
-            .collect::<Vec<_>>())
+    fn resolve_location(
+        &self,
+        location: &NetLocation,
+    ) -> Pin<Box<dyn Future<Output = std::io::Result<Vec<SocketAddr>>> + Send>> {
+        let address = location.address().clone();
+        let port = location.port();
+        use futures::future::FutureExt;
+        Box::pin(
+            tokio::net::lookup_host((address.to_string(), port)).map(move |result| {
+                let ret = result.map(|r| r.collect::<Vec<_>>());
+                debug!("NativeResolver resolved {}:{} -> {:?}", address, port, ret);
+                ret
+            }),
+        )
     }
+}
+
+pub async fn resolve_single_address(
+    resolver: &Arc<dyn Resolver>,
+    location: &NetLocation,
+) -> std::io::Result<SocketAddr> {
+    let resolve_results = resolver.resolve_location(&location).await?;
+    if resolve_results.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("could not resolve location: {}", location),
+        ));
+    }
+    Ok(resolve_results[0])
 }

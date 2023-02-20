@@ -21,10 +21,11 @@ use super::fnv1a::Fnv1aHasher;
 use super::md5::{compute_hmac_md5, compute_md5, compute_md5_repeating, create_chacha_key};
 use super::nonce::{SingleUseNonce, VmessNonceSequence};
 use super::vmess_stream::VmessStream;
-use crate::address::{Address, Location};
+use crate::address::{Address, NetLocation};
 use crate::async_stream::AsyncStream;
-use crate::protocol_handler::{
-    ClientSetupResult, ServerSetupResult, TcpClientHandler, TcpServerHandler,
+use crate::option_util::NoneOrOne;
+use crate::tcp_handler::{
+    TcpClientHandler, TcpClientSetupResult, TcpServerHandler, TcpServerSetupResult,
 };
 use crate::util::allocate_vec;
 
@@ -35,6 +36,7 @@ enum DataCipher {
     Any,
     Aes128Gcm,
     ChaCha20Poly1305,
+    None,
 }
 
 impl From<&str> for DataCipher {
@@ -43,6 +45,7 @@ impl From<&str> for DataCipher {
             "" | "any" => DataCipher::Any,
             "aes-128-gcm" => DataCipher::Aes128Gcm,
             "chacha20-poly1305" | "chacha20-ietf-poly1305" => DataCipher::ChaCha20Poly1305,
+            "none" => DataCipher::None,
             _ => {
                 panic!("Unknown cipher: {}", name);
             }
@@ -52,6 +55,7 @@ impl From<&str> for DataCipher {
 
 type UserHash = [u8; 16];
 
+#[derive(Debug)]
 struct CertHashProvider {
     user_key: [u8; 16],
     hashes: HashMap<UserHash, u64>,
@@ -107,15 +111,17 @@ impl CertHashProvider {
 
 type AesCfb = Cfb<Aes128>;
 
+#[derive(Debug)]
 pub struct VmessTcpServerHandler {
     data_cipher: DataCipher,
     instruction_key: [u8; 16],
     aead_cipher: Aes128,
     cert_hash_provider: Option<Mutex<CertHashProvider>>,
+    udp_enabled: bool,
 }
 
 impl VmessTcpServerHandler {
-    pub fn new(cipher_name: &str, user_id: &str, force_aead: bool) -> Self {
+    pub fn new(cipher_name: &str, user_id: &str, force_aead: bool, udp_enabled: bool) -> Self {
         let mut user_id_bytes = parse_hex(user_id);
         let cert_hash_provider = if force_aead {
             None
@@ -134,6 +140,7 @@ impl VmessTcpServerHandler {
             aead_cipher,
             instruction_key,
             cert_hash_provider,
+            udp_enabled,
         }
     }
 }
@@ -143,7 +150,7 @@ impl TcpServerHandler for VmessTcpServerHandler {
     async fn setup_server_stream(
         &self,
         mut server_stream: Box<dyn AsyncStream>,
-    ) -> std::io::Result<ServerSetupResult> {
+    ) -> std::io::Result<TcpServerSetupResult> {
         let mut cert_hash = [0u8; 16];
         server_stream.read_exact(&mut cert_hash).await?;
 
@@ -315,7 +322,7 @@ impl TcpServerHandler for VmessTcpServerHandler {
                     address_bytes[2],
                     address_bytes[3],
                 );
-                Location::new(Address::Ipv4(v4addr), port)
+                NetLocation::new(Address::Ipv4(v4addr), port)
             }
             2 => {
                 // domain name
@@ -340,7 +347,7 @@ impl TcpServerHandler for VmessTcpServerHandler {
                 // Although this is supposed to be a hostname, some clients will pass
                 // ipv4 and ipv6 addresses as well, so parse it rather than directly
                 // using Address:Hostname enum.
-                Location::new(Address::from(address_str)?, port)
+                NetLocation::new(Address::from(address_str)?, port)
             }
             3 => {
                 // 16 byte ipv6 address
@@ -359,7 +366,7 @@ impl TcpServerHandler for VmessTcpServerHandler {
                     u16::from_be_bytes(address_bytes[14..16].try_into().unwrap()),
                 );
 
-                Location::new(Address::Ipv6(v6addr), port)
+                NetLocation::new(Address::Ipv6(v6addr), port)
             }
             invalid_type => {
                 return Err(std::io::Error::new(
@@ -391,7 +398,7 @@ impl TcpServerHandler for VmessTcpServerHandler {
             ));
         }
 
-        let mut server_stream = header_reader.into_stream();
+        let server_stream = header_reader.into_stream();
 
         let data_encryption_iv: &[u8] = &instructions_to_addr_type[1..17];
         let data_encryption_key: &[u8] = &instructions_to_addr_type[17..33];
@@ -433,12 +440,7 @@ impl TcpServerHandler for VmessTcpServerHandler {
             }
             3 => DataCipher::Aes128Gcm,
             4 => DataCipher::ChaCha20Poly1305,
-            5 => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "No data encryption was requested",
-                ));
-            }
+            5 => DataCipher::None,
             unknown_cipher_type => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -457,15 +459,16 @@ impl TcpServerHandler for VmessTcpServerHandler {
             ));
         }
 
-        match instructions_to_addr_type[37] {
-            1 => {
-                // tcp, noop.
-            }
+        let is_udp = match instructions_to_addr_type[37] {
+            1 => false,
             2 => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "UDP was requested",
-                ));
+                if !self.udp_enabled {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "UDP not enabled",
+                    ));
+                }
+                true
             }
             unknown_protocol_type => {
                 return Err(std::io::Error::new(
@@ -473,7 +476,7 @@ impl TcpServerHandler for VmessTcpServerHandler {
                     format!("Unknown requested protocol: {}", unknown_protocol_type),
                 ));
             }
-        }
+        };
 
         let mut response_header: [u8; 4] = [
             response_authentication_v,
@@ -497,34 +500,41 @@ impl TcpServerHandler for VmessTcpServerHandler {
             )
         };
 
-        let (unbound_opening_key, unbound_sealing_key) = match requested_data_cipher {
+        let unbound_keys = match requested_data_cipher {
             // TODO: stop unwrapping
             DataCipher::Aes128Gcm => {
                 // key is 16 bytes
-                (
+                Some((
                     UnboundKey::new(&AES_128_GCM, &data_encryption_key).unwrap(),
                     UnboundKey::new(&AES_128_GCM, &response_header_key).unwrap(),
-                )
+                ))
             }
             DataCipher::ChaCha20Poly1305 => {
                 // key is 32 bytes
-                (
+                Some((
                     UnboundKey::new(&CHACHA20_POLY1305, &create_chacha_key(&data_encryption_key))
                         .unwrap(),
                     UnboundKey::new(&CHACHA20_POLY1305, &create_chacha_key(&response_header_key))
                         .unwrap(),
-                )
+                ))
             }
+            DataCipher::None => None,
             DataCipher::Any => unreachable!(),
         };
-        let opening_key = OpeningKey::new(
-            unbound_opening_key,
-            VmessNonceSequence::new(&data_encryption_iv),
-        );
-        let sealing_key = SealingKey::new(
-            unbound_sealing_key,
-            VmessNonceSequence::new(&response_header_iv),
-        );
+
+        let data_keys = if let Some((unbound_opening_key, unbound_sealing_key)) = unbound_keys {
+            let opening_key = OpeningKey::new(
+                unbound_opening_key,
+                VmessNonceSequence::new(&data_encryption_iv),
+            );
+            let sealing_key = SealingKey::new(
+                unbound_sealing_key,
+                VmessNonceSequence::new(&response_header_iv),
+            );
+            Some((opening_key, sealing_key))
+        } else {
+            None
+        };
 
         let (read_length_shake_reader, write_length_shake_reader) = if enable_chunk_masking {
             let mut request_hasher = Shake128::default();
@@ -540,16 +550,19 @@ impl TcpServerHandler for VmessTcpServerHandler {
             (None, None)
         };
 
-        if is_aead_request {
+        // store the response header as prefix bytes to read when we are streaming.
+        // writing the response header immediately without reading causes Surge to fail with
+        // "Got short header" error.
+        let prefix_bytes: Box<[u8]> = if is_aead_request {
             let response_header_length_aead_key =
                 super::sha2::kdf(&response_header_key, &[b"AEAD Resp Header Len Key"]);
             let response_header_length_nonce =
                 super::sha2::kdf(&response_header_iv, &[b"AEAD Resp Header Len IV"]);
 
-            let mut encrypted_response_header_length = [0u8; 2 + TAG_LEN];
+            let mut encrypted_response_header = [0u8; 2 + TAG_LEN + 4 + TAG_LEN];
 
             // we know the size of response_header already.
-            encrypted_response_header_length[1] = 4;
+            encrypted_response_header[1] = 4;
 
             // TODO: don't unwrap
             let unbound_key =
@@ -559,12 +572,9 @@ impl TcpServerHandler for VmessTcpServerHandler {
                 SingleUseNonce::new(&response_header_length_nonce[0..12]),
             );
             let tag = sealing_key
-                .seal_in_place_separate_tag(
-                    Aad::empty(),
-                    &mut encrypted_response_header_length[0..2],
-                )
+                .seal_in_place_separate_tag(Aad::empty(), &mut encrypted_response_header[0..2])
                 .unwrap();
-            encrypted_response_header_length[2..].copy_from_slice(tag.as_ref());
+            encrypted_response_header[2..2 + TAG_LEN].copy_from_slice(tag.as_ref());
 
             let response_header_aead_key =
                 super::sha2::kdf(&response_header_key, &[b"AEAD Resp Header Key"]);
@@ -577,42 +587,50 @@ impl TcpServerHandler for VmessTcpServerHandler {
                 SingleUseNonce::new(&response_header_nonce[0..12]),
             );
 
-            let mut encrypted_response_header = [0u8; 4 + TAG_LEN];
-            encrypted_response_header[0..4].copy_from_slice(&response_header);
+            encrypted_response_header[2 + TAG_LEN..2 + TAG_LEN + 4]
+                .copy_from_slice(&response_header);
 
             let tag = sealing_key
-                .seal_in_place_separate_tag(Aad::empty(), &mut encrypted_response_header[0..4])
+                .seal_in_place_separate_tag(
+                    Aad::empty(),
+                    &mut encrypted_response_header[2 + TAG_LEN..2 + TAG_LEN + 4],
+                )
                 .unwrap();
-            encrypted_response_header[4..].copy_from_slice(tag.as_ref());
+            encrypted_response_header[2 + TAG_LEN + 4..].copy_from_slice(tag.as_ref());
 
-            server_stream
-                .write_all(&encrypted_response_header_length)
-                .await?;
-            server_stream.write_all(&encrypted_response_header).await?;
+            Box::new(encrypted_response_header)
         } else {
             let mut response_cipher =
                 AesCfb::new_from_slices(&response_header_key, &response_header_iv).unwrap();
             response_cipher.encrypt(&mut response_header);
-            server_stream.write_all(&response_header).await?;
-        }
-
-        server_stream.flush().await?;
+            Box::new(response_header)
+        };
 
         let server_stream = Box::new(VmessStream::new(
             server_stream,
-            opening_key,
-            sealing_key,
+            is_udp,
+            data_keys,
             read_length_shake_reader,
             write_length_shake_reader,
             enable_global_padding,
+            Some(prefix_bytes),
         ));
 
-        Ok(ServerSetupResult {
-            server_stream,
-            remote_location,
-            override_proxy_provider: None,
-            initial_remote_data: None,
-        })
+        match is_udp {
+            false => Ok(TcpServerSetupResult::TcpForward {
+                remote_location,
+                stream: server_stream,
+                // Wait until there is data to send the response header.
+                need_initial_flush: false,
+                connection_success_response: None,
+                initial_remote_data: None,
+                override_proxy_provider: NoneOrOne::Unspecified,
+            }),
+            true => Ok(TcpServerSetupResult::BidirectionalUdpForward {
+                remote_location,
+                stream: server_stream,
+            }),
+        }
     }
 }
 
@@ -673,6 +691,7 @@ impl AeadHeaderReader {
     }
 }
 
+#[derive(Debug)]
 pub struct VmessTcpClientHandler {
     data_cipher: DataCipher,
     user_key: [u8; 16],
@@ -709,8 +728,8 @@ impl TcpClientHandler for VmessTcpClientHandler {
         &self,
         _server_stream: &mut Box<dyn AsyncStream>,
         mut client_stream: Box<dyn AsyncStream>,
-        remote_location: Location,
-    ) -> std::io::Result<ClientSetupResult> {
+        remote_location: NetLocation,
+    ) -> std::io::Result<TcpClientSetupResult> {
         let (cert_hash, time_bytes): ([u8; 16], [u8; 8]) = if self.is_aead {
             // AEAD allows 120 second delta from the current time.
             // See authid.go in v2ray-core.
@@ -788,13 +807,15 @@ impl TcpClientHandler for VmessTcpClientHandler {
             (Some(response_reader), Some(request_reader))
         };
 
-        let (encryption_method, unbound_opening_key, unbound_sealing_key) = match self.data_cipher {
+        let (encryption_method, unbound_keys) = match self.data_cipher {
             DataCipher::Aes128Gcm => {
                 // key is 16 bytes
                 (
                     3u8,
-                    UnboundKey::new(&AES_128_GCM, &response_header_key).unwrap(),
-                    UnboundKey::new(&AES_128_GCM, &data_encryption_key).unwrap(),
+                    Some((
+                        UnboundKey::new(&AES_128_GCM, &response_header_key).unwrap(),
+                        UnboundKey::new(&AES_128_GCM, &data_encryption_key).unwrap(),
+                    )),
                 )
             }
             DataCipher::ChaCha20Poly1305 | DataCipher::Any => {
@@ -802,21 +823,36 @@ impl TcpClientHandler for VmessTcpClientHandler {
                 // key is 32 bytes
                 (
                     4u8,
-                    UnboundKey::new(&CHACHA20_POLY1305, &create_chacha_key(&response_header_key))
+                    Some((
+                        UnboundKey::new(
+                            &CHACHA20_POLY1305,
+                            &create_chacha_key(&response_header_key),
+                        )
                         .unwrap(),
-                    UnboundKey::new(&CHACHA20_POLY1305, &create_chacha_key(&data_encryption_key))
+                        UnboundKey::new(
+                            &CHACHA20_POLY1305,
+                            &create_chacha_key(&data_encryption_key),
+                        )
                         .unwrap(),
+                    )),
                 )
             }
+            DataCipher::None => (5u8, None),
         };
-        let opening_key = OpeningKey::new(
-            unbound_opening_key,
-            VmessNonceSequence::new(&response_header_iv),
-        );
-        let sealing_key = SealingKey::new(
-            unbound_sealing_key,
-            VmessNonceSequence::new(&data_encryption_iv),
-        );
+
+        let data_keys = if let Some((unbound_opening_key, unbound_sealing_key)) = unbound_keys {
+            let opening_key = OpeningKey::new(
+                unbound_opening_key,
+                VmessNonceSequence::new(&response_header_iv),
+            );
+            let sealing_key = SealingKey::new(
+                unbound_sealing_key,
+                VmessNonceSequence::new(&data_encryption_iv),
+            );
+            Some((opening_key, sealing_key))
+        } else {
+            None
+        };
 
         // continue filling out other parts of instructions_to_addr_type.
 
@@ -945,6 +981,10 @@ impl TcpClientHandler for VmessTcpClientHandler {
         client_stream.flush().await?;
 
         // Read the server response.
+        // TODO: we shouldn't expect the server response without sending data first.
+        // This causes a bug in Surge on the server side, which is why we ended up sending the
+        // prefix bytes to VmessStream and sending it when we can, instead of forcing an initial
+        // flush.
         let response_header_bytes = if self.is_aead {
             let mut encrypted_response_header_length = [0u8; 2 + TAG_LEN];
             client_stream
@@ -1046,14 +1086,15 @@ impl TcpClientHandler for VmessTcpClientHandler {
 
         let client_stream = Box::new(VmessStream::new(
             client_stream,
-            opening_key,
-            sealing_key,
+            false,
+            data_keys,
             read_length_shake_reader,
             write_length_shake_reader,
             false,
+            None,
         ));
 
-        Ok(ClientSetupResult { client_stream })
+        Ok(TcpClientSetupResult { client_stream })
     }
 }
 

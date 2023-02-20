@@ -1,83 +1,126 @@
+#![feature(int_roundings)]
 #![feature(hash_drain_filter)]
-#![feature(once_cell)]
 
 mod address;
 mod async_stream;
-mod async_tls;
-mod client_proxy;
-mod client_proxy_provider;
+mod client_proxy_selector;
 mod config;
 mod copy_bidirectional;
+mod copy_bidirectional_message;
+mod copy_multidirectional_message;
 mod http_handler;
 mod line_reader;
-mod protocol_handler;
+mod option_util;
+mod port_forward_handler;
+mod quic_server;
+mod quic_stream;
 mod resolver;
+mod rustls_util;
+mod salt_checker;
 mod shadowsocks;
+mod snell_handler;
+mod snell_udp_stream;
+mod socket_util;
 mod socks_handler;
+mod tcp_client_connector;
+mod tcp_handler;
+mod tcp_handler_util;
 mod tcp_server;
-mod tls_factory;
+mod thread_util;
+mod timed_salt_checker;
+mod tls_handler;
 mod trojan_handler;
-mod udp_server;
+mod udp_direct_message_stream;
 mod util;
 mod vless_handler;
 mod vmess;
 mod websocket;
 
-use std::sync::Arc;
+use std::path::Path;
 
-use futures::future::try_join_all;
-use log::{debug, warn};
+use log::debug;
+use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::runtime::Builder;
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 use tokio::task::JoinHandle;
 
-use crate::async_tls::AsyncTlsFactory;
-use crate::config::{ServerConfig, ServerProtocol};
+use crate::config::{ServerConfig, Transport};
+use crate::quic_server::start_quic_server;
 use crate::tcp_server::start_tcp_server;
-use crate::tls_factory::get_tls_factory;
-use crate::udp_server::start_udp_server;
+use crate::thread_util::set_num_threads;
 
-async fn start_servers(
-    config: ServerConfig,
-    tls_factory: Arc<dyn AsyncTlsFactory>,
-) -> std::io::Result<Vec<JoinHandle<()>>> {
-    debug!("================================================================================");
-    debug!("{:#?}", &config);
-    debug!("================================================================================");
+#[derive(Debug)]
+struct ConfigChanged;
 
-    let bind_address = config.bind_address.clone();
+fn start_notify_thread(
+    config_paths: Vec<String>,
+) -> (RecommendedWatcher, UnboundedReceiver<ConfigChanged>) {
+    let (tx, rx) = unbounded_channel();
 
-    let maybe_tcp_handle = if config.server_protocols.contains(&ServerProtocol::Tcp) {
-        start_tcp_server(config.clone(), tls_factory).await?
-    } else {
-        None
-    };
-
-    let maybe_udp_handle = if config.server_protocols.contains(&ServerProtocol::Udp) {
-        start_udp_server(config).await?
-    } else {
-        None
-    };
-
-    let mut join_handles = Vec::with_capacity(2);
-
-    match maybe_tcp_handle {
-        Some(h) => join_handles.push(h),
-        None => {
-            warn!("Not starting TCP server on {}.", &bind_address);
+    let mut watcher = notify::recommended_watcher(move |res| match res {
+        Ok(_) => {
+            tx.send(ConfigChanged {}).unwrap();
         }
+        Err(e) => println!("watch error: {:?}", e),
+    })
+    .unwrap();
+
+    for config_path in config_paths {
+        watcher
+            .watch(Path::new(&config_path), RecursiveMode::NonRecursive)
+            .unwrap();
     }
 
-    match maybe_udp_handle {
-        Some(h) => join_handles.push(h),
-        None => {
-            warn!("Not starting UDP server on {}.", &bind_address);
-        }
+    (watcher, rx)
+}
+
+async fn start_servers(config: ServerConfig) -> std::io::Result<Vec<JoinHandle<()>>> {
+    let mut join_handles = Vec::with_capacity(3);
+
+    match config.transport {
+        Transport::Tcp => match start_tcp_server(config.clone()).await {
+            Ok(Some(handle)) => {
+                join_handles.push(handle);
+            }
+            Ok(None) => (),
+            Err(e) => {
+                for join_handle in join_handles {
+                    join_handle.abort();
+                }
+                return Err(e);
+            }
+        },
+        Transport::Quic => match start_quic_server(config.clone()).await {
+            Ok(Some(handle)) => {
+                join_handles.push(handle);
+            }
+            Ok(None) => (),
+            Err(e) => {
+                for join_handle in join_handles {
+                    join_handle.abort();
+                }
+                return Err(e);
+            }
+        },
+        Transport::Udp => todo!(),
+        // Transport::Udp => match start_udp_server(config.clone()).await {
+        //     Ok(Some(handle)) => {
+        //         join_handles.push(handle);
+        //     }
+        //     Ok(None) => (),
+        //     Err(e) => {
+        //         for join_handle in join_handles {
+        //             join_handle.abort();
+        //         }
+        //         return Err(e);
+        //     }
+        // },
     }
 
     if join_handles.is_empty() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::Other,
-            "failed to start both tcp and udp",
+            format!("failed to start servers at {}", &config.bind_location),
         ));
     }
 
@@ -95,6 +138,7 @@ fn main() {
     let mut args: Vec<String> = std::env::args().collect();
     let arg0 = args.remove(0);
     let mut num_threads = 0usize;
+    let mut dry_run = false;
 
     while args.len() > 0 && args[0].starts_with("-") {
         if args[0] == "--threads" || args[0] == "-t" {
@@ -112,6 +156,9 @@ fn main() {
                     return;
                 }
             };
+        } else if args[0] == "--dry-run" || args[0] == "-d" {
+            args.remove(0);
+            dry_run = true;
         } else {
             eprintln!("Invalid argument: {}", args[0]);
             print_usage_and_exit(arg0);
@@ -119,14 +166,14 @@ fn main() {
         }
     }
 
-    let configs = match ServerConfig::from_args(args) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("Failed to load server config: {}\n", e);
-            print_usage_and_exit(arg0);
-            return;
-        }
-    };
+    if args.is_empty() {
+        println!("No config specified, assuming loading from file config.shoes.json");
+        args.push("config.shoes.json".to_string())
+    }
+
+    if dry_run {
+        println!("Starting dry run.");
+    }
 
     if num_threads == 0 {
         num_threads = std::cmp::max(
@@ -140,25 +187,70 @@ fn main() {
         println!("Using custom thread count ({})", num_threads);
     }
 
-    let runtime = Builder::new_multi_thread()
-        .worker_threads(num_threads)
+    // Used by QUIC to figure out the number of endpoints.
+    // TODO: can we pass it in instead?
+    set_num_threads(num_threads);
+
+    let mut builder = if num_threads == 1 {
+        Builder::new_current_thread()
+    } else {
+        let mut mt = Builder::new_multi_thread();
+        mt.worker_threads(num_threads);
+        mt
+    };
+
+    let runtime = builder
         .enable_io()
         .enable_time()
         .build()
         .expect("Could not build tokio runtime");
 
-    let tls_factory: Arc<dyn AsyncTlsFactory> = get_tls_factory();
-
     runtime.block_on(async move {
-        println!("\nStarting {} server(s)..", configs.len());
+        let (_watcher, mut config_rx) = start_notify_thread(args.clone());
 
-        // Expect tcp and udp join handles for each.
-        let mut join_handles = Vec::with_capacity(configs.len() * 2);
-        for config in configs {
-            join_handles.append(&mut start_servers(config, tls_factory.clone()).await.unwrap());
+        // let configs = config_serde::load_configs(&args).await.unwrap();
+
+        loop {
+            let configs = match config::load_configs(&args).await {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Failed to load server configs: {}\n", e);
+                    print_usage_and_exit(arg0);
+                    return;
+                }
+            };
+
+            for config in configs.iter() {
+                debug!("================================================================================");
+                debug!("{:#?}", config);
+            }
+            debug!("================================================================================");
+
+            if dry_run {
+                println!("Finishing dry run, config parsed successfully.");
+                return;
+            }
+
+            println!("\nStarting {} server(s)..", configs.len());
+
+            // Expect tcp and udp join handles for each.
+            let mut join_handles = Vec::with_capacity(configs.len() * 2);
+            for config in configs {
+                join_handles.append(&mut start_servers(config).await.unwrap());
+            }
+
+            config_rx.recv().await.unwrap();
+
+            println!("Configs changed, restarting servers in 3 seconds..");
+
+            for join_handle in join_handles {
+                join_handle.abort();
+            }
+
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+            // Remove any extra events
+            while let Ok(_) = config_rx.try_recv() {}
         }
-
-        // Die on any server error.
-        try_join_all(join_handles).await.unwrap();
     });
 }

@@ -4,13 +4,16 @@ use async_trait::async_trait;
 use log::info;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::address::{Address, Location};
+use crate::address::{Address, NetLocation};
 use crate::async_stream::AsyncStream;
-use crate::protocol_handler::{
-    ClientSetupResult, ServerSetupResult, TcpClientHandler, TcpServerHandler,
+use crate::option_util::NoneOrOne;
+use crate::tcp_handler::{
+    TcpClientHandler, TcpClientSetupResult, TcpServerHandler, TcpServerSetupResult,
 };
+
 use crate::util::allocate_vec;
 
+#[derive(Debug)]
 pub struct VlessTcpHandler {
     user_id: Box<[u8]>,
 }
@@ -23,12 +26,17 @@ impl VlessTcpHandler {
     }
 }
 
+const SERVER_RESPONSE_HEADER: &[u8] = &[
+    0u8, // version
+    0u8, // addons length
+];
+
 #[async_trait]
 impl TcpServerHandler for VlessTcpHandler {
     async fn setup_server_stream(
         &self,
         mut server_stream: Box<dyn AsyncStream>,
-    ) -> std::io::Result<ServerSetupResult> {
+    ) -> std::io::Result<TcpServerSetupResult> {
         let mut prefix = [0u8; 18];
         server_stream.read_exact(&mut prefix).await?;
 
@@ -93,7 +101,7 @@ impl TcpServerHandler for VlessTcpHandler {
                     address_bytes[2],
                     address_bytes[3],
                 );
-                Location::new(Address::Ipv4(v4addr), port)
+                NetLocation::new(Address::Ipv4(v4addr), port)
             }
             2 => {
                 // domain name
@@ -116,7 +124,7 @@ impl TcpServerHandler for VlessTcpHandler {
                 // Although this is supposed to be a hostname, some clients will pass
                 // ipv4 and ipv6 addresses as well, so parse it rather than directly
                 // using Address:Hostname enum.
-                Location::new(Address::from(address_str)?, port)
+                NetLocation::new(Address::from(address_str)?, port)
             }
             3 => {
                 // 16 byte ipv6 address
@@ -134,7 +142,7 @@ impl TcpServerHandler for VlessTcpHandler {
                     ((address_bytes[14] as u16) << 8) | (address_bytes[15] as u16),
                 );
 
-                Location::new(Address::Ipv6(v6addr), port)
+                NetLocation::new(Address::Ipv6(v6addr), port)
             }
             invalid_type => {
                 return Err(std::io::Error::new(
@@ -144,19 +152,13 @@ impl TcpServerHandler for VlessTcpHandler {
             }
         };
 
-        let response_header = [
-            0u8, // version
-            0,   // addons length
-        ];
-
-        server_stream.write_all(&response_header).await?;
-        server_stream.flush().await?;
-
-        Ok(ServerSetupResult {
-            server_stream,
+        Ok(TcpServerSetupResult::TcpForward {
             remote_location,
-            override_proxy_provider: None,
+            stream: server_stream,
+            need_initial_flush: true,
+            connection_success_response: Some(SERVER_RESPONSE_HEADER.to_vec().into_boxed_slice()),
             initial_remote_data: None,
+            override_proxy_provider: NoneOrOne::Unspecified,
         })
     }
 }
@@ -167,8 +169,8 @@ impl TcpClientHandler for VlessTcpHandler {
         &self,
         _server_stream: &mut Box<dyn AsyncStream>,
         mut client_stream: Box<dyn AsyncStream>,
-        remote_location: Location,
-    ) -> std::io::Result<ClientSetupResult> {
+        remote_location: NetLocation,
+    ) -> std::io::Result<TcpClientSetupResult> {
         // version + user id + header addon length + command + port + address type
         let mut header_bytes = [0u8; 1 + 16 + 1 + 1 + 2 + 1];
 
@@ -236,7 +238,7 @@ impl TcpClientHandler for VlessTcpHandler {
             read_addons(&mut client_stream, addon_length).await?;
         }
 
-        Ok(ClientSetupResult { client_stream })
+        Ok(TcpClientSetupResult { client_stream })
     }
 }
 

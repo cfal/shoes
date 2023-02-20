@@ -1,8 +1,10 @@
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::SystemTime;
 
-use async_trait::async_trait;
 use futures::ready;
+use parking_lot::Mutex;
 use rand::RngCore;
 use ring::aead::{
     Aad, Algorithm, BoundKey, Nonce, NonceSequence, OpeningKey, SealingKey, UnboundKey, NONCE_LEN,
@@ -10,8 +12,14 @@ use ring::aead::{
 use ring::error::Unspecified;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use super::aead_util::{create_session_key, TAG_LEN};
-use crate::async_stream::AsyncStream;
+use super::aead_util::TAG_LEN;
+use super::shadowsocks_key::ShadowsocksKey;
+use super::shadowsocks_stream_type::ShadowsocksStreamType;
+use crate::async_stream::{
+    AsyncFlushMessage, AsyncMessageStream, AsyncPing, AsyncReadMessage, AsyncShutdownMessage,
+    AsyncStream, AsyncWriteMessage,
+};
+use crate::salt_checker::SaltChecker;
 use crate::util::allocate_vec;
 
 fn generate_iv(buf: &mut [u8]) {
@@ -41,12 +49,18 @@ impl NonceSequence for IncreasingSequence {
 }
 
 pub struct ShadowsocksStream {
-    algorithm: &'static Algorithm,
     stream: Box<dyn AsyncStream>,
-    key: Box<[u8]>,
+
+    stream_type: ShadowsocksStreamType,
+    algorithm: &'static Algorithm,
+    salt_len: usize,
+    key: Arc<Box<dyn ShadowsocksKey>>,
+    salt_checker: Option<Arc<Mutex<dyn SaltChecker>>>,
+    encrypt_iv: Box<[u8]>,
+    decrypt_iv: Option<Box<[u8]>>,
+
     sealing_key: SealingKey<IncreasingSequence>,
     opening_key: Option<OpeningKey<IncreasingSequence>>,
-    salt_len: usize,
 
     unprocessed_buf: Box<[u8]>,
     unprocessed_start_offset: usize,
@@ -60,6 +74,8 @@ pub struct ShadowsocksStream {
     write_cache_start_offset: usize,
     write_cache_end_offset: usize,
 
+    is_initial_read: bool,
+    is_initial_write: bool,
     is_eof: bool,
 }
 
@@ -69,43 +85,48 @@ enum DecryptState {
     Success,
 }
 
-// from https://shadowsocks.org/en/wiki/AEAD-Ciphers.html
-// [encrypted payload length][length tag][encrypted payload][payload tag]
-// = (2 + 16) + (0x3fff (at most) + 16)
-// = 16417
-// which means a full single packet can use at most 16417 bytes.
-const MAX_DATA_SEGMENT_SIZE: usize = 0x3fff;
 const METADATA_SIZE: usize = 2 + (2 * TAG_LEN);
-const MAX_PACKET_SIZE: usize = MAX_DATA_SEGMENT_SIZE + METADATA_SIZE;
 
 impl ShadowsocksStream {
     pub fn new(
-        algorithm: &'static Algorithm,
         stream: Box<dyn AsyncStream>,
-        key: &[u8],
+        stream_type: ShadowsocksStreamType,
+        algorithm: &'static Algorithm,
         salt_len: usize,
+        key: Arc<Box<dyn ShadowsocksKey>>,
+        salt_checker: Option<Arc<Mutex<dyn SaltChecker>>>,
     ) -> Self {
-        let unprocessed_buf = allocate_vec(MAX_PACKET_SIZE).into_boxed_slice();
+        let max_payload_len = stream_type.max_payload_len();
+        let max_packet_len = max_payload_len + METADATA_SIZE;
 
-        // The max processed data from one packet is 0x3fff = 16383, so set it to 2^14
-        let processed_buf = allocate_vec(MAX_DATA_SEGMENT_SIZE).into_boxed_slice();
-
+        // Be able to store a full packet.
+        let unprocessed_buf = allocate_vec(max_packet_len).into_boxed_slice();
+        // Be able to store a full payload.
+        let processed_buf = allocate_vec(max_payload_len).into_boxed_slice();
         // Set the write cache to exactly the size of 1 full packet.
-        let mut write_cache = allocate_vec(MAX_PACKET_SIZE).into_boxed_slice();
+        let write_cache = allocate_vec(max_packet_len).into_boxed_slice();
 
-        let mut encrypt_iv = &mut write_cache[0..salt_len];
+        let mut encrypt_iv = allocate_vec(salt_len).into_boxed_slice();
         generate_iv(&mut encrypt_iv);
-        let session_key = create_session_key(key, &encrypt_iv);
+
+        let session_key = key.create_session_key(&encrypt_iv);
         let unbound_key = UnboundKey::new(algorithm, &session_key).unwrap();
         let sealing_key = SealingKey::new(unbound_key, IncreasingSequence::new());
 
         Self {
-            algorithm,
             stream,
-            key: key.to_vec().into_boxed_slice(),
+
+            stream_type,
+            algorithm,
+            salt_len,
+            key,
+            salt_checker,
+            encrypt_iv,
+            // Needed for AEAD2022 server response.
+            decrypt_iv: None,
+
             sealing_key,
             opening_key: None,
-            salt_len,
 
             unprocessed_buf,
             unprocessed_start_offset: 0,
@@ -117,15 +138,17 @@ impl ShadowsocksStream {
 
             write_cache,
             write_cache_start_offset: 0,
-            write_cache_end_offset: salt_len,
+            write_cache_end_offset: 0,
 
+            is_initial_read: true,
+            is_initial_write: true,
             is_eof: false,
         }
     }
 
     fn process_opening_key(&mut self) -> std::io::Result<()> {
         let decrypt_iv = &self.unprocessed_buf[0..self.salt_len];
-        let session_key = create_session_key(&self.key, &decrypt_iv);
+        let session_key = self.key.create_session_key(&decrypt_iv);
         let unbound_key = UnboundKey::new(self.algorithm, &session_key).unwrap();
         let opening_key = OpeningKey::new(unbound_key, IncreasingSequence::new());
         self.opening_key = Some(opening_key);
@@ -179,7 +202,7 @@ impl ShadowsocksStream {
                 // "Payload length is a 2-byte big-endian unsigned integer capped at 0x3FFF.
                 // The higher two bits are reserved and must be set to zero. Payload is
                 // therefore limited to 16*1024 - 1 bytes."
-                if data_len_no_tag > MAX_DATA_SEGMENT_SIZE {
+                if data_len_no_tag > self.stream_type.max_payload_len() {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         "data length larger than max allowed size",
@@ -275,21 +298,28 @@ impl ShadowsocksStream {
         }
     }
 
-    fn encrypt_single(&mut self, input: &[u8]) -> std::result::Result<(), Unspecified> {
+    fn encrypt_single(
+        &mut self,
+        input: &[u8],
+        write_length_header: bool,
+    ) -> std::result::Result<(), Unspecified> {
         let output = &mut self.write_cache[self.write_cache_end_offset..];
-
         let input_len = input.len();
 
-        output[0] = (input_len >> 8) as u8;
-        output[1] = (input_len & 0xff) as u8;
+        let mut written = if write_length_header {
+            output[0] = (input_len >> 8) as u8;
+            output[1] = (input_len & 0xff) as u8;
 
-        let tag = self
-            .sealing_key
-            .seal_in_place_separate_tag(Aad::empty(), &mut output[0..2])?;
+            let tag = self
+                .sealing_key
+                .seal_in_place_separate_tag(Aad::empty(), &mut output[0..2])?;
 
-        output[2..2 + TAG_LEN].copy_from_slice(&tag.as_ref()[0..TAG_LEN]);
+            output[2..2 + TAG_LEN].copy_from_slice(&tag.as_ref()[0..TAG_LEN]);
 
-        let mut written = 2 + TAG_LEN;
+            2 + TAG_LEN
+        } else {
+            0
+        };
 
         output[written..written + input_len].copy_from_slice(input);
 
@@ -351,42 +381,364 @@ impl ShadowsocksStream {
         self.unprocessed_end_offset -= self.unprocessed_start_offset;
         self.unprocessed_start_offset = 0;
     }
-}
 
-impl AsyncRead for ShadowsocksStream {
-    fn poll_read(
+    fn read_header_len(&self) -> usize {
+        match self.stream_type {
+            ShadowsocksStreamType::AEAD => self.salt_len,
+            ShadowsocksStreamType::AEAD2022Server => {
+                // Expect the encrypted client (request) header
+                // salt (salt_len) + encrypted packet [type (1) + timestamp (8) + length (2)] + tag (TAG_LEN)
+                self.salt_len + 11 + TAG_LEN
+            }
+            ShadowsocksStreamType::AEAD2022Client => {
+                // Expect the server (response) header
+                // salt (salt_len) + encrypted packet [type (1) + timestamp (8) + salt (salt_len) + length (2)] + tag (TAG_LEN)
+                self.salt_len + 11 + self.salt_len + TAG_LEN
+            }
+        }
+    }
+
+    fn process_read_header(&mut self) -> std::io::Result<()> {
+        match self.stream_type {
+            ShadowsocksStreamType::AEAD => {
+                if let Some(salt_checker) = &self.salt_checker {
+                    let decrypt_iv = &self.unprocessed_buf[0..self.salt_len];
+                    if !salt_checker.lock().insert_and_check(&decrypt_iv) {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            "got duplicate salt",
+                        ));
+                    }
+                }
+                self.process_opening_key()?;
+                self.unprocessed_start_offset += self.salt_len;
+            }
+            ShadowsocksStreamType::AEAD2022Server => {
+                self.process_opening_key()?;
+
+                if self
+                    .opening_key
+                    .as_mut()
+                    .unwrap()
+                    .open_in_place(
+                        Aad::empty(),
+                        &mut self.unprocessed_buf[self.salt_len..self.salt_len + 11 + TAG_LEN],
+                    )
+                    .is_err()
+                {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "open failed for fixed length request header",
+                    ));
+                }
+
+                if self.unprocessed_buf[self.salt_len] != 0 {
+                    // HeaderTypeClientStream = 0
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "invalid client header type, got {}",
+                            self.unprocessed_buf[self.salt_len]
+                        ),
+                    ));
+                }
+
+                let timestamp_bytes = &self.unprocessed_buf[self.salt_len + 1..self.salt_len + 9];
+                let timestamp_secs = u64::from_be_bytes(timestamp_bytes.try_into().unwrap());
+                let current_time_secs = current_time_secs();
+                if current_time_secs >= timestamp_secs {
+                    if current_time_secs - timestamp_secs > 30 {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            "timestamp is greater than 30 seconds",
+                        ));
+                    }
+                } else {
+                    // Make sure times aren't too far in the future.
+                    if timestamp_secs - current_time_secs > 2 {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!(
+                                "timestamp is {} seconds in the future",
+                                timestamp_secs - current_time_secs
+                            ),
+                        ));
+                    }
+                }
+
+                let decrypt_iv = &self.unprocessed_buf[0..self.salt_len];
+                if let Some(salt_checker) = &self.salt_checker {
+                    if !salt_checker.lock().insert_and_check(&decrypt_iv) {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            "got duplicate salt",
+                        ));
+                    }
+                }
+
+                // Needed for writing the response
+                self.decrypt_iv = Some(decrypt_iv.to_vec().into_boxed_slice());
+
+                let variable_header_len = ((self.unprocessed_buf[self.salt_len + 9] as usize) << 8)
+                    | (self.unprocessed_buf[self.salt_len + 10] as usize);
+
+                self.unprocessed_pending_len = Some(variable_header_len);
+
+                self.unprocessed_start_offset += self.salt_len + 11 + TAG_LEN;
+            }
+            ShadowsocksStreamType::AEAD2022Client => {
+                self.process_opening_key()?;
+
+                if self
+                    .opening_key
+                    .as_mut()
+                    .unwrap()
+                    .open_in_place(
+                        Aad::empty(),
+                        &mut self.unprocessed_buf
+                            [self.salt_len..self.salt_len + 11 + self.salt_len + TAG_LEN],
+                    )
+                    .is_err()
+                {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "open failed for fixed length request header",
+                    ));
+                }
+
+                if self.unprocessed_buf[self.salt_len] != 1 {
+                    // HeaderTypeServerStream = 1
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "invalid server header type, got {}",
+                            self.unprocessed_buf[self.salt_len]
+                        ),
+                    ));
+                }
+
+                let timestamp_bytes = &self.unprocessed_buf[self.salt_len + 1..self.salt_len + 9];
+                let timestamp_secs = u64::from_be_bytes(timestamp_bytes.try_into().unwrap());
+                let current_time_secs = current_time_secs();
+                if current_time_secs >= timestamp_secs {
+                    if current_time_secs - timestamp_secs > 30 {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            "timestamp is greater than 30 seconds",
+                        ));
+                    }
+                } else {
+                    // Make sure times aren't too far in the future.
+                    if timestamp_secs - current_time_secs > 2 {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!(
+                                "timestamp is {} seconds in the future",
+                                timestamp_secs - current_time_secs
+                            ),
+                        ));
+                    }
+                }
+
+                if let Some(salt_checker) = &self.salt_checker {
+                    let decrypt_iv = &self.unprocessed_buf[0..self.salt_len];
+                    if !salt_checker.lock().insert_and_check(&decrypt_iv) {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            "got duplicate salt",
+                        ));
+                    }
+                }
+
+                let request_salt =
+                    &self.unprocessed_buf[self.salt_len + 9..self.salt_len + 9 + self.salt_len];
+
+                for (a, b) in request_salt.iter().zip(self.encrypt_iv.iter()) {
+                    if a != b {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "server returned request salt does not match",
+                        ));
+                    }
+                }
+
+                let first_chunk_len =
+                    ((self.unprocessed_buf[self.salt_len + 9 + self.salt_len] as usize) << 8)
+                        | (self.unprocessed_buf[self.salt_len + 9 + self.salt_len + 1] as usize);
+
+                self.unprocessed_pending_len = Some(first_chunk_len);
+
+                self.unprocessed_start_offset = self.salt_len + 11 + self.salt_len + TAG_LEN;
+            }
+        }
+
+        if self.unprocessed_start_offset == self.unprocessed_end_offset {
+            self.unprocessed_start_offset = 0;
+            self.unprocessed_end_offset = 0;
+        }
+
+        Ok(())
+    }
+
+    fn process_write_header(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self.stream_type {
+            ShadowsocksStreamType::AEAD => {
+                self.write_cache[0..self.salt_len].copy_from_slice(&self.encrypt_iv);
+                self.write_cache_end_offset = self.salt_len;
+
+                let handled_len = std::cmp::min(
+                    buf.len(),
+                    self.write_cache.len() - self.write_cache_end_offset - METADATA_SIZE,
+                );
+                assert!(handled_len > 0);
+
+                self.encrypt_single(&buf[0..handled_len], true)
+                    .map_err(|_| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            "failed to encrypt initial packet",
+                        )
+                    })?;
+
+                Ok(handled_len)
+            }
+            ShadowsocksStreamType::AEAD2022Server => {
+                assert!(!self.is_initial_read);
+
+                let decrypt_iv = self.decrypt_iv.take().unwrap();
+
+                self.write_cache[0..self.salt_len].copy_from_slice(&self.encrypt_iv);
+                self.write_cache_end_offset = self.salt_len;
+
+                let mut response_header = allocate_vec(1 + 8 + self.salt_len + 2);
+
+                // HeaderTypeServerStream = 1
+                response_header[0] = 1;
+                response_header[1..9].copy_from_slice(&current_time_secs().to_be_bytes());
+                response_header[9..9 + self.salt_len].copy_from_slice(&decrypt_iv);
+
+                let handled_len = std::cmp::min(
+                    buf.len(),
+                    // subtract TAG_LEN and not METADATA_SIZE because we don't need the length header + tag.
+                    self.write_cache.len()
+                        - self.salt_len
+                        - (response_header.len() + TAG_LEN)
+                        - TAG_LEN,
+                );
+
+                response_header[9 + self.salt_len] = (handled_len >> 8) as u8;
+                response_header[9 + self.salt_len + 1] = (handled_len & 0xff) as u8;
+
+                self.encrypt_single(&response_header, false).map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "failed to encrypt response header",
+                    )
+                })?;
+
+                self.encrypt_single(&buf[0..handled_len], false)
+                    .map_err(|_| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            "failed to encrypt initial server packet",
+                        )
+                    })?;
+
+                Ok(handled_len)
+            }
+            ShadowsocksStreamType::AEAD2022Client => {
+                self.write_cache[0..self.salt_len].copy_from_slice(&self.encrypt_iv);
+                self.write_cache_end_offset = self.salt_len;
+
+                let mut request_header = allocate_vec(1 + 8 + 2);
+
+                // HeaderTypeClientStream = 0
+                request_header[0] = 0;
+                request_header[1..9].copy_from_slice(&current_time_secs().to_be_bytes());
+
+                // This is a bit hacky. We expect/know that the first packet will be the "variable-length header"
+                // with the address and padding, and we need to send it all off in a single packet.
+                let buf_len = buf.len();
+                assert!(
+                    buf_len
+                        <= self.write_cache.len()
+                            - self.salt_len
+                            - (request_header.len() + TAG_LEN)
+                            - TAG_LEN
+                );
+
+                request_header[9] = (buf_len >> 8) as u8;
+                request_header[10] = (buf_len & 0xff) as u8;
+
+                self.encrypt_single(&request_header, false).map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "failed to encrypt response header",
+                    )
+                })?;
+
+                self.encrypt_single(&buf, false).map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "failed to encrypt initial client packet",
+                    )
+                })?;
+
+                Ok(buf_len)
+            }
+        }
+    }
+
+    fn poll_read_inner(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
+        fill_buffer: bool,
     ) -> std::task::Poll<std::io::Result<()>> {
         let this = self.get_mut();
-        if this.opening_key.is_none() {
+
+        if this.is_initial_read && !this.is_eof {
             loop {
-                let mut read_buf = ReadBuf::new(
-                    &mut this.unprocessed_buf[this.unprocessed_end_offset..this.salt_len],
-                );
+                let mut read_buf =
+                    ReadBuf::new(&mut this.unprocessed_buf[this.unprocessed_end_offset..]);
                 ready!(Pin::new(&mut this.stream).poll_read(cx, &mut read_buf))?;
                 let len = read_buf.filled().len();
                 if len == 0 {
+                    this.is_eof = true;
                     return Poll::Ready(Ok(()));
                 }
                 this.unprocessed_end_offset += len;
-                if this.unprocessed_end_offset == this.salt_len {
+                if this.unprocessed_end_offset >= this.read_header_len() {
                     break;
                 }
             }
-            this.process_opening_key()?;
-            this.unprocessed_end_offset = 0;
-        }
 
-        if this.processed_end_offset > 0 {
-            this.read_processed(buf);
-            return Poll::Ready(Ok(()));
-        } else if this.is_eof {
-            return Poll::Ready(Ok(()));
+            this.process_read_header()?;
+            this.is_initial_read = false;
         }
 
         loop {
+            if this.unprocessed_end_offset > 0 {
+                // Process some data to free up unprocessed_buf space.
+                loop {
+                    match this.try_decrypt()? {
+                        DecryptState::NeedData => {
+                            break;
+                        }
+                        DecryptState::BufferFull => {
+                            assert!(this.processed_end_offset > 0);
+                            break;
+                        }
+                        DecryptState::Success => {
+                            if !fill_buffer && this.processed_end_offset > 0 {
+                                break;
+                            }
+                            continue;
+                        }
+                    }
+                }
+            }
+
             if this.unprocessed_end_offset == this.unprocessed_buf.len() {
                 // if we got here, there's no data in processed buf, and we don't have
                 // space in unprocessed buf to read more to decrypt.
@@ -394,6 +746,16 @@ impl AsyncRead for ShadowsocksStream {
                 // this must be because start offset has moved forward too much.
                 this.reset_unprocessed_buf_offset();
                 assert!(this.unprocessed_end_offset < this.unprocessed_buf.len());
+            }
+
+            if this.processed_end_offset > 0 {
+                // Return the data we just got.
+                this.read_processed(buf);
+                return Poll::Ready(Ok(()));
+            }
+
+            if this.is_eof {
+                return Poll::Ready(Ok(()));
             }
 
             let mut read_buf =
@@ -406,42 +768,23 @@ impl AsyncRead for ShadowsocksStream {
             if len == 0 {
                 // We've reached EOF. Return any available data first.
                 this.is_eof = true;
-                if this.processed_end_offset > 0 {
-                    // TODO: I don't think we ever hit this clause.
-                    // The only time we read is when processed_end_offset is 0.
-                    this.read_processed(buf);
-                }
-                return Poll::Ready(Ok(()));
-            }
-
-            this.unprocessed_end_offset += len;
-
-            // Process some data to free up unprocessed_buf space.
-            loop {
-                match this.try_decrypt()? {
-                    DecryptState::NeedData => {
-                        break;
-                    }
-                    DecryptState::BufferFull => {
-                        assert!(this.processed_end_offset > 0);
-                        this.read_processed(buf);
-                        return Poll::Ready(Ok(()));
-                    }
-                    DecryptState::Success => {
-                        continue;
-                    }
-                }
-            }
-
-            if this.processed_end_offset > 0 {
-                // Return the data we just got.
-                this.read_processed(buf);
-                return Poll::Ready(Ok(()));
+            } else {
+                this.unprocessed_end_offset += len;
             }
 
             // We don't want to return zero bytes, and we haven't yet hit a Poll::Pending,
             // so try to read again.
         }
+    }
+}
+
+impl AsyncRead for ShadowsocksStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        self.poll_read_inner(cx, buf, true)
     }
 }
 
@@ -451,14 +794,25 @@ impl AsyncWrite for ShadowsocksStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
+        // TODO: This might not be optimal because we always immediately packetize `buf`, should we
+        // do something smarter?
         let this = self.get_mut();
 
-        if this.write_cache_start_offset > 0 {
-            // Previously, we didn't bother to actually write to the stream when cache space was 0
-            // and returned Pending here, but then bidirectional copy would get stuck.
-            // For now, try to write when no cache space is remaining.
-            // If we don't want to write to stream, we need to configure the
-            // context/waker to notify that writes are possible again after flush.
+        if this.is_initial_write {
+            let handled_len = this.process_write_header(buf)?;
+            assert!(handled_len > 0 && this.write_cache_end_offset > 0);
+            this.is_initial_write = false;
+
+            if let Err(e) = this.do_write_cache(cx) {
+                return Poll::Ready(Err(e));
+            }
+
+            return Poll::Ready(Ok(handled_len));
+        }
+
+        let mut write_cache_space = this.write_cache.len() - this.write_cache_end_offset;
+
+        if write_cache_space <= METADATA_SIZE {
             match this.do_write_cache(cx) {
                 Ok(all_written) => {
                     if !all_written {
@@ -468,20 +822,26 @@ impl AsyncWrite for ShadowsocksStream {
                 Err(e) => {
                     return Poll::Ready(Err(e));
                 }
-            }
+            };
             // if we got here, then everything was written.
             assert!(this.write_cache_start_offset == 0 && this.write_cache_end_offset == 0);
+            write_cache_space = this.write_cache.len();
         }
 
-        let max_write_cache_data_size = this.write_cache.len() - METADATA_SIZE;
+        let max_write_cache_data_size = write_cache_space - METADATA_SIZE;
         let packet_data_size = std::cmp::min(
             std::cmp::min(buf.len(), max_write_cache_data_size),
-            MAX_DATA_SEGMENT_SIZE,
+            this.stream_type.max_payload_len(),
         );
-        this.encrypt_single(&buf[0..packet_data_size])
+        this.encrypt_single(&buf[0..packet_data_size], true)
             .map_err(|_| {
                 std::io::Error::new(std::io::ErrorKind::Other, "failed to encrypt packet")
             })?;
+
+        if let Err(e) = this.do_write_cache(cx) {
+            return Poll::Ready(Err(e));
+        }
+
         Poll::Ready(Ok(packet_data_size))
     }
 
@@ -517,5 +877,79 @@ impl AsyncWrite for ShadowsocksStream {
     }
 }
 
-#[async_trait]
+impl AsyncReadMessage for ShadowsocksStream {
+    fn poll_read_message(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        self.poll_read_inner(cx, buf, false)
+    }
+}
+
+impl AsyncWriteMessage for ShadowsocksStream {
+    fn poll_write_message(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+
+        if this.is_initial_write {
+            let handled_len = this.process_write_header(buf)?;
+            assert!(handled_len == buf.len());
+            this.is_initial_write = false;
+            return Poll::Ready(Ok(()));
+        }
+
+        let write_cache_space = this.write_cache.len() - this.write_cache_end_offset;
+        let packet_size = buf.len() + METADATA_SIZE;
+        assert!(packet_size <= this.write_cache.len());
+
+        if packet_size > write_cache_space {
+            return Poll::Pending;
+        }
+
+        this.encrypt_single(&buf, true).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::Other, "failed to encrypt packet")
+        })?;
+
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl AsyncPing for ShadowsocksStream {
+    fn supports_ping(&self) -> bool {
+        self.stream.supports_ping()
+    }
+
+    fn poll_write_ping(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<bool>> {
+        Pin::new(&mut self.stream).poll_write_ping(cx)
+    }
+}
+
+impl AsyncFlushMessage for ShadowsocksStream {
+    fn poll_flush_message(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        self.poll_flush(cx)
+    }
+}
+
+impl AsyncShutdownMessage for ShadowsocksStream {
+    fn poll_shutdown_message(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        self.poll_shutdown(cx)
+    }
+}
+
 impl AsyncStream for ShadowsocksStream {}
+impl AsyncMessageStream for ShadowsocksStream {}
+
+#[inline]
+fn current_time_secs() -> u64 {
+    SystemTime::UNIX_EPOCH.elapsed().unwrap().as_secs() as u64
+}
