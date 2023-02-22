@@ -95,15 +95,20 @@ impl TcpClientConnector {
 
                 for _ in 0..endpoints_len {
                     // quinn handles setting the socket to non-blocking.
-                    let udp_socket = new_udp_socket(
+                    let udp_socket = match new_udp_socket(
                         client_config
                             .bind_interface
                             .as_option()
                             .map(ToString::to_string),
-                    )
-                    .unwrap()
-                    .into_std()
-                    .unwrap();
+                    ) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            error!("Failed to bind new UDP socket: {}", e);
+                            return None;
+                        }
+                    };
+                    let udp_socket = udp_socket.into_std().unwrap();
+
                     let mut endpoint = quinn::Endpoint::new(
                         quinn::EndpointConfig::default(),
                         None,
@@ -169,7 +174,7 @@ impl TcpClientConnector {
         let client_stream: Box<dyn AsyncStream> = match self.transport_config {
             TransportConfig::Tcp { no_delay } => {
                 let tcp_socket =
-                    new_tcp_socket(self.bind_interface.clone(), target_addr.is_ipv6()).unwrap();
+                    new_tcp_socket(self.bind_interface.clone(), target_addr.is_ipv6())?;
                 let client_stream = tcp_socket.connect(target_addr).await?;
                 if no_delay {
                     if let Err(e) = client_stream.set_nodelay(true) {
