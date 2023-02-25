@@ -89,6 +89,16 @@ Here's an example of running a WSS vmess and shadowsocks server, with all reques
 
 For other YAML config examples, see the [examples](./examples) directory.
 
+## Installation
+
+Precompiled binaries for x86_64 and Apple aarch64 are available on [Github Releases](https://github.com/cfal/shoes/releases).
+
+Else, if you have a fairly recent Rust and cargo installation on your system, shoes can be installed with `cargo`.
+
+```bash
+cargo install shoes
+```
+
 ## Usage
 
 ```
