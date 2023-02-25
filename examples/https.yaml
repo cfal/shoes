@@ -1,0 +1,21 @@
+# An HTTPS server with Basic Authentication.
+- address: 127.0.0.1:443
+  transport: tcp
+  protocol:
+    type: tls
+    default_target:
+      cert: cert.pem
+      key: key.pem
+      protocol:
+        type: http
+        username: secretuser
+        password: secretpass
+  rules:
+    - mask: 1.2.3.4/32
+      action: allow
+      override_ip: 192.168.0.1
+      client_proxy: direct
+    - mask: 0.0.0.0/0
+      action: allow
+      # Direct connection, don't forward requests through another proxy.
+      client_proxy: direct
