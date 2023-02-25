@@ -2,6 +2,13 @@
 name = "shoes"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
+description = "A multi-protocol proxy server."
+homepage = "https://github.com/cfal/shoes/"
+repository = "https://github.com/cfal/shoes/"
+readme = "README.md"
+keywords = ["proxy", "proxy-server", "shadowsocks", "v2ray", "gfw", "vmess", "proxy-client", "snell", "snell-server", "vless", "vmess-ws-tls"]
+categories = ["command-line-utilities", "network-programming"]
 
 [dependencies]
 aes = "0.7.5"
