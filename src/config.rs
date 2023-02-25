@@ -680,6 +680,14 @@ fn validate_client_config(client_config: &mut ClientConfig) -> std::io::Result<(
         ));
     }
 
+    #[cfg(not(any(target_os = "android", target_os = "fuchsia", target_os = "linux")))]
+    if client_config.bind_interface.is_one() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "bind_interface is only available on Android, Fuchsia, or Linux.",
+        ));
+    }
+
     Ok(())
 }
 

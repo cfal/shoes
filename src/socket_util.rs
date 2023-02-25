@@ -8,7 +8,12 @@ pub fn new_udp_socket(bind_interface: Option<String>) -> std::io::Result<tokio::
     // handle SO_BINDTODEVICE ourselves.
     let tokio_socket = tokio::net::UdpSocket::from_std(std_socket).unwrap();
     if let Some(b) = bind_interface {
+        #[cfg(all(any(target_os = "android", target_os = "fuchsia", target_os = "linux")))]
         tokio_socket.bind_device(Some(b.as_bytes()))?;
+
+        // This should be handled during config validation.
+        #[cfg(not(any(target_os = "android", target_os = "fuchsia", target_os = "linux")))]
+        panic!("Could not find to device, unsupported platform.")
     }
 
     Ok(tokio_socket)
@@ -26,7 +31,12 @@ pub fn new_tcp_socket(
     };
 
     if let Some(b) = bind_interface {
+        #[cfg(all(any(target_os = "android", target_os = "fuchsia", target_os = "linux")))]
         tcp_socket.bind_device(Some(b.as_bytes()))?;
+
+        // This should be handled during config validation.
+        #[cfg(not(any(target_os = "android", target_os = "fuchsia", target_os = "linux")))]
+        panic!("Could not find to device, unsupported platform.")
     }
 
     Ok(tcp_socket)
