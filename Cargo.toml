@@ -7,7 +7,7 @@ description = "A multi-protocol proxy server."
 homepage = "https://github.com/cfal/shoes/"
 repository = "https://github.com/cfal/shoes/"
 readme = "README.md"
-keywords = ["proxy", "proxy-server", "shadowsocks", "v2ray", "gfw", "vmess", "proxy-client", "snell", "snell-server", "vless", "vmess-ws-tls"]
+keywords = ["proxy", "proxy-server", "shadowsocks", "v2ray", "vmess"]
 categories = ["command-line-utilities", "network-programming"]
 
 [dependencies]
