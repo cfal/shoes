@@ -4,6 +4,9 @@ shoes is a multi-protocol proxy server written in Rust.
 
 ## Supported protocols
 
+- **HTTP/HTTPS**
+- **SOCKS5**
+  - TCP only
 - **Vmess**
   - TCP and UDP-over-TCP
   - AEAD and Legacy modes
@@ -14,20 +17,23 @@ shoes is a multi-protocol proxy server written in Rust.
   - TCP and UDP-over-TCP
   - Supported ciphers:
     - aes-128-gcm
-    - chacha20-poly1305
+    - aes-256-gcm
+    - chacha20-ietf-poly1305
 - **Shadowsocks**
   - TCP only
   - Supported ciphers:
     - aes-128-gcm
     - aes-256-gcm
     - chacha20-ietf-poly1305
+    - 2022-blake3-aes-128-gcm
     - 2022-blake3-aes-256-gcm
     - 2022-blake3-chacha20-ietf-poly1305
-- **HTTP/HTTPS**
-- **SOCKS5**
-  - TCP only
 - **Vless**
 - **Trojan**
+  - Supported ciphers:
+    - aes-128-gcm
+    - aes-256-gcm
+    - chacha20-ietf-poly1305
 
 ## Features
 
