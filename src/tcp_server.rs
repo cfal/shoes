@@ -128,7 +128,7 @@ where
     AS: AsyncStream + 'static,
 {
     let setup_server_stream_future = timeout(
-        Duration::from_secs(30),
+        Duration::from_secs(60),
         setup_server_stream(stream, server_handler),
     );
 
@@ -164,7 +164,7 @@ where
             };
 
             let setup_client_stream_future = timeout(
-                Duration::from_secs(30),
+                Duration::from_secs(60),
                 setup_client_stream(
                     &mut server_stream,
                     selected_proxy_provider,
