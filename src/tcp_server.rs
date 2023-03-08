@@ -169,7 +169,7 @@ where
                     &mut server_stream,
                     selected_proxy_provider,
                     resolver,
-                    remote_location,
+                    remote_location.clone(),
                 ),
             );
 
@@ -184,14 +184,17 @@ where
                     let _ = server_stream.shutdown().await;
                     return Err(std::io::Error::new(
                         e.kind(),
-                        format!("failed to setup client stream: {}", e),
+                        format!(
+                            "failed to setup client stream to {}: {}",
+                            remote_location, e
+                        ),
                     ));
                 }
                 Err(elapsed) => {
                     let _ = server_stream.shutdown().await;
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::TimedOut,
-                        format!("client setup timed out: {}", elapsed),
+                        format!("client setup to {} timed out: {}", remote_location, elapsed),
                     ));
                 }
             };
