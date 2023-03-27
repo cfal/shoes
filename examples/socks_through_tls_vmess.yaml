@@ -1,0 +1,18 @@
+# A SOCKS5 server that forwards connections through a VMess TLS proxy.
+- address: 127.0.0.1:1080
+  protocol:
+    # no auth - add 'username' and 'password' fields for authentication.
+    type: socks
+  rules:
+    # allow connections to all ips
+    mask: 0.0.0.0/0
+    action: allow
+    client_proxy:
+      address: 127.0.0.1:2000
+      protocol:
+        type: tls
+        verify: false
+        protocol:
+          type: vmess
+          cipher: any
+          user_id: b0e80a62-8a51-47f0-91f1-f0f7faf8d9d4
