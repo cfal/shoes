@@ -620,8 +620,10 @@ impl TcpServerHandler for VmessTcpServerHandler {
             false => Ok(TcpServerSetupResult::TcpForward {
                 remote_location,
                 stream: server_stream,
-                // Wait until there is data to send the response header.
-                need_initial_flush: false,
+                // TODO: this should wait until there is data to send the response header,
+                // but we flush immediately so that it works with VmessTcpClientHandler below,
+                // see the related TODO.
+                need_initial_flush: true,
                 connection_success_response: None,
                 initial_remote_data: None,
                 override_proxy_provider: NoneOrOne::Unspecified,
