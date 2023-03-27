@@ -7,7 +7,6 @@ use async_trait::async_trait;
 use cfb_mode::cipher::{AsyncStreamCipher, NewCipher};
 use cfb_mode::Cfb;
 use generic_array::GenericArray;
-use log::warn;
 use parking_lot::Mutex;
 use rand::{Rng, RngCore};
 use ring::aead::{
@@ -20,7 +19,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use super::fnv1a::Fnv1aHasher;
 use super::md5::{compute_hmac_md5, compute_md5, compute_md5_repeating, create_chacha_key};
 use super::nonce::{SingleUseNonce, VmessNonceSequence};
-use super::vmess_stream::VmessStream;
+use super::vmess_stream::{ReadHeaderInfo, VmessStream};
 use crate::address::{Address, NetLocation};
 use crate::async_stream::AsyncStream;
 use crate::option_util::NoneOrOne;
@@ -614,6 +613,7 @@ impl TcpServerHandler for VmessTcpServerHandler {
             write_length_shake_reader,
             enable_global_padding,
             Some(prefix_bytes),
+            None,
         ));
 
         match is_udp {
@@ -980,109 +980,13 @@ impl TcpClientHandler for VmessTcpClientHandler {
         // Flush the entire request.
         client_stream.flush().await?;
 
-        // Read the server response.
-        // TODO: we shouldn't expect the server response without sending data first.
-        // This causes a bug in Surge on the server side, which is why we ended up sending the
-        // prefix bytes to VmessStream and sending it when we can, instead of forcing an initial
-        // flush.
-        let response_header_bytes = if self.is_aead {
-            let mut encrypted_response_header_length = [0u8; 2 + TAG_LEN];
-            client_stream
-                .read_exact(&mut encrypted_response_header_length)
-                .await?;
-
-            let response_header_length_aead_key =
-                super::sha2::kdf(&response_header_key, &[b"AEAD Resp Header Len Key"]);
-            let response_header_length_nonce =
-                super::sha2::kdf(&response_header_iv, &[b"AEAD Resp Header Len IV"]);
-
-            let unbound_key =
-                UnboundKey::new(&AES_128_GCM, &response_header_length_aead_key[0..16]).unwrap();
-            let mut opening_key = OpeningKey::new(
-                unbound_key,
-                SingleUseNonce::new(&response_header_length_nonce[0..12]),
-            );
-
-            if opening_key
-                .open_in_place(Aad::empty(), &mut encrypted_response_header_length)
-                .is_err()
-            {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "failed to open encrypted response header length",
-                ));
-            }
-
-            let response_header_length =
-                u16::from_be_bytes(encrypted_response_header_length[0..2].try_into().unwrap());
-            let mut encrypted_response_header =
-                allocate_vec(response_header_length as usize + TAG_LEN).into_boxed_slice();
-            client_stream
-                .read_exact(&mut encrypted_response_header)
-                .await?;
-
-            let response_header_aead_key =
-                super::sha2::kdf(&response_header_key, &[b"AEAD Resp Header Key"]);
-            let response_header_nonce =
-                super::sha2::kdf(&response_header_iv, &[b"AEAD Resp Header IV"]);
-            let unbound_key =
-                UnboundKey::new(&AES_128_GCM, &response_header_aead_key[0..16]).unwrap();
-            let mut opening_key = OpeningKey::new(
-                unbound_key,
-                SingleUseNonce::new(&response_header_nonce[0..12]),
-            );
-
-            if opening_key
-                .open_in_place(Aad::empty(), &mut encrypted_response_header)
-                .is_err()
-            {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "failed to open encrypted response header",
-                ));
-            }
-
-            let command_len = encrypted_response_header[3];
-            if command_len > 0 {
-                warn!("Ignoring unused command bytes from AEAD block");
-            }
-
-            // note that this includes 16 tag bytes at the end.
-            encrypted_response_header
-        } else {
-            let mut response_cipher =
-                AesCfb::new_from_slices(&response_header_key, &response_header_iv).unwrap();
-
-            let mut response_header_bytes = [0u8; 4];
-            client_stream.read_exact(&mut response_header_bytes).await?;
-            response_cipher.decrypt(&mut response_header_bytes);
-
-            // do this here, because we would already have read/decrypted it in the aead clause.
-            let command_len = response_header_bytes[3];
-            if command_len > 0 {
-                warn!("Reading and ignoring unused command bytes");
-                let mut command_bytes = allocate_vec(command_len as usize);
-                client_stream.read_exact(&mut command_bytes).await?;
-            }
-
-            Box::new(response_header_bytes)
+        // Info for reading the server response, which arrives along with the initial data.
+        let read_header_info = ReadHeaderInfo {
+            is_aead: self.is_aead,
+            response_header_key,
+            response_header_iv,
+            response_authentication_v,
         };
-
-        if response_header_bytes[0] != response_authentication_v {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "Invalid response auth value, expected {}, got {}",
-                    response_authentication_v, response_header_bytes[0]
-                ),
-            ));
-        }
-
-        // ignore the option byte at response_header_bytes[1], since we don't do reuse of tcp
-        // connections.
-        if (response_header_bytes[2] & 0x01) == 0x01 {
-            warn!("Ignoring unsupported server dynamic port instructions.");
-        }
 
         let client_stream = Box::new(VmessStream::new(
             client_stream,
@@ -1092,6 +996,7 @@ impl TcpClientHandler for VmessTcpClientHandler {
             write_length_shake_reader,
             false,
             None,
+            Some(read_header_info),
         ));
 
         Ok(TcpClientSetupResult { client_stream })

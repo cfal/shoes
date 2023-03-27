@@ -1,19 +1,25 @@
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+use aes::Aes128;
+use cfb_mode::cipher::{AsyncStreamCipher, NewCipher};
+use cfb_mode::Cfb;
 use futures::ready;
+use log::warn;
 use rand::RngCore;
-use ring::aead::{Aad, OpeningKey, SealingKey};
+use ring::aead::{Aad, BoundKey, OpeningKey, SealingKey, UnboundKey, AES_128_GCM};
 use sha3::digest::XofReader;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use super::nonce::VmessNonceSequence;
+use super::nonce::{SingleUseNonce, VmessNonceSequence};
 use crate::async_stream::{
     AsyncFlushMessage, AsyncMessageStream, AsyncPing, AsyncReadMessage, AsyncShutdownMessage,
     AsyncStream, AsyncWriteMessage,
 };
 use crate::util::allocate_vec;
 
+// this should be the same as vmess_handler.rs TAG_LEN.
+const HEADER_TAG_LEN: usize = 16;
 const ENCRYPTION_TAG_LEN: usize = 16;
 const MAX_PADDING_LEN: usize = 64;
 
@@ -71,6 +77,9 @@ enum ShutdownState {
 pub struct VmessStream {
     stream: Box<dyn AsyncStream>,
 
+    read_header_state: ReadHeaderState,
+    read_header_info: Option<ReadHeaderInfo>,
+
     opening_key: Option<OpeningKey<VmessNonceSequence>>,
     sealing_key: Option<SealingKey<VmessNonceSequence>>,
     tag_len: usize,
@@ -104,6 +113,45 @@ enum DecryptState {
     ReceivedEof,
 }
 
+// Expected VMess header response, when we're a client.
+pub struct ReadHeaderInfo {
+    pub is_aead: bool,
+    pub response_header_key: [u8; 16],
+    pub response_header_iv: [u8; 16],
+    pub response_authentication_v: u8,
+}
+
+#[derive(PartialEq, Eq, Debug)]
+enum ReadHeaderState {
+    ReadAeadLength,
+    ReadAeadContent(usize),
+    ReadLegacyContent,
+    Done,
+}
+
+fn check_header_response(
+    response_header_bytes: &[u8],
+    response_authentication_v: u8,
+) -> std::io::Result<()> {
+    if response_header_bytes[0] != response_authentication_v {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "Invalid response auth value, expected {}, got {}",
+                response_authentication_v, response_header_bytes[0]
+            ),
+        ));
+    }
+
+    // ignore the option byte at response_header_bytes[1], since we don't do reuse of tcp
+    // connections.
+    if (response_header_bytes[2] & 0x01) == 0x01 {
+        warn!("Ignoring unsupported server dynamic port instructions.");
+    }
+
+    Ok(())
+}
+
 impl VmessStream {
     pub fn new(
         stream: Box<dyn AsyncStream>,
@@ -119,7 +167,8 @@ impl VmessStream {
             digest::core_api::XofReaderCoreWrapper<sha3::Shake128ReaderCore>,
         >,
         enable_global_padding: bool,
-        server_response_prefix_bytes: Option<Box<[u8]>>,
+        prefix_write_bytes: Option<Box<[u8]>>,
+        read_header_info: Option<ReadHeaderInfo>,
     ) -> Self {
         let (tag_len, opening_key, sealing_key) = match encryption_keys {
             Some((opening_key, sealing_key)) => {
@@ -162,13 +211,26 @@ impl VmessStream {
 
         // TODO: we should also read the server response bytes in VmessStream when we're a client.
         // See the comment in vmess_handler.rs.
-        if let Some(buf) = server_response_prefix_bytes {
+        if let Some(buf) = prefix_write_bytes {
             write_packet[0..buf.len()].copy_from_slice(&buf);
             write_packet_end_offset = buf.len();
         }
 
+        let read_header_state = match read_header_info {
+            Some(ref info) => {
+                if info.is_aead {
+                    ReadHeaderState::ReadAeadLength
+                } else {
+                    ReadHeaderState::ReadLegacyContent
+                }
+            }
+            None => ReadHeaderState::Done,
+        };
+
         Self {
             stream,
+            read_header_state,
+            read_header_info,
             opening_key,
             sealing_key,
             tag_len,
@@ -191,6 +253,160 @@ impl VmessStream {
             shutdown_state: ShutdownState::WriteRemainingData,
             is_eof: false,
         }
+    }
+
+    fn process_read_header(&mut self) -> std::io::Result<()> {
+        match self.read_header_state {
+            ReadHeaderState::ReadAeadLength => self.process_read_header_aead_length(),
+            ReadHeaderState::ReadAeadContent(content_len) => {
+                self.process_read_header_aead_content(content_len)
+            }
+            ReadHeaderState::ReadLegacyContent => self.process_read_header_legacy_content(),
+            ReadHeaderState::Done => {
+                panic!("process_read_header called with Done state");
+            }
+        }
+    }
+
+    fn process_read_header_aead_length(&mut self) -> std::io::Result<()> {
+        if self.unprocessed_end_offset - self.unprocessed_start_offset < 2 + HEADER_TAG_LEN {
+            return Ok(());
+        }
+
+        let mut encrypted_response_header_length = &mut self.unprocessed_buf
+            [self.unprocessed_start_offset..self.unprocessed_start_offset + 2 + HEADER_TAG_LEN];
+
+        let ReadHeaderInfo {
+            response_header_key,
+            response_header_iv,
+            ..
+        } = self.read_header_info.as_ref().unwrap();
+
+        let response_header_length_aead_key =
+            super::sha2::kdf(&response_header_key[..], &[b"AEAD Resp Header Len Key"]);
+        let response_header_length_nonce =
+            super::sha2::kdf(&response_header_iv[..], &[b"AEAD Resp Header Len IV"]);
+
+        let unbound_key =
+            UnboundKey::new(&AES_128_GCM, &response_header_length_aead_key[0..16]).unwrap();
+        let mut opening_key = OpeningKey::new(
+            unbound_key,
+            SingleUseNonce::new(&response_header_length_nonce[0..12]),
+        );
+
+        if opening_key
+            .open_in_place(Aad::empty(), &mut encrypted_response_header_length)
+            .is_err()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "failed to open encrypted response header length",
+            ));
+        }
+
+        let response_header_length =
+            u16::from_be_bytes(encrypted_response_header_length[0..2].try_into().unwrap()) as usize;
+
+        self.read_header_state = ReadHeaderState::ReadAeadContent(response_header_length);
+        self.unprocessed_start_offset += 2 + HEADER_TAG_LEN;
+        if self.unprocessed_start_offset == self.unprocessed_end_offset {
+            self.unprocessed_start_offset = 0;
+            self.unprocessed_end_offset = 0;
+        }
+
+        self.process_read_header_aead_content(response_header_length)
+    }
+
+    fn process_read_header_aead_content(&mut self, content_len: usize) -> std::io::Result<()> {
+        if self.unprocessed_end_offset - self.unprocessed_start_offset
+            < content_len + HEADER_TAG_LEN
+        {
+            return Ok(());
+        }
+
+        let mut encrypted_response_header = &mut self.unprocessed_buf[self.unprocessed_start_offset
+            ..self.unprocessed_start_offset + content_len + HEADER_TAG_LEN];
+
+        let ReadHeaderInfo {
+            response_header_key,
+            response_header_iv,
+            response_authentication_v,
+            ..
+        } = self.read_header_info.as_ref().unwrap();
+
+        let response_header_aead_key =
+            super::sha2::kdf(&response_header_key[..], &[b"AEAD Resp Header Key"]);
+        let response_header_nonce =
+            super::sha2::kdf(&response_header_iv[..], &[b"AEAD Resp Header IV"]);
+        let unbound_key = UnboundKey::new(&AES_128_GCM, &response_header_aead_key[0..16]).unwrap();
+        let mut opening_key = OpeningKey::new(
+            unbound_key,
+            SingleUseNonce::new(&response_header_nonce[0..12]),
+        );
+
+        if opening_key
+            .open_in_place(Aad::empty(), &mut encrypted_response_header)
+            .is_err()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "failed to open encrypted response header",
+            ));
+        }
+
+        let command_len = encrypted_response_header[3];
+        if command_len > 0 {
+            warn!("Ignoring unused command bytes from AEAD block");
+        }
+
+        self.read_header_state = ReadHeaderState::Done;
+        self.unprocessed_start_offset += content_len + HEADER_TAG_LEN;
+        if self.unprocessed_start_offset == self.unprocessed_end_offset {
+            self.unprocessed_start_offset = 0;
+            self.unprocessed_end_offset = 0;
+        }
+
+        check_header_response(&encrypted_response_header, *response_authentication_v)
+    }
+
+    fn process_read_header_legacy_content(&mut self) -> std::io::Result<()> {
+        if self.unprocessed_end_offset - self.unprocessed_start_offset < 4 {
+            return Ok(());
+        }
+
+        let ReadHeaderInfo {
+            response_header_key,
+            response_header_iv,
+            response_authentication_v,
+            ..
+        } = self.read_header_info.as_ref().unwrap();
+
+        let mut response_header_bytes = &mut self.unprocessed_buf
+            [self.unprocessed_start_offset..self.unprocessed_start_offset + 4];
+        let mut response_cipher =
+            Cfb::<Aes128>::new_from_slices(&response_header_key[..], &response_header_iv[..])
+                .unwrap();
+
+        response_cipher.decrypt(&mut response_header_bytes);
+
+        // do this here, because we would already have read/decrypted it in the aead clause.
+        let command_len = response_header_bytes[3];
+        if command_len > 0 {
+            // if this becomes an issue, we should read the command bytes and ignore them.
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "extra command bytes",
+            ));
+        }
+
+        self.read_header_state = ReadHeaderState::Done;
+        self.unprocessed_start_offset += 4;
+        if self.unprocessed_start_offset == self.unprocessed_end_offset {
+            self.unprocessed_start_offset = 0;
+            self.unprocessed_end_offset = 0;
+        }
+
+        check_header_response(&response_header_bytes, *response_authentication_v)
     }
 
     fn try_decrypt(&mut self) -> std::io::Result<DecryptState> {
@@ -484,6 +700,48 @@ impl AsyncRead for VmessStream {
         buf: &mut ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         let this = self.get_mut();
+
+        if this.read_header_state != ReadHeaderState::Done {
+            loop {
+                let mut read_buf =
+                    ReadBuf::new(&mut this.unprocessed_buf[this.unprocessed_end_offset..]);
+                ready!(Pin::new(&mut this.stream).poll_read(cx, &mut read_buf))?;
+                let len = read_buf.filled().len();
+                if len == 0 {
+                    this.is_eof = true;
+                    return Poll::Ready(Ok(()));
+                }
+                this.unprocessed_end_offset += len;
+                this.process_read_header()?;
+                if this.read_header_state == ReadHeaderState::Done {
+                    break;
+                }
+            }
+
+            this.read_header_info.take().unwrap();
+
+            // We probably already have some user data ready to be processed, so we need
+            // to do so immediately since we go straight to a poll_read below.
+            loop {
+                match this.try_decrypt()? {
+                    DecryptState::NeedData => {
+                        break;
+                    }
+                    DecryptState::ReceivedEof => {
+                        this.is_eof = true;
+                        break;
+                    }
+                    DecryptState::BufferFull => {
+                        assert!(this.processed_end_offset > 0);
+                        this.read_processed(buf);
+                        return Poll::Ready(Ok(()));
+                    }
+                    DecryptState::Success => {
+                        continue;
+                    }
+                }
+            }
+        }
 
         if this.processed_end_offset > 0 {
             this.read_processed(buf);
