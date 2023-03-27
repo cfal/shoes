@@ -103,18 +103,6 @@ async fn start_servers(config: ServerConfig) -> std::io::Result<Vec<JoinHandle<(
             }
         },
         Transport::Udp => todo!(),
-        // Transport::Udp => match start_udp_server(config.clone()).await {
-        //     Ok(Some(handle)) => {
-        //         join_handles.push(handle);
-        //     }
-        //     Ok(None) => (),
-        //     Err(e) => {
-        //         for join_handle in join_handles {
-        //             join_handle.abort();
-        //         }
-        //         return Err(e);
-        //     }
-        // },
     }
 
     if join_handles.is_empty() {
@@ -207,8 +195,6 @@ fn main() {
 
     runtime.block_on(async move {
         let (_watcher, mut config_rx) = start_notify_thread(args.clone());
-
-        // let configs = config_serde::load_configs(&args).await.unwrap();
 
         loop {
             let configs = match config::load_configs(&args).await {
