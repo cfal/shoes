@@ -167,8 +167,8 @@ fn main() {
     }
 
     if args.is_empty() {
-        println!("No config specified, assuming loading from file config.shoes.json");
-        args.push("config.shoes.json".to_string())
+        println!("No config specified, assuming loading from file config.shoes.yaml");
+        args.push("config.shoes.yaml".to_string())
     }
 
     if dry_run {
