@@ -46,3 +46,4 @@ webpki-roots = { version = "*" }
 [profile.release]
 opt-level = 3
 lto = "fat"
+strip = true
