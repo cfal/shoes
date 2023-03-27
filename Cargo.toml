@@ -41,7 +41,6 @@ serde = { version = "*", features = ["derive", "std"] }
 serde_yaml = "*"
 tokio = { version = "*", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 tokio-rustls = { version = "*", features = ["dangerous_configuration"] }
-url = "*"
 webpki-roots = { version = "*" }
 
 [profile.release]
