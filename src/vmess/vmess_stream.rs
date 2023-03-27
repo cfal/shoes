@@ -207,14 +207,13 @@ impl VmessStream {
             (write_cache, write_packet)
         };
 
-        let mut write_packet_end_offset = 0;
-
-        // TODO: we should also read the server response bytes in VmessStream when we're a client.
-        // See the comment in vmess_handler.rs.
-        if let Some(buf) = prefix_write_bytes {
-            write_packet[0..buf.len()].copy_from_slice(&buf);
-            write_packet_end_offset = buf.len();
-        }
+        let write_packet_end_offset = match prefix_write_bytes {
+            Some(buf) => {
+                write_packet[0..buf.len()].copy_from_slice(&buf);
+                buf.len()
+            }
+            None => 0,
+        };
 
         let read_header_state = match read_header_info {
             Some(ref info) => {
@@ -701,7 +700,7 @@ impl AsyncRead for VmessStream {
     ) -> std::task::Poll<std::io::Result<()>> {
         let this = self.get_mut();
 
-        if this.read_header_state != ReadHeaderState::Done {
+        if this.read_header_state != ReadHeaderState::Done && !this.is_eof {
             loop {
                 let mut read_buf =
                     ReadBuf::new(&mut this.unprocessed_buf[this.unprocessed_end_offset..]);
