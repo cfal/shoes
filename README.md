@@ -4,24 +4,20 @@ shoes is a multi-protocol proxy server written in Rust.
 
 ## Supported protocols
 
-- **HTTP/HTTPS**
-- **SOCKS5**
-  - TCP only
-- **Vmess**
-  - TCP/QUIC and UDP-over-TCP
+- **HTTP/HTTPS** (TCP, QUIC)
+- **SOCKS5** (TCP, QUIC)
+- **Vmess** (TCP, QUIC, UDP-over-TCP)
   - AEAD and Legacy modes
   - Supported ciphers:
     - aes-128-gcm
     - chacha20-poly1305
-- **Vless**
-- **Snell** v3
-  - TCP/QUIC and UDP-over-TCP
+- **Vless** (TCP, QUIC)
+- **Snell** v3 (TCP, QUIC, UDP-over-TCP)
   - Supported ciphers:
     - aes-128-gcm
     - aes-256-gcm
     - chacha20-ietf-poly1305
-- **Shadowsocks**
-  - TCP/QUIC only
+- **Shadowsocks** (TCP, QUIC)
   - Supported ciphers:
     - aes-128-gcm
     - aes-256-gcm
@@ -29,8 +25,7 @@ shoes is a multi-protocol proxy server written in Rust.
     - 2022-blake3-aes-128-gcm
     - 2022-blake3-aes-256-gcm
     - 2022-blake3-chacha20-ietf-poly1305
-- **Trojan**
-  - TCP/QUIC only
+- **Trojan** (TCP, QUIC)
   - Supported ciphers:
     - aes-128-gcm
     - aes-256-gcm
@@ -127,3 +122,9 @@ Sorry, formal documentation for the YAML config format have not yet been written
 
 - Proxy client chaining
 - SOCKS and Shadowsocks UDP support
+
+## Similar projects
+
+- [shadowsocks-rust](https://github.com/shadowsocks/shadowsocks-rust): A Rust port of shadowsocks
+
+- [v2ray-core](https://github.com/v2ray/v2ray-core): A full-featured proxy platform written in Go
