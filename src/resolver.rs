@@ -32,7 +32,10 @@ impl Resolver for NativeResolver {
         use futures::future::FutureExt;
         Box::pin(
             tokio::net::lookup_host((address.to_string(), port)).map(move |result| {
-                let ret = result.map(|r| r.collect::<Vec<_>>());
+                let ret = result.map(|r| {
+                    r.filter(|addr| !addr.ip().is_unspecified())
+                        .collect::<Vec<_>>()
+                });
                 debug!("NativeResolver resolved {}:{} -> {:?}", address, port, ret);
                 ret
             }),
