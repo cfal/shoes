@@ -1,5 +1,5 @@
-use once_cell::sync::OnceCell;
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::sync::OnceLock;
 
 use async_trait::async_trait;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -182,7 +182,7 @@ impl TcpServerHandler for SocksTcpServerHandler {
             ));
         }
 
-        static SUCCESS_RESPONSE: OnceCell<Box<[u8]>> = OnceCell::new();
+        static SUCCESS_RESPONSE: OnceLock<Box<[u8]>> = OnceLock::new();
 
         let connection_success_response = SUCCESS_RESPONSE.get_or_init(|| {
             let mut response_bytes = vec![VER_SOCKS5, RESULT_SUCCESS, 0];

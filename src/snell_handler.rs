@@ -1,5 +1,5 @@
-use once_cell::sync::OnceCell;
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 use argon2::Argon2;
 use async_trait::async_trait;
@@ -34,7 +34,7 @@ impl SnellKey {
 
 impl ShadowsocksKey for SnellKey {
     fn create_session_key(&self, salt: &[u8]) -> Box<[u8]> {
-        static ARGON2: OnceCell<Argon2> = OnceCell::new();
+        static ARGON2: OnceLock<Argon2> = OnceLock::new();
 
         let instance = ARGON2.get_or_init(|| {
             // ref: https://github.com/icpz/open-snell/blob/master/components/aead/cipher.go#L48

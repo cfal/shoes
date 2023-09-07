@@ -1,6 +1,6 @@
-use once_cell::sync::OnceCell;
+use std::sync::OnceLock;
 
-static NUM_THREADS: OnceCell<usize> = OnceCell::new();
+static NUM_THREADS: OnceLock<usize> = OnceLock::new();
 
 pub fn set_num_threads(num_threads: usize) {
     NUM_THREADS.set(num_threads).unwrap();

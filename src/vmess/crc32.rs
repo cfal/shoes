@@ -1,7 +1,7 @@
 // Copied and modified from rust-snappy
 #![allow(dead_code)]
 
-use once_cell::sync::OnceCell;
+use std::sync::OnceLock;
 
 const POLY: u32 = 0xEDB88320;
 
@@ -14,8 +14,8 @@ pub fn crc32c(buf: &[u8]) -> u32 {
 
 /// Returns the CRC32 checksum of `buf` using the Castagnoli polynomial.
 fn crc32c_slice8(mut buf: &[u8], initial_crc: u32) -> u32 {
-    static TABLE: OnceCell<[u32; 256]> = OnceCell::new();
-    static TABLE16: OnceCell<[[u32; 256]; 16]> = OnceCell::new();
+    static TABLE: OnceLock<[u32; 256]> = OnceLock::new();
+    static TABLE16: OnceLock<[[u32; 256]; 16]> = OnceLock::new();
 
     let tab = TABLE.get_or_init(|| make_table(POLY));
     let tab8 = &TABLE16.get_or_init(|| {

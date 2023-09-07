@@ -1,5 +1,5 @@
-use once_cell::sync::OnceCell;
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 pub fn create_client_config(
     verify: bool,
@@ -51,7 +51,7 @@ impl rustls::client::ServerCertVerifier for DisabledVerifier {
 }
 
 fn get_disabled_verifier() -> Arc<DisabledVerifier> {
-    static INSTANCE: OnceCell<Arc<DisabledVerifier>> = OnceCell::new();
+    static INSTANCE: OnceLock<Arc<DisabledVerifier>> = OnceLock::new();
     INSTANCE
         .get_or_init(|| Arc::new(DisabledVerifier {}))
         .clone()
