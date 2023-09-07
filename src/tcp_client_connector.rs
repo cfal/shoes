@@ -113,7 +113,7 @@ impl TcpClientConnector {
                         quinn::EndpointConfig::default(),
                         None,
                         udp_socket,
-                        quinn::TokioRuntime,
+                        Arc::new(quinn::TokioRuntime),
                     )
                     .unwrap();
                     endpoint.set_default_client_config(quic_client_config.clone());
