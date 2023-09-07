@@ -1,6 +1,3 @@
-#![feature(int_roundings)]
-#![feature(hash_drain_filter)]
-
 mod address;
 mod async_stream;
 mod client_proxy_selector;

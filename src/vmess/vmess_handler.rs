@@ -94,7 +94,7 @@ impl CertHashProvider {
         let from_time_secs = current_time_secs - 32;
 
         self.hashes
-            .drain_filter(|_, hash_time_secs| *hash_time_secs < from_time_secs);
+            .retain(|_, hash_time_secs| *hash_time_secs >= from_time_secs);
 
         let mut create_time_secs = std::cmp::max(from_time_secs, self.last_hash_time_secs);
         while create_time_secs <= to_time_secs {

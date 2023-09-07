@@ -33,6 +33,10 @@ const MAX_ENCRYPTED_WRITE_DATA_SIZE: usize = 2usize.pow(14) - 1;
 // at most MAX_ENCRYPTED_WRITE_DATA_SIZE in a packet.
 const MAX_ENCRYPTED_READ_DATA_SIZE: usize = u16::MAX as usize;
 
+const fn div_ceil(a: usize, b: usize) -> usize {
+    (a + b - 1) / b
+}
+
 struct LengthMask {
     reader: digest::core_api::XofReaderCoreWrapper<sha3::Shake128ReaderCore>,
     mask: [u8; 2],
@@ -200,7 +204,7 @@ impl VmessStream {
             let write_cache = allocate_vec(65535).into_boxed_slice();
 
             let write_packet_size = 65535
-                + (65535usize.div_ceil(max_unencrypted_write_data_size)
+                + (div_ceil(65535usize, max_unencrypted_write_data_size)
                     * (MAX_PADDING_LEN * ENCRYPTION_TAG_LEN));
             let write_packet = allocate_vec(write_packet_size + 40).into_boxed_slice();
 
