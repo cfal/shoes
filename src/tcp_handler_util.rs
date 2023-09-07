@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::sync::Arc;
 
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use log::debug;
 
 use crate::client_proxy_selector::{ClientProxySelector, ConnectAction, ConnectRule};
@@ -53,7 +54,9 @@ pub fn create_tcp_server_handler(
         )),
         ServerProxyConfig::Shadowsocks(ShadowsocksConfig { cipher, password }) => {
             if cipher.starts_with("2022-blake3-") {
-                let key_bytes = base64::decode(password).expect("could not base64 decode password");
+                let key_bytes = BASE64
+                    .decode(password)
+                    .expect("could not base64 decode password");
                 Box::new(ShadowsocksTcpHandler::new_aead2022(
                     &cipher[12..],
                     &key_bytes,
@@ -234,7 +237,9 @@ pub fn create_tcp_client_handler(
         )),
         ClientProxyConfig::Shadowsocks(ShadowsocksConfig { cipher, password }) => {
             if cipher.starts_with("2022-blake3-") {
-                let key_bytes = base64::decode(password).expect("could not base64 decode password");
+                let key_bytes = BASE64
+                    .decode(password)
+                    .expect("could not base64 decode password");
                 Box::new(ShadowsocksTcpHandler::new_aead2022(
                     &cipher[12..],
                     &key_bytes,

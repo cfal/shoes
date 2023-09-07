@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use tokio::io::AsyncWriteExt;
 
 use super::websocket_stream::WebsocketStream;
@@ -329,12 +330,12 @@ impl ParsedHttpData {
 
 fn create_websocket_key() -> String {
     let key: [u8; 16] = rand::random();
-    base64::encode(key)
+    BASE64.encode(key)
 }
 
 fn create_websocket_key_response(mut key: String) -> String {
     // after some testing - the sha1 crate seems faster than sha-1.
     key.push_str("258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
     let hash = sha1::Sha1::from(key.into_bytes()).digest().bytes();
-    base64::encode(hash)
+    BASE64.encode(hash)
 }

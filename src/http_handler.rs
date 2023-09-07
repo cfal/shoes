@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use log::debug;
 use tokio::io::AsyncWriteExt;
 
@@ -15,7 +16,7 @@ const CONNECTION_HEADER_PREFIX: &str = "connection: ";
 const PROXY_CONNECTION_HEADER_PREFIX: &str = "proxy-connection: ";
 
 fn create_http_auth_token(username: &str, password: &str) -> String {
-    base64::encode(format!("{}:{}", username, password))
+    BASE64.encode(format!("{}:{}", username, password))
 }
 
 #[derive(Debug)]
