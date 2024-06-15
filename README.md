@@ -38,9 +38,11 @@ All supported protocols can be combined with the following features:
 - **TLS support** with SNI based forwarding
 - **Websocket obfs** (Shadowsocks SIP003)
 - **Upstream proxy support**: route connections through other proxy servers
-- **Forwarding rules (allowlists/blocklists)**: Block or redirect connections based on IP or hostname
+- **Forwarding rules**: Redirect or block connections based on target IP or hostname
 - **Hot reloading**: Updated configs are automatically reloaded
 - **Netmask and proxy groups**
+
+For advanced access control of incoming connections (eg. IP allowlist/blocklists), check out [tobaru](https://github.com/cfal/tobaru).
 
 ## Examples
 
