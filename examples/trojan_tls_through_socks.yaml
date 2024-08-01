@@ -1,0 +1,28 @@
+# A TLS Trojan server that selectively forwards.
+- address: 127.0.0.1:15555
+  transport: tcp
+  protocol:
+    type: tls
+    # target for all SNIs
+    default_target:
+      # can be generated using openssl, eg: openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365000 -nodes -subj "/CN=localhost"
+      cert: cert.pem
+      key: key.pem
+      protocol:
+        type: trojan
+        password: helloworld
+  rules:
+    # For example.com, connect through a SOCKS proxy.
+    - mask: example.com
+      action: allow
+      client_proxy:
+        address: 127.0.0.1:15556
+        protocol:
+          type: socks
+          username: username
+          password: password
+
+    # Allow all other connections to connect directly.
+    - mask: 0.0.0.0/0
+      action: allow
+      client_proxy: direct
