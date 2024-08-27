@@ -266,7 +266,7 @@ impl ShadowsocksStream {
         Ok(DecryptState::Success)
     }
 
-    fn read_processed(&mut self, buf: &mut ReadBuf<'_>) -> () {
+    fn read_processed(&mut self, buf: &mut ReadBuf<'_>) {
         assert!(
             self.processed_end_offset > 0,
             "called without any processed data"
@@ -662,9 +662,9 @@ impl ShadowsocksStream {
                 assert!(
                     buf_len
                         <= self.write_cache.len()
-                            - self.salt_len
-                            - (request_header.len() + TAG_LEN)
-                            - TAG_LEN
+                        - self.salt_len
+                        - (request_header.len() + TAG_LEN)
+                        - TAG_LEN
                 );
 
                 request_header[9] = (buf_len >> 8) as u8;
@@ -677,7 +677,7 @@ impl ShadowsocksStream {
                     )
                 })?;
 
-                self.encrypt_single(&buf, false).map_err(|_| {
+                self.encrypt_single(buf, false).map_err(|_| {
                     std::io::Error::new(
                         std::io::ErrorKind::Other,
                         "failed to encrypt initial client packet",
@@ -890,7 +890,7 @@ impl AsyncReadMessage for ShadowsocksStream {
 impl AsyncWriteMessage for ShadowsocksStream {
     fn poll_write_message(
         self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
+        _cx: &mut Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<()>> {
         let this = self.get_mut();
@@ -910,7 +910,7 @@ impl AsyncWriteMessage for ShadowsocksStream {
             return Poll::Pending;
         }
 
-        this.encrypt_single(&buf, true).map_err(|_| {
+        this.encrypt_single(buf, true).map_err(|_| {
             std::io::Error::new(std::io::ErrorKind::Other, "failed to encrypt packet")
         })?;
 
@@ -951,5 +951,5 @@ impl AsyncMessageStream for ShadowsocksStream {}
 
 #[inline]
 fn current_time_secs() -> u64 {
-    SystemTime::UNIX_EPOCH.elapsed().unwrap().as_secs() as u64
+    SystemTime::UNIX_EPOCH.elapsed().unwrap().as_secs()
 }

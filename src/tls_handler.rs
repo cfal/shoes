@@ -51,7 +51,7 @@ impl TcpServerHandler for TlsServerHandler {
                 }
             },
             Some(hostname) => match self.sni_targets.get(hostname) {
-                Some(ref t) => t,
+                Some(t) => t,
                 None => match self.default_target {
                     Some(ref t) => t,
                     None => {

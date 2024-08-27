@@ -83,26 +83,25 @@ impl TcpServerHandler for HttpTcpServerHandler {
                     if line.is_empty() {
                         break;
                     }
-                    if need_auth {
-                        if line.len() > PROXY_AUTH_HEADER_PREFIX.len() + 1
-                            && line[0..PROXY_AUTH_HEADER_PREFIX.len()].to_ascii_lowercase()
-                                == PROXY_AUTH_HEADER_PREFIX
+                    if need_auth
+                        && line.len() > PROXY_AUTH_HEADER_PREFIX.len() + 1
+                        && line[0..PROXY_AUTH_HEADER_PREFIX.len()].to_ascii_lowercase()
+                            == PROXY_AUTH_HEADER_PREFIX
+                    {
+                        if &line[PROXY_AUTH_HEADER_PREFIX.len()..]
+                            != self.auth_token.as_ref().unwrap()
                         {
-                            if &line[PROXY_AUTH_HEADER_PREFIX.len()..]
-                                != self.auth_token.as_ref().unwrap()
-                            {
-                                debug!(
-                                    "Received incorrect HTTP CONNECT authentication: {}",
-                                    &line[PROXY_AUTH_HEADER_PREFIX.len()..]
-                                );
-                                return Err(std::io::Error::new(
-                                    std::io::ErrorKind::InvalidInput,
-                                    "Incorrect HTTP CONNECT authentication",
-                                ));
-                            }
-                            need_auth = false;
-                            continue;
+                            debug!(
+                                "Received incorrect HTTP CONNECT authentication: {}",
+                                &line[PROXY_AUTH_HEADER_PREFIX.len()..]
+                            );
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                "Incorrect HTTP CONNECT authentication",
+                            ));
                         }
+                        need_auth = false;
+                        continue;
                     }
                     debug!("Ignored HTTP CONNECT request header: {}", line);
                 }

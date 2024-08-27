@@ -125,10 +125,10 @@ fn main() {
     let mut num_threads = 0usize;
     let mut dry_run = false;
 
-    while args.len() > 0 && args[0].starts_with("-") {
+    while !args.is_empty() && args[0].starts_with("-") {
         if args[0] == "--threads" || args[0] == "-t" {
             args.remove(0);
-            if args.len() == 0 {
+            if args.is_empty() {
                 eprintln!("Missing threads argument.");
                 print_usage_and_exit(arg0);
                 return;
@@ -233,7 +233,7 @@ fn main() {
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 
             // Remove any extra events
-            while let Ok(_) = config_rx.try_recv() {}
+            while config_rx.try_recv().is_ok() {}
         }
     });
 }

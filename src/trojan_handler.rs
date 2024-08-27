@@ -30,7 +30,7 @@ pub struct TrojanTcpHandler {
 
 impl TrojanTcpHandler {
     pub fn new(password: &str, shadowsocks_config: &Option<ShadowsocksConfig>) -> Self {
-        let password_hash = create_password_hash(&password);
+        let password_hash = create_password_hash(password);
         let shadowsocks_data = shadowsocks_config.as_ref().map(|config| {
             let ShadowsocksConfig {
                 cipher,

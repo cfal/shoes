@@ -7,9 +7,9 @@ pub fn new_udp_socket(bind_interface: Option<String>) -> std::io::Result<tokio::
     // tokio's UdpSocket has bind_device, so construct that instead of having to
     // handle SO_BINDTODEVICE ourselves.
     let tokio_socket = tokio::net::UdpSocket::from_std(std_socket).unwrap();
-    if let Some(b) = bind_interface {
-        #[cfg(all(any(target_os = "android", target_os = "fuchsia", target_os = "linux")))]
-        tokio_socket.bind_device(Some(b.as_bytes()))?;
+    if let Some(_b) = bind_interface {
+        #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+        tokio_socket.bind_device(Some(_b.as_bytes()))?;
 
         // This should be handled during config validation.
         #[cfg(not(any(target_os = "android", target_os = "fuchsia", target_os = "linux")))]
@@ -30,9 +30,9 @@ pub fn new_tcp_socket(
         tokio::net::TcpSocket::new_v4()?
     };
 
-    if let Some(b) = bind_interface {
-        #[cfg(all(any(target_os = "android", target_os = "fuchsia", target_os = "linux")))]
-        tcp_socket.bind_device(Some(b.as_bytes()))?;
+    if let Some(_b) = bind_interface {
+        #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+        tcp_socket.bind_device(Some(_b.as_bytes()))?;
 
         // This should be handled during config validation.
         #[cfg(not(any(target_os = "android", target_os = "fuchsia", target_os = "linux")))]

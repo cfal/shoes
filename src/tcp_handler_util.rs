@@ -34,10 +34,7 @@ fn create_auth_credentials(
 ) -> Option<(String, String)> {
     match (&username, &password) {
         (None, None) => None,
-        _ => Some((
-            username.unwrap_or_else(String::new),
-            password.unwrap_or_else(String::new),
-        )),
+        _ => Some((username.unwrap_or_default(), password.unwrap_or_default())),
     }
 }
 

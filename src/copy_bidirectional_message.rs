@@ -227,10 +227,8 @@ where
 
         if a_buf.read_count != a_count || b_buf.read_count != b_count {
             *last_active = Instant::now();
-        } else {
-            if last_active.elapsed().as_secs() >= DEFAULT_ASSOCIATION_TIMEOUT_SECS.into() {
-                return Poll::Ready(Ok(()));
-            }
+        } else if last_active.elapsed().as_secs() >= DEFAULT_ASSOCIATION_TIMEOUT_SECS.into() {
+            return Poll::Ready(Ok(()));
         }
 
         if a_to_b.is_ready() {

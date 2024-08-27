@@ -616,13 +616,11 @@ fn validate_server_config(
     client_groups: &HashMap<String, Vec<ClientConfig>>,
     rule_groups: &HashMap<String, Vec<RuleConfig>>,
 ) -> std::io::Result<()> {
-    if server_config.transport != Transport::Tcp {
-        if server_config.tcp_settings.is_some() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "TCP transport is not selected but TCP settings specified",
-            ));
-        }
+    if server_config.transport != Transport::Tcp && server_config.tcp_settings.is_some() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "TCP transport is not selected but TCP settings specified",
+        ));
     }
 
     if server_config.transport == Transport::Quic {
@@ -632,13 +630,11 @@ fn validate_server_config(
                 "QUIC transport is selected but QUIC settings not specified",
             ));
         }
-    } else {
-        if server_config.quic_settings.is_some() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "QUIC transport is not selected but QUIC settings specified",
-            ));
-        }
+    } else if server_config.quic_settings.is_some() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "QUIC transport is not selected but QUIC settings specified",
+        ));
     }
 
     if let BindLocation::Path(_) = server_config.bind_location {

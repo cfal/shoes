@@ -407,18 +407,14 @@ where
 
         if a_buf.read_count != a_read_count || a_buf.write_count != a_write_count {
             *a_last_active = Instant::now();
-        } else {
-            if a_last_active.elapsed().as_secs() >= DEFAULT_ASSOCIATION_TIMEOUT_SECS.into() {
-                return Poll::Ready(Ok(()));
-            }
+        } else if a_last_active.elapsed().as_secs() >= DEFAULT_ASSOCIATION_TIMEOUT_SECS.into() {
+            return Poll::Ready(Ok(()));
         }
 
         if b_buf.read_count != b_read_count || b_buf.write_count != b_write_count {
             *b_last_active = Instant::now();
-        } else {
-            if b_last_active.elapsed().as_secs() >= DEFAULT_ASSOCIATION_TIMEOUT_SECS.into() {
-                return Poll::Ready(Ok(()));
-            }
+        } else if b_last_active.elapsed().as_secs() >= DEFAULT_ASSOCIATION_TIMEOUT_SECS.into() {
+            return Poll::Ready(Ok(()));
         }
 
         if a_to_b.is_ready() {

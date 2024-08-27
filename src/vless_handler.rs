@@ -21,7 +21,7 @@ pub struct VlessTcpHandler {
 impl VlessTcpHandler {
     pub fn new(user_id: &str) -> Self {
         Self {
-            user_id: parse_hex(&user_id),
+            user_id: parse_hex(user_id),
         }
     }
 }

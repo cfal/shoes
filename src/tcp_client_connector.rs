@@ -51,9 +51,7 @@ impl TcpClientConnector {
                     verify,
                     alpn_protocols,
                     sni_hostname,
-                } = client_config
-                    .quic_settings
-                    .unwrap_or_else(ClientQuicConfig::default);
+                } = client_config.quic_settings.unwrap_or_default();
 
                 let sni_hostname = if sni_hostname.is_unspecified() {
                     if default_sni_hostname.is_some() {
@@ -127,9 +125,7 @@ impl TcpClientConnector {
                 }
             }
             Transport::Tcp => {
-                let TcpConfig { no_delay } = client_config
-                    .tcp_settings
-                    .unwrap_or_else(TcpConfig::default);
+                let TcpConfig { no_delay } = client_config.tcp_settings.unwrap_or_default();
                 TransportConfig::Tcp { no_delay }
             }
             _ => {
@@ -233,13 +229,11 @@ impl TcpClientConnector {
         match self.client_handler {
             Some(ref client_handler) => {
                 // TODO: make this configurable
-                if ALWAYS_RESOLVE_HOSTNAMES {
-                    if remote_location.address().is_hostname() {
+                if ALWAYS_RESOLVE_HOSTNAMES && remote_location.address().is_hostname() {
                         let socket_addr =
                             resolve_single_address(resolver, &remote_location).await?;
                         remote_location =
                             NetLocation::from_ip_addr(socket_addr.ip(), socket_addr.port());
-                    }
                 }
                 let TcpClientSetupResult { client_stream } = client_handler
                     .setup_client_stream(server_stream, client_stream, remote_location)

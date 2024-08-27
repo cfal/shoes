@@ -23,7 +23,7 @@ impl<T> NoneOrOne<T> {
         }
     }
 
-    pub fn is_none(&self) -> bool {
+    pub fn _is_none(&self) -> bool {
         match self {
             NoneOrOne::None => true,
             _ => false,
@@ -72,14 +72,14 @@ pub enum NoneOrSome<T> {
 }
 
 impl<T> NoneOrSome<T> {
-    pub fn is_unspecified(&self) -> bool {
+    pub fn _is_unspecified(&self) -> bool {
         match self {
             NoneOrSome::Unspecified => true,
             _ => false,
         }
     }
 
-    pub fn as_option(&self) -> Option<Vec<&T>> {
+    pub fn _as_option(&self) -> Option<Vec<&T>> {
         match self {
             NoneOrSome::Unspecified => None,
             NoneOrSome::None => Some(vec![]),
@@ -88,7 +88,7 @@ impl<T> NoneOrSome<T> {
         }
     }
 
-    pub fn into_option(self) -> Option<Vec<T>> {
+    pub fn _into_option(self) -> Option<Vec<T>> {
         match self {
             NoneOrSome::Unspecified => None,
             NoneOrSome::None => Some(vec![]),
@@ -105,7 +105,7 @@ impl<T> NoneOrSome<T> {
         }
     }
 
-    pub fn into_iter(self) -> Box<dyn Iterator<Item = T>>
+    pub fn _into_iter(self) -> Box<dyn Iterator<Item = T>>
     where
         T: 'static,
     {
@@ -153,7 +153,7 @@ impl<T> NoneOrSome<T> {
         }
     }
 
-    pub fn filter<F>(self, f: F) -> Self
+    pub fn _filter<F>(self, f: F) -> Self
     where
         F: Fn(&T) -> bool,
     {
@@ -240,7 +240,7 @@ impl<T> OneOrSome<T> {
         }
     }
 
-    pub fn contains(&self, x: &T) -> bool
+    pub fn _contains(&self, x: &T) -> bool
     where
         T: PartialEq,
     {
