@@ -34,7 +34,7 @@ async fn run_tcp_server(
     let listener = tokio::net::TcpListener::bind(bind_address).await.unwrap();
 
     loop {
-        let (stream, _addr) = match listener.accept().await {
+        let (stream, addr) = match listener.accept().await {
             Ok(v) => v,
             Err(e) => {
                 error!("Accept failed: {}", e);
@@ -54,13 +54,13 @@ async fn run_tcp_server(
         let cloned_cache = resolver.clone();
         let cloned_handler = server_handler.clone();
         tokio::spawn(async move {
-            // if let Err(e) =
-            process_stream(stream, cloned_handler, cloned_provider, cloned_cache).await
-            // {
-            // error!("{}:{} finished with error: {:?}", addr.ip(), addr.port(), e);
-            // } else {
-            // debug!("{}:{} finished successfully", addr.ip(), addr.port());
-            // }
+            if let Err(e) =
+                process_stream(stream, cloned_handler, cloned_provider, cloned_cache).await
+            {
+                error!("{}:{} finished with error: {:?}", addr.ip(), addr.port(), e);
+            } else {
+                debug!("{}:{} finished successfully", addr.ip(), addr.port());
+            }
         });
     }
 }
