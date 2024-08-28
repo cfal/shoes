@@ -47,8 +47,8 @@ impl RecursiveHash {
         // that doesn't happen for vmess's usecase.
         assert!(key.len() <= 64);
 
-        default_outer[0..key.len()].copy_from_slice(&key);
-        default_inner[0..key.len()].copy_from_slice(&key);
+        default_outer[0..key.len()].copy_from_slice(key);
+        default_inner[0..key.len()].copy_from_slice(key);
 
         for b in default_outer.iter_mut() {
             *b ^= 0x5c;
@@ -92,10 +92,10 @@ impl VmessHash for RecursiveHash {
     }
 
     fn finalize(&mut self) -> [u8; 32] {
-        let inner_result: [u8; 32] = self.inner.finalize().into();
+        let inner_result: [u8; 32] = self.inner.finalize();
         self.outer.update(&self.default_outer);
         self.outer.update(&inner_result);
-        self.outer.finalize().into()
+        self.outer.finalize()
     }
 }
 
@@ -104,7 +104,7 @@ pub fn kdf(key: &[u8], path: &[&[u8]]) -> [u8; 32] {
         b"VMess AEAD KDF",
         Box::new(Sha256Hash::create()),
     ));
-    for path_item in path.into_iter() {
+    for path_item in path.iter() {
         current = Box::new(RecursiveHash::create(path_item, current))
     }
     current.update(key);

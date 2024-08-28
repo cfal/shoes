@@ -231,7 +231,7 @@ impl<AS> AsyncStream for tokio_rustls::server::TlsStream<AS> where AS: AsyncStre
 // pattern copied from deref_async_read macro: https://docs.rs/tokio/latest/src/tokio/io/async_read.rs.html#60
 impl<T: ?Sized + AsyncPing + Unpin> AsyncPing for Box<T> {
     fn supports_ping(&self) -> bool {
-        (&**self).supports_ping()
+        (**self).supports_ping()
     }
 
     fn poll_write_ping(
@@ -244,7 +244,7 @@ impl<T: ?Sized + AsyncPing + Unpin> AsyncPing for Box<T> {
 
 impl<T: ?Sized + AsyncPing + Unpin> AsyncPing for &mut T {
     fn supports_ping(&self) -> bool {
-        (&**self).supports_ping()
+        (**self).supports_ping()
     }
 
     fn poll_write_ping(

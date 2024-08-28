@@ -63,7 +63,7 @@ impl<T> ConnectAction<T> {
             } => {
                 let client_proxy = match client_proxies {
                     OneOrSome::One(item) => item,
-                    OneOrSome::Some(v) => select_proxy(&v, &next_proxy_index),
+                    OneOrSome::Some(v) => select_proxy(v, next_proxy_index),
                 };
 
                 ConnectDecision::Allow {
@@ -113,22 +113,16 @@ impl<T> ClientProxySelector<T> {
         for (i, rule) in rules.iter().enumerate() {
             // if it allows forwarding only to a single address, we don't want to use that as
             // the default decision.
-            match rule.action {
-                ConnectAction::Allow {
-                    ref override_address,
-                    ..
-                } => {
-                    if override_address.is_some() {
-                        continue;
-                    }
+            if let ConnectAction::Allow {
+                ref override_address,
+                ..
+            } = rule.action
+            {
+                if override_address.is_some() {
+                    continue;
                 }
-                _ => (),
             }
-            let is_cover_rule = rule
-                .masks
-                .iter()
-                .find(|&mask| mask.address_mask.netmask == 0)
-                .is_some();
+            let is_cover_rule = rule.masks.iter().any(|mask| mask.address_mask.netmask == 0);
             if is_cover_rule {
                 default_rule_index = Some(i);
                 break;
@@ -140,7 +134,7 @@ impl<T> ClientProxySelector<T> {
         }
     }
 
-    pub fn default_decision<'a>(&'a self) -> ConnectDecision<'a, T> {
+    pub fn default_decision(&self) -> ConnectDecision<'_, T> {
         match self.default_rule_index {
             Some(i) => {
                 let rule = &self.rules[i];
@@ -165,7 +159,7 @@ impl<T> ClientProxySelector<T> {
 }
 
 #[inline]
-fn select_proxy<'a, T>(proxy_list: &'a Vec<T>, index: &'a AtomicU32) -> &'a T {
+fn select_proxy<'a, T>(proxy_list: &'a [T], index: &'a AtomicU32) -> &'a T {
     match proxy_list.len() {
         0 => {
             panic!("Empty proxy list");
@@ -214,7 +208,7 @@ fn matches_domain(base_domain: &str, hostname: &str) -> bool {
 
 #[inline]
 async fn match_rule<'a, T>(
-    rules: &'a Vec<ConnectRule<T>>,
+    rules: &'a [ConnectRule<T>],
     location: &NetLocation,
     resolver: &Arc<dyn Resolver>,
 ) -> std::io::Result<Option<&'a ConnectRule<T>>> {

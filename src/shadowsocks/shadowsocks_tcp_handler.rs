@@ -70,7 +70,7 @@ impl TcpServerHandler for ShadowsocksTcpHandler {
         let stream_type = if self.aead2022 {
             ShadowsocksStreamType::AEAD2022Server
         } else {
-            ShadowsocksStreamType::AEAD
+            ShadowsocksStreamType::Aead
         };
 
         let mut server_stream: Box<dyn AsyncStream> = Box::new(ShadowsocksStream::new(
@@ -127,7 +127,7 @@ impl TcpClientHandler for ShadowsocksTcpHandler {
         let stream_type = if self.aead2022 {
             ShadowsocksStreamType::AEAD2022Client
         } else {
-            ShadowsocksStreamType::AEAD
+            ShadowsocksStreamType::Aead
         };
 
         let mut client_stream: Box<dyn AsyncStream> = Box::new(ShadowsocksStream::new(
@@ -148,6 +148,7 @@ impl TcpClientHandler for ShadowsocksTcpHandler {
             let padding_len: usize = rng.gen_range(1..=900);
 
             location_vec.reserve(padding_len + 2);
+            let _remaining = location_vec.spare_capacity_mut();
             unsafe {
                 location_vec.set_len(location_len + padding_len + 2);
             }

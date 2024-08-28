@@ -73,7 +73,7 @@ impl TcpServerHandler for HttpTcpServerHandler {
                     .parse::<u16>()
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
-                let remote_location = NetLocation::new(Address::from(&domain_name)?, port);
+                let remote_location = NetLocation::new(Address::from(domain_name)?, port);
 
                 // wait for an empty \r\n before connecting, and check for auth header line if needed.
                 let mut need_auth = self.auth_token.is_some();
@@ -83,26 +83,25 @@ impl TcpServerHandler for HttpTcpServerHandler {
                     if line.is_empty() {
                         break;
                     }
-                    if need_auth {
-                        if line.len() > PROXY_AUTH_HEADER_PREFIX.len() + 1
-                            && line[0..PROXY_AUTH_HEADER_PREFIX.len()].to_ascii_lowercase()
-                                == PROXY_AUTH_HEADER_PREFIX
+                    if need_auth
+                        && line.len() > PROXY_AUTH_HEADER_PREFIX.len() + 1
+                        && line[0..PROXY_AUTH_HEADER_PREFIX.len()].to_ascii_lowercase()
+                            == PROXY_AUTH_HEADER_PREFIX
+                    {
+                        if &line[PROXY_AUTH_HEADER_PREFIX.len()..]
+                            != self.auth_token.as_ref().unwrap()
                         {
-                            if &line[PROXY_AUTH_HEADER_PREFIX.len()..]
-                                != self.auth_token.as_ref().unwrap()
-                            {
-                                debug!(
-                                    "Received incorrect HTTP CONNECT authentication: {}",
-                                    &line[PROXY_AUTH_HEADER_PREFIX.len()..]
-                                );
-                                return Err(std::io::Error::new(
-                                    std::io::ErrorKind::InvalidInput,
-                                    "Incorrect HTTP CONNECT authentication",
-                                ));
-                            }
-                            need_auth = false;
-                            continue;
+                            debug!(
+                                "Received incorrect HTTP CONNECT authentication: {}",
+                                &line[PROXY_AUTH_HEADER_PREFIX.len()..]
+                            );
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                "Incorrect HTTP CONNECT authentication",
+                            ));
                         }
+                        need_auth = false;
+                        continue;
                     }
                     debug!("Ignored HTTP CONNECT request header: {}", line);
                 }
@@ -128,7 +127,7 @@ impl TcpServerHandler for HttpTcpServerHandler {
 
                 let unparsed_data = line_reader.unparsed_data();
 
-                let initial_remote_data = if unparsed_data.len() > 0 {
+                let initial_remote_data = if !unparsed_data.is_empty() {
                     let mut initial_remote_data = Vec::with_capacity(unparsed_data.len());
                     initial_remote_data.extend(unparsed_data.iter());
                     Some(initial_remote_data.into_boxed_slice())
@@ -359,7 +358,7 @@ impl TcpClientHandler for HttpTcpClientHandler {
         }
 
         let unparsed_data = line_reader.unparsed_data();
-        if unparsed_data.len() > 0 {
+        if !unparsed_data.is_empty() {
             server_stream.write_all(unparsed_data).await?;
             server_stream.flush().await?;
         }

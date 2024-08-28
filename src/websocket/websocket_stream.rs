@@ -83,7 +83,7 @@ impl WebsocketStream {
         let write_frame = allocate_vec(32768).into_boxed_slice();
         let ping_data = allocate_vec(80).into_boxed_slice();
 
-        let pending_initial_data = if unprocessed_data.len() > 0 {
+        let pending_initial_data = if !unprocessed_data.is_empty() {
             unprocessed_buf[0..unprocessed_data.len()].copy_from_slice(unprocessed_data);
             unprocessed_end_offset = unprocessed_data.len();
             true
@@ -585,7 +585,7 @@ impl AsyncRead for WebsocketStream {
             if read_result.is_err() {
                 return Poll::Ready(read_result);
             }
-            assert!(buf.filled().len() > 0);
+            assert!(!buf.filled().is_empty());
             return Poll::Ready(Ok(()));
         }
 
@@ -638,7 +638,7 @@ impl AsyncRead for WebsocketStream {
                 return Poll::Ready(read_result);
             }
 
-            if buf.filled().len() > 0 {
+            if !buf.filled().is_empty() {
                 return Poll::Ready(Ok(()));
             }
         }
@@ -818,7 +818,7 @@ fn pack_frame(opcode: u8, use_mask: bool, input: &[u8], output: &mut [u8]) -> us
     };
 
     if input_len > 0 {
-        output[offset..offset + input_len].copy_from_slice(&input);
+        output[offset..offset + input_len].copy_from_slice(input);
         if let Some(mask_bytes) = mask {
             let iter = output[offset..offset + input_len]
                 .iter_mut()

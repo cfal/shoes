@@ -15,14 +15,10 @@ mod resolver;
 mod rustls_util;
 mod salt_checker;
 mod shadowsocks;
-mod snell_handler;
-mod snell_udp_stream;
+mod snell;
 mod socket_util;
 mod socks_handler;
-mod tcp_client_connector;
-mod tcp_handler;
-mod tcp_handler_util;
-mod tcp_server;
+mod tcp;
 mod thread_util;
 mod timed_salt_checker;
 mod tls_handler;
@@ -37,14 +33,15 @@ use std::path::Path;
 
 use log::debug;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+use tcp_server::start_tcp_server;
 use tokio::runtime::Builder;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 use tokio::task::JoinHandle;
 
 use crate::config::{ServerConfig, Transport};
 use crate::quic_server::start_quic_server;
-use crate::tcp_server::start_tcp_server;
 use crate::thread_util::set_num_threads;
+use tcp::*;
 
 #[derive(Debug)]
 struct ConfigChanged;
@@ -125,10 +122,10 @@ fn main() {
     let mut num_threads = 0usize;
     let mut dry_run = false;
 
-    while args.len() > 0 && args[0].starts_with("-") {
+    while !args.is_empty() && args[0].starts_with("-") {
         if args[0] == "--threads" || args[0] == "-t" {
             args.remove(0);
-            if args.len() == 0 {
+            if args.is_empty() {
                 eprintln!("Missing threads argument.");
                 print_usage_and_exit(arg0);
                 return;
@@ -233,7 +230,7 @@ fn main() {
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 
             // Remove any extra events
-            while let Ok(_) = config_rx.try_recv() {}
+            while config_rx.try_recv().is_ok() {}
         }
     });
 }

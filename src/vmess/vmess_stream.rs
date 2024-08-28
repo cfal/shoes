@@ -184,23 +184,23 @@ impl VmessStream {
         let max_unencrypted_read_data_size = MAX_ENCRYPTED_READ_DATA_SIZE - tag_len;
         let max_unencrypted_write_data_size = MAX_ENCRYPTED_WRITE_DATA_SIZE - tag_len;
 
-        const max_read_packet_size: usize = MAX_ENCRYPTED_READ_DATA_SIZE + 2;
-        let unprocessed_buf = allocate_vec(max_read_packet_size).into_boxed_slice();
+        const MAX_READ_PACKET_SIZE: usize = MAX_ENCRYPTED_READ_DATA_SIZE + 2;
+        let unprocessed_buf = allocate_vec(MAX_READ_PACKET_SIZE).into_boxed_slice();
         let processed_buf = allocate_vec(max_unencrypted_read_data_size).into_boxed_slice();
 
         let (write_cache, mut write_packet) = if !is_udp {
             let write_cache = allocate_vec(max_unencrypted_write_data_size).into_boxed_slice();
 
-            const max_write_packet_size: usize = MAX_ENCRYPTED_WRITE_DATA_SIZE + 2;
+            const MAX_WRITE_PACKET_SIZE: usize = MAX_ENCRYPTED_WRITE_DATA_SIZE + 2;
 
             // we need to be able to send a full packet, and the prefix (response) data all
             // at once. the response is relatively small, check vmess_handler.
-            let write_packet = allocate_vec(max_write_packet_size + 40).into_boxed_slice();
+            let write_packet = allocate_vec(MAX_WRITE_PACKET_SIZE + 40).into_boxed_slice();
 
             (write_cache, write_packet)
         } else {
             // write_message can be called with a full UDP message, which we need to handle,
-            // ie. packetize into multiple packets and store in write_packet.
+            // i.e. packetize into multiple packets and store in write_packet.
             let write_cache = allocate_vec(65535).into_boxed_slice();
 
             let write_packet_size = 65535
@@ -276,7 +276,7 @@ impl VmessStream {
             return Ok(());
         }
 
-        let mut encrypted_response_header_length = &mut self.unprocessed_buf
+        let encrypted_response_header_length = &mut self.unprocessed_buf
             [self.unprocessed_start_offset..self.unprocessed_start_offset + 2 + HEADER_TAG_LEN];
 
         let ReadHeaderInfo {
@@ -298,7 +298,7 @@ impl VmessStream {
         );
 
         if opening_key
-            .open_in_place(Aad::empty(), &mut encrypted_response_header_length)
+            .open_in_place(Aad::empty(), encrypted_response_header_length)
             .is_err()
         {
             return Err(std::io::Error::new(
@@ -327,7 +327,7 @@ impl VmessStream {
             return Ok(());
         }
 
-        let mut encrypted_response_header = &mut self.unprocessed_buf[self.unprocessed_start_offset
+        let encrypted_response_header = &mut self.unprocessed_buf[self.unprocessed_start_offset
             ..self.unprocessed_start_offset + content_len + HEADER_TAG_LEN];
 
         let ReadHeaderInfo {
@@ -348,7 +348,7 @@ impl VmessStream {
         );
 
         if opening_key
-            .open_in_place(Aad::empty(), &mut encrypted_response_header)
+            .open_in_place(Aad::empty(), encrypted_response_header)
             .is_err()
         {
             return Err(std::io::Error::new(
@@ -369,7 +369,7 @@ impl VmessStream {
             self.unprocessed_end_offset = 0;
         }
 
-        check_header_response(&encrypted_response_header, *response_authentication_v)
+        check_header_response(encrypted_response_header, *response_authentication_v)
     }
 
     fn process_read_header_legacy_content(&mut self) -> std::io::Result<()> {
@@ -384,13 +384,13 @@ impl VmessStream {
             ..
         } = self.read_header_info.as_ref().unwrap();
 
-        let mut response_header_bytes = &mut self.unprocessed_buf
+        let response_header_bytes = &mut self.unprocessed_buf
             [self.unprocessed_start_offset..self.unprocessed_start_offset + 4];
         let mut response_cipher =
             Cfb::<Aes128>::new_from_slices(&response_header_key[..], &response_header_iv[..])
                 .unwrap();
 
-        response_cipher.decrypt(&mut response_header_bytes);
+        response_cipher.decrypt(response_header_bytes);
 
         // do this here, because we would already have read/decrypted it in the aead clause.
         let command_len = response_header_bytes[3];
@@ -409,7 +409,7 @@ impl VmessStream {
             self.unprocessed_end_offset = 0;
         }
 
-        check_header_response(&response_header_bytes, *response_authentication_v)
+        check_header_response(response_header_bytes, *response_authentication_v)
     }
 
     fn try_decrypt(&mut self) -> std::io::Result<DecryptState> {
@@ -537,7 +537,7 @@ impl VmessStream {
         Ok(DecryptState::Success)
     }
 
-    fn read_processed(&mut self, buf: &mut ReadBuf<'_>) -> () {
+    fn read_processed(&mut self, buf: &mut ReadBuf<'_>) {
         assert!(
             self.processed_end_offset > 0,
             "called without any processed data"
@@ -1060,7 +1060,7 @@ impl AsyncWriteMessage for VmessStream {
 
         // TODO: we don't need to copy and call do_write_packet. we can just create a packet
         // directly.
-        this.write_cache[0..buf.len()].copy_from_slice(&buf);
+        this.write_cache[0..buf.len()].copy_from_slice(buf);
         this.write_cache_size = buf.len();
         while this.write_cache_size > 0 && this.create_write_packet() {}
 

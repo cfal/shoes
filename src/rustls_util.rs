@@ -61,11 +61,8 @@ fn load_certs(cert_bytes: &[u8]) -> Vec<rustls::Certificate> {
     let mut reader = std::io::Cursor::new(cert_bytes);
     let mut certs = vec![];
     for item in std::iter::from_fn(|| rustls_pemfile::read_one(&mut reader).transpose()) {
-        match item.unwrap() {
-            rustls_pemfile::Item::X509Certificate(cert) => {
-                certs.push(rustls::Certificate(cert));
-            }
-            _ => (),
+        if let rustls_pemfile::Item::X509Certificate(cert) = item.unwrap() {
+            certs.push(rustls::Certificate(cert));
         }
     }
     certs

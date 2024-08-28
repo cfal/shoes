@@ -148,7 +148,7 @@ impl ShadowsocksStream {
 
     fn process_opening_key(&mut self) -> std::io::Result<()> {
         let decrypt_iv = &self.unprocessed_buf[0..self.salt_len];
-        let session_key = self.key.create_session_key(&decrypt_iv);
+        let session_key = self.key.create_session_key(decrypt_iv);
         let unbound_key = UnboundKey::new(self.algorithm, &session_key).unwrap();
         let opening_key = OpeningKey::new(unbound_key, IncreasingSequence::new());
         self.opening_key = Some(opening_key);
@@ -266,7 +266,7 @@ impl ShadowsocksStream {
         Ok(DecryptState::Success)
     }
 
-    fn read_processed(&mut self, buf: &mut ReadBuf<'_>) -> () {
+    fn read_processed(&mut self, buf: &mut ReadBuf<'_>) {
         assert!(
             self.processed_end_offset > 0,
             "called without any processed data"
@@ -384,7 +384,7 @@ impl ShadowsocksStream {
 
     fn read_header_len(&self) -> usize {
         match self.stream_type {
-            ShadowsocksStreamType::AEAD => self.salt_len,
+            ShadowsocksStreamType::Aead => self.salt_len,
             ShadowsocksStreamType::AEAD2022Server => {
                 // Expect the encrypted client (request) header
                 // salt (salt_len) + encrypted packet [type (1) + timestamp (8) + length (2)] + tag (TAG_LEN)
@@ -400,10 +400,10 @@ impl ShadowsocksStream {
 
     fn process_read_header(&mut self) -> std::io::Result<()> {
         match self.stream_type {
-            ShadowsocksStreamType::AEAD => {
+            ShadowsocksStreamType::Aead => {
                 if let Some(salt_checker) = &self.salt_checker {
                     let decrypt_iv = &self.unprocessed_buf[0..self.salt_len];
-                    if !salt_checker.lock().insert_and_check(&decrypt_iv) {
+                    if !salt_checker.lock().insert_and_check(decrypt_iv) {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::Other,
                             "got duplicate salt",
@@ -468,7 +468,7 @@ impl ShadowsocksStream {
 
                 let decrypt_iv = &self.unprocessed_buf[0..self.salt_len];
                 if let Some(salt_checker) = &self.salt_checker {
-                    if !salt_checker.lock().insert_and_check(&decrypt_iv) {
+                    if !salt_checker.lock().insert_and_check(decrypt_iv) {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::Other,
                             "got duplicate salt",
@@ -542,7 +542,7 @@ impl ShadowsocksStream {
 
                 if let Some(salt_checker) = &self.salt_checker {
                     let decrypt_iv = &self.unprocessed_buf[0..self.salt_len];
-                    if !salt_checker.lock().insert_and_check(&decrypt_iv) {
+                    if !salt_checker.lock().insert_and_check(decrypt_iv) {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::Other,
                             "got duplicate salt",
@@ -582,7 +582,7 @@ impl ShadowsocksStream {
 
     fn process_write_header(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         match self.stream_type {
-            ShadowsocksStreamType::AEAD => {
+            ShadowsocksStreamType::Aead => {
                 self.write_cache[0..self.salt_len].copy_from_slice(&self.encrypt_iv);
                 self.write_cache_end_offset = self.salt_len;
 
@@ -677,7 +677,7 @@ impl ShadowsocksStream {
                     )
                 })?;
 
-                self.encrypt_single(&buf, false).map_err(|_| {
+                self.encrypt_single(buf, false).map_err(|_| {
                     std::io::Error::new(
                         std::io::ErrorKind::Other,
                         "failed to encrypt initial client packet",
@@ -890,7 +890,7 @@ impl AsyncReadMessage for ShadowsocksStream {
 impl AsyncWriteMessage for ShadowsocksStream {
     fn poll_write_message(
         self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
+        _cx: &mut Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<()>> {
         let this = self.get_mut();
@@ -910,7 +910,7 @@ impl AsyncWriteMessage for ShadowsocksStream {
             return Poll::Pending;
         }
 
-        this.encrypt_single(&buf, true).map_err(|_| {
+        this.encrypt_single(buf, true).map_err(|_| {
             std::io::Error::new(std::io::ErrorKind::Other, "failed to encrypt packet")
         })?;
 
@@ -951,5 +951,5 @@ impl AsyncMessageStream for ShadowsocksStream {}
 
 #[inline]
 fn current_time_secs() -> u64 {
-    SystemTime::UNIX_EPOCH.elapsed().unwrap().as_secs() as u64
+    SystemTime::UNIX_EPOCH.elapsed().unwrap().as_secs()
 }

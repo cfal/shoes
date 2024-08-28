@@ -36,8 +36,8 @@ async fn run_quic_server(
         .unwrap()
         .max_concurrent_bidi_streams(1024_u32.into())
         .max_concurrent_uni_streams(0_u8.into())
-        .keep_alive_interval(Some(std::time::Duration::from_secs(15).try_into().unwrap()))
-        .max_idle_timeout(Some(std::time::Duration::from_secs(30).try_into().unwrap()));
+        .keep_alive_interval(Some(Duration::from_secs(15)))
+        .max_idle_timeout(Some(Duration::from_secs(30).try_into().unwrap()));
 
     let endpoint = quinn::Endpoint::server(server_config, bind_address)?;
 
@@ -201,7 +201,7 @@ async fn process_streams(
             copy_result?;
             Ok(())
         }
-        TcpServerSetupResult::BidirectionalUdpForward {
+        TcpServerSetupResult::BidirectionalUdp {
             remote_location,
             stream: mut server_stream,
         } => {
@@ -236,7 +236,7 @@ async fn process_streams(
                 }
             }
         }
-        TcpServerSetupResult::MultidirectionalUdpForward {
+        TcpServerSetupResult::MultiDirectionalUdp {
             stream: mut server_stream,
             need_initial_flush: server_need_initial_flush,
         } => {

@@ -60,7 +60,7 @@ impl AsyncWriteTargetedMessage for UdpDirectMessageStream {
             Some(s) => s,
             None => {
                 match this.location_cache.get(target) {
-                    Some(s) => s.clone(),
+                    Some(s) => *s,
                     None => {
                         let resolve_results = match this.resolving_locations.get_mut(target) {
                             None => {
@@ -84,7 +84,7 @@ impl AsyncWriteTargetedMessage for UdpDirectMessageStream {
                                     return Poll::Pending;
                                 }
                                 Poll::Ready(result) => {
-                                    this.resolving_locations.remove(target).unwrap();
+                                    let _ = this.resolving_locations.remove(target).unwrap();
                                     result
                                 }
                             },
@@ -102,8 +102,7 @@ impl AsyncWriteTargetedMessage for UdpDirectMessageStream {
                                 }
                                 let socket_addr = socket_addrs.into_iter().next().unwrap();
                                 // TODO: switch to using entry()
-                                this.location_cache
-                                    .insert(target.clone(), socket_addr.clone());
+                                this.location_cache.insert(target.clone(), socket_addr);
                                 socket_addr
                             }
                         }
@@ -119,7 +118,10 @@ impl AsyncWriteTargetedMessage for UdpDirectMessageStream {
 }
 
 impl AsyncFlushMessage for UdpDirectMessageStream {
-    fn poll_flush_message(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+    fn poll_flush_message(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
         Poll::Ready(Ok(()))
     }
 }
@@ -127,7 +129,7 @@ impl AsyncFlushMessage for UdpDirectMessageStream {
 impl AsyncShutdownMessage for UdpDirectMessageStream {
     fn poll_shutdown_message(
         self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
+        _cx: &mut Context<'_>,
     ) -> Poll<std::io::Result<()>> {
         Poll::Ready(Ok(()))
     }
@@ -138,7 +140,7 @@ impl AsyncPing for UdpDirectMessageStream {
         false
     }
 
-    fn poll_write_ping(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<bool>> {
+    fn poll_write_ping(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<bool>> {
         unimplemented!()
     }
 }

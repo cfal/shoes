@@ -22,11 +22,11 @@ pub enum TcpServerSetupResult {
         override_proxy_provider: NoneOrOne<Arc<ClientProxySelector<TcpClientConnector>>>,
     },
     // TODO: support udp client proxy selector
-    BidirectionalUdpForward {
+    BidirectionalUdp {
         remote_location: NetLocation,
         stream: Box<dyn AsyncMessageStream>,
     },
-    MultidirectionalUdpForward {
+    MultiDirectionalUdp {
         need_initial_flush: bool,
         stream: Box<dyn AsyncTargetedMessageStream>,
     },

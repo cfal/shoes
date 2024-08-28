@@ -28,9 +28,9 @@ impl Address {
                     // can only be a hostname.
                     break;
                 }
-            } else if (c >= b'A' && c <= b'F') || (c >= b'a' && c <= b'f') {
+            } else if (b'A'..=b'F').contains(&c) || (b'a'..=b'f').contains(&c) {
                 possible_ipv4 = false;
-            } else if c < b'0' || c > b'9' {
+            } else if !c.is_ascii_digit() {
                 possible_ipv4 = false;
                 possible_ipv6 = false;
                 break;
@@ -98,7 +98,7 @@ impl NetLocation {
         Self { address, port }
     }
 
-    pub fn is_unspecified(&self) -> bool {
+    pub fn _is_unspecified(&self) -> bool {
         self == &Self::UNSPECIFIED
     }
 
@@ -168,7 +168,7 @@ impl NetLocation {
         match self.address {
             Address::Ipv6(ref addr) => Some(SocketAddr::new(IpAddr::V6(*addr), self.port)),
             Address::Ipv4(ref addr) => Some(SocketAddr::new(IpAddr::V4(*addr), self.port)),
-            Address::Hostname(ref d) => None,
+            Address::Hostname(ref _d) => None,
         }
     }
 }

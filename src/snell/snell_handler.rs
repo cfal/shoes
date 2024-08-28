@@ -5,13 +5,13 @@ use argon2::Argon2;
 use async_trait::async_trait;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+use super::snell_udp_stream::SnellUdpStream;
 use crate::address::{Address, NetLocation};
 use crate::async_stream::AsyncStream;
 use crate::option_util::NoneOrOne;
 use crate::shadowsocks::{
     ShadowsocksCipher, ShadowsocksKey, ShadowsocksStream, ShadowsocksStreamType,
 };
-use crate::snell_udp_stream::SnellUdpStream;
 use crate::tcp_handler::{
     TcpClientHandler, TcpClientSetupResult, TcpServerHandler, TcpServerSetupResult,
 };
@@ -83,7 +83,7 @@ impl TcpServerHandler for SnellTcpHandler {
     ) -> std::io::Result<TcpServerSetupResult> {
         let mut server_stream = ShadowsocksStream::new(
             server_stream,
-            ShadowsocksStreamType::AEAD,
+            ShadowsocksStreamType::Aead,
             self.cipher.algorithm(),
             self.cipher.salt_len(),
             self.key.clone(),
@@ -169,10 +169,10 @@ impl TcpServerHandler for SnellTcpHandler {
 
             let udp_stream = SnellUdpStream::new(
                 Box::new(server_stream),
-                ShadowsocksStreamType::AEAD.max_payload_len(),
+                ShadowsocksStreamType::Aead.max_payload_len(),
             );
 
-            Ok(TcpServerSetupResult::MultidirectionalUdpForward {
+            Ok(TcpServerSetupResult::MultiDirectionalUdp {
                 stream: Box::new(udp_stream),
                 need_initial_flush: true,
             })
@@ -190,7 +190,7 @@ impl TcpClientHandler for SnellTcpHandler {
     ) -> std::io::Result<TcpClientSetupResult> {
         let mut client_stream: Box<dyn AsyncStream> = Box::new(ShadowsocksStream::new(
             client_stream,
-            ShadowsocksStreamType::AEAD,
+            ShadowsocksStreamType::Aead,
             self.cipher.algorithm(),
             self.cipher.salt_len(),
             self.key.clone(),

@@ -80,7 +80,7 @@ impl CertHashProvider {
             return Some(*time_secs);
         }
         self.update_hashes();
-        self.hashes.get(hash).map(|time_secs| *time_secs)
+        self.hashes.get(hash).copied()
     }
 
     fn update_hashes(&mut self) {
@@ -159,14 +159,14 @@ impl TcpServerHandler for VmessTcpServerHandler {
         aead_bytes.copy_from_slice(&cert_hash);
 
         self.aead_cipher
-            .decrypt_block(&mut GenericArray::from_mut_slice(&mut aead_bytes));
+            .decrypt_block(GenericArray::from_mut_slice(&mut aead_bytes));
         let checksum = super::crc32::crc32c(&aead_bytes[0..12]);
         let expected_checksum = u32::from_be_bytes(aead_bytes[12..16].try_into().unwrap());
         let is_aead_request = checksum == expected_checksum;
 
         let mut header_reader = if is_aead_request {
             let time_secs = u64::from_be_bytes(aead_bytes[0..8].try_into().unwrap());
-            let current_time_secs = SystemTime::UNIX_EPOCH.elapsed().unwrap().as_secs() as u64;
+            let current_time_secs = SystemTime::UNIX_EPOCH.elapsed().unwrap().as_secs();
             let time_delta = if time_secs > current_time_secs {
                 time_secs - current_time_secs
             } else {
@@ -487,15 +487,14 @@ impl TcpServerHandler for VmessTcpServerHandler {
         let (response_header_iv, response_header_key): ([u8; 16], [u8; 16]) = if is_aead_request {
             let mut truncated_iv = [0u8; 16];
             let mut truncated_key = [0u8; 16];
-            truncated_iv.copy_from_slice(&super::sha2::compute_sha256(&data_encryption_iv)[0..16]);
-            truncated_key
-                .copy_from_slice(&super::sha2::compute_sha256(&data_encryption_key)[0..16]);
+            truncated_iv.copy_from_slice(&super::sha2::compute_sha256(data_encryption_iv)[0..16]);
+            truncated_key.copy_from_slice(&super::sha2::compute_sha256(data_encryption_key)[0..16]);
 
             (truncated_iv, truncated_key)
         } else {
             (
-                compute_md5(&data_encryption_iv),
-                compute_md5(&data_encryption_key),
+                compute_md5(data_encryption_iv),
+                compute_md5(data_encryption_key),
             )
         };
 
@@ -504,14 +503,14 @@ impl TcpServerHandler for VmessTcpServerHandler {
             DataCipher::Aes128Gcm => {
                 // key is 16 bytes
                 Some((
-                    UnboundKey::new(&AES_128_GCM, &data_encryption_key).unwrap(),
+                    UnboundKey::new(&AES_128_GCM, data_encryption_key).unwrap(),
                     UnboundKey::new(&AES_128_GCM, &response_header_key).unwrap(),
                 ))
             }
             DataCipher::ChaCha20Poly1305 => {
                 // key is 32 bytes
                 Some((
-                    UnboundKey::new(&CHACHA20_POLY1305, &create_chacha_key(&data_encryption_key))
+                    UnboundKey::new(&CHACHA20_POLY1305, &create_chacha_key(data_encryption_key))
                         .unwrap(),
                     UnboundKey::new(&CHACHA20_POLY1305, &create_chacha_key(&response_header_key))
                         .unwrap(),
@@ -524,7 +523,7 @@ impl TcpServerHandler for VmessTcpServerHandler {
         let data_keys = if let Some((unbound_opening_key, unbound_sealing_key)) = unbound_keys {
             let opening_key = OpeningKey::new(
                 unbound_opening_key,
-                VmessNonceSequence::new(&data_encryption_iv),
+                VmessNonceSequence::new(data_encryption_iv),
             );
             let sealing_key = SealingKey::new(
                 unbound_sealing_key,
@@ -537,7 +536,7 @@ impl TcpServerHandler for VmessTcpServerHandler {
 
         let (read_length_shake_reader, write_length_shake_reader) = if enable_chunk_masking {
             let mut request_hasher = Shake128::default();
-            request_hasher.update(&data_encryption_iv);
+            request_hasher.update(data_encryption_iv);
             let request_reader = request_hasher.finalize_xof();
 
             let mut response_hasher = Shake128::default();
@@ -626,7 +625,7 @@ impl TcpServerHandler for VmessTcpServerHandler {
                 initial_remote_data: None,
                 override_proxy_provider: NoneOrOne::Unspecified,
             }),
-            true => Ok(TcpServerSetupResult::BidirectionalUdpForward {
+            true => Ok(TcpServerSetupResult::BidirectionalUdp {
                 remote_location,
                 stream: server_stream,
             }),
@@ -747,7 +746,7 @@ impl TcpClientHandler for VmessTcpClientHandler {
             aead_bytes[12..16].copy_from_slice(&checksum);
 
             self.aead_cipher
-                .encrypt_block(&mut GenericArray::from_mut_slice(&mut aead_bytes));
+                .encrypt_block(GenericArray::from_mut_slice(&mut aead_bytes));
             (aead_bytes, time_bytes)
         } else {
             // non-AEAD only allows 30 second delta.
@@ -783,21 +782,20 @@ impl TcpClientHandler for VmessTcpClientHandler {
         let (response_header_iv, response_header_key): ([u8; 16], [u8; 16]) = if self.is_aead {
             let mut truncated_iv = [0u8; 16];
             let mut truncated_key = [0u8; 16];
-            truncated_iv.copy_from_slice(&super::sha2::compute_sha256(&data_encryption_iv)[0..16]);
-            truncated_key
-                .copy_from_slice(&super::sha2::compute_sha256(&data_encryption_key)[0..16]);
+            truncated_iv.copy_from_slice(&super::sha2::compute_sha256(data_encryption_iv)[0..16]);
+            truncated_key.copy_from_slice(&super::sha2::compute_sha256(data_encryption_key)[0..16]);
 
             (truncated_iv, truncated_key)
         } else {
             (
-                compute_md5(&data_encryption_iv),
-                compute_md5(&data_encryption_key),
+                compute_md5(data_encryption_iv),
+                compute_md5(data_encryption_key),
             )
         };
 
         let (read_length_shake_reader, write_length_shake_reader) = {
             let mut request_hasher = Shake128::default();
-            request_hasher.update(&data_encryption_iv);
+            request_hasher.update(data_encryption_iv);
             let request_reader = request_hasher.finalize_xof();
 
             let mut response_hasher = Shake128::default();
@@ -814,7 +812,7 @@ impl TcpClientHandler for VmessTcpClientHandler {
                     3u8,
                     Some((
                         UnboundKey::new(&AES_128_GCM, &response_header_key).unwrap(),
-                        UnboundKey::new(&AES_128_GCM, &data_encryption_key).unwrap(),
+                        UnboundKey::new(&AES_128_GCM, data_encryption_key).unwrap(),
                     )),
                 )
             }
@@ -831,7 +829,7 @@ impl TcpClientHandler for VmessTcpClientHandler {
                         .unwrap(),
                         UnboundKey::new(
                             &CHACHA20_POLY1305,
-                            &create_chacha_key(&data_encryption_key),
+                            &create_chacha_key(data_encryption_key),
                         )
                         .unwrap(),
                     )),
@@ -847,7 +845,7 @@ impl TcpClientHandler for VmessTcpClientHandler {
             );
             let sealing_key = SealingKey::new(
                 unbound_sealing_key,
-                VmessNonceSequence::new(&data_encryption_iv),
+                VmessNonceSequence::new(data_encryption_iv),
             );
             Some((opening_key, sealing_key))
         } else {
@@ -972,9 +970,9 @@ impl TcpClientHandler for VmessTcpClientHandler {
             let instruction_iv: [u8; 16] = compute_md5_repeating(&time_bytes, 4);
             let mut cipher =
                 AesCfb::new_from_slices(&self.instruction_key, &instruction_iv).unwrap();
-            let mut sized_header_bytes = &mut header_bytes[0..cursor];
-            cipher.encrypt(&mut sized_header_bytes);
-            client_stream.write_all(&sized_header_bytes).await?;
+            let sized_header_bytes = &mut header_bytes[0..cursor];
+            cipher.encrypt(sized_header_bytes);
+            client_stream.write_all(sized_header_bytes).await?;
         }
 
         // Flush the entire request.

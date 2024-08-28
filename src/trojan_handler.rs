@@ -30,7 +30,7 @@ pub struct TrojanTcpHandler {
 
 impl TrojanTcpHandler {
     pub fn new(password: &str, shadowsocks_config: &Option<ShadowsocksConfig>) -> Self {
-        let password_hash = create_password_hash(&password);
+        let password_hash = create_password_hash(password);
         let shadowsocks_data = shadowsocks_config.as_ref().map(|config| {
             let ShadowsocksConfig {
                 cipher,
@@ -64,7 +64,7 @@ impl TcpServerHandler for TrojanTcpHandler {
         {
             server_stream = Box::new(ShadowsocksStream::new(
                 server_stream,
-                ShadowsocksStreamType::AEAD,
+                ShadowsocksStreamType::Aead,
                 cipher.algorithm(),
                 cipher.salt_len(),
                 key.clone(),
@@ -150,7 +150,7 @@ impl TcpClientHandler for TrojanTcpHandler {
         {
             client_stream = Box::new(ShadowsocksStream::new(
                 client_stream,
-                ShadowsocksStreamType::AEAD,
+                ShadowsocksStreamType::Aead,
                 cipher.algorithm(),
                 cipher.salt_len(),
                 key.clone(),
