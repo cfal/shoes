@@ -153,11 +153,8 @@ impl AsyncWriteSourcedMessage for SnellUdpStream {
         if this.write_buf_end_offset > 0 {
             // it's possible for the buffer to be written, but flush not to be completed.
             // we still want to continue in that scenario.
-            match Pin::new(&mut this).poll_flush_message(cx) {
-                Poll::Ready(Err(e)) => {
-                    return Poll::Ready(Err(e));
-                }
-                _ => (),
+            if let Poll::Ready(Err(e)) = Pin::new(&mut this).poll_flush_message(cx) {
+                return Poll::Ready(Err(e));
             }
             if this.write_buf_end_offset > 0 {
                 return Poll::Pending;

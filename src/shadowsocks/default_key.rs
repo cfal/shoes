@@ -55,7 +55,7 @@ fn get_key_bytes(key: &str, cipher_key_len: usize) -> Box<[u8]> {
             break;
         }
         context = Md5::new();
-        context.update(&digest);
+        context.update(digest);
     }
     ret.truncate(cipher_key_len);
     ret.into_boxed_slice()

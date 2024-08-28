@@ -189,11 +189,7 @@ impl TcpClientHandler for WebsocketTcpClientHandler {
         mut client_stream: Box<dyn AsyncStream>,
         remote_location: NetLocation,
     ) -> std::io::Result<TcpClientSetupResult> {
-        let request_path = self
-            .matching_path
-            .as_ref()
-            .map(String::as_str)
-            .unwrap_or("/");
+        let request_path = self.matching_path.as_deref().unwrap_or("/");
 
         let websocket_key = create_websocket_key();
         let mut http_request = String::with_capacity(1024);

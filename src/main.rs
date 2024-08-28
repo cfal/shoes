@@ -15,14 +15,10 @@ mod resolver;
 mod rustls_util;
 mod salt_checker;
 mod shadowsocks;
-mod snell_handler;
-mod snell_udp_stream;
+mod snell;
 mod socket_util;
 mod socks_handler;
-mod tcp_client_connector;
-mod tcp_handler;
-mod tcp_handler_util;
-mod tcp_server;
+mod tcp;
 mod thread_util;
 mod timed_salt_checker;
 mod tls_handler;
@@ -37,14 +33,15 @@ use std::path::Path;
 
 use log::debug;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+use tcp_server::start_tcp_server;
 use tokio::runtime::Builder;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 use tokio::task::JoinHandle;
 
 use crate::config::{ServerConfig, Transport};
 use crate::quic_server::start_quic_server;
-use crate::tcp_server::start_tcp_server;
 use crate::thread_util::set_num_threads;
+use tcp::*;
 
 #[derive(Debug)]
 struct ConfigChanged;

@@ -63,7 +63,7 @@ pub struct ServerQuicConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 pub enum Config {
-    ServerConfig(ServerConfig),
+    Server(ServerConfig),
     ClientConfigGroup {
         client_group: String,
         // TODO: do a topological sort and allow this to be OneOrSome<ConfigSelection>
@@ -128,25 +128,20 @@ pub struct WebsocketServerConfig {
     pub override_rules: NoneOrSome<ConfigSelection<RuleConfig>>,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Default, Debug, Clone, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum WebsocketPingType {
     Disabled,
+    // Ping frames are better if the websocket (or a proxy) requires it to stop from timing
+    // out because it causes the remote end to write a pong, which could prevent the connection
+    // from timing out.
+    // However, some clients (e.g. Quantumult-X) can't handle ping frames and disconnects when
+    // one is received, so empty frames can be better for compatibility.
     #[serde(alias = "ping", alias = "ping-frame")]
+    #[default]
     PingFrame,
     #[serde(alias = "empty", alias = "empty-frame")]
     EmptyFrame,
-}
-
-impl Default for WebsocketPingType {
-    fn default() -> Self {
-        // Ping frames are better if the websocket (or a proxy) requires it to stop from timing
-        // out because it causes the remote end to write a pong, which could prevent the connection
-        // from timing out.
-        // However some clients (eg. Quantumult-X) can't handle ping frames and disconnects when
-        // one is received, so empty frames can be better for compatibility.
-        WebsocketPingType::PingFrame
-    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -245,12 +240,12 @@ impl<T> ConfigSelection<T> {
         }
     }
 
-    fn replace<'a, U: 'a>(
+    fn replace<'a, U>(
         iter: impl Iterator<Item = &'a ConfigSelection<U>>,
         client_groups: &HashMap<String, Vec<U>>,
     ) -> std::io::Result<Vec<ConfigSelection<U>>>
     where
-        U: Clone,
+        U: Clone + 'a,
     {
         let mut ret = vec![];
         for selection in iter {
@@ -394,10 +389,7 @@ pub enum ClientProxyConfig {
 
 impl ClientProxyConfig {
     pub fn is_direct(&self) -> bool {
-        match self {
-            ClientProxyConfig::Direct => true,
-            _ => false,
-        }
+        matches!(self, ClientProxyConfig::Direct)
     }
 }
 
@@ -598,7 +590,7 @@ pub async fn load_configs(args: &Vec<String>) -> std::io::Result<Vec<ServerConfi
                     ));
                 }
             }
-            Config::ServerConfig(server_config) => {
+            Config::Server(server_config) => {
                 server_configs.push(server_config);
             }
         }
@@ -751,17 +743,16 @@ fn validate_rule_config(
     rule_config: &mut RuleConfig,
     client_groups: &HashMap<String, Vec<ClientConfig>>,
 ) -> std::io::Result<()> {
-    match rule_config.action {
-        RuleActionConfig::Allow {
-            ref mut client_proxies,
-            ..
-        } => {
-            ConfigSelection::replace_one_or_some_groups(client_proxies, client_groups)?;
-            for client_config_selection in client_proxies.iter_mut() {
-                validate_client_config(client_config_selection.unwrap_config_mut())?
-            }
+    if let RuleActionConfig::Allow {
+        ref mut client_proxies,
+        ..
+    } = rule_config.action
+    {
+        ConfigSelection::replace_one_or_some_groups(client_proxies, client_groups)?;
+        for client_config_selection in client_proxies.iter_mut() {
+            validate_client_config(client_config_selection.unwrap_config_mut())?
         }
-        _ => (),
     }
+
     Ok(())
 }

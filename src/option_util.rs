@@ -1,40 +1,22 @@
 use serde::Deserialize;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Default, Debug, Clone, Deserialize)]
 #[serde(untagged)]
 pub enum NoneOrOne<T> {
     #[serde(skip_deserializing)]
+    #[default]
     Unspecified,
     None,
     One(T),
 }
 
-impl<T> Default for NoneOrOne<T> {
-    fn default() -> Self {
-        NoneOrOne::Unspecified
-    }
-}
-
 impl<T> NoneOrOne<T> {
     pub fn is_unspecified(&self) -> bool {
-        match self {
-            NoneOrOne::Unspecified => true,
-            _ => false,
-        }
-    }
-
-    pub fn _is_none(&self) -> bool {
-        match self {
-            NoneOrOne::None => true,
-            _ => false,
-        }
+        matches!(self, NoneOrOne::Unspecified)
     }
 
     pub fn is_one(&self) -> bool {
-        match self {
-            NoneOrOne::One(..) => true,
-            _ => false,
-        }
+        matches!(self, NoneOrOne::One(..))
     }
 
     pub fn unwrap(self) -> T {
@@ -61,10 +43,11 @@ impl<T> NoneOrOne<T> {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Default, Debug, Clone, Deserialize)]
 #[serde(untagged)]
 pub enum NoneOrSome<T> {
     #[serde(skip_deserializing)]
+    #[default]
     Unspecified,
     None,
     One(T),
@@ -73,10 +56,7 @@ pub enum NoneOrSome<T> {
 
 impl<T> NoneOrSome<T> {
     pub fn _is_unspecified(&self) -> bool {
-        match self {
-            NoneOrSome::Unspecified => true,
-            _ => false,
-        }
+        matches!(self, NoneOrSome::Unspecified)
     }
 
     pub fn _as_option(&self) -> Option<Vec<&T>> {
@@ -176,12 +156,6 @@ impl<T> NoneOrSome<T> {
                 }
             }
         }
-    }
-}
-
-impl<T> Default for NoneOrSome<T> {
-    fn default() -> Self {
-        NoneOrSome::Unspecified
     }
 }
 

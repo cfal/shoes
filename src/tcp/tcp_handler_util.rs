@@ -16,7 +16,7 @@ use crate::option_util::NoneOrOne;
 use crate::port_forward_handler::PortForwardServerHandler;
 use crate::rustls_util::{create_client_config, create_server_config};
 use crate::shadowsocks::ShadowsocksTcpHandler;
-use crate::snell_handler::SnellTcpHandler;
+use crate::snell::snell_handler::SnellTcpHandler;
 use crate::socks_handler::{SocksTcpClientHandler, SocksTcpServerHandler};
 use crate::tcp_client_connector::TcpClientConnector;
 use crate::tcp_handler::{TcpClientHandler, TcpServerHandler};
@@ -50,14 +50,11 @@ pub fn create_tcp_server_handler(
             create_auth_credentials(username, password),
         )),
         ServerProxyConfig::Shadowsocks(ShadowsocksConfig { cipher, password }) => {
-            if cipher.starts_with("2022-blake3-") {
+            if let Some(stripped) = cipher.strip_prefix("2022-blake3-") {
                 let key_bytes = BASE64
                     .decode(password)
                     .expect("could not base64 decode password");
-                Box::new(ShadowsocksTcpHandler::new_aead2022(
-                    &cipher[12..],
-                    &key_bytes,
-                ))
+                Box::new(ShadowsocksTcpHandler::new_aead2022(stripped, &key_bytes))
             } else {
                 Box::new(ShadowsocksTcpHandler::new(&cipher, &password))
             }
@@ -233,14 +230,11 @@ pub fn create_tcp_client_handler(
             create_auth_credentials(username, password),
         )),
         ClientProxyConfig::Shadowsocks(ShadowsocksConfig { cipher, password }) => {
-            if cipher.starts_with("2022-blake3-") {
+            if let Some(stripped) = cipher.strip_prefix("2022-blake3-") {
                 let key_bytes = BASE64
                     .decode(password)
                     .expect("could not base64 decode password");
-                Box::new(ShadowsocksTcpHandler::new_aead2022(
-                    &cipher[12..],
-                    &key_bytes,
-                ))
+                Box::new(ShadowsocksTcpHandler::new_aead2022(stripped, &key_bytes))
             } else {
                 Box::new(ShadowsocksTcpHandler::new(&cipher, &password))
             }

@@ -80,7 +80,7 @@ impl CertHashProvider {
             return Some(*time_secs);
         }
         self.update_hashes();
-        self.hashes.get(hash).map(|time_secs| *time_secs)
+        self.hashes.get(hash).copied()
     }
 
     fn update_hashes(&mut self) {
@@ -625,7 +625,7 @@ impl TcpServerHandler for VmessTcpServerHandler {
                 initial_remote_data: None,
                 override_proxy_provider: NoneOrOne::Unspecified,
             }),
-            true => Ok(TcpServerSetupResult::BidirectionalUdpForward {
+            true => Ok(TcpServerSetupResult::BidirectionalUdp {
                 remote_location,
                 stream: server_stream,
             }),

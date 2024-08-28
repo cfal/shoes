@@ -80,9 +80,7 @@ impl TcpClientConnector {
                 transport_config
                     .max_concurrent_bidi_streams(0_u32.into())
                     .max_concurrent_uni_streams(0_u8.into())
-                    .keep_alive_interval(Some(
-                        std::time::Duration::from_secs(15).try_into().unwrap(),
-                    ))
+                    .keep_alive_interval(Some(std::time::Duration::from_secs(15)))
                     .max_idle_timeout(Some(std::time::Duration::from_secs(30).try_into().unwrap()));
 
                 quic_client_config.transport_config(Arc::new(transport_config));
@@ -230,10 +228,9 @@ impl TcpClientConnector {
             Some(ref client_handler) => {
                 // TODO: make this configurable
                 if ALWAYS_RESOLVE_HOSTNAMES && remote_location.address().is_hostname() {
-                        let socket_addr =
-                            resolve_single_address(resolver, &remote_location).await?;
-                        remote_location =
-                            NetLocation::from_ip_addr(socket_addr.ip(), socket_addr.port());
+                    let socket_addr = resolve_single_address(resolver, &remote_location).await?;
+                    remote_location =
+                        NetLocation::from_ip_addr(socket_addr.ip(), socket_addr.port());
                 }
                 let TcpClientSetupResult { client_stream } = client_handler
                     .setup_client_stream(server_stream, client_stream, remote_location)

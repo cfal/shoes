@@ -72,10 +72,9 @@ impl TcpServerHandler for SocksTcpServerHandler {
             METHOD_NONE
         };
 
-        if methods
+        if !methods
             .into_iter()
-            .find(move |method| *method == supported_method)
-            .is_none()
+            .any(move |method| method == supported_method)
         {
             // TODO: consider writing response: [VER_SOCKS5, METHOD_INVALID]
             return Err(std::io::Error::new(

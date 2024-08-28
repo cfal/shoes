@@ -226,7 +226,7 @@ where
             copy_result?;
             Ok(())
         }
-        TcpServerSetupResult::BidirectionalUdpForward {
+        TcpServerSetupResult::BidirectionalUdp {
             remote_location,
             stream: mut server_stream,
         } => {
@@ -261,7 +261,7 @@ where
                 }
             }
         }
-        TcpServerSetupResult::MultidirectionalUdpForward {
+        TcpServerSetupResult::MultiDirectionalUdp {
             stream: mut server_stream,
             need_initial_flush: server_need_initial_flush,
         } => {

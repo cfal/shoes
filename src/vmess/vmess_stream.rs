@@ -200,7 +200,7 @@ impl VmessStream {
             (write_cache, write_packet)
         } else {
             // write_message can be called with a full UDP message, which we need to handle,
-            // ie. packetize into multiple packets and store in write_packet.
+            // i.e. packetize into multiple packets and store in write_packet.
             let write_cache = allocate_vec(65535).into_boxed_slice();
 
             let write_packet_size = 65535
@@ -537,7 +537,7 @@ impl VmessStream {
         Ok(DecryptState::Success)
     }
 
-    fn read_processed(&mut self, buf: &mut ReadBuf<'_>) -> () {
+    fn read_processed(&mut self, buf: &mut ReadBuf<'_>) {
         assert!(
             self.processed_end_offset > 0,
             "called without any processed data"

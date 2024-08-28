@@ -64,7 +64,7 @@ impl TcpServerHandler for TrojanTcpHandler {
         {
             server_stream = Box::new(ShadowsocksStream::new(
                 server_stream,
-                ShadowsocksStreamType::AEAD,
+                ShadowsocksStreamType::Aead,
                 cipher.algorithm(),
                 cipher.salt_len(),
                 key.clone(),
@@ -150,7 +150,7 @@ impl TcpClientHandler for TrojanTcpHandler {
         {
             client_stream = Box::new(ShadowsocksStream::new(
                 client_stream,
-                ShadowsocksStreamType::AEAD,
+                ShadowsocksStreamType::Aead,
                 cipher.algorithm(),
                 cipher.salt_len(),
                 key.clone(),

@@ -28,9 +28,9 @@ impl Address {
                     // can only be a hostname.
                     break;
                 }
-            } else if (c >= b'A' && c <= b'F') || (c >= b'a' && c <= b'f') {
+            } else if (b'A'..=b'F').contains(&c) || (b'a'..=b'f').contains(&c) {
                 possible_ipv4 = false;
-            } else if c < b'0' || c > b'9' {
+            } else if !c.is_ascii_digit() {
                 possible_ipv4 = false;
                 possible_ipv6 = false;
                 break;
