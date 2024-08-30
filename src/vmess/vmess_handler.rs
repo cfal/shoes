@@ -7,7 +7,6 @@ use aes::Aes128;
 use async_trait::async_trait;
 use cfb_mode::cipher::AsyncStreamCipher;
 use digest::KeyInit;
-use generic_array::GenericArray;
 use parking_lot::Mutex;
 use rand::{Rng, RngCore};
 use ring::aead::{
@@ -132,7 +131,7 @@ impl VmessTcpServerHandler {
         let instruction_key: [u8; 16] = compute_md5(&user_id_bytes);
 
         let derived_key = super::sha2::kdf(&instruction_key, &[b"AES Auth ID Encryption"]);
-        let aead_cipher = Aes128::new(GenericArray::from_slice(&derived_key[0..16]));
+        let aead_cipher = Aes128::new((&derived_key[0..16]).into());
 
         Self {
             data_cipher: cipher_name.into(),
@@ -158,8 +157,7 @@ impl TcpServerHandler for VmessTcpServerHandler {
         let mut aead_bytes = [0u8; 16];
         aead_bytes.copy_from_slice(&cert_hash);
 
-        self.aead_cipher
-            .decrypt_block(GenericArray::from_mut_slice(&mut aead_bytes));
+        self.aead_cipher.decrypt_block((&mut aead_bytes).into());
         let checksum = super::crc32::crc32c(&aead_bytes[0..12]);
         let expected_checksum = u32::from_be_bytes(aead_bytes[12..16].try_into().unwrap());
         let is_aead_request = checksum == expected_checksum;
@@ -709,7 +707,7 @@ impl VmessTcpClientHandler {
         let instruction_key: [u8; 16] = compute_md5(&user_id_bytes);
 
         let derived_key = super::sha2::kdf(&instruction_key, &[b"AES Auth ID Encryption"]);
-        let aead_cipher = Aes128::new(GenericArray::from_slice(&derived_key[0..16]));
+        let aead_cipher = Aes128::new((&derived_key[0..16]).into());
 
         Self {
             data_cipher: cipher_name.into(),
@@ -745,8 +743,7 @@ impl TcpClientHandler for VmessTcpClientHandler {
             let checksum = super::crc32::crc32c(&aead_bytes[0..12]).to_be_bytes();
             aead_bytes[12..16].copy_from_slice(&checksum);
 
-            self.aead_cipher
-                .encrypt_block(GenericArray::from_mut_slice(&mut aead_bytes));
+            self.aead_cipher.encrypt_block((&mut aead_bytes).into());
             (aead_bytes, time_bytes)
         } else {
             // non-AEAD only allows 30 second delta.

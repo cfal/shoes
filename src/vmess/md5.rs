@@ -1,4 +1,3 @@
-use generic_array::GenericArray;
 use hmac::{Hmac, Mac};
 use md5::{Digest, Md5};
 
@@ -23,9 +22,9 @@ pub fn create_chacha_key(data: &[u8]) -> [u8; 32] {
     let mut ret = [0u8; 32];
     let mut context = Md5::new();
     md5::Digest::update(&mut context, data);
-    context.finalize_into_reset(GenericArray::from_mut_slice(&mut ret[0..16]));
+    context.finalize_into_reset((&mut ret[0..16]).into());
     md5::Digest::update(&mut context, &ret[0..16]);
-    context.finalize_into(GenericArray::from_mut_slice(&mut ret[16..]));
+    context.finalize_into((&mut ret[16..]).into());
     ret
 }
 
