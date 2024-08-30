@@ -631,6 +631,7 @@ impl TcpServerHandler for VmessTcpServerHandler {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 enum HeaderReader {
     AesCfb(AesCfbHeaderReader),
     Aead(AeadHeaderReader),

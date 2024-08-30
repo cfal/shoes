@@ -335,5 +335,5 @@ fn create_websocket_key_response(key: String) -> String {
     let mut sha1 = Sha1::default();
     sha1.update(key);
     sha1.update(WS_GUID);
-    BASE64.encode(&sha1.finalize())
+    BASE64.encode(sha1.finalize())
 }

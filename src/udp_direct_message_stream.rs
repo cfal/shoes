@@ -84,7 +84,7 @@ impl AsyncWriteTargetedMessage for UdpDirectMessageStream {
                                     return Poll::Pending;
                                 }
                                 Poll::Ready(result) => {
-                                    let _ = this.resolving_locations.remove(target).unwrap();
+                                    this.resolving_locations.remove(target);
                                     result
                                 }
                             },

@@ -1,15 +1,15 @@
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+use digest::XofReader;
 use futures::ready;
 use log::warn;
 use rand::RngCore;
 use ring::aead::{Aad, BoundKey, OpeningKey, SealingKey, UnboundKey, AES_128_GCM};
-use sha3::digest::XofReader;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use super::nonce::{SingleUseNonce, VmessNonceSequence};
-use super::typed::Aes128CfbDec;
+use super::typed::{Aes128CfbDec, VmessReader};
 
 use crate::async_stream::{
     AsyncFlushMessage, AsyncMessageStream, AsyncPing, AsyncReadMessage, AsyncShutdownMessage,
@@ -37,16 +37,13 @@ const fn div_ceil(a: usize, b: usize) -> usize {
 }
 
 struct LengthMask {
-    reader: digest::core_api::XofReaderCoreWrapper<sha3::Shake128ReaderCore>,
+    reader: VmessReader,
     mask: [u8; 2],
     enable_padding: bool,
 }
 
 impl LengthMask {
-    fn new(
-        reader: digest::core_api::XofReaderCoreWrapper<sha3::Shake128ReaderCore>,
-        enable_padding: bool,
-    ) -> Self {
+    fn new(reader: VmessReader, enable_padding: bool) -> Self {
         Self {
             reader,
             mask: [0u8; 2],
@@ -151,11 +148,11 @@ fn check_header_response(
     if (response_header_bytes[2] & 0x01) == 0x01 {
         warn!("Ignoring unsupported server dynamic port instructions.");
     }
-
     Ok(())
 }
 
 impl VmessStream {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         stream: Box<dyn AsyncStream>,
         is_udp: bool,
@@ -163,12 +160,8 @@ impl VmessStream {
             OpeningKey<VmessNonceSequence>,
             SealingKey<VmessNonceSequence>,
         )>,
-        read_length_shake_reader: Option<
-            digest::core_api::XofReaderCoreWrapper<sha3::Shake128ReaderCore>,
-        >,
-        write_length_shake_reader: Option<
-            digest::core_api::XofReaderCoreWrapper<sha3::Shake128ReaderCore>,
-        >,
+        read_length_shake_reader: Option<VmessReader>,
+        write_length_shake_reader: Option<VmessReader>,
         enable_global_padding: bool,
         prefix_write_bytes: Option<Box<[u8]>>,
         read_header_info: Option<ReadHeaderInfo>,
@@ -189,9 +182,7 @@ impl VmessStream {
 
         let (write_cache, mut write_packet) = if !is_udp {
             let write_cache = allocate_vec(max_unencrypted_write_data_size).into_boxed_slice();
-
             const MAX_WRITE_PACKET_SIZE: usize = MAX_ENCRYPTED_WRITE_DATA_SIZE + 2;
-
             // we need to be able to send a full packet, and the prefix (response) data all
             // at once. the response is relatively small, check vmess_handler.
             let write_packet = allocate_vec(MAX_WRITE_PACKET_SIZE + 40).into_boxed_slice();
