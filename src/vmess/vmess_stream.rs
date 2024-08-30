@@ -1,9 +1,6 @@
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use aes::Aes128;
-use cfb_mode::cipher::{AsyncStreamCipher, NewCipher};
-use cfb_mode::Cfb;
 use futures::ready;
 use log::warn;
 use rand::RngCore;
@@ -12,12 +9,14 @@ use sha3::digest::XofReader;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use super::nonce::{SingleUseNonce, VmessNonceSequence};
+use super::typed::Aes128CfbDec;
+
 use crate::async_stream::{
     AsyncFlushMessage, AsyncMessageStream, AsyncPing, AsyncReadMessage, AsyncShutdownMessage,
     AsyncStream, AsyncWriteMessage,
 };
 use crate::util::allocate_vec;
-
+use aes::cipher::{AsyncStreamCipher, KeyIvInit};
 // this should be the same as vmess_handler.rs TAG_LEN.
 const HEADER_TAG_LEN: usize = 16;
 const ENCRYPTION_TAG_LEN: usize = 16;
@@ -386,10 +385,10 @@ impl VmessStream {
 
         let response_header_bytes = &mut self.unprocessed_buf
             [self.unprocessed_start_offset..self.unprocessed_start_offset + 4];
-        let mut response_cipher =
-            Cfb::<Aes128>::new_from_slices(&response_header_key[..], &response_header_iv[..])
-                .unwrap();
-
+        let response_cipher = Aes128CfbDec::new(
+            (&response_header_key[..]).into(),
+            (&response_header_iv[..]).into(),
+        );
         response_cipher.decrypt(response_header_bytes);
 
         // do this here, because we would already have read/decrypted it in the aead clause.

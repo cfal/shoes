@@ -2,10 +2,11 @@ use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::time::SystemTime;
 
-use aes::{Aes128, BlockDecrypt, BlockEncrypt, NewBlockCipher};
+use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyIvInit};
+use aes::Aes128;
 use async_trait::async_trait;
-use cfb_mode::cipher::{AsyncStreamCipher, NewCipher};
-use cfb_mode::Cfb;
+use cfb_mode::cipher::AsyncStreamCipher;
+use digest::KeyInit;
 use generic_array::GenericArray;
 use parking_lot::Mutex;
 use rand::{Rng, RngCore};
@@ -19,6 +20,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use super::fnv1a::Fnv1aHasher;
 use super::md5::{compute_hmac_md5, compute_md5, compute_md5_repeating, create_chacha_key};
 use super::nonce::{SingleUseNonce, VmessNonceSequence};
+use super::typed::{Aes128CfbDec, Aes128CfbEnc};
 use super::vmess_stream::{ReadHeaderInfo, VmessStream};
 use crate::address::{Address, NetLocation};
 use crate::async_stream::AsyncStream;
@@ -107,8 +109,6 @@ impl CertHashProvider {
         self.last_hash_time_secs = to_time_secs;
     }
 }
-
-type AesCfb = Cfb<Aes128>;
 
 #[derive(Debug)]
 pub struct VmessTcpServerHandler {
@@ -283,7 +283,7 @@ impl TcpServerHandler for VmessTcpServerHandler {
             };
 
             let request_cipher =
-                AesCfb::new_from_slices(&self.instruction_key, &instruction_iv).unwrap();
+                Aes128CfbDec::new(&self.instruction_key.into(), &instruction_iv.into());
 
             HeaderReader::AesCfb(AesCfbHeaderReader {
                 server_stream,
@@ -598,8 +598,8 @@ impl TcpServerHandler for VmessTcpServerHandler {
 
             Box::new(encrypted_response_header)
         } else {
-            let mut response_cipher =
-                AesCfb::new_from_slices(&response_header_key, &response_header_iv).unwrap();
+            let response_cipher =
+                Aes128CfbEnc::new(&response_header_key.into(), &response_header_iv.into());
             response_cipher.encrypt(&mut response_header);
             Box::new(response_header)
         };
@@ -656,13 +656,13 @@ impl HeaderReader {
 
 struct AesCfbHeaderReader {
     server_stream: Box<dyn AsyncStream>,
-    request_cipher: AesCfb,
+    request_cipher: Aes128CfbDec,
 }
 
 impl AesCfbHeaderReader {
     async fn read_exact(&mut self, data: &mut [u8]) -> std::io::Result<()> {
         self.server_stream.read_exact(data).await?;
-        self.request_cipher.decrypt(data);
+        self.request_cipher.clone().decrypt(data);
         Ok(())
     }
 
@@ -955,10 +955,8 @@ impl TcpClientHandler for VmessTcpClientHandler {
 
             // TODO: don't unwrap
             let unbound_key = UnboundKey::new(&AES_128_GCM, &header_aead_key[0..16]).unwrap();
-
             let mut sealing_key =
                 SealingKey::new(unbound_key, SingleUseNonce::new(&header_nonce[0..12]));
-
             let tag = sealing_key
                 .seal_in_place_separate_tag(Aad::from(&cert_hash), &mut header_bytes[0..cursor])
                 .unwrap();
@@ -968,8 +966,7 @@ impl TcpClientHandler for VmessTcpClientHandler {
             client_stream.write_all(&header_bytes[0..cursor]).await?;
         } else {
             let instruction_iv: [u8; 16] = compute_md5_repeating(&time_bytes, 4);
-            let mut cipher =
-                AesCfb::new_from_slices(&self.instruction_key, &instruction_iv).unwrap();
+            let cipher = Aes128CfbEnc::new(&self.instruction_key.into(), &instruction_iv.into());
             let sized_header_bytes = &mut header_bytes[0..cursor];
             cipher.encrypt(sized_header_bytes);
             client_stream.write_all(sized_header_bytes).await?;
