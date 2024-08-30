@@ -1,10 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use async_trait::async_trait;
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-use tokio::io::AsyncWriteExt;
-
 use super::websocket_stream::WebsocketStream;
 use crate::address::NetLocation;
 use crate::async_stream::AsyncStream;
@@ -16,6 +12,10 @@ use crate::tcp_client_connector::TcpClientConnector;
 use crate::tcp_handler::{
     TcpClientHandler, TcpClientSetupResult, TcpServerHandler, TcpServerSetupResult,
 };
+use async_trait::async_trait;
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use sha1::{Digest, Sha1};
+use tokio::io::AsyncWriteExt;
 
 #[derive(Debug)]
 pub struct WebsocketServerTarget {
@@ -329,9 +329,11 @@ fn create_websocket_key() -> String {
     BASE64.encode(key)
 }
 
-fn create_websocket_key_response(mut key: String) -> String {
+fn create_websocket_key_response(key: String) -> String {
     // after some testing - the sha1 crate seems faster than sha-1.
-    key.push_str("258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
-    let hash = sha1::Sha1::from(key.into_bytes()).digest().bytes();
-    BASE64.encode(hash)
+    const WS_GUID: &[u8] = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    let mut sha1 = Sha1::default();
+    sha1.update(key);
+    sha1.update(WS_GUID);
+    BASE64.encode(&sha1.finalize())
 }
