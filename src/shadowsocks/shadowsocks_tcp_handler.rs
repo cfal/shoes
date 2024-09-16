@@ -146,12 +146,7 @@ impl TcpClientHandler for ShadowsocksTcpHandler {
 
             let mut rng = rand::thread_rng();
             let padding_len: usize = rng.gen_range(1..=900);
-
-            location_vec.reserve(padding_len + 2);
-            let _remaining = location_vec.spare_capacity_mut();
-            unsafe {
-                location_vec.set_len(location_len + padding_len + 2);
-            }
+            location_vec.resize(location_len + padding_len + 2, 0);
 
             let padding_len_bytes = (padding_len as u16).to_be_bytes();
             location_vec[location_len..location_len + 2].copy_from_slice(&padding_len_bytes);
