@@ -1,23 +1,22 @@
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use aes::Aes128;
-use cfb_mode::cipher::{AsyncStreamCipher, NewCipher};
-use cfb_mode::Cfb;
+use digest::XofReader;
 use futures::ready;
 use log::warn;
 use rand::RngCore;
 use ring::aead::{Aad, BoundKey, OpeningKey, SealingKey, UnboundKey, AES_128_GCM};
-use sha3::digest::XofReader;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use super::nonce::{SingleUseNonce, VmessNonceSequence};
+use super::typed::{Aes128CfbDec, VmessReader};
+
 use crate::async_stream::{
     AsyncFlushMessage, AsyncMessageStream, AsyncPing, AsyncReadMessage, AsyncShutdownMessage,
     AsyncStream, AsyncWriteMessage,
 };
 use crate::util::allocate_vec;
-
+use aes::cipher::{AsyncStreamCipher, KeyIvInit};
 // this should be the same as vmess_handler.rs TAG_LEN.
 const HEADER_TAG_LEN: usize = 16;
 const ENCRYPTION_TAG_LEN: usize = 16;
@@ -38,16 +37,13 @@ const fn div_ceil(a: usize, b: usize) -> usize {
 }
 
 struct LengthMask {
-    reader: digest::core_api::XofReaderCoreWrapper<sha3::Shake128ReaderCore>,
+    reader: VmessReader,
     mask: [u8; 2],
     enable_padding: bool,
 }
 
 impl LengthMask {
-    fn new(
-        reader: digest::core_api::XofReaderCoreWrapper<sha3::Shake128ReaderCore>,
-        enable_padding: bool,
-    ) -> Self {
+    fn new(reader: VmessReader, enable_padding: bool) -> Self {
         Self {
             reader,
             mask: [0u8; 2],
@@ -152,11 +148,11 @@ fn check_header_response(
     if (response_header_bytes[2] & 0x01) == 0x01 {
         warn!("Ignoring unsupported server dynamic port instructions.");
     }
-
     Ok(())
 }
 
 impl VmessStream {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         stream: Box<dyn AsyncStream>,
         is_udp: bool,
@@ -164,12 +160,8 @@ impl VmessStream {
             OpeningKey<VmessNonceSequence>,
             SealingKey<VmessNonceSequence>,
         )>,
-        read_length_shake_reader: Option<
-            digest::core_api::XofReaderCoreWrapper<sha3::Shake128ReaderCore>,
-        >,
-        write_length_shake_reader: Option<
-            digest::core_api::XofReaderCoreWrapper<sha3::Shake128ReaderCore>,
-        >,
+        read_length_shake_reader: Option<VmessReader>,
+        write_length_shake_reader: Option<VmessReader>,
         enable_global_padding: bool,
         prefix_write_bytes: Option<Box<[u8]>>,
         read_header_info: Option<ReadHeaderInfo>,
@@ -190,9 +182,7 @@ impl VmessStream {
 
         let (write_cache, mut write_packet) = if !is_udp {
             let write_cache = allocate_vec(max_unencrypted_write_data_size).into_boxed_slice();
-
             const MAX_WRITE_PACKET_SIZE: usize = MAX_ENCRYPTED_WRITE_DATA_SIZE + 2;
-
             // we need to be able to send a full packet, and the prefix (response) data all
             // at once. the response is relatively small, check vmess_handler.
             let write_packet = allocate_vec(MAX_WRITE_PACKET_SIZE + 40).into_boxed_slice();
@@ -386,10 +376,10 @@ impl VmessStream {
 
         let response_header_bytes = &mut self.unprocessed_buf
             [self.unprocessed_start_offset..self.unprocessed_start_offset + 4];
-        let mut response_cipher =
-            Cfb::<Aes128>::new_from_slices(&response_header_key[..], &response_header_iv[..])
-                .unwrap();
-
+        let response_cipher = Aes128CfbDec::new(
+            (&response_header_key[..]).into(),
+            (&response_header_iv[..]).into(),
+        );
         response_cipher.decrypt(response_header_bytes);
 
         // do this here, because we would already have read/decrypted it in the aead clause.

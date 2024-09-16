@@ -11,16 +11,15 @@ keywords = ["proxy", "proxy-server", "shadowsocks", "v2ray", "vmess"]
 categories = ["command-line-utilities", "network-programming"]
 
 [dependencies]
-aes = "0.7.5"
+aes = "0.8.4"
 argon2 = "0.5.2"
 async-trait = "0.1.81"
 base64 = "0.22.1"
 blake3 = "1.4.1"
-cfb-mode = "0.7.1"
+cfb-mode = "0.8.2"
 digest = "0.10.7"
 env_logger = "0.11.5"
 futures = "0.3.28"
-generic-array = "0.14.7"
 hmac = "0.12.1"
 log = "0.4.20"
 md-5 = "0.10.5"
@@ -33,12 +32,20 @@ rand = "0.8.5"
 ring = "0.17.8"
 rustls = { version = "0.21.7", features = ["dangerous_configuration"] }
 rustls-pemfile = { version = "1.0.4" }
-sha1 = "0.6.0"
+sha1 = "0.10.6"
 sha2 = "0.10.7"
 sha3 = "0.10.8"
 serde = { version = "1", features = ["derive", "std"] }
 serde_yaml = "0.9"
-tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = [
+    "fs",
+    "io-util",
+    "macros",
+    "net",
+    "rt-multi-thread",
+    "sync",
+    "time",
+] }
 tokio-rustls = { version = "0.24.1", features = ["dangerous_configuration"] }
 webpki-roots = { version = "0.25.2" }
 
