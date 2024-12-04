@@ -1,4 +1,4 @@
-use sha2::{Digest, Sha256};
+use ring::digest::{Context, SHA256};
 
 trait VmessHash: std::fmt::Debug {
     fn setup_new(&self) -> Box<dyn VmessHash>;
@@ -6,12 +6,17 @@ trait VmessHash: std::fmt::Debug {
     fn finalize(&mut self) -> [u8; 32];
 }
 
-#[derive(Debug)]
-struct Sha256Hash(Sha256);
+struct Sha256Hash(Context);
+
+impl std::fmt::Debug for Sha256Hash {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("Sha256Hash").field(&"Context").finish()
+    }
+}
 
 impl Sha256Hash {
     fn create() -> Self {
-        Self(Sha256::new())
+        Self(Context::new(&SHA256))
     }
 }
 
@@ -25,7 +30,9 @@ impl VmessHash for Sha256Hash {
     }
 
     fn finalize(&mut self) -> [u8; 32] {
-        self.0.clone().finalize().into()
+        let mut out = [0u8; 32];
+        out.copy_from_slice(self.0.clone().finish().as_ref());
+        out
     }
 }
 
@@ -112,7 +119,7 @@ pub fn kdf(key: &[u8], path: &[&[u8]]) -> [u8; 32] {
 }
 
 pub fn compute_sha256(data: &[u8]) -> [u8; 32] {
-    let mut hash = Sha256::new();
-    hash.update(data);
-    hash.finalize().into()
+    let mut out = [0u8; 32];
+    out.copy_from_slice(ring::digest::digest(&SHA256, data).as_ref());
+    out
 }
