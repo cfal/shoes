@@ -96,13 +96,14 @@ pub fn create_server_config(
     let privkey = load_private_key(key_bytes);
 
     let builder = rustls::ServerConfig::builder().with_safe_defaults();
-    let builder = if client_fingerprints.len() == 0 {
-        builder.with_no_client_auth()
-    } else {
-        builder.with_client_cert_verifier(Arc::new(KnownPublicKeysVerifier {
-            public_keys: process_client_fingerprints(client_fingerprints),
-        }))
-    };
+    let builder =
+        if client_fingerprints.len() == 0 || client_fingerprints.iter().any(|fp| fp == "any") {
+            builder.with_no_client_auth()
+        } else {
+            builder.with_client_cert_verifier(Arc::new(KnownPublicKeysVerifier {
+                public_keys: process_client_fingerprints(client_fingerprints),
+            }))
+        };
     let mut config = builder
         .with_single_cert(certs, privkey)
         .expect("bad certificate/key");
