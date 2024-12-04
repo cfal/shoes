@@ -46,22 +46,17 @@ struct RecursiveHash {
 
 impl RecursiveHash {
     fn create(key: &[u8], hash: Box<dyn VmessHash>) -> Self {
-        let mut default_outer = [0u8; 64];
-        let mut default_inner = [0u8; 64];
-
         // for hmac, we would normally have to get a derived key
         // by hashing the key when it's longer than 64 bytes, but
         // that doesn't happen for vmess's usecase.
         assert!(key.len() <= 64);
 
-        default_outer[0..key.len()].copy_from_slice(key);
-        default_inner[0..key.len()].copy_from_slice(key);
+        let mut default_outer = [0x5c; 64];
+        let mut default_inner = [0x36; 64];
 
-        for b in default_outer.iter_mut() {
-            *b ^= 0x5c;
-        }
-        for b in default_inner.iter_mut() {
-            *b ^= 0x36;
+        for (i, &b) in key.iter().enumerate() {
+            default_outer[i] ^= b;
+            default_inner[i] ^= b;
         }
 
         let mut inner = hash.setup_new();
@@ -99,9 +94,8 @@ impl VmessHash for RecursiveHash {
     }
 
     fn finalize(&mut self) -> [u8; 32] {
-        let inner_result: [u8; 32] = self.inner.finalize();
         self.outer.update(&self.default_outer);
-        self.outer.update(&inner_result);
+        self.outer.update(&self.inner.finalize());
         self.outer.finalize()
     }
 }
