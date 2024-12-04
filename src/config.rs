@@ -58,6 +58,8 @@ pub struct ServerQuicConfig {
     pub key: String,
     #[serde(alias = "alpn_protocol", default)]
     pub alpn_protocols: NoneOrSome<String>,
+    #[serde(alias = "client_fingerprint", default)]
+    pub client_fingerprints: NoneOrSome<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -108,6 +110,23 @@ pub struct TlsServerConfig {
     pub key: String,
     #[serde(alias = "alpn_protocol", default)]
     pub alpn_protocols: NoneOrSome<String>,
+
+    // sha256 fingerprint of allowed client certificates
+    //
+    // To generate a new ECDSA client certificate:
+    // 1. Generate private key with P-256 curve:
+    //    openssl ecparam -genkey -name prime256v1 -out client.key
+    // 2. Create self-signed certificate:
+    //    openssl req -new -x509 -nodes -key client.key -out client.crt -days 365 -subj "/CN=Client"
+    //
+    // Get the certificate's SHA256 fingerprint:
+    //    openssl x509 -in client.crt -noout -fingerprint -sha256
+    //
+    // Each generated key pair will be unique. Multiple fingerprints can be specified
+    // to allow multiple client certificates.
+    #[serde(alias = "client_fingerprint", default)]
+    pub client_fingerprints: NoneOrSome<String>,
+
     pub protocol: ServerProxyConfig,
 
     #[serde(alias = "override_rule", default)]
@@ -693,8 +712,16 @@ fn validate_server_proxy_config(
                 let TlsServerConfig {
                     ref mut protocol,
                     ref mut override_rules,
+                    ref mut client_fingerprints,
                     ..
                 } = *tls_server_config;
+
+                if matches!(client_fingerprints, NoneOrSome::None) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "Allowed client public keys cannot be an empty list.",
+                    ));
+                }
                 validate_server_proxy_config(protocol, client_groups, rule_groups)?;
 
                 ConfigSelection::replace_none_or_some_groups(override_rules, rule_groups)?;

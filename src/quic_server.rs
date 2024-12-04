@@ -302,6 +302,7 @@ pub async fn start_quic_server(config: ServerConfig) -> std::io::Result<Option<J
         cert,
         key,
         alpn_protocols,
+        client_fingerprints,
     } = quic_settings.unwrap();
 
     let mut cert_file = File::open(&cert).await?;
@@ -316,6 +317,7 @@ pub async fn start_quic_server(config: ServerConfig) -> std::io::Result<Option<J
         &cert_bytes,
         &key_bytes,
         &alpn_protocols.into_vec(),
+        &client_fingerprints.into_vec(),
     ));
 
     let client_proxy_selector = Arc::new(create_tcp_client_proxy_selector(rules.clone()));

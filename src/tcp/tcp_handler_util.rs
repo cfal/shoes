@@ -113,6 +113,7 @@ fn create_tls_server_target(
         cert,
         key,
         alpn_protocols,
+        client_fingerprints,
         protocol,
         override_rules,
     } = tls_server_config;
@@ -130,6 +131,7 @@ fn create_tls_server_target(
         &cert_bytes,
         &key_bytes,
         &alpn_protocols.into_vec(),
+        &client_fingerprints.into_vec(),
     ));
 
     let pushed_rules = !override_rules.is_empty();
