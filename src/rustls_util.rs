@@ -1,3 +1,5 @@
+use log::error;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::OnceLock;
 
@@ -88,12 +90,21 @@ pub fn create_server_config(
     cert_bytes: &[u8],
     key_bytes: &[u8],
     alpn_protocols: &[String],
+    client_fingerprints: &[String],
 ) -> rustls::ServerConfig {
     let certs = load_certs(cert_bytes);
     let privkey = load_private_key(key_bytes);
-    let mut config = rustls::ServerConfig::builder()
-        .with_safe_defaults()
-        .with_no_client_auth()
+
+    let builder = rustls::ServerConfig::builder().with_safe_defaults();
+    let builder =
+        if client_fingerprints.len() == 0 || client_fingerprints.iter().any(|fp| fp == "any") {
+            builder.with_no_client_auth()
+        } else {
+            builder.with_client_cert_verifier(Arc::new(KnownPublicKeysVerifier {
+                public_keys: process_client_fingerprints(client_fingerprints),
+            }))
+        };
+    let mut config = builder
         .with_single_cert(certs, privkey)
         .expect("bad certificate/key");
 
@@ -105,4 +116,73 @@ pub fn create_server_config(
     config.max_early_data_size = u32::MAX;
 
     config
+}
+
+fn process_client_fingerprints(client_fingerprints: &[String]) -> BTreeSet<Vec<u8>> {
+    let mut result = BTreeSet::new();
+
+    for fingerprint in client_fingerprints {
+        // Remove any colons and whitespace
+        let clean_fp = fingerprint.replace(":", "").replace(" ", "");
+
+        if clean_fp.len() % 2 != 0 {
+            panic!("Invalid client fingerprint, odd number of hex chars");
+        }
+
+        if let Ok(bytes) = (0..clean_fp.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&clean_fp[i..i + 2], 16))
+            .collect::<Result<Vec<u8>, _>>()
+        {
+            result.insert(bytes);
+        }
+    }
+
+    result
+}
+
+pub struct KnownPublicKeysVerifier {
+    public_keys: BTreeSet<Vec<u8>>,
+}
+
+impl rustls::server::ClientCertVerifier for KnownPublicKeysVerifier {
+    fn offer_client_auth(&self) -> bool {
+        true
+    }
+
+    fn client_auth_mandatory(&self) -> bool {
+        true
+    }
+
+    fn client_auth_root_subjects(&self) -> &[rustls::DistinguishedName] {
+        &[]
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &rustls::Certificate,
+        _intermediates: &[rustls::Certificate],
+        _now: std::time::SystemTime,
+    ) -> Result<rustls::server::ClientCertVerified, rustls::Error> {
+        // Calculate SHA-256 fingerprint of the entire certificate
+        let fingerprint = ring::digest::digest(&ring::digest::SHA256, end_entity.as_ref());
+        let fingerprint_bytes = fingerprint.as_ref().to_vec();
+
+        if self.public_keys.contains(&fingerprint_bytes) {
+            Ok(rustls::server::ClientCertVerified::assertion())
+        } else {
+            // Format fingerprint as hex string for error message
+            let hex_fingerprint = fingerprint_bytes
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect::<Vec<String>>()
+                .join(":");
+
+            error!(
+                "Unknown client certificate with public key fingerprint: {}",
+                hex_fingerprint
+            );
+            Err(rustls::Error::General("Unknown client public key".into()))
+        }
+    }
 }
