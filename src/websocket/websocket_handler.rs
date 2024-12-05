@@ -14,7 +14,7 @@ use crate::tcp_handler::{
 };
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-use sha1::{Digest, Sha1};
+use ring::digest::{digest, SHA1_FOR_LEGACY_USE_ONLY};
 use tokio::io::AsyncWriteExt;
 
 #[derive(Debug)]
@@ -330,10 +330,9 @@ fn create_websocket_key() -> String {
 }
 
 fn create_websocket_key_response(key: String) -> String {
-    // after some testing - the sha1 crate seems faster than sha-1.
     const WS_GUID: &[u8] = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-    let mut sha1 = Sha1::default();
-    sha1.update(key);
-    sha1.update(WS_GUID);
-    BASE64.encode(sha1.finalize())
+    let mut input = key.into_bytes();
+    input.extend_from_slice(WS_GUID);
+    let hash = digest(&SHA1_FOR_LEGACY_USE_ONLY, &input);
+    BASE64.encode(hash.as_ref())
 }
