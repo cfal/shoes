@@ -32,7 +32,7 @@ mod websocket;
 use std::path::Path;
 
 use log::debug;
-use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tcp_server::start_tcp_server;
 use tokio::runtime::Builder;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
@@ -51,9 +51,11 @@ fn start_notify_thread(
 ) -> (RecommendedWatcher, UnboundedReceiver<ConfigChanged>) {
     let (tx, rx) = unbounded_channel();
 
-    let mut watcher = notify::recommended_watcher(move |res| match res {
-        Ok(_) => {
-            tx.send(ConfigChanged {}).unwrap();
+    let mut watcher = notify::recommended_watcher(move |res: notify::Result<Event>| match res {
+        Ok(event) => {
+            if matches!(event.kind, EventKind::Modify(..)) {
+                tx.send(ConfigChanged {}).unwrap();
+            }
         }
         Err(e) => println!("watch error: {:?}", e),
     })
