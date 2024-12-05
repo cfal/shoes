@@ -23,7 +23,7 @@ pub fn create_client_config(
             .with_no_client_auth()
     } else {
         let root_store = rustls::RootCertStore {
-            roots: webpki_roots::TLS_SERVER_ROOTS.iter().cloned().collect(),
+            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
         };
         builder
             .with_root_certificates(root_store)
@@ -103,7 +103,7 @@ pub fn create_server_config(
     ];
 
     // there's no into_owned for PrivateKeyDer.
-    let privkey = rustls::pki_types::PrivateKeyDer::from_pem_slice(&key_bytes.to_vec()).unwrap();
+    let privkey = rustls::pki_types::PrivateKeyDer::from_pem_slice(key_bytes).unwrap();
 
     let builder = rustls::ServerConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
@@ -111,7 +111,7 @@ pub fn create_server_config(
     .with_safe_default_protocol_versions()
     .unwrap();
     let builder =
-        if client_fingerprints.len() == 0 || client_fingerprints.iter().any(|fp| fp == "any") {
+        if client_fingerprints.is_empty() || client_fingerprints.iter().any(|fp| fp == "any") {
             builder.with_no_client_auth()
         } else {
             let default_provider = rustls::crypto::ring::default_provider();
