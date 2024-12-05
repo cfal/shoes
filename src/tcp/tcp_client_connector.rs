@@ -64,13 +64,28 @@ impl TcpClientConnector {
                 } else {
                     sni_hostname.into_option()
                 };
+                let tls13_suite = match rustls::crypto::ring::cipher_suite::TLS13_AES_128_GCM_SHA256
+                {
+                    rustls::SupportedCipherSuite::Tls13(t) => t,
+                    _ => {
+                        panic!("Could not retrieve Tls13CipherSuite");
+                    }
+                };
 
-                let mut quic_client_config =
-                    quinn::ClientConfig::new(Arc::new(create_client_config(
-                        verify,
-                        &alpn_protocols.into_vec(),
-                        sni_hostname.is_some(),
-                    )));
+                let rustls_client_config = create_client_config(
+                    verify,
+                    &alpn_protocols.into_vec(),
+                    sni_hostname.is_some(),
+                );
+
+                let quic_client_config = quinn::crypto::rustls::QuicClientConfig::with_initial(
+                    Arc::new(rustls_client_config),
+                    tls13_suite.quic_suite().unwrap(),
+                )
+                .unwrap();
+
+                let mut quinn_client_config =
+                    quinn::ClientConfig::new(Arc::new(quic_client_config));
 
                 let mut transport_config = quinn::TransportConfig::default();
 
@@ -83,7 +98,7 @@ impl TcpClientConnector {
                     .keep_alive_interval(Some(std::time::Duration::from_secs(15)))
                     .max_idle_timeout(Some(std::time::Duration::from_secs(30).try_into().unwrap()));
 
-                quic_client_config.transport_config(Arc::new(transport_config));
+                quinn_client_config.transport_config(Arc::new(transport_config));
 
                 let endpoints_len = std::cmp::min(get_num_threads(), MAX_QUIC_ENDPOINTS);
 
@@ -112,7 +127,7 @@ impl TcpClientConnector {
                         Arc::new(quinn::TokioRuntime),
                     )
                     .unwrap();
-                    endpoint.set_default_client_config(quic_client_config.clone());
+                    endpoint.set_default_client_config(quinn_client_config.clone());
                     endpoints.push(Arc::new(endpoint));
                 }
 

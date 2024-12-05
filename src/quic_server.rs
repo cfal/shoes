@@ -31,7 +31,19 @@ async fn run_quic_server(
 ) -> std::io::Result<()> {
     let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
 
-    let mut server_config = quinn::ServerConfig::with_crypto(server_config);
+    let tls13_suite = match rustls::crypto::ring::cipher_suite::TLS13_AES_128_GCM_SHA256 {
+        rustls::SupportedCipherSuite::Tls13(t) => t,
+        _ => {
+            panic!("Could not retrieve Tls13CipherSuite");
+        }
+    };
+
+    let quic_server_config = quinn::crypto::rustls::QuicServerConfig::with_initial(
+        server_config,
+        tls13_suite.quic_suite().unwrap(),
+    )
+    .unwrap();
+    let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_server_config));
     Arc::get_mut(&mut server_config.transport)
         .unwrap()
         .max_concurrent_bidi_streams(1024_u32.into())
@@ -61,7 +73,7 @@ async fn process_connection(
     client_proxy_selector: Arc<ClientProxySelector<TcpClientConnector>>,
     resolver: Arc<dyn Resolver>,
     server_handler: Arc<Box<dyn TcpServerHandler>>,
-    conn: quinn::Connecting,
+    conn: quinn::Incoming,
 ) -> std::io::Result<()> {
     let connection = conn.await?;
 

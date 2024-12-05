@@ -35,7 +35,9 @@ impl AsyncWrite for QuicStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        Pin::new(&mut self.send_stream).poll_write(cx, buf)
+        Pin::new(&mut self.send_stream)
+            .poll_write(cx, buf)
+            .map_err(|err| err.into())
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {

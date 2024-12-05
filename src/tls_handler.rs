@@ -94,14 +94,14 @@ impl TcpServerHandler for TlsServerHandler {
 #[derive(Debug)]
 pub struct TlsClientHandler {
     pub client_config: Arc<rustls::ClientConfig>,
-    pub server_name: rustls::client::ServerName,
+    pub server_name: rustls::pki_types::ServerName<'static>,
     pub handler: Box<dyn TcpClientHandler>,
 }
 
 impl TlsClientHandler {
     pub fn new(
         client_config: Arc<rustls::ClientConfig>,
-        server_name: rustls::client::ServerName,
+        server_name: rustls::pki_types::ServerName<'static>,
         handler: Box<dyn TcpClientHandler>,
     ) -> Self {
         Self {
