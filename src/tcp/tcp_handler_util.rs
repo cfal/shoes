@@ -276,7 +276,7 @@ pub fn create_tcp_client_handler(
             ));
 
             let server_name = match sni_hostname {
-                Some(s) => s.as_str().try_into().unwrap(),
+                Some(s) => rustls::pki_types::ServerName::try_from(s).unwrap(),
                 // This is unused, since enable_sni is false, but connect_with still requires a
                 // parameter.
                 None => "example.com".try_into().unwrap(),
