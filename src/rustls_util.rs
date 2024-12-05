@@ -47,11 +47,11 @@ pub struct DisabledVerifier {
 impl rustls::client::danger::ServerCertVerifier for DisabledVerifier {
     fn verify_server_cert(
         &self,
-        end_entity: &rustls::pki_types::CertificateDer<'_>,
-        intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        server_name: &rustls::pki_types::ServerName<'_>,
-        ocsp_response: &[u8],
-        now: rustls::pki_types::UnixTime,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
     ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
         Ok(rustls::client::danger::ServerCertVerified::assertion())
     }
@@ -180,8 +180,8 @@ impl rustls::server::danger::ClientCertVerifier for KnownPublicKeysVerifier {
     fn verify_client_cert(
         &self,
         end_entity: &rustls::pki_types::CertificateDer<'_>,
-        intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        now: rustls::pki_types::UnixTime,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _now: rustls::pki_types::UnixTime,
     ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
         // Calculate SHA-256 fingerprint of the entire certificate
         let fingerprint = ring::digest::digest(&ring::digest::SHA256, end_entity.as_ref());
