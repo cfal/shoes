@@ -1,4 +1,3 @@
-use log::error;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -185,9 +184,9 @@ impl rustls::server::danger::ClientCertVerifier for KnownPublicKeysVerifier {
     ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
         // Calculate SHA-256 fingerprint of the entire certificate
         let fingerprint = ring::digest::digest(&ring::digest::SHA256, end_entity.as_ref());
-        let fingerprint_bytes = fingerprint.as_ref().to_vec();
+        let fingerprint_bytes = fingerprint.as_ref();
 
-        if self.public_keys.contains(&fingerprint_bytes) {
+        if self.public_keys.contains(fingerprint_bytes) {
             Ok(rustls::server::danger::ClientCertVerified::assertion())
         } else {
             // Format fingerprint as hex string for error message
@@ -197,11 +196,9 @@ impl rustls::server::danger::ClientCertVerifier for KnownPublicKeysVerifier {
                 .collect::<Vec<String>>()
                 .join(":");
 
-            error!(
-                "Unknown client certificate with public key fingerprint: {}",
-                hex_fingerprint
-            );
-            Err(rustls::Error::General("Unknown client public key".into()))
+            Err(rustls::Error::General(
+                format!("unknown client certificate: {}", hex_fingerprint).into(),
+            ))
         }
     }
 
