@@ -359,6 +359,10 @@ pub struct ClientQuicConfig {
     pub sni_hostname: NoneOrOne<String>,
     #[serde(alias = "alpn_protocol", default)]
     pub alpn_protocols: NoneOrSome<String>,
+    #[serde(default)]
+    pub key: Option<String>,
+    #[serde(default)]
+    pub cert: Option<String>,
 }
 
 impl Default for ClientQuicConfig {
@@ -367,6 +371,8 @@ impl Default for ClientQuicConfig {
             verify: true,
             sni_hostname: NoneOrOne::Unspecified,
             alpn_protocols: NoneOrSome::Unspecified,
+            key: None,
+            cert: None,
         }
     }
 }
@@ -420,6 +426,10 @@ pub struct TlsClientConfig {
     pub sni_hostname: NoneOrOne<String>,
     #[serde(alias = "alpn_protocol", default)]
     pub alpn_protocols: NoneOrSome<String>,
+    #[serde(default)]
+    pub key: Option<String>,
+    #[serde(default)]
+    pub cert: Option<String>,
     pub protocol: Box<ClientProxyConfig>,
 }
 
@@ -680,11 +690,21 @@ fn validate_client_config(client_config: &mut ClientConfig) -> std::io::Result<(
         ));
     }
 
-    if client_config.transport != Transport::Quic && client_config.quic_settings.is_some() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "QUIC transport is not selected but QUIC settings specified",
-        ));
+    if let Some(ref quic_config) = client_config.quic_settings {
+        if client_config.transport != Transport::Quic {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "QUIC transport is not selected but QUIC settings specified",
+            ));
+        }
+
+        let ClientQuicConfig { cert, key, .. } = quic_config;
+        if cert.is_none() != key.is_none() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Both client cert and key have to be specified, or both have to be omitted",
+            ));
+        }
     }
 
     #[cfg(not(any(target_os = "android", target_os = "fuchsia", target_os = "linux")))]
@@ -695,6 +715,23 @@ fn validate_client_config(client_config: &mut ClientConfig) -> std::io::Result<(
         ));
     }
 
+    validate_client_proxy_config(&client_config.protocol)?;
+
+    Ok(())
+}
+
+fn validate_client_proxy_config(client_proxy_config: &ClientProxyConfig) -> std::io::Result<()> {
+    match client_proxy_config {
+        ClientProxyConfig::Tls(TlsClientConfig { cert, key, .. }) => {
+            if cert.is_none() != key.is_none() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Both client cert and key have to be specified, or both have to be omitted",
+                ));
+            }
+        }
+        _ => {}
+    }
     Ok(())
 }
 

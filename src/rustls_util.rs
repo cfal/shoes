@@ -8,6 +8,7 @@ pub fn create_client_config(
     verify: bool,
     alpn_protocols: &[String],
     enable_sni: bool,
+    client_key_and_cert: Option<(Vec<u8>, Vec<u8>)>,
 ) -> rustls::ClientConfig {
     let builder = rustls::ClientConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
@@ -15,18 +16,31 @@ pub fn create_client_config(
     .with_safe_default_protocol_versions()
     .unwrap();
 
-    let mut config = if !verify {
+    let builder = if !verify {
         builder
             .dangerous()
             .with_custom_certificate_verifier(get_disabled_verifier())
-            .with_no_client_auth()
     } else {
         let root_store = rustls::RootCertStore {
             roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
         };
-        builder
-            .with_root_certificates(root_store)
-            .with_no_client_auth()
+        builder.with_root_certificates(root_store)
+    };
+
+    let mut config = match client_key_and_cert {
+        Some((key_bytes, cert_bytes)) => {
+            let certs = vec![
+                rustls::pki_types::CertificateDer::from_pem_slice(&cert_bytes)
+                    .unwrap()
+                    .into_owned(),
+            ];
+
+            let privkey = rustls::pki_types::PrivateKeyDer::from_pem_slice(&key_bytes).unwrap();
+            builder
+                .with_client_auth_cert(certs, privkey)
+                .expect("Could not parse client certificate")
+        }
+        None => builder.with_no_client_auth(),
     };
 
     config.alpn_protocols = alpn_protocols
@@ -101,7 +115,6 @@ pub fn create_server_config(
             .into_owned(),
     ];
 
-    // there's no into_owned for PrivateKeyDer.
     let privkey = rustls::pki_types::PrivateKeyDer::from_pem_slice(key_bytes).unwrap();
 
     let builder = rustls::ServerConfig::builder_with_provider(Arc::new(
