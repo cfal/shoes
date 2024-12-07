@@ -255,6 +255,8 @@ pub fn create_tcp_client_handler(
                 sni_hostname,
                 alpn_protocols,
                 protocol,
+                key,
+                cert,
             } = tls_client_config;
 
             let sni_hostname = if sni_hostname.is_unspecified() {
@@ -269,10 +271,24 @@ pub fn create_tcp_client_handler(
                 sni_hostname.into_option()
             };
 
+            let key_and_cert_bytes = key.zip(cert).map(|(key, cert)| {
+                // TODO: do this asynchronously
+                let mut cert_file = std::fs::File::open(&cert).unwrap();
+                let mut cert_bytes = vec![];
+                cert_file.read_to_end(&mut cert_bytes).unwrap();
+
+                let mut key_file = std::fs::File::open(&key).unwrap();
+                let mut key_bytes = vec![];
+                key_file.read_to_end(&mut key_bytes).unwrap();
+
+                (key_bytes, cert_bytes)
+            });
+
             let client_config = Arc::new(create_client_config(
                 verify,
                 &alpn_protocols.into_vec(),
                 sni_hostname.is_some(),
+                key_and_cert_bytes,
             ));
 
             let server_name = match sni_hostname {

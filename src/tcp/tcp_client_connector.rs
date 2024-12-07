@@ -1,3 +1,4 @@
+use std::io::Read;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 
@@ -51,6 +52,8 @@ impl TcpClientConnector {
                     verify,
                     alpn_protocols,
                     sni_hostname,
+                    key,
+                    cert,
                 } = client_config.quic_settings.unwrap_or_default();
 
                 let sni_hostname = if sni_hostname.is_unspecified() {
@@ -72,10 +75,24 @@ impl TcpClientConnector {
                     }
                 };
 
+                let key_and_cert_bytes = key.zip(cert).map(|(key, cert)| {
+                    // TODO: do this asynchronously
+                    let mut cert_file = std::fs::File::open(&cert).unwrap();
+                    let mut cert_bytes = vec![];
+                    cert_file.read_to_end(&mut cert_bytes).unwrap();
+
+                    let mut key_file = std::fs::File::open(&key).unwrap();
+                    let mut key_bytes = vec![];
+                    key_file.read_to_end(&mut key_bytes).unwrap();
+
+                    (key_bytes, cert_bytes)
+                });
+
                 let rustls_client_config = create_client_config(
                     verify,
                     &alpn_protocols.into_vec(),
                     sni_hostname.is_some(),
+                    key_and_cert_bytes,
                 );
 
                 let quic_client_config = quinn::crypto::rustls::QuicClientConfig::with_initial(
