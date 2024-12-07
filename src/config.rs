@@ -353,8 +353,10 @@ impl Default for ClientConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ClientQuicConfig {
-    #[serde(default = "default_true")]
-    pub verify: bool,
+    #[serde(default)]
+    pub verify: NoneOrOne<bool>,
+    #[serde(alias = "server_fingerprint", default)]
+    pub server_fingerprints: NoneOrSome<String>,
     #[serde(default)]
     pub sni_hostname: NoneOrOne<String>,
     #[serde(alias = "alpn_protocol", default)]
@@ -368,7 +370,8 @@ pub struct ClientQuicConfig {
 impl Default for ClientQuicConfig {
     fn default() -> Self {
         Self {
-            verify: true,
+            verify: NoneOrOne::Unspecified,
+            server_fingerprints: NoneOrSome::Unspecified,
             sni_hostname: NoneOrOne::Unspecified,
             alpn_protocols: NoneOrSome::Unspecified,
             key: None,
@@ -420,8 +423,10 @@ impl ClientProxyConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct TlsClientConfig {
-    #[serde(default = "default_true")]
-    pub verify: bool,
+    #[serde(default)]
+    pub verify: NoneOrOne<bool>,
+    #[serde(alias = "server_fingerprint", default)]
+    pub server_fingerprints: NoneOrSome<String>,
     #[serde(default)]
     pub sni_hostname: NoneOrOne<String>,
     #[serde(alias = "alpn_protocol", default)]
@@ -690,7 +695,7 @@ fn validate_client_config(client_config: &mut ClientConfig) -> std::io::Result<(
         ));
     }
 
-    if let Some(ref quic_config) = client_config.quic_settings {
+    if let Some(ref mut quic_config) = client_config.quic_settings {
         if client_config.transport != Transport::Quic {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -698,12 +703,35 @@ fn validate_client_config(client_config: &mut ClientConfig) -> std::io::Result<(
             ));
         }
 
-        let ClientQuicConfig { cert, key, .. } = quic_config;
+        let ClientQuicConfig {
+            cert,
+            key,
+            verify,
+            server_fingerprints,
+            ..
+        } = quic_config;
         if cert.is_none() != key.is_none() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "Both client cert and key have to be specified, or both have to be omitted",
             ));
+        }
+        match verify {
+            NoneOrOne::Unspecified | NoneOrOne::None => {
+                if server_fingerprints.is_empty() {
+                    server_fingerprints.push("webpki".to_string());
+                }
+            }
+            NoneOrOne::One(true) => {
+                if !server_fingerprints.iter().any(|fp| fp == "webpki") {
+                    server_fingerprints.push("webpki".to_string());
+                }
+            }
+            NoneOrOne::One(false) => {
+                if !server_fingerprints.iter().any(|fp| fp == "any") {
+                    server_fingerprints.push("any".to_string());
+                }
+            }
         }
     }
 
@@ -715,19 +743,44 @@ fn validate_client_config(client_config: &mut ClientConfig) -> std::io::Result<(
         ));
     }
 
-    validate_client_proxy_config(&client_config.protocol)?;
+    validate_client_proxy_config(&mut client_config.protocol)?;
 
     Ok(())
 }
 
-fn validate_client_proxy_config(client_proxy_config: &ClientProxyConfig) -> std::io::Result<()> {
+fn validate_client_proxy_config(
+    client_proxy_config: &mut ClientProxyConfig,
+) -> std::io::Result<()> {
     match client_proxy_config {
-        ClientProxyConfig::Tls(TlsClientConfig { cert, key, .. }) => {
+        ClientProxyConfig::Tls(TlsClientConfig {
+            cert,
+            key,
+            verify,
+            server_fingerprints,
+            ..
+        }) => {
             if cert.is_none() != key.is_none() {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     "Both client cert and key have to be specified, or both have to be omitted",
                 ));
+            }
+            match verify {
+                NoneOrOne::Unspecified | NoneOrOne::None => {
+                    if server_fingerprints.is_empty() {
+                        server_fingerprints.push("webpki".to_string());
+                    }
+                }
+                NoneOrOne::One(true) => {
+                    if !server_fingerprints.iter().any(|fp| fp == "webpki") {
+                        server_fingerprints.push("webpki".to_string());
+                    }
+                }
+                NoneOrOne::One(false) => {
+                    if !server_fingerprints.iter().any(|fp| fp == "any") {
+                        server_fingerprints.push("any".to_string());
+                    }
+                }
             }
         }
         _ => {}
@@ -761,10 +814,8 @@ fn validate_server_proxy_config(
                     ));
                 }
                 let client_fingerprints_vec: Vec<String> = client_fingerprints.clone().into_vec();
-                if !client_fingerprints_vec.iter().any(|fp| fp == "any") {
-                    let _ =
-                        crate::rustls_util::process_client_fingerprints(&client_fingerprints_vec)?;
-                }
+                let _ =
+                    crate::rustls_util::process_fingerprints(&client_fingerprints_vec, &["any"])?;
 
                 validate_server_proxy_config(protocol, client_groups, rule_groups)?;
 
