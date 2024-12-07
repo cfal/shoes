@@ -733,6 +733,10 @@ fn validate_client_config(client_config: &mut ClientConfig) -> std::io::Result<(
                 }
             }
         }
+        let _ = crate::rustls_util::process_fingerprints(
+            &server_fingerprints.clone().into_vec(),
+            &["any", "webpki"],
+        )?;
     }
 
     #[cfg(not(any(target_os = "android", target_os = "fuchsia", target_os = "linux")))]
@@ -782,6 +786,10 @@ fn validate_client_proxy_config(
                     }
                 }
             }
+            let _ = crate::rustls_util::process_fingerprints(
+                &server_fingerprints.clone().into_vec(),
+                &["any", "webpki"],
+            )?;
         }
         _ => {}
     }
@@ -813,9 +821,10 @@ fn validate_server_proxy_config(
                         "Allowed client public keys cannot be an empty list.",
                     ));
                 }
-                let client_fingerprints_vec: Vec<String> = client_fingerprints.clone().into_vec();
-                let _ =
-                    crate::rustls_util::process_fingerprints(&client_fingerprints_vec, &["any"])?;
+                let _ = crate::rustls_util::process_fingerprints(
+                    &client_fingerprints.clone().into_vec(),
+                    &["any"],
+                )?;
 
                 validate_server_proxy_config(protocol, client_groups, rule_groups)?;
 
