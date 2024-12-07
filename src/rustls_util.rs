@@ -5,8 +5,8 @@ use std::sync::OnceLock;
 use rustls::pki_types::pem::PemObject;
 
 pub fn create_client_config(
-    verify: bool,
-    alpn_protocols: &[String],
+    server_fingerprints: Vec<String>,
+    alpn_protocols: Vec<String>,
     enable_sni: bool,
     client_key_and_cert: Option<(Vec<u8>, Vec<u8>)>,
 ) -> rustls::ClientConfig {
@@ -16,15 +16,43 @@ pub fn create_client_config(
     .with_safe_default_protocol_versions()
     .unwrap();
 
-    let builder = if !verify {
+    let builder = if server_fingerprints.is_empty()
+        || server_fingerprints.iter().any(|fp| fp == "any")
+    {
         builder
             .dangerous()
             .with_custom_certificate_verifier(get_disabled_verifier())
+    } else if server_fingerprints.iter().any(|fp| fp == "webpki") {
+        let webpki_verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
+            get_root_cert_store(),
+            Arc::new(rustls::crypto::ring::default_provider()),
+        )
+        .build()
+        .unwrap();
+        if server_fingerprints.len() == 1 {
+            builder.with_webpki_verifier(webpki_verifier)
+        } else {
+            let default_provider = rustls::crypto::ring::default_provider();
+            let supported_algs = default_provider.signature_verification_algorithms;
+            builder
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(ServerFingerprintVerifier {
+                    supported_algs,
+                    server_fingerprints: process_fingerprints(&server_fingerprints, &["webpki"])
+                        .unwrap(),
+                    webpki_verifier: Some(Arc::into_inner(webpki_verifier).unwrap()),
+                }))
+        }
     } else {
-        let root_store = rustls::RootCertStore {
-            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-        };
-        builder.with_root_certificates(root_store)
+        let default_provider = rustls::crypto::ring::default_provider();
+        let supported_algs = default_provider.signature_verification_algorithms;
+        builder
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(ServerFingerprintVerifier {
+                supported_algs,
+                server_fingerprints: process_fingerprints(&server_fingerprints, &[]).unwrap(),
+                webpki_verifier: None,
+            }))
     };
 
     let mut config = match client_key_and_cert {
@@ -50,6 +78,76 @@ pub fn create_client_config(
 
     config.enable_sni = enable_sni;
     config
+}
+
+#[derive(Debug)]
+pub struct ServerFingerprintVerifier {
+    supported_algs: rustls::crypto::WebPkiSupportedAlgorithms,
+    server_fingerprints: BTreeSet<Vec<u8>>,
+    webpki_verifier: Option<rustls::client::WebPkiServerVerifier>,
+}
+
+impl rustls::client::danger::ServerCertVerifier for ServerFingerprintVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        server_name: &rustls::pki_types::ServerName<'_>,
+        ocsp_response: &[u8],
+        now: rustls::pki_types::UnixTime,
+    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        if let Some(ref webpki_verifier) = self.webpki_verifier {
+            let webpki_result = webpki_verifier.verify_server_cert(
+                end_entity,
+                intermediates,
+                server_name,
+                ocsp_response,
+                now,
+            );
+            if webpki_result.is_ok() {
+                return webpki_result;
+            }
+        }
+
+        let fingerprint = ring::digest::digest(&ring::digest::SHA256, end_entity.as_ref());
+        let fingerprint_bytes = fingerprint.as_ref();
+
+        if self.server_fingerprints.contains(fingerprint_bytes) {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        } else {
+            let hex_fingerprint = fingerprint_bytes
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect::<Vec<String>>()
+                .join(":");
+
+            Err(rustls::Error::General(
+                format!("unknown server fingerprint: {}", hex_fingerprint).into(),
+            ))
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.supported_algs)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.supported_algs)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.supported_algs.supported_schemes()
+    }
 }
 
 #[derive(Debug)]
@@ -103,6 +201,18 @@ fn get_disabled_verifier() -> Arc<DisabledVerifier> {
         .clone()
 }
 
+fn get_root_cert_store() -> Arc<rustls::RootCertStore> {
+    static INSTANCE: OnceLock<Arc<rustls::RootCertStore>> = OnceLock::new();
+    INSTANCE
+        .get_or_init(|| {
+            let root_store = rustls::RootCertStore {
+                roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+            };
+            Arc::new(root_store)
+        })
+        .clone()
+}
+
 pub fn create_server_config(
     cert_bytes: &[u8],
     key_bytes: &[u8],
@@ -128,9 +238,9 @@ pub fn create_server_config(
         } else {
             let default_provider = rustls::crypto::ring::default_provider();
             let supported_algs = default_provider.signature_verification_algorithms;
-            builder.with_client_cert_verifier(Arc::new(KnownPublicKeysVerifier {
+            builder.with_client_cert_verifier(Arc::new(ClientFingerprintVerifier {
                 supported_algs,
-                public_keys: process_client_fingerprints(client_fingerprints).unwrap(),
+                client_fingerprints: process_fingerprints(client_fingerprints, &[]).unwrap(),
             }))
         };
     let mut config = builder
@@ -147,12 +257,16 @@ pub fn create_server_config(
     config
 }
 
-pub fn process_client_fingerprints(
+pub fn process_fingerprints(
     client_fingerprints: &[String],
+    ignore_strings: &[&str],
 ) -> std::io::Result<BTreeSet<Vec<u8>>> {
     let mut result = BTreeSet::new();
 
     for fingerprint in client_fingerprints {
+        if ignore_strings.iter().any(|fp| fp == fingerprint) {
+            continue;
+        }
         // Remove any colons and whitespace
         let clean_fp = fingerprint.replace(":", "").replace(" ", "");
 
@@ -187,12 +301,12 @@ pub fn process_client_fingerprints(
 }
 
 #[derive(Debug)]
-pub struct KnownPublicKeysVerifier {
+pub struct ClientFingerprintVerifier {
     supported_algs: rustls::crypto::WebPkiSupportedAlgorithms,
-    public_keys: BTreeSet<Vec<u8>>,
+    client_fingerprints: BTreeSet<Vec<u8>>,
 }
 
-impl rustls::server::danger::ClientCertVerifier for KnownPublicKeysVerifier {
+impl rustls::server::danger::ClientCertVerifier for ClientFingerprintVerifier {
     fn offer_client_auth(&self) -> bool {
         true
     }
@@ -211,14 +325,12 @@ impl rustls::server::danger::ClientCertVerifier for KnownPublicKeysVerifier {
         _intermediates: &[rustls::pki_types::CertificateDer<'_>],
         _now: rustls::pki_types::UnixTime,
     ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
-        // Calculate SHA-256 fingerprint of the entire certificate
         let fingerprint = ring::digest::digest(&ring::digest::SHA256, end_entity.as_ref());
         let fingerprint_bytes = fingerprint.as_ref();
 
-        if self.public_keys.contains(fingerprint_bytes) {
+        if self.client_fingerprints.contains(fingerprint_bytes) {
             Ok(rustls::server::danger::ClientCertVerified::assertion())
         } else {
-            // Format fingerprint as hex string for error message
             let hex_fingerprint = fingerprint_bytes
                 .iter()
                 .map(|b| format!("{:02x}", b))
@@ -226,7 +338,7 @@ impl rustls::server::danger::ClientCertVerifier for KnownPublicKeysVerifier {
                 .join(":");
 
             Err(rustls::Error::General(
-                format!("unknown client certificate: {}", hex_fingerprint).into(),
+                format!("unknown client fingerprint: {}", hex_fingerprint).into(),
             ))
         }
     }

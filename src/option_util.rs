@@ -112,6 +112,17 @@ impl<T> NoneOrSome<T> {
         }
     }
 
+    pub fn push(&mut self, item: T) {
+        *self = match std::mem::take(self) {
+            NoneOrSome::Unspecified | NoneOrSome::None => NoneOrSome::One(item),
+            NoneOrSome::One(existing) => NoneOrSome::Some(vec![existing, item]),
+            NoneOrSome::Some(mut v) => {
+                v.push(item);
+                NoneOrSome::Some(v)
+            }
+        };
+    }
+
     pub fn is_empty(&self) -> bool {
         match self {
             NoneOrSome::Unspecified => true,

@@ -49,7 +49,8 @@ impl TcpClientConnector {
         let transport_config = match client_config.transport {
             Transport::Quic => {
                 let ClientQuicConfig {
-                    verify,
+                    verify: _, // unused, value already considered in server_fingerprints
+                    server_fingerprints,
                     alpn_protocols,
                     sni_hostname,
                     key,
@@ -89,8 +90,8 @@ impl TcpClientConnector {
                 });
 
                 let rustls_client_config = create_client_config(
-                    verify,
-                    &alpn_protocols.into_vec(),
+                    server_fingerprints.into_vec(),
+                    alpn_protocols.into_vec(),
                     sni_hostname.is_some(),
                     key_and_cert_bytes,
                 );
