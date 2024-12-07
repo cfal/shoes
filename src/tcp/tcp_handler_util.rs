@@ -251,7 +251,7 @@ pub fn create_tcp_client_handler(
         } => Box::new(TrojanTcpHandler::new(&password, &shadowsocks)),
         ClientProxyConfig::Tls(tls_client_config) => {
             let TlsClientConfig {
-                verify: _, // unused, value already considered in server_fingerprints
+                verify,
                 server_fingerprints,
                 sni_hostname,
                 alpn_protocols,
@@ -286,6 +286,7 @@ pub fn create_tcp_client_handler(
             });
 
             let client_config = Arc::new(create_client_config(
+                verify,
                 server_fingerprints.into_vec(),
                 alpn_protocols.into_vec(),
                 sni_hostname.is_some(),

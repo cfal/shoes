@@ -5,6 +5,7 @@ use std::sync::OnceLock;
 use rustls::pki_types::pem::PemObject;
 
 pub fn create_client_config(
+    verify_webpki: bool,
     server_fingerprints: Vec<String>,
     alpn_protocols: Vec<String>,
     enable_sni: bool,
@@ -16,43 +17,45 @@ pub fn create_client_config(
     .with_safe_default_protocol_versions()
     .unwrap();
 
-    let builder = if server_fingerprints.is_empty()
-        || server_fingerprints.iter().any(|fp| fp == "any")
-    {
-        builder
-            .dangerous()
-            .with_custom_certificate_verifier(get_disabled_verifier())
-    } else if server_fingerprints.iter().any(|fp| fp == "webpki") {
+    let check_server_fingerprints =
+        !server_fingerprints.is_empty() && !server_fingerprints.iter().any(|fp| fp == "any");
+
+    let builder = if verify_webpki {
         let webpki_verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
             get_root_cert_store(),
             Arc::new(rustls::crypto::ring::default_provider()),
         )
         .build()
         .unwrap();
-        if server_fingerprints.len() == 1 {
-            builder.with_webpki_verifier(webpki_verifier)
-        } else {
+        if check_server_fingerprints {
             let default_provider = rustls::crypto::ring::default_provider();
             let supported_algs = default_provider.signature_verification_algorithms;
             builder
                 .dangerous()
                 .with_custom_certificate_verifier(Arc::new(ServerFingerprintVerifier {
                     supported_algs,
-                    server_fingerprints: process_fingerprints(&server_fingerprints, &["webpki"])
-                        .unwrap(),
+                    server_fingerprints: process_fingerprints(&server_fingerprints).unwrap(),
                     webpki_verifier: Some(Arc::into_inner(webpki_verifier).unwrap()),
                 }))
+        } else {
+            builder.with_webpki_verifier(webpki_verifier)
         }
     } else {
-        let default_provider = rustls::crypto::ring::default_provider();
-        let supported_algs = default_provider.signature_verification_algorithms;
-        builder
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(ServerFingerprintVerifier {
-                supported_algs,
-                server_fingerprints: process_fingerprints(&server_fingerprints, &[]).unwrap(),
-                webpki_verifier: None,
-            }))
+        if check_server_fingerprints {
+            let default_provider = rustls::crypto::ring::default_provider();
+            let supported_algs = default_provider.signature_verification_algorithms;
+            builder
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(ServerFingerprintVerifier {
+                    supported_algs,
+                    server_fingerprints: process_fingerprints(&server_fingerprints).unwrap(),
+                    webpki_verifier: None,
+                }))
+        } else {
+            builder
+                .dangerous()
+                .with_custom_certificate_verifier(get_disabled_verifier())
+        }
     };
 
     let mut config = match client_key_and_cert {
@@ -104,7 +107,7 @@ impl rustls::client::danger::ServerCertVerifier for ServerFingerprintVerifier {
                 ocsp_response,
                 now,
             );
-            if webpki_result.is_ok() {
+            if webpki_result.is_err() {
                 return webpki_result;
             }
         }
@@ -240,7 +243,7 @@ pub fn create_server_config(
             let supported_algs = default_provider.signature_verification_algorithms;
             builder.with_client_cert_verifier(Arc::new(ClientFingerprintVerifier {
                 supported_algs,
-                client_fingerprints: process_fingerprints(client_fingerprints, &[]).unwrap(),
+                client_fingerprints: process_fingerprints(client_fingerprints).unwrap(),
             }))
         };
     let mut config = builder
@@ -257,16 +260,10 @@ pub fn create_server_config(
     config
 }
 
-pub fn process_fingerprints(
-    client_fingerprints: &[String],
-    ignore_strings: &[&str],
-) -> std::io::Result<BTreeSet<Vec<u8>>> {
+pub fn process_fingerprints(client_fingerprints: &[String]) -> std::io::Result<BTreeSet<Vec<u8>>> {
     let mut result = BTreeSet::new();
 
     for fingerprint in client_fingerprints {
-        if ignore_strings.iter().any(|fp| fp == fingerprint) {
-            continue;
-        }
         // Remove any colons and whitespace
         let clean_fp = fingerprint.replace(":", "").replace(" ", "");
 

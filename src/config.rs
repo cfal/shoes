@@ -353,8 +353,8 @@ impl Default for ClientConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ClientQuicConfig {
-    #[serde(default)]
-    pub verify: NoneOrOne<bool>,
+    #[serde(default = "default_true")]
+    pub verify: bool,
     #[serde(alias = "server_fingerprint", default)]
     pub server_fingerprints: NoneOrSome<String>,
     #[serde(default)]
@@ -370,7 +370,7 @@ pub struct ClientQuicConfig {
 impl Default for ClientQuicConfig {
     fn default() -> Self {
         Self {
-            verify: NoneOrOne::Unspecified,
+            verify: true,
             server_fingerprints: NoneOrSome::Unspecified,
             sni_hostname: NoneOrOne::Unspecified,
             alpn_protocols: NoneOrSome::Unspecified,
@@ -423,8 +423,8 @@ impl ClientProxyConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct TlsClientConfig {
-    #[serde(default)]
-    pub verify: NoneOrOne<bool>,
+    #[serde(default = "default_true")]
+    pub verify: bool,
     #[serde(alias = "server_fingerprint", default)]
     pub server_fingerprints: NoneOrSome<String>,
     #[serde(default)]
@@ -650,11 +650,31 @@ fn validate_server_config(
     }
 
     if server_config.transport == Transport::Quic {
-        if server_config.quic_settings.is_none() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "QUIC transport is selected but QUIC settings not specified",
-            ));
+        match server_config.quic_settings {
+            Some(ServerQuicConfig {
+                ref mut client_fingerprints,
+                ..
+            }) => {
+                if matches!(client_fingerprints, NoneOrSome::None) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "Allowed client public keys cannot be an empty list",
+                    ));
+                }
+                if client_fingerprints.iter().any(|fp| fp == "any") {
+                    let _ = std::mem::replace(client_fingerprints, NoneOrSome::Unspecified);
+                } else {
+                    let _ = crate::rustls_util::process_fingerprints(
+                        &client_fingerprints.clone().into_vec(),
+                    )?;
+                }
+            }
+            None => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "QUIC transport is selected but QUIC settings not specified",
+                ));
+            }
         }
     } else if server_config.quic_settings.is_some() {
         return Err(std::io::Error::new(
@@ -706,7 +726,6 @@ fn validate_client_config(client_config: &mut ClientConfig) -> std::io::Result<(
         let ClientQuicConfig {
             cert,
             key,
-            verify,
             server_fingerprints,
             ..
         } = quic_config;
@@ -716,27 +735,18 @@ fn validate_client_config(client_config: &mut ClientConfig) -> std::io::Result<(
                 "Both client cert and key have to be specified, or both have to be omitted",
             ));
         }
-        match verify {
-            NoneOrOne::Unspecified | NoneOrOne::None => {
-                if server_fingerprints.is_empty() {
-                    server_fingerprints.push("webpki".to_string());
-                }
-            }
-            NoneOrOne::One(true) => {
-                if !server_fingerprints.iter().any(|fp| fp == "webpki") {
-                    server_fingerprints.push("webpki".to_string());
-                }
-            }
-            NoneOrOne::One(false) => {
-                if !server_fingerprints.iter().any(|fp| fp == "any") {
-                    server_fingerprints.push("any".to_string());
-                }
-            }
+        if matches!(server_fingerprints, NoneOrSome::None) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Allowed server public keys cannot be an empty list",
+            ));
         }
-        let _ = crate::rustls_util::process_fingerprints(
-            &server_fingerprints.clone().into_vec(),
-            &["any", "webpki"],
-        )?;
+        if server_fingerprints.iter().any(|fp| fp == "any") {
+            let _ = std::mem::replace(server_fingerprints, NoneOrSome::Unspecified);
+        } else {
+            let _ =
+                crate::rustls_util::process_fingerprints(&server_fingerprints.clone().into_vec())?;
+        }
     }
 
     #[cfg(not(any(target_os = "android", target_os = "fuchsia", target_os = "linux")))]
@@ -759,7 +769,6 @@ fn validate_client_proxy_config(
         ClientProxyConfig::Tls(TlsClientConfig {
             cert,
             key,
-            verify,
             server_fingerprints,
             ..
         }) => {
@@ -769,27 +778,19 @@ fn validate_client_proxy_config(
                     "Both client cert and key have to be specified, or both have to be omitted",
                 ));
             }
-            match verify {
-                NoneOrOne::Unspecified | NoneOrOne::None => {
-                    if server_fingerprints.is_empty() {
-                        server_fingerprints.push("webpki".to_string());
-                    }
-                }
-                NoneOrOne::One(true) => {
-                    if !server_fingerprints.iter().any(|fp| fp == "webpki") {
-                        server_fingerprints.push("webpki".to_string());
-                    }
-                }
-                NoneOrOne::One(false) => {
-                    if !server_fingerprints.iter().any(|fp| fp == "any") {
-                        server_fingerprints.push("any".to_string());
-                    }
-                }
+            if matches!(server_fingerprints, NoneOrSome::None) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Allowed server public keys cannot be an empty list",
+                ));
             }
-            let _ = crate::rustls_util::process_fingerprints(
-                &server_fingerprints.clone().into_vec(),
-                &["any", "webpki"],
-            )?;
+            if server_fingerprints.iter().any(|fp| fp == "any") {
+                let _ = std::mem::replace(server_fingerprints, NoneOrSome::Unspecified);
+            } else {
+                let _ = crate::rustls_util::process_fingerprints(
+                    &server_fingerprints.clone().into_vec(),
+                )?;
+            }
         }
         _ => {}
     }
@@ -818,13 +819,17 @@ fn validate_server_proxy_config(
                 if matches!(client_fingerprints, NoneOrSome::None) {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
-                        "Allowed client public keys cannot be an empty list.",
+                        "Allowed client public keys cannot be an empty list",
                     ));
                 }
-                let _ = crate::rustls_util::process_fingerprints(
-                    &client_fingerprints.clone().into_vec(),
-                    &["any"],
-                )?;
+
+                if client_fingerprints.iter().any(|fp| fp == "any") {
+                    let _ = std::mem::replace(client_fingerprints, NoneOrSome::Unspecified);
+                } else {
+                    let _ = crate::rustls_util::process_fingerprints(
+                        &client_fingerprints.clone().into_vec(),
+                    )?;
+                }
 
                 validate_server_proxy_config(protocol, client_groups, rule_groups)?;
 
