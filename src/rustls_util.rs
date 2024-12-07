@@ -117,7 +117,7 @@ pub fn create_server_config(
             let supported_algs = default_provider.signature_verification_algorithms;
             builder.with_client_cert_verifier(Arc::new(KnownPublicKeysVerifier {
                 supported_algs,
-                public_keys: process_client_fingerprints(client_fingerprints),
+                public_keys: process_client_fingerprints(client_fingerprints).unwrap(),
             }))
         };
     let mut config = builder
@@ -134,7 +134,9 @@ pub fn create_server_config(
     config
 }
 
-fn process_client_fingerprints(client_fingerprints: &[String]) -> BTreeSet<Vec<u8>> {
+pub fn process_client_fingerprints(
+    client_fingerprints: &[String],
+) -> std::io::Result<BTreeSet<Vec<u8>>> {
     let mut result = BTreeSet::new();
 
     for fingerprint in client_fingerprints {
@@ -142,19 +144,33 @@ fn process_client_fingerprints(client_fingerprints: &[String]) -> BTreeSet<Vec<u
         let clean_fp = fingerprint.replace(":", "").replace(" ", "");
 
         if clean_fp.len() % 2 != 0 {
-            panic!("Invalid client fingerprint, odd number of hex chars");
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "Invalid client fingerprint, odd number of hex chars: {}",
+                    fingerprint
+                ),
+            ));
         }
 
-        if let Ok(bytes) = (0..clean_fp.len())
+        let bytes = (0..clean_fp.len())
             .step_by(2)
             .map(|i| u8::from_str_radix(&clean_fp[i..i + 2], 16))
             .collect::<Result<Vec<u8>, _>>()
-        {
-            result.insert(bytes);
-        }
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "Invalid client fingerprint, could not convert to hex: {}",
+                        fingerprint
+                    ),
+                )
+            })?;
+
+        result.insert(bytes);
     }
 
-    result
+    Ok(result)
 }
 
 #[derive(Debug)]

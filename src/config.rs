@@ -716,12 +716,19 @@ fn validate_server_proxy_config(
                     ..
                 } = *tls_server_config;
 
+                // can only be unspecified (defaulting to all), or provided.
                 if matches!(client_fingerprints, NoneOrSome::None) {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
                         "Allowed client public keys cannot be an empty list.",
                     ));
                 }
+                let client_fingerprints_vec: Vec<String> = client_fingerprints.clone().into_vec();
+                if !client_fingerprints_vec.iter().any(|fp| fp == "any") {
+                    let _ =
+                        crate::rustls_util::process_client_fingerprints(&client_fingerprints_vec)?;
+                }
+
                 validate_server_proxy_config(protocol, client_groups, rule_groups)?;
 
                 ConfigSelection::replace_none_or_some_groups(override_rules, rule_groups)?;
