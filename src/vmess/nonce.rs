@@ -1,5 +1,5 @@
-use ring::aead::{Nonce, NonceSequence};
-use ring::error::Unspecified;
+use aws_lc_rs::aead::{Nonce, NonceSequence};
+use aws_lc_rs::error::Unspecified;
 
 pub struct VmessNonceSequence {
     count: u16,
@@ -45,6 +45,6 @@ impl NonceSequence for SingleUseNonce {
             panic!("SingleUseNonce used twice");
         }
         self.used = true;
-        Ok(Nonce::assume_unique_for_key(self.nonce))
+        Ok(Nonce::try_assume_unique_for_key(&self.nonce)?)
     }
 }

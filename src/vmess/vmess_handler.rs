@@ -5,13 +5,13 @@ use std::time::SystemTime;
 use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyIvInit};
 use aes::Aes128;
 use async_trait::async_trait;
+use aws_lc_rs::aead::{
+    Aad, BoundKey, OpeningKey, SealingKey, UnboundKey, AES_128_GCM, CHACHA20_POLY1305,
+};
 use cfb_mode::cipher::AsyncStreamCipher;
 use digest::KeyInit;
 use parking_lot::Mutex;
 use rand::{Rng, RngCore};
-use ring::aead::{
-    Aad, BoundKey, OpeningKey, SealingKey, UnboundKey, AES_128_GCM, CHACHA20_POLY1305,
-};
 use sha3::digest::{ExtendableOutput, Update};
 use sha3::Shake128;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};

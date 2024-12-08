@@ -3,13 +3,13 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::SystemTime;
 
+use aws_lc_rs::aead::{
+    Aad, Algorithm, BoundKey, Nonce, NonceSequence, OpeningKey, SealingKey, UnboundKey, NONCE_LEN,
+};
+use aws_lc_rs::error::Unspecified;
 use futures::ready;
 use parking_lot::Mutex;
 use rand::RngCore;
-use ring::aead::{
-    Aad, Algorithm, BoundKey, Nonce, NonceSequence, OpeningKey, SealingKey, UnboundKey, NONCE_LEN,
-};
-use ring::error::Unspecified;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use super::aead_util::TAG_LEN;

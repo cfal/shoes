@@ -1,4 +1,5 @@
-use ring::aead::{Algorithm, AES_128_GCM, AES_256_GCM, CHACHA20_POLY1305};
+// TODO: investigate using SIV variants for nonce reuse resistance
+use aws_lc_rs::aead::{Algorithm, AES_128_GCM, AES_256_GCM, CHACHA20_POLY1305};
 
 use super::aead_util::TAG_LEN;
 

@@ -31,7 +31,7 @@ async fn run_quic_server(
 ) -> std::io::Result<()> {
     let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
 
-    let tls13_suite = match rustls::crypto::ring::cipher_suite::TLS13_AES_128_GCM_SHA256 {
+    let tls13_suite = match rustls::crypto::aws_lc_rs::cipher_suite::TLS13_AES_128_GCM_SHA256 {
         rustls::SupportedCipherSuite::Tls13(t) => t,
         _ => {
             panic!("Could not retrieve Tls13CipherSuite");

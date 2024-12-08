@@ -68,13 +68,13 @@ impl TcpClientConnector {
                 } else {
                     sni_hostname.into_option()
                 };
-                let tls13_suite = match rustls::crypto::ring::cipher_suite::TLS13_AES_128_GCM_SHA256
-                {
-                    rustls::SupportedCipherSuite::Tls13(t) => t,
-                    _ => {
-                        panic!("Could not retrieve Tls13CipherSuite");
-                    }
-                };
+                let tls13_suite =
+                    match rustls::crypto::aws_lc_rs::cipher_suite::TLS13_AES_128_GCM_SHA256 {
+                        rustls::SupportedCipherSuite::Tls13(t) => t,
+                        _ => {
+                            panic!("Could not retrieve Tls13CipherSuite");
+                        }
+                    };
 
                 let key_and_cert_bytes = key.zip(cert).map(|(key, cert)| {
                     // TODO: do this asynchronously

@@ -22,7 +22,7 @@ const SS_SUBKEY_INFO: &[&[u8]] = &[b"ss-subkey"];
 
 struct SliceKeyType<'a>(&'a [u8]);
 
-impl ring::hkdf::KeyType for SliceKeyType<'_> {
+impl aws_lc_rs::hkdf::KeyType for SliceKeyType<'_> {
     fn len(&self) -> usize {
         self.0.len()
     }
@@ -31,7 +31,7 @@ impl ring::hkdf::KeyType for SliceKeyType<'_> {
 impl ShadowsocksKey for DefaultKey {
     fn create_session_key(&self, salt: &[u8]) -> Box<[u8]> {
         let mut session_key = allocate_vec(self.key_len);
-        ring::hkdf::Salt::new(ring::hkdf::HKDF_SHA1_FOR_LEGACY_USE_ONLY, salt)
+        aws_lc_rs::hkdf::Salt::new(aws_lc_rs::hkdf::HKDF_SHA1_FOR_LEGACY_USE_ONLY, salt)
             .extract(&self.key_bytes)
             .expand(SS_SUBKEY_INFO, SliceKeyType(&self.key_bytes))
             .unwrap()

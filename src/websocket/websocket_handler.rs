@@ -13,8 +13,8 @@ use crate::tcp_handler::{
     TcpClientHandler, TcpClientSetupResult, TcpServerHandler, TcpServerSetupResult,
 };
 use async_trait::async_trait;
+use aws_lc_rs::digest::{digest, SHA1_FOR_LEGACY_USE_ONLY};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-use ring::digest::{digest, SHA1_FOR_LEGACY_USE_ONLY};
 use tokio::io::AsyncWriteExt;
 
 #[derive(Debug)]
