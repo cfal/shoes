@@ -774,22 +774,20 @@ fn validate_server_fingerprints(
 fn validate_client_proxy_config(
     client_proxy_config: &mut ClientProxyConfig,
 ) -> std::io::Result<()> {
-    match client_proxy_config {
-        ClientProxyConfig::Tls(TlsClientConfig {
-            cert,
-            key,
-            server_fingerprints,
-            ..
-        }) => {
-            if cert.is_none() != key.is_none() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "Both client cert and key have to be specified, or both have to be omitted",
-                ));
-            }
-            validate_server_fingerprints(server_fingerprints)?;
+    if let ClientProxyConfig::Tls(TlsClientConfig {
+        cert,
+        key,
+        server_fingerprints,
+        ..
+    }) = client_proxy_config
+    {
+        if cert.is_none() != key.is_none() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Both client cert and key have to be specified, or both have to be omitted",
+            ));
         }
-        _ => {}
+        validate_server_fingerprints(server_fingerprints)?;
     }
     Ok(())
 }

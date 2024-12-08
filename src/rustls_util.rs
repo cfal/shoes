@@ -40,22 +40,20 @@ pub fn create_client_config(
         } else {
             builder.with_webpki_verifier(webpki_verifier)
         }
+    } else if check_server_fingerprints {
+        let default_provider = rustls::crypto::ring::default_provider();
+        let supported_algs = default_provider.signature_verification_algorithms;
+        builder
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(ServerFingerprintVerifier {
+                supported_algs,
+                server_fingerprints: process_fingerprints(&server_fingerprints).unwrap(),
+                webpki_verifier: None,
+            }))
     } else {
-        if check_server_fingerprints {
-            let default_provider = rustls::crypto::ring::default_provider();
-            let supported_algs = default_provider.signature_verification_algorithms;
-            builder
-                .dangerous()
-                .with_custom_certificate_verifier(Arc::new(ServerFingerprintVerifier {
-                    supported_algs,
-                    server_fingerprints: process_fingerprints(&server_fingerprints).unwrap(),
-                    webpki_verifier: None,
-                }))
-        } else {
-            builder
-                .dangerous()
-                .with_custom_certificate_verifier(get_disabled_verifier())
-        }
+        builder
+            .dangerous()
+            .with_custom_certificate_verifier(get_disabled_verifier())
     };
 
     let mut config = match client_key_and_cert {
@@ -100,16 +98,13 @@ impl rustls::client::danger::ServerCertVerifier for ServerFingerprintVerifier {
         now: rustls::pki_types::UnixTime,
     ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
         if let Some(ref webpki_verifier) = self.webpki_verifier {
-            let webpki_result = webpki_verifier.verify_server_cert(
+            let _ = webpki_verifier.verify_server_cert(
                 end_entity,
                 intermediates,
                 server_name,
                 ocsp_response,
                 now,
-            );
-            if webpki_result.is_err() {
-                return webpki_result;
-            }
+            )?;
         }
 
         let fingerprint = ring::digest::digest(&ring::digest::SHA256, end_entity.as_ref());
@@ -124,9 +119,10 @@ impl rustls::client::danger::ServerCertVerifier for ServerFingerprintVerifier {
                 .collect::<Vec<String>>()
                 .join(":");
 
-            Err(rustls::Error::General(
-                format!("unknown server fingerprint: {}", hex_fingerprint).into(),
-            ))
+            Err(rustls::Error::General(format!(
+                "unknown server fingerprint: {}",
+                hex_fingerprint
+            )))
         }
     }
 
@@ -334,9 +330,10 @@ impl rustls::server::danger::ClientCertVerifier for ClientFingerprintVerifier {
                 .collect::<Vec<String>>()
                 .join(":");
 
-            Err(rustls::Error::General(
-                format!("unknown client fingerprint: {}", hex_fingerprint).into(),
-            ))
+            Err(rustls::Error::General(format!(
+                "unknown client fingerprint: {}",
+                hex_fingerprint
+            )))
         }
     }
 
