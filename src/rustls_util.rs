@@ -11,26 +11,22 @@ pub fn create_client_config(
     enable_sni: bool,
     client_key_and_cert: Option<(Vec<u8>, Vec<u8>)>,
 ) -> rustls::ClientConfig {
-    let builder = rustls::ClientConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_safe_default_protocol_versions()
-    .unwrap();
+    let builder = rustls::ClientConfig::builder_with_provider(get_crypto_provider())
+        .with_safe_default_protocol_versions()
+        .unwrap();
 
     let builder = if verify_webpki {
         let webpki_verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
             get_root_cert_store(),
-            Arc::new(rustls::crypto::ring::default_provider()),
+            get_crypto_provider(),
         )
         .build()
         .unwrap();
         if !server_fingerprints.is_empty() {
-            let default_provider = rustls::crypto::ring::default_provider();
-            let supported_algs = default_provider.signature_verification_algorithms;
             builder
                 .dangerous()
                 .with_custom_certificate_verifier(Arc::new(ServerFingerprintVerifier {
-                    supported_algs,
+                    supported_algs: get_supported_algorithms(),
                     server_fingerprints: process_fingerprints(&server_fingerprints).unwrap(),
                     webpki_verifier: Some(Arc::into_inner(webpki_verifier).unwrap()),
                 }))
@@ -38,12 +34,10 @@ pub fn create_client_config(
             builder.with_webpki_verifier(webpki_verifier)
         }
     } else if !server_fingerprints.is_empty() {
-        let default_provider = rustls::crypto::ring::default_provider();
-        let supported_algs = default_provider.signature_verification_algorithms;
         builder
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(ServerFingerprintVerifier {
-                supported_algs,
+                supported_algs: get_supported_algorithms(),
                 server_fingerprints: process_fingerprints(&server_fingerprints).unwrap(),
                 webpki_verifier: None,
             }))
@@ -186,13 +180,24 @@ impl rustls::client::danger::ServerCertVerifier for DisabledVerifier {
     }
 }
 
+fn get_crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
+    static INSTANCE: OnceLock<Arc<rustls::crypto::CryptoProvider>> = OnceLock::new();
+    INSTANCE
+        .get_or_init(|| Arc::new(rustls::crypto::ring::default_provider()))
+        .clone()
+}
+
+fn get_supported_algorithms() -> rustls::crypto::WebPkiSupportedAlgorithms {
+    get_crypto_provider().signature_verification_algorithms
+}
+
 fn get_disabled_verifier() -> Arc<DisabledVerifier> {
     static INSTANCE: OnceLock<Arc<DisabledVerifier>> = OnceLock::new();
     INSTANCE
         .get_or_init(|| {
-            let default_provider = rustls::crypto::ring::default_provider();
-            let supported_algs = default_provider.signature_verification_algorithms;
-            Arc::new(DisabledVerifier { supported_algs })
+            Arc::new(DisabledVerifier {
+                supported_algs: get_supported_algorithms(),
+            })
         })
         .clone()
 }
@@ -223,18 +228,14 @@ pub fn create_server_config(
 
     let privkey = rustls::pki_types::PrivateKeyDer::from_pem_slice(key_bytes).unwrap();
 
-    let builder = rustls::ServerConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_safe_default_protocol_versions()
-    .unwrap();
+    let builder = rustls::ServerConfig::builder_with_provider(get_crypto_provider())
+        .with_safe_default_protocol_versions()
+        .unwrap();
     let builder = if client_fingerprints.is_empty() {
         builder.with_no_client_auth()
     } else {
-        let default_provider = rustls::crypto::ring::default_provider();
-        let supported_algs = default_provider.signature_verification_algorithms;
         builder.with_client_cert_verifier(Arc::new(ClientFingerprintVerifier {
-            supported_algs,
+            supported_algs: get_supported_algorithms(),
             client_fingerprints: process_fingerprints(client_fingerprints).unwrap(),
         }))
     };
