@@ -655,19 +655,7 @@ fn validate_server_config(
                 ref mut client_fingerprints,
                 ..
             }) => {
-                if matches!(client_fingerprints, NoneOrSome::None) {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "Allowed client public keys cannot be an empty list",
-                    ));
-                }
-                if client_fingerprints.iter().any(|fp| fp == "any") {
-                    let _ = std::mem::replace(client_fingerprints, NoneOrSome::Unspecified);
-                } else {
-                    let _ = crate::rustls_util::process_fingerprints(
-                        &client_fingerprints.clone().into_vec(),
-                    )?;
-                }
+                validate_client_fingerprints(client_fingerprints)?;
             }
             None => {
                 return Err(std::io::Error::new(
@@ -707,6 +695,22 @@ fn validate_server_config(
     Ok(())
 }
 
+fn validate_client_fingerprints(
+    client_fingerprints: &mut NoneOrSome<String>,
+) -> std::io::Result<()> {
+    if !client_fingerprints.is_unspecified() && client_fingerprints.is_empty() {
+        println!("WARNING: Client fingerprints provided but empty, defaulting to 'any'");
+    }
+
+    if client_fingerprints.iter().any(|fp| fp == "any") {
+        let _ = std::mem::replace(client_fingerprints, NoneOrSome::Unspecified);
+    } else {
+        let _ = crate::rustls_util::process_fingerprints(&client_fingerprints.clone().into_vec())?;
+    }
+
+    Ok(())
+}
+
 fn validate_client_config(client_config: &mut ClientConfig) -> std::io::Result<()> {
     if client_config.transport != Transport::Tcp && client_config.tcp_settings.is_some() {
         return Err(std::io::Error::new(
@@ -735,18 +739,7 @@ fn validate_client_config(client_config: &mut ClientConfig) -> std::io::Result<(
                 "Both client cert and key have to be specified, or both have to be omitted",
             ));
         }
-        if matches!(server_fingerprints, NoneOrSome::None) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "Allowed server public keys cannot be an empty list",
-            ));
-        }
-        if server_fingerprints.iter().any(|fp| fp == "any") {
-            let _ = std::mem::replace(server_fingerprints, NoneOrSome::Unspecified);
-        } else {
-            let _ =
-                crate::rustls_util::process_fingerprints(&server_fingerprints.clone().into_vec())?;
-        }
+        validate_server_fingerprints(server_fingerprints)?;
     }
 
     #[cfg(not(any(target_os = "android", target_os = "fuchsia", target_os = "linux")))]
@@ -758,6 +751,22 @@ fn validate_client_config(client_config: &mut ClientConfig) -> std::io::Result<(
     }
 
     validate_client_proxy_config(&mut client_config.protocol)?;
+
+    Ok(())
+}
+
+fn validate_server_fingerprints(
+    server_fingerprints: &mut NoneOrSome<String>,
+) -> std::io::Result<()> {
+    if !server_fingerprints.is_unspecified() && server_fingerprints.is_empty() {
+        println!("WARNING: Server fingerprints provided but empty, defaulting to 'any'");
+    }
+
+    if server_fingerprints.iter().any(|fp| fp == "any") {
+        let _ = std::mem::replace(server_fingerprints, NoneOrSome::Unspecified);
+    } else {
+        let _ = crate::rustls_util::process_fingerprints(&server_fingerprints.clone().into_vec())?;
+    }
 
     Ok(())
 }
@@ -778,19 +787,7 @@ fn validate_client_proxy_config(
                     "Both client cert and key have to be specified, or both have to be omitted",
                 ));
             }
-            if matches!(server_fingerprints, NoneOrSome::None) {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "Allowed server public keys cannot be an empty list",
-                ));
-            }
-            if server_fingerprints.iter().any(|fp| fp == "any") {
-                let _ = std::mem::replace(server_fingerprints, NoneOrSome::Unspecified);
-            } else {
-                let _ = crate::rustls_util::process_fingerprints(
-                    &server_fingerprints.clone().into_vec(),
-                )?;
-            }
+            validate_server_fingerprints(server_fingerprints)?;
         }
         _ => {}
     }
@@ -815,21 +812,7 @@ fn validate_server_proxy_config(
                     ..
                 } = *tls_server_config;
 
-                // can only be unspecified (defaulting to all), or provided.
-                if matches!(client_fingerprints, NoneOrSome::None) {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "Allowed client public keys cannot be an empty list",
-                    ));
-                }
-
-                if client_fingerprints.iter().any(|fp| fp == "any") {
-                    let _ = std::mem::replace(client_fingerprints, NoneOrSome::Unspecified);
-                } else {
-                    let _ = crate::rustls_util::process_fingerprints(
-                        &client_fingerprints.clone().into_vec(),
-                    )?;
-                }
+                validate_client_fingerprints(client_fingerprints)?;
 
                 validate_server_proxy_config(protocol, client_groups, rule_groups)?;
 

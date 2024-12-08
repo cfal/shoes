@@ -55,7 +55,7 @@ pub enum NoneOrSome<T> {
 }
 
 impl<T> NoneOrSome<T> {
-    pub fn _is_unspecified(&self) -> bool {
+    pub fn is_unspecified(&self) -> bool {
         matches!(self, NoneOrSome::Unspecified)
     }
 
