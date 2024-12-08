@@ -17,9 +17,6 @@ pub fn create_client_config(
     .with_safe_default_protocol_versions()
     .unwrap();
 
-    let check_server_fingerprints =
-        !server_fingerprints.is_empty() && !server_fingerprints.iter().any(|fp| fp == "any");
-
     let builder = if verify_webpki {
         let webpki_verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
             get_root_cert_store(),
@@ -27,7 +24,7 @@ pub fn create_client_config(
         )
         .build()
         .unwrap();
-        if check_server_fingerprints {
+        if !server_fingerprints.is_empty() {
             let default_provider = rustls::crypto::ring::default_provider();
             let supported_algs = default_provider.signature_verification_algorithms;
             builder
@@ -40,7 +37,7 @@ pub fn create_client_config(
         } else {
             builder.with_webpki_verifier(webpki_verifier)
         }
-    } else if check_server_fingerprints {
+    } else if !server_fingerprints.is_empty() {
         let default_provider = rustls::crypto::ring::default_provider();
         let supported_algs = default_provider.signature_verification_algorithms;
         builder
@@ -231,17 +228,16 @@ pub fn create_server_config(
     ))
     .with_safe_default_protocol_versions()
     .unwrap();
-    let builder =
-        if client_fingerprints.is_empty() || client_fingerprints.iter().any(|fp| fp == "any") {
-            builder.with_no_client_auth()
-        } else {
-            let default_provider = rustls::crypto::ring::default_provider();
-            let supported_algs = default_provider.signature_verification_algorithms;
-            builder.with_client_cert_verifier(Arc::new(ClientFingerprintVerifier {
-                supported_algs,
-                client_fingerprints: process_fingerprints(client_fingerprints).unwrap(),
-            }))
-        };
+    let builder = if client_fingerprints.is_empty() {
+        builder.with_no_client_auth()
+    } else {
+        let default_provider = rustls::crypto::ring::default_provider();
+        let supported_algs = default_provider.signature_verification_algorithms;
+        builder.with_client_cert_verifier(Arc::new(ClientFingerprintVerifier {
+            supported_algs,
+            client_fingerprints: process_fingerprints(client_fingerprints).unwrap(),
+        }))
+    };
     let mut config = builder
         .with_single_cert(certs, privkey)
         .expect("bad certificate/key");
