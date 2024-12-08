@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use sha2::{Digest, Sha224};
+use aws_lc_rs::digest::SHA224;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::address::NetLocation;
@@ -169,10 +169,8 @@ impl TcpClientHandler for TrojanTcpHandler {
 }
 
 fn create_password_hash(password: &str) -> Box<[u8]> {
-    let mut hasher = Sha224::new();
-    hasher.update(password.as_bytes());
-    let hash_result = hasher.finalize();
-    let hash_bytes = hash_result.as_slice();
+    let digest = aws_lc_rs::digest::digest(&SHA224, password.as_bytes());
+    let hash_bytes = digest.as_ref();
     let mut hex_str = String::with_capacity(hash_bytes.len() * 2);
     for b in hash_bytes {
         hex_str.push_str(&format!("{:02x}", b));
