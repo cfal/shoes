@@ -1,11 +1,11 @@
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+use aws_lc_rs::aead::{Aad, BoundKey, OpeningKey, SealingKey, UnboundKey, AES_128_GCM};
 use digest::XofReader;
 use futures::ready;
 use log::warn;
 use rand::RngCore;
-use ring::aead::{Aad, BoundKey, OpeningKey, SealingKey, UnboundKey, AES_128_GCM};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use super::nonce::{SingleUseNonce, VmessNonceSequence};

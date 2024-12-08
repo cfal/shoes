@@ -14,6 +14,7 @@ categories = ["command-line-utilities", "network-programming"]
 aes = "*"
 argon2 = "*"
 async-trait = "*"
+aws-lc-rs = "*"
 base64 = "*"
 blake3 = "*"
 cfb-mode = "*"
@@ -27,10 +28,9 @@ memchr = "*"
 notify = "*"
 parking_lot = "*"
 percent-encoding = "*"
-quinn = "*"
+quinn = { version = "*", default-features = false, features = ["log", "platform-verifier", "runtime-tokio", "rustls-aws-lc-rs"] }
 rand = "*"
-ring = "*"
-rustls = { version = "*", default-features = false, features = ["ring"] }
+rustls = "*"
 sha2 = "*"
 sha3 = "*"
 serde = { version = "*", features = ["derive", "std"] }
@@ -44,7 +44,7 @@ tokio = { version = "*", features = [
     "sync",
     "time",
 ] }
-tokio-rustls = { version = "*", default-features = false, features = ["logging", "tls12", "ring"] }
+tokio-rustls = { version = "*", default-features = false, features = ["logging", "tls12", "aws-lc-rs"] }
 webpki-roots = { version = "*" }
 
 [profile.release]

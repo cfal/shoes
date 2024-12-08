@@ -98,7 +98,8 @@ impl rustls::client::danger::ServerCertVerifier for ServerFingerprintVerifier {
             )?;
         }
 
-        let fingerprint = ring::digest::digest(&ring::digest::SHA256, end_entity.as_ref());
+        let fingerprint =
+            aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, end_entity.as_ref());
         let fingerprint_bytes = fingerprint.as_ref();
 
         if self.server_fingerprints.contains(fingerprint_bytes) {
@@ -183,7 +184,7 @@ impl rustls::client::danger::ServerCertVerifier for DisabledVerifier {
 fn get_crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
     static INSTANCE: OnceLock<Arc<rustls::crypto::CryptoProvider>> = OnceLock::new();
     INSTANCE
-        .get_or_init(|| Arc::new(rustls::crypto::ring::default_provider()))
+        .get_or_init(|| Arc::new(rustls::crypto::aws_lc_rs::default_provider()))
         .clone()
 }
 
@@ -315,7 +316,8 @@ impl rustls::server::danger::ClientCertVerifier for ClientFingerprintVerifier {
         _intermediates: &[rustls::pki_types::CertificateDer<'_>],
         _now: rustls::pki_types::UnixTime,
     ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
-        let fingerprint = ring::digest::digest(&ring::digest::SHA256, end_entity.as_ref());
+        let fingerprint =
+            aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, end_entity.as_ref());
         let fingerprint_bytes = fingerprint.as_ref();
 
         if self.client_fingerprints.contains(fingerprint_bytes) {
