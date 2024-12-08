@@ -14,7 +14,7 @@ categories = ["command-line-utilities", "network-programming"]
 aes = "*"
 argon2 = "*"
 async-trait = "*"
-aws-lc-rs = "*"
+aws-lc-rs = { version = "*", default-features = false }
 base64 = "*"
 blake3 = "*"
 cfb-mode = "*"
