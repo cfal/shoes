@@ -23,13 +23,75 @@ pub enum TcpServerSetupResult {
     },
     // TODO: support udp client proxy selector
     BidirectionalUdp {
+        need_initial_flush: bool,
         remote_location: NetLocation,
         stream: Box<dyn AsyncMessageStream>,
+        override_proxy_provider: NoneOrOne<Arc<ClientProxySelector<TcpClientConnector>>>,
     },
     MultiDirectionalUdp {
         need_initial_flush: bool,
         stream: Box<dyn AsyncTargetedMessageStream>,
+        override_proxy_provider: NoneOrOne<Arc<ClientProxySelector<TcpClientConnector>>>,
     },
+}
+
+impl TcpServerSetupResult {
+    pub fn set_need_initial_flush(&mut self, need_initial_flush: bool) {
+        match self {
+            TcpServerSetupResult::TcpForward {
+                need_initial_flush: ref mut flush,
+                ..
+            }
+            | TcpServerSetupResult::BidirectionalUdp {
+                need_initial_flush: ref mut flush,
+                ..
+            }
+            | TcpServerSetupResult::MultiDirectionalUdp {
+                need_initial_flush: ref mut flush,
+                ..
+            } => {
+                *flush = need_initial_flush;
+            }
+        }
+    }
+    pub fn override_proxy_provider_unspecified(&self) -> bool {
+        match self {
+            TcpServerSetupResult::TcpForward {
+                override_proxy_provider,
+                ..
+            }
+            | TcpServerSetupResult::BidirectionalUdp {
+                override_proxy_provider,
+                ..
+            }
+            | TcpServerSetupResult::MultiDirectionalUdp {
+                override_proxy_provider,
+                ..
+            } => override_proxy_provider.is_unspecified(),
+        }
+    }
+
+    pub fn set_override_proxy_provider(
+        &mut self,
+        override_proxy_provider: NoneOrOne<Arc<ClientProxySelector<TcpClientConnector>>>,
+    ) {
+        match self {
+            TcpServerSetupResult::TcpForward {
+                override_proxy_provider: ref mut provider,
+                ..
+            }
+            | TcpServerSetupResult::BidirectionalUdp {
+                override_proxy_provider: ref mut provider,
+                ..
+            }
+            | TcpServerSetupResult::MultiDirectionalUdp {
+                override_proxy_provider: ref mut provider,
+                ..
+            } => {
+                *provider = override_proxy_provider;
+            }
+        }
+    }
 }
 
 #[async_trait]

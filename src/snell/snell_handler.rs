@@ -175,6 +175,7 @@ impl TcpServerHandler for SnellTcpHandler {
             Ok(TcpServerSetupResult::MultiDirectionalUdp {
                 stream: Box::new(udp_stream),
                 need_initial_flush: true,
+                override_proxy_provider: NoneOrOne::Unspecified,
             })
         }
     }

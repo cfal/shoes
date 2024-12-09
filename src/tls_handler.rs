@@ -73,17 +73,12 @@ impl TcpServerHandler for TlsServerHandler {
         );
 
         let mut target_setup_result = target.handler.setup_server_stream(tls_stream).await;
-        if let Ok(TcpServerSetupResult::TcpForward {
-            ref mut need_initial_flush,
-            override_proxy_provider: ref mut inner_override_proxy_provider,
-            ..
-        }) = target_setup_result.as_mut()
-        {
-            *need_initial_flush = true;
-            if inner_override_proxy_provider.is_unspecified()
+        if let Ok(ref mut setup_result) = target_setup_result {
+            setup_result.set_need_initial_flush(true);
+            if setup_result.override_proxy_provider_unspecified()
                 && !target.override_proxy_provider.is_unspecified()
             {
-                *inner_override_proxy_provider = target.override_proxy_provider.clone();
+                setup_result.set_override_proxy_provider(target.override_proxy_provider.clone());
             }
         }
 

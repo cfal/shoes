@@ -626,6 +626,8 @@ impl TcpServerHandler for VmessTcpServerHandler {
             true => Ok(TcpServerSetupResult::BidirectionalUdp {
                 remote_location,
                 stream: server_stream,
+                need_initial_flush: false,
+                override_proxy_provider: NoneOrOne::Unspecified,
             }),
         }
     }

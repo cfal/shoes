@@ -216,8 +216,15 @@ async fn process_streams(
         TcpServerSetupResult::BidirectionalUdp {
             remote_location,
             stream: mut server_stream,
+            need_initial_flush: server_need_initial_flush,
+            override_proxy_provider,
         } => {
-            let action = client_proxy_selector
+            let selected_proxy_provider = if override_proxy_provider.is_one() {
+                override_proxy_provider.unwrap()
+            } else {
+                client_proxy_selector
+            };
+            let action = selected_proxy_provider
                 .judge(remote_location, &resolver)
                 .await?;
             match action {
@@ -231,8 +238,13 @@ async fn process_streams(
 
                     let mut client_socket = Box::new(client_socket);
 
-                    let copy_result =
-                        copy_bidirectional_message(&mut server_stream, &mut client_socket).await;
+                    let copy_result = copy_bidirectional_message(
+                        &mut server_stream,
+                        &mut client_socket,
+                        server_need_initial_flush,
+                        false,
+                    )
+                    .await;
 
                     // TODO: add async trait ext and make this work
                     //let (_, _) = futures::join!(server_stream.shutdown_message(), client_stream.shutdown_message());
@@ -251,8 +263,14 @@ async fn process_streams(
         TcpServerSetupResult::MultiDirectionalUdp {
             stream: mut server_stream,
             need_initial_flush: server_need_initial_flush,
+            override_proxy_provider,
         } => {
-            let action = client_proxy_selector.default_decision();
+            let selected_proxy_provider = if override_proxy_provider.is_one() {
+                override_proxy_provider.unwrap()
+            } else {
+                client_proxy_selector
+            };
+            let action = selected_proxy_provider.default_decision();
             match action {
                 ConnectDecision::Allow {
                     client_proxy,

@@ -23,10 +23,10 @@ struct CopyBuffer {
 }
 
 impl CopyBuffer {
-    pub fn new() -> Self {
+    pub fn new(need_flush: bool) -> Self {
         Self {
             read_done: false,
-            need_flush: false,
+            need_flush,
             need_write_ping: false,
             cache_length: 0,
             buf: [0u8; 65535],
@@ -268,7 +268,12 @@ where
 /// # Return value
 ///
 /// Returns a tuple of bytes copied `a` to `b` and bytes copied `b` to `a`.
-pub async fn copy_bidirectional_message<A, B>(a: &mut A, b: &mut B) -> Result<(), std::io::Error>
+pub async fn copy_bidirectional_message<A, B>(
+    a: &mut A,
+    b: &mut B,
+    a_initial_flush: bool,
+    b_initial_flush: bool,
+) -> Result<(), std::io::Error>
 where
     A: AsyncMessageStream + ?Sized,
     B: AsyncMessageStream + ?Sized,
@@ -283,8 +288,8 @@ where
         // this is correctly reversed - CopyBuffer will copy from a (reader) to b (writer) using
         // a_buf, which means that the need_flush signal is for the writer (b), and vice versa for
         // b_buf.
-        a_buf: CopyBuffer::new(),
-        b_buf: CopyBuffer::new(),
+        a_buf: CopyBuffer::new(b_initial_flush),
+        b_buf: CopyBuffer::new(a_initial_flush),
         a_to_b: TransferState::Running,
         b_to_a: TransferState::Running,
         sleep_future,
