@@ -6,6 +6,7 @@ mod copy_bidirectional;
 mod copy_bidirectional_message;
 mod copy_multidirectional_message;
 mod http_handler;
+mod hysteria2_server;
 mod line_reader;
 mod option_util;
 mod port_forward_handler;
