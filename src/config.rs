@@ -222,6 +222,9 @@ pub enum ServerProxyConfig {
         #[serde(alias = "target")]
         targets: OneOrSome<NetLocation>,
     },
+    Hysteria2 {
+        password: String,
+    },
 }
 
 impl std::fmt::Display for ServerProxyConfig {
@@ -240,6 +243,7 @@ impl std::fmt::Display for ServerProxyConfig {
                 Self::Vmess { .. } => "Vmess",
                 Self::Websocket { .. } => "Websocket",
                 Self::PortForward { .. } => "Portforward",
+                Self::Hysteria2 { .. } => "Hysteria2",
             }
         )
     }

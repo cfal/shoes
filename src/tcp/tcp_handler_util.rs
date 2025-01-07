@@ -110,6 +110,9 @@ pub fn create_tcp_server_handler(
             let targets = targets.into_vec();
             Box::new(PortForwardServerHandler::new(targets))
         }
+        unknown_config => {
+            panic!("Unsupported TCP proxy config: {:?}", unknown_config)
+        }
     }
 }
 

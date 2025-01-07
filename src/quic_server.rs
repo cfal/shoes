@@ -10,7 +10,9 @@ use tokio::time::timeout;
 
 use crate::async_stream::{AsyncSourcedMessageStream, AsyncStream};
 use crate::client_proxy_selector::{ClientProxySelector, ConnectDecision};
-use crate::config::{BindLocation, ConfigSelection, ServerConfig, ServerQuicConfig};
+use crate::config::{
+    BindLocation, ConfigSelection, ServerConfig, ServerProxyConfig, ServerQuicConfig,
+};
 use crate::copy_bidirectional::copy_bidirectional;
 use crate::copy_bidirectional_message::copy_bidirectional_message;
 use crate::copy_multidirectional_message::copy_multidirectional_message;
@@ -355,19 +357,32 @@ pub async fn start_quic_server(config: ServerConfig) -> std::io::Result<Option<J
 
     let client_proxy_selector = Arc::new(create_tcp_client_proxy_selector(rules.clone()));
 
-    let mut rules_stack = vec![rules];
-    let tcp_handler: Arc<Box<dyn TcpServerHandler>> =
-        Arc::new(create_tcp_server_handler(protocol, &mut rules_stack));
-    debug!("TCP handler: {:?}", tcp_handler);
+    match protocol {
+        ServerProxyConfig::Hysteria2 { password } => Ok(Some(tokio::spawn(async move {
+            crate::hysteria2_server::run_hysteria2_server(
+                bind_address,
+                server_config,
+                password,
+                client_proxy_selector,
+            )
+            .await
+            .unwrap();
+        }))),
+        tcp_protocol => {
+            let mut rules_stack = vec![rules];
+            let tcp_handler: Arc<Box<dyn TcpServerHandler>> =
+                Arc::new(create_tcp_server_handler(tcp_protocol, &mut rules_stack));
 
-    Ok(Some(tokio::spawn(async move {
-        run_quic_server(
-            bind_address,
-            server_config,
-            client_proxy_selector,
-            tcp_handler,
-        )
-        .await
-        .unwrap();
-    })))
+            Ok(Some(tokio::spawn(async move {
+                run_quic_server(
+                    bind_address,
+                    server_config,
+                    client_proxy_selector,
+                    tcp_handler,
+                )
+                .await
+                .unwrap();
+            })))
+        }
+    }
 }
