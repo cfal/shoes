@@ -249,7 +249,9 @@ pub fn create_server_config(
         .map(|s| s.as_bytes().to_vec())
         .collect();
 
+    config.max_fragment_size = None;
     config.max_early_data_size = u32::MAX;
+    config.ignore_client_order = true;
 
     config
 }
