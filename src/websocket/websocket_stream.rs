@@ -806,7 +806,7 @@ fn pack_frame(opcode: u8, use_mask: bool, input: &[u8], output: &mut [u8]) -> us
         output[1] |= 0x80;
 
         let mut mask_bytes = [0u8; 4];
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         rng.fill_bytes(&mut mask_bytes);
 
         output[offset..offset + 4].copy_from_slice(&mask_bytes);
