@@ -19,7 +19,10 @@ use crate::quic_stream::QuicStream;
 use crate::resolver::{NativeResolver, Resolver};
 use crate::tcp_client_connector::TcpClientConnector;
 use crate::tcp_server::setup_client_stream;
+use crate::thread_util::get_num_threads;
 use crate::udp_direct_message_stream::UdpDirectMessageStream;
+
+const MAX_QUIC_ENDPOINTS: usize = 32;
 
 async fn process_hysteria2_connection(
     client_proxy_selector: Arc<ClientProxySelector<TcpClientConnector>>,
@@ -597,44 +600,86 @@ pub async fn run_hysteria2_server(
     password: String,
     client_proxy_selector: Arc<ClientProxySelector<TcpClientConnector>>,
 ) -> std::io::Result<()> {
+    // TODO: hash password instead of passing directly
+    let hysteria2_password: &'static str = Box::leak(password.into_boxed_str());
+
     let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
 
     let quic_server_config: quinn::crypto::rustls::QuicServerConfig = server_config
         .try_into()
         .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
 
-    let server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_server_config));
+    let quic_server_config = Arc::new(quic_server_config);
 
-    // Previously we set server_config.transport, but that seems to break when testing
-    // against the hysteria2 client:
-    //   Arc::get_mut(&mut server_config.transport)
-    //     .unwrap()
-    //     .max_concurrent_bidi_streams(1024_u32.into())
-    //     .max_concurrent_uni_streams(0_u8.into())
-    //     .keep_alive_interval(Some(Duration::from_secs(15)))
-    //     .max_idle_timeout(Some(Duration::from_secs(30).try_into().unwrap()));
+    let endpoints_len = std::cmp::min(get_num_threads(), MAX_QUIC_ENDPOINTS);
+    let mut join_handles = vec![];
+    for _ in 0..endpoints_len {
+        let quic_server_config = quic_server_config.clone();
+        let bind_address = bind_address.clone();
+        let resolver = resolver.clone();
+        let client_proxy_selector = client_proxy_selector.clone();
 
-    let endpoint = quinn::Endpoint::server(server_config, bind_address)?;
+        let join_handle = tokio::spawn(async move {
+            let server_config = quinn::ServerConfig::with_crypto(quic_server_config);
 
-    // TODO: hash password instead of passing directly
-    let hysteria2_password: &'static str = Box::leak(password.into_boxed_str());
+            // Previously we set server_config.transport, but that seems to break when testing
+            // against the hysteria2 client:
+            //   Arc::get_mut(&mut server_config.transport)
+            //     .unwrap()
+            //     .max_concurrent_bidi_streams(1024_u32.into())
+            //     .max_concurrent_uni_streams(0_u8.into())
+            //     .keep_alive_interval(Some(Duration::from_secs(15)))
+            //     .max_idle_timeout(Some(Duration::from_secs(30).try_into().unwrap()));
+            //
 
-    while let Some(conn) = endpoint.accept().await {
-        let cloned_selector = client_proxy_selector.clone();
-        let cloned_resolver = resolver.clone();
-        tokio::spawn(async move {
-            if let Err(e) = process_hysteria2_connection(
-                cloned_selector,
-                cloned_resolver,
-                hysteria2_password,
-                conn,
+            let socket = {
+                let socket2_socket = socket2::Socket::new(
+                    socket2::Domain::for_address(bind_address),
+                    socket2::Type::DGRAM,
+                    Some(socket2::Protocol::UDP),
+                )
+                .unwrap();
+
+                socket2_socket.set_nonblocking(true).unwrap();
+                // We need to set SO_REUSEPORT firt before binding, else we will get "Address
+                // already in use" errors.
+                socket2_socket.set_reuse_port(true).unwrap();
+
+                socket2_socket.bind(&bind_address.into()).unwrap();
+
+                socket2_socket.into()
+            };
+
+            let endpoint = quinn::Endpoint::new(
+                quinn::EndpointConfig::default(),
+                Some(server_config),
+                socket,
+                Arc::new(quinn::TokioRuntime),
             )
-            .await
-            {
-                error!("Connection ended with error: {}", e);
+            .unwrap();
+
+            while let Some(conn) = endpoint.accept().await {
+                let cloned_selector = client_proxy_selector.clone();
+                let cloned_resolver = resolver.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = process_hysteria2_connection(
+                        cloned_selector,
+                        cloned_resolver,
+                        hysteria2_password,
+                        conn,
+                    )
+                    .await
+                    {
+                        error!("Connection ended with error: {}", e);
+                    }
+                });
             }
         });
+        join_handles.push(join_handle);
     }
 
+    for join_handle in join_handles {
+        join_handle.await.unwrap();
+    }
     Ok(())
 }
