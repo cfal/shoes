@@ -13,7 +13,7 @@ pub fn new_udp_socket(bind_interface: Option<String>) -> std::io::Result<tokio::
 
         // This should be handled during config validation.
         #[cfg(not(any(target_os = "android", target_os = "fuchsia", target_os = "linux")))]
-        panic!("Could not find to device, unsupported platform.")
+        panic!("Could not bind to device, unsupported platform.")
     }
 
     Ok(tokio_socket)
