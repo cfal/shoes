@@ -1,15 +1,15 @@
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::str;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::BytesMut;
-use futures::{pin_mut, select, FutureExt};
+use bytes::{Bytes, BytesMut};
 use log::error;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::Notify;
+use tokio::net::UdpSocket;
 use tokio::time::timeout;
 
 use crate::address::NetLocation;
@@ -17,13 +17,13 @@ use crate::async_stream::AsyncStream;
 use crate::client_proxy_selector::{ClientProxySelector, ConnectDecision};
 use crate::copy_bidirectional::copy_bidirectional;
 use crate::quic_stream::QuicStream;
-use crate::resolver::{NativeResolver, Resolver};
+use crate::resolver::{NativeResolver, Resolver, ResolverCache};
 use crate::tcp_client_connector::TcpClientConnector;
 use crate::tcp_server::setup_client_stream;
 use crate::thread_util::get_num_threads;
-use crate::udp_direct_message_stream::UdpDirectMessageStream;
+use crate::udp_multi_message_stream::UdpMultiMessageStream;
 
-const MAX_QUIC_ENDPOINTS: usize = 32;
+const MAX_QUIC_ENDPOINTS: usize = 4;
 
 async fn process_hysteria2_connection(
     client_proxy_selector: Arc<ClientProxySelector<TcpClientConnector>>,
@@ -43,23 +43,30 @@ async fn process_hysteria2_connection(
             .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
     auth_hysteria2_connection(&mut h3_conn, password).await?;
 
-    let udp_future = {
+    let cancel_notify = Arc::new(AtomicBool::new(false));
+
+    {
         let connection = connection.clone();
         let client_proxy_selector = client_proxy_selector.clone();
         let resolver = resolver.clone();
-        run_hysteria2_udp_read_loop(connection, client_proxy_selector, resolver)
-    };
-
-    let tcp_future = run_hysteria2_tcp_loop(connection, client_proxy_selector, resolver);
-
-    // Pin the futures since select! requires them to be pinned
-    pin_mut!(udp_future);
-    pin_mut!(tcp_future);
-
-    select! {
-        tcp_result = tcp_future.fuse() => tcp_result,
-        udp_result = udp_future.fuse() => udp_result,
+        let cancel_notify = cancel_notify.clone();
+        tokio::spawn(run_hysteria2_udp_read_loop(
+            connection,
+            client_proxy_selector,
+            resolver,
+            cancel_notify,
+        ));
     }
+
+    tokio::spawn(run_hysteria2_tcp_loop(
+        h3_conn,
+        connection,
+        client_proxy_selector,
+        resolver,
+        cancel_notify,
+    ));
+
+    Ok(())
 }
 
 fn validate_auth_request<T>(req: http::Request<T>, password: &str) -> std::io::Result<()> {
@@ -162,52 +169,116 @@ async fn auth_hysteria2_connection(
 }
 
 struct UdpSession {
-    socket: UdpDirectMessageStream,
-    cancel_notify: Arc<Notify>,
     fragments: HashMap<u16, FragmentedPacket>,
+    tx: tokio::sync::mpsc::Sender<UdpMessage>,
+}
+
+struct UdpMessage {
+    payload: Bytes,
+    remote_location: NetLocation,
 }
 
 struct FragmentedPacket {
     fragment_count: u8,
-    received: Vec<Option<Vec<u8>>>,
-    header: Option<(String, NetLocation)>,
+    fragment_received: u8,
+    packet_len: usize,
+    received: Vec<Option<Bytes>>,
+    remote_location: NetLocation,
 }
 
 impl UdpSession {
     fn start(
         session_id: u32,
         connection: quinn::Connection,
-        socket: UdpDirectMessageStream,
+        client_sockets: Vec<Arc<UdpSocket>>,
+        resolver: Arc<dyn Resolver>,
+        cancel_notify: Arc<AtomicBool>,
     ) -> Self {
-        let notify = Arc::new(Notify::new());
+        let (tx, rx) = tokio::sync::mpsc::channel(40);
+
         let session = UdpSession {
-            socket: socket.clone(),
             fragments: HashMap::new(),
-            cancel_notify: notify.clone(),
+            tx,
         };
 
+        let send_socket = client_sockets.first().unwrap().clone();
+        //let client_stream = UdpMultiMessageStream::new(client_sockets, resolver.clone());
+
+        // Spawn a dedicated worker task to drain the outgoing UDP message queue.
+        let resolver_cache = ResolverCache::new(resolver.clone());
+        tokio::spawn(udp_sender_worker(
+            session_id,
+            send_socket,
+            rx,
+            resolver_cache,
+            cancel_notify.clone(),
+        ));
+
+        let client_stream = UdpMultiMessageStream::new(client_sockets, resolver);
         tokio::spawn(async move {
             if let Err(e) =
-                run_hysteria2_udp_write_loop(session_id, connection, socket, notify).await
+                run_hysteria2_udp_write_loop(session_id, connection, client_stream, cancel_notify)
+                    .await
             {
                 error!("Failed to write UDP loop: {}", e);
             }
         });
+
         session
+    }
+}
+
+async fn udp_sender_worker(
+    session_id: u32,
+    socket: Arc<UdpSocket>,
+    mut rx: tokio::sync::mpsc::Receiver<UdpMessage>,
+    mut resolver_cache: ResolverCache,
+    cancel_notify: Arc<AtomicBool>,
+) {
+    let mut last_location = NetLocation::UNSPECIFIED;
+    let mut last_socket_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
+
+    while let Some(UdpMessage {
+        remote_location,
+        payload,
+    }) = rx.recv().await
+    {
+        if remote_location != last_location {
+            let socket_addr = match resolver_cache.resolve_location(&remote_location).await {
+                Ok(socket_addr) => socket_addr,
+                Err(e) => {
+                    error!(
+                        "Failed to resolve remote location {}: {}",
+                        remote_location, e
+                    );
+                    continue;
+                }
+            };
+            last_location = remote_location;
+            last_socket_addr = socket_addr;
+        };
+        if let Err(e) = socket.send_to(&payload, &last_socket_addr).await {
+            error!(
+                "Failed to forward UDP payload for session {}: {}",
+                session_id, e
+            );
+        }
+        if cancel_notify.load(Ordering::Relaxed) {
+            break;
+        }
     }
 }
 
 async fn run_hysteria2_udp_write_loop(
     session_id: u32,
     connection: quinn::Connection,
-    socket: UdpDirectMessageStream,
-    cancel_notify: Arc<Notify>,
+    mut socket: UdpMultiMessageStream,
+    cancel_notify: Arc<AtomicBool>,
 ) -> std::io::Result<()> {
     let max_datagram_size = connection.max_datagram_size().unwrap();
-    let session_id = session_id;
     let mut next_packet_id: u16 = 0;
-
     let mut buf = [0u8; 65535];
+
     loop {
         match socket.read_sourced_message(&mut buf).await {
             Ok((len, src_addr)) => {
@@ -217,7 +288,6 @@ async fn run_hysteria2_udp_write_loop(
                 let header_overhead = 4 + 2 + 1 + 1 + 1 + addr_str.len(); // session_id(4) + packet_id(2) + fragment id(1) + fragment count(1) + address length(1) + address bytes
                 if header_overhead + len <= max_datagram_size {
                     let mut datagram = BytesMut::with_capacity(header_overhead + len);
-                    //let mut datagram = Vec::with_capacity(header_overhead + len);
                     datagram.extend_from_slice(&session_id.to_be_bytes());
                     datagram.extend_from_slice(&packet_id.to_be_bytes());
                     // fragment id = 0, fragment count = 0, address length
@@ -237,7 +307,7 @@ async fn run_hysteria2_udp_write_loop(
                         );
                         continue;
                     }
-                    let fragment_count = ((len + available_payload - 1) / available_payload) as u8;
+                    let fragment_count = len.div_ceil(available_payload) as u8;
                     for fragment_id in 0..fragment_count {
                         let start = (fragment_id as usize) * available_payload;
                         let end = std::cmp::min(start + available_payload, len);
@@ -262,8 +332,11 @@ async fn run_hysteria2_udp_write_loop(
             }
             Err(e) => {
                 error!("Failed to read UDP message from socket: {}", e);
-                break;
             }
+        }
+
+        if cancel_notify.load(Ordering::Relaxed) {
+            break;
         }
     }
 
@@ -274,6 +347,7 @@ async fn run_hysteria2_udp_read_loop(
     connection: quinn::Connection,
     client_proxy_selector: Arc<ClientProxySelector<TcpClientConnector>>,
     resolver: Arc<dyn Resolver>,
+    cancel_notify: Arc<AtomicBool>,
 ) -> std::io::Result<()> {
     let action = client_proxy_selector.default_decision();
     let client_proxy = match action {
@@ -340,7 +414,7 @@ async fn run_hysteria2_udp_read_loop(
             ));
         }
         let address_bytes = &data[next_index..next_index + address_len];
-        let payload_fragment = data[next_index + address_len..].to_vec();
+        let payload_fragment = data.slice(next_index + address_len..);
 
         let addr_str = match str::from_utf8(address_bytes) {
             Ok(s) => s,
@@ -361,90 +435,108 @@ async fn run_hysteria2_udp_read_loop(
         let mut session_entry = sessions.entry(session_id);
         let session = match session_entry {
             Entry::Vacant(entry) => {
-                let client_socket = client_proxy.configure_udp_socket()?;
-                // because of the AsyncWriteTargetedMessage trait, which requires &mut self,
-                // we can'e UdpDirectMessageStream in an Arc and use it repeatedly, so
-                // clone here.
-                let client_stream = UdpDirectMessageStream::new(client_socket, resolver.clone());
-                let session = UdpSession::start(session_id, connection.clone(), client_stream);
+                let client_sockets = client_proxy.configure_reuse_udp_sockets(true, 2)?;
+                let client_sockets = client_sockets.into_iter().map(Arc::new).collect::<Vec<_>>();
+                let session = UdpSession::start(
+                    session_id,
+                    connection.clone(),
+                    client_sockets,
+                    resolver.clone(),
+                    cancel_notify.clone(),
+                );
                 entry.insert(session)
             }
             Entry::Occupied(ref mut entry) => entry.get_mut(),
         };
 
         if fragment_count == 1 {
-            // Forward UDP payload asynchronously to improve performance.
-            let remote_location_clone = remote_location.clone();
-            let mut socket_clone = session.socket.clone();
-            let session_id_copy = session_id;
-            tokio::spawn(async move {
-                if let Err(e) = socket_clone
-                    .write_targeted_message(&payload_fragment, &remote_location_clone)
-                    .await
-                {
-                    error!(
-                        "Failed to forward UDP payload for session {}: {}",
-                        session_id_copy, e
-                    );
-                }
-            });
+            // Queue UDP payload for processing.
+            if let Err(e) = session
+                .tx
+                .send(UdpMessage {
+                    payload: payload_fragment,
+                    remote_location,
+                })
+                .await
+            {
+                error!(
+                    "Failed to queue UDP payload for session {}: {}",
+                    session_id, e
+                );
+            }
         } else {
-            let entry = session
-                .fragments
-                .entry(packet_id)
-                .or_insert_with(|| FragmentedPacket {
-                    fragment_count,
-                    received: vec![None; fragment_count as usize],
-                    header: Some((addr_str.to_string(), remote_location.clone())),
-                });
+            let entry =
+                session
+                    .fragments
+                    .entry(packet_id)
+                    .or_insert_with(move || FragmentedPacket {
+                        fragment_count,
+                        fragment_received: 0,
+                        packet_len: 0,
+                        received: vec![None; fragment_count as usize],
+                        remote_location,
+                    });
             if entry.fragment_count != fragment_count {
+                session.fragments.remove(&packet_id).unwrap();
                 error!(
                     "Mismatched fragment count for session {} packet {}",
                     session_id, packet_id
                 );
                 continue;
             }
-            if entry.header.is_none() {
-                entry.header = Some((addr_str.to_string(), remote_location.clone()));
+            if entry.received[fragment_id as usize].is_some() {
+                session.fragments.remove(&packet_id).unwrap();
+                error!(
+                    "Duplicate fragment for session {} packet {}",
+                    session_id, packet_id
+                );
+                continue;
             }
+            entry.fragment_received += 1;
+            entry.packet_len += payload_fragment.len();
             entry.received[fragment_id as usize] = Some(payload_fragment);
-            if entry.received.iter().all(|frag| frag.is_some()) {
-                let capacity: usize = entry
-                    .received
-                    .iter()
-                    .filter_map(|frag| frag.as_ref().map(|f| f.len()))
-                    .sum();
-                let mut complete_payload = Vec::with_capacity(capacity);
-                for frag in &entry.received {
-                    complete_payload.extend(frag.as_ref().unwrap());
+
+            if entry.fragment_received == entry.fragment_count {
+                let FragmentedPacket {
+                    remote_location,
+                    received,
+                    packet_len,
+                    ..
+                } = session.fragments.remove(&packet_id).unwrap();
+                let mut complete_payload = BytesMut::with_capacity(packet_len);
+                for frag in received.into_iter() {
+                    complete_payload.extend(frag.unwrap());
                 }
-                let complete_payload_final = complete_payload;
-                let mut socket_clone = session.socket.clone();
-                let session_id_copy = session_id;
-                tokio::spawn(async move {
-                    if let Err(e) = socket_clone
-                        .write_targeted_message(&complete_payload_final, &remote_location)
-                        .await
-                    {
-                        error!(
-                            "Failed to forward reassembled UDP payload for session {}: {}",
-                            session_id_copy, e
-                        );
-                    }
-                });
-                session.fragments.remove(&packet_id);
+                if let Err(e) = session
+                    .tx
+                    .send(UdpMessage {
+                        payload: complete_payload.freeze(),
+                        remote_location,
+                    })
+                    .await
+                {
+                    error!(
+                        "Failed to queue reassembled UDP payload for session {}: {}",
+                        session_id, e
+                    );
+                }
             }
         }
     }
 }
 async fn run_hysteria2_tcp_loop(
+    // unused, but needs to be kept in scope, see above.
+    _h3_conn: h3::server::Connection<h3_quinn::Connection, bytes::Bytes>,
     connection: quinn::Connection,
     client_proxy_selector: Arc<ClientProxySelector<TcpClientConnector>>,
     resolver: Arc<dyn Resolver>,
+    cancel_notify: Arc<AtomicBool>,
 ) -> std::io::Result<()> {
     loop {
         let (send_stream, recv_stream) = match connection.accept_bi().await {
             Err(quinn::ConnectionError::ApplicationClosed { .. }) => {
+                cancel_notify.store(true, Ordering::Relaxed);
+
                 // TODO: should this be an error?
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::Other,
@@ -452,6 +544,8 @@ async fn run_hysteria2_tcp_loop(
                 ));
             }
             Err(e) => {
+                cancel_notify.store(true, Ordering::Relaxed);
+
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::Other,
                     format!("failed to accept bidirectional stream: {}", e),
@@ -459,20 +553,23 @@ async fn run_hysteria2_tcp_loop(
             }
             Ok(s) => s,
         };
-        let cloned_selector = client_proxy_selector.clone();
-        let cloned_resolver = resolver.clone();
-        tokio::spawn(async move {
-            if let Err(e) = process_hysteria2_tcp_stream(
-                cloned_selector,
-                cloned_resolver,
-                send_stream,
-                recv_stream,
-            )
-            .await
-            {
-                error!("Failed to process streams: {}", e);
-            }
-        });
+
+        {
+            let client_proxy_selector = client_proxy_selector.clone();
+            let resolver = resolver.clone();
+            tokio::spawn(async move {
+                if let Err(e) = process_hysteria2_tcp_stream(
+                    client_proxy_selector,
+                    resolver,
+                    send_stream,
+                    recv_stream,
+                )
+                .await
+                {
+                    error!("Failed to process streams: {}", e);
+                }
+            });
+        }
     }
 }
 
@@ -631,7 +728,6 @@ pub async fn run_hysteria2_server(
     let mut join_handles = vec![];
     for _ in 0..endpoints_len {
         let quic_server_config = quic_server_config.clone();
-        let bind_address = bind_address.clone();
         let resolver = resolver.clone();
         let client_proxy_selector = client_proxy_selector.clone();
 
