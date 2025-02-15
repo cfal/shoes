@@ -365,7 +365,7 @@ where
     }
 }
 
-impl<'a, A, B> Future for CopyMultidirectional<'a, A, B>
+impl<A, B> Future for CopyMultidirectional<'_, A, B>
 where
     A: AsyncTargetedMessageStream + ?Sized,
     B: AsyncSourcedMessageStream + ?Sized,
