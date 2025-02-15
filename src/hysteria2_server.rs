@@ -1,22 +1,25 @@
+use std::collections::hash_map::Entry;
+use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::str;
 use std::sync::Arc;
 use std::time::Duration;
 
 use futures::{pin_mut, select, FutureExt};
 use log::error;
 use tokio::io::AsyncWriteExt;
+use tokio::sync::Notify;
 use tokio::time::timeout;
 
 use crate::address::NetLocation;
 use crate::async_stream::AsyncStream;
 use crate::client_proxy_selector::{ClientProxySelector, ConnectDecision};
 use crate::copy_bidirectional::copy_bidirectional;
-use crate::copy_bidirectional_message::copy_bidirectional_message;
-use crate::copy_multidirectional_message::copy_multidirectional_message;
 use crate::quic_stream::QuicStream;
 use crate::resolver::{NativeResolver, Resolver};
 use crate::tcp_client_connector::TcpClientConnector;
 use crate::tcp_server::setup_client_stream;
+use crate::udp_direct_message_stream::UdpDirectMessageStream;
 
 async fn process_hysteria2_connection(
     client_proxy_selector: Arc<ClientProxySelector<TcpClientConnector>>,
@@ -40,7 +43,7 @@ async fn process_hysteria2_connection(
         let connection = connection.clone();
         let client_proxy_selector = client_proxy_selector.clone();
         let resolver = resolver.clone();
-        run_hysteria2_udp_loop(connection, client_proxy_selector, resolver)
+        run_hysteria2_udp_read_loop(connection, client_proxy_selector, resolver)
     };
 
     let tcp_future = run_hysteria2_tcp_loop(connection, client_proxy_selector, resolver);
@@ -107,8 +110,7 @@ async fn auth_hysteria2_connection(
                     Ok(()) => {
                         let resp = http::Response::builder()
                             .status(http::status::StatusCode::from_u16(233).unwrap())
-                            // TODO: handle udp
-                            .header("Hysteria-UDP", "false")
+                            .header("Hysteria-UDP", "true")
                             .header("Hysteria-CC-RX", "0")
                             // TODO: randomize padding
                             .header("Hysteria-Padding", "test")
@@ -155,14 +157,266 @@ async fn auth_hysteria2_connection(
     }
 }
 
-async fn run_hysteria2_udp_loop(
+struct UdpSession {
+    socket: UdpDirectMessageStream,
+    cancel_notify: Arc<Notify>,
+    fragments: HashMap<u16, FragmentedPacket>,
+}
+
+struct FragmentedPacket {
+    fragment_count: u8,
+    received: Vec<Option<Vec<u8>>>,
+    header: Option<(String, NetLocation)>,
+}
+
+impl UdpSession {
+    fn start(
+        session_id: u32,
+        connection: quinn::Connection,
+        socket: UdpDirectMessageStream,
+    ) -> Self {
+        let notify = Arc::new(Notify::new());
+        let session = UdpSession {
+            socket: socket.clone(),
+            fragments: HashMap::new(),
+            cancel_notify: notify.clone(),
+        };
+
+        tokio::spawn(async move {
+            if let Err(e) =
+                run_hysteria2_udp_write_loop(session_id, connection, socket, notify).await
+            {
+                error!("Failed to write UDP loop: {}", e);
+            }
+        });
+        session
+    }
+}
+
+async fn run_hysteria2_udp_write_loop(
+    session_id: u32,
+    connection: quinn::Connection,
+    socket: UdpDirectMessageStream,
+    cancel_notify: Arc<Notify>,
+) -> std::io::Result<()> {
+    let max_datagram_size = connection.max_datagram_size().unwrap();
+    let session_id = session_id;
+    let mut next_packet_id: u16 = 0;
+    let mut buf = [0u8; 65535];
+    loop {
+        match socket.read_sourced_message(&mut buf).await {
+            Ok((len, src_addr)) => {
+                let packet_id = next_packet_id;
+                next_packet_id = next_packet_id.wrapping_add(1);
+                let addr_str = src_addr.to_string();
+                let header_overhead = 4 + 2 + 1 + 1 + 1 + addr_str.len(); // session_id(4) + packet_id(2) + fragment id(1) + fragment count(1) + address length(1) + address bytes
+                if header_overhead + len <= max_datagram_size {
+                    let mut datagram = Vec::new();
+                    datagram.extend(&session_id.to_be_bytes());
+                    datagram.extend(&packet_id.to_be_bytes());
+                    datagram.push(0); // fragment id = 0
+                    datagram.push(1); // fragment count = 1
+                    datagram.push(addr_str.len() as u8);
+                    datagram.extend(addr_str.as_bytes());
+                    datagram.extend(&buf[..len]);
+                    if let Err(e) = connection.send_datagram(datagram.into()) {
+                        error!("Failed to send UDP response datagram: {}", e);
+                    }
+                } else {
+                    // Fragment the UDP packet since it exceeds max datagram size.
+                    let available_payload = max_datagram_size - header_overhead;
+                    if available_payload == 0 {
+                        error!(
+                            "Max datagram size {} is too small for header overhead: {}",
+                            max_datagram_size, header_overhead
+                        );
+                        continue;
+                    }
+                    let fragment_count = ((len + available_payload - 1) / available_payload) as u8;
+                    for fragment_id in 0..fragment_count {
+                        let start = (fragment_id as usize) * available_payload;
+                        let end = std::cmp::min(start + available_payload, len);
+                        let mut datagram = Vec::new();
+                        datagram.extend(&session_id.to_be_bytes());
+                        datagram.extend(&packet_id.to_be_bytes());
+                        datagram.push(fragment_id);
+                        datagram.push(fragment_count);
+                        datagram.push(addr_str.len() as u8);
+                        datagram.extend(addr_str.as_bytes());
+                        datagram.extend(&buf[start..end]);
+                        if let Err(e) = connection.send_datagram(datagram.into()) {
+                            error!(
+                                "Failed to send UDP fragment {} for packet {}: {}",
+                                fragment_id, packet_id, e
+                            );
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                error!("Failed to read UDP message from socket: {}", e);
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn run_hysteria2_udp_read_loop(
     connection: quinn::Connection,
     client_proxy_selector: Arc<ClientProxySelector<TcpClientConnector>>,
     resolver: Arc<dyn Resolver>,
 ) -> std::io::Result<()> {
-    // TODO: Implement UDP support for hysteria2 protocol
-    std::future::pending::<()>().await;
-    Ok(())
+    let action = client_proxy_selector.default_decision();
+    let client_proxy = match action {
+        ConnectDecision::Allow {
+            client_proxy,
+            remote_location: _,
+        } => client_proxy,
+        // TODO: stop initializing the read loop if it's blocked
+        ConnectDecision::Block => futures::future::pending().await,
+    };
+
+    let mut sessions: HashMap<u32, UdpSession> = HashMap::new();
+
+    loop {
+        let data = connection.read_datagram().await.map_err(|err| {
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("failed to read datagram: {}", err),
+            )
+        })?;
+        if data.len() < 9 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "udp data length too short",
+            ));
+        }
+        let session_id = u32::from_be_bytes(data[0..4].try_into().unwrap());
+        let packet_id = u16::from_be_bytes(data[4..6].try_into().unwrap());
+        let fragment_id = data[6];
+        let fragment_count = data[7];
+
+        let (address_len, next_index) = {
+            let first_byte = data[8];
+            let length_indicator = (first_byte >> 6) & 0b11;
+            let mut value: u64 = (first_byte & 0b00111111) as u64;
+            let num_bytes = match length_indicator {
+                0 => 1,
+                1 => 2,
+                2 => 4,
+                3 => 8,
+                _ => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "invalid num bytes value",
+                    ))
+                }
+            };
+            let mut next_index = 9;
+            if num_bytes > 1 {
+                let remaining = &data[9..9 + (num_bytes - 1)];
+                for byte in remaining {
+                    value <<= 8;
+                    value |= *byte as u64;
+                }
+                next_index += num_bytes - 1;
+            }
+            (value as usize, next_index)
+        };
+
+        if data.len() < next_index + address_len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "invalid address length",
+            ));
+        }
+        let address_bytes = &data[next_index..next_index + address_len];
+        let payload_fragment = data[next_index + address_len..].to_vec();
+
+        let addr_str = match str::from_utf8(address_bytes) {
+            Ok(s) => s,
+            Err(e) => {
+                error!("Invalid UTF-8 in address: {}", e);
+                continue;
+            }
+        };
+
+        let remote_location = match NetLocation::from_str(addr_str, None) {
+            Ok(loc) => loc,
+            Err(e) => {
+                error!("Failed to parse remote location from {}: {}", addr_str, e);
+                continue;
+            }
+        };
+
+        let mut session_entry = sessions.entry(session_id);
+        let session = match session_entry {
+            Entry::Vacant(entry) => {
+                let client_socket = client_proxy.configure_udp_socket()?;
+                // because of the AsyncWriteTargetedMessage trait, which requires &mut self,
+                // we can'e UdpDirectMessageStream in an Arc and use it repeatedly, so
+                // clone here.
+                let client_stream = UdpDirectMessageStream::new(client_socket, resolver.clone());
+                let session = UdpSession::start(session_id, connection.clone(), client_stream);
+                entry.insert(session)
+            }
+            Entry::Occupied(ref mut entry) => entry.get_mut(),
+        };
+
+        if fragment_count == 1 {
+            // TODO: we shouldn't block on resolving `remote_location`.
+            if let Err(e) = session
+                .socket
+                .write_targeted_message(&payload_fragment, &remote_location)
+                .await
+            {
+                error!(
+                    "Failed to forward UDP payload for session {}: {}",
+                    session_id, e
+                );
+            }
+        } else {
+            let entry = session
+                .fragments
+                .entry(packet_id)
+                .or_insert_with(|| FragmentedPacket {
+                    fragment_count,
+                    received: vec![None; fragment_count as usize],
+                    header: Some((addr_str.to_string(), remote_location.clone())),
+                });
+            if entry.fragment_count != fragment_count {
+                error!(
+                    "Mismatched fragment count for session {} packet {}",
+                    session_id, packet_id
+                );
+                continue;
+            }
+            if entry.header.is_none() {
+                entry.header = Some((addr_str.to_string(), remote_location.clone()));
+            }
+            entry.received[fragment_id as usize] = Some(payload_fragment);
+            if entry.received.iter().all(|frag| frag.is_some()) {
+                let mut complete_payload = Vec::new();
+                for frag in &entry.received {
+                    complete_payload.extend(frag.as_ref().unwrap());
+                }
+                // TODO: should we just take `remote_location` from the first fragment?
+                if let Err(e) = session
+                    .socket
+                    .write_targeted_message(&complete_payload, &remote_location)
+                    .await
+                {
+                    error!(
+                        "Failed to forward reassembled UDP payload for session {}: {}",
+                        session_id, e
+                    );
+                }
+                session.fragments.remove(&packet_id);
+            }
+        }
+    }
 }
 async fn run_hysteria2_tcp_loop(
     connection: quinn::Connection,
