@@ -5,6 +5,7 @@ use std::str;
 use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::BytesMut;
 use futures::{pin_mut, select, FutureExt};
 use log::error;
 use tokio::io::AsyncWriteExt;
@@ -205,6 +206,7 @@ async fn run_hysteria2_udp_write_loop(
     let max_datagram_size = connection.max_datagram_size().unwrap();
     let session_id = session_id;
     let mut next_packet_id: u16 = 0;
+
     let mut buf = [0u8; 65535];
     loop {
         match socket.read_sourced_message(&mut buf).await {
@@ -214,15 +216,15 @@ async fn run_hysteria2_udp_write_loop(
                 let addr_str = src_addr.to_string();
                 let header_overhead = 4 + 2 + 1 + 1 + 1 + addr_str.len(); // session_id(4) + packet_id(2) + fragment id(1) + fragment count(1) + address length(1) + address bytes
                 if header_overhead + len <= max_datagram_size {
-                    let mut datagram = Vec::new();
-                    datagram.extend(&session_id.to_be_bytes());
-                    datagram.extend(&packet_id.to_be_bytes());
-                    datagram.push(0); // fragment id = 0
-                    datagram.push(1); // fragment count = 1
-                    datagram.push(addr_str.len() as u8);
-                    datagram.extend(addr_str.as_bytes());
-                    datagram.extend(&buf[..len]);
-                    if let Err(e) = connection.send_datagram(datagram.into()) {
+                    let mut datagram = BytesMut::with_capacity(header_overhead + len);
+                    //let mut datagram = Vec::with_capacity(header_overhead + len);
+                    datagram.extend_from_slice(&session_id.to_be_bytes());
+                    datagram.extend_from_slice(&packet_id.to_be_bytes());
+                    // fragment id = 0, fragment count = 0, address length
+                    datagram.extend_from_slice(&[0, 1, addr_str.len() as u8]);
+                    datagram.extend_from_slice(addr_str.as_bytes());
+                    datagram.extend_from_slice(&buf[..len]);
+                    if let Err(e) = connection.send_datagram(datagram.freeze()) {
                         error!("Failed to send UDP response datagram: {}", e);
                     }
                 } else {
@@ -239,15 +241,17 @@ async fn run_hysteria2_udp_write_loop(
                     for fragment_id in 0..fragment_count {
                         let start = (fragment_id as usize) * available_payload;
                         let end = std::cmp::min(start + available_payload, len);
-                        let mut datagram = Vec::new();
-                        datagram.extend(&session_id.to_be_bytes());
-                        datagram.extend(&packet_id.to_be_bytes());
-                        datagram.push(fragment_id);
-                        datagram.push(fragment_count);
-                        datagram.push(addr_str.len() as u8);
-                        datagram.extend(addr_str.as_bytes());
-                        datagram.extend(&buf[start..end]);
-                        if let Err(e) = connection.send_datagram(datagram.into()) {
+                        let mut datagram = BytesMut::with_capacity(header_overhead + (end - start));
+                        datagram.extend_from_slice(&session_id.to_be_bytes());
+                        datagram.extend_from_slice(&packet_id.to_be_bytes());
+                        datagram.extend_from_slice(&[
+                            fragment_id,
+                            fragment_count,
+                            addr_str.len() as u8,
+                        ]);
+                        datagram.extend_from_slice(addr_str.as_bytes());
+                        datagram.extend_from_slice(&buf[start..end]);
+                        if let Err(e) = connection.send_datagram(datagram.freeze()) {
                             error!(
                                 "Failed to send UDP fragment {} for packet {}: {}",
                                 fragment_id, packet_id, e
@@ -369,17 +373,21 @@ async fn run_hysteria2_udp_read_loop(
         };
 
         if fragment_count == 1 {
-            // TODO: we shouldn't block on resolving `remote_location`.
-            if let Err(e) = session
-                .socket
-                .write_targeted_message(&payload_fragment, &remote_location)
-                .await
-            {
-                error!(
-                    "Failed to forward UDP payload for session {}: {}",
-                    session_id, e
-                );
-            }
+            // Forward UDP payload asynchronously to improve performance.
+            let remote_location_clone = remote_location.clone();
+            let mut socket_clone = session.socket.clone();
+            let session_id_copy = session_id;
+            tokio::spawn(async move {
+                if let Err(e) = socket_clone
+                    .write_targeted_message(&payload_fragment, &remote_location_clone)
+                    .await
+                {
+                    error!(
+                        "Failed to forward UDP payload for session {}: {}",
+                        session_id_copy, e
+                    );
+                }
+            });
         } else {
             let entry = session
                 .fragments
@@ -401,21 +409,29 @@ async fn run_hysteria2_udp_read_loop(
             }
             entry.received[fragment_id as usize] = Some(payload_fragment);
             if entry.received.iter().all(|frag| frag.is_some()) {
-                let mut complete_payload = Vec::new();
+                let capacity: usize = entry
+                    .received
+                    .iter()
+                    .filter_map(|frag| frag.as_ref().map(|f| f.len()))
+                    .sum();
+                let mut complete_payload = Vec::with_capacity(capacity);
                 for frag in &entry.received {
                     complete_payload.extend(frag.as_ref().unwrap());
                 }
-                // TODO: should we just take `remote_location` from the first fragment?
-                if let Err(e) = session
-                    .socket
-                    .write_targeted_message(&complete_payload, &remote_location)
-                    .await
-                {
-                    error!(
-                        "Failed to forward reassembled UDP payload for session {}: {}",
-                        session_id, e
-                    );
-                }
+                let complete_payload_final = complete_payload;
+                let mut socket_clone = session.socket.clone();
+                let session_id_copy = session_id;
+                tokio::spawn(async move {
+                    if let Err(e) = socket_clone
+                        .write_targeted_message(&complete_payload_final, &remote_location)
+                        .await
+                    {
+                        error!(
+                            "Failed to forward reassembled UDP payload for session {}: {}",
+                            session_id_copy, e
+                        );
+                    }
+                });
                 session.fragments.remove(&packet_id);
             }
         }
