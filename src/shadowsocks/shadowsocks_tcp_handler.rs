@@ -144,8 +144,8 @@ impl TcpClientHandler for ShadowsocksTcpHandler {
         if self.aead2022 {
             let location_len = location_vec.len();
 
-            let mut rng = rand::rng();
-            let padding_len: usize = rng.random_range(1..=900);
+            let mut rng = rand::thread_rng();
+            let padding_len: usize = rng.gen_range(1..=900);
             location_vec.resize(location_len + padding_len + 2, 0);
 
             let padding_len_bytes = (padding_len as u16).to_be_bytes();

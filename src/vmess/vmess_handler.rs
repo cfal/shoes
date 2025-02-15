@@ -733,7 +733,7 @@ impl TcpClientHandler for VmessTcpClientHandler {
         let (cert_hash, time_bytes): ([u8; 16], [u8; 8]) = if self.is_aead {
             // AEAD allows 120 second delta from the current time.
             // See authid.go in v2ray-core.
-            let random_delta: u64 = rand::rng().random_range(0..241);
+            let random_delta: u64 = rand::thread_rng().gen_range(0..241);
             let time_secs: u64 =
                 SystemTime::UNIX_EPOCH.elapsed().unwrap().as_secs() - 120u64 + random_delta;
 
@@ -741,7 +741,7 @@ impl TcpClientHandler for VmessTcpClientHandler {
             let time_bytes = time_secs.to_be_bytes();
             aead_bytes[0..8].copy_from_slice(&time_bytes);
 
-            rand::rng().fill_bytes(&mut aead_bytes[8..12]);
+            rand::thread_rng().fill_bytes(&mut aead_bytes[8..12]);
 
             let checksum = super::crc32::crc32c(&aead_bytes[0..12]).to_be_bytes();
             aead_bytes[12..16].copy_from_slice(&checksum);
@@ -750,7 +750,7 @@ impl TcpClientHandler for VmessTcpClientHandler {
             (aead_bytes, time_bytes)
         } else {
             // non-AEAD only allows 30 second delta.
-            let random_delta: u64 = rand::rng().random_range(0..61);
+            let random_delta: u64 = rand::thread_rng().gen_range(0..61);
             let time_secs: u64 =
                 SystemTime::UNIX_EPOCH.elapsed().unwrap().as_secs() - 30u64 + random_delta;
             let time_bytes = time_secs.to_be_bytes();
@@ -771,7 +771,7 @@ impl TcpClientHandler for VmessTcpClientHandler {
         // - data encryption iv (16 bytes)
         // - data encryption key (16 bytes)
         // - response authentication v (1 byte)
-        rand::rng().fill_bytes(&mut header_bytes[1..34]);
+        rand::thread_rng().fill_bytes(&mut header_bytes[1..34]);
 
         let data_encryption_iv: &[u8] = &header_bytes[1..17];
         let data_encryption_key: &[u8] = &header_bytes[17..33];
@@ -895,7 +895,7 @@ impl TcpClientHandler for VmessTcpClientHandler {
         };
 
         if margin_len > 0 {
-            rand::rng().fill_bytes(&mut header_bytes[cursor..cursor + margin_len as usize]);
+            rand::thread_rng().fill_bytes(&mut header_bytes[cursor..cursor + margin_len as usize]);
             cursor += margin_len as usize;
         }
 
@@ -908,7 +908,7 @@ impl TcpClientHandler for VmessTcpClientHandler {
         if self.is_aead {
             let mut encrypted_payload_length = [0u8; 18];
             let mut nonce = [0u8; 8];
-            rand::rng().fill_bytes(&mut nonce);
+            rand::thread_rng().fill_bytes(&mut nonce);
 
             let header_length_aead_key = super::sha2::kdf(
                 &self.instruction_key,
