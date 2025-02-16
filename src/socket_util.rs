@@ -13,6 +13,40 @@ pub fn new_udp_socket(
     into_tokio_udp_socket(socket)
 }
 
+pub fn new_reuse_udp_sockets(
+    is_ipv6: bool,
+    bind_interface: Option<String>,
+    count: usize,
+) -> std::io::Result<Vec<tokio::net::UdpSocket>> {
+    let mut sockets = Vec::with_capacity(count);
+    if count == 0 {
+        return Ok(sockets);
+    }
+
+    let socket = new_socket2_udp_socket(
+        is_ipv6,
+        bind_interface.clone(),
+        Some(get_sock_addr(is_ipv6)),
+        true,
+    )?;
+
+    let local_addr = socket.local_addr()?;
+
+    sockets.push(into_tokio_udp_socket(socket)?);
+
+    for _ in 1..count {
+        let socket = new_socket2_udp_socket(
+            is_ipv6,
+            bind_interface.clone(),
+            Some(local_addr.clone()),
+            true,
+        )?;
+        sockets.push(into_tokio_udp_socket(socket)?);
+    }
+
+    Ok(sockets)
+}
+
 fn get_sock_addr(is_ipv6: bool) -> SockAddr {
     let addr: std::net::SocketAddr = if !is_ipv6 {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0)
