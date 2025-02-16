@@ -42,11 +42,11 @@ pub struct UdpMultiMessageStream {
 // UDP, we implement the relevant traits directly instead.
 impl UdpMultiMessageStream {
     pub fn new(sockets: Vec<Arc<UdpSocket>>, resolver: Arc<dyn Resolver>) -> Self {
-        if sockets.len() < 1 {
+        if sockets.is_empty() {
             panic!("at least one socket is required");
         }
 
-        let send_socket = sockets.get(0).unwrap().clone();
+        let send_socket = sockets.first().unwrap().clone();
 
         let shutdown_flag = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::channel(40);
@@ -142,7 +142,7 @@ pub struct WriteTargetedMessage<'a, 'b> {
     target: &'b NetLocation,
 }
 
-impl<'a, 'b> Future for WriteTargetedMessage<'a, 'b> {
+impl Future for WriteTargetedMessage<'_, '_> {
     type Output = std::io::Result<()>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
