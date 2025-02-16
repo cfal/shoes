@@ -94,7 +94,7 @@ fn new_socket2_udp_socket(
 fn into_tokio_udp_socket(socket: socket2::Socket) -> std::io::Result<tokio::net::UdpSocket> {
     let raw_fd = socket.into_raw_fd();
     let std_udp_socket = unsafe { std::net::UdpSocket::from_raw_fd(raw_fd) };
-    Ok(tokio::net::UdpSocket::from_std(std_udp_socket)?)
+    tokio::net::UdpSocket::from_std(std_udp_socket)
 }
 
 pub fn new_tcp_socket(

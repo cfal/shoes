@@ -94,7 +94,7 @@ impl ResolverCache {
 
         // TODO: switch to using entry()
         match self.cache.get_mut(target) {
-            Some(ResolveState::Resolved(ref socket_addr)) => Poll::Ready(Ok(socket_addr.clone())),
+            Some(ResolveState::Resolved(socket_addr)) => Poll::Ready(Ok(*socket_addr)),
             None => {
                 let mut resolve_future: Pin<
                     Box<dyn Future<Output = std::io::Result<Vec<SocketAddr>>> + Send>,
@@ -103,7 +103,7 @@ impl ResolverCache {
                     Poll::Pending => {
                         self.cache
                             .insert(target.clone(), ResolveState::Resolving(resolve_future));
-                        return Poll::Pending;
+                        Poll::Pending
                     }
                     Poll::Ready(result) => match result {
                         Ok(v) => {
@@ -122,9 +122,7 @@ impl ResolverCache {
             }
             Some(ResolveState::Resolving(ref mut resolve_future)) => {
                 match resolve_future.as_mut().poll(cx) {
-                    Poll::Pending => {
-                        return Poll::Pending;
-                    }
+                    Poll::Pending => Poll::Pending,
                     Poll::Ready(result) => {
                         let v = result?;
                         if v.is_empty() {
@@ -149,7 +147,7 @@ pub struct ResolveLocation<'a, 'b> {
     target: &'b NetLocation,
 }
 
-impl<'a, 'b> Future for ResolveLocation<'a, 'b> {
+impl Future for ResolveLocation<'_, '_> {
     type Output = std::io::Result<SocketAddr>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
