@@ -1434,6 +1434,7 @@ dependencies = [
  "serde",
  "serde_yaml",
  "sha3",
+ "socket2",
  "tokio",
  "tokio-rustls",
  "webpki-roots",
