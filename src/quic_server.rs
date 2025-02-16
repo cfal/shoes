@@ -282,6 +282,8 @@ async fn process_streams(
                     } else {
                         let client_sockets =
                             client_proxy.configure_reuse_udp_sockets(true, num_sockets)?;
+                        let client_sockets =
+                            client_sockets.into_iter().map(Arc::new).collect::<Vec<_>>();
                         Box::new(UdpMultiMessageStream::new(client_sockets, resolver))
                     };
 
