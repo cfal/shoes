@@ -247,9 +247,9 @@ where
                     remote_location,
                 } => {
                     let remote_addr = resolve_single_address(&resolver, &remote_location).await?;
-                    let client_socket = client_proxy.configure_udp_socket()?;
-                    client_socket.connect(remote_addr).await?;
 
+                    let client_socket = client_proxy.configure_udp_socket(remote_addr.is_ipv6())?;
+                    client_socket.connect(remote_addr).await?;
                     let mut client_socket = Box::new(client_socket);
 
                     let copy_result = copy_bidirectional_message(
@@ -290,7 +290,8 @@ where
                     client_proxy,
                     remote_location: _,
                 } => {
-                    let client_socket = client_proxy.configure_udp_socket()?;
+                    // support ipv6 since we don't know what the remote locations will be.
+                    let client_socket = client_proxy.configure_udp_socket(true)?;
                     let mut client_stream =
                         Box::new(UdpDirectMessageStream::new(client_socket, resolver));
 

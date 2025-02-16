@@ -126,6 +126,7 @@ impl TcpClientConnector {
                 for _ in 0..endpoints_len {
                     // quinn handles setting the socket to non-blocking.
                     let udp_socket = match new_udp_socket(
+                        client_config.address.address().is_ipv6(),
                         client_config
                             .bind_interface
                             .as_option()
@@ -180,8 +181,8 @@ impl TcpClientConnector {
         })
     }
 
-    pub fn configure_udp_socket(&self) -> std::io::Result<tokio::net::UdpSocket> {
-        let udp_socket = new_udp_socket(self.bind_interface.clone())?;
+    pub fn configure_udp_socket(&self, is_ipv6: bool) -> std::io::Result<tokio::net::UdpSocket> {
+        let udp_socket = new_udp_socket(is_ipv6, self.bind_interface.clone())?;
         Ok(udp_socket)
     }
 

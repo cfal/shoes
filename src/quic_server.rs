@@ -227,7 +227,7 @@ async fn process_streams(
                     remote_location,
                 } => {
                     let remote_addr = resolve_single_address(&resolver, &remote_location).await?;
-                    let client_socket = client_proxy.configure_udp_socket()?;
+                    let client_socket = client_proxy.configure_udp_socket(remote_addr.is_ipv6())?;
                     client_socket.connect(remote_addr).await?;
 
                     let mut client_socket = Box::new(client_socket);
@@ -270,7 +270,7 @@ async fn process_streams(
                     client_proxy,
                     remote_location: _,
                 } => {
-                    let client_socket = client_proxy.configure_udp_socket()?;
+                    let client_socket = client_proxy.configure_udp_socket(true)?;
                     let mut client_stream =
                         Box::new(UdpDirectMessageStream::new(client_socket, resolver));
 
