@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -17,12 +15,12 @@ use crate::async_stream::{
 use crate::resolver::{Resolver, ResolverCache};
 
 /// A thin wrapper around a directly connecting UdpSocket to support hostname resolution.
-pub struct UdpDirectMessageStream {
+pub struct UdpMessageStream {
     socket: UdpSocket,
     resolver_cache: ResolverCache,
 }
 
-impl UdpDirectMessageStream {
+impl UdpMessageStream {
     pub fn new(socket: UdpSocket, resolver: Arc<dyn Resolver>) -> Self {
         Self {
             socket,
@@ -31,7 +29,7 @@ impl UdpDirectMessageStream {
     }
 }
 
-impl AsyncReadSourcedMessage for UdpDirectMessageStream {
+impl AsyncReadSourcedMessage for UdpMessageStream {
     fn poll_read_sourced_message(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -41,7 +39,7 @@ impl AsyncReadSourcedMessage for UdpDirectMessageStream {
     }
 }
 
-impl AsyncWriteTargetedMessage for UdpDirectMessageStream {
+impl AsyncWriteTargetedMessage for UdpMessageStream {
     fn poll_write_targeted_message(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -59,7 +57,7 @@ impl AsyncWriteTargetedMessage for UdpDirectMessageStream {
     }
 }
 
-impl AsyncFlushMessage for UdpDirectMessageStream {
+impl AsyncFlushMessage for UdpMessageStream {
     fn poll_flush_message(
         self: Pin<&mut Self>,
         _cx: &mut Context<'_>,
@@ -68,7 +66,7 @@ impl AsyncFlushMessage for UdpDirectMessageStream {
     }
 }
 
-impl AsyncShutdownMessage for UdpDirectMessageStream {
+impl AsyncShutdownMessage for UdpMessageStream {
     fn poll_shutdown_message(
         self: Pin<&mut Self>,
         _cx: &mut Context<'_>,
@@ -77,7 +75,7 @@ impl AsyncShutdownMessage for UdpDirectMessageStream {
     }
 }
 
-impl AsyncPing for UdpDirectMessageStream {
+impl AsyncPing for UdpMessageStream {
     fn supports_ping(&self) -> bool {
         false
     }
@@ -87,4 +85,4 @@ impl AsyncPing for UdpDirectMessageStream {
     }
 }
 
-impl AsyncSourcedMessageStream for UdpDirectMessageStream {}
+impl AsyncSourcedMessageStream for UdpMessageStream {}
