@@ -18,12 +18,17 @@ use crate::async_stream::{
 use crate::resolver::{Resolver, ResolverCache};
 
 pub struct UdpMultiMessageStream {
-    sockets: Vec<Arc<UdpSocket>>,
+    // We use a dedicated send socket so that tasks waiting for writable get
+    // awoken correctly. In addition, when sending to the same destination
+    // from multiple sockets, the underlying network stack (and NIC) is
+    // typically the main throughput limiter. In many scenarios, since UDP
+    // sending is non-blocking and efficient, rotating among sockets will
+    // only provide marginal throughput improvements.
+    send_socket: Arc<UdpSocket>,
     resolver_cache: ResolverCache,
     receiver: Receiver<(Box<[u8]>, SocketAddr)>,
     notify_shutdown: Arc<AtomicBool>,
     join_handles: Vec<JoinHandle<()>>,
-    next_write_index: usize,
 }
 
 // NOTE: With multiple UDP sockets bound using SO_REUSEPORT, the OS will
@@ -41,15 +46,16 @@ impl UdpMultiMessageStream {
         }
 
         let sockets = sockets.into_iter().map(Arc::new).collect::<Vec<_>>();
+        let send_socket = sockets.get(0).unwrap().clone();
 
         let shutdown_flag = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::channel(40);
         let mut join_handles = Vec::new();
 
-        for socket in sockets.iter() {
+        for socket in sockets.into_iter() {
             let tx = tx.clone();
             let shutdown_flag = shutdown_flag.clone();
-            let receiver_socket = socket.clone();
+            let receiver_socket = socket;
             join_handles.push(tokio::spawn(async move {
                 let mut buf = [0u8; 65535];
                 'outer: loop {
@@ -91,19 +97,11 @@ impl UdpMultiMessageStream {
         }
 
         UdpMultiMessageStream {
-            sockets,
+            send_socket,
             resolver_cache: ResolverCache::new(resolver),
             receiver: rx,
             notify_shutdown: shutdown_flag,
             join_handles,
-            // TODO: consider using a dedicated send socket.
-            // Rotating can help in cases where one socket'ss send buffer is momentarily full,
-            // potentially preventing a single stalled socket from delaying all sends.
-            // However, when sending to the same destination from multiple sockets,
-            // the underlying network stack (and NIC) is typically the main throughput limiter.
-            // In many scenarios, since UDP sending is non-blocking and efficient,
-            // rotating among sockets will only provide marginal throughput improvements.
-            next_write_index: 0,
         }
     }
 }
@@ -144,9 +142,7 @@ impl AsyncWriteTargetedMessage for UdpMultiMessageStream {
     ) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
         let socket_addr = ready!(this.resolver_cache.poll_resolve_location(cx, target))?;
-        let socket = &this.sockets[this.next_write_index];
-        this.next_write_index = (this.next_write_index + 1) % this.sockets.len();
-        socket
+        this.send_socket
             .poll_send_to(cx, buf, socket_addr)
             .map(|result| result.map(|_| ()))
     }
