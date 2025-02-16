@@ -10,7 +10,7 @@ use crate::config::{ClientConfig, ClientQuicConfig, TcpConfig, Transport};
 use crate::quic_stream::QuicStream;
 use crate::resolver::{resolve_single_address, Resolver};
 use crate::rustls_util::create_client_config;
-use crate::socket_util::{new_tcp_socket, new_udp_socket};
+use crate::socket_util::{new_reuse_udp_sockets, new_tcp_socket, new_udp_socket};
 use crate::tcp_handler::{TcpClientHandler, TcpClientSetupResult};
 use crate::tcp_handler_util::create_tcp_client_handler;
 use crate::thread_util::get_num_threads;
@@ -183,6 +183,15 @@ impl TcpClientConnector {
 
     pub fn configure_udp_socket(&self, is_ipv6: bool) -> std::io::Result<tokio::net::UdpSocket> {
         let udp_socket = new_udp_socket(is_ipv6, self.bind_interface.clone())?;
+        Ok(udp_socket)
+    }
+
+    pub fn configure_reuse_udp_sockets(
+        &self,
+        is_ipv6: bool,
+        count: usize,
+    ) -> std::io::Result<Vec<tokio::net::UdpSocket>> {
+        let udp_socket = new_reuse_udp_sockets(is_ipv6, self.bind_interface.clone(), count)?;
         Ok(udp_socket)
     }
 
