@@ -1078,6 +1078,8 @@ impl AsyncFlushMessage for VmessStream {
             }
         }
 
+        ready!(Pin::new(&mut this.stream).poll_flush(cx))?;
+
         Poll::Ready(Ok(()))
     }
 }
