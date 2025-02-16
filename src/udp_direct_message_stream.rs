@@ -5,6 +5,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use futures::ready;
 use tokio::io::ReadBuf;
 use tokio::net::UdpSocket;
 
@@ -13,26 +14,19 @@ use crate::async_stream::{
     AsyncFlushMessage, AsyncPing, AsyncReadSourcedMessage, AsyncShutdownMessage,
     AsyncSourcedMessageStream, AsyncWriteTargetedMessage,
 };
-use crate::resolver::Resolver;
-
-type ResolveFuture = Pin<Box<dyn Future<Output = std::io::Result<Vec<SocketAddr>>> + Send>>;
+use crate::resolver::{Resolver, ResolverCache};
 
 /// A thin wrapper around a directly connecting UdpSocket to support hostname resolution.
 pub struct UdpDirectMessageStream {
     socket: UdpSocket,
-    resolver: Arc<dyn Resolver>,
-    location_cache: HashMap<NetLocation, SocketAddr>,
-    resolving_locations: HashMap<NetLocation, ResolveFuture>,
+    resolver_cache: ResolverCache,
 }
 
 impl UdpDirectMessageStream {
     pub fn new(socket: UdpSocket, resolver: Arc<dyn Resolver>) -> Self {
         Self {
             socket,
-            resolver,
-            // TODO: use a LRU cache
-            location_cache: HashMap::new(),
-            resolving_locations: HashMap::new(),
+            resolver_cache: ResolverCache::new(resolver),
         }
     }
 }
@@ -54,67 +48,10 @@ impl AsyncWriteTargetedMessage for UdpDirectMessageStream {
         buf: &[u8],
         target: &NetLocation,
     ) -> Poll<std::io::Result<()>> {
-        // TODO: check if NetLocation is already an IP first?
         let this = self.get_mut();
-        let socket_addr = match target.to_socket_addr_nonblocking() {
-            Some(s) => s,
-            None => {
-                match this.location_cache.get(target) {
-                    Some(s) => *s,
-                    None => {
-                        let resolve_results = match this.resolving_locations.get_mut(target) {
-                            None => {
-                                let mut resolve_future: Pin<
-                                    Box<
-                                        dyn Future<Output = std::io::Result<Vec<SocketAddr>>>
-                                            + Send,
-                                    >,
-                                > = this.resolver.resolve_location(target);
-                                match resolve_future.as_mut().poll(cx) {
-                                    Poll::Pending => {
-                                        this.resolving_locations
-                                            .insert(target.clone(), resolve_future);
-                                        return Poll::Pending;
-                                    }
-                                    Poll::Ready(result) => result,
-                                }
-                            }
-                            Some(resolve_future) => match resolve_future.as_mut().poll(cx) {
-                                Poll::Pending => {
-                                    return Poll::Pending;
-                                }
-                                Poll::Ready(result) => {
-                                    let _val = this
-                                        .resolving_locations
-                                        .remove(target)
-                                        .unwrap_or_else(|| {
-                                            panic!("{} not exist in resolving_locations", target)
-                                        });
-                                    result
-                                }
-                            },
-                        };
-                        match resolve_results {
-                            Err(e) => {
-                                return Poll::Ready(Err(e));
-                            }
-                            Ok(socket_addrs) => {
-                                if socket_addrs.is_empty() {
-                                    return Poll::Ready(Err(std::io::Error::new(
-                                        std::io::ErrorKind::Other,
-                                        format!("Failed to resolve {}", target),
-                                    )));
-                                }
-                                let socket_addr = socket_addrs.into_iter().next().unwrap();
-                                // TODO: switch to using entry()
-                                this.location_cache.insert(target.clone(), socket_addr);
-                                socket_addr
-                            }
-                        }
-                    }
-                }
-            }
-        };
+
+        let socket_addr = ready!(this.resolver_cache.poll_resolve_location(cx, target))?;
+
         // TODO: do we need to check usize result here?
         this.socket
             .poll_send_to(cx, buf, socket_addr)
