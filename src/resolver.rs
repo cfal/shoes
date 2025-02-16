@@ -73,6 +73,16 @@ impl ResolverCache {
         }
     }
 
+    pub fn resolve_location<'a, 'b>(
+        &'a mut self,
+        target: &'b NetLocation,
+    ) -> ResolveLocation<'a, 'b> {
+        ResolveLocation {
+            resolver_cache: self,
+            target,
+        }
+    }
+
     pub fn poll_resolve_location(
         &mut self,
         cx: &mut Context<'_>,
@@ -131,5 +141,19 @@ impl ResolverCache {
                 }
             }
         }
+    }
+}
+
+pub struct ResolveLocation<'a, 'b> {
+    resolver_cache: &'a mut ResolverCache,
+    target: &'b NetLocation,
+}
+
+impl<'a, 'b> Future for ResolveLocation<'a, 'b> {
+    type Output = std::io::Result<SocketAddr>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        this.resolver_cache.poll_resolve_location(cx, this.target)
     }
 }
