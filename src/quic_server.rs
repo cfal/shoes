@@ -21,7 +21,7 @@ use crate::tcp_client_connector::TcpClientConnector;
 use crate::tcp_handler::{TcpServerHandler, TcpServerSetupResult};
 use crate::tcp_handler_util::{create_tcp_client_proxy_selector, create_tcp_server_handler};
 use crate::tcp_server::setup_client_stream;
-use crate::udp_direct_message_stream::UdpDirectMessageStream;
+use crate::udp_message_stream::UdpMessageStream;
 
 async fn run_quic_server(
     bind_address: SocketAddr,
@@ -272,7 +272,7 @@ async fn process_streams(
                 } => {
                     let client_socket = client_proxy.configure_udp_socket(true)?;
                     let mut client_stream =
-                        Box::new(UdpDirectMessageStream::new(client_socket, resolver));
+                        Box::new(UdpMessageStream::new(client_socket, resolver));
 
                     let copy_result = copy_multidirectional_message(
                         &mut server_stream,
