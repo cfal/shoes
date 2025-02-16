@@ -32,6 +32,7 @@ pub enum TcpServerSetupResult {
         need_initial_flush: bool,
         stream: Box<dyn AsyncTargetedMessageStream>,
         override_proxy_provider: NoneOrOne<Arc<ClientProxySelector<TcpClientConnector>>>,
+        num_sockets: usize,
     },
 }
 

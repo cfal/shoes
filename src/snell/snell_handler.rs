@@ -56,19 +56,31 @@ impl ShadowsocksKey for SnellKey {
 }
 
 #[derive(Debug)]
-pub struct SnellTcpHandler {
+pub struct SnellServerHandler {
     cipher: ShadowsocksCipher,
     key: Arc<Box<dyn ShadowsocksKey>>,
+    udp_enabled: bool,
+    udp_num_sockets: usize,
 }
 
-impl SnellTcpHandler {
-    pub fn new(cipher_name: &str, password: &str) -> Self {
+impl SnellServerHandler {
+    pub fn new(
+        cipher_name: &str,
+        password: &str,
+        udp_enabled: bool,
+        udp_num_sockets: usize,
+    ) -> Self {
         let cipher: ShadowsocksCipher = cipher_name.into();
         let key: Arc<Box<dyn ShadowsocksKey>> = Arc::new(Box::new(SnellKey::new(
             password,
             cipher.algorithm().key_len(),
         )));
-        Self { cipher, key }
+        Self {
+            cipher,
+            key,
+            udp_enabled,
+            udp_num_sockets,
+        }
     }
 }
 
@@ -76,7 +88,7 @@ const TCP_TUNNEL_RESPONSE: &[u8] = &[0x0];
 const UDP_READY_RESPONSE: &[u8] = TCP_TUNNEL_RESPONSE;
 
 #[async_trait]
-impl TcpServerHandler for SnellTcpHandler {
+impl TcpServerHandler for SnellServerHandler {
     async fn setup_server_stream(
         &self,
         server_stream: Box<dyn AsyncStream>,
@@ -115,6 +127,12 @@ impl TcpServerHandler for SnellTcpHandler {
             }
             6 => {
                 // UDP command
+                if !self.udp_enabled {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "snell UDP requested but not enabled",
+                    ));
+                }
                 true
             }
             unknown_command => {
@@ -176,13 +194,31 @@ impl TcpServerHandler for SnellTcpHandler {
                 stream: Box::new(udp_stream),
                 need_initial_flush: true,
                 override_proxy_provider: NoneOrOne::Unspecified,
+                num_sockets: self.udp_num_sockets,
             })
         }
     }
 }
 
+#[derive(Debug)]
+pub struct SnellClientHandler {
+    cipher: ShadowsocksCipher,
+    key: Arc<Box<dyn ShadowsocksKey>>,
+}
+
+impl SnellClientHandler {
+    pub fn new(cipher_name: &str, password: &str) -> Self {
+        let cipher: ShadowsocksCipher = cipher_name.into();
+        let key: Arc<Box<dyn ShadowsocksKey>> = Arc::new(Box::new(SnellKey::new(
+            password,
+            cipher.algorithm().key_len(),
+        )));
+        Self { cipher, key }
+    }
+}
+
 #[async_trait]
-impl TcpClientHandler for SnellTcpHandler {
+impl TcpClientHandler for SnellClientHandler {
     async fn setup_client_stream(
         &self,
         _server_stream: &mut Box<dyn AsyncStream>,

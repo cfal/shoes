@@ -259,6 +259,7 @@ async fn process_streams(
             stream: mut server_stream,
             need_initial_flush: server_need_initial_flush,
             override_proxy_provider,
+            num_sockets,
         } => {
             let selected_proxy_provider = if override_proxy_provider.is_one() {
                 override_proxy_provider.unwrap()
@@ -271,19 +272,16 @@ async fn process_streams(
                     client_proxy,
                     remote_location: _,
                 } => {
-                    // TODO: make socket count configurable
-                    const NUM_UDP_SOCKETS: usize = 2;
-
-                    let mut client_stream: Box<dyn AsyncSourcedMessageStream> =
-                        if NUM_UDP_SOCKETS == 1 {
-                            // support ipv6 since we don't know what the remote locations will be.
-                            let udp_socket = client_proxy.configure_udp_socket(true)?;
-                            Box::new(UdpMessageStream::new(udp_socket, resolver))
-                        } else {
-                            let client_sockets =
-                                client_proxy.configure_reuse_udp_sockets(true, NUM_UDP_SOCKETS)?;
-                            Box::new(UdpMultiMessageStream::new(client_sockets, resolver))
-                        };
+                    let mut client_stream: Box<dyn AsyncSourcedMessageStream> = if num_sockets <= 1
+                    {
+                        // support ipv6 since we don't know what the remote locations will be.
+                        let udp_socket = client_proxy.configure_udp_socket(true)?;
+                        Box::new(UdpMessageStream::new(udp_socket, resolver))
+                    } else {
+                        let client_sockets =
+                            client_proxy.configure_reuse_udp_sockets(true, num_sockets)?;
+                        Box::new(UdpMultiMessageStream::new(client_sockets, resolver))
+                    };
 
                     let copy_result = copy_multidirectional_message(
                         &mut server_stream,
