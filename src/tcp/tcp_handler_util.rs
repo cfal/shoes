@@ -16,7 +16,7 @@ use crate::option_util::NoneOrOne;
 use crate::port_forward_handler::PortForwardServerHandler;
 use crate::rustls_util::{create_client_config, create_server_config};
 use crate::shadowsocks::ShadowsocksTcpHandler;
-use crate::snell::snell_handler::SnellTcpHandler;
+use crate::snell::snell_handler::{SnellClientHandler, SnellServerHandler};
 use crate::socks_handler::{SocksTcpClientHandler, SocksTcpServerHandler};
 use crate::tcp_client_connector::TcpClientConnector;
 use crate::tcp_handler::{TcpClientHandler, TcpServerHandler};
@@ -59,9 +59,17 @@ pub fn create_tcp_server_handler(
                 Box::new(ShadowsocksTcpHandler::new(&cipher, &password))
             }
         }
-        ServerProxyConfig::Snell(ShadowsocksConfig { cipher, password }) => {
-            Box::new(SnellTcpHandler::new(&cipher, &password))
-        }
+        ServerProxyConfig::Snell {
+            cipher,
+            password,
+            udp_enabled,
+            udp_num_sockets,
+        } => Box::new(SnellServerHandler::new(
+            &cipher,
+            &password,
+            udp_enabled,
+            udp_num_sockets,
+        )),
         ServerProxyConfig::Vless { user_id } => Box::new(VlessTcpHandler::new(&user_id)),
         ServerProxyConfig::Trojan {
             password,
@@ -242,7 +250,7 @@ pub fn create_tcp_client_handler(
             }
         }
         ClientProxyConfig::Snell(ShadowsocksConfig { cipher, password }) => {
-            Box::new(SnellTcpHandler::new(&cipher, &password))
+            Box::new(SnellClientHandler::new(&cipher, &password))
         }
         ClientProxyConfig::Vless { user_id } => Box::new(VlessTcpHandler::new(&user_id)),
         ClientProxyConfig::Trojan {

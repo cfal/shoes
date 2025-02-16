@@ -10,6 +10,10 @@ fn default_true() -> bool {
     true
 }
 
+fn default_snell_udp_num_sockets() -> usize {
+    2
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum BindLocation {
@@ -177,7 +181,15 @@ pub enum ServerProxyConfig {
     },
     #[serde(alias = "ss")]
     Shadowsocks(ShadowsocksConfig),
-    Snell(ShadowsocksConfig),
+    Snell {
+        cipher: String,
+        password: String,
+        #[serde(default = "default_true")]
+        udp_enabled: bool,
+        // number of socket for each UDP session
+        #[serde(default = "default_snell_udp_num_sockets")]
+        udp_num_sockets: usize,
+    },
     Vless {
         user_id: String,
     },
