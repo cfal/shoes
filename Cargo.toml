@@ -31,9 +31,10 @@ percent-encoding = "*"
 quinn = { version = "*", default-features = false, features = ["log", "platform-verifier", "runtime-tokio", "rustls-aws-lc-rs"] }
 rand = "*"
 rustls = "*"
-sha3 = "*"
 serde = { version = "*", features = ["derive", "std"] }
 serde_yaml = "*"
+sha3 = "*"
+socket2 = "*"
 tokio = { version = "*", features = [
     "fs",
     "io-util",
