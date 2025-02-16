@@ -30,6 +30,7 @@ shoes is a multi-protocol proxy server written in Rust.
     - aes-128-gcm
     - aes-256-gcm
     - chacha20-ietf-poly1305
+- **Hysteria2** (QUIC)
 
 ## Features
 
