@@ -24,6 +24,7 @@ mod timed_salt_checker;
 mod tls_handler;
 mod trojan_handler;
 mod udp_message_stream;
+mod udp_multi_message_stream;
 mod util;
 mod vless_handler;
 mod vmess;
