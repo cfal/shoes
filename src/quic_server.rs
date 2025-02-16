@@ -8,7 +8,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
-use crate::async_stream::AsyncStream;
+use crate::async_stream::{AsyncSourcedMessageStream, AsyncStream};
 use crate::client_proxy_selector::{ClientProxySelector, ConnectDecision};
 use crate::config::{BindLocation, ConfigSelection, ServerConfig, ServerQuicConfig};
 use crate::copy_bidirectional::copy_bidirectional;
@@ -22,6 +22,7 @@ use crate::tcp_handler::{TcpServerHandler, TcpServerSetupResult};
 use crate::tcp_handler_util::{create_tcp_client_proxy_selector, create_tcp_server_handler};
 use crate::tcp_server::setup_client_stream;
 use crate::udp_message_stream::UdpMessageStream;
+use crate::udp_multi_message_stream::UdpMultiMessageStream;
 
 async fn run_quic_server(
     bind_address: SocketAddr,
@@ -270,9 +271,19 @@ async fn process_streams(
                     client_proxy,
                     remote_location: _,
                 } => {
-                    let client_socket = client_proxy.configure_udp_socket(true)?;
-                    let mut client_stream =
-                        Box::new(UdpMessageStream::new(client_socket, resolver));
+                    // TODO: make socket count configurable
+                    const NUM_UDP_SOCKETS: usize = 2;
+
+                    let mut client_stream: Box<dyn AsyncSourcedMessageStream> =
+                        if NUM_UDP_SOCKETS == 1 {
+                            // support ipv6 since we don't know what the remote locations will be.
+                            let udp_socket = client_proxy.configure_udp_socket(true)?;
+                            Box::new(UdpMessageStream::new(udp_socket, resolver))
+                        } else {
+                            let client_sockets =
+                                client_proxy.configure_reuse_udp_sockets(true, NUM_UDP_SOCKETS)?;
+                            Box::new(UdpMultiMessageStream::new(client_sockets, resolver))
+                        };
 
                     let copy_result = copy_multidirectional_message(
                         &mut server_stream,
