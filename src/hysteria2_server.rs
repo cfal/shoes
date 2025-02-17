@@ -14,7 +14,7 @@ use tokio::time::timeout;
 use crate::address::NetLocation;
 use crate::async_stream::AsyncStream;
 use crate::client_proxy_selector::{ClientProxySelector, ConnectDecision};
-use crate::copy_bidirectional::copy_bidirectional;
+use crate::copy_bidirectional::copy_bidirectional_with_sizes;
 use crate::quic_stream::QuicStream;
 use crate::resolver::{NativeResolver, Resolver, ResolverCache};
 use crate::socket_util::new_socket2_udp_socket;
@@ -639,13 +639,18 @@ async fn process_hysteria2_tcp_stream(
         }
     };
 
-    let server_need_initial_flush = false;
-    let client_need_initial_flush = false;
-    let copy_result = copy_bidirectional(
+    // unlike tokio's implementation, we read as much as possible to fill up the
+    // buffer size before sending. reduce the buffer sizes compared to tcp -> tcp.
+    // also see https://www.privateoctopus.com/2023/12/12/quic-performance.html
+    let copy_result = copy_bidirectional_with_sizes(
         &mut server_stream,
         &mut client_stream,
-        server_need_initial_flush,
-        client_need_initial_flush,
+        false,
+        false,
+        // quic -> tcp
+        8192,
+        // tcp -> quic
+        16384,
     )
     .await;
 
