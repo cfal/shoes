@@ -2,7 +2,6 @@ use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::str;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -43,18 +42,14 @@ async fn process_hysteria2_connection(
             .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
     auth_hysteria2_connection(&mut h3_conn, password).await?;
 
-    let cancel_notify = Arc::new(AtomicBool::new(false));
-
     {
         let connection = connection.clone();
         let client_proxy_selector = client_proxy_selector.clone();
         let resolver = resolver.clone();
-        let cancel_notify = cancel_notify.clone();
         tokio::spawn(run_hysteria2_udp_read_loop(
             connection,
             client_proxy_selector,
             resolver,
-            cancel_notify,
         ));
     }
 
@@ -63,7 +58,6 @@ async fn process_hysteria2_connection(
         connection,
         client_proxy_selector,
         resolver,
-        cancel_notify,
     ));
 
     Ok(())
@@ -192,7 +186,6 @@ impl UdpSession {
         connection: quinn::Connection,
         client_sockets: Vec<Arc<UdpSocket>>,
         resolver: Arc<dyn Resolver>,
-        cancel_notify: Arc<AtomicBool>,
     ) -> Self {
         let (tx, rx) = tokio::sync::mpsc::channel(40);
 
@@ -202,25 +195,24 @@ impl UdpSession {
         };
 
         let send_socket = client_sockets.first().unwrap().clone();
-        //let client_stream = UdpMultiMessageStream::new(client_sockets, resolver.clone());
 
         // Spawn a dedicated worker task to drain the outgoing UDP message queue.
         let resolver_cache = ResolverCache::new(resolver.clone());
-        tokio::spawn(udp_sender_worker(
-            session_id,
-            send_socket,
-            rx,
-            resolver_cache,
-            cancel_notify.clone(),
-        ));
+        tokio::spawn(async move {
+            if let Err(e) =
+                run_hysteria2_udp_remote_write_loop(session_id, send_socket, rx, resolver_cache)
+                    .await
+            {
+                error!("UDP remote write loop ended with error: {}", e);
+            }
+        });
 
         let client_stream = UdpMultiMessageStream::new(client_sockets, resolver);
         tokio::spawn(async move {
             if let Err(e) =
-                run_hysteria2_udp_write_loop(session_id, connection, client_stream, cancel_notify)
-                    .await
+                run_hysteria2_udp_local_write_loop(session_id, connection, client_stream).await
             {
-                error!("Failed to write UDP loop: {}", e);
+                error!("UDP local write loop ended with error: {}", e);
             }
         });
 
@@ -228,13 +220,12 @@ impl UdpSession {
     }
 }
 
-async fn udp_sender_worker(
+async fn run_hysteria2_udp_remote_write_loop(
     session_id: u32,
     socket: Arc<UdpSocket>,
     mut rx: tokio::sync::mpsc::Receiver<UdpMessage>,
     mut resolver_cache: ResolverCache,
-    cancel_notify: Arc<AtomicBool>,
-) {
+) -> std::io::Result<()> {
     let mut last_location = NetLocation::UNSPECIFIED;
     let mut last_socket_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
 
@@ -257,97 +248,92 @@ async fn udp_sender_worker(
             last_location = remote_location;
             last_socket_addr = socket_addr;
         };
-        if let Err(e) = socket.send_to(&payload, &last_socket_addr).await {
-            error!(
-                "Failed to forward UDP payload for session {}: {}",
-                session_id, e
-            );
-        }
-        if cancel_notify.load(Ordering::Relaxed) {
-            break;
-        }
+
+        socket
+            .send_to(&payload, &last_socket_addr)
+            .await
+            .map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!(
+                        "Failed to forward UDP payload for session {}: {}",
+                        session_id, e
+                    ),
+                )
+            })?;
     }
+
+    Ok(())
 }
 
-async fn run_hysteria2_udp_write_loop(
+async fn run_hysteria2_udp_local_write_loop(
     session_id: u32,
     connection: quinn::Connection,
     mut socket: UdpMultiMessageStream,
-    cancel_notify: Arc<AtomicBool>,
 ) -> std::io::Result<()> {
-    let max_datagram_size = connection.max_datagram_size().unwrap();
+    let max_datagram_size = connection.max_datagram_size().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "datagram not supported by remote endpoint",
+        )
+    })?;
+
     let mut next_packet_id: u16 = 0;
     let mut buf = [0u8; 65535];
 
     loop {
-        match socket.read_sourced_message(&mut buf).await {
-            Ok((len, src_addr)) => {
-                let packet_id = next_packet_id;
-                next_packet_id = next_packet_id.wrapping_add(1);
-                let addr_str = src_addr.to_string();
-                let header_overhead = 4 + 2 + 1 + 1 + 1 + addr_str.len(); // session_id(4) + packet_id(2) + fragment id(1) + fragment count(1) + address length(1) + address bytes
-                if header_overhead + len <= max_datagram_size {
-                    let mut datagram = BytesMut::with_capacity(header_overhead + len);
-                    datagram.extend_from_slice(&session_id.to_be_bytes());
-                    datagram.extend_from_slice(&packet_id.to_be_bytes());
-                    // fragment id = 0, fragment count = 0, address length
-                    datagram.extend_from_slice(&[0, 1, addr_str.len() as u8]);
-                    datagram.extend_from_slice(addr_str.as_bytes());
-                    datagram.extend_from_slice(&buf[..len]);
-                    if let Err(e) = connection.send_datagram(datagram.freeze()) {
-                        error!("Failed to send UDP response datagram: {}", e);
-                    }
-                } else {
-                    // Fragment the UDP packet since it exceeds max datagram size.
-                    let available_payload = max_datagram_size - header_overhead;
-                    if available_payload == 0 {
-                        error!(
-                            "Max datagram size {} is too small for header overhead: {}",
-                            max_datagram_size, header_overhead
-                        );
-                        continue;
-                    }
-                    let fragment_count = len.div_ceil(available_payload) as u8;
-                    for fragment_id in 0..fragment_count {
-                        let start = (fragment_id as usize) * available_payload;
-                        let end = std::cmp::min(start + available_payload, len);
-                        let mut datagram = BytesMut::with_capacity(header_overhead + (end - start));
-                        datagram.extend_from_slice(&session_id.to_be_bytes());
-                        datagram.extend_from_slice(&packet_id.to_be_bytes());
-                        datagram.extend_from_slice(&[
-                            fragment_id,
-                            fragment_count,
-                            addr_str.len() as u8,
-                        ]);
-                        datagram.extend_from_slice(addr_str.as_bytes());
-                        datagram.extend_from_slice(&buf[start..end]);
-                        if let Err(e) = connection.send_datagram(datagram.freeze()) {
-                            error!(
-                                "Failed to send UDP fragment {} for packet {}: {}",
-                                fragment_id, packet_id, e
-                            );
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                error!("Failed to read UDP message from socket: {}", e);
-            }
-        }
+        let (len, src_addr) = socket.read_sourced_message(&mut buf).await?;
 
-        if cancel_notify.load(Ordering::Relaxed) {
-            break;
+        let packet_id = next_packet_id;
+        next_packet_id = next_packet_id.wrapping_add(1);
+        let addr_str = src_addr.to_string();
+        let header_overhead = 4 + 2 + 1 + 1 + 1 + addr_str.len(); // session_id(4) + packet_id(2) + fragment id(1) + fragment count(1) + address length(1) + address bytes
+        if header_overhead + len <= max_datagram_size {
+            let mut datagram = BytesMut::with_capacity(header_overhead + len);
+            datagram.extend_from_slice(&session_id.to_be_bytes());
+            datagram.extend_from_slice(&packet_id.to_be_bytes());
+            // fragment id = 0, fragment count = 0, address length
+            datagram.extend_from_slice(&[0, 1, addr_str.len() as u8]);
+            datagram.extend_from_slice(addr_str.as_bytes());
+            datagram.extend_from_slice(&buf[..len]);
+
+            connection.send_datagram(datagram.freeze()).map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Failed to send datagram: {}", e),
+                )
+            })?;
+        } else {
+            // Fragment the UDP packet since it exceeds max datagram size.
+            assert!(max_datagram_size > header_overhead);
+
+            let available_payload = max_datagram_size - header_overhead;
+            let fragment_count = len.div_ceil(available_payload) as u8;
+            for fragment_id in 0..fragment_count {
+                let start = (fragment_id as usize) * available_payload;
+                let end = std::cmp::min(start + available_payload, len);
+                let mut datagram = BytesMut::with_capacity(header_overhead + (end - start));
+                datagram.extend_from_slice(&session_id.to_be_bytes());
+                datagram.extend_from_slice(&packet_id.to_be_bytes());
+                datagram.extend_from_slice(&[fragment_id, fragment_count, addr_str.len() as u8]);
+                datagram.extend_from_slice(addr_str.as_bytes());
+                datagram.extend_from_slice(&buf[start..end]);
+
+                connection.send_datagram(datagram.freeze()).map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("Failed to send datagram fragment {}: {}", fragment_id, e),
+                    )
+                })?;
+            }
         }
     }
-
-    Ok(())
 }
 
 async fn run_hysteria2_udp_read_loop(
     connection: quinn::Connection,
     client_proxy_selector: Arc<ClientProxySelector<TcpClientConnector>>,
     resolver: Arc<dyn Resolver>,
-    cancel_notify: Arc<AtomicBool>,
 ) -> std::io::Result<()> {
     let action = client_proxy_selector.default_decision();
     let client_proxy = match action {
@@ -355,8 +341,9 @@ async fn run_hysteria2_udp_read_loop(
             client_proxy,
             remote_location: _,
         } => client_proxy,
-        // TODO: stop initializing the read loop if it's blocked
-        ConnectDecision::Block => futures::future::pending().await,
+        ConnectDecision::Block => {
+            return Ok(());
+        }
     };
 
     let mut sessions: HashMap<u32, UdpSession> = HashMap::new();
@@ -370,8 +357,8 @@ async fn run_hysteria2_udp_read_loop(
         })?;
         if data.len() < 9 {
             return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "udp data length too short",
+                std::io::ErrorKind::InvalidData,
+                "datagram length too short",
             ));
         }
         let session_id = u32::from_be_bytes(data[0..4].try_into().unwrap());
@@ -442,28 +429,32 @@ async fn run_hysteria2_udp_read_loop(
                     connection.clone(),
                     client_sockets,
                     resolver.clone(),
-                    cancel_notify.clone(),
                 );
                 entry.insert(session)
             }
             Entry::Occupied(ref mut entry) => entry.get_mut(),
         };
 
-        if fragment_count == 1 {
-            // Queue UDP payload for processing.
-            if let Err(e) = session
+        if fragment_count == 0 {
+            error!("Ignoring empty UDP fragment for session {}", session_id);
+            continue;
+        } else if fragment_count == 1 {
+            session
                 .tx
                 .send(UdpMessage {
                     payload: payload_fragment,
                     remote_location,
                 })
                 .await
-            {
-                error!(
-                    "Failed to queue UDP payload for session {}: {}",
-                    session_id, e
-                );
-            }
+                .map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!(
+                            "Failed to queue UDP payload for session {}: {}",
+                            session_id, e
+                        ),
+                    )
+                })?;
         } else {
             let entry =
                 session
@@ -507,19 +498,22 @@ async fn run_hysteria2_udp_read_loop(
                 for frag in received.into_iter() {
                     complete_payload.extend(frag.unwrap());
                 }
-                if let Err(e) = session
+                session
                     .tx
                     .send(UdpMessage {
                         payload: complete_payload.freeze(),
                         remote_location,
                     })
                     .await
-                {
-                    error!(
-                        "Failed to queue reassembled UDP payload for session {}: {}",
-                        session_id, e
-                    );
-                }
+                    .map_err(|e| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!(
+                                "Failed to queue reassembled UDP payload for session {}: {}",
+                                session_id, e
+                            ),
+                        )
+                    })?;
             }
         }
     }
@@ -530,47 +524,40 @@ async fn run_hysteria2_tcp_loop(
     connection: quinn::Connection,
     client_proxy_selector: Arc<ClientProxySelector<TcpClientConnector>>,
     resolver: Arc<dyn Resolver>,
-    cancel_notify: Arc<AtomicBool>,
 ) -> std::io::Result<()> {
     loop {
         let (send_stream, recv_stream) = match connection.accept_bi().await {
-            Err(quinn::ConnectionError::ApplicationClosed { .. }) => {
-                cancel_notify.store(true, Ordering::Relaxed);
-
-                // TODO: should this be an error?
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "Connection closed",
-                ));
+            Ok(s) => s,
+            Err(quinn::ConnectionError::ApplicationClosed(_)) => {
+                break;
+            }
+            Err(quinn::ConnectionError::ConnectionClosed(_)) => {
+                break;
             }
             Err(e) => {
-                cancel_notify.store(true, Ordering::Relaxed);
-
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::Other,
                     format!("failed to accept bidirectional stream: {}", e),
                 ));
             }
-            Ok(s) => s,
         };
 
-        {
-            let client_proxy_selector = client_proxy_selector.clone();
-            let resolver = resolver.clone();
-            tokio::spawn(async move {
-                if let Err(e) = process_hysteria2_tcp_stream(
-                    client_proxy_selector,
-                    resolver,
-                    send_stream,
-                    recv_stream,
-                )
-                .await
-                {
-                    error!("Failed to process streams: {}", e);
-                }
-            });
-        }
+        let client_proxy_selector = client_proxy_selector.clone();
+        let resolver = resolver.clone();
+        tokio::spawn(async move {
+            if let Err(e) = process_hysteria2_tcp_stream(
+                client_proxy_selector,
+                resolver,
+                send_stream,
+                recv_stream,
+            )
+            .await
+            {
+                error!("Failed to process streams: {}", e);
+            }
+        });
     }
+    Ok(())
 }
 
 async fn process_hysteria2_tcp_stream(
@@ -734,6 +721,7 @@ pub async fn run_hysteria2_server(
         let join_handle = tokio::spawn(async move {
             let server_config = quinn::ServerConfig::with_crypto(quic_server_config);
 
+            // TODO: consider setting transport config
             // Previously we set server_config.transport, but that seems to break when testing
             // against the hysteria2 client:
             //   Arc::get_mut(&mut server_config.transport)
@@ -791,7 +779,7 @@ pub async fn run_hysteria2_server(
     }
 
     for join_handle in join_handles {
-        join_handle.await.unwrap();
+        join_handle.await?;
     }
     Ok(())
 }
