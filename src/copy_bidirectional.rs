@@ -17,6 +17,8 @@ use std::task::{Context, Poll};
 use crate::async_stream::AsyncStream;
 use crate::util::allocate_vec;
 
+const DEFAULT_BUF_SIZE: usize = 16384;
+
 #[derive(Debug)]
 struct CopyBuffer {
     read_done: bool,
@@ -292,7 +294,34 @@ pub async fn copy_bidirectional<A, B>(
     b: &mut B,
     a_need_initial_flush: bool,
     b_need_initial_flush: bool,
-) -> Result<(), std::io::Error>
+) -> io::Result<()>
+where
+    A: AsyncStream + ?Sized,
+    B: AsyncStream + ?Sized,
+{
+    copy_bidirectional_with_sizes(
+        a,
+        b,
+        a_need_initial_flush,
+        b_need_initial_flush,
+        DEFAULT_BUF_SIZE,
+        DEFAULT_BUF_SIZE,
+    )
+    .await
+}
+
+/// Copies data in both directions between `a` and `b` using buffers of the specified size.
+///
+/// This method is the same as the [`copy_bidirectional()`], except that it allows you to set the
+/// size of the internal buffers used when copying data.
+pub async fn copy_bidirectional_with_sizes<A, B>(
+    a: &mut A,
+    b: &mut B,
+    a_need_initial_flush: bool,
+    b_need_initial_flush: bool,
+    a_to_b_buf_size: usize,
+    b_to_a_buf_size: usize,
+) -> io::Result<()>
 where
     A: AsyncStream + ?Sized,
     B: AsyncStream + ?Sized,
@@ -311,8 +340,8 @@ where
         // this is correctly reversed - CopyBuffer will copy from a (reader) to b (writer) using
         // a_buf, which means that the need_flush signal is for the writer (b), and vice versa for
         // b_buf.
-        a_buf: CopyBuffer::new(16384, b_need_initial_flush),
-        b_buf: CopyBuffer::new(16384, a_need_initial_flush),
+        a_buf: CopyBuffer::new(a_to_b_buf_size, b_need_initial_flush),
+        b_buf: CopyBuffer::new(b_to_a_buf_size, a_need_initial_flush),
         a_to_b: TransferState::Running,
         b_to_a: TransferState::Running,
         sleep_future,
