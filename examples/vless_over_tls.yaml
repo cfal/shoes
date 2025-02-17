@@ -1,0 +1,12 @@
+- address: 0.0.0.0:443
+  transport: tcp
+  protocol:
+    type: tls
+    sni_targets:
+      my.domain.com:
+        cert: cert.cer
+        key: key.key
+        protocol:
+          type: vless
+          user_id: 88dd7a01-4325-4575-835c-57dda13fbd58
+
