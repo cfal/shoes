@@ -17,6 +17,7 @@ use crate::client_proxy_selector::{ClientProxySelector, ConnectDecision};
 use crate::copy_bidirectional::copy_bidirectional;
 use crate::quic_stream::QuicStream;
 use crate::resolver::{NativeResolver, Resolver, ResolverCache};
+use crate::socket_util::new_socket2_udp_socket;
 use crate::tcp_client_connector::TcpClientConnector;
 use crate::tcp_server::setup_client_stream;
 use crate::thread_util::get_num_threads;
@@ -732,28 +733,14 @@ pub async fn run_hysteria2_server(
             //     .max_idle_timeout(Some(Duration::from_secs(30).try_into().unwrap()));
             //
 
-            let socket = {
-                let socket2_socket = socket2::Socket::new(
-                    socket2::Domain::for_address(bind_address),
-                    socket2::Type::DGRAM,
-                    Some(socket2::Protocol::UDP),
-                )
-                .unwrap();
-
-                socket2_socket.set_nonblocking(true).unwrap();
-                // We need to set SO_REUSEPORT firt before binding, else we will get "Address
-                // already in use" errors.
-                socket2_socket.set_reuse_port(true).unwrap();
-
-                socket2_socket.bind(&bind_address.into()).unwrap();
-
-                socket2_socket.into()
-            };
+            let socket2_socket =
+                new_socket2_udp_socket(bind_address.is_ipv6(), None, Some(bind_address), true)
+                    .unwrap();
 
             let endpoint = quinn::Endpoint::new(
                 quinn::EndpointConfig::default(),
                 Some(server_config),
-                socket,
+                socket2_socket.into(),
                 Arc::new(quinn::TokioRuntime),
             )
             .unwrap();

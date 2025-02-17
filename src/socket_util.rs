@@ -7,8 +7,12 @@ pub fn new_udp_socket(
     is_ipv6: bool,
     bind_interface: Option<String>,
 ) -> std::io::Result<tokio::net::UdpSocket> {
-    let socket =
-        new_socket2_udp_socket(is_ipv6, bind_interface, Some(get_sock_addr(is_ipv6)), false)?;
+    let socket = new_socket2_udp_socket(
+        is_ipv6,
+        bind_interface,
+        Some(get_unspecified_socket_addr(is_ipv6)),
+        false,
+    )?;
 
     into_tokio_udp_socket(socket)
 }
@@ -26,11 +30,11 @@ pub fn new_reuse_udp_sockets(
     let socket = new_socket2_udp_socket(
         is_ipv6,
         bind_interface.clone(),
-        Some(get_sock_addr(is_ipv6)),
+        Some(get_unspecified_socket_addr(is_ipv6)),
         true,
     )?;
 
-    let local_addr = socket.local_addr()?;
+    let local_addr = socket.local_addr()?.as_socket().unwrap();
 
     sockets.push(into_tokio_udp_socket(socket)?);
 
@@ -47,19 +51,18 @@ pub fn new_reuse_udp_sockets(
     Ok(sockets)
 }
 
-fn get_sock_addr(is_ipv6: bool) -> SockAddr {
-    let addr: std::net::SocketAddr = if !is_ipv6 {
+fn get_unspecified_socket_addr(is_ipv6: bool) -> SocketAddr {
+    if !is_ipv6 {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0)
     } else {
         "[::]:0".parse().unwrap()
-    };
-    SockAddr::from(addr)
+    }
 }
 
-fn new_socket2_udp_socket(
+pub fn new_socket2_udp_socket(
     is_ipv6: bool,
     bind_interface: Option<String>,
-    bind_address: Option<SockAddr>,
+    bind_address: Option<SocketAddr>,
     reuse_port: bool,
 ) -> std::io::Result<socket2::Socket> {
     let domain = if is_ipv6 { Domain::IPV6 } else { Domain::IPV4 };
@@ -84,8 +87,8 @@ fn new_socket2_udp_socket(
         panic!("Could not bind to device, unsupported platform.")
     }
 
-    if let Some(ref bind_address) = bind_address {
-        socket.bind(bind_address)?;
+    if let Some(bind_address) = bind_address {
+        socket.bind(&SockAddr::from(bind_address))?;
     }
 
     Ok(socket)
