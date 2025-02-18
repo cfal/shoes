@@ -27,7 +27,7 @@ use crate::util::allocate_vec;
 
 const MAX_QUIC_ENDPOINTS: usize = 4;
 
-async fn process_hysteria2_connection(
+async fn process_connection(
     client_proxy_selector: Arc<ClientProxySelector<TcpClientConnector>>,
     resolver: Arc<dyn Resolver>,
     password: &'static str,
@@ -43,20 +43,20 @@ async fn process_hysteria2_connection(
         h3::server::Connection::new(h3_quinn_connection)
             .await
             .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
-    auth_hysteria2_connection(&mut h3_conn, password).await?;
+    auth_connection(&mut h3_conn, password).await?;
 
     {
         let connection = connection.clone();
         let client_proxy_selector = client_proxy_selector.clone();
         let resolver = resolver.clone();
-        tokio::spawn(run_hysteria2_udp_read_loop(
+        tokio::spawn(run_udp_local_to_remote_loop(
             connection,
             client_proxy_selector,
             resolver,
         ));
     }
 
-    tokio::spawn(run_hysteria2_tcp_loop(
+    tokio::spawn(run_tcp_loop(
         h3_conn,
         connection,
         client_proxy_selector,
@@ -112,7 +112,7 @@ fn generate_ascii_string() -> String {
         .collect()
 }
 
-async fn auth_hysteria2_connection(
+async fn auth_connection(
     h3_conn: &mut h3::server::Connection<h3_quinn::Connection, bytes::Bytes>,
     password: &str,
 ) -> std::io::Result<()> {
@@ -199,7 +199,7 @@ impl UdpSession {
 
         tokio::spawn(async move {
             if let Err(e) =
-                run_hysteria2_udp_local_write_loop(session_id, connection, client_socket).await
+                run_udp_remote_to_local_loop(session_id, connection, client_socket).await
             {
                 error!("UDP local write loop ended with error: {}", e);
             }
@@ -209,7 +209,7 @@ impl UdpSession {
     }
 }
 
-async fn run_hysteria2_udp_local_write_loop(
+async fn run_udp_remote_to_local_loop(
     session_id: u32,
     connection: quinn::Connection,
     socket: Arc<UdpSocket>,
@@ -287,7 +287,7 @@ async fn run_hysteria2_udp_local_write_loop(
     }
 }
 
-async fn run_hysteria2_udp_read_loop(
+async fn run_udp_local_to_remote_loop(
     connection: quinn::Connection,
     client_proxy_selector: Arc<ClientProxySelector<TcpClientConnector>>,
     resolver: Arc<dyn Resolver>,
@@ -478,7 +478,7 @@ async fn run_hysteria2_udp_read_loop(
         }
     }
 }
-async fn run_hysteria2_tcp_loop(
+async fn run_tcp_loop(
     // unused, but needs to be kept in scope, see above.
     _h3_conn: h3::server::Connection<h3_quinn::Connection, bytes::Bytes>,
     connection: quinn::Connection,
@@ -505,13 +505,8 @@ async fn run_hysteria2_tcp_loop(
         let client_proxy_selector = client_proxy_selector.clone();
         let resolver = resolver.clone();
         tokio::spawn(async move {
-            if let Err(e) = process_hysteria2_tcp_stream(
-                client_proxy_selector,
-                resolver,
-                send_stream,
-                recv_stream,
-            )
-            .await
+            if let Err(e) =
+                process_tcp_stream(client_proxy_selector, resolver, send_stream, recv_stream).await
             {
                 error!("Failed to process streams: {}", e);
             }
@@ -520,7 +515,7 @@ async fn run_hysteria2_tcp_loop(
     Ok(())
 }
 
-async fn process_hysteria2_tcp_stream(
+async fn process_tcp_stream(
     client_proxy_selector: Arc<ClientProxySelector<TcpClientConnector>>,
     resolver: Arc<dyn Resolver>,
     mut send: quinn::SendStream,
@@ -759,7 +754,7 @@ pub async fn run_hysteria2_server(
                 let cloned_selector = client_proxy_selector.clone();
                 let cloned_resolver = resolver.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = process_hysteria2_connection(
+                    if let Err(e) = process_connection(
                         cloned_selector,
                         cloned_resolver,
                         hysteria2_password,
