@@ -49,19 +49,20 @@ async fn process_connection(
         let connection = connection.clone();
         let client_proxy_selector = client_proxy_selector.clone();
         let resolver = resolver.clone();
-        tokio::spawn(run_udp_local_to_remote_loop(
-            connection,
-            client_proxy_selector,
-            resolver,
-        ));
+        tokio::spawn(async move {
+            if let Err(e) =
+                run_udp_local_to_remote_loop(connection, client_proxy_selector, resolver).await
+            {
+                error!("UDP local-to-remote write loop ended with error: {}", e);
+            }
+        });
     }
 
-    tokio::spawn(run_tcp_loop(
-        h3_conn,
-        connection,
-        client_proxy_selector,
-        resolver,
-    ));
+    tokio::spawn(async move {
+        if let Err(e) = run_tcp_loop(h3_conn, connection, client_proxy_selector, resolver).await {
+            error!("TCP loop ended with error: {}", e);
+        }
+    });
 
     Ok(())
 }
@@ -201,7 +202,7 @@ impl UdpSession {
             if let Err(e) =
                 run_udp_remote_to_local_loop(session_id, connection, client_socket).await
             {
-                error!("UDP local write loop ended with error: {}", e);
+                error!("UDP remote-to-local write loop ended with error: {}", e);
             }
         });
 
