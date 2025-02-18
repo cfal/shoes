@@ -234,41 +234,54 @@ async fn run_hysteria2_udp_remote_write_loop(
     mut rx: tokio::sync::mpsc::Receiver<UdpMessage>,
     mut resolver_cache: ResolverCache,
 ) -> std::io::Result<()> {
+    const MAX_READ_MESSAGES: usize = 40;
+
+    let mut messages = Vec::with_capacity(MAX_READ_MESSAGES);
     let mut last_location = NetLocation::UNSPECIFIED;
     let mut last_socket_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
 
-    while let Some(UdpMessage {
-        remote_location,
-        payload,
-    }) = rx.recv().await
-    {
-        if remote_location != last_location {
-            let socket_addr = match resolver_cache.resolve_location(&remote_location).await {
-                Ok(socket_addr) => socket_addr,
-                Err(e) => {
-                    error!(
-                        "Failed to resolve remote location {}: {}",
-                        remote_location, e
-                    );
-                    continue;
-                }
-            };
-            last_location = remote_location;
-            last_socket_addr = socket_addr;
-        };
+    loop {
+        messages.clear();
 
-        socket
-            .send_to(&payload, &last_socket_addr)
-            .await
-            .map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!(
-                        "Failed to forward UDP payload for session {}: {}",
-                        session_id, e
-                    ),
-                )
-            })?;
+        let len = rx.recv_many(&mut messages, MAX_READ_MESSAGES).await;
+        if len == 0 {
+            // channel has been closed
+            break;
+        }
+
+        for UdpMessage {
+            remote_location,
+            payload,
+        } in messages.iter()
+        {
+            if remote_location != &last_location {
+                let socket_addr = match resolver_cache.resolve_location(remote_location).await {
+                    Ok(socket_addr) => socket_addr,
+                    Err(e) => {
+                        error!(
+                            "Failed to resolve remote location {}: {}",
+                            remote_location, e
+                        );
+                        continue;
+                    }
+                };
+                last_location = remote_location.clone();
+                last_socket_addr = socket_addr;
+            };
+
+            socket
+                .send_to(&payload, &last_socket_addr)
+                .await
+                .map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!(
+                            "Failed to forward UDP payload for session {}: {}",
+                            session_id, e
+                        ),
+                    )
+                })?;
+        }
     }
 
     Ok(())
