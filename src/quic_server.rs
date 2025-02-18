@@ -360,12 +360,16 @@ pub async fn start_quic_server(config: ServerConfig) -> std::io::Result<Option<J
     let client_proxy_selector = Arc::new(create_tcp_client_proxy_selector(rules.clone()));
 
     match protocol {
-        ServerProxyConfig::Hysteria2 { password } => Ok(Some(tokio::spawn(async move {
+        ServerProxyConfig::Hysteria2 {
+            password,
+            udp_enabled,
+        } => Ok(Some(tokio::spawn(async move {
             crate::hysteria2_server::run_hysteria2_server(
                 bind_address,
                 server_config,
                 password,
                 client_proxy_selector,
+                udp_enabled,
             )
             .await
             .unwrap();

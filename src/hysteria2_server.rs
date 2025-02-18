@@ -32,6 +32,7 @@ async fn process_connection(
     resolver: Arc<dyn Resolver>,
     password: &'static str,
     conn: quinn::Incoming,
+    udp_enabled: bool,
 ) -> std::io::Result<()> {
     let connection = conn.await?;
 
@@ -43,9 +44,9 @@ async fn process_connection(
         h3::server::Connection::new(h3_quinn_connection)
             .await
             .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
-    auth_connection(&mut h3_conn, password).await?;
+    auth_connection(&mut h3_conn, password, udp_enabled).await?;
 
-    {
+    if udp_enabled {
         let connection = connection.clone();
         let client_proxy_selector = client_proxy_selector.clone();
         let resolver = resolver.clone();
@@ -116,6 +117,7 @@ fn generate_ascii_string() -> String {
 async fn auth_connection(
     h3_conn: &mut h3::server::Connection<h3_quinn::Connection, bytes::Bytes>,
     password: &str,
+    udp_enabled: bool,
 ) -> std::io::Result<()> {
     loop {
         match h3_conn
@@ -127,8 +129,7 @@ async fn auth_connection(
                 Ok(()) => {
                     let resp = http::Response::builder()
                         .status(http::status::StatusCode::from_u16(233).unwrap())
-                        // TODO: allow configuring whether UDP should be enabled
-                        .header("Hysteria-UDP", "true")
+                        .header("Hysteria-UDP", if udp_enabled { "true" } else { "false" })
                         .header("Hysteria-CC-RX", "0")
                         .header("Hysteria-Padding", generate_ascii_string())
                         .body(())
@@ -706,6 +707,7 @@ pub async fn run_hysteria2_server(
     server_config: Arc<rustls::ServerConfig>,
     password: String,
     client_proxy_selector: Arc<ClientProxySelector<TcpClientConnector>>,
+    udp_enabled: bool,
 ) -> std::io::Result<()> {
     // TODO: hash password instead of passing directly
     let hysteria2_password: &'static str = Box::leak(password.into_boxed_str());
@@ -760,6 +762,7 @@ pub async fn run_hysteria2_server(
                         cloned_resolver,
                         hysteria2_password,
                         conn,
+                        udp_enabled,
                     )
                     .await
                     {

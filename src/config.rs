@@ -224,6 +224,8 @@ pub enum ServerProxyConfig {
     },
     Hysteria2 {
         password: String,
+        #[serde(default = "default_true")]
+        udp_enabled: bool,
     },
 }
 
