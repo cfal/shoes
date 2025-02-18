@@ -174,12 +174,7 @@ async fn auth_hysteria2_connection(
 
 struct UdpSession {
     fragments: HashMap<u16, FragmentedPacket>,
-    tx: tokio::sync::mpsc::Sender<UdpMessage>,
-}
-
-struct UdpMessage {
-    payload: Bytes,
-    remote_location: NetLocation,
+    send_socket: Arc<UdpSocket>,
 }
 
 struct FragmentedPacket {
@@ -191,30 +186,16 @@ struct FragmentedPacket {
 }
 
 impl UdpSession {
+    // TODO: remove this function completely and inline?
     fn start(
         session_id: u32,
         connection: quinn::Connection,
         client_socket: Arc<UdpSocket>,
-        resolver: Arc<dyn Resolver>,
     ) -> Self {
-        let (tx, rx) = tokio::sync::mpsc::channel(40);
-
         let session = UdpSession {
             fragments: HashMap::new(),
-            tx,
+            send_socket: client_socket.clone(),
         };
-
-        // Spawn a dedicated worker task to drain the outgoing UDP message queue.
-        let resolver_cache = ResolverCache::new(resolver.clone());
-        let send_socket = client_socket.clone();
-        tokio::spawn(async move {
-            if let Err(e) =
-                run_hysteria2_udp_remote_write_loop(session_id, send_socket, rx, resolver_cache)
-                    .await
-            {
-                error!("UDP remote write loop ended with error: {}", e);
-            }
-        });
 
         tokio::spawn(async move {
             if let Err(e) =
@@ -226,65 +207,6 @@ impl UdpSession {
 
         session
     }
-}
-
-async fn run_hysteria2_udp_remote_write_loop(
-    session_id: u32,
-    socket: Arc<UdpSocket>,
-    mut rx: tokio::sync::mpsc::Receiver<UdpMessage>,
-    mut resolver_cache: ResolverCache,
-) -> std::io::Result<()> {
-    const MAX_READ_MESSAGES: usize = 40;
-
-    let mut messages = Vec::with_capacity(MAX_READ_MESSAGES);
-    let mut last_location = NetLocation::UNSPECIFIED;
-    let mut last_socket_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
-
-    loop {
-        messages.clear();
-
-        let len = rx.recv_many(&mut messages, MAX_READ_MESSAGES).await;
-        if len == 0 {
-            // channel has been closed
-            break;
-        }
-
-        for UdpMessage {
-            remote_location,
-            payload,
-        } in messages.iter()
-        {
-            if remote_location != &last_location {
-                let socket_addr = match resolver_cache.resolve_location(remote_location).await {
-                    Ok(socket_addr) => socket_addr,
-                    Err(e) => {
-                        error!(
-                            "Failed to resolve remote location {}: {}",
-                            remote_location, e
-                        );
-                        continue;
-                    }
-                };
-                last_location = remote_location.clone();
-                last_socket_addr = socket_addr;
-            };
-
-            socket
-                .send_to(&payload, &last_socket_addr)
-                .await
-                .map_err(|e| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!(
-                            "Failed to forward UDP payload for session {}: {}",
-                            session_id, e
-                        ),
-                    )
-                })?;
-        }
-    }
-
-    Ok(())
 }
 
 async fn run_hysteria2_udp_local_write_loop(
@@ -381,7 +303,11 @@ async fn run_hysteria2_udp_read_loop(
         }
     };
 
+    let mut resolver_cache = ResolverCache::new(resolver);
     let mut sessions: HashMap<u32, UdpSession> = HashMap::new();
+
+    let mut last_location = NetLocation::UNSPECIFIED;
+    let mut last_socket_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
 
     loop {
         let data = connection.read_datagram().await.map_err(|err| {
@@ -459,37 +385,18 @@ async fn run_hysteria2_udp_read_loop(
             Entry::Vacant(entry) => {
                 // even if the current address is not ipv6, that could change.
                 let client_socket = client_proxy.configure_udp_socket(true)?;
-                let session = UdpSession::start(
-                    session_id,
-                    connection.clone(),
-                    Arc::new(client_socket),
-                    resolver.clone(),
-                );
+                let session =
+                    UdpSession::start(session_id, connection.clone(), Arc::new(client_socket));
                 entry.insert(session)
             }
             Entry::Occupied(ref mut entry) => entry.get_mut(),
         };
 
-        if fragment_count == 0 {
+        let (complete_payload, send_location) = if fragment_count == 0 {
             error!("Ignoring empty UDP fragment for session {}", session_id);
             continue;
         } else if fragment_count == 1 {
-            session
-                .tx
-                .send(UdpMessage {
-                    payload: payload_fragment,
-                    remote_location,
-                })
-                .await
-                .map_err(|e| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!(
-                            "Failed to queue UDP payload for session {}: {}",
-                            session_id, e
-                        ),
-                    )
-                })?;
+            (payload_fragment, remote_location)
         } else {
             let entry =
                 session
@@ -522,33 +429,51 @@ async fn run_hysteria2_udp_read_loop(
             entry.packet_len += payload_fragment.len();
             entry.received[fragment_id as usize] = Some(payload_fragment);
 
-            if entry.fragment_received == entry.fragment_count {
-                let FragmentedPacket {
-                    remote_location,
-                    received,
-                    packet_len,
-                    ..
-                } = session.fragments.remove(&packet_id).unwrap();
-                let mut complete_payload = BytesMut::with_capacity(packet_len);
-                for frag in received.into_iter() {
-                    complete_payload.extend(frag.unwrap());
+            if entry.fragment_received != entry.fragment_count {
+                continue;
+            }
+
+            let FragmentedPacket {
+                remote_location: initial_location,
+                received,
+                packet_len,
+                ..
+            } = session.fragments.remove(&packet_id).unwrap();
+            let mut complete_payload = BytesMut::with_capacity(packet_len);
+            for frag in received.iter() {
+                complete_payload.extend_from_slice(frag.as_ref().unwrap());
+            }
+            (complete_payload.freeze(), initial_location)
+        };
+
+        if send_location != last_location {
+            let socket_addr = match resolver_cache.resolve_location(&send_location).await {
+                Ok(socket_addr) => socket_addr,
+                Err(e) => {
+                    error!("Failed to resolve remote location {}: {}", send_location, e);
+                    continue;
                 }
-                session
-                    .tx
-                    .send(UdpMessage {
-                        payload: complete_payload.freeze(),
-                        remote_location,
-                    })
-                    .await
-                    .map_err(|e| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            format!(
-                                "Failed to queue reassembled UDP payload for session {}: {}",
-                                session_id, e
-                            ),
-                        )
-                    })?;
+            };
+            last_location = send_location;
+            last_socket_addr = socket_addr;
+        };
+
+        match session
+            .send_socket
+            .try_send_to(&complete_payload, last_socket_addr)
+        {
+            Ok(_) => {}
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                // drop the packet and continue
+            }
+            Err(e) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!(
+                        "Failed to forward UDP payload for session {}: {}",
+                        session_id, e
+                    ),
+                ));
             }
         }
     }
