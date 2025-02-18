@@ -23,7 +23,6 @@ use crate::socket_util::new_socket2_udp_socket;
 use crate::tcp_client_connector::TcpClientConnector;
 use crate::tcp_server::setup_client_stream;
 use crate::thread_util::get_num_threads;
-use crate::udp_multi_message_stream::UdpMultiMessageStream;
 use crate::util::allocate_vec;
 
 const MAX_QUIC_ENDPOINTS: usize = 4;
@@ -195,7 +194,7 @@ impl UdpSession {
     fn start(
         session_id: u32,
         connection: quinn::Connection,
-        client_sockets: Vec<Arc<UdpSocket>>,
+        client_socket: Arc<UdpSocket>,
         resolver: Arc<dyn Resolver>,
     ) -> Self {
         let (tx, rx) = tokio::sync::mpsc::channel(40);
@@ -205,10 +204,9 @@ impl UdpSession {
             tx,
         };
 
-        let send_socket = client_sockets.first().unwrap().clone();
-
         // Spawn a dedicated worker task to drain the outgoing UDP message queue.
         let resolver_cache = ResolverCache::new(resolver.clone());
+        let send_socket = client_socket.clone();
         tokio::spawn(async move {
             if let Err(e) =
                 run_hysteria2_udp_remote_write_loop(session_id, send_socket, rx, resolver_cache)
@@ -218,10 +216,9 @@ impl UdpSession {
             }
         });
 
-        let client_stream = UdpMultiMessageStream::new(client_sockets, resolver);
         tokio::spawn(async move {
             if let Err(e) =
-                run_hysteria2_udp_local_write_loop(session_id, connection, client_stream).await
+                run_hysteria2_udp_local_write_loop(session_id, connection, client_socket).await
             {
                 error!("UDP local write loop ended with error: {}", e);
             }
@@ -280,7 +277,7 @@ async fn run_hysteria2_udp_remote_write_loop(
 async fn run_hysteria2_udp_local_write_loop(
     session_id: u32,
     connection: quinn::Connection,
-    mut socket: UdpMultiMessageStream,
+    socket: Arc<UdpSocket>,
 ) -> std::io::Result<()> {
     let max_datagram_size = connection.max_datagram_size().ok_or_else(|| {
         std::io::Error::new(
@@ -293,17 +290,31 @@ async fn run_hysteria2_udp_local_write_loop(
     let mut buf = [0u8; 65535];
 
     loop {
-        let (len, src_addr) = socket.read_sourced_message(&mut buf).await?;
+        let (len, src_addr) = match socket.try_recv_from(&mut buf) {
+            Ok(res) => res,
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                socket.readable().await?;
+                continue;
+            }
+            Err(e) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("failed to receive from UDP socket: {}", e),
+                ));
+            }
+        };
 
         let packet_id = next_packet_id;
         next_packet_id = next_packet_id.wrapping_add(1);
         let addr_str = src_addr.to_string();
+        // TODO: address length should be a varint and calculated here as one
         let header_overhead = 4 + 2 + 1 + 1 + 1 + addr_str.len(); // session_id(4) + packet_id(2) + fragment id(1) + fragment count(1) + address length(1) + address bytes
         if header_overhead + len <= max_datagram_size {
             let mut datagram = BytesMut::with_capacity(header_overhead + len);
             datagram.extend_from_slice(&session_id.to_be_bytes());
             datagram.extend_from_slice(&packet_id.to_be_bytes());
             // fragment id = 0, fragment count = 0, address length
+            // TODO: address length should be a varint, with max length 2048
             datagram.extend_from_slice(&[0, 1, addr_str.len() as u8]);
             datagram.extend_from_slice(addr_str.as_bytes());
             datagram.extend_from_slice(&buf[..len]);
@@ -433,12 +444,12 @@ async fn run_hysteria2_udp_read_loop(
         let mut session_entry = sessions.entry(session_id);
         let session = match session_entry {
             Entry::Vacant(entry) => {
-                let client_sockets = client_proxy.configure_reuse_udp_sockets(true, 2)?;
-                let client_sockets = client_sockets.into_iter().map(Arc::new).collect::<Vec<_>>();
+                // even if the current address is not ipv6, that could change.
+                let client_socket = client_proxy.configure_udp_socket(true)?;
                 let session = UdpSession::start(
                     session_id,
                     connection.clone(),
-                    client_sockets,
+                    Arc::new(client_socket),
                     resolver.clone(),
                 );
                 entry.insert(session)
