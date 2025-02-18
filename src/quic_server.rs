@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use log::{debug, error, warn};
+use quinn::EndpointConfig;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::task::JoinHandle;
@@ -19,12 +20,16 @@ use crate::copy_multidirectional_message::copy_multidirectional_message;
 use crate::quic_stream::QuicStream;
 use crate::resolver::{resolve_single_address, NativeResolver, Resolver};
 use crate::rustls_util::create_server_config;
+use crate::socket_util::new_socket2_udp_socket;
 use crate::tcp_client_connector::TcpClientConnector;
 use crate::tcp_handler::{TcpServerHandler, TcpServerSetupResult};
 use crate::tcp_handler_util::{create_tcp_client_proxy_selector, create_tcp_server_handler};
 use crate::tcp_server::setup_client_stream;
+use crate::thread_util::get_num_threads;
 use crate::udp_message_stream::UdpMessageStream;
 use crate::udp_multi_message_stream::UdpMultiMessageStream;
+
+const MAX_QUIC_ENDPOINTS: usize = 4;
 
 async fn run_quic_server(
     bind_address: SocketAddr,
@@ -38,29 +43,53 @@ async fn run_quic_server(
         .try_into()
         .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
 
-    let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_server_config));
+    let server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_server_config));
 
-    // TODO: check these values
-    Arc::get_mut(&mut server_config.transport)
-        .unwrap()
-        .max_concurrent_bidi_streams(1024_u32.into())
-        .max_concurrent_uni_streams(0_u8.into())
-        .keep_alive_interval(Some(Duration::from_secs(15)))
-        .max_idle_timeout(Some(Duration::from_secs(30).try_into().unwrap()));
+    // TODO: consider setting transport config
+    //   Arc::get_mut(&mut server_config.transport)
+    //     .unwrap()
+    //     .max_concurrent_bidi_streams(1024_u32.into())
+    //     .max_concurrent_uni_streams(0_u8.into())
+    //     .keep_alive_interval(Some(Duration::from_secs(15)))
+    //     .max_idle_timeout(Some(Duration::from_secs(30).try_into().unwrap()));
 
-    let endpoint = quinn::Endpoint::server(server_config, bind_address)?;
+    let endpoints_len = std::cmp::min(get_num_threads(), MAX_QUIC_ENDPOINTS);
+    let mut join_handles = vec![];
+    for _ in 0..endpoints_len {
+        let socket2_socket =
+            new_socket2_udp_socket(bind_address.is_ipv6(), None, Some(bind_address), true).unwrap();
 
-    while let Some(conn) = endpoint.accept().await {
-        let cloned_selector = client_proxy_selector.clone();
-        let cloned_resolver = resolver.clone();
-        let cloned_handler = server_handler.clone();
-        tokio::spawn(async move {
-            if let Err(e) =
-                process_connection(cloned_selector, cloned_resolver, cloned_handler, conn).await
-            {
-                error!("Connection ended with error: {}", e);
+        let endpoint = quinn::Endpoint::new(
+            EndpointConfig::default(),
+            Some(server_config.clone()),
+            socket2_socket.into(),
+            Arc::new(quinn::TokioRuntime),
+        )?;
+
+        let client_proxy_selector = client_proxy_selector.clone();
+        let resolver = resolver.clone();
+        let server_handler = server_handler.clone();
+        let join_handle = tokio::spawn(async move {
+            while let Some(conn) = endpoint.accept().await {
+                let client_proxy_selector = client_proxy_selector.clone();
+                let resolver = resolver.clone();
+                let server_handler = server_handler.clone();
+                tokio::spawn(async move {
+                    if let Err(e) =
+                        process_connection(client_proxy_selector, resolver, server_handler, conn)
+                            .await
+                    {
+                        error!("Connection ended with error: {}", e);
+                    }
+                });
             }
         });
+
+        join_handles.push(join_handle);
+    }
+
+    for join_handle in join_handles {
+        join_handle.await?;
     }
 
     Ok(())
