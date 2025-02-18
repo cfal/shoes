@@ -1,10 +1,9 @@
 use memchr::memchr;
 use tokio::io::AsyncReadExt;
 
-use crate::async_stream::AsyncStream;
 use crate::util::allocate_vec;
 
-const BUFFER_SIZE: usize = 32768;
+const DEFAULT_BUFFER_SIZE: usize = 32768;
 
 pub struct LineReader {
     buf: Box<[u8]>,
@@ -14,8 +13,13 @@ pub struct LineReader {
 
 impl LineReader {
     pub fn new() -> Self {
+        Self::new_with_buffer_size(DEFAULT_BUFFER_SIZE)
+    }
+
+    pub fn new_with_buffer_size(buffer_size: usize) -> Self {
+        // note that `buffer_size` also represents the maximum line length that can be read.
         Self {
-            buf: allocate_vec(BUFFER_SIZE).into_boxed_slice(),
+            buf: allocate_vec(buffer_size).into_boxed_slice(),
             start_offset: 0usize,
             end_offset: 0usize,
         }
@@ -30,9 +34,9 @@ impl LineReader {
         self.start_offset = 0;
     }
 
-    pub async fn read_line_bytes(
+    pub async fn read_line_bytes<T: AsyncReadExt + Unpin>(
         &mut self,
-        stream: &mut Box<dyn AsyncStream>,
+        mut stream: T,
     ) -> std::io::Result<&mut [u8]> {
         loop {
             match memchr(b'\n', &self.buf[self.start_offset..self.end_offset]) {
@@ -54,13 +58,16 @@ impl LineReader {
                 }
                 None => {
                     // There are no more newlines.
-                    self.read(stream).await?;
+                    self.read(&mut stream).await?;
                 }
             }
         }
     }
 
-    pub async fn read_line(&mut self, stream: &mut Box<dyn AsyncStream>) -> std::io::Result<&str> {
+    pub async fn read_line<T: AsyncReadExt + Unpin>(
+        &mut self,
+        stream: &mut T,
+    ) -> std::io::Result<&str> {
         let line_bytes = self.read_line_bytes(stream).await?;
         std::str::from_utf8(line_bytes).map_err(|e| {
             std::io::Error::new(
@@ -70,11 +77,36 @@ impl LineReader {
         })
     }
 
+    pub async fn read_u8<T: AsyncReadExt + Unpin>(
+        &mut self,
+        stream: &mut T,
+    ) -> std::io::Result<u8> {
+        while self.end_offset - self.start_offset < 1 {
+            self.read(stream).await?;
+        }
+        let value = self.buf[self.start_offset];
+        self.start_offset += 1;
+        Ok(value)
+    }
+
+    pub async fn read_slice<T: AsyncReadExt + Unpin>(
+        &mut self,
+        stream: &mut T,
+        len: usize,
+    ) -> std::io::Result<&[u8]> {
+        while self.end_offset - self.start_offset < len {
+            self.read(stream).await?;
+        }
+        let slice = &self.buf[self.start_offset..self.start_offset + len];
+        self.start_offset += len;
+        Ok(slice)
+    }
+
     pub fn unparsed_data(&self) -> &[u8] {
         &self.buf[self.start_offset..self.end_offset]
     }
 
-    async fn read(&mut self, stream: &mut Box<dyn AsyncStream>) -> std::io::Result<()> {
+    async fn read<T: AsyncReadExt + Unpin>(&mut self, stream: &mut T) -> std::io::Result<()> {
         // Note that read() needs to work for blocking I/O. So we need to return
         // immediately after a single read() call.
         if self.is_cache_full() {
@@ -112,6 +144,6 @@ impl LineReader {
     }
 
     fn is_cache_full(&self) -> bool {
-        self.start_offset == 0 && self.end_offset == BUFFER_SIZE
+        self.start_offset == 0 && self.end_offset == DEFAULT_BUFFER_SIZE
     }
 }
