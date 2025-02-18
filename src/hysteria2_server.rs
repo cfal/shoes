@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use log::error;
+use rand::{Rng, RngCore};
 use tokio::io::AsyncWriteExt;
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
@@ -15,6 +16,7 @@ use crate::address::NetLocation;
 use crate::async_stream::AsyncStream;
 use crate::client_proxy_selector::{ClientProxySelector, ConnectDecision};
 use crate::copy_bidirectional::copy_bidirectional_with_sizes;
+use crate::line_reader::LineReader;
 use crate::quic_stream::QuicStream;
 use crate::resolver::{NativeResolver, Resolver, ResolverCache};
 use crate::socket_util::new_socket2_udp_socket;
@@ -22,6 +24,7 @@ use crate::tcp_client_connector::TcpClientConnector;
 use crate::tcp_server::setup_client_stream;
 use crate::thread_util::get_num_threads;
 use crate::udp_multi_message_stream::UdpMultiMessageStream;
+use crate::util::allocate_vec;
 
 const MAX_QUIC_ENDPOINTS: usize = 4;
 
@@ -567,39 +570,74 @@ async fn process_hysteria2_tcp_stream(
     mut send: quinn::SendStream,
     mut recv: quinn::RecvStream,
 ) -> std::io::Result<()> {
-    // TODO: read_exact is shown as non-cancellable, switch to a state machine?
-    let tcp_request_id = read_varint(&mut recv).await?;
+    let mut line_reader = LineReader::new_with_buffer_size(8192);
+
+    let tcp_request_id = read_varint(&mut recv, &mut line_reader).await?;
     if tcp_request_id != 0x401 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::Other,
             "invalid tcp request id",
         ));
     }
-    let address_length = read_varint(&mut recv).await?;
-    let mut address_bytes = vec![0u8; address_length as usize];
-    recv.read_exact(&mut address_bytes)
-        .await
-        .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
-    let padding_length = read_varint(&mut recv).await?;
-    // TODO: this could be big, don't allocate
-    let mut padding_bytes = vec![0u8; padding_length as usize];
-    recv.read_exact(&mut padding_bytes)
-        .await
-        .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
 
-    let address = std::string::String::from_utf8(address_bytes)
+    // max lengths from https://github.com/apernet/hysteria/blob/5520bcc405ee11a47c164c75bae5c40fc2b1d99d/core/internal/protocol/proxy.go#L19
+    let address_length = read_varint(&mut recv, &mut line_reader).await?;
+    if address_length > 2048 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "invalid address length",
+        ));
+    }
+    let address_bytes = line_reader
+        .read_slice(&mut recv, address_length as usize)
+        .await?;
+    let address = std::str::from_utf8(address_bytes)
         .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
-    let remote_location = NetLocation::from_str(&address, None)?;
+    let remote_location = NetLocation::from_str(address, None)?;
 
-    // TODO: add message or padding
-    // [uint8] Status (0x00 = OK, 0x01 = Error)
-    // [varint] Message length
-    // [bytes] Message string
-    // [varint] Padding length
-    // [bytes] Random padding
-    send.write_all(&[0u8, 0u8, 0u8])
-        .await
-        .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
+    let padding_length = read_varint(&mut recv, &mut line_reader).await?;
+    if padding_length > 4096 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "invalid padding length",
+        ));
+    }
+    line_reader
+        .read_slice(&mut recv, padding_length as usize)
+        .await?;
+
+    {
+        let response_bytes = {
+            // [uint8] Status (0x00 = OK, 0x01 = Error)
+            // [varint] Message length
+            // [bytes] Message string
+            // [varint] Padding length
+            // [bytes] Random padding
+
+            let mut rng = rand::thread_rng();
+
+            // only use the lower 6 bits so that the varint always fits in a single u8
+            let padding_length = rng.gen_range(0..=63);
+
+            // first 3 bytes of status = 0x0, message length = 0, padding length
+            let mut response_bytes = allocate_vec(3 + (padding_length as usize));
+            response_bytes[0] = 0;
+            response_bytes[1] = 0;
+            response_bytes[2] = padding_length;
+            rng.fill_bytes(&mut response_bytes[3..]);
+
+            response_bytes
+        };
+        let len = response_bytes.len();
+        let mut i = 0;
+        while i < len {
+            let count = send
+                .write(&response_bytes[i..len])
+                .await
+                .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
+            i += count;
+        }
+    }
 
     let mut server_stream: Box<dyn AsyncStream> = Box::new(QuicStream::from(send, recv));
 
@@ -639,14 +677,32 @@ async fn process_hysteria2_tcp_stream(
         }
     };
 
+    let unparsed_data = line_reader.unparsed_data();
+    let client_requires_flush = if unparsed_data.is_empty() {
+        false
+    } else {
+        let len = unparsed_data.len();
+        let mut i = 0;
+        while i < len {
+            let count = client_stream
+                .write(&unparsed_data[i..len])
+                .await
+                .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
+            i += count;
+        }
+        true
+    };
+    drop(line_reader);
+
     // unlike tokio's implementation, we read as much as possible to fill up the
     // buffer size before sending. reduce the buffer sizes compared to tcp -> tcp.
     // also see https://www.privateoctopus.com/2023/12/12/quic-performance.html
     let copy_result = copy_bidirectional_with_sizes(
         &mut server_stream,
         &mut client_stream,
+        // no need to flush even through we wrote this response since it's quic
         false,
-        false,
+        client_requires_flush,
         // quic -> tcp
         8192,
         // tcp -> quic
@@ -660,14 +716,14 @@ async fn process_hysteria2_tcp_stream(
     Ok(())
 }
 
-async fn read_varint(recv: &mut quinn::RecvStream) -> std::io::Result<u64> {
-    let mut first_byte = [0u8];
-    recv.read_exact(&mut first_byte)
-        .await
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+async fn read_varint(
+    recv: &mut quinn::RecvStream,
+    line_reader: &mut LineReader,
+) -> std::io::Result<u64> {
+    let first_byte = line_reader.read_u8(recv).await?;
 
-    let length = (first_byte[0] >> 6) & 0b11; // Get top two bits
-    let mut value: u64 = (first_byte[0] & 0b00111111) as u64; // Remaining bits of the first byte
+    let length = first_byte >> 6;
+    let mut value: u64 = (first_byte & 0b00111111) as u64;
 
     let num_bytes = match length {
         0 => 1,
@@ -683,17 +739,10 @@ async fn read_varint(recv: &mut quinn::RecvStream) -> std::io::Result<u64> {
     };
 
     if num_bytes > 1 {
-        let mut remaining_bytes = vec![0u8; num_bytes - 1];
-        recv.read_exact(&mut remaining_bytes).await.map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("Failed to read remaining bytes: {}", e),
-            )
-        })?;
-
+        let remaining_bytes = line_reader.read_slice(recv, num_bytes - 1).await?;
         for byte in remaining_bytes {
             value <<= 8; // Shift left by 8 bits for each subsequent byte
-            value |= byte as u64; // Add the next byte
+            value |= *byte as u64; // Add the next byte
         }
     }
 
