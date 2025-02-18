@@ -240,16 +240,25 @@ async fn run_udp_remote_to_local_loop(
 
         let packet_id = next_packet_id;
         next_packet_id = next_packet_id.wrapping_add(1);
+
         let addr_str = src_addr.to_string();
-        // TODO: address length should be a varint and calculated here as one
-        let header_overhead = 4 + 2 + 1 + 1 + 1 + addr_str.len(); // session_id(4) + packet_id(2) + fragment id(1) + fragment count(1) + address length(1) + address bytes
+        let addr_len = addr_str.len();
+        if addr_len > 2048 {
+            error!("Address length too long ({}), skipping", addr_len);
+            continue;
+        }
+        let addr_len_bytes = encode_varint(addr_len as u64)?;
+
+        // session_id(4) + packet_id(2) + fragment id(1) + fragment count(1) + address length varint + address bytes
+        let header_overhead = 4 + 2 + 1 + 1 + addr_len_bytes.len() + addr_str.len();
+
         if header_overhead + len <= max_datagram_size {
             let mut datagram = BytesMut::with_capacity(header_overhead + len);
             datagram.extend_from_slice(&session_id.to_be_bytes());
             datagram.extend_from_slice(&packet_id.to_be_bytes());
-            // fragment id = 0, fragment count = 0, address length
-            // TODO: address length should be a varint, with max length 2048
-            datagram.extend_from_slice(&[0, 1, addr_str.len() as u8]);
+            // fragment id = 0, fragment count = 0
+            datagram.extend_from_slice(&[0, 1]);
+            datagram.extend_from_slice(&addr_len_bytes);
             datagram.extend_from_slice(addr_str.as_bytes());
             datagram.extend_from_slice(&buf[..len]);
 
@@ -260,9 +269,6 @@ async fn run_udp_remote_to_local_loop(
                 )
             })?;
         } else {
-            // Fragment the UDP packet since it exceeds max datagram size.
-            assert!(max_datagram_size > header_overhead);
-
             let available_payload = max_datagram_size - header_overhead;
             let fragment_count = len.div_ceil(available_payload) as u8;
             for fragment_id in 0..fragment_count {
@@ -271,7 +277,8 @@ async fn run_udp_remote_to_local_loop(
                 let mut datagram = BytesMut::with_capacity(header_overhead + (end - start));
                 datagram.extend_from_slice(&session_id.to_be_bytes());
                 datagram.extend_from_slice(&packet_id.to_be_bytes());
-                datagram.extend_from_slice(&[fragment_id, fragment_count, addr_str.len() as u8]);
+                datagram.extend_from_slice(&[fragment_id, fragment_count]);
+                datagram.extend_from_slice(&addr_len_bytes);
                 datagram.extend_from_slice(addr_str.as_bytes());
                 datagram.extend_from_slice(&buf[start..end]);
 
@@ -664,6 +671,30 @@ async fn process_tcp_stream(
 
     copy_result?;
     Ok(())
+}
+
+#[inline]
+fn encode_varint(value: u64) -> std::io::Result<Box<[u8]>> {
+    if value <= 0b00111111 {
+        Ok(Box::new([value as u8]))
+    } else if value < (1 << 14) {
+        let mut bytes = (value as u16).to_be_bytes();
+        bytes[0] |= 0b01000000;
+        Ok(Box::new(bytes))
+    } else if value < (1 << 30) {
+        let mut bytes = (value as u32).to_be_bytes();
+        bytes[0] |= 0b10000000;
+        Ok(Box::new(bytes))
+    } else if value < (1 << 62) {
+        let mut bytes = value.to_be_bytes();
+        bytes[0] |= 0b11000000;
+        Ok(Box::new(bytes))
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "value too large to encode as varint",
+        ))
+    }
 }
 
 async fn read_varint(
