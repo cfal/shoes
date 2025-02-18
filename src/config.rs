@@ -5,6 +5,7 @@ use serde::Deserialize;
 
 use crate::address::{NetLocation, NetLocationMask};
 use crate::option_util::{NoneOrOne, NoneOrSome, OneOrSome};
+use crate::thread_util::get_num_threads;
 
 fn default_true() -> bool {
     true
@@ -64,6 +65,9 @@ pub struct ServerQuicConfig {
     pub alpn_protocols: NoneOrSome<String>,
     #[serde(alias = "client_fingerprint", default)]
     pub client_fingerprints: NoneOrSome<String>,
+    // num_endpoints of 0 will use the number of threads as the default value.
+    #[serde(default)]
+    pub num_endpoints: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -671,9 +675,14 @@ fn validate_server_config(
         match server_config.quic_settings {
             Some(ServerQuicConfig {
                 ref mut client_fingerprints,
+                ref mut num_endpoints,
                 ..
             }) => {
                 validate_client_fingerprints(client_fingerprints)?;
+
+                if *num_endpoints == 0 {
+                    *num_endpoints = get_num_threads();
+                }
             }
             None => {
                 return Err(std::io::Error::new(

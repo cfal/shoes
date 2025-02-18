@@ -25,17 +25,15 @@ use crate::tcp_client_connector::TcpClientConnector;
 use crate::tcp_handler::{TcpServerHandler, TcpServerSetupResult};
 use crate::tcp_handler_util::{create_tcp_client_proxy_selector, create_tcp_server_handler};
 use crate::tcp_server::setup_client_stream;
-use crate::thread_util::get_num_threads;
 use crate::udp_message_stream::UdpMessageStream;
 use crate::udp_multi_message_stream::UdpMultiMessageStream;
-
-const MAX_QUIC_ENDPOINTS: usize = 4;
 
 async fn run_quic_server(
     bind_address: SocketAddr,
     server_config: Arc<rustls::ServerConfig>,
     client_proxy_selector: Arc<ClientProxySelector<TcpClientConnector>>,
     server_handler: Arc<Box<dyn TcpServerHandler>>,
+    num_endpoints: usize,
 ) -> std::io::Result<()> {
     let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
 
@@ -53,9 +51,8 @@ async fn run_quic_server(
     //     .keep_alive_interval(Some(Duration::from_secs(15)))
     //     .max_idle_timeout(Some(Duration::from_secs(30).try_into().unwrap()));
 
-    let endpoints_len = std::cmp::min(get_num_threads(), MAX_QUIC_ENDPOINTS);
     let mut join_handles = vec![];
-    for _ in 0..endpoints_len {
+    for _ in 0..num_endpoints {
         let socket2_socket =
             new_socket2_udp_socket(bind_address.is_ipv6(), None, Some(bind_address), true).unwrap();
 
@@ -369,6 +366,7 @@ pub async fn start_quic_server(config: ServerConfig) -> std::io::Result<Option<J
         key,
         alpn_protocols,
         client_fingerprints,
+        num_endpoints,
     } = quic_settings.unwrap();
 
     let mut cert_file = File::open(&cert).await?;
@@ -398,6 +396,7 @@ pub async fn start_quic_server(config: ServerConfig) -> std::io::Result<Option<J
                 server_config,
                 password,
                 client_proxy_selector,
+                num_endpoints,
                 udp_enabled,
             )
             .await
@@ -414,6 +413,7 @@ pub async fn start_quic_server(config: ServerConfig) -> std::io::Result<Option<J
                     server_config,
                     client_proxy_selector,
                     tcp_handler,
+                    num_endpoints,
                 )
                 .await
                 .unwrap();

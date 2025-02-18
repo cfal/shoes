@@ -22,10 +22,7 @@ use crate::resolver::{NativeResolver, Resolver, ResolverCache};
 use crate::socket_util::new_socket2_udp_socket;
 use crate::tcp_client_connector::TcpClientConnector;
 use crate::tcp_server::setup_client_stream;
-use crate::thread_util::get_num_threads;
 use crate::util::allocate_vec;
-
-const MAX_QUIC_ENDPOINTS: usize = 4;
 
 async fn process_connection(
     client_proxy_selector: Arc<ClientProxySelector<TcpClientConnector>>,
@@ -707,6 +704,7 @@ pub async fn run_hysteria2_server(
     server_config: Arc<rustls::ServerConfig>,
     password: String,
     client_proxy_selector: Arc<ClientProxySelector<TcpClientConnector>>,
+    num_endpoints: usize,
     udp_enabled: bool,
 ) -> std::io::Result<()> {
     // TODO: hash password instead of passing directly
@@ -720,9 +718,8 @@ pub async fn run_hysteria2_server(
 
     let quic_server_config = Arc::new(quic_server_config);
 
-    let endpoints_len = std::cmp::min(get_num_threads(), MAX_QUIC_ENDPOINTS);
     let mut join_handles = vec![];
-    for _ in 0..endpoints_len {
+    for _ in 0..num_endpoints {
         let quic_server_config = quic_server_config.clone();
         let resolver = resolver.clone();
         let client_proxy_selector = client_proxy_selector.clone();
