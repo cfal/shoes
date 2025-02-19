@@ -821,18 +821,12 @@ pub async fn run_hysteria2_server(
         let client_proxy_selector = client_proxy_selector.clone();
 
         let join_handle = tokio::spawn(async move {
-            let server_config = quinn::ServerConfig::with_crypto(quic_server_config);
+            let mut server_config = quinn::ServerConfig::with_crypto(quic_server_config);
 
-            // TODO: consider setting transport config
-            // Previously we set server_config.transport, but that seems to break when testing
-            // against the hysteria2 client:
-            //   Arc::get_mut(&mut server_config.transport)
-            //     .unwrap()
-            //     .max_concurrent_bidi_streams(1024_u32.into())
-            //     .max_concurrent_uni_streams(0_u8.into())
-            //     .keep_alive_interval(Some(Duration::from_secs(15)))
-            //     .max_idle_timeout(Some(Duration::from_secs(30).try_into().unwrap()));
-            //
+            Arc::get_mut(&mut server_config.transport)
+                .unwrap()
+                .keep_alive_interval(Some(Duration::from_secs(15)))
+                .max_idle_timeout(Some(Duration::from_secs(30).try_into().unwrap()));
 
             let socket2_socket =
                 new_socket2_udp_socket(bind_address.is_ipv6(), None, Some(bind_address), true)
