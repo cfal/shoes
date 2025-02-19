@@ -528,23 +528,15 @@ async fn run_udp_local_to_remote_loop(
             },
         };
 
-        match session
+        if let Err(e) = session
             .send_socket
-            .try_send_to(&complete_payload, socket_addr)
+            .send_to(&complete_payload, socket_addr)
+            .await
         {
-            Ok(_) => {}
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                // drop the packet and continue
-            }
-            Err(e) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!(
-                        "Failed to forward UDP payload for session {}: {}",
-                        session_id, e
-                    ),
-                ));
-            }
+            error!(
+                "Failed to forward UDP payload for session {}: {}",
+                session_id, e
+            );
         }
     }
 }
