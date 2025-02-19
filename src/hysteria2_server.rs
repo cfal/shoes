@@ -36,31 +36,40 @@ async fn process_connection(
     // we unfortunately need to keep the h3 connection around because it closes the underlying
     // connection on drop, see
     // https://github.com/hyperium/h3/blob/dbf2523d26e115f096b66cdd8a6f68127a17a156/h3/src/server/connection.rs#L427
+    //
+    // we keep this function waiting for the tcp and udp tasks both to finish before dropping,
+    // instead of passing the connection to one of the two loops, incase one finishes first.
     let h3_quinn_connection = h3_quinn::Connection::new(connection.clone());
+
     let mut h3_conn: h3::server::Connection<h3_quinn::Connection, bytes::Bytes> =
         h3::server::Connection::new(h3_quinn_connection)
             .await
             .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
     auth_connection(&mut h3_conn, password, udp_enabled).await?;
 
+    let mut join_handles = vec![];
     if udp_enabled {
         let connection = connection.clone();
         let client_proxy_selector = client_proxy_selector.clone();
         let resolver = resolver.clone();
-        tokio::spawn(async move {
+        join_handles.push(tokio::spawn(async move {
             if let Err(e) =
                 run_udp_local_to_remote_loop(connection, client_proxy_selector, resolver).await
             {
                 error!("UDP local-to-remote write loop ended with error: {}", e);
             }
-        });
+        }));
     }
 
-    tokio::spawn(async move {
-        if let Err(e) = run_tcp_loop(h3_conn, connection, client_proxy_selector, resolver).await {
+    join_handles.push(tokio::spawn(async move {
+        if let Err(e) = run_tcp_loop(connection, client_proxy_selector, resolver).await {
             error!("TCP loop ended with error: {}", e);
         }
-    });
+    }));
+
+    for join_handle in join_handles {
+        join_handle.await?;
+    }
 
     Ok(())
 }
@@ -562,8 +571,6 @@ async fn run_udp_local_to_remote_loop(
 }
 
 async fn run_tcp_loop(
-    // unused, but needs to be kept in scope, see above.
-    _h3_conn: h3::server::Connection<h3_quinn::Connection, bytes::Bytes>,
     connection: quinn::Connection,
     client_proxy_selector: Arc<ClientProxySelector<TcpClientConnector>>,
     resolver: Arc<dyn Resolver>,
