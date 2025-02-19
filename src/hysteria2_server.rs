@@ -78,13 +78,13 @@ fn validate_auth_request<T>(req: http::Request<T>, password: &str) -> std::io::R
     if req.uri() != "https://hysteria/auth" {
         return Err(std::io::Error::new(
             std::io::ErrorKind::Other,
-            "invalid uri",
+            format!("unexpected uri: {}", req.uri()),
         ));
     }
     if req.method() != "POST" {
         return Err(std::io::Error::new(
             std::io::ErrorKind::Other,
-            "invalid method",
+            format!("unexpected method: {}", req.method()),
         ));
     }
 
@@ -104,7 +104,7 @@ fn validate_auth_request<T>(req: http::Request<T>, password: &str) -> std::io::R
     if auth_str != password {
         return Err(std::io::Error::new(
             std::io::ErrorKind::Other,
-            "missing host header",
+            format!("incorrect auth password: {}", auth_str),
         ));
     }
 
