@@ -230,8 +230,23 @@ async fn run_udp_remote_to_local_loop(
         )
     })?;
 
-    let original_address_bytes: Option<Bytes> =
-        original_address.map(|a| a.to_string().into_bytes().into());
+    let original_address_bytes: Option<(Bytes, Bytes)> = match original_address {
+        Some(a) => {
+            let address_bytes: Bytes = a.to_string().into_bytes().into();
+
+            let address_len = address_bytes.len();
+            if address_len > 2048 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "original address length too long",
+                ));
+            }
+
+            let address_len_bytes = encode_varint(address_len as u64)?;
+            Some((address_bytes, address_len_bytes.into()))
+        }
+        None => None,
+    };
 
     let mut next_packet_id: u16 = 0;
     let mut buf = [0u8; 65535];
@@ -254,21 +269,26 @@ async fn run_udp_remote_to_local_loop(
         let packet_id = next_packet_id;
         next_packet_id = next_packet_id.wrapping_add(1);
 
-        let address_bytes = match original_address_bytes {
-            Some(ref a) => a.clone(),
-            None => src_addr.to_string().into_bytes().into(),
+        let (address_bytes, address_len_bytes) = match original_address_bytes {
+            Some((ref a, ref b)) => (a.clone(), b.clone()),
+            None => {
+                let address_bytes: Bytes = src_addr.to_string().into_bytes().into();
+                // no need to do a length check since this is a socket address and an IP.
+                let address_len = address_bytes.len();
+                let address_len_bytes = encode_varint(address_len as u64)?.into();
+                (address_bytes, address_len_bytes)
+            }
         };
-
-        let address_len = address_bytes.len();
-        if address_len > 2048 {
-            error!("Address length too long ({}), skipping", address_len);
-            continue;
-        }
-
-        let address_len_bytes = encode_varint(address_len as u64)?;
 
         // session_id(4) + packet_id(2) + fragment id(1) + fragment count(1) + address length varint + address bytes
         let header_overhead = 4 + 2 + 1 + 1 + address_len_bytes.len() + address_bytes.len();
+
+        assert!(
+            max_datagram_size > header_overhead,
+            "max datagram size ({}) is smaller than header overhead ({})",
+            max_datagram_size,
+            header_overhead
+        );
 
         if header_overhead + payload_len <= max_datagram_size {
             let mut datagram = BytesMut::with_capacity(header_overhead + payload_len);
