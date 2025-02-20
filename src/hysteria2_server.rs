@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
-use log::error;
+use log::{error, warn};
 use rand::{Rng, RngCore};
 use tokio::io::AsyncWriteExt;
 use tokio::net::UdpSocket;
@@ -183,7 +183,11 @@ async fn auth_connection(
 struct UdpSession {
     fragments: HashMap<u16, FragmentedPacket>,
     send_socket: Arc<UdpSocket>,
-    override_address: Option<SocketAddr>,
+    // we cache the last location in case of mid-session address changes, and
+    // don't want to have to call ClientProxySelector::judge on every packet.
+    last_location: NetLocation,
+    last_socket_addr: SocketAddr,
+    override_remote_write_address: Option<SocketAddr>,
 }
 
 struct FragmentedPacket {
@@ -200,13 +204,17 @@ impl UdpSession {
         session_id: u32,
         connection: quinn::Connection,
         client_socket: Arc<UdpSocket>,
-        original_address: Option<NetLocation>,
-        override_address: Option<SocketAddr>,
+        initial_location: NetLocation,
+        initial_socket_addr: SocketAddr,
+        override_local_write_location: Option<NetLocation>,
+        override_remote_write_address: Option<SocketAddr>,
     ) -> Self {
         let session = UdpSession {
             fragments: HashMap::new(),
             send_socket: client_socket.clone(),
-            override_address,
+            last_location: initial_location,
+            last_socket_addr: initial_socket_addr,
+            override_remote_write_address,
         };
 
         tokio::spawn(async move {
@@ -214,7 +222,7 @@ impl UdpSession {
                 session_id,
                 connection,
                 client_socket,
-                original_address,
+                override_local_write_location,
             )
             .await
             {
@@ -230,7 +238,7 @@ async fn run_udp_remote_to_local_loop(
     session_id: u32,
     connection: quinn::Connection,
     socket: Arc<UdpSocket>,
-    original_address: Option<NetLocation>,
+    override_local_write_address: Option<NetLocation>,
 ) -> std::io::Result<()> {
     let max_datagram_size = connection.max_datagram_size().ok_or_else(|| {
         std::io::Error::new(
@@ -239,7 +247,7 @@ async fn run_udp_remote_to_local_loop(
         )
     })?;
 
-    let original_address_bytes: Option<(Bytes, Bytes)> = match original_address {
+    let original_address_bytes: Option<(Bytes, Bytes)> = match override_local_write_address {
         Some(a) => {
             let address_bytes: Bytes = a.to_string().into_bytes().into();
             let address_len = address_bytes.len();
@@ -337,18 +345,7 @@ async fn run_udp_local_to_remote_loop(
     client_proxy_selector: Arc<ClientProxySelector<TcpClientConnector>>,
     resolver: Arc<dyn Resolver>,
 ) -> std::io::Result<()> {
-    let action = client_proxy_selector.default_decision();
-    let client_proxy = match action {
-        ConnectDecision::Allow {
-            client_proxy,
-            remote_location: _,
-        } => client_proxy,
-        ConnectDecision::Block => {
-            return Ok(());
-        }
-    };
-
-    let mut resolver_cache = ResolverCache::new(resolver);
+    let mut resolver_cache = ResolverCache::new(resolver.clone());
     let mut sessions: HashMap<u32, UdpSession> = HashMap::new();
 
     loop {
@@ -433,10 +430,30 @@ async fn run_udp_local_to_remote_loop(
         let mut session_entry = sessions.entry(session_id);
         let session = match session_entry {
             Entry::Vacant(entry) => {
+                let action = client_proxy_selector
+                    .judge(remote_location.clone(), &resolver)
+                    .await;
+
+                let (client_proxy, updated_location) = match action {
+                    Ok(ConnectDecision::Allow {
+                        client_proxy,
+                        remote_location,
+                    }) => (client_proxy, remote_location),
+                    Ok(ConnectDecision::Block) => {
+                        warn!("Blocked UDP forward to {}", remote_location);
+                        continue;
+                    }
+                    Err(e) => {
+                        error!("Failed to judge UDP forward to {}: {}", remote_location, e);
+                        continue;
+                    }
+                };
+
                 // the remote location specified at the beginning of a session is assumed
                 // to be the remote location for the entire session iif it does not match
                 // the resolved address, as per the official client - which is only if
-                // it's a hostname.
+                // it's a hostname. in our case, we also have to handle when the remote
+                // location is replaced by a different location in the rules.
                 //
                 // it's possible that when we receive packets on the client socket,
                 // it could be the resolved hostname versus what was initially provided,
@@ -448,19 +465,19 @@ async fn run_udp_local_to_remote_loop(
                 //
                 // ref: https://github.com/apernet/hysteria/blob/5520bcc405ee11a47c164c75bae5c40fc2b1d99d/core/server/udp.go#L137
 
-                let resolved_address = match resolver_cache.resolve_location(&remote_location).await
-                {
-                    Ok(s) => s,
-                    Err(e) => {
-                        error!(
-                            "Failed to resolve remote location {}: {}",
-                            remote_location, e
-                        );
-                        continue;
-                    }
-                };
+                let resolved_address =
+                    match resolver_cache.resolve_location(&updated_location).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            error!(
+                                "Failed to resolve initial remote location {}: {}",
+                                remote_location, e
+                            );
+                            continue;
+                        }
+                    };
 
-                let (override_address, original_address, is_ipv6) =
+                let (override_remote_write_address, override_local_write_location, is_ipv6) =
                     if resolved_address.to_string() != remote_location.to_string() {
                         (
                             Some(resolved_address),
@@ -474,12 +491,15 @@ async fn run_udp_local_to_remote_loop(
                     };
 
                 let client_socket = client_proxy.configure_udp_socket(is_ipv6)?;
+
                 let session = UdpSession::start(
                     session_id,
                     connection.clone(),
                     Arc::new(client_socket),
-                    original_address,
-                    override_address,
+                    remote_location.clone(),
+                    resolved_address,
+                    override_local_write_location,
+                    override_remote_write_address,
                 );
                 entry.insert(session)
             }
@@ -540,21 +560,49 @@ async fn run_udp_local_to_remote_loop(
             (complete_payload.freeze(), initial_location)
         };
 
-        let socket_addr = match session.override_address {
+        let socket_addr = match session.override_remote_write_address {
             Some(addr) => addr,
-            None => match remote_location.to_socket_addr_nonblocking() {
-                Some(addr) => addr,
-                None => match resolver_cache.resolve_location(&remote_location).await {
-                    Ok(s) => s,
-                    Err(e) => {
-                        error!(
-                            "Failed to resolve remote location {}: {}",
-                            remote_location, e
-                        );
-                        continue;
-                    }
-                },
-            },
+            None => {
+                if remote_location == session.last_location {
+                    session.last_socket_addr
+                } else {
+                    warn!(
+                        "Location changed during ongoing UDP session: {}",
+                        remote_location.clone()
+                    );
+                    let action = client_proxy_selector
+                        .judge(remote_location.clone(), &resolver)
+                        .await;
+                    let updated_location = match action {
+                        Ok(ConnectDecision::Allow {
+                            client_proxy: _,
+                            remote_location,
+                        }) => remote_location,
+                        Ok(ConnectDecision::Block) => {
+                            warn!("Blocked UDP forward to {}", remote_location);
+                            continue;
+                        }
+                        Err(e) => {
+                            error!("Failed to judge UDP forward to {}: {}", remote_location, e);
+                            continue;
+                        }
+                    };
+                    let updated_socket_addr =
+                        match resolver_cache.resolve_location(&updated_location).await {
+                            Ok(s) => s,
+                            Err(e) => {
+                                error!(
+                                    "Failed to resolve updated remote location {}: {}",
+                                    updated_location, e
+                                );
+                                continue;
+                            }
+                        };
+                    session.last_location = updated_location;
+                    session.last_socket_addr = updated_socket_addr;
+                    updated_socket_addr
+                }
+            }
         };
 
         if let Err(e) = session
@@ -854,7 +902,7 @@ pub async fn run_hysteria2_server(
             Arc::get_mut(&mut server_config.transport)
                 .unwrap()
                 .keep_alive_interval(Some(Duration::from_secs(15)))
-                .max_idle_timeout(Some(Duration::from_secs(30).try_into().unwrap()));
+                .max_idle_timeout(Some(Duration::from_secs(120).try_into().unwrap()));
 
             let socket2_socket =
                 new_socket2_udp_socket(bind_address.is_ipv6(), None, Some(bind_address), true)
