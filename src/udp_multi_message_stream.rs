@@ -1,4 +1,3 @@
-use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -103,52 +102,6 @@ impl UdpMultiMessageStream {
             notify_shutdown: shutdown_flag,
             join_handles,
         }
-    }
-
-    pub async fn read_sourced_message(
-        &mut self,
-        buf: &mut [u8],
-    ) -> std::io::Result<(usize, SocketAddr)> {
-        match self.receiver.recv().await {
-            Some((message, from_addr)) => {
-                // TODO: should we return an error instead?
-                let len = std::cmp::min(message.len(), buf.len());
-                buf[..len].copy_from_slice(&message[..len]);
-                Ok((len, from_addr))
-            }
-            None => Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "channel closed",
-            )),
-        }
-    }
-
-    pub fn write_targeted_message<'a, 'b>(
-        &'a mut self,
-        buf: &'b [u8],
-        target: &'b NetLocation,
-    ) -> WriteTargetedMessage<'a, 'b> {
-        WriteTargetedMessage {
-            stream: self,
-            buf,
-            target,
-        }
-    }
-}
-
-pub struct WriteTargetedMessage<'a, 'b> {
-    stream: &'a mut UdpMultiMessageStream,
-    buf: &'b [u8],
-    target: &'b NetLocation,
-}
-
-impl Future for WriteTargetedMessage<'_, '_> {
-    type Output = std::io::Result<()>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        // Safety: we're not moving any fields out of self
-        let this = unsafe { self.get_unchecked_mut() };
-        Pin::new(&mut *this.stream).poll_write_targeted_message(cx, this.buf, this.target)
     }
 }
 
