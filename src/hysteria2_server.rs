@@ -242,15 +242,7 @@ async fn run_udp_remote_to_local_loop(
     let original_address_bytes: Option<(Bytes, Bytes)> = match original_address {
         Some(a) => {
             let address_bytes: Bytes = a.to_string().into_bytes().into();
-
             let address_len = address_bytes.len();
-            if address_len > 2048 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "original address length too long",
-                ));
-            }
-
             let address_len_bytes = encode_varint(address_len as u64)?;
             Some((address_bytes, address_len_bytes.into()))
         }
@@ -379,7 +371,7 @@ async fn run_udp_local_to_remote_loop(
 
         let (address_len, next_index) = {
             let first_byte = data[8];
-            let length_indicator = (first_byte >> 6) & 0b11;
+            let length_indicator = first_byte >> 6;
             let mut value: u64 = (first_byte & 0b00111111) as u64;
             let num_bytes = match length_indicator {
                 0 => 1,
@@ -387,10 +379,8 @@ async fn run_udp_local_to_remote_loop(
                 2 => 4,
                 3 => 8,
                 _ => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        "invalid num bytes value",
-                    ))
+                    // impossible since we only have 2 bits
+                    panic!("invalid num bytes value");
                 }
             };
             let mut next_index = 9;
@@ -404,6 +394,16 @@ async fn run_udp_local_to_remote_loop(
             }
             (value as usize, next_index)
         };
+
+        if address_len == 0 {
+            error!("Ignoring packet with empty address");
+            continue;
+        }
+
+        if address_len > 2048 {
+            error!("Ignoring packet with address length {}", address_len);
+            continue;
+        }
 
         if data.len() < next_index + address_len {
             return Err(std::io::Error::new(
@@ -622,15 +622,15 @@ async fn process_tcp_stream(
     }
 
     // max lengths from https://github.com/apernet/hysteria/blob/5520bcc405ee11a47c164c75bae5c40fc2b1d99d/core/internal/protocol/proxy.go#L19
-    let address_length = read_varint(&mut recv, &mut line_reader).await?;
-    if address_length > 2048 {
+    let address_len = read_varint(&mut recv, &mut line_reader).await?;
+    if address_len > 2048 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::Other,
             "invalid address length",
         ));
     }
     let address_bytes = line_reader
-        .read_slice(&mut recv, address_length as usize)
+        .read_slice(&mut recv, address_len as usize)
         .await?;
     let address = std::str::from_utf8(address_bytes)
         .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
@@ -796,10 +796,8 @@ async fn read_varint(
         2 => 4,
         3 => 8,
         _ => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "invalid num bytes value",
-            ))
+            // impossible since we only have 2 bits
+            panic!("invalid num bytes value");
         }
     };
 
