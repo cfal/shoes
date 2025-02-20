@@ -605,16 +605,15 @@ async fn run_tcp_loop(
     Ok(())
 }
 
-async fn process_tcp_stream(
-    client_proxy_selector: Arc<ClientProxySelector<TcpClientConnector>>,
-    resolver: Arc<dyn Resolver>,
-    mut send: quinn::SendStream,
-    mut recv: quinn::RecvStream,
-) -> std::io::Result<()> {
+async fn handle_tcp_header(
+    send: &mut quinn::SendStream,
+    recv: &mut quinn::RecvStream,
+) -> std::io::Result<(NetLocation, LineReader)> {
     let mut line_reader = LineReader::new_with_buffer_size(8192);
 
-    let tcp_request_id = read_varint(&mut recv, &mut line_reader).await?;
-    if tcp_request_id != 0x401 {
+    // the tcp request id is a varint with value 0x401, which is encoded as [0x44, 0x01]
+    let tcp_request_id = line_reader.read_slice(recv, 2).await?;
+    if tcp_request_id[0] != 0x44 || tcp_request_id[1] != 0x01 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::Other,
             "invalid tcp request id",
@@ -622,63 +621,75 @@ async fn process_tcp_stream(
     }
 
     // max lengths from https://github.com/apernet/hysteria/blob/5520bcc405ee11a47c164c75bae5c40fc2b1d99d/core/internal/protocol/proxy.go#L19
-    let address_len = read_varint(&mut recv, &mut line_reader).await?;
+    let address_len = read_varint(recv, &mut line_reader).await?;
     if address_len > 2048 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::Other,
             "invalid address length",
         ));
     }
-    let address_bytes = line_reader
-        .read_slice(&mut recv, address_len as usize)
-        .await?;
+    let address_bytes = line_reader.read_slice(recv, address_len as usize).await?;
     let address = std::str::from_utf8(address_bytes)
         .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
     let remote_location = NetLocation::from_str(address, None)?;
 
-    let padding_length = read_varint(&mut recv, &mut line_reader).await?;
-    if padding_length > 4096 {
+    let padding_len = read_varint(recv, &mut line_reader).await?;
+    if padding_len > 4096 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::Other,
             "invalid padding length",
         ));
     }
-    line_reader
-        .read_slice(&mut recv, padding_length as usize)
-        .await?;
+    line_reader.read_slice(recv, padding_len as usize).await?;
 
-    {
-        let response_bytes = {
-            // [uint8] Status (0x00 = OK, 0x01 = Error)
-            // [varint] Message length
-            // [bytes] Message string
-            // [varint] Padding length
-            // [bytes] Random padding
+    let response_bytes = {
+        // [uint8] Status (0x00 = OK, 0x01 = Error)
+        // [varint] Message length
+        // [bytes] Message string
+        // [varint] Padding length
+        // [bytes] Random padding
 
-            let mut rng = rand::thread_rng();
+        let mut rng = rand::thread_rng();
 
-            // only use the lower 6 bits so that the varint always fits in a single u8
-            let padding_length = rng.gen_range(0..=63);
+        // only use the lower 6 bits so that the varint always fits in a single u8
+        let padding_len = rng.gen_range(0..=63);
 
-            // first 3 bytes of status = 0x0, message length = 0, padding length
-            let mut response_bytes = allocate_vec(3 + (padding_length as usize));
-            response_bytes[0] = 0;
-            response_bytes[1] = 0;
-            response_bytes[2] = padding_length;
-            rng.fill_bytes(&mut response_bytes[3..]);
+        // first 3 bytes of status = 0x0, message length = 0, padding length
+        let mut response_bytes = allocate_vec(3 + (padding_len as usize));
+        response_bytes[0] = 0;
+        response_bytes[1] = 0;
+        response_bytes[2] = padding_len;
+        rng.fill_bytes(&mut response_bytes[3..]);
 
-            response_bytes
-        };
-        let len = response_bytes.len();
-        let mut i = 0;
-        while i < len {
-            let count = send
-                .write(&response_bytes[i..len])
-                .await
-                .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
-            i += count;
-        }
+        response_bytes
+    };
+
+    let len = response_bytes.len();
+    let mut i = 0;
+    while i < len {
+        let count = send
+            .write(&response_bytes[i..len])
+            .await
+            .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
+        i += count;
     }
+
+    Ok((remote_location, line_reader))
+}
+
+async fn process_tcp_stream(
+    client_proxy_selector: Arc<ClientProxySelector<TcpClientConnector>>,
+    resolver: Arc<dyn Resolver>,
+    mut send: quinn::SendStream,
+    mut recv: quinn::RecvStream,
+) -> std::io::Result<()> {
+    let (remote_location, line_reader) = match handle_tcp_header(&mut send, &mut recv).await {
+        Ok(res) => res,
+        Err(e) => {
+            let _ = send.shutdown().await;
+            return Err(e);
+        }
+    };
 
     let mut server_stream: Box<dyn AsyncStream> = Box::new(QuicStream::from(send, recv));
 
