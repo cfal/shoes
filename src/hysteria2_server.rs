@@ -901,6 +901,7 @@ pub async fn run_hysteria2_server(
 
             Arc::get_mut(&mut server_config.transport)
                 .unwrap()
+                .max_concurrent_bidi_streams(4096_u32.into())
                 .keep_alive_interval(Some(Duration::from_secs(15)))
                 .max_idle_timeout(Some(Duration::from_secs(120).try_into().unwrap()));
 
