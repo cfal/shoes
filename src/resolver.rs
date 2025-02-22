@@ -45,6 +45,9 @@ pub async fn resolve_single_address(
     resolver: &Arc<dyn Resolver>,
     location: &NetLocation,
 ) -> std::io::Result<SocketAddr> {
+    if let Some(socket_addr) = location.to_socket_addr_nonblocking() {
+        return Ok(socket_addr);
+    }
     let resolve_results = resolver.resolve_location(location).await?;
     if resolve_results.is_empty() {
         return Err(std::io::Error::new(
