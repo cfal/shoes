@@ -61,6 +61,23 @@ async fn process_connection(
         }));
     }
 
+    // depending on the client, unidirectional streams could still be sent, accept and drop.
+    {
+        let connection = connection.clone();
+        join_handles.push(tokio::spawn(async move {
+            loop {
+                match connection.accept_uni().await {
+                    Ok(mut recv_stream) => {
+                        let _ = recv_stream.stop(0u32.into());
+                    }
+                    Err(e) => {
+                        error!("Unidirectional loop ended with error: {}", e);
+                        break;
+                    }
+                }
+            }
+        }));
+    }
     join_handles.push(tokio::spawn(async move {
         if let Err(e) = run_tcp_loop(connection, client_proxy_selector, resolver).await {
             error!("TCP loop ended with error: {}", e);
@@ -902,6 +919,8 @@ pub async fn run_hysteria2_server(
             Arc::get_mut(&mut server_config.transport)
                 .unwrap()
                 .max_concurrent_bidi_streams(4096_u32.into())
+                // required for HTTP/3 QPACK updates
+                .max_concurrent_uni_streams(1024_u32.into())
                 .keep_alive_interval(Some(Duration::from_secs(15)))
                 .max_idle_timeout(Some(Duration::from_secs(120).try_into().unwrap()));
 
