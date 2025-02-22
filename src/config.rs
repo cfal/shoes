@@ -232,6 +232,11 @@ pub enum ServerProxyConfig {
         #[serde(default = "default_true")]
         udp_enabled: bool,
     },
+    #[serde(alias = "tuic")]
+    TuicV5 {
+        uuid: String,
+        password: String,
+    },
 }
 
 impl std::fmt::Display for ServerProxyConfig {
@@ -251,6 +256,7 @@ impl std::fmt::Display for ServerProxyConfig {
                 Self::Websocket { .. } => "Websocket",
                 Self::PortForward { .. } => "Portforward",
                 Self::Hysteria2 { .. } => "Hysteria2",
+                Self::TuicV5 { .. } => "TuicV5",
             }
         )
     }
@@ -884,6 +890,9 @@ fn validate_server_proxy_config(
                     validate_rule_config(rule_config_selection.unwrap_config_mut(), client_groups)?;
                 }
             }
+        }
+        ServerProxyConfig::TuicV5 { uuid, .. } => {
+            parse_uuid(uuid)?;
         }
         _ => (),
     }

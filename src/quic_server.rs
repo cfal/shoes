@@ -402,6 +402,18 @@ pub async fn start_quic_server(config: ServerConfig) -> std::io::Result<Option<J
             .await
             .unwrap();
         }))),
+        ServerProxyConfig::TuicV5 { uuid, password } => Ok(Some(tokio::spawn(async move {
+            crate::tuic_server::run_tuic_server(
+                bind_address,
+                server_config,
+                uuid,
+                password,
+                client_proxy_selector,
+                num_endpoints,
+            )
+            .await
+            .unwrap();
+        }))),
         tcp_protocol => {
             let mut rules_stack = vec![rules];
             let tcp_handler: Arc<Box<dyn TcpServerHandler>> =
