@@ -24,6 +24,7 @@ mod thread_util;
 mod timed_salt_checker;
 mod tls_handler;
 mod trojan_handler;
+mod tuic_server;
 mod udp_message_stream;
 mod udp_multi_message_stream;
 mod util;
