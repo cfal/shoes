@@ -89,6 +89,19 @@ impl LineReader {
         Ok(value)
     }
 
+    pub async fn read_u16_be<T: AsyncReadExt + Unpin>(
+        &mut self,
+        stream: &mut T,
+    ) -> std::io::Result<u16> {
+        while self.end_offset - self.start_offset < 2 {
+            self.read(stream).await?;
+        }
+        let value =
+            u16::from_be_bytes([self.buf[self.start_offset], self.buf[self.start_offset + 1]]);
+        self.start_offset += 2;
+        Ok(value)
+    }
+
     pub async fn read_slice<T: AsyncReadExt + Unpin>(
         &mut self,
         stream: &mut T,
