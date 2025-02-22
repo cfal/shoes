@@ -494,20 +494,18 @@ async fn run_udp_local_to_remote_loop(
                         }
                     };
 
-                let (override_remote_write_address, override_local_write_location, is_ipv6) =
+                let (override_remote_write_address, override_local_write_location) =
                     if resolved_address.to_string() != remote_location.to_string() {
-                        (
-                            Some(resolved_address),
-                            Some(remote_location.clone()),
-                            resolved_address.is_ipv6(),
-                        )
+                        (Some(resolved_address), Some(remote_location.clone()))
                     } else {
-                        // since we don't replace addresses, support the case where a future
-                        // address is ipv6
-                        (None, None, true)
+                        (None, None)
                     };
 
-                let client_socket = client_proxy.configure_udp_socket(is_ipv6)?;
+                // even if the remote location is ipv4, a future location could be ipv6.
+                // TODO: the configured client socket is for the current remote_location, but
+                // the remote_location could be changed later on with a different client_socket
+                // configuration.
+                let client_socket = client_proxy.configure_udp_socket(true)?;
 
                 let session = UdpSession::start(
                     session_id,
