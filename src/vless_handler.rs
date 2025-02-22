@@ -11,7 +11,7 @@ use crate::tcp_handler::{
     TcpClientHandler, TcpClientSetupResult, TcpServerHandler, TcpServerSetupResult,
 };
 
-use crate::util::allocate_vec;
+use crate::util::{allocate_vec, parse_uuid};
 
 #[derive(Debug)]
 pub struct VlessTcpHandler {
@@ -21,7 +21,7 @@ pub struct VlessTcpHandler {
 impl VlessTcpHandler {
     pub fn new(user_id: &str) -> Self {
         Self {
-            user_id: parse_hex(user_id),
+            user_id: parse_uuid(user_id).unwrap().into_boxed_slice(),
         }
     }
 }
@@ -240,25 +240,6 @@ impl TcpClientHandler for VlessTcpHandler {
 
         Ok(TcpClientSetupResult { client_stream })
     }
-}
-
-fn parse_hex(hex_asm: &str) -> Box<[u8]> {
-    let mut hex_bytes = hex_asm
-        .as_bytes()
-        .iter()
-        .filter_map(|b| match b {
-            b'0'..=b'9' => Some(b - b'0'),
-            b'a'..=b'f' => Some(b - b'a' + 10),
-            b'A'..=b'F' => Some(b - b'A' + 10),
-            _ => None,
-        })
-        .fuse();
-
-    let mut bytes = Vec::new();
-    while let (Some(h), Some(l)) = (hex_bytes.next(), hex_bytes.next()) {
-        bytes.push(h << 4 | l)
-    }
-    bytes.into_boxed_slice()
 }
 
 fn read_varint(data: &[u8]) -> std::io::Result<(u64, usize)> {

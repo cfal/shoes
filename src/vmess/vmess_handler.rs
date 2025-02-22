@@ -27,7 +27,7 @@ use crate::option_util::NoneOrOne;
 use crate::tcp_handler::{
     TcpClientHandler, TcpClientSetupResult, TcpServerHandler, TcpServerSetupResult,
 };
-use crate::util::allocate_vec;
+use crate::util::{allocate_vec, parse_uuid};
 
 const TAG_LEN: usize = 16;
 
@@ -120,7 +120,7 @@ pub struct VmessTcpServerHandler {
 
 impl VmessTcpServerHandler {
     pub fn new(cipher_name: &str, user_id: &str, force_aead: bool, udp_enabled: bool) -> Self {
-        let mut user_id_bytes = parse_hex(user_id);
+        let mut user_id_bytes = parse_uuid(user_id).unwrap();
         let cert_hash_provider = if force_aead {
             None
         } else {
@@ -702,7 +702,7 @@ pub struct VmessTcpClientHandler {
 
 impl VmessTcpClientHandler {
     pub fn new(cipher_name: &str, user_id: &str, is_aead: bool) -> Self {
-        let mut user_id_bytes = parse_hex(user_id);
+        let mut user_id_bytes = parse_uuid(user_id).unwrap();
         let mut user_key = [0u8; 16];
         user_key.copy_from_slice(&user_id_bytes);
 
@@ -996,24 +996,4 @@ impl TcpClientHandler for VmessTcpClientHandler {
 
         Ok(TcpClientSetupResult { client_stream })
     }
-}
-
-// taken from https://codereview.stackexchange.com/questions/201698/convert-string-of-hex-into-vector-of-bytes
-fn parse_hex(hex_asm: &str) -> Vec<u8> {
-    let mut hex_bytes = hex_asm
-        .as_bytes()
-        .iter()
-        .filter_map(|b| match b {
-            b'0'..=b'9' => Some(b - b'0'),
-            b'a'..=b'f' => Some(b - b'a' + 10),
-            b'A'..=b'F' => Some(b - b'A' + 10),
-            _ => None,
-        })
-        .fuse();
-
-    let mut bytes = Vec::new();
-    while let (Some(h), Some(l)) = (hex_bytes.next(), hex_bytes.next()) {
-        bytes.push(h << 4 | l)
-    }
-    bytes
 }
