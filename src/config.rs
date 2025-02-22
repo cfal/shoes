@@ -6,6 +6,7 @@ use serde::Deserialize;
 use crate::address::{NetLocation, NetLocationMask};
 use crate::option_util::{NoneOrOne, NoneOrSome, OneOrSome};
 use crate::thread_util::get_num_threads;
+use crate::util::parse_uuid;
 
 fn default_true() -> bool {
     true
@@ -825,6 +826,12 @@ fn validate_server_proxy_config(
     rule_groups: &HashMap<String, Vec<RuleConfig>>,
 ) -> std::io::Result<()> {
     match server_proxy_config {
+        ServerProxyConfig::Vless { user_id } => {
+            parse_uuid(user_id)?;
+        }
+        ServerProxyConfig::Vmess { user_id, .. } => {
+            parse_uuid(user_id)?;
+        }
         ServerProxyConfig::Tls {
             sni_targets,
             default_target,
