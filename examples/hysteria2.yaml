@@ -5,8 +5,6 @@
     key: cert.pem
     alpn_protocols:
     - h3
-    - any
-    - none
   protocol:
     type: hysteria2
     password: abc128459
