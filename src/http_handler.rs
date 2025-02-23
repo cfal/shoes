@@ -125,20 +125,10 @@ impl TcpServerHandler for HttpTcpServerHandler {
                         .into_boxed_slice(),
                 );
 
-                let unparsed_data = line_reader.unparsed_data();
-
-                let initial_remote_data = if !unparsed_data.is_empty() {
-                    let mut initial_remote_data = Vec::with_capacity(unparsed_data.len());
-                    initial_remote_data.extend(unparsed_data.iter());
-                    Some(initial_remote_data.into_boxed_slice())
-                } else {
-                    None
-                };
-
                 (
                     remote_location,
                     connection_success_response,
-                    initial_remote_data,
+                    line_reader.unparsed_data_owned(),
                     true,
                 )
             } else {
