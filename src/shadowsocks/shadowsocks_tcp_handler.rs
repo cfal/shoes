@@ -104,7 +104,7 @@ impl TcpServerHandler for ShadowsocksTcpHandler {
                     .await?;
             }
 
-            Some(line_reader.unparsed_data().to_vec().into_boxed_slice())
+            line_reader.unparsed_data_owned()
         } else {
             None
         };
