@@ -28,7 +28,7 @@ use crate::option_util::NoneOrOne;
 use crate::tcp_handler::{
     TcpClientHandler, TcpClientSetupResult, TcpServerHandler, TcpServerSetupResult,
 };
-use crate::util::{allocate_vec, parse_uuid};
+use crate::util::{allocate_vec, parse_uuid, write_all};
 
 const TAG_LEN: usize = 16;
 
@@ -758,17 +758,6 @@ impl VmessTcpClientHandler {
             is_aead,
         }
     }
-}
-
-// a cancellable alternative to AsyncWriteExt::write_all
-async fn write_all<T: AsyncWriteExt + Unpin>(stream: &mut T, buf: &[u8]) -> std::io::Result<()> {
-    let mut i = 0;
-    let n = buf.len();
-    while i < n {
-        let n = stream.write(&buf[i..]).await?;
-        i += n;
-    }
-    Ok(())
 }
 
 #[async_trait]
