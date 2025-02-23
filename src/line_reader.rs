@@ -157,6 +157,15 @@ impl LineReader {
         &self.buf[self.start_offset..self.end_offset]
     }
 
+    pub fn unparsed_data_owned(&self) -> Option<Box<[u8]>> {
+        let unparsed_data = self.unparsed_data();
+        if unparsed_data.is_empty() {
+            None
+        } else {
+            Some(unparsed_data.to_vec().into_boxed_slice())
+        }
+    }
+
     async fn read<T: AsyncReadExt + Unpin>(&mut self, stream: &mut T) -> std::io::Result<()> {
         // Note that read() needs to work for blocking I/O. So we need to return
         // immediately after a single read() call.
