@@ -265,7 +265,6 @@ impl VmessStream {
             if self.read_header_state != ReadHeaderState::Done {
                 return Ok(());
             }
-            self.read_header_info.take().unwrap();
         }
 
         loop {
@@ -364,7 +363,6 @@ impl VmessStream {
         let ReadHeaderInfo {
             response_header_key,
             response_header_iv,
-            response_authentication_v,
             ..
         } = self.read_header_info.as_ref().unwrap();
 
@@ -400,7 +398,12 @@ impl VmessStream {
             self.unprocessed_end_offset = 0;
         }
 
-        check_header_response(encrypted_response_header, *response_authentication_v)
+        let ReadHeaderInfo {
+            response_authentication_v,
+            ..
+        } = self.read_header_info.take().unwrap();
+
+        check_header_response(encrypted_response_header, response_authentication_v)
     }
 
     fn process_read_header_legacy_content(&mut self) -> std::io::Result<()> {
@@ -411,7 +414,6 @@ impl VmessStream {
         let ReadHeaderInfo {
             response_header_key,
             response_header_iv,
-            response_authentication_v,
             ..
         } = self.read_header_info.as_ref().unwrap();
 
@@ -440,7 +442,12 @@ impl VmessStream {
             self.unprocessed_end_offset = 0;
         }
 
-        check_header_response(response_header_bytes, *response_authentication_v)
+        let ReadHeaderInfo {
+            response_authentication_v,
+            ..
+        } = self.read_header_info.take().unwrap();
+
+        check_header_response(response_header_bytes, response_authentication_v)
     }
 
     fn try_decrypt(&mut self) -> std::io::Result<DecryptState> {
@@ -752,8 +759,6 @@ impl AsyncRead for VmessStream {
                 }
             }
 
-            this.read_header_info.take().unwrap();
-
             // We probably already have some user data ready to be processed, so we need
             // to do so immediately since we go straight to a poll_read below.
             loop {
@@ -978,6 +983,46 @@ impl AsyncReadMessage for VmessStream {
         buf: &mut ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         let this = self.get_mut();
+
+        if this.read_header_state != ReadHeaderState::Done && !this.is_eof {
+            loop {
+                let mut read_buf =
+                    ReadBuf::new(&mut this.unprocessed_buf[this.unprocessed_end_offset..]);
+                ready!(Pin::new(&mut this.stream).poll_read(cx, &mut read_buf))?;
+                let len = read_buf.filled().len();
+                if len == 0 {
+                    this.is_eof = true;
+                    return Poll::Ready(Ok(()));
+                }
+                this.unprocessed_end_offset += len;
+                this.process_read_header()?;
+                if this.read_header_state == ReadHeaderState::Done {
+                    break;
+                }
+            }
+
+            // We probably already have some user data ready to be processed, so we need
+            // to do so immediately since we go straight to a poll_read below.
+            loop {
+                match this.try_decrypt()? {
+                    DecryptState::NeedData => {
+                        break;
+                    }
+                    DecryptState::ReceivedEof => {
+                        this.is_eof = true;
+                        break;
+                    }
+                    DecryptState::BufferFull => {
+                        assert!(this.processed_end_offset > 0);
+                        this.read_processed(buf);
+                        return Poll::Ready(Ok(()));
+                    }
+                    DecryptState::Success => {
+                        continue;
+                    }
+                }
+            }
+        }
 
         if this.processed_end_offset > 0 {
             this.read_processed(buf);
