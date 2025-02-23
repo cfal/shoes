@@ -39,12 +39,8 @@ pub fn new_reuse_udp_sockets(
     sockets.push(into_tokio_udp_socket(socket)?);
 
     for _ in 1..count {
-        let socket = new_socket2_udp_socket(
-            is_ipv6,
-            bind_interface.clone(),
-            Some(local_addr.clone()),
-            true,
-        )?;
+        let socket =
+            new_socket2_udp_socket(is_ipv6, bind_interface.clone(), Some(local_addr), true)?;
         sockets.push(into_tokio_udp_socket(socket)?);
     }
 
