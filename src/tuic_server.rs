@@ -775,8 +775,8 @@ async fn process_udp_recv_stream(
             let removed_session = udp_session_map.remove(&assoc_id);
             if removed_session.is_none() {
                 error!("UDP session {} not found to dissociate", assoc_id);
-                continue;
             }
+            continue;
         } else if command_type != COMMAND_TYPE_PACKET {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
