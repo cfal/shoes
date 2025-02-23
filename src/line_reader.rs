@@ -85,7 +85,13 @@ impl LineReader {
             self.read(stream).await?;
         }
         let value = self.buf[self.start_offset];
-        self.start_offset += 1;
+        let new_start_offset = self.start_offset + 1;
+        if new_start_offset == self.end_offset {
+            self.start_offset = 0;
+            self.end_offset = 0;
+        } else {
+            self.start_offset = new_start_offset;
+        }
         Ok(value)
     }
 
@@ -98,7 +104,13 @@ impl LineReader {
         }
         let value =
             u16::from_be_bytes([self.buf[self.start_offset], self.buf[self.start_offset + 1]]);
-        self.start_offset += 2;
+        let new_start_offset = self.start_offset + 2;
+        if new_start_offset == self.end_offset {
+            self.start_offset = 0;
+            self.end_offset = 0;
+        } else {
+            self.start_offset = new_start_offset;
+        }
         Ok(value)
     }
 
@@ -107,11 +119,27 @@ impl LineReader {
         stream: &mut T,
         len: usize,
     ) -> std::io::Result<&[u8]> {
+        if len > self.buf.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "Requested length {} exceeds buffer size {}",
+                    len,
+                    self.buf.len()
+                ),
+            ));
+        }
         while self.end_offset - self.start_offset < len {
             self.read(stream).await?;
         }
         let slice = &self.buf[self.start_offset..self.start_offset + len];
-        self.start_offset += len;
+        let new_start_offset = self.start_offset + len;
+        if new_start_offset == self.end_offset {
+            self.start_offset = 0;
+            self.end_offset = 0;
+        } else {
+            self.start_offset = new_start_offset;
+        }
         Ok(slice)
     }
 
