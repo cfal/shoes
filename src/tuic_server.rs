@@ -141,15 +141,15 @@ async fn auth_connection(
     if specified_uuid != uuid {
         // TODO: pretty print
         return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
+            std::io::ErrorKind::PermissionDenied,
             format!("incorrect uuid: {:?}", specified_uuid),
         ));
     }
     let token_bytes = line_reader.read_slice(&mut recv_stream, 32).await?;
     if token_bytes != expected_token_bytes {
         return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("incorrect token"),
+            std::io::ErrorKind::PermissionDenied,
+            "incorrect token",
         ));
     }
 
@@ -488,7 +488,7 @@ impl UdpSession {
                     (self.last_socket_addr, false)
                 } else {
                     let action = client_proxy_selector
-                        .judge(location.clone(), &resolver)
+                        .judge(location.clone(), resolver)
                         .await?;
 
                     let updated_location = match action {
@@ -504,7 +504,7 @@ impl UdpSession {
                         }
                     };
                     let updated_address =
-                        match resolve_single_address(&resolver, &updated_location).await {
+                        match resolve_single_address(resolver, &updated_location).await {
                             Ok(s) => s,
                             Err(e) => {
                                 error!(
@@ -666,7 +666,7 @@ async fn run_udp_remote_to_local_datagram_loop(
             let other_capacity = max_datagram_size - other_overhead;
 
             let remaining = payload_len.saturating_sub(first_capacity);
-            let additional_fragments = (remaining + other_capacity - 1) / other_capacity;
+            let additional_fragments = remaining.div_ceil(other_capacity);
             let fragment_count = 1 + additional_fragments;
 
             let mut offset = 0;
@@ -822,6 +822,7 @@ async fn process_udp_packet(
     payload_fragment: &[u8],
     is_uni_stream: bool,
 ) -> std::io::Result<()> {
+    // TODO: this session is immediately dropped when frag_total > 1
     let session = match udp_session_map.get(&assoc_id) {
         Some(s) => s,
         None => {
@@ -837,7 +838,7 @@ async fn process_udp_packet(
             let remote_location = remote_location.clone().unwrap();
 
             let action = client_proxy_selector
-                .judge(remote_location.clone(), &resolver)
+                .judge(remote_location.clone(), resolver)
                 .await;
 
             let (client_proxy, updated_location) = match action {
@@ -859,7 +860,7 @@ async fn process_udp_packet(
                 }
             };
 
-            let resolved_address = resolve_single_address(&resolver, &updated_location)
+            let resolved_address = resolve_single_address(resolver, &updated_location)
                 .await
                 .map_err(|e| {
                     std::io::Error::new(
@@ -934,7 +935,7 @@ async fn process_udp_packet(
         let remote_location = remote_location.as_ref().unwrap();
 
         let (socket_addr, is_updated) = session
-            .resolve_address(&remote_location, &client_proxy_selector, &resolver)
+            .resolve_address(remote_location, client_proxy_selector, resolver)
             .await
             .map_err(|e| {
                 std::io::Error::new(
@@ -948,7 +949,7 @@ async fn process_udp_packet(
 
         if let Err(e) = session
             .send_socket
-            .send_to(&payload_fragment, socket_addr)
+            .send_to(payload_fragment, socket_addr)
             .await
         {
             error!(
@@ -1037,7 +1038,7 @@ async fn process_udp_packet(
         let remote_location = remote_location.unwrap();
 
         let (socket_addr, is_updated) = session
-            .resolve_address(&remote_location, &client_proxy_selector, &resolver)
+            .resolve_address(&remote_location, client_proxy_selector, resolver)
             .await
             .map_err(|e| {
                 std::io::Error::new(
