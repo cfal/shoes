@@ -822,6 +822,13 @@ async fn process_udp_packet(
     payload_fragment: &[u8],
     is_uni_stream: bool,
 ) -> std::io::Result<()> {
+    if frag_total == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "Ignoring packet with empty fragment total",
+        ));
+    }
+
     // TODO: this session is immediately dropped when frag_total > 1
     let session = match udp_session_map.get(&assoc_id) {
         Some(s) => s,
@@ -920,12 +927,7 @@ async fn process_udp_packet(
         }
     };
 
-    if frag_total == 0 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "Ignoring packet with empty fragment total",
-        ));
-    } else if frag_total == 1 {
+    if frag_total == 1 {
         if remote_location.is_none() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
