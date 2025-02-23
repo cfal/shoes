@@ -1,14 +1,13 @@
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::str;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use log::{error, warn};
-use rand::{Rng, RngCore};
 use tokio::io::AsyncWriteExt;
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
@@ -19,17 +18,21 @@ use crate::client_proxy_selector::{ClientProxySelector, ConnectDecision};
 use crate::copy_bidirectional::copy_bidirectional_with_sizes;
 use crate::line_reader::LineReader;
 use crate::quic_stream::QuicStream;
-use crate::resolver::{resolve_single_address, NativeResolver, Resolver, ResolverCache};
+use crate::resolver::{resolve_single_address, NativeResolver, Resolver};
 use crate::socket_util::new_socket2_udp_socket;
 use crate::tcp_client_connector::TcpClientConnector;
 use crate::tcp_server::setup_client_stream;
-use crate::util::{allocate_vec, parse_uuid};
+use crate::util::parse_uuid;
 
 const COMMAND_TYPE_AUTHENTICATE: u8 = 0x00;
 const COMMAND_TYPE_CONNECT: u8 = 0x01;
 const COMMAND_TYPE_PACKET: u8 = 0x02;
 const COMMAND_TYPE_DISSOCIATE: u8 = 0x03;
 const COMMAND_TYPE_HEARTBEAT: u8 = 0x04;
+
+// hostname case: type (1) + hostname length (1) + hostname bytes (255) + port (2)
+const MAX_ADDRESS_BYTES_LEN: usize = 1 + 1 + 255 + 2;
+const MAX_HEADER_LEN: usize = 2 + 2 + 1 + 1 + 2 + MAX_ADDRESS_BYTES_LEN;
 
 async fn process_connection(
     client_proxy_selector: Arc<ClientProxySelector<TcpClientConnector>>,
@@ -76,7 +79,7 @@ async fn process_connection(
             )
             .await
             {
-                error!("Bidirectional loop ended with error: {}", e);
+                error!("Unidirectional loop ended with error: {}", e);
             }
         }));
     }
@@ -87,7 +90,7 @@ async fn process_connection(
                 run_datagram_loop(connection, client_proxy_selector, resolver, udp_session_map)
                     .await
             {
-                error!("Bidirectional loop ended with error: {}", e);
+                error!("Datagram loop ended with error: {}", e);
             }
         }));
     }
@@ -405,8 +408,7 @@ struct FragmentedPacket {
 }
 
 impl UdpSession {
-    // TODO: remove this function completely and inline?
-    fn start(
+    fn start_with_send_stream(
         assoc_id: u16,
         send_stream: quinn::SendStream,
         client_socket: Arc<UdpSocket>,
@@ -427,6 +429,39 @@ impl UdpSession {
             if let Err(e) = run_udp_remote_to_local_stream_loop(
                 assoc_id,
                 send_stream,
+                client_socket,
+                override_local_write_location,
+            )
+            .await
+            {
+                error!("UDP remote-to-local write loop ended with error: {}", e);
+            }
+        });
+
+        session
+    }
+
+    fn start_with_datagram(
+        assoc_id: u16,
+        connection: quinn::Connection,
+        client_socket: Arc<UdpSocket>,
+        initial_location: NetLocation,
+        initial_socket_addr: SocketAddr,
+        override_local_write_location: Option<NetLocation>,
+        override_remote_write_address: Option<SocketAddr>,
+    ) -> Self {
+        let session = UdpSession {
+            fragments: HashMap::new(),
+            send_socket: client_socket.clone(),
+            last_location: initial_location,
+            last_socket_addr: initial_socket_addr,
+            override_remote_write_address,
+        };
+
+        tokio::spawn(async move {
+            if let Err(e) = run_udp_remote_to_local_datagram_loop(
+                assoc_id,
+                connection,
                 client_socket,
                 override_local_write_location,
             )
@@ -498,10 +533,6 @@ async fn run_udp_remote_to_local_stream_loop(
     let original_address_bytes: Option<Bytes> =
         override_local_write_address.map(|a| serialize_address(&a).into());
 
-    // hostname case: type (1) + hostname length (1) + hostname bytes (255) + port (2)
-    const MAX_ADDRESS_BYTES_LEN: usize = 1 + 1 + 255 + 2;
-    const MAX_HEADER_LEN: usize = 2 + 2 + 1 + 1 + 2 + MAX_ADDRESS_BYTES_LEN;
-
     let mut next_packet_id: u16 = 0;
     let mut buf = [0u8; MAX_HEADER_LEN + 65535];
 
@@ -557,6 +588,120 @@ async fn run_udp_remote_to_local_stream_loop(
     }
 }
 
+async fn run_udp_remote_to_local_datagram_loop(
+    assoc_id: u16,
+    connection: quinn::Connection,
+    client_socket: Arc<UdpSocket>,
+    override_local_write_location: Option<NetLocation>,
+) -> std::io::Result<()> {
+    use bytes::BufMut;
+
+    let max_datagram_size = connection.max_datagram_size().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "datagram not supported by remote endpoint",
+        )
+    })?;
+
+    let original_address_bytes: Option<Bytes> =
+        override_local_write_location.map(|a| serialize_address(&a).into());
+
+    let mut next_packet_id: u16 = 0;
+    let mut buf = [0u8; 65535];
+
+    loop {
+        let (payload_len, src_addr) = match client_socket.try_recv_from(&mut buf) {
+            Ok(res) => res,
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                client_socket.readable().await?;
+                continue;
+            }
+            Err(e) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("failed to receive from UDP socket: {}", e),
+                ));
+            }
+        };
+
+        let packet_id = next_packet_id;
+        next_packet_id = next_packet_id.wrapping_add(1);
+
+        let address_bytes: Bytes = match &original_address_bytes {
+            Some(a) => a.clone(),
+            None => serialize_socket_addr(&src_addr).into(),
+        };
+        let address_bytes_len = address_bytes.len();
+
+        // Header format:
+        // tuic_version (1 byte) + command_type (1 byte)
+        // + assoc_id (2 bytes) + packet_id (2 bytes)
+        // + frag_total (1 byte) + frag_id (1 byte)
+        // + payload_size (2 bytes) + address_bytes
+        let header_overhead = 1 + 1 + 2 + 2 + 1 + 1 + 2 + address_bytes_len;
+
+        if header_overhead + payload_len <= max_datagram_size {
+            let mut datagram = BytesMut::with_capacity(header_overhead + payload_len);
+            datagram.put_u8(5); // tuic version
+            datagram.put_u8(COMMAND_TYPE_PACKET); // command type
+            datagram.extend_from_slice(&assoc_id.to_be_bytes());
+            datagram.extend_from_slice(&packet_id.to_be_bytes());
+            datagram.put_u8(1); // frag_total = 1
+            datagram.put_u8(0); // frag_id = 0
+            datagram.extend_from_slice(&(payload_len as u16).to_be_bytes());
+            datagram.extend_from_slice(&address_bytes);
+            datagram.extend_from_slice(&buf[..payload_len]);
+
+            connection.send_datagram(datagram.freeze()).map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Failed to send datagram: {}", e),
+                )
+            })?;
+        } else {
+            // Calculate header sizes for first fragment and subsequent fragments.
+            let first_overhead = header_overhead; // full address included in the first fragment
+            let other_overhead = 1 + 1 + 2 + 2 + 1 + 1 + 2 + 1; // 0xff marker instead of full address
+            let first_capacity = max_datagram_size - first_overhead;
+            let other_capacity = max_datagram_size - other_overhead;
+
+            let remaining = payload_len.saturating_sub(first_capacity);
+            let additional_fragments = (remaining + other_capacity - 1) / other_capacity;
+            let fragment_count = 1 + additional_fragments;
+
+            let mut offset = 0;
+            for fragment_id in 0..fragment_count {
+                let (fragment_payload_len, header_size) = if fragment_id == 0 {
+                    let len = std::cmp::min(first_capacity, payload_len);
+                    (len, first_overhead)
+                } else {
+                    let len = std::cmp::min(other_capacity, payload_len - offset);
+                    (len, other_overhead)
+                };
+
+                let mut datagram = BytesMut::with_capacity(header_size + fragment_payload_len);
+                datagram.extend_from_slice(&[5, COMMAND_TYPE_PACKET]);
+                datagram.extend_from_slice(&assoc_id.to_be_bytes());
+                datagram.extend_from_slice(&packet_id.to_be_bytes());
+                datagram.extend_from_slice(&[fragment_count as u8, fragment_id as u8]);
+                datagram.extend_from_slice(&(fragment_payload_len as u16).to_be_bytes());
+                if fragment_id == 0 {
+                    datagram.extend_from_slice(&address_bytes);
+                } else {
+                    datagram.put_u8(0xff);
+                }
+                datagram.extend_from_slice(&buf[offset..offset + fragment_payload_len]);
+                connection.send_datagram(datagram.freeze()).map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("Failed to send datagram fragment {}: {}", fragment_id, e),
+                    )
+                })?;
+                offset += fragment_payload_len;
+            }
+        }
+    }
+}
 async fn run_unidirectional_loop(
     connection: quinn::Connection,
     client_proxy_selector: Arc<ClientProxySelector<TcpClientConnector>>,
@@ -598,7 +743,6 @@ async fn run_unidirectional_loop(
             }
         });
     }
-    std::future::pending::<()>().await;
     Ok(())
 }
 
@@ -609,7 +753,7 @@ async fn process_udp_recv_stream(
     mut recv_stream: quinn::RecvStream,
     udp_session_map: UdpSessionMap,
 ) -> std::io::Result<()> {
-    let mut line_reader = LineReader::new_with_buffer_size(65535);
+    let mut line_reader = LineReader::new_with_buffer_size(MAX_HEADER_LEN + 65535);
     loop {
         let tuic_version = line_reader.read_u8(&mut recv_stream).await?;
         if tuic_version != 5 {
@@ -619,9 +763,7 @@ async fn process_udp_recv_stream(
             ));
         }
         let command_type = line_reader.read_u8(&mut recv_stream).await?;
-        if command_type == COMMAND_TYPE_HEARTBEAT {
-            continue;
-        } else if command_type == COMMAND_TYPE_DISSOCIATE {
+        if command_type == COMMAND_TYPE_DISSOCIATE {
             let assoc_id = line_reader.read_u16_be(&mut recv_stream).await?;
             let removed_session = udp_session_map.remove(&assoc_id);
             if removed_session.is_none() {
@@ -703,7 +845,7 @@ async fn process_udp_recv_stream(
                 // TODO: should we only have a single send stream?
                 let send_stream = connection.open_uni().await?;
 
-                let session = UdpSession::start(
+                let session = UdpSession::start_with_send_stream(
                     assoc_id,
                     send_stream,
                     Arc::new(client_socket),
@@ -859,7 +1001,7 @@ async fn process_udp_recv_stream(
 
             if let Err(e) = session
                 .send_socket
-                .send_to(&payload_fragment, socket_addr)
+                .send_to(&complete_payload, socket_addr)
                 .await
             {
                 error!(
@@ -877,9 +1019,325 @@ async fn run_datagram_loop(
     resolver: Arc<dyn Resolver>,
     udp_session_map: UdpSessionMap,
 ) -> std::io::Result<()> {
-    // TODO
-    std::future::pending::<()>().await;
-    Ok(())
+    loop {
+        let data = connection.read_datagram().await.map_err(|err| {
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("failed to read datagram: {}", err),
+            )
+        })?;
+
+        if data.len() < 2 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "datagram length too short",
+            ));
+        }
+
+        let tuic_version = data[0];
+        if tuic_version != 5 {
+            error!("Invalid tuic version: {}", tuic_version);
+            continue;
+        }
+
+        let command_type = data[1];
+        if command_type == COMMAND_TYPE_HEARTBEAT {
+            continue;
+        } else if command_type != COMMAND_TYPE_PACKET {
+            error!("Invalid command type: {}", command_type);
+            continue;
+        }
+
+        let data_len = data.len();
+        if data_len < 11 {
+            error!("Received invalid short datagram");
+            continue;
+        }
+
+        let assoc_id = u16::from_be_bytes([data[2], data[3]]);
+        let packet_id = u16::from_be_bytes([data[4], data[5]]);
+        let frag_total = data[6];
+        let frag_id = data[7];
+        let payload_size = u16::from_be_bytes([data[8], data[9]]) as usize;
+
+        let address_type = data[10];
+
+        let (remote_location, offset) = match address_type {
+            0xff => (None, 11),
+            0x00 => {
+                if data_len < 14 {
+                    // Minimum length for hostname (1 byte len + 1 byte hostname + 2 bytes port)
+                    error!("Received invalid short hostname datagram");
+                    continue;
+                }
+                let address_len = data[11] as usize;
+                if data_len < 12 + address_len + 2 + payload_size {
+                    error!("Received invalid truncated hostname datagram");
+                    continue;
+                }
+                let address_bytes = &data[12..12 + address_len];
+                let address_str = String::from_utf8(address_bytes.to_vec()).map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("invalid address: {}", e),
+                    )
+                })?;
+                let port = u16::from_be_bytes([data[12 + address_len], data[12 + address_len + 1]]);
+                (
+                    Some(NetLocation::new(Address::Hostname(address_str), port)),
+                    12 + address_len + 2,
+                )
+            }
+            0x01 => {
+                if data_len < 17 + payload_size {
+                    error!("Received invalid short IPv4 datagram");
+                    continue;
+                }
+                let ipv4_addr = Ipv4Addr::new(data[11], data[12], data[13], data[14]);
+                let port = u16::from_be_bytes([data[15], data[16]]);
+                (Some(NetLocation::new(Address::Ipv4(ipv4_addr), port)), 17)
+            }
+            0x02 => {
+                if data_len < 29 + payload_size {
+                    error!("Received invalid short IPv6 datagram");
+                    continue;
+                }
+                let ipv6_bytes: [u8; 16] = data[11..27].try_into().unwrap();
+                let ipv6_addr = Ipv6Addr::from(ipv6_bytes);
+                let port = u16::from_be_bytes([data[27], data[28]]);
+                (Some(NetLocation::new(Address::Ipv6(ipv6_addr), port)), 29)
+            }
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("invalid address type: {}", address_type),
+                ));
+            }
+        };
+
+        let payload_fragment = &data[offset..offset + payload_size];
+
+        let session = match udp_session_map.get(&assoc_id) {
+            Some(s) => s,
+            None => {
+                // TODO: it's possible that a new session starts with a fragmented packet, and we
+                // receive this initial packet out of order so there's no address.
+                if remote_location.is_none() {
+                    warn!("Ignoring packet with unknown session and empty address");
+                    continue;
+                }
+
+                let remote_location = remote_location.clone().unwrap();
+
+                let action = client_proxy_selector
+                    .judge(remote_location.clone(), &resolver)
+                    .await;
+
+                let (client_proxy, updated_location) = match action {
+                    Ok(ConnectDecision::Allow {
+                        client_proxy,
+                        remote_location,
+                    }) => (client_proxy, remote_location),
+                    Ok(ConnectDecision::Block) => {
+                        warn!("Blocked UDP forward to {}", remote_location);
+                        continue;
+                    }
+                    Err(e) => {
+                        error!("Failed to judge UDP forward to {}: {}", remote_location, e);
+                        continue;
+                    }
+                };
+
+                let resolved_address =
+                    match resolve_single_address(&resolver, &updated_location).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            error!(
+                                "Failed to resolve initial remote location {}: {}",
+                                updated_location, e
+                            );
+                            continue;
+                        }
+                    };
+
+                let (override_remote_write_address, override_local_write_location) =
+                    if resolved_address.to_string() != remote_location.to_string() {
+                        (Some(resolved_address), Some(remote_location.clone()))
+                    } else {
+                        // since we don't replace addresses, support the case where a future
+                        // address is ipv6
+                        (None, None)
+                    };
+
+                let client_socket = client_proxy.configure_udp_socket(true)?;
+
+                let session = UdpSession::start_with_datagram(
+                    assoc_id,
+                    connection.clone(),
+                    Arc::new(client_socket),
+                    remote_location,
+                    resolved_address,
+                    override_local_write_location,
+                    override_remote_write_address,
+                );
+
+                // it's possible that the session is already on the map since we last checked.
+                match udp_session_map.get(&assoc_id) {
+                    Some(session) => session,
+                    None => {
+                        // TODO: is there a better way to do this?
+                        udp_session_map.insert(assoc_id, session);
+                        udp_session_map.get(&assoc_id).unwrap()
+                    }
+                }
+            }
+        };
+
+        if frag_total == 0 {
+            error!("Ignoring empty UDP fragment for session {}", assoc_id);
+            continue;
+        } else if frag_total == 1 {
+            if remote_location.is_none() {
+                warn!("Ignoring packet with single fragment and no address");
+                continue;
+            }
+
+            let remote_location = remote_location.as_ref().unwrap();
+
+            let (socket_addr, is_updated) = match session
+                .resolve_address(&remote_location, &client_proxy_selector, &resolver)
+                .await
+            {
+                Ok(res) => res,
+                Err(e) => {
+                    error!(
+                        "Failed to resolve remote location {}: {}",
+                        remote_location, e
+                    );
+                    continue;
+                }
+            };
+
+            if let Err(e) = session
+                .send_socket
+                .send_to(&payload_fragment, socket_addr)
+                .await
+            {
+                error!(
+                    "Failed to forward UDP payload for session {}: {}",
+                    assoc_id, e
+                );
+            }
+
+            if is_updated {
+                drop(session);
+                let mut session = udp_session_map.get_mut(&assoc_id).unwrap();
+                session.last_location = remote_location.clone();
+                session.last_socket_addr = socket_addr;
+            }
+        } else {
+            drop(session);
+
+            let mut session = udp_session_map.get_mut(&assoc_id).unwrap();
+
+            let (mut entry, is_new) = match session.fragments.entry(packet_id) {
+                Entry::Occupied(entry) => (entry, false),
+                Entry::Vacant(v) => (
+                    v.insert_entry(FragmentedPacket {
+                        fragment_count: frag_total,
+                        fragment_received: 0,
+                        packet_len: 0,
+                        received: vec![None; frag_total as usize],
+                        remote_location: remote_location.clone(),
+                    }),
+                    true,
+                ),
+            };
+
+            let packet = entry.get_mut();
+
+            if is_new && frag_id == 0 && packet.remote_location.is_none() {
+                if remote_location.is_none() {
+                    entry.remove();
+                    error!(
+                        "Ignoring packet with empty first fragment address for session {}",
+                        assoc_id
+                    );
+                    continue;
+                }
+                packet.remote_location = remote_location.clone();
+            }
+
+            if packet.fragment_count != frag_total {
+                entry.remove();
+                error!(
+                    "Mismatched fragment count for session {} packet {}",
+                    assoc_id, packet_id
+                );
+                continue;
+            }
+            if packet.received[frag_id as usize].is_some() {
+                entry.remove();
+                error!(
+                    "Duplicate fragment for session {} packet {}",
+                    assoc_id, packet_id
+                );
+                continue;
+            }
+
+            packet.fragment_received += 1;
+            packet.packet_len += payload_fragment.len();
+            packet.received[frag_id as usize] = Some(payload_fragment.to_vec().into());
+
+            if packet.fragment_received != packet.fragment_count {
+                continue;
+            }
+
+            let FragmentedPacket {
+                remote_location,
+                received,
+                packet_len,
+                ..
+            } = entry.remove();
+
+            let remote_location = remote_location.unwrap();
+
+            let (socket_addr, is_updated) = match session
+                .resolve_address(&remote_location, &client_proxy_selector, &resolver)
+                .await
+            {
+                Ok(res) => res,
+                Err(e) => {
+                    error!(
+                        "Failed to resolve remote location {}: {}",
+                        remote_location, e
+                    );
+                    continue;
+                }
+            };
+
+            if is_updated {
+                session.last_location = remote_location.clone();
+                session.last_socket_addr = socket_addr;
+            }
+
+            let mut complete_payload = Vec::with_capacity(packet_len);
+            for frag in received.iter() {
+                complete_payload.extend_from_slice(frag.as_ref().unwrap());
+            }
+
+            if let Err(e) = session
+                .send_socket
+                .send_to(&complete_payload, socket_addr)
+                .await
+            {
+                error!(
+                    "Failed to forward UDP payload for session {}: {}",
+                    assoc_id, e
+                );
+            }
+        }
+    }
 }
 
 pub async fn run_tuic_server(
