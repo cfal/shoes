@@ -83,13 +83,13 @@ impl TcpServerHandler for ShadowsocksTcpHandler {
             self.salt_checker.clone(),
         );
 
+        let mut line_reader = LineReader::new_with_buffer_size(1024);
+
         // We can do this in a blocking manner for the server, because we expect the client to
         // always send the location before we send anything.
-        let remote_location = read_location(&mut server_stream).await?;
+        let remote_location = read_location(&mut server_stream, &mut line_reader).await?;
 
-        let initial_remote_data = if self.aead2022 {
-            let mut line_reader = LineReader::new_with_buffer_size(1024);
-
+        if self.aead2022 {
             let padding_len = line_reader.read_u16_be(&mut server_stream).await?;
 
             if padding_len > 0 {
@@ -103,11 +103,7 @@ impl TcpServerHandler for ShadowsocksTcpHandler {
                     .read_slice(&mut server_stream, padding_len as usize)
                     .await?;
             }
-
-            line_reader.unparsed_data_owned()
-        } else {
-            None
-        };
+        }
 
         Ok(TcpServerSetupResult::TcpForward {
             remote_location,
@@ -115,7 +111,7 @@ impl TcpServerHandler for ShadowsocksTcpHandler {
             // we don't need an initial flush, let the IV be written when data actually arrives.
             need_initial_flush: false,
             connection_success_response: None,
-            initial_remote_data,
+            initial_remote_data: line_reader.unparsed_data_owned(),
             override_proxy_provider: NoneOrOne::Unspecified,
         })
     }
