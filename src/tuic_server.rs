@@ -34,6 +34,8 @@ const COMMAND_TYPE_HEARTBEAT: u8 = 0x04;
 const MAX_ADDRESS_BYTES_LEN: usize = 1 + 1 + 255 + 2;
 const MAX_HEADER_LEN: usize = 2 + 2 + 1 + 1 + 2 + MAX_ADDRESS_BYTES_LEN;
 
+type UdpSessionMap = Arc<DashMap<u16, UdpSession>>;
+
 async fn process_connection(
     client_proxy_selector: Arc<ClientProxySelector<TcpClientConnector>>,
     resolver: Arc<dyn Resolver>,
@@ -387,10 +389,7 @@ async fn process_tcp_stream(
     Ok(())
 }
 
-type UdpSessionMap = Arc<DashMap<u16, UdpSession>>;
-
 struct UdpSession {
-    fragments: HashMap<u16, FragmentedPacket>,
     send_socket: Arc<UdpSocket>,
     // we cache the last location in case of mid-session address changes, and
     // don't want to have to call ClientProxySelector::judge on every packet.
@@ -418,7 +417,6 @@ impl UdpSession {
         override_remote_write_address: Option<SocketAddr>,
     ) -> Self {
         let session = UdpSession {
-            fragments: HashMap::new(),
             send_socket: client_socket.clone(),
             last_location: initial_location,
             last_socket_addr: initial_socket_addr,
@@ -451,7 +449,6 @@ impl UdpSession {
         override_remote_write_address: Option<SocketAddr>,
     ) -> Self {
         let session = UdpSession {
-            fragments: HashMap::new(),
             send_socket: client_socket.clone(),
             last_location: initial_location,
             last_socket_addr: initial_socket_addr,
@@ -521,6 +518,11 @@ impl UdpSession {
         };
 
         Ok((addr, is_updated))
+    }
+
+    fn update_last_location(&mut self, location: NetLocation, socket_addr: SocketAddr) {
+        self.last_location = location;
+        self.last_socket_addr = socket_addr;
     }
 }
 
@@ -754,6 +756,11 @@ async fn process_udp_recv_stream(
     udp_session_map: UdpSessionMap,
 ) -> std::io::Result<()> {
     let mut line_reader = LineReader::new_with_buffer_size(MAX_HEADER_LEN + 65535);
+
+    // we assume that all fragments of a single packet will be sent through the same stream to
+    // prevent unnecessary locking.
+    let mut fragments: HashMap<u16, FragmentedPacket> = HashMap::new();
+
     loop {
         let tuic_version = line_reader.read_u8(&mut recv_stream).await?;
         if tuic_version != 5 {
@@ -793,6 +800,7 @@ async fn process_udp_recv_stream(
             &client_proxy_selector,
             &resolver,
             &udp_session_map,
+            &mut fragments,
             assoc_id,
             packet_id,
             frag_total,
@@ -814,6 +822,7 @@ async fn process_udp_packet(
     client_proxy_selector: &Arc<ClientProxySelector<TcpClientConnector>>,
     resolver: &Arc<dyn Resolver>,
     udp_session_map: &UdpSessionMap,
+    fragments: &mut HashMap<u16, FragmentedPacket>,
     assoc_id: u16,
     packet_id: u16,
     frag_total: u8,
@@ -829,99 +838,100 @@ async fn process_udp_packet(
         ));
     }
 
-    // TODO: this session is immediately dropped when frag_total > 1
-    let session = match udp_session_map.get(&assoc_id) {
-        Some(s) => s,
-        None => {
-            // TODO: it's possible that a new session starts with a fragmented packet, and we
-            // receive this initial packet out of order so there's no address.
-            if remote_location.is_none() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "Ignoring packet with unknown session and empty address",
-                ));
-            }
-
-            let remote_location = remote_location.clone().unwrap();
-
-            let action = client_proxy_selector
-                .judge(remote_location.clone(), resolver)
-                .await;
-
-            let (client_proxy, updated_location) = match action {
-                Ok(ConnectDecision::Allow {
-                    client_proxy,
-                    remote_location,
-                }) => (client_proxy, remote_location),
-                Ok(ConnectDecision::Block) => {
+    let session = {
+        match udp_session_map.get(&assoc_id) {
+            Some(s) => s,
+            None => {
+                // TODO: it's possible that a new session starts with a fragmented packet, and we
+                // receive this initial packet out of order so there's no address.
+                if remote_location.is_none() {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::Other,
-                        format!("Blocked UDP forward to {}", remote_location),
+                        "Ignoring packet with unknown session and empty address",
                     ));
                 }
-                Err(e) => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("Failed to judge UDP forward to {}: {}", remote_location, e),
-                    ));
-                }
-            };
 
-            let resolved_address = resolve_single_address(resolver, &updated_location)
-                .await
-                .map_err(|e| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!(
-                            "Failed to resolve initial remote location {}: {}",
-                            updated_location, e
-                        ),
-                    )
-                })?;
+                let remote_location = remote_location.clone().unwrap();
 
-            let (override_remote_write_address, override_local_write_location) =
-                if resolved_address.to_string() != remote_location.to_string() {
-                    (Some(resolved_address), Some(remote_location.clone()))
-                } else {
-                    // since we don't replace addresses, support the case where a future
-                    // address is ipv6
-                    (None, None)
+                let action = client_proxy_selector
+                    .judge(remote_location.clone(), resolver)
+                    .await;
+
+                let (client_proxy, updated_location) = match action {
+                    Ok(ConnectDecision::Allow {
+                        client_proxy,
+                        remote_location,
+                    }) => (client_proxy, remote_location),
+                    Ok(ConnectDecision::Block) => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!("Blocked UDP forward to {}", remote_location),
+                        ));
+                    }
+                    Err(e) => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!("Failed to judge UDP forward to {}: {}", remote_location, e),
+                        ));
+                    }
                 };
 
-            let client_socket = client_proxy.configure_udp_socket(true)?;
+                let resolved_address = resolve_single_address(resolver, &updated_location)
+                    .await
+                    .map_err(|e| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!(
+                                "Failed to resolve initial remote location {}: {}",
+                                updated_location, e
+                            ),
+                        )
+                    })?;
 
-            let session = if is_uni_stream {
-                // TODO: should we only have a single send stream?
-                let send_stream = connection.open_uni().await?;
+                let (override_remote_write_address, override_local_write_location) =
+                    if resolved_address.to_string() != remote_location.to_string() {
+                        (Some(resolved_address), Some(remote_location.clone()))
+                    } else {
+                        // since we don't replace addresses, support the case where a future
+                        // address is ipv6
+                        (None, None)
+                    };
 
-                UdpSession::start_with_send_stream(
-                    assoc_id,
-                    send_stream,
-                    Arc::new(client_socket),
-                    remote_location,
-                    resolved_address,
-                    override_local_write_location,
-                    override_remote_write_address,
-                )
-            } else {
-                UdpSession::start_with_datagram(
-                    assoc_id,
-                    connection.clone(),
-                    Arc::new(client_socket),
-                    remote_location,
-                    resolved_address,
-                    override_local_write_location,
-                    override_remote_write_address,
-                )
-            };
+                let client_socket = client_proxy.configure_udp_socket(true)?;
 
-            // it's possible that the session is already on the map since we last checked.
-            match udp_session_map.get(&assoc_id) {
-                Some(session) => session,
-                None => {
-                    // TODO: is there a better way to do this?
-                    udp_session_map.insert(assoc_id, session);
-                    udp_session_map.get(&assoc_id).unwrap()
+                let session = if is_uni_stream {
+                    // TODO: should we only have a single send stream?
+                    let send_stream = connection.open_uni().await?;
+
+                    UdpSession::start_with_send_stream(
+                        assoc_id,
+                        send_stream,
+                        Arc::new(client_socket),
+                        remote_location,
+                        resolved_address,
+                        override_local_write_location,
+                        override_remote_write_address,
+                    )
+                } else {
+                    UdpSession::start_with_datagram(
+                        assoc_id,
+                        connection.clone(),
+                        Arc::new(client_socket),
+                        remote_location,
+                        resolved_address,
+                        override_local_write_location,
+                        override_remote_write_address,
+                    )
+                };
+
+                // it's possible that the session is already on the map since we last checked.
+                // TODO: why is there no way to get a Ref<_> from an Entry<_>? see if we can
+                // do better than converting into a RefMut<_> and then downgrading.
+                match udp_session_map.entry(assoc_id) {
+                    dashmap::mapref::entry::Entry::Occupied(entry) => entry.into_ref().downgrade(),
+                    dashmap::mapref::entry::Entry::Vacant(entry) => {
+                        entry.insert_entry(session).into_ref().downgrade()
+                    }
                 }
             }
         }
@@ -962,16 +972,12 @@ async fn process_udp_packet(
 
         if is_updated {
             drop(session);
-            let mut session = udp_session_map.get_mut(&assoc_id).unwrap();
-            session.last_location = remote_location.clone();
-            session.last_socket_addr = socket_addr;
+            if let Some(mut session) = udp_session_map.get_mut(&assoc_id) {
+                session.update_last_location(remote_location.clone(), socket_addr);
+            }
         }
     } else {
-        drop(session);
-
-        let mut session = udp_session_map.get_mut(&assoc_id).unwrap();
-
-        let (mut entry, is_new) = match session.fragments.entry(packet_id) {
+        let (mut entry, is_new) = match fragments.entry(packet_id) {
             Entry::Occupied(entry) => (entry, false),
             Entry::Vacant(v) => (
                 v.insert_entry(FragmentedPacket {
@@ -1052,11 +1058,6 @@ async fn process_udp_packet(
                 )
             })?;
 
-        if is_updated {
-            session.last_location = remote_location.clone();
-            session.last_socket_addr = socket_addr;
-        }
-
         let mut complete_payload = Vec::with_capacity(packet_len);
         for frag in received.iter() {
             complete_payload.extend_from_slice(frag.as_ref().unwrap());
@@ -1075,6 +1076,13 @@ async fn process_udp_packet(
                     ),
                 )
             })?;
+
+        if is_updated {
+            drop(session);
+            if let Some(mut session) = udp_session_map.get_mut(&assoc_id) {
+                session.update_last_location(remote_location.clone(), socket_addr);
+            }
+        }
     }
 
     Ok(())
@@ -1086,6 +1094,9 @@ async fn run_datagram_loop(
     resolver: Arc<dyn Resolver>,
     udp_session_map: UdpSessionMap,
 ) -> std::io::Result<()> {
+    // we assume that all fragments of a single packet will be sent through the same mechanism
+    // (in this case, datagram) to prevent unnecessary locking.
+    let mut fragments: HashMap<u16, FragmentedPacket> = HashMap::new();
     loop {
         let data = connection.read_datagram().await.map_err(|err| {
             std::io::Error::new(
@@ -1189,6 +1200,7 @@ async fn run_datagram_loop(
             &client_proxy_selector,
             &resolver,
             &udp_session_map,
+            &mut fragments,
             assoc_id,
             packet_id,
             frag_total,
