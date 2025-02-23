@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
-use log::{error, warn};
+use log::error;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
@@ -788,64 +788,105 @@ async fn process_udp_recv_stream(
             .read_slice(&mut recv_stream, payload_size as usize)
             .await?;
 
-        let session = match udp_session_map.get(&assoc_id) {
-            Some(s) => s,
-            None => {
-                // TODO: it's possible that a new session starts with a fragmented packet, and we
-                // receive this initial packet out of order so there's no address.
-                if remote_location.is_none() {
-                    warn!("Ignoring packet with unknown session and empty address");
-                    continue;
+        if let Err(e) = process_udp_packet(
+            &connection,
+            &client_proxy_selector,
+            &resolver,
+            &udp_session_map,
+            assoc_id,
+            packet_id,
+            frag_total,
+            frag_id,
+            remote_location,
+            payload_fragment,
+            true,
+        )
+        .await
+        {
+            error!("Failed to process stream UDP packet: {}", e);
+        }
+    }
+}
+
+#[inline(always)]
+async fn process_udp_packet(
+    connection: &quinn::Connection,
+    client_proxy_selector: &Arc<ClientProxySelector<TcpClientConnector>>,
+    resolver: &Arc<dyn Resolver>,
+    udp_session_map: &UdpSessionMap,
+    assoc_id: u16,
+    packet_id: u16,
+    frag_total: u8,
+    frag_id: u8,
+    remote_location: Option<NetLocation>,
+    payload_fragment: &[u8],
+    is_uni_stream: bool,
+) -> std::io::Result<()> {
+    let session = match udp_session_map.get(&assoc_id) {
+        Some(s) => s,
+        None => {
+            // TODO: it's possible that a new session starts with a fragmented packet, and we
+            // receive this initial packet out of order so there's no address.
+            if remote_location.is_none() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "Ignoring packet with unknown session and empty address",
+                ));
+            }
+
+            let remote_location = remote_location.clone().unwrap();
+
+            let action = client_proxy_selector
+                .judge(remote_location.clone(), &resolver)
+                .await;
+
+            let (client_proxy, updated_location) = match action {
+                Ok(ConnectDecision::Allow {
+                    client_proxy,
+                    remote_location,
+                }) => (client_proxy, remote_location),
+                Ok(ConnectDecision::Block) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("Blocked UDP forward to {}", remote_location),
+                    ));
                 }
+                Err(e) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("Failed to judge UDP forward to {}: {}", remote_location, e),
+                    ));
+                }
+            };
 
-                let remote_location = remote_location.clone().unwrap();
+            let resolved_address = resolve_single_address(&resolver, &updated_location)
+                .await
+                .map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!(
+                            "Failed to resolve initial remote location {}: {}",
+                            updated_location, e
+                        ),
+                    )
+                })?;
 
-                let action = client_proxy_selector
-                    .judge(remote_location.clone(), &resolver)
-                    .await;
-
-                let (client_proxy, updated_location) = match action {
-                    Ok(ConnectDecision::Allow {
-                        client_proxy,
-                        remote_location,
-                    }) => (client_proxy, remote_location),
-                    Ok(ConnectDecision::Block) => {
-                        warn!("Blocked UDP forward to {}", remote_location);
-                        continue;
-                    }
-                    Err(e) => {
-                        error!("Failed to judge UDP forward to {}: {}", remote_location, e);
-                        continue;
-                    }
+            let (override_remote_write_address, override_local_write_location) =
+                if resolved_address.to_string() != remote_location.to_string() {
+                    (Some(resolved_address), Some(remote_location.clone()))
+                } else {
+                    // since we don't replace addresses, support the case where a future
+                    // address is ipv6
+                    (None, None)
                 };
 
-                let resolved_address =
-                    match resolve_single_address(&resolver, &updated_location).await {
-                        Ok(s) => s,
-                        Err(e) => {
-                            error!(
-                                "Failed to resolve initial remote location {}: {}",
-                                updated_location, e
-                            );
-                            continue;
-                        }
-                    };
+            let client_socket = client_proxy.configure_udp_socket(true)?;
 
-                let (override_remote_write_address, override_local_write_location) =
-                    if resolved_address.to_string() != remote_location.to_string() {
-                        (Some(resolved_address), Some(remote_location.clone()))
-                    } else {
-                        // since we don't replace addresses, support the case where a future
-                        // address is ipv6
-                        (None, None)
-                    };
-
-                let client_socket = client_proxy.configure_udp_socket(true)?;
-
+            let session = if is_uni_stream {
                 // TODO: should we only have a single send stream?
                 let send_stream = connection.open_uni().await?;
 
-                let session = UdpSession::start_with_send_stream(
+                UdpSession::start_with_send_stream(
                     assoc_id,
                     send_stream,
                     Arc::new(client_socket),
@@ -853,164 +894,187 @@ async fn process_udp_recv_stream(
                     resolved_address,
                     override_local_write_location,
                     override_remote_write_address,
-                );
-
-                // it's possible that the session is already on the map since we last checked.
-                match udp_session_map.get(&assoc_id) {
-                    Some(session) => session,
-                    None => {
-                        // TODO: is there a better way to do this?
-                        udp_session_map.insert(assoc_id, session);
-                        udp_session_map.get(&assoc_id).unwrap()
-                    }
-                }
-            }
-        };
-
-        if frag_total == 0 {
-            error!("Ignoring packet with empty fragment total");
-            continue;
-        } else if frag_total == 1 {
-            if remote_location.is_none() {
-                warn!("Ignoring packet with single fragment and no address");
-                continue;
-            }
-            let remote_location = remote_location.as_ref().unwrap();
-
-            let (socket_addr, is_updated) = match session
-                .resolve_address(&remote_location, &client_proxy_selector, &resolver)
-                .await
-            {
-                Ok(res) => res,
-                Err(e) => {
-                    error!(
-                        "Failed to resolve remote location {}: {}",
-                        remote_location, e
-                    );
-                    continue;
-                }
+                )
+            } else {
+                UdpSession::start_with_datagram(
+                    assoc_id,
+                    connection.clone(),
+                    Arc::new(client_socket),
+                    remote_location,
+                    resolved_address,
+                    override_local_write_location,
+                    override_remote_write_address,
+                )
             };
 
-            if let Err(e) = session
-                .send_socket
-                .send_to(&payload_fragment, socket_addr)
-                .await
-            {
-                error!(
-                    "Failed to forward UDP payload for session {}: {}",
-                    assoc_id, e
-                );
-            }
-
-            if is_updated {
-                drop(session);
-                let mut session = udp_session_map.get_mut(&assoc_id).unwrap();
-                session.last_location = remote_location.clone();
-                session.last_socket_addr = socket_addr;
-            }
-        } else {
-            drop(session);
-
-            let mut session = udp_session_map.get_mut(&assoc_id).unwrap();
-
-            let (mut entry, is_new) = match session.fragments.entry(packet_id) {
-                Entry::Occupied(entry) => (entry, false),
-                Entry::Vacant(v) => (
-                    v.insert_entry(FragmentedPacket {
-                        fragment_count: frag_total,
-                        fragment_received: 0,
-                        packet_len: 0,
-                        received: vec![None; frag_total as usize],
-                        remote_location: remote_location.clone(),
-                    }),
-                    true,
-                ),
-            };
-
-            let packet = entry.get_mut();
-
-            if is_new && frag_id == 0 && packet.remote_location.is_none() {
-                if remote_location.is_none() {
-                    entry.remove();
-                    error!(
-                        "Ignoring packet with empty first fragment address for session {}",
-                        assoc_id
-                    );
-                    continue;
+            // it's possible that the session is already on the map since we last checked.
+            match udp_session_map.get(&assoc_id) {
+                Some(session) => session,
+                None => {
+                    // TODO: is there a better way to do this?
+                    udp_session_map.insert(assoc_id, session);
+                    udp_session_map.get(&assoc_id).unwrap()
                 }
-                packet.remote_location = remote_location.clone();
-            }
-
-            if packet.fragment_count != frag_total {
-                entry.remove();
-                error!(
-                    "Mismatched fragment count for session {} packet {}",
-                    assoc_id, packet_id
-                );
-                continue;
-            }
-            if packet.received[frag_id as usize].is_some() {
-                entry.remove();
-                error!(
-                    "Duplicate fragment for session {} packet {}",
-                    assoc_id, packet_id
-                );
-                continue;
-            }
-
-            packet.fragment_received += 1;
-            packet.packet_len += payload_fragment.len();
-            packet.received[frag_id as usize] = Some(payload_fragment.to_vec().into());
-
-            if packet.fragment_received != packet.fragment_count {
-                continue;
-            }
-
-            let FragmentedPacket {
-                remote_location,
-                received,
-                packet_len,
-                ..
-            } = entry.remove();
-
-            let remote_location = remote_location.unwrap();
-
-            let (socket_addr, is_updated) = match session
-                .resolve_address(&remote_location, &client_proxy_selector, &resolver)
-                .await
-            {
-                Ok(res) => res,
-                Err(e) => {
-                    error!(
-                        "Failed to resolve remote location {}: {}",
-                        remote_location, e
-                    );
-                    continue;
-                }
-            };
-
-            if is_updated {
-                session.last_location = remote_location.clone();
-                session.last_socket_addr = socket_addr;
-            }
-
-            let mut complete_payload = Vec::with_capacity(packet_len);
-            for frag in received.iter() {
-                complete_payload.extend_from_slice(frag.as_ref().unwrap());
-            }
-
-            if let Err(e) = session
-                .send_socket
-                .send_to(&complete_payload, socket_addr)
-                .await
-            {
-                error!(
-                    "Failed to forward UDP payload for session {}: {}",
-                    assoc_id, e
-                );
             }
         }
+    };
+
+    if frag_total == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "Ignoring packet with empty fragment total",
+        ));
+    } else if frag_total == 1 {
+        if remote_location.is_none() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "Ignoring packet with single fragment and no address",
+            ));
+        }
+        let remote_location = remote_location.as_ref().unwrap();
+
+        let (socket_addr, is_updated) = session
+            .resolve_address(&remote_location, &client_proxy_selector, &resolver)
+            .await
+            .map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!(
+                        "Failed to resolve remote location {}: {}",
+                        remote_location, e
+                    ),
+                )
+            })?;
+
+        if let Err(e) = session
+            .send_socket
+            .send_to(&payload_fragment, socket_addr)
+            .await
+        {
+            error!(
+                "Failed to forward UDP payload for session {}: {}",
+                assoc_id, e
+            );
+        }
+
+        if is_updated {
+            drop(session);
+            let mut session = udp_session_map.get_mut(&assoc_id).unwrap();
+            session.last_location = remote_location.clone();
+            session.last_socket_addr = socket_addr;
+        }
+    } else {
+        drop(session);
+
+        let mut session = udp_session_map.get_mut(&assoc_id).unwrap();
+
+        let (mut entry, is_new) = match session.fragments.entry(packet_id) {
+            Entry::Occupied(entry) => (entry, false),
+            Entry::Vacant(v) => (
+                v.insert_entry(FragmentedPacket {
+                    fragment_count: frag_total,
+                    fragment_received: 0,
+                    packet_len: 0,
+                    received: vec![None; frag_total as usize],
+                    remote_location: remote_location.clone(),
+                }),
+                true,
+            ),
+        };
+
+        let packet = entry.get_mut();
+
+        if is_new && frag_id == 0 && packet.remote_location.is_none() {
+            if remote_location.is_none() {
+                entry.remove();
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!(
+                        "Ignoring packet with empty first fragment address for session {}",
+                        assoc_id
+                    ),
+                ));
+            }
+            packet.remote_location = remote_location.clone();
+        }
+
+        if packet.fragment_count != frag_total {
+            entry.remove();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!(
+                    "Mismatched fragment count for session {} packet {}",
+                    assoc_id, packet_id
+                ),
+            ));
+        }
+        if packet.received[frag_id as usize].is_some() {
+            entry.remove();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!(
+                    "Duplicate fragment for session {} packet {}",
+                    assoc_id, packet_id
+                ),
+            ));
+        }
+
+        packet.fragment_received += 1;
+        packet.packet_len += payload_fragment.len();
+        packet.received[frag_id as usize] = Some(payload_fragment.to_vec().into());
+
+        if packet.fragment_received != packet.fragment_count {
+            return Ok(());
+        }
+
+        let FragmentedPacket {
+            remote_location,
+            received,
+            packet_len,
+            ..
+        } = entry.remove();
+
+        let remote_location = remote_location.unwrap();
+
+        let (socket_addr, is_updated) = session
+            .resolve_address(&remote_location, &client_proxy_selector, &resolver)
+            .await
+            .map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!(
+                        "Failed to resolve remote location {}: {}",
+                        remote_location, e
+                    ),
+                )
+            })?;
+
+        if is_updated {
+            session.last_location = remote_location.clone();
+            session.last_socket_addr = socket_addr;
+        }
+
+        let mut complete_payload = Vec::with_capacity(packet_len);
+        for frag in received.iter() {
+            complete_payload.extend_from_slice(frag.as_ref().unwrap());
+        }
+
+        session
+            .send_socket
+            .send_to(&complete_payload, socket_addr)
+            .await
+            .map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!(
+                        "Failed to forward UDP payload for session {}: {}",
+                        assoc_id, e
+                    ),
+                )
+            })?;
     }
+
+    Ok(())
 }
 
 async fn run_datagram_loop(
@@ -1117,225 +1181,22 @@ async fn run_datagram_loop(
 
         let payload_fragment = &data[offset..offset + payload_size];
 
-        let session = match udp_session_map.get(&assoc_id) {
-            Some(s) => s,
-            None => {
-                // TODO: it's possible that a new session starts with a fragmented packet, and we
-                // receive this initial packet out of order so there's no address.
-                if remote_location.is_none() {
-                    warn!("Ignoring packet with unknown session and empty address");
-                    continue;
-                }
-
-                let remote_location = remote_location.clone().unwrap();
-
-                let action = client_proxy_selector
-                    .judge(remote_location.clone(), &resolver)
-                    .await;
-
-                let (client_proxy, updated_location) = match action {
-                    Ok(ConnectDecision::Allow {
-                        client_proxy,
-                        remote_location,
-                    }) => (client_proxy, remote_location),
-                    Ok(ConnectDecision::Block) => {
-                        warn!("Blocked UDP forward to {}", remote_location);
-                        continue;
-                    }
-                    Err(e) => {
-                        error!("Failed to judge UDP forward to {}: {}", remote_location, e);
-                        continue;
-                    }
-                };
-
-                let resolved_address =
-                    match resolve_single_address(&resolver, &updated_location).await {
-                        Ok(s) => s,
-                        Err(e) => {
-                            error!(
-                                "Failed to resolve initial remote location {}: {}",
-                                updated_location, e
-                            );
-                            continue;
-                        }
-                    };
-
-                let (override_remote_write_address, override_local_write_location) =
-                    if resolved_address.to_string() != remote_location.to_string() {
-                        (Some(resolved_address), Some(remote_location.clone()))
-                    } else {
-                        // since we don't replace addresses, support the case where a future
-                        // address is ipv6
-                        (None, None)
-                    };
-
-                let client_socket = client_proxy.configure_udp_socket(true)?;
-
-                let session = UdpSession::start_with_datagram(
-                    assoc_id,
-                    connection.clone(),
-                    Arc::new(client_socket),
-                    remote_location,
-                    resolved_address,
-                    override_local_write_location,
-                    override_remote_write_address,
-                );
-
-                // it's possible that the session is already on the map since we last checked.
-                match udp_session_map.get(&assoc_id) {
-                    Some(session) => session,
-                    None => {
-                        // TODO: is there a better way to do this?
-                        udp_session_map.insert(assoc_id, session);
-                        udp_session_map.get(&assoc_id).unwrap()
-                    }
-                }
-            }
-        };
-
-        if frag_total == 0 {
-            error!("Ignoring empty UDP fragment for session {}", assoc_id);
-            continue;
-        } else if frag_total == 1 {
-            if remote_location.is_none() {
-                warn!("Ignoring packet with single fragment and no address");
-                continue;
-            }
-
-            let remote_location = remote_location.as_ref().unwrap();
-
-            let (socket_addr, is_updated) = match session
-                .resolve_address(&remote_location, &client_proxy_selector, &resolver)
-                .await
-            {
-                Ok(res) => res,
-                Err(e) => {
-                    error!(
-                        "Failed to resolve remote location {}: {}",
-                        remote_location, e
-                    );
-                    continue;
-                }
-            };
-
-            if let Err(e) = session
-                .send_socket
-                .send_to(&payload_fragment, socket_addr)
-                .await
-            {
-                error!(
-                    "Failed to forward UDP payload for session {}: {}",
-                    assoc_id, e
-                );
-            }
-
-            if is_updated {
-                drop(session);
-                let mut session = udp_session_map.get_mut(&assoc_id).unwrap();
-                session.last_location = remote_location.clone();
-                session.last_socket_addr = socket_addr;
-            }
-        } else {
-            drop(session);
-
-            let mut session = udp_session_map.get_mut(&assoc_id).unwrap();
-
-            let (mut entry, is_new) = match session.fragments.entry(packet_id) {
-                Entry::Occupied(entry) => (entry, false),
-                Entry::Vacant(v) => (
-                    v.insert_entry(FragmentedPacket {
-                        fragment_count: frag_total,
-                        fragment_received: 0,
-                        packet_len: 0,
-                        received: vec![None; frag_total as usize],
-                        remote_location: remote_location.clone(),
-                    }),
-                    true,
-                ),
-            };
-
-            let packet = entry.get_mut();
-
-            if is_new && frag_id == 0 && packet.remote_location.is_none() {
-                if remote_location.is_none() {
-                    entry.remove();
-                    error!(
-                        "Ignoring packet with empty first fragment address for session {}",
-                        assoc_id
-                    );
-                    continue;
-                }
-                packet.remote_location = remote_location.clone();
-            }
-
-            if packet.fragment_count != frag_total {
-                entry.remove();
-                error!(
-                    "Mismatched fragment count for session {} packet {}",
-                    assoc_id, packet_id
-                );
-                continue;
-            }
-            if packet.received[frag_id as usize].is_some() {
-                entry.remove();
-                error!(
-                    "Duplicate fragment for session {} packet {}",
-                    assoc_id, packet_id
-                );
-                continue;
-            }
-
-            packet.fragment_received += 1;
-            packet.packet_len += payload_fragment.len();
-            packet.received[frag_id as usize] = Some(payload_fragment.to_vec().into());
-
-            if packet.fragment_received != packet.fragment_count {
-                continue;
-            }
-
-            let FragmentedPacket {
-                remote_location,
-                received,
-                packet_len,
-                ..
-            } = entry.remove();
-
-            let remote_location = remote_location.unwrap();
-
-            let (socket_addr, is_updated) = match session
-                .resolve_address(&remote_location, &client_proxy_selector, &resolver)
-                .await
-            {
-                Ok(res) => res,
-                Err(e) => {
-                    error!(
-                        "Failed to resolve remote location {}: {}",
-                        remote_location, e
-                    );
-                    continue;
-                }
-            };
-
-            if is_updated {
-                session.last_location = remote_location.clone();
-                session.last_socket_addr = socket_addr;
-            }
-
-            let mut complete_payload = Vec::with_capacity(packet_len);
-            for frag in received.iter() {
-                complete_payload.extend_from_slice(frag.as_ref().unwrap());
-            }
-
-            if let Err(e) = session
-                .send_socket
-                .send_to(&complete_payload, socket_addr)
-                .await
-            {
-                error!(
-                    "Failed to forward UDP payload for session {}: {}",
-                    assoc_id, e
-                );
-            }
+        if let Err(e) = process_udp_packet(
+            &connection,
+            &client_proxy_selector,
+            &resolver,
+            &udp_session_map,
+            assoc_id,
+            packet_id,
+            frag_total,
+            frag_id,
+            remote_location,
+            payload_fragment,
+            false,
+        )
+        .await
+        {
+            error!("Failed to process datagram UDP packet: {}", e);
         }
     }
 }
