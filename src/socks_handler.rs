@@ -413,40 +413,6 @@ pub async fn read_location<T: AsyncReadExt + Unpin>(
     }
 }
 
-pub async fn write_location(
-    stream: &mut Box<dyn AsyncStream>,
-    location: &NetLocation,
-) -> std::io::Result<()> {
-    let (address, port) = location.components();
-    let mut data = [0u8; 1];
-    match address {
-        Address::Ipv4(v4addr) => {
-            data[0] = ADDR_TYPE_IPV4;
-            stream.write_all(&data).await?;
-            stream.write_all(&v4addr.octets()).await?;
-        }
-        Address::Ipv6(v6addr) => {
-            data[0] = ADDR_TYPE_IPV6;
-            stream.write_all(&data).await?;
-            stream.write_all(&v6addr.octets()).await?;
-        }
-        Address::Hostname(domain_name) => {
-            data[0] = ADDR_TYPE_DOMAIN_NAME;
-            stream.write_all(&data).await?;
-
-            let domain_name_bytes = domain_name.as_bytes();
-            data[0] = domain_name_bytes.len() as u8;
-            stream.write_all(&data).await?;
-            stream.write_all(domain_name_bytes).await?;
-        }
-    }
-
-    let port_bytes = [(port >> 8) as u8, (port & 0xff) as u8];
-    stream.write_all(&port_bytes).await?;
-
-    Ok(())
-}
-
 pub fn write_location_to_vec(location: &NetLocation) -> Vec<u8> {
     let (address, port) = location.components();
     let mut vec = match address {
