@@ -146,53 +146,6 @@ impl ShadowsocksStream {
         }
     }
 
-    pub fn feed_initial_read_data(
-        &mut self,
-        data: &[u8],
-        fill_buffer: bool,
-    ) -> std::io::Result<()> {
-        if self.unprocessed_start_offset != 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "feed_initial_read_data called with unprocessed data",
-            ));
-        } else if data.len() > self.unprocessed_buf.len() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "feed_initial_read_data called with too much data",
-            ));
-        }
-
-        self.unprocessed_buf[0..data.len()].copy_from_slice(data);
-        self.unprocessed_end_offset = data.len();
-
-        if self.unprocessed_end_offset < self.read_header_len() {
-            return Ok(());
-        }
-
-        self.process_read_header()?;
-        self.is_initial_read = false;
-
-        loop {
-            match self.try_decrypt()? {
-                DecryptState::NeedData => {
-                    break;
-                }
-                DecryptState::BufferFull => {
-                    break;
-                }
-                DecryptState::Success => {
-                    if !fill_buffer && self.processed_end_offset > 0 {
-                        break;
-                    }
-                    continue;
-                }
-            }
-        }
-
-        Ok(())
-    }
-
     fn process_opening_key(&mut self) -> std::io::Result<()> {
         let decrypt_iv = &self.unprocessed_buf[0..self.salt_len];
         let session_key = self.key.create_session_key(decrypt_iv);
