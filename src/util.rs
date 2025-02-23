@@ -1,3 +1,5 @@
+use tokio::io::AsyncWriteExt;
+
 #[inline]
 #[allow(clippy::uninit_vec)]
 pub fn allocate_vec<T>(len: usize) -> Vec<T> {
@@ -38,4 +40,18 @@ pub fn parse_uuid(uuid_str: &str) -> std::io::Result<Vec<u8>> {
         ));
     }
     Ok(bytes)
+}
+
+// a cancellable alternative to AsyncWriteExt::write_all
+pub async fn write_all<T: AsyncWriteExt + Unpin>(
+    stream: &mut T,
+    buf: &[u8],
+) -> std::io::Result<()> {
+    let mut i = 0;
+    let n = buf.len();
+    while i < n {
+        let n = stream.write(&buf[i..]).await?;
+        i += n;
+    }
+    Ok(())
 }
