@@ -143,6 +143,16 @@ impl LineReader {
         Ok(slice)
     }
 
+    pub async fn read_slice_into<T: AsyncReadExt + Unpin>(
+        &mut self,
+        stream: &mut T,
+        buf: &mut [u8],
+    ) -> std::io::Result<()> {
+        let slice = self.read_slice(stream, buf.len()).await?;
+        buf.copy_from_slice(slice);
+        Ok(())
+    }
+
     pub fn unparsed_data(&self) -> &[u8] {
         &self.buf[self.start_offset..self.end_offset]
     }
