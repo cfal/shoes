@@ -299,7 +299,9 @@ impl TcpClientHandler for SocksTcpClientHandler {
     }
 }
 
-pub async fn read_location(stream: &mut Box<dyn AsyncStream>) -> std::io::Result<NetLocation> {
+pub async fn read_location<T: AsyncReadExt + Unpin>(
+    stream: &mut T,
+) -> std::io::Result<NetLocation> {
     let mut data = [0u8; 1];
 
     stream.read_exact(&mut data).await?;
