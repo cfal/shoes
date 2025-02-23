@@ -2,19 +2,21 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use aws_lc_rs::digest::SHA224;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 
 use crate::address::NetLocation;
 use crate::async_stream::AsyncStream;
 use crate::config::ShadowsocksConfig;
+use crate::line_reader::LineReader;
 use crate::option_util::NoneOrOne;
 use crate::shadowsocks::{
     DefaultKey, ShadowsocksCipher, ShadowsocksKey, ShadowsocksStream, ShadowsocksStreamType,
 };
-use crate::socks_handler::{read_location, write_location, CMD_CONNECT, CMD_UDP_ASSOCIATE};
+use crate::socks_handler::{read_location, write_location_to_vec, CMD_CONNECT, CMD_UDP_ASSOCIATE};
 use crate::tcp_handler::{
     TcpClientHandler, TcpClientSetupResult, TcpServerHandler, TcpServerSetupResult,
 };
+use crate::util::write_all;
 
 #[derive(Debug)]
 struct ShadowsocksData {
@@ -72,8 +74,9 @@ impl TcpServerHandler for TrojanTcpHandler {
             ));
         }
 
-        let mut received_hash = [0u8; 56];
-        server_stream.read_exact(&mut received_hash).await?;
+        let mut line_reader = LineReader::new_with_buffer_size(400);
+
+        let received_hash = line_reader.read_slice(&mut server_stream, 56).await?;
         for (b1, b2) in self.password_hash.iter().zip(received_hash.iter()) {
             if b1 != b2 {
                 return Err(std::io::Error::new(
@@ -83,42 +86,37 @@ impl TcpServerHandler for TrojanTcpHandler {
             }
         }
 
-        let mut request_prefix = [0u8; 3];
-        server_stream.read_exact(&mut request_prefix).await?;
-
-        if request_prefix[0] != 0x0d || request_prefix[1] != 0x0a {
+        let request_prefix = line_reader.read_u16_be(&mut server_stream).await?;
+        if request_prefix != 0x0d0a {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
-                format!(
-                    "Invalid request bytes (1) {} {}",
-                    request_prefix[0], request_prefix[1]
-                ),
+                format!("Invalid request prefix bytes {}", request_prefix),
             ));
         }
 
-        if request_prefix[2] == CMD_UDP_ASSOCIATE {
+        let command_type = line_reader.read_u8(&mut server_stream).await?;
+
+        if command_type == CMD_UDP_ASSOCIATE {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "UDP associate command is not supported",
             ));
         }
 
-        if request_prefix[2] != CMD_CONNECT {
+        if command_type != CMD_CONNECT {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                format!("Invalid command code: {}", request_prefix[2]),
+                format!("Invalid command code: {}", command_type),
             ));
         }
 
-        let remote_location = read_location(&mut server_stream).await?;
+        let remote_location = read_location(&mut server_stream, &mut line_reader).await?;
 
-        let mut request_suffix = [0u8; 2];
-        server_stream.read_exact(&mut request_suffix).await?;
-
-        if request_suffix[0] != 0x0d || request_suffix[1] != 0x0a {
+        let request_suffix = line_reader.read_u16_be(&mut server_stream).await?;
+        if request_suffix != 0x0d0a {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
-                "Invalid request bytes (2)",
+                format!("Invalid request suffix bytes {}", request_prefix),
             ));
         }
 
@@ -127,7 +125,7 @@ impl TcpServerHandler for TrojanTcpHandler {
             stream: server_stream,
             need_initial_flush: false,
             connection_success_response: None,
-            initial_remote_data: None,
+            initial_remote_data: line_reader.unparsed_data_owned(),
             override_proxy_provider: NoneOrOne::Unspecified,
         })
     }
@@ -158,11 +156,12 @@ impl TcpClientHandler for TrojanTcpHandler {
             ));
         }
 
-        client_stream.write_all(&self.password_hash).await?;
-        client_stream.write_all(&CRLF_BYTES).await?;
-        client_stream.write_all(&[CMD_CONNECT]).await?;
-        write_location(&mut client_stream, &remote_location).await?;
-        client_stream.write_all(&CRLF_BYTES).await?;
+        write_all(&mut client_stream, &self.password_hash).await?;
+        write_all(&mut client_stream, &CRLF_BYTES).await?;
+        write_all(&mut client_stream, &[CMD_CONNECT]).await?;
+        let location_bytes = write_location_to_vec(&remote_location);
+        write_all(&mut client_stream, &location_bytes).await?;
+        write_all(&mut client_stream, &CRLF_BYTES).await?;
         client_stream.flush().await?;
         Ok(TcpClientSetupResult { client_stream })
     }
