@@ -244,6 +244,51 @@ impl VmessStream {
         }
     }
 
+    pub fn feed_initial_read_data(&mut self, data: &[u8]) -> std::io::Result<()> {
+        if self.unprocessed_start_offset != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "feed_initial_read_data called with unprocessed data",
+            ));
+        } else if data.len() > self.unprocessed_buf.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "feed_initial_read_data called with too much data",
+            ));
+        }
+
+        self.unprocessed_buf[0..data.len()].copy_from_slice(data);
+        self.unprocessed_end_offset = data.len();
+
+        if self.read_header_state != ReadHeaderState::Done {
+            self.process_read_header()?;
+            if self.read_header_state != ReadHeaderState::Done {
+                return Ok(());
+            }
+            self.read_header_info.take().unwrap();
+        }
+
+        loop {
+            match self.try_decrypt()? {
+                DecryptState::NeedData => {
+                    break;
+                }
+                DecryptState::ReceivedEof => {
+                    self.is_eof = true;
+                    break;
+                }
+                DecryptState::BufferFull => {
+                    break;
+                }
+                DecryptState::Success => {
+                    continue;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     fn process_read_header(&mut self) -> std::io::Result<()> {
         match self.read_header_state {
             ReadHeaderState::ReadAeadLength => self.process_read_header_aead_length(),
