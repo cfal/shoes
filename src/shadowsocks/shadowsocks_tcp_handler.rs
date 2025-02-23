@@ -3,10 +3,11 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use rand::{Rng, RngCore};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 
 use crate::address::NetLocation;
 use crate::async_stream::AsyncStream;
+use crate::line_reader::LineReader;
 use crate::option_util::NoneOrOne;
 use crate::salt_checker::SaltChecker;
 use crate::socks_handler::{read_location, write_location_to_vec};
@@ -14,7 +15,7 @@ use crate::tcp_handler::{
     TcpClientHandler, TcpClientSetupResult, TcpServerHandler, TcpServerSetupResult,
 };
 use crate::timed_salt_checker::TimedSaltChecker;
-use crate::util::allocate_vec;
+use crate::util::write_all;
 
 use super::blake3_key::Blake3Key;
 use super::default_key::DefaultKey;
@@ -73,44 +74,48 @@ impl TcpServerHandler for ShadowsocksTcpHandler {
             ShadowsocksStreamType::Aead
         };
 
-        let mut server_stream: Box<dyn AsyncStream> = Box::new(ShadowsocksStream::new(
+        let mut server_stream = ShadowsocksStream::new(
             server_stream,
             stream_type,
             self.cipher.algorithm(),
             self.cipher.salt_len(),
             self.key.clone(),
             self.salt_checker.clone(),
-        ));
+        );
 
         // We can do this in a blocking manner for the server, because we expect the client to
         // always send the location before we send anything.
         let remote_location = read_location(&mut server_stream).await?;
 
-        if self.aead2022 {
-            let mut padding_len_bytes = [0u8; 2];
-            server_stream.read_exact(&mut padding_len_bytes).await?;
+        let initial_remote_data = if self.aead2022 {
+            let mut line_reader = LineReader::new_with_buffer_size(1024);
 
-            let padding_len = u16::from_be_bytes(padding_len_bytes);
-            if padding_len > 900 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("invalid padding length: {}", padding_len),
-                ));
-            }
+            let padding_len = line_reader.read_u16_be(&mut server_stream).await?;
 
             if padding_len > 0 {
-                let mut padding_bytes = allocate_vec(padding_len as usize);
-                server_stream.read_exact(&mut padding_bytes).await?;
+                if padding_len > 900 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("invalid padding length: {}", padding_len),
+                    ));
+                }
+                line_reader
+                    .read_slice(&mut server_stream, padding_len as usize)
+                    .await?;
             }
-        }
+
+            Some(line_reader.unparsed_data().to_vec().into_boxed_slice())
+        } else {
+            None
+        };
 
         Ok(TcpServerSetupResult::TcpForward {
             remote_location,
-            stream: server_stream,
+            stream: Box::new(server_stream),
             // we don't need an initial flush, let the IV be written when data actually arrives.
             need_initial_flush: false,
             connection_success_response: None,
-            initial_remote_data: None,
+            initial_remote_data,
             override_proxy_provider: NoneOrOne::Unspecified,
         })
     }
@@ -154,7 +159,7 @@ impl TcpClientHandler for ShadowsocksTcpHandler {
             rng.fill_bytes(&mut location_vec[location_len + 2..]);
         }
 
-        client_stream.write_all(&location_vec).await?;
+        write_all(&mut client_stream, &location_vec).await?;
         client_stream.flush().await?;
 
         Ok(TcpClientSetupResult { client_stream })
