@@ -13,7 +13,7 @@ fn default_true() -> bool {
 }
 
 fn default_snell_udp_num_sockets() -> usize {
-    2
+    1
 }
 
 #[derive(Debug, Clone, Deserialize)]
