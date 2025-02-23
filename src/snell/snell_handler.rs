@@ -8,6 +8,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use super::snell_udp_stream::SnellUdpStream;
 use crate::address::{Address, NetLocation};
 use crate::async_stream::AsyncStream;
+use crate::line_reader::LineReader;
 use crate::option_util::NoneOrOne;
 use crate::shadowsocks::{
     ShadowsocksCipher, ShadowsocksKey, ShadowsocksStream, ShadowsocksStreamType,
@@ -15,7 +16,7 @@ use crate::shadowsocks::{
 use crate::tcp_handler::{
     TcpClientHandler, TcpClientSetupResult, TcpServerHandler, TcpServerSetupResult,
 };
-use crate::util::allocate_vec;
+use crate::util::{allocate_vec, write_all};
 
 #[derive(Debug, Clone)]
 struct SnellKey {
@@ -102,19 +103,22 @@ impl TcpServerHandler for SnellServerHandler {
             None,
         );
 
-        let mut header = [0u8; 3];
-        server_stream.read_exact(&mut header).await?;
-        if header[0] != 1 {
+        let mut line_reader = LineReader::new_with_buffer_size(400);
+
+        let version = line_reader.read_u8(&mut server_stream).await?;
+        if version != 1 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
-                format!("unexpected snell version: {}", header[0]),
+                format!("unexpected snell version: {}", version),
             ));
         }
 
-        let is_udp = match header[1] {
+        let command_type = line_reader.read_u8(&mut server_stream).await?;
+        let is_udp = match command_type {
             0 => {
                 // Ping command
-                server_stream.write_all(&[0x01]).await?;
+                write_all(&mut server_stream, &[0x01]).await?;
+                server_stream.flush().await?;
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::Other,
                     "responded to ping",
@@ -143,20 +147,22 @@ impl TcpServerHandler for SnellServerHandler {
             }
         };
 
-        let mut buf = [0u8; 256];
-
-        let client_id_len = header[2] as usize;
+        let client_id_len = line_reader.read_u8(&mut server_stream).await?;
         if client_id_len > 0 {
-            server_stream.read_exact(&mut buf[0..client_id_len]).await?;
+            line_reader
+                .read_slice(&mut server_stream, client_id_len as usize)
+                .await?;
         }
 
         if !is_udp {
-            server_stream.read_exact(&mut header[0..1]).await?;
+            let hostname_len = line_reader.read_u8(&mut server_stream).await? as usize;
 
-            let hostname_len = header[0] as usize;
-            server_stream.read_exact(&mut buf[0..hostname_len]).await?;
+            let hostname_and_port_bytes = line_reader
+                .read_slice(&mut server_stream, hostname_len + 2)
+                .await?;
 
-            let hostname_str = match std::str::from_utf8(&buf[0..hostname_len]) {
+            let hostname_str = match std::str::from_utf8(&hostname_and_port_bytes[0..hostname_len])
+            {
                 Ok(s) => s,
                 Err(e) => {
                     return Err(std::io::Error::new(
@@ -166,8 +172,8 @@ impl TcpServerHandler for SnellServerHandler {
                 }
             };
 
-            server_stream.read_exact(&mut header[0..2]).await?;
-            let port = ((header[0] as u16) << 8) | (header[1] as u16);
+            let port =
+                u16::from_be_bytes(hostname_and_port_bytes[hostname_len..].try_into().unwrap());
 
             let remote_location = NetLocation::new(Address::from(hostname_str)?, port);
 
@@ -178,12 +184,12 @@ impl TcpServerHandler for SnellServerHandler {
                 // flush the tunnel response
                 need_initial_flush: true,
                 connection_success_response: Some(TCP_TUNNEL_RESPONSE.to_vec().into_boxed_slice()),
-                initial_remote_data: None,
+                initial_remote_data: line_reader.unparsed_data_owned(),
                 override_proxy_provider: NoneOrOne::Unspecified,
             })
         } else {
             // write tunnel response.
-            server_stream.write_all(UDP_READY_RESPONSE).await?;
+            write_all(&mut server_stream, UDP_READY_RESPONSE).await?;
 
             let udp_stream = SnellUdpStream::new(
                 Box::new(server_stream),
@@ -243,27 +249,37 @@ impl TcpClientHandler for SnellClientHandler {
             ));
         }
 
-        client_stream
-            .write_all(&[
+        write_all(
+            &mut client_stream,
+            &[
                 1, // snell version,
                 1, // connect command,
                 0, // client id length,
                 hostname_bytes.len() as u8,
-            ])
-            .await?;
+            ],
+        )
+        .await?;
 
-        client_stream.write_all(&hostname_bytes).await?;
+        write_all(&mut client_stream, &hostname_bytes).await?;
 
         let port = remote_location.port();
 
-        client_stream
-            .write_all(&[(port >> 8) as u8, (port & 0xff) as u8])
-            .await?;
+        write_all(
+            &mut client_stream,
+            &[(port >> 8) as u8, (port & 0xff) as u8],
+        )
+        .await?;
 
         client_stream.flush().await?;
 
         let mut response = [0u8; 1];
-        client_stream.read_exact(&mut response).await?;
+        let n = client_stream.read(&mut response).await?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "unexpected EOF when reading tunnel response",
+            ));
+        }
 
         if response[0] != 0 {
             return Err(std::io::Error::new(
