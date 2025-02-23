@@ -205,13 +205,16 @@ async fn read_address(
         0x00 => {
             let address_len = line_reader.read_u8(recv).await? as usize;
             let address_bytes = line_reader.read_slice(recv, address_len).await?;
-            let address_str = String::from_utf8(address_bytes.to_vec()).map_err(|e| {
+            let address_str = str::from_utf8(address_bytes).map_err(|e| {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     format!("invalid address: {}", e),
                 )
             })?;
-            Address::Hostname(address_str)
+            // Although this is supposed to be a hostname, some clients will pass
+            // ipv4 and ipv6 addresses as well, so parse it rather than directly
+            // using Address:Hostname enum.
+            Address::from(address_str)?
         }
         0x01 => {
             let ipv4_bytes = line_reader.read_slice(recv, 4).await?;
@@ -1154,17 +1157,23 @@ async fn run_datagram_loop(
                     continue;
                 }
                 let address_bytes = &data[12..12 + address_len];
-                let address_str = String::from_utf8(address_bytes.to_vec()).map_err(|e| {
+                let address_str = str::from_utf8(address_bytes).map_err(|e| {
                     std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         format!("invalid address: {}", e),
                     )
                 })?;
+                // Although this is supposed to be a hostname, some clients will pass
+                // ipv4 and ipv6 addresses as well, so parse it rather than directly
+                // using Address:Hostname enum.
+                let address = Address::from(address_str).map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("could not parse address: {}", e),
+                    )
+                })?;
                 let port = u16::from_be_bytes([data[12 + address_len], data[12 + address_len + 1]]);
-                (
-                    Some(NetLocation::new(Address::Hostname(address_str), port)),
-                    12 + address_len + 2,
-                )
+                (Some(NetLocation::new(address, port)), 12 + address_len + 2)
             }
             0x01 => {
                 if data_len < 17 + payload_size {
