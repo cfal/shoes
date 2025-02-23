@@ -14,7 +14,7 @@ use parking_lot::Mutex;
 use rand::{Rng, RngCore};
 use sha3::digest::{ExtendableOutput, Update};
 use sha3::Shake128;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 
 use super::fnv1a::Fnv1aHasher;
 use super::md5::{compute_hmac_md5, compute_md5, compute_md5_repeating, create_chacha_key};
@@ -23,6 +23,7 @@ use super::typed::{Aes128CfbDec, Aes128CfbEnc};
 use super::vmess_stream::{ReadHeaderInfo, VmessStream};
 use crate::address::{Address, NetLocation};
 use crate::async_stream::AsyncStream;
+use crate::line_reader::LineReader;
 use crate::option_util::NoneOrOne;
 use crate::tcp_handler::{
     TcpClientHandler, TcpClientSetupResult, TcpServerHandler, TcpServerSetupResult,
@@ -149,8 +150,12 @@ impl TcpServerHandler for VmessTcpServerHandler {
         &self,
         mut server_stream: Box<dyn AsyncStream>,
     ) -> std::io::Result<TcpServerSetupResult> {
+        let mut line_reader = LineReader::new_with_buffer_size(8192);
+
         let mut cert_hash = [0u8; 16];
-        server_stream.read_exact(&mut cert_hash).await?;
+        line_reader
+            .read_slice_into(&mut server_stream, &mut cert_hash)
+            .await?;
 
         // we need to copy it over because if this is an aead request, we need the original
         // bytes for decrypting the header.
@@ -181,12 +186,14 @@ impl TcpServerHandler for VmessTcpServerHandler {
             }
 
             let mut encrypted_payload_length = [0u8; 18];
-            let mut nonce = [0u8; 8];
-
-            server_stream
-                .read_exact(&mut encrypted_payload_length)
+            line_reader
+                .read_slice_into(&mut server_stream, &mut encrypted_payload_length)
                 .await?;
-            server_stream.read_exact(&mut nonce).await?;
+
+            let mut nonce = [0u8; 8];
+            line_reader
+                .read_slice_into(&mut server_stream, &mut nonce)
+                .await?;
 
             let header_length_aead_key = super::sha2::kdf(
                 &self.instruction_key,
@@ -233,7 +240,9 @@ impl TcpServerHandler for VmessTcpServerHandler {
             let mut encrypted_header =
                 allocate_vec(payload_length as usize + TAG_LEN).into_boxed_slice();
 
-            server_stream.read_exact(&mut encrypted_header).await?;
+            line_reader
+                .read_slice_into(&mut server_stream, &mut encrypted_header)
+                .await?;
 
             // TODO: don't unwrap
             let unbound_key = UnboundKey::new(&AES_128_GCM, &header_aead_key[0..16]).unwrap();
@@ -293,7 +302,7 @@ impl TcpServerHandler for VmessTcpServerHandler {
 
         let mut instructions_to_addr_type = [0u8; 41];
         header_reader
-            .read_exact(&mut instructions_to_addr_type)
+            .read_slice_into(&mut line_reader, &mut instructions_to_addr_type)
             .await?;
         fnv_hasher.write(&instructions_to_addr_type);
 
@@ -310,7 +319,9 @@ impl TcpServerHandler for VmessTcpServerHandler {
             1 => {
                 // 4 byte ipv4 address
                 let mut address_bytes = [0u8; 4];
-                header_reader.read_exact(&mut address_bytes).await?;
+                header_reader
+                    .read_slice_into(&mut line_reader, &mut address_bytes)
+                    .await?;
                 fnv_hasher.write(&address_bytes);
 
                 let v4addr = Ipv4Addr::new(
@@ -324,11 +335,15 @@ impl TcpServerHandler for VmessTcpServerHandler {
             2 => {
                 // domain name
                 let mut domain_name_len = [0u8; 1];
-                header_reader.read_exact(&mut domain_name_len).await?;
+                header_reader
+                    .read_slice_into(&mut line_reader, &mut domain_name_len)
+                    .await?;
                 fnv_hasher.write(&domain_name_len);
 
                 let mut domain_name_bytes = allocate_vec(domain_name_len[0] as usize);
-                header_reader.read_exact(&mut domain_name_bytes).await?;
+                header_reader
+                    .read_slice_into(&mut line_reader, &mut domain_name_bytes)
+                    .await?;
                 fnv_hasher.write(&domain_name_bytes);
 
                 let address_str = match std::str::from_utf8(&domain_name_bytes) {
@@ -349,7 +364,9 @@ impl TcpServerHandler for VmessTcpServerHandler {
             3 => {
                 // 16 byte ipv6 address
                 let mut address_bytes = [0u8; 16];
-                header_reader.read_exact(&mut address_bytes).await?;
+                header_reader
+                    .read_slice_into(&mut line_reader, &mut address_bytes)
+                    .await?;
                 fnv_hasher.write(&address_bytes);
 
                 let v6addr = Ipv6Addr::new(
@@ -376,12 +393,16 @@ impl TcpServerHandler for VmessTcpServerHandler {
         let margin_len: u8 = instructions_to_addr_type[35] >> 4;
         if margin_len > 0 {
             let mut margin_bytes = allocate_vec(margin_len as usize).into_boxed_slice();
-            header_reader.read_exact(&mut margin_bytes).await?;
+            header_reader
+                .read_slice_into(&mut line_reader, &mut margin_bytes)
+                .await?;
             fnv_hasher.write(&margin_bytes);
         }
 
         let mut check_bytes = [0u8; 4];
-        header_reader.read_exact(&mut check_bytes).await?;
+        header_reader
+            .read_slice_into(&mut line_reader, &mut check_bytes)
+            .await?;
 
         let expected_check_value = u32::from_be_bytes(check_bytes[0..4].try_into().unwrap());
         let actual_check_value = fnv_hasher.finish();
@@ -602,7 +623,7 @@ impl TcpServerHandler for VmessTcpServerHandler {
             Box::new(response_header)
         };
 
-        let server_stream = Box::new(VmessStream::new(
+        let mut vmess_stream = VmessStream::new(
             server_stream,
             is_udp,
             data_keys,
@@ -611,7 +632,14 @@ impl TcpServerHandler for VmessTcpServerHandler {
             enable_global_padding,
             Some(prefix_bytes),
             None,
-        ));
+        );
+
+        let unparsed_data = line_reader.unparsed_data();
+        if !unparsed_data.is_empty() {
+            vmess_stream.feed_initial_read_data(unparsed_data)?;
+        }
+
+        let server_stream = Box::new(vmess_stream);
 
         match is_udp {
             false => Ok(TcpServerSetupResult::TcpForward {
@@ -640,10 +668,14 @@ enum HeaderReader {
 }
 
 impl HeaderReader {
-    async fn read_exact(&mut self, data: &mut [u8]) -> std::io::Result<()> {
+    async fn read_slice_into(
+        &mut self,
+        line_reader: &mut LineReader,
+        data: &mut [u8],
+    ) -> std::io::Result<()> {
         match self {
-            HeaderReader::AesCfb(ref mut reader) => reader.read_exact(data).await,
-            HeaderReader::Aead(ref mut reader) => reader.read_exact(data),
+            HeaderReader::AesCfb(ref mut reader) => reader.read_slice_into(line_reader, data).await,
+            HeaderReader::Aead(ref mut reader) => reader.read_slice_into(data),
         }
     }
 
@@ -661,8 +693,14 @@ struct AesCfbHeaderReader {
 }
 
 impl AesCfbHeaderReader {
-    async fn read_exact(&mut self, data: &mut [u8]) -> std::io::Result<()> {
-        self.server_stream.read_exact(data).await?;
+    async fn read_slice_into(
+        &mut self,
+        line_reader: &mut LineReader,
+        data: &mut [u8],
+    ) -> std::io::Result<()> {
+        line_reader
+            .read_slice_into(&mut self.server_stream, data)
+            .await?;
         self.request_cipher.clone().decrypt(data);
         Ok(())
     }
@@ -679,7 +717,7 @@ struct AeadHeaderReader {
 }
 
 impl AeadHeaderReader {
-    fn read_exact(&mut self, data: &mut [u8]) -> std::io::Result<()> {
+    fn read_slice_into(&mut self, data: &mut [u8]) -> std::io::Result<()> {
         let len = data.len();
         data.copy_from_slice(&self.decrypted_header[self.cursor..self.cursor + len]);
         self.cursor += len;
@@ -722,6 +760,17 @@ impl VmessTcpClientHandler {
     }
 }
 
+// a cancellable alternative to AsyncWriteExt::write_all
+async fn write_all<T: AsyncWriteExt + Unpin>(stream: &mut T, buf: &[u8]) -> std::io::Result<()> {
+    let mut i = 0;
+    let n = buf.len();
+    while i < n {
+        let n = stream.write(&buf[i..]).await?;
+        i += n;
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl TcpClientHandler for VmessTcpClientHandler {
     async fn setup_client_stream(
@@ -758,7 +807,7 @@ impl TcpClientHandler for VmessTcpClientHandler {
             (hash_bytes, time_bytes)
         };
 
-        client_stream.write_all(&cert_hash).await?;
+        write_all(&mut client_stream, &cert_hash).await?;
 
         // max length of encrypted header:
         // 41 (instructions up to addr type) + 256 (max domain name length 255 + 1 length byte) +
@@ -940,8 +989,8 @@ impl TcpClientHandler for VmessTcpClientHandler {
 
             encrypted_payload_length[2..].copy_from_slice(tag.as_ref());
 
-            client_stream.write_all(&encrypted_payload_length).await?;
-            client_stream.write_all(&nonce).await?;
+            write_all(&mut client_stream, &encrypted_payload_length).await?;
+            write_all(&mut client_stream, &nonce).await?;
 
             let header_aead_key = super::sha2::kdf(
                 &self.instruction_key,
@@ -963,13 +1012,13 @@ impl TcpClientHandler for VmessTcpClientHandler {
 
             header_bytes[cursor..cursor + TAG_LEN].copy_from_slice(tag.as_ref());
             cursor += TAG_LEN;
-            client_stream.write_all(&header_bytes[0..cursor]).await?;
+            write_all(&mut client_stream, &header_bytes[0..cursor]).await?;
         } else {
             let instruction_iv: [u8; 16] = compute_md5_repeating(&time_bytes, 4);
             let cipher = Aes128CfbEnc::new(&self.instruction_key.into(), &instruction_iv.into());
             let sized_header_bytes = &mut header_bytes[0..cursor];
             cipher.encrypt(sized_header_bytes);
-            client_stream.write_all(sized_header_bytes).await?;
+            write_all(&mut client_stream, sized_header_bytes).await?;
         }
 
         // Flush the entire request.
