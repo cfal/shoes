@@ -1257,8 +1257,9 @@ pub async fn run_tuic_server(
                 .unwrap()
                 .max_concurrent_bidi_streams(4096_u32.into())
                 .max_concurrent_uni_streams(4096_u32.into())
-                .keep_alive_interval(Some(Duration::from_secs(15)))
-                .max_idle_timeout(Some(Duration::from_secs(120).try_into().unwrap()));
+                .max_idle_timeout(Some(Duration::from_secs(120).try_into().unwrap()))
+                .send_window(16 * 1024 * 1024)
+                .stream_receive_window((8u32 * 1024 * 1024).into());
 
             let socket2_socket =
                 new_socket2_udp_socket(bind_address.is_ipv6(), None, Some(bind_address), true)
