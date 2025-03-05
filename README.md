@@ -11,7 +11,7 @@ shoes is a multi-protocol proxy server written in Rust.
   - Supported ciphers:
     - aes-128-gcm
     - chacha20-poly1305
-- **Vless** (TCP, QUIC)
+- **Vless** (TCP, QUIC, UDP-over-TCP)
 - **Snell** v3 (TCP, QUIC, UDP-over-TCP)
   - Supported ciphers:
     - aes-128-gcm
