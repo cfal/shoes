@@ -6,11 +6,12 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::address::{Address, NetLocation};
 use crate::async_stream::AsyncStream;
+use crate::line_reader::LineReader;
 use crate::option_util::NoneOrOne;
 use crate::tcp_handler::{
     TcpClientHandler, TcpClientSetupResult, TcpServerHandler, TcpServerSetupResult,
 };
-use crate::util::{allocate_vec, parse_uuid};
+use crate::util::{allocate_vec, parse_uuid, write_all};
 use crate::vless_message_stream::VlessMessageStream;
 
 #[derive(Debug)]
@@ -39,21 +40,22 @@ impl TcpServerHandler for VlessTcpServerHandler {
         &self,
         mut server_stream: Box<dyn AsyncStream>,
     ) -> std::io::Result<TcpServerSetupResult> {
-        let mut prefix = [0u8; 18];
-        // TODO: don't read_exact
-        server_stream.read_exact(&mut prefix).await?;
+        // this needs to be less than `read_buf` size in VlessMessageStream so that
+        // feed_initial_data can handle the unparsed data.
+        let mut line_reader = LineReader::new_with_buffer_size(800);
 
-        if prefix[0] != 0 {
+        let client_version = line_reader.read_u8(&mut server_stream).await?;
+        if client_version != 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
                 format!(
                     "invalid client protocol version, expected 0, got {}",
-                    prefix[0]
+                    client_version
                 ),
             ));
         }
 
-        let target_id = &prefix[1..17];
+        let target_id = line_reader.read_slice(&mut server_stream, 16).await?;
         for (b1, b2) in self.user_id.iter().zip(target_id.iter()) {
             if b1 != b2 {
                 return Err(std::io::Error::new(
@@ -63,16 +65,15 @@ impl TcpServerHandler for VlessTcpServerHandler {
             }
         }
 
-        let addon_length = prefix[17];
-
+        let addon_length = line_reader.read_u8(&mut server_stream).await?;
         if addon_length > 0 {
-            read_addons(&mut server_stream, addon_length).await?;
+            line_reader
+                .read_slice(&mut server_stream, addon_length as usize)
+                .await?;
         }
 
-        let mut address_prefix = [0u8; 4];
-        server_stream.read_exact(&mut address_prefix).await?;
-
-        let is_udp = match address_prefix[0] {
+        let instruction = line_reader.read_u8(&mut server_stream).await?;
+        let is_udp = match instruction {
             1 => {
                 // tcp
                 false
@@ -94,14 +95,13 @@ impl TcpServerHandler for VlessTcpServerHandler {
             }
         };
 
-        let port = ((address_prefix[1] as u16) << 8) | (address_prefix[2] as u16);
+        let port = line_reader.read_u16_be(&mut server_stream).await?;
 
-        let remote_location = match address_prefix[3] {
+        let address_type = line_reader.read_u8(&mut server_stream).await?;
+        let remote_location = match address_type {
             1 => {
                 // 4 byte ipv4 address
-                let mut address_bytes = [0u8; 4];
-                server_stream.read_exact(&mut address_bytes).await?;
-
+                let address_bytes = line_reader.read_slice(&mut server_stream, 4).await?;
                 let v4addr = Ipv4Addr::new(
                     address_bytes[0],
                     address_bytes[1],
@@ -112,13 +112,12 @@ impl TcpServerHandler for VlessTcpServerHandler {
             }
             2 => {
                 // domain name
-                let mut domain_name_len = [0u8; 1];
-                server_stream.read_exact(&mut domain_name_len).await?;
+                let domain_name_len = line_reader.read_u8(&mut server_stream).await?;
+                let domain_name_bytes = line_reader
+                    .read_slice(&mut server_stream, domain_name_len as usize)
+                    .await?;
 
-                let mut domain_name_bytes = allocate_vec(domain_name_len[0] as usize);
-                server_stream.read_exact(&mut domain_name_bytes).await?;
-
-                let address_str = match std::str::from_utf8(&domain_name_bytes) {
+                let address_str = match std::str::from_utf8(domain_name_bytes) {
                     Ok(s) => s,
                     Err(e) => {
                         return Err(std::io::Error::new(
@@ -135,9 +134,7 @@ impl TcpServerHandler for VlessTcpServerHandler {
             }
             3 => {
                 // 16 byte ipv6 address
-                let mut address_bytes = [0u8; 16];
-                server_stream.read_exact(&mut address_bytes).await?;
-
+                let address_bytes = line_reader.read_slice(&mut server_stream, 16).await?;
                 let v6addr = Ipv6Addr::new(
                     ((address_bytes[0] as u16) << 8) | (address_bytes[1] as u16),
                     ((address_bytes[2] as u16) << 8) | (address_bytes[3] as u16),
@@ -159,6 +156,8 @@ impl TcpServerHandler for VlessTcpServerHandler {
             }
         };
 
+        let unparsed_data = line_reader.unparsed_data();
+
         if !is_udp {
             Ok(TcpServerSetupResult::TcpForward {
                 remote_location,
@@ -167,15 +166,25 @@ impl TcpServerHandler for VlessTcpServerHandler {
                 connection_success_response: Some(
                     SERVER_RESPONSE_HEADER.to_vec().into_boxed_slice(),
                 ),
-                initial_remote_data: None,
+                initial_remote_data: if unparsed_data.is_empty() {
+                    None
+                } else {
+                    Some(unparsed_data.to_vec().into_boxed_slice())
+                },
                 override_proxy_provider: NoneOrOne::Unspecified,
             })
         } else {
-            server_stream.write_all(&SERVER_RESPONSE_HEADER).await?;
+            write_all(&mut server_stream, &SERVER_RESPONSE_HEADER).await?;
+
+            let mut vless_stream = VlessMessageStream::new(server_stream);
+            if !unparsed_data.is_empty() {
+                vless_stream.feed_initial_read_data(unparsed_data)?;
+            }
+
             Ok(TcpServerSetupResult::BidirectionalUdp {
                 remote_location,
-                stream: Box::new(VlessMessageStream::new(server_stream)),
-                // write the response with the initial data.
+                stream: Box::new(vless_stream),
+                // don't flush and write the server response with the initial data.
                 need_initial_flush: false,
                 override_proxy_provider: NoneOrOne::Unspecified,
             })
@@ -221,17 +230,17 @@ impl TcpClientHandler for VlessTcpClientHandler {
         match remote_address {
             Address::Ipv4(v4addr) => {
                 header_bytes[21] = 1;
-                client_stream.write_all(&header_bytes).await?;
+                write_all(&mut client_stream, &header_bytes).await?;
 
                 let address_bytes = v4addr.octets();
-                client_stream.write_all(&address_bytes).await?;
+                write_all(&mut client_stream, &address_bytes).await?;
             }
             Address::Ipv6(v6addr) => {
                 header_bytes[21] = 3;
-                client_stream.write_all(&header_bytes).await?;
+                write_all(&mut client_stream, &header_bytes).await?;
 
                 let address_bytes = v6addr.octets();
-                client_stream.write_all(&address_bytes).await?;
+                write_all(&mut client_stream, &address_bytes).await?;
             }
             Address::Hostname(hostname) => {
                 if hostname.len() > 255 {
@@ -242,17 +251,18 @@ impl TcpClientHandler for VlessTcpClientHandler {
                 }
 
                 header_bytes[21] = 2;
-                client_stream.write_all(&header_bytes).await?;
+                write_all(&mut client_stream, &header_bytes).await?;
 
                 let hostname_len_byte: [u8; 1] = [hostname.len() as u8];
-                client_stream.write_all(&hostname_len_byte).await?;
+                write_all(&mut client_stream, &hostname_len_byte).await?;
 
                 let hostname_bytes = hostname.into_bytes();
-                client_stream.write_all(&hostname_bytes).await?;
+                write_all(&mut client_stream, &hostname_bytes).await?;
             }
         }
         client_stream.flush().await?;
 
+        // TODO: remove read_exact, used buffered writes above.
         let mut response_header = [0u8; 2];
         client_stream.read_exact(&mut response_header).await?;
 
