@@ -197,6 +197,8 @@ pub enum ServerProxyConfig {
     },
     Vless {
         user_id: String,
+        #[serde(default = "default_true")]
+        udp_enabled: bool,
     },
     Trojan {
         password: String,
@@ -233,10 +235,7 @@ pub enum ServerProxyConfig {
         udp_enabled: bool,
     },
     #[serde(alias = "tuic")]
-    TuicV5 {
-        uuid: String,
-        password: String,
-    },
+    TuicV5 { uuid: String, password: String },
 }
 
 impl std::fmt::Display for ServerProxyConfig {
@@ -832,7 +831,7 @@ fn validate_server_proxy_config(
     rule_groups: &HashMap<String, Vec<RuleConfig>>,
 ) -> std::io::Result<()> {
     match server_proxy_config {
-        ServerProxyConfig::Vless { user_id } => {
+        ServerProxyConfig::Vless { user_id, .. } => {
             parse_uuid(user_id)?;
         }
         ServerProxyConfig::Vmess { user_id, .. } => {
