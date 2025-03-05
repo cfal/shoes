@@ -38,6 +38,11 @@ impl AsyncReadMessage for VlessMessageStream {
         out_buf: &mut ReadBuf<'_>,
     ) -> Poll<Result<()>> {
         let this = self.get_mut();
+
+        if this.is_eof {
+            return Poll::Ready(Ok(()));
+        }
+
         loop {
             if this.read_end_index >= 2 {
                 let payload_len = u16::from_be_bytes([this.read_buf[0], this.read_buf[1]]) as usize;
@@ -179,5 +184,4 @@ impl AsyncPing for VlessMessageStream {
     }
 }
 
-//
 impl AsyncMessageStream for VlessMessageStream {}
