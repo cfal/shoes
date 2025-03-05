@@ -1128,26 +1128,20 @@ impl AsyncWriteMessage for VmessStream {
             }
         }
 
-        let max_padding_len = if this.write_length_mask.is_some() {
-            MAX_PADDING_LEN
-        } else {
-            0
+        let (padding_len, length_mask) = match this.write_length_mask {
+            Some(ref mut mask) => mask.next_values(),
+            None => (0, 0),
         };
 
-        let max_metadata_size = 2 + max_padding_len + this.tag_len;
-        let min_available_space = this.write_packet.len() - max_metadata_size;
-        if min_available_space < buf.len() {
+        let metadata_size = 2 + padding_len + this.tag_len;
+
+        let available_space = this.write_packet.len() - metadata_size;
+        if available_space < buf.len() {
             return Poll::Ready(Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
                 "write payload is too large",
             )));
         }
-
-        // TODO: allow peeking so that we don't need to use MAX_PADDING_LEN above.
-        let (padding_len, length_mask) = match this.write_length_mask {
-            Some(ref mut mask) => mask.next_values(),
-            None => (0, 0),
-        };
 
         let write_packet_size = buf.len() + padding_len + this.tag_len;
         let write_packet_size = (write_packet_size as u16) ^ length_mask;
