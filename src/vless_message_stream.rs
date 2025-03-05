@@ -29,6 +29,18 @@ impl VlessMessageStream {
             is_eof: false,
         }
     }
+
+    pub fn feed_initial_read_data(&mut self, data: &[u8]) -> std::io::Result<()> {
+        if data.len() > self.read_buf.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "feed_initial_read_data called with too much data",
+            ));
+        }
+        self.read_buf[0..data.len()].copy_from_slice(data);
+        self.read_end_index = data.len();
+        Ok(())
+    }
 }
 
 impl AsyncReadMessage for VlessMessageStream {
