@@ -171,9 +171,11 @@ impl TcpServerHandler for VlessTcpServerHandler {
                 override_proxy_provider: NoneOrOne::Unspecified,
             })
         } else {
+            server_stream.write_all(&SERVER_RESPONSE_HEADER).await?;
             Ok(TcpServerSetupResult::BidirectionalUdp {
                 remote_location,
                 stream: Box::new(VlessMessageStream::new(server_stream)),
+                // write the response with the initial data.
                 need_initial_flush: false,
                 override_proxy_provider: NoneOrOne::Unspecified,
             })
