@@ -10,8 +10,8 @@ use crate::option_util::NoneOrOne;
 use crate::tcp_handler::{
     TcpClientHandler, TcpClientSetupResult, TcpServerHandler, TcpServerSetupResult,
 };
-
 use crate::util::{allocate_vec, parse_uuid};
+use crate::vless_message_stream::VlessMessageStream;
 
 #[derive(Debug)]
 pub struct VlessTcpHandler {
@@ -38,6 +38,7 @@ impl TcpServerHandler for VlessTcpHandler {
         mut server_stream: Box<dyn AsyncStream>,
     ) -> std::io::Result<TcpServerSetupResult> {
         let mut prefix = [0u8; 18];
+        // TODO: don't read_exact
         server_stream.read_exact(&mut prefix).await?;
 
         if prefix[0] != 0 {
@@ -69,15 +70,14 @@ impl TcpServerHandler for VlessTcpHandler {
         let mut address_prefix = [0u8; 4];
         server_stream.read_exact(&mut address_prefix).await?;
 
-        match address_prefix[0] {
+        let is_udp = match address_prefix[0] {
             1 => {
-                // tcp, noop.
+                // tcp
+                false
             }
             2 => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "UDP was requested",
-                ));
+                // TODO: add and check udp_enabled
+                true
             }
             unknown_protocol_type => {
                 return Err(std::io::Error::new(
@@ -85,7 +85,7 @@ impl TcpServerHandler for VlessTcpHandler {
                     format!("Unknown requested protocol: {}", unknown_protocol_type),
                 ));
             }
-        }
+        };
 
         let port = ((address_prefix[1] as u16) << 8) | (address_prefix[2] as u16);
 
@@ -152,14 +152,25 @@ impl TcpServerHandler for VlessTcpHandler {
             }
         };
 
-        Ok(TcpServerSetupResult::TcpForward {
-            remote_location,
-            stream: server_stream,
-            need_initial_flush: true,
-            connection_success_response: Some(SERVER_RESPONSE_HEADER.to_vec().into_boxed_slice()),
-            initial_remote_data: None,
-            override_proxy_provider: NoneOrOne::Unspecified,
-        })
+        if !is_udp {
+            Ok(TcpServerSetupResult::TcpForward {
+                remote_location,
+                stream: server_stream,
+                need_initial_flush: false,
+                connection_success_response: Some(
+                    SERVER_RESPONSE_HEADER.to_vec().into_boxed_slice(),
+                ),
+                initial_remote_data: None,
+                override_proxy_provider: NoneOrOne::Unspecified,
+            })
+        } else {
+            Ok(TcpServerSetupResult::BidirectionalUdp {
+                remote_location,
+                stream: Box::new(VlessMessageStream::new(server_stream)),
+                need_initial_flush: false,
+                override_proxy_provider: NoneOrOne::Unspecified,
+            })
+        }
     }
 }
 
