@@ -29,6 +29,7 @@ mod udp_message_stream;
 mod udp_multi_message_stream;
 mod util;
 mod vless_handler;
+mod vless_message_stream;
 mod vmess;
 mod websocket;
 
