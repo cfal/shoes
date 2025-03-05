@@ -687,6 +687,7 @@ impl VmessStream {
         true
     }
 
+    #[inline]
     fn do_write_packet(&mut self, cx: &mut Context<'_>) -> std::io::Result<bool> {
         // returns true when everything is written.
         loop {
@@ -1106,12 +1107,26 @@ impl AsyncReadMessage for VmessStream {
 impl AsyncWriteMessage for VmessStream {
     fn poll_write_message(
         self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
+        cx: &mut Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<()>> {
-        // TODO: clean this up - it's possible we have space and we can add to the write packet
-        // without ensuring its all written.
         let this = self.get_mut();
+
+        // the write cache is not used in message mode.
+        assert!(this.write_cache_size == 0);
+
+        if this.write_packet_end_offset > 0 {
+            match this.do_write_packet(cx) {
+                Ok(all_written) => {
+                    if !all_written {
+                        return Poll::Pending;
+                    }
+                }
+                Err(e) => {
+                    return Poll::Ready(Err(e));
+                }
+            }
+        }
 
         let max_padding_len = if this.write_length_mask.is_some() {
             MAX_PADDING_LEN
@@ -1120,27 +1135,45 @@ impl AsyncWriteMessage for VmessStream {
         };
 
         let max_metadata_size = 2 + max_padding_len + this.tag_len;
-        let write_packet_space = this.write_packet.len() - this.write_packet_end_offset;
-        if max_metadata_size >= write_packet_space {
-            return Poll::Pending;
+        let min_available_space = this.write_packet.len() - max_metadata_size;
+        if min_available_space < buf.len() {
+            return Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "write payload is too large",
+            )));
         }
 
-        let min_available_space = write_packet_space - max_metadata_size;
+        // TODO: allow peeking so that we don't need to use MAX_PADDING_LEN above.
+        let (padding_len, length_mask) = match this.write_length_mask {
+            Some(ref mut mask) => mask.next_values(),
+            None => (0, 0),
+        };
 
-        if buf.len() > min_available_space {
-            return Poll::Pending;
+        let write_packet_size = buf.len() + padding_len + this.tag_len;
+        let write_packet_size = (write_packet_size as u16) ^ length_mask;
+
+        this.write_packet[0] = (write_packet_size >> 8) as u8;
+        this.write_packet[1] = (write_packet_size & 0xff) as u8;
+
+        let mut end_index = 2 + buf.len();
+        this.write_packet[2..end_index].copy_from_slice(buf);
+
+        if let Some(ref mut sealing_key) = this.sealing_key {
+            let tag = sealing_key
+                .seal_in_place_separate_tag(Aad::empty(), &mut this.write_packet[2..end_index])
+                .map_err(|err| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("failed to seal message: {}", err),
+                    )
+                })?;
+
+            this.write_packet[end_index..end_index + this.tag_len].copy_from_slice(tag.as_ref());
+
+            end_index += this.tag_len;
         }
 
-        // if we are in message mode, we don't ever use write cache size.
-        assert!(this.write_cache_size == 0);
-
-        // TODO: we don't need to copy and call do_write_packet. we can just create a packet
-        // directly.
-        this.write_cache[0..buf.len()].copy_from_slice(buf);
-        this.write_cache_size = buf.len();
-        while this.write_cache_size > 0 && this.create_write_packet() {}
-
-        assert!(this.write_cache_size == 0 && this.write_packet_end_offset > 0);
+        this.write_packet_end_offset = end_index;
 
         Poll::Ready(Ok(()))
     }
@@ -1153,6 +1186,7 @@ impl AsyncFlushMessage for VmessStream {
     ) -> std::task::Poll<std::io::Result<()>> {
         let this = self.get_mut();
 
+        // the write cache is not used in message mode.
         assert!(this.write_cache_size == 0);
 
         if this.write_packet_end_offset > 0 {
