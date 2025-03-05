@@ -22,7 +22,7 @@ use crate::tcp_client_connector::TcpClientConnector;
 use crate::tcp_handler::{TcpClientHandler, TcpServerHandler};
 use crate::tls_handler::{TlsClientHandler, TlsServerHandler, TlsServerTarget};
 use crate::trojan_handler::TrojanTcpHandler;
-use crate::vless_handler::VlessTcpHandler;
+use crate::vless_handler::{VlessTcpClientHandler, VlessTcpServerHandler};
 use crate::vmess::{VmessTcpClientHandler, VmessTcpServerHandler};
 use crate::websocket::{
     WebsocketServerTarget, WebsocketTcpClientHandler, WebsocketTcpServerHandler,
@@ -70,7 +70,10 @@ pub fn create_tcp_server_handler(
             udp_enabled,
             udp_num_sockets,
         )),
-        ServerProxyConfig::Vless { user_id } => Box::new(VlessTcpHandler::new(&user_id)),
+        ServerProxyConfig::Vless {
+            user_id,
+            udp_enabled,
+        } => Box::new(VlessTcpServerHandler::new(&user_id, udp_enabled)),
         ServerProxyConfig::Trojan {
             password,
             shadowsocks,
@@ -255,7 +258,7 @@ pub fn create_tcp_client_handler(
         ClientProxyConfig::Snell(ShadowsocksConfig { cipher, password }) => {
             Box::new(SnellClientHandler::new(&cipher, &password))
         }
-        ClientProxyConfig::Vless { user_id } => Box::new(VlessTcpHandler::new(&user_id)),
+        ClientProxyConfig::Vless { user_id } => Box::new(VlessTcpClientHandler::new(&user_id)),
         ClientProxyConfig::Trojan {
             password,
             shadowsocks,

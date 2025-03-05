@@ -14,14 +14,16 @@ use crate::util::{allocate_vec, parse_uuid};
 use crate::vless_message_stream::VlessMessageStream;
 
 #[derive(Debug)]
-pub struct VlessTcpHandler {
+pub struct VlessTcpServerHandler {
     user_id: Box<[u8]>,
+    udp_enabled: bool,
 }
 
-impl VlessTcpHandler {
-    pub fn new(user_id: &str) -> Self {
+impl VlessTcpServerHandler {
+    pub fn new(user_id: &str, udp_enabled: bool) -> Self {
         Self {
             user_id: parse_uuid(user_id).unwrap().into_boxed_slice(),
+            udp_enabled,
         }
     }
 }
@@ -32,7 +34,7 @@ const SERVER_RESPONSE_HEADER: &[u8] = &[
 ];
 
 #[async_trait]
-impl TcpServerHandler for VlessTcpHandler {
+impl TcpServerHandler for VlessTcpServerHandler {
     async fn setup_server_stream(
         &self,
         mut server_stream: Box<dyn AsyncStream>,
@@ -76,7 +78,12 @@ impl TcpServerHandler for VlessTcpHandler {
                 false
             }
             2 => {
-                // TODO: add and check udp_enabled
+                if !self.udp_enabled {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "UDP not enabled",
+                    ));
+                }
                 true
             }
             unknown_protocol_type => {
@@ -174,8 +181,21 @@ impl TcpServerHandler for VlessTcpHandler {
     }
 }
 
+#[derive(Debug)]
+pub struct VlessTcpClientHandler {
+    user_id: Box<[u8]>,
+}
+
+impl VlessTcpClientHandler {
+    pub fn new(user_id: &str) -> Self {
+        Self {
+            user_id: parse_uuid(user_id).unwrap().into_boxed_slice(),
+        }
+    }
+}
+
 #[async_trait]
-impl TcpClientHandler for VlessTcpHandler {
+impl TcpClientHandler for VlessTcpClientHandler {
     async fn setup_client_stream(
         &self,
         _server_stream: &mut Box<dyn AsyncStream>,
