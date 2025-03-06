@@ -31,18 +31,12 @@ use crate::util::parse_uuid;
 
 async fn start_quic_server(
     bind_address: SocketAddr,
-    server_config: Arc<rustls::ServerConfig>,
+    quic_server_config: Arc<quinn::crypto::rustls::QuicServerConfig>,
     client_proxy_selector: Arc<ClientProxySelector<TcpClientConnector>>,
     resolver: Arc<dyn Resolver>,
     server_handler: Arc<Box<dyn TcpServerHandler>>,
     num_endpoints: usize,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
-    let quic_server_config: quinn::crypto::rustls::QuicServerConfig = server_config
-        .try_into()
-        .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
-
-    let server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_server_config));
-
     // TODO: consider setting transport config
     //   Arc::get_mut(&mut server_config.transport)
     //     .unwrap()
@@ -53,12 +47,14 @@ async fn start_quic_server(
 
     let mut join_handles = vec![];
     for _ in 0..num_endpoints {
+        let server_config = quinn::ServerConfig::with_crypto(quic_server_config.clone());
+
         let socket2_socket =
             new_socket2_udp_socket(bind_address.is_ipv6(), None, Some(bind_address), true).unwrap();
 
         let endpoint = quinn::Endpoint::new(
             EndpointConfig::default(),
-            Some(server_config.clone()),
+            Some(server_config),
             socket2_socket.into(),
             Arc::new(quinn::TokioRuntime),
         )?;
@@ -383,6 +379,12 @@ pub async fn start_quic_servers(config: ServerConfig) -> std::io::Result<Vec<Joi
         &client_fingerprints.into_vec(),
     ));
 
+    let quic_server_config: quinn::crypto::rustls::QuicServerConfig = server_config
+        .try_into()
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
+
+    let quic_server_config = Arc::new(quic_server_config);
+
     let client_proxy_selector = Arc::new(create_tcp_client_proxy_selector(rules.clone()));
     let resolver = Arc::new(NativeResolver::new());
 
@@ -397,12 +399,12 @@ pub async fn start_quic_servers(config: ServerConfig) -> std::io::Result<Vec<Joi
             let hysteria2_password: &'static str = Box::leak(password.into_boxed_str());
 
             for bind_address in bind_addresses.into_iter() {
-                let server_config = server_config.clone();
+                let quic_server_config = quic_server_config.clone();
                 let client_proxy_selector = client_proxy_selector.clone();
                 let resolver = resolver.clone();
                 let hysteria2_handles = crate::hysteria2_server::start_hysteria2_server(
                     bind_address,
-                    server_config,
+                    quic_server_config,
                     hysteria2_password,
                     client_proxy_selector,
                     resolver,
@@ -417,12 +419,12 @@ pub async fn start_quic_servers(config: ServerConfig) -> std::io::Result<Vec<Joi
             let uuid: &'static [u8] = Box::leak(parse_uuid(&uuid)?.into_boxed_slice());
             let password: &'static str = Box::leak(password.into_boxed_str());
             for bind_address in bind_addresses.into_iter() {
-                let server_config = server_config.clone();
+                let quic_server_config = quic_server_config.clone();
                 let client_proxy_selector = client_proxy_selector.clone();
                 let resolver = resolver.clone();
                 let tuic_handles = crate::tuic_server::start_tuic_server(
                     bind_address,
-                    server_config,
+                    quic_server_config,
                     uuid,
                     password,
                     client_proxy_selector,
@@ -439,13 +441,13 @@ pub async fn start_quic_servers(config: ServerConfig) -> std::io::Result<Vec<Joi
                 Arc::new(create_tcp_server_handler(tcp_protocol, &mut rules_stack));
 
             for bind_address in bind_addresses.into_iter() {
-                let server_config = server_config.clone();
+                let quic_server_config = quic_server_config.clone();
                 let client_proxy_selector = client_proxy_selector.clone();
                 let resolver = resolver.clone();
                 let tcp_handler = tcp_handler.clone();
                 let quic_handles = start_quic_server(
                     bind_address,
-                    server_config,
+                    quic_server_config,
                     client_proxy_selector,
                     resolver,
                     tcp_handler,

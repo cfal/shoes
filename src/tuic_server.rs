@@ -1227,19 +1227,13 @@ async fn run_datagram_loop(
 
 pub async fn start_tuic_server(
     bind_address: SocketAddr,
-    server_config: Arc<rustls::ServerConfig>,
+    quic_server_config: Arc<quinn::crypto::rustls::QuicServerConfig>,
     uuid: &'static [u8],
     password: &'static str,
     client_proxy_selector: Arc<ClientProxySelector<TcpClientConnector>>,
     resolver: Arc<dyn Resolver>,
     num_endpoints: usize,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
-    let quic_server_config: quinn::crypto::rustls::QuicServerConfig = server_config
-        .try_into()
-        .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
-
-    let quic_server_config = Arc::new(quic_server_config);
-
     let mut join_handles = vec![];
     for _ in 0..num_endpoints {
         let quic_server_config = quic_server_config.clone();
