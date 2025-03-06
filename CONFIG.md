@@ -7,7 +7,7 @@ shoes uses a YAML-based configuration format. Each configuration file can contai
 There are three main configuration types:
 
 1. Server configurations (`ServerConfig`)
-2. Client proxy groups (`ClientConfigGroup`) 
+2. Client proxy groups (`ClientConfigGroup`)
 3. Rule groups (`RuleConfigGroup`)
 
 ## Server Configuration
@@ -40,12 +40,22 @@ protocol:
   password: string?  # Optional
 ```
 
-#### Shadowsocks/Snell
+#### Shadowsocks
 ```yaml
 protocol:
-  type: shadowsocks | ss | snell
-  cipher: string    # Encryption algorithm
+  type: shadowsocks | ss
+  cipher: string         # Encryption algorithm
   password: string
+```
+
+#### Snell
+```yaml
+protocol:
+  type: snell
+  cipher: string         # Encryption algorithm
+  password: string
+  udp_enabled: bool      # Optional, defaults to true
+  udp_num_sockets: int   # Optional, defaults to 1
 ```
 
 #### VLESS
@@ -112,6 +122,22 @@ protocol:
 protocol:
   type: forward | port_forward
   targets: string | [string]  # Target address(es) to forward to
+```
+
+#### Hysteria2
+```yaml
+protocol:
+  type: hysteria2
+  password: string    # Proxy password
+  udp_enabled: bool   # Optional, defaults to true
+```
+
+#### Tuic v5
+```yaml
+protocol:
+  type: tuic | tuicv5
+  uuid: string        # UUID for identification
+  password: string
 ```
 
 ### Client Protocols
@@ -300,3 +326,20 @@ protocol:
 rules: routing
 ```
 
+### Hysteria2 Proxy Server
+```yaml
+bind_location: "0.0.0.0:4443"
+protocol:
+  type: hysteria2
+  password: "hysteria_secret"
+  udp_enabled: true
+```
+
+### Tuic v5 Proxy Server
+```yaml
+bind_location: "0.0.0.0:5555"
+protocol:
+  type: tuicv5
+  uuid: "123e4567-e89b-12d3-a456-426614174000"
+  password: "tuic_secret"
+```
