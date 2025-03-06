@@ -1,0 +1,12 @@
+# specify a port range to allow port hopping.
+- address: 0.0.0.0:5000-6000
+  transport: quic
+  quic_settings:
+    cert: cert.pem
+    key: cert.pem
+  protocol:
+    type: tuic
+    uuid: d685aef3-b3c4-4932-9a9d-d0c2f6727dfa
+    password: abc128459
+  rules:
+    - allow-all-direct
