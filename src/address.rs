@@ -179,6 +179,176 @@ impl std::fmt::Display for NetLocation {
     }
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct NetLocationPortRange {
+    address: Address,
+    ports: Vec<u16>,
+}
+
+impl NetLocationPortRange {
+    pub fn new(address: Address, mut ports: Vec<u16>) -> std::io::Result<Self> {
+        ports.sort_unstable();
+        ports.dedup();
+        if ports.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "No valid ports specified",
+            ));
+        }
+        Ok(Self { address, ports })
+    }
+
+    pub fn from_str(s: &str) -> std::io::Result<Self> {
+        // Split address and port specification
+        let (address_str, port_str) = match s.rfind(':') {
+            Some(i) => (&s[0..i], &s[i + 1..]),
+            None => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Missing port specification",
+                ))
+            }
+        };
+
+        // Parse the address
+        let address = Address::from(address_str)?;
+
+        // Parse the port ranges
+        let mut ports = Vec::new();
+        for part in port_str.split(',') {
+            if part.contains('-') {
+                // Handle range like "1-5"
+                let range_parts: Vec<&str> = part.split('-').collect();
+                if range_parts.len() != 2 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("Invalid port range format: {}", part),
+                    ));
+                }
+
+                let start = range_parts[0].parse::<u16>().map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("Invalid port number: {}", e),
+                    )
+                })?;
+
+                let end = range_parts[1].parse::<u16>().map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("Invalid port number: {}", e),
+                    )
+                })?;
+
+                if start > end {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("Invalid port range (start > end): {}-{}", start, end),
+                    ));
+                }
+
+                for port in start..=end {
+                    ports.push(port);
+                }
+            } else {
+                // Handle single port like "8"
+                let port = part.parse::<u16>().map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("Invalid port number: {}", e),
+                    )
+                })?;
+
+                ports.push(port);
+            }
+        }
+
+        Self::new(address, ports)
+    }
+
+    pub fn to_socket_addrs(&self) -> std::io::Result<Vec<SocketAddr>> {
+        let mut socket_addrs = Vec::with_capacity(self.ports.len());
+
+        match &self.address {
+            Address::Ipv4(addr) => {
+                let ip = IpAddr::V4(*addr);
+                for &port in &self.ports {
+                    socket_addrs.push(SocketAddr::new(ip, port));
+                }
+                Ok(socket_addrs)
+            }
+            Address::Ipv6(addr) => {
+                let ip = IpAddr::V6(*addr);
+                for &port in &self.ports {
+                    socket_addrs.push(SocketAddr::new(ip, port));
+                }
+                Ok(socket_addrs)
+            }
+            Address::Hostname(hostname) => {
+                let mut result = Vec::new();
+                for &port in &self.ports {
+                    let addr_iter = format!("{}:{}", hostname, port).to_socket_addrs()?;
+                    for addr in addr_iter {
+                        result.push(addr);
+                    }
+                }
+                if result.is_empty() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "Hostname lookup failed for all ports",
+                    ));
+                }
+                Ok(result)
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for NetLocationPortRange {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{}:", self.address)?;
+
+        // It shouldn't be possible to create an instance with empty ports.
+        assert!(!self.ports.is_empty());
+
+        let mut start_idx = 0;
+        let mut idx = 0;
+
+        while idx < self.ports.len() {
+            // Find consecutive sequences
+            let start_port = self.ports[start_idx];
+
+            while idx + 1 < self.ports.len() && self.ports[idx] + 1 == self.ports[idx + 1] {
+                idx += 1;
+            }
+
+            // Now idx points to the end of a consecutive sequence
+            let end_port = self.ports[idx];
+
+            // Print it properly
+            if start_idx > 0 {
+                write!(f, ",")?;
+            }
+
+            if start_port == end_port {
+                // Single port
+                write!(f, "{}", start_port)?;
+            } else if end_port - start_port == 1 {
+                // Just two consecutive ports, write as comma-separated
+                write!(f, "{},{}", start_port, end_port)?;
+            } else {
+                // Range of ports
+                write!(f, "{}-{}", start_port, end_port)?;
+            }
+
+            idx += 1;
+            start_idx = idx;
+        }
+
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AddressMask {
     pub address: Address,

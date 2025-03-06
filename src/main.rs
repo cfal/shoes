@@ -37,13 +37,13 @@ use std::path::Path;
 
 use log::debug;
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use tcp_server::start_tcp_server;
+use tcp_server::start_tcp_servers;
 use tokio::runtime::Builder;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 use tokio::task::JoinHandle;
 
 use crate::config::{ServerConfig, Transport};
-use crate::quic_server::start_quic_server;
+use crate::quic_server::start_quic_servers;
 use crate::thread_util::set_num_threads;
 use tcp::*;
 
@@ -78,11 +78,10 @@ async fn start_servers(config: ServerConfig) -> std::io::Result<Vec<JoinHandle<(
     let mut join_handles = Vec::with_capacity(3);
 
     match config.transport {
-        Transport::Tcp => match start_tcp_server(config.clone()).await {
-            Ok(Some(handle)) => {
-                join_handles.push(handle);
+        Transport::Tcp => match start_tcp_servers(config.clone()).await {
+            Ok(handles) => {
+                join_handles.extend(handles);
             }
-            Ok(None) => (),
             Err(e) => {
                 for join_handle in join_handles {
                     join_handle.abort();
@@ -90,11 +89,10 @@ async fn start_servers(config: ServerConfig) -> std::io::Result<Vec<JoinHandle<(
                 return Err(e);
             }
         },
-        Transport::Quic => match start_quic_server(config.clone()).await {
-            Ok(Some(handle)) => {
-                join_handles.push(handle);
+        Transport::Quic => match start_quic_servers(config.clone()).await {
+            Ok(handles) => {
+                join_handles.extend(handles);
             }
-            Ok(None) => (),
             Err(e) => {
                 for join_handle in join_handles {
                     join_handle.abort();
@@ -219,10 +217,9 @@ fn main() {
 
             println!("\nStarting {} server(s)..", configs.len());
 
-            // Expect tcp and udp join handles for each.
-            let mut join_handles = Vec::with_capacity(configs.len() * 2);
+            let mut join_handles = vec![];
             for config in configs {
-                join_handles.append(&mut start_servers(config).await.unwrap());
+                join_handles.extend(start_servers(config).await.unwrap());
             }
 
             config_rx.recv().await.unwrap();
