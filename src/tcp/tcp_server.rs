@@ -26,11 +26,10 @@ async fn run_tcp_server(
     bind_address: SocketAddr,
     tcp_config: TcpConfig,
     client_proxy_selector: Arc<ClientProxySelector<TcpClientConnector>>,
+    resolver: Arc<dyn Resolver>,
     server_handler: Arc<Box<dyn TcpServerHandler>>,
 ) -> std::io::Result<()> {
     let TcpConfig { no_delay } = tcp_config;
-
-    let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
 
     let listener = tokio::net::TcpListener::bind(bind_address).await.unwrap();
 
@@ -70,10 +69,9 @@ async fn run_tcp_server(
 async fn run_unix_server(
     path_buf: PathBuf,
     client_proxy_selector: Arc<ClientProxySelector<TcpClientConnector>>,
+    resolver: Arc<dyn Resolver>,
     server_handler: Arc<Box<dyn TcpServerHandler>>,
 ) -> std::io::Result<()> {
-    let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
-
     if tokio::fs::symlink_metadata(&path_buf).await.is_ok() {
         println!(
             "WARNING: replacing file at socket path {}",
@@ -354,7 +352,7 @@ pub async fn setup_client_stream(
     }
 }
 
-pub async fn start_tcp_server(config: ServerConfig) -> std::io::Result<Option<JoinHandle<()>>> {
+pub async fn start_tcp_servers(config: ServerConfig) -> std::io::Result<Vec<JoinHandle<()>>> {
     let ServerConfig {
         bind_location,
         tcp_settings,
@@ -373,32 +371,58 @@ pub async fn start_tcp_server(config: ServerConfig) -> std::io::Result<Option<Jo
 
     let client_proxy_selector = Arc::new(create_tcp_client_proxy_selector(rules.clone()));
 
+    let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+
     let mut rules_stack = vec![rules];
     let tcp_handler: Arc<Box<dyn TcpServerHandler>> =
         Arc::new(create_tcp_server_handler(protocol, &mut rules_stack));
     debug!("TCP handler: {:?}", tcp_handler);
 
-    Ok(Some(tokio::spawn(async move {
-        match bind_location {
-            BindLocation::Address(a) => {
-                // TODO: make this non-blocking?
-                let socket_addr = a.to_socket_addr().unwrap();
-                run_tcp_server(socket_addr, tcp_config, client_proxy_selector, tcp_handler)
+    let mut handles = vec![];
+
+    match bind_location {
+        BindLocation::Address(a) => {
+            let socket_addrs = a.to_socket_addrs()?;
+            for socket_addr in socket_addrs {
+                let tcp_config = tcp_config.clone();
+                let client_proxy_selector = client_proxy_selector.clone();
+                let tcp_handler = tcp_handler.clone();
+                let resolver = resolver.clone();
+                let handle = tokio::spawn(async move {
+                    run_tcp_server(
+                        socket_addr,
+                        tcp_config,
+                        client_proxy_selector,
+                        resolver,
+                        tcp_handler,
+                    )
                     .await
                     .unwrap();
-            }
-            BindLocation::Path(path_buf) => {
-                #[cfg(target_family = "unix")]
-                {
-                    run_unix_server(path_buf, client_proxy_selector, tcp_handler)
-                        .await
-                        .unwrap();
-                }
-                #[cfg(not(target_family = "unix"))]
-                {
-                    panic!("Unix sockets are not supported on non-unix OSes.");
-                }
+                });
+                handles.push(handle);
             }
         }
-    })))
+        BindLocation::Path(path_buf) => {
+            #[cfg(target_family = "unix")]
+            {
+                let client_proxy_selector = client_proxy_selector.clone();
+                let tcp_handler = tcp_handler.clone();
+                let handle = tokio::spawn(async move {
+                    run_unix_server(path_buf, client_proxy_selector, resolver, tcp_handler)
+                        .await
+                        .unwrap();
+                });
+                handles.push(handle);
+            }
+            #[cfg(not(target_family = "unix"))]
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "Unix sockets are not supported on this platform",
+                ));
+            }
+        }
+    }
+
+    Ok(handles)
 }

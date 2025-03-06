@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 
-use crate::address::{NetLocation, NetLocationMask};
+use crate::address::{NetLocation, NetLocationMask, NetLocationPortRange};
 use crate::option_util::{NoneOrOne, NoneOrSome, OneOrSome};
 use crate::thread_util::get_num_threads;
 use crate::util::parse_uuid;
@@ -19,7 +19,7 @@ fn default_snell_udp_num_sockets() -> usize {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum BindLocation {
-    Address(NetLocation),
+    Address(NetLocationPortRange),
     Path(PathBuf),
 }
 
@@ -557,6 +557,23 @@ impl<'de> serde::de::Deserialize<'de> for NetLocationMask {
         })?;
 
         Ok(net_location_mask)
+    }
+}
+
+impl<'de> serde::de::Deserialize<'de> for NetLocationPortRange {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::de::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        let net_location_port_range = NetLocationPortRange::from_str(&value).map_err(|e| {
+            serde::de::Error::invalid_value(
+                serde::de::Unexpected::Other(&format!("invalid net location port range: {}", e)),
+                &"valid net location port range (address:port[-port][,port])",
+            )
+        })?;
+
+        Ok(net_location_port_range)
     }
 }
 

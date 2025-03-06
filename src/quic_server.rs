@@ -27,16 +27,16 @@ use crate::tcp_handler_util::{create_tcp_client_proxy_selector, create_tcp_serve
 use crate::tcp_server::setup_client_stream;
 use crate::udp_message_stream::UdpMessageStream;
 use crate::udp_multi_message_stream::UdpMultiMessageStream;
+use crate::util::parse_uuid;
 
-async fn run_quic_server(
+async fn start_quic_server(
     bind_address: SocketAddr,
     server_config: Arc<rustls::ServerConfig>,
     client_proxy_selector: Arc<ClientProxySelector<TcpClientConnector>>,
+    resolver: Arc<dyn Resolver>,
     server_handler: Arc<Box<dyn TcpServerHandler>>,
     num_endpoints: usize,
-) -> std::io::Result<()> {
-    let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
-
+) -> std::io::Result<Vec<JoinHandle<()>>> {
     let quic_server_config: quinn::crypto::rustls::QuicServerConfig = server_config
         .try_into()
         .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
@@ -85,11 +85,7 @@ async fn run_quic_server(
         join_handles.push(join_handle);
     }
 
-    for join_handle in join_handles {
-        join_handle.await?;
-    }
-
-    Ok(())
+    Ok(join_handles)
 }
 
 async fn process_connection(
@@ -338,7 +334,7 @@ async fn process_streams(
     }
 }
 
-pub async fn start_quic_server(config: ServerConfig) -> std::io::Result<Option<JoinHandle<()>>> {
+pub async fn start_quic_servers(config: ServerConfig) -> std::io::Result<Vec<JoinHandle<()>>> {
     let ServerConfig {
         bind_location,
         quic_settings,
@@ -353,11 +349,14 @@ pub async fn start_quic_server(config: ServerConfig) -> std::io::Result<Option<J
     // We should always have a direct entry.
     assert!(!rules.is_empty());
 
-    let bind_address = match bind_location {
+    let bind_addresses = match bind_location {
         // TODO: switch to non-blocking resolve?
-        BindLocation::Address(a) => a.to_socket_addr()?,
+        BindLocation::Address(a) => a.to_socket_addrs()?,
         BindLocation::Path(_) => {
-            panic!("Cannot listen on path, QUIC does not have unix domain socket support");
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "Cannot listen on path, QUIC does not have unix domain socket support",
+            ));
         }
     };
 
@@ -385,51 +384,79 @@ pub async fn start_quic_server(config: ServerConfig) -> std::io::Result<Option<J
     ));
 
     let client_proxy_selector = Arc::new(create_tcp_client_proxy_selector(rules.clone()));
+    let resolver = Arc::new(NativeResolver::new());
+
+    let mut handles = vec![];
 
     match protocol {
         ServerProxyConfig::Hysteria2 {
             password,
             udp_enabled,
-        } => Ok(Some(tokio::spawn(async move {
-            crate::hysteria2_server::run_hysteria2_server(
-                bind_address,
-                server_config,
-                password,
-                client_proxy_selector,
-                num_endpoints,
-                udp_enabled,
-            )
-            .await
-            .unwrap();
-        }))),
-        ServerProxyConfig::TuicV5 { uuid, password } => Ok(Some(tokio::spawn(async move {
-            crate::tuic_server::run_tuic_server(
-                bind_address,
-                server_config,
-                uuid,
-                password,
-                client_proxy_selector,
-                num_endpoints,
-            )
-            .await
-            .unwrap();
-        }))),
+        } => {
+            // TODO: hash password instead of passing directly
+            let hysteria2_password: &'static str = Box::leak(password.into_boxed_str());
+
+            for bind_address in bind_addresses.into_iter() {
+                let server_config = server_config.clone();
+                let client_proxy_selector = client_proxy_selector.clone();
+                let resolver = resolver.clone();
+                let hysteria2_handles = crate::hysteria2_server::start_hysteria2_server(
+                    bind_address,
+                    server_config,
+                    hysteria2_password,
+                    client_proxy_selector,
+                    resolver,
+                    num_endpoints,
+                    udp_enabled,
+                )
+                .await?;
+                handles.extend(hysteria2_handles);
+            }
+        }
+        ServerProxyConfig::TuicV5 { uuid, password } => {
+            let uuid: &'static [u8] = Box::leak(parse_uuid(&uuid)?.into_boxed_slice());
+            let password: &'static str = Box::leak(password.into_boxed_str());
+            for bind_address in bind_addresses.into_iter() {
+                let server_config = server_config.clone();
+                let client_proxy_selector = client_proxy_selector.clone();
+                let resolver = resolver.clone();
+                let tuic_handles = crate::tuic_server::start_tuic_server(
+                    bind_address,
+                    server_config,
+                    uuid,
+                    password,
+                    client_proxy_selector,
+                    resolver,
+                    num_endpoints,
+                )
+                .await?;
+                handles.extend(tuic_handles);
+            }
+        }
         tcp_protocol => {
             let mut rules_stack = vec![rules];
             let tcp_handler: Arc<Box<dyn TcpServerHandler>> =
                 Arc::new(create_tcp_server_handler(tcp_protocol, &mut rules_stack));
 
-            Ok(Some(tokio::spawn(async move {
-                run_quic_server(
+            for bind_address in bind_addresses.into_iter() {
+                let server_config = server_config.clone();
+                let client_proxy_selector = client_proxy_selector.clone();
+                let resolver = resolver.clone();
+                let tcp_handler = tcp_handler.clone();
+                let quic_handles = start_quic_server(
                     bind_address,
                     server_config,
                     client_proxy_selector,
+                    resolver,
                     tcp_handler,
                     num_endpoints,
                 )
-                .await
-                .unwrap();
-            })))
+                .await?;
+
+                handles.extend(quic_handles);
+            }
         }
     }
+
+    Ok(handles)
 }

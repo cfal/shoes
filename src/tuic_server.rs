@@ -10,6 +10,7 @@ use dashmap::DashMap;
 use log::error;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UdpSocket;
+use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
 use crate::address::{Address, NetLocation};
@@ -18,11 +19,10 @@ use crate::client_proxy_selector::{ClientProxySelector, ConnectDecision};
 use crate::copy_bidirectional::copy_bidirectional_with_sizes;
 use crate::line_reader::LineReader;
 use crate::quic_stream::QuicStream;
-use crate::resolver::{resolve_single_address, NativeResolver, Resolver};
+use crate::resolver::{resolve_single_address, Resolver};
 use crate::socket_util::new_socket2_udp_socket;
 use crate::tcp_client_connector::TcpClientConnector;
 use crate::tcp_server::setup_client_stream;
-use crate::util::parse_uuid;
 
 const COMMAND_TYPE_AUTHENTICATE: u8 = 0x00;
 const COMMAND_TYPE_CONNECT: u8 = 0x01;
@@ -1225,19 +1225,15 @@ async fn run_datagram_loop(
     }
 }
 
-pub async fn run_tuic_server(
+pub async fn start_tuic_server(
     bind_address: SocketAddr,
     server_config: Arc<rustls::ServerConfig>,
-    uuid: String,
-    password: String,
+    uuid: &'static [u8],
+    password: &'static str,
     client_proxy_selector: Arc<ClientProxySelector<TcpClientConnector>>,
+    resolver: Arc<dyn Resolver>,
     num_endpoints: usize,
-) -> std::io::Result<()> {
-    let uuid: &'static [u8] = Box::leak(parse_uuid(&uuid)?.into_boxed_slice());
-    let password: &'static str = Box::leak(password.into_boxed_str());
-
-    let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
-
+) -> std::io::Result<Vec<JoinHandle<()>>> {
     let quic_server_config: quinn::crypto::rustls::QuicServerConfig = server_config
         .try_into()
         .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
@@ -1289,8 +1285,5 @@ pub async fn run_tuic_server(
         join_handles.push(join_handle);
     }
 
-    for join_handle in join_handles {
-        join_handle.await?;
-    }
-    Ok(())
+    Ok(join_handles)
 }
