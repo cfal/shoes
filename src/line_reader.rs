@@ -204,6 +204,6 @@ impl LineReader {
     }
 
     fn is_cache_full(&self) -> bool {
-        self.start_offset == 0 && self.end_offset == DEFAULT_BUFFER_SIZE
+        self.start_offset == 0 && self.end_offset == self.buf.len()
     }
 }
