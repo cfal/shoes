@@ -118,9 +118,9 @@ OPTIONS:
         Parse the config and exit.
 ```
 
-## Config format
+## Configuration
 
-Sorry, formal documentation for the YAML config format have not yet been written. You can refer to the [examples](./examples), or open an issue if you need help.
+See [CONFIG.md](./CONFIG.md) for the YAML config format. You can also refer to the [examples](./examples), or open an issue if you need help.
 
 ## Roadmap
 
