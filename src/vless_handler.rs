@@ -174,7 +174,7 @@ impl TcpServerHandler for VlessTcpServerHandler {
                 override_proxy_provider: NoneOrOne::Unspecified,
             })
         } else {
-            write_all(&mut server_stream, &SERVER_RESPONSE_HEADER).await?;
+            write_all(&mut server_stream, SERVER_RESPONSE_HEADER).await?;
 
             let mut vless_stream = VlessMessageStream::new(server_stream);
             if !unparsed_data.is_empty() {

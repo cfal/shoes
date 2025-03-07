@@ -69,7 +69,7 @@ impl AsyncReadMessage for VlessMessageStream {
                     out_buf.put_slice(&this.read_buf[2..total_len]);
                     if this.read_end_index > total_len {
                         this.read_buf.copy_within(total_len..this.read_end_index, 0);
-                        this.read_end_index = this.read_end_index - total_len;
+                        this.read_end_index -= total_len;
                     } else {
                         // this.read_end_index == total_len
                         this.read_end_index = 0;

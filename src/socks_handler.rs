@@ -75,7 +75,7 @@ impl TcpServerHandler for SocksTcpServerHandler {
         };
 
         if !methods
-            .into_iter()
+            .iter()
             .any(move |method| *method == supported_method)
         {
             // TODO: consider writing response: [VER_SOCKS5, METHOD_INVALID]
@@ -109,7 +109,7 @@ impl TcpServerHandler for SocksTcpServerHandler {
                 .read_slice(&mut server_stream, username_len)
                 .await?;
 
-            let username_str = match std::str::from_utf8(&username) {
+            let username_str = match std::str::from_utf8(username) {
                 Ok(s) => s,
                 Err(e) => {
                     return Err(std::io::Error::new(
@@ -139,7 +139,7 @@ impl TcpServerHandler for SocksTcpServerHandler {
                 .read_slice(&mut server_stream, password_len)
                 .await?;
 
-            let password_str = match std::str::from_utf8(&password) {
+            let password_str = match std::str::from_utf8(password) {
                 Ok(s) => s,
                 Err(e) => {
                     return Err(std::io::Error::new(
