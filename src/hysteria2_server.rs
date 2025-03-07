@@ -1,5 +1,5 @@
+use rustc_hash::FxHashMap;
 use std::collections::hash_map::Entry;
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::str;
 use std::sync::Arc;
@@ -199,7 +199,7 @@ async fn auth_connection(
 }
 
 struct UdpSession {
-    fragments: HashMap<u16, FragmentedPacket>,
+    fragments: FxHashMap<u16, FragmentedPacket>,
     send_socket: Arc<UdpSocket>,
     // we cache the last location in case of mid-session address changes, and
     // don't want to have to call ClientProxySelector::judge on every packet.
@@ -228,7 +228,7 @@ impl UdpSession {
         override_remote_write_address: Option<SocketAddr>,
     ) -> Self {
         let session = UdpSession {
-            fragments: HashMap::new(),
+            fragments: FxHashMap::default(),
             send_socket: client_socket.clone(),
             last_location: initial_location,
             last_socket_addr: initial_socket_addr,
@@ -364,7 +364,7 @@ async fn run_udp_local_to_remote_loop(
     resolver: Arc<dyn Resolver>,
 ) -> std::io::Result<()> {
     let mut resolver_cache = ResolverCache::new(resolver.clone());
-    let mut sessions: HashMap<u32, UdpSession> = HashMap::new();
+    let mut sessions: FxHashMap<u32, UdpSession> = FxHashMap::default();
 
     loop {
         let data = connection.read_datagram().await.map_err(|err| {
