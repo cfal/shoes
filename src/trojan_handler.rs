@@ -76,7 +76,21 @@ impl TcpServerHandler for TrojanTcpHandler {
 
         let mut line_reader = LineReader::new_with_buffer_size(400);
 
-        let received_hash = line_reader.read_slice(&mut server_stream, 56).await?;
+        // read the entire line rather than exactly 56 bytes, so that we can masquerade as an HTTP server
+        // and handle the request as if it were a HTTP request.
+        // TODO: implement http response
+        let received_hash = line_reader.read_line_bytes(&mut server_stream).await?;
+        if received_hash.len() != self.password_hash.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!(
+                    "Invalid password hash length, expected {}, got {}",
+                    self.password_hash.len(),
+                    received_hash.len()
+                ),
+            ));
+        }
+
         for (b1, b2) in self.password_hash.iter().zip(received_hash.iter()) {
             if b1 != b2 {
                 return Err(std::io::Error::new(
@@ -84,14 +98,6 @@ impl TcpServerHandler for TrojanTcpHandler {
                     "Invalid password hash",
                 ));
             }
-        }
-
-        let request_prefix = line_reader.read_u16_be(&mut server_stream).await?;
-        if request_prefix != 0x0d0a {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("Invalid request prefix bytes {}", request_prefix),
-            ));
         }
 
         let command_type = line_reader.read_u8(&mut server_stream).await?;
@@ -116,7 +122,7 @@ impl TcpServerHandler for TrojanTcpHandler {
         if request_suffix != 0x0d0a {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
-                format!("Invalid request suffix bytes {}", request_prefix),
+                format!("Invalid request suffix bytes {}", request_suffix),
             ));
         }
 
