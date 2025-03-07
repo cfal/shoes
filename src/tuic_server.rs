@@ -1,5 +1,4 @@
 use std::collections::hash_map::Entry;
-use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::str;
 use std::sync::Arc;
@@ -8,6 +7,7 @@ use std::time::Duration;
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use log::error;
+use rustc_hash::FxHashMap;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UdpSocket;
 use tokio::task::JoinHandle;
@@ -762,7 +762,7 @@ async fn process_udp_recv_stream(
 
     // we assume that all fragments of a single packet will be sent through the same stream to
     // prevent unnecessary locking.
-    let mut fragments: HashMap<u16, FragmentedPacket> = HashMap::new();
+    let mut fragments: FxHashMap<u16, FragmentedPacket> = FxHashMap::default();
 
     loop {
         let tuic_version = line_reader.read_u8(&mut recv_stream).await?;
@@ -825,7 +825,7 @@ async fn process_udp_packet(
     client_proxy_selector: &Arc<ClientProxySelector<TcpClientConnector>>,
     resolver: &Arc<dyn Resolver>,
     udp_session_map: &UdpSessionMap,
-    fragments: &mut HashMap<u16, FragmentedPacket>,
+    fragments: &mut FxHashMap<u16, FragmentedPacket>,
     assoc_id: u16,
     packet_id: u16,
     frag_total: u8,
@@ -1099,7 +1099,8 @@ async fn run_datagram_loop(
 ) -> std::io::Result<()> {
     // we assume that all fragments of a single packet will be sent through the same mechanism
     // (in this case, datagram) to prevent unnecessary locking.
-    let mut fragments: HashMap<u16, FragmentedPacket> = HashMap::new();
+    let mut fragments: FxHashMap<u16, FragmentedPacket> = FxHashMap::default();
+
     loop {
         let data = connection.read_datagram().await.map_err(|err| {
             std::io::Error::new(
