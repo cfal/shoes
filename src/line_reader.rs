@@ -4,6 +4,7 @@ use tokio::io::AsyncReadExt;
 use crate::util::allocate_vec;
 
 const DEFAULT_BUFFER_SIZE: usize = 32768;
+const ERROR_ON_BARE_LF: bool = true;
 
 pub struct LineReader {
     buf: Box<[u8]>,
@@ -36,19 +37,29 @@ impl LineReader {
 
     pub async fn read_line_bytes<T: AsyncReadExt + Unpin>(
         &mut self,
-        mut stream: T,
+        stream: &mut T,
     ) -> std::io::Result<&mut [u8]> {
+        let mut search_start_offset = self.start_offset;
         loop {
-            match memchr(b'\n', &self.buf[self.start_offset..self.end_offset]) {
+            let search_end_offset = self.end_offset;
+            match memchr(b'\n', &self.buf[search_start_offset..search_end_offset]) {
                 Some(pos) => {
-                    let newline_pos = self.start_offset + pos;
-                    let line = if newline_pos > 0 && self.buf[newline_pos - 1] == b'\r' {
-                        &mut self.buf[self.start_offset..newline_pos - 1]
-                    } else {
-                        &mut self.buf[self.start_offset..newline_pos]
-                    };
+                    let newline_pos = search_start_offset + pos;
+                    if newline_pos == self.start_offset || self.buf[newline_pos - 1] != b'\r' {
+                        if ERROR_ON_BARE_LF {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "Line is not terminated by CRLF",
+                            ));
+                        } else {
+                            search_start_offset = newline_pos + 1;
+                            continue;
+                        }
+                    }
+                    // strip crlf
+                    let line = &mut self.buf[self.start_offset..newline_pos - 1];
                     let new_start_offset = newline_pos + 1;
-                    if new_start_offset == self.end_offset {
+                    if new_start_offset == search_end_offset {
                         self.start_offset = 0;
                         self.end_offset = 0;
                     } else {
@@ -58,7 +69,18 @@ impl LineReader {
                 }
                 None => {
                     // There are no more newlines.
-                    self.read(&mut stream).await?;
+                    let previous_start_offset = self.start_offset;
+
+                    self.read(stream).await?;
+
+                    // Only search through new data.
+                    if previous_start_offset != self.start_offset {
+                        // this can only move to zero when reset_buf_offset is called.
+                        assert!(self.start_offset == 0);
+                        search_start_offset = search_end_offset - previous_start_offset;
+                    } else {
+                        search_start_offset = search_end_offset;
+                    }
                 }
             }
         }
