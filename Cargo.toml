@@ -35,6 +35,7 @@ parking_lot = "*"
 percent-encoding = "*"
 quinn = { version = "*", default-features = false, features = ["log", "platform-verifier", "runtime-tokio", "rustls-aws-lc-rs"] }
 rand = "*"
+rustc-hash = "1"
 rustls = "*"
 serde = { version = "*", features = ["derive", "std"] }
 serde_yaml = "*"
