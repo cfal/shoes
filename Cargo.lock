@@ -1513,6 +1513,7 @@ dependencies = [
  "percent-encoding",
  "quinn",
  "rand",
+ "rustc-hash 1.1.0",
  "rustls",
  "serde",
  "serde_yaml",
