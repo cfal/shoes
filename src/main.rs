@@ -1,5 +1,6 @@
 mod address;
 mod async_stream;
+mod buf_reader;
 mod client_proxy_selector;
 mod config;
 mod copy_bidirectional;
@@ -16,6 +17,9 @@ mod quic_stream;
 mod resolver;
 mod rustls_util;
 mod salt_checker;
+mod shadow_tls_handler;
+mod shadow_tls_hmac;
+mod shadow_tls_stream;
 mod shadowsocks;
 mod snell;
 mod socket_util;
