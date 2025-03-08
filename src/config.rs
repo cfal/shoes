@@ -143,6 +143,36 @@ pub struct TlsServerConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct ShadowTlsServerConfig {
+    pub password: String,
+    pub handshake: ShadowTlsServerHandshakeConfig,
+    pub protocol: ServerProxyConfig,
+    #[serde(alias = "override_rule", default)]
+    pub override_rules: NoneOrSome<ConfigSelection<RuleConfig>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum ShadowTlsServerHandshakeConfig {
+    // Do the handshake locally with the provided TLS config.
+    // This does not require a remote server, but for most clients,
+    // the provided certificate must be signed by a trusted CA.
+    Local {
+        cert: String,
+        key: String,
+        #[serde(alias = "alpn_protocol", default)]
+        alpn_protocols: NoneOrSome<String>,
+        #[serde(alias = "client_fingerprint", default)]
+        client_fingerprints: NoneOrSome<String>,
+    },
+    Remote {
+        address: NetLocation,
+        #[serde(alias = "client_proxy", default)]
+        client_proxies: NoneOrSome<ConfigSelection<ClientConfig>>,
+    },
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct WebsocketServerConfig {
     #[serde(default)]
     pub matching_path: Option<String>,
@@ -211,6 +241,13 @@ pub enum ServerProxyConfig {
         #[serde(default)]
         default_target: Option<Box<TlsServerConfig>>,
     },
+    #[serde(alias = "shadowtls")]
+    ShadowTlsV3 {
+        #[serde(default)]
+        sni_targets: HashMap<String, ShadowTlsServerConfig>,
+        #[serde(default)]
+        default_target: Option<Box<ShadowTlsServerConfig>>,
+    },
     Vmess {
         cipher: String,
         user_id: String,
@@ -250,7 +287,8 @@ impl std::fmt::Display for ServerProxyConfig {
                 Self::Snell { .. } => "Snell",
                 Self::Vless { .. } => "Vless",
                 Self::Trojan { .. } => "Trojan",
-                Self::Tls { .. } => "Tls",
+                Self::Tls { .. } => "TLS",
+                Self::ShadowTlsV3 { .. } => "ShadowTLS v3",
                 Self::Vmess { .. } => "Vmess",
                 Self::Websocket { .. } => "Websocket",
                 Self::PortForward { .. } => "Portforward",
@@ -882,6 +920,77 @@ fn validate_server_proxy_config(
                     ref mut override_rules,
                     ..
                 } = **tls_server_config;
+                validate_server_proxy_config(protocol, client_groups, rule_groups)?;
+
+                ConfigSelection::replace_none_or_some_groups(override_rules, rule_groups)?;
+
+                for rule_config_selection in override_rules.iter_mut() {
+                    validate_rule_config(rule_config_selection.unwrap_config_mut(), client_groups)?;
+                }
+            }
+        }
+        ServerProxyConfig::ShadowTlsV3 {
+            sni_targets,
+            default_target,
+        } => {
+            for (_, shadow_tls_server_config) in sni_targets.iter_mut() {
+                let ShadowTlsServerConfig {
+                    ref mut handshake,
+                    ref mut protocol,
+                    ref mut override_rules,
+                    ..
+                } = *shadow_tls_server_config;
+                match handshake {
+                    ShadowTlsServerHandshakeConfig::Local {
+                        ref mut client_fingerprints,
+                        ..
+                    } => {
+                        validate_client_fingerprints(client_fingerprints)?;
+                    }
+                    ShadowTlsServerHandshakeConfig::Remote {
+                        ref mut client_proxies,
+                        ..
+                    } => {
+                        ConfigSelection::replace_none_or_some_groups(
+                            client_proxies,
+                            client_groups,
+                        )?;
+                    }
+                }
+
+                validate_server_proxy_config(protocol, client_groups, rule_groups)?;
+
+                ConfigSelection::replace_none_or_some_groups(override_rules, rule_groups)?;
+
+                for rule_config_selection in override_rules.iter_mut() {
+                    validate_rule_config(rule_config_selection.unwrap_config_mut(), client_groups)?;
+                }
+            }
+
+            if let Some(shadow_tls_server_config) = default_target {
+                let ShadowTlsServerConfig {
+                    ref mut handshake,
+                    ref mut protocol,
+                    ref mut override_rules,
+                    ..
+                } = **shadow_tls_server_config;
+                match handshake {
+                    ShadowTlsServerHandshakeConfig::Local {
+                        ref mut client_fingerprints,
+                        ..
+                    } => {
+                        validate_client_fingerprints(client_fingerprints)?;
+                    }
+                    ShadowTlsServerHandshakeConfig::Remote {
+                        ref mut client_proxies,
+                        ..
+                    } => {
+                        ConfigSelection::replace_none_or_some_groups(
+                            client_proxies,
+                            client_groups,
+                        )?;
+                    }
+                }
                 validate_server_proxy_config(protocol, client_groups, rule_groups)?;
 
                 ConfigSelection::replace_none_or_some_groups(override_rules, rule_groups)?;
