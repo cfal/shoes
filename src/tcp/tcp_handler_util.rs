@@ -7,14 +7,17 @@ use log::debug;
 
 use crate::client_proxy_selector::{ClientProxySelector, ConnectAction, ConnectRule};
 use crate::config::{
-    ClientProxyConfig, ConfigSelection, RuleActionConfig, RuleConfig, ServerProxyConfig,
-    ShadowsocksConfig, TlsClientConfig, TlsServerConfig, WebsocketClientConfig,
-    WebsocketServerConfig,
+    ClientConfig, ClientProxyConfig, ConfigSelection, RuleActionConfig, RuleConfig,
+    ServerProxyConfig, ShadowTlsServerConfig, ShadowTlsServerHandshakeConfig, ShadowsocksConfig,
+    TlsClientConfig, TlsServerConfig, WebsocketClientConfig, WebsocketServerConfig,
 };
 use crate::http_handler::{HttpTcpClientHandler, HttpTcpServerHandler};
 use crate::option_util::NoneOrOne;
 use crate::port_forward_handler::PortForwardServerHandler;
 use crate::rustls_util::{create_client_config, create_server_config};
+use crate::shadow_tls_handler::{
+    ShadowTlsServerHandler, ShadowTlsServerTarget, ShadowTlsServerTargetHandshake,
+};
 use crate::shadowsocks::ShadowsocksTcpHandler;
 use crate::snell::snell_handler::{SnellClientHandler, SnellServerHandler};
 use crate::socks_handler::{SocksTcpClientHandler, SocksTcpServerHandler};
@@ -89,6 +92,18 @@ pub fn create_tcp_server_handler(
             let default_target =
                 default_target.map(|config| create_tls_server_target(*config, rules_stack));
             Box::new(TlsServerHandler::new(sni_targets, default_target))
+        }
+        ServerProxyConfig::ShadowTls {
+            sni_targets,
+            default_target,
+        } => {
+            let sni_targets = sni_targets
+                .into_iter()
+                .map(|(sni, config)| (sni, create_shadow_tls_server_target(config, rules_stack)))
+                .collect::<HashMap<String, ShadowTlsServerTarget>>();
+            let default_target =
+                default_target.map(|config| create_shadow_tls_server_target(*config, rules_stack));
+            Box::new(ShadowTlsServerHandler::new(sni_targets, default_target))
         }
         ServerProxyConfig::Vmess {
             cipher,
@@ -176,6 +191,85 @@ fn create_tls_server_target(
         handler,
         override_proxy_provider,
     }
+}
+
+fn create_shadow_tls_server_target(
+    shadow_tls_server_config: ShadowTlsServerConfig,
+    rules_stack: &mut Vec<Vec<RuleConfig>>,
+) -> ShadowTlsServerTarget {
+    let ShadowTlsServerConfig {
+        password,
+        handshake,
+        protocol,
+        override_rules,
+    } = shadow_tls_server_config;
+
+    let target_handshake = match handshake {
+        ShadowTlsServerHandshakeConfig::Local {
+            cert,
+            key,
+            alpn_protocols,
+            client_fingerprints,
+        } => {
+            // TODO: do this asynchronously
+            let mut cert_file = std::fs::File::open(&cert).unwrap();
+            let mut cert_bytes = vec![];
+            cert_file.read_to_end(&mut cert_bytes).unwrap();
+
+            let mut key_file = std::fs::File::open(&key).unwrap();
+            let mut key_bytes = vec![];
+            key_file.read_to_end(&mut key_bytes).unwrap();
+
+            let server_config = Arc::new(create_server_config(
+                &cert_bytes,
+                &key_bytes,
+                &alpn_protocols.into_vec(),
+                &client_fingerprints.into_vec(),
+            ));
+
+            ShadowTlsServerTargetHandshake::new_local(server_config)
+        }
+        ShadowTlsServerHandshakeConfig::Remote {
+            address,
+            client_proxies,
+        } => {
+            let mut client_proxies: Vec<TcpClientConnector> = client_proxies
+                .into_iter()
+                .map(ConfigSelection::unwrap_config)
+                .map(TcpClientConnector::try_from)
+                .map(Option::unwrap)
+                .collect();
+            if client_proxies.is_empty() {
+                client_proxies.push(TcpClientConnector::try_from(ClientConfig::default()).unwrap());
+            }
+            ShadowTlsServerTargetHandshake::new_remote(address, client_proxies)
+        }
+    };
+
+    let pushed_rules = !override_rules.is_empty();
+    if pushed_rules {
+        rules_stack.push(
+            override_rules
+                .clone()
+                .map(ConfigSelection::unwrap_config)
+                .into_vec(),
+        );
+    }
+
+    let handler = create_tcp_server_handler(protocol, rules_stack);
+
+    let override_proxy_provider = if override_rules.is_empty() {
+        NoneOrOne::None
+    } else {
+        let rules = rules_stack.last().unwrap().clone();
+        NoneOrOne::One(Arc::new(create_tcp_client_proxy_selector(rules)))
+    };
+
+    if pushed_rules {
+        rules_stack.pop().unwrap();
+    }
+
+    ShadowTlsServerTarget::new(password, target_handshake, handler, override_proxy_provider)
 }
 
 fn create_websocket_server_target(
