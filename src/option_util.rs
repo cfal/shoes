@@ -85,7 +85,7 @@ impl<T> NoneOrSome<T> {
         }
     }
 
-    pub fn _into_iter(self) -> Box<dyn Iterator<Item = T>>
+    pub fn into_iter(self) -> Box<dyn Iterator<Item = T>>
     where
         T: 'static,
     {
