@@ -27,7 +27,7 @@ async fn run_tcp_server(
     tcp_config: TcpConfig,
     client_proxy_selector: Arc<ClientProxySelector<TcpClientConnector>>,
     resolver: Arc<dyn Resolver>,
-    server_handler: Arc<Box<dyn TcpServerHandler>>,
+    server_handler: Arc<dyn TcpServerHandler>,
 ) -> std::io::Result<()> {
     let TcpConfig { no_delay } = tcp_config;
 
@@ -70,7 +70,7 @@ async fn run_unix_server(
     path_buf: PathBuf,
     client_proxy_selector: Arc<ClientProxySelector<TcpClientConnector>>,
     resolver: Arc<dyn Resolver>,
-    server_handler: Arc<Box<dyn TcpServerHandler>>,
+    server_handler: Arc<dyn TcpServerHandler>,
 ) -> std::io::Result<()> {
     if tokio::fs::symlink_metadata(&path_buf).await.is_ok() {
         println!(
@@ -108,7 +108,7 @@ async fn run_unix_server(
 
 async fn setup_server_stream<AS>(
     stream: AS,
-    server_handler: Arc<Box<dyn TcpServerHandler>>,
+    server_handler: Arc<dyn TcpServerHandler>,
 ) -> std::io::Result<TcpServerSetupResult>
 where
     AS: AsyncStream + 'static,
@@ -119,7 +119,7 @@ where
 
 async fn process_stream<AS>(
     stream: AS,
-    server_handler: Arc<Box<dyn TcpServerHandler>>,
+    server_handler: Arc<dyn TcpServerHandler>,
     client_proxy_selector: Arc<ClientProxySelector<TcpClientConnector>>,
     resolver: Arc<dyn Resolver>,
 ) -> std::io::Result<()>
@@ -374,8 +374,8 @@ pub async fn start_tcp_servers(config: ServerConfig) -> std::io::Result<Vec<Join
     let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
 
     let mut rules_stack = vec![rules];
-    let tcp_handler: Arc<Box<dyn TcpServerHandler>> =
-        Arc::new(create_tcp_server_handler(protocol, &mut rules_stack));
+    let tcp_handler: Arc<dyn TcpServerHandler> =
+        create_tcp_server_handler(protocol, &mut rules_stack).into();
     debug!("TCP handler: {:?}", tcp_handler);
 
     let mut handles = vec![];

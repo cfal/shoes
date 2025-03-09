@@ -34,7 +34,7 @@ async fn start_quic_server(
     quic_server_config: Arc<quinn::crypto::rustls::QuicServerConfig>,
     client_proxy_selector: Arc<ClientProxySelector<TcpClientConnector>>,
     resolver: Arc<dyn Resolver>,
-    server_handler: Arc<Box<dyn TcpServerHandler>>,
+    server_handler: Arc<dyn TcpServerHandler>,
     num_endpoints: usize,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
     // TODO: consider setting transport config
@@ -87,7 +87,7 @@ async fn start_quic_server(
 async fn process_connection(
     client_proxy_selector: Arc<ClientProxySelector<TcpClientConnector>>,
     resolver: Arc<dyn Resolver>,
-    server_handler: Arc<Box<dyn TcpServerHandler>>,
+    server_handler: Arc<dyn TcpServerHandler>,
     conn: quinn::Incoming,
 ) -> std::io::Result<()> {
     let connection = conn.await?;
@@ -124,7 +124,7 @@ async fn process_connection(
 async fn process_streams(
     client_proxy_selector: Arc<ClientProxySelector<TcpClientConnector>>,
     resolver: Arc<dyn Resolver>,
-    server_handler: Arc<Box<dyn TcpServerHandler>>,
+    server_handler: Arc<dyn TcpServerHandler>,
     (send, recv): (quinn::SendStream, quinn::RecvStream),
 ) -> std::io::Result<()> {
     let quic_stream: Box<dyn AsyncStream> = Box::new(QuicStream::from(send, recv));
@@ -437,8 +437,8 @@ pub async fn start_quic_servers(config: ServerConfig) -> std::io::Result<Vec<Joi
         }
         tcp_protocol => {
             let mut rules_stack = vec![rules];
-            let tcp_handler: Arc<Box<dyn TcpServerHandler>> =
-                Arc::new(create_tcp_server_handler(tcp_protocol, &mut rules_stack));
+            let tcp_handler: Arc<dyn TcpServerHandler> =
+                create_tcp_server_handler(tcp_protocol, &mut rules_stack).into();
 
             for bind_address in bind_addresses.into_iter() {
                 let quic_server_config = quic_server_config.clone();
