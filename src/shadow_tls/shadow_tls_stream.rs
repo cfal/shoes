@@ -6,7 +6,7 @@ use super::shadow_tls_hmac::ShadowTlsHmac;
 use crate::async_stream::{AsyncPing, AsyncStream};
 use crate::util::allocate_vec;
 
-// see comment in shadow_tls_handler.rs
+// see comment in shadow_tls_server_handler.rs
 // TODO: remove duplicated consts
 const TLS_HEADER_LEN: usize = 5;
 const TLS_FRAME_MAX_LEN: usize = TLS_HEADER_LEN + 65535;
