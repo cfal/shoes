@@ -355,11 +355,14 @@ impl AsyncWrite for ShadowTlsStream {
 
 impl AsyncPing for ShadowTlsStream {
     fn supports_ping(&self) -> bool {
-        false
+        self.stream.supports_ping()
     }
 
-    fn poll_write_ping(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<bool>> {
-        Poll::Ready(Ok(false))
+    fn poll_write_ping(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<bool>> {
+        Pin::new(&mut self.stream).poll_write_ping(cx)
     }
 }
 
