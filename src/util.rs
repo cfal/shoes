@@ -28,7 +28,7 @@ pub fn parse_uuid(uuid_str: &str) -> std::io::Result<Vec<u8>> {
             }
         };
         if let Some(first) = first_nibble.take() {
-            bytes.push(first << 4 | hex);
+            bytes.push((first << 4) | hex);
         } else {
             first_nibble = Some(hex);
         }
