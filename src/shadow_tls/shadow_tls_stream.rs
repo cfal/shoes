@@ -55,6 +55,12 @@ impl ShadowTlsStream {
         }
         processed_buf[..initial_processed_data.len()].copy_from_slice(initial_processed_data);
 
+        let mut write_buf = allocate_vec(WRITE_BUF_LEN).into_boxed_slice();
+        // set partial frame header that never changes
+        write_buf[0] = CONTENT_TYPE_APPLICATION_DATA;
+        write_buf[1] = 0x03; // TLS_MAJOR
+        write_buf[2] = 0x03; // TLS_MINOR
+
         Ok(Self {
             stream,
             hmac_client_data,
@@ -65,7 +71,7 @@ impl ShadowTlsStream {
             processed_end_offset: initial_processed_data.len(),
             unprocessed_buf: allocate_vec(TLS_FRAME_MAX_LEN).into_boxed_slice(),
             unprocessed_end_offset: 0,
-            write_buf: allocate_vec(WRITE_BUF_LEN).into_boxed_slice(),
+            write_buf,
             write_buf_pos: 0,
             write_buf_end: 0,
         })
@@ -122,7 +128,7 @@ impl ShadowTlsStream {
 
     #[inline]
     fn try_deframe(&mut self) -> std::io::Result<DeframeState> {
-        // We should only deframe when there is no readily available processed data.
+        // we should only deframe when there is no readily available processed data.
         assert!(self.processed_end_offset == 0);
 
         if self.unprocessed_end_offset < TLS_HEADER_LEN {
@@ -155,10 +161,9 @@ impl ShadowTlsStream {
             return Ok(DeframeState::NeedData);
         }
 
-        // Compute the payload length (frame_len includes 4 bytes for HMAC)
+        // frame length minus HMAC
         let payload_len = frame_len - 4;
 
-        // Ensure there is space in the processed buffer (compact if needed)
         if payload_len > self.processed_buf.len() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
@@ -166,7 +171,6 @@ impl ShadowTlsStream {
             ));
         }
 
-        // Process the TLS frame: the frame_body consists of a 4-byte HMAC followed by the payload.
         let frame_body = &self.unprocessed_buf[TLS_HEADER_LEN..total_len];
         let received_digest = &frame_body[0..4];
         let payload = &frame_body[4..];
@@ -180,11 +184,9 @@ impl ShadowTlsStream {
         }
         self.hmac_client_data.update(&expected_digest);
 
-        // Append payload into the processed buffer
         self.processed_buf[0..payload_len].copy_from_slice(payload);
         self.processed_end_offset = payload_len;
 
-        // Advance the unprocessed buffer pointer
         if total_len < self.unprocessed_end_offset {
             self.unprocessed_buf
                 .copy_within(total_len..self.unprocessed_end_offset, 0);
@@ -220,7 +222,6 @@ impl AsyncRead for ShadowTlsStream {
         }
 
         if this.unprocessed_end_offset > 0 {
-            // Deframe any complete TLS frames available.
             match this.try_deframe()? {
                 DeframeState::Success => {
                     this.read_processed(buf);
@@ -230,7 +231,6 @@ impl AsyncRead for ShadowTlsStream {
                 DeframeState::ReceivedAlert => return Poll::Ready(Ok(())),
             }
 
-            // If the unprocessed buffer is full, return an error.
             if this.unprocessed_end_offset == this.unprocessed_buf.len() {
                 return Poll::Ready(Err(std::io::Error::new(
                     std::io::ErrorKind::Other,
@@ -239,7 +239,6 @@ impl AsyncRead for ShadowTlsStream {
             }
         }
 
-        // Read more TLS data from the underlying stream.
         loop {
             let mut read_buf =
                 ReadBuf::new(&mut this.unprocessed_buf[this.unprocessed_end_offset..]);
@@ -276,7 +275,6 @@ impl AsyncWrite for ShadowTlsStream {
     ) -> Poll<std::io::Result<usize>> {
         let this = self.get_mut();
 
-        // Flush any pending write buffer first.
         while this.write_buf_pos < this.write_buf_end {
             let remaining = &this.write_buf[this.write_buf_pos..this.write_buf_end];
             match Pin::new(&mut this.stream).poll_write(cx, remaining) {
@@ -294,33 +292,25 @@ impl AsyncWrite for ShadowTlsStream {
             }
         }
 
-        // Reset buffer positions
         this.write_buf_pos = 0;
         this.write_buf_end = 0;
 
         let consumed_buf_len = std::cmp::min(buf.len(), MAX_WRITE_PAYLOAD_LEN);
         let consumed_buf = &buf[0..consumed_buf_len];
 
-        // Construct TLS frame in our preallocated buffer
         let frame_len = consumed_buf_len + 4; // HMAC(4) + payload
 
-        // Write TLS header
-        this.write_buf[0] = CONTENT_TYPE_APPLICATION_DATA;
-        this.write_buf[1] = 0x03; // TLS_MAJOR
-        this.write_buf[2] = 0x03; // TLS_MINOR
+        // write_buf[0..2] never changes and is set in the constructor.
         this.write_buf[3..5].copy_from_slice(&(frame_len as u16).to_be_bytes());
 
-        // Calculate and write HMAC
         this.hmac_server_data.update(consumed_buf);
         let digest = this.hmac_server_data.digest();
         this.hmac_server_data.update(&digest);
 
         this.write_buf[5..9].copy_from_slice(&digest);
 
-        // Write payload
         this.write_buf[9..9 + consumed_buf_len].copy_from_slice(consumed_buf);
 
-        // Set end position
         this.write_buf_end = TLS_HEADER_LEN + frame_len;
 
         Poll::Ready(Ok(consumed_buf_len))
@@ -329,7 +319,6 @@ impl AsyncWrite for ShadowTlsStream {
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         let this = self.as_mut().get_mut();
 
-        // If we have pending data to write, write it first
         while this.write_buf_pos < this.write_buf_end {
             let remaining = &this.write_buf[this.write_buf_pos..this.write_buf_end];
             match Pin::new(&mut this.stream).poll_write(cx, remaining) {
@@ -347,11 +336,9 @@ impl AsyncWrite for ShadowTlsStream {
             }
         }
 
-        // Reset buffer positions
         this.write_buf_pos = 0;
         this.write_buf_end = 0;
 
-        // Flush the underlying stream
         Pin::new(&mut this.stream).poll_flush(cx)
     }
 
