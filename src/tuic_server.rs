@@ -819,6 +819,8 @@ async fn process_udp_recv_stream(
     }
 }
 
+// TODO: fix too many arguments warning
+#[allow(clippy::too_many_arguments)]
 #[inline(always)]
 async fn process_udp_packet(
     connection: &quinn::Connection,
