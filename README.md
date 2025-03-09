@@ -39,6 +39,7 @@ All supported protocols can be combined with the following features:
 
 - **TLS support** with SNI based forwarding
 - **Websocket obfs** (Shadowsocks SIP003)
+- **ShadowTLS v3**
 - **Upstream proxy support**: route connections through other proxy servers
 - **Forwarding rules**: Redirect or block connections based on target IP or hostname
 - **Hot reloading**: Updated configs are automatically reloaded
@@ -132,3 +133,6 @@ See [CONFIG.md](./CONFIG.md) for the YAML config format. You can also refer to t
 - [shadowsocks-rust](https://github.com/shadowsocks/shadowsocks-rust): A Rust port of shadowsocks
 
 - [v2ray-core](https://github.com/v2ray/v2ray-core): A full-featured proxy platform written in Go
+
+- [shadow-tls](https://github.com/ihciah/shadow-tls): A proxy to expose real TLS handshake to the firewall
+
