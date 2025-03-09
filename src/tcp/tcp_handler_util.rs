@@ -15,7 +15,7 @@ use crate::http_handler::{HttpTcpClientHandler, HttpTcpServerHandler};
 use crate::option_util::NoneOrOne;
 use crate::port_forward_handler::PortForwardServerHandler;
 use crate::rustls_util::{create_client_config, create_server_config};
-use crate::shadow_tls_handler::{
+use crate::shadow_tls::{
     ShadowTlsServerHandler, ShadowTlsServerTarget, ShadowTlsServerTargetHandshake,
 };
 use crate::shadowsocks::ShadowsocksTcpHandler;
@@ -93,7 +93,7 @@ pub fn create_tcp_server_handler(
                 default_target.map(|config| create_tls_server_target(*config, rules_stack));
             Box::new(TlsServerHandler::new(sni_targets, default_target))
         }
-        ServerProxyConfig::ShadowTls {
+        ServerProxyConfig::ShadowTlsV3 {
             sni_targets,
             default_target,
         } => {

@@ -13,6 +13,8 @@ use async_trait::async_trait;
 use futures::FutureExt;
 use tokio::io::AsyncWriteExt;
 
+use super::shadow_tls_hmac::ShadowTlsHmac;
+use super::shadow_tls_stream::ShadowTlsStream;
 use crate::address::NetLocation;
 use crate::async_stream::AsyncStream;
 use crate::buf_reader::BufReader;
@@ -21,8 +23,6 @@ use crate::line_reader::LineReader;
 use crate::noop_stream::NoopStream;
 use crate::option_util::NoneOrOne;
 use crate::resolver::{NativeResolver, Resolver};
-use crate::shadow_tls_hmac::ShadowTlsHmac;
-use crate::shadow_tls_stream::ShadowTlsStream;
 use crate::tcp_client_connector::TcpClientConnector;
 use crate::tcp_handler::{TcpServerHandler, TcpServerSetupResult};
 use crate::util::{allocate_vec, write_all};
@@ -558,7 +558,7 @@ async fn setup_remote_handshake(
                 let server_payload_size = u16::from_be_bytes(server_header_bytes[3..5].try_into().unwrap()) as usize;
                 server_frame.extend_from_slice(server_header_bytes);
                 let server_payload_bytes = server_reader
-                    .read_slice(&mut server_stream, server_payload_size)
+                    .read_slice(&mut client_stream, server_payload_size)
                     .await?;
                 server_frame.extend_from_slice(server_payload_bytes);
 
@@ -601,7 +601,7 @@ async fn setup_remote_handshake(
                 client_frame.extend_from_slice(client_header_bytes);
 
                 let client_payload_bytes = client_reader
-                    .read_slice(&mut client_stream, client_payload_size)
+                    .read_slice(&mut server_stream, client_payload_size)
                     .await?;
 
                 if client_content_type == CONTENT_TYPE_APPLICATION_DATA {

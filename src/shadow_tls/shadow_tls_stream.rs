@@ -2,8 +2,8 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
+use super::shadow_tls_hmac::ShadowTlsHmac;
 use crate::async_stream::{AsyncPing, AsyncStream};
-use crate::shadow_tls_hmac::ShadowTlsHmac;
 use crate::util::allocate_vec;
 
 // see comment in shadow_tls_handler.rs
