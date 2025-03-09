@@ -4,6 +4,7 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 
 use log::debug;
 
@@ -61,19 +62,27 @@ pub async fn resolve_single_address(
 pub struct ResolverCache {
     resolver: Arc<dyn Resolver>,
     cache: HashMap<NetLocation, ResolveState>,
+    result_timeout_secs: u64,
 }
 
 enum ResolveState {
     Resolving(ResolveFuture),
-    Resolved(SocketAddr),
+    Resolved(Instant, SocketAddr),
 }
 
 impl ResolverCache {
-    pub fn new(resolver: Arc<dyn Resolver>) -> Self {
+    pub const DEFAULT_RESULT_TIMEOUT_SECS: u64 = 60 * 60;
+
+    pub fn new_with_timeout(resolver: Arc<dyn Resolver>, result_timeout_secs: u64) -> Self {
         Self {
             resolver,
             cache: HashMap::new(),
+            result_timeout_secs,
         }
+    }
+
+    pub fn new(resolver: Arc<dyn Resolver>) -> Self {
+        Self::new_with_timeout(resolver, Self::DEFAULT_RESULT_TIMEOUT_SECS)
     }
 
     pub fn resolve_location<'a, 'b>(
@@ -95,39 +104,19 @@ impl ResolverCache {
             return Poll::Ready(Ok(socket_addr));
         }
 
-        // TODO: switch to using entry()
-        match self.cache.get_mut(target) {
-            Some(ResolveState::Resolved(socket_addr)) => Poll::Ready(Ok(*socket_addr)),
-            None => {
-                let mut resolve_future: Pin<
-                    Box<dyn Future<Output = std::io::Result<Vec<SocketAddr>>> + Send>,
-                > = self.resolver.resolve_location(target);
-                match resolve_future.as_mut().poll(cx) {
-                    Poll::Pending => {
-                        self.cache
-                            .insert(target.clone(), ResolveState::Resolving(resolve_future));
-                        Poll::Pending
-                    }
-                    Poll::Ready(result) => match result {
-                        Ok(v) => {
-                            if v.is_empty() {
-                                return Poll::Ready(Err(std::io::Error::new(
-                                    std::io::ErrorKind::Other,
-                                    format!("Failed to resolve {}, no results", target),
-                                )));
-                            }
-                            let socket_addr = v.into_iter().next().unwrap();
-                            Poll::Ready(Ok(socket_addr))
-                        }
-                        Err(e) => Poll::Ready(Err(e)),
-                    },
-                }
+        if let Some(ResolveState::Resolved(ts, socket_addr)) = self.cache.get(target) {
+            if Instant::now().duration_since(*ts) <= Duration::from_secs(self.result_timeout_secs) {
+                return Poll::Ready(Ok(*socket_addr));
+            } else {
+                self.cache.remove(target);
             }
-            Some(ResolveState::Resolving(ref mut resolve_future)) => {
-                match resolve_future.as_mut().poll(cx) {
-                    Poll::Pending => Poll::Pending,
-                    Poll::Ready(result) => {
-                        let v = result?;
+        }
+
+        if let Some(ResolveState::Resolving(resolve_future)) = self.cache.get_mut(target) {
+            match resolve_future.as_mut().poll(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(result) => match result {
+                    Ok(v) => {
                         if v.is_empty() {
                             return Poll::Ready(Err(std::io::Error::new(
                                 std::io::ErrorKind::Other,
@@ -135,12 +124,41 @@ impl ResolverCache {
                             )));
                         }
                         let socket_addr = v.into_iter().next().unwrap();
-                        self.cache
-                            .insert(target.clone(), ResolveState::Resolved(socket_addr));
-                        Poll::Ready(Ok(socket_addr))
+                        self.cache.insert(
+                            target.clone(),
+                            ResolveState::Resolved(Instant::now(), socket_addr),
+                        );
+                        return Poll::Ready(Ok(socket_addr));
                     }
-                }
+                    Err(e) => return Poll::Ready(Err(e)),
+                },
             }
+        }
+
+        let mut resolve_future = self.resolver.resolve_location(target);
+        match resolve_future.as_mut().poll(cx) {
+            Poll::Pending => {
+                self.cache
+                    .insert(target.clone(), ResolveState::Resolving(resolve_future));
+                Poll::Pending
+            }
+            Poll::Ready(result) => match result {
+                Ok(v) => {
+                    if v.is_empty() {
+                        return Poll::Ready(Err(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!("Failed to resolve {}, no results", target),
+                        )));
+                    }
+                    let socket_addr = v.into_iter().next().unwrap();
+                    self.cache.insert(
+                        target.clone(),
+                        ResolveState::Resolved(Instant::now(), socket_addr),
+                    );
+                    Poll::Ready(Ok(socket_addr))
+                }
+                Err(e) => Poll::Ready(Err(e)),
+            },
         }
     }
 }
