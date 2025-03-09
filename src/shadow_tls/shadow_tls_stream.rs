@@ -7,7 +7,15 @@ use crate::async_stream::{AsyncPing, AsyncStream};
 use crate::util::allocate_vec;
 
 // see comment in shadow_tls_handler.rs
-const TLS_FRAME_MAX_LEN: usize = 5 + 65535;
+// TODO: remove duplicated consts
+const TLS_HEADER_LEN: usize = 5;
+const TLS_FRAME_MAX_LEN: usize = TLS_HEADER_LEN + 65535;
+
+// the max size allowed for a payload ie. `buf` in poll_write.
+// 2^14 - 4 (HMAC) = 16380
+const MAX_WRITE_PAYLOAD_LEN: usize = 16380;
+// 2^14 + 5 (header) = 16385
+const WRITE_BUF_LEN: usize = 16389;
 
 const CONTENT_TYPE_ALERT: u8 = 0x15;
 const CONTENT_TYPE_APPLICATION_DATA: u8 = 0x17;
@@ -57,7 +65,7 @@ impl ShadowTlsStream {
             processed_end_offset: initial_processed_data.len(),
             unprocessed_buf: allocate_vec(TLS_FRAME_MAX_LEN).into_boxed_slice(),
             unprocessed_end_offset: 0,
-            write_buf: allocate_vec(TLS_FRAME_MAX_LEN).into_boxed_slice(),
+            write_buf: allocate_vec(WRITE_BUF_LEN).into_boxed_slice(),
             write_buf_pos: 0,
             write_buf_end: 0,
         })
@@ -117,12 +125,11 @@ impl ShadowTlsStream {
         // We should only deframe when there is no readily available processed data.
         assert!(self.processed_end_offset == 0);
 
-        // Need at least 5 bytes for a TLS header
-        if self.unprocessed_end_offset < 5 {
+        if self.unprocessed_end_offset < TLS_HEADER_LEN {
             return Ok(DeframeState::NeedData);
         }
 
-        let header = &self.unprocessed_buf[0..5];
+        let header = &self.unprocessed_buf[0..TLS_HEADER_LEN];
         let content_type = header[0];
         if content_type == CONTENT_TYPE_ALERT {
             self.is_eof = true;
@@ -143,7 +150,7 @@ impl ShadowTlsStream {
             ));
         }
 
-        let total_len = 5 + frame_len;
+        let total_len = TLS_HEADER_LEN + frame_len;
         if self.unprocessed_end_offset < total_len {
             return Ok(DeframeState::NeedData);
         }
@@ -160,7 +167,7 @@ impl ShadowTlsStream {
         }
 
         // Process the TLS frame: the frame_body consists of a 4-byte HMAC followed by the payload.
-        let frame_body = &self.unprocessed_buf[5..total_len];
+        let frame_body = &self.unprocessed_buf[TLS_HEADER_LEN..total_len];
         let received_digest = &frame_body[0..4];
         let payload = &frame_body[4..];
         self.hmac_client_data.update(payload);
@@ -291,22 +298,11 @@ impl AsyncWrite for ShadowTlsStream {
         this.write_buf_pos = 0;
         this.write_buf_end = 0;
 
+        let consumed_buf_len = std::cmp::min(buf.len(), MAX_WRITE_PAYLOAD_LEN);
+        let consumed_buf = &buf[0..consumed_buf_len];
+
         // Construct TLS frame in our preallocated buffer
-        let frame_len = buf.len() + 4; // HMAC(4) + payload
-
-        if frame_len > 0xFFFF {
-            return Poll::Ready(Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "Payload too large for TLS record",
-            )));
-        }
-
-        if 5 + frame_len > this.write_buf.len() {
-            return Poll::Ready(Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "Payload too large for TLS header",
-            )));
-        }
+        let frame_len = consumed_buf_len + 4; // HMAC(4) + payload
 
         // Write TLS header
         this.write_buf[0] = CONTENT_TYPE_APPLICATION_DATA;
@@ -315,19 +311,19 @@ impl AsyncWrite for ShadowTlsStream {
         this.write_buf[3..5].copy_from_slice(&(frame_len as u16).to_be_bytes());
 
         // Calculate and write HMAC
-        this.hmac_server_data.update(buf);
+        this.hmac_server_data.update(consumed_buf);
         let digest = this.hmac_server_data.digest();
         this.hmac_server_data.update(&digest);
 
         this.write_buf[5..9].copy_from_slice(&digest);
 
         // Write payload
-        this.write_buf[9..9 + buf.len()].copy_from_slice(buf);
+        this.write_buf[9..9 + consumed_buf_len].copy_from_slice(consumed_buf);
 
         // Set end position
-        this.write_buf_end = 5 + frame_len;
+        this.write_buf_end = TLS_HEADER_LEN + frame_len;
 
-        Poll::Ready(Ok(buf.len()))
+        Poll::Ready(Ok(consumed_buf_len))
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
