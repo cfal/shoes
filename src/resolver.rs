@@ -1,3 +1,4 @@
+use std::fmt::Debug;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -12,10 +13,11 @@ use crate::address::NetLocation;
 
 type ResolveFuture = Pin<Box<dyn Future<Output = std::io::Result<Vec<SocketAddr>>> + Send>>;
 
-pub trait Resolver: Send + Sync {
+pub trait Resolver: Send + Sync + Debug {
     fn resolve_location(&self, location: &NetLocation) -> ResolveFuture;
 }
 
+#[derive(Debug)]
 pub struct NativeResolver;
 
 impl NativeResolver {
