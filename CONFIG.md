@@ -15,17 +15,18 @@ There are three main configuration types:
 A server configuration defines a proxy server instance:
 
 ```yaml
-bind_location: address | path  # Network address or Unix socket path
-protocol: ServerProxyConfig    # Server protocol configuration
-transport: tcp | quic | udp    # Optional, defaults to tcp
-tcp_settings:                  # Optional TCP settings
-  no_delay: bool              # Default: true
-quic_settings:                # Required if transport is quic
-  cert: string               # TLS certificate path
-  key: string                # TLS private key path
-  alpn_protocols: [string]   # Optional ALPN protocols
-  client_fingerprints: [string] # Optional allowed client cert fingerprints
-rules: string | RuleConfig   # Optional, defaults to allow-all-direct
+bind_location: address | path  # Network address or Unix socket path (use a file path for Unix sockets)
+protocol: ServerProxyConfig    # Server protocol configuration (see available types below)
+transport: tcp | quic | udp     # Optional, defaults to tcp; note: Unix socket binding is supported only with tcp
+tcp_settings:                   # Optional TCP settings
+  no_delay: bool               # Default: true
+quic_settings:                 # Required if transport is quic
+  cert: string                # TLS certificate path
+  key: string                 # TLS private key path
+  alpn_protocols: [string]    # Optional ALPN protocols (alias: alpn_protocol)
+  client_fingerprints: [string] # Optional allowed client cert fingerprints (alias: client_fingerprint)
+  num_endpoints: int          # Optional; if set to 0, defaults to the number of available threads
+rules: string | RuleConfig    # Optional; defaults to allow-all-direct if omitted
 ```
 
 ## Protocol Types
@@ -89,7 +90,7 @@ protocol:
 ```yaml
 protocol:
   type: tls
-  sni_targets:                # Map of SNI hostnames to configs
+  sni_targets:                # Map of SNI hostnames to TLS configs
     "example.com":
       cert: string           # Certificate path
       key: string            # Private key path
@@ -100,6 +101,44 @@ protocol:
   default_target:            # Optional default configuration
     cert: string
     key: string
+    protocol: ServerProxyConfig
+    override_rules: string | [RuleConfig]
+```
+
+#### ShadowTLS v3 (in-process handshake)
+```yaml
+protocol:
+  type: shadowtls
+  sni_targets:                # Map of SNI hostnames to ShadowTLS v3 configs
+    "example.com":
+      password: string        # ShadowTLS password
+      handshake:              # TLS handshake configuration; can be defined in two ways:
+        cert: string         # Local handshake: certificate path
+        key: string          # Local handshake: private key path
+        alpn_protocols: [string]  # Optional ALPN protocols
+        client_fingerprints: [string]  # Optional allowed client fingerprints
+      protocol: ServerProxyConfig  # Inner protocol configuration
+      override_rules: string | [RuleConfig]  # Optional override rules
+  default_target:            # Optional default configuration for ShadowTLS v3
+    handshake: { ... }        # Handshake configuration (local or remote)
+    protocol: ServerProxyConfig
+    override_rules: string | [RuleConfig]
+```
+
+#### ShadowTLS v3 (remote handshake server)
+```yaml
+protocol:
+  type: shadowtls
+  sni_targets:                # Map of SNI hostnames to ShadowTLS v3 configs
+    "example.com":
+      password: string        # ShadowTLS password
+      handshake:              # TLS handshake configuration; can be defined in two ways:
+        address: example.com:443  # Remote handshake: address of handshake server
+        client_proxies: ClientConfig # Remote handshake: client proxy configuration for handshake server
+      protocol: ServerProxyConfig  # Inner protocol configuration
+      override_rules: string | [RuleConfig]  # Optional override rules
+  default_target:            # Optional default configuration for ShadowTLS v3
+    handshake: { ... }        # Handshake configuration (local or remote)
     protocol: ServerProxyConfig
     override_rules: string | [RuleConfig]
 ```
@@ -179,19 +218,19 @@ protocol:
 A client configuration defines proxy client settings:
 
 ```yaml
-bind_interface: string?     # Optional interface name (Linux/Android only)
-address: string            # Optional target address
-protocol: ClientProxyConfig  # Client protocol configuration
-transport: tcp | quic | udp  # Optional, defaults to tcp
-tcp_settings:               # Optional TCP settings
-  no_delay: bool           # Default: true
-quic_settings:             # Optional QUIC settings
-  verify: bool            # Default: true
-  server_fingerprints: [string]  # Optional allowed server fingerprints
-  sni_hostname: string?   # Optional SNI hostname
-  alpn_protocols: [string]  # Optional ALPN protocols
-  key: string?           # Optional client key
-  cert: string?          # Optional client cert
+bind_interface: string?      # Optional interface name (available on Linux, Android, or Fuchsia)
+address: string             # Target address; defaults to unspecified if omitted
+protocol: ClientProxyConfig   # Client protocol configuration
+transport: tcp | quic | udp   # Optional, defaults to tcp
+tcp_settings:                # Optional TCP settings
+  no_delay: bool            # Default: true
+quic_settings:              # Optional QUIC settings (only applicable if transport is quic)
+  verify: bool             # Default: true
+  server_fingerprints: [string]  # Optional allowed server fingerprints (alias: server_fingerprint)
+  sni_hostname: string?    # Optional SNI hostname
+  alpn_protocols: [string]   # Optional ALPN protocols (alias: alpn_protocol)
+  key: string?            # Optional client key (must be paired with cert)
+  cert: string?           # Optional client cert (must be paired with key)
 ```
 
 ## Client Proxy Groups
@@ -218,7 +257,7 @@ rules: RuleConfig | [RuleConfig]
 masks: string | [string]  # IP/CIDR masks to match
 action: allow | block     # Action to take
 override_address: string?  # Optional address override for allow action
-client_proxies: string | ClientConfig | [string | ClientConfig]  # Required for allow action
+client_proxies: string | ClientConfig | [string | ClientConfig]  # Required for allow action (alias: client_proxy)
 ```
 
 ## Built-in Defaults
@@ -343,3 +382,12 @@ protocol:
   uuid: "123e4567-e89b-12d3-a456-426614174000"
   password: "tuic_secret"
 ```
+
+## Advanced Configuration Details
+
+- Multiple configuration blocks can be combined in a single YAML file.
+- Fields support aliases (e.g., "alpn_protocol" and "alpn_protocols", "client_proxy" for "client_proxies").
+- For QUIC transport, if "num_endpoints" is set to 0, it defaults to the number of available CPU threads.
+- Unix domain socket binding is supported only when using TCP transport.
+- Client configurations require both certificate and key to be specified together.
+- UUIDs in Vless and Vmess protocols are validated for correct format.
