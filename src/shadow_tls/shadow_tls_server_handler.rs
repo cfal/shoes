@@ -14,7 +14,7 @@ use tokio::io::AsyncWriteExt;
 
 use super::shadow_tls_hmac::ShadowTlsHmac;
 use super::shadow_tls_stream::ShadowTlsStream;
-use crate::address::NetLocation;
+use crate::address::{Address, NetLocation};
 use crate::async_stream::AsyncStream;
 use crate::buf_reader::BufReader;
 use crate::client_proxy_selector::ClientProxySelector;
@@ -119,9 +119,9 @@ impl TcpServerHandler for ShadowTlsServerHandler {
             requested_server_name,
         } = read_client_hello(&mut server_stream).await?;
 
-        let target = match requested_server_name {
+        let (target, allow_user_specified) = match requested_server_name {
             None => match self.default_target {
-                Some(ref t) => t,
+                Some(ref t) => (t, false),
                 None => {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::Other,
@@ -129,10 +129,12 @@ impl TcpServerHandler for ShadowTlsServerHandler {
                     ));
                 }
             },
-            Some(hostname) => match self.sni_targets.get(&hostname) {
-                Some(t) => t,
+            Some(ref hostname) => match self.sni_targets.get(hostname) {
+                // allow user specified since it's already explicitly an
+                // entry, and would result in the same hostname.
+                Some(t) => (t, true),
                 None => match self.default_target {
-                    Some(ref t) => t,
+                    Some(ref t) => (t, true),
                     None => {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::Other,
@@ -168,6 +170,23 @@ impl TcpServerHandler for ShadowTlsServerHandler {
                 ref client_connectors,
                 ref next_proxy_index,
             } => {
+                // Allow the magic address `user-specified` in the default target to mean the user provided SNI.
+                // Note that this doesn't allow any arbitrary connection to specify an address to
+                // connect to, as the client hello HMAC has already been validated at this stage.
+                let location = if location.address().hostname() == Some("user-specified") {
+                    if !allow_user_specified {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "user-specified address but no SNI provided",
+                        ));
+                    }
+                    let user_specified_address =
+                        Address::from(requested_server_name.as_ref().unwrap())?;
+                    NetLocation::new(user_specified_address, location.port())
+                } else {
+                    location.clone()
+                };
+
                 let index = next_proxy_index.fetch_add(1, Ordering::Relaxed);
                 let client_connector = &client_connectors[index % client_connectors.len()];
                 setup_remote_handshake(
@@ -176,7 +195,7 @@ impl TcpServerHandler for ShadowTlsServerHandler {
                     client_reader,
                     client_hello_frame,
                     hmac_key,
-                    location.clone(),
+                    location,
                     client_connector,
                     &self.resolver,
                 )
