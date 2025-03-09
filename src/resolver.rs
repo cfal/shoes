@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -7,6 +6,7 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use log::debug;
+use rustc_hash::FxHashMap;
 
 use crate::address::NetLocation;
 
@@ -61,7 +61,7 @@ pub async fn resolve_single_address(
 
 pub struct ResolverCache {
     resolver: Arc<dyn Resolver>,
-    cache: HashMap<NetLocation, ResolveState>,
+    cache: FxHashMap<NetLocation, ResolveState>,
     result_timeout_secs: u64,
 }
 
@@ -76,7 +76,7 @@ impl ResolverCache {
     pub fn new_with_timeout(resolver: Arc<dyn Resolver>, result_timeout_secs: u64) -> Self {
         Self {
             resolver,
-            cache: HashMap::new(),
+            cache: FxHashMap::default(),
             result_timeout_secs,
         }
     }
