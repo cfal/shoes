@@ -10,7 +10,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use futures::FutureExt;
 use tokio::io::AsyncWriteExt;
 
 use super::shadow_tls_hmac::ShadowTlsHmac;
@@ -492,6 +491,7 @@ async fn setup_remote_handshake(
     // is fine.
     let mut noop_stream: Box<dyn AsyncStream> = Box::new(NoopStream);
 
+    // this is confusing, but the TLS server is called client_stream.
     let mut client_stream = client_connector
         .connect(&mut noop_stream, remote_addr, resolver)
         .await?;
@@ -539,19 +539,8 @@ async fn setup_remote_handshake(
     let mut client_frame = vec![];
 
     loop {
-        // this is confusing, but the TLS server is called client_stream.
-        let mut server_read_header_future = server_reader
-            .read_slice(&mut client_stream, TLS_HEADER_LEN)
-            .boxed()
-            .fuse();
-        let mut client_read_header_future = client_reader
-            .read_slice(&mut server_stream, TLS_HEADER_LEN)
-            .boxed()
-            .fuse();
-        futures::select! {
-            server_read_result = server_read_header_future => {
-                drop(server_read_header_future);
-                drop(client_read_header_future);
+        tokio::select! {
+            server_read_result = server_reader.read_slice(&mut client_stream, TLS_HEADER_LEN) => {
                 server_frame.clear();
 
                 let server_header_bytes = server_read_result?;
@@ -589,9 +578,7 @@ async fn setup_remote_handshake(
 
                 write_all(&mut server_stream, &server_frame).await?;
             }
-            client_read_result = client_read_header_future => {
-                drop(server_read_header_future);
-                drop(client_read_header_future);
+            client_read_result = client_reader.read_slice(&mut server_stream, TLS_HEADER_LEN) => {
                 client_frame.clear();
 
                 let client_header_bytes = client_read_result?;
