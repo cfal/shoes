@@ -245,12 +245,9 @@ impl VmessStream {
     }
 
     pub fn feed_initial_read_data(&mut self, data: &[u8]) -> std::io::Result<()> {
-        if self.unprocessed_start_offset != 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "feed_initial_read_data called with unprocessed data",
-            ));
-        } else if data.len() > self.unprocessed_buf.len() {
+        assert!(self.unprocessed_end_offset == 0);
+
+        if data.len() > self.unprocessed_buf.len() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
                 "feed_initial_read_data called with too much data",
