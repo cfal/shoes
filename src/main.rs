@@ -8,6 +8,7 @@ mod copy_multidirectional_message;
 mod http_handler;
 mod hysteria2_server;
 mod line_reader;
+mod noop_stream;
 mod option_util;
 mod port_forward_handler;
 mod quic_server;
