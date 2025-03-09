@@ -603,12 +603,17 @@ async fn setup_remote_handshake(
 
                         let _ = client_stream.shutdown().await;
 
-                        let shadow_tls_stream = ShadowTlsStream::new(
+                        let mut shadow_tls_stream = ShadowTlsStream::new(
                             server_stream,
                             initial_client_data,
                             hmac_client_data,
                             hmac_server_data,
                         )?;
+
+                        let unparsed_data = client_reader.unparsed_data();
+                        if !unparsed_data.is_empty() {
+                            shadow_tls_stream.feed_initial_read_data(&unparsed_data)?;
+                        }
 
                         return Ok(shadow_tls_stream);
                     }
