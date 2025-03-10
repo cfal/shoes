@@ -34,13 +34,16 @@
           address: google.com:443
 
     # specify a default target for SNIs that don't match, or if an SNI is not
-    # provided. here, we use a local in-process handshake instead of a remote
-    # server.
+    # provided.
     default_target:
       password: asdf
       handshake:
-        cert: cert.pem
-        key: cert.pem
+        # `user-specified` is a magic value that means to use the user specified SNI
+        # as the handshake server. note that this does not allow an arbitrary connection
+        # to specify a hostname to connect to, as the client password has already been
+        # validated against the ClientHello by the time we start the handshake connection.
+        # if the user has not specified a server name, the handshake will fail.
+        address: user-specified:443
       protocol:
         type: http
         username: http-user123
