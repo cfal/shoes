@@ -95,13 +95,25 @@ pub async fn setup_shadowtls_server_stream(
         client_hello_record_legacy_version_minor,
         client_hello_content_version_major,
         client_hello_content_version_minor,
-        client_hello_digest,
-        client_hello_digest_start_index,
-        client_hello_digest_end_index,
+        parsed_digest,
         client_reader,
         supports_tls13: client_supports_tls13,
         ..
     } = parsed_client_hello;
+
+    let ParsedClientHelloDigest {
+        client_hello_digest,
+        client_hello_digest_start_index,
+        client_hello_digest_end_index,
+    } = match parsed_digest {
+        Some(d) => d,
+        None => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "client did not send a 32-byte session id",
+            ))
+        }
+    };
 
     if !client_supports_tls13 {
         return Err(std::io::Error::new(
@@ -206,12 +218,16 @@ pub struct ParsedClientHello {
     pub client_hello_record_legacy_version_minor: u8,
     pub client_hello_content_version_major: u8,
     pub client_hello_content_version_minor: u8,
-    pub client_hello_digest: Vec<u8>,
-    pub client_hello_digest_start_index: usize,
-    pub client_hello_digest_end_index: usize,
+    pub parsed_digest: Option<ParsedClientHelloDigest>,
     pub client_reader: LineReader,
     pub requested_server_name: Option<String>,
     pub supports_tls13: bool,
+}
+
+pub struct ParsedClientHelloDigest {
+    pub client_hello_digest: Vec<u8>,
+    pub client_hello_digest_start_index: usize,
+    pub client_hello_digest_end_index: usize,
 }
 
 #[inline]
@@ -258,18 +274,28 @@ pub async fn read_client_hello(
     client_hello.skip(32)?;
 
     let client_session_id_len = client_hello.read_u8()?;
-    if client_session_id_len != 32 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("expected session id len 32, got {}", client_session_id_len),
-        ));
-    }
 
-    let client_session_id = client_hello.read_slice(32)?;
+    let parsed_digest = if client_session_id_len == 32 {
+        let client_session_id = client_hello.read_slice(32)?;
 
-    // save the hmac digest and session id position for validation once we know the server name
-    let client_hello_digest = client_session_id[client_session_id.len() - 4..].to_vec();
-    let post_session_id_index = client_hello.position() as usize;
+        // save the hmac digest and session id position for validation once we know the server name
+        let client_hello_digest = client_session_id[28..].to_vec();
+        let post_session_id_index = client_hello.position() as usize;
+
+        let client_hello_digest_start_index = TLS_HEADER_LEN + post_session_id_index - 4;
+        let client_hello_digest_end_index = TLS_HEADER_LEN + post_session_id_index;
+
+        Some(ParsedClientHelloDigest {
+            client_hello_digest,
+            client_hello_digest_start_index,
+            client_hello_digest_end_index,
+        })
+    } else {
+        if client_session_id_len > 0 {
+            client_hello.skip(client_session_id_len as usize)?;
+        }
+        None
+    };
 
     let client_cipher_suite_len = client_hello.read_u16_be()?;
     client_hello.skip(client_cipher_suite_len as usize)?;
@@ -346,9 +372,7 @@ pub async fn read_client_hello(
         client_hello_record_legacy_version_minor: client_legacy_version_minor,
         client_hello_content_version_major: client_version_major,
         client_hello_content_version_minor: client_version_minor,
-        client_hello_digest,
-        client_hello_digest_start_index: TLS_HEADER_LEN + post_session_id_index - 4,
-        client_hello_digest_end_index: TLS_HEADER_LEN + post_session_id_index,
+        parsed_digest,
         client_reader,
         requested_server_name,
         supports_tls13: client_supports_tls13,
