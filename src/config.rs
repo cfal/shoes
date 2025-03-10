@@ -62,6 +62,8 @@ impl Default for TcpConfig {
 pub struct ServerQuicConfig {
     pub cert: String,
     pub key: String,
+    #[serde(alias = "client_ca_cert", default)]
+    pub client_ca_certs: NoneOrSome<String>,
     #[serde(alias = "alpn_protocol", default)]
     pub alpn_protocols: NoneOrSome<String>,
     #[serde(alias = "client_fingerprint", default)]
@@ -120,6 +122,13 @@ pub struct TlsServerConfig {
     #[serde(alias = "alpn_protocol", default)]
     pub alpn_protocols: NoneOrSome<String>,
 
+    // trusted CA certs that client certs must chain to.
+    // note that if a client cert chains back to a cert in this field,
+    // it is validated even if the leaf certificate is not in `client_fingerprints`
+    // below.
+    #[serde(alias = "client_ca_cert", default)]
+    pub client_ca_certs: NoneOrSome<String>,
+
     // sha256 fingerprint of allowed client certificates
     //
     // To generate a new ECDSA client certificate:
@@ -160,6 +169,8 @@ pub enum ShadowTlsServerHandshakeConfig {
     Local {
         cert: String,
         key: String,
+        #[serde(alias = "client_ca_cert", default)]
+        client_ca_certs: NoneOrSome<String>,
         #[serde(alias = "alpn_protocol", default)]
         alpn_protocols: NoneOrSome<String>,
         #[serde(alias = "client_fingerprint", default)]

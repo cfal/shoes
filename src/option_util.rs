@@ -77,6 +77,15 @@ impl<T> NoneOrSome<T> {
         }
     }
 
+    pub fn len(&self) -> usize {
+        match self {
+            NoneOrSome::Unspecified => 0,
+            NoneOrSome::None => 0,
+            NoneOrSome::One(_) => 1,
+            NoneOrSome::Some(v) => v.len(),
+        }
+    }
+
     pub fn into_vec(self) -> Vec<T> {
         match self {
             NoneOrSome::Unspecified | NoneOrSome::None => vec![],

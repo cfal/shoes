@@ -218,6 +218,7 @@ fn get_root_cert_store() -> Arc<rustls::RootCertStore> {
 pub fn create_server_config(
     cert_bytes: &[u8],
     key_bytes: &[u8],
+    ca_cert_bytes: Vec<Vec<u8>>,
     alpn_protocols: &[String],
     client_fingerprints: &[String],
 ) -> rustls::ServerConfig {
@@ -229,14 +230,34 @@ pub fn create_server_config(
 
     let privkey = rustls::pki_types::PrivateKeyDer::from_pem_slice(key_bytes).unwrap();
 
+    let webpki_verifier = if ca_cert_bytes.is_empty() {
+        None
+    } else {
+        let mut store = rustls::RootCertStore::empty();
+        for ca_cert in ca_cert_bytes.into_iter() {
+            let ca_cert = rustls::pki_types::CertificateDer::from_pem_slice(&ca_cert)
+                .unwrap()
+                .into_owned();
+            store.add(ca_cert).unwrap();
+        }
+        let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+            Arc::new(store),
+            get_crypto_provider(),
+        )
+        .build()
+        .unwrap();
+        Some(verifier)
+    };
+
     let builder = rustls::ServerConfig::builder_with_provider(get_crypto_provider())
         .with_safe_default_protocol_versions()
         .unwrap();
-    let builder = if client_fingerprints.is_empty() {
+    let builder = if client_fingerprints.is_empty() && webpki_verifier.is_none() {
         builder.with_no_client_auth()
     } else {
         builder.with_client_cert_verifier(Arc::new(ClientFingerprintVerifier {
             supported_algs: get_supported_algorithms(),
+            webpki_verifier,
             client_fingerprints: process_fingerprints(client_fingerprints).unwrap(),
         }))
     };
@@ -296,6 +317,7 @@ pub fn process_fingerprints(client_fingerprints: &[String]) -> std::io::Result<B
 #[derive(Debug)]
 pub struct ClientFingerprintVerifier {
     supported_algs: rustls::crypto::WebPkiSupportedAlgorithms,
+    webpki_verifier: Option<Arc<dyn rustls::server::danger::ClientCertVerifier>>,
     client_fingerprints: BTreeSet<Vec<u8>>,
 }
 
@@ -315,9 +337,16 @@ impl rustls::server::danger::ClientCertVerifier for ClientFingerprintVerifier {
     fn verify_client_cert(
         &self,
         end_entity: &rustls::pki_types::CertificateDer<'_>,
-        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        _now: rustls::pki_types::UnixTime,
+        intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        now: rustls::pki_types::UnixTime,
     ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
+        if let Some(ref webpki_verifier) = self.webpki_verifier {
+            let result = webpki_verifier.verify_client_cert(end_entity, intermediates, now);
+            if result.is_ok() {
+                return Ok(rustls::server::danger::ClientCertVerified::assertion());
+            }
+        }
+
         let fingerprint =
             aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, end_entity.as_ref());
         let fingerprint_bytes = fingerprint.as_ref();

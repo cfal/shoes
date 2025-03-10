@@ -142,6 +142,7 @@ fn create_tls_server_target(
         cert,
         key,
         alpn_protocols,
+        client_ca_certs,
         client_fingerprints,
         protocol,
         override_rules,
@@ -156,9 +157,20 @@ fn create_tls_server_target(
     let mut key_bytes = vec![];
     key_file.read_to_end(&mut key_bytes).unwrap();
 
+    let client_ca_certs = client_ca_certs
+        .into_iter()
+        .map(|cert| {
+            let mut cert_file = std::fs::File::open(cert).unwrap();
+            let mut cert_bytes = vec![];
+            cert_file.read_to_end(&mut cert_bytes).unwrap();
+            cert_bytes
+        })
+        .collect();
+
     let server_config = Arc::new(create_server_config(
         &cert_bytes,
         &key_bytes,
+        client_ca_certs,
         &alpn_protocols.into_vec(),
         &client_fingerprints.into_vec(),
     ));
@@ -208,6 +220,7 @@ fn create_shadow_tls_server_target(
         ShadowTlsServerHandshakeConfig::Local {
             cert,
             key,
+            client_ca_certs,
             alpn_protocols,
             client_fingerprints,
         } => {
@@ -220,9 +233,20 @@ fn create_shadow_tls_server_target(
             let mut key_bytes = vec![];
             key_file.read_to_end(&mut key_bytes).unwrap();
 
+            let client_ca_certs = client_ca_certs
+                .into_iter()
+                .map(|cert| {
+                    let mut cert_file = std::fs::File::open(cert).unwrap();
+                    let mut cert_bytes = vec![];
+                    cert_file.read_to_end(&mut cert_bytes).unwrap();
+                    cert_bytes
+                })
+                .collect();
+
             let server_config = Arc::new(create_server_config(
                 &cert_bytes,
                 &key_bytes,
+                client_ca_certs,
                 &alpn_protocols.into_vec(),
                 &client_fingerprints.into_vec(),
             ));

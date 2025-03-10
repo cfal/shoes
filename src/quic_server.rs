@@ -359,6 +359,7 @@ pub async fn start_quic_servers(config: ServerConfig) -> std::io::Result<Vec<Joi
     let ServerQuicConfig {
         cert,
         key,
+        client_ca_certs,
         alpn_protocols,
         client_fingerprints,
         num_endpoints,
@@ -372,9 +373,18 @@ pub async fn start_quic_servers(config: ServerConfig) -> std::io::Result<Vec<Joi
     let mut key_bytes = vec![];
     key_file.read_to_end(&mut key_bytes).await?;
 
+    let mut processed_ca_certs = Vec::with_capacity(client_ca_certs.len());
+    for cert in client_ca_certs.into_iter() {
+        let mut cert_file = File::open(cert).await?;
+        let mut cert_bytes = vec![];
+        cert_file.read_to_end(&mut cert_bytes).await?;
+        processed_ca_certs.push(cert_bytes);
+    }
+
     let server_config = Arc::new(create_server_config(
         &cert_bytes,
         &key_bytes,
+        processed_ca_certs,
         &alpn_protocols.into_vec(),
         &client_fingerprints.into_vec(),
     ));
