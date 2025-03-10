@@ -58,6 +58,7 @@ Here's an example of running a WSS vmess and shadowsocks server, with all reques
   # Use TLS as the first protocol layer
   protocol:
     type: tls
+
     # Set a default target, for any (or no) SNI
     default_target:
       cert: cert.pem
@@ -80,6 +81,23 @@ Here's an example of running a WSS vmess and shadowsocks server, with all reques
               type: shadowsocks
               cipher: 2022-blake3-aes-256-gcm
               password: Hax8btYlNao5qcaN/l/NUl9JgbwapfqG5QyAtH+aKPg=
+
+    # Set a ShadowTLS v3 target by SNI
+    shadowtls_targets:
+      google.com:
+        # ShadowTLS password
+        password: 83a44859c0e7fbb589b
+        # Configure handshake server.
+        handshake:
+          address: google.com:443
+          # Use the local SOCKS server to connect to the handshake server.
+          client_proxies:
+            - address: 127.0.0.1:1080
+              protocol:
+                type: socks
+                username: socksuser
+                password: secretpass
+    
   rules:
     # Allow clients to connect to all IPs
     - mask: 0.0.0.0/0
