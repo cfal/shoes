@@ -1,10 +1,11 @@
+# server example of a single server that serves both normal TLS and ShadowTLS
 - address: 127.0.0.1:44300
   transport: tcp
   protocol:
-    type: shadowtls
-    # specify different configs based on ShadowTLS SNI
-    sni_targets:
+    type: tls
 
+    # specify different passwords and proxy protocols based on ShadowTLS SNI
+    shadowtls_targets:
       example.com:
         password: asdf123
         handshake:
@@ -33,21 +34,25 @@
           # connect directly to google.com as the handshake server
           address: google.com:443
 
-    # specify a default target for SNIs that don't match, or if an SNI is not
-    # provided.
-    default_target:
-      password: asdf
-      handshake:
-        # `user-specified` is a magic value that means to use the user specified SNI
-        # as the handshake server. note that this does not allow an arbitrary connection
-        # to specify a hostname to connect to, as the client password has already been
-        # validated against the ClientHello by the time we start the handshake connection.
-        # if the user has not specified a server name, the handshake will fail.
-        address: user-specified:443
+    # regular TLS targets
+    tls_targets:
+      # provide a regular HTTPS proxy
+      example2.com:
+        key: private_key.pem
+        cert: cert.pem
+        protocol:
+          type: http
+          username: https-user
+          password: https-password
+
+    # default TLS target, when no SNI is provided or no SNI from `targets` matches.
+    default_tls_target:
+      key: default_key.pem
+      cert: default_cert.pem
       protocol:
-        type: http
-        username: http-user123
-        password: http-password345
+        type: socks
+        username: default-socks-user
+        password: default-socks-pass
 
   rules:
     - mask: 0.0.0.0/0
