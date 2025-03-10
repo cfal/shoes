@@ -2,12 +2,17 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tokio_rustls::LazyConfigAcceptor;
+use tokio_rustls::TlsAcceptor;
 
 use crate::address::NetLocation;
 use crate::async_stream::AsyncStream;
 use crate::client_proxy_selector::ClientProxySelector;
 use crate::option_util::NoneOrOne;
+use crate::resolver::{NativeResolver, Resolver};
+use crate::shadow_tls::{
+    feed_server_connection, read_client_hello, setup_shadowtls_server_stream, ParsedClientHello,
+    ShadowTlsServerTarget,
+};
 use crate::tcp_client_connector::TcpClientConnector;
 use crate::tcp_handler::{
     TcpClientHandler, TcpClientSetupResult, TcpServerHandler, TcpServerSetupResult,
@@ -17,6 +22,18 @@ use crate::tcp_handler::{
 pub struct TlsServerHandler {
     sni_targets: HashMap<String, TlsServerTarget>,
     default_target: Option<TlsServerTarget>,
+    // used to resolve handshake server hostnames
+    shadowtls_resolver: Arc<dyn Resolver>,
+}
+
+#[derive(Debug)]
+pub enum TlsServerTarget {
+    Tls {
+        server_config: Arc<rustls::ServerConfig>,
+        handler: Box<dyn TcpServerHandler>,
+        override_proxy_provider: NoneOrOne<Arc<ClientProxySelector<TcpClientConnector>>>,
+    },
+    ShadowTls(ShadowTlsServerTarget),
 }
 
 impl TlsServerHandler {
@@ -27,6 +44,7 @@ impl TlsServerHandler {
         Self {
             sni_targets,
             default_target,
+            shadowtls_resolver: Arc::new(NativeResolver::new()),
         }
     }
 }
@@ -35,12 +53,11 @@ impl TlsServerHandler {
 impl TcpServerHandler for TlsServerHandler {
     async fn setup_server_stream(
         &self,
-        server_stream: Box<dyn AsyncStream>,
+        mut server_stream: Box<dyn AsyncStream>,
     ) -> std::io::Result<TcpServerSetupResult> {
-        let acceptor = LazyConfigAcceptor::new(rustls::server::Acceptor::default(), server_stream);
-        let start_handshake = acceptor.await?;
-        let client_hello = start_handshake.client_hello();
-        let target = match client_hello.server_name() {
+        let parsed_client_hello = read_client_hello(&mut server_stream).await?;
+
+        let target = match parsed_client_hello.requested_server_name.as_ref() {
             None => match self.default_target {
                 Some(ref t) => t,
                 None => {
@@ -64,25 +81,84 @@ impl TcpServerHandler for TlsServerHandler {
             },
         };
 
-        let tls_stream: Box<dyn AsyncStream> = Box::new(
-            start_handshake
-                .into_stream_with(target.server_config.clone(), |server_conn| {
-                    server_conn.set_buffer_limit(Some(32768));
-                })
-                .await?,
-        );
+        match target {
+            TlsServerTarget::Tls {
+                ref server_config,
+                ref handler,
+                ref override_proxy_provider,
+            } => {
+                let ParsedClientHello {
+                    client_hello_frame,
+                    client_reader,
+                    ..
+                } = parsed_client_hello;
+                let tls_acceptor = TlsAcceptor::from(server_config.clone());
 
-        let mut target_setup_result = target.handler.setup_server_stream(tls_stream).await;
-        if let Ok(ref mut setup_result) = target_setup_result {
-            setup_result.set_need_initial_flush(true);
-            if setup_result.override_proxy_provider_unspecified()
-                && !target.override_proxy_provider.is_unspecified()
-            {
-                setup_result.set_override_proxy_provider(target.override_proxy_provider.clone());
+                let accept_future = {
+                    let mut accept_error: Option<std::io::Error> = None;
+
+                    let accept_future = tls_acceptor.accept_with(server_stream, |server_conn| {
+                        server_conn.set_buffer_limit(Some(32768));
+
+                        if let Err(e) = feed_server_connection(server_conn, &client_hello_frame) {
+                            let _ = accept_error.insert(std::io::Error::new(
+                                std::io::ErrorKind::Other,
+                                format!("Failed to feed initial frame to server connection: {}", e),
+                            ));
+                            return;
+                        }
+                        let unparsed_data = client_reader.unparsed_data();
+                        if !unparsed_data.is_empty() {
+                            if let Err(e) = feed_server_connection(server_conn, unparsed_data) {
+                                let _ = accept_error.insert(std::io::Error::new(
+                                    std::io::ErrorKind::Other,
+                                    format!(
+                                        "Failed to feed unparsed data to server connection: {}",
+                                        e
+                                    ),
+                                ));
+                                return;
+                            }
+                        }
+                        if let Err(e) = server_conn.process_new_packets() {
+                            let _ = accept_error.insert(std::io::Error::new(
+                                std::io::ErrorKind::Other,
+                                format!("Failed to process new packets: {}", e),
+                            ));
+                        }
+                    });
+
+                    if let Some(e) = accept_error {
+                        return Err(e);
+                    }
+
+                    accept_future
+                };
+
+                let tls_stream: Box<dyn AsyncStream> = Box::new(accept_future.await?);
+
+                let mut target_setup_result = handler.setup_server_stream(tls_stream).await;
+                if let Ok(ref mut setup_result) = target_setup_result {
+                    setup_result.set_need_initial_flush(true);
+                    if setup_result.override_proxy_provider_unspecified()
+                        && !override_proxy_provider.is_unspecified()
+                    {
+                        setup_result.set_override_proxy_provider(override_proxy_provider.clone());
+                    }
+                }
+
+                target_setup_result
+            }
+            TlsServerTarget::ShadowTls(ref target) => {
+                setup_shadowtls_server_stream(
+                    server_stream,
+                    target,
+                    parsed_client_hello,
+                    &self.shadowtls_resolver,
+                )
+                .await
             }
         }
-
-        return target_setup_result;
     }
 }
 
@@ -128,11 +204,4 @@ impl TcpClientHandler for TlsClientHandler {
             .setup_client_stream(server_stream, tls_stream, remote_location)
             .await
     }
-}
-
-#[derive(Debug)]
-pub struct TlsServerTarget {
-    pub server_config: Arc<rustls::ServerConfig>,
-    pub handler: Box<dyn TcpServerHandler>,
-    pub override_proxy_provider: NoneOrOne<Arc<ClientProxySelector<TcpClientConnector>>>,
 }

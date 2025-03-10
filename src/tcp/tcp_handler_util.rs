@@ -15,9 +15,7 @@ use crate::http_handler::{HttpTcpClientHandler, HttpTcpServerHandler};
 use crate::option_util::NoneOrOne;
 use crate::port_forward_handler::PortForwardServerHandler;
 use crate::rustls_util::{create_client_config, create_server_config};
-use crate::shadow_tls::{
-    ShadowTlsServerHandler, ShadowTlsServerTarget, ShadowTlsServerTargetHandshake,
-};
+use crate::shadow_tls::{ShadowTlsServerTarget, ShadowTlsServerTargetHandshake};
 use crate::shadowsocks::ShadowsocksTcpHandler;
 use crate::snell::snell_handler::{SnellClientHandler, SnellServerHandler};
 use crate::socks_handler::{SocksTcpClientHandler, SocksTcpServerHandler};
@@ -82,28 +80,22 @@ pub fn create_tcp_server_handler(
             shadowsocks,
         } => Box::new(TrojanTcpHandler::new(&password, &shadowsocks)),
         ServerProxyConfig::Tls {
-            sni_targets,
+            targets,
             default_target,
+            shadowtls_targets,
         } => {
-            let sni_targets = sni_targets
+            let mut targets = targets
                 .into_iter()
                 .map(|(sni, config)| (sni, create_tls_server_target(config, rules_stack)))
                 .collect::<HashMap<String, TlsServerTarget>>();
             let default_target =
                 default_target.map(|config| create_tls_server_target(*config, rules_stack));
-            Box::new(TlsServerHandler::new(sni_targets, default_target))
-        }
-        ServerProxyConfig::ShadowTlsV3 {
-            sni_targets,
-            default_target,
-        } => {
-            let sni_targets = sni_targets
+            let shadowtls_targets = shadowtls_targets
                 .into_iter()
                 .map(|(sni, config)| (sni, create_shadow_tls_server_target(config, rules_stack)))
-                .collect::<HashMap<String, ShadowTlsServerTarget>>();
-            let default_target =
-                default_target.map(|config| create_shadow_tls_server_target(*config, rules_stack));
-            Box::new(ShadowTlsServerHandler::new(sni_targets, default_target))
+                .collect::<HashMap<String, TlsServerTarget>>();
+            targets.extend(shadowtls_targets);
+            Box::new(TlsServerHandler::new(targets, default_target))
         }
         ServerProxyConfig::Vmess {
             cipher,
@@ -198,7 +190,7 @@ fn create_tls_server_target(
         rules_stack.pop().unwrap();
     }
 
-    TlsServerTarget {
+    TlsServerTarget::TLS {
         server_config,
         handler,
         override_proxy_provider,
@@ -208,7 +200,7 @@ fn create_tls_server_target(
 fn create_shadow_tls_server_target(
     shadow_tls_server_config: ShadowTlsServerConfig,
     rules_stack: &mut Vec<Vec<RuleConfig>>,
-) -> ShadowTlsServerTarget {
+) -> TlsServerTarget {
     let ShadowTlsServerConfig {
         password,
         handshake,
@@ -293,7 +285,12 @@ fn create_shadow_tls_server_target(
         rules_stack.pop().unwrap();
     }
 
-    ShadowTlsServerTarget::new(password, target_handshake, handler, override_proxy_provider)
+    TlsServerTarget::ShadowTLS(ShadowTlsServerTarget::new(
+        password,
+        target_handshake,
+        handler,
+        override_proxy_provider,
+    ))
 }
 
 fn create_websocket_server_target(

@@ -4,34 +4,25 @@
 /// - https://commandlinefanatic.com/cgi-bin/showarticle.cgi?article=art080
 /// - https://wiki.osdev.org/TLS_Handshake#Client_Hello_Message
 /// - https://tls13.xargs.org/#client-hello/annotated
-use std::collections::HashMap;
 use std::io::Cursor;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use tokio::io::AsyncWriteExt;
 
 use super::shadow_tls_hmac::ShadowTlsHmac;
 use super::shadow_tls_stream::ShadowTlsStream;
-use crate::address::{Address, NetLocation};
+use crate::address::NetLocation;
 use crate::async_stream::AsyncStream;
 use crate::buf_reader::BufReader;
 use crate::client_proxy_selector::ClientProxySelector;
 use crate::line_reader::LineReader;
 use crate::noop_stream::NoopStream;
 use crate::option_util::NoneOrOne;
-use crate::resolver::{NativeResolver, Resolver};
+use crate::resolver::Resolver;
 use crate::tcp_client_connector::TcpClientConnector;
 use crate::tcp_handler::{TcpServerHandler, TcpServerSetupResult};
 use crate::util::{allocate_vec, write_all};
-
-#[derive(Debug)]
-pub struct ShadowTlsServerHandler {
-    sni_targets: HashMap<String, ShadowTlsServerTarget>,
-    default_target: Option<ShadowTlsServerTarget>,
-    resolver: Arc<dyn Resolver>,
-}
 
 #[derive(Debug)]
 pub struct ShadowTlsServerTarget {
@@ -81,19 +72,6 @@ impl ShadowTlsServerTargetHandshake {
     }
 }
 
-impl ShadowTlsServerHandler {
-    pub fn new(
-        sni_targets: HashMap<String, ShadowTlsServerTarget>,
-        default_target: Option<ShadowTlsServerTarget>,
-    ) -> Self {
-        Self {
-            sni_targets,
-            default_target,
-            resolver: Arc::new(NativeResolver::new()),
-        }
-    }
-}
-
 const TLS_HEADER_LEN: usize = 5;
 
 // the limit should be 5 (header) + 2^14 + 256 (AEAD encryption overhead) = 16640,
@@ -104,154 +82,109 @@ const TLS_FRAME_MAX_LEN: usize = TLS_HEADER_LEN + 65535;
 const CONTENT_TYPE_HANDSHAKE: u8 = 0x16;
 const CONTENT_TYPE_APPLICATION_DATA: u8 = 0x17;
 
-#[async_trait]
-impl TcpServerHandler for ShadowTlsServerHandler {
-    async fn setup_server_stream(
-        &self,
-        mut server_stream: Box<dyn AsyncStream>,
-    ) -> std::io::Result<TcpServerSetupResult> {
-        let ParsedClientHello {
-            client_hello_frame,
-            client_hello_digest,
-            client_hello_digest_start_index,
-            client_hello_digest_end_index,
-            client_reader,
-            requested_server_name,
-            supports_tls13: client_supports_tls13,
-        } = read_client_hello(&mut server_stream).await?;
+pub async fn setup_shadowtls_server_stream(
+    server_stream: Box<dyn AsyncStream>,
+    target: &ShadowTlsServerTarget,
+    parsed_client_hello: ParsedClientHello,
+    resolver: &Arc<dyn Resolver>,
+) -> std::io::Result<TcpServerSetupResult> {
+    let ParsedClientHello {
+        client_hello_frame,
+        client_hello_digest,
+        client_hello_digest_start_index,
+        client_hello_digest_end_index,
+        client_reader,
+        supports_tls13: client_supports_tls13,
+        ..
+    } = parsed_client_hello;
 
-        if !client_supports_tls13 {
-            return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "client does not support TLS1.3",
-            ));
-        }
-
-        let (target, allow_user_specified) = match requested_server_name {
-            None => match self.default_target {
-                Some(ref t) => (t, false),
-                None => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        "No default target for unspecified SNI",
-                    ));
-                }
-            },
-            Some(ref hostname) => match self.sni_targets.get(hostname) {
-                // allow user specified since it's already explicitly an
-                // entry, and would result in the same hostname.
-                Some(t) => (t, true),
-                None => match self.default_target {
-                    Some(ref t) => (t, true),
-                    None => {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            "No default target for unknown SNI",
-                        ));
-                    }
-                },
-            },
-        };
-
-        // verify the hmac digest
-        let hmac_key = aws_lc_rs::hmac::Key::new(
-            aws_lc_rs::hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY,
-            &target.password,
-        );
-        let mut hmac_client_hello = ShadowTlsHmac::new(&hmac_key);
-        hmac_client_hello
-            .update(&client_hello_frame[TLS_HEADER_LEN..client_hello_digest_start_index]);
-        hmac_client_hello.update(&[0; 4]);
-        hmac_client_hello.update(&client_hello_frame[client_hello_digest_end_index..]);
-
-        if client_hello_digest != hmac_client_hello.finalized_digest() {
-            // TODO: forward to handshake server
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "hmac tag mismatch",
-            ));
-        }
-
-        let shadow_tls_stream = match target.handshake {
-            ShadowTlsServerTargetHandshake::Remote {
-                ref location,
-                ref client_connectors,
-                ref next_proxy_index,
-            } => {
-                // Allow the magic address `user-specified` in the default target to mean the user provided SNI.
-                // Note that this doesn't allow any arbitrary connection to specify an address to
-                // connect to, as the client hello HMAC has already been validated at this stage.
-                let location = if location.address().hostname() == Some("user-specified") {
-                    if !allow_user_specified {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            "user-specified address but no SNI provided",
-                        ));
-                    }
-                    let user_specified_address =
-                        Address::from(requested_server_name.as_ref().unwrap())?;
-                    NetLocation::new(user_specified_address, location.port())
-                } else {
-                    location.clone()
-                };
-
-                let index = next_proxy_index.fetch_add(1, Ordering::Relaxed);
-                let client_connector = &client_connectors[index % client_connectors.len()];
-                setup_remote_handshake(
-                    &target.password,
-                    server_stream,
-                    client_reader,
-                    client_hello_frame,
-                    hmac_key,
-                    location,
-                    client_connector,
-                    &self.resolver,
-                )
-                .await?
-            }
-            ShadowTlsServerTargetHandshake::Local(ref local_config) => {
-                setup_local_handshake(
-                    &target.password,
-                    server_stream,
-                    client_reader,
-                    client_hello_frame,
-                    hmac_key,
-                    local_config.clone(),
-                )
-                .await?
-            }
-        };
-
-        let mut target_setup_result = target
-            .handler
-            .setup_server_stream(Box::new(shadow_tls_stream))
-            .await;
-
-        if let Ok(ref mut setup_result) = target_setup_result {
-            // TODO: do we need initial flush?
-            if setup_result.override_proxy_provider_unspecified()
-                && !target.override_proxy_provider.is_unspecified()
-            {
-                setup_result.set_override_proxy_provider(target.override_proxy_provider.clone());
-            }
-        }
-
-        target_setup_result
+    if !client_supports_tls13 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "client does not support TLS1.3",
+        ));
     }
+
+    // verify the hmac digest
+    let hmac_key = aws_lc_rs::hmac::Key::new(
+        aws_lc_rs::hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY,
+        &target.password,
+    );
+    let mut hmac_client_hello = ShadowTlsHmac::new(&hmac_key);
+    hmac_client_hello.update(&client_hello_frame[TLS_HEADER_LEN..client_hello_digest_start_index]);
+    hmac_client_hello.update(&[0; 4]);
+    hmac_client_hello.update(&client_hello_frame[client_hello_digest_end_index..]);
+
+    if client_hello_digest != hmac_client_hello.finalized_digest() {
+        // TODO: forward to handshake server
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "hmac tag mismatch",
+        ));
+    }
+
+    let shadow_tls_stream = match target.handshake {
+        ShadowTlsServerTargetHandshake::Remote {
+            ref location,
+            ref client_connectors,
+            ref next_proxy_index,
+        } => {
+            let index = next_proxy_index.fetch_add(1, Ordering::Relaxed);
+            let client_connector = &client_connectors[index % client_connectors.len()];
+            setup_remote_handshake(
+                &target.password,
+                server_stream,
+                client_reader,
+                client_hello_frame,
+                hmac_key,
+                location.clone(),
+                client_connector,
+                resolver,
+            )
+            .await?
+        }
+        ShadowTlsServerTargetHandshake::Local(ref local_config) => {
+            setup_local_handshake(
+                &target.password,
+                server_stream,
+                client_reader,
+                client_hello_frame,
+                hmac_key,
+                local_config.clone(),
+            )
+            .await?
+        }
+    };
+
+    let mut target_setup_result = target
+        .handler
+        .setup_server_stream(Box::new(shadow_tls_stream))
+        .await;
+
+    if let Ok(ref mut setup_result) = target_setup_result {
+        // TODO: do we need initial flush?
+        if setup_result.override_proxy_provider_unspecified()
+            && !target.override_proxy_provider.is_unspecified()
+        {
+            setup_result.set_override_proxy_provider(target.override_proxy_provider.clone());
+        }
+    }
+
+    target_setup_result
 }
 
-struct ParsedClientHello {
-    client_hello_frame: Vec<u8>,
-    client_hello_digest: Vec<u8>,
-    client_hello_digest_start_index: usize,
-    client_hello_digest_end_index: usize,
-    client_reader: LineReader,
-    requested_server_name: Option<String>,
-    supports_tls13: bool,
+pub struct ParsedClientHello {
+    pub client_hello_frame: Vec<u8>,
+    pub client_hello_digest: Vec<u8>,
+    pub client_hello_digest_start_index: usize,
+    pub client_hello_digest_end_index: usize,
+    pub client_reader: LineReader,
+    pub requested_server_name: Option<String>,
+    pub supports_tls13: bool,
 }
 
 #[inline]
-async fn read_client_hello(
+pub async fn read_client_hello(
     server_stream: &mut Box<dyn AsyncStream>,
 ) -> std::io::Result<ParsedClientHello> {
     // enough for tls header + a max tls payload
@@ -634,7 +567,7 @@ async fn setup_remote_handshake(
 
                         let unparsed_data = client_reader.unparsed_data();
                         if !unparsed_data.is_empty() {
-                            shadow_tls_stream.feed_initial_read_data(&unparsed_data)?;
+                            shadow_tls_stream.feed_initial_read_data(unparsed_data)?;
                         }
 
                         return Ok(shadow_tls_stream);
@@ -891,7 +824,7 @@ async fn setup_local_handshake(
 }
 
 #[inline]
-fn feed_server_connection(
+pub fn feed_server_connection(
     server_connection: &mut rustls::ServerConnection,
     data: &[u8],
 ) -> std::io::Result<()> {
