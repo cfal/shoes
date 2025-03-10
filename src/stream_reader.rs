@@ -6,13 +6,13 @@ use crate::util::allocate_vec;
 const DEFAULT_BUFFER_SIZE: usize = 32768;
 const ERROR_ON_BARE_LF: bool = true;
 
-pub struct LineReader {
+pub struct StreamReader {
     buf: Box<[u8]>,
     start_offset: usize,
     end_offset: usize,
 }
 
-impl LineReader {
+impl StreamReader {
     pub fn new() -> Self {
         Self::new_with_buffer_size(DEFAULT_BUFFER_SIZE)
     }

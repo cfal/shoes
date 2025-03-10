@@ -16,10 +16,10 @@ use crate::address::NetLocation;
 use crate::async_stream::AsyncStream;
 use crate::buf_reader::BufReader;
 use crate::client_proxy_selector::ClientProxySelector;
-use crate::line_reader::LineReader;
 use crate::noop_stream::NoopStream;
 use crate::option_util::NoneOrOne;
 use crate::resolver::Resolver;
+use crate::stream_reader::StreamReader;
 use crate::tcp_client_connector::TcpClientConnector;
 use crate::tcp_handler::{TcpServerHandler, TcpServerSetupResult};
 use crate::util::{allocate_vec, write_all};
@@ -219,7 +219,7 @@ pub struct ParsedClientHello {
     pub client_hello_content_version_major: u8,
     pub client_hello_content_version_minor: u8,
     pub parsed_digest: Option<ParsedClientHelloDigest>,
-    pub client_reader: LineReader,
+    pub client_reader: StreamReader,
     pub requested_server_name: Option<String>,
     pub supports_tls13: bool,
 }
@@ -235,7 +235,7 @@ pub async fn read_client_hello(
     server_stream: &mut Box<dyn AsyncStream>,
 ) -> std::io::Result<ParsedClientHello> {
     // enough for tls header + a max tls payload
-    let mut client_reader = LineReader::new_with_buffer_size(TLS_FRAME_MAX_LEN);
+    let mut client_reader = StreamReader::new_with_buffer_size(TLS_FRAME_MAX_LEN);
 
     // read the first tls frame, allocate so that we can borrow and use the payload below
     let client_tls_header_bytes = client_reader.read_slice(server_stream, 5).await?.to_vec();
@@ -482,7 +482,7 @@ async fn parse_server_hello(server_hello_frame: &[u8]) -> std::io::Result<Parsed
 async fn setup_remote_handshake(
     password: &[u8],
     mut server_stream: Box<dyn AsyncStream>,
-    mut client_reader: LineReader,
+    mut client_reader: StreamReader,
     client_hello_frame: Vec<u8>,
     hmac_key: aws_lc_rs::hmac::Key,
     remote_addr: NetLocation,
@@ -500,7 +500,7 @@ async fn setup_remote_handshake(
 
     write_all(&mut client_stream, &client_hello_frame).await?;
 
-    let mut server_reader = LineReader::new_with_buffer_size(TLS_FRAME_MAX_LEN);
+    let mut server_reader = StreamReader::new_with_buffer_size(TLS_FRAME_MAX_LEN);
     let server_header_bytes = server_reader
         .read_slice(&mut client_stream, TLS_HEADER_LEN)
         .await?;
@@ -632,7 +632,7 @@ async fn setup_remote_handshake(
 async fn setup_local_handshake(
     password: &[u8],
     mut server_stream: Box<dyn AsyncStream>,
-    mut client_reader: LineReader,
+    mut client_reader: StreamReader,
     client_hello_frame: Vec<u8>,
     hmac_key: aws_lc_rs::hmac::Key,
     server_config: Arc<rustls::ServerConfig>,

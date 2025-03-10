@@ -8,11 +8,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use super::snell_udp_stream::SnellUdpStream;
 use crate::address::{Address, NetLocation};
 use crate::async_stream::AsyncStream;
-use crate::line_reader::LineReader;
 use crate::option_util::NoneOrOne;
 use crate::shadowsocks::{
     ShadowsocksCipher, ShadowsocksKey, ShadowsocksStream, ShadowsocksStreamType,
 };
+use crate::stream_reader::StreamReader;
 use crate::tcp_handler::{
     TcpClientHandler, TcpClientSetupResult, TcpServerHandler, TcpServerSetupResult,
 };
@@ -103,9 +103,9 @@ impl TcpServerHandler for SnellServerHandler {
             None,
         );
 
-        let mut line_reader = LineReader::new_with_buffer_size(400);
+        let mut stream_reader = StreamReader::new_with_buffer_size(400);
 
-        let version = line_reader.read_u8(&mut server_stream).await?;
+        let version = stream_reader.read_u8(&mut server_stream).await?;
         if version != 1 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
@@ -113,7 +113,7 @@ impl TcpServerHandler for SnellServerHandler {
             ));
         }
 
-        let command_type = line_reader.read_u8(&mut server_stream).await?;
+        let command_type = stream_reader.read_u8(&mut server_stream).await?;
         let is_udp = match command_type {
             0 => {
                 // Ping command
@@ -147,17 +147,17 @@ impl TcpServerHandler for SnellServerHandler {
             }
         };
 
-        let client_id_len = line_reader.read_u8(&mut server_stream).await?;
+        let client_id_len = stream_reader.read_u8(&mut server_stream).await?;
         if client_id_len > 0 {
-            line_reader
+            stream_reader
                 .read_slice(&mut server_stream, client_id_len as usize)
                 .await?;
         }
 
         if !is_udp {
-            let hostname_len = line_reader.read_u8(&mut server_stream).await? as usize;
+            let hostname_len = stream_reader.read_u8(&mut server_stream).await? as usize;
 
-            let hostname_and_port_bytes = line_reader
+            let hostname_and_port_bytes = stream_reader
                 .read_slice(&mut server_stream, hostname_len + 2)
                 .await?;
 
@@ -184,7 +184,7 @@ impl TcpServerHandler for SnellServerHandler {
                 // flush the tunnel response
                 need_initial_flush: true,
                 connection_success_response: Some(TCP_TUNNEL_RESPONSE.to_vec().into_boxed_slice()),
-                initial_remote_data: line_reader.unparsed_data_owned(),
+                initial_remote_data: stream_reader.unparsed_data_owned(),
                 override_proxy_provider: NoneOrOne::Unspecified,
             })
         } else {

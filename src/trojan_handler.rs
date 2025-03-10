@@ -7,12 +7,12 @@ use tokio::io::AsyncWriteExt;
 use crate::address::NetLocation;
 use crate::async_stream::AsyncStream;
 use crate::config::ShadowsocksConfig;
-use crate::line_reader::LineReader;
 use crate::option_util::NoneOrOne;
 use crate::shadowsocks::{
     DefaultKey, ShadowsocksCipher, ShadowsocksKey, ShadowsocksStream, ShadowsocksStreamType,
 };
 use crate::socks_handler::{read_location, write_location_to_vec, CMD_CONNECT, CMD_UDP_ASSOCIATE};
+use crate::stream_reader::StreamReader;
 use crate::tcp_handler::{
     TcpClientHandler, TcpClientSetupResult, TcpServerHandler, TcpServerSetupResult,
 };
@@ -74,12 +74,12 @@ impl TcpServerHandler for TrojanTcpHandler {
             ));
         }
 
-        let mut line_reader = LineReader::new_with_buffer_size(400);
+        let mut stream_reader = StreamReader::new_with_buffer_size(400);
 
         // read the entire line rather than exactly 56 bytes, so that we can masquerade as an HTTP server
         // and handle the request as if it were a HTTP request.
         // TODO: implement http response
-        let received_hash = line_reader.read_line_bytes(&mut server_stream).await?;
+        let received_hash = stream_reader.read_line_bytes(&mut server_stream).await?;
         if received_hash.len() != self.password_hash.len() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
@@ -100,7 +100,7 @@ impl TcpServerHandler for TrojanTcpHandler {
             }
         }
 
-        let command_type = line_reader.read_u8(&mut server_stream).await?;
+        let command_type = stream_reader.read_u8(&mut server_stream).await?;
 
         if command_type == CMD_UDP_ASSOCIATE {
             return Err(std::io::Error::new(
@@ -116,9 +116,9 @@ impl TcpServerHandler for TrojanTcpHandler {
             ));
         }
 
-        let remote_location = read_location(&mut server_stream, &mut line_reader).await?;
+        let remote_location = read_location(&mut server_stream, &mut stream_reader).await?;
 
-        let request_suffix = line_reader.read_u16_be(&mut server_stream).await?;
+        let request_suffix = stream_reader.read_u16_be(&mut server_stream).await?;
         if request_suffix != 0x0d0a {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
@@ -131,7 +131,7 @@ impl TcpServerHandler for TrojanTcpHandler {
             stream: server_stream,
             need_initial_flush: false,
             connection_success_response: None,
-            initial_remote_data: line_reader.unparsed_data_owned(),
+            initial_remote_data: stream_reader.unparsed_data_owned(),
             override_proxy_provider: NoneOrOne::Unspecified,
         })
     }

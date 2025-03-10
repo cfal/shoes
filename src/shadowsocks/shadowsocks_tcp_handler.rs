@@ -7,10 +7,10 @@ use tokio::io::AsyncWriteExt;
 
 use crate::address::NetLocation;
 use crate::async_stream::AsyncStream;
-use crate::line_reader::LineReader;
 use crate::option_util::NoneOrOne;
 use crate::salt_checker::SaltChecker;
 use crate::socks_handler::{read_location, write_location_to_vec};
+use crate::stream_reader::StreamReader;
 use crate::tcp_handler::{
     TcpClientHandler, TcpClientSetupResult, TcpServerHandler, TcpServerSetupResult,
 };
@@ -83,14 +83,14 @@ impl TcpServerHandler for ShadowsocksTcpHandler {
             self.salt_checker.clone(),
         );
 
-        let mut line_reader = LineReader::new_with_buffer_size(1024);
+        let mut stream_reader = StreamReader::new_with_buffer_size(1024);
 
         // We can do this in a blocking manner for the server, because we expect the client to
         // always send the location before we send anything.
-        let remote_location = read_location(&mut server_stream, &mut line_reader).await?;
+        let remote_location = read_location(&mut server_stream, &mut stream_reader).await?;
 
         if self.aead2022 {
-            let padding_len = line_reader.read_u16_be(&mut server_stream).await?;
+            let padding_len = stream_reader.read_u16_be(&mut server_stream).await?;
 
             if padding_len > 0 {
                 if padding_len > 900 {
@@ -99,7 +99,7 @@ impl TcpServerHandler for ShadowsocksTcpHandler {
                         format!("invalid padding length: {}", padding_len),
                     ));
                 }
-                line_reader
+                stream_reader
                     .read_slice(&mut server_stream, padding_len as usize)
                     .await?;
             }
@@ -111,7 +111,7 @@ impl TcpServerHandler for ShadowsocksTcpHandler {
             // we don't need an initial flush, let the IV be written when data actually arrives.
             need_initial_flush: false,
             connection_success_response: None,
-            initial_remote_data: line_reader.unparsed_data_owned(),
+            initial_remote_data: stream_reader.unparsed_data_owned(),
             override_proxy_provider: NoneOrOne::Unspecified,
         })
     }

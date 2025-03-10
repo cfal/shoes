@@ -6,8 +6,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::address::{Address, NetLocation};
 use crate::async_stream::AsyncStream;
-use crate::line_reader::LineReader;
 use crate::option_util::NoneOrOne;
+use crate::stream_reader::StreamReader;
 use crate::tcp_handler::{
     TcpClientHandler, TcpClientSetupResult, TcpServerHandler, TcpServerSetupResult,
 };
@@ -46,9 +46,9 @@ impl TcpServerHandler for SocksTcpServerHandler {
         &self,
         mut server_stream: Box<dyn AsyncStream>,
     ) -> std::io::Result<TcpServerSetupResult> {
-        let mut line_reader = LineReader::new_with_buffer_size(400);
+        let mut stream_reader = StreamReader::new_with_buffer_size(400);
 
-        let socks_version = line_reader.read_u8(&mut server_stream).await?;
+        let socks_version = stream_reader.read_u8(&mut server_stream).await?;
         if socks_version != VER_SOCKS5 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -56,7 +56,7 @@ impl TcpServerHandler for SocksTcpServerHandler {
             ));
         }
 
-        let method_len = line_reader.read_u8(&mut server_stream).await? as usize;
+        let method_len = stream_reader.read_u8(&mut server_stream).await? as usize;
         if method_len < 1 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -64,7 +64,7 @@ impl TcpServerHandler for SocksTcpServerHandler {
             ));
         }
 
-        let methods = line_reader
+        let methods = stream_reader
             .read_slice(&mut server_stream, method_len)
             .await?;
 
@@ -89,7 +89,7 @@ impl TcpServerHandler for SocksTcpServerHandler {
         write_all(&mut server_stream, &[VER_SOCKS5, supported_method]).await?;
 
         if let Some((target_username, target_password)) = self.auth_info.as_ref() {
-            let auth_version = line_reader.read_u8(&mut server_stream).await?;
+            let auth_version = stream_reader.read_u8(&mut server_stream).await?;
             if auth_version != VER_AUTH {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
@@ -97,7 +97,7 @@ impl TcpServerHandler for SocksTcpServerHandler {
                 ));
             }
 
-            let username_len = line_reader.read_u8(&mut server_stream).await? as usize;
+            let username_len = stream_reader.read_u8(&mut server_stream).await? as usize;
             if username_len == 0 {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
@@ -105,7 +105,7 @@ impl TcpServerHandler for SocksTcpServerHandler {
                 ));
             }
 
-            let username = line_reader
+            let username = stream_reader
                 .read_slice(&mut server_stream, username_len)
                 .await?;
 
@@ -127,7 +127,7 @@ impl TcpServerHandler for SocksTcpServerHandler {
                 ));
             }
 
-            let password_len = line_reader.read_u8(&mut server_stream).await? as usize;
+            let password_len = stream_reader.read_u8(&mut server_stream).await? as usize;
             if password_len == 0 {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
@@ -135,7 +135,7 @@ impl TcpServerHandler for SocksTcpServerHandler {
                 ));
             }
 
-            let password = line_reader
+            let password = stream_reader
                 .read_slice(&mut server_stream, password_len)
                 .await?;
 
@@ -159,7 +159,7 @@ impl TcpServerHandler for SocksTcpServerHandler {
             write_all(&mut server_stream, &[VER_AUTH, RESULT_SUCCESS]).await?;
         }
 
-        let connection_request = line_reader.read_slice(&mut server_stream, 3).await?;
+        let connection_request = stream_reader.read_slice(&mut server_stream, 3).await?;
         if connection_request[0] != VER_SOCKS5 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -200,7 +200,7 @@ impl TcpServerHandler for SocksTcpServerHandler {
             response_bytes.into_boxed_slice()
         });
 
-        let location = read_location(&mut server_stream, &mut line_reader).await?;
+        let location = read_location(&mut server_stream, &mut stream_reader).await?;
 
         Ok(TcpServerSetupResult::TcpForward {
             remote_location: location,
@@ -209,7 +209,7 @@ impl TcpServerHandler for SocksTcpServerHandler {
             connection_success_response: Some(
                 connection_success_response.to_vec().into_boxed_slice(),
             ),
-            initial_remote_data: line_reader.unparsed_data_owned(),
+            initial_remote_data: stream_reader.unparsed_data_owned(),
             override_proxy_provider: NoneOrOne::Unspecified,
         })
     }
@@ -264,9 +264,9 @@ impl TcpClientHandler for SocksTcpClientHandler {
         write_all(&mut client_stream, &location_bytes).await?;
         client_stream.flush().await?;
 
-        let mut line_reader = LineReader::new_with_buffer_size(400);
+        let mut stream_reader = StreamReader::new_with_buffer_size(400);
 
-        let socks_version = line_reader.read_u8(&mut client_stream).await?;
+        let socks_version = stream_reader.read_u8(&mut client_stream).await?;
         if socks_version != VER_SOCKS5 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -274,7 +274,7 @@ impl TcpClientHandler for SocksTcpClientHandler {
             ));
         }
 
-        let auth_method = line_reader.read_u8(&mut client_stream).await?;
+        let auth_method = stream_reader.read_u8(&mut client_stream).await?;
         if auth_method == METHOD_INVALID {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -284,7 +284,7 @@ impl TcpClientHandler for SocksTcpClientHandler {
 
         if self.has_auth {
             // read auth response
-            let auth_version = line_reader.read_u8(&mut client_stream).await?;
+            let auth_version = stream_reader.read_u8(&mut client_stream).await?;
             if auth_version != VER_AUTH {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
@@ -292,7 +292,7 @@ impl TcpClientHandler for SocksTcpClientHandler {
                 ));
             }
 
-            let auth_result = line_reader.read_u8(&mut client_stream).await?;
+            let auth_result = stream_reader.read_u8(&mut client_stream).await?;
             if auth_result != RESULT_SUCCESS {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
@@ -301,7 +301,7 @@ impl TcpClientHandler for SocksTcpClientHandler {
             }
         }
 
-        let socks_version = line_reader.read_u8(&mut client_stream).await?;
+        let socks_version = stream_reader.read_u8(&mut client_stream).await?;
         if socks_version != VER_SOCKS5 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -309,7 +309,7 @@ impl TcpClientHandler for SocksTcpClientHandler {
             ));
         }
 
-        let connect_response = line_reader.read_u8(&mut client_stream).await?;
+        let connect_response = stream_reader.read_u8(&mut client_stream).await?;
         if connect_response != RESULT_SUCCESS {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -320,7 +320,7 @@ impl TcpClientHandler for SocksTcpClientHandler {
             ));
         }
 
-        let reserved = line_reader.read_u8(&mut client_stream).await?;
+        let reserved = stream_reader.read_u8(&mut client_stream).await?;
         if reserved != 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -329,9 +329,9 @@ impl TcpClientHandler for SocksTcpClientHandler {
         }
 
         // Read the final location part of the connect response.
-        read_location(&mut client_stream, &mut line_reader).await?;
+        read_location(&mut client_stream, &mut stream_reader).await?;
 
-        let unparsed_data = line_reader.unparsed_data();
+        let unparsed_data = stream_reader.unparsed_data();
         if !unparsed_data.is_empty() {
             write_all(server_stream, unparsed_data).await?;
             server_stream.flush().await?;
@@ -343,12 +343,12 @@ impl TcpClientHandler for SocksTcpClientHandler {
 
 pub async fn read_location<T: AsyncReadExt + Unpin>(
     stream: &mut T,
-    line_reader: &mut LineReader,
+    stream_reader: &mut StreamReader,
 ) -> std::io::Result<NetLocation> {
-    let address_type = line_reader.read_u8(stream).await?;
+    let address_type = stream_reader.read_u8(stream).await?;
     match address_type {
         ADDR_TYPE_IPV4 => {
-            let address_bytes = line_reader.read_slice(stream, 6).await?;
+            let address_bytes = stream_reader.read_slice(stream, 6).await?;
 
             let v4addr = Ipv4Addr::new(
                 address_bytes[0],
@@ -362,7 +362,7 @@ pub async fn read_location<T: AsyncReadExt + Unpin>(
             Ok(NetLocation::new(Address::Ipv4(v4addr), port))
         }
         ADDR_TYPE_IPV6 => {
-            let address_bytes = line_reader.read_slice(stream, 18).await?;
+            let address_bytes = stream_reader.read_slice(stream, 18).await?;
 
             let v6addr = Ipv6Addr::new(
                 u16::from_be_bytes(address_bytes[0..2].try_into().unwrap()),
@@ -380,9 +380,9 @@ pub async fn read_location<T: AsyncReadExt + Unpin>(
             Ok(NetLocation::new(Address::Ipv6(v6addr), port))
         }
         ADDR_TYPE_DOMAIN_NAME => {
-            let address_len = line_reader.read_u8(stream).await? as usize;
+            let address_len = stream_reader.read_u8(stream).await? as usize;
 
-            let address_bytes = line_reader.read_slice(stream, address_len + 2).await?;
+            let address_bytes = stream_reader.read_slice(stream, address_len + 2).await?;
 
             let address_str = match std::str::from_utf8(&address_bytes[0..address_len]) {
                 Ok(s) => s,

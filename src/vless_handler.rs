@@ -6,8 +6,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::address::{Address, NetLocation};
 use crate::async_stream::AsyncStream;
-use crate::line_reader::LineReader;
 use crate::option_util::NoneOrOne;
+use crate::stream_reader::StreamReader;
 use crate::tcp_handler::{
     TcpClientHandler, TcpClientSetupResult, TcpServerHandler, TcpServerSetupResult,
 };
@@ -42,9 +42,9 @@ impl TcpServerHandler for VlessTcpServerHandler {
     ) -> std::io::Result<TcpServerSetupResult> {
         // this needs to be less than `read_buf` size in VlessMessageStream so that
         // feed_initial_data can handle the unparsed data.
-        let mut line_reader = LineReader::new_with_buffer_size(800);
+        let mut stream_reader = StreamReader::new_with_buffer_size(800);
 
-        let client_version = line_reader.read_u8(&mut server_stream).await?;
+        let client_version = stream_reader.read_u8(&mut server_stream).await?;
         if client_version != 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
@@ -55,7 +55,7 @@ impl TcpServerHandler for VlessTcpServerHandler {
             ));
         }
 
-        let target_id = line_reader.read_slice(&mut server_stream, 16).await?;
+        let target_id = stream_reader.read_slice(&mut server_stream, 16).await?;
         for (b1, b2) in self.user_id.iter().zip(target_id.iter()) {
             if b1 != b2 {
                 return Err(std::io::Error::new(
@@ -65,14 +65,14 @@ impl TcpServerHandler for VlessTcpServerHandler {
             }
         }
 
-        let addon_length = line_reader.read_u8(&mut server_stream).await?;
+        let addon_length = stream_reader.read_u8(&mut server_stream).await?;
         if addon_length > 0 {
-            line_reader
+            stream_reader
                 .read_slice(&mut server_stream, addon_length as usize)
                 .await?;
         }
 
-        let instruction = line_reader.read_u8(&mut server_stream).await?;
+        let instruction = stream_reader.read_u8(&mut server_stream).await?;
         let is_udp = match instruction {
             1 => {
                 // tcp
@@ -95,13 +95,13 @@ impl TcpServerHandler for VlessTcpServerHandler {
             }
         };
 
-        let port = line_reader.read_u16_be(&mut server_stream).await?;
+        let port = stream_reader.read_u16_be(&mut server_stream).await?;
 
-        let address_type = line_reader.read_u8(&mut server_stream).await?;
+        let address_type = stream_reader.read_u8(&mut server_stream).await?;
         let remote_location = match address_type {
             1 => {
                 // 4 byte ipv4 address
-                let address_bytes = line_reader.read_slice(&mut server_stream, 4).await?;
+                let address_bytes = stream_reader.read_slice(&mut server_stream, 4).await?;
                 let v4addr = Ipv4Addr::new(
                     address_bytes[0],
                     address_bytes[1],
@@ -112,8 +112,8 @@ impl TcpServerHandler for VlessTcpServerHandler {
             }
             2 => {
                 // domain name
-                let domain_name_len = line_reader.read_u8(&mut server_stream).await?;
-                let domain_name_bytes = line_reader
+                let domain_name_len = stream_reader.read_u8(&mut server_stream).await?;
+                let domain_name_bytes = stream_reader
                     .read_slice(&mut server_stream, domain_name_len as usize)
                     .await?;
 
@@ -134,7 +134,7 @@ impl TcpServerHandler for VlessTcpServerHandler {
             }
             3 => {
                 // 16 byte ipv6 address
-                let address_bytes = line_reader.read_slice(&mut server_stream, 16).await?;
+                let address_bytes = stream_reader.read_slice(&mut server_stream, 16).await?;
                 let v6addr = Ipv6Addr::new(
                     ((address_bytes[0] as u16) << 8) | (address_bytes[1] as u16),
                     ((address_bytes[2] as u16) << 8) | (address_bytes[3] as u16),
@@ -156,7 +156,7 @@ impl TcpServerHandler for VlessTcpServerHandler {
             }
         };
 
-        let unparsed_data = line_reader.unparsed_data();
+        let unparsed_data = stream_reader.unparsed_data();
 
         if !is_udp {
             Ok(TcpServerSetupResult::TcpForward {

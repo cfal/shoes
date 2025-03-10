@@ -17,10 +17,10 @@ use crate::address::{Address, NetLocation};
 use crate::async_stream::AsyncStream;
 use crate::client_proxy_selector::{ClientProxySelector, ConnectDecision};
 use crate::copy_bidirectional::copy_bidirectional_with_sizes;
-use crate::line_reader::LineReader;
 use crate::quic_stream::QuicStream;
 use crate::resolver::{resolve_single_address, Resolver};
 use crate::socket_util::new_socket2_udp_socket;
+use crate::stream_reader::StreamReader;
 use crate::tcp_client_connector::TcpClientConnector;
 use crate::tcp_server::setup_client_stream;
 
@@ -124,22 +124,22 @@ async fn auth_connection(
         })?;
 
     let mut recv_stream = connection.accept_uni().await?;
-    let mut line_reader = LineReader::new_with_buffer_size(80);
-    let tuic_version = line_reader.read_u8(&mut recv_stream).await?;
+    let mut stream_reader = StreamReader::new_with_buffer_size(80);
+    let tuic_version = stream_reader.read_u8(&mut recv_stream).await?;
     if tuic_version != 5 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::Other,
             format!("invalid tuic version: {}", tuic_version),
         ));
     }
-    let command_type = line_reader.read_u8(&mut recv_stream).await?;
+    let command_type = stream_reader.read_u8(&mut recv_stream).await?;
     if command_type != COMMAND_TYPE_AUTHENTICATE {
         return Err(std::io::Error::new(
             std::io::ErrorKind::Other,
             format!("invalid command type: {}", command_type),
         ));
     }
-    let specified_uuid = line_reader.read_slice(&mut recv_stream, 16).await?;
+    let specified_uuid = stream_reader.read_slice(&mut recv_stream, 16).await?;
     if specified_uuid != uuid {
         // TODO: pretty print
         return Err(std::io::Error::new(
@@ -147,7 +147,7 @@ async fn auth_connection(
             format!("incorrect uuid: {:?}", specified_uuid),
         ));
     }
-    let token_bytes = line_reader.read_slice(&mut recv_stream, 32).await?;
+    let token_bytes = stream_reader.read_slice(&mut recv_stream, 32).await?;
     if token_bytes != expected_token_bytes {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
@@ -195,16 +195,16 @@ async fn run_bidirectional_loop(
 
 async fn read_address(
     recv: &mut quinn::RecvStream,
-    line_reader: &mut LineReader,
+    stream_reader: &mut StreamReader,
 ) -> std::io::Result<Option<NetLocation>> {
-    let address_type = line_reader.read_u8(recv).await?;
+    let address_type = stream_reader.read_u8(recv).await?;
     let address = match address_type {
         0xff => {
             return Ok(None);
         }
         0x00 => {
-            let address_len = line_reader.read_u8(recv).await? as usize;
-            let address_bytes = line_reader.read_slice(recv, address_len).await?;
+            let address_len = stream_reader.read_u8(recv).await? as usize;
+            let address_bytes = stream_reader.read_slice(recv, address_len).await?;
             let address_str = str::from_utf8(address_bytes).map_err(|e| {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -217,13 +217,13 @@ async fn read_address(
             Address::from(address_str)?
         }
         0x01 => {
-            let ipv4_bytes = line_reader.read_slice(recv, 4).await?;
+            let ipv4_bytes = stream_reader.read_slice(recv, 4).await?;
             let ipv4_addr =
                 Ipv4Addr::new(ipv4_bytes[0], ipv4_bytes[1], ipv4_bytes[2], ipv4_bytes[3]);
             Address::Ipv4(ipv4_addr)
         }
         0x02 => {
-            let ipv6_bytes = line_reader.read_slice(recv, 16).await?;
+            let ipv6_bytes = stream_reader.read_slice(recv, 16).await?;
             let ipv6_bytes: [u8; 16] = ipv6_bytes.try_into().unwrap();
             let ipv6_addr = Ipv6Addr::from(ipv6_bytes);
             Address::Ipv6(ipv6_addr)
@@ -236,7 +236,7 @@ async fn read_address(
         }
     };
 
-    let port = line_reader.read_u16_be(recv).await?;
+    let port = stream_reader.read_u16_be(recv).await?;
 
     Ok(Some(NetLocation::new(address, port)))
 }
@@ -296,15 +296,15 @@ async fn process_tcp_stream(
     send: quinn::SendStream,
     mut recv: quinn::RecvStream,
 ) -> std::io::Result<()> {
-    let mut line_reader = LineReader::new_with_buffer_size(1024);
-    let tuic_version = line_reader.read_u8(&mut recv).await?;
+    let mut stream_reader = StreamReader::new_with_buffer_size(1024);
+    let tuic_version = stream_reader.read_u8(&mut recv).await?;
     if tuic_version != 5 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::Other,
             format!("invalid tuic version: {}", tuic_version),
         ));
     }
-    let command_type = line_reader.read_u8(&mut recv).await?;
+    let command_type = stream_reader.read_u8(&mut recv).await?;
     if command_type != COMMAND_TYPE_CONNECT {
         return Err(std::io::Error::new(
             std::io::ErrorKind::Other,
@@ -312,7 +312,7 @@ async fn process_tcp_stream(
         ));
     }
 
-    let remote_location = read_address(&mut recv, &mut line_reader)
+    let remote_location = read_address(&mut recv, &mut stream_reader)
         .await?
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "empty address"))?;
 
@@ -353,7 +353,7 @@ async fn process_tcp_stream(
         }
     };
 
-    let unparsed_data = line_reader.unparsed_data();
+    let unparsed_data = stream_reader.unparsed_data();
     let client_requires_flush = if unparsed_data.is_empty() {
         false
     } else {
@@ -368,7 +368,7 @@ async fn process_tcp_stream(
         }
         true
     };
-    drop(line_reader);
+    drop(stream_reader);
 
     // unlike tokio's implementation, we read as much as possible to fill up the
     // buffer size before sending. reduce the buffer sizes compared to tcp -> tcp.
@@ -758,23 +758,23 @@ async fn process_udp_recv_stream(
     mut recv_stream: quinn::RecvStream,
     udp_session_map: UdpSessionMap,
 ) -> std::io::Result<()> {
-    let mut line_reader = LineReader::new_with_buffer_size(MAX_HEADER_LEN + 65535);
+    let mut stream_reader = StreamReader::new_with_buffer_size(MAX_HEADER_LEN + 65535);
 
     // we assume that all fragments of a single packet will be sent through the same stream to
     // prevent unnecessary locking.
     let mut fragments: FxHashMap<u16, FragmentedPacket> = FxHashMap::default();
 
     loop {
-        let tuic_version = line_reader.read_u8(&mut recv_stream).await?;
+        let tuic_version = stream_reader.read_u8(&mut recv_stream).await?;
         if tuic_version != 5 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
                 format!("invalid tuic version: {}", tuic_version),
             ));
         }
-        let command_type = line_reader.read_u8(&mut recv_stream).await?;
+        let command_type = stream_reader.read_u8(&mut recv_stream).await?;
         if command_type == COMMAND_TYPE_DISSOCIATE {
-            let assoc_id = line_reader.read_u16_be(&mut recv_stream).await?;
+            let assoc_id = stream_reader.read_u16_be(&mut recv_stream).await?;
             let removed_session = udp_session_map.remove(&assoc_id);
             if removed_session.is_none() {
                 error!("UDP session {} not found to dissociate", assoc_id);
@@ -787,14 +787,14 @@ async fn process_udp_recv_stream(
             ));
         }
 
-        let assoc_id = line_reader.read_u16_be(&mut recv_stream).await?;
-        let packet_id = line_reader.read_u16_be(&mut recv_stream).await?;
-        let frag_total = line_reader.read_u8(&mut recv_stream).await?;
-        let frag_id = line_reader.read_u8(&mut recv_stream).await?;
-        let payload_size = line_reader.read_u16_be(&mut recv_stream).await?;
-        let remote_location = read_address(&mut recv_stream, &mut line_reader).await?;
+        let assoc_id = stream_reader.read_u16_be(&mut recv_stream).await?;
+        let packet_id = stream_reader.read_u16_be(&mut recv_stream).await?;
+        let frag_total = stream_reader.read_u8(&mut recv_stream).await?;
+        let frag_id = stream_reader.read_u8(&mut recv_stream).await?;
+        let payload_size = stream_reader.read_u16_be(&mut recv_stream).await?;
+        let remote_location = read_address(&mut recv_stream, &mut stream_reader).await?;
 
-        let payload_fragment = line_reader
+        let payload_fragment = stream_reader
             .read_slice(&mut recv_stream, payload_size as usize)
             .await?;
 

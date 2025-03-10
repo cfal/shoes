@@ -5,8 +5,8 @@ use tokio::io::AsyncWriteExt;
 
 use crate::address::{Address, NetLocation};
 use crate::async_stream::AsyncStream;
-use crate::line_reader::LineReader;
 use crate::option_util::NoneOrOne;
+use crate::stream_reader::StreamReader;
 use crate::tcp_handler::{
     TcpClientHandler, TcpClientSetupResult, TcpServerHandler, TcpServerSetupResult,
 };
@@ -41,9 +41,9 @@ impl TcpServerHandler for HttpTcpServerHandler {
         &self,
         mut server_stream: Box<dyn AsyncStream>,
     ) -> std::io::Result<TcpServerSetupResult> {
-        let mut line_reader = LineReader::new();
+        let mut stream_reader = StreamReader::new();
 
-        let line = line_reader.read_line(&mut server_stream).await?;
+        let line = stream_reader.read_line(&mut server_stream).await?;
         if !line.ends_with(" HTTP/1.0") && !line.ends_with(" HTTP/1.1") {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -79,7 +79,7 @@ impl TcpServerHandler for HttpTcpServerHandler {
                 let mut need_auth = self.auth_token.is_some();
 
                 loop {
-                    let line = line_reader.read_line(&mut server_stream).await?;
+                    let line = stream_reader.read_line(&mut server_stream).await?;
                     if line.is_empty() {
                         break;
                     }
@@ -128,7 +128,7 @@ impl TcpServerHandler for HttpTcpServerHandler {
                 (
                     remote_location,
                     connection_success_response,
-                    line_reader.unparsed_data_owned(),
+                    stream_reader.unparsed_data_owned(),
                     true,
                 )
             } else {
@@ -183,7 +183,7 @@ impl TcpServerHandler for HttpTcpServerHandler {
                 let mut need_auth = self.auth_token.is_some();
 
                 loop {
-                    let line = line_reader.read_line(&mut server_stream).await?;
+                    let line = stream_reader.read_line(&mut server_stream).await?;
                     if line.is_empty() {
                         break;
                     }
@@ -255,7 +255,7 @@ impl TcpServerHandler for HttpTcpServerHandler {
 
                 let request_bytes = request.into_bytes();
 
-                let unparsed_data = line_reader.unparsed_data();
+                let unparsed_data = stream_reader.unparsed_data();
 
                 let mut initial_remote_data =
                     Vec::with_capacity(request_bytes.len() + unparsed_data.len());
@@ -329,8 +329,8 @@ impl TcpClientHandler for HttpTcpClientHandler {
         client_stream.write_all(&connect_str.into_bytes()).await?;
         client_stream.flush().await?;
 
-        let mut line_reader = LineReader::new();
-        let line = line_reader.read_line(&mut client_stream).await?;
+        let mut stream_reader = StreamReader::new();
+        let line = stream_reader.read_line(&mut client_stream).await?;
 
         // Expected response: HTTP/1.1 200 Connection established\r\n\r\n
         if !line.starts_with("HTTP/1.1 200") && !line.starts_with("HTTP/1.0 200") {
@@ -341,13 +341,13 @@ impl TcpClientHandler for HttpTcpClientHandler {
         }
 
         loop {
-            let line = line_reader.read_line(&mut client_stream).await?;
+            let line = stream_reader.read_line(&mut client_stream).await?;
             if line.is_empty() {
                 break;
             }
         }
 
-        let unparsed_data = line_reader.unparsed_data();
+        let unparsed_data = stream_reader.unparsed_data();
         if !unparsed_data.is_empty() {
             server_stream.write_all(unparsed_data).await?;
             server_stream.flush().await?;

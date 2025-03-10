@@ -6,8 +6,8 @@ use crate::address::NetLocation;
 use crate::async_stream::AsyncStream;
 use crate::client_proxy_selector::ClientProxySelector;
 use crate::config::WebsocketPingType;
-use crate::line_reader::LineReader;
 use crate::option_util::NoneOrOne;
+use crate::stream_reader::StreamReader;
 use crate::tcp_client_connector::TcpClientConnector;
 use crate::tcp_handler::{
     TcpClientHandler, TcpClientSetupResult, TcpServerHandler, TcpServerSetupResult,
@@ -46,7 +46,7 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
         let ParsedHttpData {
             mut first_line,
             headers: mut request_headers,
-            line_reader,
+            stream_reader,
         } = ParsedHttpData::parse(&mut server_stream).await?;
         let request_path = {
             if !first_line.ends_with(" HTTP/1.0") && !first_line.ends_with(" HTTP/1.1") {
@@ -129,7 +129,7 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
                 server_stream,
                 false,
                 ping_type.clone(),
-                line_reader.unparsed_data(),
+                stream_reader.unparsed_data(),
             ));
 
             let mut target_setup_result = handler.setup_server_stream(websocket_stream).await;
@@ -216,7 +216,7 @@ impl TcpClientHandler for WebsocketTcpClientHandler {
         let ParsedHttpData {
             first_line,
             headers: response_headers,
-            line_reader,
+            stream_reader,
         } = ParsedHttpData::parse(&mut client_stream).await?;
 
         if !first_line.starts_with("HTTP/1.1 101") && !first_line.starts_with("HTTP/1.0 101") {
@@ -251,7 +251,7 @@ impl TcpClientHandler for WebsocketTcpClientHandler {
             client_stream,
             true,
             self.ping_type.clone(),
-            line_reader.unparsed_data(),
+            stream_reader.unparsed_data(),
         ));
         self.handler
             .setup_client_stream(server_stream, websocket_stream, remote_location)
@@ -262,18 +262,18 @@ impl TcpClientHandler for WebsocketTcpClientHandler {
 struct ParsedHttpData {
     first_line: String,
     headers: HashMap<String, String>,
-    line_reader: LineReader,
+    stream_reader: StreamReader,
 }
 
 impl ParsedHttpData {
     async fn parse(stream: &mut Box<dyn AsyncStream>) -> std::io::Result<Self> {
-        let mut line_reader = LineReader::new();
+        let mut stream_reader = StreamReader::new();
         let mut first_line: Option<String> = None;
         let mut headers: HashMap<String, String> = HashMap::new();
 
         let mut line_count = 0;
         loop {
-            let line = line_reader.read_line(stream).await?;
+            let line = stream_reader.read_line(stream).await?;
             if line.is_empty() {
                 break;
             }
@@ -315,7 +315,7 @@ impl ParsedHttpData {
         Ok(Self {
             first_line,
             headers,
-            line_reader,
+            stream_reader,
         })
     }
 }

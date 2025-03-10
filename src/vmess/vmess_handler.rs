@@ -23,8 +23,8 @@ use super::typed::{Aes128CfbDec, Aes128CfbEnc};
 use super::vmess_stream::{ReadHeaderInfo, VmessStream};
 use crate::address::{Address, NetLocation};
 use crate::async_stream::AsyncStream;
-use crate::line_reader::LineReader;
 use crate::option_util::NoneOrOne;
+use crate::stream_reader::StreamReader;
 use crate::tcp_handler::{
     TcpClientHandler, TcpClientSetupResult, TcpServerHandler, TcpServerSetupResult,
 };
@@ -150,10 +150,10 @@ impl TcpServerHandler for VmessTcpServerHandler {
         &self,
         mut server_stream: Box<dyn AsyncStream>,
     ) -> std::io::Result<TcpServerSetupResult> {
-        let mut line_reader = LineReader::new_with_buffer_size(8192);
+        let mut stream_reader = StreamReader::new_with_buffer_size(8192);
 
         let mut cert_hash = [0u8; 16];
-        line_reader
+        stream_reader
             .read_slice_into(&mut server_stream, &mut cert_hash)
             .await?;
 
@@ -186,12 +186,12 @@ impl TcpServerHandler for VmessTcpServerHandler {
             }
 
             let mut encrypted_payload_length = [0u8; 18];
-            line_reader
+            stream_reader
                 .read_slice_into(&mut server_stream, &mut encrypted_payload_length)
                 .await?;
 
             let mut nonce = [0u8; 8];
-            line_reader
+            stream_reader
                 .read_slice_into(&mut server_stream, &mut nonce)
                 .await?;
 
@@ -240,7 +240,7 @@ impl TcpServerHandler for VmessTcpServerHandler {
             let mut encrypted_header =
                 allocate_vec(payload_length as usize + TAG_LEN).into_boxed_slice();
 
-            line_reader
+            stream_reader
                 .read_slice_into(&mut server_stream, &mut encrypted_header)
                 .await?;
 
@@ -302,7 +302,7 @@ impl TcpServerHandler for VmessTcpServerHandler {
 
         let mut instructions_to_addr_type = [0u8; 41];
         header_reader
-            .read_slice_into(&mut line_reader, &mut instructions_to_addr_type)
+            .read_slice_into(&mut stream_reader, &mut instructions_to_addr_type)
             .await?;
         fnv_hasher.write(&instructions_to_addr_type);
 
@@ -320,7 +320,7 @@ impl TcpServerHandler for VmessTcpServerHandler {
                 // 4 byte ipv4 address
                 let mut address_bytes = [0u8; 4];
                 header_reader
-                    .read_slice_into(&mut line_reader, &mut address_bytes)
+                    .read_slice_into(&mut stream_reader, &mut address_bytes)
                     .await?;
                 fnv_hasher.write(&address_bytes);
 
@@ -336,13 +336,13 @@ impl TcpServerHandler for VmessTcpServerHandler {
                 // domain name
                 let mut domain_name_len = [0u8; 1];
                 header_reader
-                    .read_slice_into(&mut line_reader, &mut domain_name_len)
+                    .read_slice_into(&mut stream_reader, &mut domain_name_len)
                     .await?;
                 fnv_hasher.write(&domain_name_len);
 
                 let mut domain_name_bytes = allocate_vec(domain_name_len[0] as usize);
                 header_reader
-                    .read_slice_into(&mut line_reader, &mut domain_name_bytes)
+                    .read_slice_into(&mut stream_reader, &mut domain_name_bytes)
                     .await?;
                 fnv_hasher.write(&domain_name_bytes);
 
@@ -365,7 +365,7 @@ impl TcpServerHandler for VmessTcpServerHandler {
                 // 16 byte ipv6 address
                 let mut address_bytes = [0u8; 16];
                 header_reader
-                    .read_slice_into(&mut line_reader, &mut address_bytes)
+                    .read_slice_into(&mut stream_reader, &mut address_bytes)
                     .await?;
                 fnv_hasher.write(&address_bytes);
 
@@ -394,14 +394,14 @@ impl TcpServerHandler for VmessTcpServerHandler {
         if margin_len > 0 {
             let mut margin_bytes = allocate_vec(margin_len as usize).into_boxed_slice();
             header_reader
-                .read_slice_into(&mut line_reader, &mut margin_bytes)
+                .read_slice_into(&mut stream_reader, &mut margin_bytes)
                 .await?;
             fnv_hasher.write(&margin_bytes);
         }
 
         let mut check_bytes = [0u8; 4];
         header_reader
-            .read_slice_into(&mut line_reader, &mut check_bytes)
+            .read_slice_into(&mut stream_reader, &mut check_bytes)
             .await?;
 
         let expected_check_value = u32::from_be_bytes(check_bytes[0..4].try_into().unwrap());
@@ -634,7 +634,7 @@ impl TcpServerHandler for VmessTcpServerHandler {
             None,
         );
 
-        let unparsed_data = line_reader.unparsed_data();
+        let unparsed_data = stream_reader.unparsed_data();
         if !unparsed_data.is_empty() {
             vmess_stream.feed_initial_read_data(unparsed_data)?;
         }
@@ -670,11 +670,13 @@ enum HeaderReader {
 impl HeaderReader {
     async fn read_slice_into(
         &mut self,
-        line_reader: &mut LineReader,
+        stream_reader: &mut StreamReader,
         data: &mut [u8],
     ) -> std::io::Result<()> {
         match self {
-            HeaderReader::AesCfb(ref mut reader) => reader.read_slice_into(line_reader, data).await,
+            HeaderReader::AesCfb(ref mut reader) => {
+                reader.read_slice_into(stream_reader, data).await
+            }
             HeaderReader::Aead(ref mut reader) => reader.read_slice_into(data),
         }
     }
@@ -695,10 +697,10 @@ struct AesCfbHeaderReader {
 impl AesCfbHeaderReader {
     async fn read_slice_into(
         &mut self,
-        line_reader: &mut LineReader,
+        stream_reader: &mut StreamReader,
         data: &mut [u8],
     ) -> std::io::Result<()> {
-        line_reader
+        stream_reader
             .read_slice_into(&mut self.server_stream, data)
             .await?;
         self.request_cipher.clone().decrypt(data);
