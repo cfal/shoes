@@ -117,7 +117,15 @@ impl TcpServerHandler for ShadowTlsServerHandler {
             client_hello_digest_end_index,
             client_reader,
             requested_server_name,
+            supports_tls13: client_supports_tls13,
         } = read_client_hello(&mut server_stream).await?;
+
+        if !client_supports_tls13 {
+            return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "client does not support TLS1.3",
+            ));
+        }
 
         let (target, allow_user_specified) = match requested_server_name {
             None => match self.default_target {
@@ -239,6 +247,7 @@ struct ParsedClientHello {
     client_hello_digest_end_index: usize,
     client_reader: LineReader,
     requested_server_name: Option<String>,
+    supports_tls13: bool,
 }
 
 #[inline]
@@ -377,13 +386,6 @@ async fn read_client_hello(
         }
     }
 
-    if !client_supports_tls13 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "client does not support TLS1.3",
-        ));
-    }
-
     let mut client_hello_frame =
         Vec::with_capacity(client_tls_header_bytes.len() + client_payload_bytes.len());
     client_hello_frame.extend_from_slice(&client_tls_header_bytes);
@@ -396,6 +398,7 @@ async fn read_client_hello(
         client_hello_digest_end_index: TLS_HEADER_LEN + post_session_id_index,
         client_reader,
         requested_server_name,
+        supports_tls13: client_supports_tls13,
     })
 }
 
