@@ -80,22 +80,22 @@ pub fn create_tcp_server_handler(
             shadowsocks,
         } => Box::new(TrojanTcpHandler::new(&password, &shadowsocks)),
         ServerProxyConfig::Tls {
-            targets,
-            default_target,
+            tls_targets,
+            default_tls_target,
             shadowtls_targets,
         } => {
-            let mut targets = targets
+            let mut all_targets = tls_targets
                 .into_iter()
                 .map(|(sni, config)| (sni, create_tls_server_target(config, rules_stack)))
                 .collect::<HashMap<String, TlsServerTarget>>();
-            let default_target =
-                default_target.map(|config| create_tls_server_target(*config, rules_stack));
+            let default_tls_target =
+                default_tls_target.map(|config| create_tls_server_target(*config, rules_stack));
             let shadowtls_targets = shadowtls_targets
                 .into_iter()
                 .map(|(sni, config)| (sni, create_shadow_tls_server_target(config, rules_stack)))
                 .collect::<HashMap<String, TlsServerTarget>>();
-            targets.extend(shadowtls_targets);
-            Box::new(TlsServerHandler::new(targets, default_target))
+            all_targets.extend(shadowtls_targets);
+            Box::new(TlsServerHandler::new(all_targets, default_tls_target))
         }
         ServerProxyConfig::Vmess {
             cipher,
@@ -190,7 +190,7 @@ fn create_tls_server_target(
         rules_stack.pop().unwrap();
     }
 
-    TlsServerTarget::TLS {
+    TlsServerTarget::Tls {
         server_config,
         handler,
         override_proxy_provider,
@@ -212,8 +212,8 @@ fn create_shadow_tls_server_target(
         ShadowTlsServerHandshakeConfig::Local {
             cert,
             key,
-            client_ca_certs,
             alpn_protocols,
+            client_ca_certs,
             client_fingerprints,
         } => {
             // TODO: do this asynchronously
@@ -285,7 +285,7 @@ fn create_shadow_tls_server_target(
         rules_stack.pop().unwrap();
     }
 
-    TlsServerTarget::ShadowTLS(ShadowTlsServerTarget::new(
+    TlsServerTarget::ShadowTls(ShadowTlsServerTarget::new(
         password,
         target_handshake,
         handler,

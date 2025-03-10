@@ -62,10 +62,10 @@ impl Default for TcpConfig {
 pub struct ServerQuicConfig {
     pub cert: String,
     pub key: String,
-    #[serde(alias = "client_ca_cert", default)]
-    pub client_ca_certs: NoneOrSome<String>,
     #[serde(alias = "alpn_protocol", default)]
     pub alpn_protocols: NoneOrSome<String>,
+    #[serde(alias = "client_ca_cert", default)]
+    pub client_ca_certs: NoneOrSome<String>,
     #[serde(alias = "client_fingerprint", default)]
     pub client_fingerprints: NoneOrSome<String>,
     // num_endpoints of 0 will use the number of threads as the default value.
@@ -169,10 +169,10 @@ pub enum ShadowTlsServerHandshakeConfig {
     Local {
         cert: String,
         key: String,
-        #[serde(alias = "client_ca_cert", default)]
-        client_ca_certs: NoneOrSome<String>,
         #[serde(alias = "alpn_protocol", default)]
         alpn_protocols: NoneOrSome<String>,
+        #[serde(alias = "client_ca_cert", default)]
+        client_ca_certs: NoneOrSome<String>,
         #[serde(alias = "client_fingerprint", default)]
         client_fingerprints: NoneOrSome<String>,
     },
@@ -247,10 +247,12 @@ pub enum ServerProxyConfig {
         shadowsocks: Option<ShadowsocksConfig>,
     },
     Tls {
-        #[serde(default, alias = "sni_targets")]
-        targets: HashMap<String, TlsServerConfig>,
-        #[serde(default)]
-        default_target: Option<Box<TlsServerConfig>>,
+        // sni_targets is the previous field name
+        #[serde(default, alias = "sni_targets", alias = "targets")]
+        tls_targets: HashMap<String, TlsServerConfig>,
+        // default_target is the previous field name
+        #[serde(default, alias = "default_target")]
+        default_tls_target: Option<Box<TlsServerConfig>>,
         #[serde(default)]
         shadowtls_targets: HashMap<String, ShadowTlsServerConfig>,
     },
@@ -294,11 +296,11 @@ impl std::fmt::Display for ServerProxyConfig {
                 Self::Vless { .. } => "Vless",
                 Self::Trojan { .. } => "Trojan",
                 Self::Tls {
-                    targets,
-                    default_target,
+                    tls_targets,
+                    default_tls_target,
                     shadowtls_targets,
                 } => {
-                    let has_tls = !targets.is_empty() || !default_target.is_none();
+                    let has_tls = !tls_targets.is_empty() || !default_tls_target.is_none();
                     let has_shadowtls = !shadowtls_targets.is_empty();
                     if has_tls && has_shadowtls {
                         "TLS+ShadowTLSv3"
@@ -912,11 +914,11 @@ fn validate_server_proxy_config(
             parse_uuid(user_id)?;
         }
         ServerProxyConfig::Tls {
-            targets,
-            default_target,
+            tls_targets,
+            default_tls_target,
             shadowtls_targets,
         } => {
-            for (_, tls_server_config) in targets.iter_mut() {
+            for (_, tls_server_config) in tls_targets.iter_mut() {
                 let TlsServerConfig {
                     ref mut protocol,
                     ref mut override_rules,
@@ -934,7 +936,7 @@ fn validate_server_proxy_config(
                     validate_rule_config(rule_config_selection.unwrap_config_mut(), client_groups)?;
                 }
             }
-            if let Some(tls_server_config) = default_target {
+            if let Some(tls_server_config) = default_tls_target {
                 let TlsServerConfig {
                     ref mut protocol,
                     ref mut override_rules,
@@ -949,7 +951,7 @@ fn validate_server_proxy_config(
                 }
             }
             for (sni_hostname, tls_server_config) in shadowtls_targets.iter_mut() {
-                if targets.contains_key(sni_hostname) {
+                if tls_targets.contains_key(sni_hostname) {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
                         format!(
