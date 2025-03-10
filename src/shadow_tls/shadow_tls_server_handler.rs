@@ -82,6 +82,7 @@ const TLS_FRAME_MAX_LEN: usize = TLS_HEADER_LEN + 65535;
 const CONTENT_TYPE_HANDSHAKE: u8 = 0x16;
 const CONTENT_TYPE_APPLICATION_DATA: u8 = 0x17;
 
+#[inline]
 pub async fn setup_shadowtls_server_stream(
     server_stream: Box<dyn AsyncStream>,
     target: &ShadowTlsServerTarget,
@@ -90,6 +91,10 @@ pub async fn setup_shadowtls_server_stream(
 ) -> std::io::Result<TcpServerSetupResult> {
     let ParsedClientHello {
         client_hello_frame,
+        client_hello_record_legacy_version_major,
+        client_hello_record_legacy_version_minor,
+        client_hello_content_version_major,
+        client_hello_content_version_minor,
         client_hello_digest,
         client_hello_digest_start_index,
         client_hello_digest_end_index,
@@ -102,6 +107,28 @@ pub async fn setup_shadowtls_server_stream(
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "client does not support TLS1.3",
+        ));
+    }
+
+    if client_hello_record_legacy_version_major != 3
+        || client_hello_record_legacy_version_minor != 1
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "expected client TLS record protocol 1.0 (major/minor 3.1), got major/minor {}.{}",
+                client_hello_record_legacy_version_major, client_hello_record_legacy_version_minor
+            ),
+        ));
+    }
+
+    if client_hello_content_version_major != 3 || client_hello_content_version_minor != 3 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "expected client TLS content protocol 1.2 (major/minor 3.3), got major/minor {}.{}",
+                client_hello_content_version_major, client_hello_content_version_minor
+            ),
         ));
     }
 
@@ -175,6 +202,10 @@ pub async fn setup_shadowtls_server_stream(
 
 pub struct ParsedClientHello {
     pub client_hello_frame: Vec<u8>,
+    pub client_hello_record_legacy_version_major: u8,
+    pub client_hello_record_legacy_version_minor: u8,
+    pub client_hello_content_version_major: u8,
+    pub client_hello_content_version_minor: u8,
     pub client_hello_digest: Vec<u8>,
     pub client_hello_digest_start_index: usize,
     pub client_hello_digest_end_index: usize,
@@ -203,15 +234,6 @@ pub async fn read_client_hello(
 
     let client_legacy_version_major = client_tls_header_bytes[1];
     let client_legacy_version_minor = client_tls_header_bytes[2];
-    if client_legacy_version_major != 3 || client_legacy_version_minor != 1 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!(
-                "expected client TLS record protocol 1.0 (major/minor 3.1), got major/minor {}.{}",
-                client_legacy_version_major, client_legacy_version_minor
-            ),
-        ));
-    }
 
     let client_payload_size =
         u16::from_be_bytes([client_tls_header_bytes[3], client_tls_header_bytes[4]]);
@@ -231,12 +253,6 @@ pub async fn read_client_hello(
 
     let client_version_major = client_hello.read_u8()?;
     let client_version_minor = client_hello.read_u8()?;
-    if client_version_major != 3 || client_version_minor != 3 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "expected TLS 1.2",
-        ));
-    }
 
     // skip client random
     client_hello.skip(32)?;
@@ -326,6 +342,10 @@ pub async fn read_client_hello(
 
     Ok(ParsedClientHello {
         client_hello_frame,
+        client_hello_record_legacy_version_major: client_legacy_version_major,
+        client_hello_record_legacy_version_minor: client_legacy_version_minor,
+        client_hello_content_version_major: client_version_major,
+        client_hello_content_version_minor: client_version_minor,
         client_hello_digest,
         client_hello_digest_start_index: TLS_HEADER_LEN + post_session_id_index - 4,
         client_hello_digest_end_index: TLS_HEADER_LEN + post_session_id_index,
@@ -375,7 +395,10 @@ async fn parse_server_hello(server_hello_frame: &[u8]) -> std::io::Result<Parsed
     if server_version_major != 3 || server_version_minor != 3 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            "expected TLS 1.2",
+            format!(
+                "expected TLS 1.2 (major/minor 3.3), got major/minor {}.{}",
+                server_version_major, server_version_minor
+            ),
         ));
     }
 
