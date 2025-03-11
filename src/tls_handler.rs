@@ -24,6 +24,7 @@ pub struct TlsServerHandler {
     default_target: Option<TlsServerTarget>,
     // used to resolve handshake server hostnames
     shadowtls_resolver: Arc<dyn Resolver>,
+    tls_buffer_size: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -40,11 +41,13 @@ impl TlsServerHandler {
     pub fn new(
         sni_targets: FxHashMap<String, TlsServerTarget>,
         default_target: Option<TlsServerTarget>,
+        tls_buffer_size: Option<usize>,
     ) -> Self {
         Self {
             sni_targets,
             default_target,
             shadowtls_resolver: Arc::new(NativeResolver::new()),
+            tls_buffer_size,
         }
     }
 }
@@ -98,7 +101,9 @@ impl TcpServerHandler for TlsServerHandler {
                     let mut accept_error: Option<std::io::Error> = None;
 
                     let accept_future = tls_acceptor.accept_with(server_stream, |server_conn| {
-                        server_conn.set_buffer_limit(Some(32768));
+                        if let Some(size) = self.tls_buffer_size {
+                            server_conn.set_buffer_limit(Some(size));
+                        }
 
                         if let Err(e) = feed_server_connection(server_conn, &client_hello_frame) {
                             let _ = accept_error.insert(std::io::Error::new(
@@ -165,6 +170,7 @@ impl TcpServerHandler for TlsServerHandler {
 #[derive(Debug)]
 pub struct TlsClientHandler {
     pub client_config: Arc<rustls::ClientConfig>,
+    pub tls_buffer_size: Option<usize>,
     pub server_name: rustls::pki_types::ServerName<'static>,
     pub handler: Box<dyn TcpClientHandler>,
 }
@@ -172,11 +178,13 @@ pub struct TlsClientHandler {
 impl TlsClientHandler {
     pub fn new(
         client_config: Arc<rustls::ClientConfig>,
+        tls_buffer_size: Option<usize>,
         server_name: rustls::pki_types::ServerName<'static>,
         handler: Box<dyn TcpClientHandler>,
     ) -> Self {
         Self {
             client_config,
+            tls_buffer_size,
             server_name,
             handler,
         }
@@ -195,7 +203,9 @@ impl TcpClientHandler for TlsClientHandler {
         let tls_stream = Box::new(
             connector
                 .connect_with(self.server_name.clone(), client_stream, |client_conn| {
-                    client_conn.set_buffer_limit(Some(32768));
+                    if let Some(size) = self.tls_buffer_size {
+                        client_conn.set_buffer_limit(Some(size));
+                    }
                 })
                 .await?,
         );

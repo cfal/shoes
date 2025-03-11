@@ -8,6 +8,8 @@ use crate::option_util::{NoneOrOne, NoneOrSome, OneOrSome};
 use crate::thread_util::get_num_threads;
 use crate::util::parse_uuid;
 
+const MIN_TLS_BUFFER_SIZE: usize = 16 * 1024;
+
 fn default_true() -> bool {
     true
 }
@@ -255,6 +257,9 @@ pub enum ServerProxyConfig {
         default_tls_target: Option<Box<TlsServerConfig>>,
         #[serde(default)]
         shadowtls_targets: HashMap<String, ShadowTlsServerConfig>,
+
+        #[serde(default)]
+        tls_buffer_size: Option<usize>,
     },
     Vmess {
         cipher: String,
@@ -299,6 +304,7 @@ impl std::fmt::Display for ServerProxyConfig {
                     tls_targets,
                     default_tls_target,
                     shadowtls_targets,
+                    ..
                 } => {
                     let has_tls = !tls_targets.is_empty() || !default_tls_target.is_none();
                     let has_shadowtls = !shadowtls_targets.is_empty();
@@ -518,6 +524,8 @@ pub struct TlsClientConfig {
     pub sni_hostname: NoneOrOne<String>,
     #[serde(alias = "alpn_protocol", default)]
     pub alpn_protocols: NoneOrSome<String>,
+    #[serde(default)]
+    pub tls_buffer_size: Option<usize>,
     #[serde(default)]
     pub key: Option<String>,
     #[serde(default)]
@@ -917,6 +925,7 @@ fn validate_server_proxy_config(
             tls_targets,
             default_tls_target,
             shadowtls_targets,
+            tls_buffer_size,
         } => {
             for (_, tls_server_config) in tls_targets.iter_mut() {
                 let TlsServerConfig {
@@ -981,6 +990,15 @@ fn validate_server_proxy_config(
 
                 for rule_config_selection in override_rules.iter_mut() {
                     validate_rule_config(rule_config_selection.unwrap_config_mut(), client_groups)?;
+                }
+            }
+
+            if let Some(size) = tls_buffer_size {
+                if *size < MIN_TLS_BUFFER_SIZE {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("TLS buffer size must be at least {}", MIN_TLS_BUFFER_SIZE),
+                    ));
                 }
             }
         }

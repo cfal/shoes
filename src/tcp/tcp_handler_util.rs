@@ -83,6 +83,7 @@ pub fn create_tcp_server_handler(
             tls_targets,
             default_tls_target,
             shadowtls_targets,
+            tls_buffer_size,
         } => {
             let mut all_targets = tls_targets
                 .into_iter()
@@ -95,7 +96,11 @@ pub fn create_tcp_server_handler(
                 .map(|(sni, config)| (sni, create_shadow_tls_server_target(config, rules_stack)))
                 .collect::<FxHashMap<String, TlsServerTarget>>();
             all_targets.extend(shadowtls_targets);
-            Box::new(TlsServerHandler::new(all_targets, default_tls_target))
+            Box::new(TlsServerHandler::new(
+                all_targets,
+                default_tls_target,
+                tls_buffer_size,
+            ))
         }
         ServerProxyConfig::Vmess {
             cipher,
@@ -384,6 +389,7 @@ pub fn create_tcp_client_handler(
                 server_fingerprints,
                 sni_hostname,
                 alpn_protocols,
+                tls_buffer_size,
                 protocol,
                 key,
                 cert,
@@ -431,7 +437,12 @@ pub fn create_tcp_client_handler(
 
             let handler = create_tcp_client_handler(*protocol, None);
 
-            Box::new(TlsClientHandler::new(client_config, server_name, handler))
+            Box::new(TlsClientHandler::new(
+                client_config,
+                tls_buffer_size,
+                server_name,
+                handler,
+            ))
         }
         ClientProxyConfig::Vmess {
             cipher,
