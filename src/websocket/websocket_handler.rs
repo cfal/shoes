@@ -1,6 +1,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use async_trait::async_trait;
+use aws_lc_rs::digest::{digest, SHA1_FOR_LEGACY_USE_ONLY};
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use rustc_hash::FxHashMap;
+use tokio::io::AsyncWriteExt;
+
 use super::websocket_stream::WebsocketStream;
 use crate::address::NetLocation;
 use crate::async_stream::AsyncStream;
@@ -12,15 +18,11 @@ use crate::tcp_client_connector::TcpClientConnector;
 use crate::tcp_handler::{
     TcpClientHandler, TcpClientSetupResult, TcpServerHandler, TcpServerSetupResult,
 };
-use async_trait::async_trait;
-use aws_lc_rs::digest::{digest, SHA1_FOR_LEGACY_USE_ONLY};
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-use tokio::io::AsyncWriteExt;
 
 #[derive(Debug)]
 pub struct WebsocketServerTarget {
     pub matching_path: Option<String>,
-    pub matching_headers: Option<HashMap<String, String>>,
+    pub matching_headers: Option<FxHashMap<String, String>>,
     pub ping_type: WebsocketPingType,
     pub handler: Box<dyn TcpServerHandler>,
     pub override_proxy_provider: NoneOrOne<Arc<ClientProxySelector<TcpClientConnector>>>,
@@ -156,7 +158,7 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
 #[derive(Debug)]
 pub struct WebsocketTcpClientHandler {
     matching_path: Option<String>,
-    matching_headers: Option<HashMap<String, String>>,
+    matching_headers: Option<FxHashMap<String, String>>,
     ping_type: WebsocketPingType,
     handler: Box<dyn TcpClientHandler>,
 }
@@ -164,7 +166,7 @@ pub struct WebsocketTcpClientHandler {
 impl WebsocketTcpClientHandler {
     pub fn new(
         matching_path: Option<String>,
-        matching_headers: Option<HashMap<String, String>>,
+        matching_headers: Option<FxHashMap<String, String>>,
         ping_type: WebsocketPingType,
         handler: Box<dyn TcpClientHandler>,
     ) -> Self {
@@ -269,6 +271,7 @@ impl ParsedHttpData {
     async fn parse(stream: &mut Box<dyn AsyncStream>) -> std::io::Result<Self> {
         let mut stream_reader = StreamReader::new();
         let mut first_line: Option<String> = None;
+        // don't use FxHashMap for unvalidated user data
         let mut headers: HashMap<String, String> = HashMap::new();
 
         let mut line_count = 0;

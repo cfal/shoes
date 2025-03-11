@@ -1,9 +1,9 @@
-use std::collections::HashMap;
 use std::io::Read;
 use std::sync::Arc;
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use log::debug;
+use rustc_hash::FxHashMap;
 
 use crate::client_proxy_selector::{ClientProxySelector, ConnectAction, ConnectRule};
 use crate::config::{
@@ -87,13 +87,13 @@ pub fn create_tcp_server_handler(
             let mut all_targets = tls_targets
                 .into_iter()
                 .map(|(sni, config)| (sni, create_tls_server_target(config, rules_stack)))
-                .collect::<HashMap<String, TlsServerTarget>>();
+                .collect::<FxHashMap<String, TlsServerTarget>>();
             let default_tls_target =
                 default_tls_target.map(|config| create_tls_server_target(*config, rules_stack));
             let shadowtls_targets = shadowtls_targets
                 .into_iter()
                 .map(|(sni, config)| (sni, create_shadow_tls_server_target(config, rules_stack)))
-                .collect::<HashMap<String, TlsServerTarget>>();
+                .collect::<FxHashMap<String, TlsServerTarget>>();
             all_targets.extend(shadowtls_targets);
             Box::new(TlsServerHandler::new(all_targets, default_tls_target))
         }
@@ -311,7 +311,7 @@ fn create_websocket_server_target(
                 key.make_ascii_lowercase();
                 (key, val)
             })
-            .collect::<HashMap<_, _>>()
+            .collect::<FxHashMap<_, _>>()
     });
 
     let pushed_rules = !override_rules.is_empty();
@@ -450,7 +450,7 @@ pub fn create_tcp_client_handler(
 
             Box::new(WebsocketTcpClientHandler::new(
                 matching_path,
-                matching_headers,
+                matching_headers.map(|h| h.into_iter().collect()),
                 ping_type,
                 handler,
             ))

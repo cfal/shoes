@@ -1,7 +1,7 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use rustc_hash::FxHashMap;
 use tokio_rustls::TlsAcceptor;
 
 use crate::address::NetLocation;
@@ -20,7 +20,7 @@ use crate::tcp_handler::{
 
 #[derive(Debug)]
 pub struct TlsServerHandler {
-    sni_targets: HashMap<String, TlsServerTarget>,
+    sni_targets: FxHashMap<String, TlsServerTarget>,
     default_target: Option<TlsServerTarget>,
     // used to resolve handshake server hostnames
     shadowtls_resolver: Arc<dyn Resolver>,
@@ -38,7 +38,7 @@ pub enum TlsServerTarget {
 
 impl TlsServerHandler {
     pub fn new(
-        sni_targets: HashMap<String, TlsServerTarget>,
+        sni_targets: FxHashMap<String, TlsServerTarget>,
         default_target: Option<TlsServerTarget>,
     ) -> Self {
         Self {
