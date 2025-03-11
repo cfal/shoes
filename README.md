@@ -146,11 +146,14 @@ See [CONFIG.md](./CONFIG.md) for the YAML config format. You can also refer to t
 - Proxy client chaining
 - SOCKS and Shadowsocks UDP support
 
-## Similar projects
+## Similar and related projects
 
-- [shadowsocks-rust](https://github.com/shadowsocks/shadowsocks-rust): A Rust port of shadowsocks
+- [shadowsocks/shadowsocks-rust](https://github.com/shadowsocks/shadowsocks-rust): A Rust port of shadowsocks
 
-- [v2ray-core](https://github.com/v2ray/v2ray-core): A full-featured proxy platform written in Go
+- [v2ray/v2ray-core](https://github.com/v2ray/v2ray-core): A full-featured proxy platform written in Go
 
-- [shadow-tls](https://github.com/ihciah/shadow-tls): A proxy to expose real TLS handshake to the firewall
+- [ihciah/shadow-tls](https://github.com/ihciah/shadow-tls): A proxy to expose real TLS handshake to the firewall
 
+- [apernet/hysteria](https://github.com/apernet/hysteria): Hysteria is a powerful, lightning fast and censorship resistant proxy
+
+- [tuic-protocol/tuic](https://github.com/tuic-protocol/tuic): Delicately-TUICed 0-RTT proxy protocol
