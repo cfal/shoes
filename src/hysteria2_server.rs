@@ -905,13 +905,16 @@ pub async fn start_hysteria2_server(
         let join_handle = tokio::spawn(async move {
             let mut server_config = quinn::ServerConfig::with_crypto(quic_server_config);
 
+            // values estimated from https://github.com/apernet/hysteria/blob/5520bcc405ee11a47c164c75bae5c40fc2b1d99d/core/server/config.go#L16
             Arc::get_mut(&mut server_config.transport)
                 .unwrap()
                 .max_concurrent_bidi_streams(4096_u32.into())
                 // required for HTTP/3 QPACK updates
                 .max_concurrent_uni_streams(1024_u32.into())
-                .keep_alive_interval(Some(Duration::from_secs(15)))
-                .max_idle_timeout(Some(Duration::from_secs(120).try_into().unwrap()));
+                .max_idle_timeout(Some(Duration::from_secs(60).try_into().unwrap()))
+                .send_window(16 * 1024 * 1024)
+                .receive_window((20u32 * 1024 * 1024).into())
+                .stream_receive_window((8u32 * 1024 * 1024).into());
 
             let socket2_socket =
                 new_socket2_udp_socket(bind_address.is_ipv6(), None, Some(bind_address), true)
