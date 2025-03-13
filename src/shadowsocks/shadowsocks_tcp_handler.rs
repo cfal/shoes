@@ -107,6 +107,7 @@ impl TcpServerHandler for ShadowsocksTcpHandler {
 
         Ok(TcpServerSetupResult::TcpForward {
             remote_location,
+            remote_location_tls_config: None,
             stream: Box::new(server_stream),
             // we don't need an initial flush, let the IV be written when data actually arrives.
             need_initial_flush: false,

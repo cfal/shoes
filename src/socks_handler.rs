@@ -204,6 +204,7 @@ impl TcpServerHandler for SocksTcpServerHandler {
 
         Ok(TcpServerSetupResult::TcpForward {
             remote_location: location,
+            remote_location_tls_config: None,
             stream: server_stream,
             need_initial_flush: true,
             connection_success_response: Some(

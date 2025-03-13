@@ -153,6 +153,7 @@ async fn process_streams(
     match setup_result {
         TcpServerSetupResult::TcpForward {
             remote_location,
+            remote_location_tls_config,
             stream: mut server_stream,
             need_initial_flush: server_need_initial_flush,
             override_proxy_provider,
@@ -172,6 +173,7 @@ async fn process_streams(
                     selected_proxy_provider,
                     resolver,
                     remote_location.clone(),
+                    remote_location_tls_config,
                 ),
             );
 

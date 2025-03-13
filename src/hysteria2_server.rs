@@ -764,6 +764,7 @@ async fn process_tcp_stream(
             client_proxy_selector,
             resolver,
             remote_location.clone(),
+            None,
         ),
     );
 
