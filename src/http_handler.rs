@@ -272,7 +272,6 @@ impl TcpServerHandler for HttpTcpServerHandler {
 
         Ok(TcpServerSetupResult::TcpForward {
             remote_location,
-            remote_location_tls_config: None,
             stream: server_stream,
             need_initial_flush,
             connection_success_response,

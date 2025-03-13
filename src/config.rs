@@ -216,29 +216,6 @@ pub enum WebsocketPingType {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
-pub enum PortForwardTlsTargetConfig {
-    Address(NetLocation),
-    FullConfig {
-        address: NetLocation,
-        #[serde(default = "default_true")]
-        verify: bool,
-        #[serde(alias = "server_fingerprint", default)]
-        server_fingerprints: NoneOrSome<String>,
-        #[serde(default)]
-        sni_hostname: NoneOrOne<String>,
-        #[serde(alias = "alpn_protocol", default)]
-        alpn_protocols: NoneOrSome<String>,
-        #[serde(default)]
-        tls_buffer_size: Option<usize>,
-        #[serde(default)]
-        key: Option<String>,
-        #[serde(default)]
-        cert: Option<String>,
-    },
-}
-
-#[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ServerProxyConfig {
     Http {
@@ -299,10 +276,8 @@ pub enum ServerProxyConfig {
     },
     #[serde(alias = "forward")]
     PortForward {
-        #[serde(default, alias = "target")]
-        targets: NoneOrSome<NetLocation>,
-        #[serde(default, alias = "tls_target")]
-        tls_targets: NoneOrSome<PortForwardTlsTargetConfig>,
+        #[serde(alias = "target")]
+        targets: OneOrSome<NetLocation>,
     },
     Hysteria2 {
         password: String,
@@ -1040,37 +1015,6 @@ fn validate_server_proxy_config(
 
                 for rule_config_selection in override_rules.iter_mut() {
                     validate_rule_config(rule_config_selection.unwrap_config_mut(), client_groups)?;
-                }
-            }
-        }
-        ServerProxyConfig::PortForward {
-            targets,
-            tls_targets,
-        } => {
-            if targets.is_empty() && tls_targets.is_empty() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "At least one port forward target is required",
-                ));
-            }
-
-            // Validate TLS targets
-            for tls_target in tls_targets.iter_mut() {
-                if let PortForwardTlsTargetConfig::FullConfig {
-                    ref mut server_fingerprints,
-                    ref mut tls_buffer_size,
-                    ..
-                } = tls_target
-                {
-                    if let Some(size) = tls_buffer_size {
-                        if *size < MIN_TLS_BUFFER_SIZE {
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::InvalidInput,
-                                format!("TLS buffer size must be at least {}", MIN_TLS_BUFFER_SIZE),
-                            ));
-                        }
-                    }
-                    validate_server_fingerprints(server_fingerprints)?;
                 }
             }
         }

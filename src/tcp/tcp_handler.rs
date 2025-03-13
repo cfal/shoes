@@ -12,8 +12,6 @@ use crate::tcp_client_connector::TcpClientConnector;
 pub enum TcpServerSetupResult {
     TcpForward {
         remote_location: NetLocation,
-        // if provided, TLS will be used to connect to the remote location
-        remote_location_tls_config: Option<TcpServerRemoteLocationTlsConfig>,
         stream: Box<dyn AsyncStream>,
         need_initial_flush: bool,
         // the response to write to the server stream after a connection to the remote location is
@@ -36,13 +34,6 @@ pub enum TcpServerSetupResult {
         override_proxy_provider: NoneOrOne<Arc<ClientProxySelector<TcpClientConnector>>>,
         num_sockets: usize,
     },
-}
-
-#[derive(Debug, Clone)]
-pub struct TcpServerRemoteLocationTlsConfig {
-    pub client_config: Arc<rustls::ClientConfig>,
-    pub tls_buffer_size: Option<usize>,
-    pub server_name: Option<rustls::pki_types::ServerName<'static>>,
 }
 
 impl TcpServerSetupResult {

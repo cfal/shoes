@@ -644,7 +644,6 @@ impl TcpServerHandler for VmessTcpServerHandler {
         match is_udp {
             false => Ok(TcpServerSetupResult::TcpForward {
                 remote_location,
-                remote_location_tls_config: None,
                 stream: server_stream,
                 // Wait until there is data to send the response header.
                 need_initial_flush: false,

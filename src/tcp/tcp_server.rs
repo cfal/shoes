@@ -17,9 +17,7 @@ use crate::copy_bidirectional_message::copy_bidirectional_message;
 use crate::copy_multidirectional_message::copy_multidirectional_message;
 use crate::resolver::{resolve_single_address, NativeResolver, Resolver};
 use crate::tcp_client_connector::TcpClientConnector;
-use crate::tcp_handler::{
-    TcpServerHandler, TcpServerRemoteLocationTlsConfig, TcpServerSetupResult,
-};
+use crate::tcp_handler::{TcpServerHandler, TcpServerSetupResult};
 use crate::tcp_handler_util::{create_tcp_client_proxy_selector, create_tcp_server_handler};
 use crate::udp_message_stream::UdpMessageStream;
 use crate::udp_multi_message_stream::UdpMultiMessageStream;
@@ -152,7 +150,6 @@ where
     match setup_result {
         TcpServerSetupResult::TcpForward {
             remote_location,
-            remote_location_tls_config,
             stream: mut server_stream,
             need_initial_flush: server_need_initial_flush,
             override_proxy_provider,
@@ -172,7 +169,6 @@ where
                     selected_proxy_provider,
                     resolver,
                     remote_location.clone(),
-                    remote_location_tls_config,
                 ),
             );
 
@@ -337,7 +333,6 @@ pub async fn setup_client_stream(
     client_proxy_selector: Arc<ClientProxySelector<TcpClientConnector>>,
     resolver: Arc<dyn Resolver>,
     remote_location: NetLocation,
-    remote_location_tls_config: Option<TcpServerRemoteLocationTlsConfig>,
 ) -> std::io::Result<Option<Box<dyn AsyncStream>>> {
     let action = client_proxy_selector
         .judge(remote_location, &resolver)
@@ -349,33 +344,9 @@ pub async fn setup_client_stream(
             remote_location,
         } => {
             let client_stream = client_proxy
-                .connect(server_stream, remote_location.clone(), &resolver)
+                .connect(server_stream, remote_location, &resolver)
                 .await?;
-            if let Some(tls_config) = remote_location_tls_config {
-                let TcpServerRemoteLocationTlsConfig {
-                    client_config,
-                    tls_buffer_size,
-                    server_name,
-                } = tls_config;
-                let connector: tokio_rustls::TlsConnector = client_config.into();
-                let server_name = server_name.unwrap_or_else(|| {
-                    // This is unused, since enable_sni is false, but connect_with still requires a
-                    // parameter.
-                    "example.com".try_into().unwrap()
-                });
-                let tls_stream = Box::new(
-                    connector
-                        .connect_with(server_name, client_stream, |client_conn| {
-                            if let Some(size) = tls_buffer_size {
-                                client_conn.set_buffer_limit(Some(size));
-                            }
-                        })
-                        .await?,
-                );
-                Ok(Some(tls_stream))
-            } else {
-                Ok(Some(client_stream))
-            }
+            Ok(Some(client_stream))
         }
         ConnectDecision::Block => Ok(None),
     }

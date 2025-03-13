@@ -179,8 +179,8 @@ impl TcpServerHandler for SnellServerHandler {
 
             Ok(TcpServerSetupResult::TcpForward {
                 remote_location,
-                remote_location_tls_config: None,
                 stream: Box::new(server_stream),
+
                 // flush the tunnel response
                 need_initial_flush: true,
                 connection_success_response: Some(TCP_TUNNEL_RESPONSE.to_vec().into_boxed_slice()),

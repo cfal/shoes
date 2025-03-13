@@ -7,21 +7,20 @@ use rustc_hash::FxHashMap;
 
 use crate::client_proxy_selector::{ClientProxySelector, ConnectAction, ConnectRule};
 use crate::config::{
-    ClientConfig, ClientProxyConfig, ConfigSelection, PortForwardTlsTargetConfig, RuleActionConfig,
-    RuleConfig, ServerProxyConfig, ShadowTlsServerConfig, ShadowTlsServerHandshakeConfig,
-    ShadowsocksConfig, TlsClientConfig, TlsServerConfig, WebsocketClientConfig,
-    WebsocketServerConfig,
+    ClientConfig, ClientProxyConfig, ConfigSelection, RuleActionConfig, RuleConfig,
+    ServerProxyConfig, ShadowTlsServerConfig, ShadowTlsServerHandshakeConfig, ShadowsocksConfig,
+    TlsClientConfig, TlsServerConfig, WebsocketClientConfig, WebsocketServerConfig,
 };
 use crate::http_handler::{HttpTcpClientHandler, HttpTcpServerHandler};
 use crate::option_util::NoneOrOne;
-use crate::port_forward_handler::{PortForwardServerHandler, PortForwardTarget};
+use crate::port_forward_handler::PortForwardServerHandler;
 use crate::rustls_util::{create_client_config, create_server_config};
 use crate::shadow_tls::{ShadowTlsServerTarget, ShadowTlsServerTargetHandshake};
 use crate::shadowsocks::ShadowsocksTcpHandler;
 use crate::snell::snell_handler::{SnellClientHandler, SnellServerHandler};
 use crate::socks_handler::{SocksTcpClientHandler, SocksTcpServerHandler};
 use crate::tcp_client_connector::TcpClientConnector;
-use crate::tcp_handler::{TcpClientHandler, TcpServerHandler, TcpServerRemoteLocationTlsConfig};
+use crate::tcp_handler::{TcpClientHandler, TcpServerHandler};
 use crate::tls_handler::{TlsClientHandler, TlsServerHandler, TlsServerTarget};
 use crate::trojan_handler::TrojanTcpHandler;
 use crate::vless_handler::{VlessTcpClientHandler, VlessTcpServerHandler};
@@ -122,85 +121,8 @@ pub fn create_tcp_server_handler(
                 .collect::<Vec<_>>();
             Box::new(WebsocketTcpServerHandler::new(server_targets))
         }
-        ServerProxyConfig::PortForward {
-            targets,
-            tls_targets,
-        } => {
-            let mut targets = targets
-                .into_iter()
-                .map(|t| PortForwardTarget::new(t, None))
-                .collect::<Vec<_>>();
-            targets.extend(tls_targets.into_iter().map(|t| {
-                let (net_location, tls_config) = match t {
-                    PortForwardTlsTargetConfig::Address(net_location) => {
-                        let client_config = Arc::new(create_client_config(
-                            /* verify_webpki= */ true,
-                            /* server_fingerprints= */ vec![],
-                            /* alpn_protocols= */ vec![],
-                            /* enable_sni= */ true,
-                            None,
-                        ));
-                        let server_name = if let Some(hostname) = net_location.address().hostname()
-                        {
-                            Some(
-                                rustls::pki_types::ServerName::try_from(hostname.to_string())
-                                    .unwrap(),
-                            )
-                        } else {
-                            None
-                        };
-                        (
-                            net_location,
-                            TcpServerRemoteLocationTlsConfig {
-                                client_config,
-                                tls_buffer_size: None,
-                                server_name,
-                            },
-                        )
-                    }
-                    PortForwardTlsTargetConfig::FullConfig {
-                        address,
-                        verify,
-                        server_fingerprints,
-                        sni_hostname,
-                        alpn_protocols,
-                        tls_buffer_size,
-                        key,
-                        cert,
-                    } => {
-                        let key_and_cert_bytes = if key.is_some() && cert.is_some() {
-                            let mut cert_file = std::fs::File::open(cert.unwrap()).unwrap();
-                            let mut cert_bytes = vec![];
-                            cert_file.read_to_end(&mut cert_bytes).unwrap();
-                            let mut key_file = std::fs::File::open(key.unwrap()).unwrap();
-                            let mut key_bytes = vec![];
-                            key_file.read_to_end(&mut key_bytes).unwrap();
-                            Some((key_bytes, cert_bytes))
-                        } else {
-                            None
-                        };
-                        let client_config = Arc::new(create_client_config(
-                            verify,
-                            server_fingerprints.into_vec(),
-                            alpn_protocols.into_vec(),
-                            /* enable_sni= */ true,
-                            key_and_cert_bytes,
-                        ));
-                        let server_name = sni_hostname
-                            .into_option()
-                            .map(|s| rustls::pki_types::ServerName::try_from(s).unwrap());
-                        (
-                            address,
-                            TcpServerRemoteLocationTlsConfig {
-                                client_config,
-                                tls_buffer_size,
-                                server_name,
-                            },
-                        )
-                    }
-                };
-                PortForwardTarget::new(net_location, Some(tls_config))
-            }));
+        ServerProxyConfig::PortForward { targets } => {
+            let targets = targets.into_vec();
             Box::new(PortForwardServerHandler::new(targets))
         }
         unknown_config => {
