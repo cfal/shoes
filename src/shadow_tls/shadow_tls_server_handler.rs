@@ -422,16 +422,37 @@ async fn parse_server_hello(server_hello_frame: &[u8]) -> std::io::Result<Parsed
     }
 
     let mut server_hello = BufReader::new(&server_hello_frame[TLS_HEADER_LEN..]);
-    if server_hello.read_u8()? != 0x02 {
+    if server_hello.read_u8().map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("failed to read message type from ServerHello: {}", e),
+        )
+    })? != 0x02
+    {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "expected ServerHello",
         ));
     }
     // TODO: validate length
-    let _server_hello_message_length = server_hello.read_u24_be()?;
-    let server_version_major = server_hello.read_u8()?;
-    let server_version_minor = server_hello.read_u8()?;
+    let _server_hello_message_length = server_hello.read_u24_be().map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("failed to read message length from ServerHello: {}", e),
+        )
+    })?;
+    let server_version_major = server_hello.read_u8().map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("failed to read version major from ServerHello: {}", e),
+        )
+    })?;
+    let server_version_minor = server_hello.read_u8().map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("failed to read version minor from ServerHello: {}", e),
+        )
+    })?;
     if server_version_major != 3 || server_version_minor != 3 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -442,32 +463,90 @@ async fn parse_server_hello(server_hello_frame: &[u8]) -> std::io::Result<Parsed
         ));
     }
 
-    let server_random = server_hello.read_slice(32)?.to_vec();
+    let server_random = server_hello
+        .read_slice(32)
+        .map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("failed to read random from ServerHello: {}", e),
+            )
+        })?
+        .to_vec();
 
-    let server_session_id_len = server_hello.read_u8()?;
+    let server_session_id_len = server_hello.read_u8().map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("failed to read session ID length from ServerHello: {}", e),
+        )
+    })?;
     if server_session_id_len != 32 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("expected session id len 32, got {}", server_session_id_len),
         ));
     }
-    let _server_session_id = server_hello.read_slice(32)?;
+    let _server_session_id = server_hello.read_slice(32).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("failed to read session ID from ServerHello: {}", e),
+        )
+    })?;
 
-    let _server_selected_cipher_suite = server_hello.read_u16_be()?;
-    let _server_compression_method = server_hello.read_u8()?;
+    let _server_selected_cipher_suite = server_hello.read_u16_be().map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("failed to read cipher suite from ServerHello: {}", e),
+        )
+    })?;
+    let _server_compression_method = server_hello.read_u8().map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("failed to read compression method from ServerHello: {}", e),
+        )
+    })?;
 
-    let server_extensions_len = server_hello.read_u16_be()? as usize;
-    let server_extension_bytes = server_hello.read_slice(server_extensions_len)?;
+    let server_extensions_len = server_hello.read_u16_be().map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("failed to read extensions length from ServerHello: {}", e),
+        )
+    })? as usize;
+    let server_extension_bytes = server_hello
+        .read_slice(server_extensions_len)
+        .map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "failed to read extensions from ServerHello (length {}): {}",
+                    server_extensions_len, e
+                ),
+            )
+        })?;
 
     let mut server_extensions = BufReader::new(server_extension_bytes);
     let mut server_has_supported_version = false;
     while !server_extensions.is_consumed() {
-        let extension_type = server_extensions.read_u16_be()?;
-        let extension_len = server_extensions.read_u16_be()? as usize;
+        let extension_type = server_extensions.read_u16_be().map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("failed to read extension type from ServerHello: {}", e),
+            )
+        })?;
+        let extension_len = server_extensions.read_u16_be().map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("failed to read extension length from ServerHello: {}", e),
+            )
+        })? as usize;
 
         if extension_type == 0x002b {
             // supported versions
-            let version_bytes = server_extensions.read_slice(2)?;
+            let version_bytes = server_extensions.read_slice(2).map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("failed to read supported version from ServerHello: {}", e),
+                )
+            })?;
             if version_bytes[0] != 3 && version_bytes[1] != 4 {
                 return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
@@ -479,7 +558,12 @@ async fn parse_server_hello(server_hello_frame: &[u8]) -> std::io::Result<Parsed
             }
             server_has_supported_version = true;
         } else {
-            server_extensions.skip(extension_len)?;
+            server_extensions.skip(extension_len).map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("failed to skip extension in ServerHello: {}", e),
+                )
+            })?;
         }
     }
 
@@ -512,14 +596,36 @@ async fn setup_remote_handshake(
     // this is confusing, but the TLS server is called client_stream.
     let mut client_stream = client_connector
         .connect(&mut noop_stream, remote_addr, resolver)
-        .await?;
+        .await
+        .map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                format!("failed to connect to remote handshake server: {}", e),
+            )
+        })?;
 
-    write_all(&mut client_stream, &client_hello_frame).await?;
+    write_all(&mut client_stream, &client_hello_frame)
+        .await
+        .map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                format!("failed to send ClientHello to remote server: {}", e),
+            )
+        })?;
 
     let mut server_reader = StreamReader::new_with_buffer_size(TLS_FRAME_MAX_LEN);
     let server_header_bytes = server_reader
         .read_slice(&mut client_stream, TLS_HEADER_LEN)
-        .await?;
+        .await
+        .map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                format!(
+                    "failed to read ServerHello header from remote server: {}",
+                    e
+                ),
+            )
+        })?;
 
     let server_payload_size = u16::from_be_bytes([server_header_bytes[3], server_header_bytes[4]]);
 
@@ -529,13 +635,35 @@ async fn setup_remote_handshake(
 
     let server_payload_bytes = server_reader
         .read_slice(&mut client_stream, server_payload_size as usize)
-        .await?;
+        .await
+        .map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                format!(
+                    "failed to read ServerHello payload from remote server (size: {}): {}",
+                    server_payload_size, e
+                ),
+            )
+        })?;
     server_hello_frame.extend_from_slice(server_payload_bytes);
 
-    let ParsedServerHello { server_random } = parse_server_hello(&server_hello_frame).await?;
+    let ParsedServerHello { server_random } =
+        parse_server_hello(&server_hello_frame).await.map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("failed to parse ServerHello from remote server: {}", e),
+            )
+        })?;
 
     // write the server hello frame to the client
-    write_all(&mut server_stream, &server_hello_frame).await?;
+    write_all(&mut server_stream, &server_hello_frame)
+        .await
+        .map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                format!("failed to write ServerHello to client: {}", e),
+            )
+        })?;
 
     let mut hmac_server_random = ShadowTlsHmac::new(&hmac_key);
     hmac_server_random.update(&server_random);
@@ -561,12 +689,21 @@ async fn setup_remote_handshake(
             server_read_result = server_reader.read_slice(&mut client_stream, TLS_HEADER_LEN) => {
                 server_frame.clear();
 
-                let server_header_bytes = server_read_result?;
+                let server_header_bytes = server_read_result
+                    .map_err(|e| std::io::Error::new(
+                        std::io::ErrorKind::ConnectionAborted,
+                        format!("failed to read TLS header from remote server during handshake: {}", e)
+                    ))?;
                 let server_payload_size = u16::from_be_bytes(server_header_bytes[3..5].try_into().unwrap()) as usize;
                 server_frame.extend_from_slice(server_header_bytes);
                 let server_payload_bytes = server_reader
                     .read_slice(&mut client_stream, server_payload_size)
-                    .await?;
+                    .await
+                    .map_err(|e| std::io::Error::new(
+                        std::io::ErrorKind::ConnectionAborted,
+                        format!("failed to read TLS payload from remote server during handshake (size {}): {}",
+                                server_payload_size, e)
+                    ))?;
                 server_frame.extend_from_slice(server_payload_bytes);
 
                 let server_content_type = server_frame[0];
@@ -594,12 +731,20 @@ async fn setup_remote_handshake(
                    server_frame[3..5].copy_from_slice(&updated_payload_size.to_be_bytes());
                 }
 
-                write_all(&mut server_stream, &server_frame).await?;
+                write_all(&mut server_stream, &server_frame).await
+                    .map_err(|e| std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        format!("failed to write server frame to client: {}", e)
+                    ))?;
             }
             client_read_result = client_reader.read_slice(&mut server_stream, TLS_HEADER_LEN) => {
                 client_frame.clear();
 
-                let client_header_bytes = client_read_result?;
+                let client_header_bytes = client_read_result
+                    .map_err(|e| std::io::Error::new(
+                        std::io::ErrorKind::ConnectionAborted,
+                        format!("failed to read TLS header from client during handshake: {}", e)
+                    ))?;
 
                 let client_content_type = client_header_bytes[0];
                 let client_payload_size = u16::from_be_bytes([client_header_bytes[3], client_header_bytes[4]]) as usize;
@@ -607,7 +752,12 @@ async fn setup_remote_handshake(
 
                 let client_payload_bytes = client_reader
                     .read_slice(&mut server_stream, client_payload_size)
-                    .await?;
+                    .await
+                    .map_err(|e| std::io::Error::new(
+                        std::io::ErrorKind::ConnectionAborted,
+                        format!("failed to read TLS payload from client during handshake (size {}): {}",
+                                client_payload_size, e)
+                    ))?;
 
                 if client_content_type == CONTENT_TYPE_APPLICATION_DATA {
                     let mut tmp_hmac = hmac_client_data.clone();
@@ -626,11 +776,18 @@ async fn setup_remote_handshake(
                             initial_client_data,
                             hmac_client_data,
                             hmac_server_data,
-                        )?;
+                        ).map_err(|e| std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!("failed to create ShadowTlsStream: {}", e)
+                        ))?;
 
                         let unparsed_data = client_reader.unparsed_data();
                         if !unparsed_data.is_empty() {
-                            shadow_tls_stream.feed_initial_read_data(unparsed_data)?;
+                            shadow_tls_stream.feed_initial_read_data(unparsed_data)
+                                .map_err(|e| std::io::Error::new(
+                                    std::io::ErrorKind::Other,
+                                    format!("failed to feed initial data to ShadowTlsStream: {}", e)
+                                ))?;
                         }
 
                         return Ok(shadow_tls_stream);
@@ -638,7 +795,11 @@ async fn setup_remote_handshake(
                 }
 
                 client_frame.extend_from_slice(client_payload_bytes);
-                write_all(&mut client_stream, &client_frame).await?;
+                write_all(&mut client_stream, &client_frame).await
+                    .map_err(|e| std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        format!("failed to write client frame to remote server: {}", e)
+                    ))?;
             }
         }
     }
