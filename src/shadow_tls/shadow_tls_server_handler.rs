@@ -612,6 +612,12 @@ async fn setup_remote_handshake(
                 format!("failed to send ClientHello to remote server: {}", e),
             )
         })?;
+    client_stream.flush().await.map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            format!("failed to flush ClientHello to remote server: {}", e),
+        )
+    })?;
 
     let mut server_reader = StreamReader::new_with_buffer_size(TLS_FRAME_MAX_LEN);
     let server_header_bytes = server_reader
@@ -664,6 +670,12 @@ async fn setup_remote_handshake(
                 format!("failed to write ServerHello to client: {}", e),
             )
         })?;
+    server_stream.flush().await.map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            format!("failed to flush ServerHello to client: {}", e),
+        )
+    })?;
 
     let mut hmac_server_random = ShadowTlsHmac::new(&hmac_key);
     hmac_server_random.update(&server_random);
@@ -736,6 +748,12 @@ async fn setup_remote_handshake(
                         std::io::ErrorKind::BrokenPipe,
                         format!("failed to write server frame to client: {}", e)
                     ))?;
+                server_stream.flush().await.map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        format!("failed to flush server frame to client: {}", e),
+                    )
+                })?;
             }
             client_read_result = client_reader.read_slice(&mut server_stream, TLS_HEADER_LEN) => {
                 client_frame.clear();
@@ -800,6 +818,12 @@ async fn setup_remote_handshake(
                         std::io::ErrorKind::BrokenPipe,
                         format!("failed to write client frame to remote server: {}", e)
                     ))?;
+                client_stream.flush().await.map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        format!("failed to flush client frame to remote server: {}", e),
+                    )
+                })?;
             }
         }
     }
