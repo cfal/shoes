@@ -180,25 +180,41 @@ pub async fn setup_shadowtls_server_stream(
                 client_connector,
                 resolver,
             )
-            .await?
+            .await
+            .map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("failed to setup remote handshake: {}", e),
+                )
+            })?
         }
-        ShadowTlsServerTargetHandshake::Local(ref local_config) => {
-            setup_local_handshake(
-                &target.password,
-                server_stream,
-                client_reader,
-                client_hello_frame,
-                hmac_key,
-                local_config.clone(),
+        ShadowTlsServerTargetHandshake::Local(ref local_config) => setup_local_handshake(
+            &target.password,
+            server_stream,
+            client_reader,
+            client_hello_frame,
+            hmac_key,
+            local_config.clone(),
+        )
+        .await
+        .map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("failed to setup local handshake: {}", e),
             )
-            .await?
-        }
+        })?,
     };
 
     let mut target_setup_result = target
         .handler
         .setup_server_stream(Box::new(shadow_tls_stream))
-        .await;
+        .await
+        .map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("failed to setup server stream after shadow tls: {}", e),
+            )
+        });
 
     if let Ok(ref mut setup_result) = target_setup_result {
         // TODO: do we need initial flush?
