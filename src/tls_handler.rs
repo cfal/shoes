@@ -77,7 +77,7 @@ impl TcpServerHandler for TlsServerHandler {
                     None => {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::Other,
-                            "No default target for unknown SNI",
+                            format!("No default target for unknown SNI: {}", hostname),
                         ));
                     }
                 },
