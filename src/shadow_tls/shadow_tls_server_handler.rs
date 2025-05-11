@@ -103,6 +103,7 @@ const CONTENT_TYPE_HANDSHAKE: u8 = 0x16;
 const CONTENT_TYPE_APPLICATION_DATA: u8 = 0x17;
 
 const HANDSHAKE_TYPE_SERVER_HELLO: u8 = 0x02;
+const HANDSHAKE_TYPE_CLIENT_HELLO: u8 = 0x01;
 
 // retry request random value, see https://datatracker.ietf.org/doc/html/rfc8446#section-4.1.3
 // TODO: should we also check to disallow TLS1.2/TLS1.1 client downgrade requests?
@@ -279,7 +280,10 @@ pub async fn read_client_hello(
     let mut client_reader = StreamReader::new_with_buffer_size(TLS_FRAME_MAX_LEN);
 
     // read the first tls frame, allocate so that we can borrow and use the payload below
-    let client_tls_header_bytes = client_reader.read_slice(server_stream, 5).await?.to_vec();
+    let client_tls_header_bytes = client_reader
+        .read_slice(server_stream, TLS_HEADER_LEN)
+        .await?
+        .to_vec();
 
     let client_content_type = client_tls_header_bytes[0];
     if client_content_type != CONTENT_TYPE_HANDSHAKE {
@@ -292,24 +296,42 @@ pub async fn read_client_hello(
     let client_legacy_version_major = client_tls_header_bytes[1];
     let client_legacy_version_minor = client_tls_header_bytes[2];
 
-    let client_payload_size =
-        u16::from_be_bytes([client_tls_header_bytes[3], client_tls_header_bytes[4]]);
+    let client_payload_len =
+        u16::from_be_bytes([client_tls_header_bytes[3], client_tls_header_bytes[4]]) as usize;
     let client_payload_bytes = client_reader
-        .read_slice(server_stream, client_payload_size as usize)
+        .read_slice(server_stream, client_payload_len)
         .await?;
 
     let mut client_hello = BufReader::new(client_payload_bytes);
-    if client_hello.read_u8()? != 0x01 {
+    if client_hello.read_u8()? != HANDSHAKE_TYPE_CLIENT_HELLO {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "expected ClientHello",
         ));
     }
-    // TODO: validate length
-    let _client_hello_message_length = client_hello.read_u24_be()?;
+
+    let client_hello_message_len = client_hello.read_u24_be()? as usize;
+    // this should be 4 bytes less than the payload length (handshake type + 3 bytes length)
+    if client_hello_message_len + 4 != client_payload_len {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "client hello message length mismatch",
+        ));
+    }
 
     let client_version_major = client_hello.read_u8()?;
     let client_version_minor = client_hello.read_u8()?;
+    let record_protocol_version_ok = client_version_major == 0x03
+        && (client_version_minor == 0x01 || client_version_minor == 0x03);
+    if !record_protocol_version_ok {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "unexpected ClientHello TLS version {}.{}",
+                client_version_major, client_version_minor
+            ),
+        ));
+    }
 
     // skip client random
     client_hello.skip(32)?;
@@ -432,7 +454,9 @@ pub fn parse_server_hello(server_hello_frame: &[u8]) -> std::io::Result<ParsedSe
         ));
     }
 
-    let server_content_type = server_hello_frame[0];
+    let mut server_hello = BufReader::new(server_hello_frame);
+
+    let server_content_type = server_hello.read_u8()?;
     if server_content_type != CONTENT_TYPE_HANDSHAKE {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -440,9 +464,8 @@ pub fn parse_server_hello(server_hello_frame: &[u8]) -> std::io::Result<ParsedSe
         ));
     }
 
-    // TODO: validate?
-    let server_legacy_version_major = server_hello_frame[1];
-    let server_legacy_version_minor = server_hello_frame[2];
+    let server_legacy_version_major = server_hello.read_u8()?;
+    let server_legacy_version_minor = server_hello.read_u8()?;
     if server_legacy_version_major != 3 || server_legacy_version_minor != 3 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -453,26 +476,36 @@ pub fn parse_server_hello(server_hello_frame: &[u8]) -> std::io::Result<ParsedSe
         ));
     }
 
-    let mut server_hello = BufReader::new(&server_hello_frame[TLS_HEADER_LEN..]);
-    if server_hello.read_u8().map_err(|e| {
+    let server_payload_len = server_hello.read_u16_be()? as usize;
+
+    let server_handshake_type = server_hello.read_u8().map_err(|e| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("failed to read message type from ServerHello: {}", e),
+            format!("failed to read handshake type from ServerHello: {}", e),
         )
-    })? != HANDSHAKE_TYPE_SERVER_HELLO
-    {
+    })?;
+
+    if server_handshake_type != HANDSHAKE_TYPE_SERVER_HELLO {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "expected ServerHello",
         ));
     }
-    // TODO: validate length
-    let _server_hello_message_length = server_hello.read_u24_be().map_err(|e| {
+
+    let server_hello_message_len = server_hello.read_u24_be().map_err(|e| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("failed to read message length from ServerHello: {}", e),
         )
-    })?;
+    })? as usize;
+    // this should be 4 bytes less than the payload length (handshake type + 3 bytes length)
+    if server_hello_message_len + 4 != server_payload_len {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "server hello message length mismatch",
+        ));
+    }
+
     let server_version_major = server_hello.read_u8().map_err(|e| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -876,7 +909,6 @@ async fn setup_local_handshake(
     initial_xor_context: &ShadowTlsXorContext,
     server_config: Arc<rustls::ServerConfig>,
 ) -> std::io::Result<ShadowTlsStream> {
-    // TODO: support forwarding to a valid server
     let mut server_connection = rustls::ServerConnection::new(server_config).map_err(|e| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,

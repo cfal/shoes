@@ -60,9 +60,9 @@ impl ShadowTlsClientHandler {
 impl TcpClientHandler for ShadowTlsClientHandler {
     async fn setup_client_stream(
         &self,
-        _server_stream: &mut Box<dyn AsyncStream>,
+        server_stream: &mut Box<dyn AsyncStream>,
         mut client_stream: Box<dyn AsyncStream>,
-        _remote_location: NetLocation,
+        remote_location: NetLocation,
     ) -> std::io::Result<TcpClientSetupResult> {
         let mut client_conn =
             rustls::ClientConnection::new(self.client_config.clone(), self.server_name.clone())
@@ -201,15 +201,12 @@ impl TcpClientHandler for ShadowTlsClientHandler {
         }
 
         self.handler
-            .setup_client_stream(
-                _server_stream,
-                Box::new(shadow_tls_stream),
-                _remote_location,
-            )
+            .setup_client_stream(server_stream, Box::new(shadow_tls_stream), remote_location)
             .await
     }
 }
 
+// TODO: consider reusing server read_client_hello code
 #[inline]
 fn modify_client_hello(
     original_frame: &[u8],
