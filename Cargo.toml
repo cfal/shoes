@@ -53,6 +53,9 @@ tokio = { version = "*", features = [
 tokio-rustls = { version = "*", default-features = false, features = ["logging", "tls12", "aws-lc-rs"] }
 webpki-roots = { version = "*" }
 
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = "0.6"
+
 [profile.release]
 opt-level = 3
 lto = "fat"
