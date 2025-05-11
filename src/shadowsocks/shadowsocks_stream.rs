@@ -23,7 +23,7 @@ use crate::salt_checker::SaltChecker;
 use crate::util::allocate_vec;
 
 fn generate_iv(buf: &mut [u8]) {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     rng.fill_bytes(buf);
 }
 

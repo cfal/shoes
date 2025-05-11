@@ -302,7 +302,7 @@ fn modify_client_hello(
     let remaining_ch_data = &original_frame[TLS_HEADER_LEN + remaining_ch_data_offset..];
 
     let mut new_session_id_value = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut new_session_id_value[0..28]); // First 28 bytes random
+    rand::rng().fill_bytes(&mut new_session_id_value[0..28]); // First 28 bytes random
 
     // new length for the session id
     let new_client_hello_payload_len = client_hello_payload_len + (32 - original_session_id_len);

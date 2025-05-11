@@ -665,8 +665,7 @@ impl VmessStream {
         }
 
         if padding_len > 0 {
-            rand::thread_rng()
-                .fill_bytes(&mut self.write_packet[next_index..next_index + padding_len]);
+            rand::rng().fill_bytes(&mut self.write_packet[next_index..next_index + padding_len]);
             next_index += padding_len;
         }
 

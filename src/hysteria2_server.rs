@@ -131,8 +131,8 @@ fn validate_auth_request<T>(req: http::Request<T>, password: &str) -> std::io::R
 }
 
 fn generate_ascii_string() -> String {
-    let mut rng = rand::thread_rng();
-    let length = rng.gen_range(1..80);
+    let mut rng = rand::rng();
+    let length = rng.random_range(1..80);
     rng.sample_iter(Alphanumeric)
         .take(length)
         .map(char::from)
@@ -722,10 +722,10 @@ async fn handle_tcp_header(
         // [varint] Padding length
         // [bytes] Random padding
 
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
 
         // only use the lower 6 bits so that the varint always fits in a single u8
-        let padding_len = rng.gen_range(0..=63);
+        let padding_len = rng.random_range(0..=63);
 
         // first 3 bytes of status = 0x0, message length = 0, padding length
         let mut response_bytes = allocate_vec(3 + (padding_len as usize));
