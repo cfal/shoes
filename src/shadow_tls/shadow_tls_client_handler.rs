@@ -88,7 +88,6 @@ impl TcpClientHandler for ShadowTlsClientHandler {
         write_all(&mut client_stream, &modified_client_hello).await?;
         client_stream.flush().await?;
 
-        // TODO: validate the read amount is exactly a single ServerHello frame
         let mut remote_reader = StreamReader::new_with_buffer_size(TLS_FRAME_MAX_LEN * 2);
 
         let server_hello_frame =
@@ -142,11 +141,12 @@ impl TcpClientHandler for ShadowTlsClientHandler {
                 // the handshake server, so we expect it to pass the ServerRandom hmac check.
                 // once we get here, we are done with the initial handshake and can break.
                 let payload_len = u16::from_be_bytes([server_frame[3], server_frame[4]]) as usize;
-                if payload_len < 4 {
-                    // Must be at least 4 for HMAC
+                if payload_len < 4 + 1 {
+                    // must be at least 4 for the hmac digest and non-empty data after it
+                    // TODO: should this check for a larger record size?
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
-                        "AppData frame too short for ShadowTLS HMAC",
+                        "app data record too short for handshake data",
                     ));
                 }
 
@@ -158,7 +158,7 @@ impl TcpClientHandler for ShadowTlsClientHandler {
                 if hmac_server_random.digest() != received_hmac {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
-                        "Invalid HMAC for Stage1 AppData or unexpected AppData frame",
+                        "invalid HMAC for handshake data",
                     ));
                 }
 
