@@ -21,7 +21,8 @@ const CONTEXT_STR: &str = "shadowsocks 2022 session subkey";
 impl ShadowsocksKey for Blake3Key {
     fn create_session_key(&self, salt: &[u8]) -> Box<[u8]> {
         let salt_len = salt.len();
-        // both are 16 for aes-128-gcm, and both are 32 for aes-32-gcm
+        // both are 16 for aes-128-gcm, and both are 32 for aes-256-gcm
+        // TODO: validate password length before we hit this assertion
         assert!(self.key_bytes.len() == salt_len);
 
         let mut key_material = allocate_vec(salt_len * 2);
