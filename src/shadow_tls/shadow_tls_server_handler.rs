@@ -447,16 +447,10 @@ pub struct ParsedServerHello {
 }
 
 pub fn parse_server_hello(server_hello_frame: &[u8]) -> std::io::Result<ParsedServerHello> {
-    if server_hello_frame.len() < TLS_HEADER_LEN {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "ServerHello frame too short for header",
-        ));
-    }
-
-    let mut server_hello = BufReader::new(server_hello_frame);
-
-    let server_content_type = server_hello.read_u8()?;
+    // we don't need to validate that the frame is large enough to contain the header, because
+    // a full header was read in order to successfully read the complete frame that is passed in
+    // to this function.
+    let server_content_type = server_hello_frame[0];
     if server_content_type != CONTENT_TYPE_HANDSHAKE {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -464,8 +458,8 @@ pub fn parse_server_hello(server_hello_frame: &[u8]) -> std::io::Result<ParsedSe
         ));
     }
 
-    let server_legacy_version_major = server_hello.read_u8()?;
-    let server_legacy_version_minor = server_hello.read_u8()?;
+    let server_legacy_version_major = server_hello_frame[1];
+    let server_legacy_version_minor = server_hello_frame[2];
     if server_legacy_version_major != 3 || server_legacy_version_minor != 3 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -476,15 +470,12 @@ pub fn parse_server_hello(server_hello_frame: &[u8]) -> std::io::Result<ParsedSe
         ));
     }
 
-    let server_payload_len = server_hello.read_u16_be()? as usize;
+    // we don't need to validate the frame payload length, because this value was used to
+    // read the complete frame that is passed in to this function.
+    let server_payload_len =
+        u16::from_be_bytes([server_hello_frame[3], server_hello_frame[4]]) as usize;
 
-    let server_handshake_type = server_hello.read_u8().map_err(|e| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("failed to read handshake type from ServerHello: {}", e),
-        )
-    })?;
-
+    let server_handshake_type = server_hello_frame[5];
     if server_handshake_type != HANDSHAKE_TYPE_SERVER_HELLO {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -492,12 +483,13 @@ pub fn parse_server_hello(server_hello_frame: &[u8]) -> std::io::Result<ParsedSe
         ));
     }
 
-    let server_hello_message_len = server_hello.read_u24_be().map_err(|e| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("failed to read message length from ServerHello: {}", e),
-        )
-    })? as usize;
+    let server_hello_message_len = u32::from_be_bytes([
+        0,
+        server_hello_frame[6],
+        server_hello_frame[7],
+        server_hello_frame[8],
+    ]) as usize;
+
     // this should be 4 bytes less than the payload length (handshake type + 3 bytes length)
     if server_hello_message_len + 4 != server_payload_len {
         return Err(std::io::Error::new(
@@ -506,18 +498,8 @@ pub fn parse_server_hello(server_hello_frame: &[u8]) -> std::io::Result<ParsedSe
         ));
     }
 
-    let server_version_major = server_hello.read_u8().map_err(|e| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("failed to read version major from ServerHello: {}", e),
-        )
-    })?;
-    let server_version_minor = server_hello.read_u8().map_err(|e| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("failed to read version minor from ServerHello: {}", e),
-        )
-    })?;
+    let server_version_major = server_hello_frame[9];
+    let server_version_minor = server_hello_frame[10];
     if server_version_major != 3 || server_version_minor != 3 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -528,71 +510,41 @@ pub fn parse_server_hello(server_hello_frame: &[u8]) -> std::io::Result<ParsedSe
         ));
     }
 
-    let server_random = server_hello.read_slice(32).map_err(|e| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("failed to read random from ServerHello: {}", e),
-        )
-    })?;
-
+    let server_random = &server_hello_frame[11..43];
     if server_random == RETRY_REQUEST_RANDOM_BYTES {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "server sent a HelloRetryRequest",
         ));
     }
-
     let server_random = server_random.to_vec();
 
-    let server_session_id_len = server_hello.read_u8().map_err(|e| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("failed to read session ID length from ServerHello: {}", e),
-        )
-    })?;
+    let server_session_id_len = server_hello_frame[43];
     if server_session_id_len != 32 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("expected session id len 32, got {}", server_session_id_len),
         ));
     }
-    let _server_session_id = server_hello.read_slice(32).map_err(|e| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("failed to read session ID from ServerHello: {}", e),
-        )
-    })?;
 
-    let _server_selected_cipher_suite = server_hello.read_u16_be().map_err(|e| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("failed to read cipher suite from ServerHello: {}", e),
-        )
-    })?;
-    let _server_compression_method = server_hello.read_u8().map_err(|e| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("failed to read compression method from ServerHello: {}", e),
-        )
-    })?;
+    // skip unused fields:
+    //   let _server_session_id = &server_hello_frame[44..76];
+    //   let _server_selected_cipher_suite =
+    //     u16::from_be_bytes([server_hello_frame[76], server_hello_frame[77]]);
+    //   let _server_compression_method = server_hello_frame[78];
 
-    let server_extensions_len = server_hello.read_u16_be().map_err(|e| {
-        std::io::Error::new(
+    // this length needs to be validated because it is unchecked when reading the complete
+    // frame that is passed in to this function.
+    let server_extensions_len =
+        u16::from_be_bytes([server_hello_frame[79], server_hello_frame[80]]) as usize;
+    if server_hello_frame.len() < 81 + server_extensions_len {
+        return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("failed to read extensions length from ServerHello: {}", e),
-        )
-    })? as usize;
-    let server_extension_bytes = server_hello
-        .read_slice(server_extensions_len)
-        .map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "failed to read extensions from ServerHello (length {}): {}",
-                    server_extensions_len, e
-                ),
-            )
-        })?;
+            "server hello message too short for extensions",
+        ));
+    }
+
+    let server_extension_bytes = &server_hello_frame[81..81 + server_extensions_len];
 
     let mut server_extensions = BufReader::new(server_extension_bytes);
     let mut server_has_supported_version = false;
