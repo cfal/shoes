@@ -82,6 +82,13 @@ const TLS_FRAME_MAX_LEN: usize = TLS_HEADER_LEN + 65535;
 const CONTENT_TYPE_HANDSHAKE: u8 = 0x16;
 const CONTENT_TYPE_APPLICATION_DATA: u8 = 0x17;
 
+// retry request random value, see https://datatracker.ietf.org/doc/html/rfc8446#section-4.1.3
+// TODO: should we also check to disallow TLS1.2/TLS1.1 client downgrade requests?
+const RETRY_REQUEST_RANDOM_BYTES: [u8; 32] = [
+    0xCF, 0x21, 0xAD, 0x74, 0xE5, 0x9A, 0x61, 0x11, 0xBE, 0x1D, 0x8C, 0x02, 0x1E, 0x65, 0xB8, 0x91,
+    0xC2, 0xA2, 0x11, 0x16, 0x7A, 0xBB, 0x8C, 0x5E, 0x07, 0x9E, 0x09, 0xE2, 0xC8, 0xA8, 0x33, 0x9C,
+];
+
 #[inline]
 pub async fn setup_shadowtls_server_stream(
     server_stream: Box<dyn AsyncStream>,
@@ -470,15 +477,21 @@ pub fn parse_server_hello(server_hello_frame: &[u8]) -> std::io::Result<ParsedSe
         ));
     }
 
-    let server_random = server_hello
-        .read_slice(32)
-        .map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("failed to read random from ServerHello: {}", e),
-            )
-        })?
-        .to_vec();
+    let server_random = server_hello.read_slice(32).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("failed to read random from ServerHello: {}", e),
+        )
+    })?;
+
+    if server_random == RETRY_REQUEST_RANDOM_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "server sent a HelloRetryRequest",
+        ));
+    }
+
+    let server_random = server_random.to_vec();
 
     let server_session_id_len = server_hello.read_u8().map_err(|e| {
         std::io::Error::new(
