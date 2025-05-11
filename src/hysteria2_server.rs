@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use log::{error, warn};
+use rand::distr::Alphanumeric;
 use rand::{Rng, RngCore};
 use tokio::io::AsyncWriteExt;
 use tokio::net::UdpSocket;
@@ -132,7 +133,7 @@ fn validate_auth_request<T>(req: http::Request<T>, password: &str) -> std::io::R
 fn generate_ascii_string() -> String {
     let mut rng = rand::thread_rng();
     let length = rng.gen_range(1..80);
-    rng.sample_iter(&rand::distributions::Alphanumeric)
+    rng.sample_iter(Alphanumeric)
         .take(length)
         .map(char::from)
         .collect()
@@ -149,44 +150,52 @@ async fn auth_connection(
             .await
             .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?
         {
-            Some((req, mut stream)) => match validate_auth_request(req, password) {
-                Ok(()) => {
-                    let resp = http::Response::builder()
-                        .status(http::status::StatusCode::from_u16(233).unwrap())
-                        .header("Hysteria-UDP", if udp_enabled { "true" } else { "false" })
-                        .header("Hysteria-CC-RX", "0")
-                        .header("Hysteria-Padding", generate_ascii_string())
-                        .body(())
-                        .unwrap();
+            Some(resolver) => {
+                let (req, mut stream) = resolver.resolve_request().await.map_err(|err| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("Failed to resolve request: {}", err),
+                    )
+                })?;
+                match validate_auth_request(req, password) {
+                    Ok(()) => {
+                        let resp = http::Response::builder()
+                            .status(http::status::StatusCode::from_u16(233).unwrap())
+                            .header("Hysteria-UDP", if udp_enabled { "true" } else { "false" })
+                            .header("Hysteria-CC-RX", "0")
+                            .header("Hysteria-Padding", generate_ascii_string())
+                            .body(())
+                            .unwrap();
 
-                    stream
-                        .send_response(resp)
-                        .await
-                        .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
+                        stream
+                            .send_response(resp)
+                            .await
+                            .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
 
-                    stream
-                        .finish()
-                        .await
-                        .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
+                        stream
+                            .finish()
+                            .await
+                            .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
 
-                    return Ok(());
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        error!("Received non-hysteria2 auth http3 request: {}", e);
+                        let resp = http::Response::builder()
+                            .status(http::status::StatusCode::NOT_FOUND)
+                            .body(())
+                            .unwrap();
+                        stream
+                            .send_response(resp)
+                            .await
+                            .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
+                        stream
+                            .finish()
+                            .await
+                            .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
+                    }
                 }
-                Err(e) => {
-                    error!("Received non-hysteria2 auth http3 request: {}", e);
-                    let resp = http::Response::builder()
-                        .status(http::status::StatusCode::NOT_FOUND)
-                        .body(())
-                        .unwrap();
-                    stream
-                        .send_response(resp)
-                        .await
-                        .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
-                    stream
-                        .finish()
-                        .await
-                        .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
-                }
-            },
+            }
             // indicating no more streams to be received
             None => {
                 return Err(std::io::Error::new(
