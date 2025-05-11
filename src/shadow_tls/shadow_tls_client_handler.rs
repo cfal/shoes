@@ -29,7 +29,7 @@ const HANDSHAKE_TYPE_SERVER_HELLO: u8 = 0x02;
 
 #[derive(Debug)]
 pub struct ShadowTlsClientHandler {
-    password: Vec<u8>,
+    initial_hmac: ShadowTlsHmac,
     client_config: Arc<rustls::ClientConfig>,
     server_name: rustls::pki_types::ServerName<'static>,
     handler: Box<dyn TcpClientHandler>,
@@ -42,8 +42,13 @@ impl ShadowTlsClientHandler {
         server_name: rustls::pki_types::ServerName<'static>,
         handler: Box<dyn TcpClientHandler>,
     ) -> Self {
+        let hmac_key = aws_lc_rs::hmac::Key::new(
+            aws_lc_rs::hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY,
+            &password.into_bytes(),
+        );
+        let initial_hmac = ShadowTlsHmac::new(&hmac_key);
         Self {
-            password: password.into_bytes(),
+            initial_hmac,
             client_config,
             server_name,
             handler,
@@ -51,7 +56,198 @@ impl ShadowTlsClientHandler {
     }
 }
 
-fn modify_client_hello(original_frame: &[u8], password: &[u8]) -> std::io::Result<Vec<u8>> {
+#[async_trait]
+impl TcpClientHandler for ShadowTlsClientHandler {
+    async fn setup_client_stream(
+        &self,
+        _server_stream: &mut Box<dyn AsyncStream>,
+        mut client_stream: Box<dyn AsyncStream>,
+        _remote_location: NetLocation,
+    ) -> std::io::Result<TcpClientSetupResult> {
+        let mut client_conn =
+            rustls::ClientConnection::new(self.client_config.clone(), self.server_name.clone())
+                .map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("Failed to create ClientConnection: {}", e),
+                    )
+                })?;
+
+        let mut client_hello_buf = Vec::with_capacity(512); // Typical ClientHello
+        if client_conn.wants_write() {
+            client_conn.write_tls(&mut Cursor::new(&mut client_hello_buf))?;
+        }
+        if client_hello_buf.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "rustls::ClientConnection did not produce ClientHello",
+            ));
+        }
+
+        let modified_client_hello = modify_client_hello(&client_hello_buf, &self.initial_hmac)?;
+
+        write_all(&mut client_stream, &modified_client_hello).await?;
+        client_stream.flush().await?;
+
+        // TODO: validate the read amount is exactly a single ServerHello frame
+        let mut remote_reader = StreamReader::new_with_buffer_size(TLS_FRAME_MAX_LEN * 2);
+
+        let parsed_server_hello = {
+            let server_hello_frame =
+                read_full_tls_frame(&mut remote_reader, &mut client_stream).await?;
+
+            if server_hello_frame.len() < TLS_HEADER_LEN + 1 + 3 + 32 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "ServerHello frame too short for header",
+                ));
+            }
+
+            let server_content_type = server_hello_frame[0];
+            if server_content_type != CONTENT_TYPE_HANDSHAKE {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "Expected ServerHello handshake content type, got {}",
+                        server_content_type
+                    ),
+                ));
+            }
+
+            if server_hello_frame[TLS_HEADER_LEN] != HANDSHAKE_TYPE_SERVER_HELLO {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Expected ServerHello handshake message type",
+                ));
+            }
+
+            let parsed_server_hello = parse_server_hello(&server_hello_frame)?;
+
+            feed_client_connection(&mut client_conn, &server_hello_frame)?;
+            client_conn.process_new_packets().map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("Failed to process ServerHello frame: {}", e),
+                )
+            })?;
+
+            parsed_server_hello
+        };
+
+        let mut rustls_write_buf = allocate_vec(TLS_FRAME_MAX_LEN); // For client_conn.write_tls()
+
+        let mut hmac_server_random = self.initial_hmac.clone();
+        hmac_server_random.update(&parsed_server_hello.server_random);
+
+        let mut hmac_client_data = hmac_server_random.clone();
+        hmac_client_data.update(b"C");
+
+        let mut hmac_server_data = hmac_server_random.clone();
+        hmac_server_data.update(b"S");
+
+        while client_conn.is_handshaking() {
+            if client_conn.wants_write() {
+                let mut cursor = Cursor::new(&mut rustls_write_buf[..]);
+                match client_conn.write_tls(&mut cursor) {
+                    Ok(n) if n > 0 => {
+                        write_all(&mut client_stream, &rustls_write_buf[..n]).await?;
+                        client_stream.flush().await?;
+                    }
+                    Ok(_) => { /* wrote 0 bytes */ }
+                    Err(e) => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!("rustls write_tls error: {}", e),
+                        ))
+                    }
+                }
+                continue;
+            }
+
+            let server_frame = read_full_tls_frame(&mut remote_reader, &mut client_stream).await?;
+            let content_type = server_frame[0];
+
+            if content_type == CONTENT_TYPE_APPLICATION_DATA {
+                // since we are still handshaking, this must be an encrypted TLS 1.3 handshake record from
+                // the handshake server, so we expect it to pass the ServerRandom hmac check.
+                // once we get here, we are done with the initial handshake and can break.
+                let payload_len = u16::from_be_bytes([server_frame[3], server_frame[4]]) as usize;
+                if payload_len < 4 {
+                    // Must be at least 4 for HMAC
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "AppData frame too short for ShadowTLS HMAC",
+                    ));
+                }
+
+                let received_hmac = &server_frame[TLS_HEADER_LEN..TLS_HEADER_LEN + 4];
+                let data_after_hmac =
+                    &server_frame[TLS_HEADER_LEN + 4..TLS_HEADER_LEN + payload_len];
+
+                hmac_server_random.update(data_after_hmac);
+                if hmac_server_random.digest() != received_hmac {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "Invalid HMAC for Stage1 AppData or unexpected AppData frame",
+                    ));
+                }
+
+                break;
+            }
+
+            if content_type == CONTENT_TYPE_ALERT {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("Unexpected alert frame from ShadowTLS server during handshake"),
+                ));
+            }
+
+            feed_client_connection(&mut client_conn, &server_frame)?;
+            client_conn.process_new_packets().map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "Failed to process handshake frame of type {}: {}",
+                        content_type, e
+                    ),
+                )
+            })?;
+        }
+
+        // The ShadowTlsStream will need to be adapted for client-side logic:
+        // - On read, first try to match HMAC_ServerRandom (from hmac_key_psk + server_random). If match, XOR and discard.
+        // - If not, try to match HMAC_ServerRandomS (from hmac_for_receiving_data). If match, this is app data.
+        // - Once HMAC_ServerRandomS matches, only use that for future frames.
+        // For now, assuming ShadowTlsStream takes the Stage 2 HMACs directly.
+
+        let mut shadow_tls_stream = ShadowTlsStream::new(
+            client_stream,
+            &[],
+            hmac_server_data,
+            hmac_client_data,
+            Some(hmac_server_random),
+        )?;
+
+        // Feed any unconsumed data from StreamReader from handshake phase
+        let unparsed_handshake_data = remote_reader.unparsed_data();
+        if !unparsed_handshake_data.is_empty() {
+            shadow_tls_stream.feed_initial_read_data(unparsed_handshake_data)?;
+        }
+
+        self.handler
+            .setup_client_stream(
+                _server_stream,
+                Box::new(shadow_tls_stream),
+                _remote_location,
+            )
+            .await
+    }
+}
+
+fn modify_client_hello(
+    original_frame: &[u8],
+    initial_hmac: &ShadowTlsHmac,
+) -> std::io::Result<Vec<u8>> {
     if original_frame.len() < TLS_HEADER_LEN {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -163,9 +359,7 @@ fn modify_client_hello(original_frame: &[u8], password: &[u8]) -> std::io::Resul
     modified_frame.extend_from_slice(&[0u8; 4]);
     modified_frame.extend_from_slice(remaining_ch_data);
 
-    let hmac_key =
-        aws_lc_rs::hmac::Key::new(aws_lc_rs::hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY, password);
-    let mut hmac_ctx = ShadowTlsHmac::new(&hmac_key);
+    let mut hmac_ctx = initial_hmac.clone();
     hmac_ctx.update(&modified_frame[TLS_HEADER_LEN..]);
     let hmac_tag = hmac_ctx.finalized_digest();
     modified_frame[digest_index..digest_index + 4].copy_from_slice(&hmac_tag);
@@ -195,199 +389,6 @@ async fn read_full_tls_frame(
     full_frame.extend_from_slice(payload_bytes);
 
     Ok(full_frame)
-}
-
-#[async_trait]
-impl TcpClientHandler for ShadowTlsClientHandler {
-    async fn setup_client_stream(
-        &self,
-        _server_stream: &mut Box<dyn AsyncStream>,
-        mut client_stream: Box<dyn AsyncStream>,
-        _remote_location: NetLocation,
-    ) -> std::io::Result<TcpClientSetupResult> {
-        let mut client_conn =
-            rustls::ClientConnection::new(self.client_config.clone(), self.server_name.clone())
-                .map_err(|e| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("Failed to create ClientConnection: {}", e),
-                    )
-                })?;
-
-        let mut client_hello_buf = Vec::with_capacity(512); // Typical ClientHello
-        if client_conn.wants_write() {
-            client_conn.write_tls(&mut Cursor::new(&mut client_hello_buf))?;
-        }
-        if client_hello_buf.is_empty() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "rustls::ClientConnection did not produce ClientHello",
-            ));
-        }
-
-        let modified_client_hello = modify_client_hello(&client_hello_buf, &self.password)?;
-
-        write_all(&mut client_stream, &modified_client_hello).await?;
-        client_stream.flush().await?;
-
-        // TODO: validate the read amount is exactly a single ServerHello frame
-        let mut remote_reader = StreamReader::new_with_buffer_size(TLS_FRAME_MAX_LEN * 2);
-
-        let parsed_server_hello = {
-            let server_hello_frame =
-                read_full_tls_frame(&mut remote_reader, &mut client_stream).await?;
-
-            if server_hello_frame.len() < TLS_HEADER_LEN + 1 + 3 + 32 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "ServerHello frame too short for header",
-                ));
-            }
-
-            let server_content_type = server_hello_frame[0];
-            if server_content_type != CONTENT_TYPE_HANDSHAKE {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!(
-                        "Expected ServerHello handshake content type, got {}",
-                        server_content_type
-                    ),
-                ));
-            }
-
-            if server_hello_frame[TLS_HEADER_LEN] != HANDSHAKE_TYPE_SERVER_HELLO {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "Expected ServerHello handshake message type",
-                ));
-            }
-
-            let parsed_server_hello = parse_server_hello(&server_hello_frame)?;
-
-            feed_client_connection(&mut client_conn, &server_hello_frame)?;
-            client_conn.process_new_packets().map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("Failed to process ServerHello frame: {}", e),
-                )
-            })?;
-
-            parsed_server_hello
-        };
-
-        let mut rustls_write_buf = allocate_vec(TLS_FRAME_MAX_LEN); // For client_conn.write_tls()
-
-        let hmac_key = aws_lc_rs::hmac::Key::new(
-            aws_lc_rs::hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY,
-            &self.password,
-        );
-
-        let mut hmac_server_random = ShadowTlsHmac::new(&hmac_key);
-        hmac_server_random.update(&parsed_server_hello.server_random);
-
-        let mut hmac_client_data = hmac_server_random.clone();
-        hmac_client_data.update(b"C");
-
-        let mut hmac_server_data = hmac_server_random.clone();
-        hmac_server_data.update(b"S");
-
-        while client_conn.is_handshaking() {
-            if client_conn.wants_write() {
-                let mut cursor = Cursor::new(&mut rustls_write_buf[..]);
-                match client_conn.write_tls(&mut cursor) {
-                    Ok(n) if n > 0 => {
-                        write_all(&mut client_stream, &rustls_write_buf[..n]).await?;
-                        client_stream.flush().await?;
-                    }
-                    Ok(_) => { /* wrote 0 bytes */ }
-                    Err(e) => {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            format!("rustls write_tls error: {}", e),
-                        ))
-                    }
-                }
-                continue;
-            }
-
-            let server_frame = read_full_tls_frame(&mut remote_reader, &mut client_stream).await?;
-            let content_type = server_frame[0];
-
-            if content_type == CONTENT_TYPE_APPLICATION_DATA {
-                // since we are still handshaking, this must be an encrypted TLS 1.3 handshake record from
-                // the handshake server, so we expect it to pass the ServerRandom hmac check.
-                // once we get here, we are done with the initial handshake and can break.
-                let payload_len = u16::from_be_bytes([server_frame[3], server_frame[4]]) as usize;
-                if payload_len < 4 {
-                    // Must be at least 4 for HMAC
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "AppData frame too short for ShadowTLS HMAC",
-                    ));
-                }
-
-                let received_hmac = &server_frame[TLS_HEADER_LEN..TLS_HEADER_LEN + 4];
-                let data_after_hmac =
-                    &server_frame[TLS_HEADER_LEN + 4..TLS_HEADER_LEN + payload_len];
-
-                hmac_server_random.update(data_after_hmac);
-                if hmac_server_random.digest() != received_hmac {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "Invalid HMAC for Stage1 AppData or unexpected AppData frame",
-                    ));
-                }
-
-                break;
-            }
-
-            if content_type == CONTENT_TYPE_ALERT {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("Unexpected alert frame from ShadowTLS server during handshake"),
-                ));
-            }
-
-            feed_client_connection(&mut client_conn, &server_frame)?;
-            client_conn.process_new_packets().map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!(
-                        "Failed to process handshake frame of type {}: {}",
-                        content_type, e
-                    ),
-                )
-            })?;
-        }
-
-        // The ShadowTlsStream will need to be adapted for client-side logic:
-        // - On read, first try to match HMAC_ServerRandom (from hmac_key_psk + server_random). If match, XOR and discard.
-        // - If not, try to match HMAC_ServerRandomS (from hmac_for_receiving_data). If match, this is app data.
-        // - Once HMAC_ServerRandomS matches, only use that for future frames.
-        // For now, assuming ShadowTlsStream takes the Stage 2 HMACs directly.
-
-        let mut shadow_tls_stream = ShadowTlsStream::new(
-            client_stream,
-            &[],
-            hmac_server_data,
-            hmac_client_data,
-            Some(hmac_server_random),
-        )?;
-
-        // Feed any unconsumed data from StreamReader from handshake phase
-        let unparsed_handshake_data = remote_reader.unparsed_data();
-        if !unparsed_handshake_data.is_empty() {
-            shadow_tls_stream.feed_initial_read_data(unparsed_handshake_data)?;
-        }
-
-        self.handler
-            .setup_client_stream(
-                _server_stream,
-                Box::new(shadow_tls_stream),
-                _remote_location,
-            )
-            .await
-    }
 }
 
 #[inline]

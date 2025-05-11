@@ -1,4 +1,4 @@
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct ShadowTlsHmac {
     context: aws_lc_rs::hmac::Context,
 }
