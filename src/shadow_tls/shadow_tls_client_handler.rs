@@ -96,8 +96,8 @@ fn modify_client_hello(original_frame: &[u8], password: &[u8]) -> std::io::Resul
         ));
     }
 
-    let original_ch_msg_len = reader.read_u24_be()? as usize; // ClientHello message len
-    if reader.position() + original_ch_msg_len != original_payload_len {
+    let client_hello_payload_len = reader.read_u24_be()? as usize;
+    if reader.position() + client_hello_payload_len != original_payload_len {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "ClientHello message length inconsistent with record payload length",
@@ -139,31 +139,10 @@ fn modify_client_hello(original_frame: &[u8], password: &[u8]) -> std::io::Resul
     rand::thread_rng().fill_bytes(&mut new_session_id_value[0..28]); // First 28 bytes random
 
     // new length for the session id
-    let new_ch_msg_len = original_ch_msg_len + (32 - original_session_id_len);
-
-    let mut hmac_payload = Vec::with_capacity(new_ch_msg_len);
-    hmac_payload.push(handshake_type);
-    hmac_payload.extend_from_slice(&(new_ch_msg_len as u32).to_be_bytes()[1..]); // u24
-    hmac_payload.push(ch_protocol_ver_major);
-    hmac_payload.push(ch_protocol_ver_minor);
-    hmac_payload.extend_from_slice(&client_random);
-    hmac_payload.push(32u8);
-    hmac_payload.extend_from_slice(&new_session_id_value[0..28]);
-    let digest_index = hmac_payload.len();
-    hmac_payload.extend_from_slice(&[0u8; 4]);
-    hmac_payload.extend_from_slice(remaining_ch_data);
-
-    let hmac_key =
-        aws_lc_rs::hmac::Key::new(aws_lc_rs::hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY, password);
-    let mut hmac_ctx = ShadowTlsHmac::new(&hmac_key);
-    hmac_ctx.update(&hmac_payload);
-    let hmac_tag = hmac_ctx.finalized_digest(); // 4 bytes
-
-    // Place HMAC tag into the new SessionID value
-    new_session_id_value[28..32].copy_from_slice(&hmac_tag);
+    let new_client_hello_payload_len = client_hello_payload_len + (32 - original_session_id_len);
 
     // 4 bytes more because of handshake message type (1 byte) and hello data length (3 bytes)
-    let new_record_payload_len = new_ch_msg_len + 4;
+    let new_record_payload_len = new_client_hello_payload_len + 4;
 
     let mut modified_frame = Vec::with_capacity(TLS_HEADER_LEN + new_record_payload_len);
 
@@ -171,8 +150,25 @@ fn modify_client_hello(original_frame: &[u8], password: &[u8]) -> std::io::Resul
     modified_frame.push(original_frame[1]); // Record protocol major (e.g., 0x03)
     modified_frame.push(original_frame[2]); // Record protocol minor (e.g., 0x01 or 0x03)
     modified_frame.extend_from_slice(&(new_record_payload_len as u16).to_be_bytes());
-    modified_frame.extend_from_slice(&hmac_payload);
-    modified_frame[digest_index + 5..digest_index + 5 + 4].copy_from_slice(&hmac_tag);
+
+    // client hello payload
+    modified_frame.push(handshake_type);
+    modified_frame.extend_from_slice(&(new_client_hello_payload_len as u32).to_be_bytes()[1..]); // u24
+    modified_frame.push(ch_protocol_ver_major);
+    modified_frame.push(ch_protocol_ver_minor);
+    modified_frame.extend_from_slice(&client_random);
+    modified_frame.push(32u8);
+    modified_frame.extend_from_slice(&new_session_id_value[0..28]);
+    let digest_index = modified_frame.len();
+    modified_frame.extend_from_slice(&[0u8; 4]);
+    modified_frame.extend_from_slice(remaining_ch_data);
+
+    let hmac_key =
+        aws_lc_rs::hmac::Key::new(aws_lc_rs::hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY, password);
+    let mut hmac_ctx = ShadowTlsHmac::new(&hmac_key);
+    hmac_ctx.update(&modified_frame[TLS_HEADER_LEN..]);
+    let hmac_tag = hmac_ctx.finalized_digest();
+    modified_frame[digest_index..digest_index + 4].copy_from_slice(&hmac_tag);
 
     Ok(modified_frame)
 }
