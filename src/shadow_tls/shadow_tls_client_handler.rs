@@ -17,6 +17,7 @@ use crate::util::{allocate_vec, write_all}; // Assuming write_all is from crate:
 use super::shadow_tls_server_handler::parse_server_hello;
 
 // Constants from shadow_tls_server_handler
+// TODO: deduplicate consts
 const TLS_HEADER_LEN: usize = 5;
 const TLS_FRAME_MAX_LEN: usize = TLS_HEADER_LEN + 65535;
 const CONTENT_TYPE_HANDSHAKE: u8 = 0x16;
@@ -90,20 +91,20 @@ impl TcpClientHandler for ShadowTlsClientHandler {
 
         let mut remote_reader = StreamReader::new_with_buffer_size(TLS_FRAME_MAX_LEN * 2);
 
+        let mut frame_buf = allocate_vec(TLS_FRAME_MAX_LEN);
+
         let server_hello_frame =
-            read_full_tls_frame(&mut remote_reader, &mut client_stream).await?;
+            read_tls_frame(&mut remote_reader, &mut client_stream, &mut frame_buf).await?;
 
-        let parsed_server_hello = parse_server_hello(&server_hello_frame)?;
+        let parsed_server_hello = parse_server_hello(server_hello_frame)?;
 
-        feed_client_connection(&mut client_conn, &server_hello_frame)?;
+        feed_client_connection(&mut client_conn, server_hello_frame)?;
         client_conn.process_new_packets().map_err(|e| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("Failed to process ServerHello frame: {}", e),
             )
         })?;
-
-        let mut rustls_write_buf = allocate_vec(TLS_FRAME_MAX_LEN); // For client_conn.write_tls()
 
         let mut hmac_server_random = self.initial_hmac.clone();
         hmac_server_random.update(&parsed_server_hello.server_random);
@@ -116,10 +117,10 @@ impl TcpClientHandler for ShadowTlsClientHandler {
 
         while client_conn.is_handshaking() {
             if client_conn.wants_write() {
-                let mut cursor = Cursor::new(&mut rustls_write_buf[..]);
+                let mut cursor = Cursor::new(&mut frame_buf[..]);
                 match client_conn.write_tls(&mut cursor) {
                     Ok(n) if n > 0 => {
-                        write_all(&mut client_stream, &rustls_write_buf[..n]).await?;
+                        write_all(&mut client_stream, &frame_buf[..n]).await?;
                         client_stream.flush().await?;
                     }
                     Ok(_) => { /* wrote 0 bytes */ }
@@ -133,7 +134,8 @@ impl TcpClientHandler for ShadowTlsClientHandler {
                 continue;
             }
 
-            let server_frame = read_full_tls_frame(&mut remote_reader, &mut client_stream).await?;
+            let server_frame =
+                read_tls_frame(&mut remote_reader, &mut client_stream, &mut frame_buf).await?;
             let content_type = server_frame[0];
 
             if content_type == CONTENT_TYPE_APPLICATION_DATA {
@@ -168,27 +170,21 @@ impl TcpClientHandler for ShadowTlsClientHandler {
             if content_type == CONTENT_TYPE_ALERT {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    format!("Unexpected alert frame from ShadowTLS server during handshake"),
+                    "unexpected alert frame from ShadowTLS server during handshake",
                 ));
             }
 
-            feed_client_connection(&mut client_conn, &server_frame)?;
+            feed_client_connection(&mut client_conn, server_frame)?;
             client_conn.process_new_packets().map_err(|e| {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     format!(
-                        "Failed to process handshake frame of type {}: {}",
+                        "failed to process handshake frame of type {}: {}",
                         content_type, e
                     ),
                 )
             })?;
         }
-
-        // The ShadowTlsStream will need to be adapted for client-side logic:
-        // - On read, first try to match HMAC_ServerRandom (from hmac_key_psk + server_random). If match, XOR and discard.
-        // - If not, try to match HMAC_ServerRandomS (from hmac_for_receiving_data). If match, this is app data.
-        // - Once HMAC_ServerRandomS matches, only use that for future frames.
-        // For now, assuming ShadowTlsStream takes the Stage 2 HMACs directly.
 
         let mut shadow_tls_stream = ShadowTlsStream::new(
             client_stream,
@@ -214,6 +210,7 @@ impl TcpClientHandler for ShadowTlsClientHandler {
     }
 }
 
+#[inline]
 fn modify_client_hello(
     original_frame: &[u8],
     initial_hmac: &ShadowTlsHmac,
@@ -232,8 +229,8 @@ fn modify_client_hello(
     }
 
     // TLS 1.3 ClientHello is sent in a TLS 1.0 (0x0301) or TLS 1.2 (0x0303) record format.
-    let record_protocol_version_ok = (original_frame[1] == 0x03 && original_frame[2] == 0x01)
-        || (original_frame[1] == 0x03 && original_frame[2] == 0x03);
+    let record_protocol_version_ok =
+        original_frame[1] == 0x03 && (original_frame[2] == 0x01 || original_frame[2] == 0x03);
     if !record_protocol_version_ok {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -301,46 +298,47 @@ fn modify_client_hello(
     let remaining_ch_data_offset = reader.position();
     let remaining_ch_data = &original_frame[TLS_HEADER_LEN + remaining_ch_data_offset..];
 
-    let mut new_session_id_value = [0u8; 32];
-    rand::rng().fill_bytes(&mut new_session_id_value[0..28]); // First 28 bytes random
-
     // new length for the session id
     let new_client_hello_payload_len = client_hello_payload_len + (32 - original_session_id_len);
 
     // 4 bytes more because of handshake message type (1 byte) and hello data length (3 bytes)
     let new_record_payload_len = new_client_hello_payload_len + 4;
 
-    let mut modified_frame = Vec::with_capacity(TLS_HEADER_LEN + new_record_payload_len);
+    let mut modified_frame = allocate_vec(TLS_HEADER_LEN + new_record_payload_len);
 
-    modified_frame.push(CONTENT_TYPE_HANDSHAKE);
-    modified_frame.push(original_frame[1]); // Record protocol major (e.g., 0x03)
-    modified_frame.push(original_frame[2]); // Record protocol minor (e.g., 0x01 or 0x03)
-    modified_frame.extend_from_slice(&(new_record_payload_len as u16).to_be_bytes());
+    modified_frame[0] = CONTENT_TYPE_HANDSHAKE;
+    modified_frame[1] = original_frame[1]; // Record protocol major (e.g., 0x03)
+    modified_frame[2] = original_frame[2]; // Record protocol minor (e.g., 0x01 or 0x03)
+    modified_frame[3..5].copy_from_slice(&(new_record_payload_len as u16).to_be_bytes());
 
-    // client hello payload
-    modified_frame.push(handshake_type);
-    modified_frame.extend_from_slice(&(new_client_hello_payload_len as u32).to_be_bytes()[1..]); // u24
-    modified_frame.push(ch_protocol_ver_major);
-    modified_frame.push(ch_protocol_ver_minor);
-    modified_frame.extend_from_slice(&client_random);
-    modified_frame.push(32u8);
-    modified_frame.extend_from_slice(&new_session_id_value[0..28]);
-    let digest_index = modified_frame.len();
-    modified_frame.extend_from_slice(&[0u8; 4]);
-    modified_frame.extend_from_slice(remaining_ch_data);
+    modified_frame[5] = handshake_type;
+    // skip the first byte for u24
+    modified_frame[6..9].copy_from_slice(&(new_client_hello_payload_len as u32).to_be_bytes()[1..]);
+    modified_frame[9] = ch_protocol_ver_major;
+    modified_frame[10] = ch_protocol_ver_minor;
+    modified_frame[11..43].copy_from_slice(&client_random);
+
+    // session id
+    modified_frame[43] = 32u8;
+    // first 28 bytes of the session id, last 4 bytes (72..76) will be the digest
+    rand::rng().fill_bytes(&mut modified_frame[44..72]);
+    modified_frame[72..76].copy_from_slice(&[0, 0, 0, 0]);
+    modified_frame[76..].copy_from_slice(remaining_ch_data);
 
     let mut hmac_ctx = initial_hmac.clone();
     hmac_ctx.update(&modified_frame[TLS_HEADER_LEN..]);
     let hmac_tag = hmac_ctx.finalized_digest();
-    modified_frame[digest_index..digest_index + 4].copy_from_slice(&hmac_tag);
+    modified_frame[72..76].copy_from_slice(&hmac_tag);
 
     Ok(modified_frame)
 }
 
-async fn read_full_tls_frame(
+#[inline]
+async fn read_tls_frame<'a>(
     reader: &mut StreamReader,
     stream: &mut Box<dyn AsyncStream>,
-) -> std::io::Result<Vec<u8>> {
+    read_buf: &'a mut [u8],
+) -> std::io::Result<&'a [u8]> {
     let header_bytes = reader.read_slice(stream, TLS_HEADER_LEN).await?;
 
     let payload_len = u16::from_be_bytes([header_bytes[3], header_bytes[4]]) as usize;
@@ -352,13 +350,12 @@ async fn read_full_tls_frame(
         ));
     }
 
-    let mut full_frame = Vec::with_capacity(TLS_HEADER_LEN + payload_len);
-    full_frame.extend_from_slice(header_bytes);
+    read_buf[0..TLS_HEADER_LEN].copy_from_slice(header_bytes);
 
     let payload_bytes = reader.read_slice(stream, payload_len).await?;
-    full_frame.extend_from_slice(payload_bytes);
+    read_buf[TLS_HEADER_LEN..TLS_HEADER_LEN + payload_len].copy_from_slice(payload_bytes);
 
-    Ok(full_frame)
+    Ok(&read_buf[..TLS_HEADER_LEN + payload_len])
 }
 
 #[inline]
