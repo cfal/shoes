@@ -395,11 +395,18 @@ pub async fn read_client_hello(
     })
 }
 
-struct ParsedServerHello {
-    server_random: Vec<u8>,
+pub struct ParsedServerHello {
+    pub server_random: Vec<u8>,
 }
 
-async fn parse_server_hello(server_hello_frame: &[u8]) -> std::io::Result<ParsedServerHello> {
+pub fn parse_server_hello(server_hello_frame: &[u8]) -> std::io::Result<ParsedServerHello> {
+    if server_hello_frame.len() < TLS_HEADER_LEN {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "ServerHello frame too short for header",
+        ));
+    }
+
     let server_content_type = server_hello_frame[0];
     if server_content_type != CONTENT_TYPE_HANDSHAKE {
         return Err(std::io::Error::new(
@@ -654,7 +661,7 @@ async fn setup_remote_handshake(
     server_hello_frame.extend_from_slice(server_payload_bytes);
 
     let ParsedServerHello { server_random } =
-        parse_server_hello(&server_hello_frame).await.map_err(|e| {
+        parse_server_hello(&server_hello_frame).map_err(|e| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("failed to parse ServerHello from remote server: {}", e),
@@ -794,6 +801,7 @@ async fn setup_remote_handshake(
                             initial_client_data,
                             hmac_client_data,
                             hmac_server_data,
+                            None,
                         ).map_err(|e| std::io::Error::new(
                             std::io::ErrorKind::Other,
                             format!("failed to create ShadowTlsStream: {}", e)
@@ -884,7 +892,7 @@ async fn setup_local_handshake(
 
     let server_hello_frame = &server_data[0..TLS_HEADER_LEN + server_hello_payload_size];
 
-    let ParsedServerHello { server_random } = parse_server_hello(server_hello_frame).await?;
+    let ParsedServerHello { server_random } = parse_server_hello(server_hello_frame)?;
 
     // write the server hello frame to the client
     write_all(&mut server_stream, server_hello_frame).await?;
@@ -1053,6 +1061,7 @@ async fn setup_local_handshake(
                     initial_client_data,
                     hmac_client_data,
                     hmac_server_data,
+                    None,
                 )?;
 
                 return Ok(shadow_tls_stream);

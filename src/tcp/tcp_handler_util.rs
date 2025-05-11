@@ -15,7 +15,9 @@ use crate::http_handler::{HttpTcpClientHandler, HttpTcpServerHandler};
 use crate::option_util::NoneOrOne;
 use crate::port_forward_handler::PortForwardServerHandler;
 use crate::rustls_util::{create_client_config, create_server_config};
-use crate::shadow_tls::{ShadowTlsServerTarget, ShadowTlsServerTargetHandshake};
+use crate::shadow_tls::{
+    ShadowTlsClientHandler, ShadowTlsServerTarget, ShadowTlsServerTargetHandshake,
+};
 use crate::shadowsocks::ShadowsocksTcpHandler;
 use crate::snell::snell_handler::{SnellClientHandler, SnellServerHandler};
 use crate::socks_handler::{SocksTcpClientHandler, SocksTcpServerHandler};
@@ -393,6 +395,7 @@ pub fn create_tcp_client_handler(
                 protocol,
                 key,
                 cert,
+                shadowtls_password,
             } = tls_client_config;
 
             let sni_hostname = if sni_hostname.is_unspecified() {
@@ -437,12 +440,25 @@ pub fn create_tcp_client_handler(
 
             let handler = create_tcp_client_handler(*protocol, None);
 
-            Box::new(TlsClientHandler::new(
-                client_config,
-                tls_buffer_size,
-                server_name,
-                handler,
-            ))
+            match shadowtls_password {
+                None => Box::new(TlsClientHandler::new(
+                    client_config,
+                    tls_buffer_size,
+                    server_name,
+                    handler,
+                )),
+                Some(password) => {
+                    // TODO: Ensure client_config is suitable for TLS 1.3.
+                    // Rustls ClientConfig by default supports TLS 1.3 if server does.
+                    // The server handler enforces TLS 1.3 from client and for negotiation.
+                    Box::new(ShadowTlsClientHandler::new(
+                        password,
+                        client_config,
+                        server_name,
+                        handler,
+                    ))
+                }
+            }
         }
         ClientProxyConfig::Vmess {
             cipher,

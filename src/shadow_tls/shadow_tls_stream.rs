@@ -1,5 +1,6 @@
 use std::pin::Pin;
 use std::task::{Context, Poll};
+
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use super::shadow_tls_hmac::ShadowTlsHmac;
@@ -22,8 +23,11 @@ const CONTENT_TYPE_APPLICATION_DATA: u8 = 0x17;
 
 pub struct ShadowTlsStream {
     stream: Box<dyn AsyncStream>,
-    hmac_client_data: ShadowTlsHmac,
-    hmac_server_data: ShadowTlsHmac,
+    read_hmac: ShadowTlsHmac,
+    write_hmac: ShadowTlsHmac,
+
+    // the HMAC_ServerRandom used client-side to verify handshake app data frames.
+    handshake_hmac: Option<ShadowTlsHmac>,
 
     is_eof: bool,
 
@@ -43,8 +47,9 @@ impl ShadowTlsStream {
     pub fn new(
         stream: Box<dyn AsyncStream>,
         initial_processed_data: &[u8],
-        hmac_client_data: ShadowTlsHmac,
-        hmac_server_data: ShadowTlsHmac,
+        read_hmac: ShadowTlsHmac,
+        write_hmac: ShadowTlsHmac,
+        handshake_hmac: Option<ShadowTlsHmac>,
     ) -> std::io::Result<Self> {
         let mut processed_buf = allocate_vec(TLS_FRAME_MAX_LEN).into_boxed_slice();
         if initial_processed_data.len() > processed_buf.len() {
@@ -63,8 +68,9 @@ impl ShadowTlsStream {
 
         Ok(Self {
             stream,
-            hmac_client_data,
-            hmac_server_data,
+            read_hmac,
+            write_hmac,
+            handshake_hmac,
             is_eof: false,
             processed_buf,
             processed_start_offset: 0,
@@ -141,12 +147,6 @@ impl ShadowTlsStream {
             self.is_eof = true;
             return Ok(DeframeState::ReceivedAlert);
         }
-        if content_type != CONTENT_TYPE_APPLICATION_DATA {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "Invalid record type",
-            ));
-        }
 
         let frame_len = u16::from_be_bytes([header[3], header[4]]) as usize;
         if frame_len < 4 {
@@ -159,6 +159,27 @@ impl ShadowTlsStream {
         let total_len = TLS_HEADER_LEN + frame_len;
         if self.unprocessed_end_offset < total_len {
             return Ok(DeframeState::NeedData);
+        }
+
+        if content_type != CONTENT_TYPE_APPLICATION_DATA {
+            if self.handshake_hmac.is_some() {
+                // Allow any other frame type while we haven't completed
+                // the handshake, ie. we haven't received non-forwarded app
+                // data.
+                if total_len < self.unprocessed_end_offset {
+                    self.unprocessed_buf
+                        .copy_within(total_len..self.unprocessed_end_offset, 0);
+                    self.unprocessed_end_offset -= total_len;
+                    return Ok(DeframeState::HandshakeFrame);
+                } else {
+                    self.unprocessed_end_offset = 0;
+                    return Ok(DeframeState::NeedData);
+                }
+            }
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Invalid record type",
+            ));
         }
 
         // frame length minus HMAC
@@ -174,15 +195,35 @@ impl ShadowTlsStream {
         let frame_body = &self.unprocessed_buf[TLS_HEADER_LEN..total_len];
         let received_digest = &frame_body[0..4];
         let payload = &frame_body[4..];
-        self.hmac_client_data.update(payload);
-        let expected_digest = self.hmac_client_data.digest();
+
+        if let Some(ref mut handshake_hmac) = self.handshake_hmac {
+            handshake_hmac.update(payload);
+            let expected_digest = handshake_hmac.digest();
+            if received_digest == expected_digest {
+                if total_len < self.unprocessed_end_offset {
+                    self.unprocessed_buf
+                        .copy_within(total_len..self.unprocessed_end_offset, 0);
+                    self.unprocessed_end_offset -= total_len;
+                    return Ok(DeframeState::HandshakeFrame);
+                } else {
+                    self.unprocessed_end_offset = 0;
+                    return Ok(DeframeState::NeedData);
+                }
+            }
+            // this must be the first non-handshake server data frame, or else
+            // this is malformed and we error out in the follow hmac check.
+            self.handshake_hmac = None;
+        }
+
+        self.read_hmac.update(payload);
+        let expected_digest = self.read_hmac.digest();
         if received_digest != expected_digest {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "HMAC verification failed",
             ));
         }
-        self.hmac_client_data.update(&expected_digest);
+        self.read_hmac.update(&expected_digest);
 
         self.processed_buf[0..payload_len].copy_from_slice(payload);
         self.processed_end_offset = payload_len;
@@ -203,6 +244,7 @@ enum DeframeState {
     NeedData,
     Success,
     ReceivedAlert,
+    HandshakeFrame,
 }
 
 impl AsyncRead for ShadowTlsStream {
@@ -222,13 +264,16 @@ impl AsyncRead for ShadowTlsStream {
         }
 
         if this.unprocessed_end_offset > 0 {
-            match this.try_deframe()? {
-                DeframeState::Success => {
-                    this.read_processed(buf);
-                    return Poll::Ready(Ok(()));
+            loop {
+                match this.try_deframe()? {
+                    DeframeState::Success => {
+                        this.read_processed(buf);
+                        return Poll::Ready(Ok(()));
+                    }
+                    DeframeState::NeedData => break,
+                    DeframeState::ReceivedAlert => return Poll::Ready(Ok(())),
+                    DeframeState::HandshakeFrame => {}
                 }
-                DeframeState::NeedData => {}
-                DeframeState::ReceivedAlert => return Poll::Ready(Ok(())),
             }
 
             if this.unprocessed_end_offset == this.unprocessed_buf.len() {
@@ -251,13 +296,16 @@ impl AsyncRead for ShadowTlsStream {
                     }
                     this.unprocessed_end_offset += n;
 
-                    match this.try_deframe()? {
-                        DeframeState::Success => {
-                            this.read_processed(buf);
-                            return Poll::Ready(Ok(()));
+                    loop {
+                        match this.try_deframe()? {
+                            DeframeState::Success => {
+                                this.read_processed(buf);
+                                return Poll::Ready(Ok(()));
+                            }
+                            DeframeState::NeedData => break,
+                            DeframeState::ReceivedAlert => return Poll::Ready(Ok(())),
+                            DeframeState::HandshakeFrame => {}
                         }
-                        DeframeState::NeedData => {}
-                        DeframeState::ReceivedAlert => return Poll::Ready(Ok(())),
                     }
                 }
                 Poll::Pending => return Poll::Pending,
@@ -303,9 +351,9 @@ impl AsyncWrite for ShadowTlsStream {
         // write_buf[0..2] never changes and is set in the constructor.
         this.write_buf[3..5].copy_from_slice(&(frame_len as u16).to_be_bytes());
 
-        this.hmac_server_data.update(consumed_buf);
-        let digest = this.hmac_server_data.digest();
-        this.hmac_server_data.update(&digest);
+        this.write_hmac.update(consumed_buf);
+        let digest = this.write_hmac.digest();
+        this.write_hmac.update(&digest);
 
         this.write_buf[5..9].copy_from_slice(&digest);
 

@@ -530,6 +530,8 @@ pub struct TlsClientConfig {
     pub key: Option<String>,
     #[serde(default)]
     pub cert: Option<String>,
+    #[serde(default)]
+    pub shadowtls_password: Option<String>,
     pub protocol: Box<ClientProxyConfig>,
 }
 
