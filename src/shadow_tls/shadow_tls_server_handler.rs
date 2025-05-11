@@ -4,6 +4,7 @@
 /// - https://commandlinefanatic.com/cgi-bin/showarticle.cgi?article=art080
 /// - https://wiki.osdev.org/TLS_Handshake#Client_Hello_Message
 /// - https://tls13.xargs.org/#client-hello/annotated
+use std::fmt::Debug;
 use std::io::Cursor;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -24,9 +25,19 @@ use crate::tcp_client_connector::TcpClientConnector;
 use crate::tcp_handler::{TcpServerHandler, TcpServerSetupResult};
 use crate::util::{allocate_vec, write_all};
 
+// context wrapper because it's not Debug
+struct ShadowTlsXorContext(aws_lc_rs::digest::Context);
+
+impl Debug for ShadowTlsXorContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "[ShadowTlsXorContext]")
+    }
+}
+
 #[derive(Debug)]
 pub struct ShadowTlsServerTarget {
-    password: Vec<u8>,
+    initial_hmac: ShadowTlsHmac,
+    initial_xor_context: ShadowTlsXorContext,
     handshake: ShadowTlsServerTargetHandshake,
     handler: Box<dyn TcpServerHandler>,
     override_proxy_provider: NoneOrOne<Arc<ClientProxySelector<TcpClientConnector>>>,
@@ -39,8 +50,17 @@ impl ShadowTlsServerTarget {
         handler: Box<dyn TcpServerHandler>,
         override_proxy_provider: NoneOrOne<Arc<ClientProxySelector<TcpClientConnector>>>,
     ) -> Self {
+        let password_bytes = password.into_bytes();
+        let hmac_key = aws_lc_rs::hmac::Key::new(
+            aws_lc_rs::hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY,
+            &password_bytes,
+        );
+        let initial_hmac = ShadowTlsHmac::new(&hmac_key);
+        let mut initial_xor_context = aws_lc_rs::digest::Context::new(&aws_lc_rs::digest::SHA256);
+        initial_xor_context.update(&password_bytes);
         Self {
-            password: password.into_bytes(),
+            initial_hmac,
+            initial_xor_context: ShadowTlsXorContext(initial_xor_context),
             handshake,
             handler,
             override_proxy_provider,
@@ -152,11 +172,7 @@ pub async fn setup_shadowtls_server_stream(
     }
 
     // verify the hmac digest
-    let hmac_key = aws_lc_rs::hmac::Key::new(
-        aws_lc_rs::hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY,
-        &target.password,
-    );
-    let mut hmac_client_hello = ShadowTlsHmac::new(&hmac_key);
+    let mut hmac_client_hello = target.initial_hmac.clone();
     hmac_client_hello.update(&client_hello_frame[TLS_HEADER_LEN..client_hello_digest_start_index]);
     hmac_client_hello.update(&[0; 4]);
     hmac_client_hello.update(&client_hello_frame[client_hello_digest_end_index..]);
@@ -178,11 +194,11 @@ pub async fn setup_shadowtls_server_stream(
             let index = next_proxy_index.fetch_add(1, Ordering::Relaxed);
             let client_connector = &client_connectors[index % client_connectors.len()];
             setup_remote_handshake(
-                &target.password,
                 server_stream,
                 client_reader,
                 client_hello_frame,
-                hmac_key,
+                &target.initial_hmac,
+                &target.initial_xor_context,
                 location.clone(),
                 client_connector,
                 resolver,
@@ -196,11 +212,11 @@ pub async fn setup_shadowtls_server_stream(
             })?
         }
         ShadowTlsServerTargetHandshake::Local(ref local_config) => setup_local_handshake(
-            &target.password,
             server_stream,
             client_reader,
             client_hello_frame,
-            hmac_key,
+            &target.initial_hmac,
+            &target.initial_xor_context,
             local_config.clone(),
         )
         .await
@@ -600,11 +616,11 @@ pub fn parse_server_hello(server_hello_frame: &[u8]) -> std::io::Result<ParsedSe
 #[allow(clippy::too_many_arguments)]
 #[inline]
 async fn setup_remote_handshake(
-    password: &[u8],
     mut server_stream: Box<dyn AsyncStream>,
     mut client_reader: StreamReader,
     client_hello_frame: Vec<u8>,
-    hmac_key: aws_lc_rs::hmac::Key,
+    initial_hmac: &ShadowTlsHmac,
+    initial_xor_context: &ShadowTlsXorContext,
     remote_addr: NetLocation,
     client_connector: &TcpClientConnector,
     resolver: &Arc<dyn Resolver>,
@@ -697,7 +713,7 @@ async fn setup_remote_handshake(
         )
     })?;
 
-    let mut hmac_server_random = ShadowTlsHmac::new(&hmac_key);
+    let mut hmac_server_random = initial_hmac.clone();
     hmac_server_random.update(&server_random);
 
     let mut hmac_client_data = hmac_server_random.clone();
@@ -707,8 +723,7 @@ async fn setup_remote_handshake(
     hmac_server_data.update(b"S");
 
     let server_app_data_xor = {
-        let mut key_context = aws_lc_rs::digest::Context::new(&aws_lc_rs::digest::SHA256);
-        key_context.update(password);
+        let mut key_context = initial_xor_context.0.clone();
         key_context.update(&server_random);
         key_context.finish().as_ref().to_vec()
     };
@@ -852,11 +867,11 @@ async fn setup_remote_handshake(
 
 #[inline]
 async fn setup_local_handshake(
-    password: &[u8],
     mut server_stream: Box<dyn AsyncStream>,
     mut client_reader: StreamReader,
     client_hello_frame: Vec<u8>,
-    hmac_key: aws_lc_rs::hmac::Key,
+    initial_hmac: &ShadowTlsHmac,
+    initial_xor_context: &ShadowTlsXorContext,
     server_config: Arc<rustls::ServerConfig>,
 ) -> std::io::Result<ShadowTlsStream> {
     // TODO: support forwarding to a valid server
@@ -923,7 +938,7 @@ async fn setup_local_handshake(
     }
     let mut server_data_end_index = remaining_server_data_len;
 
-    let mut hmac_server_random = ShadowTlsHmac::new(&hmac_key);
+    let mut hmac_server_random = initial_hmac.clone();
     hmac_server_random.update(&server_random);
 
     let mut hmac_client_data = hmac_server_random.clone();
@@ -933,8 +948,7 @@ async fn setup_local_handshake(
     hmac_server_data.update(b"S");
 
     let server_app_data_xor = {
-        let mut key_context = aws_lc_rs::digest::Context::new(&aws_lc_rs::digest::SHA256);
-        key_context.update(password);
+        let mut key_context = initial_xor_context.0.clone();
         key_context.update(&server_random);
         key_context.finish().as_ref().to_vec()
     };
