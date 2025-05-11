@@ -25,7 +25,6 @@ const CONTENT_TYPE_ALERT: u8 = 0x15;
 
 // Handshake message types
 const HANDSHAKE_TYPE_CLIENT_HELLO: u8 = 0x01;
-const HANDSHAKE_TYPE_SERVER_HELLO: u8 = 0x02;
 
 #[derive(Debug)]
 pub struct ShadowTlsClientHandler {
@@ -92,47 +91,18 @@ impl TcpClientHandler for ShadowTlsClientHandler {
         // TODO: validate the read amount is exactly a single ServerHello frame
         let mut remote_reader = StreamReader::new_with_buffer_size(TLS_FRAME_MAX_LEN * 2);
 
-        let parsed_server_hello = {
-            let server_hello_frame =
-                read_full_tls_frame(&mut remote_reader, &mut client_stream).await?;
+        let server_hello_frame =
+            read_full_tls_frame(&mut remote_reader, &mut client_stream).await?;
 
-            if server_hello_frame.len() < TLS_HEADER_LEN + 1 + 3 + 32 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "ServerHello frame too short for header",
-                ));
-            }
+        let parsed_server_hello = parse_server_hello(&server_hello_frame)?;
 
-            let server_content_type = server_hello_frame[0];
-            if server_content_type != CONTENT_TYPE_HANDSHAKE {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!(
-                        "Expected ServerHello handshake content type, got {}",
-                        server_content_type
-                    ),
-                ));
-            }
-
-            if server_hello_frame[TLS_HEADER_LEN] != HANDSHAKE_TYPE_SERVER_HELLO {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "Expected ServerHello handshake message type",
-                ));
-            }
-
-            let parsed_server_hello = parse_server_hello(&server_hello_frame)?;
-
-            feed_client_connection(&mut client_conn, &server_hello_frame)?;
-            client_conn.process_new_packets().map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("Failed to process ServerHello frame: {}", e),
-                )
-            })?;
-
-            parsed_server_hello
-        };
+        feed_client_connection(&mut client_conn, &server_hello_frame)?;
+        client_conn.process_new_packets().map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Failed to process ServerHello frame: {}", e),
+            )
+        })?;
 
         let mut rustls_write_buf = allocate_vec(TLS_FRAME_MAX_LEN); // For client_conn.write_tls()
 

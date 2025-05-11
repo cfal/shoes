@@ -102,6 +102,8 @@ const TLS_FRAME_MAX_LEN: usize = TLS_HEADER_LEN + 65535;
 const CONTENT_TYPE_HANDSHAKE: u8 = 0x16;
 const CONTENT_TYPE_APPLICATION_DATA: u8 = 0x17;
 
+const HANDSHAKE_TYPE_SERVER_HELLO: u8 = 0x02;
+
 // retry request random value, see https://datatracker.ietf.org/doc/html/rfc8446#section-4.1.3
 // TODO: should we also check to disallow TLS1.2/TLS1.1 client downgrade requests?
 const RETRY_REQUEST_RANDOM_BYTES: [u8; 32] = [
@@ -457,7 +459,7 @@ pub fn parse_server_hello(server_hello_frame: &[u8]) -> std::io::Result<ParsedSe
             std::io::ErrorKind::InvalidData,
             format!("failed to read message type from ServerHello: {}", e),
         )
-    })? != 0x02
+    })? != HANDSHAKE_TYPE_SERVER_HELLO
     {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
