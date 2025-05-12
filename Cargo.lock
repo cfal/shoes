@@ -1523,6 +1523,7 @@ dependencies = [
  "h3-quinn",
  "hmac",
  "http",
+ "libc",
  "log",
  "md-5",
  "memchr",

@@ -1,6 +1,7 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::os::fd::{FromRawFd, IntoRawFd};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
 
+use log::error;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
 pub fn new_udp_socket(
@@ -96,6 +97,82 @@ fn into_tokio_udp_socket(socket: socket2::Socket) -> std::io::Result<tokio::net:
     tokio::net::UdpSocket::from_std(std_udp_socket)
 }
 
+pub fn set_server_tcp_fastopen<T: AsRawFd>(tcp_socket: &T) {
+    // TODO: implement for windows
+    #[cfg(unix)]
+    {
+        // queue length on linux, enable/disable otherwise
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let value: libc::c_int = 256;
+
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        let value: libc::c_int = 1;
+
+        unsafe {
+            let ret = libc::setsockopt(
+                tcp_socket.as_raw_fd(),
+                libc::IPPROTO_TCP,
+                libc::TCP_FASTOPEN,
+                &value as *const libc::c_int as *const libc::c_void,
+                std::mem::size_of_val(&value) as libc::socklen_t,
+            );
+            if ret < 0 {
+                error!(
+                    "failed to set TCP fastopen: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
+    }
+}
+
+pub fn set_client_tcp_fastopen<T: AsRawFd>(tcp_socket: &T) {
+    // TODO: implement for windows
+    #[cfg(unix)]
+    {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            let value: libc::c_int = 1;
+            unsafe {
+                let ret = libc::setsockopt(
+                    tcp_socket.as_raw_fd(),
+                    libc::IPPROTO_TCP,
+                    libc::TCP_FASTOPEN_CONNECT,
+                    &value as *const libc::c_int as *const libc::c_void,
+                    std::mem::size_of_val(&value) as libc::socklen_t,
+                );
+                if ret < 0 {
+                    error!(
+                        "failed to set TCP fastopen connect: {}",
+                        std::io::Error::last_os_error()
+                    );
+                }
+            }
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            let value: libc::c_int = 1;
+            unsafe {
+                // On macOS, TCP_FASTOPEN works for both server and client
+                let ret = libc::setsockopt(
+                    tcp_socket.as_raw_fd(),
+                    libc::IPPROTO_TCP,
+                    libc::TCP_FASTOPEN,
+                    &value as *const libc::c_int as *const libc::c_void,
+                    std::mem::size_of_val(&value) as libc::socklen_t,
+                );
+                if ret < 0 {
+                    error!(
+                        "failed to set TCP fastopen for client: {}",
+                        std::io::Error::last_os_error()
+                    );
+                }
+            }
+        }
+    }
+}
+
 pub fn new_tcp_socket(
     bind_interface: Option<String>,
     is_ipv6: bool,
@@ -114,6 +191,8 @@ pub fn new_tcp_socket(
         #[cfg(not(any(target_os = "android", target_os = "fuchsia", target_os = "linux")))]
         panic!("Could not find to device, unsupported platform.")
     }
+
+    set_client_tcp_fastopen(&tcp_socket);
 
     Ok(tcp_socket)
 }

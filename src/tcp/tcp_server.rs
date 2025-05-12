@@ -16,6 +16,7 @@ use crate::copy_bidirectional::copy_bidirectional;
 use crate::copy_bidirectional_message::copy_bidirectional_message;
 use crate::copy_multidirectional_message::copy_multidirectional_message;
 use crate::resolver::{resolve_single_address, NativeResolver, Resolver};
+use crate::socket_util::set_server_tcp_fastopen;
 use crate::tcp_client_connector::TcpClientConnector;
 use crate::tcp_handler::{TcpServerHandler, TcpServerSetupResult};
 use crate::tcp_handler_util::{create_tcp_client_proxy_selector, create_tcp_server_handler};
@@ -32,6 +33,7 @@ async fn run_tcp_server(
     let TcpConfig { no_delay } = tcp_config;
 
     let listener = tokio::net::TcpListener::bind(bind_address).await.unwrap();
+    set_server_tcp_fastopen(&listener);
 
     loop {
         let (stream, addr) = match listener.accept().await {
