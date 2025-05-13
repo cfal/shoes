@@ -16,7 +16,7 @@ use crate::copy_bidirectional::copy_bidirectional;
 use crate::copy_bidirectional_message::copy_bidirectional_message;
 use crate::copy_multidirectional_message::copy_multidirectional_message;
 use crate::resolver::{resolve_single_address, NativeResolver, Resolver};
-use crate::socket_util::{new_tcp_socket, set_server_tcp_fastopen};
+use crate::socket_util::set_server_tcp_fastopen;
 use crate::tcp_client_connector::TcpClientConnector;
 use crate::tcp_handler::{TcpServerHandler, TcpServerSetupResult};
 use crate::tcp_handler_util::{create_tcp_client_proxy_selector, create_tcp_server_handler};
@@ -32,16 +32,8 @@ async fn run_tcp_server(
 ) -> std::io::Result<()> {
     let TcpConfig { no_delay } = tcp_config;
 
-    let socket = new_tcp_socket(None, bind_address.ip().is_ipv6())?;
-
-    socket.set_reuseaddr(true)?;
-
-    // set TFO before binding
-    set_server_tcp_fastopen(&socket);
-
-    socket.bind(bind_address)?;
-
-    let listener = socket.listen(1024)?;
+    let listener = tokio::net::TcpListener::bind(bind_address).await.unwrap();
+    set_server_tcp_fastopen(&listener);
 
     loop {
         let (stream, addr) = match listener.accept().await {
