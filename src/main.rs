@@ -43,6 +43,7 @@ use tikv_jemallocator::Jemalloc;
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
 
+use std::io::Write;
 use std::path::Path;
 
 use log::debug;
@@ -129,7 +130,31 @@ fn print_usage_and_exit(arg0: String) {
 }
 
 fn main() {
-    env_logger::init();
+    env_logger::builder()
+        .format(|buf, record| {
+            let timestamp = buf.timestamp();
+            let level_style = buf.default_level_style(record.level());
+            let sanitized_args = format!("{}", record.args())
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_graphic() || c == ' ' {
+                        c
+                    } else {
+                        '?'
+                    }
+                })
+                .collect::<String>();
+
+            writeln!(
+                buf,
+                "[{} {level_style}{}{level_style:#} {}] {}",
+                timestamp,
+                record.level(),
+                record.target(),
+                sanitized_args
+            )
+        })
+        .init();
 
     let mut args: Vec<String> = std::env::args().collect();
     let arg0 = args.remove(0);
