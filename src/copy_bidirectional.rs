@@ -252,13 +252,11 @@ where
         let a_to_b = transfer_one_direction(cx, a_to_b, &mut *a_buf, &mut *a, &mut *b);
         let b_to_a = transfer_one_direction(cx, b_to_a, &mut *b_buf, &mut *b, &mut *a);
 
-        if a_to_b.is_ready() {
-            return a_to_b;
-        } else if b_to_a.is_ready() {
-            return b_to_a;
+        match (a_to_b, b_to_a) {
+            (Poll::Ready(Err(e)), _) | (_, Poll::Ready(Err(e))) => Poll::Ready(Err(e)),
+            (Poll::Ready(Ok(())), Poll::Ready(Ok(()))) => Poll::Ready(Ok(())),
+            _ => Poll::Pending,
         }
-
-        Poll::Pending
     }
 }
 
