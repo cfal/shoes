@@ -1,0 +1,214 @@
+name: Build Binaries
+
+on:
+  push:
+    branches: [ master ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ master ]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux builds (using cross for cross-compilation)
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            use_cross: false
+            binary_name: shoes
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            use_cross: true
+            binary_name: shoes
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            use_cross: true
+            binary_name: shoes
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            use_cross: true
+            binary_name: shoes
+
+          # macOS builds (native compilation)
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            use_cross: false
+            binary_name: shoes
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            use_cross: false
+            binary_name: shoes
+
+          # Windows builds
+          # TODO: enable when working
+          # - target: x86_64-pc-windows-msvc
+          #   os: windows-latest
+          #   use_cross: false
+          #   binary_name: shoes.exe
+          # - target: aarch64-pc-windows-msvc
+          #   os: windows-latest
+          #   use_cross: false
+          #   binary_name: shoes.exe
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install system dependencies
+        if: matrix.use_cross == true
+        run: |
+          sudo apt-get update
+          case "${{ matrix.target }}" in
+            "aarch64-unknown-linux-gnu")
+              sudo apt-get install -y gcc-aarch64-linux-gnu
+              ;;
+            "aarch64-unknown-linux-musl")
+              sudo apt-get install -y gcc-aarch64-linux-gnu musl-tools
+              ;;
+            "x86_64-unknown-linux-musl")
+              sudo apt-get install -y musl-tools
+              ;;
+          esac
+
+      - name: Install cross-compilation tool
+        if: matrix.use_cross == true
+        run: |
+          cargo install cross
+
+      - name: Setup cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build binary (using cross)
+        if: matrix.use_cross == true
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Build binary (native)
+        if: matrix.use_cross == false
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Verify binary exists
+        run: |
+          if [ -f "target/${{ matrix.target }}/release/${{ matrix.binary_name }}" ]; then
+            echo "Binary found: target/${{ matrix.target }}/release/${{ matrix.binary_name }}"
+            ls -la "target/${{ matrix.target }}/release/${{ matrix.binary_name }}"
+            
+            # Show file type and architecture
+            file "target/${{ matrix.target }}/release/${{ matrix.binary_name }}" || true
+            
+            # Test the binary can be executed (for native builds only)
+            if [[ "${{ matrix.target }}" == "x86_64-unknown-linux-gnu" ]]; then
+              echo "Testing binary execution..."
+              "./target/${{ matrix.target }}/release/${{ matrix.binary_name }}" --help || echo "Binary test failed, but file exists"
+            fi
+          else
+            echo "Binary not found!"
+            echo "Contents of release directory:"
+            ls -la "target/${{ matrix.target }}/release/" || echo "Release directory doesn't exist"
+            exit 1
+          fi
+
+      - name: Prepare binary (Unix)
+        if: "!contains(matrix.os, 'windows')"
+        run: |
+          mkdir -p artifacts
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary_name }}" "artifacts/${{ matrix.binary_name }}"
+          
+          # Strip the binary to reduce size
+          if command -v strip &> /dev/null; then
+            strip "artifacts/${{ matrix.binary_name }}" || echo "Strip failed, continuing..."
+          fi
+          
+          # Create tarball
+          cd artifacts
+          tar -czf ${{ github.event.repository.name }}-${{ matrix.target }}.tar.gz "${{ matrix.binary_name }}"
+          
+          # Debug: show what files were created
+          echo "Contents of artifacts directory:"
+          ls -la
+          
+          # Verify the tarball was created
+          if [ -f "${{ github.event.repository.name }}-${{ matrix.target }}.tar.gz" ]; then
+            echo "Tarball created successfully: ${{ github.event.repository.name }}-${{ matrix.target }}.tar.gz"
+          else
+            echo "ERROR: Tarball was not created!"
+            exit 1
+          fi
+          
+          rm "${{ matrix.binary_name }}"
+
+      - name: Prepare binary (Windows)
+        if: contains(matrix.os, 'windows')
+        shell: bash
+        run: |
+          mkdir -p artifacts
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary_name }}" "artifacts/${{ matrix.binary_name }}"
+          cd artifacts
+          7z a ${{ github.event.repository.name }}-${{ matrix.target }}.zip "${{ matrix.binary_name }}"
+
+      - name: Verify artifacts before upload
+        run: |
+          echo "Checking for artifacts to upload..."
+          ls -la artifacts/ || echo "artifacts directory not found"
+          
+          # Check for expected file patterns
+          if ls artifacts/*.tar.gz 1> /dev/null 2>&1; then
+            echo "Found .tar.gz files:"
+            ls -la artifacts/*.tar.gz
+          fi
+          
+          if ls artifacts/*.zip 1> /dev/null 2>&1; then
+            echo "Found .zip files:"
+            ls -la artifacts/*.zip
+          fi
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.event.repository.name }}-${{ matrix.target }}
+          path: |
+            artifacts/*.tar.gz
+            artifacts/*.zip
+          if-no-files-found: error
+
+  release:
+    name: Create Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: List artifacts
+        run: |
+          echo "Downloaded artifacts:"
+          find artifacts -type f -name "*.tar.gz" -o -name "*.zip" | sort
+
+      - name: Flatten artifacts
+        run: |
+          mkdir -p release-artifacts
+          find artifacts -type f \( -name "*.tar.gz" -o -name "*.zip" \) -exec cp {} release-artifacts/ \;
+          ls -la release-artifacts/
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-artifacts/*
+          draft: true
+          generate_release_notes: true
