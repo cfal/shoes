@@ -33,6 +33,10 @@
         handshake:
           # connect directly to google.com as the handshake server
           address: google.com:443
+        protocol:
+          type: socks
+          username: google-socks-user
+          password: google-socks-pass
 
     # regular TLS targets
     tls_targets:
