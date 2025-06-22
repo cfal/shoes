@@ -226,7 +226,8 @@ fn create_shadow_tls_server_target(
             let mut key_bytes = vec![];
             key_file.read_to_end(&mut key_bytes).unwrap();
 
-            let client_ca_certs = handshake.client_ca_certs
+            let client_ca_certs = handshake
+                .client_ca_certs
                 .into_iter()
                 .map(|cert| {
                     let mut cert_file = std::fs::File::open(cert).unwrap();
@@ -247,7 +248,8 @@ fn create_shadow_tls_server_target(
             ShadowTlsServerTargetHandshake::new_local(server_config)
         }
         ShadowTlsServerHandshakeConfig::Remote(handshake) => {
-            let mut client_proxies: Vec<TcpClientConnector> = handshake.client_proxies
+            let mut client_proxies: Vec<TcpClientConnector> = handshake
+                .client_proxies
                 .into_iter()
                 .map(ConfigSelection::unwrap_config)
                 .map(TcpClientConnector::try_from)
