@@ -59,25 +59,19 @@ impl AsyncReadTargetedMessage for SnellUdpStream {
         }
 
         if len < 4 {
-            return Poll::Ready(Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "snell packet size too small",
-            )));
+            return Poll::Ready(Err(std::io::Error::other("snell packet size too small")));
         }
 
         if len > this.max_payload_size {
-            return Poll::Ready(Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "snell packet size too big",
-            )));
+            return Poll::Ready(Err(std::io::Error::other("snell packet size too big")));
         }
 
         let cmd = this.read_buf[0];
         if cmd != 1 {
-            return Poll::Ready(Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("invalid snell command: {}", cmd),
-            )));
+            return Poll::Ready(Err(std::io::Error::other(format!(
+                "invalid snell command: {}",
+                cmd
+            ))));
         }
 
         let address_len = this.read_buf[1] as usize;
@@ -85,8 +79,7 @@ impl AsyncReadTargetedMessage for SnellUdpStream {
             let ip_version = this.read_buf[2];
             if ip_version == 4 {
                 if len < 9 {
-                    return Poll::Ready(Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
+                    return Poll::Ready(Err(std::io::Error::other(
                         "invalid snell packet size for ipv4 target",
                     )));
                 }
@@ -96,8 +89,7 @@ impl AsyncReadTargetedMessage for SnellUdpStream {
                 (NetLocation::new(Address::Ipv4(ip_addr), port), 9)
             } else if ip_version == 6 {
                 if len < 21 {
-                    return Poll::Ready(Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
+                    return Poll::Ready(Err(std::io::Error::other(
                         "invalid snell packet size for ipv6 target",
                     )));
                 }
@@ -106,25 +98,20 @@ impl AsyncReadTargetedMessage for SnellUdpStream {
                 let port = u16::from_be_bytes(this.read_buf[19..21].try_into().unwrap());
                 (NetLocation::new(Address::Ipv6(ip_addr), port), 21)
             } else {
-                return Poll::Ready(Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("invalid ip version: {}", ip_version),
-                )));
+                return Poll::Ready(Err(std::io::Error::other(format!(
+                    "invalid ip version: {}",
+                    ip_version
+                ))));
             }
         } else {
             if len < 4 + address_len {
-                return Poll::Ready(Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
+                return Poll::Ready(Err(std::io::Error::other(
                     "invalid snell packet size for host target",
                 )));
             }
             let hostname_bytes = &this.read_buf[2..2 + address_len];
-            let hostname = std::str::from_utf8(hostname_bytes).map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("could not parse hostname: {}", e),
-                )
-            })?;
+            let hostname = std::str::from_utf8(hostname_bytes)
+                .map_err(|e| std::io::Error::other(format!("could not parse hostname: {}", e)))?;
             let port = u16::from_be_bytes(
                 this.read_buf[2 + address_len..4 + address_len]
                     .try_into()

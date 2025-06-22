@@ -218,8 +218,7 @@ impl TcpServerHandler for VmessTcpServerHandler {
                 .open_in_place(Aad::from(&cert_hash), &mut encrypted_payload_length)
                 .is_err()
             {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
+                return Err(std::io::Error::other(
                     "failed to open encrypted header length",
                 ));
             }
@@ -254,10 +253,7 @@ impl TcpServerHandler for VmessTcpServerHandler {
                 .open_in_place(Aad::from(&cert_hash), &mut encrypted_header)
                 .is_err()
             {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "failed to open encrypted header",
-                ));
+                return Err(std::io::Error::other("failed to open encrypted header"));
             }
 
             HeaderReader::Aead(AeadHeaderReader {
@@ -270,15 +266,11 @@ impl TcpServerHandler for VmessTcpServerHandler {
                 Some(ref provider) => match provider.lock().check(&cert_hash) {
                     Some(t) => t,
                     None => {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            "unauthorized request, unknown hash",
-                        ));
+                        return Err(std::io::Error::other("unauthorized request, unknown hash"));
                     }
                 },
                 None => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
+                    return Err(std::io::Error::other(
                         "unauthorized request, unknown aead hash",
                     ));
                 }

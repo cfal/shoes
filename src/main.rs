@@ -115,10 +115,10 @@ async fn start_servers(config: ServerConfig) -> std::io::Result<Vec<JoinHandle<(
     }
 
     if join_handles.is_empty() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("failed to start servers at {}", &config.bind_location),
-        ));
+        return Err(std::io::Error::other(format!(
+            "failed to start servers at {}",
+            &config.bind_location
+        )));
     }
 
     Ok(join_handles)
@@ -234,6 +234,15 @@ fn main() {
                 Ok(c) => c,
                 Err(e) => {
                     eprintln!("Failed to load server configs: {}\n", e);
+                    print_usage_and_exit(arg0);
+                    return;
+                }
+            };
+
+            let configs = match config::validate_configs(configs) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Failed to validate server configs: {}\n", e);
                     print_usage_and_exit(arg0);
                     return;
                 }

@@ -67,10 +67,7 @@ impl TcpClientHandler for ShadowTlsClientHandler {
         let mut client_conn =
             rustls::ClientConnection::new(self.client_config.clone(), self.server_name.clone())
                 .map_err(|e| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("Failed to create ClientConnection: {}", e),
-                    )
+                    std::io::Error::other(format!("Failed to create ClientConnection: {}", e))
                 })?;
 
         let mut client_hello_buf = Vec::with_capacity(512); // Typical ClientHello
@@ -78,8 +75,7 @@ impl TcpClientHandler for ShadowTlsClientHandler {
             client_conn.write_tls(&mut Cursor::new(&mut client_hello_buf))?;
         }
         if client_hello_buf.is_empty() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(std::io::Error::other(
                 "rustls::ClientConnection did not produce ClientHello",
             ));
         }
@@ -125,10 +121,10 @@ impl TcpClientHandler for ShadowTlsClientHandler {
                     }
                     Ok(_) => { /* wrote 0 bytes */ }
                     Err(e) => {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            format!("rustls write_tls error: {}", e),
-                        ))
+                        return Err(std::io::Error::other(format!(
+                            "rustls write_tls error: {}",
+                            e
+                        )))
                     }
                 }
                 continue;

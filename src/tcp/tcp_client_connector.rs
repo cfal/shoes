@@ -244,24 +244,15 @@ impl TcpClientConnector {
                 let conn = endpoint
                     .connect(target_addr, domain)
                     .map_err(|e| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            format!("Failed to connect to quic endpoint: {}", e),
-                        )
+                        std::io::Error::other(format!("Failed to connect to quic endpoint: {}", e))
                     })?
                     .await
                     .map_err(|e| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            format!("Failed to connect to quic endpoint: {}", e),
-                        )
+                        std::io::Error::other(format!("Failed to connect to quic endpoint: {}", e))
                     })?;
 
                 let (send, recv) = conn.open_bi().await.map_err(|e| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("Failed to open stream to quic endpoint: {}", e),
-                    )
+                    std::io::Error::other(format!("Failed to open stream to quic endpoint: {}", e))
                 })?;
 
                 Box::new(QuicStream::from(send, recv))

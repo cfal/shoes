@@ -248,8 +248,7 @@ impl VmessStream {
         assert!(self.unprocessed_end_offset == 0);
 
         if data.len() > self.unprocessed_buf.len() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(std::io::Error::other(
                 "feed_initial_read_data called with too much data",
             ));
         }
@@ -328,8 +327,7 @@ impl VmessStream {
             .open_in_place(Aad::empty(), encrypted_response_header_length)
             .is_err()
         {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(std::io::Error::other(
                 "failed to open encrypted response header length",
             ));
         }
@@ -377,8 +375,7 @@ impl VmessStream {
             .open_in_place(Aad::empty(), encrypted_response_header)
             .is_err()
         {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(std::io::Error::other(
                 "failed to open encrypted response header",
             ));
         }
@@ -426,10 +423,7 @@ impl VmessStream {
         let command_len = response_header_bytes[3];
         if command_len > 0 {
             // if this becomes an issue, we should read the command bytes and ignore them.
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "extra command bytes",
-            ));
+            return Err(std::io::Error::other("extra command bytes"));
         }
 
         self.read_header_state = ReadHeaderState::Done;
@@ -1133,10 +1127,7 @@ impl AsyncWriteMessage for VmessStream {
 
         let available_space = this.write_packet.len() - metadata_size;
         if available_space < buf.len() {
-            return Poll::Ready(Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "write payload is too large",
-            )));
+            return Poll::Ready(Err(std::io::Error::other("write payload is too large")));
         }
 
         let write_packet_size = buf.len() + padding_len + this.tag_len;
@@ -1151,12 +1142,7 @@ impl AsyncWriteMessage for VmessStream {
         if let Some(ref mut sealing_key) = this.sealing_key {
             let tag = sealing_key
                 .seal_in_place_separate_tag(Aad::empty(), &mut this.write_packet[2..end_index])
-                .map_err(|err| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("failed to seal message: {}", err),
-                    )
-                })?;
+                .map_err(|err| std::io::Error::other(format!("failed to seal message: {}", err)))?;
 
             this.write_packet[end_index..end_index + this.tag_len].copy_from_slice(tag.as_ref());
 

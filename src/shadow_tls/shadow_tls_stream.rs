@@ -87,8 +87,7 @@ impl ShadowTlsStream {
         assert!(self.unprocessed_end_offset == 0);
 
         if data.len() > self.unprocessed_buf.len() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(std::io::Error::other(
                 "feed_initial_read_data called with too much data",
             ));
         }
@@ -186,8 +185,7 @@ impl ShadowTlsStream {
         let payload_len = frame_len - 4;
 
         if payload_len > self.processed_buf.len() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(std::io::Error::other(
                 "Payload too large for processed buffer",
             ));
         }
@@ -277,10 +275,7 @@ impl AsyncRead for ShadowTlsStream {
             }
 
             if this.unprocessed_end_offset == this.unprocessed_buf.len() {
-                return Poll::Ready(Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "Unprocessed buffer full",
-                )));
+                return Poll::Ready(Err(std::io::Error::other("Unprocessed buffer full")));
             }
         }
 

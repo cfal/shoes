@@ -1,6 +1,6 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Default, Debug, Clone, Deserialize)]
+#[derive(Default, Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum NoneOrOne<T> {
     #[serde(skip_deserializing)]
@@ -43,7 +43,7 @@ impl<T> NoneOrOne<T> {
     }
 }
 
-#[derive(Default, Debug, Clone, Deserialize)]
+#[derive(Default, Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum NoneOrSome<T> {
     #[serde(skip_deserializing)]
@@ -168,7 +168,7 @@ impl<T> NoneOrSome<T> {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum OneOrSome<T> {
     One(T),
@@ -241,5 +241,19 @@ impl<T> Iterator for SingleItemIter<T> {
 
     fn next(&mut self) -> Option<Self::Item> {
         self.0.take()
+    }
+}
+
+impl<T> TryFrom<Vec<T>> for OneOrSome<T> {
+    type Error = std::io::Error;
+    fn try_from(vec: Vec<T>) -> std::io::Result<Self> {
+        match vec.len() {
+            0 => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Cannot create OneOrSome from empty vector",
+            )),
+            1 => Ok(OneOrSome::One(vec.into_iter().next().unwrap())),
+            _ => Ok(OneOrSome::Some(vec)),
+        }
     }
 }

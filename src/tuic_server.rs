@@ -116,28 +116,23 @@ async fn auth_connection(
             uuid.as_ref(),
             password.as_bytes(),
         )
-        .map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("Failed to export keying material: {:?}", e),
-            )
-        })?;
+        .map_err(|e| std::io::Error::other(format!("Failed to export keying material: {:?}", e)))?;
 
     let mut recv_stream = connection.accept_uni().await?;
     let mut stream_reader = StreamReader::new_with_buffer_size(80);
     let tuic_version = stream_reader.read_u8(&mut recv_stream).await?;
     if tuic_version != 5 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("invalid tuic version: {}", tuic_version),
-        ));
+        return Err(std::io::Error::other(format!(
+            "invalid tuic version: {}",
+            tuic_version
+        )));
     }
     let command_type = stream_reader.read_u8(&mut recv_stream).await?;
     if command_type != COMMAND_TYPE_AUTHENTICATE {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("invalid command type: {}", command_type),
-        ));
+        return Err(std::io::Error::other(format!(
+            "invalid command type: {}",
+            command_type
+        )));
     }
     let specified_uuid = stream_reader.read_slice(&mut recv_stream, 16).await?;
     if specified_uuid != uuid {
@@ -173,10 +168,10 @@ async fn run_bidirectional_loop(
                 break;
             }
             Err(e) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("failed to accept bidirectional stream: {}", e),
-                ));
+                return Err(std::io::Error::other(format!(
+                    "failed to accept bidirectional stream: {}",
+                    e
+                )));
             }
         };
 
@@ -229,10 +224,10 @@ async fn read_address(
             Address::Ipv6(ipv6_addr)
         }
         _ => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("invalid address type: {}", address_type),
-            ));
+            return Err(std::io::Error::other(format!(
+                "invalid address type: {}",
+                address_type
+            )));
         }
     };
 
@@ -299,22 +294,22 @@ async fn process_tcp_stream(
     let mut stream_reader = StreamReader::new_with_buffer_size(1024);
     let tuic_version = stream_reader.read_u8(&mut recv).await?;
     if tuic_version != 5 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("invalid tuic version: {}", tuic_version),
-        ));
+        return Err(std::io::Error::other(format!(
+            "invalid tuic version: {}",
+            tuic_version
+        )));
     }
     let command_type = stream_reader.read_u8(&mut recv).await?;
     if command_type != COMMAND_TYPE_CONNECT {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("invalid command type: {}", command_type),
-        ));
+        return Err(std::io::Error::other(format!(
+            "invalid command type: {}",
+            command_type
+        )));
     }
 
     let remote_location = read_address(&mut recv, &mut stream_reader)
         .await?
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "empty address"))?;
+        .ok_or_else(|| std::io::Error::other("empty address"))?;
 
     let mut server_stream: Box<dyn AsyncStream> = Box::new(QuicStream::from(send, recv));
     let setup_client_stream_future = timeout(
@@ -363,7 +358,7 @@ async fn process_tcp_stream(
             let count = client_stream
                 .write(&unparsed_data[i..len])
                 .await
-                .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
+                .map_err(std::io::Error::other)?;
             i += count;
         }
         true
@@ -497,10 +492,10 @@ impl UdpSession {
                             remote_location,
                         } => remote_location,
                         ConnectDecision::Block => {
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::Other,
-                                format!("Blocked UDP forward to {}", location),
-                            ));
+                            return Err(std::io::Error::other(format!(
+                                "Blocked UDP forward to {}",
+                                location
+                            )));
                         }
                     };
                     let updated_address =
@@ -549,10 +544,10 @@ async fn run_udp_remote_to_local_stream_loop(
                 continue;
             }
             Err(e) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("failed to receive from UDP socket: {}", e),
-                ));
+                return Err(std::io::Error::other(format!(
+                    "failed to receive from UDP socket: {}",
+                    e
+                )));
             }
         };
 
@@ -587,7 +582,7 @@ async fn run_udp_remote_to_local_stream_loop(
             let count = send_stream
                 .write(&buf[i..end_offset])
                 .await
-                .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
+                .map_err(std::io::Error::other)?;
             i += count;
         }
     }
@@ -601,12 +596,9 @@ async fn run_udp_remote_to_local_datagram_loop(
 ) -> std::io::Result<()> {
     use bytes::BufMut;
 
-    let max_datagram_size = connection.max_datagram_size().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "datagram not supported by remote endpoint",
-        )
-    })?;
+    let max_datagram_size = connection
+        .max_datagram_size()
+        .ok_or_else(|| std::io::Error::other("datagram not supported by remote endpoint"))?;
 
     let original_address_bytes: Option<Bytes> =
         override_local_write_location.map(|a| serialize_address(&a).into());
@@ -622,10 +614,10 @@ async fn run_udp_remote_to_local_datagram_loop(
                 continue;
             }
             Err(e) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("failed to receive from UDP socket: {}", e),
-                ));
+                return Err(std::io::Error::other(format!(
+                    "failed to receive from UDP socket: {}",
+                    e
+                )));
             }
         };
 
@@ -657,12 +649,9 @@ async fn run_udp_remote_to_local_datagram_loop(
             datagram.extend_from_slice(&address_bytes);
             datagram.extend_from_slice(&buf[..payload_len]);
 
-            connection.send_datagram(datagram.freeze()).map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("Failed to send datagram: {}", e),
-                )
-            })?;
+            connection
+                .send_datagram(datagram.freeze())
+                .map_err(|e| std::io::Error::other(format!("Failed to send datagram: {}", e)))?;
         } else {
             // Calculate header sizes for first fragment and subsequent fragments.
             let first_overhead = header_overhead; // full address included in the first fragment
@@ -697,10 +686,10 @@ async fn run_udp_remote_to_local_datagram_loop(
                 }
                 datagram.extend_from_slice(&buf[offset..offset + fragment_payload_len]);
                 connection.send_datagram(datagram.freeze()).map_err(|e| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("Failed to send datagram fragment {}: {}", fragment_id, e),
-                    )
+                    std::io::Error::other(format!(
+                        "Failed to send datagram fragment {}: {}",
+                        fragment_id, e
+                    ))
                 })?;
                 offset += fragment_payload_len;
             }
@@ -723,10 +712,10 @@ async fn run_unidirectional_loop(
                 break;
             }
             Err(e) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("failed to accept unidirectional stream: {}", e),
-                ));
+                return Err(std::io::Error::other(format!(
+                    "failed to accept unidirectional stream: {}",
+                    e
+                )));
             }
         };
 
@@ -767,10 +756,10 @@ async fn process_udp_recv_stream(
     loop {
         let tuic_version = stream_reader.read_u8(&mut recv_stream).await?;
         if tuic_version != 5 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("invalid tuic version: {}", tuic_version),
-            ));
+            return Err(std::io::Error::other(format!(
+                "invalid tuic version: {}",
+                tuic_version
+            )));
         }
         let command_type = stream_reader.read_u8(&mut recv_stream).await?;
         if command_type == COMMAND_TYPE_DISSOCIATE {
@@ -781,10 +770,10 @@ async fn process_udp_recv_stream(
             }
             continue;
         } else if command_type != COMMAND_TYPE_PACKET {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("invalid UDP stream command type: {}", command_type),
-            ));
+            return Err(std::io::Error::other(format!(
+                "invalid UDP stream command type: {}",
+                command_type
+            )));
         }
 
         let assoc_id = stream_reader.read_u16_be(&mut recv_stream).await?;
@@ -837,8 +826,7 @@ async fn process_udp_packet(
     is_uni_stream: bool,
 ) -> std::io::Result<()> {
     if frag_total == 0 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        return Err(std::io::Error::other(
             "Ignoring packet with empty fragment total",
         ));
     }
@@ -850,8 +838,7 @@ async fn process_udp_packet(
                 // TODO: it's possible that a new session starts with a fragmented packet, and we
                 // receive this initial packet out of order so there's no address.
                 if remote_location.is_none() {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
+                    return Err(std::io::Error::other(
                         "Ignoring packet with unknown session and empty address",
                     ));
                 }
@@ -868,29 +855,26 @@ async fn process_udp_packet(
                         remote_location,
                     }) => (client_proxy, remote_location),
                     Ok(ConnectDecision::Block) => {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            format!("Blocked UDP forward to {}", remote_location),
-                        ));
+                        return Err(std::io::Error::other(format!(
+                            "Blocked UDP forward to {}",
+                            remote_location
+                        )));
                     }
                     Err(e) => {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            format!("Failed to judge UDP forward to {}: {}", remote_location, e),
-                        ));
+                        return Err(std::io::Error::other(format!(
+                            "Failed to judge UDP forward to {}: {}",
+                            remote_location, e
+                        )));
                     }
                 };
 
                 let resolved_address = resolve_single_address(resolver, &updated_location)
                     .await
                     .map_err(|e| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            format!(
-                                "Failed to resolve initial remote location {}: {}",
-                                updated_location, e
-                            ),
-                        )
+                        std::io::Error::other(format!(
+                            "Failed to resolve initial remote location {}: {}",
+                            updated_location, e
+                        ))
                     })?;
 
                 let (override_remote_write_address, override_local_write_location) =
@@ -944,8 +928,7 @@ async fn process_udp_packet(
 
     if frag_total == 1 {
         if remote_location.is_none() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(std::io::Error::other(
                 "Ignoring packet with single fragment and no address",
             ));
         }
@@ -955,13 +938,10 @@ async fn process_udp_packet(
             .resolve_address(remote_location, client_proxy_selector, resolver)
             .await
             .map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!(
-                        "Failed to resolve remote location {}: {}",
-                        remote_location, e
-                    ),
-                )
+                std::io::Error::other(format!(
+                    "Failed to resolve remote location {}: {}",
+                    remote_location, e
+                ))
             })?;
 
         if let Err(e) = session
@@ -1001,36 +981,27 @@ async fn process_udp_packet(
         if is_new && frag_id == 0 && packet.remote_location.is_none() {
             if remote_location.is_none() {
                 entry.remove();
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!(
-                        "Ignoring packet with empty first fragment address for session {}",
-                        assoc_id
-                    ),
-                ));
+                return Err(std::io::Error::other(format!(
+                    "Ignoring packet with empty first fragment address for session {}",
+                    assoc_id
+                )));
             }
             packet.remote_location = remote_location.clone();
         }
 
         if packet.fragment_count != frag_total {
             entry.remove();
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!(
-                    "Mismatched fragment count for session {} packet {}",
-                    assoc_id, packet_id
-                ),
-            ));
+            return Err(std::io::Error::other(format!(
+                "Mismatched fragment count for session {} packet {}",
+                assoc_id, packet_id
+            )));
         }
         if packet.received[frag_id as usize].is_some() {
             entry.remove();
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!(
-                    "Duplicate fragment for session {} packet {}",
-                    assoc_id, packet_id
-                ),
-            ));
+            return Err(std::io::Error::other(format!(
+                "Duplicate fragment for session {} packet {}",
+                assoc_id, packet_id
+            )));
         }
 
         packet.fragment_received += 1;
@@ -1054,13 +1025,10 @@ async fn process_udp_packet(
             .resolve_address(&remote_location, client_proxy_selector, resolver)
             .await
             .map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!(
-                        "Failed to resolve remote location {}: {}",
-                        remote_location, e
-                    ),
-                )
+                std::io::Error::other(format!(
+                    "Failed to resolve remote location {}: {}",
+                    remote_location, e
+                ))
             })?;
 
         let mut complete_payload = Vec::with_capacity(packet_len);
@@ -1073,13 +1041,10 @@ async fn process_udp_packet(
             .send_to(&complete_payload, socket_addr)
             .await
             .map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!(
-                        "Failed to forward UDP payload for session {}: {}",
-                        assoc_id, e
-                    ),
-                )
+                std::io::Error::other(format!(
+                    "Failed to forward UDP payload for session {}: {}",
+                    assoc_id, e
+                ))
             })?;
 
         if is_updated {
@@ -1104,12 +1069,10 @@ async fn run_datagram_loop(
     let mut fragments: FxHashMap<u16, FragmentedPacket> = FxHashMap::default();
 
     loop {
-        let data = connection.read_datagram().await.map_err(|err| {
-            std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("failed to read datagram: {}", err),
-            )
-        })?;
+        let data = connection
+            .read_datagram()
+            .await
+            .map_err(|err| std::io::Error::other(format!("failed to read datagram: {}", err)))?;
 
         if data.len() < 2 {
             return Err(std::io::Error::new(
@@ -1198,10 +1161,10 @@ async fn run_datagram_loop(
                 (Some(NetLocation::new(Address::Ipv6(ipv6_addr), port)), 29)
             }
             _ => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("invalid address type: {}", address_type),
-                ));
+                return Err(std::io::Error::other(format!(
+                    "invalid address type: {}",
+                    address_type
+                )));
             }
         };
 

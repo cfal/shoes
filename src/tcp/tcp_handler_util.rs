@@ -216,23 +216,18 @@ fn create_shadow_tls_server_target(
     } = shadow_tls_server_config;
 
     let target_handshake = match handshake {
-        ShadowTlsServerHandshakeConfig::Local {
-            cert,
-            key,
-            alpn_protocols,
-            client_ca_certs,
-            client_fingerprints,
-        } => {
+        ShadowTlsServerHandshakeConfig::Local(handshake) => {
             // TODO: do this asynchronously
-            let mut cert_file = std::fs::File::open(&cert).unwrap();
+            let mut cert_file = std::fs::File::open(&handshake.cert).unwrap();
             let mut cert_bytes = vec![];
             cert_file.read_to_end(&mut cert_bytes).unwrap();
 
-            let mut key_file = std::fs::File::open(&key).unwrap();
+            let mut key_file = std::fs::File::open(&handshake.key).unwrap();
             let mut key_bytes = vec![];
             key_file.read_to_end(&mut key_bytes).unwrap();
 
-            let client_ca_certs = client_ca_certs
+            let client_ca_certs = handshake
+                .client_ca_certs
                 .into_iter()
                 .map(|cert| {
                     let mut cert_file = std::fs::File::open(cert).unwrap();
@@ -246,17 +241,15 @@ fn create_shadow_tls_server_target(
                 &cert_bytes,
                 &key_bytes,
                 client_ca_certs,
-                &alpn_protocols.into_vec(),
-                &client_fingerprints.into_vec(),
+                &handshake.alpn_protocols.into_vec(),
+                &handshake.client_fingerprints.into_vec(),
             ));
 
             ShadowTlsServerTargetHandshake::new_local(server_config)
         }
-        ShadowTlsServerHandshakeConfig::Remote {
-            address,
-            client_proxies,
-        } => {
-            let mut client_proxies: Vec<TcpClientConnector> = client_proxies
+        ShadowTlsServerHandshakeConfig::Remote(handshake) => {
+            let mut client_proxies: Vec<TcpClientConnector> = handshake
+                .client_proxies
                 .into_iter()
                 .map(ConfigSelection::unwrap_config)
                 .map(TcpClientConnector::try_from)
@@ -265,7 +258,7 @@ fn create_shadow_tls_server_target(
             if client_proxies.is_empty() {
                 client_proxies.push(TcpClientConnector::try_from(ClientConfig::default()).unwrap());
             }
-            ShadowTlsServerTargetHandshake::new_remote(address, client_proxies)
+            ShadowTlsServerTargetHandshake::new_remote(handshake.address, client_proxies)
         }
     };
 

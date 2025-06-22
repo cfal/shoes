@@ -52,17 +52,17 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
         } = ParsedHttpData::parse(&mut server_stream).await?;
         let request_path = {
             if !first_line.ends_with(" HTTP/1.0") && !first_line.ends_with(" HTTP/1.1") {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("invalid http request version: {}", first_line),
-                ));
+                return Err(std::io::Error::other(format!(
+                    "invalid http request version: {}",
+                    first_line
+                )));
             }
 
             if !first_line.starts_with("GET ") {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("invalid http request: {}", first_line),
-                ));
+                return Err(std::io::Error::other(format!(
+                    "invalid http request: {}",
+                    first_line
+                )));
             }
 
             // remove ' HTTP/1.x'
@@ -72,9 +72,9 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
             first_line.split_off(4)
         };
 
-        let websocket_key = request_headers.remove("sec-websocket-key").ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::Other, "missing websocket key header")
-        })?;
+        let websocket_key = request_headers
+            .remove("sec-websocket-key")
+            .ok_or_else(|| std::io::Error::other("missing websocket key header"))?;
 
         'outer: for server_target in self.server_targets.iter() {
             let WebsocketServerTarget {
@@ -148,10 +148,7 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
             return target_setup_result;
         }
 
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "No matching websocket targets",
-        ))
+        Err(std::io::Error::other("No matching websocket targets"))
     }
 }
 
@@ -222,31 +219,22 @@ impl TcpClientHandler for WebsocketTcpClientHandler {
         } = ParsedHttpData::parse(&mut client_stream).await?;
 
         if !first_line.starts_with("HTTP/1.1 101") && !first_line.starts_with("HTTP/1.0 101") {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("Bad websocket response: {}", first_line),
-            ));
+            return Err(std::io::Error::other(format!(
+                "Bad websocket response: {}",
+                first_line
+            )));
         }
 
-        let websocket_key_response =
-            response_headers
-                .get("sec-websocket-accept")
-                .ok_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        "missing websocket key response header",
-                    )
-                })?;
+        let websocket_key_response = response_headers
+            .get("sec-websocket-accept")
+            .ok_or_else(|| std::io::Error::other("missing websocket key response header"))?;
 
         let expected_key_response = create_websocket_key_response(websocket_key);
         if websocket_key_response != &expected_key_response {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!(
-                    "incorrect websocket key response, expected {}, got {}",
-                    expected_key_response, websocket_key_response
-                ),
-            ));
+            return Err(std::io::Error::other(format!(
+                "incorrect websocket key response, expected {}, got {}",
+                expected_key_response, websocket_key_response
+            )));
         }
 
         let websocket_stream = Box::new(WebsocketStream::new(
@@ -282,10 +270,7 @@ impl ParsedHttpData {
             }
 
             if line.len() >= 4096 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "http request line is too long",
-                ));
+                return Err(std::io::Error::other("http request line is too long"));
             }
 
             if first_line.is_none() {
@@ -293,10 +278,10 @@ impl ParsedHttpData {
             } else {
                 let tokens: Vec<&str> = line.splitn(2, ':').collect();
                 if tokens.len() != 2 {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("invalid http request line: {}", line),
-                    ));
+                    return Err(std::io::Error::other(format!(
+                        "invalid http request line: {}",
+                        line
+                    )));
                 }
                 let header_key = tokens[0].trim().to_lowercase();
                 let header_value = tokens[1].trim().to_string();
@@ -305,15 +290,11 @@ impl ParsedHttpData {
 
             line_count += 1;
             if line_count >= 40 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "http request is too long",
-                ));
+                return Err(std::io::Error::other("http request is too long"));
             }
         }
 
-        let first_line = first_line
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "empty http request"))?;
+        let first_line = first_line.ok_or_else(|| std::io::Error::other("empty http request"))?;
 
         Ok(Self {
             first_line,

@@ -46,7 +46,7 @@ async fn process_connection(
     let mut h3_conn: h3::server::Connection<h3_quinn::Connection, bytes::Bytes> =
         h3::server::Connection::new(h3_quinn_connection)
             .await
-            .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
+            .map_err(std::io::Error::other)?;
     auth_connection(&mut h3_conn, password, udp_enabled).await?;
 
     let mut join_handles = vec![];
@@ -95,36 +95,31 @@ async fn process_connection(
 
 fn validate_auth_request<T>(req: http::Request<T>, password: &str) -> std::io::Result<()> {
     if req.uri() != "https://hysteria/auth" {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("unexpected uri: {}", req.uri()),
-        ));
+        return Err(std::io::Error::other(format!(
+            "unexpected uri: {}",
+            req.uri()
+        )));
     }
     if req.method() != "POST" {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("unexpected method: {}", req.method()),
-        ));
+        return Err(std::io::Error::other(format!(
+            "unexpected method: {}",
+            req.method()
+        )));
     }
 
     let headers = req.headers();
     let auth_value = match headers.get("hysteria-auth") {
         Some(h) => h,
         None => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "missing auth header",
-            ));
+            return Err(std::io::Error::other("missing auth header"));
         }
     };
-    let auth_str = auth_value
-        .to_str()
-        .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
+    let auth_str = auth_value.to_str().map_err(std::io::Error::other)?;
     if auth_str != password {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("incorrect auth password: {}", auth_str),
-        ));
+        return Err(std::io::Error::other(format!(
+            "incorrect auth password: {}",
+            auth_str
+        )));
     }
 
     Ok(())
@@ -145,17 +140,10 @@ async fn auth_connection(
     udp_enabled: bool,
 ) -> std::io::Result<()> {
     loop {
-        match h3_conn
-            .accept()
-            .await
-            .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?
-        {
+        match h3_conn.accept().await.map_err(std::io::Error::other)? {
             Some(resolver) => {
                 let (req, mut stream) = resolver.resolve_request().await.map_err(|err| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("Failed to resolve request: {}", err),
-                    )
+                    std::io::Error::other(format!("Failed to resolve request: {}", err))
                 })?;
                 match validate_auth_request(req, password) {
                     Ok(()) => {
@@ -170,12 +158,9 @@ async fn auth_connection(
                         stream
                             .send_response(resp)
                             .await
-                            .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
+                            .map_err(std::io::Error::other)?;
 
-                        stream
-                            .finish()
-                            .await
-                            .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
+                        stream.finish().await.map_err(std::io::Error::other)?;
 
                         return Ok(());
                     }
@@ -188,11 +173,8 @@ async fn auth_connection(
                         stream
                             .send_response(resp)
                             .await
-                            .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
-                        stream
-                            .finish()
-                            .await
-                            .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
+                            .map_err(std::io::Error::other)?;
+                        stream.finish().await.map_err(std::io::Error::other)?;
                     }
                 }
             }
@@ -267,12 +249,9 @@ async fn run_udp_remote_to_local_loop(
     socket: Arc<UdpSocket>,
     override_local_write_address: Option<NetLocation>,
 ) -> std::io::Result<()> {
-    let max_datagram_size = connection.max_datagram_size().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "datagram not supported by remote endpoint",
-        )
-    })?;
+    let max_datagram_size = connection
+        .max_datagram_size()
+        .ok_or_else(|| std::io::Error::other("datagram not supported by remote endpoint"))?;
 
     let original_address_bytes: Option<(Bytes, Bytes)> = match override_local_write_address {
         Some(a) => {
@@ -295,10 +274,10 @@ async fn run_udp_remote_to_local_loop(
                 continue;
             }
             Err(e) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("failed to receive from UDP socket: {}", e),
-                ));
+                return Err(std::io::Error::other(format!(
+                    "failed to receive from UDP socket: {}",
+                    e
+                )));
             }
         };
 
@@ -336,12 +315,9 @@ async fn run_udp_remote_to_local_loop(
             datagram.extend_from_slice(&address_bytes);
             datagram.extend_from_slice(&buf[..payload_len]);
 
-            connection.send_datagram(datagram.freeze()).map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("Failed to send datagram: {}", e),
-                )
-            })?;
+            connection
+                .send_datagram(datagram.freeze())
+                .map_err(|e| std::io::Error::other(format!("Failed to send datagram: {}", e)))?;
         } else {
             let available_payload = max_datagram_size - header_overhead;
             let fragment_count = payload_len.div_ceil(available_payload) as u8;
@@ -357,10 +333,10 @@ async fn run_udp_remote_to_local_loop(
                 datagram.extend_from_slice(&buf[start..end]);
 
                 connection.send_datagram(datagram.freeze()).map_err(|e| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("Failed to send datagram fragment {}: {}", fragment_id, e),
-                    )
+                    std::io::Error::other(format!(
+                        "Failed to send datagram fragment {}: {}",
+                        fragment_id, e
+                    ))
                 })?;
             }
         }
@@ -376,12 +352,10 @@ async fn run_udp_local_to_remote_loop(
     let mut sessions: FxHashMap<u32, UdpSession> = FxHashMap::default();
 
     loop {
-        let data = connection.read_datagram().await.map_err(|err| {
-            std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("failed to read datagram: {}", err),
-            )
-        })?;
+        let data = connection
+            .read_datagram()
+            .await
+            .map_err(|err| std::io::Error::other(format!("failed to read datagram: {}", err)))?;
         if data.len() < 9 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -430,10 +404,7 @@ async fn run_udp_local_to_remote_loop(
         }
 
         if data.len() < next_index + address_len {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "invalid address length",
-            ));
+            return Err(std::io::Error::other("invalid address length"));
         }
         let address_bytes = &data[next_index..next_index + address_len];
         let payload_fragment = data.slice(next_index + address_len..);
@@ -658,10 +629,10 @@ async fn run_tcp_loop(
                 break;
             }
             Err(e) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("failed to accept bidirectional stream: {}", e),
-                ));
+                return Err(std::io::Error::other(format!(
+                    "failed to accept bidirectional stream: {}",
+                    e
+                )));
             }
         };
 
@@ -687,31 +658,21 @@ async fn handle_tcp_header(
     // the tcp request id is a varint with value 0x401, which is encoded as [0x44, 0x01]
     let tcp_request_id = stream_reader.read_slice(recv, 2).await?;
     if tcp_request_id[0] != 0x44 || tcp_request_id[1] != 0x01 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "invalid tcp request id",
-        ));
+        return Err(std::io::Error::other("invalid tcp request id"));
     }
 
     // max lengths from https://github.com/apernet/hysteria/blob/5520bcc405ee11a47c164c75bae5c40fc2b1d99d/core/internal/protocol/proxy.go#L19
     let address_len = read_varint(recv, &mut stream_reader).await?;
     if address_len > 2048 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "invalid address length",
-        ));
+        return Err(std::io::Error::other("invalid address length"));
     }
     let address_bytes = stream_reader.read_slice(recv, address_len as usize).await?;
-    let address = std::str::from_utf8(address_bytes)
-        .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
+    let address = std::str::from_utf8(address_bytes).map_err(std::io::Error::other)?;
     let remote_location = NetLocation::from_str(address, None)?;
 
     let padding_len = read_varint(recv, &mut stream_reader).await?;
     if padding_len > 4096 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "invalid padding length",
-        ));
+        return Err(std::io::Error::other("invalid padding length"));
     }
     stream_reader.read_slice(recv, padding_len as usize).await?;
 
@@ -743,7 +704,7 @@ async fn handle_tcp_header(
         let count = send
             .write(&response_bytes[i..len])
             .await
-            .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
+            .map_err(std::io::Error::other)?;
         i += count;
     }
 
@@ -812,7 +773,7 @@ async fn process_tcp_stream(
             let count = client_stream
                 .write(&unparsed_data[i..len])
                 .await
-                .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
+                .map_err(std::io::Error::other)?;
             i += count;
         }
         true
@@ -858,10 +819,7 @@ fn encode_varint(value: u64) -> std::io::Result<Box<[u8]>> {
         bytes[0] |= 0b11000000;
         Ok(Box::new(bytes))
     } else {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "value too large to encode as varint",
-        ))
+        Err(std::io::Error::other("value too large to encode as varint"))
     }
 }
 

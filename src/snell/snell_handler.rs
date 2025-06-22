@@ -107,10 +107,10 @@ impl TcpServerHandler for SnellServerHandler {
 
         let version = stream_reader.read_u8(&mut server_stream).await?;
         if version != 1 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("unexpected snell version: {}", version),
-            ));
+            return Err(std::io::Error::other(format!(
+                "unexpected snell version: {}",
+                version
+            )));
         }
 
         let command_type = stream_reader.read_u8(&mut server_stream).await?;
@@ -119,10 +119,7 @@ impl TcpServerHandler for SnellServerHandler {
                 // Ping command
                 write_all(&mut server_stream, &[0x01]).await?;
                 server_stream.flush().await?;
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "responded to ping",
-                ));
+                return Err(std::io::Error::other("responded to ping"));
             }
             1 | 5 => {
                 // 1 is Connect, used by Snell v3
@@ -132,18 +129,15 @@ impl TcpServerHandler for SnellServerHandler {
             6 => {
                 // UDP command
                 if !self.udp_enabled {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        "snell UDP requested but not enabled",
-                    ));
+                    return Err(std::io::Error::other("snell UDP requested but not enabled"));
                 }
                 true
             }
             unknown_command => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("Got unknown command: {}", unknown_command),
-                ));
+                return Err(std::io::Error::other(format!(
+                    "Got unknown command: {}",
+                    unknown_command
+                )));
             }
         };
 
@@ -243,10 +237,7 @@ impl TcpClientHandler for SnellClientHandler {
         let hostname_bytes = remote_location.address().to_string().into_bytes();
 
         if hostname_bytes.len() > 255 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "hostname is too long",
-            ));
+            return Err(std::io::Error::other("hostname is too long"));
         }
 
         write_all(
@@ -282,10 +273,10 @@ impl TcpClientHandler for SnellClientHandler {
         }
 
         if response[0] != 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("Got non-tunnel response ({})", response[0]),
-            ));
+            return Err(std::io::Error::other(format!(
+                "Got non-tunnel response ({})",
+                response[0]
+            )));
         }
 
         Ok(TcpClientSetupResult { client_stream })

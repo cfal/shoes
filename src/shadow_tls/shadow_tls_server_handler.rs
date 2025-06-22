@@ -208,10 +208,7 @@ pub async fn setup_shadowtls_server_stream(
             )
             .await
             .map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("failed to setup remote handshake: {}", e),
-                )
+                std::io::Error::other(format!("failed to setup remote handshake: {}", e))
             })?
         }
         ShadowTlsServerTargetHandshake::Local(ref local_config) => setup_local_handshake(
@@ -223,12 +220,7 @@ pub async fn setup_shadowtls_server_stream(
             local_config.clone(),
         )
         .await
-        .map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("failed to setup local handshake: {}", e),
-            )
-        })?,
+        .map_err(|e| std::io::Error::other(format!("failed to setup local handshake: {}", e)))?,
     };
 
     let mut target_setup_result = target
@@ -236,10 +228,10 @@ pub async fn setup_shadowtls_server_stream(
         .setup_server_stream(Box::new(shadow_tls_stream))
         .await
         .map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("failed to setup server stream after shadow tls: {}", e),
-            )
+            std::io::Error::other(format!(
+                "failed to setup server stream after shadow tls: {}",
+                e
+            ))
         });
 
     if let Ok(ref mut setup_result) = target_setup_result {
@@ -343,7 +335,7 @@ pub async fn read_client_hello(
 
         // save the hmac digest and session id position for validation once we know the server name
         let client_hello_digest = client_session_id[28..].to_vec();
-        let post_session_id_index = client_hello.position() as usize;
+        let post_session_id_index = client_hello.position();
 
         let client_hello_digest_start_index = TLS_HEADER_LEN + post_session_id_index - 4;
         let client_hello_digest_end_index = TLS_HEADER_LEN + post_session_id_index;
@@ -817,16 +809,14 @@ async fn setup_remote_handshake(
                             hmac_client_data,
                             hmac_server_data,
                             None,
-                        ).map_err(|e| std::io::Error::new(
-                            std::io::ErrorKind::Other,
+                        ).map_err(|e| std::io::Error::other(
                             format!("failed to create ShadowTlsStream: {}", e)
                         ))?;
 
                         let unparsed_data = client_reader.unparsed_data();
                         if !unparsed_data.is_empty() {
                             shadow_tls_stream.feed_initial_read_data(unparsed_data)
-                                .map_err(|e| std::io::Error::new(
-                                    std::io::ErrorKind::Other,
+                                .map_err(|e| std::io::Error::other(
                                     format!("failed to feed initial data to ShadowTlsStream: {}", e)
                                 ))?;
                         }

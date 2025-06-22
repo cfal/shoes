@@ -46,22 +46,16 @@ impl TcpServerHandler for VlessTcpServerHandler {
 
         let client_version = stream_reader.read_u8(&mut server_stream).await?;
         if client_version != 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!(
-                    "invalid client protocol version, expected 0, got {}",
-                    client_version
-                ),
-            ));
+            return Err(std::io::Error::other(format!(
+                "invalid client protocol version, expected 0, got {}",
+                client_version
+            )));
         }
 
         let target_id = stream_reader.read_slice(&mut server_stream, 16).await?;
         for (b1, b2) in self.user_id.iter().zip(target_id.iter()) {
             if b1 != b2 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "Unknown user id",
-                ));
+                return Err(std::io::Error::other("Unknown user id"));
             }
         }
 
@@ -267,13 +261,10 @@ impl TcpClientHandler for VlessTcpClientHandler {
         client_stream.read_exact(&mut response_header).await?;
 
         if response_header[0] != 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!(
-                    "invalid server protocol version, expected 0, got {}",
-                    response_header[0]
-                ),
-            ));
+            return Err(std::io::Error::other(format!(
+                "invalid server protocol version, expected 0, got {}",
+                response_header[0]
+            )));
         }
 
         let addon_length = response_header[1];
@@ -297,10 +288,7 @@ fn read_varint(data: &[u8]) -> std::io::Result<(u64, usize)> {
             return Ok((length, cursor + 1));
         }
         if cursor == 7 || cursor == data.len() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "Varint is too long",
-            ));
+            return Err(std::io::Error::other("Varint is too long"));
         }
         cursor += 1;
     }
@@ -323,13 +311,10 @@ async fn read_addons(stream: &mut Box<dyn AsyncStream>, addon_length: u8) -> std
     addon_cursor += seed_length as usize;
 
     if addon_cursor as u8 != addon_length {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!(
-                "Did not consume all addon bytes, cursor is at {}, length is {}",
-                addon_cursor, addon_length
-            ),
-        ));
+        return Err(std::io::Error::other(format!(
+            "Did not consume all addon bytes, cursor is at {}, length is {}",
+            addon_cursor, addon_length
+        )));
     }
 
     info!(
