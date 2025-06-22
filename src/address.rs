@@ -1,6 +1,7 @@
+use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 
-#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub enum Address {
     Ipv4(Ipv4Addr),
     Ipv6(Ipv6Addr),
@@ -166,10 +167,28 @@ impl std::fmt::Display for NetLocation {
     }
 }
 
+impl serde::ser::Serialize for NetLocation {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::ser::Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct NetLocationPortRange {
     address: Address,
     ports: Vec<u16>,
+}
+
+impl From<NetLocation> for NetLocationPortRange {
+    fn from(location: NetLocation) -> Self {
+        Self {
+            address: location.address,
+            ports: vec![location.port],
+        }
+    }
 }
 
 impl NetLocationPortRange {
@@ -336,7 +355,16 @@ impl std::fmt::Display for NetLocationPortRange {
     }
 }
 
-#[derive(Debug, Clone)]
+impl serde::ser::Serialize for NetLocationPortRange {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::ser::Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AddressMask {
     pub address: Address,
     pub netmask: u128,
@@ -415,6 +443,35 @@ impl AddressMask {
     }
 }
 
+impl std::fmt::Display for AddressMask {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        // Convert the 128-bit netmask back to number of bits
+        let bits = if self.netmask == 0 {
+            0
+        } else {
+            128 - self.netmask.trailing_zeros() as u8
+        };
+
+        // Determine if this is IPv4 or IPv6 based on address
+        let display_bits = match &self.address {
+            Address::Ipv4(_) => {
+                // For IPv4, we need to subtract the IPv6 prefix (96 bits)
+                if bits > 96 {
+                    bits - 96
+                } else if bits == 0 {
+                    0
+                } else {
+                    bits
+                }
+            }
+            Address::Ipv6(_) => bits,
+            Address::Hostname(_) => bits,
+        };
+
+        write!(f, "{}/{}", self.address, display_bits)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct NetLocationMask {
     pub address_mask: AddressMask,
@@ -445,5 +502,69 @@ impl NetLocationMask {
             address_mask: AddressMask::from(address_mask_str)?,
             port,
         })
+    }
+}
+
+impl std::fmt::Display for NetLocationMask {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        if self.port == 0 {
+            write!(f, "{}", self.address_mask)
+        } else {
+            write!(f, "{}:{}", self.address_mask, self.port)
+        }
+    }
+}
+
+impl serde::ser::Serialize for NetLocationMask {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::ser::Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    #[test]
+    fn test_netlocation_serialization() {
+        let net_loc = NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
+        let yaml_str = serde_yaml::to_string(&net_loc).expect("Failed to serialize NetLocation");
+        println!("NetLocation YAML: {}", yaml_str);
+
+        let deserialized: NetLocation =
+            serde_yaml::from_str(&yaml_str).expect("Failed to deserialize NetLocation");
+        assert_eq!(deserialized.port(), 8080);
+    }
+
+    #[test]
+    fn test_address_mask_serialization() {
+        let address_mask =
+            AddressMask::from("192.168.0.0/16").expect("Failed to create AddressMask");
+        let yaml_str =
+            serde_yaml::to_string(&address_mask).expect("Failed to serialize AddressMask");
+        println!("AddressMask YAML: {}", yaml_str);
+
+        let deserialized: AddressMask =
+            serde_yaml::from_str(&yaml_str).expect("Failed to deserialize AddressMask");
+
+        assert_eq!(address_mask.to_string(), deserialized.to_string());
+    }
+
+    #[test]
+    fn test_netlocationmask_serialization() {
+        let net_location_mask =
+            NetLocationMask::from("192.168.0.0/16:80").expect("Failed to create NetLocationMask");
+        let yaml_str =
+            serde_yaml::to_string(&net_location_mask).expect("Failed to serialize NetLocationMask");
+        println!("NetLocationMask YAML: {}", yaml_str);
+
+        let deserialized: NetLocationMask =
+            serde_yaml::from_str(&yaml_str).expect("Failed to deserialize NetLocationMask");
+
+        assert_eq!(net_location_mask.to_string(), deserialized.to_string());
     }
 }

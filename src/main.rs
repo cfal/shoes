@@ -239,6 +239,15 @@ fn main() {
                 }
             };
 
+            let configs = match config::validate_configs(configs) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Failed to validate server configs: {}\n", e);
+                    print_usage_and_exit(arg0);
+                    return;
+                }
+            };
+
             for config in configs.iter() {
                 debug!("================================================================================");
                 debug!("{:#?}", config);
