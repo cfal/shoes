@@ -115,8 +115,7 @@ async fn start_servers(config: ServerConfig) -> std::io::Result<Vec<JoinHandle<(
     }
 
     if join_handles.is_empty() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        return Err(std::io::Error::other(
             format!("failed to start servers at {}", &config.bind_location),
         ));
     }

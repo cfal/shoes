@@ -409,6 +409,7 @@ fn validate_rule_config(
     Ok(())
 }
 
+#[allow(dead_code)]
 pub async fn save_config(path: &Path, configs: &[Config]) -> std::io::Result<()> {
     let yaml_str = serde_yaml::to_string(configs).map_err(|e| {
         std::io::Error::new(

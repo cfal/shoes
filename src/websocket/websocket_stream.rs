@@ -148,8 +148,7 @@ impl WebsocketStream {
             && self.read_frame_opcode != OpCode::Binary
             && self.read_frame_opcode != OpCode::Continue
         {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(std::io::Error::other(
                 format!(
                     "cannot handle non-final frames of type {:?}",
                     self.read_frame_opcode
@@ -208,8 +207,7 @@ impl WebsocketStream {
         self.read_frame_length = length;
 
         if self.read_frame_length > 0x7fffffffffffffffu64 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(std::io::Error::other(
                 format!("Invalid frame length ({})", self.read_frame_length),
             ));
         }
@@ -272,8 +270,7 @@ impl WebsocketStream {
                     self.step_init(cx, buf)
                 } else {
                     if self.read_frame_length as usize > self.ping_data.len() {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::Other,
+                        return Err(std::io::Error::other(
                             format!(
                                 "cannot handle ping data length ({})",
                                 self.read_frame_length
@@ -300,8 +297,7 @@ impl WebsocketStream {
 
                 // Our ping frames are always with zero data.
                 if self.read_frame_length != 0 {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
+                    return Err(std::io::Error::other(
                         format!("unexpected pong data length ({})", self.read_frame_length),
                     ));
                 }

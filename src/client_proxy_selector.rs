@@ -225,8 +225,7 @@ async fn match_rule<'a, T>(
                     }
                 }
                 Err(MatchMaskError::Fatal(e)) => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
+                    return Err(std::io::Error::other(
                         format!("fatal error while matching mask for {}: {}", location, e),
                     ));
                 }

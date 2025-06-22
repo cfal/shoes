@@ -32,8 +32,7 @@ impl VlessMessageStream {
 
     pub fn feed_initial_read_data(&mut self, data: &[u8]) -> std::io::Result<()> {
         if data.len() > self.read_buf.len() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(std::io::Error::other(
                 "feed_initial_read_data called with too much data",
             ));
         }
@@ -61,8 +60,7 @@ impl AsyncReadMessage for VlessMessageStream {
                 let total_len = 2 + payload_len;
                 if this.read_end_index >= total_len {
                     if out_buf.remaining() < payload_len {
-                        return Poll::Ready(Err(Error::new(
-                            ErrorKind::Other,
+                        return Poll::Ready(Err(Error::other(
                             "out_buf is too small to hold the message",
                         )));
                     }

@@ -404,8 +404,7 @@ impl ShadowsocksStream {
                 if let Some(salt_checker) = &self.salt_checker {
                     let decrypt_iv = &self.unprocessed_buf[0..self.salt_len];
                     if !salt_checker.lock().insert_and_check(decrypt_iv) {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::Other,
+                        return Err(std::io::Error::other(
                             "got duplicate salt",
                         ));
                     }
@@ -448,16 +447,14 @@ impl ShadowsocksStream {
                 let current_time_secs = current_time_secs();
                 if current_time_secs >= timestamp_secs {
                     if current_time_secs - timestamp_secs > 30 {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::Other,
+                        return Err(std::io::Error::other(
                             "timestamp is greater than 30 seconds",
                         ));
                     }
                 } else {
                     // Make sure times aren't too far in the future.
                     if timestamp_secs - current_time_secs > 2 {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::Other,
+                        return Err(std::io::Error::other(
                             format!(
                                 "timestamp is {} seconds in the future",
                                 timestamp_secs - current_time_secs
@@ -469,8 +466,7 @@ impl ShadowsocksStream {
                 let decrypt_iv = &self.unprocessed_buf[0..self.salt_len];
                 if let Some(salt_checker) = &self.salt_checker {
                     if !salt_checker.lock().insert_and_check(decrypt_iv) {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::Other,
+                        return Err(std::io::Error::other(
                             "got duplicate salt",
                         ));
                     }
@@ -522,16 +518,14 @@ impl ShadowsocksStream {
                 let current_time_secs = current_time_secs();
                 if current_time_secs >= timestamp_secs {
                     if current_time_secs - timestamp_secs > 30 {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::Other,
+                        return Err(std::io::Error::other(
                             "timestamp is greater than 30 seconds",
                         ));
                     }
                 } else {
                     // Make sure times aren't too far in the future.
                     if timestamp_secs - current_time_secs > 2 {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::Other,
+                        return Err(std::io::Error::other(
                             format!(
                                 "timestamp is {} seconds in the future",
                                 timestamp_secs - current_time_secs
@@ -543,8 +537,7 @@ impl ShadowsocksStream {
                 if let Some(salt_checker) = &self.salt_checker {
                     let decrypt_iv = &self.unprocessed_buf[0..self.salt_len];
                     if !salt_checker.lock().insert_and_check(decrypt_iv) {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::Other,
+                        return Err(std::io::Error::other(
                             "got duplicate salt",
                         ));
                     }
@@ -594,8 +587,7 @@ impl ShadowsocksStream {
 
                 self.encrypt_single(&buf[0..handled_len], true)
                     .map_err(|_| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::Other,
+                        std::io::Error::other(
                             "failed to encrypt initial packet",
                         )
                     })?;
@@ -630,16 +622,14 @@ impl ShadowsocksStream {
                 response_header[9 + self.salt_len + 1] = (handled_len & 0xff) as u8;
 
                 self.encrypt_single(&response_header, false).map_err(|_| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::Other,
+                    std::io::Error::other(
                         "failed to encrypt response header",
                     )
                 })?;
 
                 self.encrypt_single(&buf[0..handled_len], false)
                     .map_err(|_| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::Other,
+                        std::io::Error::other(
                             "failed to encrypt initial server packet",
                         )
                     })?;
@@ -671,15 +661,13 @@ impl ShadowsocksStream {
                 request_header[10] = (buf_len & 0xff) as u8;
 
                 self.encrypt_single(&request_header, false).map_err(|_| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::Other,
+                    std::io::Error::other(
                         "failed to encrypt response header",
                     )
                 })?;
 
                 self.encrypt_single(buf, false).map_err(|_| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::Other,
+                    std::io::Error::other(
                         "failed to encrypt initial client packet",
                     )
                 })?;
@@ -835,7 +823,7 @@ impl AsyncWrite for ShadowsocksStream {
         );
         this.encrypt_single(&buf[0..packet_data_size], true)
             .map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::Other, "failed to encrypt packet")
+                std::io::Error::other("failed to encrypt packet")
             })?;
 
         if let Err(e) = this.do_write_cache(cx) {
@@ -911,7 +899,7 @@ impl AsyncWriteMessage for ShadowsocksStream {
         }
 
         this.encrypt_single(buf, true).map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::Other, "failed to encrypt packet")
+            std::io::Error::other("failed to encrypt packet")
         })?;
 
         Poll::Ready(Ok(()))

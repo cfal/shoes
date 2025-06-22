@@ -87,6 +87,7 @@ pub struct RuleConfigGroup {
 }
 
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum Config {
     Server(ServerConfig),
     ClientConfigGroup(ClientConfigGroup),
@@ -110,10 +111,10 @@ impl<'de> serde::de::Deserialize<'de> for Config {
         })?;
 
         // Look for discriminating fields
-        let has_client_group = map.contains_key(&Value::String("client_group".to_string()));
-        let has_rule_group = map.contains_key(&Value::String("rule_group".to_string()));
-        let has_address = map.contains_key(&Value::String("address".to_string()));
-        let has_path = map.contains_key(&Value::String("path".to_string()));
+        let has_client_group = map.contains_key(Value::String("client_group".to_string()));
+        let has_rule_group = map.contains_key(Value::String("rule_group".to_string()));
+        let has_address = map.contains_key(Value::String("address".to_string()));
+        let has_path = map.contains_key(Value::String("path".to_string()));
 
         // Try to determine which variant based on fields
         if has_client_group {
@@ -280,6 +281,7 @@ pub struct ShadowTlsRemoteHandshake {
 }
 
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum ShadowTlsServerHandshakeConfig {
     // Do the handshake locally with the provided TLS config.
     // This does not require a remote server, but for most clients,
@@ -305,9 +307,9 @@ impl<'de> serde::de::Deserialize<'de> for ShadowTlsServerHandshakeConfig {
         })?;
 
         // Look for discriminating fields
-        let has_cert = map.contains_key(&Value::String("cert".to_string()));
-        let has_key = map.contains_key(&Value::String("key".to_string()));
-        let has_address = map.contains_key(&Value::String("address".to_string()));
+        let has_cert = map.contains_key(Value::String("cert".to_string()));
+        let has_key = map.contains_key(Value::String("key".to_string()));
+        let has_address = map.contains_key(Value::String("address".to_string()));
 
         if has_cert || has_key {
             // This is a Local handshake config
@@ -811,6 +813,7 @@ impl Default for RuleConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "action", rename_all = "lowercase")]
+#[allow(clippy::large_enum_variant)]
 pub enum RuleActionConfig {
     Allow {
         #[serde(default, deserialize_with = "deserialize_override_address")]

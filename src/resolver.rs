@@ -53,8 +53,7 @@ pub async fn resolve_single_address(
     }
     let resolve_results = resolver.resolve_location(location).await?;
     if resolve_results.is_empty() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        return Err(std::io::Error::other(
             format!("could not resolve location: {}", location),
         ));
     }
@@ -120,8 +119,7 @@ impl ResolverCache {
                 Poll::Ready(result) => match result {
                     Ok(v) => {
                         if v.is_empty() {
-                            return Poll::Ready(Err(std::io::Error::new(
-                                std::io::ErrorKind::Other,
+                            return Poll::Ready(Err(std::io::Error::other(
                                 format!("Failed to resolve {}, no results", target),
                             )));
                         }
@@ -147,8 +145,7 @@ impl ResolverCache {
             Poll::Ready(result) => match result {
                 Ok(v) => {
                     if v.is_empty() {
-                        return Poll::Ready(Err(std::io::Error::new(
-                            std::io::ErrorKind::Other,
+                        return Poll::Ready(Err(std::io::Error::other(
                             format!("Failed to resolve {}, no results", target),
                         )));
                     }

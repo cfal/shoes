@@ -52,15 +52,13 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
         } = ParsedHttpData::parse(&mut server_stream).await?;
         let request_path = {
             if !first_line.ends_with(" HTTP/1.0") && !first_line.ends_with(" HTTP/1.1") {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
+                return Err(std::io::Error::other(
                     format!("invalid http request version: {}", first_line),
                 ));
             }
 
             if !first_line.starts_with("GET ") {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
+                return Err(std::io::Error::other(
                     format!("invalid http request: {}", first_line),
                 ));
             }
@@ -73,7 +71,7 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
         };
 
         let websocket_key = request_headers.remove("sec-websocket-key").ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::Other, "missing websocket key header")
+            std::io::Error::other("missing websocket key header")
         })?;
 
         'outer: for server_target in self.server_targets.iter() {
@@ -148,8 +146,7 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
             return target_setup_result;
         }
 
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        Err(std::io::Error::other(
             "No matching websocket targets",
         ))
     }
@@ -222,8 +219,7 @@ impl TcpClientHandler for WebsocketTcpClientHandler {
         } = ParsedHttpData::parse(&mut client_stream).await?;
 
         if !first_line.starts_with("HTTP/1.1 101") && !first_line.starts_with("HTTP/1.0 101") {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(std::io::Error::other(
                 format!("Bad websocket response: {}", first_line),
             ));
         }
@@ -232,16 +228,14 @@ impl TcpClientHandler for WebsocketTcpClientHandler {
             response_headers
                 .get("sec-websocket-accept")
                 .ok_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::Other,
+                    std::io::Error::other(
                         "missing websocket key response header",
                     )
                 })?;
 
         let expected_key_response = create_websocket_key_response(websocket_key);
         if websocket_key_response != &expected_key_response {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(std::io::Error::other(
                 format!(
                     "incorrect websocket key response, expected {}, got {}",
                     expected_key_response, websocket_key_response
@@ -282,8 +276,7 @@ impl ParsedHttpData {
             }
 
             if line.len() >= 4096 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
+                return Err(std::io::Error::other(
                     "http request line is too long",
                 ));
             }
@@ -293,8 +286,7 @@ impl ParsedHttpData {
             } else {
                 let tokens: Vec<&str> = line.splitn(2, ':').collect();
                 if tokens.len() != 2 {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
+                    return Err(std::io::Error::other(
                         format!("invalid http request line: {}", line),
                     ));
                 }
@@ -305,15 +297,14 @@ impl ParsedHttpData {
 
             line_count += 1;
             if line_count >= 40 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
+                return Err(std::io::Error::other(
                     "http request is too long",
                 ));
             }
         }
 
         let first_line = first_line
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "empty http request"))?;
+            .ok_or_else(|| std::io::Error::other("empty http request"))?;
 
         Ok(Self {
             first_line,
