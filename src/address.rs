@@ -117,9 +117,7 @@ impl NetLocation {
 
         let address = Address::from(address_str)?;
         if expect_ipv6 && !address.is_ipv6() {
-            return Err(std::io::Error::other(
-                "Invalid location",
-            ));
+            return Err(std::io::Error::other("Invalid location"));
         }
 
         let port = port.ok_or_else(|| std::io::Error::other("No port"))?;
@@ -378,9 +376,7 @@ impl AddressMask {
         let (address_str, num_bits) = match s.rfind('/') {
             Some(i) => {
                 let num_bits = s[i + 1..].parse::<u8>().map_err(|e| {
-                    std::io::Error::other(
-                        format!("Failed to parse netmask: {}", e),
-                    )
+                    std::io::Error::other(format!("Failed to parse netmask: {}", e))
                 })?;
                 (&s[0..i], Some(num_bits))
             }
@@ -391,9 +387,10 @@ impl AddressMask {
             Address::Ipv4(_) => {
                 let num_bits = num_bits.unwrap_or(32);
                 if num_bits > 32 {
-                    return Err(std::io::Error::other(
-                        format!("Invalid number of bits for ipv4 address: {}", num_bits),
-                    ));
+                    return Err(std::io::Error::other(format!(
+                        "Invalid number of bits for ipv4 address: {}",
+                        num_bits
+                    )));
                 }
                 if num_bits == 0 {
                     // We make an exception when 0 is specified, because even if it's IPv6, we
@@ -406,20 +403,19 @@ impl AddressMask {
             Address::Ipv6(_) => {
                 let num_bits = num_bits.unwrap_or(128);
                 if num_bits > 128 {
-                    return Err(std::io::Error::other(
-                        format!("Invalid number of bits for ipv4 address: {}", num_bits),
-                    ));
+                    return Err(std::io::Error::other(format!(
+                        "Invalid number of bits for ipv4 address: {}",
+                        num_bits
+                    )));
                 }
                 num_bits
             }
             Address::Hostname(ref hostname) => {
                 if num_bits.is_some() {
-                    return Err(std::io::Error::other(
-                        format!(
-                            "Cannot specify number of number of netmask bits for hostnames: {}",
-                            hostname
-                        ),
-                    ));
+                    return Err(std::io::Error::other(format!(
+                        "Cannot specify number of number of netmask bits for hostnames: {}",
+                        hostname
+                    )));
                 }
                 128
             }
@@ -481,11 +477,9 @@ impl NetLocationMask {
     pub fn from(s: &str) -> std::io::Result<Self> {
         let (address_mask_str, port) = match s.find(':') {
             Some(i) => {
-                let port = s[i + 1..].parse::<u16>().map_err(|e| {
-                    std::io::Error::other(
-                        format!("Failed to parse port: {}", e),
-                    )
-                })?;
+                let port = s[i + 1..]
+                    .parse::<u16>()
+                    .map_err(|e| std::io::Error::other(format!("Failed to parse port: {}", e)))?;
                 (&s[0..i], port)
             }
             None => (s, 0),

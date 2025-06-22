@@ -275,9 +275,7 @@ impl AsyncRead for ShadowTlsStream {
             }
 
             if this.unprocessed_end_offset == this.unprocessed_buf.len() {
-                return Poll::Ready(Err(std::io::Error::other(
-                    "Unprocessed buffer full",
-                )));
+                return Poll::Ready(Err(std::io::Error::other("Unprocessed buffer full")));
             }
         }
 

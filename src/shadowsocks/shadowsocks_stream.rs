@@ -404,9 +404,7 @@ impl ShadowsocksStream {
                 if let Some(salt_checker) = &self.salt_checker {
                     let decrypt_iv = &self.unprocessed_buf[0..self.salt_len];
                     if !salt_checker.lock().insert_and_check(decrypt_iv) {
-                        return Err(std::io::Error::other(
-                            "got duplicate salt",
-                        ));
+                        return Err(std::io::Error::other("got duplicate salt"));
                     }
                 }
                 self.process_opening_key()?;
@@ -454,21 +452,17 @@ impl ShadowsocksStream {
                 } else {
                     // Make sure times aren't too far in the future.
                     if timestamp_secs - current_time_secs > 2 {
-                        return Err(std::io::Error::other(
-                            format!(
-                                "timestamp is {} seconds in the future",
-                                timestamp_secs - current_time_secs
-                            ),
-                        ));
+                        return Err(std::io::Error::other(format!(
+                            "timestamp is {} seconds in the future",
+                            timestamp_secs - current_time_secs
+                        )));
                     }
                 }
 
                 let decrypt_iv = &self.unprocessed_buf[0..self.salt_len];
                 if let Some(salt_checker) = &self.salt_checker {
                     if !salt_checker.lock().insert_and_check(decrypt_iv) {
-                        return Err(std::io::Error::other(
-                            "got duplicate salt",
-                        ));
+                        return Err(std::io::Error::other("got duplicate salt"));
                     }
                 }
 
@@ -525,21 +519,17 @@ impl ShadowsocksStream {
                 } else {
                     // Make sure times aren't too far in the future.
                     if timestamp_secs - current_time_secs > 2 {
-                        return Err(std::io::Error::other(
-                            format!(
-                                "timestamp is {} seconds in the future",
-                                timestamp_secs - current_time_secs
-                            ),
-                        ));
+                        return Err(std::io::Error::other(format!(
+                            "timestamp is {} seconds in the future",
+                            timestamp_secs - current_time_secs
+                        )));
                     }
                 }
 
                 if let Some(salt_checker) = &self.salt_checker {
                     let decrypt_iv = &self.unprocessed_buf[0..self.salt_len];
                     if !salt_checker.lock().insert_and_check(decrypt_iv) {
-                        return Err(std::io::Error::other(
-                            "got duplicate salt",
-                        ));
+                        return Err(std::io::Error::other("got duplicate salt"));
                     }
                 }
 
@@ -586,11 +576,7 @@ impl ShadowsocksStream {
                 assert!(handled_len > 0);
 
                 self.encrypt_single(&buf[0..handled_len], true)
-                    .map_err(|_| {
-                        std::io::Error::other(
-                            "failed to encrypt initial packet",
-                        )
-                    })?;
+                    .map_err(|_| std::io::Error::other("failed to encrypt initial packet"))?;
 
                 Ok(handled_len)
             }
@@ -621,17 +607,12 @@ impl ShadowsocksStream {
                 response_header[9 + self.salt_len] = (handled_len >> 8) as u8;
                 response_header[9 + self.salt_len + 1] = (handled_len & 0xff) as u8;
 
-                self.encrypt_single(&response_header, false).map_err(|_| {
-                    std::io::Error::other(
-                        "failed to encrypt response header",
-                    )
-                })?;
+                self.encrypt_single(&response_header, false)
+                    .map_err(|_| std::io::Error::other("failed to encrypt response header"))?;
 
                 self.encrypt_single(&buf[0..handled_len], false)
                     .map_err(|_| {
-                        std::io::Error::other(
-                            "failed to encrypt initial server packet",
-                        )
+                        std::io::Error::other("failed to encrypt initial server packet")
                     })?;
 
                 Ok(handled_len)
@@ -660,16 +641,11 @@ impl ShadowsocksStream {
                 request_header[9] = (buf_len >> 8) as u8;
                 request_header[10] = (buf_len & 0xff) as u8;
 
-                self.encrypt_single(&request_header, false).map_err(|_| {
-                    std::io::Error::other(
-                        "failed to encrypt response header",
-                    )
-                })?;
+                self.encrypt_single(&request_header, false)
+                    .map_err(|_| std::io::Error::other("failed to encrypt response header"))?;
 
                 self.encrypt_single(buf, false).map_err(|_| {
-                    std::io::Error::other(
-                        "failed to encrypt initial client packet",
-                    )
+                    std::io::Error::other("failed to encrypt initial client packet")
                 })?;
 
                 Ok(buf_len)
@@ -822,9 +798,7 @@ impl AsyncWrite for ShadowsocksStream {
             this.stream_type.max_payload_len(),
         );
         this.encrypt_single(&buf[0..packet_data_size], true)
-            .map_err(|_| {
-                std::io::Error::other("failed to encrypt packet")
-            })?;
+            .map_err(|_| std::io::Error::other("failed to encrypt packet"))?;
 
         if let Err(e) = this.do_write_cache(cx) {
             return Poll::Ready(Err(e));
@@ -898,9 +872,8 @@ impl AsyncWriteMessage for ShadowsocksStream {
             return Poll::Pending;
         }
 
-        this.encrypt_single(buf, true).map_err(|_| {
-            std::io::Error::other("failed to encrypt packet")
-        })?;
+        this.encrypt_single(buf, true)
+            .map_err(|_| std::io::Error::other("failed to encrypt packet"))?;
 
         Poll::Ready(Ok(()))
     }

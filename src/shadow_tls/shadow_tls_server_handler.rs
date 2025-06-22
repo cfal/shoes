@@ -208,9 +208,7 @@ pub async fn setup_shadowtls_server_stream(
             )
             .await
             .map_err(|e| {
-                std::io::Error::other(
-                    format!("failed to setup remote handshake: {}", e),
-                )
+                std::io::Error::other(format!("failed to setup remote handshake: {}", e))
             })?
         }
         ShadowTlsServerTargetHandshake::Local(ref local_config) => setup_local_handshake(
@@ -222,11 +220,7 @@ pub async fn setup_shadowtls_server_stream(
             local_config.clone(),
         )
         .await
-        .map_err(|e| {
-            std::io::Error::other(
-                format!("failed to setup local handshake: {}", e),
-            )
-        })?,
+        .map_err(|e| std::io::Error::other(format!("failed to setup local handshake: {}", e)))?,
     };
 
     let mut target_setup_result = target
@@ -234,9 +228,10 @@ pub async fn setup_shadowtls_server_stream(
         .setup_server_stream(Box::new(shadow_tls_stream))
         .await
         .map_err(|e| {
-            std::io::Error::other(
-                format!("failed to setup server stream after shadow tls: {}", e),
-            )
+            std::io::Error::other(format!(
+                "failed to setup server stream after shadow tls: {}",
+                e
+            ))
         });
 
     if let Ok(ref mut setup_result) = target_setup_result {

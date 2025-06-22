@@ -53,9 +53,10 @@ pub async fn resolve_single_address(
     }
     let resolve_results = resolver.resolve_location(location).await?;
     if resolve_results.is_empty() {
-        return Err(std::io::Error::other(
-            format!("could not resolve location: {}", location),
-        ));
+        return Err(std::io::Error::other(format!(
+            "could not resolve location: {}",
+            location
+        )));
     }
     Ok(resolve_results[0])
 }
@@ -119,9 +120,10 @@ impl ResolverCache {
                 Poll::Ready(result) => match result {
                     Ok(v) => {
                         if v.is_empty() {
-                            return Poll::Ready(Err(std::io::Error::other(
-                                format!("Failed to resolve {}, no results", target),
-                            )));
+                            return Poll::Ready(Err(std::io::Error::other(format!(
+                                "Failed to resolve {}, no results",
+                                target
+                            ))));
                         }
                         let socket_addr = v.into_iter().next().unwrap();
                         self.cache.insert(
@@ -145,9 +147,10 @@ impl ResolverCache {
             Poll::Ready(result) => match result {
                 Ok(v) => {
                     if v.is_empty() {
-                        return Poll::Ready(Err(std::io::Error::other(
-                            format!("Failed to resolve {}, no results", target),
-                        )));
+                        return Poll::Ready(Err(std::io::Error::other(format!(
+                            "Failed to resolve {}, no results",
+                            target
+                        ))));
                     }
                     let socket_addr = v.into_iter().next().unwrap();
                     self.cache.insert(

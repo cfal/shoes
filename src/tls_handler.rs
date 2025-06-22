@@ -75,9 +75,10 @@ impl TcpServerHandler for TlsServerHandler {
                 None => match self.default_target {
                     Some(ref t) => t,
                     None => {
-                        return Err(std::io::Error::other(
-                            format!("No default target for unknown SNI: {}", hostname),
-                        ));
+                        return Err(std::io::Error::other(format!(
+                            "No default target for unknown SNI: {}",
+                            hostname
+                        )));
                     }
                 },
             },
@@ -105,27 +106,27 @@ impl TcpServerHandler for TlsServerHandler {
                         }
 
                         if let Err(e) = feed_server_connection(server_conn, &client_hello_frame) {
-                            let _ = accept_error.insert(std::io::Error::other(
-                                format!("Failed to feed initial frame to server connection: {}", e),
-                            ));
+                            let _ = accept_error.insert(std::io::Error::other(format!(
+                                "Failed to feed initial frame to server connection: {}",
+                                e
+                            )));
                             return;
                         }
                         let unparsed_data = client_reader.unparsed_data();
                         if !unparsed_data.is_empty() {
                             if let Err(e) = feed_server_connection(server_conn, unparsed_data) {
-                                let _ = accept_error.insert(std::io::Error::other(
-                                    format!(
-                                        "Failed to feed unparsed data to server connection: {}",
-                                        e
-                                    ),
-                                ));
+                                let _ = accept_error.insert(std::io::Error::other(format!(
+                                    "Failed to feed unparsed data to server connection: {}",
+                                    e
+                                )));
                                 return;
                             }
                         }
                         if let Err(e) = server_conn.process_new_packets() {
-                            let _ = accept_error.insert(std::io::Error::other(
-                                format!("Failed to process new packets: {}", e),
-                            ));
+                            let _ = accept_error.insert(std::io::Error::other(format!(
+                                "Failed to process new packets: {}",
+                                e
+                            )));
                         }
                     });
 

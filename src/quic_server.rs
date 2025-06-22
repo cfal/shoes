@@ -99,9 +99,10 @@ async fn process_connection(
                 break;
             }
             Err(e) => {
-                return Err(std::io::Error::other(
-                    format!("quic connection error: {}", e),
-                ));
+                return Err(std::io::Error::other(format!(
+                    "quic connection error: {}",
+                    e
+                )));
             }
             Ok(s) => s,
         };
@@ -387,9 +388,8 @@ pub async fn start_quic_servers(config: ServerConfig) -> std::io::Result<Vec<Joi
         &client_fingerprints.into_vec(),
     ));
 
-    let quic_server_config: quinn::crypto::rustls::QuicServerConfig = server_config
-        .try_into()
-        .map_err(std::io::Error::other)?;
+    let quic_server_config: quinn::crypto::rustls::QuicServerConfig =
+        server_config.try_into().map_err(std::io::Error::other)?;
 
     let quic_server_config = Arc::new(quic_server_config);
 

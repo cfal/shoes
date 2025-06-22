@@ -148,12 +148,10 @@ impl WebsocketStream {
             && self.read_frame_opcode != OpCode::Binary
             && self.read_frame_opcode != OpCode::Continue
         {
-            return Err(std::io::Error::other(
-                format!(
-                    "cannot handle non-final frames of type {:?}",
-                    self.read_frame_opcode
-                ),
-            ));
+            return Err(std::io::Error::other(format!(
+                "cannot handle non-final frames of type {:?}",
+                self.read_frame_opcode
+            )));
         }
 
         let length = second & 0x7f;
@@ -207,9 +205,10 @@ impl WebsocketStream {
         self.read_frame_length = length;
 
         if self.read_frame_length > 0x7fffffffffffffffu64 {
-            return Err(std::io::Error::other(
-                format!("Invalid frame length ({})", self.read_frame_length),
-            ));
+            return Err(std::io::Error::other(format!(
+                "Invalid frame length ({})",
+                self.read_frame_length
+            )));
         }
 
         if self.read_frame_masked {
@@ -270,12 +269,10 @@ impl WebsocketStream {
                     self.step_init(cx, buf)
                 } else {
                     if self.read_frame_length as usize > self.ping_data.len() {
-                        return Err(std::io::Error::other(
-                            format!(
-                                "cannot handle ping data length ({})",
-                                self.read_frame_length
-                            ),
-                        ));
+                        return Err(std::io::Error::other(format!(
+                            "cannot handle ping data length ({})",
+                            self.read_frame_length
+                        )));
                     }
 
                     // Make sure we aren't writing pongs when we're reading new ping data.
@@ -297,9 +294,10 @@ impl WebsocketStream {
 
                 // Our ping frames are always with zero data.
                 if self.read_frame_length != 0 {
-                    return Err(std::io::Error::other(
-                        format!("unexpected pong data length ({})", self.read_frame_length),
-                    ));
+                    return Err(std::io::Error::other(format!(
+                        "unexpected pong data length ({})",
+                        self.read_frame_length
+                    )));
                 }
                 self.read_state = ReadState::Init;
                 self.step_init(cx, buf)

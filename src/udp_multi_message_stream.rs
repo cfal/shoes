@@ -115,9 +115,7 @@ impl AsyncReadSourcedMessage for UdpMultiMessageStream {
         match Pin::new(&mut this.receiver).poll_recv(cx) {
             Poll::Ready(Some((message, from_addr))) => {
                 if message.len() > buf.remaining() {
-                    return Poll::Ready(Err(std::io::Error::other(
-                        "buffer too small",
-                    )));
+                    return Poll::Ready(Err(std::io::Error::other("buffer too small")));
                 }
                 buf.put_slice(&message);
                 Poll::Ready(Ok(from_addr))

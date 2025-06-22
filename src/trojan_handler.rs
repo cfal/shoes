@@ -81,20 +81,16 @@ impl TcpServerHandler for TrojanTcpHandler {
         // TODO: implement http response
         let received_hash = stream_reader.read_line_bytes(&mut server_stream).await?;
         if received_hash.len() != self.password_hash.len() {
-            return Err(std::io::Error::other(
-                format!(
-                    "Invalid password hash length, expected {}, got {}",
-                    self.password_hash.len(),
-                    received_hash.len()
-                ),
-            ));
+            return Err(std::io::Error::other(format!(
+                "Invalid password hash length, expected {}, got {}",
+                self.password_hash.len(),
+                received_hash.len()
+            )));
         }
 
         for (b1, b2) in self.password_hash.iter().zip(received_hash.iter()) {
             if b1 != b2 {
-                return Err(std::io::Error::other(
-                    "Invalid password hash",
-                ));
+                return Err(std::io::Error::other("Invalid password hash"));
             }
         }
 
@@ -118,9 +114,10 @@ impl TcpServerHandler for TrojanTcpHandler {
 
         let request_suffix = stream_reader.read_u16_be(&mut server_stream).await?;
         if request_suffix != 0x0d0a {
-            return Err(std::io::Error::other(
-                format!("Invalid request suffix bytes {}", request_suffix),
-            ));
+            return Err(std::io::Error::other(format!(
+                "Invalid request suffix bytes {}",
+                request_suffix
+            )));
         }
 
         Ok(TcpServerSetupResult::TcpForward {

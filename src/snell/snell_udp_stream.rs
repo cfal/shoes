@@ -59,22 +59,19 @@ impl AsyncReadTargetedMessage for SnellUdpStream {
         }
 
         if len < 4 {
-            return Poll::Ready(Err(std::io::Error::other(
-                "snell packet size too small",
-            )));
+            return Poll::Ready(Err(std::io::Error::other("snell packet size too small")));
         }
 
         if len > this.max_payload_size {
-            return Poll::Ready(Err(std::io::Error::other(
-                "snell packet size too big",
-            )));
+            return Poll::Ready(Err(std::io::Error::other("snell packet size too big")));
         }
 
         let cmd = this.read_buf[0];
         if cmd != 1 {
-            return Poll::Ready(Err(std::io::Error::other(
-                format!("invalid snell command: {}", cmd),
-            )));
+            return Poll::Ready(Err(std::io::Error::other(format!(
+                "invalid snell command: {}",
+                cmd
+            ))));
         }
 
         let address_len = this.read_buf[1] as usize;
@@ -101,9 +98,10 @@ impl AsyncReadTargetedMessage for SnellUdpStream {
                 let port = u16::from_be_bytes(this.read_buf[19..21].try_into().unwrap());
                 (NetLocation::new(Address::Ipv6(ip_addr), port), 21)
             } else {
-                return Poll::Ready(Err(std::io::Error::other(
-                    format!("invalid ip version: {}", ip_version),
-                )));
+                return Poll::Ready(Err(std::io::Error::other(format!(
+                    "invalid ip version: {}",
+                    ip_version
+                ))));
             }
         } else {
             if len < 4 + address_len {
@@ -112,11 +110,8 @@ impl AsyncReadTargetedMessage for SnellUdpStream {
                 )));
             }
             let hostname_bytes = &this.read_buf[2..2 + address_len];
-            let hostname = std::str::from_utf8(hostname_bytes).map_err(|e| {
-                std::io::Error::other(
-                    format!("could not parse hostname: {}", e),
-                )
-            })?;
+            let hostname = std::str::from_utf8(hostname_bytes)
+                .map_err(|e| std::io::Error::other(format!("could not parse hostname: {}", e)))?;
             let port = u16::from_be_bytes(
                 this.read_buf[2 + address_len..4 + address_len]
                     .try_into()
