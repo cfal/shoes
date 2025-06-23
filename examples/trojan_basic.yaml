@@ -1,0 +1,45 @@
+# Basic Trojan server examples
+
+# Simple Trojan server over TLS
+- address: "0.0.0.0:443"
+  protocol:
+    type: tls
+    sni_targets:
+      "trojan.example.com":
+        cert: "cert.pem"
+        key: "key.pem"
+        protocol:
+          type: trojan
+          password: "trojan-secret-password"
+
+# Trojan with Shadowsocks obfuscation
+- address: "0.0.0.0:8443"
+  protocol:
+    type: tls
+    default_target:
+      cert: "cert.pem"
+      key: "key.pem"
+      protocol:
+        type: trojan
+        password: "trojan-password"
+        shadowsocks:
+          cipher: aes-256-gcm
+          password: "shadowsocks-password"
+
+# Trojan over WebSocket
+- address: "0.0.0.0:443"
+  protocol:
+    type: tls
+    sni_targets:
+      "ws.example.com":
+        cert: "cert.pem"
+        key: "key.pem"
+        protocol:
+          type: websocket
+          targets:
+            - matching_path: "/trojan"
+              matching_headers:
+                User-Agent: "Mozilla/5.0"
+              protocol:
+                type: trojan
+                password: "websocket-trojan-password"
