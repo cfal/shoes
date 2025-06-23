@@ -5,6 +5,8 @@ pub use types::*;
 use std::collections::HashMap;
 use std::path::Path;
 
+use log::debug;
+
 use crate::address::NetLocationMask;
 use crate::option_util::{NoneOrSome, OneOrSome};
 use crate::thread_util::get_num_threads;
@@ -56,7 +58,9 @@ pub async fn load_configs(args: &Vec<String>) -> std::io::Result<Vec<Config>> {
     Ok(all_configs)
 }
 
-pub fn validate_configs(all_configs: Vec<Config>) -> std::io::Result<Vec<ServerConfig>> {
+pub async fn validate_configs(
+    all_configs: Vec<Config>,
+) -> std::io::Result<(Vec<ServerConfig>, usize)> {
     let mut client_groups: HashMap<String, Vec<ClientConfig>> = HashMap::new();
     client_groups.insert(String::from("direct"), vec![ClientConfig::default()]);
 
@@ -80,6 +84,10 @@ pub fn validate_configs(all_configs: Vec<Config>) -> std::io::Result<Vec<ServerC
     );
 
     let mut server_configs: Vec<ServerConfig> = vec![];
+    let mut named_certs: HashMap<String, String> = HashMap::new();
+    let mut named_keys: HashMap<String, String> = HashMap::new();
+
+    let mut embedded_keys_count = 0;
 
     for config in all_configs.into_iter() {
         match config {
@@ -108,6 +116,38 @@ pub fn validate_configs(all_configs: Vec<Config>) -> std::io::Result<Vec<ServerC
             Config::Server(server_config) => {
                 server_configs.push(server_config);
             }
+            Config::NamedCert(cert) => {
+                let cert_data = match cert.source {
+                    CertKeySource::Path(ref path) => {
+                        embedded_keys_count += 1;
+                        read_cert_to_string(path).await?
+                    }
+                    CertKeySource::Data(data) => data,
+                };
+
+                if named_certs.insert(cert.cert.clone(), cert_data).is_some() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("named certificate already exists: {}", cert.cert),
+                    ));
+                }
+            }
+            Config::NamedPrivateKey(key) => {
+                let key_data = match key.source {
+                    CertKeySource::Path(ref path) => {
+                        embedded_keys_count += 1;
+                        read_cert_to_string(path).await?
+                    }
+                    CertKeySource::Data(data) => data,
+                };
+
+                if named_keys.insert(key.key.clone(), key_data).is_some() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("named private key already exists: {}", key.key),
+                    ));
+                }
+            }
         }
     }
 
@@ -115,7 +155,11 @@ pub fn validate_configs(all_configs: Vec<Config>) -> std::io::Result<Vec<ServerC
         validate_server_config(config, &client_groups, &rule_groups)?;
     }
 
-    Ok(server_configs)
+    for config in server_configs.iter_mut() {
+        embedded_keys_count += embed_file_based_certs(config, &named_certs, &named_keys).await?;
+    }
+
+    Ok((server_configs, embedded_keys_count))
 }
 
 fn validate_server_config(
@@ -407,6 +451,137 @@ fn validate_rule_config(
     }
 
     Ok(())
+}
+
+async fn embed_file_based_certs(
+    server_config: &mut ServerConfig,
+    named_certs: &HashMap<String, String>,
+    named_keys: &HashMap<String, String>,
+) -> std::io::Result<usize> {
+    let mut embedded_count = 0;
+
+    if let Some(ref mut quic_settings) = server_config.quic_settings {
+        if let Some(cert_data) = named_certs.get(&quic_settings.cert) {
+            quic_settings.cert = cert_data.clone();
+        } else if is_cert_file_path(&quic_settings.cert) {
+            quic_settings.cert = read_cert_to_string(&quic_settings.cert).await?;
+            embedded_count += 1;
+        }
+
+        if let Some(key_data) = named_keys.get(&quic_settings.key) {
+            quic_settings.key = key_data.clone();
+        } else if is_cert_file_path(&quic_settings.key) {
+            quic_settings.key = read_cert_to_string(&quic_settings.key).await?;
+            embedded_count += 1;
+        }
+
+        for cert in quic_settings.client_ca_certs.iter_mut() {
+            if let Some(cert_data) = named_certs.get(cert) {
+                *cert = cert_data.clone();
+            } else if is_cert_file_path(cert) {
+                *cert = read_cert_to_string(cert).await?;
+                embedded_count += 1;
+            }
+        }
+    }
+
+    if let ServerProxyConfig::Tls {
+        ref mut tls_targets,
+        ref mut default_tls_target,
+        ref mut shadowtls_targets,
+        ..
+    } = &mut server_config.protocol
+    {
+        for (_, tls_config) in tls_targets.iter_mut() {
+            if let Some(cert_data) = named_certs.get(&tls_config.cert) {
+                tls_config.cert = cert_data.clone();
+            } else if is_cert_file_path(&tls_config.cert) {
+                tls_config.cert = read_cert_to_string(&tls_config.cert).await?;
+                embedded_count += 1;
+            }
+
+            if let Some(key_data) = named_keys.get(&tls_config.key) {
+                tls_config.key = key_data.clone();
+            } else if is_cert_file_path(&tls_config.key) {
+                tls_config.key = read_cert_to_string(&tls_config.key).await?;
+                embedded_count += 1;
+            }
+
+            for cert in tls_config.client_ca_certs.iter_mut() {
+                if let Some(cert_data) = named_certs.get(cert) {
+                    *cert = cert_data.clone();
+                } else if is_cert_file_path(cert) {
+                    *cert = read_cert_to_string(cert).await?;
+                    embedded_count += 1;
+                }
+            }
+        }
+
+        if let Some(ref mut tls_config) = default_tls_target {
+            if let Some(cert_data) = named_certs.get(&tls_config.cert) {
+                tls_config.cert = cert_data.clone();
+            } else if is_cert_file_path(&tls_config.cert) {
+                tls_config.cert = read_cert_to_string(&tls_config.cert).await?;
+                embedded_count += 1;
+            }
+
+            if let Some(key_data) = named_keys.get(&tls_config.key) {
+                tls_config.key = key_data.clone();
+            } else if is_cert_file_path(&tls_config.key) {
+                tls_config.key = read_cert_to_string(&tls_config.key).await?;
+                embedded_count += 1;
+            }
+
+            for cert in tls_config.client_ca_certs.iter_mut() {
+                if let Some(cert_data) = named_certs.get(cert) {
+                    *cert = cert_data.clone();
+                } else if is_cert_file_path(cert) {
+                    *cert = read_cert_to_string(cert).await?;
+                    embedded_count += 1;
+                }
+            }
+        }
+
+        for (_, shadowtls_config) in shadowtls_targets.iter_mut() {
+            if let ShadowTlsServerHandshakeConfig::Local(ref mut handshake) =
+                shadowtls_config.handshake
+            {
+                if let Some(cert_data) = named_certs.get(&handshake.cert) {
+                    handshake.cert = cert_data.clone();
+                } else if is_cert_file_path(&handshake.cert) {
+                    handshake.cert = read_cert_to_string(&handshake.cert).await?;
+                    embedded_count += 1;
+                }
+
+                if let Some(key_data) = named_keys.get(&handshake.key) {
+                    handshake.key = key_data.clone();
+                } else if is_cert_file_path(&handshake.key) {
+                    handshake.key = read_cert_to_string(&handshake.key).await?;
+                    embedded_count += 1;
+                }
+            }
+        }
+    }
+
+    Ok(embedded_count)
+}
+fn is_cert_file_path(s: &str) -> bool {
+    !s.trim_start().starts_with("-----BEGIN")
+        && (s.contains('/')
+            || s.contains('\\')
+            || s.ends_with(".pem")
+            || s.ends_with(".crt")
+            || s.ends_with(".key"))
+}
+
+async fn read_cert_to_string(path: &str) -> std::io::Result<String> {
+    debug!("Reading certificate/key file: {}", path);
+    tokio::fs::read_to_string(path).await.map_err(|e| {
+        std::io::Error::new(
+            e.kind(),
+            format!("Failed to read certificate/key file '{}': {}", path, e),
+        )
+    })
 }
 
 #[allow(dead_code)]

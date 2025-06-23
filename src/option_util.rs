@@ -94,9 +94,9 @@ impl<T> NoneOrSome<T> {
         }
     }
 
-    pub fn into_iter(self) -> Box<dyn Iterator<Item = T>>
+    pub fn into_iter(self) -> Box<dyn Iterator<Item = T> + Send>
     where
-        T: 'static,
+        T: Send + 'static,
     {
         match self {
             NoneOrSome::Unspecified | NoneOrSome::None => Box::new(std::iter::empty()),
@@ -105,7 +105,10 @@ impl<T> NoneOrSome<T> {
         }
     }
 
-    pub fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = &'a T> + 'a> {
+    pub fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = &'a T> + Send + 'a>
+    where
+        T: Sync,
+    {
         match self {
             NoneOrSome::Unspecified | NoneOrSome::None => Box::new(std::iter::empty()),
             NoneOrSome::One(item) => Box::new(SingleItemIter(Some(item))),
@@ -113,7 +116,10 @@ impl<T> NoneOrSome<T> {
         }
     }
 
-    pub fn iter_mut<'a>(&'a mut self) -> Box<dyn Iterator<Item = &'a mut T> + 'a> {
+    pub fn iter_mut<'a>(&'a mut self) -> Box<dyn Iterator<Item = &'a mut T> + Send + 'a>
+    where
+        T: Send,
+    {
         match self {
             NoneOrSome::Unspecified | NoneOrSome::None => Box::new(std::iter::empty()),
             NoneOrSome::One(ref mut item) => Box::new(SingleItemIter(Some(item))),
@@ -199,14 +205,20 @@ impl<T> OneOrSome<T> {
         }
     }
 
-    pub fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = &'a T> + 'a> {
+    pub fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = &'a T> + Send + 'a>
+    where
+        T: Sync,
+    {
         match self {
             OneOrSome::One(item) => Box::new(SingleItemIter(Some(item))),
             OneOrSome::Some(v) => Box::new(v.iter()),
         }
     }
 
-    pub fn iter_mut<'a>(&'a mut self) -> Box<dyn Iterator<Item = &'a mut T> + 'a> {
+    pub fn iter_mut<'a>(&'a mut self) -> Box<dyn Iterator<Item = &'a mut T> + Send + 'a>
+    where
+        T: Send,
+    {
         match self {
             OneOrSome::One(ref mut item) => Box::new(SingleItemIter(Some(item))),
             OneOrSome::Some(v) => Box::new(v.iter_mut()),

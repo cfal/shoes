@@ -4,8 +4,7 @@ use std::time::Duration;
 
 use log::{debug, error, warn};
 use quinn::EndpointConfig;
-use tokio::fs::File;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
@@ -364,20 +363,13 @@ pub async fn start_quic_servers(config: ServerConfig) -> std::io::Result<Vec<Joi
         num_endpoints,
     } = quic_settings.unwrap();
 
-    let mut cert_file = File::open(&cert).await?;
-    let mut cert_bytes = vec![];
-    cert_file.read_to_end(&mut cert_bytes).await?;
-
-    let mut key_file = File::open(&key).await?;
-    let mut key_bytes = vec![];
-    key_file.read_to_end(&mut key_bytes).await?;
+    // Certificates are already embedded as PEM data during config validation
+    let cert_bytes = cert.as_bytes().to_vec();
+    let key_bytes = key.as_bytes().to_vec();
 
     let mut processed_ca_certs = Vec::with_capacity(client_ca_certs.len());
     for cert in client_ca_certs.into_iter() {
-        let mut cert_file = File::open(cert).await?;
-        let mut cert_bytes = vec![];
-        cert_file.read_to_end(&mut cert_bytes).await?;
-        processed_ca_certs.push(cert_bytes);
+        processed_ca_certs.push(cert.as_bytes().to_vec());
     }
 
     let server_config = Arc::new(create_server_config(
