@@ -19,19 +19,17 @@ You can define certificates and private keys once and reference them throughout 
 ### Named Certificate
 ```yaml
 cert: string                # Name identifier for the certificate
-source:                     # Certificate source
-  path: string             # File path to certificate
-  # OR
-  data: string             # Inline PEM-encoded certificate data
+path: string                # File path to certificate
+# OR
+data: string                # Inline PEM-encoded certificate data
 ```
 
 ### Named Private Key
 ```yaml
 key: string                 # Name identifier for the private key
-source:                     # Key source
-  path: string             # File path to private key
-  # OR
-  data: string             # Inline PEM-encoded private key data
+path: string                # File path to private key
+# OR
+data: string                # Inline PEM-encoded private key data
 ```
 
 ## Server Configuration
@@ -359,19 +357,16 @@ Certificates and keys can be specified in three ways:
 ```yaml
 # Define named certificates and keys
 - cert: "shared-cert"
-  source:
-    path: "/etc/certs/shared.crt"
+  path: "/etc/certs/shared.crt"
 
 - key: "shared-key"
-  source:
-    path: "/etc/certs/shared.key"
+  path: "/etc/certs/shared.key"
 
 - cert: "ca-cert"
-  source:
-    data: |
-      -----BEGIN CERTIFICATE-----
-      MIIDXTCCAkWgAwIBAgIJAKl...
-      -----END CERTIFICATE-----
+  data: |
+    -----BEGIN CERTIFICATE-----
+    MIIDXTCCAkWgAwIBAgIJAKl...
+    -----END CERTIFICATE-----
 
 # Use named certificates in server configurations
 - bind_location: "0.0.0.0:443"
