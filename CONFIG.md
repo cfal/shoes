@@ -4,11 +4,35 @@ shoes uses a YAML-based configuration format. Each configuration file can contai
 
 ## Configuration Types
 
-There are three main configuration types:
+There are five main configuration types:
 
 1. Server configurations (`ServerConfig`)
 2. Client proxy groups (`ClientConfigGroup`)
 3. Rule groups (`RuleConfigGroup`)
+4. Named certificates (`NamedCert`)
+5. Named private keys (`NamedPrivateKey`)
+
+## Named Certificates and Private Keys
+
+You can define certificates and private keys once and reference them throughout your configuration:
+
+### Named Certificate
+```yaml
+cert: string                # Name identifier for the certificate
+source:                     # Certificate source
+  path: string             # File path to certificate
+  # OR
+  data: string             # Inline PEM-encoded certificate data
+```
+
+### Named Private Key
+```yaml
+key: string                 # Name identifier for the private key
+source:                     # Key source
+  path: string             # File path to private key
+  # OR
+  data: string             # Inline PEM-encoded private key data
+```
 
 ## Server Configuration
 
@@ -21,10 +45,11 @@ transport: tcp | quic | udp     # Optional, defaults to tcp; note: Unix socket b
 tcp_settings:                   # Optional TCP settings
   no_delay: bool               # Default: true
 quic_settings:                 # Required if transport is quic
-  cert: string                # TLS certificate path
-  key: string                 # TLS private key path
+  cert: string                # TLS certificate (path, inline PEM data, or named certificate reference)
+  key: string                 # TLS private key (path, inline PEM data, or named key reference)
   alpn_protocols: [string]    # Optional ALPN protocols (alias: alpn_protocol)
   client_fingerprints: [string] # Optional allowed client cert fingerprints (alias: client_fingerprint)
+  client_ca_certs: [string]   # Optional client CA certificates (path, inline PEM, or named cert reference)
   num_endpoints: int          # Optional; if set to 0, defaults to the number of available threads
 rules: string | RuleConfig    # Optional; defaults to allow-all-direct if omitted
 ```
@@ -92,17 +117,20 @@ protocol:
   type: tls
   sni_targets:                # Map of SNI hostnames to TLS configs
     "example.com":
-      cert: string           # Certificate path
-      key: string            # Private key path
+      cert: string           # Certificate (path, inline PEM data, or named certificate reference)
+      key: string            # Private key (path, inline PEM data, or named key reference)
       alpn_protocols: [string]  # Optional ALPN protocols
       client_fingerprints: [string]  # Optional allowed client fingerprints
+      client_ca_certs: [string]  # Optional client CA certificates
       protocol: ServerProxyConfig  # Inner protocol configuration
       override_rules: string | [RuleConfig]  # Optional override rules
   default_target:            # Optional default configuration
     cert: string
     key: string
+    client_ca_certs: [string]
     protocol: ServerProxyConfig
     override_rules: string | [RuleConfig]
+  tls_buffer_size: int       # Optional TLS buffer size (minimum 16384)
 ```
 
 #### ShadowTLS v3 (in-process handshake)
@@ -113,13 +141,14 @@ protocol:
     "example.com":
       password: string        # ShadowTLS password
       handshake:              # TLS handshake configuration; can be defined in two ways:
-        cert: string         # Local handshake: certificate path
-        key: string          # Local handshake: private key path
+        cert: string         # Local handshake: certificate (path, inline PEM, or named reference)
+        key: string          # Local handshake: private key (path, inline PEM, or named reference)
         alpn_protocols: [string]  # Optional ALPN protocols
         client_fingerprints: [string]  # Optional allowed client fingerprints
       protocol: ServerProxyConfig  # Inner protocol configuration
       override_rules: string | [RuleConfig]  # Optional override rules
   default_target:            # Optional default configuration for ShadowTLS v3
+    password: string
     handshake: { ... }        # Handshake configuration (local or remote)
     protocol: ServerProxyConfig
     override_rules: string | [RuleConfig]
@@ -197,8 +226,8 @@ protocol:
   server_fingerprints: [string]  # Optional allowed server fingerprints
   sni_hostname: string?     # Optional SNI hostname
   alpn_protocols: [string]  # Optional ALPN protocols
-  key: string?             # Optional client key
-  cert: string?            # Optional client cert
+  key: string?             # Optional client key (path, inline PEM, or named reference)
+  cert: string?            # Optional client cert (path, inline PEM, or named reference)
   protocol: ClientProxyConfig  # Inner protocol configuration
 ```
 
@@ -229,8 +258,8 @@ quic_settings:              # Optional QUIC settings (only applicable if transpo
   server_fingerprints: [string]  # Optional allowed server fingerprints (alias: server_fingerprint)
   sni_hostname: string?    # Optional SNI hostname
   alpn_protocols: [string]   # Optional ALPN protocols (alias: alpn_protocol)
-  key: string?            # Optional client key (must be paired with cert)
-  cert: string?           # Optional client cert (must be paired with key)
+  key: string?            # Optional client key (path, inline PEM, or named reference; must be paired with cert)
+  cert: string?           # Optional client cert (path, inline PEM, or named reference; must be paired with key)
 ```
 
 ## Client Proxy Groups
@@ -295,7 +324,76 @@ The system includes these built-in defaults:
    - Consider using TLS for transport security
    - Implement rate limiting if needed
 
+## Certificate and Key Specification
+
+Certificates and keys can be specified in three ways:
+
+1. **File Path**: Provide the path to a PEM-encoded certificate or key file
+   ```yaml
+   cert: "/etc/certs/server.crt"
+   key: "/etc/certs/server.key"
+   ```
+
+2. **Inline PEM Data**: Embed the certificate or key directly in the configuration
+   ```yaml
+   cert: |
+     -----BEGIN CERTIFICATE-----
+     MIIDXTCCAkWgAwIBAgIJAKl...
+     -----END CERTIFICATE-----
+   key: |
+     -----BEGIN PRIVATE KEY-----
+     MIIEvQIBADANBgkqhkiG9w0...
+     -----END PRIVATE KEY-----
+   ```
+
+3. **Named Reference**: Reference a previously defined named certificate or key
+   ```yaml
+   cert: "my-server-cert"  # References a named certificate
+   key: "my-server-key"    # References a named private key
+   ```
+
 ## Examples
+
+### Using Named Certificates
+
+```yaml
+# Define named certificates and keys
+- cert: "shared-cert"
+  source:
+    path: "/etc/certs/shared.crt"
+
+- key: "shared-key"
+  source:
+    path: "/etc/certs/shared.key"
+
+- cert: "ca-cert"
+  source:
+    data: |
+      -----BEGIN CERTIFICATE-----
+      MIIDXTCCAkWgAwIBAgIJAKl...
+      -----END CERTIFICATE-----
+
+# Use named certificates in server configurations
+- bind_location: "0.0.0.0:443"
+  transport: quic
+  quic_settings:
+    cert: "shared-cert"      # Reference named certificate
+    key: "shared-key"        # Reference named key
+    client_ca_certs:
+      - "ca-cert"            # Reference named CA certificate
+  protocol:
+    type: socks
+
+- bind_location: "0.0.0.0:8443"
+  protocol:
+    type: tls
+    sni_targets:
+      "example.com":
+        cert: "shared-cert"  # Reuse the same certificate
+        key: "shared-key"    # Reuse the same key
+        protocol:
+          type: http
+```
 
 ### Basic HTTP Proxy Server
 ```yaml
