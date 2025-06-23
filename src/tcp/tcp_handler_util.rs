@@ -1,4 +1,3 @@
-use std::io::Read;
 use std::sync::Arc;
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
@@ -147,23 +146,13 @@ fn create_tls_server_target(
         override_rules,
     } = tls_server_config;
 
-    // TODO: do this asynchronously
-    let mut cert_file = std::fs::File::open(&cert).unwrap();
-    let mut cert_bytes = vec![];
-    cert_file.read_to_end(&mut cert_bytes).unwrap();
-
-    let mut key_file = std::fs::File::open(&key).unwrap();
-    let mut key_bytes = vec![];
-    key_file.read_to_end(&mut key_bytes).unwrap();
+    // Certificates are already embedded as PEM data during config validation
+    let cert_bytes = cert.as_bytes().to_vec();
+    let key_bytes = key.as_bytes().to_vec();
 
     let client_ca_certs = client_ca_certs
         .into_iter()
-        .map(|cert| {
-            let mut cert_file = std::fs::File::open(cert).unwrap();
-            let mut cert_bytes = vec![];
-            cert_file.read_to_end(&mut cert_bytes).unwrap();
-            cert_bytes
-        })
+        .map(|cert| cert.as_bytes().to_vec())
         .collect();
 
     let server_config = Arc::new(create_server_config(
@@ -217,24 +206,14 @@ fn create_shadow_tls_server_target(
 
     let target_handshake = match handshake {
         ShadowTlsServerHandshakeConfig::Local(handshake) => {
-            // TODO: do this asynchronously
-            let mut cert_file = std::fs::File::open(&handshake.cert).unwrap();
-            let mut cert_bytes = vec![];
-            cert_file.read_to_end(&mut cert_bytes).unwrap();
-
-            let mut key_file = std::fs::File::open(&handshake.key).unwrap();
-            let mut key_bytes = vec![];
-            key_file.read_to_end(&mut key_bytes).unwrap();
+            // Certificates are already embedded as PEM data during config validation
+            let cert_bytes = handshake.cert.as_bytes().to_vec();
+            let key_bytes = handshake.key.as_bytes().to_vec();
 
             let client_ca_certs = handshake
                 .client_ca_certs
                 .into_iter()
-                .map(|cert| {
-                    let mut cert_file = std::fs::File::open(cert).unwrap();
-                    let mut cert_bytes = vec![];
-                    cert_file.read_to_end(&mut cert_bytes).unwrap();
-                    cert_bytes
-                })
+                .map(|cert| cert.as_bytes().to_vec())
                 .collect();
 
             let server_config = Arc::new(create_server_config(
@@ -404,14 +383,9 @@ pub fn create_tcp_client_handler(
             };
 
             let key_and_cert_bytes = key.zip(cert).map(|(key, cert)| {
-                // TODO: do this asynchronously
-                let mut cert_file = std::fs::File::open(&cert).unwrap();
-                let mut cert_bytes = vec![];
-                cert_file.read_to_end(&mut cert_bytes).unwrap();
-
-                let mut key_file = std::fs::File::open(&key).unwrap();
-                let mut key_bytes = vec![];
-                key_file.read_to_end(&mut key_bytes).unwrap();
+                // Certificates are already embedded as PEM data during config validation
+                let cert_bytes = cert.as_bytes().to_vec();
+                let key_bytes = key.as_bytes().to_vec();
 
                 (key_bytes, cert_bytes)
             });

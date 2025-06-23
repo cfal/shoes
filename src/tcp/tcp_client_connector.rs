@@ -1,4 +1,3 @@
-use std::io::Read;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 
@@ -77,14 +76,9 @@ impl TcpClientConnector {
                     };
 
                 let key_and_cert_bytes = key.zip(cert).map(|(key, cert)| {
-                    // TODO: do this asynchronously
-                    let mut cert_file = std::fs::File::open(&cert).unwrap();
-                    let mut cert_bytes = vec![];
-                    cert_file.read_to_end(&mut cert_bytes).unwrap();
-
-                    let mut key_file = std::fs::File::open(&key).unwrap();
-                    let mut key_bytes = vec![];
-                    key_file.read_to_end(&mut key_bytes).unwrap();
+                    // Certificates are already embedded as PEM data during config validation
+                    let cert_bytes = cert.as_bytes().to_vec();
+                    let key_bytes = key.as_bytes().to_vec();
 
                     (key_bytes, cert_bytes)
                 });

@@ -1,0 +1,68 @@
+# Basic HTTP/HTTPS proxy examples
+
+# Simple HTTP proxy without authentication
+- address: "0.0.0.0:8080"
+  protocol:
+    type: http
+
+# HTTP proxy with authentication
+- address: "0.0.0.0:8081"
+  protocol:
+    type: http
+    username: "proxyuser"
+    password: "proxypass"
+
+# HTTPS proxy with TLS termination
+- address: "0.0.0.0:8443"
+  protocol:
+    type: tls
+    default_target:
+      cert: "cert.pem"
+      key: "key.pem"
+      protocol:
+        type: http
+        username: "secureuser"
+        password: "securepass"
+
+# HTTP proxy with client certificate authentication
+- address: "0.0.0.0:9443"
+  protocol:
+    type: tls
+    default_target:
+      cert: "server-cert.pem"
+      key: "server-key.pem"
+      client_ca_certs:
+        - "ca-cert.pem"
+      client_fingerprints:
+        - "SHA256:1234567890abcdef..."
+      protocol:
+        type: http
+
+# HTTP proxy with custom routing rules
+- address: "0.0.0.0:3128"
+  protocol:
+    type: http
+  rules:
+    # Block access to private networks
+    - masks: ["192.168.0.0/16", "10.0.0.0/8", "172.16.0.0/12"]
+      action: block
+    # Allow everything else directly
+    - masks: "0.0.0.0/0"
+      action: allow
+      client_proxy: direct
+
+# HTTP proxy chained through SOCKS5
+- address: "0.0.0.0:8082"
+  protocol:
+    type: http
+    username: "chainuser"
+    password: "chainpass"
+  rules:
+    - masks: "0.0.0.0/0"
+      action: allow
+      client_proxy:
+        address: "socks5.proxy.com:1080"
+        protocol:
+          type: socks
+          username: "socksuser"
+          password: "sockspass"

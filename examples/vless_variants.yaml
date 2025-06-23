@@ -1,0 +1,52 @@
+# Various VLESS server configurations
+
+# Basic VLESS server
+- address: "0.0.0.0:16823"
+  protocol:
+    type: vless
+    user_id: "b85798ef-e9dc-46a4-9a87-8da4499d36d0"
+
+# VLESS over WebSocket
+- address: "0.0.0.0:443"
+  protocol:
+    type: tls
+    sni_targets:
+      "vless.example.com":
+        cert: "cert.pem"
+        key: "key.pem"
+        protocol:
+          type: websocket
+          targets:
+            - matching_path: "/vless"
+              protocol:
+                type: vless
+                user_id: "b85798ef-e9dc-46a4-9a87-8da4499d36d0"
+
+# VLESS over QUIC
+- address: "0.0.0.0:4443"
+  transport: quic
+  quic_settings:
+    cert: "cert.pem"
+    key: "key.pem"
+    alpn_protocols: ["h3"]
+  protocol:
+    type: vless
+    user_id: "b85798ef-e9dc-46a4-9a87-8da4499d36d0"
+
+# VLESS with custom rules and upstream proxy
+- address: "0.0.0.0:16824"
+  protocol:
+    type: vless
+    user_id: "b85798ef-e9dc-46a4-9a87-8da4499d36d0"
+  rules:
+    # Direct connection for local addresses
+    - masks: ["192.168.0.0/16"]
+      action: allow
+      client_proxy: direct
+    # Route international traffic through proxy
+    - masks: "0.0.0.0/0"
+      action: allow
+      client_proxy:
+        address: "proxy.example.com:1080"
+        protocol:
+          type: socks

@@ -7,7 +7,7 @@
     # specify different passwords and proxy protocols based on ShadowTLS SNI
     shadowtls_targets:
       example.com:
-        password: asdf123
+        password: shadowtls-password
         handshake:
           # connect to example.com:443 as the handshake server
           address: example.com:443
@@ -29,7 +29,7 @@
           password: socks-pass
 
       google.com:
-        password: fdsa321
+        password: shadowtls-password2
         handshake:
           # connect directly to google.com as the handshake server
           address: google.com:443

@@ -239,7 +239,7 @@ fn main() {
                 }
             };
 
-            let configs = match config::validate_configs(configs) {
+            let (configs, embedded_keys_count) = match config::validate_configs(configs).await {
                 Ok(c) => c,
                 Err(e) => {
                     eprintln!("Failed to validate server configs: {}\n", e);
@@ -247,6 +247,10 @@ fn main() {
                     return;
                 }
             };
+
+            if embedded_keys_count > 0 {
+                println!("Read {} embedded keys from files", embedded_keys_count);
+            }
 
             for config in configs.iter() {
                 debug!("================================================================================");

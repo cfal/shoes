@@ -1,0 +1,52 @@
+# Basic Shadowsocks server examples
+
+# Shadowsocks with AES-128-GCM cipher
+- address: "0.0.0.0:8388"
+  protocol:
+    type: shadowsocks
+    cipher: aes-128-gcm
+    password: "mypassword123"
+
+# Shadowsocks with ChaCha20-Poly1305 cipher
+- address: "0.0.0.0:8389"
+  protocol:
+    type: shadowsocks
+    cipher: chacha20-ietf-poly1305
+    password: "anotherpassword456"
+
+# Shadowsocks 2022 with Blake3 (requires base64 encoded key)
+- address: "0.0.0.0:8390"
+  protocol:
+    type: shadowsocks
+    cipher: 2022-blake3-aes-256-gcm
+    password: "N5tp51JibWA9kIPEUoDHzyyjfgkDYToOERh+u9L47fk="
+
+# Shadowsocks over QUIC transport
+- address: "0.0.0.0:8391"
+  transport: quic
+  quic_settings:
+    cert: "cert.pem"
+    key: "key.pem"
+  protocol:
+    type: shadowsocks
+    cipher: aes-256-gcm
+    password: "securepassword789"
+
+# Shadowsocks with custom routing rules
+- address: "0.0.0.0:8392"
+  protocol:
+    type: shadowsocks
+    cipher: chacha20-ietf-poly1305
+    password: "routingpassword"
+  rules:
+    # Allow local network direct connection
+    - masks: ["192.168.0.0/16", "10.0.0.0/8"]
+      action: allow
+      client_proxy: direct
+    # Route everything else through upstream proxy
+    - masks: "0.0.0.0/0"
+      action: allow
+      client_proxy:
+        address: "upstream.proxy.com:1080"
+        protocol:
+          type: socks
