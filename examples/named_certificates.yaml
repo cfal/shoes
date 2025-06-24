@@ -1,35 +1,35 @@
-# Example demonstrating named certificates and keys
-# This shows how to define certificates once and use them in multiple places
+# Example demonstrating named PEM files (certificates and keys)
+# This shows how to define PEM files once and use them in multiple places
 
-# Define named certificates and keys
-- cert: "main-server-cert"
+# Define named PEM files (can contain both cert and key)
+- pem: "main-server-cert"
   path: "cert.pem"
 
-- key: "main-server-key"
+- pem: "main-server-key"
   path: "key.pem"
 
-- cert: "client-ca"
+- pem: "client-ca"
   path: "ca-cert.pem"
 
 # Define a self-signed certificate inline
-- cert: "self-signed-cert"
+- pem: "self-signed-cert"
   data: |
     -----BEGIN CERTIFICATE-----
     certificate data
     -----END CERTIFICATE-----
 
-- key: "self-signed-key"
+- pem: "self-signed-key"
   data: |
     -----BEGIN PRIVATE KEY-----
     private key data
     -----END PRIVATE KEY-----
 
-# QUIC server using named certificates
+# QUIC server using named PEM files
 - address: "0.0.0.0:443"
   transport: quic
   quic_settings:
-    cert: "main-server-cert"    # Reference named certificate
-    key: "main-server-key"      # Reference named key
+    cert: "main-server-cert"    # Reference named PEM file
+    key: "main-server-key"      # Reference named PEM file
     client_ca_certs:
       - "client-ca"             # Reference named CA certificate
   protocol:
