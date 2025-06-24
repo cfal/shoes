@@ -239,17 +239,17 @@ fn main() {
                 }
             };
 
-            let (configs, embedded_keys_count) = match config::validate_configs(configs).await {
+            let (configs, load_file_count) = match config::convert_cert_paths(configs).await {
                 Ok(c) => c,
                 Err(e) => {
-                    eprintln!("Failed to validate server configs: {}\n", e);
+                    eprintln!("Failed to load cert files: {}\n", e);
                     print_usage_and_exit(arg0);
                     return;
                 }
             };
 
-            if embedded_keys_count > 0 {
-                println!("Read {} embedded keys from files", embedded_keys_count);
+            if load_file_count > 0 {
+                    println!("Loaded {} certs/keys from files", load_file_count);
             }
 
             for config in configs.iter() {
@@ -259,15 +259,28 @@ fn main() {
             debug!("================================================================================");
 
             if dry_run {
-                println!("Finishing dry run, config parsed successfully.");
+                if let Err(e) = config::create_server_configs(configs).await {
+                    eprintln!("Dry run failed, could not create server configs: {}\n", e);
+                } else {
+                    println!("Finishing dry run, config parsed successfully.");
+                }
                 return;
             }
 
             println!("\nStarting {} server(s)..", configs.len());
 
             let mut join_handles = vec![];
-            for config in configs {
-                join_handles.extend(start_servers(config).await.unwrap());
+
+            let server_configs = match config::create_server_configs(configs).await {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Failed to create server configs: {}\n", e);
+                    print_usage_and_exit(arg0);
+                    return;
+                }
+            };
+            for server_config in server_configs {
+                join_handles.extend(start_servers(server_config).await.unwrap());
             }
 
             config_rx.recv().await.unwrap();
