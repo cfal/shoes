@@ -1,6 +1,7 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::os::fd::{FromRawFd, IntoRawFd};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
 
+use log::error;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
 pub fn new_udp_socket(
@@ -94,6 +95,35 @@ fn into_tokio_udp_socket(socket: socket2::Socket) -> std::io::Result<tokio::net:
     let raw_fd = socket.into_raw_fd();
     let std_udp_socket = unsafe { std::net::UdpSocket::from_raw_fd(raw_fd) };
     tokio::net::UdpSocket::from_std(std_udp_socket)
+}
+
+pub fn set_server_tcp_fastopen<T: AsRawFd>(tcp_socket: &T) {
+    // TODO: implement for windows
+    #[cfg(unix)]
+    {
+        // queue length on linux, enable/disable otherwise
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let value: libc::c_int = 256;
+
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        let value: libc::c_int = 1;
+
+        unsafe {
+            let ret = libc::setsockopt(
+                tcp_socket.as_raw_fd(),
+                libc::IPPROTO_TCP,
+                libc::TCP_FASTOPEN,
+                &value as *const libc::c_int as *const libc::c_void,
+                std::mem::size_of_val(&value) as libc::socklen_t,
+            );
+            if ret < 0 {
+                error!(
+                    "failed to set TCP fastopen: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
+    }
 }
 
 pub fn new_tcp_socket(
