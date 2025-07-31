@@ -58,7 +58,7 @@ async fn process_connection(
             if let Err(e) =
                 run_udp_local_to_remote_loop(connection, client_proxy_selector, resolver).await
             {
-                error!("UDP local-to-remote write loop ended with error: {}", e);
+                error!("UDP local-to-remote write loop ended with error: {e}");
             }
         }));
     }
@@ -73,7 +73,7 @@ async fn process_connection(
                         let _ = recv_stream.stop(0u32.into());
                     }
                     Err(e) => {
-                        error!("Unidirectional loop ended with error: {}", e);
+                        error!("Unidirectional loop ended with error: {e}");
                         break;
                     }
                 }
@@ -82,7 +82,7 @@ async fn process_connection(
     }
     join_handles.push(tokio::spawn(async move {
         if let Err(e) = run_tcp_loop(connection, client_proxy_selector, resolver).await {
-            error!("TCP loop ended with error: {}", e);
+            error!("TCP loop ended with error: {e}");
         }
     }));
 
@@ -117,8 +117,7 @@ fn validate_auth_request<T>(req: http::Request<T>, password: &str) -> std::io::R
     let auth_str = auth_value.to_str().map_err(std::io::Error::other)?;
     if auth_str != password {
         return Err(std::io::Error::other(format!(
-            "incorrect auth password: {}",
-            auth_str
+            "incorrect auth password: {auth_str}"
         )));
     }
 
@@ -143,7 +142,7 @@ async fn auth_connection(
         match h3_conn.accept().await.map_err(std::io::Error::other)? {
             Some(resolver) => {
                 let (req, mut stream) = resolver.resolve_request().await.map_err(|err| {
-                    std::io::Error::other(format!("Failed to resolve request: {}", err))
+                    std::io::Error::other(format!("Failed to resolve request: {err}"))
                 })?;
                 match validate_auth_request(req, password) {
                     Ok(()) => {
@@ -165,7 +164,7 @@ async fn auth_connection(
                         return Ok(());
                     }
                     Err(e) => {
-                        error!("Received non-hysteria2 auth http3 request: {}", e);
+                        error!("Received non-hysteria2 auth http3 request: {e}");
                         let resp = http::Response::builder()
                             .status(http::status::StatusCode::NOT_FOUND)
                             .body(())
@@ -235,7 +234,7 @@ impl UdpSession {
             )
             .await
             {
-                error!("UDP remote-to-local write loop ended with error: {}", e);
+                error!("UDP remote-to-local write loop ended with error: {e}");
             }
         });
 
@@ -275,8 +274,7 @@ async fn run_udp_remote_to_local_loop(
             }
             Err(e) => {
                 return Err(std::io::Error::other(format!(
-                    "failed to receive from UDP socket: {}",
-                    e
+                    "failed to receive from UDP socket: {e}"
                 )));
             }
         };
@@ -300,9 +298,7 @@ async fn run_udp_remote_to_local_loop(
 
         assert!(
             max_datagram_size > header_overhead,
-            "max datagram size ({}) is smaller than header overhead ({})",
-            max_datagram_size,
-            header_overhead
+            "max datagram size ({max_datagram_size}) is smaller than header overhead ({header_overhead})"
         );
 
         if header_overhead + payload_len <= max_datagram_size {
@@ -317,7 +313,7 @@ async fn run_udp_remote_to_local_loop(
 
             connection
                 .send_datagram(datagram.freeze())
-                .map_err(|e| std::io::Error::other(format!("Failed to send datagram: {}", e)))?;
+                .map_err(|e| std::io::Error::other(format!("Failed to send datagram: {e}")))?;
         } else {
             let available_payload = max_datagram_size - header_overhead;
             let fragment_count = payload_len.div_ceil(available_payload) as u8;
@@ -334,8 +330,7 @@ async fn run_udp_remote_to_local_loop(
 
                 connection.send_datagram(datagram.freeze()).map_err(|e| {
                     std::io::Error::other(format!(
-                        "Failed to send datagram fragment {}: {}",
-                        fragment_id, e
+                        "Failed to send datagram fragment {fragment_id}: {e}"
                     ))
                 })?;
             }
@@ -355,7 +350,7 @@ async fn run_udp_local_to_remote_loop(
         let data = connection
             .read_datagram()
             .await
-            .map_err(|err| std::io::Error::other(format!("failed to read datagram: {}", err)))?;
+            .map_err(|err| std::io::Error::other(format!("failed to read datagram: {err}")))?;
         if data.len() < 9 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -399,7 +394,7 @@ async fn run_udp_local_to_remote_loop(
         }
 
         if address_len > 2048 {
-            error!("Ignoring packet with address length {}", address_len);
+            error!("Ignoring packet with address length {address_len}");
             continue;
         }
 
@@ -412,7 +407,7 @@ async fn run_udp_local_to_remote_loop(
         let addr_str = match str::from_utf8(address_bytes) {
             Ok(s) => s,
             Err(e) => {
-                error!("Invalid UTF-8 in address: {}", e);
+                error!("Invalid UTF-8 in address: {e}");
                 continue;
             }
         };
@@ -420,7 +415,7 @@ async fn run_udp_local_to_remote_loop(
         let remote_location = match NetLocation::from_str(addr_str, None) {
             Ok(loc) => loc,
             Err(e) => {
-                error!("Failed to parse remote location from {}: {}", addr_str, e);
+                error!("Failed to parse remote location from {addr_str}: {e}");
                 continue;
             }
         };
@@ -438,11 +433,11 @@ async fn run_udp_local_to_remote_loop(
                         remote_location,
                     }) => (client_proxy, remote_location),
                     Ok(ConnectDecision::Block) => {
-                        warn!("Blocked UDP forward to {}", remote_location);
+                        warn!("Blocked UDP forward to {remote_location}");
                         continue;
                     }
                     Err(e) => {
-                        error!("Failed to judge UDP forward to {}: {}", remote_location, e);
+                        error!("Failed to judge UDP forward to {remote_location}: {e}");
                         continue;
                     }
                 };
@@ -463,17 +458,16 @@ async fn run_udp_local_to_remote_loop(
                 //
                 // ref: https://github.com/apernet/hysteria/blob/5520bcc405ee11a47c164c75bae5c40fc2b1d99d/core/server/udp.go#L137
 
-                let resolved_address =
-                    match resolver_cache.resolve_location(&updated_location).await {
-                        Ok(s) => s,
-                        Err(e) => {
-                            error!(
-                                "Failed to resolve initial remote location {}: {}",
-                                remote_location, e
-                            );
-                            continue;
-                        }
-                    };
+                let resolved_address = match resolver_cache
+                    .resolve_location(&updated_location)
+                    .await
+                {
+                    Ok(s) => s,
+                    Err(e) => {
+                        error!("Failed to resolve initial remote location {remote_location}: {e}");
+                        continue;
+                    }
+                };
 
                 let (override_remote_write_address, override_local_write_location) =
                     if resolved_address.to_string() != remote_location.to_string() {
@@ -503,7 +497,7 @@ async fn run_udp_local_to_remote_loop(
         };
 
         let (complete_payload, remote_location) = if fragment_count == 0 {
-            error!("Ignoring empty UDP fragment for session {}", session_id);
+            error!("Ignoring empty UDP fragment for session {session_id}");
             continue;
         } else if fragment_count == 1 {
             (payload_fragment, remote_location)
@@ -521,18 +515,12 @@ async fn run_udp_local_to_remote_loop(
                     });
             if entry.fragment_count != fragment_count {
                 session.fragments.remove(&packet_id).unwrap();
-                error!(
-                    "Mismatched fragment count for session {} packet {}",
-                    session_id, packet_id
-                );
+                error!("Mismatched fragment count for session {session_id} packet {packet_id}");
                 continue;
             }
             if entry.received[fragment_id as usize].is_some() {
                 session.fragments.remove(&packet_id).unwrap();
-                error!(
-                    "Duplicate fragment for session {} packet {}",
-                    session_id, packet_id
-                );
+                error!("Duplicate fragment for session {session_id} packet {packet_id}");
                 continue;
             }
             entry.fragment_received += 1;
@@ -575,11 +563,11 @@ async fn run_udp_local_to_remote_loop(
                             remote_location,
                         }) => remote_location,
                         Ok(ConnectDecision::Block) => {
-                            warn!("Blocked UDP forward to {}", remote_location);
+                            warn!("Blocked UDP forward to {remote_location}");
                             continue;
                         }
                         Err(e) => {
-                            error!("Failed to judge UDP forward to {}: {}", remote_location, e);
+                            error!("Failed to judge UDP forward to {remote_location}: {e}");
                             continue;
                         }
                     };
@@ -588,9 +576,8 @@ async fn run_udp_local_to_remote_loop(
                             Ok(s) => s,
                             Err(e) => {
                                 error!(
-                                    "Failed to resolve updated remote location {}: {}",
-                                    updated_location, e
-                                );
+                                "Failed to resolve updated remote location {updated_location}: {e}"
+                            );
                                 continue;
                             }
                         };
@@ -606,10 +593,7 @@ async fn run_udp_local_to_remote_loop(
             .send_to(&complete_payload, socket_addr)
             .await
         {
-            error!(
-                "Failed to forward UDP payload for session {}: {}",
-                session_id, e
-            );
+            error!("Failed to forward UDP payload for session {session_id}: {e}");
         }
     }
 }
@@ -630,8 +614,7 @@ async fn run_tcp_loop(
             }
             Err(e) => {
                 return Err(std::io::Error::other(format!(
-                    "failed to accept bidirectional stream: {}",
-                    e
+                    "failed to accept bidirectional stream: {e}"
                 )));
             }
         };
@@ -642,7 +625,7 @@ async fn run_tcp_loop(
             if let Err(e) =
                 process_tcp_stream(client_proxy_selector, resolver, send_stream, recv_stream).await
             {
-                error!("Failed to process streams: {}", e);
+                error!("Failed to process streams: {e}");
             }
         });
     }
@@ -748,17 +731,14 @@ async fn process_tcp_stream(
             let _ = server_stream.shutdown().await;
             return Err(std::io::Error::new(
                 e.kind(),
-                format!(
-                    "failed to setup client stream to {}: {}",
-                    remote_location, e
-                ),
+                format!("failed to setup client stream to {remote_location}: {e}"),
             ));
         }
         Err(elapsed) => {
             let _ = server_stream.shutdown().await;
             return Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
-                format!("client setup to {} timed out: {}", remote_location, elapsed),
+                format!("client setup to {remote_location} timed out: {elapsed}"),
             ));
         }
     };
@@ -908,7 +888,7 @@ pub async fn start_hysteria2_server(
                     )
                     .await
                     {
-                        error!("Connection ended with error: {}", e);
+                        error!("Connection ended with error: {e}");
                     }
                 });
             }

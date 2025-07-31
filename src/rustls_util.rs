@@ -107,13 +107,12 @@ impl rustls::client::danger::ServerCertVerifier for ServerFingerprintVerifier {
         } else {
             let hex_fingerprint = fingerprint_bytes
                 .iter()
-                .map(|b| format!("{:02x}", b))
+                .map(|b| format!("{b:02x}"))
                 .collect::<Vec<String>>()
                 .join(":");
 
             Err(rustls::Error::General(format!(
-                "unknown server fingerprint: {}",
-                hex_fingerprint
+                "unknown server fingerprint: {hex_fingerprint}"
             )))
         }
     }
@@ -287,10 +286,7 @@ pub fn process_fingerprints(client_fingerprints: &[String]) -> std::io::Result<B
         if clean_fp.len() % 2 != 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                format!(
-                    "Invalid client fingerprint, odd number of hex chars: {}",
-                    fingerprint
-                ),
+                format!("Invalid client fingerprint, odd number of hex chars: {fingerprint}"),
             ));
         }
 
@@ -301,10 +297,7 @@ pub fn process_fingerprints(client_fingerprints: &[String]) -> std::io::Result<B
             .map_err(|_| {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
-                    format!(
-                        "Invalid client fingerprint, could not convert to hex: {}",
-                        fingerprint
-                    ),
+                    format!("Invalid client fingerprint, could not convert to hex: {fingerprint}"),
                 )
             })?;
 
@@ -356,13 +349,12 @@ impl rustls::server::danger::ClientCertVerifier for ClientFingerprintVerifier {
         } else {
             let hex_fingerprint = fingerprint_bytes
                 .iter()
-                .map(|b| format!("{:02x}", b))
+                .map(|b| format!("{b:02x}"))
                 .collect::<Vec<String>>()
                 .join(":");
 
             Err(rustls::Error::General(format!(
-                "unknown client fingerprint: {}",
-                hex_fingerprint
+                "unknown client fingerprint: {hex_fingerprint}"
             )))
         }
     }

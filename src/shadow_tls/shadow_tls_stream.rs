@@ -112,9 +112,7 @@ impl ShadowTlsStream {
         let write_amount = std::cmp::min(unfilled_len, available_len);
         assert!(
             write_amount > 0,
-            "no data to write (available_len = {}, unfilled_len = {})",
-            available_len,
-            unfilled_len,
+            "no data to write (available_len = {available_len}, unfilled_len = {unfilled_len})",
         );
 
         buf.put_slice(

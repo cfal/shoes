@@ -220,21 +220,17 @@ async fn match_rule<'a, T>(
             match match_mask(mask, location, &mut resolved_ip, resolver).await {
                 Ok(is_match) => {
                     if is_match {
-                        debug!("Found matching mask for {} -> {:?}", location, mask);
+                        debug!("Found matching mask for {location} -> {mask:?}");
                         return Ok(Some(rule));
                     }
                 }
                 Err(MatchMaskError::Fatal(e)) => {
                     return Err(std::io::Error::other(format!(
-                        "fatal error while matching mask for {}: {}",
-                        location, e
+                        "fatal error while matching mask for {location}: {e}"
                     )));
                 }
                 Err(MatchMaskError::NonFatal(e)) => {
-                    error!(
-                        "Non-fatal error while trying to match mask for {}: {}",
-                        location, e
-                    );
+                    error!("Non-fatal error while trying to match mask for {location}: {e}");
                 }
             }
         }

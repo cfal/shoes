@@ -75,7 +75,7 @@ impl<'a> BufReader<'a> {
         std::str::from_utf8(slice).map_err(|e| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("Invalid UTF-8 sequence: {}", e),
+                format!("Invalid UTF-8 sequence: {e}"),
             )
         })
     }

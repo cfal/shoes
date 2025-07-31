@@ -52,7 +52,7 @@ impl TcpServerHandler for SocksTcpServerHandler {
         if socks_version != VER_SOCKS5 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                format!("Unsupported SOCKS version: {}", socks_version),
+                format!("Unsupported SOCKS version: {socks_version}"),
             ));
         }
 
@@ -60,7 +60,7 @@ impl TcpServerHandler for SocksTcpServerHandler {
         if method_len < 1 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                format!("Invalid method length: {}", method_len),
+                format!("Invalid method length: {method_len}"),
             ));
         }
 
@@ -111,7 +111,7 @@ impl TcpServerHandler for SocksTcpServerHandler {
                 Err(e) => {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
-                        format!("Failed to decode username: {}", e),
+                        format!("Failed to decode username: {e}"),
                     ));
                 }
             };
@@ -141,7 +141,7 @@ impl TcpServerHandler for SocksTcpServerHandler {
                 Err(e) => {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
-                        format!("Failed to decode password: {}", e),
+                        format!("Failed to decode password: {e}"),
                     ));
                 }
             };
@@ -267,7 +267,7 @@ impl TcpClientHandler for SocksTcpClientHandler {
         if socks_version != VER_SOCKS5 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                format!("Unsupported SOCKS version: {}", socks_version),
+                format!("Unsupported SOCKS version: {socks_version}"),
             ));
         }
 
@@ -293,7 +293,7 @@ impl TcpClientHandler for SocksTcpClientHandler {
             if auth_result != RESULT_SUCCESS {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
-                    format!("SOCKS server authentication failed: error {}", auth_result),
+                    format!("SOCKS server authentication failed: error {auth_result}"),
                 ));
             }
         }
@@ -302,7 +302,7 @@ impl TcpClientHandler for SocksTcpClientHandler {
         if socks_version != VER_SOCKS5 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                format!("Unsupported SOCKS version: {}", socks_version),
+                format!("Unsupported SOCKS version: {socks_version}"),
             ));
         }
 
@@ -310,10 +310,7 @@ impl TcpClientHandler for SocksTcpClientHandler {
         if connect_response != RESULT_SUCCESS {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                format!(
-                    "SOCKS server connect command failed: error {}",
-                    connect_response
-                ),
+                format!("SOCKS server connect command failed: error {connect_response}"),
             ));
         }
 
@@ -386,7 +383,7 @@ pub async fn read_location<T: AsyncReadExt + Unpin>(
                 Err(e) => {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
-                        format!("Failed to decode address: {}", e),
+                        format!("Failed to decode address: {e}"),
                     ));
                 }
             };
@@ -405,7 +402,7 @@ pub async fn read_location<T: AsyncReadExt + Unpin>(
 
         _ => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            format!("Unknown address type: {}", address_type),
+            format!("Unknown address type: {address_type}"),
         )),
     }
 }

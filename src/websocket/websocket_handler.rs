@@ -53,15 +53,13 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
         let request_path = {
             if !first_line.ends_with(" HTTP/1.0") && !first_line.ends_with(" HTTP/1.1") {
                 return Err(std::io::Error::other(format!(
-                    "invalid http request version: {}",
-                    first_line
+                    "invalid http request version: {first_line}"
                 )));
             }
 
             if !first_line.starts_with("GET ") {
                 return Err(std::io::Error::other(format!(
-                    "invalid http request: {}",
-                    first_line
+                    "invalid http request: {first_line}"
                 )));
             }
 
@@ -102,13 +100,13 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
             let websocket_key_response = create_websocket_key_response(websocket_key);
 
             let host_response_header = match request_headers.get("host") {
-                Some(v) => format!("Host: {}\r\n", v),
+                Some(v) => format!("Host: {v}\r\n"),
                 None => "".to_string(),
             };
 
             let websocket_version_response_header =
                 match request_headers.get("sec-websocket_version") {
-                    Some(v) => format!("Sec-WebSocket-Version: {}\r\n", v),
+                    Some(v) => format!("Sec-WebSocket-Version: {v}\r\n"),
                     None => "".to_string(),
                 };
 
@@ -220,8 +218,7 @@ impl TcpClientHandler for WebsocketTcpClientHandler {
 
         if !first_line.starts_with("HTTP/1.1 101") && !first_line.starts_with("HTTP/1.0 101") {
             return Err(std::io::Error::other(format!(
-                "Bad websocket response: {}",
-                first_line
+                "Bad websocket response: {first_line}"
             )));
         }
 
@@ -232,8 +229,7 @@ impl TcpClientHandler for WebsocketTcpClientHandler {
         let expected_key_response = create_websocket_key_response(websocket_key);
         if websocket_key_response != &expected_key_response {
             return Err(std::io::Error::other(format!(
-                "incorrect websocket key response, expected {}, got {}",
-                expected_key_response, websocket_key_response
+                "incorrect websocket key response, expected {expected_key_response}, got {websocket_key_response}"
             )));
         }
 
@@ -279,8 +275,7 @@ impl ParsedHttpData {
                 let tokens: Vec<&str> = line.splitn(2, ':').collect();
                 if tokens.len() != 2 {
                     return Err(std::io::Error::other(format!(
-                        "invalid http request line: {}",
-                        line
+                        "invalid http request line: {line}"
                     )));
                 }
                 let header_key = tokens[0].trim().to_lowercase();

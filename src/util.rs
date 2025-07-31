@@ -23,7 +23,7 @@ pub fn parse_uuid(uuid_str: &str) -> std::io::Result<Vec<u8>> {
             _ => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    format!("Invalid uuid: {}", uuid_str),
+                    format!("Invalid uuid: {uuid_str}"),
                 ));
             }
         };
@@ -36,7 +36,7 @@ pub fn parse_uuid(uuid_str: &str) -> std::io::Result<Vec<u8>> {
     if first_nibble.is_some() || bytes.len() != 16 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("Invalid uuid: {}", uuid_str),
+            format!("Invalid uuid: {uuid_str}"),
         ));
     }
     Ok(bytes)

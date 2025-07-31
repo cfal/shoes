@@ -72,7 +72,7 @@ fn start_notify_thread(
                 tx.send(ConfigChanged {}).unwrap();
             }
         }
-        Err(e) => println!("watch error: {:?}", e),
+        Err(e) => println!("watch error: {e:?}"),
     })
     .unwrap();
 
@@ -125,7 +125,7 @@ async fn start_servers(config: ServerConfig) -> std::io::Result<Vec<JoinHandle<(
 }
 
 fn print_usage_and_exit(arg0: String) {
-    eprintln!("Usage: {} [--threads/-t N] <server uri or config filename> [server uri or config filename] [..]", arg0);
+    eprintln!("Usage: {arg0} [--threads/-t N] <server uri or config filename> [server uri or config filename] [..]");
     std::process::exit(1);
 }
 
@@ -172,7 +172,7 @@ fn main() {
             num_threads = match args.remove(0).parse::<usize>() {
                 Ok(n) => n,
                 Err(e) => {
-                    eprintln!("Invalid thread count: {}", e);
+                    eprintln!("Invalid thread count: {e}");
                     print_usage_and_exit(arg0);
                     return;
                 }
@@ -203,9 +203,9 @@ fn main() {
                 .map(|n| n.get())
                 .unwrap_or(1),
         );
-        debug!("Runtime threads: {}", num_threads);
+        debug!("Runtime threads: {num_threads}");
     } else {
-        println!("Using custom thread count ({})", num_threads);
+        println!("Using custom thread count ({num_threads})");
     }
 
     // Used by QUIC to figure out the number of endpoints.
@@ -233,7 +233,7 @@ fn main() {
             let configs = match config::load_configs(&args).await {
                 Ok(c) => c,
                 Err(e) => {
-                    eprintln!("Failed to load server configs: {}\n", e);
+                    eprintln!("Failed to load server configs: {e}\n");
                     print_usage_and_exit(arg0);
                     return;
                 }
@@ -242,25 +242,25 @@ fn main() {
             let (configs, load_file_count) = match config::convert_cert_paths(configs).await {
                 Ok(c) => c,
                 Err(e) => {
-                    eprintln!("Failed to load cert files: {}\n", e);
+                    eprintln!("Failed to load cert files: {e}\n");
                     print_usage_and_exit(arg0);
                     return;
                 }
             };
 
             if load_file_count > 0 {
-                    println!("Loaded {} certs/keys from files", load_file_count);
+                    println!("Loaded {load_file_count} certs/keys from files");
             }
 
             for config in configs.iter() {
                 debug!("================================================================================");
-                debug!("{:#?}", config);
+                debug!("{config:#?}");
             }
             debug!("================================================================================");
 
             if dry_run {
                 if let Err(e) = config::create_server_configs(configs).await {
-                    eprintln!("Dry run failed, could not create server configs: {}\n", e);
+                    eprintln!("Dry run failed, could not create server configs: {e}\n");
                 } else {
                     println!("Finishing dry run, config parsed successfully.");
                 }
@@ -274,7 +274,7 @@ fn main() {
             let server_configs = match config::create_server_configs(configs).await {
                 Ok(c) => c,
                 Err(e) => {
-                    eprintln!("Failed to create server configs: {}\n", e);
+                    eprintln!("Failed to create server configs: {e}\n");
                     print_usage_and_exit(arg0);
                     return;
                 }

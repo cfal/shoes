@@ -94,7 +94,7 @@ impl StreamReader {
         std::str::from_utf8(line_bytes).map_err(|e| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("Failed to decode utf8: {}", e),
+                format!("Failed to decode utf8: {e}"),
             )
         })
     }

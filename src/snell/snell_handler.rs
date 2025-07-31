@@ -108,8 +108,7 @@ impl TcpServerHandler for SnellServerHandler {
         let version = stream_reader.read_u8(&mut server_stream).await?;
         if version != 1 {
             return Err(std::io::Error::other(format!(
-                "unexpected snell version: {}",
-                version
+                "unexpected snell version: {version}"
             )));
         }
 
@@ -135,8 +134,7 @@ impl TcpServerHandler for SnellServerHandler {
             }
             unknown_command => {
                 return Err(std::io::Error::other(format!(
-                    "Got unknown command: {}",
-                    unknown_command
+                    "Got unknown command: {unknown_command}"
                 )));
             }
         };
@@ -161,7 +159,7 @@ impl TcpServerHandler for SnellServerHandler {
                 Err(e) => {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
-                        format!("Failed to decode hostname: {}", e),
+                        format!("Failed to decode hostname: {e}"),
                     ));
                 }
             };

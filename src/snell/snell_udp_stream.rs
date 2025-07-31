@@ -69,8 +69,7 @@ impl AsyncReadTargetedMessage for SnellUdpStream {
         let cmd = this.read_buf[0];
         if cmd != 1 {
             return Poll::Ready(Err(std::io::Error::other(format!(
-                "invalid snell command: {}",
-                cmd
+                "invalid snell command: {cmd}"
             ))));
         }
 
@@ -99,8 +98,7 @@ impl AsyncReadTargetedMessage for SnellUdpStream {
                 (NetLocation::new(Address::Ipv6(ip_addr), port), 21)
             } else {
                 return Poll::Ready(Err(std::io::Error::other(format!(
-                    "invalid ip version: {}",
-                    ip_version
+                    "invalid ip version: {ip_version}"
                 ))));
             }
         } else {
@@ -111,7 +109,7 @@ impl AsyncReadTargetedMessage for SnellUdpStream {
             }
             let hostname_bytes = &this.read_buf[2..2 + address_len];
             let hostname = std::str::from_utf8(hostname_bytes)
-                .map_err(|e| std::io::Error::other(format!("could not parse hostname: {}", e)))?;
+                .map_err(|e| std::io::Error::other(format!("could not parse hostname: {e}")))?;
             let port = u16::from_be_bytes(
                 this.read_buf[2 + address_len..4 + address_len]
                     .try_into()
@@ -151,7 +149,7 @@ impl AsyncWriteSourcedMessage for SnellUdpStream {
         let buf_len = buf.len();
         if buf_len + 19 > this.write_buf.len() {
             // TODO: if it's too big, we need to split up the message into this.max_payload_size chunks.
-            panic!("single message is larger than our write buf: {}", buf_len);
+            panic!("single message is larger than our write buf: {buf_len}");
         }
 
         let offset = match source {

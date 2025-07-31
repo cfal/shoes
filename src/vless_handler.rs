@@ -47,8 +47,7 @@ impl TcpServerHandler for VlessTcpServerHandler {
         let client_version = stream_reader.read_u8(&mut server_stream).await?;
         if client_version != 0 {
             return Err(std::io::Error::other(format!(
-                "invalid client protocol version, expected 0, got {}",
-                client_version
+                "invalid client protocol version, expected 0, got {client_version}"
             )));
         }
 
@@ -84,7 +83,7 @@ impl TcpServerHandler for VlessTcpServerHandler {
             unknown_protocol_type => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    format!("Unknown requested protocol: {}", unknown_protocol_type),
+                    format!("Unknown requested protocol: {unknown_protocol_type}"),
                 ));
             }
         };
@@ -116,7 +115,7 @@ impl TcpServerHandler for VlessTcpServerHandler {
                     Err(e) => {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
-                            format!("Failed to decode address: {}", e),
+                            format!("Failed to decode address: {e}"),
                         ));
                     }
                 };
@@ -145,7 +144,7 @@ impl TcpServerHandler for VlessTcpServerHandler {
             invalid_type => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    format!("Invalid address type: {}", invalid_type),
+                    format!("Invalid address type: {invalid_type}"),
                 ));
             }
         };
@@ -240,7 +239,7 @@ impl TcpClientHandler for VlessTcpClientHandler {
                 if hostname.len() > 255 {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
-                        format!("Hostname is too long: {}", hostname),
+                        format!("Hostname is too long: {hostname}"),
                     ));
                 }
 
@@ -312,8 +311,7 @@ async fn read_addons(stream: &mut Box<dyn AsyncStream>, addon_length: u8) -> std
 
     if addon_cursor as u8 != addon_length {
         return Err(std::io::Error::other(format!(
-            "Did not consume all addon bytes, cursor is at {}, length is {}",
-            addon_cursor, addon_length
+            "Did not consume all addon bytes, cursor is at {addon_cursor}, length is {addon_length}"
         )));
     }
 

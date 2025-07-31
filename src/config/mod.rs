@@ -22,7 +22,7 @@ pub async fn load_configs(args: &Vec<String>) -> std::io::Result<Vec<Config>> {
             Err(e) => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
-                    format!("Could not read config file {}: {}", config_filename, e),
+                    format!("Could not read config file {config_filename}: {e}"),
                 ));
             }
         };
@@ -32,10 +32,7 @@ pub async fn load_configs(args: &Vec<String>) -> std::io::Result<Vec<Config>> {
             Err(e) => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
-                    format!(
-                        "Could not parse config file {} as UTF8: {}",
-                        config_filename, e
-                    ),
+                    format!("Could not parse config file {config_filename} as UTF8: {e}"),
                 ));
             }
         };
@@ -45,10 +42,7 @@ pub async fn load_configs(args: &Vec<String>) -> std::io::Result<Vec<Config>> {
             Err(e) => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
-                    format!(
-                        "Could not parse config file {} as config YAML: {}",
-                        config_filename, e
-                    ),
+                    format!("Could not parse config file {config_filename} as config YAML: {e}"),
                 ));
             }
         };
@@ -653,8 +647,7 @@ fn validate_server_proxy_config(
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
                         format!(
-                            "duplicated SNI hostname between TLS and ShadowTLS targets: {}",
-                            sni_hostname
+                            "duplicated SNI hostname between TLS and ShadowTLS targets: {sni_hostname}"
                         ),
                     ));
                 }
@@ -689,7 +682,7 @@ fn validate_server_proxy_config(
                 if *size < MIN_TLS_BUFFER_SIZE {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
-                        format!("TLS buffer size must be at least {}", MIN_TLS_BUFFER_SIZE),
+                        format!("TLS buffer size must be at least {MIN_TLS_BUFFER_SIZE}"),
                     ));
                 }
             }
@@ -751,12 +744,9 @@ fn is_pem_file_path(s: &str) -> bool {
 }
 
 async fn read_pem_to_string(path: &str) -> std::io::Result<String> {
-    debug!("Reading PEM file: {}", path);
+    debug!("Reading PEM file: {path}");
     tokio::fs::read_to_string(path).await.map_err(|e| {
-        std::io::Error::new(
-            e.kind(),
-            format!("Failed to read PEM file '{}': {}", path, e),
-        )
+        std::io::Error::new(e.kind(), format!("Failed to read PEM file '{path}': {e}"))
     })
 }
 
@@ -772,7 +762,7 @@ fn process_pem_path(
                 *pem = named_pem.pem.clone();
             }
             None => {
-                let new_name = format!("inlined-{}", pem);
+                let new_name = format!("inlined-{pem}");
                 unknown_pem_paths.insert(pem.clone(), new_name.clone());
                 *pem = new_name;
             }
@@ -795,7 +785,7 @@ fn embed_pem_from_map(pem: &mut String, named_pems: &HashMap<String, String>) {
     if let Some(pem_data) = named_pems.get(pem) {
         *pem = pem_data.clone();
     } else if is_pem_file_path(pem) {
-        panic!("PEM file path {} was not loaded during conversion", pem);
+        panic!("PEM file path {pem} was not loaded during conversion");
     }
 }
 
@@ -810,7 +800,7 @@ pub async fn save_config(path: &Path, configs: &[Config]) -> std::io::Result<()>
     let yaml_str = serde_yaml::to_string(configs).map_err(|e| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("Failed to serialize to YAML: {}", e),
+            format!("Failed to serialize to YAML: {e}"),
         )
     })?;
 

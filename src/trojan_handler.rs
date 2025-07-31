@@ -106,7 +106,7 @@ impl TcpServerHandler for TrojanTcpHandler {
         if command_type != CMD_CONNECT {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                format!("Invalid command code: {}", command_type),
+                format!("Invalid command code: {command_type}"),
             ));
         }
 
@@ -115,8 +115,7 @@ impl TcpServerHandler for TrojanTcpHandler {
         let request_suffix = stream_reader.read_u16_be(&mut server_stream).await?;
         if request_suffix != 0x0d0a {
             return Err(std::io::Error::other(format!(
-                "Invalid request suffix bytes {}",
-                request_suffix
+                "Invalid request suffix bytes {request_suffix}"
             )));
         }
 
@@ -172,7 +171,7 @@ fn create_password_hash(password: &str) -> Box<[u8]> {
     let hash_bytes = digest.as_ref();
     let mut hex_str = String::with_capacity(hash_bytes.len() * 2);
     for b in hash_bytes {
-        hex_str.push_str(&format!("{:02x}", b));
+        hex_str.push_str(&format!("{b:02x}"));
     }
     let hex_bytes = hex_str.into_bytes().into_boxed_slice();
     if hex_bytes.len() != 56 {

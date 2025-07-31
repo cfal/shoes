@@ -16,7 +16,7 @@ const CONNECTION_HEADER_PREFIX: &str = "connection: ";
 const PROXY_CONNECTION_HEADER_PREFIX: &str = "proxy-connection: ";
 
 fn create_http_auth_token(username: &str, password: &str) -> String {
-    BASE64.encode(format!("{}:{}", username, password))
+    BASE64.encode(format!("{username}:{password}"))
 }
 
 #[derive(Debug)]
@@ -47,7 +47,7 @@ impl TcpServerHandler for HttpTcpServerHandler {
         if !line.ends_with(" HTTP/1.0") && !line.ends_with(" HTTP/1.1") {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                format!("Unrecognized http request: {}", line),
+                format!("Unrecognized http request: {line}"),
             ));
         }
 
@@ -103,13 +103,13 @@ impl TcpServerHandler for HttpTcpServerHandler {
                         need_auth = false;
                         continue;
                     }
-                    debug!("Ignored HTTP CONNECT request header: {}", line);
+                    debug!("Ignored HTTP CONNECT request header: {line}");
                 }
 
                 if need_auth {
                     // We need to write Proxy-Authenticate or apps such as FoxyProxy will never send Proxy-Authorization.
                     server_stream.write_all(
-                    &format!("{} 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"proxy\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", http_version).into_bytes()
+                    &format!("{http_version} 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"proxy\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").into_bytes()
                 ).await?;
                     server_stream.flush().await?;
                     return Err(std::io::Error::new(
@@ -120,7 +120,7 @@ impl TcpServerHandler for HttpTcpServerHandler {
 
                 // We need an initial flush for this line.
                 let connection_success_response = Some(
-                    format!("{} 200 Connection established\r\n\r\n", http_version)
+                    format!("{http_version} 200 Connection established\r\n\r\n")
                         .into_bytes()
                         .into_boxed_slice(),
                 );
@@ -143,7 +143,7 @@ impl TcpServerHandler for HttpTcpServerHandler {
                 let space_index = line.find(' ').ok_or_else(|| {
                     std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
-                        format!("Unrecognized http request: {} {}", line, http_version),
+                        format!("Unrecognized http request: {line} {http_version}"),
                     )
                 })?;
 
@@ -154,7 +154,7 @@ impl TcpServerHandler for HttpTcpServerHandler {
                     // we can't handle https
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
-                        format!("Unsupported http forward url: {}", url),
+                        format!("Unsupported http forward url: {url}"),
                     ));
                 }
 
@@ -177,7 +177,7 @@ impl TcpServerHandler for HttpTcpServerHandler {
                     None => NetLocation::new(Address::from(address)?, 80),
                 };
 
-                let mut request = format!("{} {} {}\r\n", directive, location, http_version);
+                let mut request = format!("{directive} {location} {http_version}\r\n");
 
                 // wait for an empty \r\n before connecting, and check for auth header line if needed.
                 let mut need_auth = self.auth_token.is_some();
@@ -237,7 +237,7 @@ impl TcpServerHandler for HttpTcpServerHandler {
                 if need_auth {
                     // We need to write Proxy-Authenticate or apps such as FoxyProxy will never send Proxy-Authorization.
                     server_stream.write_all(
-                    &format!("{} 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"proxy\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", http_version).into_bytes()
+                    &format!("{http_version} 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"proxy\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").into_bytes()
                 ).await?;
                     server_stream.flush().await?;
                     return Err(std::io::Error::new(
@@ -336,7 +336,7 @@ impl TcpClientHandler for HttpTcpClientHandler {
         if !line.starts_with("HTTP/1.1 200") && !line.starts_with("HTTP/1.0 200") {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("HTTP CONNECT request failed: {}", line),
+                format!("HTTP CONNECT request failed: {line}"),
             ));
         }
 

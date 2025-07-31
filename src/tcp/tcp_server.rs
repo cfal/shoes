@@ -37,14 +37,14 @@ async fn run_tcp_server(
         let (stream, addr) = match listener.accept().await {
             Ok(v) => v,
             Err(e) => {
-                error!("Accept failed: {}", e);
+                error!("Accept failed: {e}");
                 continue;
             }
         };
 
         if no_delay {
             if let Err(e) = stream.set_nodelay(true) {
-                error!("Failed to set TCP nodelay: {}", e);
+                error!("Failed to set TCP nodelay: {e}");
             }
         }
 
@@ -86,7 +86,7 @@ async fn run_unix_server(
         let (stream, addr) = match listener.accept().await {
             Ok(v) => v,
             Err(e) => {
-                error!("Accept failed: {:?}", e);
+                error!("Accept failed: {e:?}");
                 continue;
             }
         };
@@ -98,9 +98,9 @@ async fn run_unix_server(
             if let Err(e) =
                 process_stream(stream, cloned_handler, cloned_provider, cloned_cache).await
             {
-                error!("{:?} finished with error: {:?}", addr, e);
+                error!("{addr:?} finished with error: {e:?}");
             } else {
-                debug!("{:?} finished successfully", addr);
+                debug!("{addr:?} finished successfully");
             }
         });
     }
@@ -136,13 +136,13 @@ where
         Ok(Err(e)) => {
             return Err(std::io::Error::new(
                 e.kind(),
-                format!("failed to setup server stream: {}", e),
+                format!("failed to setup server stream: {e}"),
             ));
         }
         Err(elapsed) => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
-                format!("server setup timed out: {}", elapsed),
+                format!("server setup timed out: {elapsed}"),
             ));
         }
     };
@@ -183,17 +183,14 @@ where
                     let _ = server_stream.shutdown().await;
                     return Err(std::io::Error::new(
                         e.kind(),
-                        format!(
-                            "failed to setup client stream to {}: {}",
-                            remote_location, e
-                        ),
+                        format!("failed to setup client stream to {remote_location}: {e}"),
                     ));
                 }
                 Err(elapsed) => {
                     let _ = server_stream.shutdown().await;
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::TimedOut,
-                        format!("client setup to {} timed out: {}", remote_location, elapsed),
+                        format!("client setup to {remote_location} timed out: {elapsed}"),
                     ));
                 }
             };
@@ -376,7 +373,7 @@ pub async fn start_tcp_servers(config: ServerConfig) -> std::io::Result<Vec<Join
     let mut rules_stack = vec![rules];
     let tcp_handler: Arc<dyn TcpServerHandler> =
         create_tcp_server_handler(protocol, &mut rules_stack).into();
-    debug!("TCP handler: {:?}", tcp_handler);
+    debug!("TCP handler: {tcp_handler:?}");
 
     let mut handles = vec![];
 

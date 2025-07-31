@@ -470,10 +470,7 @@ impl VmessStream {
                 if data_len > MAX_ENCRYPTED_READ_DATA_SIZE {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
-                        format!(
-                            "encrypted data length larger than {}",
-                            MAX_ENCRYPTED_READ_DATA_SIZE
-                        ),
+                        format!("encrypted data length larger than {MAX_ENCRYPTED_READ_DATA_SIZE}"),
                     ));
                 }
 
@@ -579,9 +576,7 @@ impl VmessStream {
         let write_amount = std::cmp::min(unfilled_len, available_len);
         assert!(
             write_amount > 0,
-            "no data to write (available_len = {}, unfilled_len = {})",
-            available_len,
-            unfilled_len,
+            "no data to write (available_len = {available_len}, unfilled_len = {unfilled_len})",
         );
 
         buf.put_slice(
@@ -1142,7 +1137,7 @@ impl AsyncWriteMessage for VmessStream {
         if let Some(ref mut sealing_key) = this.sealing_key {
             let tag = sealing_key
                 .seal_in_place_separate_tag(Aad::empty(), &mut this.write_packet[2..end_index])
-                .map_err(|err| std::io::Error::other(format!("failed to seal message: {}", err)))?;
+                .map_err(|err| std::io::Error::other(format!("failed to seal message: {err}")))?;
 
             this.write_packet[end_index..end_index + this.tag_len].copy_from_slice(tag.as_ref());
 

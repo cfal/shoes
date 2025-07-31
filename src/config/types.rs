@@ -24,7 +24,7 @@ pub enum BindLocation {
 impl std::fmt::Display for BindLocation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            BindLocation::Address(n) => write!(f, "{}", n),
+            BindLocation::Address(n) => write!(f, "{n}"),
             BindLocation::Path(p) => write!(f, "{}", p.display()),
         }
     }
@@ -238,8 +238,7 @@ impl<'de> serde::de::Deserialize<'de> for Config {
             // This is a NamedPem (pem field is unique to NamedPem)
             let pem: NamedPem = serde_yaml::from_value(value)
                 .map_err(|e| Error::custom(format!(
-                    "Failed to parse named PEM: {}. Expected fields: 'pem' and either 'path' or 'data'",
-                    e
+                    "Failed to parse named PEM: {e}. Expected fields: 'pem' and either 'path' or 'data'"
                 )))?;
 
             Ok(Config::NamedPem(pem))
@@ -247,8 +246,7 @@ impl<'de> serde::de::Deserialize<'de> for Config {
             // This is a ClientConfigGroup
             let group: ClientConfigGroup = serde_yaml::from_value(value)
                 .map_err(|e| Error::custom(format!(
-                    "Failed to parse client config group: {}. Expected fields: 'client_group' and 'client_proxies' (or 'client_proxy')",
-                    e
+                    "Failed to parse client config group: {e}. Expected fields: 'client_group' and 'client_proxies' (or 'client_proxy')"
                 )))?;
 
             Ok(Config::ClientConfigGroup(group))
@@ -256,8 +254,7 @@ impl<'de> serde::de::Deserialize<'de> for Config {
             // This is a RuleConfigGroup
             let group: RuleConfigGroup = serde_yaml::from_value(value)
                 .map_err(|e| Error::custom(format!(
-                    "Failed to parse rule config group: {}. Expected fields: 'rule_group' and 'rules' (or 'rule')",
-                    e
+                    "Failed to parse rule config group: {e}. Expected fields: 'rule_group' and 'rules' (or 'rule')"
                 )))?;
 
             Ok(Config::RuleConfigGroup(group))
@@ -265,8 +262,7 @@ impl<'de> serde::de::Deserialize<'de> for Config {
             // This is a Server config
             let server: ServerConfig = serde_yaml::from_value(value)
                 .map_err(|e| Error::custom(format!(
-                    "Failed to parse server config: {}. Server configs must have either 'address' or 'path' field, plus 'protocol' and optional fields",
-                    e
+                    "Failed to parse server config: {e}. Server configs must have either 'address' or 'path' field, plus 'protocol' and optional fields"
                 )))?;
 
             Ok(Config::Server(server))
@@ -278,11 +274,10 @@ impl<'de> serde::de::Deserialize<'de> for Config {
                 .collect();
 
             Err(Error::custom(format!(
-                "Unable to determine config type. Found fields: {:?}. Expected one of:\n\
+                "Unable to determine config type. Found fields: {found_fields:?}. Expected one of:\n\
                 - Server config: must have 'address' or 'path' field\n\
                 - Client config group: must have 'client_group' field\n\
-                - Rule config group: must have 'rule_group' field",
-                found_fields
+                - Rule config group: must have 'rule_group' field"
             )))
         }
     }
@@ -443,10 +438,9 @@ impl<'de> serde::de::Deserialize<'de> for ShadowTlsServerHandshakeConfig {
             let handshake: ShadowTlsLocalHandshake =
                 serde_yaml::from_value(value).map_err(|e| {
                     Error::custom(format!(
-                        "Failed to parse local ShadowTLS handshake config: {}. \
+                        "Failed to parse local ShadowTLS handshake config: {e}. \
                     Local handshake requires 'cert' and 'key' fields, with optional \
-                    'alpn_protocols', 'client_ca_certs', and 'client_fingerprints'",
-                        e
+                    'alpn_protocols', 'client_ca_certs', and 'client_fingerprints'"
                     ))
                 })?;
 
@@ -456,9 +450,8 @@ impl<'de> serde::de::Deserialize<'de> for ShadowTlsServerHandshakeConfig {
             let handshake: ShadowTlsRemoteHandshake =
                 serde_yaml::from_value(value).map_err(|e| {
                     Error::custom(format!(
-                        "Failed to parse remote ShadowTLS handshake config: {}. \
-                    Remote handshake requires 'address' field, with optional 'client_proxies'",
-                        e
+                        "Failed to parse remote ShadowTLS handshake config: {e}. \
+                    Remote handshake requires 'address' field, with optional 'client_proxies'"
                     ))
                 })?;
 
@@ -471,10 +464,9 @@ impl<'de> serde::de::Deserialize<'de> for ShadowTlsServerHandshakeConfig {
                 .collect();
 
             Err(Error::custom(format!(
-                "Unable to determine ShadowTLS handshake type. Found fields: {:?}. Expected one of:\n\
+                "Unable to determine ShadowTLS handshake type. Found fields: {found_fields:?}. Expected one of:\n\
                 - Local handshake: must have 'cert' and 'key' fields\n\
-                - Remote handshake: must have 'address' field",
-                found_fields
+                - Remote handshake: must have 'address' field"
             )))
         }
     }
@@ -679,7 +671,7 @@ impl<T> ConfigSelection<T> {
                         None => {
                             return Err(std::io::Error::new(
                                 std::io::ErrorKind::InvalidInput,
-                                format!("No such client group: {}", client_group),
+                                format!("No such client group: {client_group}"),
                             ));
                         }
                     }
@@ -757,9 +749,8 @@ where
             {
                 let config = T::deserialize(serde::de::value::MapAccessDeserializer::new(map))
                     .map_err(|e| Error::custom(format!(
-                        "Failed to parse inline configuration: {}. \
-                        Expected either a string referencing a named group or a valid configuration object",
-                        e
+                        "Failed to parse inline configuration: {e}. \
+                        Expected either a string referencing a named group or a valid configuration object"
                     )))?;
                 Ok(ConfigSelection::Config(config))
             }
@@ -1010,7 +1001,7 @@ impl<'de> serde::de::Deserialize<'de> for NetLocationPortRange {
         let value = String::deserialize(deserializer)?;
         let net_location_port_range = NetLocationPortRange::from_str(&value).map_err(|e| {
             serde::de::Error::invalid_value(
-                serde::de::Unexpected::Other(&format!("invalid net location port range: {}", e)),
+                serde::de::Unexpected::Other(&format!("invalid net location port range: {e}")),
                 &"valid net location port range (address:port[-port][,port])",
             )
         })?;
@@ -1312,7 +1303,7 @@ mod tests {
     fn test_server_config_http() {
         let original = vec![Config::Server(create_test_server_config_http())];
         let yaml_str = serde_yaml::to_string(&original).expect("Failed to serialize");
-        println!("HTTP config YAML:\n{}", yaml_str);
+        println!("HTTP config YAML:\n{yaml_str}");
         let deserialized: Vec<Config> =
             serde_yaml::from_str(&yaml_str).expect("Failed to deserialize");
 
@@ -1344,7 +1335,7 @@ mod tests {
     fn test_server_config_shadowsocks() {
         let original = vec![Config::Server(create_test_server_config_shadowsocks())];
         let yaml_str = serde_yaml::to_string(&original).expect("Failed to serialize");
-        println!("Shadowsocks YAML: {}", yaml_str);
+        println!("Shadowsocks YAML: {yaml_str}");
         let deserialized: Vec<Config> =
             serde_yaml::from_str(&yaml_str).expect("Failed to deserialize");
 
@@ -1760,13 +1751,13 @@ mod tests {
         // Test each example file
         for example_file in &example_files {
             let file_name = example_file.file_name().unwrap().to_str().unwrap();
-            println!("\nTesting example file: {}", file_name);
+            println!("\nTesting example file: {file_name}");
 
             // Read the file
             let content = match std::fs::read_to_string(example_file) {
                 Ok(c) => c,
                 Err(e) => {
-                    failures.push(format!("- {}: Failed to read file: {}", file_name, e));
+                    failures.push(format!("- {file_name}: Failed to read file: {e}"));
                     continue;
                 }
             };
@@ -1775,7 +1766,7 @@ mod tests {
             let configs: Vec<Config> = match serde_yaml::from_str(&content) {
                 Ok(c) => c,
                 Err(e) => {
-                    failures.push(format!("- {}: Failed to parse YAML: {}", file_name, e));
+                    failures.push(format!("- {file_name}: Failed to parse YAML: {e}"));
                     continue;
                 }
             };
@@ -1805,7 +1796,7 @@ mod tests {
         let result: Result<Vec<Config>, _> = serde_yaml::from_str(invalid_yaml);
         assert!(result.is_err());
         let error_msg = result.unwrap_err().to_string();
-        println!("Error for invalid config: {}", error_msg);
+        println!("Error for invalid config: {error_msg}");
         assert!(error_msg.contains("Unable to determine config type"));
         assert!(error_msg.contains("Found fields: "));
         assert!(error_msg.contains("foo"));
@@ -1820,7 +1811,7 @@ mod tests {
         let result: Result<Vec<Config>, _> = serde_yaml::from_str(invalid_server_yaml);
         assert!(result.is_err());
         let error_msg = result.unwrap_err().to_string();
-        println!("Error for invalid server: {}", error_msg);
+        println!("Error for invalid server: {error_msg}");
         assert!(error_msg.contains("Failed to parse server config"));
 
         // Test invalid client group
@@ -1832,7 +1823,7 @@ mod tests {
         let result: Result<Vec<Config>, _> = serde_yaml::from_str(invalid_client_yaml);
         assert!(result.is_err());
         let error_msg = result.unwrap_err().to_string();
-        println!("Error for invalid client group: {}", error_msg);
+        println!("Error for invalid client group: {error_msg}");
         assert!(error_msg.contains("Failed to parse client config group"));
     }
 
@@ -1850,7 +1841,7 @@ mod tests {
         };
 
         let yaml = serde_yaml::to_string(&local).unwrap();
-        println!("Local handshake (minimal):\n{}", yaml);
+        println!("Local handshake (minimal):\n{yaml}");
 
         // Should only contain cert and key
         assert!(yaml.contains("cert:"));
@@ -1866,7 +1857,7 @@ mod tests {
         };
 
         let yaml = serde_yaml::to_string(&remote).unwrap();
-        println!("Remote handshake (minimal):\n{}", yaml);
+        println!("Remote handshake (minimal):\n{yaml}");
 
         // Should only contain address
         assert!(yaml.contains("address:"));
@@ -1886,7 +1877,7 @@ mod tests {
             serde_yaml::from_str(invalid_missing_key);
         assert!(result.is_err());
         let error_msg = result.unwrap_err().to_string();
-        println!("Error for missing key: {}", error_msg);
+        println!("Error for missing key: {error_msg}");
         assert!(error_msg.contains("Failed to parse local ShadowTLS handshake config"));
         assert!(error_msg.contains("missing field `key`"));
         assert!(error_msg.contains("Local handshake requires 'cert' and 'key' fields"));
@@ -1900,7 +1891,7 @@ mod tests {
         let result: Result<ShadowTlsServerHandshakeConfig, _> = serde_yaml::from_str(invalid_mixed);
         assert!(result.is_err());
         let error_msg = result.unwrap_err().to_string();
-        println!("Error for mixed handshake fields: {}", error_msg);
+        println!("Error for mixed handshake fields: {error_msg}");
         // Since it has cert, it will try to parse as Local and fail due to missing key
         assert!(error_msg.contains("Failed to parse local ShadowTLS handshake config"));
         assert!(error_msg.contains("missing field `key`"));
@@ -1915,7 +1906,7 @@ mod tests {
             serde_yaml::from_str(invalid_unknown);
         assert!(result.is_err());
         let error_msg = result.unwrap_err().to_string();
-        println!("Error for unknown handshake fields: {}", error_msg);
+        println!("Error for unknown handshake fields: {error_msg}");
         assert!(error_msg.contains("Unable to determine ShadowTLS handshake type"));
         assert!(error_msg.contains("Found fields:"));
         assert!(error_msg.contains("unknown_field"));
@@ -1955,7 +1946,7 @@ mod tests {
             serde_yaml::from_str(invalid_remote_syntax);
         assert!(result.is_err());
         let error_msg = result.unwrap_err().to_string();
-        println!("Error for invalid remote syntax: {}", error_msg);
+        println!("Error for invalid remote syntax: {error_msg}");
         // This will generate a parse error for NetLocation
         assert!(error_msg.contains("Failed to parse remote ShadowTLS handshake config"));
     }
@@ -1969,7 +1960,7 @@ mod tests {
         };
 
         let yaml = serde_yaml::to_string(&pem_with_path).unwrap();
-        println!("NamedPem with path YAML:\n{}", yaml);
+        println!("NamedPem with path YAML:\n{yaml}");
         assert!(yaml.contains("pem: my-server-pem"));
         assert!(yaml.contains("path: /etc/certs/server.pem"));
 
@@ -1989,7 +1980,7 @@ mod tests {
         };
 
         let yaml = serde_yaml::to_string(&pem_with_data).unwrap();
-        println!("NamedPem with data YAML:\n{}", yaml);
+        println!("NamedPem with data YAML:\n{yaml}");
         assert!(yaml.contains("pem: inline-pem"));
         assert!(yaml.contains("data: "));
         assert!(yaml.contains("-----BEGIN CERTIFICATE-----"));
@@ -2283,7 +2274,7 @@ mod tests {
         });
 
         let yaml = serde_yaml::to_string(&pem_config).unwrap();
-        println!("Config::NamedPem YAML:\n{}", yaml);
+        println!("Config::NamedPem YAML:\n{yaml}");
 
         let deserialized: Config = serde_yaml::from_str(&yaml).unwrap();
         match deserialized {
@@ -2304,7 +2295,7 @@ mod tests {
         });
 
         let yaml = serde_yaml::to_string(&pem_config_data).unwrap();
-        println!("Config::NamedPem with data YAML:\n{}", yaml);
+        println!("Config::NamedPem with data YAML:\n{yaml}");
 
         let deserialized: Config = serde_yaml::from_str(&yaml).unwrap();
         match deserialized {
