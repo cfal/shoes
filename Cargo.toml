@@ -11,37 +11,37 @@ keywords = ["proxy", "proxy-server", "shadowsocks", "v2ray", "vmess"]
 categories = ["command-line-utilities", "network-programming"]
 
 [dependencies]
-aes = "*"
-argon2 = "*"
-async-trait = "*"
-aws-lc-rs = { version = "*", default-features = false }
-base64 = "*"
-blake3 = "*"
-bytes = "*"
-cfb-mode = "*"
-dashmap = "*"
-digest = "*"
-env_logger = "*"
-futures = "*"
-h3 = "*"
-h3-quinn = "*"
-hmac = "*"
-http = "*"
-log = "*"
-md-5 = "*"
-memchr = "*"
-notify = "*"
-parking_lot = "*"
-percent-encoding = "*"
-quinn = { version = "*", default-features = false, features = ["log", "platform-verifier", "runtime-tokio", "rustls-aws-lc-rs"] }
-rand = "*"
-rustc-hash = "1"
-rustls = "*"
-serde = { version = "*", features = ["derive", "std"] }
-serde_yaml = "*"
-sha3 = "*"
-socket2 = "*"
-tokio = { version = "*", features = [
+aes = "0.8.4"
+argon2 = "0.5.3"
+async-trait = "0.1.88"
+aws-lc-rs = { version = "1.13.1", default-features = false }
+base64 = "0.22.1"
+blake3 = "1.8.2"
+bytes = "1.10.1"
+cfb-mode = "0.8.2"
+dashmap = "6.1.0"
+digest = "0.10.7"
+env_logger = "0.11.8"
+futures = "0.3.31"
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+hmac = "0.12.1"
+http = "1.3.1"
+log = "0.4.27"
+md-5 = "0.10.6"
+memchr = "2.7.4"
+notify = "8.0.0"
+parking_lot = "0.12.3"
+percent-encoding = "2.3.1"
+quinn = { version = "0.11.8", default-features = false, features = ["log", "platform-verifier", "runtime-tokio", "rustls-aws-lc-rs"] }
+rand = "0.9.1"
+rustc-hash = "1.1.0"
+rustls = "0.23.27"
+serde = { version = "1.0.219", features = ["derive", "std"] }
+serde_yaml = "0.9.34+deprecated"
+sha3 = "0.10.8"
+socket2 = "0.5.9"
+tokio = { version = "1.45.0", features = [
     "fs",
     "io-util",
     "macros",
@@ -50,11 +50,11 @@ tokio = { version = "*", features = [
     "sync",
     "time",
 ] }
-tokio-rustls = { version = "*", default-features = false, features = ["logging", "tls12", "aws-lc-rs"] }
-webpki-roots = { version = "*" }
+tokio-rustls = { version = "0.26.2", default-features = false, features = ["logging", "tls12", "aws-lc-rs"] }
+webpki-roots = { version = "1.0.0" }
 
 [dev-dependencies]
-tempfile = "*"
+tempfile = "3.20.0"
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = "0.6"
