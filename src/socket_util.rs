@@ -67,7 +67,7 @@ pub fn new_socket2_udp_socket(
     socket.set_nonblocking(true)?;
 
     if reuse_port {
-        #[cfg(not(any(target_os = "solaris", target_os = "illumos")))]
+        #[cfg(all(unix, not(any(target_os = "solaris", target_os = "illumos"))))]
         socket.set_reuse_port(true)?;
 
         #[cfg(any(not(unix), target_os = "solaris", target_os = "illumos"))]
@@ -112,7 +112,7 @@ pub fn new_tcp_socket(
 
         // This should be handled during config validation.
         #[cfg(not(any(target_os = "android", target_os = "fuchsia", target_os = "linux")))]
-        panic!("Could not find to device, unsupported platform.")
+        panic!("Could not bind to device, unsupported platform.")
     }
 
     Ok(tcp_socket)
