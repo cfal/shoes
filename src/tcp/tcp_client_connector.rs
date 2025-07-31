@@ -128,7 +128,7 @@ impl TcpClientConnector {
                     ) {
                         Ok(s) => s,
                         Err(e) => {
-                            error!("Failed to bind new UDP socket: {}", e);
+                            error!("Failed to bind new UDP socket: {e}");
                             return None;
                         }
                     };
@@ -210,7 +210,7 @@ impl TcpClientConnector {
                 let client_stream = tcp_socket.connect(target_addr).await?;
                 if no_delay {
                     if let Err(e) = client_stream.set_nodelay(true) {
-                        error!("Failed to set TCP no-delay on client socket: {}", e);
+                        error!("Failed to set TCP no-delay on client socket: {e}");
                     }
                 }
                 Box::new(client_stream)
@@ -238,15 +238,15 @@ impl TcpClientConnector {
                 let conn = endpoint
                     .connect(target_addr, domain)
                     .map_err(|e| {
-                        std::io::Error::other(format!("Failed to connect to quic endpoint: {}", e))
+                        std::io::Error::other(format!("Failed to connect to quic endpoint: {e}"))
                     })?
                     .await
                     .map_err(|e| {
-                        std::io::Error::other(format!("Failed to connect to quic endpoint: {}", e))
+                        std::io::Error::other(format!("Failed to connect to quic endpoint: {e}"))
                     })?;
 
                 let (send, recv) = conn.open_bi().await.map_err(|e| {
-                    std::io::Error::other(format!("Failed to open stream to quic endpoint: {}", e))
+                    std::io::Error::other(format!("Failed to open stream to quic endpoint: {e}"))
                 })?;
 
                 Box::new(QuicStream::from(send, recv))

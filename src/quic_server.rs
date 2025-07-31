@@ -71,7 +71,7 @@ async fn start_quic_server(
                         process_connection(client_proxy_selector, resolver, server_handler, conn)
                             .await
                     {
-                        error!("Connection ended with error: {}", e);
+                        error!("Connection ended with error: {e}");
                     }
                 });
             }
@@ -98,10 +98,7 @@ async fn process_connection(
                 break;
             }
             Err(e) => {
-                return Err(std::io::Error::other(format!(
-                    "quic connection error: {}",
-                    e
-                )));
+                return Err(std::io::Error::other(format!("quic connection error: {e}")));
             }
             Ok(s) => s,
         };
@@ -112,7 +109,7 @@ async fn process_connection(
             if let Err(e) =
                 process_streams(cloned_selector, cloned_resolver, cloned_handler, stream).await
             {
-                error!("Failed to process streams: {}", e);
+                error!("Failed to process streams: {e}");
             }
         });
     }
@@ -138,13 +135,13 @@ async fn process_streams(
         Ok(Err(e)) => {
             return Err(std::io::Error::new(
                 e.kind(),
-                format!("failed to setup server stream: {}", e),
+                format!("failed to setup server stream: {e}"),
             ));
         }
         Err(elapsed) => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
-                format!("server setup timed out: {}", elapsed),
+                format!("server setup timed out: {elapsed}"),
             ));
         }
     };
@@ -185,17 +182,14 @@ async fn process_streams(
                     let _ = server_stream.shutdown().await;
                     return Err(std::io::Error::new(
                         e.kind(),
-                        format!(
-                            "failed to setup client stream to {}: {}",
-                            remote_location, e
-                        ),
+                        format!("failed to setup client stream to {remote_location}: {e}"),
                     ));
                 }
                 Err(elapsed) => {
                     let _ = server_stream.shutdown().await;
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::TimedOut,
-                        format!("client setup to {} timed out: {}", remote_location, elapsed),
+                        format!("client setup to {remote_location} timed out: {elapsed}"),
                     ));
                 }
             };

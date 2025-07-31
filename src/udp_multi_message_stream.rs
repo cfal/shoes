@@ -86,7 +86,7 @@ impl UdpMultiMessageStream {
                                 continue 'outer;
                             }
                             Err(e) => {
-                                eprintln!("UDP recv error: {:?}", e);
+                                eprintln!("UDP recv error: {e:?}");
                                 break;
                             }
                         }

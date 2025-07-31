@@ -4,33 +4,33 @@ shoes uses a YAML-based configuration format. Each configuration file can contai
 
 ## Configuration Types
 
-There are five main configuration types:
+There are four main configuration types:
 
 1. Server configurations (`ServerConfig`)
 2. Client proxy groups (`ClientConfigGroup`)
 3. Rule groups (`RuleConfigGroup`)
-4. Named certificates (`NamedCert`)
-5. Named private keys (`NamedPrivateKey`)
+4. Named PEM files (`NamedPem`)
 
-## Named Certificates and Private Keys
+## Named PEM Files
 
-You can define certificates and private keys once and reference them throughout your configuration:
+You can define PEM files (containing certificates and/or private keys) once and reference them throughout your configuration. This is particularly useful when the same certificate/key pair is used in multiple places.
 
-### Named Certificate
+### Named PEM
 ```yaml
-cert: string                # Name identifier for the certificate
-path: string                # File path to certificate
+pem: string                 # Name identifier for the PEM data
+path: string                # File path to PEM file
 # OR
-data: string                # Inline PEM-encoded certificate data
+data: string                # Inline PEM-encoded data
 ```
 
-### Named Private Key
-```yaml
-key: string                 # Name identifier for the private key
-path: string                # File path to private key
-# OR
-data: string                # Inline PEM-encoded private key data
-```
+**Note**: A single PEM file can contain:
+- Just a certificate
+- Just a private key
+- Both certificate and private key
+- Multiple certificates (chain)
+- Any combination of the above
+
+When referenced in a `cert` field, only the certificate portion is used. When referenced in a `key` field, only the private key portion is used.
 
 ## Server Configuration
 
@@ -43,11 +43,11 @@ transport: tcp | quic | udp     # Optional, defaults to tcp; note: Unix socket b
 tcp_settings:                   # Optional TCP settings
   no_delay: bool               # Default: true
 quic_settings:                 # Required if transport is quic
-  cert: string                # TLS certificate (path, inline PEM data, or named certificate reference)
-  key: string                 # TLS private key (path, inline PEM data, or named key reference)
+  cert: string                # TLS certificate (path, inline PEM data, or named PEM reference)
+  key: string                 # TLS private key (path, inline PEM data, or named PEM reference)
   alpn_protocols: [string]    # Optional ALPN protocols (alias: alpn_protocol)
   client_fingerprints: [string] # Optional allowed client cert fingerprints (alias: client_fingerprint)
-  client_ca_certs: [string]   # Optional client CA certificates (path, inline PEM, or named cert reference)
+  client_ca_certs: [string]   # Optional client CA certificates (path, inline PEM, or named PEM reference)
   num_endpoints: int          # Optional; if set to 0, defaults to the number of available threads
 rules: string | RuleConfig    # Optional; defaults to allow-all-direct if omitted
 ```
@@ -115,8 +115,8 @@ protocol:
   type: tls
   sni_targets:                # Map of SNI hostnames to TLS configs
     "example.com":
-      cert: string           # Certificate (path, inline PEM data, or named certificate reference)
-      key: string            # Private key (path, inline PEM data, or named key reference)
+      cert: string           # Certificate (path, inline PEM data, or named PEM reference)
+      key: string            # Private key (path, inline PEM data, or named PEM reference)
       alpn_protocols: [string]  # Optional ALPN protocols
       client_fingerprints: [string]  # Optional allowed client fingerprints
       client_ca_certs: [string]  # Optional client CA certificates
@@ -139,8 +139,8 @@ protocol:
     "example.com":
       password: string        # ShadowTLS password
       handshake:              # TLS handshake configuration; can be defined in two ways:
-        cert: string         # Local handshake: certificate (path, inline PEM, or named reference)
-        key: string          # Local handshake: private key (path, inline PEM, or named reference)
+        cert: string         # Local handshake: certificate (path, inline PEM, or named PEM reference)
+        key: string          # Local handshake: private key (path, inline PEM, or named PEM reference)
         alpn_protocols: [string]  # Optional ALPN protocols
         client_fingerprints: [string]  # Optional allowed client fingerprints
       protocol: ServerProxyConfig  # Inner protocol configuration
@@ -224,8 +224,8 @@ protocol:
   server_fingerprints: [string]  # Optional allowed server fingerprints
   sni_hostname: string?     # Optional SNI hostname
   alpn_protocols: [string]  # Optional ALPN protocols
-  key: string?             # Optional client key (path, inline PEM, or named reference)
-  cert: string?            # Optional client cert (path, inline PEM, or named reference)
+  key: string?             # Optional client key (path, inline PEM, or named PEM reference)
+  cert: string?            # Optional client cert (path, inline PEM, or named PEM reference)
   protocol: ClientProxyConfig  # Inner protocol configuration
 ```
 
@@ -256,8 +256,8 @@ quic_settings:              # Optional QUIC settings (only applicable if transpo
   server_fingerprints: [string]  # Optional allowed server fingerprints (alias: server_fingerprint)
   sni_hostname: string?    # Optional SNI hostname
   alpn_protocols: [string]   # Optional ALPN protocols (alias: alpn_protocol)
-  key: string?            # Optional client key (path, inline PEM, or named reference; must be paired with cert)
-  cert: string?           # Optional client cert (path, inline PEM, or named reference; must be paired with key)
+  key: string?            # Optional client key (path, inline PEM, or named PEM reference; must be paired with cert)
+  cert: string?           # Optional client cert (path, inline PEM, or named PEM reference; must be paired with key)
 ```
 
 ## Client Proxy Groups
@@ -326,13 +326,13 @@ The system includes these built-in defaults:
 
 Certificates and keys can be specified in three ways:
 
-1. **File Path**: Provide the path to a PEM-encoded certificate or key file
+1. **File Path**: Provide the path to a PEM-encoded file
    ```yaml
-   cert: "/etc/certs/server.crt"
-   key: "/etc/certs/server.key"
+   cert: "/etc/certs/server.pem"
+   key: "/etc/certs/server.pem"  # Can be the same file if it contains both
    ```
 
-2. **Inline PEM Data**: Embed the certificate or key directly in the configuration
+2. **Inline PEM Data**: Embed the PEM data directly in the configuration
    ```yaml
    cert: |
      -----BEGIN CERTIFICATE-----
@@ -344,36 +344,35 @@ Certificates and keys can be specified in three ways:
      -----END PRIVATE KEY-----
    ```
 
-3. **Named Reference**: Reference a previously defined named certificate or key
+3. **Named PEM Reference**: Reference a previously defined named PEM
    ```yaml
-   cert: "my-server-cert"  # References a named certificate
-   key: "my-server-key"    # References a named private key
+   cert: "my-server-pem"  # References a named PEM (certificate portion will be used)
+   key: "my-server-pem"   # References a named PEM (private key portion will be used)
    ```
+
+**Important**: When a PEM file contains both certificate and private key, you can reference it in both `cert` and `key` fields. The system will automatically extract the appropriate portion.
 
 ## Examples
 
-### Using Named Certificates
+### Using Named PEM Files
 
 ```yaml
-# Define named certificates and keys
-- cert: "shared-cert"
-  path: "/etc/certs/shared.crt"
+# Define named PEM files
+- pem: "server-pem"
+  path: "/etc/certs/server.pem"  # Contains both cert and key
 
-- key: "shared-key"
-  path: "/etc/certs/shared.key"
-
-- cert: "ca-cert"
+- pem: "ca-cert"
   data: |
     -----BEGIN CERTIFICATE-----
     MIIDXTCCAkWgAwIBAgIJAKl...
     -----END CERTIFICATE-----
 
-# Use named certificates in server configurations
+# Use named PEM files in server configurations
 - bind_location: "0.0.0.0:443"
   transport: quic
   quic_settings:
-    cert: "shared-cert"      # Reference named certificate
-    key: "shared-key"        # Reference named key
+    cert: "server-pem"       # Reference named PEM (cert portion)
+    key: "server-pem"        # Reference named PEM (key portion)
     client_ca_certs:
       - "ca-cert"            # Reference named CA certificate
   protocol:
@@ -384,8 +383,8 @@ Certificates and keys can be specified in three ways:
     type: tls
     sni_targets:
       "example.com":
-        cert: "shared-cert"  # Reuse the same certificate
-        key: "shared-key"    # Reuse the same key
+        cert: "server-pem"   # Reuse the same PEM file
+        key: "server-pem"    # Reuse the same PEM file
         protocol:
           type: http
 ```

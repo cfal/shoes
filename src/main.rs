@@ -72,7 +72,7 @@ fn start_notify_thread(
                 tx.send(ConfigChanged {}).unwrap();
             }
         }
-        Err(e) => println!("watch error: {:?}", e),
+        Err(e) => println!("watch error: {e:?}"),
     })
     .unwrap();
 
@@ -125,7 +125,7 @@ async fn start_servers(config: ServerConfig) -> std::io::Result<Vec<JoinHandle<(
 }
 
 fn print_usage_and_exit(arg0: String) {
-    eprintln!("Usage: {} [--threads/-t N] <server uri or config filename> [server uri or config filename] [..]", arg0);
+    eprintln!("Usage: {arg0} [--threads/-t N] <server uri or config filename> [server uri or config filename] [..]");
     std::process::exit(1);
 }
 
@@ -172,7 +172,7 @@ fn main() {
             num_threads = match args.remove(0).parse::<usize>() {
                 Ok(n) => n,
                 Err(e) => {
-                    eprintln!("Invalid thread count: {}", e);
+                    eprintln!("Invalid thread count: {e}");
                     print_usage_and_exit(arg0);
                     return;
                 }
@@ -203,9 +203,9 @@ fn main() {
                 .map(|n| n.get())
                 .unwrap_or(1),
         );
-        debug!("Runtime threads: {}", num_threads);
+        debug!("Runtime threads: {num_threads}");
     } else {
-        println!("Using custom thread count ({})", num_threads);
+        println!("Using custom thread count ({num_threads})");
     }
 
     // Used by QUIC to figure out the number of endpoints.
@@ -233,41 +233,54 @@ fn main() {
             let configs = match config::load_configs(&args).await {
                 Ok(c) => c,
                 Err(e) => {
-                    eprintln!("Failed to load server configs: {}\n", e);
+                    eprintln!("Failed to load server configs: {e}\n");
                     print_usage_and_exit(arg0);
                     return;
                 }
             };
 
-            let (configs, embedded_keys_count) = match config::validate_configs(configs).await {
+            let (configs, load_file_count) = match config::convert_cert_paths(configs).await {
                 Ok(c) => c,
                 Err(e) => {
-                    eprintln!("Failed to validate server configs: {}\n", e);
+                    eprintln!("Failed to load cert files: {e}\n");
                     print_usage_and_exit(arg0);
                     return;
                 }
             };
 
-            if embedded_keys_count > 0 {
-                println!("Read {} embedded keys from files", embedded_keys_count);
+            if load_file_count > 0 {
+                    println!("Loaded {load_file_count} certs/keys from files");
             }
 
             for config in configs.iter() {
                 debug!("================================================================================");
-                debug!("{:#?}", config);
+                debug!("{config:#?}");
             }
             debug!("================================================================================");
 
             if dry_run {
-                println!("Finishing dry run, config parsed successfully.");
+                if let Err(e) = config::create_server_configs(configs).await {
+                    eprintln!("Dry run failed, could not create server configs: {e}\n");
+                } else {
+                    println!("Finishing dry run, config parsed successfully.");
+                }
                 return;
             }
 
             println!("\nStarting {} server(s)..", configs.len());
 
             let mut join_handles = vec![];
-            for config in configs {
-                join_handles.extend(start_servers(config).await.unwrap());
+
+            let server_configs = match config::create_server_configs(configs).await {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Failed to create server configs: {e}\n");
+                    print_usage_and_exit(arg0);
+                    return;
+                }
+            };
+            for server_config in server_configs {
+                join_handles.extend(start_servers(server_config).await.unwrap());
             }
 
             config_rx.recv().await.unwrap();

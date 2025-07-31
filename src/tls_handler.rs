@@ -76,8 +76,7 @@ impl TcpServerHandler for TlsServerHandler {
                     Some(ref t) => t,
                     None => {
                         return Err(std::io::Error::other(format!(
-                            "No default target for unknown SNI: {}",
-                            hostname
+                            "No default target for unknown SNI: {hostname}"
                         )));
                     }
                 },
@@ -107,8 +106,7 @@ impl TcpServerHandler for TlsServerHandler {
 
                         if let Err(e) = feed_server_connection(server_conn, &client_hello_frame) {
                             let _ = accept_error.insert(std::io::Error::other(format!(
-                                "Failed to feed initial frame to server connection: {}",
-                                e
+                                "Failed to feed initial frame to server connection: {e}"
                             )));
                             return;
                         }
@@ -116,16 +114,14 @@ impl TcpServerHandler for TlsServerHandler {
                         if !unparsed_data.is_empty() {
                             if let Err(e) = feed_server_connection(server_conn, unparsed_data) {
                                 let _ = accept_error.insert(std::io::Error::other(format!(
-                                    "Failed to feed unparsed data to server connection: {}",
-                                    e
+                                    "Failed to feed unparsed data to server connection: {e}"
                                 )));
                                 return;
                             }
                         }
                         if let Err(e) = server_conn.process_new_packets() {
                             let _ = accept_error.insert(std::io::Error::other(format!(
-                                "Failed to process new packets: {}",
-                                e
+                                "Failed to process new packets: {e}"
                             )));
                         }
                     });

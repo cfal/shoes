@@ -56,7 +56,7 @@ impl Address {
 
         Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("Failed to parse address: {}", s),
+            format!("Failed to parse address: {s}"),
         ))
     }
 
@@ -79,9 +79,9 @@ impl Address {
 impl std::fmt::Display for Address {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
-            Address::Ipv4(i) => write!(f, "{}", i),
-            Address::Ipv6(i) => write!(f, "{}", i),
-            Address::Hostname(h) => write!(f, "{}", h),
+            Address::Ipv4(i) => write!(f, "{i}"),
+            Address::Ipv6(i) => write!(f, "{i}"),
+            Address::Hostname(h) => write!(f, "{h}"),
         }
     }
 }
@@ -225,28 +225,28 @@ impl NetLocationPortRange {
                 if range_parts.len() != 2 {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
-                        format!("Invalid port range format: {}", part),
+                        format!("Invalid port range format: {part}"),
                     ));
                 }
 
                 let start = range_parts[0].parse::<u16>().map_err(|e| {
                     std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
-                        format!("Invalid port number: {}", e),
+                        format!("Invalid port number: {e}"),
                     )
                 })?;
 
                 let end = range_parts[1].parse::<u16>().map_err(|e| {
                     std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
-                        format!("Invalid port number: {}", e),
+                        format!("Invalid port number: {e}"),
                     )
                 })?;
 
                 if start > end {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
-                        format!("Invalid port range (start > end): {}-{}", start, end),
+                        format!("Invalid port range (start > end): {start}-{end}"),
                     ));
                 }
 
@@ -258,7 +258,7 @@ impl NetLocationPortRange {
                 let port = part.parse::<u16>().map_err(|e| {
                     std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
-                        format!("Invalid port number: {}", e),
+                        format!("Invalid port number: {e}"),
                     )
                 })?;
 
@@ -290,7 +290,7 @@ impl NetLocationPortRange {
             Address::Hostname(hostname) => {
                 let mut result = Vec::new();
                 for &port in &self.ports {
-                    let addr_iter = format!("{}:{}", hostname, port).to_socket_addrs()?;
+                    let addr_iter = format!("{hostname}:{port}").to_socket_addrs()?;
                     for addr in addr_iter {
                         result.push(addr);
                     }
@@ -334,13 +334,13 @@ impl std::fmt::Display for NetLocationPortRange {
 
             if start_port == end_port {
                 // Single port
-                write!(f, "{}", start_port)?;
+                write!(f, "{start_port}")?;
             } else if end_port - start_port == 1 {
                 // Just two consecutive ports, write as comma-separated
-                write!(f, "{},{}", start_port, end_port)?;
+                write!(f, "{start_port},{end_port}")?;
             } else {
                 // Range of ports
-                write!(f, "{}-{}", start_port, end_port)?;
+                write!(f, "{start_port}-{end_port}")?;
             }
 
             idx += 1;
@@ -375,9 +375,9 @@ impl AddressMask {
     pub fn from(s: &str) -> std::io::Result<Self> {
         let (address_str, num_bits) = match s.rfind('/') {
             Some(i) => {
-                let num_bits = s[i + 1..].parse::<u8>().map_err(|e| {
-                    std::io::Error::other(format!("Failed to parse netmask: {}", e))
-                })?;
+                let num_bits = s[i + 1..]
+                    .parse::<u8>()
+                    .map_err(|e| std::io::Error::other(format!("Failed to parse netmask: {e}")))?;
                 (&s[0..i], Some(num_bits))
             }
             None => (s, None),
@@ -388,8 +388,7 @@ impl AddressMask {
                 let num_bits = num_bits.unwrap_or(32);
                 if num_bits > 32 {
                     return Err(std::io::Error::other(format!(
-                        "Invalid number of bits for ipv4 address: {}",
-                        num_bits
+                        "Invalid number of bits for ipv4 address: {num_bits}"
                     )));
                 }
                 if num_bits == 0 {
@@ -404,8 +403,7 @@ impl AddressMask {
                 let num_bits = num_bits.unwrap_or(128);
                 if num_bits > 128 {
                     return Err(std::io::Error::other(format!(
-                        "Invalid number of bits for ipv4 address: {}",
-                        num_bits
+                        "Invalid number of bits for ipv4 address: {num_bits}"
                     )));
                 }
                 num_bits
@@ -413,8 +411,7 @@ impl AddressMask {
             Address::Hostname(ref hostname) => {
                 if num_bits.is_some() {
                     return Err(std::io::Error::other(format!(
-                        "Cannot specify number of number of netmask bits for hostnames: {}",
-                        hostname
+                        "Cannot specify number of number of netmask bits for hostnames: {hostname}"
                     )));
                 }
                 128
@@ -479,7 +476,7 @@ impl NetLocationMask {
             Some(i) => {
                 let port = s[i + 1..]
                     .parse::<u16>()
-                    .map_err(|e| std::io::Error::other(format!("Failed to parse port: {}", e)))?;
+                    .map_err(|e| std::io::Error::other(format!("Failed to parse port: {e}")))?;
                 (&s[0..i], port)
             }
             None => (s, 0),
@@ -520,7 +517,7 @@ mod tests {
     fn test_netlocation_serialization() {
         let net_loc = NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
         let yaml_str = serde_yaml::to_string(&net_loc).expect("Failed to serialize NetLocation");
-        println!("NetLocation YAML: {}", yaml_str);
+        println!("NetLocation YAML: {yaml_str}");
 
         let deserialized: NetLocation =
             serde_yaml::from_str(&yaml_str).expect("Failed to deserialize NetLocation");
@@ -533,7 +530,7 @@ mod tests {
             AddressMask::from("192.168.0.0/16").expect("Failed to create AddressMask");
         let yaml_str =
             serde_yaml::to_string(&address_mask).expect("Failed to serialize AddressMask");
-        println!("AddressMask YAML: {}", yaml_str);
+        println!("AddressMask YAML: {yaml_str}");
 
         let deserialized: AddressMask =
             serde_yaml::from_str(&yaml_str).expect("Failed to deserialize AddressMask");
@@ -547,7 +544,7 @@ mod tests {
             NetLocationMask::from("192.168.0.0/16:80").expect("Failed to create NetLocationMask");
         let yaml_str =
             serde_yaml::to_string(&net_location_mask).expect("Failed to serialize NetLocationMask");
-        println!("NetLocationMask YAML: {}", yaml_str);
+        println!("NetLocationMask YAML: {yaml_str}");
 
         let deserialized: NetLocationMask =
             serde_yaml::from_str(&yaml_str).expect("Failed to deserialize NetLocationMask");

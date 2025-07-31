@@ -48,7 +48,7 @@ impl From<&str> for DataCipher {
             "chacha20-poly1305" | "chacha20-ietf-poly1305" => DataCipher::ChaCha20Poly1305,
             "none" => DataCipher::None,
             _ => {
-                panic!("Unknown cipher: {}", name);
+                panic!("Unknown cipher: {name}");
             }
         }
     }
@@ -170,18 +170,11 @@ impl TcpServerHandler for VmessTcpServerHandler {
         let mut header_reader = if is_aead_request {
             let time_secs = u64::from_be_bytes(aead_bytes[0..8].try_into().unwrap());
             let current_time_secs = SystemTime::UNIX_EPOCH.elapsed().unwrap().as_secs();
-            let time_delta = if time_secs > current_time_secs {
-                time_secs - current_time_secs
-            } else {
-                current_time_secs - time_secs
-            };
+            let time_delta = time_secs.abs_diff(current_time_secs);
             if time_delta > 120 {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    format!(
-                        "Hash timestamp is too old ({} is {} seconds old)",
-                        time_secs, time_delta
-                    ),
+                    format!("Hash timestamp is too old ({time_secs} is {time_delta} seconds old)"),
                 ));
             }
 
@@ -343,7 +336,7 @@ impl TcpServerHandler for VmessTcpServerHandler {
                     Err(e) => {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
-                            format!("Failed to decode address: {}", e),
+                            format!("Failed to decode address: {e}"),
                         ));
                     }
                 };
@@ -377,7 +370,7 @@ impl TcpServerHandler for VmessTcpServerHandler {
             invalid_type => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    format!("Invalid address type: {}", invalid_type),
+                    format!("Invalid address type: {invalid_type}"),
                 ));
             }
         };
@@ -402,8 +395,7 @@ impl TcpServerHandler for VmessTcpServerHandler {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!(
-                    "Bad fnv1a checksum, expected {}, got {}",
-                    expected_check_value, actual_check_value
+                    "Bad fnv1a checksum, expected {expected_check_value}, got {actual_check_value}"
                 ),
             ));
         }
@@ -454,7 +446,7 @@ impl TcpServerHandler for VmessTcpServerHandler {
             unknown_cipher_type => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    format!("Unknown requested cipher: {}", unknown_cipher_type),
+                    format!("Unknown requested cipher: {unknown_cipher_type}"),
                 ));
             }
         };
@@ -483,7 +475,7 @@ impl TcpServerHandler for VmessTcpServerHandler {
             unknown_protocol_type => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    format!("Unknown requested protocol: {}", unknown_protocol_type),
+                    format!("Unknown requested protocol: {unknown_protocol_type}"),
                 ));
             }
         };
@@ -916,7 +908,7 @@ impl TcpClientHandler for VmessTcpClientHandler {
                 if hostname.len() > 255 {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
-                        format!("Hostname is too long: {}", hostname),
+                        format!("Hostname is too long: {hostname}"),
                     ));
                 }
                 header_bytes[40] = 2;

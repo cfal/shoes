@@ -96,7 +96,7 @@ impl TcpServerHandler for ShadowsocksTcpHandler {
                 if padding_len > 900 {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
-                        format!("invalid padding length: {}", padding_len),
+                        format!("invalid padding length: {padding_len}"),
                     ));
                 }
                 stream_reader

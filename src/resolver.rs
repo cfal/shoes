@@ -37,7 +37,7 @@ impl Resolver for NativeResolver {
                     r.filter(|addr| !addr.ip().is_unspecified())
                         .collect::<Vec<_>>()
                 });
-                debug!("NativeResolver resolved {}:{} -> {:?}", address, port, ret);
+                debug!("NativeResolver resolved {address}:{port} -> {ret:?}");
                 ret
             }),
         )
@@ -54,8 +54,7 @@ pub async fn resolve_single_address(
     let resolve_results = resolver.resolve_location(location).await?;
     if resolve_results.is_empty() {
         return Err(std::io::Error::other(format!(
-            "could not resolve location: {}",
-            location
+            "could not resolve location: {location}"
         )));
     }
     Ok(resolve_results[0])
@@ -121,8 +120,7 @@ impl ResolverCache {
                     Ok(v) => {
                         if v.is_empty() {
                             return Poll::Ready(Err(std::io::Error::other(format!(
-                                "Failed to resolve {}, no results",
-                                target
+                                "Failed to resolve {target}, no results"
                             ))));
                         }
                         let socket_addr = v.into_iter().next().unwrap();
@@ -148,8 +146,7 @@ impl ResolverCache {
                 Ok(v) => {
                     if v.is_empty() {
                         return Poll::Ready(Err(std::io::Error::other(format!(
-                            "Failed to resolve {}, no results",
-                            target
+                            "Failed to resolve {target}, no results"
                         ))));
                     }
                     let socket_addr = v.into_iter().next().unwrap();

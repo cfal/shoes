@@ -67,7 +67,7 @@ impl TcpClientHandler for ShadowTlsClientHandler {
         let mut client_conn =
             rustls::ClientConnection::new(self.client_config.clone(), self.server_name.clone())
                 .map_err(|e| {
-                    std::io::Error::other(format!("Failed to create ClientConnection: {}", e))
+                    std::io::Error::other(format!("Failed to create ClientConnection: {e}"))
                 })?;
 
         let mut client_hello_buf = Vec::with_capacity(512); // Typical ClientHello
@@ -98,7 +98,7 @@ impl TcpClientHandler for ShadowTlsClientHandler {
         client_conn.process_new_packets().map_err(|e| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("Failed to process ServerHello frame: {}", e),
+                format!("Failed to process ServerHello frame: {e}"),
             )
         })?;
 
@@ -122,8 +122,7 @@ impl TcpClientHandler for ShadowTlsClientHandler {
                     Ok(_) => { /* wrote 0 bytes */ }
                     Err(e) => {
                         return Err(std::io::Error::other(format!(
-                            "rustls write_tls error: {}",
-                            e
+                            "rustls write_tls error: {e}"
                         )))
                     }
                 }
@@ -174,10 +173,7 @@ impl TcpClientHandler for ShadowTlsClientHandler {
             client_conn.process_new_packets().map_err(|e| {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    format!(
-                        "failed to process handshake frame of type {}: {}",
-                        content_type, e
-                    ),
+                    format!("failed to process handshake frame of type {content_type}: {e}"),
                 )
             })?;
         }
@@ -267,8 +263,7 @@ fn modify_client_hello(
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!(
-                "ClientHello message version is {}.{}, expected 3.3 for TLS 1.3",
-                ch_protocol_ver_major, ch_protocol_ver_minor
+                "ClientHello message version is {ch_protocol_ver_major}.{ch_protocol_ver_minor}, expected 3.3 for TLS 1.3"
             ),
         ));
     }
@@ -362,7 +357,7 @@ fn feed_client_connection(
         let n = client_connection.read_tls(&mut cursor).map_err(|e| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("failed to feed client connection: {}", e),
+                format!("failed to feed client connection: {e}"),
             )
         })?;
         i += n;

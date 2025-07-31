@@ -24,7 +24,7 @@ pub enum BindLocation {
 impl std::fmt::Display for BindLocation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            BindLocation::Address(n) => write!(f, "{}", n),
+            BindLocation::Address(n) => write!(f, "{n}"),
             BindLocation::Path(p) => write!(f, "{}", p.display()),
         }
     }
@@ -87,167 +87,98 @@ pub struct RuleConfigGroup {
 }
 
 #[derive(Debug, Clone)]
-pub struct NamedCert {
-    pub cert: String, // The name identifier
-    pub source: CertKeySource,
+pub struct NamedPem {
+    pub pem: String, // The name identifier
+    pub source: PemSource,
 }
 
 #[derive(Debug, Clone)]
-pub struct NamedPrivateKey {
-    pub key: String, // The name identifier
-    pub source: CertKeySource,
-}
-
-#[derive(Debug, Clone)]
-pub enum CertKeySource {
+pub enum PemSource {
     Path(String),
     Data(String),
 }
 
-impl<'de> Deserialize<'de> for NamedCert {
+impl<'de> Deserialize<'de> for NamedPem {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::de::Deserializer<'de>,
     {
-        use serde::de::Error;
-        use serde_yaml::Value;
+        use serde::de::{Error, MapAccess, Visitor};
+        use std::fmt;
 
-        let value = Value::deserialize(deserializer)?;
-        let map = value
-            .as_mapping()
-            .ok_or_else(|| Error::custom("Expected a mapping for NamedCert"))?;
+        struct NamedPemVisitor;
 
-        // Get the cert name
-        let cert_name = map
-            .get(Value::String("cert".to_string()))
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| Error::custom("Missing 'cert' field in NamedCert"))?
-            .to_string();
+        impl<'de> Visitor<'de> for NamedPemVisitor {
+            type Value = NamedPem;
 
-        // Determine source based on fields
-        let has_path = map.contains_key(Value::String("path".to_string()));
-        let has_data = map.contains_key(Value::String("data".to_string()));
-
-        let source = match (has_path, has_data) {
-            (true, false) => {
-                let path = map
-                    .get(Value::String("path".to_string()))
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| Error::custom("Invalid 'path' value"))?
-                    .to_string();
-                CertKeySource::Path(path)
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("a NamedPem with 'pem' and either 'path' or 'data' fields")
             }
-            (false, true) => {
-                let data = map
-                    .get(Value::String("data".to_string()))
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| Error::custom("Invalid 'data' value"))?
-                    .to_string();
-                CertKeySource::Data(data)
-            }
-            (true, true) => {
-                return Err(Error::custom(
-                    "NamedCert cannot have both 'path' and 'data' fields",
-                ));
-            }
-            (false, false) => {
-                return Err(Error::custom(
-                    "NamedCert must have either 'path' or 'data' field",
-                ));
-            }
-        };
 
-        Ok(NamedCert {
-            cert: cert_name,
-            source,
-        })
-    }
-}
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut pem_name: Option<String> = None;
+                let mut path: Option<String> = None;
+                let mut data: Option<String> = None;
 
-impl Serialize for NamedCert {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::ser::Serializer,
-    {
-        use serde::ser::SerializeMap;
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "pem" => {
+                            if pem_name.is_some() {
+                                return Err(Error::duplicate_field("pem"));
+                            }
+                            pem_name = Some(map.next_value()?);
+                        }
+                        "path" => {
+                            if path.is_some() {
+                                return Err(Error::duplicate_field("path"));
+                            }
+                            path = Some(map.next_value()?);
+                        }
+                        "data" => {
+                            if data.is_some() {
+                                return Err(Error::duplicate_field("data"));
+                            }
+                            data = Some(map.next_value()?);
+                        }
+                        _ => {
+                            // Ignore unknown fields
+                            let _: serde::de::IgnoredAny = map.next_value()?;
+                        }
+                    }
+                }
 
-        let mut map = serializer.serialize_map(Some(2))?;
-        map.serialize_entry("cert", &self.cert)?;
+                let pem_name = pem_name.ok_or_else(|| Error::missing_field("pem"))?;
 
-        match &self.source {
-            CertKeySource::Path(path) => {
-                map.serialize_entry("path", path)?;
-            }
-            CertKeySource::Data(data) => {
-                map.serialize_entry("data", data)?;
+                let source = match (path, data) {
+                    (Some(p), None) => PemSource::Path(p),
+                    (None, Some(d)) => PemSource::Data(d),
+                    (Some(_), Some(_)) => {
+                        return Err(Error::custom(
+                            "NamedPem cannot have both 'path' and 'data' fields",
+                        ));
+                    }
+                    (None, None) => {
+                        return Err(Error::custom(
+                            "NamedPem must have either 'path' or 'data' field",
+                        ));
+                    }
+                };
+
+                Ok(NamedPem {
+                    pem: pem_name,
+                    source,
+                })
             }
         }
 
-        map.end()
+        deserializer.deserialize_map(NamedPemVisitor)
     }
 }
 
-impl<'de> Deserialize<'de> for NamedPrivateKey {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::de::Deserializer<'de>,
-    {
-        use serde::de::Error;
-        use serde_yaml::Value;
-
-        let value = Value::deserialize(deserializer)?;
-        let map = value
-            .as_mapping()
-            .ok_or_else(|| Error::custom("Expected a mapping for NamedPrivateKey"))?;
-
-        // Get the key name
-        let key_name = map
-            .get(Value::String("key".to_string()))
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| Error::custom("Missing 'key' field in NamedPrivateKey"))?
-            .to_string();
-
-        // Determine source based on fields
-        let has_path = map.contains_key(Value::String("path".to_string()));
-        let has_data = map.contains_key(Value::String("data".to_string()));
-
-        let source = match (has_path, has_data) {
-            (true, false) => {
-                let path = map
-                    .get(Value::String("path".to_string()))
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| Error::custom("Invalid 'path' value"))?
-                    .to_string();
-                CertKeySource::Path(path)
-            }
-            (false, true) => {
-                let data = map
-                    .get(Value::String("data".to_string()))
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| Error::custom("Invalid 'data' value"))?
-                    .to_string();
-                CertKeySource::Data(data)
-            }
-            (true, true) => {
-                return Err(Error::custom(
-                    "NamedPrivateKey cannot have both 'path' and 'data' fields",
-                ));
-            }
-            (false, false) => {
-                return Err(Error::custom(
-                    "NamedPrivateKey must have either 'path' or 'data' field",
-                ));
-            }
-        };
-
-        Ok(NamedPrivateKey {
-            key: key_name,
-            source,
-        })
-    }
-}
-
-impl Serialize for NamedPrivateKey {
+impl Serialize for NamedPem {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::ser::Serializer,
@@ -255,13 +186,13 @@ impl Serialize for NamedPrivateKey {
         use serde::ser::SerializeMap;
 
         let mut map = serializer.serialize_map(Some(2))?;
-        map.serialize_entry("key", &self.key)?;
+        map.serialize_entry("pem", &self.pem)?;
 
         match &self.source {
-            CertKeySource::Path(path) => {
+            PemSource::Path(path) => {
                 map.serialize_entry("path", path)?;
             }
-            CertKeySource::Data(data) => {
+            PemSource::Data(data) => {
                 map.serialize_entry("data", data)?;
             }
         }
@@ -276,8 +207,7 @@ pub enum Config {
     Server(ServerConfig),
     ClientConfigGroup(ClientConfigGroup),
     RuleConfigGroup(RuleConfigGroup),
-    NamedCert(NamedCert),
-    NamedPrivateKey(NamedPrivateKey),
+    NamedPem(NamedPem),
 }
 
 impl<'de> serde::de::Deserialize<'de> for Config {
@@ -301,34 +231,22 @@ impl<'de> serde::de::Deserialize<'de> for Config {
         let has_rule_group = map.contains_key(Value::String("rule_group".to_string()));
         let has_address = map.contains_key(Value::String("address".to_string()));
         let has_path_field = map.contains_key(Value::String("path".to_string()));
-        let has_cert = map.contains_key(Value::String("cert".to_string()));
-        let has_key = map.contains_key(Value::String("key".to_string()));
+        let has_pem = map.contains_key(Value::String("pem".to_string()));
 
         // Try to determine which variant based on fields
-        if has_cert && !has_address {
-            // This is a NamedCert (cert field is unique to NamedCert)
-            let cert: NamedCert = serde_yaml::from_value(value)
+        if has_pem {
+            // This is a NamedPem (pem field is unique to NamedPem)
+            let pem: NamedPem = serde_yaml::from_value(value)
                 .map_err(|e| Error::custom(format!(
-                    "Failed to parse named certificate: {}. Expected fields: 'cert' and either 'path' or 'data'",
-                    e
+                    "Failed to parse named PEM: {e}. Expected fields: 'pem' and either 'path' or 'data'"
                 )))?;
 
-            Ok(Config::NamedCert(cert))
-        } else if has_key && !has_cert && !has_address {
-            // This is a NamedPrivateKey (key field without cert is unique to NamedPrivateKey)
-            let key: NamedPrivateKey = serde_yaml::from_value(value)
-                .map_err(|e| Error::custom(format!(
-                    "Failed to parse named private key: {}. Expected fields: 'key' and either 'path' or 'data'",
-                    e
-                )))?;
-
-            Ok(Config::NamedPrivateKey(key))
+            Ok(Config::NamedPem(pem))
         } else if has_client_group {
             // This is a ClientConfigGroup
             let group: ClientConfigGroup = serde_yaml::from_value(value)
                 .map_err(|e| Error::custom(format!(
-                    "Failed to parse client config group: {}. Expected fields: 'client_group' and 'client_proxies' (or 'client_proxy')",
-                    e
+                    "Failed to parse client config group: {e}. Expected fields: 'client_group' and 'client_proxies' (or 'client_proxy')"
                 )))?;
 
             Ok(Config::ClientConfigGroup(group))
@@ -336,8 +254,7 @@ impl<'de> serde::de::Deserialize<'de> for Config {
             // This is a RuleConfigGroup
             let group: RuleConfigGroup = serde_yaml::from_value(value)
                 .map_err(|e| Error::custom(format!(
-                    "Failed to parse rule config group: {}. Expected fields: 'rule_group' and 'rules' (or 'rule')",
-                    e
+                    "Failed to parse rule config group: {e}. Expected fields: 'rule_group' and 'rules' (or 'rule')"
                 )))?;
 
             Ok(Config::RuleConfigGroup(group))
@@ -345,8 +262,7 @@ impl<'de> serde::de::Deserialize<'de> for Config {
             // This is a Server config
             let server: ServerConfig = serde_yaml::from_value(value)
                 .map_err(|e| Error::custom(format!(
-                    "Failed to parse server config: {}. Server configs must have either 'address' or 'path' field, plus 'protocol' and optional fields",
-                    e
+                    "Failed to parse server config: {e}. Server configs must have either 'address' or 'path' field, plus 'protocol' and optional fields"
                 )))?;
 
             Ok(Config::Server(server))
@@ -358,11 +274,10 @@ impl<'de> serde::de::Deserialize<'de> for Config {
                 .collect();
 
             Err(Error::custom(format!(
-                "Unable to determine config type. Found fields: {:?}. Expected one of:\n\
+                "Unable to determine config type. Found fields: {found_fields:?}. Expected one of:\n\
                 - Server config: must have 'address' or 'path' field\n\
                 - Client config group: must have 'client_group' field\n\
-                - Rule config group: must have 'rule_group' field",
-                found_fields
+                - Rule config group: must have 'rule_group' field"
             )))
         }
     }
@@ -377,8 +292,7 @@ impl serde::ser::Serialize for Config {
             Config::Server(server) => server.serialize(serializer),
             Config::ClientConfigGroup(group) => group.serialize(serializer),
             Config::RuleConfigGroup(group) => group.serialize(serializer),
-            Config::NamedCert(cert) => cert.serialize(serializer),
-            Config::NamedPrivateKey(key) => key.serialize(serializer),
+            Config::NamedPem(pem) => pem.serialize(serializer),
         }
     }
 }
@@ -524,10 +438,9 @@ impl<'de> serde::de::Deserialize<'de> for ShadowTlsServerHandshakeConfig {
             let handshake: ShadowTlsLocalHandshake =
                 serde_yaml::from_value(value).map_err(|e| {
                     Error::custom(format!(
-                        "Failed to parse local ShadowTLS handshake config: {}. \
+                        "Failed to parse local ShadowTLS handshake config: {e}. \
                     Local handshake requires 'cert' and 'key' fields, with optional \
-                    'alpn_protocols', 'client_ca_certs', and 'client_fingerprints'",
-                        e
+                    'alpn_protocols', 'client_ca_certs', and 'client_fingerprints'"
                     ))
                 })?;
 
@@ -537,9 +450,8 @@ impl<'de> serde::de::Deserialize<'de> for ShadowTlsServerHandshakeConfig {
             let handshake: ShadowTlsRemoteHandshake =
                 serde_yaml::from_value(value).map_err(|e| {
                     Error::custom(format!(
-                        "Failed to parse remote ShadowTLS handshake config: {}. \
-                    Remote handshake requires 'address' field, with optional 'client_proxies'",
-                        e
+                        "Failed to parse remote ShadowTLS handshake config: {e}. \
+                    Remote handshake requires 'address' field, with optional 'client_proxies'"
                     ))
                 })?;
 
@@ -552,10 +464,9 @@ impl<'de> serde::de::Deserialize<'de> for ShadowTlsServerHandshakeConfig {
                 .collect();
 
             Err(Error::custom(format!(
-                "Unable to determine ShadowTLS handshake type. Found fields: {:?}. Expected one of:\n\
+                "Unable to determine ShadowTLS handshake type. Found fields: {found_fields:?}. Expected one of:\n\
                 - Local handshake: must have 'cert' and 'key' fields\n\
-                - Remote handshake: must have 'address' field",
-                found_fields
+                - Remote handshake: must have 'address' field"
             )))
         }
     }
@@ -760,7 +671,7 @@ impl<T> ConfigSelection<T> {
                         None => {
                             return Err(std::io::Error::new(
                                 std::io::ErrorKind::InvalidInput,
-                                format!("No such client group: {}", client_group),
+                                format!("No such client group: {client_group}"),
                             ));
                         }
                     }
@@ -838,9 +749,8 @@ where
             {
                 let config = T::deserialize(serde::de::value::MapAccessDeserializer::new(map))
                     .map_err(|e| Error::custom(format!(
-                        "Failed to parse inline configuration: {}. \
-                        Expected either a string referencing a named group or a valid configuration object",
-                        e
+                        "Failed to parse inline configuration: {e}. \
+                        Expected either a string referencing a named group or a valid configuration object"
                     )))?;
                 Ok(ConfigSelection::Config(config))
             }
@@ -1091,7 +1001,7 @@ impl<'de> serde::de::Deserialize<'de> for NetLocationPortRange {
         let value = String::deserialize(deserializer)?;
         let net_location_port_range = NetLocationPortRange::from_str(&value).map_err(|e| {
             serde::de::Error::invalid_value(
-                serde::de::Unexpected::Other(&format!("invalid net location port range: {}", e)),
+                serde::de::Unexpected::Other(&format!("invalid net location port range: {e}")),
                 &"valid net location port range (address:port[-port][,port])",
             )
         })?;
@@ -1104,11 +1014,16 @@ impl<'de> serde::de::Deserialize<'de> for NetLocationPortRange {
 mod tests {
     use super::*;
     use crate::address::*;
-    use crate::config::*;
+    use crate::config::{convert_cert_paths, create_server_configs};
     use crate::option_util::*;
     use std::collections::HashMap;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::path::PathBuf;
+
+    async fn validate_configs_test(configs: Vec<Config>) -> std::io::Result<Vec<ServerConfig>> {
+        let (converted_configs, _) = convert_cert_paths(configs).await?;
+        create_server_configs(converted_configs).await
+    }
 
     fn create_test_server_config_http() -> ServerConfig {
         ServerConfig {
@@ -1388,7 +1303,7 @@ mod tests {
     fn test_server_config_http() {
         let original = vec![Config::Server(create_test_server_config_http())];
         let yaml_str = serde_yaml::to_string(&original).expect("Failed to serialize");
-        println!("HTTP config YAML:\n{}", yaml_str);
+        println!("HTTP config YAML:\n{yaml_str}");
         let deserialized: Vec<Config> =
             serde_yaml::from_str(&yaml_str).expect("Failed to deserialize");
 
@@ -1420,7 +1335,7 @@ mod tests {
     fn test_server_config_shadowsocks() {
         let original = vec![Config::Server(create_test_server_config_shadowsocks())];
         let yaml_str = serde_yaml::to_string(&original).expect("Failed to serialize");
-        println!("Shadowsocks YAML: {}", yaml_str);
+        println!("Shadowsocks YAML: {yaml_str}");
         let deserialized: Vec<Config> =
             serde_yaml::from_str(&yaml_str).expect("Failed to deserialize");
 
@@ -1676,7 +1591,7 @@ mod tests {
             }),
         ];
 
-        assert!(validate_configs(configs).await.is_ok());
+        assert!(validate_configs_test(configs).await.is_ok());
     }
 
     #[tokio::test]
@@ -1687,23 +1602,16 @@ mod tests {
             serde_yaml::from_str(&yaml_str).expect("Failed to deserialize");
 
         assert_eq!(deserialized.len(), 0);
-        assert!(validate_configs(deserialized).await.is_ok());
+        assert!(validate_configs_test(deserialized).await.is_ok());
     }
 
     #[tokio::test]
-    async fn test_named_cert_and_key_validation() {
+    async fn test_named_pem_validation() {
         let configs = vec![
-            Config::NamedCert(NamedCert {
-                cert: "my-server-cert".to_string(),
-                source: CertKeySource::Data(
-                    "-----BEGIN CERTIFICATE-----\ntest cert data\n-----END CERTIFICATE-----"
-                        .to_string(),
-                ),
-            }),
-            Config::NamedPrivateKey(NamedPrivateKey {
-                key: "my-server-key".to_string(),
-                source: CertKeySource::Data(
-                    "-----BEGIN PRIVATE KEY-----\ntest key data\n-----END PRIVATE KEY-----"
+            Config::NamedPem(NamedPem {
+                pem: "my-server-pem".to_string(),
+                source: PemSource::Data(
+                    "-----BEGIN CERTIFICATE-----\ntest cert data\n-----END CERTIFICATE-----\n-----BEGIN PRIVATE KEY-----\ntest key data\n-----END PRIVATE KEY-----"
                         .to_string(),
                 ),
             }),
@@ -1715,8 +1623,8 @@ mod tests {
                     tls_targets: vec![(
                         "example.com".to_string(),
                         TlsServerConfig {
-                            cert: "my-server-cert".to_string(), // Reference to named cert
-                            key: "my-server-key".to_string(),   // Reference to named key
+                            cert: "my-server-pem".to_string(), // Reference to named pem
+                            key: "my-server-pem".to_string(),   // Reference to named pem
                             client_ca_certs: NoneOrSome::None,
                             client_fingerprints: NoneOrSome::Unspecified,
                             alpn_protocols: NoneOrSome::Unspecified,
@@ -1740,10 +1648,10 @@ mod tests {
             }),
         ];
 
-        let result = validate_configs(configs).await;
+        let result = validate_configs_test(configs).await;
         assert!(result.is_ok());
 
-        let (server_configs, _) = result.unwrap();
+        let server_configs = result.unwrap();
         assert_eq!(server_configs.len(), 1);
 
         // Check that the named cert/key were resolved to the actual data
@@ -1752,16 +1660,55 @@ mod tests {
         } = server_configs[0].protocol
         {
             let tls_config = &tls_targets["example.com"];
+            // Both cert and key fields should contain the full PEM data
+            // The actual parsing/extraction happens when the data is used
             assert_eq!(
                 tls_config.cert,
-                "-----BEGIN CERTIFICATE-----\ntest cert data\n-----END CERTIFICATE-----"
+                "-----BEGIN CERTIFICATE-----\ntest cert data\n-----END CERTIFICATE-----\n-----BEGIN PRIVATE KEY-----\ntest key data\n-----END PRIVATE KEY-----"
             );
             assert_eq!(
                 tls_config.key,
-                "-----BEGIN PRIVATE KEY-----\ntest key data\n-----END PRIVATE KEY-----"
+                "-----BEGIN CERTIFICATE-----\ntest cert data\n-----END CERTIFICATE-----\n-----BEGIN PRIVATE KEY-----\ntest key data\n-----END PRIVATE KEY-----"
             );
         } else {
             panic!("Expected TLS protocol");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_named_pem_json_serialization() {
+        // Test that NamedPem can be serialized to JSON (for API responses)
+        let pem1 = NamedPem {
+            pem: "test-cert".to_string(),
+            source: PemSource::Data(
+                "-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----".to_string(),
+            ),
+        };
+
+        let json = serde_yaml::to_string(&pem1).expect("Failed to serialize NamedPem to YAML");
+        assert!(json.contains("pem: test-cert"));
+        assert!(json.contains("data: |"));
+        assert!(json.contains("-----BEGIN CERTIFICATE-----"));
+
+        // Test with path source
+        let pem2 = NamedPem {
+            pem: "test-cert-2".to_string(),
+            source: PemSource::Path("/etc/certs/test.pem".to_string()),
+        };
+
+        let yaml2 =
+            serde_yaml::to_string(&pem2).expect("Failed to serialize NamedPem with path to YAML");
+        assert!(yaml2.contains("pem: test-cert-2"));
+        assert!(yaml2.contains("path: /etc/certs/test.pem"));
+
+        // Test round-trip serialization
+        let yaml_str = "pem: test-cert\ndata: |\n  -----BEGIN CERTIFICATE-----\n  test\n  -----END CERTIFICATE-----";
+        let deserialized: NamedPem =
+            serde_yaml::from_str(yaml_str).expect("Failed to deserialize NamedPem from YAML");
+        assert_eq!(deserialized.pem, "test-cert");
+        match deserialized.source {
+            PemSource::Data(data) => assert!(data.contains("-----BEGIN CERTIFICATE-----")),
+            _ => panic!("Expected Data source"),
         }
     }
 
@@ -1804,13 +1751,13 @@ mod tests {
         // Test each example file
         for example_file in &example_files {
             let file_name = example_file.file_name().unwrap().to_str().unwrap();
-            println!("\nTesting example file: {}", file_name);
+            println!("\nTesting example file: {file_name}");
 
             // Read the file
             let content = match std::fs::read_to_string(example_file) {
                 Ok(c) => c,
                 Err(e) => {
-                    failures.push(format!("- {}: Failed to read file: {}", file_name, e));
+                    failures.push(format!("- {file_name}: Failed to read file: {e}"));
                     continue;
                 }
             };
@@ -1819,7 +1766,7 @@ mod tests {
             let configs: Vec<Config> = match serde_yaml::from_str(&content) {
                 Ok(c) => c,
                 Err(e) => {
-                    failures.push(format!("- {}: Failed to parse YAML: {}", file_name, e));
+                    failures.push(format!("- {file_name}: Failed to parse YAML: {e}"));
                     continue;
                 }
             };
@@ -1849,7 +1796,7 @@ mod tests {
         let result: Result<Vec<Config>, _> = serde_yaml::from_str(invalid_yaml);
         assert!(result.is_err());
         let error_msg = result.unwrap_err().to_string();
-        println!("Error for invalid config: {}", error_msg);
+        println!("Error for invalid config: {error_msg}");
         assert!(error_msg.contains("Unable to determine config type"));
         assert!(error_msg.contains("Found fields: "));
         assert!(error_msg.contains("foo"));
@@ -1864,7 +1811,7 @@ mod tests {
         let result: Result<Vec<Config>, _> = serde_yaml::from_str(invalid_server_yaml);
         assert!(result.is_err());
         let error_msg = result.unwrap_err().to_string();
-        println!("Error for invalid server: {}", error_msg);
+        println!("Error for invalid server: {error_msg}");
         assert!(error_msg.contains("Failed to parse server config"));
 
         // Test invalid client group
@@ -1876,7 +1823,7 @@ mod tests {
         let result: Result<Vec<Config>, _> = serde_yaml::from_str(invalid_client_yaml);
         assert!(result.is_err());
         let error_msg = result.unwrap_err().to_string();
-        println!("Error for invalid client group: {}", error_msg);
+        println!("Error for invalid client group: {error_msg}");
         assert!(error_msg.contains("Failed to parse client config group"));
     }
 
@@ -1894,7 +1841,7 @@ mod tests {
         };
 
         let yaml = serde_yaml::to_string(&local).unwrap();
-        println!("Local handshake (minimal):\n{}", yaml);
+        println!("Local handshake (minimal):\n{yaml}");
 
         // Should only contain cert and key
         assert!(yaml.contains("cert:"));
@@ -1910,7 +1857,7 @@ mod tests {
         };
 
         let yaml = serde_yaml::to_string(&remote).unwrap();
-        println!("Remote handshake (minimal):\n{}", yaml);
+        println!("Remote handshake (minimal):\n{yaml}");
 
         // Should only contain address
         assert!(yaml.contains("address:"));
@@ -1930,7 +1877,7 @@ mod tests {
             serde_yaml::from_str(invalid_missing_key);
         assert!(result.is_err());
         let error_msg = result.unwrap_err().to_string();
-        println!("Error for missing key: {}", error_msg);
+        println!("Error for missing key: {error_msg}");
         assert!(error_msg.contains("Failed to parse local ShadowTLS handshake config"));
         assert!(error_msg.contains("missing field `key`"));
         assert!(error_msg.contains("Local handshake requires 'cert' and 'key' fields"));
@@ -1944,7 +1891,7 @@ mod tests {
         let result: Result<ShadowTlsServerHandshakeConfig, _> = serde_yaml::from_str(invalid_mixed);
         assert!(result.is_err());
         let error_msg = result.unwrap_err().to_string();
-        println!("Error for mixed handshake fields: {}", error_msg);
+        println!("Error for mixed handshake fields: {error_msg}");
         // Since it has cert, it will try to parse as Local and fail due to missing key
         assert!(error_msg.contains("Failed to parse local ShadowTLS handshake config"));
         assert!(error_msg.contains("missing field `key`"));
@@ -1959,7 +1906,7 @@ mod tests {
             serde_yaml::from_str(invalid_unknown);
         assert!(result.is_err());
         let error_msg = result.unwrap_err().to_string();
-        println!("Error for unknown handshake fields: {}", error_msg);
+        println!("Error for unknown handshake fields: {error_msg}");
         assert!(error_msg.contains("Unable to determine ShadowTLS handshake type"));
         assert!(error_msg.contains("Found fields:"));
         assert!(error_msg.contains("unknown_field"));
@@ -1999,113 +1946,75 @@ mod tests {
             serde_yaml::from_str(invalid_remote_syntax);
         assert!(result.is_err());
         let error_msg = result.unwrap_err().to_string();
-        println!("Error for invalid remote syntax: {}", error_msg);
+        println!("Error for invalid remote syntax: {error_msg}");
         // This will generate a parse error for NetLocation
         assert!(error_msg.contains("Failed to parse remote ShadowTLS handshake config"));
     }
 
     #[test]
-    fn test_named_cert() {
+    fn test_named_pem() {
         // Test with path
-        let cert_with_path = NamedCert {
-            cert: "my-server-cert".to_string(),
-            source: CertKeySource::Path("/etc/certs/server.pem".to_string()),
+        let pem_with_path = NamedPem {
+            pem: "my-server-pem".to_string(),
+            source: PemSource::Path("/etc/certs/server.pem".to_string()),
         };
 
-        let yaml = serde_yaml::to_string(&cert_with_path).unwrap();
-        println!("NamedCert with path YAML:\n{}", yaml);
-        assert!(yaml.contains("cert: my-server-cert"));
+        let yaml = serde_yaml::to_string(&pem_with_path).unwrap();
+        println!("NamedPem with path YAML:\n{yaml}");
+        assert!(yaml.contains("pem: my-server-pem"));
         assert!(yaml.contains("path: /etc/certs/server.pem"));
 
-        let deserialized: NamedCert = serde_yaml::from_str(&yaml).unwrap();
-        assert_eq!(deserialized.cert, "my-server-cert");
+        let deserialized: NamedPem = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(deserialized.pem, "my-server-pem");
         match deserialized.source {
-            CertKeySource::Path(p) => assert_eq!(p, "/etc/certs/server.pem"),
+            PemSource::Path(p) => assert_eq!(p, "/etc/certs/server.pem"),
             _ => panic!("Expected Path source"),
         }
 
-        // Test with data
-        let cert_with_data = NamedCert {
-            cert: "inline-cert".to_string(),
-            source: CertKeySource::Data(
-                "-----BEGIN CERTIFICATE-----\nMIIBkTCB+wIJAKHHI...".to_string(),
+        // Test with data (combined cert and key)
+        let pem_with_data = NamedPem {
+            pem: "inline-pem".to_string(),
+            source: PemSource::Data(
+                "-----BEGIN CERTIFICATE-----\nMIIBkTCB+wIJAKHHI...\n-----END CERTIFICATE-----\n-----BEGIN PRIVATE KEY-----\nMIIEvQ...\n-----END PRIVATE KEY-----".to_string(),
             ),
         };
 
-        let yaml = serde_yaml::to_string(&cert_with_data).unwrap();
-        println!("NamedCert with data YAML:\n{}", yaml);
-        assert!(yaml.contains("cert: inline-cert"));
+        let yaml = serde_yaml::to_string(&pem_with_data).unwrap();
+        println!("NamedPem with data YAML:\n{yaml}");
+        assert!(yaml.contains("pem: inline-pem"));
         assert!(yaml.contains("data: "));
         assert!(yaml.contains("-----BEGIN CERTIFICATE-----"));
+        assert!(yaml.contains("-----BEGIN PRIVATE KEY-----"));
 
-        let deserialized: NamedCert = serde_yaml::from_str(&yaml).unwrap();
-        assert_eq!(deserialized.cert, "inline-cert");
+        let deserialized: NamedPem = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(deserialized.pem, "inline-pem");
         match deserialized.source {
-            CertKeySource::Data(d) => assert!(d.contains("-----BEGIN CERTIFICATE-----")),
+            PemSource::Data(d) => {
+                assert!(d.contains("-----BEGIN CERTIFICATE-----"));
+                assert!(d.contains("-----BEGIN PRIVATE KEY-----"));
+            }
             _ => panic!("Expected Data source"),
         }
     }
 
     #[test]
-    fn test_named_private_key() {
-        // Test with path
-        let key_with_path = NamedPrivateKey {
-            key: "my-server-key".to_string(),
-            source: CertKeySource::Path("/etc/keys/server.key".to_string()),
-        };
-
-        let yaml = serde_yaml::to_string(&key_with_path).unwrap();
-        println!("NamedPrivateKey with path YAML:\n{}", yaml);
-        assert!(yaml.contains("key: my-server-key"));
-        assert!(yaml.contains("path: /etc/keys/server.key"));
-
-        let deserialized: NamedPrivateKey = serde_yaml::from_str(&yaml).unwrap();
-        assert_eq!(deserialized.key, "my-server-key");
-        match deserialized.source {
-            CertKeySource::Path(p) => assert_eq!(p, "/etc/keys/server.key"),
-            _ => panic!("Expected Path source"),
-        }
-
-        // Test with data
-        let key_with_data = NamedPrivateKey {
-            key: "inline-key".to_string(),
-            source: CertKeySource::Data(
-                "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEA...".to_string(),
-            ),
-        };
-
-        let yaml = serde_yaml::to_string(&key_with_data).unwrap();
-        println!("NamedPrivateKey with data YAML:\n{}", yaml);
-        assert!(yaml.contains("key: inline-key"));
-        assert!(yaml.contains("data: "));
-        assert!(yaml.contains("-----BEGIN OPENSSH PRIVATE KEY-----"));
-
-        let deserialized: NamedPrivateKey = serde_yaml::from_str(&yaml).unwrap();
-        assert_eq!(deserialized.key, "inline-key");
-        match deserialized.source {
-            CertKeySource::Data(d) => assert!(d.contains("-----BEGIN OPENSSH PRIVATE KEY-----")),
-            _ => panic!("Expected Data source"),
-        }
-    }
-
-    #[test]
-    fn test_named_cert_invalid_yaml() {
-        // Missing cert field
+    fn test_named_pem_invalid_yaml() {
+        // Missing pem field
         let yaml = r#"
         path: /etc/certs/server.pem
         "#;
-        let result: Result<NamedCert, _> = serde_yaml::from_str(yaml);
+        let result: Result<NamedPem, _> = serde_yaml::from_str(yaml);
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
             .to_string()
-            .contains("Missing 'cert' field"));
+            .contains("missing field `pem`"));
 
         // Missing source (no path or data)
         let yaml = r#"
-        cert: my-cert
+        pem: my-pem
         "#;
-        let result: Result<NamedCert, _> = serde_yaml::from_str(yaml);
+        let result: Result<NamedPem, _> = serde_yaml::from_str(yaml);
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -2114,11 +2023,11 @@ mod tests {
 
         // Both path and data
         let yaml = r#"
-        cert: my-cert
+        pem: my-pem
         path: /etc/certs/server.pem
         data: "-----BEGIN CERTIFICATE-----"
         "#;
-        let result: Result<NamedCert, _> = serde_yaml::from_str(yaml);
+        let result: Result<NamedPem, _> = serde_yaml::from_str(yaml);
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -2127,20 +2036,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_quic_with_named_certs() {
-        // Test QUIC server with named certificates
+    async fn test_quic_with_named_pems() {
+        // Test QUIC server with named PEM
         let configs = vec![
-            Config::NamedCert(NamedCert {
-                cert: "quic-cert".to_string(),
-                source: CertKeySource::Data(
-                    "-----BEGIN CERTIFICATE-----\nquic cert data\n-----END CERTIFICATE-----"
-                        .to_string(),
-                ),
-            }),
-            Config::NamedPrivateKey(NamedPrivateKey {
-                key: "quic-key".to_string(),
-                source: CertKeySource::Data(
-                    "-----BEGIN PRIVATE KEY-----\nquic key data\n-----END PRIVATE KEY-----"
+            Config::NamedPem(NamedPem {
+                pem: "quic-pem".to_string(),
+                source: PemSource::Data(
+                    "-----BEGIN CERTIFICATE-----\nquic cert data\n-----END CERTIFICATE-----\n-----BEGIN PRIVATE KEY-----\nquic key data\n-----END PRIVATE KEY-----"
                         .to_string(),
                 ),
             }),
@@ -2155,8 +2057,8 @@ mod tests {
                 transport: Transport::Quic,
                 tcp_settings: None,
                 quic_settings: Some(ServerQuicConfig {
-                    cert: "quic-cert".to_string(), // Reference to named cert
-                    key: "quic-key".to_string(),   // Reference to named key
+                    cert: "quic-pem".to_string(), // Reference to named pem
+                    key: "quic-pem".to_string(),   // Reference to named pem
                     alpn_protocols: NoneOrSome::Some(vec!["h3".to_string()]),
                     client_ca_certs: NoneOrSome::None,
                     client_fingerprints: NoneOrSome::None,
@@ -2166,38 +2068,31 @@ mod tests {
             }),
         ];
 
-        let result = validate_configs(configs).await;
+        let result = validate_configs_test(configs).await;
         assert!(result.is_ok());
 
-        let (server_configs, _) = result.unwrap();
+        let server_configs = result.unwrap();
         assert_eq!(server_configs.len(), 1);
 
         let quic_settings = server_configs[0].quic_settings.as_ref().unwrap();
         assert_eq!(
             quic_settings.cert,
-            "-----BEGIN CERTIFICATE-----\nquic cert data\n-----END CERTIFICATE-----"
+            "-----BEGIN CERTIFICATE-----\nquic cert data\n-----END CERTIFICATE-----\n-----BEGIN PRIVATE KEY-----\nquic key data\n-----END PRIVATE KEY-----"
         );
         assert_eq!(
             quic_settings.key,
-            "-----BEGIN PRIVATE KEY-----\nquic key data\n-----END PRIVATE KEY-----"
+            "-----BEGIN CERTIFICATE-----\nquic cert data\n-----END CERTIFICATE-----\n-----BEGIN PRIVATE KEY-----\nquic key data\n-----END PRIVATE KEY-----"
         );
     }
 
     #[tokio::test]
-    async fn test_shadowtls_with_named_certs() {
-        // Test ShadowTLS with named certificates
+    async fn test_shadowtls_with_named_pems() {
+        // Test ShadowTLS with named PEM
         let configs = vec![
-            Config::NamedCert(NamedCert {
-                cert: "shadow-cert".to_string(),
-                source: CertKeySource::Data(
-                    "-----BEGIN CERTIFICATE-----\nshadow cert\n-----END CERTIFICATE-----"
-                        .to_string(),
-                ),
-            }),
-            Config::NamedPrivateKey(NamedPrivateKey {
-                key: "shadow-key".to_string(),
-                source: CertKeySource::Data(
-                    "-----BEGIN PRIVATE KEY-----\nshadow key\n-----END PRIVATE KEY-----"
+            Config::NamedPem(NamedPem {
+                pem: "shadow-pem".to_string(),
+                source: PemSource::Data(
+                    "-----BEGIN CERTIFICATE-----\nshadow cert\n-----END CERTIFICATE-----\n-----BEGIN PRIVATE KEY-----\nshadow key\n-----END PRIVATE KEY-----"
                         .to_string(),
                 ),
             }),
@@ -2214,8 +2109,8 @@ mod tests {
                             password: "shadow-password".to_string(),
                             handshake: ShadowTlsServerHandshakeConfig::Local(
                                 ShadowTlsLocalHandshake {
-                                    cert: "shadow-cert".to_string(),
-                                    key: "shadow-key".to_string(),
+                                    cert: "shadow-pem".to_string(),
+                                    key: "shadow-pem".to_string(),
                                     alpn_protocols: NoneOrSome::Unspecified,
                                     client_ca_certs: NoneOrSome::Unspecified,
                                     client_fingerprints: NoneOrSome::Unspecified,
@@ -2239,10 +2134,10 @@ mod tests {
             }),
         ];
 
-        let result = validate_configs(configs).await;
+        let result = validate_configs_test(configs).await;
         assert!(result.is_ok());
 
-        let (server_configs, _) = result.unwrap();
+        let server_configs = result.unwrap();
         if let ServerProxyConfig::Tls {
             ref shadowtls_targets,
             ..
@@ -2250,13 +2145,14 @@ mod tests {
         {
             let shadow_config = &shadowtls_targets["shadow.example.com"];
             if let ShadowTlsServerHandshakeConfig::Local(ref handshake) = shadow_config.handshake {
+                // Both cert and key fields should contain the full PEM data
                 assert_eq!(
                     handshake.cert,
-                    "-----BEGIN CERTIFICATE-----\nshadow cert\n-----END CERTIFICATE-----"
+                    "-----BEGIN CERTIFICATE-----\nshadow cert\n-----END CERTIFICATE-----\n-----BEGIN PRIVATE KEY-----\nshadow key\n-----END PRIVATE KEY-----"
                 );
                 assert_eq!(
                     handshake.key,
-                    "-----BEGIN PRIVATE KEY-----\nshadow key\n-----END PRIVATE KEY-----"
+                    "-----BEGIN CERTIFICATE-----\nshadow cert\n-----END CERTIFICATE-----\n-----BEGIN PRIVATE KEY-----\nshadow key\n-----END PRIVATE KEY-----"
                 );
             } else {
                 panic!("Expected Local handshake");
@@ -2265,61 +2161,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_named_cert_duplicate_names() {
-        // Test that duplicate named cert/key names are rejected
+    async fn test_named_pem_duplicate_names() {
+        // Test that duplicate named PEM names are rejected
         let configs = vec![
-            Config::NamedCert(NamedCert {
-                cert: "duplicate-name".to_string(),
-                source: CertKeySource::Data("cert1".to_string()),
+            Config::NamedPem(NamedPem {
+                pem: "duplicate-name".to_string(),
+                source: PemSource::Data("pem1".to_string()),
             }),
-            Config::NamedCert(NamedCert {
-                cert: "duplicate-name".to_string(),
-                source: CertKeySource::Data("cert2".to_string()),
+            Config::NamedPem(NamedPem {
+                pem: "duplicate-name".to_string(),
+                source: PemSource::Data("pem2".to_string()),
             }),
         ];
 
-        let result = validate_configs(configs).await;
+        let result = validate_configs_test(configs).await;
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
             .to_string()
-            .contains("named certificate already exists: duplicate-name"));
-    }
-
-    #[tokio::test]
-    async fn test_named_key_duplicate_names() {
-        let configs = vec![
-            Config::NamedPrivateKey(NamedPrivateKey {
-                key: "duplicate-key".to_string(),
-                source: CertKeySource::Data("key1".to_string()),
-            }),
-            Config::NamedPrivateKey(NamedPrivateKey {
-                key: "duplicate-key".to_string(),
-                source: CertKeySource::Data("key2".to_string()),
-            }),
-        ];
-
-        let result = validate_configs(configs).await;
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("named private key already exists: duplicate-key"));
+            .contains("named pem already exists: duplicate-name"));
     }
 
     #[tokio::test]
     async fn test_client_ca_certs_with_named_refs() {
-        // Test that client CA certs can use named certificate references
+        // Test that client CA certs can use named PEM references
         let configs = vec![
-            Config::NamedCert(NamedCert {
-                cert: "ca-cert-1".to_string(),
-                source: CertKeySource::Data(
+            Config::NamedPem(NamedPem {
+                pem: "ca-pem-1".to_string(),
+                source: PemSource::Data(
                     "-----BEGIN CERTIFICATE-----\nCA1\n-----END CERTIFICATE-----".to_string(),
                 ),
             }),
-            Config::NamedCert(NamedCert {
-                cert: "ca-cert-2".to_string(),
-                source: CertKeySource::Data(
+            Config::NamedPem(NamedPem {
+                pem: "ca-pem-2".to_string(),
+                source: PemSource::Data(
                     "-----BEGIN CERTIFICATE-----\nCA2\n-----END CERTIFICATE-----".to_string(),
                 ),
             }),
@@ -2336,8 +2211,8 @@ mod tests {
                             key: "-----BEGIN PRIVATE KEY-----\nkey\n-----END PRIVATE KEY-----"
                                 .to_string(),
                             client_ca_certs: NoneOrSome::Some(vec![
-                                "ca-cert-1".to_string(),
-                                "ca-cert-2".to_string(),
+                                "ca-pem-1".to_string(),
+                                "ca-pem-2".to_string(),
                                 "-----BEGIN CERTIFICATE-----\nCA3\n-----END CERTIFICATE-----"
                                     .to_string(),
                             ]),
@@ -2363,10 +2238,10 @@ mod tests {
             }),
         ];
 
-        let result = validate_configs(configs).await;
+        let result = validate_configs_test(configs).await;
         assert!(result.is_ok());
 
-        let (server_configs, _) = result.unwrap();
+        let server_configs = result.unwrap();
         if let ServerProxyConfig::Tls {
             ref tls_targets, ..
         } = server_configs[0].protocol
@@ -2391,47 +2266,50 @@ mod tests {
     }
 
     #[test]
-    fn test_config_with_named_certs() {
-        // Test NamedCert as Config
-        let cert_config = Config::NamedCert(NamedCert {
-            cert: "web-server-cert".to_string(),
-            source: CertKeySource::Path("/etc/certs/web.pem".to_string()),
+    fn test_config_with_named_pems() {
+        // Test NamedPem as Config with path
+        let pem_config = Config::NamedPem(NamedPem {
+            pem: "web-server-pem".to_string(),
+            source: PemSource::Path("/etc/certs/web.pem".to_string()),
         });
 
-        let yaml = serde_yaml::to_string(&cert_config).unwrap();
-        println!("Config::NamedCert YAML:\n{}", yaml);
+        let yaml = serde_yaml::to_string(&pem_config).unwrap();
+        println!("Config::NamedPem YAML:\n{yaml}");
 
         let deserialized: Config = serde_yaml::from_str(&yaml).unwrap();
         match deserialized {
-            Config::NamedCert(cert) => {
-                assert_eq!(cert.cert, "web-server-cert");
-                match cert.source {
-                    CertKeySource::Path(p) => assert_eq!(p, "/etc/certs/web.pem"),
+            Config::NamedPem(pem) => {
+                assert_eq!(pem.pem, "web-server-pem");
+                match pem.source {
+                    PemSource::Path(p) => assert_eq!(p, "/etc/certs/web.pem"),
                     _ => panic!("Expected Path source"),
                 }
             }
-            _ => panic!("Expected NamedCert config"),
+            _ => panic!("Expected NamedPem config"),
         }
 
-        // Test NamedPrivateKey as Config
-        let key_config = Config::NamedPrivateKey(NamedPrivateKey {
-            key: "web-server-key".to_string(),
-            source: CertKeySource::Data("-----BEGIN PRIVATE KEY-----\n...".to_string()),
+        // Test NamedPem as Config with data
+        let pem_config_data = Config::NamedPem(NamedPem {
+            pem: "web-server-pem-data".to_string(),
+            source: PemSource::Data("-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----\n-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----".to_string()),
         });
 
-        let yaml = serde_yaml::to_string(&key_config).unwrap();
-        println!("Config::NamedPrivateKey YAML:\n{}", yaml);
+        let yaml = serde_yaml::to_string(&pem_config_data).unwrap();
+        println!("Config::NamedPem with data YAML:\n{yaml}");
 
         let deserialized: Config = serde_yaml::from_str(&yaml).unwrap();
         match deserialized {
-            Config::NamedPrivateKey(key) => {
-                assert_eq!(key.key, "web-server-key");
-                match key.source {
-                    CertKeySource::Data(d) => assert!(d.contains("-----BEGIN PRIVATE KEY-----")),
+            Config::NamedPem(pem) => {
+                assert_eq!(pem.pem, "web-server-pem-data");
+                match pem.source {
+                    PemSource::Data(d) => {
+                        assert!(d.contains("-----BEGIN CERTIFICATE-----"));
+                        assert!(d.contains("-----BEGIN PRIVATE KEY-----"));
+                    }
                     _ => panic!("Expected Data source"),
                 }
             }
-            _ => panic!("Expected NamedPrivateKey config"),
+            _ => panic!("Expected NamedPem config"),
         }
     }
 }

@@ -50,7 +50,7 @@ impl From<&str> for ShadowsocksCipher {
             "aes-256-gcm" => ShadowsocksCipher::aes_256_gcm(),
             "aes-128-gcm" => ShadowsocksCipher::aes_128_gcm(),
             _ => {
-                panic!("Unknown cipher: {}", name);
+                panic!("Unknown cipher: {name}");
             }
         }
     }

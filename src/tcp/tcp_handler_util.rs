@@ -127,7 +127,7 @@ pub fn create_tcp_server_handler(
             Box::new(PortForwardServerHandler::new(targets))
         }
         unknown_config => {
-            panic!("Unsupported TCP proxy config: {:?}", unknown_config)
+            panic!("Unsupported TCP proxy config: {unknown_config:?}")
         }
     }
 }
