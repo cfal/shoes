@@ -54,7 +54,7 @@ impl<T> ConnectAction<T> {
         ConnectAction::Block
     }
 
-    pub fn to_decision(&self, target_location: NetLocation) -> ConnectDecision<T> {
+    pub fn to_decision(&self, target_location: NetLocation) -> ConnectDecision<'_, T> {
         match self {
             ConnectAction::Allow {
                 override_address,
