@@ -86,8 +86,10 @@ async fn process_connection(
         }
     }));
 
-    for join_handle in join_handles {
-        join_handle.await?;
+    // Use try_join to fail fast if any task errors
+    let results = futures::future::join_all(join_handles).await;
+    for result in results {
+        result?;
     }
 
     Ok(())
@@ -196,6 +198,7 @@ struct UdpSession {
     last_location: NetLocation,
     last_socket_addr: SocketAddr,
     override_remote_write_address: Option<SocketAddr>,
+    last_activity: std::time::Instant,
 }
 
 struct FragmentedPacket {
@@ -223,6 +226,7 @@ impl UdpSession {
             last_location: initial_location,
             last_socket_addr: initial_socket_addr,
             override_remote_write_address,
+            last_activity: std::time::Instant::now(),
         };
 
         tokio::spawn(async move {
@@ -345,8 +349,26 @@ async fn run_udp_local_to_remote_loop(
 ) -> std::io::Result<()> {
     let mut resolver_cache = ResolverCache::new(resolver.clone());
     let mut sessions: FxHashMap<u32, UdpSession> = FxHashMap::default();
+    let mut last_cleanup = std::time::Instant::now();
+
+    const CLEANUP_INTERVAL: Duration = Duration::from_secs(100);
+    const IDLE_TIMEOUT: Duration = Duration::from_secs(200);
 
     loop {
+        // Periodically clean up stale sessions
+        let now = std::time::Instant::now();
+        if (now - last_cleanup) > CLEANUP_INTERVAL {
+            sessions.retain(|session_id, session| {
+                if session.last_activity.elapsed() > IDLE_TIMEOUT {
+                    error!("Removing inactive UDP session {session_id}");
+                    false
+                } else {
+                    true
+                }
+            });
+            last_cleanup = now;
+        }
+
         let data = connection
             .read_datagram()
             .await
@@ -373,7 +395,7 @@ async fn run_udp_local_to_remote_loop(
                 3 => 8,
                 _ => {
                     // impossible since we only have 2 bits
-                    panic!("invalid num bytes value");
+                    unreachable!();
                 }
             };
             let mut next_index = 9;
@@ -594,6 +616,8 @@ async fn run_udp_local_to_remote_loop(
             .await
         {
             error!("Failed to forward UDP payload for session {session_id}: {e}");
+            // Remove the failed session
+            sessions.remove(&session_id);
         }
     }
 }
@@ -859,6 +883,7 @@ pub async fn start_hysteria2_server(
                 // required for HTTP/3 QPACK updates
                 .max_concurrent_uni_streams(1024_u32.into())
                 .max_idle_timeout(Some(Duration::from_secs(60).try_into().unwrap()))
+                .keep_alive_interval(Some(Duration::from_secs(15)))
                 .send_window(16 * 1024 * 1024)
                 .receive_window((20u32 * 1024 * 1024).into())
                 .stream_receive_window((8u32 * 1024 * 1024).into());
