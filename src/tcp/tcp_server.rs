@@ -16,6 +16,7 @@ use crate::copy_bidirectional::copy_bidirectional;
 use crate::copy_bidirectional_message::copy_bidirectional_message;
 use crate::copy_multidirectional_message::copy_multidirectional_message;
 use crate::resolver::{resolve_single_address, NativeResolver, Resolver};
+use crate::socket_util::set_tcp_keepalive;
 use crate::tcp_client_connector::TcpClientConnector;
 use crate::tcp_handler::{TcpServerHandler, TcpServerSetupResult};
 use crate::tcp_handler_util::{create_tcp_client_proxy_selector, create_tcp_server_handler};
@@ -41,6 +42,14 @@ async fn run_tcp_server(
                 continue;
             }
         };
+
+        if let Err(e) = set_tcp_keepalive(
+            &stream,
+            std::time::Duration::from_secs(300),
+            std::time::Duration::from_secs(60),
+        ) {
+            error!("Failed to set TCP keepalive: {e}");
+        }
 
         if no_delay {
             if let Err(e) = stream.set_nodelay(true) {
