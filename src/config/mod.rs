@@ -60,6 +60,7 @@ pub async fn convert_cert_paths(all_configs: Vec<Config>) -> std::io::Result<(Ve
     let mut data_configs = vec![];
     let mut load_count = 0usize;
     let mut server_configs = vec![];
+    let mut client_group_configs = vec![];
     let mut other_configs = vec![];
     for config in all_configs.into_iter() {
         match config {
@@ -86,6 +87,9 @@ pub async fn convert_cert_paths(all_configs: Vec<Config>) -> std::io::Result<(Ve
             Config::Server(server_config) => {
                 server_configs.push(server_config);
             }
+            Config::ClientConfigGroup(client_group_config) => {
+                client_group_configs.push(client_group_config);
+            }
             _ => other_configs.push(config),
         }
     }
@@ -96,7 +100,15 @@ pub async fn convert_cert_paths(all_configs: Vec<Config>) -> std::io::Result<(Ve
     // we do this as a separate step because we can't load the data in an async manner
     // right away due to recursion.
     for config in server_configs.iter_mut() {
-        gather_pem_file_paths(config, &path_pem_configs, &mut unknown_pem_paths);
+        gather_pem_file_paths_from_server_config(config, &path_pem_configs, &mut unknown_pem_paths);
+    }
+
+    for config in client_group_configs.iter_mut() {
+        gather_pem_file_paths_from_client_config_group(
+            config,
+            &path_pem_configs,
+            &mut unknown_pem_paths,
+        );
     }
 
     let mut updated_configs = vec![];
@@ -121,6 +133,10 @@ pub async fn convert_cert_paths(all_configs: Vec<Config>) -> std::io::Result<(Ve
     }
 
     updated_configs.append(&mut other_configs);
+
+    for client_group_config in client_group_configs.into_iter() {
+        updated_configs.push(Config::ClientConfigGroup(client_group_config));
+    }
 
     for server_config in server_configs.into_iter() {
         updated_configs.push(Config::Server(server_config));
@@ -207,7 +223,7 @@ pub async fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<
     Ok(server_configs)
 }
 
-fn gather_pem_file_paths(
+fn gather_pem_file_paths_from_server_config(
     server_config: &mut ServerConfig,
     known_pem_paths: &HashMap<String, NamedPem>,
     unknown_pem_paths: &mut HashMap<String, String>,
@@ -231,6 +247,16 @@ fn gather_pem_file_paths(
     // Check rules
     for rule in server_config.rules.iter_mut() {
         gather_pem_file_paths_from_rule(rule, known_pem_paths, unknown_pem_paths);
+    }
+}
+
+fn gather_pem_file_paths_from_client_config_group(
+    client_group_config: &mut ClientConfigGroup,
+    known_pem_paths: &HashMap<String, NamedPem>,
+    unknown_pem_paths: &mut HashMap<String, String>,
+) {
+    for client_config in client_group_config.client_proxies.iter_mut() {
+        gather_pem_file_paths_from_client_config(client_config, known_pem_paths, unknown_pem_paths);
     }
 }
 
