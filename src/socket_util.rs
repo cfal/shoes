@@ -1,5 +1,6 @@
+use std::mem::ManuallyDrop;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::os::fd::{FromRawFd, IntoRawFd};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
 
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
@@ -116,4 +117,23 @@ pub fn new_tcp_socket(
     }
 
     Ok(tcp_socket)
+}
+
+pub fn set_tcp_keepalive(
+    tcp_stream: &tokio::net::TcpStream,
+    idle_time: std::time::Duration,
+    send_interval: std::time::Duration,
+) -> std::io::Result<()> {
+    let raw_fd = tcp_stream.as_raw_fd();
+    let socket2_socket = ManuallyDrop::new(unsafe { Socket::from_raw_fd(raw_fd) });
+    if idle_time.is_zero() && send_interval.is_zero() {
+        socket2_socket.set_keepalive(false)?;
+    } else {
+        let keepalive = socket2::TcpKeepalive::new()
+            .with_time(idle_time)
+            .with_interval(send_interval);
+        socket2_socket.set_keepalive(true)?;
+        socket2_socket.set_tcp_keepalive(&keepalive)?;
+    }
+    Ok(())
 }

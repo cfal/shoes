@@ -9,7 +9,9 @@ use crate::config::{ClientConfig, ClientQuicConfig, TcpConfig, Transport};
 use crate::quic_stream::QuicStream;
 use crate::resolver::{resolve_single_address, Resolver};
 use crate::rustls_util::create_client_config;
-use crate::socket_util::{new_reuse_udp_sockets, new_tcp_socket, new_udp_socket};
+use crate::socket_util::{
+    new_reuse_udp_sockets, new_tcp_socket, new_udp_socket, set_tcp_keepalive,
+};
 use crate::tcp_handler::{TcpClientHandler, TcpClientSetupResult};
 use crate::tcp_handler_util::create_tcp_client_handler;
 use crate::thread_util::get_num_threads;
@@ -208,6 +210,16 @@ impl TcpClientConnector {
                 let tcp_socket =
                     new_tcp_socket(self.bind_interface.clone(), target_addr.is_ipv6())?;
                 let client_stream = tcp_socket.connect(target_addr).await?;
+
+                // set shorter interval for proxy to target for faster failure detection
+                if let Err(e) = set_tcp_keepalive(
+                    &client_stream,
+                    std::time::Duration::from_secs(120),
+                    std::time::Duration::from_secs(30),
+                ) {
+                    error!("Failed to set TCP keepalive on client socket: {e}");
+                }
+
                 if no_delay {
                     if let Err(e) = client_stream.set_nodelay(true) {
                         error!("Failed to set TCP no-delay on client socket: {e}");
