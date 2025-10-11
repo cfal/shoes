@@ -34,6 +34,9 @@ const COMMAND_TYPE_HEARTBEAT: u8 = 0x04;
 const MAX_ADDRESS_BYTES_LEN: usize = 1 + 1 + 255 + 2;
 const MAX_HEADER_LEN: usize = 2 + 2 + 1 + 1 + 2 + MAX_ADDRESS_BYTES_LEN;
 
+const CLEANUP_INTERVAL: Duration = Duration::from_secs(100);
+const IDLE_TIMEOUT: Duration = Duration::from_secs(200);
+
 type UdpSessionMap = Arc<DashMap<u16, UdpSession>>;
 
 async fn process_connection(
@@ -385,6 +388,7 @@ struct UdpSession {
     last_location: NetLocation,
     last_socket_addr: SocketAddr,
     override_remote_write_address: Option<SocketAddr>,
+    last_activity: std::time::Instant,
 }
 
 struct FragmentedPacket {
@@ -410,6 +414,7 @@ impl UdpSession {
             last_location: initial_location,
             last_socket_addr: initial_socket_addr,
             override_remote_write_address,
+            last_activity: std::time::Instant::now(),
         };
 
         tokio::spawn(async move {
@@ -442,6 +447,7 @@ impl UdpSession {
             last_location: initial_location,
             last_socket_addr: initial_socket_addr,
             override_remote_write_address,
+            last_activity: std::time::Instant::now(),
         };
 
         tokio::spawn(async move {
@@ -686,6 +692,23 @@ async fn run_unidirectional_loop(
     resolver: Arc<dyn Resolver>,
     udp_session_map: UdpSessionMap,
 ) -> std::io::Result<()> {
+    // Spawn a cleanup task for UDP sessions
+    let cleanup_session_map = udp_session_map.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(CLEANUP_INTERVAL);
+        loop {
+            interval.tick().await;
+            cleanup_session_map.retain(|assoc_id, session| {
+                if session.last_activity.elapsed() > IDLE_TIMEOUT {
+                    error!("Removing inactive UDP session {assoc_id}");
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+    });
+
     loop {
         let recv_stream = match connection.accept_uni().await {
             Ok(recv_stream) => recv_stream,
@@ -927,11 +950,17 @@ async fn process_udp_packet(
             .await
         {
             error!("Failed to forward UDP payload for session {assoc_id}: {e}");
+            // Remove the failed session
+            drop(session);
+            udp_session_map.remove(&assoc_id);
+            return Ok(());
         }
 
-        if is_updated {
-            drop(session);
-            if let Some(mut session) = udp_session_map.get_mut(&assoc_id) {
+        // Update activity timestamp
+        drop(session);
+        if let Some(mut session) = udp_session_map.get_mut(&assoc_id) {
+            session.last_activity = std::time::Instant::now();
+            if is_updated {
                 session.update_last_location(remote_location.clone(), socket_addr);
             }
         }
@@ -1006,19 +1035,23 @@ async fn process_udp_packet(
             complete_payload.extend_from_slice(frag.as_ref().unwrap());
         }
 
-        session
+        if let Err(e) = session
             .send_socket
             .send_to(&complete_payload, socket_addr)
             .await
-            .map_err(|e| {
-                std::io::Error::other(format!(
-                    "Failed to forward UDP payload for session {assoc_id}: {e}"
-                ))
-            })?;
-
-        if is_updated {
+        {
+            error!("Failed to forward UDP payload for session {assoc_id}: {e}");
+            // Remove the failed session
             drop(session);
-            if let Some(mut session) = udp_session_map.get_mut(&assoc_id) {
+            udp_session_map.remove(&assoc_id);
+            return Ok(());
+        }
+
+        // Update activity timestamp
+        drop(session);
+        if let Some(mut session) = udp_session_map.get_mut(&assoc_id) {
+            session.last_activity = std::time::Instant::now();
+            if is_updated {
                 session.update_last_location(remote_location.clone(), socket_addr);
             }
         }
@@ -1036,8 +1069,23 @@ async fn run_datagram_loop(
     // we assume that all fragments of a single packet will be sent through the same mechanism
     // (in this case, datagram) to prevent unnecessary locking.
     let mut fragments: FxHashMap<u16, FragmentedPacket> = FxHashMap::default();
+    let mut last_cleanup = std::time::Instant::now();
 
     loop {
+        // Periodically clean up stale sessions
+        let now = std::time::Instant::now();
+        if (now - last_cleanup) > CLEANUP_INTERVAL {
+            udp_session_map.retain(|assoc_id, session| {
+                if session.last_activity.elapsed() > IDLE_TIMEOUT {
+                    error!("Removing inactive UDP session {assoc_id}");
+                    false
+                } else {
+                    true
+                }
+            });
+            last_cleanup = now;
+        }
+
         let data = connection
             .read_datagram()
             .await
