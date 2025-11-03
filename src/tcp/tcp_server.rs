@@ -16,7 +16,7 @@ use crate::copy_bidirectional::copy_bidirectional;
 use crate::copy_bidirectional_message::copy_bidirectional_message;
 use crate::copy_multidirectional_message::copy_multidirectional_message;
 use crate::resolver::{resolve_single_address, NativeResolver, Resolver};
-use crate::socket_util::set_tcp_keepalive;
+use crate::socket_util::{new_tcp_listener, set_tcp_keepalive};
 use crate::tcp_client_connector::TcpClientConnector;
 use crate::tcp_handler::{TcpServerHandler, TcpServerSetupResult};
 use crate::tcp_handler_util::{create_tcp_client_proxy_selector, create_tcp_server_handler};
@@ -32,7 +32,7 @@ async fn run_tcp_server(
 ) -> std::io::Result<()> {
     let TcpConfig { no_delay } = tcp_config;
 
-    let listener = tokio::net::TcpListener::bind(bind_address).await.unwrap();
+    let listener = new_tcp_listener(bind_address, 4096, None)?;
 
     loop {
         let (stream, addr) = match listener.accept().await {
@@ -89,7 +89,7 @@ async fn run_unix_server(
         let _ = tokio::fs::remove_file(&path_buf).await;
     }
 
-    let listener = tokio::net::UnixListener::bind(path_buf).unwrap();
+    let listener = crate::socket_util::new_unix_listener(path_buf, 4096)?;
 
     loop {
         let (stream, addr) = match listener.accept().await {
