@@ -125,7 +125,7 @@ async fn start_servers(config: ServerConfig) -> std::io::Result<Vec<JoinHandle<(
 }
 
 fn print_usage_and_exit(arg0: String) {
-    eprintln!("Usage: {arg0} [--threads/-t N] <server uri or config filename> [server uri or config filename] [..]");
+    eprintln!("Usage: {arg0} [--threads/-t N] [--dry-run/-d] [--no-reload] <server uri or config filename> [server uri or config filename] [..]");
     std::process::exit(1);
 }
 
@@ -160,6 +160,7 @@ fn main() {
     let arg0 = args.remove(0);
     let mut num_threads = 0usize;
     let mut dry_run = false;
+    let mut no_reload = false;
 
     while !args.is_empty() && args[0].starts_with("-") {
         if args[0] == "--threads" || args[0] == "-t" {
@@ -180,6 +181,9 @@ fn main() {
         } else if args[0] == "--dry-run" || args[0] == "-d" {
             args.remove(0);
             dry_run = true;
+        } else if args[0] == "--no-reload" {
+            args.remove(0);
+            no_reload = true;
         } else {
             eprintln!("Invalid argument: {}", args[0]);
             print_usage_and_exit(arg0);
@@ -227,7 +231,12 @@ fn main() {
         .expect("Could not build tokio runtime");
 
     runtime.block_on(async move {
-        let (_watcher, mut config_rx) = start_notify_thread(args.clone());
+        let mut reload_state = if no_reload {
+            None
+        } else {
+            let (watcher, rx) = start_notify_thread(args.clone());
+            Some((watcher, rx))
+        };
 
         loop {
             let configs = match config::load_configs(&args).await {
@@ -283,18 +292,29 @@ fn main() {
                 join_handles.extend(start_servers(server_config).await.unwrap());
             }
 
-            config_rx.recv().await.unwrap();
+            match reload_state.as_mut() {
+                Some((_watcher, rx)) => {
+                    // Wait for config change
+                    rx.recv().await.unwrap();
 
-            println!("Configs changed, restarting servers in 3 seconds..");
+                    println!("Configs changed, restarting servers in 3 seconds..");
 
-            for join_handle in join_handles {
-                join_handle.abort();
+                    for join_handle in join_handles {
+                        join_handle.abort();
+                    }
+
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+                    // Remove any extra events
+                    while rx.try_recv().is_ok() {}
+                }
+                None => {
+                    // No reload mode - wait forever
+                    // TODO: signal handling?
+                    futures::future::pending::<()>().await;
+                    unreachable!();
+                }
             }
-
-            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-
-            // Remove any extra events
-            while config_rx.try_recv().is_ok() {}
         }
     });
 }
