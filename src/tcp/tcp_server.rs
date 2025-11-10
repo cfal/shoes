@@ -22,6 +22,7 @@ use crate::tcp_handler::{TcpServerHandler, TcpServerSetupResult};
 use crate::tcp_handler_util::{create_tcp_client_proxy_selector, create_tcp_server_handler};
 use crate::udp_message_stream::UdpMessageStream;
 use crate::udp_multi_message_stream::UdpMultiMessageStream;
+use crate::util::write_all;
 
 async fn run_tcp_server(
     bind_address: SocketAddr,
@@ -205,14 +206,14 @@ where
             };
 
             if let Some(data) = connection_success_response {
-                server_stream.write_all(&data).await?;
+                write_all(&mut server_stream, &data).await?;
                 // server_need_initial_flush should be set to true by the handler if
                 // it's needed.
             }
 
             let client_need_initial_flush = match initial_remote_data {
                 Some(data) => {
-                    client_stream.write_all(&data).await?;
+                    write_all(&mut client_stream, &data).await?;
                     true
                 }
                 None => false,
