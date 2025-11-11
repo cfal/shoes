@@ -551,7 +551,7 @@ pub fn parse_server_hello(server_hello_frame: &[u8]) -> std::io::Result<ParsedSe
                     format!("failed to read supported version from ServerHello: {e}"),
                 )
             })?;
-            if version_bytes[0] != 3 && version_bytes[1] != 4 {
+            if version_bytes[0] != 3 || version_bytes[1] != 4 {
                 return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         format!(
