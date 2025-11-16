@@ -34,6 +34,11 @@ pub enum TcpServerSetupResult {
         override_proxy_provider: NoneOrOne<Arc<ClientProxySelector<TcpClientConnector>>>,
         num_sockets: usize,
     },
+    SessionBasedUdp {
+        need_initial_flush: bool,
+        stream: Box<dyn crate::async_stream::AsyncSessionMessageStream>,
+        override_proxy_provider: NoneOrOne<Arc<ClientProxySelector<TcpClientConnector>>>,
+    },
 }
 
 impl TcpServerSetupResult {
@@ -48,6 +53,10 @@ impl TcpServerSetupResult {
                 ..
             }
             | TcpServerSetupResult::MultiDirectionalUdp {
+                need_initial_flush: ref mut flush,
+                ..
+            }
+            | TcpServerSetupResult::SessionBasedUdp {
                 need_initial_flush: ref mut flush,
                 ..
             } => {
@@ -68,6 +77,10 @@ impl TcpServerSetupResult {
             | TcpServerSetupResult::MultiDirectionalUdp {
                 override_proxy_provider,
                 ..
+            }
+            | TcpServerSetupResult::SessionBasedUdp {
+                override_proxy_provider,
+                ..
             } => override_proxy_provider.is_unspecified(),
         }
     }
@@ -86,6 +99,10 @@ impl TcpServerSetupResult {
                 ..
             }
             | TcpServerSetupResult::MultiDirectionalUdp {
+                override_proxy_provider: ref mut provider,
+                ..
+            }
+            | TcpServerSetupResult::SessionBasedUdp {
                 override_proxy_provider: ref mut provider,
                 ..
             } => {

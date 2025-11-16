@@ -71,7 +71,7 @@ impl SnellServerHandler {
         udp_enabled: bool,
         udp_num_sockets: usize,
     ) -> Self {
-        let cipher: ShadowsocksCipher = cipher_name.into();
+        let cipher: ShadowsocksCipher = cipher_name.try_into().unwrap();
         let key: Arc<Box<dyn ShadowsocksKey>> = Arc::new(Box::new(SnellKey::new(
             password,
             cipher.algorithm().key_len(),
@@ -206,7 +206,7 @@ pub struct SnellClientHandler {
 
 impl SnellClientHandler {
     pub fn new(cipher_name: &str, password: &str) -> Self {
-        let cipher: ShadowsocksCipher = cipher_name.into();
+        let cipher: ShadowsocksCipher = cipher_name.try_into().unwrap();
         let key: Arc<Box<dyn ShadowsocksKey>> = Arc::new(Box::new(SnellKey::new(
             password,
             cipher.algorithm().key_len(),

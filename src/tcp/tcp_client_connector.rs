@@ -8,7 +8,7 @@ use crate::async_stream::AsyncStream;
 use crate::config::{ClientConfig, ClientQuicConfig, TcpConfig, Transport};
 use crate::quic_stream::QuicStream;
 use crate::resolver::{resolve_single_address, Resolver};
-use crate::rustls_util::create_client_config;
+use crate::rustls_config_util::create_client_config;
 use crate::socket_util::{
     new_reuse_udp_sockets, new_tcp_socket, new_udp_socket, set_tcp_keepalive,
 };
@@ -175,6 +175,10 @@ impl TcpClientConnector {
                 ))
             },
         })
+    }
+
+    pub fn bind_interface(&self) -> &Option<String> {
+        &self.bind_interface
     }
 
     pub fn configure_udp_socket(&self, is_ipv6: bool) -> std::io::Result<tokio::net::UdpSocket> {

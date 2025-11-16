@@ -1,123 +1,52 @@
 # shoes
 
-shoes is a multi-protocol proxy server written in Rust.
+shoes is a high-performance multi-protocol proxy server written in Rust.
 
-## Supported protocols
+## Supported Protocols
 
-- **HTTP/HTTPS** (TCP, QUIC)
-- **SOCKS5** (TCP, QUIC)
-- **Vmess** (TCP, QUIC, UDP-over-TCP)
-  - AEAD and Legacy modes
-  - Supported ciphers:
-    - aes-128-gcm
-    - chacha20-poly1305
-- **Vless** (TCP, QUIC, UDP-over-TCP)
-- **Snell** v3 (TCP, QUIC, UDP-over-TCP)
-  - Supported ciphers:
-    - aes-128-gcm
-    - aes-256-gcm
-    - chacha20-ietf-poly1305
-- **Shadowsocks** (TCP, QUIC)
-  - Supported ciphers:
-    - aes-128-gcm
-    - aes-256-gcm
-    - chacha20-ietf-poly1305
-    - 2022-blake3-aes-128-gcm
-    - 2022-blake3-aes-256-gcm
-    - 2022-blake3-chacha20-ietf-poly1305
-- **Trojan** (TCP, QUIC)
-  - Supported ciphers:
-    - aes-128-gcm
-    - aes-256-gcm
-    - chacha20-ietf-poly1305
-- **Hysteria2** (QUIC)
-- **TUIC v5** (QUIC)
+### Proxy Protocols
+- **HTTP/HTTPS**
+- **SOCKS5**
+- **VMess AEAD**
+- **VLESS**
+- **Shadowsocks**
+- **Trojan**
+- **Snell v3**
+- **Hysteria2**
+- **TUIC v5**
+
+### Transport Protocols
+All server protocols plus:
+- **SagerNet UDP over TCP** (for Shadowsocks and SOCKS5)
+- **ShadowTLS v3**
+- **TLS**
+- **WebSocket** (Shadowsocks SIP003)
+- **XTLS Reality**
+- **XTLS Vision** (for VLESS)
+
+### Supported Ciphers
+- **VMess**: `aes-128-gcm`, `chacha20-poly1305`, `none`
+- **Shadowsocks**: `aes-128-gcm`, `aes-256-gcm`, `chacha20-ietf-poly1305`, `2022-blake3-aes-128-gcm`, `2022-blake3-aes-256-gcm`, `2022-blake3-chacha20-ietf-poly1305`
+- **Snell v3**: `aes-128-gcm`, `aes-256-gcm`, `chacha20-ietf-poly1305`
 
 ## Features
 
-All supported protocols can be combined with the following features:
+- **Multi-transport**: TCP or QUIC for all protocols
+- **TLS with SNI routing**: Route by Server Name Indication
+- **Upstream proxy chaining**: Route through multiple proxies
+- **Rule-based routing**: Route by IP/CIDR or hostname masks
+- **Named PEM certificates**: Define once, reference everywhere
+- **TLS fingerprint authentication**: Certificate pinning for TLS/QUIC
+- **Hot reloading**: Apply config changes without restart
+- **Unix socket support**: Bind to Unix domain sockets
 
-- **TLS support** with SNI based forwarding
-- **Websocket obfs** (Shadowsocks SIP003)
-- **ShadowTLS v3**
-- **Upstream proxy support**: route connections through other proxy servers
-- **Forwarding rules**: Redirect or block connections based on target IP or hostname
-- **Hot reloading**: Updated configs are automatically reloaded
-- **Netmask and proxy groups**
-
-For advanced access control of incoming connections (eg. IP allowlist/blocklists), check out [tobaru](https://github.com/cfal/tobaru).
-
-## Examples
-
-Here's an example of running a WSS vmess and shadowsocks server, with all requests routed through a SOCKS proxy:
-
-```yaml
-# Listen on all IPv4 interfaces, port 443 (HTTPS)
-- address: 0.0.0.0:443
-  transport: tcp
-  # Use TLS as the first protocol layer
-  protocol:
-    type: tls
-
-    # Set a default target, for any (or no) SNI
-    default_target:
-      cert: cert.pem
-      key: key.pem
-      # ..which goes to a websocket server
-      protocol:
-        type: ws
-        # .. where we have different supported proxy protocols, based on HTTP request path and headers.
-        targets:
-          - matching_path: /vmess
-            matching_headers:
-              X-Secret-Key: "secret"
-            protocol:
-              type: vmess
-              # allow any cipher, which means: none, aes-128-gcm, or chacha20-poly1305.
-              cipher: any
-              user_id: b0e80a62-8a51-47f0-91f1-f0f7faf8d9d4
-          - matching_path: /shadowsocks
-            protocol:
-              type: shadowsocks
-              cipher: 2022-blake3-aes-256-gcm
-              password: Hax8btYlNao5qcaN/l/NUl9JgbwapfqG5QyAtH+aKPg=
-
-    # Set a ShadowTLS v3 target by SNI
-    shadowtls_targets:
-      google.com:
-        # ShadowTLS password
-        password: 83a44859c0e7fbb589b
-        # Configure handshake server.
-        handshake:
-          address: google.com:443
-          # Use the local SOCKS server to connect to the handshake server.
-          client_proxies:
-            - address: 127.0.0.1:1080
-              protocol:
-                type: socks
-                username: socksuser
-                password: secretpass
-    
-  rules:
-    # Allow clients to connect to all IPs
-    - mask: 0.0.0.0/0
-      action: allow
-      # Forward all requests through a local SOCKS server.
-      client_proxy:
-        address: 127.0.0.1:5000
-        protocol:
-          type: socks
-          username: socksuser
-          password: secretpass
-```
-
-For other YAML config examples, see the [examples](./examples) directory.
+For advanced access control (IP allowlist/blocklists), see [tobaru](https://github.com/cfal/tobaru).
 
 ## Installation
 
 Precompiled binaries for x86_64 and Apple aarch64 are available on [Github Releases](https://github.com/cfal/shoes/releases).
 
-Else, if you have a fairly recent Rust and cargo installation on your system, shoes can be installed with `cargo`.
+Or install with cargo:
 
 ```bash
 cargo install shoes
@@ -126,34 +55,146 @@ cargo install shoes
 ## Usage
 
 ```
-shoes [OPTIONS] <YAML CONFIG PATH> [YAML CONFIG PATH] [..]
+shoes [OPTIONS] <config.yaml> [config.yaml...]
 
 OPTIONS:
+    -t, --threads NUM    Set the number of worker threads (default: CPU count)
+    -d, --dry-run        Parse the config and exit
+    --no-reload          Disable automatic config reloading on file changes
 
-    -t, --threads NUM
-        Set the number of worker threads. This usually defaults to the number of CPUs.
+COMMANDS:
+    generate-reality-keypair                  Generate a new Reality X25519 keypair
+    generate-shadowsocks-password <cipher>    Generate a Shadowsocks password
+```
 
-    -d, --dry-run
-        Parse the config and exit.
+### Examples
+```bash
+# Run with a single config file
+shoes config.yaml
+
+# Run with multiple config files
+shoes server1.yaml server2.yaml rules.yaml
+
+# Run with custom thread count
+shoes --threads 8 config.yaml
+
+# Validate configuration without starting
+shoes --dry-run config.yaml
+
+# Run without hot-reloading
+shoes --no-reload config.yaml
+
+# Generate Reality keypair
+shoes generate-reality-keypair
+
+# Generate Shadowsocks password
+shoes generate-shadowsocks-password 2022-blake3-aes-256-gcm
 ```
 
 ## Configuration
 
-See [CONFIG.md](./CONFIG.md) for the YAML config format. You can also refer to the [examples](./examples), or open an issue if you need help.
+See [CONFIG.md](./CONFIG.md) for the complete YAML configuration reference.
 
-## Roadmap
+## Examples
 
-- Proxy client chaining
-- SOCKS and Shadowsocks UDP support
+See the [examples](./examples) directory for all examples.
 
-## Similar and related projects
+### Basic VMess Server
+```yaml
+- address: 0.0.0.0:16823
+  protocol:
+    type: vmess
+    cipher: chacha20-poly1305
+    user_id: b0e80a62-8a51-47f0-91f1-f0f7faf8d9d4
+    udp_enabled: true
+```
 
-- [shadowsocks/shadowsocks-rust](https://github.com/shadowsocks/shadowsocks-rust): A Rust port of shadowsocks
+### VLESS with Vision over TLS
+```yaml
+- address: 0.0.0.0:443
+  protocol:
+    type: tls
+    tls_targets:
+      "vless.example.com":
+        cert: cert.pem
+        key: key.pem
+        vision: true
+        alpn_protocols: ["http/1.1"]
+        protocol:
+          type: vless
+          user_id: b85798ef-e9dc-46a4-9a87-8da4499d36d0
+          udp_enabled: true
+```
 
-- [v2ray/v2ray-core](https://github.com/v2ray/v2ray-core): A full-featured proxy platform written in Go
+### Reality Server
+```yaml
+- address: 0.0.0.0:443
+  protocol:
+    type: tls
+    reality_targets:
+      "www.example.com":
+        private_key: "YOUR_BASE64URL_PRIVATE_KEY"
+        short_ids: ["0123456789abcdef", ""]
+        dest: "www.example.com:443"
+        protocol:
+          type: vless
+          user_id: b85798ef-e9dc-46a4-9a87-8da4499d36d0
+          udp_enabled: true
+```
 
-- [ihciah/shadow-tls](https://github.com/ihciah/shadow-tls): A proxy to expose real TLS handshake to the firewall
+### Reality Client
+```yaml
+- address: 127.0.0.1:1080
+  protocol:
+    type: socks
+  rules:
+    - masks: "0.0.0.0/0"
+      action: allow
+      client_proxy:
+        address: "server.example.com:443"
+        protocol:
+          type: reality
+          public_key: "SERVER_PUBLIC_KEY"
+          short_id: "0123456789abcdef"
+          sni_hostname: "www.example.com"
+          protocol:
+            type: vless
+            user_id: b85798ef-e9dc-46a4-9a87-8da4499d36d0
+```
 
-- [apernet/hysteria](https://github.com/apernet/hysteria): Hysteria is a powerful, lightning fast and censorship resistant proxy
+### Hysteria2 Server
+```yaml
+- address: 0.0.0.0:443
+  transport: quic
+  quic_settings:
+    cert: cert.pem
+    key: key.pem
+    alpn_protocols: ["h3"]
+  protocol:
+    type: hysteria2
+    password: supersecret
+    udp_enabled: true
+```
 
-- [tuic-protocol/tuic](https://github.com/tuic-protocol/tuic): Delicately-TUICed 0-RTT proxy protocol
+### TUIC v5 Server
+```yaml
+- address: 0.0.0.0:443
+  transport: quic
+  quic_settings:
+    cert: cert.pem
+    key: key.pem
+  protocol:
+    type: tuic
+    uuid: d685aef3-b3c4-4932-9a9d-d0c2f6727dfa
+    password: supersecret
+```
+
+## Similar Projects
+
+- [apernet/hysteria](https://github.com/apernet/hysteria)
+- [ihciah/shadow-tls](https://github.com/ihciah/shadow-tls)
+- [SagerNet/sing-box](https://github.com/SagerNet/sing-box)
+- [shadowsocks/shadowsocks-rust](https://github.com/shadowsocks/shadowsocks-rust)
+- [EAimTY/tuic](https://github.com/EAimTY/tuic)
+- [v2fly/v2ray-core](https://github.com/v2fly/v2ray-core)
+- [XTLS/Xray-core](https://github.com/XTLS/Xray-core)

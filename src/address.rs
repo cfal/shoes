@@ -472,14 +472,69 @@ impl NetLocationMask {
     };
 
     pub fn from(s: &str) -> std::io::Result<Self> {
-        let (address_mask_str, port) = match s.find(':') {
-            Some(i) => {
-                let port = s[i + 1..]
+        // Handle IPv6 with port: [::1/128]:80
+        if s.starts_with('[') {
+            if let Some(bracket_end) = s.find(']') {
+                let address_mask_str = &s[1..bracket_end];
+                let port = if s.len() > bracket_end + 1 && s.as_bytes()[bracket_end + 1] == b':' {
+                    s[bracket_end + 2..]
+                        .parse::<u16>()
+                        .map_err(|e| std::io::Error::other(format!("Failed to parse port: {e}")))?
+                } else {
+                    0
+                };
+                return Ok(Self {
+                    address_mask: AddressMask::from(address_mask_str)?,
+                    port,
+                });
+            }
+        }
+
+        // For addresses without brackets, we need to distinguish IPv6 from port notation.
+        // IPv6 addresses contain multiple colons. If there's a `/` (CIDR), the port must come
+        // after it. If no `/`, use rfind(':') and check if what follows looks like a port.
+        let (address_mask_str, port) = if let Some(slash_pos) = s.rfind('/') {
+            // Has CIDR notation. Port (if any) must come after the slash.
+            // Format: addr/bits:port or addr/bits
+            let after_slash = &s[slash_pos + 1..];
+            if let Some(colon_in_suffix) = after_slash.find(':') {
+                // There's a port after the CIDR
+                let bits_str = &after_slash[..colon_in_suffix];
+                let port_str = &after_slash[colon_in_suffix + 1..];
+                // Validate bits is a number
+                bits_str.parse::<u8>().map_err(|e| {
+                    std::io::Error::other(format!("Failed to parse netmask bits: {e}"))
+                })?;
+                let port = port_str
                     .parse::<u16>()
                     .map_err(|e| std::io::Error::other(format!("Failed to parse port: {e}")))?;
-                (&s[0..i], port)
+                (&s[..slash_pos + 1 + colon_in_suffix], port)
+            } else {
+                // No port, just addr/bits
+                (s, 0)
             }
-            None => (s, 0),
+        } else {
+            // No CIDR notation. Could be:
+            // - hostname:port (example.com:80)
+            // - IPv4:port (1.2.3.4:80)
+            // - IPv6 (::1, fe80::1)
+            // - hostname (example.com)
+            // - IPv4 (1.2.3.4)
+            //
+            // IPv6 addresses have multiple colons, so if there's more than one colon,
+            // it's IPv6 and has no port. If there's exactly one colon, use it as port separator.
+            let colon_count = s.chars().filter(|&c| c == ':').count();
+            if colon_count == 1 {
+                // Single colon - treat as port separator
+                let colon_pos = s.find(':').unwrap();
+                let port = s[colon_pos + 1..]
+                    .parse::<u16>()
+                    .map_err(|e| std::io::Error::other(format!("Failed to parse port: {e}")))?;
+                (&s[..colon_pos], port)
+            } else {
+                // Zero or multiple colons - no port (IPv6 or plain hostname/IPv4)
+                (s, 0)
+            }
         };
 
         Ok(Self {

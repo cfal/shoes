@@ -15,6 +15,7 @@ use crate::config::{BindLocation, ConfigSelection, ServerConfig, TcpConfig};
 use crate::copy_bidirectional::copy_bidirectional;
 use crate::copy_bidirectional_message::copy_bidirectional_message;
 use crate::copy_multidirectional_message::copy_multidirectional_message;
+use crate::copy_session_messages::copy_session_messages;
 use crate::resolver::{resolve_single_address, NativeResolver, Resolver};
 use crate::socket_util::{new_tcp_listener, set_tcp_keepalive};
 use crate::tcp_client_connector::TcpClientConnector;
@@ -22,6 +23,7 @@ use crate::tcp_handler::{TcpServerHandler, TcpServerSetupResult};
 use crate::tcp_handler_util::{create_tcp_client_proxy_selector, create_tcp_server_handler};
 use crate::udp_message_stream::UdpMessageStream;
 use crate::udp_multi_message_stream::UdpMultiMessageStream;
+use crate::udp_session_message_stream::{UdpSessionMessageStream, UdpSocketConfig};
 use crate::util::write_all;
 
 async fn run_tcp_server(
@@ -326,6 +328,56 @@ where
                 }
                 ConnectDecision::Block => {
                     warn!("Blocked multidirectional udp forward, because the default action is to block.");
+                    // TODO: add async trait ext and make this work
+                    // let _ = server_stream.shutdown_message().await;
+                    Ok(())
+                }
+            }
+        }
+        TcpServerSetupResult::SessionBasedUdp {
+            stream: mut server_stream,
+            need_initial_flush: server_need_initial_flush,
+            override_proxy_provider,
+        } => {
+            let selected_proxy_provider = if override_proxy_provider.is_one() {
+                override_proxy_provider.unwrap()
+            } else {
+                client_proxy_selector
+            };
+            let action = selected_proxy_provider.default_decision();
+            match action {
+                ConnectDecision::Allow {
+                    client_proxy,
+                    remote_location: _,
+                } => {
+                    // Create UdpSessionMessageStream with user's interface configuration
+                    let config = UdpSocketConfig {
+                        bind_interface: client_proxy.bind_interface().clone(),
+                    };
+                    let mut session_manager = UdpSessionMessageStream::new(config);
+
+                    // IMPORTANT: We do NOT create any sessions upfront
+                    // Sessions will be created on-demand as XUDP frames arrive
+                    // This is handled by the copy_session_messages function
+                    // which will call poll_write_session_message, which in turn
+                    // will create sessions via SessionUdpManager::create_session
+
+                    let copy_result = copy_session_messages(
+                        &mut server_stream,
+                        &mut session_manager,
+                        server_need_initial_flush,
+                        false,
+                    )
+                    .await;
+
+                    // TODO: add async trait ext and make this work
+                    //let (_, _) = futures::join!(server_stream.shutdown_message(), client_stream.shutdown_message());
+
+                    copy_result?;
+                    Ok(())
+                }
+                ConnectDecision::Block => {
+                    warn!("Blocked session-based udp forward, because the default action is to block.");
                     // TODO: add async trait ext and make this work
                     // let _ = server_stream.shutdown_message().await;
                     Ok(())

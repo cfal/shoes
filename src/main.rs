@@ -6,6 +6,8 @@ mod config;
 mod copy_bidirectional;
 mod copy_bidirectional_message;
 mod copy_multidirectional_message;
+mod copy_session_messages;
+mod crypto;
 mod http_handler;
 mod hysteria2_server;
 mod noop_stream;
@@ -13,28 +15,35 @@ mod option_util;
 mod port_forward_handler;
 mod quic_server;
 mod quic_stream;
+mod reality;
+mod reality_client_handler;
 mod resolver;
-mod rustls_util;
-mod salt_checker;
+mod rustls_config_util;
+mod rustls_connection_util;
+mod rustls_handshake;
 mod shadow_tls;
 mod shadowsocks;
+mod slide_buffer;
 mod snell;
 mod socket_util;
 mod socks_handler;
 mod stream_reader;
+mod sync_adapter;
 mod tcp;
 mod thread_util;
-mod timed_salt_checker;
-mod tls_handler;
+mod tls_client_handler;
+mod tls_server_handler;
 mod trojan_handler;
 mod tuic_server;
 mod udp_message_stream;
 mod udp_multi_message_stream;
+mod udp_session_message_stream;
+mod uot;
 mod util;
-mod vless_handler;
-mod vless_message_stream;
+mod vless;
 mod vmess;
 mod websocket;
+mod xudp;
 
 #[cfg(not(target_env = "msvc"))]
 use tikv_jemallocator::Jemalloc;
@@ -55,6 +64,8 @@ use tokio::task::JoinHandle;
 
 use crate::config::{ServerConfig, Transport};
 use crate::quic_server::start_quic_servers;
+use crate::reality::generate_keypair;
+use crate::shadowsocks::ShadowsocksCipher;
 use crate::thread_util::set_num_threads;
 use tcp::*;
 
@@ -191,6 +202,74 @@ fn main() {
         }
     }
 
+    if args.iter().any(|s| s == "generate-reality-keypair") {
+        let (private_key, public_key) = generate_keypair().unwrap();
+        println!(
+            "--------------------------------------------------------------------------------"
+        );
+        println!("REALITY private key: {}", private_key);
+        println!("REALITY public key: {}", public_key);
+        println!(
+            "--------------------------------------------------------------------------------"
+        );
+        return;
+    }
+
+    if let Some(pos) = args
+        .iter()
+        .position(|s| s == "generate-shadowsocks-password")
+    {
+        let cipher = args.get(pos + 1).map(|s| s.as_str());
+        match cipher {
+            Some(c) => {
+                // Strip 2022-blake3- prefix if present for cipher lookup
+                let base_cipher = c.strip_prefix("2022-blake3-").unwrap_or(c);
+                match ShadowsocksCipher::try_from(base_cipher) {
+                    Ok(cipher) => {
+                        use aws_lc_rs::rand::{SecureRandom, SystemRandom};
+                        use base64::engine::{general_purpose::STANDARD, Engine as _};
+
+                        let rng = SystemRandom::new();
+                        let mut key_bytes = vec![0u8; cipher.key_len()];
+                        rng.fill(&mut key_bytes).expect("RNG failed");
+                        let password = STANDARD.encode(&key_bytes);
+                        println!(
+                            "--------------------------------------------------------------------------------"
+                        );
+                        println!("Cipher: {}", c);
+                        println!("Password: {}", password);
+                        println!(
+                            "--------------------------------------------------------------------------------"
+                        );
+                    }
+                    Err(_) => {
+                        eprintln!("Unknown cipher: {}", c);
+                        eprintln!("Supported ciphers:");
+                        eprintln!("  aes-128-gcm");
+                        eprintln!("  aes-256-gcm");
+                        eprintln!("  chacha20-ietf-poly1305");
+                        eprintln!("  2022-blake3-aes-128-gcm");
+                        eprintln!("  2022-blake3-aes-256-gcm");
+                        eprintln!("  2022-blake3-chacha20-poly1305");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            None => {
+                eprintln!("Usage: {} generate-shadowsocks-password <cipher>", arg0);
+                eprintln!("Supported ciphers:");
+                eprintln!("  aes-128-gcm");
+                eprintln!("  aes-256-gcm");
+                eprintln!("  chacha20-ietf-poly1305");
+                eprintln!("  2022-blake3-aes-128-gcm");
+                eprintln!("  2022-blake3-aes-256-gcm");
+                eprintln!("  2022-blake3-chacha20-poly1305");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
     if args.is_empty() {
         println!("No config specified, assuming loading from file config.shoes.yaml");
         args.push("config.shoes.yaml".to_string())
@@ -276,8 +355,6 @@ fn main() {
                 return;
             }
 
-            println!("\nStarting {} server(s)..", configs.len());
-
             let mut join_handles = vec![];
 
             let server_configs = match config::create_server_configs(configs).await {
@@ -288,6 +365,9 @@ fn main() {
                     return;
                 }
             };
+
+            println!("\nStarting {} server(s)..", server_configs.len());
+
             for server_config in server_configs {
                 join_handles.extend(start_servers(server_config).await.unwrap());
             }

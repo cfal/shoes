@@ -1,25 +1,21 @@
-use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::time::SystemTime;
 
-use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyIvInit};
+use aes::cipher::{BlockDecrypt, BlockEncrypt};
 use aes::Aes128;
 use async_trait::async_trait;
 use aws_lc_rs::aead::{
     Aad, BoundKey, OpeningKey, SealingKey, UnboundKey, AES_128_GCM, CHACHA20_POLY1305,
 };
-use cfb_mode::cipher::AsyncStreamCipher;
 use digest::KeyInit;
-use parking_lot::Mutex;
 use rand::{Rng, RngCore};
 use sha3::digest::{ExtendableOutput, Update};
 use sha3::Shake128;
 use tokio::io::AsyncWriteExt;
 
 use super::fnv1a::Fnv1aHasher;
-use super::md5::{compute_hmac_md5, compute_md5, compute_md5_repeating, create_chacha_key};
+use super::md5::{compute_md5, create_chacha_key};
 use super::nonce::{SingleUseNonce, VmessNonceSequence};
-use super::typed::{Aes128CfbDec, Aes128CfbEnc};
 use super::vmess_stream::{ReadHeaderInfo, VmessStream};
 use crate::address::{Address, NetLocation};
 use crate::async_stream::AsyncStream;
@@ -29,8 +25,14 @@ use crate::tcp_handler::{
     TcpClientHandler, TcpClientSetupResult, TcpServerHandler, TcpServerSetupResult,
 };
 use crate::util::{allocate_vec, parse_uuid, write_all};
+use crate::xudp::XudpMessageStream;
 
 const TAG_LEN: usize = 16;
+
+// VMess protocol command types
+const COMMAND_TCP: u8 = 1;
+const COMMAND_UDP: u8 = 2;
+const COMMAND_MUX: u8 = 3; // MUX/XUDP mode
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum DataCipher {
@@ -54,80 +56,17 @@ impl From<&str> for DataCipher {
     }
 }
 
-type UserHash = [u8; 16];
-
-#[derive(Debug)]
-struct CertHashProvider {
-    user_key: [u8; 16],
-    hashes: HashMap<UserHash, u64>,
-    last_hash_time_secs: u64,
-}
-
-impl CertHashProvider {
-    pub fn new(user_id_bytes: &[u8]) -> Self {
-        if user_id_bytes.len() != 16 {
-            panic!("invalid user id bytes length ({})", user_id_bytes.len());
-        }
-        let mut user_key = [0u8; 16];
-        user_key.copy_from_slice(user_id_bytes);
-        Self {
-            user_key,
-            hashes: HashMap::with_capacity(64),
-            last_hash_time_secs: 0,
-        }
-    }
-
-    pub fn check(&mut self, hash: &UserHash) -> Option<u64> {
-        if let Some(time_secs) = self.hashes.get(hash) {
-            return Some(*time_secs);
-        }
-        self.update_hashes();
-        self.hashes.get(hash).copied()
-    }
-
-    fn update_hashes(&mut self) {
-        let current_time_secs = SystemTime::UNIX_EPOCH.elapsed().unwrap().as_secs();
-
-        let to_time_secs = current_time_secs + 32;
-        if self.last_hash_time_secs >= to_time_secs {
-            return;
-        }
-
-        let from_time_secs = current_time_secs - 32;
-
-        self.hashes
-            .retain(|_, hash_time_secs| *hash_time_secs >= from_time_secs);
-
-        let mut create_time_secs = std::cmp::max(from_time_secs, self.last_hash_time_secs);
-        while create_time_secs <= to_time_secs {
-            let hash_bytes: [u8; 16] =
-                compute_hmac_md5(&self.user_key, &create_time_secs.to_be_bytes());
-            self.hashes.insert(hash_bytes, create_time_secs);
-            create_time_secs += 1;
-        }
-
-        self.last_hash_time_secs = to_time_secs;
-    }
-}
-
 #[derive(Debug)]
 pub struct VmessTcpServerHandler {
     data_cipher: DataCipher,
     instruction_key: [u8; 16],
     aead_cipher: Aes128,
-    cert_hash_provider: Option<Mutex<CertHashProvider>>,
     udp_enabled: bool,
 }
 
 impl VmessTcpServerHandler {
-    pub fn new(cipher_name: &str, user_id: &str, force_aead: bool, udp_enabled: bool) -> Self {
+    pub fn new(cipher_name: &str, user_id: &str, udp_enabled: bool) -> Self {
         let mut user_id_bytes = parse_uuid(user_id).unwrap();
-        let cert_hash_provider = if force_aead {
-            None
-        } else {
-            Some(Mutex::new(CertHashProvider::new(&user_id_bytes)))
-        };
-
         user_id_bytes.extend(b"c48619fe-8f02-49e0-b9e9-edf763e17e21");
         let instruction_key: [u8; 16] = compute_md5(&user_id_bytes);
 
@@ -138,7 +77,6 @@ impl VmessTcpServerHandler {
             data_cipher: cipher_name.into(),
             aead_cipher,
             instruction_key,
-            cert_hash_provider,
             udp_enabled,
         }
     }
@@ -165,232 +103,221 @@ impl TcpServerHandler for VmessTcpServerHandler {
         self.aead_cipher.decrypt_block((&mut aead_bytes).into());
         let checksum = super::crc32::crc32c(&aead_bytes[0..12]);
         let expected_checksum = u32::from_be_bytes(aead_bytes[12..16].try_into().unwrap());
-        let is_aead_request = checksum == expected_checksum;
 
-        let mut header_reader = if is_aead_request {
-            let time_secs = u64::from_be_bytes(aead_bytes[0..8].try_into().unwrap());
-            let current_time_secs = SystemTime::UNIX_EPOCH.elapsed().unwrap().as_secs();
-            let time_delta = time_secs.abs_diff(current_time_secs);
-            if time_delta > 120 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("Hash timestamp is too old ({time_secs} is {time_delta} seconds old)"),
-                ));
-            }
+        if checksum != expected_checksum {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "AEAD authentication failed: checksum mismatch",
+            ));
+        }
 
-            let mut encrypted_payload_length = [0u8; 18];
-            stream_reader
-                .read_slice_into(&mut server_stream, &mut encrypted_payload_length)
-                .await?;
+        let time_secs = u64::from_be_bytes(aead_bytes[0..8].try_into().unwrap());
+        let current_time_secs = SystemTime::UNIX_EPOCH.elapsed().unwrap().as_secs();
+        let time_delta = time_secs.abs_diff(current_time_secs);
+        if time_delta > 120 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Hash timestamp is too old ({time_secs} is {time_delta} seconds old)"),
+            ));
+        }
 
-            let mut nonce = [0u8; 8];
-            stream_reader
-                .read_slice_into(&mut server_stream, &mut nonce)
-                .await?;
+        let mut encrypted_payload_length = [0u8; 18];
+        stream_reader
+            .read_slice_into(&mut server_stream, &mut encrypted_payload_length)
+            .await?;
 
-            let header_length_aead_key = super::sha2::kdf(
-                &self.instruction_key,
-                &[b"VMess Header AEAD Key_Length", &cert_hash, &nonce],
-            );
+        let mut nonce = [0u8; 8];
+        stream_reader
+            .read_slice_into(&mut server_stream, &mut nonce)
+            .await?;
 
-            let header_length_nonce = super::sha2::kdf(
-                &self.instruction_key,
-                &[b"VMess Header AEAD Nonce_Length", &cert_hash, &nonce],
-            );
+        let header_length_aead_key = super::sha2::kdf(
+            &self.instruction_key,
+            &[b"VMess Header AEAD Key_Length", &cert_hash, &nonce],
+        );
 
-            // TODO: don't unwrap
-            let unbound_key =
-                UnboundKey::new(&AES_128_GCM, &header_length_aead_key[0..16]).unwrap();
+        let header_length_nonce = super::sha2::kdf(
+            &self.instruction_key,
+            &[b"VMess Header AEAD Nonce_Length", &cert_hash, &nonce],
+        );
 
-            let mut opening_key = OpeningKey::new(
-                unbound_key,
-                SingleUseNonce::new(&header_length_nonce[0..12]),
-            );
+        // TODO: don't unwrap
+        let unbound_key = UnboundKey::new(&AES_128_GCM, &header_length_aead_key[0..16]).unwrap();
 
-            if opening_key
-                .open_in_place(Aad::from(&cert_hash), &mut encrypted_payload_length)
-                .is_err()
-            {
-                return Err(std::io::Error::other(
-                    "failed to open encrypted header length",
-                ));
-            }
+        let mut opening_key = OpeningKey::new(
+            unbound_key,
+            SingleUseNonce::new(&header_length_nonce[0..12]),
+        );
 
-            let payload_length =
-                u16::from_be_bytes(encrypted_payload_length[0..2].try_into().unwrap());
+        if opening_key
+            .open_in_place(Aad::from(&cert_hash), &mut encrypted_payload_length)
+            .is_err()
+        {
+            return Err(std::io::Error::other(
+                "failed to open encrypted header length",
+            ));
+        }
 
-            let header_aead_key = super::sha2::kdf(
-                &self.instruction_key,
-                &[b"VMess Header AEAD Key", &cert_hash, &nonce],
-            );
+        let payload_length = u16::from_be_bytes(encrypted_payload_length[0..2].try_into().unwrap());
 
-            let header_nonce = super::sha2::kdf(
-                &self.instruction_key,
-                &[b"VMess Header AEAD Nonce", &cert_hash, &nonce],
-            );
+        let header_aead_key = super::sha2::kdf(
+            &self.instruction_key,
+            &[b"VMess Header AEAD Key", &cert_hash, &nonce],
+        );
 
-            let mut encrypted_header =
-                allocate_vec(payload_length as usize + TAG_LEN).into_boxed_slice();
+        let header_nonce = super::sha2::kdf(
+            &self.instruction_key,
+            &[b"VMess Header AEAD Nonce", &cert_hash, &nonce],
+        );
 
-            stream_reader
-                .read_slice_into(&mut server_stream, &mut encrypted_header)
-                .await?;
+        let mut encrypted_header =
+            allocate_vec(payload_length as usize + TAG_LEN).into_boxed_slice();
 
-            // TODO: don't unwrap
-            let unbound_key = UnboundKey::new(&AES_128_GCM, &header_aead_key[0..16]).unwrap();
+        stream_reader
+            .read_slice_into(&mut server_stream, &mut encrypted_header)
+            .await?;
 
-            let mut opening_key =
-                OpeningKey::new(unbound_key, SingleUseNonce::new(&header_nonce[0..12]));
+        // TODO: don't unwrap
+        let unbound_key = UnboundKey::new(&AES_128_GCM, &header_aead_key[0..16]).unwrap();
 
-            if opening_key
-                .open_in_place(Aad::from(&cert_hash), &mut encrypted_header)
-                .is_err()
-            {
-                return Err(std::io::Error::other("failed to open encrypted header"));
-            }
+        let mut opening_key =
+            OpeningKey::new(unbound_key, SingleUseNonce::new(&header_nonce[0..12]));
 
-            HeaderReader::Aead(AeadHeaderReader {
-                server_stream,
-                decrypted_header: encrypted_header,
-                cursor: 0,
-            })
-        } else {
-            let hash_time_secs = match self.cert_hash_provider {
-                Some(ref provider) => match provider.lock().check(&cert_hash) {
-                    Some(t) => t,
-                    None => {
-                        return Err(std::io::Error::other("unauthorized request, unknown hash"));
-                    }
-                },
-                None => {
-                    return Err(std::io::Error::other(
-                        "unauthorized request, unknown aead hash",
-                    ));
-                }
-            };
+        if opening_key
+            .open_in_place(Aad::from(&cert_hash), &mut encrypted_header)
+            .is_err()
+        {
+            return Err(std::io::Error::other("failed to open encrypted header"));
+        }
 
-            let instruction_iv: [u8; 16] = {
-                let time_bytes = hash_time_secs.to_be_bytes();
-                compute_md5_repeating(&time_bytes, 4)
-            };
-
-            let request_cipher =
-                Aes128CfbDec::new(&self.instruction_key.into(), &instruction_iv.into());
-
-            HeaderReader::AesCfb(AesCfbHeaderReader {
-                server_stream,
-                request_cipher,
-            })
+        let mut header_reader = AeadHeaderReader {
+            server_stream,
+            decrypted_header: encrypted_header,
+            cursor: 0,
         };
 
         let mut fnv_hasher = Fnv1aHasher::new();
 
-        let mut instructions_to_addr_type = [0u8; 41];
-        header_reader
-            .read_slice_into(&mut stream_reader, &mut instructions_to_addr_type)
-            .await?;
-        fnv_hasher.write(&instructions_to_addr_type);
+        // Read fixed 38-byte header first
+        let mut fixed_header = [0u8; 38];
+        header_reader.read_slice_into(&mut fixed_header)?;
+        fnv_hasher.write(&fixed_header);
 
-        if instructions_to_addr_type[0] != 1 {
+        if fixed_header[0] != 1 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("Invalid version {}", instructions_to_addr_type[0]),
+                format!("Invalid version {}", fixed_header[0]),
             ));
         }
 
-        let port = u16::from_be_bytes(instructions_to_addr_type[38..40].try_into().unwrap());
+        let command = fixed_header[37];
 
-        let remote_location = match instructions_to_addr_type[40] {
-            1 => {
-                // 4 byte ipv4 address
-                let mut address_bytes = [0u8; 4];
-                header_reader
-                    .read_slice_into(&mut stream_reader, &mut address_bytes)
-                    .await?;
-                fnv_hasher.write(&address_bytes);
+        log::info!("VMess command: {}", command);
 
-                let v4addr = Ipv4Addr::new(
-                    address_bytes[0],
-                    address_bytes[1],
-                    address_bytes[2],
-                    address_bytes[3],
-                );
-                NetLocation::new(Address::Ipv4(v4addr), port)
-            }
-            2 => {
-                // domain name
-                let mut domain_name_len = [0u8; 1];
-                header_reader
-                    .read_slice_into(&mut stream_reader, &mut domain_name_len)
-                    .await?;
-                fnv_hasher.write(&domain_name_len);
+        // For MUX/XUDP command (0x03), there is NO destination in the VMess header
+        // Destinations come in XUDP frames themselves
+        let remote_location = if command == COMMAND_MUX {
+            // Use a placeholder address for XUDP - actual destinations come from XUDP frames
+            log::info!(
+                "VMess MUX/XUDP: No destination in VMess header (destinations come in XUDP frames)"
+            );
+            NetLocation::new(Address::Ipv4(Ipv4Addr::new(0, 0, 0, 0)), 0)
+        } else {
+            // For TCP/UDP commands, read port (2 bytes) and address
+            let mut port_and_addr_type = [0u8; 3];
+            header_reader.read_slice_into(&mut port_and_addr_type)?;
+            fnv_hasher.write(&port_and_addr_type);
 
-                let mut domain_name_bytes = allocate_vec(domain_name_len[0] as usize);
-                header_reader
-                    .read_slice_into(&mut stream_reader, &mut domain_name_bytes)
-                    .await?;
-                fnv_hasher.write(&domain_name_bytes);
+            let port = u16::from_be_bytes(port_and_addr_type[0..2].try_into().unwrap());
 
-                let address_str = match std::str::from_utf8(&domain_name_bytes) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            format!("Failed to decode address: {e}"),
-                        ));
-                    }
-                };
+            match port_and_addr_type[2] {
+                1 => {
+                    // 4 byte ipv4 address
+                    let mut address_bytes = [0u8; 4];
+                    header_reader.read_slice_into(&mut address_bytes)?;
+                    fnv_hasher.write(&address_bytes);
 
-                // Although this is supposed to be a hostname, some clients will pass
-                // ipv4 and ipv6 addresses as well, so parse it rather than directly
-                // using Address:Hostname enum.
-                NetLocation::new(Address::from(address_str)?, port)
-            }
-            3 => {
-                // 16 byte ipv6 address
-                let mut address_bytes = [0u8; 16];
-                header_reader
-                    .read_slice_into(&mut stream_reader, &mut address_bytes)
-                    .await?;
-                fnv_hasher.write(&address_bytes);
+                    let v4addr = Ipv4Addr::new(
+                        address_bytes[0],
+                        address_bytes[1],
+                        address_bytes[2],
+                        address_bytes[3],
+                    );
+                    NetLocation::new(Address::Ipv4(v4addr), port)
+                }
+                2 => {
+                    // domain name
+                    let mut domain_name_len = [0u8; 1];
+                    header_reader.read_slice_into(&mut domain_name_len)?;
+                    fnv_hasher.write(&domain_name_len);
 
-                let v6addr = Ipv6Addr::new(
-                    u16::from_be_bytes(address_bytes[0..2].try_into().unwrap()),
-                    u16::from_be_bytes(address_bytes[2..4].try_into().unwrap()),
-                    u16::from_be_bytes(address_bytes[4..6].try_into().unwrap()),
-                    u16::from_be_bytes(address_bytes[6..8].try_into().unwrap()),
-                    u16::from_be_bytes(address_bytes[8..10].try_into().unwrap()),
-                    u16::from_be_bytes(address_bytes[10..12].try_into().unwrap()),
-                    u16::from_be_bytes(address_bytes[12..14].try_into().unwrap()),
-                    u16::from_be_bytes(address_bytes[14..16].try_into().unwrap()),
-                );
+                    let mut domain_name_bytes = allocate_vec(domain_name_len[0] as usize);
+                    header_reader.read_slice_into(&mut domain_name_bytes)?;
+                    fnv_hasher.write(&domain_name_bytes);
 
-                NetLocation::new(Address::Ipv6(v6addr), port)
-            }
-            invalid_type => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("Invalid address type: {invalid_type}"),
-                ));
+                    let address_str = match std::str::from_utf8(&domain_name_bytes) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!("Failed to decode address: {e}"),
+                            ));
+                        }
+                    };
+
+                    // Although this is supposed to be a hostname, some clients will pass
+                    // ipv4 and ipv6 addresses as well, so parse it rather than directly
+                    // using Address:Hostname enum.
+                    NetLocation::new(Address::from(address_str)?, port)
+                }
+                3 => {
+                    // 16 byte ipv6 address
+                    let mut address_bytes = [0u8; 16];
+                    header_reader.read_slice_into(&mut address_bytes)?;
+                    fnv_hasher.write(&address_bytes);
+
+                    let v6addr = Ipv6Addr::new(
+                        u16::from_be_bytes(address_bytes[0..2].try_into().unwrap()),
+                        u16::from_be_bytes(address_bytes[2..4].try_into().unwrap()),
+                        u16::from_be_bytes(address_bytes[4..6].try_into().unwrap()),
+                        u16::from_be_bytes(address_bytes[6..8].try_into().unwrap()),
+                        u16::from_be_bytes(address_bytes[8..10].try_into().unwrap()),
+                        u16::from_be_bytes(address_bytes[10..12].try_into().unwrap()),
+                        u16::from_be_bytes(address_bytes[12..14].try_into().unwrap()),
+                        u16::from_be_bytes(address_bytes[14..16].try_into().unwrap()),
+                    );
+
+                    NetLocation::new(Address::Ipv6(v6addr), port)
+                }
+                invalid_type => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("Invalid address type: {invalid_type}"),
+                    ));
+                }
             }
         };
 
-        let margin_len: u8 = instructions_to_addr_type[35] >> 4;
+        let margin_len: u8 = fixed_header[35] >> 4;
+        log::info!("VMess margin_len: {}, command: {}", margin_len, command);
         if margin_len > 0 {
             let mut margin_bytes = allocate_vec(margin_len as usize).into_boxed_slice();
-            header_reader
-                .read_slice_into(&mut stream_reader, &mut margin_bytes)
-                .await?;
+            header_reader.read_slice_into(&mut margin_bytes)?;
+            log::info!("VMess margin_bytes: {:?}", &margin_bytes[..]);
             fnv_hasher.write(&margin_bytes);
         }
 
         let mut check_bytes = [0u8; 4];
-        header_reader
-            .read_slice_into(&mut stream_reader, &mut check_bytes)
-            .await?;
+        header_reader.read_slice_into(&mut check_bytes)?;
+        log::info!("VMess check_bytes: {:?}", &check_bytes);
 
         let expected_check_value = u32::from_be_bytes(check_bytes[0..4].try_into().unwrap());
         let actual_check_value = fnv_hasher.finish();
+        log::info!(
+            "VMess FNV1a: expected={}, actual={}",
+            expected_check_value,
+            actual_check_value
+        );
         if expected_check_value != actual_check_value {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -402,10 +329,10 @@ impl TcpServerHandler for VmessTcpServerHandler {
 
         let server_stream = header_reader.into_stream();
 
-        let data_encryption_iv: &[u8] = &instructions_to_addr_type[1..17];
-        let data_encryption_key: &[u8] = &instructions_to_addr_type[17..33];
-        let response_authentication_v = instructions_to_addr_type[33];
-        let option = instructions_to_addr_type[34];
+        let data_encryption_iv: &[u8] = &fixed_header[1..17];
+        let data_encryption_key: &[u8] = &fixed_header[17..33];
+        let response_authentication_v = fixed_header[33];
+        let option = fixed_header[34];
 
         if option & 0x01 != 0x01 {
             return Err(std::io::Error::new(
@@ -433,7 +360,7 @@ impl TcpServerHandler for VmessTcpServerHandler {
 
         // the developer docs have incorrect values for the data type,
         // see headers.pb.go in v2ray-core for the correct values.
-        let requested_data_cipher = match instructions_to_addr_type[35] & 0b1111 {
+        let requested_data_cipher = match fixed_header[35] & 0b1111 {
             1 => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -461,45 +388,20 @@ impl TcpServerHandler for VmessTcpServerHandler {
             ));
         }
 
-        let is_udp = match instructions_to_addr_type[37] {
-            1 => false,
-            2 => {
-                if !self.udp_enabled {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "UDP not enabled",
-                    ));
-                }
-                true
-            }
-            unknown_protocol_type => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("Unknown requested protocol: {unknown_protocol_type}"),
-                ));
-            }
-        };
-
-        let mut response_header: [u8; 4] = [
+        let response_header: [u8; 4] = [
             response_authentication_v,
             0, // option
             0, // command
             0, // command length
         ];
 
-        let (response_header_iv, response_header_key): ([u8; 16], [u8; 16]) = if is_aead_request {
-            let mut truncated_iv = [0u8; 16];
-            let mut truncated_key = [0u8; 16];
-            truncated_iv.copy_from_slice(&super::sha2::compute_sha256(data_encryption_iv)[0..16]);
-            truncated_key.copy_from_slice(&super::sha2::compute_sha256(data_encryption_key)[0..16]);
-
-            (truncated_iv, truncated_key)
-        } else {
-            (
-                compute_md5(data_encryption_iv),
-                compute_md5(data_encryption_key),
-            )
-        };
+        // AEAD mode only - use SHA256 for response header keys
+        let mut truncated_iv = [0u8; 16];
+        let mut truncated_key = [0u8; 16];
+        truncated_iv.copy_from_slice(&super::sha2::compute_sha256(data_encryption_iv)[0..16]);
+        truncated_key.copy_from_slice(&super::sha2::compute_sha256(data_encryption_key)[0..16]);
+        let response_header_iv = truncated_iv;
+        let response_header_key = truncated_key;
 
         let unbound_keys = match requested_data_cipher {
             // TODO: stop unwrapping
@@ -554,145 +456,156 @@ impl TcpServerHandler for VmessTcpServerHandler {
         // store the response header as prefix bytes to read when we are streaming.
         // writing the response header immediately without reading causes Surge to fail with
         // "Got short header" error.
-        let prefix_bytes: Box<[u8]> = if is_aead_request {
-            let response_header_length_aead_key =
-                super::sha2::kdf(&response_header_key, &[b"AEAD Resp Header Len Key"]);
-            let response_header_length_nonce =
-                super::sha2::kdf(&response_header_iv, &[b"AEAD Resp Header Len IV"]);
+        // AEAD mode only
+        let response_header_length_aead_key =
+            super::sha2::kdf(&response_header_key, &[b"AEAD Resp Header Len Key"]);
+        let response_header_length_nonce =
+            super::sha2::kdf(&response_header_iv, &[b"AEAD Resp Header Len IV"]);
 
-            let mut encrypted_response_header = [0u8; 2 + TAG_LEN + 4 + TAG_LEN];
+        let mut encrypted_response_header = [0u8; 2 + TAG_LEN + 4 + TAG_LEN];
 
-            // we know the size of response_header already.
-            encrypted_response_header[1] = 4;
+        // we know the size of response_header already.
+        encrypted_response_header[1] = 4;
 
-            // TODO: don't unwrap
-            let unbound_key =
-                UnboundKey::new(&AES_128_GCM, &response_header_length_aead_key[0..16]).unwrap();
-            let mut sealing_key = SealingKey::new(
-                unbound_key,
-                SingleUseNonce::new(&response_header_length_nonce[0..12]),
-            );
-            let tag = sealing_key
-                .seal_in_place_separate_tag(Aad::empty(), &mut encrypted_response_header[0..2])
-                .unwrap();
-            encrypted_response_header[2..2 + TAG_LEN].copy_from_slice(tag.as_ref());
+        // TODO: don't unwrap
+        let unbound_key =
+            UnboundKey::new(&AES_128_GCM, &response_header_length_aead_key[0..16]).unwrap();
+        let mut sealing_key = SealingKey::new(
+            unbound_key,
+            SingleUseNonce::new(&response_header_length_nonce[0..12]),
+        );
+        let tag = sealing_key
+            .seal_in_place_separate_tag(Aad::empty(), &mut encrypted_response_header[0..2])
+            .unwrap();
+        encrypted_response_header[2..2 + TAG_LEN].copy_from_slice(tag.as_ref());
 
-            let response_header_aead_key =
-                super::sha2::kdf(&response_header_key, &[b"AEAD Resp Header Key"]);
-            let response_header_nonce =
-                super::sha2::kdf(&response_header_iv, &[b"AEAD Resp Header IV"]);
-            let unbound_key =
-                UnboundKey::new(&AES_128_GCM, &response_header_aead_key[0..16]).unwrap();
-            let mut sealing_key = SealingKey::new(
-                unbound_key,
-                SingleUseNonce::new(&response_header_nonce[0..12]),
-            );
-
-            encrypted_response_header[2 + TAG_LEN..2 + TAG_LEN + 4]
-                .copy_from_slice(&response_header);
-
-            let tag = sealing_key
-                .seal_in_place_separate_tag(
-                    Aad::empty(),
-                    &mut encrypted_response_header[2 + TAG_LEN..2 + TAG_LEN + 4],
-                )
-                .unwrap();
-            encrypted_response_header[2 + TAG_LEN + 4..].copy_from_slice(tag.as_ref());
-
-            Box::new(encrypted_response_header)
-        } else {
-            let response_cipher =
-                Aes128CfbEnc::new(&response_header_key.into(), &response_header_iv.into());
-            response_cipher.encrypt(&mut response_header);
-            Box::new(response_header)
-        };
-
-        let mut vmess_stream = VmessStream::new(
-            server_stream,
-            is_udp,
-            data_keys,
-            read_length_shake_reader,
-            write_length_shake_reader,
-            enable_global_padding,
-            Some(prefix_bytes),
-            None,
+        let response_header_aead_key =
+            super::sha2::kdf(&response_header_key, &[b"AEAD Resp Header Key"]);
+        let response_header_nonce =
+            super::sha2::kdf(&response_header_iv, &[b"AEAD Resp Header IV"]);
+        let unbound_key = UnboundKey::new(&AES_128_GCM, &response_header_aead_key[0..16]).unwrap();
+        let mut sealing_key = SealingKey::new(
+            unbound_key,
+            SingleUseNonce::new(&response_header_nonce[0..12]),
         );
 
-        let unparsed_data = stream_reader.unparsed_data();
-        if !unparsed_data.is_empty() {
-            vmess_stream.feed_initial_read_data(unparsed_data)?;
-        }
+        encrypted_response_header[2 + TAG_LEN..2 + TAG_LEN + 4].copy_from_slice(&response_header);
 
-        let server_stream = Box::new(vmess_stream);
+        let tag = sealing_key
+            .seal_in_place_separate_tag(
+                Aad::empty(),
+                &mut encrypted_response_header[2 + TAG_LEN..2 + TAG_LEN + 4],
+            )
+            .unwrap();
+        encrypted_response_header[2 + TAG_LEN + 4..].copy_from_slice(tag.as_ref());
 
-        match is_udp {
-            false => Ok(TcpServerSetupResult::TcpForward {
-                remote_location,
-                stream: server_stream,
-                // Wait until there is data to send the response header.
-                need_initial_flush: false,
-                connection_success_response: None,
-                initial_remote_data: None,
-                override_proxy_provider: NoneOrOne::Unspecified,
-            }),
-            true => Ok(TcpServerSetupResult::BidirectionalUdp {
-                remote_location,
-                stream: server_stream,
-                need_initial_flush: false,
-                override_proxy_provider: NoneOrOne::Unspecified,
-            }),
-        }
-    }
-}
+        let prefix_bytes: Box<[u8]> = Box::new(encrypted_response_header);
 
-#[allow(clippy::large_enum_variant)]
-enum HeaderReader {
-    AesCfb(AesCfbHeaderReader),
-    Aead(AeadHeaderReader),
-}
+        match command {
+            COMMAND_TCP => {
+                let mut vmess_stream = VmessStream::new(
+                    server_stream,
+                    false, // is_udp = false
+                    data_keys,
+                    read_length_shake_reader,
+                    write_length_shake_reader,
+                    enable_global_padding,
+                    Some(prefix_bytes),
+                    None,
+                );
 
-impl HeaderReader {
-    async fn read_slice_into(
-        &mut self,
-        stream_reader: &mut StreamReader,
-        data: &mut [u8],
-    ) -> std::io::Result<()> {
-        match self {
-            HeaderReader::AesCfb(ref mut reader) => {
-                reader.read_slice_into(stream_reader, data).await
+                let unparsed_data = stream_reader.unparsed_data();
+                if !unparsed_data.is_empty() {
+                    vmess_stream.feed_initial_read_data(unparsed_data)?;
+                }
+
+                let server_stream = Box::new(vmess_stream);
+
+                Ok(TcpServerSetupResult::TcpForward {
+                    remote_location,
+                    stream: server_stream,
+                    // Wait until there is data to send the response header.
+                    need_initial_flush: false,
+                    connection_success_response: None,
+                    initial_remote_data: None,
+                    override_proxy_provider: NoneOrOne::Unspecified,
+                })
             }
-            HeaderReader::Aead(ref mut reader) => reader.read_slice_into(data),
+            COMMAND_UDP => {
+                if !self.udp_enabled {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "UDP not enabled",
+                    ));
+                }
+
+                let mut vmess_stream = VmessStream::new(
+                    server_stream,
+                    true, // is_udp = true
+                    data_keys,
+                    read_length_shake_reader,
+                    write_length_shake_reader,
+                    enable_global_padding,
+                    Some(prefix_bytes),
+                    None,
+                );
+
+                let unparsed_data = stream_reader.unparsed_data();
+                if !unparsed_data.is_empty() {
+                    vmess_stream.feed_initial_read_data(unparsed_data)?;
+                }
+
+                let server_stream = Box::new(vmess_stream);
+
+                Ok(TcpServerSetupResult::BidirectionalUdp {
+                    remote_location,
+                    stream: server_stream,
+                    need_initial_flush: false,
+                    override_proxy_provider: NoneOrOne::Unspecified,
+                })
+            }
+            COMMAND_MUX => {
+                if !self.udp_enabled {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "MUX/XUDP requires UDP to be enabled",
+                    ));
+                }
+
+                // For XUDP mode, use is_udp=false since XUDP wraps the stream
+                let mut vmess_stream = VmessStream::new(
+                    server_stream,
+                    false, // XUDP handles UDP multiplexing, VmessStream sees it as TCP-like
+                    data_keys,
+                    read_length_shake_reader,
+                    write_length_shake_reader,
+                    enable_global_padding,
+                    Some(prefix_bytes),
+                    None,
+                );
+
+                let unparsed_data = stream_reader.unparsed_data();
+                if !unparsed_data.is_empty() {
+                    vmess_stream.feed_initial_read_data(unparsed_data)?;
+                }
+
+                // Wrap VmessStream with XudpMessageStream for session multiplexing
+                let xudp_stream = XudpMessageStream::new(Box::new(vmess_stream));
+
+                // No unparsed data to feed since VmessStream already consumed it
+                // (XUDP framing starts after VMess header)
+
+                Ok(TcpServerSetupResult::SessionBasedUdp {
+                    stream: Box::new(xudp_stream),
+                    need_initial_flush: false,
+                    override_proxy_provider: NoneOrOne::Unspecified,
+                })
+            }
+            unknown_protocol_type => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Unknown requested protocol: {unknown_protocol_type}"),
+            )),
         }
-    }
-
-    fn into_stream(self) -> Box<dyn AsyncStream> {
-        match self {
-            HeaderReader::AesCfb(reader) => reader.into_stream(),
-            HeaderReader::Aead(reader) => reader.into_stream(),
-        }
-    }
-}
-
-struct AesCfbHeaderReader {
-    server_stream: Box<dyn AsyncStream>,
-    request_cipher: Aes128CfbDec,
-}
-
-impl AesCfbHeaderReader {
-    async fn read_slice_into(
-        &mut self,
-        stream_reader: &mut StreamReader,
-        data: &mut [u8],
-    ) -> std::io::Result<()> {
-        stream_reader
-            .read_slice_into(&mut self.server_stream, data)
-            .await?;
-        self.request_cipher.clone().decrypt(data);
-        Ok(())
-    }
-
-    fn into_stream(self) -> Box<dyn AsyncStream> {
-        self.server_stream
     }
 }
 
@@ -718,18 +631,13 @@ impl AeadHeaderReader {
 #[derive(Debug)]
 pub struct VmessTcpClientHandler {
     data_cipher: DataCipher,
-    user_key: [u8; 16],
     instruction_key: [u8; 16],
     aead_cipher: Aes128,
-    is_aead: bool,
 }
 
 impl VmessTcpClientHandler {
-    pub fn new(cipher_name: &str, user_id: &str, is_aead: bool) -> Self {
+    pub fn new(cipher_name: &str, user_id: &str) -> Self {
         let mut user_id_bytes = parse_uuid(user_id).unwrap();
-        let mut user_key = [0u8; 16];
-        user_key.copy_from_slice(&user_id_bytes);
-
         user_id_bytes.extend(b"c48619fe-8f02-49e0-b9e9-edf763e17e21");
         let instruction_key: [u8; 16] = compute_md5(&user_id_bytes);
 
@@ -739,9 +647,7 @@ impl VmessTcpClientHandler {
         Self {
             data_cipher: cipher_name.into(),
             aead_cipher,
-            user_key,
             instruction_key,
-            is_aead,
         }
     }
 }
@@ -754,35 +660,25 @@ impl TcpClientHandler for VmessTcpClientHandler {
         mut client_stream: Box<dyn AsyncStream>,
         remote_location: NetLocation,
     ) -> std::io::Result<TcpClientSetupResult> {
-        let (cert_hash, time_bytes): ([u8; 16], [u8; 8]) = if self.is_aead {
-            // AEAD allows 120 second delta from the current time.
-            // See authid.go in v2ray-core.
-            let random_delta: u64 = rand::rng().random_range(0..241);
-            let time_secs: u64 =
-                SystemTime::UNIX_EPOCH.elapsed().unwrap().as_secs() - 120u64 + random_delta;
+        // AEAD allows 120 second delta from the current time.
+        // See authid.go in v2ray-core.
+        let random_delta: u64 = rand::rng().random_range(0..241);
+        let time_secs: u64 =
+            SystemTime::UNIX_EPOCH.elapsed().unwrap().as_secs() - 120u64 + random_delta;
 
-            let mut aead_bytes = [0u8; 16];
-            let time_bytes = time_secs.to_be_bytes();
-            aead_bytes[0..8].copy_from_slice(&time_bytes);
+        let mut aead_bytes = [0u8; 16];
+        let time_bytes = time_secs.to_be_bytes();
+        aead_bytes[0..8].copy_from_slice(&time_bytes);
 
-            rand::rng().fill_bytes(&mut aead_bytes[8..12]);
+        rand::rng().fill_bytes(&mut aead_bytes[8..12]);
 
-            let checksum = super::crc32::crc32c(&aead_bytes[0..12]).to_be_bytes();
-            aead_bytes[12..16].copy_from_slice(&checksum);
+        let checksum_value = super::crc32::crc32c(&aead_bytes[0..12]);
+        let checksum = checksum_value.to_be_bytes();
+        aead_bytes[12..16].copy_from_slice(&checksum);
 
-            self.aead_cipher.encrypt_block((&mut aead_bytes).into());
-            (aead_bytes, time_bytes)
-        } else {
-            // non-AEAD only allows 30 second delta.
-            let random_delta: u64 = rand::rng().random_range(0..61);
-            let time_secs: u64 =
-                SystemTime::UNIX_EPOCH.elapsed().unwrap().as_secs() - 30u64 + random_delta;
-            let time_bytes = time_secs.to_be_bytes();
-            let hash_bytes = compute_hmac_md5(&self.user_key, &time_bytes);
-            (hash_bytes, time_bytes)
-        };
+        self.aead_cipher.encrypt_block((&mut aead_bytes).into());
 
-        write_all(&mut client_stream, &cert_hash).await?;
+        let cert_hash = aead_bytes;
 
         // max length of encrypted header:
         // 41 (instructions up to addr type) + 256 (max domain name length 255 + 1 length byte) +
@@ -803,19 +699,13 @@ impl TcpClientHandler for VmessTcpClientHandler {
 
         // construct everything where we need data_encryption_iv and data_encryption_key now,
         // because instructions_to_addr_type will be encrypted once it's filled.
-        let (response_header_iv, response_header_key): ([u8; 16], [u8; 16]) = if self.is_aead {
-            let mut truncated_iv = [0u8; 16];
-            let mut truncated_key = [0u8; 16];
-            truncated_iv.copy_from_slice(&super::sha2::compute_sha256(data_encryption_iv)[0..16]);
-            truncated_key.copy_from_slice(&super::sha2::compute_sha256(data_encryption_key)[0..16]);
-
-            (truncated_iv, truncated_key)
-        } else {
-            (
-                compute_md5(data_encryption_iv),
-                compute_md5(data_encryption_key),
-            )
-        };
+        // AEAD mode only - use SHA256 for response header keys
+        let mut truncated_iv = [0u8; 16];
+        let mut truncated_key = [0u8; 16];
+        truncated_iv.copy_from_slice(&super::sha2::compute_sha256(data_encryption_iv)[0..16]);
+        truncated_key.copy_from_slice(&super::sha2::compute_sha256(data_encryption_key)[0..16]);
+        let response_header_iv = truncated_iv;
+        let response_header_key = truncated_key;
 
         let (read_length_shake_reader, write_length_shake_reader) = {
             let mut request_hasher = Shake128::default();
@@ -929,79 +819,75 @@ impl TcpClientHandler for VmessTcpClientHandler {
         header_bytes[cursor..cursor + 4].copy_from_slice(&check_bytes);
         cursor += 4;
 
-        if self.is_aead {
-            let mut encrypted_payload_length = [0u8; 18];
-            let mut nonce = [0u8; 8];
-            rand::rng().fill_bytes(&mut nonce);
+        // AEAD mode only
+        let mut encrypted_payload_length = [0u8; 18];
+        let mut nonce = [0u8; 8];
+        rand::rng().fill_bytes(&mut nonce);
 
-            let header_length_aead_key = super::sha2::kdf(
-                &self.instruction_key,
-                &[b"VMess Header AEAD Key_Length", &cert_hash, &nonce],
-            );
+        let header_length_aead_key = super::sha2::kdf(
+            &self.instruction_key,
+            &[b"VMess Header AEAD Key_Length", &cert_hash, &nonce],
+        );
 
-            let header_length_nonce = super::sha2::kdf(
-                &self.instruction_key,
-                &[b"VMess Header AEAD Nonce_Length", &cert_hash, &nonce],
-            );
+        let header_length_nonce = super::sha2::kdf(
+            &self.instruction_key,
+            &[b"VMess Header AEAD Nonce_Length", &cert_hash, &nonce],
+        );
 
-            let unbound_key =
-                UnboundKey::new(&AES_128_GCM, &header_length_aead_key[0..16]).unwrap();
+        let unbound_key = UnboundKey::new(&AES_128_GCM, &header_length_aead_key[0..16]).unwrap();
 
-            let mut sealing_key = SealingKey::new(
-                unbound_key,
-                SingleUseNonce::new(&header_length_nonce[0..12]),
-            );
+        let mut sealing_key = SealingKey::new(
+            unbound_key,
+            SingleUseNonce::new(&header_length_nonce[0..12]),
+        );
 
-            encrypted_payload_length[0] = (cursor >> 8) as u8;
-            encrypted_payload_length[1] = (cursor & 0xff) as u8;
+        encrypted_payload_length[0] = (cursor >> 8) as u8;
+        encrypted_payload_length[1] = (cursor & 0xff) as u8;
 
-            let tag = sealing_key
-                .seal_in_place_separate_tag(
-                    Aad::from(&cert_hash),
-                    &mut encrypted_payload_length[0..2],
-                )
-                .unwrap();
+        let tag = sealing_key
+            .seal_in_place_separate_tag(Aad::from(&cert_hash), &mut encrypted_payload_length[0..2])
+            .unwrap();
 
-            encrypted_payload_length[2..].copy_from_slice(tag.as_ref());
+        encrypted_payload_length[2..].copy_from_slice(tag.as_ref());
 
-            write_all(&mut client_stream, &encrypted_payload_length).await?;
-            write_all(&mut client_stream, &nonce).await?;
+        let header_aead_key = super::sha2::kdf(
+            &self.instruction_key,
+            &[b"VMess Header AEAD Key", &cert_hash, &nonce],
+        );
 
-            let header_aead_key = super::sha2::kdf(
-                &self.instruction_key,
-                &[b"VMess Header AEAD Key", &cert_hash, &nonce],
-            );
+        let header_nonce = super::sha2::kdf(
+            &self.instruction_key,
+            &[b"VMess Header AEAD Nonce", &cert_hash, &nonce],
+        );
 
-            let header_nonce = super::sha2::kdf(
-                &self.instruction_key,
-                &[b"VMess Header AEAD Nonce", &cert_hash, &nonce],
-            );
+        // TODO: don't unwrap
+        let unbound_key = UnboundKey::new(&AES_128_GCM, &header_aead_key[0..16]).unwrap();
+        let mut sealing_key =
+            SealingKey::new(unbound_key, SingleUseNonce::new(&header_nonce[0..12]));
+        let tag = sealing_key
+            .seal_in_place_separate_tag(Aad::from(&cert_hash), &mut header_bytes[0..cursor])
+            .unwrap();
 
-            // TODO: don't unwrap
-            let unbound_key = UnboundKey::new(&AES_128_GCM, &header_aead_key[0..16]).unwrap();
-            let mut sealing_key =
-                SealingKey::new(unbound_key, SingleUseNonce::new(&header_nonce[0..12]));
-            let tag = sealing_key
-                .seal_in_place_separate_tag(Aad::from(&cert_hash), &mut header_bytes[0..cursor])
-                .unwrap();
+        header_bytes[cursor..cursor + TAG_LEN].copy_from_slice(tag.as_ref());
+        cursor += TAG_LEN;
 
-            header_bytes[cursor..cursor + TAG_LEN].copy_from_slice(tag.as_ref());
-            cursor += TAG_LEN;
-            write_all(&mut client_stream, &header_bytes[0..cursor]).await?;
-        } else {
-            let instruction_iv: [u8; 16] = compute_md5_repeating(&time_bytes, 4);
-            let cipher = Aes128CfbEnc::new(&self.instruction_key.into(), &instruction_iv.into());
-            let sized_header_bytes = &mut header_bytes[0..cursor];
-            cipher.encrypt(sized_header_bytes);
-            write_all(&mut client_stream, sized_header_bytes).await?;
-        }
+        // Build complete AEAD request in a single buffer to avoid multiple writes as some
+        // servers expect to read the entire header in one shot
+        let total_len = 16 + 18 + 8 + cursor;
+        let mut complete_request = Vec::with_capacity(total_len);
+        complete_request.extend_from_slice(&cert_hash);
+        complete_request.extend_from_slice(&encrypted_payload_length);
+        complete_request.extend_from_slice(&nonce);
+        complete_request.extend_from_slice(&header_bytes[0..cursor]);
+
+        write_all(&mut client_stream, &complete_request).await?;
 
         // Flush the entire request.
         client_stream.flush().await?;
 
         // Info for reading the server response, which arrives along with the initial data.
+        // Always AEAD mode
         let read_header_info = ReadHeaderInfo {
-            is_aead: self.is_aead,
             response_header_key,
             response_header_iv,
             response_authentication_v,

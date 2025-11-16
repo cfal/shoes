@@ -3,7 +3,6 @@ mod types;
 pub use types::*;
 
 use std::collections::HashMap;
-use std::path::Path;
 
 use log::debug;
 
@@ -100,7 +99,11 @@ pub async fn convert_cert_paths(all_configs: Vec<Config>) -> std::io::Result<(Ve
     // we do this as a separate step because we can't load the data in an async manner
     // right away due to recursion.
     for config in server_configs.iter_mut() {
-        gather_pem_file_paths_from_server_config(config, &path_pem_configs, &mut unknown_pem_paths);
+        gather_pem_file_paths_from_server_config(
+            config,
+            &path_pem_configs,
+            &mut unknown_pem_paths,
+        )?;
     }
 
     for config in client_group_configs.iter_mut() {
@@ -227,7 +230,7 @@ fn gather_pem_file_paths_from_server_config(
     server_config: &mut ServerConfig,
     known_pem_paths: &HashMap<String, NamedPem>,
     unknown_pem_paths: &mut HashMap<String, String>,
-) {
+) -> std::io::Result<()> {
     // Check QUIC settings
     if let Some(ref mut quic_settings) = server_config.quic_settings {
         process_pem_path(&mut quic_settings.cert, known_pem_paths, unknown_pem_paths);
@@ -242,12 +245,13 @@ fn gather_pem_file_paths_from_server_config(
         &mut server_config.protocol,
         known_pem_paths,
         unknown_pem_paths,
-    );
+    )?;
 
     // Check rules
     for rule in server_config.rules.iter_mut() {
         gather_pem_file_paths_from_rule(rule, known_pem_paths, unknown_pem_paths);
     }
+    Ok(())
 }
 
 fn gather_pem_file_paths_from_client_config_group(
@@ -260,31 +264,126 @@ fn gather_pem_file_paths_from_client_config_group(
     }
 }
 
+/// Validates that Vision is only enabled when the inner protocol is VLESS.
+///
+/// Vision (XTLS-RPRX-Vision) is a TLS-in-TLS optimization protocol that requires
+/// VLESS as the inner protocol to function correctly.
+fn validate_vision_protocol(
+    vision_enabled: bool,
+    protocol: &ServerProxyConfig,
+    config_type: &str,
+) -> std::io::Result<()> {
+    if !vision_enabled {
+        // Vision not enabled, no validation needed
+        return Ok(());
+    }
+
+    // Vision is enabled - verify inner protocol is VLESS
+    match protocol {
+        ServerProxyConfig::Vless { .. } => {
+            // Valid: Vision + VLESS
+            Ok(())
+        }
+        other_protocol => {
+            // Invalid: Vision requires VLESS
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "{} config has vision=true but inner protocol is {} (not VLESS). \
+                     Vision (XTLS-RPRX-Vision) requires VLESS as the inner protocol. \
+                     Either set vision=false or change the inner protocol to VLESS.",
+                    config_type, other_protocol
+                ),
+            ))
+        }
+    }
+}
+
+/// Validates that Vision is only enabled when the inner protocol is VLESS (client-side)
+fn validate_client_vision_protocol(
+    vision_enabled: bool,
+    protocol: &ClientProxyConfig,
+    config_type: &str,
+) -> std::io::Result<()> {
+    if !vision_enabled {
+        return Ok(());
+    }
+
+    match protocol {
+        ClientProxyConfig::Vless { .. } => Ok(()),
+        other_protocol => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "{} client config has vision=true but inner protocol is {} (not VLESS). \
+                     Vision (XTLS-RPRX-Vision) requires VLESS as the inner protocol. \
+                     Either set vision=false or change the inner protocol to VLESS.",
+                config_type,
+                other_protocol.protocol_name()
+            ),
+        )),
+    }
+}
+
+/// Recursive validation of client proxy config structure (Vision rules, etc.)
+fn validate_client_proxy_structure(config: &ClientProxyConfig) -> std::io::Result<()> {
+    match config {
+        ClientProxyConfig::Tls(tls_config) => {
+            validate_client_vision_protocol(tls_config.vision, &tls_config.protocol, "TLS")?;
+            validate_client_proxy_structure(&tls_config.protocol)
+        }
+
+        ClientProxyConfig::Reality {
+            vision, protocol, ..
+        } => {
+            validate_client_vision_protocol(*vision, protocol, "Reality")?;
+            validate_client_proxy_structure(protocol)
+        }
+
+        ClientProxyConfig::ShadowTls { protocol, .. } => validate_client_proxy_structure(protocol),
+
+        ClientProxyConfig::Websocket(ws_config) => {
+            validate_client_proxy_structure(&ws_config.protocol)
+        }
+
+        // Leaf protocols
+        _ => Ok(()),
+    }
+}
+
 fn gather_pem_file_paths_from_server_proxy(
     server_proxy: &mut ServerProxyConfig,
     known_pem_paths: &HashMap<String, NamedPem>,
     unknown_pem_paths: &mut HashMap<String, String>,
-) {
+) -> std::io::Result<()> {
     match server_proxy {
         ServerProxyConfig::Tls {
             tls_targets,
             default_tls_target,
             shadowtls_targets,
+            reality_targets,
             ..
         } => {
             // Process TLS targets
-            for (_, tls_config) in tls_targets.iter_mut() {
+            for (sni, tls_config) in tls_targets.iter_mut() {
                 process_pem_path(&mut tls_config.cert, known_pem_paths, unknown_pem_paths);
                 process_pem_path(&mut tls_config.key, known_pem_paths, unknown_pem_paths);
                 for cert in tls_config.client_ca_certs.iter_mut() {
                     process_pem_path(cert, known_pem_paths, unknown_pem_paths);
                 }
+
+                // Validate Vision configuration
+                validate_vision_protocol(
+                    tls_config.vision,
+                    &tls_config.protocol,
+                    &format!("TLS target '{}'", sni),
+                )?;
+
                 // Recurse into inner protocol
                 gather_pem_file_paths_from_server_proxy(
                     &mut tls_config.protocol,
                     known_pem_paths,
                     unknown_pem_paths,
-                );
+                )?;
                 // Check override rules
                 for rule in tls_config.override_rules.iter_mut() {
                     gather_pem_file_paths_from_rule(rule, known_pem_paths, unknown_pem_paths);
@@ -298,12 +397,20 @@ fn gather_pem_file_paths_from_server_proxy(
                 for cert in tls_config.client_ca_certs.iter_mut() {
                     process_pem_path(cert, known_pem_paths, unknown_pem_paths);
                 }
+
+                // Validate Vision configuration
+                validate_vision_protocol(
+                    tls_config.vision,
+                    &tls_config.protocol,
+                    "default TLS target",
+                )?;
+
                 // Recurse into inner protocol
                 gather_pem_file_paths_from_server_proxy(
                     &mut tls_config.protocol,
                     known_pem_paths,
                     unknown_pem_paths,
-                );
+                )?;
                 // Check override rules
                 for rule in tls_config.override_rules.iter_mut() {
                     gather_pem_file_paths_from_rule(rule, known_pem_paths, unknown_pem_paths);
@@ -323,9 +430,30 @@ fn gather_pem_file_paths_from_server_proxy(
                     &mut shadowtls_config.protocol,
                     known_pem_paths,
                     unknown_pem_paths,
-                );
+                )?;
                 // Check override rules
                 for rule in shadowtls_config.override_rules.iter_mut() {
+                    gather_pem_file_paths_from_rule(rule, known_pem_paths, unknown_pem_paths);
+                }
+            }
+
+            // Process Reality targets
+            for (sni, reality_config) in reality_targets.iter_mut() {
+                // Validate Vision configuration
+                validate_vision_protocol(
+                    reality_config.vision,
+                    &reality_config.protocol,
+                    &format!("Reality target '{}'", sni),
+                )?;
+
+                // Recurse into inner protocol
+                gather_pem_file_paths_from_server_proxy(
+                    &mut reality_config.protocol,
+                    known_pem_paths,
+                    unknown_pem_paths,
+                )?;
+                // Check override rules
+                for rule in reality_config.override_rules.iter_mut() {
                     gather_pem_file_paths_from_rule(rule, known_pem_paths, unknown_pem_paths);
                 }
             }
@@ -337,15 +465,17 @@ fn gather_pem_file_paths_from_server_proxy(
                     &mut websocket_config.protocol,
                     known_pem_paths,
                     unknown_pem_paths,
-                );
+                )?;
                 // Check override rules
                 for rule in websocket_config.override_rules.iter_mut() {
                     gather_pem_file_paths_from_rule(rule, known_pem_paths, unknown_pem_paths);
                 }
             }
         }
+        ServerProxyConfig::Vless { .. } => {}
         _ => {}
     }
+    Ok(())
 }
 
 fn gather_pem_file_paths_from_rule(
@@ -499,7 +629,135 @@ fn validate_client_fingerprints(
     if client_fingerprints.iter().any(|fp| fp == "any") {
         let _ = std::mem::replace(client_fingerprints, NoneOrSome::Unspecified);
     } else {
-        let _ = crate::rustls_util::process_fingerprints(&client_fingerprints.clone().into_vec())?;
+        let _ = crate::rustls_config_util::process_fingerprints(
+            &client_fingerprints.clone().into_vec(),
+        )?;
+    }
+
+    Ok(())
+}
+
+/// Validates Reality short_ids to ensure they are valid hexadecimal strings.
+///
+/// Each short_id must be:
+///   - Valid hexadecimal (0-9, a-f, A-F)
+///   - Even length (to decode to whole bytes)
+///   - Maximum 16 characters (8 bytes when decoded)
+///
+/// Validates Reality private_key to ensure it's a valid base64url-encoded X25519 key.
+///
+/// The private key must:
+///   - Be valid base64url encoding
+///   - Decode to exactly 32 bytes (X25519 key size)
+fn validate_reality_private_key(private_key: &str, target_name: &str) -> std::io::Result<()> {
+    use crate::reality::decode_private_key;
+
+    decode_private_key(private_key).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "REALITY target '{}': invalid private_key: {}",
+                target_name, e
+            ),
+        )
+    })?;
+
+    Ok(())
+}
+
+/// Validates Reality client short_id to ensure it's a valid hexadecimal string
+fn validate_reality_client_short_id(short_id: &str) -> std::io::Result<()> {
+    use crate::reality::decode_short_id;
+
+    // Check length
+    if short_id.len() > 16 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "Reality client short_id is too long: '{}' ({} chars, max 16)",
+                short_id,
+                short_id.len()
+            ),
+        ));
+    }
+
+    // Check for valid hexadecimal characters
+    if !short_id.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "Reality client short_id contains non-hexadecimal characters: '{}'. \
+                 Only 0-9, a-f, and A-F are allowed.",
+                short_id
+            ),
+        ));
+    }
+
+    // Try to decode to validate format
+    decode_short_id(short_id).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("Reality client short_id decode failed: {}", e),
+        )
+    })?;
+
+    Ok(())
+}
+
+fn validate_reality_server_short_ids(
+    short_ids: &crate::option_util::OneOrSome<String>,
+    target_name: &str,
+) -> std::io::Result<()> {
+    // OneOrSome ensures at least one short_id is always present (default is all zeros)
+
+    // Check if it's exactly one short_id with the default all-zeros value
+    let is_default = match short_ids {
+        crate::option_util::OneOrSome::One(id) => {
+            id == crate::config::types::DEFAULT_REALITY_SHORT_ID
+        }
+        crate::option_util::OneOrSome::Some(ids) => {
+            ids.len() == 1 && ids[0] == crate::config::types::DEFAULT_REALITY_SHORT_ID
+        }
+    };
+
+    if is_default {
+        log::warn!(
+            "Reality server '{}' using default short_ids (all zeros). \
+             For better security in production, configure explicit short_ids.",
+            target_name
+        );
+    }
+
+    for (i, short_id) in short_ids.iter().enumerate() {
+        // Check length
+        if short_id.len() > 16 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "REALITY target '{}': short_ids[{}] is too long: '{}' ({} chars, max 16)",
+                    target_name,
+                    i,
+                    short_id,
+                    short_id.len()
+                ),
+            ));
+        }
+
+        // Check for valid hexadecimal characters
+        if !short_id.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "REALITY target '{}': short_ids[{}] contains non-hexadecimal characters: '{}'. \
+                     Only 0-9, a-f, and A-F are allowed.",
+                    target_name, i, short_id
+                ),
+            ));
+        }
+
+        // Empty string is technically valid (will be left-padded to 16 zeros)
+        // but odd-length strings are also valid (will be left-padded)
+        // The decode_short_id function handles padding internally
     }
 
     Ok(())
@@ -566,7 +824,9 @@ fn validate_server_fingerprints(
     if server_fingerprints.iter().any(|fp| fp == "any") {
         let _ = std::mem::replace(server_fingerprints, NoneOrSome::Unspecified);
     } else {
-        let _ = crate::rustls_util::process_fingerprints(&server_fingerprints.clone().into_vec())?;
+        let _ = crate::rustls_config_util::process_fingerprints(
+            &server_fingerprints.clone().into_vec(),
+        )?;
     }
 
     Ok(())
@@ -576,21 +836,45 @@ fn validate_client_proxy_config(
     client_proxy_config: &mut ClientProxyConfig,
     named_pems: &HashMap<String, String>,
 ) -> std::io::Result<()> {
-    if let ClientProxyConfig::Tls(ref mut tls_config) = client_proxy_config {
-        // Embed certificates before validation
-        embed_optional_pem_from_map(&mut tls_config.cert, named_pems);
-        embed_optional_pem_from_map(&mut tls_config.key, named_pems);
+    // First validate the structure (Vision rules, etc.)
+    validate_client_proxy_structure(client_proxy_config)?;
 
-        if tls_config.cert.is_none() != tls_config.key.is_none() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "Both client cert and key have to be specified, or both have to be omitted",
-            ));
+    match client_proxy_config {
+        ClientProxyConfig::Reality {
+            short_id, protocol, ..
+        } => {
+            // Validate short_id format
+            validate_reality_client_short_id(short_id)?;
+
+            // Warn if using default all-zeros short_id
+            if short_id == crate::config::types::DEFAULT_REALITY_SHORT_ID {
+                log::warn!(
+                    "Reality client using default short_id (all zeros). \
+                     For better security in production, configure an explicit short_id that matches your server."
+                );
+            }
+
+            // Recurse into inner protocol
+            validate_client_proxy_config(protocol, named_pems)?;
         }
-        validate_server_fingerprints(&mut tls_config.server_fingerprints)?;
 
-        // Recursively validate inner protocol
-        validate_client_proxy_config(&mut tls_config.protocol, named_pems)?;
+        ClientProxyConfig::Tls(ref mut tls_config) => {
+            // Embed certificates before validation
+            embed_optional_pem_from_map(&mut tls_config.cert, named_pems);
+            embed_optional_pem_from_map(&mut tls_config.key, named_pems);
+
+            if tls_config.cert.is_none() != tls_config.key.is_none() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Both client cert and key have to be specified, or both have to be omitted",
+                ));
+            }
+            validate_server_fingerprints(&mut tls_config.server_fingerprints)?;
+
+            // Recursively validate inner protocol
+            validate_client_proxy_config(&mut tls_config.protocol, named_pems)?;
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -612,8 +896,19 @@ fn validate_server_proxy_config(
             tls_targets,
             default_tls_target,
             shadowtls_targets,
+            reality_targets,
             tls_buffer_size,
         } => {
+            if tls_targets.is_empty()
+                && default_tls_target.is_none()
+                && shadowtls_targets.is_empty()
+                && reality_targets.is_empty()
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "TLS server has no entries",
+                ));
+            }
             for (_, tls_server_config) in tls_targets.iter_mut() {
                 // Embed certificates
                 embed_pem_from_map(&mut tls_server_config.cert, named_pems);
@@ -696,6 +991,53 @@ fn validate_server_proxy_config(
                 ConfigSelection::replace_none_or_some_groups(override_rules, rule_groups)?;
 
                 for rule_config_selection in override_rules.iter_mut() {
+                    validate_rule_config(
+                        rule_config_selection.unwrap_config_mut(),
+                        client_groups,
+                        named_pems,
+                    )?;
+                }
+            }
+
+            for (sni_hostname, reality_config) in reality_targets.iter_mut() {
+                if tls_targets.contains_key(sni_hostname) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "duplicated SNI hostname between TLS and REALITY targets: {sni_hostname}"
+                        ),
+                    ));
+                }
+                if shadowtls_targets.contains_key(sni_hostname) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "duplicated SNI hostname between ShadowTLS and REALITY targets: {sni_hostname}"
+                        ),
+                    ));
+                }
+
+                // Validate Reality private_key (must be valid base64url-encoded X25519 key)
+                validate_reality_private_key(&reality_config.private_key, sni_hostname)?;
+
+                // Validate Reality short_ids (must be valid hex strings)
+                validate_reality_server_short_ids(&reality_config.short_ids, sni_hostname)?;
+
+                // Validate inner protocol
+                validate_server_proxy_config(
+                    &mut reality_config.protocol,
+                    client_groups,
+                    rule_groups,
+                    named_pems,
+                )?;
+
+                // Validate override_rules
+                ConfigSelection::replace_none_or_some_groups(
+                    &mut reality_config.override_rules,
+                    rule_groups,
+                )?;
+
+                for rule_config_selection in reality_config.override_rules.iter_mut() {
                     validate_rule_config(
                         rule_config_selection.unwrap_config_mut(),
                         client_groups,
@@ -819,19 +1161,6 @@ fn embed_optional_pem_from_map(pem: &mut Option<String>, named_pems: &HashMap<St
     if let Some(ref mut pem_str) = pem {
         embed_pem_from_map(pem_str, named_pems);
     }
-}
-
-#[allow(dead_code)]
-pub async fn save_config(path: &Path, configs: &[Config]) -> std::io::Result<()> {
-    let yaml_str = serde_yaml::to_string(configs).map_err(|e| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("Failed to serialize to YAML: {e}"),
-        )
-    })?;
-
-    tokio::fs::write(path, yaml_str).await?;
-    Ok(())
 }
 
 #[cfg(test)]

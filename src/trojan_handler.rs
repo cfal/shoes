@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use aws_lc_rs::digest::SHA224;
+use subtle::ConstantTimeEq;
 use tokio::io::AsyncWriteExt;
 
 use crate::address::NetLocation;
@@ -38,7 +39,7 @@ impl TrojanTcpHandler {
                 cipher,
                 password: shadowsocks_password,
             } = config;
-            let cipher: ShadowsocksCipher = cipher.as_str().into();
+            let cipher: ShadowsocksCipher = cipher.as_str().try_into().unwrap();
             let key: Arc<Box<dyn ShadowsocksKey>> = Arc::new(Box::new(DefaultKey::new(
                 shadowsocks_password,
                 cipher.algorithm().key_len(),
@@ -88,10 +89,9 @@ impl TcpServerHandler for TrojanTcpHandler {
             )));
         }
 
-        for (b1, b2) in self.password_hash.iter().zip(received_hash.iter()) {
-            if b1 != b2 {
-                return Err(std::io::Error::other("Invalid password hash"));
-            }
+        // Use constant-time comparison to prevent timing attacks
+        if self.password_hash.ct_eq(received_hash).unwrap_u8() == 0 {
+            return Err(std::io::Error::other("Invalid password hash"));
         }
 
         let command_type = stream_reader.read_u8(&mut server_stream).await?;

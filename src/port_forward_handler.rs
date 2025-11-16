@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use crate::address::NetLocation;
 use crate::async_stream::AsyncStream;
 use crate::option_util::NoneOrOne;
+use crate::tcp_handler::{TcpClientHandler, TcpClientSetupResult};
 use crate::tcp_handler::{TcpServerHandler, TcpServerSetupResult};
 
 #[derive(Debug)]
@@ -38,10 +39,25 @@ impl TcpServerHandler for PortForwardServerHandler {
         Ok(TcpServerSetupResult::TcpForward {
             remote_location: location.clone(),
             stream: server_stream,
-            need_initial_flush: false,
+            need_initial_flush: true,
             connection_success_response: None,
             initial_remote_data: None,
             override_proxy_provider: NoneOrOne::Unspecified,
         })
+    }
+}
+
+#[derive(Debug)]
+pub struct PortForwardClientHandler;
+
+#[async_trait]
+impl TcpClientHandler for PortForwardClientHandler {
+    async fn setup_client_stream(
+        &self,
+        _server_stream: &mut Box<dyn AsyncStream>,
+        client_stream: Box<dyn AsyncStream>,
+        _remote_location: NetLocation,
+    ) -> std::io::Result<TcpClientSetupResult> {
+        Ok(TcpClientSetupResult { client_stream })
     }
 }

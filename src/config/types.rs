@@ -6,12 +6,95 @@ use serde::{Deserialize, Serialize};
 use crate::address::{NetLocation, NetLocationMask, NetLocationPortRange};
 use crate::option_util::{NoneOrOne, NoneOrSome, OneOrSome};
 
+/// Default Reality short_id: all zeros (16 hex chars = 8 bytes of zeros)
+pub const DEFAULT_REALITY_SHORT_ID: &str = "0000000000000000";
+
 fn default_true() -> bool {
     true
 }
 
 fn default_snell_udp_num_sockets() -> usize {
     1
+}
+
+fn default_reality_client_short_id() -> String {
+    DEFAULT_REALITY_SHORT_ID.to_string()
+}
+
+fn default_reality_server_short_ids() -> OneOrSome<String> {
+    OneOrSome::One(DEFAULT_REALITY_SHORT_ID.to_string())
+}
+
+/// Custom deserializer for ServerProxyConfig::Vmess that validates legacy force_aead field
+fn deserialize_vmess_server<'de, D>(deserializer: D) -> Result<(String, String, bool), D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+
+    #[derive(Deserialize)]
+    struct VmessServerTemp {
+        cipher: String,
+        user_id: String,
+        #[serde(default = "default_true")]
+        udp_enabled: bool,
+        #[serde(default)]
+        force_aead: Option<bool>,
+    }
+
+    let temp = VmessServerTemp::deserialize(deserializer)?;
+
+    // Check if force_aead was explicitly set
+    if let Some(force_aead_value) = temp.force_aead {
+        if !force_aead_value {
+            return Err(Error::custom(
+                "Non-AEAD VMess mode (force_aead=false) is no longer supported. \
+                 Please remove the force_aead field from your configuration, or set it to true.",
+            ));
+        }
+        // Warn about deprecated field
+        log::warn!(
+            "The 'force_aead' field in VMess server configuration is deprecated and will be removed in a future version. \
+             AEAD mode is now always enabled. Please remove this field from your configuration."
+        );
+    }
+
+    Ok((temp.cipher, temp.user_id, temp.udp_enabled))
+}
+
+/// Custom deserializer for ClientProxyConfig::Vmess that validates legacy aead field
+fn deserialize_vmess_client<'de, D>(deserializer: D) -> Result<(String, String), D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+
+    #[derive(Deserialize)]
+    struct VmessClientTemp {
+        cipher: String,
+        user_id: String,
+        #[serde(default)]
+        aead: Option<bool>,
+    }
+
+    let temp = VmessClientTemp::deserialize(deserializer)?;
+
+    // Check if aead was explicitly set
+    if let Some(aead_value) = temp.aead {
+        if !aead_value {
+            return Err(Error::custom(
+                "Non-AEAD VMess mode (aead=false) is no longer supported. \
+                 Please remove the aead field from your configuration, or set it to true.",
+            ));
+        }
+        // Warn about deprecated field
+        log::warn!(
+            "The 'aead' field in VMess client configuration is deprecated and will be removed in a future version. \
+             AEAD mode is now always enabled. Please remove this field from your configuration."
+        );
+    }
+
+    Ok((temp.cipher, temp.user_id))
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -30,18 +113,13 @@ impl std::fmt::Display for BindLocation {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Transport {
+    #[default]
     Tcp,
     Quic,
     Udp,
-}
-
-impl Default for Transport {
-    fn default() -> Self {
-        Self::Tcp
-    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -322,6 +400,51 @@ pub struct ShadowsocksConfig {
     pub password: String,
 }
 
+// REALITY Protocol Configuration
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RealityServerConfig {
+    /// X25519 private key (32 bytes, base64url encoded)
+    pub private_key: String,
+
+    /// List of valid short IDs (hex strings, 0-16 chars each)
+    #[serde(alias = "short_id", default = "default_reality_server_short_ids")]
+    pub short_ids: OneOrSome<String>,
+
+    /// Fallback destination (e.g., "example.com:443")
+    pub dest: NetLocation,
+
+    /// Maximum timestamp difference in milliseconds (optional)
+    #[serde(default = "default_reality_time_diff")]
+    pub max_time_diff: Option<u64>,
+
+    /// Minimum client version [major, minor, patch] (optional)
+    #[serde(default)]
+    pub min_client_version: Option<[u8; 3]>,
+
+    /// Maximum client version [major, minor, patch] (optional)
+    #[serde(default)]
+    pub max_client_version: Option<[u8; 3]>,
+
+    /// Enable XTLS-Vision protocol for TLS-in-TLS optimization.
+    /// When enabled, the inner protocol MUST be VLESS.
+    /// Vision detects TLS-in-TLS scenarios and switches to Direct mode for zero-copy performance.
+    /// Reality provides censorship resistance while Vision provides performance optimization.
+    #[serde(default)]
+    pub vision: bool,
+    /// Inner protocol (VLESS, Trojan, etc.)
+    pub protocol: ServerProxyConfig,
+
+    /// Override rules
+    #[serde(alias = "override_rule", default)]
+    pub override_rules: NoneOrSome<ConfigSelection<RuleConfig>>,
+}
+
+fn default_reality_time_diff() -> Option<u64> {
+    // 1 minute
+    Some(1000 * 60)
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TlsServerConfig {
     pub cert: String,
@@ -352,6 +475,12 @@ pub struct TlsServerConfig {
     #[serde(alias = "client_fingerprint", default)]
     pub client_fingerprints: NoneOrSome<String>,
 
+    /// Enable XTLS-Vision protocol for TLS-in-TLS optimization.
+    /// When enabled, the inner protocol MUST be VLESS.
+    /// Vision detects TLS-in-TLS scenarios and switches to Direct mode for zero-copy performance.
+    /// Requires TLS 1.3.
+    #[serde(default)]
+    pub vision: bool,
     pub protocol: ServerProxyConfig,
 
     #[serde(alias = "override_rule", default)]
@@ -556,15 +685,16 @@ pub enum ServerProxyConfig {
         default_tls_target: Option<Box<TlsServerConfig>>,
         #[serde(default)]
         shadowtls_targets: HashMap<String, ShadowTlsServerConfig>,
+        #[serde(default)]
+        reality_targets: HashMap<String, RealityServerConfig>,
 
         #[serde(default)]
         tls_buffer_size: Option<usize>,
     },
+    #[serde(deserialize_with = "deserialize_vmess_server")]
     Vmess {
         cipher: String,
         user_id: String,
-        #[serde(default = "default_true")]
-        force_aead: bool,
         #[serde(default = "default_true")]
         udp_enabled: bool,
     },
@@ -589,39 +719,47 @@ pub enum ServerProxyConfig {
 
 impl std::fmt::Display for ServerProxyConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}",
-            match self {
-                Self::Http { .. } => "HTTP",
-                Self::Socks { .. } => "SOCKS",
-                Self::Shadowsocks { .. } => "Shadowsocks",
-                Self::Snell { .. } => "Snell",
-                Self::Vless { .. } => "Vless",
-                Self::Trojan { .. } => "Trojan",
-                Self::Tls {
-                    tls_targets,
-                    default_tls_target,
-                    shadowtls_targets,
-                    ..
-                } => {
-                    let has_tls = !tls_targets.is_empty() || !default_tls_target.is_none();
-                    let has_shadowtls = !shadowtls_targets.is_empty();
-                    if has_tls && has_shadowtls {
-                        "TLS+ShadowTLSv3"
-                    } else if has_shadowtls {
-                        "ShadowTLSv3"
-                    } else {
-                        "TLS"
-                    }
+        match self {
+            Self::Http { .. } => write!(f, "HTTP"),
+            Self::Socks { .. } => write!(f, "SOCKS"),
+            Self::Shadowsocks { .. } => write!(f, "Shadowsocks"),
+            Self::Snell { .. } => write!(f, "Snell"),
+            Self::Vless { .. } => write!(f, "Vless"),
+            Self::Trojan { .. } => write!(f, "Trojan"),
+            Self::Tls {
+                tls_targets,
+                default_tls_target,
+                shadowtls_targets,
+                reality_targets,
+                ..
+            } => {
+                let mut parts = vec![];
+
+                if !tls_targets.is_empty() {
+                    parts.push("TLS");
                 }
-                Self::Vmess { .. } => "Vmess",
-                Self::Websocket { .. } => "Websocket",
-                Self::PortForward { .. } => "Portforward",
-                Self::Hysteria2 { .. } => "Hysteria2",
-                Self::TuicV5 { .. } => "TuicV5",
+
+                if !reality_targets.is_empty() {
+                    parts.push("REALITY");
+                }
+                if !shadowtls_targets.is_empty() {
+                    parts.push("ShadowTLSv3");
+                }
+                if tls_targets.values().any(|cfg| cfg.vision)
+                    || default_tls_target.as_ref().is_some_and(|cfg| cfg.vision)
+                    || reality_targets.values().any(|cfg| cfg.vision)
+                {
+                    parts.push("Vision");
+                }
+
+                write!(f, "{}", parts.join("+"))
             }
-        )
+            Self::Vmess { .. } => write!(f, "Vmess"),
+            Self::Websocket { .. } => write!(f, "Websocket"),
+            Self::PortForward { .. } => write!(f, "Portforward"),
+            Self::Hysteria2 { .. } => write!(f, "Hysteria2"),
+            Self::TuicV5 { .. } => write!(f, "TuicV5"),
+        }
     }
 }
 
@@ -860,24 +998,160 @@ pub enum ClientProxyConfig {
         #[serde(default)]
         shadowsocks: Option<ShadowsocksConfig>,
     },
+    Reality {
+        public_key: String,
+        #[serde(default = "default_reality_client_short_id")]
+        short_id: String,
+        #[serde(default)]
+        sni_hostname: Option<String>,
+
+        /// Enable XTLS-Vision protocol for TLS-in-TLS optimization.
+        /// When enabled, the inner protocol MUST be VLESS.
+        #[serde(default)]
+        vision: bool,
+
+        protocol: Box<ClientProxyConfig>,
+    },
+    #[serde(alias = "shadowtls")]
+    ShadowTls {
+        /// ShadowTLS password for authentication
+        password: String,
+
+        /// Optional SNI hostname override
+        #[serde(default)]
+        sni_hostname: Option<String>,
+
+        /// Inner protocol (typically VLESS, Trojan, etc.)
+        protocol: Box<ClientProxyConfig>,
+    },
+    #[serde(deserialize_with = "deserialize_tls_variant")]
     Tls(TlsClientConfig),
+    #[serde(deserialize_with = "deserialize_vmess_client")]
     Vmess {
         cipher: String,
         user_id: String,
-        #[serde(default = "default_true")]
-        aead: bool,
     },
     #[serde(alias = "ws")]
     Websocket(WebsocketClientConfig),
+    #[serde(alias = "noop")]
+    PortForward,
 }
 
 impl ClientProxyConfig {
     pub fn is_direct(&self) -> bool {
         matches!(self, ClientProxyConfig::Direct)
     }
+
+    /// Returns the protocol name for display/error messages
+    pub fn protocol_name(&self) -> &str {
+        match self {
+            ClientProxyConfig::Direct => "Direct",
+            ClientProxyConfig::Http { .. } => "HTTP",
+            ClientProxyConfig::Socks { .. } => "SOCKS5",
+            ClientProxyConfig::Shadowsocks(..) => "Shadowsocks",
+            ClientProxyConfig::Snell(..) => "Snell",
+            ClientProxyConfig::Vless { .. } => "VLESS",
+            ClientProxyConfig::Trojan { .. } => "Trojan",
+            ClientProxyConfig::Reality { .. } => "Reality",
+            ClientProxyConfig::Tls(..) => "TLS",
+            ClientProxyConfig::ShadowTls { .. } => "ShadowTLS",
+            ClientProxyConfig::Vmess { .. } => "VMess",
+            ClientProxyConfig::Websocket(..) => "WebSocket",
+            ClientProxyConfig::PortForward => "PortForward",
+        }
+    }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+/// Custom deserializer for TlsClientConfig that handles deprecated shadowtls_password field
+fn deserialize_tls_client_config<'de, D>(deserializer: D) -> Result<TlsClientConfig, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+
+    #[derive(Deserialize)]
+    struct TlsClientConfigTemp {
+        #[serde(default = "default_true")]
+        verify: bool,
+        #[serde(alias = "server_fingerprint", default)]
+        server_fingerprints: NoneOrSome<String>,
+        #[serde(default)]
+        sni_hostname: NoneOrOne<String>,
+        #[serde(alias = "alpn_protocol", default)]
+        alpn_protocols: NoneOrSome<String>,
+        #[serde(default)]
+        tls_buffer_size: Option<usize>,
+        #[serde(default)]
+        key: Option<String>,
+        #[serde(default)]
+        cert: Option<String>,
+        #[serde(default)]
+        shadowtls_password: Option<String>,
+        #[serde(default)]
+        vision: bool,
+        protocol: Box<ClientProxyConfig>,
+    }
+
+    let temp = TlsClientConfigTemp::deserialize(deserializer)?;
+
+    // Check for mutually exclusive fields
+    if temp.vision && temp.shadowtls_password.is_some() {
+        return Err(Error::custom(
+            "TLS client config cannot have both vision=true and shadowtls_password set. \
+             Vision and ShadowTLS are incompatible. \
+             Use either 'vision: true' with regular TLS, or 'type: shadowtls' for ShadowTLS.",
+        ));
+    }
+
+    // Check if deprecated shadowtls_password was used
+    if let Some(password) = temp.shadowtls_password {
+        log::warn!(
+            "The 'shadowtls_password' field in TLS client configuration is deprecated. \
+             Please use 'type: shadowtls' with 'password' field instead. \
+             This field will be removed in a future version."
+        );
+
+        // Transform to ShadowTLS variant internally by wrapping protocol
+        return Ok(TlsClientConfig {
+            verify: temp.verify,
+            server_fingerprints: temp.server_fingerprints,
+            sni_hostname: temp.sni_hostname.clone(),
+            alpn_protocols: temp.alpn_protocols,
+            tls_buffer_size: temp.tls_buffer_size,
+            key: temp.key,
+            cert: temp.cert,
+            vision: false,
+            protocol: Box::new(ClientProxyConfig::ShadowTls {
+                password,
+                sni_hostname: temp.sni_hostname.into_option(),
+                protocol: temp.protocol,
+            }),
+        });
+    }
+
+    // Normal case - no shadowtls_password
+    Ok(TlsClientConfig {
+        verify: temp.verify,
+        server_fingerprints: temp.server_fingerprints,
+        sni_hostname: temp.sni_hostname,
+        alpn_protocols: temp.alpn_protocols,
+        tls_buffer_size: temp.tls_buffer_size,
+        key: temp.key,
+        cert: temp.cert,
+        vision: temp.vision,
+        protocol: temp.protocol,
+    })
+}
+
+/// Variant deserializer for Tls in ClientProxyConfig enum
+fn deserialize_tls_variant<'de, D>(deserializer: D) -> Result<TlsClientConfig, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_tls_client_config(deserializer)
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct TlsClientConfig {
     #[serde(default = "default_true")]
     pub verify: bool,
@@ -893,8 +1167,13 @@ pub struct TlsClientConfig {
     pub key: Option<String>,
     #[serde(default)]
     pub cert: Option<String>,
+
+    /// Enable XTLS-Vision protocol for TLS-in-TLS optimization.
+    /// When enabled, the inner protocol MUST be VLESS.
+    /// Requires TLS 1.3.
     #[serde(default)]
-    pub shadowtls_password: Option<String>,
+    pub vision: bool,
+
     pub protocol: Box<ClientProxyConfig>,
 }
 
@@ -1037,7 +1316,7 @@ mod tests {
             transport: Transport::Tcp,
             tcp_settings: Some(TcpConfig { no_delay: true }),
             quic_settings: None,
-            rules: NoneOrSome::One(ConfigSelection::GroupName("test-rules".to_string())),
+            rules: NoneOrSome::None,
         }
     }
 
@@ -1067,7 +1346,7 @@ mod tests {
             transport: Transport::Tcp,
             tcp_settings: None,
             quic_settings: None,
-            rules: NoneOrSome::One(ConfigSelection::GroupName("test-rules".to_string())),
+            rules: NoneOrSome::None,
         }
     }
 
@@ -1124,6 +1403,7 @@ mod tests {
                 alpn_protocols: NoneOrSome::Some(vec!["h2".to_string(), "http/1.1".to_string()]),
                 client_ca_certs: NoneOrSome::One("ca.crt".to_string()),
                 client_fingerprints: NoneOrSome::One("abc123".to_string()),
+                vision: false,
                 protocol: ServerProxyConfig::Http {
                     username: None,
                     password: None,
@@ -1144,6 +1424,7 @@ mod tests {
                     alpn_protocols: NoneOrSome::None,
                     client_ca_certs: NoneOrSome::None,
                     client_fingerprints: NoneOrSome::None,
+                    vision: false,
                     protocol: ServerProxyConfig::Http {
                         username: None,
                         password: None,
@@ -1151,6 +1432,7 @@ mod tests {
                     override_rules: NoneOrSome::None,
                 })),
                 shadowtls_targets: HashMap::new(),
+                reality_targets: HashMap::new(),
                 tls_buffer_size: Some(8192),
             },
             transport: Transport::Tcp,
@@ -1168,7 +1450,6 @@ mod tests {
             protocol: ServerProxyConfig::Vmess {
                 cipher: "aes-128-gcm".to_string(),
                 user_id: "b831381d-6324-4d53-ad4f-8cda48b30811".to_string(),
-                force_aead: true,
                 udp_enabled: false,
             },
             transport: Transport::Tcp,
@@ -1628,6 +1909,7 @@ mod tests {
                             client_ca_certs: NoneOrSome::None,
                             client_fingerprints: NoneOrSome::Unspecified,
                             alpn_protocols: NoneOrSome::Unspecified,
+                            vision: false,
                             protocol: ServerProxyConfig::Http {
                                 username: None,
                                 password: None,
@@ -1639,13 +1921,14 @@ mod tests {
                     .collect(),
                     default_tls_target: None,
                     shadowtls_targets: HashMap::new(),
+                reality_targets: HashMap::new(),
                     tls_buffer_size: None,
                 },
                 transport: Transport::Tcp,
                 tcp_settings: None,
                 quic_settings: None,
                 rules: NoneOrSome::One(ConfigSelection::GroupName("allow-all-direct".to_string())),
-            }),
+                }),
         ];
 
         let result = validate_configs_test(configs).await;
@@ -2065,7 +2348,7 @@ mod tests {
                     num_endpoints: 1,
                 }),
                 rules: NoneOrSome::One(ConfigSelection::GroupName("allow-all-direct".to_string())),
-            }),
+                }),
         ];
 
         let result = validate_configs_test(configs).await;
@@ -2125,13 +2408,14 @@ mod tests {
                     )]
                     .into_iter()
                     .collect(),
+                reality_targets: HashMap::new(),
                     tls_buffer_size: None,
                 },
                 transport: Transport::Tcp,
                 tcp_settings: None,
                 quic_settings: None,
                 rules: NoneOrSome::One(ConfigSelection::GroupName("allow-all-direct".to_string())),
-            }),
+                }),
         ];
 
         let result = validate_configs_test(configs).await;
@@ -2218,6 +2502,7 @@ mod tests {
                             ]),
                             client_fingerprints: NoneOrSome::Unspecified,
                             alpn_protocols: NoneOrSome::Unspecified,
+                            vision: false,
                             protocol: ServerProxyConfig::Http {
                                 username: None,
                                 password: None,
@@ -2229,6 +2514,7 @@ mod tests {
                     .collect(),
                     default_tls_target: None,
                     shadowtls_targets: HashMap::new(),
+                    reality_targets: HashMap::new(),
                     tls_buffer_size: None,
                 },
                 transport: Transport::Tcp,

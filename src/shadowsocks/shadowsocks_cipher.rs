@@ -39,19 +39,23 @@ impl ShadowsocksCipher {
     pub fn salt_len(&self) -> usize {
         self.salt_len
     }
+
+    pub fn key_len(&self) -> usize {
+        self.algorithm.key_len()
+    }
 }
 
-impl From<&str> for ShadowsocksCipher {
-    fn from(name: &str) -> Self {
+impl TryFrom<&str> for ShadowsocksCipher {
+    type Error = std::io::Error;
+
+    fn try_from(name: &str) -> Result<Self, Self::Error> {
         match name {
             "chacha20-ietf-poly1305" | "chacha20-poly1305" => {
-                ShadowsocksCipher::chacha20_ietf_poly1305()
+                Ok(ShadowsocksCipher::chacha20_ietf_poly1305())
             }
-            "aes-256-gcm" => ShadowsocksCipher::aes_256_gcm(),
-            "aes-128-gcm" => ShadowsocksCipher::aes_128_gcm(),
-            _ => {
-                panic!("Unknown cipher: {name}");
-            }
+            "aes-256-gcm" => Ok(ShadowsocksCipher::aes_256_gcm()),
+            "aes-128-gcm" => Ok(ShadowsocksCipher::aes_128_gcm()),
+            _ => Err(std::io::Error::other(format!("Unknown cipher: {name}"))),
         }
     }
 }

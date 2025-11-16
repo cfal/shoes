@@ -80,6 +80,28 @@ pub trait AsyncWriteSourcedMessage {
     ) -> Poll<std::io::Result<()>>;
 }
 
+/// Session-based message reading trait. Used by protocols like XUDP that have session IDs.
+/// Returns (session_id, data, source_addr) tuples.
+pub trait AsyncReadSessionMessage {
+    fn poll_read_session_message(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<(u16, SocketAddr)>>;
+}
+
+/// Session-based message writing trait. Used by protocols like XUDP that have session IDs.
+/// Writes data for a specific session ID to a target address.
+pub trait AsyncWriteSessionMessage {
+    fn poll_write_session_message(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        session_id: u16,
+        buf: &[u8],
+        target: &SocketAddr,
+    ) -> Poll<std::io::Result<()>>;
+}
+
 impl AsyncReadMessage for UdpSocket {
     fn poll_read_message(
         self: Pin<&mut Self>,
@@ -158,6 +180,19 @@ pub trait AsyncSourcedMessageStream:
 {
 }
 
+/// Session-based stream trait for protocols like XUDP that multiplex sessions over a single connection.
+/// Reads return (session_id, data, source_addr) and writes target (session_id, data, target_addr).
+pub trait AsyncSessionMessageStream:
+    AsyncReadSessionMessage
+    + AsyncWriteSessionMessage
+    + AsyncFlushMessage
+    + AsyncShutdownMessage
+    + AsyncPing
+    + Unpin
+    + Send
+{
+}
+
 impl AsyncPing for TcpStream {
     fn supports_ping(&self) -> bool {
         false
@@ -195,38 +230,6 @@ impl AsyncPing for UdpSocket {
 }
 
 impl AsyncMessageStream for UdpSocket {}
-
-impl<AS> AsyncPing for tokio_rustls::client::TlsStream<AS>
-where
-    AS: AsyncPing + Unpin,
-{
-    fn supports_ping(&self) -> bool {
-        self.get_ref().0.supports_ping()
-    }
-
-    fn poll_write_ping(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<bool>> {
-        let this = self.get_mut();
-        Pin::new(this.get_mut().0).poll_write_ping(cx)
-    }
-}
-
-impl<AS> AsyncStream for tokio_rustls::client::TlsStream<AS> where AS: AsyncStream {}
-
-impl<AS> AsyncPing for tokio_rustls::server::TlsStream<AS>
-where
-    AS: AsyncPing + Unpin,
-{
-    fn supports_ping(&self) -> bool {
-        self.get_ref().0.supports_ping()
-    }
-
-    fn poll_write_ping(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<bool>> {
-        let this = self.get_mut();
-        Pin::new(this.get_mut().0).poll_write_ping(cx)
-    }
-}
-
-impl<AS> AsyncStream for tokio_rustls::server::TlsStream<AS> where AS: AsyncStream {}
 
 // pattern copied from deref_async_read macro: https://docs.rs/tokio/latest/src/tokio/io/async_read.rs.html#60
 impl<T: ?Sized + AsyncPing + Unpin> AsyncPing for Box<T> {
@@ -426,3 +429,50 @@ impl<T: ?Sized + AsyncTargetedMessageStream + Unpin> AsyncTargetedMessageStream 
 
 impl<T: ?Sized + AsyncSourcedMessageStream + Unpin> AsyncSourcedMessageStream for Box<T> {}
 impl<T: ?Sized + AsyncSourcedMessageStream + Unpin> AsyncSourcedMessageStream for &mut T {}
+
+impl<T: ?Sized + AsyncReadSessionMessage + Unpin> AsyncReadSessionMessage for Box<T> {
+    fn poll_read_session_message(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<(u16, SocketAddr)>> {
+        Pin::new(&mut **self).poll_read_session_message(cx, buf)
+    }
+}
+
+impl<T: ?Sized + AsyncReadSessionMessage + Unpin> AsyncReadSessionMessage for &mut T {
+    fn poll_read_session_message(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<(u16, SocketAddr)>> {
+        Pin::new(&mut **self).poll_read_session_message(cx, buf)
+    }
+}
+
+impl<T: ?Sized + AsyncWriteSessionMessage + Unpin> AsyncWriteSessionMessage for Box<T> {
+    fn poll_write_session_message(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        session_id: u16,
+        buf: &[u8],
+        target: &SocketAddr,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut **self).poll_write_session_message(cx, session_id, buf, target)
+    }
+}
+
+impl<T: ?Sized + AsyncWriteSessionMessage + Unpin> AsyncWriteSessionMessage for &mut T {
+    fn poll_write_session_message(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        session_id: u16,
+        buf: &[u8],
+        target: &SocketAddr,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut **self).poll_write_session_message(cx, session_id, buf, target)
+    }
+}
+
+impl<T: ?Sized + AsyncSessionMessageStream + Unpin> AsyncSessionMessageStream for Box<T> {}
+impl<T: ?Sized + AsyncSessionMessageStream + Unpin> AsyncSessionMessageStream for &mut T {}

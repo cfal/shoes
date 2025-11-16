@@ -1,7 +1,7 @@
 use std::collections::{HashSet, VecDeque};
 use std::time::Instant;
 
-use crate::salt_checker::SaltChecker;
+use super::salt_checker::SaltChecker;
 
 #[derive(Debug)]
 struct TimeEntry {

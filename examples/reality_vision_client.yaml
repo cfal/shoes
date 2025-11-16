@@ -1,0 +1,31 @@
+# Reality + Vision client configuration
+# Maximum performance and censorship resistance
+#
+# Reality provides censorship resistance through TLS 1.3 mimicry
+# Vision provides zero-copy performance for TLS-in-TLS scenarios
+# Together they offer both benefits with VLESS as the inner protocol
+
+# Local SOCKS proxy using Reality + Vision
+- address: "127.0.0.1:1080"
+  protocol:
+    type: socks
+  rules:
+    - masks: "0.0.0.0/0"
+      action: allow
+      client_proxy:
+        address: "your-server.example.com:443"
+        protocol:
+          type: reality
+          public_key: "SERVER_PUBLIC_KEY_HERE"
+          short_id: "0123456789abcdef"
+          sni_hostname: "www.google.com"
+          vision: true  # Enable Vision (must use VLESS)
+          protocol:
+            type: vless  # Vision REQUIRES VLESS
+            user_id: "b85798ef-e9dc-46a4-9a87-8da4499d36d0"
+
+# Benefits of Reality + Vision client:
+# - Censorship resistance: Looks like normal TLS traffic to censors
+# - Performance: Vision provides zero-copy for TLS-in-TLS
+# - Anti-detection: Vision adds padding to mimic real TLS patterns
+# - Compatibility: Works with CDNs and middleboxes

@@ -1,6 +1,6 @@
 [package]
 name = "shoes"
-version = "0.1.8"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 description = "A multi-protocol proxy server."
@@ -18,16 +18,15 @@ aws-lc-rs = { version = "*", default-features = false }
 base64 = "*"
 blake3 = "*"
 bytes = "*"
-cfb-mode = "*"
 dashmap = "*"
 digest = "*"
 env_logger = "*"
 futures = "*"
 h3 = "*"
 h3-quinn = "*"
-hmac = "*"
 http = "*"
-log = "*"
+log = { version = "*", features = ["release_max_level_info"] }
+lru = "*"
 md-5 = "*"
 memchr = "*"
 notify = "*"
@@ -35,9 +34,12 @@ parking_lot = "*"
 percent-encoding = "*"
 quinn = { version = "*", default-features = false, features = ["log", "platform-verifier", "runtime-tokio", "rustls-aws-lc-rs"] }
 rand = "*"
+rand_core = "*"
+rcgen = { version = "*", features = ["x509-parser"] }
 rustc-hash = "1"
 rustls = "*"
 serde = { version = "*", features = ["derive", "std"] }
+subtle = "*"
 serde_yaml = "*"
 sha3 = "*"
 socket2 = "*"
@@ -50,11 +52,17 @@ tokio = { version = "*", features = [
     "sync",
     "time",
 ] }
-tokio-rustls = { version = "*", default-features = false, features = ["logging", "tls12", "aws-lc-rs"] }
 webpki-roots = { version = "*" }
+x509-parser = "*"
 
 [dev-dependencies]
 tempfile = "*"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "server"] }
+http-body-util = "0.1"
+rustls-pemfile = "*"
+rcgen = "*"
+tokio-rustls = "*"
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = "0.6"

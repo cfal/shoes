@@ -20,6 +20,7 @@ use crate::client_proxy_selector::ClientProxySelector;
 use crate::noop_stream::NoopStream;
 use crate::option_util::NoneOrOne;
 use crate::resolver::Resolver;
+use crate::rustls_connection_util::feed_rustls_server_connection;
 use crate::stream_reader::StreamReader;
 use crate::tcp_client_connector::TcpClientConnector;
 use crate::tcp_handler::{TcpServerHandler, TcpServerSetupResult};
@@ -841,7 +842,7 @@ async fn setup_local_handshake(
         )
     })?;
 
-    feed_server_connection(&mut server_connection, &client_hello_frame)?;
+    feed_rustls_server_connection(&mut server_connection, &client_hello_frame)?;
 
     server_connection.process_new_packets().map_err(|e| {
         std::io::Error::new(
@@ -1041,7 +1042,7 @@ async fn setup_local_handshake(
                 hmac_client_data.update(initial_client_data);
                 hmac_client_data.update(&hmac_client_data.digest());
 
-                let shadow_tls_stream = ShadowTlsStream::new(
+                let mut shadow_tls_stream = ShadowTlsStream::new(
                     server_stream,
                     initial_client_data,
                     hmac_client_data,
@@ -1049,12 +1050,18 @@ async fn setup_local_handshake(
                     None,
                 )?;
 
+                // Feed any leftover data from the reader to the stream
+                let leftover = client_reader.unparsed_data();
+                if !leftover.is_empty() {
+                    shadow_tls_stream.feed_initial_read_data(leftover)?;
+                }
+
                 return Ok(shadow_tls_stream);
             }
         }
 
-        feed_server_connection(&mut server_connection, &client_header_bytes)?;
-        feed_server_connection(&mut server_connection, client_payload_bytes)?;
+        feed_rustls_server_connection(&mut server_connection, &client_header_bytes)?;
+        feed_rustls_server_connection(&mut server_connection, client_payload_bytes)?;
 
         server_connection.process_new_packets().map_err(|e| {
             std::io::Error::new(
@@ -1063,25 +1070,6 @@ async fn setup_local_handshake(
             )
         })?;
     }
-}
-
-#[inline]
-pub fn feed_server_connection(
-    server_connection: &mut rustls::ServerConnection,
-    data: &[u8],
-) -> std::io::Result<()> {
-    let mut cursor = Cursor::new(data);
-    let mut i = 0;
-    while i < data.len() {
-        let n = server_connection.read_tls(&mut cursor).map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("failed to feed server connection: {e}"),
-            )
-        })?;
-        i += n;
-    }
-    Ok(())
 }
 
 #[inline]
