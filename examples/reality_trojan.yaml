@@ -1,0 +1,56 @@
+# Reality server with Trojan inner protocol
+# Shows Reality works with protocols other than VLESS (when Vision is disabled)
+#
+# Reality provides censorship resistance regardless of the inner protocol
+# However, Vision (TLS-in-TLS optimization) only works with VLESS
+# This example uses Trojan without Vision
+
+- address: "0.0.0.0:443"
+  protocol:
+    type: tls
+    reality_targets:
+      "www.cloudflare.com":
+        private_key: "YOUR_PRIVATE_KEY_HERE"
+        short_ids: ["0123456789abcdef"]
+        dest: "www.cloudflare.com:443"
+
+        # vision: false (default)
+        # Vision is not enabled because Trojan is the inner protocol
+        # Vision only works with VLESS
+
+        protocol:
+          type: trojan
+          password: "your-trojan-password"
+
+# Multiple Reality targets with different inner protocols
+- address: "0.0.0.0:8443"
+  protocol:
+    type: tls
+    reality_targets:
+      # VLESS target
+      "vless.example.com":
+        private_key: "YOUR_PRIVATE_KEY_1"
+        short_ids: ["0123456789abcdef"]
+        dest: "www.cloudflare.com:443"
+        protocol:
+          type: vless
+          user_id: "b85798ef-e9dc-46a4-9a87-8da4499d36d0"
+
+      # Trojan target
+      "trojan.example.com":
+        private_key: "YOUR_PRIVATE_KEY_2"
+        short_ids: ["1234567890abcdef"]
+        dest: "www.google.com:443"
+        protocol:
+          type: trojan
+          password: "trojan-password"
+
+      # Shadowsocks target
+      "ss.example.com":
+        private_key: "YOUR_PRIVATE_KEY_3"
+        short_ids: ["abcdef0123456789"]
+        dest: "www.microsoft.com:443"
+        protocol:
+          type: shadowsocks
+          cipher: 2022-blake3-chacha20-ietf-poly1305
+          password: "N5tp51JibWA9kIPEUoDHzyyjfgkDYToOERh+u9L47fk="

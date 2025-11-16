@@ -1,0 +1,31 @@
+# Reality + Vision server
+# Combines censorship resistance with TLS-in-TLS optimization
+#
+# Reality provides censorship resistance through TLS 1.3 mimicry
+# Vision provides zero-copy performance when TLS-in-TLS is detected
+# Together they offer both benefits
+
+- address: "0.0.0.0:443"
+  protocol:
+    type: tls
+    reality_targets:
+      "www.google.com":
+        private_key: "YOUR_PRIVATE_KEY_HERE"
+        short_ids: ["0123456789abcdef"]
+        dest: "www.google.com:443"
+
+        # Enable XTLS-Vision for TLS-in-TLS optimization
+        # When enabled, Vision detects TLS-in-TLS scenarios and switches
+        # to Direct mode for zero-copy performance
+        # IMPORTANT: Vision requires VLESS as the inner protocol
+        vision: true
+
+        protocol:
+          type: vless  # Vision REQUIRES VLESS
+          user_id: "b85798ef-e9dc-46a4-9a87-8da4499d36d0"
+          udp_enabled: true
+
+# Benefits of Reality + Vision:
+# - Reality: Censorship resistance, looks like real TLS traffic
+# - Vision: Zero-copy performance, better anti-detection
+# - Combined: Maximum security and performance

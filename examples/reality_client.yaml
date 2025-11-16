@@ -1,0 +1,45 @@
+# Reality client configuration
+# Connects to a Reality server with censorship resistance
+#
+# This example shows how to configure a client to connect to a Reality server
+# The client needs the server's public key and a valid short ID
+
+# Local SOCKS proxy that uses Reality client
+- address: "127.0.0.1:1080"
+  protocol:
+    type: socks
+  rules:
+    - masks: "0.0.0.0/0"
+      action: allow
+      client_proxy:
+        address: "your-server.example.com:443"
+        protocol:
+          type: reality
+          # Server's public key (from keypair generation)
+          public_key: "SERVER_PUBLIC_KEY_HERE"
+          # Your client ID (must match server's short_ids list)
+          short_id: "0123456789abcdef"
+          # Hostname to use (should match server's reality_targets key)
+          sni_hostname: "www.cloudflare.com"
+          # Inner protocol - must match what the server expects
+          protocol:
+            type: vless
+            user_id: "b85798ef-e9dc-46a4-9a87-8da4499d36d0"
+
+# Alternative: HTTP proxy using Reality
+- address: "127.0.0.1:8080"
+  protocol:
+    type: http
+  rules:
+    - masks: "0.0.0.0/0"
+      action: allow
+      client_proxy:
+        address: "your-server.example.com:443"
+        protocol:
+          type: reality
+          public_key: "SERVER_PUBLIC_KEY_HERE"
+          short_id: "0123456789abcdef"
+          sni_hostname: "www.cloudflare.com"
+          protocol:
+            type: vless
+            user_id: "b85798ef-e9dc-46a4-9a87-8da4499d36d0"

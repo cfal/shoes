@@ -9,14 +9,13 @@ use rand::RngCore;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use super::nonce::{SingleUseNonce, VmessNonceSequence};
-use super::typed::{Aes128CfbDec, VmessReader};
+use super::typed::VmessReader;
 
 use crate::async_stream::{
     AsyncFlushMessage, AsyncMessageStream, AsyncPing, AsyncReadMessage, AsyncShutdownMessage,
     AsyncStream, AsyncWriteMessage,
 };
 use crate::util::allocate_vec;
-use aes::cipher::{AsyncStreamCipher, KeyIvInit};
 // this should be the same as vmess_handler.rs TAG_LEN.
 const HEADER_TAG_LEN: usize = 16;
 const ENCRYPTION_TAG_LEN: usize = 16;
@@ -111,7 +110,6 @@ enum DecryptState {
 
 // Expected VMess header response, when we're a client.
 pub struct ReadHeaderInfo {
-    pub is_aead: bool,
     pub response_header_key: [u8; 16],
     pub response_header_iv: [u8; 16],
     pub response_authentication_v: u8,
@@ -121,7 +119,6 @@ pub struct ReadHeaderInfo {
 enum ReadHeaderState {
     ReadAeadLength,
     ReadAeadContent(usize),
-    ReadLegacyContent,
     Done,
 }
 
@@ -206,13 +203,7 @@ impl VmessStream {
         };
 
         let read_header_state = match read_header_info {
-            Some(ref info) => {
-                if info.is_aead {
-                    ReadHeaderState::ReadAeadLength
-                } else {
-                    ReadHeaderState::ReadLegacyContent
-                }
-            }
+            Some(_) => ReadHeaderState::ReadAeadLength,
             None => ReadHeaderState::Done,
         };
 
@@ -290,7 +281,6 @@ impl VmessStream {
             ReadHeaderState::ReadAeadContent(content_len) => {
                 self.process_read_header_aead_content(content_len)
             }
-            ReadHeaderState::ReadLegacyContent => self.process_read_header_legacy_content(),
             ReadHeaderState::Done => {
                 panic!("process_read_header called with Done state");
             }
@@ -398,47 +388,6 @@ impl VmessStream {
         } = self.read_header_info.take().unwrap();
 
         check_header_response(encrypted_response_header, response_authentication_v)
-    }
-
-    fn process_read_header_legacy_content(&mut self) -> std::io::Result<()> {
-        if self.unprocessed_end_offset - self.unprocessed_start_offset < 4 {
-            return Ok(());
-        }
-
-        let ReadHeaderInfo {
-            response_header_key,
-            response_header_iv,
-            ..
-        } = self.read_header_info.as_ref().unwrap();
-
-        let response_header_bytes = &mut self.unprocessed_buf
-            [self.unprocessed_start_offset..self.unprocessed_start_offset + 4];
-        let response_cipher = Aes128CfbDec::new(
-            (&response_header_key[..]).into(),
-            (&response_header_iv[..]).into(),
-        );
-        response_cipher.decrypt(response_header_bytes);
-
-        // do this here, because we would already have read/decrypted it in the aead clause.
-        let command_len = response_header_bytes[3];
-        if command_len > 0 {
-            // if this becomes an issue, we should read the command bytes and ignore them.
-            return Err(std::io::Error::other("extra command bytes"));
-        }
-
-        self.read_header_state = ReadHeaderState::Done;
-        self.unprocessed_start_offset += 4;
-        if self.unprocessed_start_offset == self.unprocessed_end_offset {
-            self.unprocessed_start_offset = 0;
-            self.unprocessed_end_offset = 0;
-        }
-
-        let ReadHeaderInfo {
-            response_authentication_v,
-            ..
-        } = self.read_header_info.take().unwrap();
-
-        check_header_response(response_header_bytes, response_authentication_v)
     }
 
     fn try_decrypt(&mut self) -> std::io::Result<DecryptState> {

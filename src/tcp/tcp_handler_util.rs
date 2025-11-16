@@ -6,14 +6,15 @@ use rustc_hash::FxHashMap;
 
 use crate::client_proxy_selector::{ClientProxySelector, ConnectAction, ConnectRule};
 use crate::config::{
-    ClientConfig, ClientProxyConfig, ConfigSelection, RuleActionConfig, RuleConfig,
-    ServerProxyConfig, ShadowTlsServerConfig, ShadowTlsServerHandshakeConfig, ShadowsocksConfig,
-    TlsClientConfig, TlsServerConfig, WebsocketClientConfig, WebsocketServerConfig,
+    ClientConfig, ClientProxyConfig, ConfigSelection, RealityServerConfig, RuleActionConfig,
+    RuleConfig, ServerProxyConfig, ShadowTlsServerConfig, ShadowTlsServerHandshakeConfig,
+    ShadowsocksConfig, TlsClientConfig, TlsServerConfig, WebsocketClientConfig,
+    WebsocketServerConfig,
 };
 use crate::http_handler::{HttpTcpClientHandler, HttpTcpServerHandler};
 use crate::option_util::NoneOrOne;
-use crate::port_forward_handler::PortForwardServerHandler;
-use crate::rustls_util::{create_client_config, create_server_config};
+use crate::port_forward_handler::{PortForwardClientHandler, PortForwardServerHandler};
+use crate::rustls_config_util::{create_client_config, create_server_config};
 use crate::shadow_tls::{
     ShadowTlsClientHandler, ShadowTlsServerTarget, ShadowTlsServerTargetHandshake,
 };
@@ -22,9 +23,13 @@ use crate::snell::snell_handler::{SnellClientHandler, SnellServerHandler};
 use crate::socks_handler::{SocksTcpClientHandler, SocksTcpServerHandler};
 use crate::tcp_client_connector::TcpClientConnector;
 use crate::tcp_handler::{TcpClientHandler, TcpServerHandler};
-use crate::tls_handler::{TlsClientHandler, TlsServerHandler, TlsServerTarget};
+use crate::tls_client_handler::TlsClientHandler;
+use crate::tls_server_handler::{
+    RealityServerTarget, TlsServerHandler, TlsServerTarget, VisionConfig,
+};
 use crate::trojan_handler::TrojanTcpHandler;
-use crate::vless_handler::{VlessTcpClientHandler, VlessTcpServerHandler};
+use crate::vless::vless_client_handler::VlessTcpClientHandler;
+use crate::vless::vless_server_handler::VlessTcpServerHandler;
 use crate::vmess::{VmessTcpClientHandler, VmessTcpServerHandler};
 use crate::websocket::{
     WebsocketServerTarget, WebsocketTcpClientHandler, WebsocketTcpServerHandler,
@@ -84,6 +89,7 @@ pub fn create_tcp_server_handler(
             tls_targets,
             default_tls_target,
             shadowtls_targets,
+            reality_targets,
             tls_buffer_size,
         } => {
             let mut all_targets = tls_targets
@@ -97,6 +103,11 @@ pub fn create_tcp_server_handler(
                 .map(|(sni, config)| (sni, create_shadow_tls_server_target(config, rules_stack)))
                 .collect::<FxHashMap<String, TlsServerTarget>>();
             all_targets.extend(shadowtls_targets);
+            let reality_server_targets = reality_targets
+                .into_iter()
+                .map(|(sni, config)| (sni, create_reality_server_target(config, rules_stack)))
+                .collect::<FxHashMap<String, TlsServerTarget>>();
+            all_targets.extend(reality_server_targets);
             Box::new(TlsServerHandler::new(
                 all_targets,
                 default_tls_target,
@@ -106,14 +117,8 @@ pub fn create_tcp_server_handler(
         ServerProxyConfig::Vmess {
             cipher,
             user_id,
-            force_aead,
             udp_enabled,
-        } => Box::new(VmessTcpServerHandler::new(
-            &cipher,
-            &user_id,
-            force_aead,
-            udp_enabled,
-        )),
+        } => Box::new(VmessTcpServerHandler::new(&cipher, &user_id, udp_enabled)),
         ServerProxyConfig::Websocket { targets } => {
             let server_targets: Vec<WebsocketServerTarget> = targets
                 .into_vec()
@@ -142,6 +147,7 @@ fn create_tls_server_target(
         alpn_protocols,
         client_ca_certs,
         client_fingerprints,
+        vision,
         protocol,
         override_rules,
     } = tls_server_config;
@@ -173,6 +179,28 @@ fn create_tls_server_target(
         );
     }
 
+    // Create vision_config if vision is enabled
+    let vision_config = if vision {
+        // Vision requires VLESS protocol (validated in config/mod.rs)
+        if let ServerProxyConfig::Vless {
+            user_id,
+            udp_enabled,
+        } = &protocol
+        {
+            let user_id_bytes = crate::util::parse_uuid(user_id)
+                .expect("Invalid user_id UUID")
+                .into_boxed_slice();
+            Some(VisionConfig {
+                user_id: user_id_bytes,
+                udp_enabled: *udp_enabled,
+            })
+        } else {
+            unreachable!("Vision requires VLESS (should be validated during config load)")
+        }
+    } else {
+        None
+    };
+
     let handler = create_tcp_server_handler(protocol, rules_stack);
 
     let override_proxy_provider = if override_rules.is_empty() {
@@ -190,6 +218,7 @@ fn create_tls_server_target(
         server_config,
         handler,
         override_proxy_provider,
+        vision_config,
     }
 }
 
@@ -272,6 +301,90 @@ fn create_shadow_tls_server_target(
     ))
 }
 
+fn create_reality_server_target(
+    reality_server_config: RealityServerConfig,
+    rules_stack: &mut Vec<Vec<RuleConfig>>,
+) -> TlsServerTarget {
+    let RealityServerConfig {
+        private_key,
+        short_ids,
+        dest,
+        max_time_diff,
+        min_client_version,
+        max_client_version,
+        vision,
+        protocol,
+        override_rules,
+    } = reality_server_config;
+
+    // Decode private key from base64url (validated during config load)
+    let private_key_bytes = crate::reality::decode_private_key(&private_key)
+        .expect("Invalid REALITY private key (should be validated during config load)");
+
+    // Decode short IDs from hex strings (validated during config load)
+    // OneOrSome ensures at least one short_id is always present (default is all zeros)
+    let short_id_bytes: Vec<[u8; 8]> = short_ids
+        .into_vec()
+        .into_iter()
+        .map(|s| {
+            crate::reality::decode_short_id(&s)
+                .expect("Invalid REALITY short_id (should be validated during config load)")
+        })
+        .collect();
+
+    // Create vision_config if vision is enabled
+    let vision_config = if vision {
+        // Vision requires VLESS protocol (validated in config/mod.rs)
+        if let ServerProxyConfig::Vless {
+            user_id,
+            udp_enabled,
+        } = &protocol
+        {
+            let user_id_bytes = crate::util::parse_uuid(user_id)
+                .expect("Invalid user_id UUID")
+                .into_boxed_slice();
+            Some(VisionConfig {
+                user_id: user_id_bytes,
+                udp_enabled: *udp_enabled,
+            })
+        } else {
+            unreachable!("Vision requires VLESS (should be validated during config load)")
+        }
+    } else {
+        None
+    };
+
+    // Create inner handler
+    let handler = create_tcp_server_handler(protocol, rules_stack);
+
+    let override_proxy_provider = if override_rules.is_empty() {
+        NoneOrOne::None
+    } else {
+        rules_stack.push(
+            override_rules
+                .clone()
+                .map(ConfigSelection::unwrap_config)
+                .into_vec(),
+        );
+        let rules = rules_stack.last().unwrap().clone();
+        let provider = NoneOrOne::One(Arc::new(create_tcp_client_proxy_selector(rules)));
+        rules_stack.pop().unwrap();
+        provider
+    };
+
+    TlsServerTarget::Reality(RealityServerTarget {
+        private_key: private_key_bytes,
+        short_ids: short_id_bytes,
+        dest,
+        max_time_diff,
+        min_client_version,
+        max_client_version,
+        handler,
+        override_proxy_provider,
+        vision_config,
+    })
+}
+
 fn create_websocket_server_target(
     websocket_server_config: WebsocketServerConfig,
     rules_stack: &mut Vec<Vec<RuleConfig>>,
@@ -352,7 +465,10 @@ pub fn create_tcp_client_handler(
         ClientProxyConfig::Snell(ShadowsocksConfig { cipher, password }) => {
             Box::new(SnellClientHandler::new(&cipher, &password))
         }
-        ClientProxyConfig::Vless { user_id } => Box::new(VlessTcpClientHandler::new(&user_id)),
+        ClientProxyConfig::Vless { user_id } => {
+            // Plain VLESS without TLS
+            Box::new(VlessTcpClientHandler::new(&user_id))
+        }
         ClientProxyConfig::Trojan {
             password,
             shadowsocks,
@@ -367,7 +483,7 @@ pub fn create_tcp_client_handler(
                 protocol,
                 key,
                 cert,
-                shadowtls_password,
+                vision,
             } = tls_client_config;
 
             let sni_hostname = if sni_hostname.is_unspecified() {
@@ -405,33 +521,122 @@ pub fn create_tcp_client_handler(
                 None => "example.com".try_into().unwrap(),
             };
 
-            let handler = create_tcp_client_handler(*protocol, None);
+            if vision {
+                let ClientProxyConfig::Vless { user_id } = protocol.as_ref() else {
+                    // Validated when loading config
+                    unreachable!();
+                };
+                let user_id_bytes = crate::util::parse_uuid(user_id)
+                    .expect("Invalid user_id UUID")
+                    .into_boxed_slice();
+                Box::new(TlsClientHandler::new_vision_vless(
+                    client_config,
+                    tls_buffer_size,
+                    server_name,
+                    user_id_bytes,
+                ))
+            } else {
+                let handler = create_tcp_client_handler(*protocol, None);
 
-            match shadowtls_password {
-                None => Box::new(TlsClientHandler::new(
+                Box::new(TlsClientHandler::new(
                     client_config,
                     tls_buffer_size,
                     server_name,
                     handler,
-                )),
-                Some(password) => {
-                    // TODO: Ensure client_config is suitable for TLS 1.3.
-                    // Rustls ClientConfig by default supports TLS 1.3 if server does.
-                    // The server handler enforces TLS 1.3 from client and for negotiation.
-                    Box::new(ShadowTlsClientHandler::new(
-                        password,
-                        client_config,
-                        server_name,
-                        handler,
-                    ))
-                }
+                ))
             }
         }
-        ClientProxyConfig::Vmess {
-            cipher,
-            user_id,
-            aead,
-        } => Box::new(VmessTcpClientHandler::new(&cipher, &user_id, aead)),
+        ClientProxyConfig::Reality {
+            public_key,
+            short_id,
+            sni_hostname,
+            vision,
+            protocol,
+        } => {
+            eprintln!("========== CREATING REALITY CLIENT HANDLER ==========");
+
+            // Decode public key from base64url
+            let public_key_bytes =
+                crate::reality::decode_public_key(&public_key).expect("Invalid REALITY public key");
+
+            // Decode short ID from hex string
+            let short_id_bytes =
+                crate::reality::decode_short_id(&short_id).expect("Invalid REALITY short_id");
+
+            // Determine SNI hostname
+            let sni_hostname = sni_hostname.or(default_sni_hostname.clone());
+            let server_name = match sni_hostname {
+                Some(s) => rustls::pki_types::ServerName::try_from(s)
+                    .unwrap()
+                    .to_owned(),
+                None => {
+                    panic!("REALITY client requires sni_hostname to be specified");
+                }
+            };
+
+            if vision {
+                let ClientProxyConfig::Vless { user_id } = protocol.as_ref() else {
+                    unreachable!("Vision requires VLESS (should be validated during config load)")
+                };
+                let user_id_bytes = crate::util::parse_uuid(user_id)
+                    .expect("Invalid user_id UUID")
+                    .into_boxed_slice();
+                Box::new(
+                    crate::reality_client_handler::RealityClientHandler::new_vision_vless(
+                        public_key_bytes,
+                        short_id_bytes,
+                        server_name,
+                        user_id_bytes,
+                    ),
+                )
+            } else {
+                let inner_handler = create_tcp_client_handler(*protocol, None);
+                Box::new(crate::reality_client_handler::RealityClientHandler::new(
+                    public_key_bytes,
+                    short_id_bytes,
+                    server_name,
+                    inner_handler,
+                ))
+            }
+        }
+        ClientProxyConfig::ShadowTls {
+            password,
+            sni_hostname,
+            protocol,
+        } => {
+            // ShadowTLS client handler
+            let sni_hostname = sni_hostname.or(default_sni_hostname);
+            let enable_sni = sni_hostname.is_some();
+
+            let server_name = match sni_hostname {
+                Some(s) => rustls::pki_types::ServerName::try_from(s).unwrap(),
+                None => "example.com".try_into().unwrap(), // Fallback
+            };
+
+            // Create TLS config for ShadowTLS
+            // TODO: Ensure client_config is suitable for TLS 1.3.
+            // Rustls ClientConfig by default supports TLS 1.3 if server does.
+            // The server handler enforces TLS 1.3 from client and for negotiation.
+            let client_config = Arc::new(create_client_config(
+                false,      // No WebPKI verification needed for ShadowTLS
+                Vec::new(), // No fingerprints
+                Vec::new(), // No ALPN
+                enable_sni, // Enable SNI if hostname provided
+                None,       // No client cert
+            ));
+
+            let handler = create_tcp_client_handler(*protocol, None);
+
+            Box::new(ShadowTlsClientHandler::new(
+                password,
+                client_config,
+                server_name,
+                handler,
+            ))
+        }
+        ClientProxyConfig::Vmess { cipher, user_id } => {
+            Box::new(VmessTcpClientHandler::new(&cipher, &user_id))
+        }
         ClientProxyConfig::Websocket(websocket_client_config) => {
             let WebsocketClientConfig {
                 matching_path,
@@ -449,6 +654,7 @@ pub fn create_tcp_client_handler(
                 handler,
             ))
         }
+        ClientProxyConfig::PortForward => Box::new(PortForwardClientHandler),
     }
 }
 

@@ -10,16 +10,17 @@ use aws_lc_rs::error::Unspecified;
 use futures::ready;
 use parking_lot::Mutex;
 use rand::RngCore;
+use subtle::ConstantTimeEq;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use super::aead_util::TAG_LEN;
+use super::salt_checker::SaltChecker;
 use super::shadowsocks_key::ShadowsocksKey;
 use super::shadowsocks_stream_type::ShadowsocksStreamType;
 use crate::async_stream::{
     AsyncFlushMessage, AsyncMessageStream, AsyncPing, AsyncReadMessage, AsyncShutdownMessage,
     AsyncStream, AsyncWriteMessage,
 };
-use crate::salt_checker::SaltChecker;
 use crate::util::allocate_vec;
 
 fn generate_iv(buf: &mut [u8]) {
@@ -534,13 +535,12 @@ impl ShadowsocksStream {
                 let request_salt =
                     &self.unprocessed_buf[self.salt_len + 9..self.salt_len + 9 + self.salt_len];
 
-                for (a, b) in request_salt.iter().zip(self.encrypt_iv.iter()) {
-                    if a != b {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            "server returned request salt does not match",
-                        ));
-                    }
+                // Use constant-time comparison to prevent timing attacks
+                if request_salt.ct_eq(&self.encrypt_iv[..]).unwrap_u8() == 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "server returned request salt does not match",
+                    ));
                 }
 
                 let first_chunk_len =

@@ -1,0 +1,39 @@
+# Basic Reality server with VLESS
+# Provides enhanced privacy through TLS 1.3 mimicry
+#
+# Reality uses X25519 key exchange and HMAC-signed certificates to provide
+# enhanced privacy. Non-Reality traffic is forwarded to the fallback
+# destination, making the server look like a real website to observers.
+#
+# Generate a Reality keypair with: an X25519 keypair generation tool
+
+- address: "0.0.0.0:443"
+  protocol:
+    type: tls
+    reality_targets:
+      "www.cloudflare.com":
+        # X25519 private key (32 bytes, base64url encoded)
+        # Keep this secret! Clients need the corresponding public key.
+        private_key: "YOUR_PRIVATE_KEY_HERE"
+
+        # List of valid short IDs (hex strings, 0-16 chars)
+        # Clients must use one of these IDs to connect
+        # Empty string "" allows all clients (less secure but convenient)
+        short_ids:
+          - "0123456789abcdef"  # Specific client ID
+          - ""                  # Allow all clients
+
+        # Fallback destination for non-Reality traffic
+        # This should be a real website - traffic that doesn't match Reality
+        # protocol will be forwarded here, making observers see a real site
+        dest: "www.cloudflare.com:443"
+
+        # Optional: Maximum timestamp difference in milliseconds (default: 60000)
+        # Prevents replay attacks by rejecting connections with old timestamps
+        max_time_diff: 60000  # 1 minute
+
+        # Inner protocol - the actual proxy protocol used after Reality handshake
+        protocol:
+          type: vless
+          user_id: "b85798ef-e9dc-46a4-9a87-8da4499d36d0"
+          udp_enabled: true  # Enable XUDP for UDP multiplexing

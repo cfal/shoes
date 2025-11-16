@@ -50,3 +50,47 @@
         address: "proxy.example.com:1080"
         protocol:
           type: socks
+
+# VLESS over Reality (censorship resistance)
+- address: "0.0.0.0:8443"
+  protocol:
+    type: tls
+    reality_targets:
+      "www.cloudflare.com":
+        private_key: "YOUR_PRIVATE_KEY_HERE"
+        short_ids: ["0123456789abcdef", ""]
+        dest: "www.cloudflare.com:443"
+        protocol:
+          type: vless
+          user_id: "b85798ef-e9dc-46a4-9a87-8da4499d36d0"
+          udp_enabled: true
+
+# VLESS over Reality with Vision (censorship + performance)
+- address: "0.0.0.0:9443"
+  protocol:
+    type: tls
+    reality_targets:
+      "www.google.com":
+        private_key: "YOUR_PRIVATE_KEY_HERE"
+        short_ids: ["0123456789abcdef"]
+        dest: "www.google.com:443"
+        vision: true  # Enable Vision
+        protocol:
+          type: vless  # Vision requires VLESS
+          user_id: "b85798ef-e9dc-46a4-9a87-8da4499d36d0"
+          udp_enabled: true
+
+# VLESS over TLS with Vision (no Reality)
+- address: "0.0.0.0:10443"
+  protocol:
+    type: tls
+    tls_targets:
+      "vless.example.com":
+        cert: "cert.pem"
+        key: "key.pem"
+        vision: true  # Enable Vision
+        alpn_protocols: ["http/1.1"]
+        protocol:
+          type: vless
+          user_id: "b85798ef-e9dc-46a4-9a87-8da4499d36d0"
+          udp_enabled: true

@@ -1,485 +1,658 @@
-# Configuration Guide
+# Configuration Reference
 
-shoes uses a YAML-based configuration format. Each configuration file can contain multiple entries of different types.
+shoes uses YAML configuration files. Multiple configuration types can be combined in a single file or split across multiple files.
 
-## Configuration Types
+## Table of Contents
+- [Configuration Structure](#configuration-structure)
+- [Server Config](#server-config)
+- [Server Protocols](#server-protocols)
+- [Client Config](#client-config)
+- [Client Protocols](#client-protocols)
+- [Rules System](#rules-system)
+- [Named Groups](#named-groups)
+- [Named PEMs](#named-pems)
+- [Advanced Features](#advanced-features)
+- [Command Line](#command-line)
 
-There are four main configuration types:
+## Configuration Structure
 
-1. Server configurations (`ServerConfig`)
-2. Client proxy groups (`ClientConfigGroup`)
-3. Rule groups (`RuleConfigGroup`)
-4. Named PEM files (`NamedPem`)
+A configuration file is a YAML array containing one or more configuration entries. Each entry can be:
 
-## Named PEM Files
-
-You can define PEM files (containing certificates and/or private keys) once and reference them throughout your configuration. This is particularly useful when the same certificate/key pair is used in multiple places.
-
-### Named PEM
-```yaml
-pem: string                 # Name identifier for the PEM data
-path: string                # File path to PEM file
-# OR
-data: string                # Inline PEM-encoded data
-```
-
-**Note**: A single PEM file can contain:
-- Just a certificate
-- Just a private key
-- Both certificate and private key
-- Multiple certificates (chain)
-- Any combination of the above
-
-When referenced in a `cert` field, only the certificate portion is used. When referenced in a `key` field, only the private key portion is used.
-
-## Server Configuration
-
-A server configuration defines a proxy server instance:
+- **Server Config** - Defines a proxy server instance
+- **Client Config Group** - Defines reusable upstream proxy configurations
+- **Rule Config Group** - Defines reusable routing rules
+- **Named PEM** - Defines reusable certificate/key data
 
 ```yaml
-bind_location: address | path  # Network address or Unix socket path (use a file path for Unix sockets)
-protocol: ServerProxyConfig    # Server protocol configuration (see available types below)
-transport: tcp | quic | udp     # Optional, defaults to tcp; note: Unix socket binding is supported only with tcp
-tcp_settings:                   # Optional TCP settings
-  no_delay: bool               # Default: true
-quic_settings:                 # Required if transport is quic
-  cert: string                # TLS certificate (path, inline PEM data, or named PEM reference)
-  key: string                 # TLS private key (path, inline PEM data, or named PEM reference)
-  alpn_protocols: [string]    # Optional ALPN protocols (alias: alpn_protocol)
-  client_fingerprints: [string] # Optional allowed client cert fingerprints (alias: client_fingerprint)
-  client_ca_certs: [string]   # Optional client CA certificates (path, inline PEM, or named PEM reference)
-  num_endpoints: int          # Optional; if set to 0, defaults to the number of available threads
-rules: string | RuleConfig    # Optional; defaults to allow-all-direct if omitted
+# Server configs have 'address' or 'path'
+- address: "0.0.0.0:8080"
+  protocol: ...
+
+# Client config groups have 'client_group'
+- client_group: my-upstream
+  client_proxy: ...
+
+# Rule config groups have 'rule_group'
+- rule_group: my-rules
+  rules: ...
+
+# Named PEMs have 'pem'
+- pem: my-cert
+  path: /path/to/cert.pem
 ```
 
-## Protocol Types
+## Server Config
 
-### Server Protocols
+```yaml
+# Bind to IP address and port
+address: "0.0.0.0:8080"        # IPv4
+address: "[::]:8080"           # IPv6
+address: "0.0.0.0:443-445"     # Port range
 
-#### HTTP/SOCKS5 Proxy
+# OR bind to Unix socket (TCP only)
+path: "/tmp/shoes.sock"
+
+# Protocol configuration (required)
+protocol: ServerProxyConfig
+
+# Transport layer (default: tcp)
+transport: tcp | quic
+
+# TCP settings (only when transport: tcp)
+tcp_settings:
+  no_delay: true               # Default: true
+
+# QUIC settings (required when transport: quic)
+quic_settings:
+  cert: string                 # TLS certificate (path or named PEM)
+  key: string                  # TLS private key (path or named PEM)
+  alpn_protocols: [string]     # Optional ALPN protocols
+  client_ca_certs: [string]    # Optional client CA certificates
+  client_fingerprints: [string] # Optional client certificate fingerprints
+  num_endpoints: int           # Optional, 0 = auto (based on thread count)
+
+# Routing rules (default: allow-all-direct)
+rules: string | [RuleConfig]
+```
+
+## Server Protocols
+
+### HTTP
 ```yaml
 protocol:
-  type: http | socks
-  username: string?  # Optional
-  password: string?  # Optional
+  type: http
+  username: string?            # Optional authentication
+  password: string?
 ```
 
-#### Shadowsocks
+### SOCKS5
 ```yaml
 protocol:
-  type: shadowsocks | ss
-  cipher: string         # Encryption algorithm
+  type: socks                  # Aliases: socks5
+  username: string?
+  password: string?
+```
+
+### Shadowsocks
+```yaml
+protocol:
+  type: shadowsocks            # Aliases: ss
+  cipher: string               # See supported ciphers below
   password: string
+
+# Supported ciphers:
+# - aes-128-gcm
+# - aes-256-gcm
+# - chacha20-ietf-poly1305
+# - 2022-blake3-aes-128-gcm
+# - 2022-blake3-aes-256-gcm
+# - 2022-blake3-chacha20-ietf-poly1305
 ```
 
-#### Snell
+### VMess
 ```yaml
 protocol:
-  type: snell
-  cipher: string         # Encryption algorithm
-  password: string
-  udp_enabled: bool      # Optional, defaults to true
-  udp_num_sockets: int   # Optional, defaults to 1
+  type: vmess
+  cipher: string               # aes-128-gcm, chacha20-poly1305, none
+  user_id: string              # UUID
+  udp_enabled: true            # Default: true (enables XUDP)
 ```
 
-#### VLESS
+### VLESS
 ```yaml
 protocol:
   type: vless
-  user_id: string  # UUID
+  user_id: string              # UUID
+  udp_enabled: true            # Default: true (enables XUDP)
 ```
 
-#### Trojan
+### Trojan
 ```yaml
 protocol:
   type: trojan
   password: string
-  shadowsocks:      # Optional additional encryption
+  shadowsocks:                 # Optional encryption layer
     cipher: string
     password: string
 ```
 
-#### VMess
+### Snell v3
 ```yaml
 protocol:
-  type: vmess
-  cipher: string
-  user_id: string   # UUID
-  force_aead: bool  # Default: true
-  udp_enabled: bool # Default: true
+  type: snell
+  cipher: string               # aes-128-gcm, aes-256-gcm, chacha20-ietf-poly1305
+  password: string
+  udp_enabled: true            # Default: true
+  udp_num_sockets: 1           # Default: 1, sockets per UDP session
 ```
 
-#### TLS Server
+### TLS Server
 ```yaml
 protocol:
   type: tls
-  sni_targets:                # Map of SNI hostnames to TLS configs
+
+  # Standard TLS targets (by SNI)
+  tls_targets:                 # Aliases: sni_targets, targets
     "example.com":
-      cert: string           # Certificate (path, inline PEM data, or named PEM reference)
-      key: string            # Private key (path, inline PEM data, or named PEM reference)
-      alpn_protocols: [string]  # Optional ALPN protocols
-      client_fingerprints: [string]  # Optional allowed client fingerprints
-      client_ca_certs: [string]  # Optional client CA certificates
-      protocol: ServerProxyConfig  # Inner protocol configuration
-      override_rules: string | [RuleConfig]  # Optional override rules
-  default_target:            # Optional default configuration
+      cert: string             # Certificate (path or named PEM)
+      key: string              # Private key (path or named PEM)
+      alpn_protocols: [string] # Optional ALPN
+      client_ca_certs: [string] # Optional client CA certs
+      client_fingerprints: [string] # Optional client cert fingerprints
+      vision: false            # Enable Vision (requires VLESS inner protocol)
+      protocol: ServerProxyConfig
+      override_rules: [RuleConfig] # Optional rule override
+
+  # Default TLS target (for unmatched/no SNI)
+  default_tls_target:          # Aliases: default_target
     cert: string
     key: string
-    client_ca_certs: [string]
-    protocol: ServerProxyConfig
-    override_rules: string | [RuleConfig]
-  tls_buffer_size: int       # Optional TLS buffer size (minimum 16384)
-```
+    # ... same fields as tls_targets
 
-#### ShadowTLS v3 (in-process handshake)
-```yaml
-protocol:
-  type: shadowtls
-  sni_targets:                # Map of SNI hostnames to ShadowTLS v3 configs
+  # Reality targets (by SNI)
+  reality_targets:
+    "www.cloudflare.com":
+      private_key: string      # X25519 private key (base64url)
+      short_ids: [string]      # Valid client IDs (hex, 0-16 chars)
+      dest: string             # Fallback destination (e.g., "example.com:443")
+      max_time_diff: 60000     # Max timestamp diff in ms (default: 60000)
+      vision: false            # Enable Vision (requires VLESS inner protocol)
+      protocol: ServerProxyConfig
+      override_rules: [RuleConfig]
+
+  # ShadowTLS v3 targets (by SNI)
+  shadowtls_targets:
     "example.com":
-      password: string        # ShadowTLS password
-      handshake:              # TLS handshake configuration; can be defined in two ways:
-        cert: string         # Local handshake: certificate (path, inline PEM, or named PEM reference)
-        key: string          # Local handshake: private key (path, inline PEM, or named PEM reference)
-        alpn_protocols: [string]  # Optional ALPN protocols
-        client_fingerprints: [string]  # Optional allowed client fingerprints
-      protocol: ServerProxyConfig  # Inner protocol configuration
-      override_rules: string | [RuleConfig]  # Optional override rules
-  default_target:            # Optional default configuration for ShadowTLS v3
-    password: string
-    handshake: { ... }        # Handshake configuration (local or remote)
-    protocol: ServerProxyConfig
-    override_rules: string | [RuleConfig]
+      password: string
+      handshake:
+        # Local handshake (with own certificate):
+        cert: string
+        key: string
+        alpn_protocols: [string]
+        client_ca_certs: [string]
+        client_fingerprints: [string]
+        # OR Remote handshake (proxy to real server):
+        address: string        # e.g., "google.com:443"
+        client_proxies: [ClientConfig] # Optional proxies for handshake
+      protocol: ServerProxyConfig
+      override_rules: [RuleConfig]
+
+  # Buffer size for TLS (optional, min 16384)
+  tls_buffer_size: int
 ```
 
-#### ShadowTLS v3 (remote handshake server)
+### WebSocket
 ```yaml
 protocol:
-  type: shadowtls
-  sni_targets:                # Map of SNI hostnames to ShadowTLS v3 configs
-    "example.com":
-      password: string        # ShadowTLS password
-      handshake:              # TLS handshake configuration; can be defined in two ways:
-        address: example.com:443  # Remote handshake: address of handshake server
-        client_proxies: ClientConfig # Remote handshake: client proxy configuration for handshake server
-      protocol: ServerProxyConfig  # Inner protocol configuration
-      override_rules: string | [RuleConfig]  # Optional override rules
-  default_target:            # Optional default configuration for ShadowTLS v3
-    handshake: { ... }        # Handshake configuration (local or remote)
-    protocol: ServerProxyConfig
-    override_rules: string | [RuleConfig]
-```
-
-#### WebSocket
-```yaml
-protocol:
-  type: websocket | ws
+  type: websocket              # Aliases: ws
   targets:
-    - matching_path: string?     # Optional path to match
-      matching_headers:          # Optional headers to match
-        header_name: string
-      protocol: ServerProxyConfig  # Inner protocol configuration
-      ping_type: disabled | ping-frame | empty-frame  # Default: ping-frame
-      override_rules: string | [RuleConfig]  # Optional override rules
+    - matching_path: string?   # Optional path filter (e.g., "/ws")
+      matching_headers:        # Optional header filters
+        X-Custom-Header: "value"
+      protocol: ServerProxyConfig
+      ping_type: ping-frame    # disabled | ping-frame | empty-frame
+      override_rules: [RuleConfig]
 ```
 
-#### Port Forward
+### Port Forward
 ```yaml
 protocol:
-  type: forward | port_forward
-  targets: string | [string]  # Target address(es) to forward to
+  type: forward                # Aliases: port_forward, portforward
+  targets: string | [string]   # Target address(es)
 ```
 
-#### Hysteria2
+### Hysteria2
 ```yaml
 protocol:
   type: hysteria2
-  password: string    # Proxy password
-  udp_enabled: bool   # Optional, defaults to true
+  password: string
+  udp_enabled: true            # Default: true
 ```
 
-#### Tuic v5
+### TUIC v5
 ```yaml
 protocol:
-  type: tuic | tuicv5
-  uuid: string        # UUID for identification
+  type: tuic                   # Aliases: tuicv5
+  uuid: string                 # UUID
   password: string
 ```
 
-### Client Protocols
+## Client Config
 
-Client protocols (`ClientProxyConfig`) include all server protocols plus:
+Used in rules to specify upstream proxies.
 
-#### Direct Connection
+```yaml
+address: string                # Proxy server address (e.g., "proxy.example.com:1080")
+protocol: ClientProxyConfig
+transport: tcp | quic          # Default: tcp
+bind_interface: string         # Optional, Linux/Android/Fuchsia only
+
+tcp_settings:
+  no_delay: true
+
+quic_settings:
+  verify: true                 # Default: true
+  server_fingerprints: [string]
+  sni_hostname: string
+  alpn_protocols: [string]
+  cert: string                 # Client certificate for mTLS
+  key: string                  # Client key for mTLS
+```
+
+## Client Protocols
+
+### Direct
 ```yaml
 protocol:
   type: direct
 ```
 
-#### TLS Client
+### HTTP
+```yaml
+protocol:
+  type: http
+  username: string?
+  password: string?
+```
+
+### SOCKS5
+```yaml
+protocol:
+  type: socks
+  username: string?
+  password: string?
+```
+
+### Shadowsocks
+```yaml
+protocol:
+  type: shadowsocks
+  cipher: string
+  password: string
+```
+
+### Snell
+```yaml
+protocol:
+  type: snell
+  cipher: string
+  password: string
+```
+
+### VMess
+```yaml
+protocol:
+  type: vmess
+  cipher: string
+  user_id: string
+```
+
+### VLESS
+```yaml
+protocol:
+  type: vless
+  user_id: string
+```
+
+### Trojan
+```yaml
+protocol:
+  type: trojan
+  password: string
+  shadowsocks:                 # Optional
+    cipher: string
+    password: string
+```
+
+### TLS Client
 ```yaml
 protocol:
   type: tls
-  verify: bool               # Default: true
-  server_fingerprints: [string]  # Optional allowed server fingerprints
-  sni_hostname: string?     # Optional SNI hostname
-  alpn_protocols: [string]  # Optional ALPN protocols
-  key: string?             # Optional client key (path, inline PEM, or named PEM reference)
-  cert: string?            # Optional client cert (path, inline PEM, or named PEM reference)
-  protocol: ClientProxyConfig  # Inner protocol configuration
+  verify: true                 # Default: true
+  server_fingerprints: [string]
+  sni_hostname: string
+  alpn_protocols: [string]
+  tls_buffer_size: int
+  cert: string                 # Client certificate for mTLS
+  key: string                  # Client key for mTLS
+  vision: false                # Enable Vision (requires VLESS inner protocol)
+  protocol: ClientProxyConfig
 ```
 
-#### WebSocket Client
+### Reality Client
 ```yaml
 protocol:
-  type: websocket | ws
-  matching_path: string?     # Optional path to match
-  matching_headers:          # Optional headers to match
+  type: reality
+  public_key: string           # Server's X25519 public key (base64url)
+  short_id: string             # Your client ID (hex, 0-16 chars)
+  sni_hostname: string         # SNI to send (must match server's reality_targets key)
+  vision: false                # Enable Vision (requires VLESS inner protocol)
+  protocol: ClientProxyConfig  # Inner protocol (typically VLESS)
+```
+
+### ShadowTLS Client
+```yaml
+protocol:
+  type: shadowtls
+  password: string
+  sni_hostname: string?        # Optional SNI override
+  protocol: ClientProxyConfig
+```
+
+### WebSocket Client
+```yaml
+protocol:
+  type: websocket
+  matching_path: string?
+  matching_headers:
     header_name: string
-  ping_type: disabled | ping-frame | empty-frame  # Default: ping-frame
-  protocol: ClientProxyConfig  # Inner protocol configuration
+  ping_type: ping-frame        # disabled | ping-frame | empty-frame
+  protocol: ClientProxyConfig
 ```
 
-## Client Configuration
-
-A client configuration defines proxy client settings:
-
+### Port Forward (No-op)
 ```yaml
-bind_interface: string?      # Optional interface name (available on Linux, Android, or Fuchsia)
-address: string             # Target address; defaults to unspecified if omitted
-protocol: ClientProxyConfig   # Client protocol configuration
-transport: tcp | quic | udp   # Optional, defaults to tcp
-tcp_settings:                # Optional TCP settings
-  no_delay: bool            # Default: true
-quic_settings:              # Optional QUIC settings (only applicable if transport is quic)
-  verify: bool             # Default: true
-  server_fingerprints: [string]  # Optional allowed server fingerprints (alias: server_fingerprint)
-  sni_hostname: string?    # Optional SNI hostname
-  alpn_protocols: [string]   # Optional ALPN protocols (alias: alpn_protocol)
-  key: string?            # Optional client key (path, inline PEM, or named PEM reference; must be paired with cert)
-  cert: string?           # Optional client cert (path, inline PEM, or named PEM reference; must be paired with key)
+protocol:
+  type: portforward            # Aliases: noop
 ```
 
-## Client Proxy Groups
+Passes through the raw connection without protocol wrapping. Useful for testing or transparent proxying.
 
-Client proxy groups allow defining reusable proxy configurations:
+## Rules System
 
+Rules determine how incoming connections are routed.
+
+### Rule Config
 ```yaml
-client_group: string
-client_proxies: ClientConfig | [ClientConfig]
+rules:
+  - masks: string | [string]   # IP/CIDR or hostname masks
+    action: allow | block
+    # For action: allow
+    override_address: string?  # Optional address override
+    client_proxy: string | ClientConfig | [ClientConfig]
 ```
 
-## Rule Groups
-
-Rule groups define access control and routing rules:
-
+### Mask Syntax
 ```yaml
-rule_group: string
-rules: RuleConfig | [RuleConfig]
+# IP/CIDR masks
+masks: "0.0.0.0/0"             # All IPv4
+masks: "::/0"                  # All IPv6
+masks: "192.168.0.0/16"        # Subnet
+masks: "10.0.0.1:80"           # Specific IP and port
+
+# Hostname masks
+masks: "*.google.com"          # Wildcard subdomain
+masks: "example.com"           # Exact match
+
+# Multiple masks
+masks:
+  - "192.168.0.0/16"
+  - "10.0.0.0/8"
+  - "*.internal.com"
 ```
 
-### Rule Configuration
+### Built-in Rule Groups
+- `allow-all-direct` - Allow all connections, direct routing
+- `block-all` - Block all connections
 
+### Example Rules
 ```yaml
-masks: string | [string]  # IP/CIDR masks to match
-action: allow | block     # Action to take
-override_address: string?  # Optional address override for allow action
-client_proxies: string | ClientConfig | [string | ClientConfig]  # Required for allow action (alias: client_proxy)
+rules:
+  # Direct connection for local networks
+  - masks: ["192.168.0.0/16", "10.0.0.0/8", "172.16.0.0/12"]
+    action: allow
+    client_proxy: direct
+
+  # Block specific domains
+  - masks: ["*.ads.example.com", "tracking.example.com"]
+    action: block
+
+  # Route through upstream proxy
+  - masks: "0.0.0.0/0"
+    action: allow
+    client_proxy:
+      address: "proxy.example.com:1080"
+      protocol:
+        type: socks
 ```
 
-## Built-in Defaults
+## Named Groups
 
-The system includes these built-in defaults:
-
-### Client Groups
-- `direct`: Direct connections without proxy
-
-### Rule Groups
-- `allow-all-direct`: Allows all traffic directly
-- `block-all`: Blocks all traffic
-
-## Security Considerations
-
-1. TLS/QUIC Security:
-   - Use strong certificates and private keys
-   - Consider enabling client certificate authentication
-   - Use secure cipher suites
-   - Verify certificate fingerprints when possible
-
-2. Authentication:
-   - Use strong passwords for all authentication methods
-   - Consider using client certificates where supported
-   - Rotate credentials regularly
-
-3. Network Security:
-   - Be cautious with 0.0.0.0 bind addresses
-   - Use firewalls to restrict access
-   - Consider binding to specific interfaces when possible
-   - Monitor logs for suspicious activity
-
-4. WebSocket Security:
-   - Use path and header matching to restrict access
-   - Consider using TLS for transport security
-   - Implement rate limiting if needed
-
-## Certificate and Key Specification
-
-Certificates and keys can be specified in three ways:
-
-1. **File Path**: Provide the path to a PEM-encoded file
-   ```yaml
-   cert: "/etc/certs/server.pem"
-   key: "/etc/certs/server.pem"  # Can be the same file if it contains both
-   ```
-
-2. **Inline PEM Data**: Embed the PEM data directly in the configuration
-   ```yaml
-   cert: |
-     -----BEGIN CERTIFICATE-----
-     MIIDXTCCAkWgAwIBAgIJAKl...
-     -----END CERTIFICATE-----
-   key: |
-     -----BEGIN PRIVATE KEY-----
-     MIIEvQIBADANBgkqhkiG9w0...
-     -----END PRIVATE KEY-----
-   ```
-
-3. **Named PEM Reference**: Reference a previously defined named PEM
-   ```yaml
-   cert: "my-server-pem"  # References a named PEM (certificate portion will be used)
-   key: "my-server-pem"   # References a named PEM (private key portion will be used)
-   ```
-
-**Important**: When a PEM file contains both certificate and private key, you can reference it in both `cert` and `key` fields. The system will automatically extract the appropriate portion.
-
-## Examples
-
-### Using Named PEM Files
-
+### Client Proxy Group
 ```yaml
-# Define named PEM files
-- pem: "server-pem"
-  path: "/etc/certs/server.pem"  # Contains both cert and key
+- client_group: my-upstream
+  client_proxy:                # Or client_proxies for multiple
+    - address: "proxy1.example.com:1080"
+      protocol:
+        type: socks
+    - address: "proxy2.example.com:1080"
+      protocol:
+        type: socks
 
-- pem: "ca-cert"
-  data: |
-    -----BEGIN CERTIFICATE-----
-    MIIDXTCCAkWgAwIBAgIJAKl...
-    -----END CERTIFICATE-----
-
-# Use named PEM files in server configurations
-- bind_location: "0.0.0.0:443"
-  transport: quic
-  quic_settings:
-    cert: "server-pem"       # Reference named PEM (cert portion)
-    key: "server-pem"        # Reference named PEM (key portion)
-    client_ca_certs:
-      - "ca-cert"            # Reference named CA certificate
+# Reference in rules
+- address: "0.0.0.0:8080"
   protocol:
-    type: socks
+    type: http
+  rules:
+    - masks: "0.0.0.0/0"
+      action: allow
+      client_proxy: my-upstream  # Reference by name
+```
 
-- bind_location: "0.0.0.0:8443"
+### Rule Group
+```yaml
+- rule_group: standard-rules
+  rules:
+    - masks: ["192.168.0.0/16"]
+      action: allow
+      client_proxy: direct
+    - masks: "0.0.0.0/0"
+      action: allow
+      client_proxy: my-upstream
+
+# Reference in server config
+- address: "0.0.0.0:8080"
+  protocol:
+    type: http
+  rules: standard-rules        # Reference by name
+```
+
+## Named PEMs
+
+Define certificates once and reference throughout configuration.
+
+```yaml
+# From file
+- pem: my-cert
+  path: /path/to/certificate.pem
+
+# Inline data
+- pem: my-key
+  data: |
+    -----BEGIN PRIVATE KEY-----
+    ...
+    -----END PRIVATE KEY-----
+
+# Reference in config
+- address: "0.0.0.0:443"
   protocol:
     type: tls
-    sni_targets:
+    tls_targets:
       "example.com":
-        cert: "server-pem"   # Reuse the same PEM file
-        key: "server-pem"    # Reuse the same PEM file
+        cert: my-cert          # Reference by name
+        key: my-key
         protocol:
           type: http
 ```
 
-### Basic HTTP Proxy Server
-```yaml
-bind_location: "127.0.0.1:8080"
-protocol:
-  type: http
-  username: user
-  password: pass
-```
+## Advanced Features
 
-### SOCKS5 with TLS
+### Vision (XTLS-Vision)
+
+Vision optimizes TLS-in-TLS scenarios by detecting inner TLS traffic and switching to direct mode for zero-copy performance.
+
+**Requirements:**
+- Inner protocol MUST be VLESS
+- Works with both TLS and Reality
+
 ```yaml
-bind_location: "0.0.0.0:1080"
+# TLS + Vision
 protocol:
   type: tls
-  sni_targets:
-    "proxy.example.com":
-      cert: "cert.pem"
-      key: "key.pem"
+  tls_targets:
+    "example.com":
+      cert: cert.pem
+      key: key.pem
+      vision: true
+      alpn_protocols: ["http/1.1"]
       protocol:
-        type: socks
-        username: user
-        password: pass
+        type: vless
+        user_id: "uuid"
+
+# Reality + Vision
+protocol:
+  type: tls
+  reality_targets:
+    "www.google.com":
+      private_key: "..."
+      short_ids: ["..."]
+      dest: "www.google.com:443"
+      vision: true
+      protocol:
+        type: vless
+        user_id: "uuid"
 ```
 
-### VMess over WebSocket
+### XUDP Multiplexing
+
+Automatically enabled for VMess and VLESS when `udp_enabled: true`. Multiplexes UDP traffic over a single connection.
+
+### Proxy Chaining
+
+Chain multiple proxies by nesting client protocols:
+
 ```yaml
-bind_location: "0.0.0.0:443"
-protocol:
-  type: websocket
-  targets:
-    - matching_path: "/vmess"
+client_proxy:
+  address: "proxy1.example.com:1080"
+  protocol:
+    type: socks
+    protocol:
+      type: tls
       protocol:
         type: vmess
-        cipher: auto
-        user_id: "123e4567-e89b-12d3-a456-426614174000"
+        cipher: aes-128-gcm
+        user_id: "uuid"
 ```
 
-### Complex Routing Setup
+### Hot Reloading
+
+Configuration changes are automatically detected and applied without restarting. Disable with `--no-reload` flag.
+
+### mTLS (Mutual TLS)
+
+Require client certificates for authentication:
+
 ```yaml
-# Define client proxies
-client_group: "proxies"
-client_proxies:
-  - protocol:
-      type: shadowsocks
-      cipher: chacha20-ietf-poly1305
-      password: secret1
-  - protocol:
-      type: vmess
-      cipher: auto
-      user_id: "123e4567-e89b-12d3-a456-426614174000"
-
-# Define routing rules
-rule_group: "routing"
-rules:
-  - masks: "192.168.0.0/16"
-    action: allow
-    client_proxy: direct
-  - masks: "0.0.0.0/0"
-    action: allow
-    client_proxy: proxies
-
-# Main server config
-bind_location: "0.0.0.0:8080"
+# Server side
 protocol:
-  type: http
-rules: routing
+  type: tls
+  tls_targets:
+    "example.com":
+      cert: server.crt
+      key: server.key
+      client_ca_certs: [ca.crt]  # Required CA
+      client_fingerprints: ["sha256:..."]  # Optional specific certs
+      protocol: ...
+
+# Client side
+client_proxy:
+  address: "example.com:443"
+  protocol:
+    type: tls
+    cert: client.crt
+    key: client.key
+    protocol: ...
 ```
 
-### Hysteria2 Proxy Server
-```yaml
-bind_location: "0.0.0.0:4443"
-protocol:
-  type: hysteria2
-  password: "hysteria_secret"
-  udp_enabled: true
+## Command Line
+
+```bash
+shoes [OPTIONS] <config.yaml> [config.yaml...]
+
+OPTIONS:
+  -t, --threads NUM    Worker threads (default: CPU count)
+  -d, --dry-run        Parse config and exit
+  --no-reload          Disable hot-reloading
+
+COMMANDS:
+  generate-reality-keypair                  Generate Reality X25519 keypair
+  generate-shadowsocks-password <cipher>    Generate Shadowsocks password
 ```
 
-### Tuic v5 Proxy Server
-```yaml
-bind_location: "0.0.0.0:5555"
-protocol:
-  type: tuicv5
-  uuid: "123e4567-e89b-12d3-a456-426614174000"
-  password: "tuic_secret"
+## Tips
+
+### Generate Keys
+
+**Reality keypair:**
+```bash
+shoes generate-reality-keypair
 ```
 
-## Advanced Configuration Details
+**Shadowsocks password:**
+```bash
+shoes generate-shadowsocks-password 2022-blake3-aes-256-gcm
+```
 
-- Multiple configuration blocks can be combined in a single YAML file.
-- Fields support aliases (e.g., "alpn_protocol" and "alpn_protocols", "client_proxy" for "client_proxies").
-- For QUIC transport, if "num_endpoints" is set to 0, it defaults to the number of available CPU threads.
-- Unix domain socket binding is supported only when using TCP transport.
-- Client configurations require both certificate and key to be specified together.
-- UUIDs in Vless and Vmess protocols are validated for correct format.
+**UUID:**
+```bash
+uuidgen
+```
+
+**TLS certificate fingerprint:**
+```bash
+openssl x509 -in cert.pem -noout -fingerprint -sha256
+```
+
+### Security Best Practices
+
+- Use strong, random passwords
+- Keep private keys secure
+- Use `127.0.0.1` instead of `0.0.0.0` for local-only access
+- Use firewall rules to restrict access
+- Enable client certificate authentication for sensitive services
+- Use Vision with Reality for maximum privacy
+
+### Performance Tips
+
+- Enable `vision: true` for TLS-in-TLS scenarios
+- Use `tcp_settings.no_delay: true` for low latency
+- Set `quic_settings.num_endpoints` to match worker threads
+- Use QUIC transport for high-latency or lossy networks
+
+### Common Issues
+
+- **"Address already in use"**: Change port or stop conflicting service
+- **"Permission denied"**: Ports < 1024 require root/admin
+- **Reality connection fails**: Verify keys match, UUID matches, SNI matches server's reality_targets key
+- **Vision not working**: Ensure inner protocol is VLESS
+- **Config validation fails**: Run with `--dry-run` for detailed errors

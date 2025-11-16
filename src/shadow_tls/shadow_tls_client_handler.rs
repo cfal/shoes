@@ -8,6 +8,7 @@ use tokio::io::AsyncWriteExt; // For write_all // For random bytes
 use crate::address::NetLocation;
 use crate::async_stream::AsyncStream;
 use crate::buf_reader::BufReader;
+use crate::rustls_connection_util::feed_rustls_client_connection;
 use crate::shadow_tls::shadow_tls_hmac::ShadowTlsHmac;
 use crate::shadow_tls::shadow_tls_stream::ShadowTlsStream;
 use crate::stream_reader::StreamReader;
@@ -94,7 +95,7 @@ impl TcpClientHandler for ShadowTlsClientHandler {
 
         let parsed_server_hello = parse_server_hello(server_hello_frame)?;
 
-        feed_client_connection(&mut client_conn, server_hello_frame)?;
+        feed_rustls_client_connection(&mut client_conn, server_hello_frame)?;
         client_conn.process_new_packets().map_err(|e| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -169,7 +170,7 @@ impl TcpClientHandler for ShadowTlsClientHandler {
                 ));
             }
 
-            feed_client_connection(&mut client_conn, server_frame)?;
+            feed_rustls_client_connection(&mut client_conn, server_frame)?;
             client_conn.process_new_packets().map_err(|e| {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -344,23 +345,4 @@ async fn read_tls_frame<'a>(
     read_buf[TLS_HEADER_LEN..TLS_HEADER_LEN + payload_len].copy_from_slice(payload_bytes);
 
     Ok(&read_buf[..TLS_HEADER_LEN + payload_len])
-}
-
-#[inline]
-fn feed_client_connection(
-    client_connection: &mut rustls::ClientConnection,
-    data: &[u8],
-) -> std::io::Result<()> {
-    let mut cursor = Cursor::new(data);
-    let mut i = 0;
-    while i < data.len() {
-        let n = client_connection.read_tls(&mut cursor).map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("failed to feed client connection: {e}"),
-            )
-        })?;
-        i += n;
-    }
-    Ok(())
 }

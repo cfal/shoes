@@ -11,6 +11,7 @@ use crate::stream_reader::StreamReader;
 use crate::tcp_handler::{
     TcpClientHandler, TcpClientSetupResult, TcpServerHandler, TcpServerSetupResult,
 };
+use crate::uot::{UotV1Stream, UotV2Stream, UOT_V1_MAGIC_ADDRESS, UOT_V2_MAGIC_ADDRESS};
 use crate::util::write_all;
 
 pub const VER_SOCKS5: u8 = 0x05;
@@ -198,6 +199,84 @@ impl TcpServerHandler for SocksTcpServerHandler {
         });
 
         let location = read_location(&mut server_stream, &mut stream_reader).await?;
+
+        // Check for UDP-over-TCP (UoT) magic addresses
+        if let Address::Hostname(ref host) = location.address() {
+            if host == UOT_V1_MAGIC_ADDRESS {
+                // UoT V1: Multi-destination UDP
+                // Each packet has: ATYP + address + port + length + data
+                // Send success response first
+                write_all(&mut server_stream, connection_success_response).await?;
+                server_stream.flush().await?;
+
+                let mut uot_stream = UotV1Stream::new(Box::new(server_stream));
+
+                // Feed any unparsed data (first UoT packet might be in same TCP segment)
+                let unparsed_data = stream_reader.unparsed_data();
+                if !unparsed_data.is_empty() {
+                    log::debug!(
+                        "SOCKS UoT V1: feeding {} bytes of initial data",
+                        unparsed_data.len()
+                    );
+                    uot_stream.feed_initial_data(unparsed_data);
+                }
+
+                return Ok(TcpServerSetupResult::MultiDirectionalUdp {
+                    stream: Box::new(uot_stream),
+                    need_initial_flush: false,
+                    override_proxy_provider: NoneOrOne::Unspecified,
+                    num_sockets: 4,
+                });
+            } else if host == UOT_V2_MAGIC_ADDRESS {
+                // UoT V2: Read request header first
+                // Request: isConnect(u8) + ATYP + address + port
+                // Send success response first
+                write_all(&mut server_stream, connection_success_response).await?;
+                server_stream.flush().await?;
+
+                let is_connect = stream_reader.read_u8(&mut server_stream).await?;
+                log::debug!("SOCKS UoT V2: is_connect = {}", is_connect);
+
+                // Read destination address using SOCKS address format
+                let destination = read_location(&mut server_stream, &mut stream_reader).await?;
+                log::debug!("SOCKS UoT V2: destination = {:?}", destination);
+
+                if is_connect == 1 {
+                    // V2 Connect mode: Single destination, length-prefixed packets only
+                    let unparsed_data = stream_reader.unparsed_data();
+                    let mut uot_v2_stream = UotV2Stream::new(Box::new(server_stream));
+                    if !unparsed_data.is_empty() {
+                        uot_v2_stream.feed_initial_read_data(unparsed_data)?;
+                    }
+
+                    return Ok(TcpServerSetupResult::BidirectionalUdp {
+                        remote_location: destination,
+                        stream: Box::new(uot_v2_stream),
+                        need_initial_flush: false,
+                        override_proxy_provider: NoneOrOne::Unspecified,
+                    });
+                } else {
+                    // V2 Non-connect mode: Same as V1 (multi-destination)
+                    let mut uot_stream = UotV1Stream::new(Box::new(server_stream));
+
+                    let unparsed_data = stream_reader.unparsed_data();
+                    if !unparsed_data.is_empty() {
+                        log::debug!(
+                            "SOCKS UoT V2 non-connect: feeding {} bytes of initial data",
+                            unparsed_data.len()
+                        );
+                        uot_stream.feed_initial_data(unparsed_data);
+                    }
+
+                    return Ok(TcpServerSetupResult::MultiDirectionalUdp {
+                        stream: Box::new(uot_stream),
+                        need_initial_flush: false,
+                        override_proxy_provider: NoneOrOne::Unspecified,
+                        num_sockets: 4,
+                    });
+                }
+            }
+        }
 
         Ok(TcpServerSetupResult::TcpForward {
             remote_location: location,
