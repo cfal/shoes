@@ -178,8 +178,10 @@ impl AsyncFlushMessage for SnellUdpStream {
     fn poll_flush_message(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
         if this.write_buf_end_offset > 0 {
-            ready!(Pin::new(&mut this.stream)
-                .poll_write_message(cx, &this.write_buf[0..this.write_buf_end_offset]))?;
+            ready!(
+                Pin::new(&mut this.stream)
+                    .poll_write_message(cx, &this.write_buf[0..this.write_buf_end_offset])
+            )?;
             this.write_buf_end_offset = 0;
         }
         Pin::new(&mut this.stream).poll_flush_message(cx)

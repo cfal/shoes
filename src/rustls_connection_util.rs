@@ -1,23 +1,5 @@
 use std::io::Cursor;
 
-use rustls::Connection;
-
-/// Feed all data to a rustls connection, looping until all bytes are consumed.
-///
-/// rustls's read_tls() may not consume all bytes in one call, so we must loop
-/// until all data has been fed. This is critical to avoid losing bytes.
-#[inline(always)]
-pub fn feed_rustls_connection(connection: &mut Connection, data: &[u8]) -> std::io::Result<()> {
-    match connection {
-        Connection::Client(client_connection) => {
-            feed_rustls_client_connection(client_connection, data)
-        }
-        Connection::Server(server_connection) => {
-            feed_rustls_server_connection(server_connection, data)
-        }
-    }
-}
-
 #[inline(always)]
 pub fn feed_rustls_server_connection(
     connection: &mut rustls::ServerConnection,

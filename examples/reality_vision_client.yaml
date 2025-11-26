@@ -12,7 +12,7 @@
   rules:
     - masks: "0.0.0.0/0"
       action: allow
-      client_proxy:
+      client_chain:
         address: "your-server.example.com:443"
         protocol:
           type: reality

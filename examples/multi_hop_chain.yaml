@@ -1,0 +1,152 @@
+# Multi-hop proxy chain examples
+#
+# Round-robin behavior happens at multiple levels:
+# 1. Between chains: when using client_chains (plural), each connection picks the next chain
+# 2. Between servers in a group: when a hop references a group with multiple proxies
+# 3. Between servers in a pool: when using pool: [...] syntax
+#
+# Traffic always flows: client -> hop1 -> hop2 -> ... -> target
+
+# Define reusable proxy groups (each group round-robins between its members)
+- client_group: us-proxies
+  client_proxies:
+    - address: "us1.example.com:1080"
+      protocol:
+        type: socks
+    - address: "us2.example.com:1080"
+      protocol:
+        type: socks
+
+- client_group: eu-proxies
+  client_proxies:
+    - address: "eu1.example.com:1080"
+      protocol:
+        type: socks
+
+- client_group: exit-proxy
+  client_proxies:
+    - address: "exit.example.com:443"
+      protocol:
+        type: tls
+        protocol:
+          type: vless
+          user_id: "b85798ef-e9dc-46a4-9a87-8da4499d36d0"
+
+#
+# Example 1: Single chain with multiple hops (inline configs)
+# Each connection goes through BOTH proxies in sequence.
+# No round-robin here - just one fixed path.
+#
+- address: "127.0.0.1:1080"
+  protocol:
+    type: socks
+  rules:
+    - masks: "0.0.0.0/0"
+      action: allow
+      client_chain:
+        # Array of hops - traffic goes through each in order
+        - address: "proxy1.example.com:1080"
+          protocol:
+            type: socks
+        - address: "proxy2.example.com:443"
+          protocol:
+            type: tls
+            protocol:
+              type: vless
+              user_id: "b85798ef-e9dc-46a4-9a87-8da4499d36d0"
+
+#
+# Example 2: Single chain using named groups
+# Round-robin happens WITHIN each hop (between group members).
+# Connection 1: us1 -> exit
+# Connection 2: us2 -> exit
+# Connection 3: us1 -> exit (cycles back)
+#
+- address: "127.0.0.1:1081"
+  protocol:
+    type: socks
+  rules:
+    - masks: "0.0.0.0/0"
+      action: allow
+      client_chain:
+        - us-proxies    # Round-robins between us1 and us2
+        - exit-proxy    # Single exit proxy
+
+#
+# Example 3: Two chains - round-robin between ROUTES
+# Each connection picks the next chain, alternating between US and EU routes.
+# Connection 1: us-proxies -> exit (US route)
+# Connection 2: eu-proxies -> exit (EU route)
+# Connection 3: us-proxies -> exit (US route, cycles back)
+#
+- address: "127.0.0.1:1082"
+  protocol:
+    type: http
+  rules:
+    - masks: "0.0.0.0/0"
+      action: allow
+      client_chains:
+        # Chain 1: US route
+        - chain:
+            - us-proxies
+            - exit-proxy
+        # Chain 2: EU route
+        - chain:
+            - eu-proxies
+            - exit-proxy
+
+#
+# Example 4: Two chains - one multi-hop, one single-hop
+# Alternates between a 2-hop chain and a direct 1-hop chain.
+# Connection 1: us-proxies -> exit-proxy (2 hops)
+# Connection 2: eu-proxies (1 hop, direct to target)
+# Connection 3: us-proxies -> exit-proxy (cycles back)
+#
+- address: "127.0.0.1:1083"
+  protocol:
+    type: http
+  rules:
+    - masks: "0.0.0.0/0"
+      action: allow
+      client_chains:
+        # Chain 1: Two hops
+        - chain:
+            - us-proxies
+            - exit-proxy
+        # Chain 2: Single hop (no chain: needed for one hop)
+        - eu-proxies
+
+#
+# Example 5: Pool at a hop - combine multiple sources
+# A pool merges proxies from groups and inline configs into one round-robin set.
+# First hop round-robins between: us1, us2, backup
+# Second hop is always exit-proxy.
+#
+- address: "127.0.0.1:1084"
+  protocol:
+    type: socks
+  rules:
+    - masks: "0.0.0.0/0"
+      action: allow
+      client_chain:
+        # First hop: pool combines us-proxies group + inline backup
+        - pool:
+            - us-proxies  # Expands to us1, us2
+            - address: "backup.example.com:1080"
+              protocol:
+                type: socks
+        # Second hop
+        - exit-proxy
+
+#
+# Example 6: Simple single-hop (backwards compatible)
+# Just reference a group directly - equivalent to old client_proxy syntax.
+# Round-robins between us1 and us2.
+#
+- address: "127.0.0.1:1085"
+  protocol:
+    type: http
+  rules:
+    - masks: "0.0.0.0/0"
+      action: allow
+      client_chain: us-proxies

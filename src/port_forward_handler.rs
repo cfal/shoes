@@ -52,12 +52,14 @@ pub struct PortForwardClientHandler;
 
 #[async_trait]
 impl TcpClientHandler for PortForwardClientHandler {
-    async fn setup_client_stream(
+    async fn setup_client_tcp_stream(
         &self,
-        _server_stream: &mut Box<dyn AsyncStream>,
         client_stream: Box<dyn AsyncStream>,
         _remote_location: NetLocation,
     ) -> std::io::Result<TcpClientSetupResult> {
-        Ok(TcpClientSetupResult { client_stream })
+        Ok(TcpClientSetupResult {
+            client_stream,
+            early_data: None,
+        })
     }
 }

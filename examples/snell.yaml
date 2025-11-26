@@ -9,4 +9,4 @@
     - mask: 0.0.0.0/0
       action: allow
       # Direct connection, don't forward requests through another proxy.
-      client_proxy: direct
+      client_chain: direct

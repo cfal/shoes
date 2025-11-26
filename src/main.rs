@@ -1,6 +1,7 @@
 mod address;
 mod async_stream;
 mod buf_reader;
+mod client_proxy_chain;
 mod client_proxy_selector;
 mod config;
 mod copy_bidirectional;
@@ -10,7 +11,6 @@ mod copy_session_messages;
 mod crypto;
 mod http_handler;
 mod hysteria2_server;
-mod noop_stream;
 mod option_util;
 mod port_forward_handler;
 mod quic_server;
@@ -20,7 +20,6 @@ mod reality_client_handler;
 mod resolver;
 mod rustls_config_util;
 mod rustls_connection_util;
-mod rustls_handshake;
 mod shadow_tls;
 mod shadowsocks;
 mod slide_buffer;
@@ -55,11 +54,13 @@ static GLOBAL: Jemalloc = Jemalloc;
 use std::io::Write;
 use std::path::Path;
 
+use aws_lc_rs::rand::{SecureRandom, SystemRandom};
+use base64::engine::{Engine as _, general_purpose::STANDARD};
 use log::debug;
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tcp_server::start_tcp_servers;
 use tokio::runtime::Builder;
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
+use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 use tokio::task::JoinHandle;
 
 use crate::config::{ServerConfig, Transport};
@@ -136,7 +137,18 @@ async fn start_servers(config: ServerConfig) -> std::io::Result<Vec<JoinHandle<(
 }
 
 fn print_usage_and_exit(arg0: String) {
-    eprintln!("Usage: {arg0} [--threads/-t N] [--dry-run/-d] [--no-reload] <server uri or config filename> [server uri or config filename] [..]");
+    eprintln!("{arg0} [OPTIONS] <config.yaml> [config.yaml...]");
+    eprintln!();
+    eprintln!("OPTIONS:");
+    eprintln!("    -t, --threads NUM    Set the number of worker threads (default: CPU count)");
+    eprintln!("    -d, --dry-run        Parse the config and exit");
+    eprintln!("    --no-reload          Disable automatic config reloading on file changes");
+    eprintln!();
+    eprintln!("COMMANDS:");
+    eprintln!(
+        "    generate-reality-keypair                       Generate a new Reality X25519 keypair"
+    );
+    eprintln!("    generate-shadowsocks-2022-password <cipher>    Generate a Shadowsocks password");
     std::process::exit(1);
 }
 
@@ -217,18 +229,23 @@ fn main() {
 
     if let Some(pos) = args
         .iter()
-        .position(|s| s == "generate-shadowsocks-password")
+        .position(|s| s == "generate-shadowsocks-2022-password")
     {
         let cipher = args.get(pos + 1).map(|s| s.as_str());
         match cipher {
             Some(c) => {
                 // Strip 2022-blake3- prefix if present for cipher lookup
-                let base_cipher = c.strip_prefix("2022-blake3-").unwrap_or(c);
+                let base_cipher = match c.strip_prefix("2022-blake3-") {
+                    Some(b) => b,
+                    None => {
+                        eprintln!(
+                            "Password generation is only necessary for shadowsocks 2022 ciphers."
+                        );
+                        std::process::exit(1);
+                    }
+                };
                 match ShadowsocksCipher::try_from(base_cipher) {
                     Ok(cipher) => {
-                        use aws_lc_rs::rand::{SecureRandom, SystemRandom};
-                        use base64::engine::{general_purpose::STANDARD, Engine as _};
-
                         let rng = SystemRandom::new();
                         let mut key_bytes = vec![0u8; cipher.key_len()];
                         rng.fill(&mut key_bytes).expect("RNG failed");
@@ -244,10 +261,7 @@ fn main() {
                     }
                     Err(_) => {
                         eprintln!("Unknown cipher: {}", c);
-                        eprintln!("Supported ciphers:");
-                        eprintln!("  aes-128-gcm");
-                        eprintln!("  aes-256-gcm");
-                        eprintln!("  chacha20-ietf-poly1305");
+                        eprintln!("Supported shadowsocks 2022 ciphers:");
                         eprintln!("  2022-blake3-aes-128-gcm");
                         eprintln!("  2022-blake3-aes-256-gcm");
                         eprintln!("  2022-blake3-chacha20-poly1305");
@@ -256,11 +270,11 @@ fn main() {
                 }
             }
             None => {
-                eprintln!("Usage: {} generate-shadowsocks-password <cipher>", arg0);
-                eprintln!("Supported ciphers:");
-                eprintln!("  aes-128-gcm");
-                eprintln!("  aes-256-gcm");
-                eprintln!("  chacha20-ietf-poly1305");
+                eprintln!(
+                    "Usage: {} generate-shadowsocks-2022-password <cipher>",
+                    arg0
+                );
+                eprintln!("Supported shadowsocks 2022 ciphers:");
                 eprintln!("  2022-blake3-aes-128-gcm");
                 eprintln!("  2022-blake3-aes-256-gcm");
                 eprintln!("  2022-blake3-chacha20-poly1305");

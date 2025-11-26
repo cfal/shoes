@@ -61,17 +61,10 @@ pub struct SnellServerHandler {
     cipher: ShadowsocksCipher,
     key: Arc<Box<dyn ShadowsocksKey>>,
     udp_enabled: bool,
-    udp_num_sockets: usize,
 }
 
 impl SnellServerHandler {
-    pub fn new(
-        cipher_name: &str,
-        password: &str,
-        udp_enabled: bool,
-        udp_num_sockets: usize,
-    ) -> Self {
-        let cipher: ShadowsocksCipher = cipher_name.try_into().unwrap();
+    pub fn new(cipher: ShadowsocksCipher, password: &str, udp_enabled: bool) -> Self {
         let key: Arc<Box<dyn ShadowsocksKey>> = Arc::new(Box::new(SnellKey::new(
             password,
             cipher.algorithm().key_len(),
@@ -80,7 +73,6 @@ impl SnellServerHandler {
             cipher,
             key,
             udp_enabled,
-            udp_num_sockets,
         }
     }
 }
@@ -192,7 +184,6 @@ impl TcpServerHandler for SnellServerHandler {
                 stream: Box::new(udp_stream),
                 need_initial_flush: true,
                 override_proxy_provider: NoneOrOne::Unspecified,
-                num_sockets: self.udp_num_sockets,
             })
         }
     }
@@ -205,8 +196,7 @@ pub struct SnellClientHandler {
 }
 
 impl SnellClientHandler {
-    pub fn new(cipher_name: &str, password: &str) -> Self {
-        let cipher: ShadowsocksCipher = cipher_name.try_into().unwrap();
+    pub fn new(cipher: ShadowsocksCipher, password: &str) -> Self {
         let key: Arc<Box<dyn ShadowsocksKey>> = Arc::new(Box::new(SnellKey::new(
             password,
             cipher.algorithm().key_len(),
@@ -217,9 +207,8 @@ impl SnellClientHandler {
 
 #[async_trait]
 impl TcpClientHandler for SnellClientHandler {
-    async fn setup_client_stream(
+    async fn setup_client_tcp_stream(
         &self,
-        _server_stream: &mut Box<dyn AsyncStream>,
         client_stream: Box<dyn AsyncStream>,
         remote_location: NetLocation,
     ) -> std::io::Result<TcpClientSetupResult> {
@@ -277,6 +266,9 @@ impl TcpClientHandler for SnellClientHandler {
             )));
         }
 
-        Ok(TcpClientSetupResult { client_stream })
+        Ok(TcpClientSetupResult {
+            client_stream,
+            early_data: None,
+        })
     }
 }

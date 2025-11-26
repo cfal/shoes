@@ -374,10 +374,12 @@ mod tests {
 
         let result = deframer.next_record();
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Invalid TLS protocol version"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Invalid TLS protocol version")
+        );
     }
 
     #[test]
@@ -391,10 +393,12 @@ mod tests {
 
         let result = deframer.next_record();
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Invalid TLS content type"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Invalid TLS content type")
+        );
     }
 
     #[test]
@@ -568,10 +572,12 @@ mod tests {
 
         let result = deframer.next_records();
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Invalid TLS content type"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Invalid TLS content type")
+        );
     }
 
     #[test]

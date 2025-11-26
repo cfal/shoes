@@ -125,7 +125,10 @@ impl VisionUnpadder {
                                 command: Some(UnpadCommand::Continue),
                             });
                         }
-                        debug_assert!(self.accumulated_buffer.is_empty(), "self.accumulated_buffer should be empty when returning default in ReadingCommand");
+                        debug_assert!(
+                            self.accumulated_buffer.is_empty(),
+                            "self.accumulated_buffer should be empty when returning default in ReadingCommand"
+                        );
                         return Ok(UnpadResult::default());
                     }
                     let command_byte = data[0];
@@ -151,7 +154,10 @@ impl VisionUnpadder {
                                 command: Some(UnpadCommand::Continue),
                             });
                         }
-                        debug_assert!(self.accumulated_buffer.is_empty(), "self.accumulated_buffer should be empty when returning default in ReadingContentLength");
+                        debug_assert!(
+                            self.accumulated_buffer.is_empty(),
+                            "self.accumulated_buffer should be empty when returning default in ReadingContentLength"
+                        );
                         return Ok(UnpadResult::default());
                     }
                     match first_byte {
@@ -186,7 +192,10 @@ impl VisionUnpadder {
                                 command: Some(UnpadCommand::Continue),
                             });
                         }
-                        debug_assert!(self.accumulated_buffer.is_empty(), "self.accumulated_buffer should be empty when returning default in ReadingPaddingLength");
+                        debug_assert!(
+                            self.accumulated_buffer.is_empty(),
+                            "self.accumulated_buffer should be empty when returning default in ReadingPaddingLength"
+                        );
                         return Ok(UnpadResult::default());
                     }
                     match first_byte {
@@ -198,7 +207,12 @@ impl VisionUnpadder {
                             let low_byte = data[0];
                             data = &data[1..];
                             let padding_len = ((*high_byte as u16) << 8) | (low_byte as u16);
-                            log::debug!("UNPADDER: Parsed header - command={:?}, content_len={}, padding_len={}", *command, *content_len, padding_len);
+                            log::debug!(
+                                "UNPADDER: Parsed header - command={:?}, content_len={}, padding_len={}",
+                                *command,
+                                *content_len,
+                                padding_len
+                            );
                             // Pre-allocate based on min of content_len and available data
                             // (we eagerly return when data runs out, so we may not need full content_len)
                             let prealloc_size = (*content_len as usize).min(data.len());
@@ -243,8 +257,11 @@ impl VisionUnpadder {
                     }
 
                     if *remaining_content_len == 0 {
-                        log::debug!("UNPADDER: Content read complete ({} bytes), accumulated at {}, transitioning to padding",
-                            partial_content.len(), self.accumulated_buffer.len());
+                        log::debug!(
+                            "UNPADDER: Content read complete ({} bytes), accumulated at {}, transitioning to padding",
+                            partial_content.len(),
+                            self.accumulated_buffer.len()
+                        );
                         let content = std::mem::take(partial_content);
                         self.state = UnpadState::ReadingPadding {
                             command: *command,
@@ -275,8 +292,12 @@ impl VisionUnpadder {
                             // Note that append moves all of `content` and leaves it empty.
                             self.accumulated_buffer.append(content);
 
-                            log::debug!("UNPADDER: Out of data in ReadingPadding with {} padding bytes remaining, returning {} bytes (first_block={})",
-                                *remaining_padding_len, self.accumulated_buffer.len(), self.first_block);
+                            log::debug!(
+                                "UNPADDER: Out of data in ReadingPadding with {} padding bytes remaining, returning {} bytes (first_block={})",
+                                *remaining_padding_len,
+                                self.accumulated_buffer.len(),
+                                self.first_block
+                            );
 
                             if !self.first_block {
                                 return Ok(UnpadResult {
@@ -301,11 +322,17 @@ impl VisionUnpadder {
                         // Block complete (all padding skipped)
                         self.accumulated_buffer.append(content);
 
-                        log::debug!("UNPADDER: Padding complete for command {:?}, {} accumulated bytes total", *command, self.accumulated_buffer.len());
+                        log::debug!(
+                            "UNPADDER: Padding complete for command {:?}, {} accumulated bytes total",
+                            *command,
+                            self.accumulated_buffer.len()
+                        );
                         match *command {
                             UnpadCommand::Continue => {
                                 // Continue to next block
-                                log::debug!("UNPADDER: Continue command - transitioning to ReadingCommand for next block");
+                                log::debug!(
+                                    "UNPADDER: Continue command - transitioning to ReadingCommand for next block"
+                                );
                                 self.state = UnpadState::ReadingCommand;
                             }
                             end_or_direct_command => {
@@ -314,8 +341,13 @@ impl VisionUnpadder {
                                 // Append it to content so caller gets everything in one place
                                 let remaining_len = data.len();
                                 self.accumulated_buffer.extend_from_slice(data);
-                                log::debug!("UNPADDER: {:?} command - transitioning to Done state, returning {} bytes content ({} from padding, {} remaining after)",
-                                    end_or_direct_command, self.accumulated_buffer.len(), self.accumulated_buffer.len() - remaining_len, remaining_len);
+                                log::debug!(
+                                    "UNPADDER: {:?} command - transitioning to Done state, returning {} bytes content ({} from padding, {} remaining after)",
+                                    end_or_direct_command,
+                                    self.accumulated_buffer.len(),
+                                    self.accumulated_buffer.len() - remaining_len,
+                                    remaining_len
+                                );
                                 self.state = UnpadState::Done;
                                 return Ok(UnpadResult {
                                     content: std::mem::take(&mut self.accumulated_buffer),

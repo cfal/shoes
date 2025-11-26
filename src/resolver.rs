@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
+use futures::future::FutureExt;
 use log::debug;
 use rustc_hash::FxHashMap;
 
@@ -30,7 +31,6 @@ impl Resolver for NativeResolver {
     fn resolve_location(&self, location: &NetLocation) -> ResolveFuture {
         let address = location.address().clone();
         let port = location.port();
-        use futures::future::FutureExt;
         Box::pin(
             tokio::net::lookup_host((address.to_string(), port)).map(move |result| {
                 let ret = result.map(|r| {

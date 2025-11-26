@@ -34,7 +34,7 @@ pub struct XudpMessageStream {
     next_session_id: u16,
 
     /// Active sessions: destination (RESOLVED IP) -> session_id
-    /// IMPORTANT: Keys are always resolved IP addresses, never hostnames
+    /// Keys are always resolved IP addresses, never hostnames
     /// This ensures responses from UDP sockets (which give us IPs) can find the correct session
     destination_to_session: HashMap<NetLocation, u16>,
 
@@ -44,7 +44,6 @@ pub struct XudpMessageStream {
 
     /// Maps session_id -> ORIGINAL destination (before resolution)
     /// This preserves hostnames for encoding in response frames
-    /// CRITICAL FOR WEBRTC: Client expects responses to reference original hostname, not resolved IP
     session_to_original_destination: HashMap<u16, NetLocation>,
 
     /// Resolver cache for hostname resolution
@@ -136,7 +135,7 @@ impl XudpMessageStream {
                 .insert(resolved_destination.clone(), session_id);
             self.session_to_destination
                 .insert(session_id, resolved_destination.clone());
-            // CRITICAL: Store original destination for use in response frames
+            // Store original destination for use in response frames
             self.session_to_original_destination
                 .insert(session_id, original_destination.clone());
             log::debug!(
@@ -148,14 +147,15 @@ impl XudpMessageStream {
     }
 
     /// Try to decode one complete XUDP frame from the read buffer.
+    ///
+    /// This function must NOT consume any bytes from the buffer unless
+    /// it successfully decodes a complete frame. Otherwise, partial frames would
+    /// be lost when the function is called again with more data.
+    ///
     /// Returns:
     ///   Ok(Some((data, destination))) - Successfully decoded a complete frame
     ///   Ok(None) - Buffer doesn't contain a complete frame yet (need more data)
     ///   Err(e) - Error during decoding
-    ///
-    /// IMPORTANT: This function must NOT consume any bytes from the buffer unless
-    /// it successfully decodes a complete frame. Otherwise, partial frames would
-    /// be lost when the function is called again with more data.
     fn try_decode_one_frame(&mut self) -> std::io::Result<Option<(Vec<u8>, NetLocation)>> {
         log::debug!(
             "[XUDP READ] Attempting to decode frame, buffer len: {}",
@@ -201,8 +201,14 @@ impl XudpMessageStream {
             let metadata = FrameMetadata::decode(&mut self.read_buffer)?
                 .expect("metadata decode should succeed after length check");
 
-            log::debug!("[XUDP READ] Decoded frame: session_id={}, status={:?}, has_data={}, target={:?}, network={:?}",
-                metadata.session_id, metadata.status, metadata.option.has_data(), metadata.target, metadata.network);
+            log::debug!(
+                "[XUDP READ] Decoded frame: session_id={}, status={:?}, has_data={}, target={:?}, network={:?}",
+                metadata.session_id,
+                metadata.status,
+                metadata.option.has_data(),
+                metadata.target,
+                metadata.network
+            );
 
             // Handle session mappings
             if let Some(ref target) = metadata.target {
@@ -258,8 +264,14 @@ impl XudpMessageStream {
         let metadata = FrameMetadata::decode(&mut self.read_buffer)?
             .expect("metadata decode should succeed after length check");
 
-        log::debug!("[XUDP READ] Decoded frame: session_id={}, status={:?}, has_data={}, target={:?}, network={:?}",
-            metadata.session_id, metadata.status, metadata.option.has_data(), metadata.target, metadata.network);
+        log::debug!(
+            "[XUDP READ] Decoded frame: session_id={}, status={:?}, has_data={}, target={:?}, network={:?}",
+            metadata.session_id,
+            metadata.status,
+            metadata.option.has_data(),
+            metadata.target,
+            metadata.network
+        );
 
         // Check for TCP destination - we don't support TCP over XUDP
         if let Some(TargetNetwork::Tcp) = metadata.network {
@@ -391,17 +403,14 @@ impl AsyncReadSessionMessage for XudpMessageStream {
                     .resolver_cache
                     .poll_resolve_location(cx, &original_destination)
                 {
-                    Poll::Ready(Ok(socket_addr)) => {
-                        let resolved = match socket_addr {
-                            SocketAddr::V4(addr) => {
-                                NetLocation::new(Address::Ipv4(*addr.ip()), addr.port())
-                            }
-                            SocketAddr::V6(addr) => {
-                                NetLocation::new(Address::Ipv6(*addr.ip()), addr.port())
-                            }
-                        };
-                        resolved
-                    }
+                    Poll::Ready(Ok(socket_addr)) => match socket_addr {
+                        SocketAddr::V4(addr) => {
+                            NetLocation::new(Address::Ipv4(*addr.ip()), addr.port())
+                        }
+                        SocketAddr::V6(addr) => {
+                            NetLocation::new(Address::Ipv6(*addr.ip()), addr.port())
+                        }
+                    },
                     Poll::Ready(Err(e)) => {
                         return Poll::Ready(Err(e));
                     }
@@ -418,9 +427,10 @@ impl AsyncReadSessionMessage for XudpMessageStream {
                 this.get_or_create_session(&resolved_destination, &original_destination);
 
             // Convert to SocketAddr for return
-            let socket_addr = futures::ready!(this
-                .resolver_cache
-                .poll_resolve_location(cx, &original_destination))?;
+            let socket_addr = futures::ready!(
+                this.resolver_cache
+                    .poll_resolve_location(cx, &original_destination)
+            )?;
 
             buf.put_slice(&data);
             return Poll::Ready(Ok((session_id, socket_addr)));
@@ -551,8 +561,7 @@ impl AsyncWriteSessionMessage for XudpMessageStream {
         target: &SocketAddr,
     ) -> Poll<std::io::Result<()>> {
         // This is the reverse direction: UDP response from internet → XUDP client
-        // CRITICAL: Use ORIGINAL destination (may be hostname) in response frame, NOT resolved IP!
-        // WebRTC and other protocols expect responses to reference the hostname they requested.
+        // Use original destination (may be hostname) in response frame, NOT resolved IP
 
         log::debug!(
             "[XUDP SESSION WRITE] Writing {} bytes for session {} from source {}",
@@ -566,26 +575,45 @@ impl AsyncWriteSessionMessage for XudpMessageStream {
             ready!(self.as_mut().poll_flush_message(cx))?;
         }
 
-        // CRITICAL FIX: Use original destination (hostname) instead of resolved IP
-        // Look up the original destination that the client requested
-        let target_location = self
+        // Use original destination (hostname) instead of resolved IP
+        // Look up the original destination that the client requested.
+        // If not found (e.g., XUDP-to-XUDP forwarding), use the target from the caller
+        // and create a new session entry.
+        let target_location = if let Some(original) = self
             .session_to_original_destination
             .get(&session_id)
             .cloned()
-            .ok_or_else(|| {
-                log::error!(
-                    "[XUDP SESSION WRITE] No original destination found for session {}! \
-                    This should not happen - session was created but original dest not stored.",
-                    session_id
-                );
-                std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    format!("No original destination for session {}", session_id),
-                )
-            })?;
+        {
+            original
+        } else {
+            // Session doesn't exist yet - this happens when forwarding from another XUDP stream.
+            // Create a new session using the target address.
+            let addr = match target.ip() {
+                std::net::IpAddr::V4(v4) => Address::Ipv4(v4),
+                std::net::IpAddr::V6(v6) => Address::Ipv6(v6),
+            };
+            let target_location = NetLocation::new(addr, target.port());
+            log::debug!(
+                "[XUDP SESSION WRITE] Creating new session {} for destination {} (forwarding mode)",
+                session_id,
+                target_location
+            );
+            // Store the mapping for potential future writes with same session_id
+            self.session_to_original_destination
+                .insert(session_id, target_location.clone());
+            let resolved = target_location.clone();
+            self.destination_to_session
+                .insert(resolved.clone(), session_id);
+            self.session_to_destination.insert(session_id, resolved);
+            target_location
+        };
 
-        log::debug!("[XUDP SESSION WRITE] Using original destination {} for session {} (response came from {})",
-            target_location, session_id, target);
+        log::debug!(
+            "[XUDP SESSION WRITE] Using original destination {} for session {} (response came from {})",
+            target_location,
+            session_id,
+            target
+        );
 
         // Build Keep frame with data
         let metadata = FrameMetadata {

@@ -1,9 +1,10 @@
 // TLS 1.3 Key Schedule Implementation
 //
 // Implements RFC 8446 key derivation for TLS 1.3
-// Using HKDF-SHA256 for all key derivation operations
+// Supports both SHA256 and SHA384 based cipher suites
 
-use aws_lc_rs::digest;
+use super::reality_cipher_suite::CipherSuite;
+use aws_lc_rs::{digest, hmac};
 use std::io::{Error, ErrorKind, Result};
 
 /// Intermediate TLS 1.3 keys (handshake secrets + master secret)
@@ -19,13 +20,17 @@ pub struct Tls13HandshakeKeys {
     pub master_secret: Vec<u8>,
 }
 
-/// HKDF-Expand implementation using HMAC-SHA256 directly
+/// HKDF-Expand implementation with configurable HMAC algorithm
 /// This follows RFC 5869 Section 2.3
-pub fn hkdf_expand_sha256(prk: &[u8], info: &[u8], length: usize) -> Result<Vec<u8>> {
-    use aws_lc_rs::hmac;
-
-    const HASH_LEN: usize = 32; // SHA256 output length
-    let n = length.div_ceil(HASH_LEN); // Number of iterations
+pub fn hkdf_expand(
+    hmac_algorithm: hmac::Algorithm,
+    prk: &[u8],
+    info: &[u8],
+    length: usize,
+) -> Result<Vec<u8>> {
+    // Get hash length from the algorithm's digest
+    let hash_len = hmac_algorithm.digest_algorithm().output_len();
+    let n = length.div_ceil(hash_len); // Number of iterations
 
     if n > 255 {
         return Err(Error::new(ErrorKind::InvalidData, "HKDF output too long"));
@@ -35,7 +40,7 @@ pub fn hkdf_expand_sha256(prk: &[u8], info: &[u8], length: usize) -> Result<Vec<
     let mut prev = Vec::new();
 
     for i in 1..=n {
-        let key = hmac::Key::new(hmac::HMAC_SHA256, prk);
+        let key = hmac::Key::new(hmac_algorithm, prk);
         let mut ctx = hmac::Context::with_key(&key);
 
         log::debug!(
@@ -65,7 +70,8 @@ pub fn hkdf_expand_sha256(prk: &[u8], info: &[u8], length: usize) -> Result<Vec<
 }
 
 /// HKDF-Expand-Label as defined in RFC 8446 Section 7.1
-fn hkdf_expand_label(
+fn hkdf_expand_label_with_algorithm(
+    hmac_algorithm: hmac::Algorithm,
     secret: &[u8],
     label: &[u8],
     context: &[u8],
@@ -101,42 +107,96 @@ fn hkdf_expand_label(
 
     log::debug!("HKDF_LABEL_BYTES: {:02x?}", hkdf_label);
 
-    // Use our helper function
-    hkdf_expand_sha256(secret, &hkdf_label, length)
+    // Use HKDF expand with the specified algorithm
+    hkdf_expand(hmac_algorithm, secret, &hkdf_label, length)
 }
 
-/// Derive-Secret as defined in RFC 8446 Section 7.1
-fn derive_secret(secret: &[u8], label: &[u8], messages_hash: &[u8]) -> Result<Vec<u8>> {
-    hkdf_expand_label(secret, label, messages_hash, 32)
+/// Derive-Secret as defined in RFC 8446 Section 7.1 (with configurable hash)
+fn derive_secret_with_algorithm(
+    hmac_algorithm: hmac::Algorithm,
+    secret: &[u8],
+    label: &[u8],
+    messages_hash: &[u8],
+) -> Result<Vec<u8>> {
+    let hash_len = hmac_algorithm.digest_algorithm().output_len();
+    hkdf_expand_label_with_algorithm(hmac_algorithm, secret, label, messages_hash, hash_len)
 }
 
-/// HKDF-Extract operation
-fn hkdf_extract(salt: &[u8], ikm: &[u8]) -> Vec<u8> {
-    // Use hmac directly for extract operation since aws-lc-rs doesn't expose PRK bytes
-    use aws_lc_rs::hmac;
-    let key = hmac::Key::new(hmac::HMAC_SHA256, salt);
+/// HKDF-Extract operation with configurable HMAC algorithm
+fn hkdf_extract_with_algorithm(
+    hmac_algorithm: hmac::Algorithm,
+    salt: &[u8],
+    ikm: &[u8],
+) -> Vec<u8> {
+    let key = hmac::Key::new(hmac_algorithm, salt);
     let tag = hmac::sign(&key, ikm);
     tag.as_ref().to_vec()
 }
 
-/// Derive TLS 1.3 handshake keys and master secret (Phase 1)
+/// Derive traffic keys and IV from traffic secret using CipherSuite
+///
+/// # Arguments
+/// * `traffic_secret` - Traffic secret (hash_len bytes)
+/// * `cipher_suite` - CipherSuite with key/IV lengths and HMAC algorithm
+///
+/// # Returns
+/// (key, iv) tuple for AEAD
+pub fn derive_traffic_keys(
+    traffic_secret: &[u8],
+    cipher_suite: CipherSuite,
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    let key_length = cipher_suite.key_len();
+    let iv_length = cipher_suite.nonce_len();
+    let hash_len = cipher_suite.hash_len();
+    let hmac_algorithm = cipher_suite.hmac_algorithm();
+
+    log::debug!(
+        "TRAFFIC_KEY_DERIVE: cipher_suite={:?}, key_len={}, iv_len={}, hash_len={}",
+        cipher_suite,
+        key_length,
+        iv_length,
+        hash_len
+    );
+    log::debug!("TRAFFIC_KEY_DERIVE: traffic_secret={:02x?}", traffic_secret);
+
+    // key = HKDF-Expand-Label(Secret, "key", "", key_length)
+    let key =
+        hkdf_expand_label_with_algorithm(hmac_algorithm, traffic_secret, b"key", b"", key_length)?;
+
+    // iv = HKDF-Expand-Label(Secret, "iv", "", iv_length)
+    let iv =
+        hkdf_expand_label_with_algorithm(hmac_algorithm, traffic_secret, b"iv", b"", iv_length)?;
+
+    log::info!("TRAFFIC_KEY_DERIVE: key={:02x?}", key);
+    log::info!("TRAFFIC_KEY_DERIVE: iv={:02x?}", iv);
+
+    Ok((key, iv))
+}
+
+/// Derive TLS 1.3 handshake keys and master secret using CipherSuite (Phase 1)
 ///
 /// This function derives handshake traffic secrets and the master secret,
 /// but NOT the application traffic secrets. Application secrets must be
 /// derived separately after the server Finished message is sent (Phase 2).
 ///
 /// # Arguments
+/// * `cipher_suite` - CipherSuite with HMAC/digest algorithms
 /// * `shared_secret` - ECDH shared secret (32 bytes for X25519)
-/// * `client_hello_hash` - SHA256 hash of ClientHello (32 bytes)
-/// * `server_hello_hash` - SHA256 hash of ClientHello...ServerHello (32 bytes)
+/// * `client_hello_hash` - Hash of ClientHello (hash_len bytes)
+/// * `server_hello_hash` - Hash of ClientHello...ServerHello (hash_len bytes)
 ///
 /// # Returns
 /// Handshake traffic secrets and master secret
 pub fn derive_handshake_keys(
+    cipher_suite: CipherSuite,
     shared_secret: &[u8],
-    client_hello_hash: &[u8],
+    _client_hello_hash: &[u8], // Not used in TLS 1.3 key derivation - kept for API consistency
     server_hello_hash: &[u8],
 ) -> Result<Tls13HandshakeKeys> {
+    let hash_len = cipher_suite.hash_len();
+    let hmac_algorithm = cipher_suite.hmac_algorithm();
+    let digest_algorithm = cipher_suite.digest_algorithm();
+
     // Validate input lengths
     if shared_secret.len() != 32 {
         return Err(Error::new(
@@ -147,44 +207,70 @@ pub fn derive_handshake_keys(
             ),
         ));
     }
-    if client_hello_hash.len() != 32 || server_hello_hash.len() != 32 {
+    if server_hello_hash.len() != hash_len {
         return Err(Error::new(
             ErrorKind::InvalidInput,
-            "All hashes must be 32 bytes (SHA256)",
+            format!(
+                "Hash length mismatch: {} (expected {})",
+                server_hello_hash.len(),
+                hash_len
+            ),
         ));
     }
 
-    log::debug!("TLS13 DEBUG: Deriving handshake keys (Phase 1)...");
+    log::debug!(
+        "TLS13 DEBUG: Deriving handshake keys (Phase 1) with {:?}...",
+        cipher_suite
+    );
 
     // 1. Early Secret = HKDF-Extract(salt=0, IKM=0)
-    let zero_salt = vec![0u8; 32];
-    let early_secret = hkdf_extract(&zero_salt, &zero_salt);
+    let zero_salt = vec![0u8; hash_len];
+    let early_secret = hkdf_extract_with_algorithm(hmac_algorithm, &zero_salt, &zero_salt);
 
     // 2. Derive-Secret(., "derived", "")
-    let mut empty_ctx = digest::Context::new(&digest::SHA256);
+    let mut empty_ctx = digest::Context::new(digest_algorithm);
     empty_ctx.update(b"");
     let empty_hash = empty_ctx.finish();
-    let derived_secret = derive_secret(&early_secret, b"derived", empty_hash.as_ref())?;
+    let derived_secret = derive_secret_with_algorithm(
+        hmac_algorithm,
+        &early_secret,
+        b"derived",
+        empty_hash.as_ref(),
+    )?;
 
     // 3. Handshake Secret = HKDF-Extract(salt=derived_secret, IKM=shared_secret)
-    let handshake_secret = hkdf_extract(&derived_secret, shared_secret);
+    let handshake_secret =
+        hkdf_extract_with_algorithm(hmac_algorithm, &derived_secret, shared_secret);
 
     // 4. Client Handshake Traffic Secret
-    let client_handshake_traffic_secret =
-        derive_secret(&handshake_secret, b"c hs traffic", server_hello_hash)?;
+    let client_handshake_traffic_secret = derive_secret_with_algorithm(
+        hmac_algorithm,
+        &handshake_secret,
+        b"c hs traffic",
+        server_hello_hash,
+    )?;
 
     // 5. Server Handshake Traffic Secret
-    let server_handshake_traffic_secret =
-        derive_secret(&handshake_secret, b"s hs traffic", server_hello_hash)?;
+    let server_handshake_traffic_secret = derive_secret_with_algorithm(
+        hmac_algorithm,
+        &handshake_secret,
+        b"s hs traffic",
+        server_hello_hash,
+    )?;
 
     // 6. Derive-Secret(., "derived", "")
-    let mut empty_ctx_2 = digest::Context::new(&digest::SHA256);
+    let mut empty_ctx_2 = digest::Context::new(digest_algorithm);
     empty_ctx_2.update(b"");
     let empty_hash_2 = empty_ctx_2.finish();
-    let derived_secret_2 = derive_secret(&handshake_secret, b"derived", empty_hash_2.as_ref())?;
+    let derived_secret_2 = derive_secret_with_algorithm(
+        hmac_algorithm,
+        &handshake_secret,
+        b"derived",
+        empty_hash_2.as_ref(),
+    )?;
 
     // 7. Master Secret = HKDF-Extract(salt=derived_secret, IKM=0)
-    let master_secret = hkdf_extract(&derived_secret_2, &zero_salt);
+    let master_secret = hkdf_extract_with_algorithm(hmac_algorithm, &derived_secret_2, &zero_salt);
 
     log::debug!("  master_secret: {:?}", &master_secret[..8]);
 
@@ -195,37 +281,52 @@ pub fn derive_handshake_keys(
     })
 }
 
-/// Derive TLS 1.3 application traffic secrets (Phase 2)
+/// Derive TLS 1.3 application traffic secrets using CipherSuite (Phase 2)
 ///
 /// This function must be called AFTER the server Finished message is sent,
 /// with a transcript hash that includes the Finished message.
 ///
 /// # Arguments
-/// * `master_secret` - Master secret from Phase 1
-/// * `handshake_hash` - SHA256 hash including server Finished (32 bytes)
+/// * `cipher_suite` - CipherSuite with HMAC algorithm
+/// * `master_secret` - Master secret from Phase 1 (hash_len bytes)
+/// * `handshake_hash` - Hash including server Finished (hash_len bytes)
 ///
 /// # Returns
 /// (client_application_traffic_secret, server_application_traffic_secret)
 pub fn derive_application_secrets(
+    cipher_suite: CipherSuite,
     master_secret: &[u8],
     handshake_hash: &[u8],
 ) -> Result<(Vec<u8>, Vec<u8>)> {
-    if master_secret.len() != 32 || handshake_hash.len() != 32 {
+    let hash_len = cipher_suite.hash_len();
+    let hmac_algorithm = cipher_suite.hmac_algorithm();
+
+    if master_secret.len() != hash_len || handshake_hash.len() != hash_len {
         return Err(Error::new(
             ErrorKind::InvalidInput,
-            "Master secret and handshake hash must be 32 bytes",
+            format!(
+                "Master secret and handshake hash must be {} bytes",
+                hash_len
+            ),
         ));
     }
 
-    log::debug!("TLS13 DEBUG: Deriving application secrets (Phase 2)...");
+    log::debug!(
+        "TLS13 DEBUG: Deriving application secrets (Phase 2) with {:?}...",
+        cipher_suite
+    );
     log::info!(
         "  handshake_hash (with Finished): {:?}",
         &handshake_hash[..8]
     );
 
     // Client Application Traffic Secret
-    let client_application_traffic_secret =
-        derive_secret(master_secret, b"c ap traffic", handshake_hash)?;
+    let client_application_traffic_secret = derive_secret_with_algorithm(
+        hmac_algorithm,
+        master_secret,
+        b"c ap traffic",
+        handshake_hash,
+    )?;
 
     log::debug!(
         "  client_app_traffic: {:?}",
@@ -237,8 +338,12 @@ pub fn derive_application_secrets(
     );
 
     // Server Application Traffic Secret
-    let server_application_traffic_secret =
-        derive_secret(master_secret, b"s ap traffic", handshake_hash)?;
+    let server_application_traffic_secret = derive_secret_with_algorithm(
+        hmac_algorithm,
+        master_secret,
+        b"s ap traffic",
+        handshake_hash,
+    )?;
 
     log::debug!(
         "  server_app_traffic: {:?}",
@@ -255,63 +360,24 @@ pub fn derive_application_secrets(
     ))
 }
 
-/// Derive traffic keys and IV from traffic secret
-///
-/// # Arguments
-/// * `traffic_secret` - Traffic secret (32 bytes)
-/// * `cipher_suite` - TLS cipher suite (e.g., 0x1301 for TLS_AES_128_GCM_SHA256)
-///
-/// # Returns
-/// (key, iv) tuple for AES-GCM
-pub fn derive_traffic_keys(traffic_secret: &[u8], cipher_suite: u16) -> Result<(Vec<u8>, Vec<u8>)> {
-    // For TLS_AES_128_GCM_SHA256 (0x1301):
-    // - key_length = 16 bytes
-    // - iv_length = 12 bytes
-
-    let (key_length, iv_length) = match cipher_suite {
-        0x1301 => (16, 12), // TLS_AES_128_GCM_SHA256
-        0x1302 => (32, 12), // TLS_AES_256_GCM_SHA384
-        0x1303 => (32, 12), // TLS_CHACHA20_POLY1305_SHA256
-        _ => {
-            return Err(Error::new(
-                ErrorKind::InvalidInput,
-                format!("Unsupported cipher suite: 0x{:04x}", cipher_suite),
-            ))
-        }
-    };
-
-    log::debug!(
-        "TRAFFIC_KEY_DERIVE: cipher_suite=0x{:04x}, key_len={}, iv_len={}",
-        cipher_suite,
-        key_length,
-        iv_length
-    );
-    log::debug!("TRAFFIC_KEY_DERIVE: traffic_secret={:02x?}", traffic_secret);
-
-    // key = HKDF-Expand-Label(Secret, "key", "", key_length)
-    let key = hkdf_expand_label(traffic_secret, b"key", b"", key_length)?;
-
-    // iv = HKDF-Expand-Label(Secret, "iv", "", iv_length)
-    let iv = hkdf_expand_label(traffic_secret, b"iv", b"", iv_length)?;
-
-    log::info!("TRAFFIC_KEY_DERIVE: key={:02x?}", key);
-    log::info!("TRAFFIC_KEY_DERIVE: iv={:02x?}", iv);
-
-    Ok((key, iv))
-}
-
-/// Compute "Finished" verify data
+/// Compute "Finished" verify data using CipherSuite
 ///
 /// finished_key = HKDF-Expand-Label(BaseKey, "finished", "", Hash.length)
 /// verify_data = HMAC(finished_key, Transcript-Hash(Handshake Context))
-pub fn compute_finished_verify_data(base_key: &[u8], handshake_hash: &[u8]) -> Result<Vec<u8>> {
-    use aws_lc_rs::hmac;
+pub fn compute_finished_verify_data(
+    cipher_suite: CipherSuite,
+    base_key: &[u8],
+    handshake_hash: &[u8],
+) -> Result<Vec<u8>> {
+    let hash_len = cipher_suite.hash_len();
+    let hmac_algorithm = cipher_suite.hmac_algorithm();
 
-    // finished_key = HKDF-Expand-Label(BaseKey, "finished", "", 32)
-    let finished_key = hkdf_expand_label(base_key, b"finished", b"", 32)?;
+    // finished_key = HKDF-Expand-Label(BaseKey, "finished", "", hash_len)
+    let finished_key =
+        hkdf_expand_label_with_algorithm(hmac_algorithm, base_key, b"finished", b"", hash_len)?;
 
     // verify_data = HMAC(finished_key, handshake_hash)
-    let key = hmac::Key::new(hmac::HMAC_SHA256, &finished_key);
+    let key = hmac::Key::new(hmac_algorithm, &finished_key);
     let tag = hmac::sign(&key, handshake_hash);
     let verify_data = tag.as_ref().to_vec();
 
@@ -321,6 +387,8 @@ pub fn compute_finished_verify_data(base_key: &[u8], handshake_hash: &[u8]) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const CS_SHA256: CipherSuite = CipherSuite::AES_128_GCM_SHA256;
 
     // Test vectors from RFC 5869 Appendix A
     #[test]
@@ -333,7 +401,7 @@ mod tests {
         ];
         let info = [0xf0, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9];
 
-        let result = hkdf_expand_sha256(&prk, &info, 42).unwrap();
+        let result = hkdf_expand(hmac::HMAC_SHA256, &prk, &info, 42).unwrap();
         assert_eq!(result.len(), 42);
 
         // Check first few bytes match expected pattern
@@ -345,7 +413,7 @@ mod tests {
     #[test]
     fn test_hkdf_expand_sha256_empty_info() {
         let prk = vec![0x42u8; 32];
-        let result = hkdf_expand_sha256(&prk, &[], 16);
+        let result = hkdf_expand(hmac::HMAC_SHA256, &prk, &[], 16);
         assert!(result.is_ok());
         assert_eq!(result.unwrap().len(), 16);
     }
@@ -356,19 +424,19 @@ mod tests {
         let info = b"test info";
 
         // Maximum output length is 255 * hash_len (32 for SHA256) = 8160 bytes
-        let result = hkdf_expand_sha256(&prk, info, 8160);
+        let result = hkdf_expand(hmac::HMAC_SHA256, &prk, info, 8160);
         assert!(result.is_ok());
         assert_eq!(result.unwrap().len(), 8160);
 
         // Should fail for length > 8160
-        let result = hkdf_expand_sha256(&prk, info, 8161);
+        let result = hkdf_expand(hmac::HMAC_SHA256, &prk, info, 8161);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_hkdf_expand_label() {
         let secret = vec![0x42u8; 32];
-        let result = hkdf_expand_label(&secret, b"test", b"", 16);
+        let result = hkdf_expand_label_with_algorithm(hmac::HMAC_SHA256, &secret, b"test", b"", 16);
         assert!(result.is_ok());
         assert_eq!(result.unwrap().len(), 16);
     }
@@ -377,13 +445,16 @@ mod tests {
     fn test_hkdf_expand_label_with_context() {
         let secret = vec![0x42u8; 32];
         let context = vec![0x11u8; 32];
-        let result = hkdf_expand_label(&secret, b"finished", &context, 32);
+        let result =
+            hkdf_expand_label_with_algorithm(hmac::HMAC_SHA256, &secret, b"finished", &context, 32);
         assert!(result.is_ok());
         let output = result.unwrap();
         assert_eq!(output.len(), 32);
 
         // Result should be deterministic
-        let result2 = hkdf_expand_label(&secret, b"finished", &context, 32).unwrap();
+        let result2 =
+            hkdf_expand_label_with_algorithm(hmac::HMAC_SHA256, &secret, b"finished", &context, 32)
+                .unwrap();
         assert_eq!(output, result2);
     }
 
@@ -392,16 +463,16 @@ mod tests {
         let salt = vec![0x11u8; 32];
         let ikm = vec![0x22u8; 32];
 
-        let result1 = hkdf_extract(&salt, &ikm);
+        let result1 = hkdf_extract_with_algorithm(hmac::HMAC_SHA256, &salt, &ikm);
         assert_eq!(result1.len(), 32); // SHA256 output length
 
         // Should be deterministic
-        let result2 = hkdf_extract(&salt, &ikm);
+        let result2 = hkdf_extract_with_algorithm(hmac::HMAC_SHA256, &salt, &ikm);
         assert_eq!(result1, result2);
 
         // Different input should give different output
         let ikm2 = vec![0x33u8; 32];
-        let result3 = hkdf_extract(&salt, &ikm2);
+        let result3 = hkdf_extract_with_algorithm(hmac::HMAC_SHA256, &salt, &ikm2);
         assert_ne!(result1, result3);
     }
 
@@ -410,7 +481,7 @@ mod tests {
         let traffic_secret = vec![0x99u8; 32];
 
         // Test TLS_AES_128_GCM_SHA256
-        let result = derive_traffic_keys(&traffic_secret, 0x1301);
+        let result = derive_traffic_keys(&traffic_secret, CS_SHA256);
         assert!(result.is_ok());
         let (key, iv) = result.unwrap();
         assert_eq!(key.len(), 16);
@@ -422,7 +493,7 @@ mod tests {
         let base_key = vec![0xAAu8; 32];
         let handshake_hash = vec![0xBBu8; 32];
 
-        let result = compute_finished_verify_data(&base_key, &handshake_hash);
+        let result = compute_finished_verify_data(CS_SHA256, &base_key, &handshake_hash);
         assert!(result.is_ok());
         assert_eq!(result.unwrap().len(), 32);
     }

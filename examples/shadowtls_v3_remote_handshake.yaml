@@ -61,4 +61,5 @@
   rules:
     - mask: 0.0.0.0/0
       action: allow
-      client_proxy: direct
+      # client_chain: direct is optional - direct is the default when omitted
+      client_chain: direct

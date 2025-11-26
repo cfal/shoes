@@ -11,11 +11,11 @@
     - mask: hello.com:80
       action: allow
       override_address: 127.0.0.1:55556
-      client_proxy: direct
+      client_chain: direct
     # Clients can access 10.x addresses.
     - mask: 10.0.0.0/8
       action: allow
-      client_proxy: direct
+      client_chain: direct
     # Block all other addresses.
     - mask: 0.0.0.0/0
       action: block

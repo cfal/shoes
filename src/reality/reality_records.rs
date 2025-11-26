@@ -7,27 +7,15 @@ use std::io;
 
 use super::common::{
     CONTENT_TYPE_APPLICATION_DATA, CONTENT_TYPE_HANDSHAKE, MAX_TLS_CIPHERTEXT_LEN,
-    MAX_TLS_PLAINTEXT_LEN, TLS_RECORD_HEADER_SIZE,
+    MAX_TLS_PLAINTEXT_LEN, TLS_RECORD_HEADER_SIZE, increment_seq,
 };
 use super::reality_aead::encrypt_tls13_record;
+use super::reality_cipher_suite::CipherSuite;
 
-/// Encrypt plaintext into TLS 1.3 application data records, fragmenting if necessary.
-///
-/// This function handles the TLS 1.3 record size limit by splitting large plaintext
-/// into multiple records of at most `MAX_TLS_PLAINTEXT_LEN` bytes each.
-///
-/// # Arguments
-/// * `plaintext` - The plaintext data to encrypt (will be cleared after encryption)
-/// * `app_write_key` - The application traffic key (16 bytes for AES-128-GCM)
-/// * `app_write_iv` - The application traffic IV (12 bytes)
-/// * `write_seq` - Mutable reference to the write sequence number (incremented per record)
-/// * `ciphertext_buf` - Buffer to append encrypted TLS records to
-///
-/// # Returns
-/// * `Ok(())` on success
-/// * `Err` if encryption fails
+/// Encrypt plaintext into TLS 1.3 records with CipherSuite, fragmenting if necessary.
 #[inline]
 pub fn encrypt_plaintext_to_records(
+    cipher_suite: CipherSuite,
     plaintext: &mut Vec<u8>,
     app_write_key: &[u8],
     app_write_iv: &[u8],
@@ -41,6 +29,7 @@ pub fn encrypt_plaintext_to_records(
     // Fast path: single record (most common case, ~16KB or less)
     if plaintext.len() <= MAX_TLS_PLAINTEXT_LEN {
         encrypt_single_record(
+            cipher_suite,
             plaintext,
             app_write_key,
             app_write_iv,
@@ -67,6 +56,7 @@ pub fn encrypt_plaintext_to_records(
         let chunk = &plaintext[offset..chunk_end];
 
         encrypt_chunk_with_type(
+            cipher_suite,
             chunk,
             app_write_key,
             app_write_iv,
@@ -81,34 +71,30 @@ pub fn encrypt_plaintext_to_records(
     Ok(())
 }
 
-/// Encrypt a single record where plaintext fits within MAX_TLS_PLAINTEXT_LEN.
-/// This is the fast path - we can use mem::take to avoid allocation for plaintext_with_type.
 #[inline]
 fn encrypt_single_record(
+    cipher_suite: CipherSuite,
     plaintext: &mut Vec<u8>,
     app_write_key: &[u8],
     app_write_iv: &[u8],
     write_seq: &mut u64,
     ciphertext_buf: &mut Vec<u8>,
 ) -> io::Result<()> {
-    // TLS 1.3: plaintext_with_type = plaintext || ContentType
-    // Take ownership to avoid allocation, we'll restore and clear it
     let mut plaintext_with_type = std::mem::take(plaintext);
     plaintext_with_type.push(CONTENT_TYPE_APPLICATION_DATA);
 
-    // Ciphertext length = plaintext_with_type + GCM tag (16 bytes)
     let ciphertext_len = (plaintext_with_type.len() + 16) as u16;
 
-    // Build TLS record header (also serves as AAD for AEAD)
     let tls_header: [u8; TLS_RECORD_HEADER_SIZE] = [
         CONTENT_TYPE_APPLICATION_DATA,
         0x03,
-        0x03, // TLS 1.2 version for compatibility
+        0x03,
         (ciphertext_len >> 8) as u8,
         (ciphertext_len & 0xff) as u8,
     ];
 
     let ciphertext = encrypt_tls13_record(
+        cipher_suite,
         app_write_key,
         app_write_iv,
         *write_seq,
@@ -116,28 +102,20 @@ fn encrypt_single_record(
         &tls_header,
     )?;
 
-    *write_seq += 1;
+    increment_seq(write_seq)?;
 
-    // Append TLS record to output buffer
     ciphertext_buf.reserve(TLS_RECORD_HEADER_SIZE + ciphertext.len());
     ciphertext_buf.extend_from_slice(&tls_header);
     ciphertext_buf.extend_from_slice(&ciphertext);
 
-    // Restore the vec for reuse by caller (will be cleared by caller)
     *plaintext = plaintext_with_type;
 
     Ok(())
 }
 
-/// Encrypt a chunk of data into a single TLS 1.3 record.
-///
-/// This is the core encryption function used by both application data and handshake
-/// fragmentation. The `inner_content_type` specifies the content type byte that gets
-/// encrypted inside the record (0x17 for app data, 0x16 for handshake).
-///
-/// The outer record type is always 0x17 (ApplicationData) for TLS 1.3 encrypted records.
 #[inline]
 fn encrypt_chunk_with_type(
+    cipher_suite: CipherSuite,
     chunk: &[u8],
     key: &[u8],
     iv: &[u8],
@@ -145,15 +123,12 @@ fn encrypt_chunk_with_type(
     ciphertext_buf: &mut Vec<u8>,
     inner_content_type: u8,
 ) -> io::Result<()> {
-    // TLS 1.3: plaintext_with_type = chunk || ContentType
     let mut plaintext_with_type = Vec::with_capacity(chunk.len() + 1);
     plaintext_with_type.extend_from_slice(chunk);
     plaintext_with_type.push(inner_content_type);
 
-    // Ciphertext length = plaintext_with_type + GCM tag (16 bytes)
     let ciphertext_len = (plaintext_with_type.len() + 16) as u16;
 
-    // Verify we don't exceed TLS 1.3 limit (this should never happen if callers fragment correctly)
     debug_assert!(
         (ciphertext_len as usize) <= MAX_TLS_CIPHERTEXT_LEN,
         "BUG: ciphertext_len {} exceeds MAX_TLS_CIPHERTEXT_LEN {}",
@@ -161,20 +136,25 @@ fn encrypt_chunk_with_type(
         MAX_TLS_CIPHERTEXT_LEN
     );
 
-    // Build TLS record header (outer type is always ApplicationData for encrypted records)
     let tls_header: [u8; TLS_RECORD_HEADER_SIZE] = [
         CONTENT_TYPE_APPLICATION_DATA,
         0x03,
-        0x03, // TLS 1.2 version for compatibility
+        0x03,
         (ciphertext_len >> 8) as u8,
         (ciphertext_len & 0xff) as u8,
     ];
 
-    let ciphertext = encrypt_tls13_record(key, iv, *write_seq, &plaintext_with_type, &tls_header)?;
+    let ciphertext = encrypt_tls13_record(
+        cipher_suite,
+        key,
+        iv,
+        *write_seq,
+        &plaintext_with_type,
+        &tls_header,
+    )?;
 
-    *write_seq += 1;
+    increment_seq(write_seq)?;
 
-    // Append TLS record to output buffer
     ciphertext_buf.reserve(TLS_RECORD_HEADER_SIZE + ciphertext.len());
     ciphertext_buf.extend_from_slice(&tls_header);
     ciphertext_buf.extend_from_slice(&ciphertext);
@@ -182,27 +162,10 @@ fn encrypt_chunk_with_type(
     Ok(())
 }
 
-/// Encrypt handshake data into TLS 1.3 records, fragmenting if necessary.
-///
-/// This function handles the TLS 1.3 record size limit by splitting large handshake
-/// data into multiple records of at most `MAX_TLS_PLAINTEXT_LEN` bytes each.
-///
-/// Unlike application data encryption, handshake records use content type 0x16 (handshake)
-/// inside the encrypted payload, though the outer record type is still 0x17 (application_data)
-/// as per TLS 1.3 encrypted record format.
-///
-/// # Arguments
-/// * `handshake_data` - The combined handshake messages to encrypt
-/// * `key` - The handshake traffic key (16 bytes for AES-128-GCM)
-/// * `iv` - The handshake traffic IV (12 bytes)
-/// * `write_seq` - Mutable reference to the write sequence number (incremented per record)
-/// * `ciphertext_buf` - Buffer to append encrypted TLS records to
-///
-/// # Returns
-/// * `Ok(())` on success
-/// * `Err` if encryption fails
+/// Encrypt handshake data into TLS 1.3 records with CipherSuite, fragmenting if necessary.
 #[inline]
 pub fn encrypt_handshake_to_records(
+    cipher_suite: CipherSuite,
     handshake_data: &[u8],
     key: &[u8],
     iv: &[u8],
@@ -213,10 +176,9 @@ pub fn encrypt_handshake_to_records(
         return Ok(());
     }
 
-    // Check if fragmentation is needed
     if handshake_data.len() <= MAX_TLS_PLAINTEXT_LEN {
-        // Fast path: single record (most handshakes fit in one record)
         encrypt_chunk_with_type(
+            cipher_suite,
             handshake_data,
             key,
             iv,
@@ -225,7 +187,6 @@ pub fn encrypt_handshake_to_records(
             CONTENT_TYPE_HANDSHAKE,
         )?;
     } else {
-        // Slow path: fragment into multiple records (large certificates)
         let total_len = handshake_data.len();
         let num_records = total_len.div_ceil(MAX_TLS_PLAINTEXT_LEN);
         log::debug!(
@@ -241,6 +202,7 @@ pub fn encrypt_handshake_to_records(
             let chunk = &handshake_data[offset..chunk_end];
 
             encrypt_chunk_with_type(
+                cipher_suite,
                 chunk,
                 key,
                 iv,
@@ -260,6 +222,8 @@ mod tests {
     use super::*;
     use crate::reality::common::{CIPHERTEXT_READ_BUF_CAPACITY, TLS_MAX_RECORD_SIZE};
 
+    const CS: CipherSuite = CipherSuite::AES_128_GCM_SHA256;
+
     #[test]
     fn test_constants() {
         // Verify constants match expected TLS 1.3 values
@@ -278,8 +242,14 @@ mod tests {
         let mut seq = 0u64;
         let mut ciphertext_buf = Vec::new();
 
-        let result =
-            encrypt_plaintext_to_records(&mut plaintext, &key, &iv, &mut seq, &mut ciphertext_buf);
+        let result = encrypt_plaintext_to_records(
+            CS,
+            &mut plaintext,
+            &key,
+            &iv,
+            &mut seq,
+            &mut ciphertext_buf,
+        );
         assert!(result.is_ok());
         assert!(ciphertext_buf.is_empty());
         assert_eq!(seq, 0); // No records encrypted
@@ -293,8 +263,14 @@ mod tests {
         let mut seq = 0u64;
         let mut ciphertext_buf = Vec::new();
 
-        let result =
-            encrypt_plaintext_to_records(&mut plaintext, &key, &iv, &mut seq, &mut ciphertext_buf);
+        let result = encrypt_plaintext_to_records(
+            CS,
+            &mut plaintext,
+            &key,
+            &iv,
+            &mut seq,
+            &mut ciphertext_buf,
+        );
         assert!(result.is_ok());
         assert!(plaintext.is_empty()); // Should be cleared
 
@@ -320,8 +296,14 @@ mod tests {
         let mut seq = 5u64;
         let mut ciphertext_buf = Vec::new();
 
-        let result =
-            encrypt_plaintext_to_records(&mut plaintext, &key, &iv, &mut seq, &mut ciphertext_buf);
+        let result = encrypt_plaintext_to_records(
+            CS,
+            &mut plaintext,
+            &key,
+            &iv,
+            &mut seq,
+            &mut ciphertext_buf,
+        );
         assert!(result.is_ok());
         assert!(plaintext.is_empty());
 
@@ -340,8 +322,14 @@ mod tests {
         let mut seq = 0u64;
         let mut ciphertext_buf = Vec::new();
 
-        let result =
-            encrypt_plaintext_to_records(&mut plaintext, &key, &iv, &mut seq, &mut ciphertext_buf);
+        let result = encrypt_plaintext_to_records(
+            CS,
+            &mut plaintext,
+            &key,
+            &iv,
+            &mut seq,
+            &mut ciphertext_buf,
+        );
         assert!(result.is_ok());
         assert!(plaintext.is_empty());
         assert_eq!(seq, 2); // Two records encrypted
@@ -380,8 +368,14 @@ mod tests {
         let mut seq = 10u64;
         let mut ciphertext_buf = Vec::new();
 
-        let result =
-            encrypt_plaintext_to_records(&mut plaintext, &key, &iv, &mut seq, &mut ciphertext_buf);
+        let result = encrypt_plaintext_to_records(
+            CS,
+            &mut plaintext,
+            &key,
+            &iv,
+            &mut seq,
+            &mut ciphertext_buf,
+        );
         assert!(result.is_ok());
         assert!(plaintext.is_empty());
         assert_eq!(seq, 13); // Three records encrypted
@@ -401,8 +395,14 @@ mod tests {
         let mut seq = 0u64;
         let mut ciphertext_buf = Vec::new();
 
-        let result =
-            encrypt_plaintext_to_records(&mut plaintext, &key, &iv, &mut seq, &mut ciphertext_buf);
+        let result = encrypt_plaintext_to_records(
+            CS,
+            &mut plaintext,
+            &key,
+            &iv,
+            &mut seq,
+            &mut ciphertext_buf,
+        );
         assert!(result.is_ok());
         assert!(plaintext.is_empty());
         assert_eq!(seq, 3); // Three records
@@ -425,14 +425,28 @@ mod tests {
 
         // First call with small data
         let mut plaintext1 = vec![0x46u8; 50];
-        encrypt_plaintext_to_records(&mut plaintext1, &key, &iv, &mut seq, &mut ciphertext_buf)
-            .unwrap();
+        encrypt_plaintext_to_records(
+            CS,
+            &mut plaintext1,
+            &key,
+            &iv,
+            &mut seq,
+            &mut ciphertext_buf,
+        )
+        .unwrap();
         assert_eq!(seq, 101);
 
         // Second call with data requiring fragmentation
         let mut plaintext2 = vec![0x47u8; MAX_TLS_PLAINTEXT_LEN + 500];
-        encrypt_plaintext_to_records(&mut plaintext2, &key, &iv, &mut seq, &mut ciphertext_buf)
-            .unwrap();
+        encrypt_plaintext_to_records(
+            CS,
+            &mut plaintext2,
+            &key,
+            &iv,
+            &mut seq,
+            &mut ciphertext_buf,
+        )
+        .unwrap();
         assert_eq!(seq, 103); // Two more records
     }
 
@@ -448,7 +462,7 @@ mod tests {
         let initial_len = ciphertext_buf.len();
 
         let mut plaintext = vec![0x48u8; 100];
-        encrypt_plaintext_to_records(&mut plaintext, &key, &iv, &mut seq, &mut ciphertext_buf)
+        encrypt_plaintext_to_records(CS, &mut plaintext, &key, &iv, &mut seq, &mut ciphertext_buf)
             .unwrap();
 
         // Should append, not overwrite
@@ -465,8 +479,14 @@ mod tests {
         let mut seq = 0u64;
         let mut ciphertext_buf = Vec::new();
 
-        let result =
-            encrypt_plaintext_to_records(&mut plaintext, &key, &iv, &mut seq, &mut ciphertext_buf);
+        let result = encrypt_plaintext_to_records(
+            CS,
+            &mut plaintext,
+            &key,
+            &iv,
+            &mut seq,
+            &mut ciphertext_buf,
+        );
         assert!(result.is_ok());
         assert!(plaintext.is_empty());
         assert_eq!(seq, 1);
@@ -484,8 +504,14 @@ mod tests {
         let mut seq = 0u64;
         let mut ciphertext_buf = Vec::new();
 
-        let result =
-            encrypt_plaintext_to_records(&mut plaintext, &key, &iv, &mut seq, &mut ciphertext_buf);
+        let result = encrypt_plaintext_to_records(
+            CS,
+            &mut plaintext,
+            &key,
+            &iv,
+            &mut seq,
+            &mut ciphertext_buf,
+        );
         assert!(result.is_ok());
         assert!(plaintext.is_empty());
         assert_eq!(seq, 1); // Still single record
@@ -507,8 +533,14 @@ mod tests {
         let mut seq = 0u64;
         let mut ciphertext_buf = Vec::new();
 
-        let result =
-            encrypt_plaintext_to_records(&mut plaintext, &key, &iv, &mut seq, &mut ciphertext_buf);
+        let result = encrypt_plaintext_to_records(
+            CS,
+            &mut plaintext,
+            &key,
+            &iv,
+            &mut seq,
+            &mut ciphertext_buf,
+        );
         assert!(result.is_ok());
         assert!(plaintext.is_empty());
         assert_eq!(seq, 32); // 32 records
@@ -532,15 +564,27 @@ mod tests {
 
         // Small data - single record
         let mut plaintext = vec![0x4Bu8; 100];
-        let result =
-            encrypt_plaintext_to_records(&mut plaintext, &key, &iv, &mut seq, &mut ciphertext_buf);
+        let result = encrypt_plaintext_to_records(
+            CS,
+            &mut plaintext,
+            &key,
+            &iv,
+            &mut seq,
+            &mut ciphertext_buf,
+        );
         assert!(result.is_ok());
         assert_eq!(seq, u64::MAX - 4);
 
         // Another small record
         let mut plaintext2 = vec![0x4Cu8; 100];
-        let result2 =
-            encrypt_plaintext_to_records(&mut plaintext2, &key, &iv, &mut seq, &mut ciphertext_buf);
+        let result2 = encrypt_plaintext_to_records(
+            CS,
+            &mut plaintext2,
+            &key,
+            &iv,
+            &mut seq,
+            &mut ciphertext_buf,
+        );
         assert!(result2.is_ok());
         assert_eq!(seq, u64::MAX - 3);
     }
@@ -555,7 +599,7 @@ mod tests {
         let mut seq = 0u64;
         let mut ciphertext_buf = Vec::new();
 
-        encrypt_plaintext_to_records(&mut plaintext, &key, &iv, &mut seq, &mut ciphertext_buf)
+        encrypt_plaintext_to_records(CS, &mut plaintext, &key, &iv, &mut seq, &mut ciphertext_buf)
             .unwrap();
         assert_eq!(seq, 4);
 
@@ -625,8 +669,8 @@ mod tests {
         let mut buf1 = Vec::new();
         let mut buf2 = Vec::new();
 
-        encrypt_plaintext_to_records(&mut data1, &key1, &iv, &mut seq1, &mut buf1).unwrap();
-        encrypt_plaintext_to_records(&mut data2, &key2, &iv, &mut seq2, &mut buf2).unwrap();
+        encrypt_plaintext_to_records(CS, &mut data1, &key1, &iv, &mut seq1, &mut buf1).unwrap();
+        encrypt_plaintext_to_records(CS, &mut data2, &key2, &iv, &mut seq2, &mut buf2).unwrap();
 
         assert_eq!(buf1.len(), buf2.len());
         assert_ne!(buf1, buf2); // Different keys = different ciphertext
@@ -645,8 +689,8 @@ mod tests {
         let mut buf1 = Vec::new();
         let mut buf2 = Vec::new();
 
-        encrypt_plaintext_to_records(&mut data1, &key, &iv1, &mut seq1, &mut buf1).unwrap();
-        encrypt_plaintext_to_records(&mut data2, &key, &iv2, &mut seq2, &mut buf2).unwrap();
+        encrypt_plaintext_to_records(CS, &mut data1, &key, &iv1, &mut seq1, &mut buf1).unwrap();
+        encrypt_plaintext_to_records(CS, &mut data2, &key, &iv2, &mut seq2, &mut buf2).unwrap();
 
         assert_eq!(buf1.len(), buf2.len());
         assert_ne!(buf1, buf2); // Different IVs = different ciphertext
@@ -664,8 +708,8 @@ mod tests {
         let mut buf1 = Vec::new();
         let mut buf2 = Vec::new();
 
-        encrypt_plaintext_to_records(&mut data1, &key, &iv, &mut seq1, &mut buf1).unwrap();
-        encrypt_plaintext_to_records(&mut data2, &key, &iv, &mut seq2, &mut buf2).unwrap();
+        encrypt_plaintext_to_records(CS, &mut data1, &key, &iv, &mut seq1, &mut buf1).unwrap();
+        encrypt_plaintext_to_records(CS, &mut data2, &key, &iv, &mut seq2, &mut buf2).unwrap();
 
         assert_eq!(buf1.len(), buf2.len());
         assert_ne!(buf1, buf2); // Different seq = different nonce = different ciphertext
@@ -679,7 +723,7 @@ mod tests {
         let mut seq = 0u64;
         let mut ciphertext_buf = Vec::new();
 
-        encrypt_plaintext_to_records(&mut plaintext, &key, &iv, &mut seq, &mut ciphertext_buf)
+        encrypt_plaintext_to_records(CS, &mut plaintext, &key, &iv, &mut seq, &mut ciphertext_buf)
             .unwrap();
         assert!(plaintext.is_empty());
         assert_eq!(seq, 2);
@@ -697,7 +741,7 @@ mod tests {
         let mut seq = 0u64;
         let mut ciphertext_buf = Vec::new();
 
-        encrypt_plaintext_to_records(&mut plaintext, &key, &iv, &mut seq, &mut ciphertext_buf)
+        encrypt_plaintext_to_records(CS, &mut plaintext, &key, &iv, &mut seq, &mut ciphertext_buf)
             .unwrap();
         assert!(plaintext.is_empty());
         assert_eq!(seq, 3);
@@ -719,7 +763,7 @@ mod tests {
         let mut seq = 0u64;
         let mut ciphertext_buf = Vec::new();
 
-        encrypt_plaintext_to_records(&mut plaintext, &key, &iv, &mut seq, &mut ciphertext_buf)
+        encrypt_plaintext_to_records(CS, &mut plaintext, &key, &iv, &mut seq, &mut ciphertext_buf)
             .unwrap();
         assert!(plaintext.is_empty());
         assert_eq!(seq, 16);
@@ -747,7 +791,7 @@ mod tests {
         let mut seq = 0u64;
         let mut ciphertext_buf = Vec::new();
 
-        encrypt_plaintext_to_records(&mut plaintext, &key, &iv, &mut seq, &mut ciphertext_buf)
+        encrypt_plaintext_to_records(CS, &mut plaintext, &key, &iv, &mut seq, &mut ciphertext_buf)
             .unwrap();
 
         let mut offset = 0;
@@ -771,8 +815,15 @@ mod tests {
             let mut seq = 0u64;
             let mut ciphertext_buf = Vec::new();
 
-            encrypt_plaintext_to_records(&mut plaintext, &key, &iv, &mut seq, &mut ciphertext_buf)
-                .unwrap();
+            encrypt_plaintext_to_records(
+                CS,
+                &mut plaintext,
+                &key,
+                &iv,
+                &mut seq,
+                &mut ciphertext_buf,
+            )
+            .unwrap();
             assert!(plaintext.is_empty());
             assert_eq!(seq, 1, "Size {} should be single record", size);
 
@@ -791,8 +842,15 @@ mod tests {
             let mut seq = 0u64;
             let mut ciphertext_buf = Vec::new();
 
-            encrypt_plaintext_to_records(&mut plaintext, &key, &iv, &mut seq, &mut ciphertext_buf)
-                .unwrap();
+            encrypt_plaintext_to_records(
+                CS,
+                &mut plaintext,
+                &key,
+                &iv,
+                &mut seq,
+                &mut ciphertext_buf,
+            )
+            .unwrap();
             assert!(plaintext.is_empty());
 
             let expected_records = if size <= MAX_TLS_PLAINTEXT_LEN { 1 } else { 2 };
@@ -812,12 +870,14 @@ mod tests {
         let mut ciphertext_buf = Vec::new();
 
         let mut data1 = vec![0x44u8; 1000];
-        encrypt_plaintext_to_records(&mut data1, &key, &iv, &mut seq, &mut ciphertext_buf).unwrap();
+        encrypt_plaintext_to_records(CS, &mut data1, &key, &iv, &mut seq, &mut ciphertext_buf)
+            .unwrap();
         let len1 = ciphertext_buf.len();
         assert_eq!(seq, 1);
 
         let mut data2 = vec![0x55u8; MAX_TLS_PLAINTEXT_LEN + 500];
-        encrypt_plaintext_to_records(&mut data2, &key, &iv, &mut seq, &mut ciphertext_buf).unwrap();
+        encrypt_plaintext_to_records(CS, &mut data2, &key, &iv, &mut seq, &mut ciphertext_buf)
+            .unwrap();
         assert!(ciphertext_buf.len() > len1);
         assert_eq!(seq, 3); // 1 + 2 more
     }
@@ -831,7 +891,7 @@ mod tests {
 
         // Fragmentation at high seq numbers
         let mut plaintext = vec![0x66u8; MAX_TLS_PLAINTEXT_LEN + 100];
-        encrypt_plaintext_to_records(&mut plaintext, &key, &iv, &mut seq, &mut ciphertext_buf)
+        encrypt_plaintext_to_records(CS, &mut plaintext, &key, &iv, &mut seq, &mut ciphertext_buf)
             .unwrap();
         assert_eq!(seq, u64::MAX - 3); // 2 records
     }
@@ -844,7 +904,7 @@ mod tests {
         let mut seq = 0u64;
         let mut ciphertext_buf = Vec::new();
 
-        encrypt_plaintext_to_records(&mut plaintext, &key, &iv, &mut seq, &mut ciphertext_buf)
+        encrypt_plaintext_to_records(CS, &mut plaintext, &key, &iv, &mut seq, &mut ciphertext_buf)
             .unwrap();
         assert_eq!(seq, 1);
 
@@ -861,7 +921,7 @@ mod tests {
         let mut seq = 0u64;
         let mut ciphertext_buf = Vec::new();
 
-        encrypt_plaintext_to_records(&mut plaintext, &key, &iv, &mut seq, &mut ciphertext_buf)
+        encrypt_plaintext_to_records(CS, &mut plaintext, &key, &iv, &mut seq, &mut ciphertext_buf)
             .unwrap();
         assert_eq!(seq, 2);
 
@@ -888,8 +948,14 @@ mod tests {
         let mut seq = 0u64;
         let mut ciphertext_buf = Vec::new();
 
-        let result =
-            encrypt_handshake_to_records(handshake_data, &key, &iv, &mut seq, &mut ciphertext_buf);
+        let result = encrypt_handshake_to_records(
+            CS,
+            handshake_data,
+            &key,
+            &iv,
+            &mut seq,
+            &mut ciphertext_buf,
+        );
         assert!(result.is_ok());
         assert!(ciphertext_buf.is_empty());
         assert_eq!(seq, 0); // No records encrypted
@@ -904,8 +970,14 @@ mod tests {
         let mut seq = 0u64;
         let mut ciphertext_buf = Vec::new();
 
-        let result =
-            encrypt_handshake_to_records(&handshake_data, &key, &iv, &mut seq, &mut ciphertext_buf);
+        let result = encrypt_handshake_to_records(
+            CS,
+            &handshake_data,
+            &key,
+            &iv,
+            &mut seq,
+            &mut ciphertext_buf,
+        );
         assert!(result.is_ok());
         assert_eq!(seq, 1); // One record encrypted
 
@@ -930,8 +1002,14 @@ mod tests {
         let mut seq = 5u64;
         let mut ciphertext_buf = Vec::new();
 
-        let result =
-            encrypt_handshake_to_records(&handshake_data, &key, &iv, &mut seq, &mut ciphertext_buf);
+        let result = encrypt_handshake_to_records(
+            CS,
+            &handshake_data,
+            &key,
+            &iv,
+            &mut seq,
+            &mut ciphertext_buf,
+        );
         assert!(result.is_ok());
         assert_eq!(seq, 6); // One record encrypted
 
@@ -948,8 +1026,14 @@ mod tests {
         let mut seq = 0u64;
         let mut ciphertext_buf = Vec::new();
 
-        let result =
-            encrypt_handshake_to_records(&handshake_data, &key, &iv, &mut seq, &mut ciphertext_buf);
+        let result = encrypt_handshake_to_records(
+            CS,
+            &handshake_data,
+            &key,
+            &iv,
+            &mut seq,
+            &mut ciphertext_buf,
+        );
         assert!(result.is_ok());
         assert_eq!(seq, 2); // Two records encrypted
 
@@ -970,8 +1054,14 @@ mod tests {
         let mut seq = 0u64;
         let mut ciphertext_buf = Vec::new();
 
-        let result =
-            encrypt_handshake_to_records(&handshake_data, &key, &iv, &mut seq, &mut ciphertext_buf);
+        let result = encrypt_handshake_to_records(
+            CS,
+            &handshake_data,
+            &key,
+            &iv,
+            &mut seq,
+            &mut ciphertext_buf,
+        );
         assert!(result.is_ok());
         assert_eq!(seq, 2); // Should be 2 records (20000 / 16384 = 1.2)
 
@@ -1016,8 +1106,14 @@ mod tests {
         let mut seq = 0u64;
         let mut ciphertext_buf = Vec::new();
 
-        let result =
-            encrypt_handshake_to_records(&handshake_data, &key, &iv, &mut seq, &mut ciphertext_buf);
+        let result = encrypt_handshake_to_records(
+            CS,
+            &handshake_data,
+            &key,
+            &iv,
+            &mut seq,
+            &mut ciphertext_buf,
+        );
         assert!(result.is_ok());
 
         // 50000 / 16384 = 3.01 -> 4 records
@@ -1051,13 +1147,13 @@ mod tests {
 
         // First handshake - single record
         let handshake1 = vec![0x16u8; 1000];
-        encrypt_handshake_to_records(&handshake1, &key, &iv, &mut seq, &mut ciphertext_buf)
+        encrypt_handshake_to_records(CS, &handshake1, &key, &iv, &mut seq, &mut ciphertext_buf)
             .unwrap();
         assert_eq!(seq, 1);
 
         // Second handshake - requires fragmentation
         let handshake2 = vec![0x16u8; MAX_TLS_PLAINTEXT_LEN + 5000];
-        encrypt_handshake_to_records(&handshake2, &key, &iv, &mut seq, &mut ciphertext_buf)
+        encrypt_handshake_to_records(CS, &handshake2, &key, &iv, &mut seq, &mut ciphertext_buf)
             .unwrap();
         assert_eq!(seq, 3); // 1 + 2 more records
     }
@@ -1077,6 +1173,7 @@ mod tests {
         let mut ciphertext_buf = Vec::new();
 
         let result = encrypt_handshake_to_records(
+            CS,
             &typical_handshake,
             &key,
             &iv,
@@ -1102,6 +1199,7 @@ mod tests {
         let mut ciphertext_buf = Vec::new();
 
         let result = encrypt_handshake_to_records(
+            CS,
             &large_cert_handshake,
             &key,
             &iv,
@@ -1127,6 +1225,7 @@ mod tests {
         let mut ciphertext_buf = Vec::new();
 
         let result = encrypt_handshake_to_records(
+            CS,
             &very_large_handshake,
             &key,
             &iv,
@@ -1146,8 +1245,14 @@ mod tests {
         let mut seq = 0u64;
         let mut ciphertext_buf = Vec::new();
 
-        let result =
-            encrypt_handshake_to_records(&handshake_data, &key, &iv, &mut seq, &mut ciphertext_buf);
+        let result = encrypt_handshake_to_records(
+            CS,
+            &handshake_data,
+            &key,
+            &iv,
+            &mut seq,
+            &mut ciphertext_buf,
+        );
         assert!(result.is_ok());
         assert_eq!(seq, 1); // Exactly one record
 
@@ -1165,8 +1270,14 @@ mod tests {
         let mut seq = 0u64;
         let mut ciphertext_buf = Vec::new();
 
-        let result =
-            encrypt_handshake_to_records(&handshake_data, &key, &iv, &mut seq, &mut ciphertext_buf);
+        let result = encrypt_handshake_to_records(
+            CS,
+            &handshake_data,
+            &key,
+            &iv,
+            &mut seq,
+            &mut ciphertext_buf,
+        );
         assert!(result.is_ok());
         assert_eq!(seq, 2); // Requires two records
 
@@ -1191,8 +1302,14 @@ mod tests {
         let mut seq = 0u64;
         let mut ciphertext_buf = Vec::new();
 
-        let result =
-            encrypt_handshake_to_records(&handshake_data, &key, &iv, &mut seq, &mut ciphertext_buf);
+        let result = encrypt_handshake_to_records(
+            CS,
+            &handshake_data,
+            &key,
+            &iv,
+            &mut seq,
+            &mut ciphertext_buf,
+        );
         assert!(result.is_ok());
         assert_eq!(seq, 1);
 
@@ -1210,8 +1327,15 @@ mod tests {
         let mut seq = 0u64;
         let mut ciphertext_buf = Vec::new();
 
-        encrypt_handshake_to_records(&handshake_data, &key, &iv, &mut seq, &mut ciphertext_buf)
-            .unwrap();
+        encrypt_handshake_to_records(
+            CS,
+            &handshake_data,
+            &key,
+            &iv,
+            &mut seq,
+            &mut ciphertext_buf,
+        )
+        .unwrap();
         assert_eq!(seq, 4); // 3 full + 1 partial
 
         let mut offset = 0;
@@ -1256,13 +1380,13 @@ mod tests {
 
         // Single record
         let handshake1 = vec![0x16u8; 1000];
-        encrypt_handshake_to_records(&handshake1, &key, &iv, &mut seq, &mut ciphertext_buf)
+        encrypt_handshake_to_records(CS, &handshake1, &key, &iv, &mut seq, &mut ciphertext_buf)
             .unwrap();
         assert_eq!(seq, u64::MAX - 9);
 
         // Two records (fragmentation at high seq)
         let handshake2 = vec![0x16u8; MAX_TLS_PLAINTEXT_LEN + 100];
-        encrypt_handshake_to_records(&handshake2, &key, &iv, &mut seq, &mut ciphertext_buf)
+        encrypt_handshake_to_records(CS, &handshake2, &key, &iv, &mut seq, &mut ciphertext_buf)
             .unwrap();
         assert_eq!(seq, u64::MAX - 7); // 2 more records
     }
@@ -1279,7 +1403,8 @@ mod tests {
         let initial_len = ciphertext_buf.len();
 
         let handshake = vec![0x16u8; 500];
-        encrypt_handshake_to_records(&handshake, &key, &iv, &mut seq, &mut ciphertext_buf).unwrap();
+        encrypt_handshake_to_records(CS, &handshake, &key, &iv, &mut seq, &mut ciphertext_buf)
+            .unwrap();
 
         // Should append, not overwrite
         assert!(ciphertext_buf.len() > initial_len);
@@ -1299,13 +1424,15 @@ mod tests {
 
         // First batch (e.g., just EE + Cert)
         let batch1 = vec![0x16u8; 5000];
-        encrypt_handshake_to_records(&batch1, &key, &iv, &mut seq, &mut ciphertext_buf).unwrap();
+        encrypt_handshake_to_records(CS, &batch1, &key, &iv, &mut seq, &mut ciphertext_buf)
+            .unwrap();
         let len_after_batch1 = ciphertext_buf.len();
         assert_eq!(seq, 1);
 
         // Second batch (e.g., CV + Finished) - note seq continues
         let batch2 = vec![0x16u8; 300];
-        encrypt_handshake_to_records(&batch2, &key, &iv, &mut seq, &mut ciphertext_buf).unwrap();
+        encrypt_handshake_to_records(CS, &batch2, &key, &iv, &mut seq, &mut ciphertext_buf)
+            .unwrap();
         assert!(ciphertext_buf.len() > len_after_batch1);
         assert_eq!(seq, 2);
     }
@@ -1319,8 +1446,14 @@ mod tests {
         let mut seq = 0u64;
         let mut ciphertext_buf = Vec::new();
 
-        let result =
-            encrypt_handshake_to_records(&handshake_data, &key, &iv, &mut seq, &mut ciphertext_buf);
+        let result = encrypt_handshake_to_records(
+            CS,
+            &handshake_data,
+            &key,
+            &iv,
+            &mut seq,
+            &mut ciphertext_buf,
+        );
         assert!(result.is_ok());
         assert_eq!(seq, 1); // Still single record (fast path)
 
@@ -1337,8 +1470,14 @@ mod tests {
         let mut seq = 0u64;
         let mut ciphertext_buf = Vec::new();
 
-        let result =
-            encrypt_handshake_to_records(&handshake_data, &key, &iv, &mut seq, &mut ciphertext_buf);
+        let result = encrypt_handshake_to_records(
+            CS,
+            &handshake_data,
+            &key,
+            &iv,
+            &mut seq,
+            &mut ciphertext_buf,
+        );
         assert!(result.is_ok());
         assert_eq!(seq, 2);
 
@@ -1356,8 +1495,14 @@ mod tests {
         let mut seq = 0u64;
         let mut ciphertext_buf = Vec::new();
 
-        let result =
-            encrypt_handshake_to_records(&handshake_data, &key, &iv, &mut seq, &mut ciphertext_buf);
+        let result = encrypt_handshake_to_records(
+            CS,
+            &handshake_data,
+            &key,
+            &iv,
+            &mut seq,
+            &mut ciphertext_buf,
+        );
         assert!(result.is_ok());
         assert_eq!(seq, 3);
 
@@ -1379,8 +1524,8 @@ mod tests {
         let mut buf1 = Vec::new();
         let mut buf2 = Vec::new();
 
-        encrypt_handshake_to_records(&handshake, &key1, &iv, &mut seq1, &mut buf1).unwrap();
-        encrypt_handshake_to_records(&handshake, &key2, &iv, &mut seq2, &mut buf2).unwrap();
+        encrypt_handshake_to_records(CS, &handshake, &key1, &iv, &mut seq1, &mut buf1).unwrap();
+        encrypt_handshake_to_records(CS, &handshake, &key2, &iv, &mut seq2, &mut buf2).unwrap();
 
         // Same structure but different ciphertext
         assert_eq!(buf1.len(), buf2.len());
@@ -1400,8 +1545,8 @@ mod tests {
         let mut buf1 = Vec::new();
         let mut buf2 = Vec::new();
 
-        encrypt_handshake_to_records(&handshake, &key, &iv1, &mut seq1, &mut buf1).unwrap();
-        encrypt_handshake_to_records(&handshake, &key, &iv2, &mut seq2, &mut buf2).unwrap();
+        encrypt_handshake_to_records(CS, &handshake, &key, &iv1, &mut seq1, &mut buf1).unwrap();
+        encrypt_handshake_to_records(CS, &handshake, &key, &iv2, &mut seq2, &mut buf2).unwrap();
 
         assert_eq!(buf1.len(), buf2.len());
         assert_ne!(buf1, buf2); // Different IVs = different ciphertext
@@ -1419,8 +1564,8 @@ mod tests {
         let mut buf1 = Vec::new();
         let mut buf2 = Vec::new();
 
-        encrypt_handshake_to_records(&handshake, &key, &iv, &mut seq1, &mut buf1).unwrap();
-        encrypt_handshake_to_records(&handshake, &key, &iv, &mut seq2, &mut buf2).unwrap();
+        encrypt_handshake_to_records(CS, &handshake, &key, &iv, &mut seq1, &mut buf1).unwrap();
+        encrypt_handshake_to_records(CS, &handshake, &key, &iv, &mut seq2, &mut buf2).unwrap();
 
         assert_eq!(buf1.len(), buf2.len());
         assert_ne!(buf1, buf2); // Different seq = different nonce = different ciphertext
@@ -1442,8 +1587,9 @@ mod tests {
         let mut hs_buf = Vec::new();
 
         let mut app_data = data.clone();
-        encrypt_plaintext_to_records(&mut app_data, &key, &iv, &mut seq1, &mut app_buf).unwrap();
-        encrypt_handshake_to_records(&data, &key, &iv, &mut seq2, &mut hs_buf).unwrap();
+        encrypt_plaintext_to_records(CS, &mut app_data, &key, &iv, &mut seq1, &mut app_buf)
+            .unwrap();
+        encrypt_handshake_to_records(CS, &data, &key, &iv, &mut seq2, &mut hs_buf).unwrap();
 
         // Same size but different content (inner content type differs)
         assert_eq!(app_buf.len(), hs_buf.len());
@@ -1463,8 +1609,14 @@ mod tests {
         let mut seq = 0u64;
         let mut ciphertext_buf = Vec::new();
 
-        let result =
-            encrypt_handshake_to_records(&handshake_data, &key, &iv, &mut seq, &mut ciphertext_buf);
+        let result = encrypt_handshake_to_records(
+            CS,
+            &handshake_data,
+            &key,
+            &iv,
+            &mut seq,
+            &mut ciphertext_buf,
+        );
         assert!(result.is_ok());
         assert_eq!(seq, 16);
 
@@ -1498,8 +1650,9 @@ mod tests {
         let mut app_data = vec![0xBBu8; size];
         let hs_data = vec![0xCCu8; size];
 
-        encrypt_plaintext_to_records(&mut app_data, &key, &iv, &mut app_seq, &mut app_buf).unwrap();
-        encrypt_handshake_to_records(&hs_data, &key, &iv, &mut hs_seq, &mut hs_buf).unwrap();
+        encrypt_plaintext_to_records(CS, &mut app_data, &key, &iv, &mut app_seq, &mut app_buf)
+            .unwrap();
+        encrypt_handshake_to_records(CS, &hs_data, &key, &iv, &mut hs_seq, &mut hs_buf).unwrap();
 
         // Both should produce exactly 2 records
         assert_eq!(app_seq, 2);
@@ -1518,8 +1671,15 @@ mod tests {
         let mut seq = 0u64;
         let mut ciphertext_buf = Vec::new();
 
-        encrypt_handshake_to_records(&handshake_data, &key, &iv, &mut seq, &mut ciphertext_buf)
-            .unwrap();
+        encrypt_handshake_to_records(
+            CS,
+            &handshake_data,
+            &key,
+            &iv,
+            &mut seq,
+            &mut ciphertext_buf,
+        )
+        .unwrap();
 
         // Parse records and verify total plaintext size matches
         let mut offset = 0;
@@ -1548,6 +1708,7 @@ mod tests {
             let mut ciphertext_buf = Vec::new();
 
             let result = encrypt_handshake_to_records(
+                CS,
                 &handshake_data,
                 &key,
                 &iv,
@@ -1575,6 +1736,7 @@ mod tests {
             let mut ciphertext_buf = Vec::new();
 
             let result = encrypt_handshake_to_records(
+                CS,
                 &handshake_data,
                 &key,
                 &iv,

@@ -655,7 +655,7 @@ mod tests {
         let mut buf = BytesMut::new();
         buf.put_u16(10); // metadata length = 10
         buf.put_u16(1); // session_id
-                        // Only 2 bytes of metadata, but length says 10
+        // Only 2 bytes of metadata, but length says 10
 
         let result = FrameMetadata::decode(&mut buf).unwrap();
         assert!(

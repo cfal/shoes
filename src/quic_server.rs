@@ -8,7 +8,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
-use crate::async_stream::{AsyncSourcedMessageStream, AsyncStream};
+use crate::async_stream::AsyncStream;
 use crate::client_proxy_selector::{ClientProxySelector, ConnectDecision};
 use crate::config::{
     BindLocation, ConfigSelection, ServerConfig, ServerProxyConfig, ServerQuicConfig,
@@ -18,22 +18,21 @@ use crate::copy_bidirectional_message::copy_bidirectional_message;
 use crate::copy_multidirectional_message::copy_multidirectional_message;
 use crate::copy_session_messages::copy_session_messages;
 use crate::quic_stream::QuicStream;
-use crate::resolver::{resolve_single_address, NativeResolver, Resolver};
+use crate::resolver::{NativeResolver, Resolver};
 use crate::rustls_config_util::create_server_config;
 use crate::socket_util::new_socket2_udp_socket;
-use crate::tcp_client_connector::TcpClientConnector;
-use crate::tcp_handler::{TcpServerHandler, TcpServerSetupResult};
-use crate::tcp_handler_util::{create_tcp_client_proxy_selector, create_tcp_server_handler};
-use crate::tcp_server::setup_client_stream;
-use crate::udp_message_stream::UdpMessageStream;
-use crate::udp_multi_message_stream::UdpMultiMessageStream;
-use crate::udp_session_message_stream::{UdpSessionMessageStream, UdpSocketConfig};
+use crate::tcp::tcp_client_handler_factory::create_tcp_client_proxy_selector;
+use crate::tcp::tcp_server_handler_factory::create_tcp_server_handler;
+use crate::tcp_handler::{
+    TcpClientUdpSetupResult, TcpServerHandler, TcpServerSetupResult, UdpStreamRequest,
+};
+use crate::tcp_server::setup_client_tcp_stream;
 use crate::util::parse_uuid;
 
 async fn start_quic_server(
     bind_address: SocketAddr,
     quic_server_config: Arc<quinn::crypto::rustls::QuicServerConfig>,
-    client_proxy_selector: Arc<ClientProxySelector<TcpClientConnector>>,
+    client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
     server_handler: Arc<dyn TcpServerHandler>,
     num_endpoints: usize,
@@ -86,7 +85,7 @@ async fn start_quic_server(
 }
 
 async fn process_connection(
-    client_proxy_selector: Arc<ClientProxySelector<TcpClientConnector>>,
+    client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
     server_handler: Arc<dyn TcpServerHandler>,
     conn: quinn::Incoming,
@@ -120,7 +119,7 @@ async fn process_connection(
 }
 
 async fn process_streams(
-    client_proxy_selector: Arc<ClientProxySelector<TcpClientConnector>>,
+    client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
     server_handler: Arc<dyn TcpServerHandler>,
     (send, recv): (quinn::SendStream, quinn::RecvStream),
@@ -165,7 +164,7 @@ async fn process_streams(
 
             let setup_client_stream_future = timeout(
                 Duration::from_secs(60),
-                setup_client_stream(
+                setup_client_tcp_stream(
                     &mut server_stream,
                     selected_proxy_provider,
                     resolver,
@@ -225,7 +224,7 @@ async fn process_streams(
         }
         TcpServerSetupResult::BidirectionalUdp {
             remote_location,
-            stream: mut server_stream,
+            stream: server_stream,
             need_initial_flush: server_need_initial_flush,
             override_proxy_provider,
         } => {
@@ -234,47 +233,60 @@ async fn process_streams(
             } else {
                 client_proxy_selector
             };
+
             let action = selected_proxy_provider
                 .judge(remote_location, &resolver)
                 .await?;
             match action {
                 ConnectDecision::Allow {
-                    client_proxy,
+                    chain_group,
                     remote_location,
                 } => {
-                    let remote_addr = resolve_single_address(&resolver, &remote_location).await?;
-                    let client_socket = client_proxy.configure_udp_socket(remote_addr.is_ipv6())?;
-                    client_socket.connect(remote_addr).await?;
+                    // Use chain_group's UDP connection with Bidirectional mode
+                    // Pass server stream so handler can return matched pair
+                    let udp_result = chain_group
+                        .connect_udp(
+                            &resolver,
+                            UdpStreamRequest::Bidirectional {
+                                server_stream,
+                                target: remote_location,
+                            },
+                        )
+                        .await?;
 
-                    let mut client_socket = Box::new(client_socket);
-
-                    let copy_result = copy_bidirectional_message(
-                        &mut server_stream,
-                        &mut client_socket,
-                        server_need_initial_flush,
-                        false,
-                    )
-                    .await;
-
-                    // TODO: add async trait ext and make this work
-                    //let (_, _) = futures::join!(server_stream.shutdown_message(), client_stream.shutdown_message());
-
-                    copy_result?;
-                    Ok(())
+                    match udp_result {
+                        TcpClientUdpSetupResult::Bidirectional {
+                            mut server_stream,
+                            mut client_stream,
+                        } => {
+                            let copy_result = copy_bidirectional_message(
+                                &mut server_stream,
+                                &mut client_stream,
+                                server_need_initial_flush,
+                                false,
+                            )
+                            .await;
+                            copy_result?;
+                            Ok(())
+                        }
+                        _ => {
+                            // Handler should have returned Bidirectional or errored
+                            unreachable!(
+                                "Handler must return Bidirectional stream type when requested, or error"
+                            )
+                        }
+                    }
                 }
                 ConnectDecision::Block => {
                     // Must have been blocked.
-                    // TODO: add async trait ext and make this work
-                    // let _ = server_stream.shutdown_message().await;
                     Ok(())
                 }
             }
         }
         TcpServerSetupResult::MultiDirectionalUdp {
-            stream: mut server_stream,
+            stream: server_stream,
             need_initial_flush: server_need_initial_flush,
             override_proxy_provider,
-            num_sockets,
         } => {
             let selected_proxy_provider = if override_proxy_provider.is_one() {
                 override_proxy_provider.unwrap()
@@ -284,46 +296,52 @@ async fn process_streams(
             let action = selected_proxy_provider.default_decision();
             match action {
                 ConnectDecision::Allow {
-                    client_proxy,
+                    chain_group,
                     remote_location: _,
                 } => {
-                    let mut client_stream: Box<dyn AsyncSourcedMessageStream> = if num_sockets <= 1
-                    {
-                        // support ipv6 since we don't know what the remote locations will be.
-                        let udp_socket = client_proxy.configure_udp_socket(true)?;
-                        Box::new(UdpMessageStream::new(udp_socket, resolver))
-                    } else {
-                        let client_sockets =
-                            client_proxy.configure_reuse_udp_sockets(true, num_sockets)?;
-                        let client_sockets =
-                            client_sockets.into_iter().map(Arc::new).collect::<Vec<_>>();
-                        Box::new(UdpMultiMessageStream::new(client_sockets, resolver))
-                    };
+                    // Use chain_group's UDP connection with MultiDirectional mode
+                    // Pass server stream so handler can return matched pair
+                    let udp_result = chain_group
+                        .connect_udp(
+                            &resolver,
+                            UdpStreamRequest::MultiDirectional { server_stream },
+                        )
+                        .await?;
 
-                    let copy_result = copy_multidirectional_message(
-                        &mut server_stream,
-                        &mut client_stream,
-                        server_need_initial_flush,
-                        false,
-                    )
-                    .await;
+                    match udp_result {
+                        TcpClientUdpSetupResult::MultiDirectional {
+                            mut server_stream,
+                            mut client_stream,
+                        } => {
+                            let copy_result = copy_multidirectional_message(
+                                &mut server_stream,
+                                &mut client_stream,
+                                server_need_initial_flush,
+                                false,
+                            )
+                            .await;
 
-                    // TODO: add async trait ext and make this work
-                    //let (_, _) = futures::join!(server_stream.shutdown_message(), client_stream.shutdown_message());
-
-                    copy_result?;
-                    Ok(())
+                            copy_result?;
+                            Ok(())
+                        }
+                        _ => {
+                            // Handler should have returned MultiDirectional or errored
+                            unreachable!(
+                                "Handler must return MultiDirectional stream type when requested, or error"
+                            )
+                        }
+                    }
                 }
                 ConnectDecision::Block => {
-                    warn!("Blocked multidirectional udp forward, because the default action is to block.");
-                    // TODO: add async trait ext and make this work
-                    // let _ = server_stream.shutdown_message().await;
+                    warn!(
+                        "Blocked multidirectional udp forward, because the default action is to block."
+                    );
                     Ok(())
                 }
             }
         }
         TcpServerSetupResult::SessionBasedUdp {
-            stream: mut server_stream,
+            stream: server_stream,
             need_initial_flush: server_need_initial_flush,
             override_proxy_provider,
         } => {
@@ -335,28 +353,43 @@ async fn process_streams(
             let action = selected_proxy_provider.default_decision();
             match action {
                 ConnectDecision::Allow {
-                    client_proxy,
+                    chain_group,
                     remote_location: _,
                 } => {
-                    // Create UdpSessionMessageStream with user's interface configuration
-                    let config = UdpSocketConfig {
-                        bind_interface: client_proxy.bind_interface().clone(),
-                    };
-                    let mut session_manager = UdpSessionMessageStream::new(config);
+                    // Use chain_group's UDP connection with SessionBased mode
+                    // Pass server stream so handler can return matched pair
+                    let udp_result = chain_group
+                        .connect_udp(&resolver, UdpStreamRequest::SessionBased { server_stream })
+                        .await?;
 
-                    let copy_result = copy_session_messages(
-                        &mut server_stream,
-                        &mut session_manager,
-                        server_need_initial_flush,
-                        false,
-                    )
-                    .await;
-
-                    copy_result?;
-                    Ok(())
+                    match udp_result {
+                        TcpClientUdpSetupResult::SessionBased {
+                            mut server_stream,
+                            mut client_stream,
+                        } => {
+                            // Both server and client are session-based (XUDP) - use copy_session_messages
+                            let copy_result = copy_session_messages(
+                                &mut server_stream,
+                                &mut client_stream,
+                                server_need_initial_flush,
+                                false,
+                            )
+                            .await;
+                            copy_result?;
+                            Ok(())
+                        }
+                        _ => {
+                            // Handler should have returned SessionBased or errored
+                            unreachable!(
+                                "Handler must return SessionBased stream type when requested, or error"
+                            )
+                        }
+                    }
                 }
                 ConnectDecision::Block => {
-                    warn!("Blocked session-based udp forward, because the default action is to block.");
+                    warn!(
+                        "Blocked session-based udp forward, because the default action is to block."
+                    );
                     Ok(())
                 }
             }
@@ -450,7 +483,11 @@ pub async fn start_quic_servers(config: ServerConfig) -> std::io::Result<Vec<Joi
                 handles.extend(hysteria2_handles);
             }
         }
-        ServerProxyConfig::TuicV5 { uuid, password } => {
+        ServerProxyConfig::TuicV5 {
+            uuid,
+            password,
+            zero_rtt_handshake,
+        } => {
             let uuid: &'static [u8] = Box::leak(parse_uuid(&uuid)?.into_boxed_slice());
             let password: &'static str = Box::leak(password.into_boxed_str());
             for bind_address in bind_addresses.into_iter() {
@@ -465,6 +502,7 @@ pub async fn start_quic_servers(config: ServerConfig) -> std::io::Result<Vec<Joi
                     client_proxy_selector,
                     resolver,
                     num_endpoints,
+                    zero_rtt_handshake,
                 )
                 .await?;
                 handles.extend(tuic_handles);

@@ -5,6 +5,7 @@
 // - Close notify alert construction
 
 use super::reality_aead::encrypt_tls13_record;
+use super::reality_cipher_suite::CipherSuite;
 use std::io;
 
 // TLS ContentType values
@@ -76,10 +77,30 @@ pub const CIPHERTEXT_READ_BUF_CAPACITY: usize = TLS_MAX_RECORD_SIZE * 2;
 /// Buffer capacity for plaintext read
 pub const PLAINTEXT_READ_BUF_CAPACITY: usize = TLS_MAX_RECORD_SIZE * 2;
 
+/// Increment a TLS 1.3 sequence number, checking for overflow.
+///
+/// Per RFC 8446 Section 5.3: "Sequence numbers MUST NOT wrap."
+/// This function returns an error if incrementing would cause wrap-around.
+#[inline(always)]
+pub fn increment_seq(seq: &mut u64) -> io::Result<()> {
+    if *seq == u64::MAX {
+        return Err(io::Error::other(
+            "TLS sequence number exhausted (RFC 8446 Section 5.3)",
+        ));
+    }
+    *seq += 1;
+    Ok(())
+}
+
 /// Build an encrypted close_notify alert for TLS 1.3
 ///
 /// In TLS 1.3, alerts must be encrypted like application data.
-pub fn build_close_notify_alert(key: &[u8], iv: &[u8], seq_num: u64) -> io::Result<Vec<u8>> {
+pub fn build_close_notify_alert(
+    cipher_suite: CipherSuite,
+    key: &[u8],
+    iv: &[u8],
+    seq_num: u64,
+) -> io::Result<Vec<u8>> {
     // Build alert message: level(1) + description(0) + ContentType
     let alert_with_type = vec![
         ALERT_LEVEL_WARNING,
@@ -99,7 +120,14 @@ pub fn build_close_notify_alert(key: &[u8], iv: &[u8], seq_num: u64) -> io::Resu
     tls_header[3..5].copy_from_slice(&ciphertext_len.to_be_bytes());
 
     // Encrypt the alert
-    let ciphertext = encrypt_tls13_record(key, iv, seq_num, &alert_with_type, &tls_header)?;
+    let ciphertext = encrypt_tls13_record(
+        cipher_suite,
+        key,
+        iv,
+        seq_num,
+        &alert_with_type,
+        &tls_header,
+    )?;
 
     // Build complete TLS record
     let mut record = Vec::with_capacity(5 + ciphertext.len());

@@ -42,11 +42,11 @@
     # Allow local network direct connection
     - masks: ["192.168.0.0/16", "10.0.0.0/8"]
       action: allow
-      client_proxy: direct
+      client_chain: direct
     # Route everything else through upstream proxy
     - masks: "0.0.0.0/0"
       action: allow
-      client_proxy:
+      client_chain:
         address: "upstream.proxy.com:1080"
         protocol:
           type: socks

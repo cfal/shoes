@@ -9,25 +9,23 @@
     # Directly connect to 192.168.*
     - mask: 192.168.0.0/16
       action: allow
-      client_proxy: direct
+      # client_chain: direct is optional - direct is the default when omitted
+      client_chain: direct
     # Forward all other connection requests through a Vmess WSS server.
     - mask: 0.0.0.0/0
       action: allow
-      client_proxy:
-        - address: 127.0.0.1:1234
+      client_chain:
+        address: 127.0.0.1:1234
+        protocol:
+          type: tls
+          # Set to false to disable TLS verification, if, for example, the upstream server
+          # uses a self-signed certificate
+          verify: true
           protocol:
-            type: tls
-            # Set to false to disable TLS verification, if, for example, the upstream server
-            # uses a self-signed certificate
-            verify: true
+            type: ws
+            # The path to the websocket server
+            matching_path: /ws
             protocol:
-              type: ws
-              # The path to the websocket server
-              matching_path: /ws
-              protocol:
-                type: vmess
-                cipher: aes-128-gcm
-                user_id: b0e80a62-8a51-47f0-91f1-f0f7faf8d9d4
-                # this defaults to true to enabled AEAD mode. Set to false to switch back
-                # legacy mode.
-                force_aead: true
+              type: vmess
+              cipher: aes-128-gcm
+              user_id: b0e80a62-8a51-47f0-91f1-f0f7faf8d9d4

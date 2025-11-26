@@ -112,7 +112,7 @@ pub struct VisionStream<IO> {
     partial_vless_response: BytesMut,
 
     /// Whether we need to send VLESS response header (server-side only)
-    /// The response will be prepended to the first write, like sing-box does
+    /// The response will be prepended to the first write as per the protocol
     /// Used in PaddingTls mode
     vless_response_to_send: bool,
 
@@ -287,7 +287,9 @@ where
             )));
         }
 
-        log::debug!("VISION READ: Switching to direct copy mode (asymmetric - write side may still use padding)");
+        log::debug!(
+            "VISION READ: Switching to direct copy mode (asymmetric - write side may still use padding)"
+        );
 
         // Set read mode to Direct FIRST to avoid inconsistent state
         self.read_mode = VisionMode::Direct;
@@ -327,7 +329,9 @@ where
             )));
         }
 
-        log::debug!("VISION WRITE: Switching to direct copy mode (asymmetric - read side may still use padding)");
+        log::debug!(
+            "VISION WRITE: Switching to direct copy mode (asymmetric - read side may still use padding)"
+        );
 
         // Set write mode to Direct
         self.write_mode = VisionMode::Direct;
@@ -375,8 +379,6 @@ where
     /// Returns Poll::Ready(Ok(())) when fully drained
     /// Returns Poll::Pending if session buffer is full (needs TLS/TCP drain first)
     fn drain_pending_plain_writes(&mut self, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        use std::io::Write;
-
         if self.pending_plain_writes.is_empty() {
             return Poll::Ready(Ok(()));
         }
@@ -393,9 +395,9 @@ where
                     if n == 0 {
                         // Session buffer full - return Pending so drain_all_writes can drain TLS/TCP first
                         log::debug!(
-                        "VISION WRITE: Session buffer full ({} plaintext bytes remaining), returning Pending",
-                        self.pending_plain_writes.len()
-                    );
+                            "VISION WRITE: Session buffer full ({} plaintext bytes remaining), returning Pending",
+                            self.pending_plain_writes.len()
+                        );
                         return Poll::Pending;
                     }
 
@@ -475,8 +477,6 @@ where
     /// Write data to TLS session, handling buffer full by saving to pending buffer
     /// Used in PaddingTls mode
     fn write_to_session(&mut self, data: &[u8]) -> io::Result<()> {
-        use std::io::Write;
-
         if !self.pending_plain_writes.is_empty() {
             // If there's already pending data, just append to it
             // (don't try to write, as that would require cx for polling)
@@ -679,12 +679,12 @@ where
             self.partial_vless_response.advance(total_response_len);
 
             log::debug!(
-                    "VLESS: Successfully parsed {} byte response header (version={}, addon_length={}), {} bytes remaining in buffer",
-                    total_response_len,
-                    version,
-                    addon_length,
-                    self.partial_vless_response.len()
-                );
+                "VLESS: Successfully parsed {} byte response header (version={}, addon_length={}), {} bytes remaining in buffer",
+                total_response_len,
+                version,
+                addon_length,
+                self.partial_vless_response.len()
+            );
 
             // If there's any remaining data in partial buffer, it belongs to the actual payload
             let remaining_data = std::mem::take(&mut self.partial_vless_response);
@@ -737,7 +737,9 @@ where
                 {
                     Some(record) => record,
                     None => {
-                        log::debug!("VISION READ: No more complete TLS records in deframer, need more TCP data");
+                        log::debug!(
+                            "VISION READ: No more complete TLS records in deframer, need more TCP data"
+                        );
                         break; // Need more TCP data
                     }
                 };
@@ -863,7 +865,10 @@ where
                         // Invalid TLS packet - stop filtering
                         // This only occurs if we've already seen valid TLS records, and
                         // then encountered invalid ones.
-                        log::error!("VISION READ: Read invalid TLS data after valid records - stopping filtering: {}", e);
+                        log::error!(
+                            "VISION READ: Read invalid TLS data after valid records - stopping filtering: {}",
+                            e
+                        );
                         self.filter
                             .stop_filtering("read invalid TLS data".to_string());
                         break;

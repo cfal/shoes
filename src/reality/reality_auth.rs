@@ -1,6 +1,6 @@
-use aws_lc_rs::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
+use aws_lc_rs::aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
 use aws_lc_rs::agreement;
-use aws_lc_rs::hkdf::{Salt, HKDF_SHA256};
+use aws_lc_rs::hkdf::{HKDF_SHA256, Salt};
 
 #[cfg(test)]
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -208,7 +208,7 @@ fn create_session_id(version: [u8; 3], timestamp: u32, short_id: &[u8; 8]) -> [u
     session_id[0] = version[0]; // Major version
     session_id[1] = version[1]; // Minor version
     session_id[2] = version[2]; // Patch version
-                                // session_id[3] = 0 (reserved)
+    // session_id[3] = 0 (reserved)
     session_id[4..8].copy_from_slice(&timestamp.to_be_bytes());
     session_id[8..16].copy_from_slice(short_id);
     // session_id[16..32] remain zeros

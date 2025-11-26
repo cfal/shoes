@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use aws_lc_rs::digest::{digest, SHA1_FOR_LEGACY_USE_ONLY};
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use aws_lc_rs::digest::{SHA1_FOR_LEGACY_USE_ONLY, digest};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use rustc_hash::FxHashMap;
 use tokio::io::AsyncWriteExt;
 
@@ -14,9 +14,9 @@ use crate::client_proxy_selector::ClientProxySelector;
 use crate::config::WebsocketPingType;
 use crate::option_util::NoneOrOne;
 use crate::stream_reader::StreamReader;
-use crate::tcp_client_connector::TcpClientConnector;
 use crate::tcp_handler::{
-    TcpClientHandler, TcpClientSetupResult, TcpServerHandler, TcpServerSetupResult,
+    TcpClientHandler, TcpClientSetupResult, TcpClientUdpSetupResult, TcpServerHandler,
+    TcpServerSetupResult, UdpStreamRequest,
 };
 
 #[derive(Debug)]
@@ -25,7 +25,7 @@ pub struct WebsocketServerTarget {
     pub matching_headers: Option<FxHashMap<String, String>>,
     pub ping_type: WebsocketPingType,
     pub handler: Box<dyn TcpServerHandler>,
-    pub override_proxy_provider: NoneOrOne<Arc<ClientProxySelector<TcpClientConnector>>>,
+    pub override_proxy_provider: NoneOrOne<Arc<ClientProxySelector>>,
 }
 
 #[derive(Debug)]
@@ -83,10 +83,10 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
                 override_proxy_provider,
             } = server_target;
 
-            if let Some(path) = matching_path {
-                if path != &request_path {
-                    continue;
-                }
+            if let Some(path) = matching_path
+                && path != &request_path
+            {
+                continue;
             }
 
             if let Some(headers) = matching_headers {
@@ -172,16 +172,11 @@ impl WebsocketTcpClientHandler {
             handler,
         }
     }
-}
 
-#[async_trait]
-impl TcpClientHandler for WebsocketTcpClientHandler {
-    async fn setup_client_stream(
+    async fn setup_client_stream_common(
         &self,
-        server_stream: &mut Box<dyn AsyncStream>,
         mut client_stream: Box<dyn AsyncStream>,
-        remote_location: NetLocation,
-    ) -> std::io::Result<TcpClientSetupResult> {
+    ) -> std::io::Result<WebsocketStream> {
         let request_path = self.matching_path.as_deref().unwrap_or("/");
 
         let websocket_key = create_websocket_key();
@@ -233,14 +228,40 @@ impl TcpClientHandler for WebsocketTcpClientHandler {
             )));
         }
 
-        let websocket_stream = Box::new(WebsocketStream::new(
+        Ok(WebsocketStream::new(
             client_stream,
             true,
             self.ping_type.clone(),
             stream_reader.unparsed_data(),
-        ));
+        ))
+    }
+}
+
+#[async_trait]
+impl TcpClientHandler for WebsocketTcpClientHandler {
+    async fn setup_client_tcp_stream(
+        &self,
+        client_stream: Box<dyn AsyncStream>,
+        remote_location: NetLocation,
+    ) -> std::io::Result<TcpClientSetupResult> {
+        let websocket_stream = self.setup_client_stream_common(client_stream).await?;
         self.handler
-            .setup_client_stream(server_stream, websocket_stream, remote_location)
+            .setup_client_tcp_stream(Box::new(websocket_stream), remote_location)
+            .await
+    }
+
+    fn supports_udp_over_tcp(&self) -> bool {
+        self.handler.supports_udp_over_tcp()
+    }
+
+    async fn setup_client_udp_stream(
+        &self,
+        client_stream: Box<dyn AsyncStream>,
+        request: UdpStreamRequest,
+    ) -> std::io::Result<TcpClientUdpSetupResult> {
+        let websocket_stream = self.setup_client_stream_common(client_stream).await?;
+        self.handler
+            .setup_client_udp_stream(Box::new(websocket_stream), request)
             .await
     }
 }

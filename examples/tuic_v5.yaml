@@ -1,3 +1,4 @@
+# Basic TUIC v5 server
 - address: 0.0.0.0:443
   transport: quic
   quic_settings:
@@ -7,5 +8,8 @@
     type: tuic
     uuid: d685aef3-b3c4-4932-9a9d-d0c2f6727dfa
     password: abc128459
+    # Enable 0-RTT handshake for lower latency (default: false)
+    # Note: 0-RTT is vulnerable to replay attacks, only enable if acceptable
+    zero_rtt_handshake: false
   rules:
     - allow-all-direct

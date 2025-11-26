@@ -42,11 +42,12 @@
     # Direct connection for local addresses
     - masks: ["192.168.0.0/16"]
       action: allow
-      client_proxy: direct
+      # client_chain: direct is optional - direct is the default when omitted
+      client_chain: direct
     # Route international traffic through proxy
     - masks: "0.0.0.0/0"
       action: allow
-      client_proxy:
+      client_chain:
         address: "proxy.example.com:1080"
         protocol:
           type: socks

@@ -9,13 +9,14 @@
     # Directly connect to 192.168.*
     - mask: 192.168.0.0/16
       action: allow
-      client_proxy: direct
+      # client_chain: direct is optional - direct is the default when omitted
+      client_chain: direct
     # Forward all other connection requests through a SOCKS server.
     - mask: 0.0.0.0/0
       action: allow
-      client_proxy:
-        - address: 127.0.0.1:1234
-          protocol:
-            type: socks
-            username: socksuser
-            password: sockspass
+      client_chain:
+        address: 127.0.0.1:1234
+        protocol:
+          type: socks
+          username: socksuser
+          password: sockspass

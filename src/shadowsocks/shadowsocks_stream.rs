@@ -4,7 +4,7 @@ use std::task::{Context, Poll};
 use std::time::SystemTime;
 
 use aws_lc_rs::aead::{
-    Aad, Algorithm, BoundKey, Nonce, NonceSequence, OpeningKey, SealingKey, UnboundKey, NONCE_LEN,
+    Aad, Algorithm, BoundKey, NONCE_LEN, Nonce, NonceSequence, OpeningKey, SealingKey, UnboundKey,
 };
 use aws_lc_rs::error::Unspecified;
 use futures::ready;
@@ -459,10 +459,10 @@ impl ShadowsocksStream {
                 }
 
                 let decrypt_iv = &self.unprocessed_buf[0..self.salt_len];
-                if let Some(salt_checker) = &self.salt_checker {
-                    if !salt_checker.lock().insert_and_check(decrypt_iv) {
-                        return Err(std::io::Error::other("got duplicate salt"));
-                    }
+                if let Some(salt_checker) = &self.salt_checker
+                    && !salt_checker.lock().insert_and_check(decrypt_iv)
+                {
+                    return Err(std::io::Error::other("got duplicate salt"));
                 }
 
                 // Needed for writing the response

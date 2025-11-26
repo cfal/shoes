@@ -28,13 +28,6 @@ impl<T> NoneOrOne<T> {
         }
     }
 
-    pub fn as_option(&self) -> Option<&T> {
-        match self {
-            NoneOrOne::One(item) => Some(item),
-            _ => None,
-        }
-    }
-
     pub fn into_option(self) -> Option<T> {
         match self {
             NoneOrOne::One(item) => Some(item),
@@ -57,24 +50,6 @@ pub enum NoneOrSome<T> {
 impl<T> NoneOrSome<T> {
     pub fn is_unspecified(&self) -> bool {
         matches!(self, NoneOrSome::Unspecified)
-    }
-
-    pub fn _as_option(&self) -> Option<Vec<&T>> {
-        match self {
-            NoneOrSome::Unspecified => None,
-            NoneOrSome::None => Some(vec![]),
-            NoneOrSome::One(item) => Some(vec![&item]),
-            NoneOrSome::Some(v) => Some(v.iter().collect()),
-        }
-    }
-
-    pub fn _into_option(self) -> Option<Vec<T>> {
-        match self {
-            NoneOrSome::Unspecified => None,
-            NoneOrSome::None => Some(vec![]),
-            NoneOrSome::One(item) => Some(vec![item]),
-            NoneOrSome::Some(v) => Some(v),
-        }
     }
 
     pub fn len(&self) -> usize {
@@ -122,7 +97,7 @@ impl<T> NoneOrSome<T> {
     {
         match self {
             NoneOrSome::Unspecified | NoneOrSome::None => Box::new(std::iter::empty()),
-            NoneOrSome::One(ref mut item) => Box::new(SingleItemIter(Some(item))),
+            NoneOrSome::One(item) => Box::new(SingleItemIter(Some(item))),
             NoneOrSome::Some(v) => Box::new(v.iter_mut()),
         }
     }
@@ -198,6 +173,14 @@ where
 }
 
 impl<T> OneOrSome<T> {
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        match self {
+            OneOrSome::One(_) => 1,
+            OneOrSome::Some(v) => v.len(),
+        }
+    }
+
     pub fn into_vec(self) -> Vec<T> {
         match self {
             OneOrSome::One(item) => vec![item],
@@ -220,18 +203,8 @@ impl<T> OneOrSome<T> {
         T: Send,
     {
         match self {
-            OneOrSome::One(ref mut item) => Box::new(SingleItemIter(Some(item))),
+            OneOrSome::One(item) => Box::new(SingleItemIter(Some(item))),
             OneOrSome::Some(v) => Box::new(v.iter_mut()),
-        }
-    }
-
-    pub fn map<F, U>(self, mut f: F) -> OneOrSome<U>
-    where
-        F: FnMut(T) -> U,
-    {
-        match self {
-            OneOrSome::One(item) => OneOrSome::One(f(item)),
-            OneOrSome::Some(v) => OneOrSome::Some(v.into_iter().map(f).collect()),
         }
     }
 
