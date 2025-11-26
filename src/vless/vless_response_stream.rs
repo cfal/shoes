@@ -1,21 +1,25 @@
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+use futures::ready;
 use log::info;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use crate::async_stream::AsyncStream;
+use crate::async_stream::{AsyncPing, AsyncStream};
 
 /// A wrapper stream that reads VLESS response header on first read, similar
 /// to vmess and shadowsocks.
-pub struct VlessResponseStream {
-    inner: Box<dyn AsyncStream>,
+pub struct VlessResponseStream<IO> {
+    inner: IO,
     response_pending: bool,
     response_buffer: Vec<u8>,
 }
 
-impl VlessResponseStream {
-    pub fn new(inner: Box<dyn AsyncStream>) -> Self {
+impl<IO> VlessResponseStream<IO>
+where
+    IO: AsyncStream,
+{
+    pub fn new(inner: IO) -> Self {
         Self {
             inner,
             response_pending: true,
@@ -24,8 +28,6 @@ impl VlessResponseStream {
     }
 
     fn poll_read_response(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        use futures::ready;
-
         // Need to read at least 2 bytes for the response header
         while self.response_buffer.len() < 2 {
             let mut buf = [0u8; 2];
@@ -80,7 +82,10 @@ impl VlessResponseStream {
     }
 }
 
-impl AsyncRead for VlessResponseStream {
+impl<IO> AsyncRead for VlessResponseStream<IO>
+where
+    IO: AsyncStream,
+{
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -103,7 +108,10 @@ impl AsyncRead for VlessResponseStream {
     }
 }
 
-impl AsyncWrite for VlessResponseStream {
+impl<IO> AsyncWrite for VlessResponseStream<IO>
+where
+    IO: AsyncStream,
+{
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -121,7 +129,10 @@ impl AsyncWrite for VlessResponseStream {
     }
 }
 
-impl crate::async_stream::AsyncPing for VlessResponseStream {
+impl<IO> AsyncPing for VlessResponseStream<IO>
+where
+    IO: AsyncStream,
+{
     fn supports_ping(&self) -> bool {
         self.inner.supports_ping()
     }
@@ -134,4 +145,4 @@ impl crate::async_stream::AsyncPing for VlessResponseStream {
     }
 }
 
-impl AsyncStream for VlessResponseStream {}
+impl<IO> AsyncStream for VlessResponseStream<IO> where IO: AsyncStream {}

@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use log::debug;
 use tokio::io::AsyncWriteExt;
 
@@ -303,9 +303,8 @@ impl HttpTcpClientHandler {
 
 #[async_trait]
 impl TcpClientHandler for HttpTcpClientHandler {
-    async fn setup_client_stream(
+    async fn setup_client_tcp_stream(
         &self,
-        server_stream: &mut Box<dyn AsyncStream>,
         mut client_stream: Box<dyn AsyncStream>,
         remote_location: NetLocation,
     ) -> std::io::Result<TcpClientSetupResult> {
@@ -347,12 +346,16 @@ impl TcpClientHandler for HttpTcpClientHandler {
             }
         }
 
-        let unparsed_data = stream_reader.unparsed_data();
-        if !unparsed_data.is_empty() {
-            server_stream.write_all(unparsed_data).await?;
-            server_stream.flush().await?;
-        }
+        let early_data = stream_reader.unparsed_data();
+        let early_data = if early_data.is_empty() {
+            None
+        } else {
+            Some(early_data.to_vec())
+        };
 
-        Ok(TcpClientSetupResult { client_stream })
+        Ok(TcpClientSetupResult {
+            client_stream,
+            early_data,
+        })
     }
 }

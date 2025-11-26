@@ -1567,6 +1567,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_json"
+version = "1.0.145"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "402a6f66d8c709116cf22f558eab210f5a50187f702eb4d7e5ef38d9a7f1c79c"
+dependencies = [
+ "itoa",
+ "memchr",
+ "ryu",
+ "serde",
+ "serde_core",
+]
+
+[[package]]
 name = "serde_yaml"
 version = "0.9.34+deprecated"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1597,7 +1610,7 @@ checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 
 [[package]]
 name = "shoes"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "aes",
  "argon2",
@@ -1625,12 +1638,13 @@ dependencies = [
  "percent-encoding",
  "quinn",
  "rand",
- "rand_core 0.6.4",
+ "rand_core 0.9.3",
  "rcgen",
  "rustc-hash 1.1.0",
  "rustls",
  "rustls-pemfile",
  "serde",
+ "serde_json",
  "serde_yaml",
  "sha3",
  "socket2",
@@ -1639,6 +1653,7 @@ dependencies = [
  "tikv-jemallocator",
  "tokio",
  "tokio-rustls",
+ "tokio-util",
  "webpki-roots",
  "x509-parser",
 ]

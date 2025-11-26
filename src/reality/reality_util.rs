@@ -2,8 +2,9 @@ use aws_lc_rs::{
     agreement,
     rand::{SecureRandom, SystemRandom},
 };
-use base64::engine::{general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use base64::engine::{Engine as _, general_purpose::URL_SAFE_NO_PAD};
 
+use super::reality_cipher_suite::CipherSuite;
 use crate::buf_reader::BufReader;
 
 /// Decodes a base64url-encoded public key
@@ -362,6 +363,103 @@ fn parse_server_keyshare_extension(data: &[u8]) -> Result<[u8; 32], std::io::Err
     ))
 }
 
+/// Extract the cipher suite selected by the server from ServerHello message
+///
+/// This parses the TLS 1.3 ServerHello to find the cipher suite.
+/// ServerHello contains a single cipher suite (the server's choice).
+pub fn extract_server_cipher_suite(server_hello: &[u8]) -> Result<u16, std::io::Error> {
+    const TLS_HEADER_LEN: usize = 5;
+
+    if server_hello.len() < TLS_HEADER_LEN {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "ServerHello too short",
+        ));
+    }
+
+    let mut reader = BufReader::new(&server_hello[TLS_HEADER_LEN..]);
+
+    // Parse handshake header
+    let _handshake_type = reader.read_u8()?;
+    let _handshake_len = reader.read_u24_be()?;
+    let _protocol_version = reader.read_u16_be()?;
+
+    // Skip random (32 bytes)
+    reader.skip(32)?;
+
+    // Read session ID (ServerHello can echo it back)
+    let session_id_len = reader.read_u8()? as usize;
+    reader.skip(session_id_len)?;
+
+    // Read cipher suite (single 2-byte value in ServerHello)
+    let cipher_suite = reader.read_u16_be()?;
+
+    Ok(cipher_suite)
+}
+
+/// Extracts cipher suites offered by client from ClientHello
+///
+/// Returns a Vec of cipher suite IDs in the order they appear in the ClientHello.
+pub fn extract_client_cipher_suites(client_hello: &[u8]) -> Result<Vec<u16>, std::io::Error> {
+    const TLS_HEADER_LEN: usize = 5;
+
+    if client_hello.len() < TLS_HEADER_LEN {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "ClientHello too short",
+        ));
+    }
+
+    let mut reader = BufReader::new(&client_hello[TLS_HEADER_LEN..]);
+
+    // Parse handshake header
+    let _handshake_type = reader.read_u8()?;
+    let _handshake_len = reader.read_u24_be()?;
+    let _protocol_version = reader.read_u16_be()?;
+
+    // Skip random (32 bytes)
+    reader.skip(32)?;
+
+    // Skip session ID
+    let session_id_len = reader.read_u8()? as usize;
+    reader.skip(session_id_len)?;
+
+    // Read cipher suites
+    let cipher_suites_len = reader.read_u16_be()? as usize;
+    if !cipher_suites_len.is_multiple_of(2) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Invalid cipher suites length (not even)",
+        ));
+    }
+
+    let cipher_suites_data = reader.read_slice(cipher_suites_len)?;
+    let mut cipher_suites = Vec::with_capacity(cipher_suites_len / 2);
+
+    for chunk in cipher_suites_data.chunks(2) {
+        let suite = u16::from_be_bytes([chunk[0], chunk[1]]);
+        cipher_suites.push(suite);
+    }
+
+    Ok(cipher_suites)
+}
+
+/// Negotiate cipher suite between server preferences and client offers (CipherSuite version)
+///
+/// Returns the first CipherSuite from server_preferences that the client supports,
+/// or None if no common cipher suite is found.
+pub fn negotiate_cipher_suite(
+    server_preferences: &[CipherSuite],
+    client_cipher_suite_ids: &[u16],
+) -> Option<CipherSuite> {
+    for server_suite in server_preferences {
+        if client_cipher_suite_ids.contains(&server_suite.id()) {
+            return Some(*server_suite);
+        }
+    }
+    None
+}
+
 pub fn generate_keypair() -> std::io::Result<(String, String)> {
     // Step 1: Generate 32 random bytes for private key
     let rng = SystemRandom::new();
@@ -439,7 +537,7 @@ mod tests {
 
     #[test]
     fn test_decode_public_key() {
-        use base64::engine::{general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        use base64::engine::{Engine as _, general_purpose::URL_SAFE_NO_PAD};
 
         // Valid 32-byte key
         let key_bytes = [0x42u8; 32];

@@ -6,8 +6,8 @@
 use std::io::{self, Read, Write};
 
 use crate::reality::{
-    feed_reality_client_connection, feed_reality_server_connection, RealityClientConnection,
-    RealityServerConnection,
+    RealityClientConnection, RealityServerConnection, feed_reality_client_connection,
+    feed_reality_server_connection,
 };
 
 use crate::rustls_connection_util::{feed_rustls_client_connection, feed_rustls_server_connection};
@@ -200,6 +200,18 @@ impl CryptoConnection {
         }
     }
 
+    /// Check if the connection wants to read data
+    ///
+    /// If true, the application should call `read_tls()` as soon as possible.
+    pub fn wants_read(&self) -> bool {
+        match self {
+            CryptoConnection::RustlsServer(conn) => conn.wants_read(),
+            CryptoConnection::RustlsClient(conn) => conn.wants_read(),
+            CryptoConnection::RealityServer(conn) => conn.wants_read(),
+            CryptoConnection::RealityClient(conn) => conn.wants_read(),
+        }
+    }
+
     /// Check whether the handshake is complete
     ///
     /// For both client and server connections, this returns true when
@@ -260,6 +272,7 @@ mod tests {
             max_time_diff: None,
             min_client_version: None,
             max_client_version: None,
+            cipher_suites: Vec::new(),
         };
         let reality_server = RealityServerConnection::new(server_config).unwrap();
         let server_conn = CryptoConnection::new_reality_server(reality_server);
@@ -282,6 +295,7 @@ mod tests {
             ],
             short_id: [0u8; 8],
             server_name: "test.example.com".to_string(),
+            cipher_suites: Vec::new(),
         };
         let reality_client = RealityClientConnection::new(client_config).unwrap();
         let client_conn = CryptoConnection::new_reality_client(reality_client);

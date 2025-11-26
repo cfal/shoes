@@ -1,17 +1,20 @@
 // TLS 1.3 Encryption/Decryption Helpers
 //
-// AES-GCM encryption for TLS 1.3 records using aws-lc-rs
+// AEAD encryption for TLS 1.3 records using aws-lc-rs
+// Supports AES-128-GCM, AES-256-GCM, and ChaCha20-Poly1305
 
 use super::common::{
     CONTENT_TYPE_ALERT, CONTENT_TYPE_APPLICATION_DATA, VERSION_TLS_1_2_MAJOR, VERSION_TLS_1_2_MINOR,
 };
-use aws_lc_rs::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_128_GCM};
+use super::reality_cipher_suite::CipherSuite;
+use aws_lc_rs::aead::{Aad, LessSafeKey, Nonce, UnboundKey};
 use std::io::{Error, ErrorKind, Result};
 
-/// Encrypt TLS 1.3 record using AES-128-GCM
+/// Encrypt TLS 1.3 record using CipherSuite
 ///
 /// # Arguments
-/// * `key` - AES key (16 bytes for AES-128)
+/// * `cipher_suite` - CipherSuite with AEAD algorithm
+/// * `key` - AEAD key (16 bytes for AES-128, 32 bytes for AES-256/ChaCha20)
 /// * `iv` - Base IV (12 bytes)
 /// * `sequence_number` - TLS record sequence number
 /// * `plaintext` - Plaintext data (including ContentType trailer)
@@ -20,16 +23,25 @@ use std::io::{Error, ErrorKind, Result};
 /// # Returns
 /// Ciphertext with authentication tag appended
 pub fn encrypt_tls13_record(
+    cipher_suite: CipherSuite,
     key: &[u8],
     iv: &[u8],
     sequence_number: u64,
     plaintext: &[u8],
     additional_data: &[u8],
 ) -> Result<Vec<u8>> {
-    if key.len() != 16 {
+    let algorithm = cipher_suite.algorithm();
+    let expected_key_len = cipher_suite.key_len();
+
+    if key.len() != expected_key_len {
         return Err(Error::new(
             ErrorKind::InvalidInput,
-            format!("Invalid key length: {} (expected 16)", key.len()),
+            format!(
+                "Invalid key length for {:?}: {} (expected {})",
+                cipher_suite,
+                key.len(),
+                expected_key_len
+            ),
         ));
     }
     if iv.len() != 12 {
@@ -50,7 +62,7 @@ pub fn encrypt_tls13_record(
     }
 
     // Create key and nonce for aws-lc-rs
-    let unbound_key = UnboundKey::new(&AES_128_GCM, key)
+    let unbound_key = UnboundKey::new(algorithm, key)
         .map_err(|e| Error::new(ErrorKind::InvalidInput, format!("Invalid key: {:?}", e)))?;
     let sealing_key = LessSafeKey::new(unbound_key);
 
@@ -76,10 +88,11 @@ pub fn encrypt_tls13_record(
     Ok(in_out)
 }
 
-/// Decrypt TLS 1.3 record using AES-128-GCM
+/// Decrypt TLS 1.3 record using CipherSuite
 ///
 /// # Arguments
-/// * `key` - AES key (16 bytes for AES-128)
+/// * `cipher_suite` - CipherSuite with AEAD algorithm
+/// * `key` - AEAD key (16 bytes for AES-128, 32 bytes for AES-256/ChaCha20)
 /// * `iv` - Base IV (12 bytes)
 /// * `sequence_number` - TLS record sequence number
 /// * `ciphertext` - Ciphertext with authentication tag
@@ -88,16 +101,25 @@ pub fn encrypt_tls13_record(
 /// # Returns
 /// Plaintext data (including ContentType trailer)
 pub fn decrypt_tls13_record(
+    cipher_suite: CipherSuite,
     key: &[u8],
     iv: &[u8],
     sequence_number: u64,
     ciphertext: &[u8],
     additional_data: &[u8],
 ) -> Result<Vec<u8>> {
-    if key.len() != 16 {
+    let algorithm = cipher_suite.algorithm();
+    let expected_key_len = cipher_suite.key_len();
+
+    if key.len() != expected_key_len {
         return Err(Error::new(
             ErrorKind::InvalidInput,
-            format!("Invalid key length: {} (expected 16)", key.len()),
+            format!(
+                "Invalid key length for {:?}: {} (expected {})",
+                cipher_suite,
+                key.len(),
+                expected_key_len
+            ),
         ));
     }
     if iv.len() != 12 {
@@ -118,7 +140,7 @@ pub fn decrypt_tls13_record(
     }
 
     // Create key and nonce for aws-lc-rs
-    let unbound_key = UnboundKey::new(&AES_128_GCM, key)
+    let unbound_key = UnboundKey::new(algorithm, key)
         .map_err(|e| Error::new(ErrorKind::InvalidInput, format!("Invalid key: {:?}", e)))?;
     let opening_key = LessSafeKey::new(unbound_key);
 
@@ -141,10 +163,11 @@ pub fn decrypt_tls13_record(
     Ok(plaintext.to_vec())
 }
 
-/// Decrypt TLS 1.3 handshake message
+/// Decrypt TLS 1.3 handshake message using CipherSuite
 ///
 /// Decrypts and extracts handshake message, removing ContentType trailer
 pub fn decrypt_handshake_message(
+    cipher_suite: CipherSuite,
     key: &[u8],
     iv: &[u8],
     sequence_number: u64,
@@ -157,8 +180,14 @@ pub fn decrypt_handshake_message(
     additional_data.extend_from_slice(&[VERSION_TLS_1_2_MAJOR, VERSION_TLS_1_2_MINOR]); // TLS 1.2
     additional_data.extend_from_slice(&record_length.to_be_bytes());
 
-    let mut plaintext =
-        decrypt_tls13_record(key, iv, sequence_number, ciphertext, &additional_data)?;
+    let mut plaintext = decrypt_tls13_record(
+        cipher_suite,
+        key,
+        iv,
+        sequence_number,
+        ciphertext,
+        &additional_data,
+    )?;
 
     // Remove ContentType trailer
     if plaintext.is_empty() {
@@ -197,6 +226,8 @@ pub fn decrypt_handshake_message(
 mod tests {
     use super::*;
 
+    const CS: CipherSuite = CipherSuite::AES_128_GCM_SHA256;
+
     #[test]
     fn test_encrypt_decrypt_record() {
         let key = vec![0x42u8; 16];
@@ -204,9 +235,9 @@ mod tests {
         let plaintext = b"Hello, TLS 1.3!";
         let aad = b"additional data";
 
-        let ciphertext = encrypt_tls13_record(&key, &iv, 0, plaintext, aad).unwrap();
+        let ciphertext = encrypt_tls13_record(CS, &key, &iv, 0, plaintext, aad).unwrap();
 
-        let decrypted = decrypt_tls13_record(&key, &iv, 0, &ciphertext, aad).unwrap();
+        let decrypted = decrypt_tls13_record(CS, &key, &iv, 0, &ciphertext, aad).unwrap();
 
         assert_eq!(&decrypted[..], plaintext);
     }
@@ -230,10 +261,10 @@ mod tests {
             (ciphertext_length & 0xff) as u8,
         ];
 
-        let ciphertext = encrypt_tls13_record(&key, &iv, 0, &plaintext, &aad).unwrap();
+        let ciphertext = encrypt_tls13_record(CS, &key, &iv, 0, &plaintext, &aad).unwrap();
 
         let decrypted =
-            decrypt_handshake_message(&key, &iv, 0, &ciphertext, ciphertext_length).unwrap();
+            decrypt_handshake_message(CS, &key, &iv, 0, &ciphertext, ciphertext_length).unwrap();
 
         assert_eq!(decrypted, handshake_msg);
     }
@@ -246,9 +277,9 @@ mod tests {
         let aad = b"aad";
 
         // Test that different sequence numbers produce different ciphertexts
-        let cipher1 = encrypt_tls13_record(&key, &iv, 1, plaintext, aad).unwrap();
-        let cipher2 = encrypt_tls13_record(&key, &iv, 2, plaintext, aad).unwrap();
-        let cipher3 = encrypt_tls13_record(&key, &iv, 100, plaintext, aad).unwrap();
+        let cipher1 = encrypt_tls13_record(CS, &key, &iv, 1, plaintext, aad).unwrap();
+        let cipher2 = encrypt_tls13_record(CS, &key, &iv, 2, plaintext, aad).unwrap();
+        let cipher3 = encrypt_tls13_record(CS, &key, &iv, 100, plaintext, aad).unwrap();
 
         // Ciphertexts should all be different
         assert_ne!(cipher1, cipher2);
@@ -256,9 +287,9 @@ mod tests {
         assert_ne!(cipher1, cipher3);
 
         // But they should all decrypt correctly
-        let decrypt1 = decrypt_tls13_record(&key, &iv, 1, &cipher1, aad).unwrap();
-        let decrypt2 = decrypt_tls13_record(&key, &iv, 2, &cipher2, aad).unwrap();
-        let decrypt3 = decrypt_tls13_record(&key, &iv, 100, &cipher3, aad).unwrap();
+        let decrypt1 = decrypt_tls13_record(CS, &key, &iv, 1, &cipher1, aad).unwrap();
+        let decrypt2 = decrypt_tls13_record(CS, &key, &iv, 2, &cipher2, aad).unwrap();
+        let decrypt3 = decrypt_tls13_record(CS, &key, &iv, 100, &cipher3, aad).unwrap();
 
         assert_eq!(decrypt1, plaintext);
         assert_eq!(decrypt2, plaintext);
@@ -272,10 +303,10 @@ mod tests {
         let plaintext = b"Test sequence";
         let aad = b"aad";
 
-        let ciphertext = encrypt_tls13_record(&key, &iv, 5, plaintext, aad).unwrap();
+        let ciphertext = encrypt_tls13_record(CS, &key, &iv, 5, plaintext, aad).unwrap();
 
         // Decrypting with wrong sequence number should fail
-        let result = decrypt_tls13_record(&key, &iv, 6, &ciphertext, aad);
+        let result = decrypt_tls13_record(CS, &key, &iv, 6, &ciphertext, aad);
         assert!(result.is_err());
     }
 
@@ -287,10 +318,10 @@ mod tests {
         let aad = b"correct aad";
         let wrong_aad = b"wrong aad";
 
-        let ciphertext = encrypt_tls13_record(&key, &iv, 0, plaintext, aad).unwrap();
+        let ciphertext = encrypt_tls13_record(CS, &key, &iv, 0, plaintext, aad).unwrap();
 
         // Decrypting with wrong AAD should fail
-        let result = decrypt_tls13_record(&key, &iv, 0, &ciphertext, wrong_aad);
+        let result = decrypt_tls13_record(CS, &key, &iv, 0, &ciphertext, wrong_aad);
         assert!(result.is_err());
     }
 
@@ -301,7 +332,7 @@ mod tests {
         let plaintext = b"Test";
         let aad = b"aad";
 
-        let result = encrypt_tls13_record(&invalid_key, &iv, 0, plaintext, aad);
+        let result = encrypt_tls13_record(CS, &invalid_key, &iv, 0, plaintext, aad);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().kind(), ErrorKind::InvalidInput);
     }
@@ -313,7 +344,7 @@ mod tests {
         let plaintext = b"Test";
         let aad = b"aad";
 
-        let result = encrypt_tls13_record(&key, &invalid_iv, 0, plaintext, aad);
+        let result = encrypt_tls13_record(CS, &key, &invalid_iv, 0, plaintext, aad);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().kind(), ErrorKind::InvalidInput);
     }
@@ -325,12 +356,12 @@ mod tests {
         let plaintext = b"Test corruption";
         let aad = b"aad";
 
-        let mut ciphertext = encrypt_tls13_record(&key, &iv, 0, plaintext, aad).unwrap();
+        let mut ciphertext = encrypt_tls13_record(CS, &key, &iv, 0, plaintext, aad).unwrap();
 
         // Corrupt the ciphertext
         ciphertext[5] ^= 0xFF;
 
-        let result = decrypt_tls13_record(&key, &iv, 0, &ciphertext, aad);
+        let result = decrypt_tls13_record(CS, &key, &iv, 0, &ciphertext, aad);
         assert!(result.is_err());
     }
 
@@ -341,12 +372,12 @@ mod tests {
         let plaintext = b"";
         let aad = b"aad";
 
-        let ciphertext = encrypt_tls13_record(&key, &iv, 0, plaintext, aad).unwrap();
+        let ciphertext = encrypt_tls13_record(CS, &key, &iv, 0, plaintext, aad).unwrap();
 
         // Should still produce a ciphertext with auth tag
         assert!(ciphertext.len() >= 16); // At least the auth tag
 
-        let decrypted = decrypt_tls13_record(&key, &iv, 0, &ciphertext, aad).unwrap();
+        let decrypted = decrypt_tls13_record(CS, &key, &iv, 0, &ciphertext, aad).unwrap();
         assert_eq!(decrypted, plaintext);
     }
 
@@ -357,8 +388,8 @@ mod tests {
         let plaintext = vec![0xAB; 16384]; // 16KB
         let aad = b"aad";
 
-        let ciphertext = encrypt_tls13_record(&key, &iv, 42, &plaintext, aad).unwrap();
-        let decrypted = decrypt_tls13_record(&key, &iv, 42, &ciphertext, aad).unwrap();
+        let ciphertext = encrypt_tls13_record(CS, &key, &iv, 42, &plaintext, aad).unwrap();
+        let decrypted = decrypt_tls13_record(CS, &key, &iv, 42, &ciphertext, aad).unwrap();
 
         assert_eq!(decrypted, plaintext);
     }

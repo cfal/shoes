@@ -8,9 +8,9 @@
     # allow connections to all ips
     - mask: 0.0.0.0/0
       action: allow
-      client_proxy:
-        - address: 1.2.3.4:6666
-          protocol:
-            type: socks
-            username: socksuser
-            password: secretpass
+      client_chain:
+        address: 1.2.3.4:6666
+        protocol:
+          type: socks
+          username: socksuser
+          password: secretpass

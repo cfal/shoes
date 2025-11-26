@@ -4,7 +4,10 @@ use async_trait::async_trait;
 
 use crate::address::NetLocation;
 use crate::async_stream::AsyncStream;
-use crate::tcp_handler::{TcpClientHandler, TcpClientSetupResult};
+use crate::crypto::{CryptoConnection, CryptoTlsStream, perform_crypto_handshake};
+use crate::tcp_handler::{
+    TcpClientHandler, TcpClientSetupResult, TcpClientUdpSetupResult, UdpStreamRequest,
+};
 
 #[derive(Debug)]
 pub struct TlsClientHandler {
@@ -17,7 +20,7 @@ pub struct TlsClientHandler {
 #[derive(Debug)]
 pub enum TlsInnerClientHandler {
     Default(Box<dyn TcpClientHandler>),
-    VisionVless { uuid: Box<[u8]> },
+    VisionVless { uuid: Box<[u8]>, udp_enabled: bool },
 }
 
 impl TlsClientHandler {
@@ -40,29 +43,26 @@ impl TlsClientHandler {
         tls_buffer_size: Option<usize>,
         server_name: rustls::pki_types::ServerName<'static>,
         uuid: Box<[u8]>,
+        udp_enabled: bool,
     ) -> Self {
         Self {
             client_config,
             tls_buffer_size,
             server_name,
-            handler: TlsInnerClientHandler::VisionVless { uuid },
+            handler: TlsInnerClientHandler::VisionVless { uuid, udp_enabled },
         }
     }
 }
 
 #[async_trait]
 impl TcpClientHandler for TlsClientHandler {
-    async fn setup_client_stream(
+    async fn setup_client_tcp_stream(
         &self,
-        server_stream: &mut Box<dyn AsyncStream>,
         mut client_stream: Box<dyn AsyncStream>,
         remote_location: NetLocation,
     ) -> std::io::Result<TcpClientSetupResult> {
-        use crate::crypto::{CryptoConnection, CryptoTlsStream};
-        use crate::rustls_handshake::perform_handshake;
-
         // Create rustls ClientConnection
-        let client_conn =
+        let mut client_conn =
             rustls::ClientConnection::new(self.client_config.clone(), self.server_name.clone())
                 .map_err(|e| {
                     std::io::Error::new(
@@ -71,39 +71,82 @@ impl TcpClientHandler for TlsClientHandler {
                     )
                 })?;
 
-        // Wrap in rustls::Connection enum for handshake
-        let mut rustls_connection = rustls::Connection::Client(client_conn);
-
         // Set buffer limits if configured
         if let Some(size) = self.tls_buffer_size {
-            rustls_connection.set_buffer_limit(Some(size));
+            client_conn.set_buffer_limit(Some(size));
         }
+
+        let mut connection = CryptoConnection::new_rustls_client(client_conn);
 
         // Perform the TLS handshake using the generic helper
         // This works for both TLS 1.2 and TLS 1.3
-        perform_handshake(&mut rustls_connection, &mut client_stream, 16384).await?;
-
-        // Extract the ClientConnection back from the enum
-        let client_conn = match rustls_connection {
-            rustls::Connection::Client(conn) => conn,
-            _ => unreachable!("We created a Client variant"),
-        };
+        perform_crypto_handshake(&mut connection, &mut client_stream, 16384).await?;
 
         // Wrap in CryptoTlsStream
-        let connection = CryptoConnection::new_rustls_client(client_conn);
         let tls_stream = CryptoTlsStream::new(client_stream, connection);
 
-        match self.handler {
-            TlsInnerClientHandler::Default(ref handler) => {
+        match &self.handler {
+            TlsInnerClientHandler::Default(handler) => {
                 handler
-                    .setup_client_stream(server_stream, Box::new(tls_stream), remote_location)
+                    .setup_client_tcp_stream(Box::new(tls_stream), remote_location)
                     .await
             }
-            TlsInnerClientHandler::VisionVless { ref uuid } => {
+            TlsInnerClientHandler::VisionVless { uuid, .. } => {
                 crate::vless::vless_client_handler::setup_custom_tls_vision_vless_client_stream(
                     tls_stream,
                     uuid,
                     &remote_location,
+                )
+                .await
+            }
+        }
+    }
+
+    fn supports_udp_over_tcp(&self) -> bool {
+        match &self.handler {
+            TlsInnerClientHandler::Default(handler) => handler.supports_udp_over_tcp(),
+            TlsInnerClientHandler::VisionVless { udp_enabled, .. } => *udp_enabled, // VLESS supports XUDP when enabled
+        }
+    }
+
+    async fn setup_client_udp_stream(
+        &self,
+        mut client_stream: Box<dyn AsyncStream>,
+        request: UdpStreamRequest,
+    ) -> std::io::Result<TcpClientUdpSetupResult> {
+        // Create rustls ClientConnection
+        let mut client_conn =
+            rustls::ClientConnection::new(self.client_config.clone(), self.server_name.clone())
+                .map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("Failed to create client connection: {e}"),
+                    )
+                })?;
+
+        // Set buffer limits if configured
+        if let Some(size) = self.tls_buffer_size {
+            client_conn.set_buffer_limit(Some(size));
+        }
+
+        let mut connection = CryptoConnection::new_rustls_client(client_conn);
+
+        // Perform the TLS handshake
+        perform_crypto_handshake(&mut connection, &mut client_stream, 16384).await?;
+
+        // Wrap in CryptoTlsStream
+        let tls_stream = CryptoTlsStream::new(client_stream, connection);
+
+        match &self.handler {
+            TlsInnerClientHandler::Default(handler) => {
+                handler
+                    .setup_client_udp_stream(Box::new(tls_stream), request)
+                    .await
+            }
+            TlsInnerClientHandler::VisionVless { uuid, .. } => {
+                // Vision VLESS UDP setup - use the VLESS handler's method
+                crate::vless::vless_client_handler::setup_vless_udp_stream(
+                    tls_stream, uuid, request,
                 )
                 .await
             }

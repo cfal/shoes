@@ -1,6 +1,7 @@
-use rustc_hash::FxHashMap;
+use lru::LruCache;
 use std::collections::hash_map::Entry;
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::str;
 use std::sync::Arc;
 use std::time::Duration;
@@ -9,10 +10,20 @@ use bytes::{Bytes, BytesMut};
 use log::{error, warn};
 use rand::distr::Alphanumeric;
 use rand::{Rng, RngCore};
+use rustc_hash::FxHashMap;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UdpSocket;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
+use tokio_util::sync::CancellationToken;
+
+/// Maximum number of fragmented packets to track per session.
+/// Old entries are automatically evicted when this limit is reached.
+const MAX_FRAGMENT_CACHE_SIZE: usize = 256;
+
+/// Authentication timeout - close connection if client doesn't authenticate within this time.
+/// Default is 3 seconds per sing-box reference implementation.
+const AUTH_TIMEOUT: Duration = Duration::from_secs(3);
 
 use crate::address::NetLocation;
 use crate::async_stream::AsyncStream;
@@ -22,18 +33,21 @@ use crate::quic_stream::QuicStream;
 use crate::resolver::{Resolver, ResolverCache};
 use crate::socket_util::new_socket2_udp_socket;
 use crate::stream_reader::StreamReader;
-use crate::tcp_client_connector::TcpClientConnector;
-use crate::tcp_server::setup_client_stream;
+use crate::tcp_server::setup_client_tcp_stream;
 use crate::util::allocate_vec;
 
 async fn process_connection(
-    client_proxy_selector: Arc<ClientProxySelector<TcpClientConnector>>,
+    client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
     password: &'static str,
     conn: quinn::Incoming,
     udp_enabled: bool,
 ) -> std::io::Result<()> {
     let connection = conn.await?;
+
+    // Create a cancellation token for the entire connection lifecycle.
+    // When cancelled, all spawned tasks (UDP sessions) will terminate gracefully.
+    let cancel_token = CancellationToken::new();
 
     // we unfortunately need to keep the h3 connection around because it closes the underlying
     // connection on drop, see
@@ -47,16 +61,44 @@ async fn process_connection(
         h3::server::Connection::new(h3_quinn_connection)
             .await
             .map_err(std::io::Error::other)?;
-    auth_connection(&mut h3_conn, password, udp_enabled).await?;
+
+    // Authentication with timeout - per sing-box reference, default 3 seconds.
+    // This prevents malicious clients from holding connections open without authenticating.
+    match timeout(
+        AUTH_TIMEOUT,
+        auth_connection(&mut h3_conn, password, udp_enabled),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            connection.close(0u32.into(), b"auth failed");
+            return Err(e);
+        }
+        Err(_elapsed) => {
+            error!("Authentication timeout");
+            connection.close(0u32.into(), b"auth timeout");
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "authentication timeout",
+            ));
+        }
+    }
 
     let mut join_handles = vec![];
     if udp_enabled {
         let connection = connection.clone();
         let client_proxy_selector = client_proxy_selector.clone();
         let resolver = resolver.clone();
+        let cancel_token = cancel_token.clone();
         join_handles.push(tokio::spawn(async move {
-            if let Err(e) =
-                run_udp_local_to_remote_loop(connection, client_proxy_selector, resolver).await
+            if let Err(e) = run_udp_local_to_remote_loop(
+                connection,
+                client_proxy_selector,
+                resolver,
+                cancel_token,
+            )
+            .await
             {
                 error!("UDP local-to-remote write loop ended with error: {e}");
             }
@@ -91,6 +133,9 @@ async fn process_connection(
     for result in results {
         result?;
     }
+
+    // Cancel all remaining tasks (UDP session loops)
+    cancel_token.cancel();
 
     Ok(())
 }
@@ -191,7 +236,7 @@ async fn auth_connection(
 }
 
 struct UdpSession {
-    fragments: FxHashMap<u16, FragmentedPacket>,
+    fragments: LruCache<u16, FragmentedPacket>,
     send_socket: Arc<UdpSocket>,
     // we cache the last location in case of mid-session address changes, and
     // don't want to have to call ClientProxySelector::judge on every packet.
@@ -199,6 +244,8 @@ struct UdpSession {
     last_socket_addr: SocketAddr,
     override_remote_write_address: Option<SocketAddr>,
     last_activity: std::time::Instant,
+    // Cancellation token for this session's background task
+    cancel_token: CancellationToken,
 }
 
 struct FragmentedPacket {
@@ -211,6 +258,7 @@ struct FragmentedPacket {
 
 impl UdpSession {
     // TODO: remove this function completely and inline?
+    #[allow(clippy::too_many_arguments)]
     fn start(
         session_id: u32,
         connection: quinn::Connection,
@@ -219,14 +267,19 @@ impl UdpSession {
         initial_socket_addr: SocketAddr,
         override_local_write_location: Option<NetLocation>,
         override_remote_write_address: Option<SocketAddr>,
+        parent_cancel_token: &CancellationToken,
     ) -> Self {
+        // Create a child token so this session is cancelled when the parent (connection) is cancelled
+        let session_cancel_token = parent_cancel_token.child_token();
+
         let session = UdpSession {
-            fragments: FxHashMap::default(),
+            fragments: LruCache::new(NonZeroUsize::new(MAX_FRAGMENT_CACHE_SIZE).unwrap()),
             send_socket: client_socket.clone(),
             last_location: initial_location,
             last_socket_addr: initial_socket_addr,
             override_remote_write_address,
             last_activity: std::time::Instant::now(),
+            cancel_token: session_cancel_token.clone(),
         };
 
         tokio::spawn(async move {
@@ -235,6 +288,7 @@ impl UdpSession {
                 connection,
                 client_socket,
                 override_local_write_location,
+                session_cancel_token,
             )
             .await
             {
@@ -251,6 +305,7 @@ async fn run_udp_remote_to_local_loop(
     connection: quinn::Connection,
     socket: Arc<UdpSocket>,
     override_local_write_address: Option<NetLocation>,
+    cancel_token: CancellationToken,
 ) -> std::io::Result<()> {
     let max_datagram_size = connection
         .max_datagram_size()
@@ -273,8 +328,16 @@ async fn run_udp_remote_to_local_loop(
         let (payload_len, src_addr) = match socket.try_recv_from(&mut buf) {
             Ok(res) => res,
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                socket.readable().await?;
-                continue;
+                // Use select! to allow cancellation while waiting for socket to be readable
+                tokio::select! {
+                    _ = cancel_token.cancelled() => {
+                        return Ok(());
+                    }
+                    result = socket.readable() => {
+                        result?;
+                        continue;
+                    }
+                }
             }
             Err(e) => {
                 return Err(std::io::Error::other(format!(
@@ -344,8 +407,9 @@ async fn run_udp_remote_to_local_loop(
 
 async fn run_udp_local_to_remote_loop(
     connection: quinn::Connection,
-    client_proxy_selector: Arc<ClientProxySelector<TcpClientConnector>>,
+    client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
+    cancel_token: CancellationToken,
 ) -> std::io::Result<()> {
     let mut resolver_cache = ResolverCache::new(resolver.clone());
     let mut sessions: FxHashMap<u32, UdpSession> = FxHashMap::default();
@@ -360,6 +424,8 @@ async fn run_udp_local_to_remote_loop(
         if (now - last_cleanup) > CLEANUP_INTERVAL {
             sessions.retain(|session_id, session| {
                 if session.last_activity.elapsed() > IDLE_TIMEOUT {
+                    // Cancel the session's background task before removing
+                    session.cancel_token.cancel();
                     error!("Removing inactive UDP session {session_id}");
                     false
                 } else {
@@ -449,11 +515,11 @@ async fn run_udp_local_to_remote_loop(
                     .judge(remote_location.clone(), &resolver)
                     .await;
 
-                let (client_proxy, updated_location) = match action {
+                let (_chain_group, updated_location) = match action {
                     Ok(ConnectDecision::Allow {
-                        client_proxy,
+                        chain_group,
                         remote_location,
-                    }) => (client_proxy, remote_location),
+                    }) => (chain_group, remote_location),
                     Ok(ConnectDecision::Block) => {
                         warn!("Blocked UDP forward to {remote_location}");
                         continue;
@@ -502,7 +568,8 @@ async fn run_udp_local_to_remote_loop(
                 // TODO: the configured client socket is for the current remote_location, but
                 // the remote_location could be changed later on with a different client_socket
                 // configuration.
-                let client_socket = client_proxy.configure_udp_socket(true)?;
+                // Use IPv6 dual-stack socket for direct UDP
+                let client_socket = crate::socket_util::new_udp_socket(true, None)?;
 
                 let session = UdpSession::start(
                     session_id,
@@ -512,6 +579,7 @@ async fn run_udp_local_to_remote_loop(
                     resolved_address,
                     override_local_write_location,
                     override_remote_write_address,
+                    &cancel_token,
                 );
                 entry.insert(session)
             }
@@ -524,24 +592,39 @@ async fn run_udp_local_to_remote_loop(
         } else if fragment_count == 1 {
             (payload_fragment, remote_location)
         } else {
-            let entry =
-                session
-                    .fragments
-                    .entry(packet_id)
-                    .or_insert_with(move || FragmentedPacket {
+            // Check if we already have this packet in the LRU cache
+            let is_new = !session.fragments.contains(&packet_id);
+
+            if is_new {
+                // Insert new fragmented packet entry
+                session.fragments.put(
+                    packet_id,
+                    FragmentedPacket {
                         fragment_count,
                         fragment_received: 0,
                         packet_len: 0,
                         received: vec![None; fragment_count as usize],
-                        remote_location,
-                    });
+                        remote_location: remote_location.clone(),
+                    },
+                );
+            }
+
+            let entry = match session.fragments.get_mut(&packet_id) {
+                Some(e) => e,
+                None => {
+                    // This shouldn't happen since we just inserted it
+                    error!("Fragment cache error for session {session_id}");
+                    continue;
+                }
+            };
+
             if entry.fragment_count != fragment_count {
-                session.fragments.remove(&packet_id).unwrap();
+                session.fragments.pop(&packet_id);
                 error!("Mismatched fragment count for session {session_id} packet {packet_id}");
                 continue;
             }
             if entry.received[fragment_id as usize].is_some() {
-                session.fragments.remove(&packet_id).unwrap();
+                session.fragments.pop(&packet_id);
                 error!("Duplicate fragment for session {session_id} packet {packet_id}");
                 continue;
             }
@@ -553,12 +636,13 @@ async fn run_udp_local_to_remote_loop(
                 continue;
             }
 
+            // All fragments received - remove from cache and process
             let FragmentedPacket {
                 remote_location: initial_location,
                 received,
                 packet_len,
                 ..
-            } = session.fragments.remove(&packet_id).unwrap();
+            } = session.fragments.pop(&packet_id).unwrap();
             let mut complete_payload = BytesMut::with_capacity(packet_len);
             for frag in received.iter() {
                 complete_payload.extend_from_slice(frag.as_ref().unwrap());
@@ -581,7 +665,7 @@ async fn run_udp_local_to_remote_loop(
                         .await;
                     let updated_location = match action {
                         Ok(ConnectDecision::Allow {
-                            client_proxy: _,
+                            chain_group: _,
                             remote_location,
                         }) => remote_location,
                         Ok(ConnectDecision::Block) => {
@@ -593,16 +677,18 @@ async fn run_udp_local_to_remote_loop(
                             continue;
                         }
                     };
-                    let updated_socket_addr =
-                        match resolver_cache.resolve_location(&updated_location).await {
-                            Ok(s) => s,
-                            Err(e) => {
-                                error!(
+                    let updated_socket_addr = match resolver_cache
+                        .resolve_location(&updated_location)
+                        .await
+                    {
+                        Ok(s) => s,
+                        Err(e) => {
+                            error!(
                                 "Failed to resolve updated remote location {updated_location}: {e}"
                             );
-                                continue;
-                            }
-                        };
+                            continue;
+                        }
+                    };
                     session.last_location = updated_location;
                     session.last_socket_addr = updated_socket_addr;
                     updated_socket_addr
@@ -624,7 +710,7 @@ async fn run_udp_local_to_remote_loop(
 
 async fn run_tcp_loop(
     connection: quinn::Connection,
-    client_proxy_selector: Arc<ClientProxySelector<TcpClientConnector>>,
+    client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
 ) -> std::io::Result<()> {
     loop {
@@ -656,16 +742,24 @@ async fn run_tcp_loop(
     Ok(())
 }
 
+/// TCP request frame type constant from Hysteria2 protocol.
+/// See: https://github.com/apernet/hysteria/blob/master/core/internal/protocol/proxy.go#L15
+const FRAME_TYPE_TCP_REQUEST: u64 = 0x401;
+
 async fn handle_tcp_header(
     send: &mut quinn::SendStream,
     recv: &mut quinn::RecvStream,
 ) -> std::io::Result<(NetLocation, StreamReader)> {
     let mut stream_reader = StreamReader::new_with_buffer_size(8192);
 
-    // the tcp request id is a varint with value 0x401, which is encoded as [0x44, 0x01]
-    let tcp_request_id = stream_reader.read_slice(recv, 2).await?;
-    if tcp_request_id[0] != 0x44 || tcp_request_id[1] != 0x01 {
-        return Err(std::io::Error::other("invalid tcp request id"));
+    // Read the TCP request frame type as a QUIC varint per protocol spec.
+    // The value 0x401 can be encoded in multiple valid ways (e.g., [0x44, 0x01] as 2-byte form).
+    let tcp_request_id = read_varint(recv, &mut stream_reader).await?;
+    if tcp_request_id != FRAME_TYPE_TCP_REQUEST {
+        return Err(std::io::Error::other(format!(
+            "invalid tcp request id: expected {:#x}, got {:#x}",
+            FRAME_TYPE_TCP_REQUEST, tcp_request_id
+        )));
     }
 
     // max lengths from https://github.com/apernet/hysteria/blob/5520bcc405ee11a47c164c75bae5c40fc2b1d99d/core/internal/protocol/proxy.go#L19
@@ -719,7 +813,7 @@ async fn handle_tcp_header(
 }
 
 async fn process_tcp_stream(
-    client_proxy_selector: Arc<ClientProxySelector<TcpClientConnector>>,
+    client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
     mut send: quinn::SendStream,
     mut recv: quinn::RecvStream,
@@ -736,7 +830,7 @@ async fn process_tcp_stream(
 
     let setup_client_stream_future = timeout(
         Duration::from_secs(60),
-        setup_client_stream(
+        setup_client_tcp_stream(
             &mut server_stream,
             client_proxy_selector,
             resolver,
@@ -862,7 +956,7 @@ pub async fn start_hysteria2_server(
     bind_address: SocketAddr,
     quic_server_config: Arc<quinn::crypto::rustls::QuicServerConfig>,
     hysteria2_password: &'static str,
-    client_proxy_selector: Arc<ClientProxySelector<TcpClientConnector>>,
+    client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
     num_endpoints: usize,
     udp_enabled: bool,

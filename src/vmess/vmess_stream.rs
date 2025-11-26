@@ -1,7 +1,8 @@
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use aws_lc_rs::aead::{Aad, BoundKey, OpeningKey, SealingKey, UnboundKey, AES_128_GCM};
+use aws_lc_rs::aead::{AES_128_GCM, Aad, BoundKey, OpeningKey, SealingKey, UnboundKey};
+use bytes::BytesMut;
 use digest::XofReader;
 use futures::ready;
 use log::warn;
@@ -21,9 +22,10 @@ const HEADER_TAG_LEN: usize = 16;
 const ENCRYPTION_TAG_LEN: usize = 16;
 const MAX_PADDING_LEN: usize = 64;
 
-// should be 2^14, but it's 2^14 - 1 due to a quantumult bug.
-// ref: https://www.v2fly.org/en_US/developer/protocols/vmess.html#standard-format
-const MAX_ENCRYPTED_WRITE_DATA_SIZE: usize = 2usize.pow(14) - 1;
+// Use 8192 + tag (8208) so plaintext chunk is 8192 bytes, matching Xray-core.
+// (Previously was 2^14 - 1 = 16383 due to quantumult bug workaround)
+// Reducing the size fixed a hanging issue with sing-box client on mobile
+const MAX_ENCRYPTED_WRITE_DATA_SIZE: usize = 8192 + ENCRYPTION_TAG_LEN;
 
 // although the dev docs say that the max data segment is 2^14, seems like
 // some clients (like surge pre-aead) send up to 65535 bytes in a packet.
@@ -97,6 +99,9 @@ pub struct VmessStream {
     write_packet_start_offset: usize,
     write_packet_end_offset: usize,
 
+    // Response header bytes to write on first poll_write (server mode).
+    pending_prefix_write: Option<BytesMut>,
+
     shutdown_state: ShutdownState,
     is_eof: bool,
 }
@@ -156,7 +161,7 @@ impl VmessStream {
         read_length_shake_reader: Option<VmessReader>,
         write_length_shake_reader: Option<VmessReader>,
         enable_global_padding: bool,
-        prefix_write_bytes: Option<Box<[u8]>>,
+        prefix_write_bytes: Option<BytesMut>,
         read_header_info: Option<ReadHeaderInfo>,
     ) -> Self {
         let (tag_len, opening_key, sealing_key) = match encryption_keys {
@@ -173,7 +178,7 @@ impl VmessStream {
         let unprocessed_buf = allocate_vec(MAX_READ_PACKET_SIZE).into_boxed_slice();
         let processed_buf = allocate_vec(max_unencrypted_read_data_size).into_boxed_slice();
 
-        let (write_cache, mut write_packet) = if !is_udp {
+        let (write_cache, write_packet) = if !is_udp {
             let write_cache = allocate_vec(max_unencrypted_write_data_size).into_boxed_slice();
             const MAX_WRITE_PACKET_SIZE: usize = MAX_ENCRYPTED_WRITE_DATA_SIZE + 2;
             // we need to be able to send a full packet, and the prefix (response) data all
@@ -192,14 +197,6 @@ impl VmessStream {
             let write_packet = allocate_vec(write_packet_size + 40).into_boxed_slice();
 
             (write_cache, write_packet)
-        };
-
-        let write_packet_end_offset = match prefix_write_bytes {
-            Some(buf) => {
-                write_packet[0..buf.len()].copy_from_slice(&buf);
-                buf.len()
-            }
-            None => 0,
         };
 
         let read_header_state = match read_header_info {
@@ -229,7 +226,10 @@ impl VmessStream {
             write_cache_size: 0,
             write_packet,
             write_packet_start_offset: 0,
-            write_packet_end_offset,
+            write_packet_end_offset: 0,
+            // previously we wrote it to the write packet directly, but wrapping streams
+            // such as TLS can set need_initial_flush to true, causing it to be sent independently.
+            pending_prefix_write: prefix_write_bytes,
             shutdown_state: ShutdownState::WriteRemainingData,
             is_eof: false,
         }
@@ -477,20 +477,19 @@ impl VmessStream {
             }
         };
 
-        if let Some(ref mut opening_key) = self.opening_key {
-            if opening_key
+        if let Some(ref mut opening_key) = self.opening_key
+            && opening_key
                 .open_in_place(
                     Aad::empty(),
                     &mut self.unprocessed_buf[self.unprocessed_start_offset
                         ..self.unprocessed_start_offset + data_len - padding_len],
                 )
                 .is_err()
-            {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "open failed for data",
-                ));
-            }
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "open failed for data",
+            ));
         }
 
         let processed_data_len = data_len - padding_len - self.tag_len;
@@ -543,6 +542,15 @@ impl VmessStream {
     }
 
     fn create_write_packet(&mut self) -> bool {
+        // If we have a pending prefix, prepend it to the write_packet buffer
+        // so that the response header and first data packet go out together.
+        if let Some(prefix) = self.pending_prefix_write.take() {
+            assert!(self.write_packet_end_offset == 0);
+            let prefix_len = prefix.len();
+            self.write_packet[0..prefix_len].copy_from_slice(&prefix);
+            self.write_packet_end_offset = prefix_len;
+        }
+
         // note that this should allow creating an empty packet.
         let write_packet_space = self.write_packet.len() - self.write_packet_end_offset;
         let max_padding_len = if self.write_length_mask.is_some() {
@@ -1049,6 +1057,15 @@ impl AsyncWriteMessage for VmessStream {
         // the write cache is not used in message mode.
         assert!(this.write_cache_size == 0);
 
+        if let Some(prefix) = this.pending_prefix_write.take() {
+            // we need to handle this here because we do not call create_write_packet
+            // for UDP streams
+            assert!(this.write_packet_end_offset == 0);
+            let prefix_len = prefix.len();
+            this.write_packet[0..prefix_len].copy_from_slice(&prefix);
+            this.write_packet_end_offset = prefix_len;
+        }
+
         if this.write_packet_end_offset > 0 {
             match this.do_write_packet(cx) {
                 Ok(all_written) => {
@@ -1061,7 +1078,6 @@ impl AsyncWriteMessage for VmessStream {
                 }
             }
         }
-
         let (padding_len, length_mask) = match this.write_length_mask {
             Some(ref mut mask) => mask.next_values(),
             None => (0, 0),

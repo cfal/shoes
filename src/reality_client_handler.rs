@@ -5,12 +5,11 @@
 // 2. Avoids a dependency cycle: crypto → reality (core types), but this handler → crypto
 
 use async_trait::async_trait;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::address::NetLocation;
 use crate::async_stream::AsyncStream;
-use crate::crypto::{CryptoConnection, CryptoTlsStream};
-use crate::reality::{RealityClientConfig, RealityClientConnection};
+use crate::crypto::{CryptoConnection, CryptoTlsStream, perform_crypto_handshake};
+use crate::reality::{CipherSuite, RealityClientConfig, RealityClientConnection};
 use crate::tcp_handler::{TcpClientHandler, TcpClientSetupResult};
 
 /// REALITY client handler using buffered Connection API
@@ -22,13 +21,14 @@ pub struct RealityClientHandler {
     public_key: [u8; 32],
     short_id: [u8; 8],
     server_name: rustls::pki_types::ServerName<'static>,
+    cipher_suites: Vec<CipherSuite>,
     handler: RealityInnerClientHandler,
 }
 
 #[derive(Debug)]
 pub enum RealityInnerClientHandler {
     Default(Box<dyn TcpClientHandler>),
-    VisionVless { uuid: Box<[u8]> },
+    VisionVless { uuid: Box<[u8]>, udp_enabled: bool },
 }
 
 impl RealityClientHandler {
@@ -36,12 +36,14 @@ impl RealityClientHandler {
         public_key: [u8; 32],
         short_id: [u8; 8],
         server_name: rustls::pki_types::ServerName<'static>,
+        cipher_suites: Vec<CipherSuite>,
         handler: Box<dyn TcpClientHandler>,
     ) -> Self {
         Self {
             public_key,
             short_id,
             server_name,
+            cipher_suites,
             handler: RealityInnerClientHandler::Default(handler),
         }
     }
@@ -49,25 +51,26 @@ impl RealityClientHandler {
         public_key: [u8; 32],
         short_id: [u8; 8],
         server_name: rustls::pki_types::ServerName<'static>,
+        cipher_suites: Vec<CipherSuite>,
         user_id: Box<[u8]>,
+        udp_enabled: bool,
     ) -> Self {
         Self {
             public_key,
             short_id,
             server_name,
-            handler: RealityInnerClientHandler::VisionVless { uuid: user_id },
+            cipher_suites,
+            handler: RealityInnerClientHandler::VisionVless {
+                uuid: user_id,
+                udp_enabled,
+            },
         }
     }
-}
 
-#[async_trait]
-impl TcpClientHandler for RealityClientHandler {
-    async fn setup_client_stream(
+    async fn setup_client_stream_common(
         &self,
-        server_stream: &mut Box<dyn AsyncStream>,
         mut client_stream: Box<dyn AsyncStream>,
-        remote_location: NetLocation,
-    ) -> std::io::Result<TcpClientSetupResult> {
+    ) -> std::io::Result<CryptoTlsStream<Box<dyn AsyncStream>>> {
         // Extract server name as string
         let server_name_str = match &self.server_name {
             rustls::pki_types::ServerName::DnsName(name) => name.as_ref(),
@@ -75,132 +78,88 @@ impl TcpClientHandler for RealityClientHandler {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     format!("REALITY requires DNS name, got IP address: {:?}", ip),
-                ))
+                ));
             }
             _ => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     "REALITY requires DNS name",
-                ))
+                ));
             }
         };
 
-        // Step 1: Create buffered REALITY client connection
         log::debug!("REALITY CLIENT: Creating buffered RealityClientConnection");
         let reality_config = RealityClientConfig {
             public_key: self.public_key,
             short_id: self.short_id,
             server_name: server_name_str.to_string(),
+            cipher_suites: self.cipher_suites.clone(),
         };
 
-        let mut reality_conn = RealityClientConnection::new(reality_config)?;
+        let reality_conn = RealityClientConnection::new(reality_config)?;
 
-        // Step 2: Write ClientHello to server
-        log::debug!("REALITY CLIENT: Writing ClientHello");
-        {
-            let mut write_buf = Vec::new();
-            while reality_conn.wants_write() {
-                reality_conn.write_tls(&mut write_buf)?;
-            }
-            if !write_buf.is_empty() {
-                client_stream.write_all(&write_buf).await?;
-                client_stream.flush().await?;
-            }
-        }
-
-        // Step 3: Read server's handshake messages
-        log::debug!("REALITY CLIENT: Reading server handshake");
-        {
-            let mut buf = vec![0u8; 16384]; // Large enough for server handshake
-            let n = client_stream.read(&mut buf).await?;
-            if n == 0 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "EOF while waiting for server handshake",
-                ));
-            }
-            let mut cursor = std::io::Cursor::new(&buf[..n]);
-            reality_conn.read_tls(&mut cursor)?;
-        }
-
-        // Step 4: Process server handshake
-        log::debug!("REALITY CLIENT: Processing server handshake");
-        reality_conn.process_new_packets()?;
-
-        // Continue processing packets until handshake is complete
-        while reality_conn.is_handshaking() {
-            log::debug!("REALITY CLIENT: Handshake still in progress, checking for more work");
-
-            // Check if we need to write (e.g., client Finished)
-            if reality_conn.wants_write() {
-                log::debug!("REALITY CLIENT: Writing buffered handshake data");
-                let mut write_buf = Vec::new();
-                while reality_conn.wants_write() {
-                    reality_conn.write_tls(&mut write_buf)?;
-                }
-                if !write_buf.is_empty() {
-                    client_stream.write_all(&write_buf).await?;
-                    client_stream.flush().await?;
-                    log::debug!("REALITY CLIENT: Sent {} bytes to server", write_buf.len());
-                }
-            }
-
-            // Try to process more packets
-            let prev_state = reality_conn.is_handshaking();
-            reality_conn.process_new_packets()?;
-
-            // If we're still handshaking and state didn't change, read more data
-            if reality_conn.is_handshaking() && prev_state == reality_conn.is_handshaking() {
-                log::debug!("REALITY CLIENT: Reading more server handshake data");
-                let mut buf = vec![0u8; 16384];
-                let n = client_stream.read(&mut buf).await?;
-                if n == 0 {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::UnexpectedEof,
-                        "EOF while reading server handshake",
-                    ));
-                }
-                log::debug!("REALITY CLIENT: Read {} bytes from server", n);
-                let mut cursor = std::io::Cursor::new(&buf[..n]);
-                reality_conn.read_tls(&mut cursor)?;
-
-                // Process the new data
-                reality_conn.process_new_packets()?;
-            }
-        }
-
-        // Step 5: Final check for any remaining writes
-        if reality_conn.wants_write() {
-            log::debug!("REALITY CLIENT: Writing final handshake data");
-            let mut write_buf = Vec::new();
-            while reality_conn.wants_write() {
-                reality_conn.write_tls(&mut write_buf)?;
-            }
-            if !write_buf.is_empty() {
-                client_stream.write_all(&write_buf).await?;
-                client_stream.flush().await?;
-            }
-        }
-
-        // Step 6: Wrap in Connection enum
+        // Wrap in Connection enum
         log::debug!("REALITY CLIENT: Creating Connection");
-        let connection = CryptoConnection::new_reality_client(reality_conn);
+        let mut connection = CryptoConnection::new_reality_client(reality_conn);
 
+        // Perform the TLS handshake
+        perform_crypto_handshake(&mut connection, &mut client_stream, 16384).await?;
         log::debug!("REALITY CLIENT: Handshake completed successfully");
 
-        let tls_stream = CryptoTlsStream::new(client_stream, connection);
+        Ok(CryptoTlsStream::new(client_stream, connection))
+    }
+}
+
+#[async_trait]
+impl TcpClientHandler for RealityClientHandler {
+    async fn setup_client_tcp_stream(
+        &self,
+        client_stream: Box<dyn AsyncStream>,
+        remote_location: NetLocation,
+    ) -> std::io::Result<TcpClientSetupResult> {
+        let tls_stream = self.setup_client_stream_common(client_stream).await?;
 
         match self.handler {
             RealityInnerClientHandler::Default(ref handler) => {
                 handler
-                    .setup_client_stream(server_stream, Box::new(tls_stream), remote_location)
+                    .setup_client_tcp_stream(Box::new(tls_stream), remote_location)
                     .await
             }
-            RealityInnerClientHandler::VisionVless { ref uuid } => {
+            RealityInnerClientHandler::VisionVless { ref uuid, .. } => {
                 crate::vless::vless_client_handler::setup_custom_tls_vision_vless_client_stream(
                     tls_stream,
                     uuid,
                     &remote_location,
+                )
+                .await
+            }
+        }
+    }
+
+    fn supports_udp_over_tcp(&self) -> bool {
+        match &self.handler {
+            RealityInnerClientHandler::Default(handler) => handler.supports_udp_over_tcp(),
+            RealityInnerClientHandler::VisionVless { udp_enabled, .. } => *udp_enabled,
+        }
+    }
+
+    async fn setup_client_udp_stream(
+        &self,
+        client_stream: Box<dyn AsyncStream>,
+        request: crate::tcp_handler::UdpStreamRequest,
+    ) -> std::io::Result<crate::tcp_handler::TcpClientUdpSetupResult> {
+        let tls_stream = self.setup_client_stream_common(client_stream).await?;
+
+        match &self.handler {
+            RealityInnerClientHandler::Default(handler) => {
+                handler
+                    .setup_client_udp_stream(Box::new(tls_stream), request)
+                    .await
+            }
+            RealityInnerClientHandler::VisionVless { uuid, .. } => {
+                // Vision VLESS UDP setup - use the VLESS handler's method
+                crate::vless::vless_client_handler::setup_vless_udp_stream(
+                    tls_stream, uuid, request,
                 )
                 .await
             }

@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;

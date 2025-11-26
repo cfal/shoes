@@ -1,6 +1,4 @@
 // Copied and modified from rust-snappy
-#![allow(dead_code)]
-
 use std::sync::OnceLock;
 
 const POLY: u32 = 0xEDB88320;
@@ -73,40 +71,4 @@ fn make_table(poly: u32) -> [u32; 256] {
         rev_tab[i as usize] = rev;
     }
     tab
-}
-
-fn make_reverse_table(poly: u32) -> [u32; 256] {
-    let mut rev_tab = [0; 256];
-    for i in 0u32..256u32 {
-        let mut rev = i << 24;
-        for _ in 0..8 {
-            if (rev & 0x80000000) != 0 {
-                rev = ((rev ^ poly) << 1) | 1;
-            } else {
-                rev <<= 1;
-            }
-        }
-        rev_tab[i as usize] = rev;
-    }
-    rev_tab
-}
-
-pub struct CrcBuilder(u32);
-
-impl CrcBuilder {
-    pub fn new() -> Self {
-        Self(!0)
-    }
-
-    pub fn new_with_initial(initial: u32) -> Self {
-        Self(initial)
-    }
-
-    pub fn update(&mut self, buf: &[u8]) {
-        self.0 = crc32c_slice8(buf, self.0);
-    }
-
-    pub fn to_crc(&self) -> u32 {
-        !self.0
-    }
 }

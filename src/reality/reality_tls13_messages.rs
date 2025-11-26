@@ -177,7 +177,7 @@ pub fn construct_certificate(cert_der: &[u8]) -> Result<Vec<u8>> {
 ///
 /// # Arguments
 /// * `signing_key` - Ed25519 signing key
-/// * `handshake_hash` - SHA256 hash of all handshake messages up to this point
+/// * `handshake_hash` - Hash of all handshake messages up to this point (32 or 48 bytes depending on cipher suite)
 pub fn construct_certificate_verify(
     signing_key: &Ed25519KeyPair,
     handshake_hash: &[u8],
@@ -252,16 +252,22 @@ pub fn construct_finished(verify_data: &[u8]) -> Result<Vec<u8>> {
     Ok(finished)
 }
 
-/// Write TLS record header
-///
 /// Construct TLS 1.3 ClientHello message
 ///
 /// Returns handshake message bytes (without record header)
+///
+/// # Arguments
+/// * `client_random` - 32 bytes client random
+/// * `session_id` - 32 bytes session ID
+/// * `client_public_key` - X25519 public key bytes
+/// * `server_name` - SNI hostname
+/// * `cipher_suites` - Cipher suite IDs to offer (e.g., &[0x1301, 0x1302, 0x1303])
 pub fn construct_client_hello(
     client_random: &[u8; 32],
     session_id: &[u8; 32],
     client_public_key: &[u8],
     server_name: &str,
+    cipher_suites: &[u16],
 ) -> Result<Vec<u8>> {
     let mut hello = Vec::with_capacity(512);
 
@@ -283,9 +289,11 @@ pub fn construct_client_hello(
     hello.extend_from_slice(session_id);
 
     // Cipher suites
-    // Support only TLS_AES_128_GCM_SHA256 (0x1301)
-    hello.extend_from_slice(&[0x00, 0x02]); // Cipher suites length: 2 bytes
-    hello.extend_from_slice(&[0x13, 0x01]); // TLS_AES_128_GCM_SHA256
+    let cipher_suites_len = (cipher_suites.len() * 2) as u16;
+    hello.extend_from_slice(&cipher_suites_len.to_be_bytes());
+    for &suite in cipher_suites {
+        hello.extend_from_slice(&suite.to_be_bytes());
+    }
 
     // Compression methods (1 method: null)
     hello.extend_from_slice(&[0x01, 0x00]);
@@ -362,6 +370,8 @@ pub fn construct_client_hello(
     Ok(hello)
 }
 
+/// Write TLS record header
+///
 /// # Arguments
 /// * `record_type` - TLS record type (0x16 for Handshake, 0x17 for ApplicationData)
 /// * `length` - Length of record payload

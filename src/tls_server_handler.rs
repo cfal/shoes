@@ -2,16 +2,23 @@ use std::sync::{Arc, LazyLock};
 
 use async_trait::async_trait;
 use rustc_hash::FxHashMap;
+use tokio::io::AsyncWriteExt;
+use tokio::net::TcpStream;
 
 use crate::address::NetLocation;
 use crate::async_stream::AsyncStream;
 use crate::client_proxy_selector::ClientProxySelector;
+use crate::crypto::perform_crypto_handshake;
+use crate::crypto::{CryptoConnection, CryptoTlsStream};
 use crate::option_util::NoneOrOne;
-use crate::resolver::{NativeResolver, Resolver};
-use crate::shadow_tls::{
-    read_client_hello, setup_shadowtls_server_stream, ParsedClientHello, ShadowTlsServerTarget,
+use crate::reality::{
+    RealityServerConfig, RealityServerConnection, feed_reality_server_connection,
 };
-use crate::tcp_client_connector::TcpClientConnector;
+use crate::resolver::{NativeResolver, Resolver};
+use crate::rustls_connection_util::feed_rustls_server_connection;
+use crate::shadow_tls::{
+    ParsedClientHello, ShadowTlsServerTarget, read_client_hello, setup_shadowtls_server_stream,
+};
 use crate::tcp_handler::{TcpServerHandler, TcpServerSetupResult};
 
 #[derive(Debug, Clone)]
@@ -28,8 +35,9 @@ pub struct RealityServerTarget {
     pub max_time_diff: Option<u64>, // in milliseconds
     pub min_client_version: Option<[u8; 3]>,
     pub max_client_version: Option<[u8; 3]>,
+    pub cipher_suites: Vec<crate::reality::CipherSuite>,
     pub handler: Box<dyn TcpServerHandler>,
-    pub override_proxy_provider: NoneOrOne<Arc<ClientProxySelector<TcpClientConnector>>>,
+    pub override_proxy_provider: NoneOrOne<Arc<ClientProxySelector>>,
     pub vision_config: Option<VisionConfig>,
 }
 
@@ -39,7 +47,7 @@ pub enum TlsServerTarget {
     Tls {
         server_config: Arc<rustls::ServerConfig>,
         handler: Box<dyn TcpServerHandler>,
-        override_proxy_provider: NoneOrOne<Arc<ClientProxySelector<TcpClientConnector>>>,
+        override_proxy_provider: NoneOrOne<Arc<ClientProxySelector>>,
         vision_config: Option<VisionConfig>,
     },
     ShadowTls(ShadowTlsServerTarget),
@@ -102,14 +110,11 @@ impl TcpServerHandler for TlsServerHandler {
 
         match target {
             TlsServerTarget::Tls {
-                ref server_config,
-                ref handler,
-                ref override_proxy_provider,
-                ref vision_config,
+                server_config,
+                handler,
+                override_proxy_provider,
+                vision_config,
             } => {
-                use crate::crypto::{CryptoConnection, CryptoTlsStream};
-                use crate::rustls_handshake::perform_handshake;
-
                 let ParsedClientHello {
                     client_hello_frame,
                     client_reader,
@@ -117,55 +122,45 @@ impl TcpServerHandler for TlsServerHandler {
                 } = parsed_client_hello;
 
                 // Create rustls ServerConnection
-                let server_conn =
-                    rustls::ServerConnection::new(server_config.clone()).map_err(|e| {
+                let mut server_conn = rustls::ServerConnection::new(server_config.clone())
+                    .map_err(|e| {
                         std::io::Error::new(
                             std::io::ErrorKind::InvalidInput,
                             format!("Failed to create server connection: {e}"),
                         )
                     })?;
 
-                // Wrap in rustls::Connection enum for handshake
-                let mut rustls_connection = rustls::Connection::Server(server_conn);
-
                 // Set buffer limits if configured
                 if let Some(size) = self.tls_buffer_size {
-                    rustls_connection.set_buffer_limit(Some(size));
+                    server_conn.set_buffer_limit(Some(size));
                 }
 
                 // Feed the ClientHello we already parsed
-                {
-                    use std::io::Cursor;
+                feed_rustls_server_connection(&mut server_conn, &client_hello_frame)?;
+                server_conn.process_new_packets().map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("Failed to process ClientHello: {e}"),
+                    )
+                })?;
 
-                    let mut cursor = Cursor::new(&client_hello_frame);
-                    rustls_connection.read_tls(&mut cursor)?;
-
-                    let unparsed_data = client_reader.unparsed_data();
-                    if !unparsed_data.is_empty() {
-                        let mut cursor = Cursor::new(unparsed_data);
-                        rustls_connection.read_tls(&mut cursor)?;
-                    }
-
-                    rustls_connection.process_new_packets().map_err(|e| {
+                let unparsed_data = client_reader.unparsed_data();
+                if !unparsed_data.is_empty() {
+                    feed_rustls_server_connection(&mut server_conn, unparsed_data)?;
+                    server_conn.process_new_packets().map_err(|e| {
                         std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
-                            format!("Failed to process ClientHello: {e}"),
+                            format!("Failed to process client handshake data: {e}"),
                         )
                     })?;
                 }
 
                 // Perform the TLS handshake using the generic helper
                 // This works for both TLS 1.2 and TLS 1.3
-                perform_handshake(&mut rustls_connection, &mut server_stream, 16384).await?;
-
-                // Extract the ServerConnection back from the enum
-                let server_conn = match rustls_connection {
-                    rustls::Connection::Server(conn) => conn,
-                    _ => unreachable!("We created a Server variant"),
-                };
+                let mut connection = CryptoConnection::new_rustls_server(server_conn);
+                perform_crypto_handshake(&mut connection, &mut server_stream, 16384).await?;
 
                 // Wrap in CryptoTlsStream
-                let connection = CryptoConnection::new_rustls_server(server_conn);
                 let tls_stream = CryptoTlsStream::new(server_stream, connection);
 
                 let mut target_setup_result = if let Some(vision_cfg) = vision_config {
@@ -192,7 +187,7 @@ impl TcpServerHandler for TlsServerHandler {
 
                 target_setup_result
             }
-            TlsServerTarget::ShadowTls(ref target) => {
+            TlsServerTarget::ShadowTls(target) => {
                 setup_shadowtls_server_stream(
                     server_stream,
                     target,
@@ -201,25 +196,19 @@ impl TcpServerHandler for TlsServerHandler {
                 )
                 .await
             }
-            TlsServerTarget::Reality(ref target) => {
-                use crate::crypto::{CryptoConnection, CryptoTlsStream};
-                use crate::reality::{RealityServerConfig, RealityServerConnection};
-                use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
+            TlsServerTarget::Reality(target) => {
                 // Note: Vision over Reality would require updating setup_vision_vless_server_stream
                 // to accept CryptoTlsStream instead of tokio_rustls::server::TlsStream.
                 // For now, vision_config should always be None for Reality targets.
                 // This will be enforced in tcp_handler_util.rs
 
-                log::debug!("REALITY DEBUG: setup_reality_server_stream called");
                 let client_hello_frame = &parsed_client_hello.client_hello_frame;
                 log::debug!(
-                    "REALITY DEBUG: ClientHello frame length: {}",
+                    "REALITY ClientHello frame length: {}",
                     client_hello_frame.len()
                 );
 
                 // Create buffered REALITY connection
-                log::debug!("REALITY DEBUG: Creating buffered RealityServerConnection");
                 let reality_config = RealityServerConfig {
                     private_key: target.private_key,
                     short_ids: target.short_ids.clone(),
@@ -227,28 +216,26 @@ impl TcpServerHandler for TlsServerHandler {
                     max_time_diff: target.max_time_diff,
                     min_client_version: target.min_client_version,
                     max_client_version: target.max_client_version,
+                    cipher_suites: target.cipher_suites.clone(),
                 };
 
                 let mut reality_conn = RealityServerConnection::new(reality_config)?;
 
                 // Feed the ClientHello to the connection
-                log::debug!("REALITY DEBUG: Feeding ClientHello to connection via read_tls");
-                {
-                    let mut cursor = std::io::Cursor::new(client_hello_frame);
-                    reality_conn.read_tls(&mut cursor)?;
-                }
+                feed_reality_server_connection(&mut reality_conn, client_hello_frame)?;
 
                 // Process the ClientHello to advance handshake (this validates everything)
-                log::debug!("REALITY DEBUG: Processing ClientHello via process_new_packets");
+                log::debug!("Processing REALITY ClientHello via process_new_packets");
                 if let Err(e) = reality_conn.process_new_packets() {
                     // Check if this is an authentication failure
                     if e.kind() == std::io::ErrorKind::PermissionDenied {
                         log::warn!(
-                            "REALITY: Authentication failed, falling back to dest: {} - reason: {}",
+                            "REALITY authentication failed, falling back to dest: {} - reason: {}",
                             target.dest,
                             e
                         );
                         // Implement fallback mechanism
+                        // TODO: disable server stream setup timeout?
                         return reality_fallback_to_dest(
                             server_stream,
                             client_hello_frame,
@@ -261,52 +248,17 @@ impl TcpServerHandler for TlsServerHandler {
                     }
                 }
 
-                // Write the server's handshake response to the stream
-                log::debug!("REALITY DEBUG: Writing server handshake response");
-                {
-                    let mut write_buf = Vec::new();
-                    while reality_conn.wants_write() {
-                        reality_conn.write_tls(&mut write_buf)?;
-                    }
-                    if !write_buf.is_empty() {
-                        server_stream.write_all(&write_buf).await?;
-                        server_stream.flush().await?;
-                    }
-                }
-
-                // Read client's Finished message
-                log::debug!("REALITY DEBUG: Reading client Finished");
-                {
-                    let mut buf = vec![0u8; 4096];
-                    let n = server_stream.read(&mut buf).await?;
-                    if n == 0 {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::UnexpectedEof,
-                            "EOF while waiting for client Finished",
-                        ));
-                    }
-                    let mut cursor = std::io::Cursor::new(&buf[..n]);
-                    reality_conn.read_tls(&mut cursor)?;
-                }
-
-                // Process client Finished to complete handshake
-                log::debug!("REALITY DEBUG: Processing client Finished");
-                let io_state = reality_conn.process_new_packets()?;
-                log::debug!(
-                    "REALITY DEBUG: After processing, plaintext_bytes_to_read={}",
-                    io_state.plaintext_bytes_to_read()
-                );
+                let mut connection = CryptoConnection::new_reality_server(reality_conn);
+                perform_crypto_handshake(&mut connection, &mut server_stream, 16384).await?;
 
                 // Wrap in Connection enum and CryptoTlsStream
                 log::debug!("REALITY DEBUG: Wrapping in CryptoTlsStream");
-                let connection = CryptoConnection::new_reality_server(reality_conn);
                 let tls_stream = CryptoTlsStream::new(server_stream, connection);
 
                 log::debug!("REALITY DEBUG: TLS 1.3 handshake completed successfully");
 
                 // Check if Vision is enabled
                 let mut target_setup_result = if let Some(vision_cfg) = &target.vision_config {
-                    log::info!("REALITY+Vision: Setting up VLESS+VISION stream");
                     // Vision is enabled - call setup_vision_vless_server_stream_from_custom_tls
                     crate::vless::vless_server_handler::setup_custom_tls_vision_vless_server_stream(
                         tls_stream,
@@ -348,9 +300,6 @@ async fn reality_fallback_to_dest(
     client_hello_bytes: &[u8],
     dest: &NetLocation,
 ) -> std::io::Result<TcpServerSetupResult> {
-    use tokio::io::AsyncWriteExt;
-    use tokio::net::TcpStream;
-
     log::info!("REALITY FALLBACK: Connecting to dest server: {}", dest);
 
     /// Shared resolver instance for Reality fallback connections

@@ -38,16 +38,15 @@ impl Address {
             }
         }
 
-        if possible_ipv4 && dots == 3 {
-            if let Ok(addr) = s.parse::<Ipv4Addr>() {
-                return Ok(Address::Ipv4(addr));
-            }
+        if possible_ipv4
+            && dots == 3
+            && let Ok(addr) = s.parse::<Ipv4Addr>()
+        {
+            return Ok(Address::Ipv4(addr));
         }
 
-        if possible_ipv6 {
-            if let Ok(addr) = s.parse::<Ipv6Addr>() {
-                return Ok(Address::Ipv6(addr));
-            }
+        if possible_ipv6 && let Ok(addr) = s.parse::<Ipv6Addr>() {
+            return Ok(Address::Ipv6(addr));
         }
 
         if possible_hostname {
@@ -64,13 +63,9 @@ impl Address {
         matches!(self, Address::Ipv6(_))
     }
 
-    pub fn is_hostname(&self) -> bool {
-        matches!(self, Address::Hostname(_))
-    }
-
     pub fn hostname(&self) -> Option<&str> {
         match self {
-            Address::Hostname(ref hostname) => Some(hostname),
+            Address::Hostname(hostname) => Some(hostname),
             _ => None,
         }
     }
@@ -125,6 +120,7 @@ impl NetLocation {
         Ok(Self { address, port })
     }
 
+    #[cfg(test)]
     pub fn from_ip_addr(ip: IpAddr, port: u16) -> Self {
         let address = match ip {
             IpAddr::V4(addr) => Address::Ipv4(addr),
@@ -209,7 +205,7 @@ impl NetLocationPortRange {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     "Missing port specification",
-                ))
+                ));
             }
         };
 
@@ -473,21 +469,21 @@ impl NetLocationMask {
 
     pub fn from(s: &str) -> std::io::Result<Self> {
         // Handle IPv6 with port: [::1/128]:80
-        if s.starts_with('[') {
-            if let Some(bracket_end) = s.find(']') {
-                let address_mask_str = &s[1..bracket_end];
-                let port = if s.len() > bracket_end + 1 && s.as_bytes()[bracket_end + 1] == b':' {
-                    s[bracket_end + 2..]
-                        .parse::<u16>()
-                        .map_err(|e| std::io::Error::other(format!("Failed to parse port: {e}")))?
-                } else {
-                    0
-                };
-                return Ok(Self {
-                    address_mask: AddressMask::from(address_mask_str)?,
-                    port,
-                });
-            }
+        if s.starts_with('[')
+            && let Some(bracket_end) = s.find(']')
+        {
+            let address_mask_str = &s[1..bracket_end];
+            let port = if s.len() > bracket_end + 1 && s.as_bytes()[bracket_end + 1] == b':' {
+                s[bracket_end + 2..]
+                    .parse::<u16>()
+                    .map_err(|e| std::io::Error::other(format!("Failed to parse port: {e}")))?
+            } else {
+                0
+            };
+            return Ok(Self {
+                address_mask: AddressMask::from(address_mask_str)?,
+                port,
+            });
         }
 
         // For addresses without brackets, we need to distinguish IPv6 from port notation.

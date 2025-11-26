@@ -11,7 +11,7 @@
   rules:
     - masks: "0.0.0.0/0"
       action: allow
-      client_proxy:
+      client_chain:
         address: "your-server.example.com:443"
         protocol:
           type: reality
@@ -21,6 +21,8 @@
           short_id: "0123456789abcdef"
           # Hostname to use (should match server's reality_targets key)
           sni_hostname: "www.cloudflare.com"
+          # Optional: TLS 1.3 cipher suites to offer
+          # cipher_suites: ["TLS_AES_256_GCM_SHA384"]
           # Inner protocol - must match what the server expects
           protocol:
             type: vless
@@ -33,7 +35,7 @@
   rules:
     - masks: "0.0.0.0/0"
       action: allow
-      client_proxy:
+      client_chain:
         address: "your-server.example.com:443"
         protocol:
           type: reality

@@ -12,7 +12,9 @@ use crate::rustls_connection_util::feed_rustls_client_connection;
 use crate::shadow_tls::shadow_tls_hmac::ShadowTlsHmac;
 use crate::shadow_tls::shadow_tls_stream::ShadowTlsStream;
 use crate::stream_reader::StreamReader;
-use crate::tcp_handler::{TcpClientHandler, TcpClientSetupResult};
+use crate::tcp_handler::{
+    TcpClientHandler, TcpClientSetupResult, TcpClientUdpSetupResult, UdpStreamRequest,
+};
 use crate::util::{allocate_vec, write_all}; // Assuming write_all is from crate::util
 
 use super::shadow_tls_server_handler::parse_server_hello;
@@ -55,16 +57,11 @@ impl ShadowTlsClientHandler {
             handler,
         }
     }
-}
 
-#[async_trait]
-impl TcpClientHandler for ShadowTlsClientHandler {
-    async fn setup_client_stream(
+    async fn setup_client_stream_common(
         &self,
-        server_stream: &mut Box<dyn AsyncStream>,
         mut client_stream: Box<dyn AsyncStream>,
-        remote_location: NetLocation,
-    ) -> std::io::Result<TcpClientSetupResult> {
+    ) -> std::io::Result<ShadowTlsStream> {
         let mut client_conn =
             rustls::ClientConnection::new(self.client_config.clone(), self.server_name.clone())
                 .map_err(|e| {
@@ -124,7 +121,7 @@ impl TcpClientHandler for ShadowTlsClientHandler {
                     Err(e) => {
                         return Err(std::io::Error::other(format!(
                             "rustls write_tls error: {e}"
-                        )))
+                        )));
                     }
                 }
                 continue;
@@ -193,8 +190,35 @@ impl TcpClientHandler for ShadowTlsClientHandler {
             shadow_tls_stream.feed_initial_read_data(unparsed_handshake_data)?;
         }
 
+        Ok(shadow_tls_stream)
+    }
+}
+
+#[async_trait]
+impl TcpClientHandler for ShadowTlsClientHandler {
+    async fn setup_client_tcp_stream(
+        &self,
+        client_stream: Box<dyn AsyncStream>,
+        remote_location: NetLocation,
+    ) -> std::io::Result<TcpClientSetupResult> {
+        let shadow_tls_stream = self.setup_client_stream_common(client_stream).await?;
         self.handler
-            .setup_client_stream(server_stream, Box::new(shadow_tls_stream), remote_location)
+            .setup_client_tcp_stream(Box::new(shadow_tls_stream), remote_location)
+            .await
+    }
+
+    fn supports_udp_over_tcp(&self) -> bool {
+        self.handler.supports_udp_over_tcp()
+    }
+
+    async fn setup_client_udp_stream(
+        &self,
+        client_stream: Box<dyn AsyncStream>,
+        request: UdpStreamRequest,
+    ) -> std::io::Result<TcpClientUdpSetupResult> {
+        let shadow_tls_stream = self.setup_client_stream_common(client_stream).await?;
+        self.handler
+            .setup_client_udp_stream(Box::new(shadow_tls_stream), request)
             .await
     }
 }

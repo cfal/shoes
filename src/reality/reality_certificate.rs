@@ -2,15 +2,34 @@ use aws_lc_rs::hmac;
 use aws_lc_rs::signature::Ed25519KeyPair;
 use std::io::{Error, ErrorKind, Result};
 
-/// Generate a template Ed25519 certificate for the given hostname
-fn generate_template_cert(hostname: &str) -> (Vec<u8>, Ed25519KeyPair) {
+/// Generate a minimal Ed25519 certificate matching XTLS/REALITY reference size (~178 bytes)
+///
+/// The reference implementation creates a minimal certificate with:
+/// - Empty Subject and Issuer
+/// - Serial number 0
+/// - No SAN (Subject Alternative Name)
+///
+/// This matches the reference: `x509.Certificate{SerialNumber: &big.Int{}}`
+fn generate_template_cert(_hostname: &str) -> (Vec<u8>, Ed25519KeyPair) {
     // Generate Ed25519 keypair using rcgen
     let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519)
         .expect("Failed to generate Ed25519 key pair");
 
-    // Generate a minimal self-signed certificate using rcgen with Ed25519
-    let params = rcgen::CertificateParams::new(vec![hostname.to_string()])
-        .expect("Failed to create certificate params");
+    // Create minimal certificate params matching reference implementation
+    let mut params = rcgen::CertificateParams::default();
+
+    // No Subject Alternative Names (reference has empty DNSNames)
+    params.subject_alt_names = vec![];
+
+    // Empty distinguished name (reference has empty Subject/Issuer)
+    params.distinguished_name = rcgen::DistinguishedName::new();
+
+    // Serial number 0 (reference uses &big.Int{} which is 0)
+    params.serial_number = Some(rcgen::SerialNumber::from(vec![0u8]));
+
+    // Note: rcgen uses 1975-01-01 to 4096-01-01 by default
+    // Reference uses 0001-01-01 for both, but this is close enough
+    // and results in ~176 bytes (vs 178 bytes reference)
 
     // Create self-signed certificate
     let cert = params
@@ -27,22 +46,13 @@ fn generate_template_cert(hostname: &str) -> (Vec<u8>, Ed25519KeyPair) {
     let public_key_bytes = signing_key.public_key().as_ref();
 
     log::debug!(
-        "REALITY DEBUG: Generated template certificate ({} bytes) for {}",
-        cert_der.len(),
-        hostname
+        "REALITY DEBUG: Generated minimal certificate ({} bytes, reference ~178 bytes)",
+        cert_der.len()
     );
     log::debug!(
-        "REALITY DEBUG: Using public key: {:?}",
+        "REALITY DEBUG: Using public key: {:02x?}",
         &public_key_bytes[..16.min(public_key_bytes.len())]
     );
-
-    // Debug: print last 70 bytes to see signature structure
-    if cert_der.len() > 70 {
-        log::debug!(
-            "REALITY DEBUG: Last 70 bytes: {:?}",
-            &cert_der[cert_der.len() - 70..]
-        );
-    }
 
     (cert_der, signing_key)
 }
@@ -147,12 +157,50 @@ mod tests {
 
         let (cert_der, _signing_key) = result.unwrap();
 
+        // Print actual size for comparison with reference (178 bytes)
+        println!("shoes certificate size: {} bytes", cert_der.len());
+
         // Certificate should be a reasonable size (few hundred bytes)
         assert!(cert_der.len() > 100);
         assert!(cert_der.len() < 1000);
 
         // Should start with SEQUENCE tag
         assert_eq!(cert_der[0], 0x30);
+    }
+
+    #[test]
+    fn test_minimal_certificate_size() {
+        use rcgen::{DistinguishedName, SerialNumber};
+
+        let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+
+        // Try to create minimal params similar to Go's x509.Certificate{SerialNumber: &big.Int{}}
+        let mut params = rcgen::CertificateParams::default();
+
+        // Clear subject_alt_names
+        params.subject_alt_names = vec![];
+
+        // Empty distinguished name (no CN, etc.)
+        params.distinguished_name = DistinguishedName::new();
+
+        // Serial number 0
+        params.serial_number = Some(SerialNumber::from(vec![0u8]));
+
+        // Note: rcgen's default dates are 1975-01-01 to 4096-01-01
+        // The reference uses 0001-01-01 for both, which rcgen doesn't easily support
+        // This will make our cert slightly larger due to date encoding
+
+        let cert = params.self_signed(&key_pair).unwrap();
+        let cert_der = cert.der().to_vec();
+
+        println!(
+            "Minimal rcgen certificate size: {} bytes (reference: 178 bytes)",
+            cert_der.len()
+        );
+        println!("Certificate hex: {:02x?}", &cert_der);
+
+        // Let's see if we can get close to 178 bytes
+        // If not, we may need to use yasna directly
     }
 
     #[test]

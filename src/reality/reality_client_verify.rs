@@ -88,7 +88,7 @@ pub fn extract_certificate_der(certificate_message: &[u8]) -> io::Result<&[u8]> 
 /// Verify the HMAC signature embedded in the REALITY certificate
 ///
 /// In REALITY protocol, the server embeds HMAC-SHA512(auth_key, ed25519_public_key)
-/// in the signature field of the certificate. We compare the first 32 bytes.
+/// in the signature field of the certificate.
 ///
 /// Uses proper X.509 parsing via x509-parser crate for robust extraction.
 #[inline]
@@ -123,21 +123,22 @@ pub fn verify_certificate_hmac(cert_der: &[u8], auth_key: &[u8; 32]) -> io::Resu
         ));
     }
 
-    // Verify signature is long enough (should be 64 bytes for Ed25519, containing HMAC-SHA512)
-    if signature.len() < 32 {
+    // Verify signature is exactly 64 bytes (HMAC-SHA512 output)
+    if signature.len() != 64 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "Signature too short for HMAC verification: {} bytes",
+                "Expected 64-byte signature for HMAC-SHA512 verification, got {} bytes",
                 signature.len()
             ),
         ));
     }
 
     // Compute expected HMAC: HMAC-SHA512(auth_key, ed25519_public_key)
+    // Reference: sing-box reality_client.go lines 273-275
     let hmac_key = hmac::Key::new(hmac::HMAC_SHA512, auth_key);
     let hmac_tag = hmac::sign(&hmac_key, pubkey_data);
-    let expected_signature = &hmac_tag.as_ref()[..32]; // First 32 bytes
+    let expected_signature = hmac_tag.as_ref(); // Full 64 bytes
 
     log::debug!(
         "REALITY CLIENT: HMAC verification - ed25519_pubkey={:02x?}",
@@ -149,12 +150,12 @@ pub fn verify_certificate_hmac(cert_der: &[u8], auth_key: &[u8; 32]) -> io::Resu
     );
     log::debug!(
         "REALITY CLIENT: HMAC verification - actual_sig={:02x?}",
-        &signature[..32]
+        signature
     );
 
-    // Compare first 32 bytes of signature with expected HMAC using constant-time comparison
+    // Compare full 64-byte signature with expected HMAC using constant-time comparison
     // to prevent timing attacks that could leak information about the expected signature
-    if expected_signature.ct_eq(&signature[..32]).unwrap_u8() == 0 {
+    if expected_signature.ct_eq(signature).unwrap_u8() == 0 {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "Certificate HMAC verification failed - signature mismatch",

@@ -15,7 +15,7 @@
     # For example.com, connect through a SOCKS proxy.
     - mask: example.com
       action: allow
-      client_proxy:
+      client_chain:
         address: 127.0.0.1:15556
         protocol:
           type: socks
@@ -25,4 +25,5 @@
     # Allow all other connections to connect directly.
     - mask: 0.0.0.0/0
       action: allow
-      client_proxy: direct
+      # client_chain: direct is optional - direct is the default when omitted
+      client_chain: direct

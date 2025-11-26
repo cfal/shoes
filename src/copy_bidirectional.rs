@@ -236,7 +236,7 @@ where
             sleep_future,
         } = &mut *self;
 
-        if let Some(ref mut sleep) = sleep_future {
+        if let Some(sleep) = sleep_future {
             let ping_fired = sleep.as_mut().poll(cx).is_ready();
             if ping_fired {
                 // a_buf writes to b - so we need to check if b supports ping, and similarly

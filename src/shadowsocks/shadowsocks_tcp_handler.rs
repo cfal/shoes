@@ -15,7 +15,7 @@ use crate::stream_reader::StreamReader;
 use crate::tcp_handler::{
     TcpClientHandler, TcpClientSetupResult, TcpServerHandler, TcpServerSetupResult,
 };
-use crate::uot::{UotV1Stream, UotV2Stream, UOT_V1_MAGIC_ADDRESS, UOT_V2_MAGIC_ADDRESS};
+use crate::uot::{UOT_V1_MAGIC_ADDRESS, UOT_V2_MAGIC_ADDRESS, UotV1Stream, UotV2Stream};
 use crate::util::write_all;
 
 use super::blake3_key::Blake3Key;
@@ -34,8 +34,7 @@ pub struct ShadowsocksTcpHandler {
 }
 
 impl ShadowsocksTcpHandler {
-    pub fn new(cipher_name: &str, password: &str) -> Self {
-        let cipher: ShadowsocksCipher = cipher_name.try_into().unwrap();
+    pub fn new(cipher: ShadowsocksCipher, password: &str) -> Self {
         let key: Arc<Box<dyn ShadowsocksKey>> = Arc::new(Box::new(DefaultKey::new(
             password,
             cipher.algorithm().key_len(),
@@ -48,8 +47,7 @@ impl ShadowsocksTcpHandler {
         }
     }
 
-    pub fn new_aead2022(cipher_name: &str, key_bytes: &[u8]) -> Self {
-        let cipher: ShadowsocksCipher = cipher_name.try_into().unwrap();
+    pub fn new_aead2022(cipher: ShadowsocksCipher, key_bytes: &[u8]) -> Self {
         let key: Arc<Box<dyn ShadowsocksKey>> = Arc::new(Box::new(Blake3Key::new(
             key_bytes.to_vec().into_boxed_slice(),
             cipher.algorithm().key_len(),
@@ -107,7 +105,7 @@ impl TcpServerHandler for ShadowsocksTcpHandler {
         }
 
         // Check for UDP-over-TCP (UoT) magic addresses
-        if let Address::Hostname(ref host) = remote_location.address() {
+        if let Address::Hostname(host) = remote_location.address() {
             if host == UOT_V1_MAGIC_ADDRESS {
                 // UoT V1: Multi-destination UDP
                 // Each packet has: ATYP + address + port + length + data
@@ -127,7 +125,6 @@ impl TcpServerHandler for ShadowsocksTcpHandler {
                     stream: Box::new(uot_stream),
                     need_initial_flush: false,
                     override_proxy_provider: NoneOrOne::Unspecified,
-                    num_sockets: 4, // TODO: make configurable
                 });
             } else if host == UOT_V2_MAGIC_ADDRESS {
                 // UoT V2: Read request header first
@@ -174,7 +171,6 @@ impl TcpServerHandler for ShadowsocksTcpHandler {
                         stream: Box::new(uot_stream),
                         need_initial_flush: false,
                         override_proxy_provider: NoneOrOne::Unspecified,
-                        num_sockets: 4,
                     });
                 }
             }
@@ -194,9 +190,8 @@ impl TcpServerHandler for ShadowsocksTcpHandler {
 
 #[async_trait]
 impl TcpClientHandler for ShadowsocksTcpHandler {
-    async fn setup_client_stream(
+    async fn setup_client_tcp_stream(
         &self,
-        _server_stream: &mut Box<dyn AsyncStream>,
         client_stream: Box<dyn AsyncStream>,
         remote_location: NetLocation,
     ) -> std::io::Result<TcpClientSetupResult> {
@@ -233,6 +228,9 @@ impl TcpClientHandler for ShadowsocksTcpHandler {
         write_all(&mut client_stream, &location_vec).await?;
         client_stream.flush().await?;
 
-        Ok(TcpClientSetupResult { client_stream })
+        Ok(TcpClientSetupResult {
+            client_stream,
+            early_data: None,
+        })
     }
 }

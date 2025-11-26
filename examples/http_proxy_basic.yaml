@@ -49,7 +49,8 @@
     # Allow everything else directly
     - masks: "0.0.0.0/0"
       action: allow
-      client_proxy: direct
+      # client_chain: direct is optional - direct is the default when omitted
+      client_chain: direct
 
 # HTTP proxy chained through SOCKS5
 - address: "0.0.0.0:8082"
@@ -60,7 +61,7 @@
   rules:
     - masks: "0.0.0.0/0"
       action: allow
-      client_proxy:
+      client_chain:
         address: "socks5.proxy.com:1080"
         protocol:
           type: socks

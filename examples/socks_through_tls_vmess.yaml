@@ -7,7 +7,7 @@
     # allow connections to all ips
     mask: 0.0.0.0/0
     action: allow
-    client_proxy:
+    client_chain:
       address: 127.0.0.1:2000
       protocol:
         type: tls

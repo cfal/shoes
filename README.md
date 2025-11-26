@@ -33,7 +33,7 @@ All server protocols plus:
 
 - **Multi-transport**: TCP or QUIC for all protocols
 - **TLS with SNI routing**: Route by Server Name Indication
-- **Upstream proxy chaining**: Route through multiple proxies
+- **Upstream proxy chaining**: Multi-hop chains with load balancing
 - **Rule-based routing**: Route by IP/CIDR or hostname masks
 - **Named PEM certificates**: Define once, reference everywhere
 - **TLS fingerprint authentication**: Certificate pinning for TLS/QUIC
@@ -64,7 +64,7 @@ OPTIONS:
 
 COMMANDS:
     generate-reality-keypair                  Generate a new Reality X25519 keypair
-    generate-shadowsocks-password <cipher>    Generate a Shadowsocks password
+    generate-shadowsocks-2022-password <cipher>    Generate a Shadowsocks password
 ```
 
 ### Examples
@@ -87,8 +87,8 @@ shoes --no-reload config.yaml
 # Generate Reality keypair
 shoes generate-reality-keypair
 
-# Generate Shadowsocks password
-shoes generate-shadowsocks-password 2022-blake3-aes-256-gcm
+# Generate Shadowsocks 2022 cipher password
+shoes generate-shadowsocks-2022-password 2022-blake3-aes-256-gcm
 ```
 
 ## Configuration
@@ -150,7 +150,7 @@ See the [examples](./examples) directory for all examples.
   rules:
     - masks: "0.0.0.0/0"
       action: allow
-      client_proxy:
+      client_chain:
         address: "server.example.com:443"
         protocol:
           type: reality

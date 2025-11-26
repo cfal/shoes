@@ -118,6 +118,8 @@ protocol:
   udp_enabled: true            # Default: true (enables XUDP)
 ```
 
+**Note:** VMess AEAD mode is always enabled. The legacy `force_aead` field is deprecated and non-AEAD mode is no longer supported.
+
 ### VLESS
 ```yaml
 protocol:
@@ -176,6 +178,9 @@ protocol:
       short_ids: [string]      # Valid client IDs (hex, 0-16 chars)
       dest: string             # Fallback destination (e.g., "example.com:443")
       max_time_diff: 60000     # Max timestamp diff in ms (default: 60000)
+      min_client_version: [1, 8, 0]  # Optional [major, minor, patch]
+      max_client_version: [2, 0, 0]  # Optional [major, minor, patch]
+      cipher_suites: [string]  # Optional TLS 1.3 cipher suites (see below)
       vision: false            # Enable Vision (requires VLESS inner protocol)
       protocol: ServerProxyConfig
       override_rules: [RuleConfig]
@@ -235,6 +240,7 @@ protocol:
   type: tuic                   # Aliases: tuicv5
   uuid: string                 # UUID
   password: string
+  zero_rtt_handshake: false    # Default: false (enables 0-RTT for lower latency)
 ```
 
 ## Client Config
@@ -307,6 +313,8 @@ protocol:
   user_id: string
 ```
 
+**Note:** VMess AEAD mode is always enabled. The legacy `aead` field is deprecated.
+
 ### VLESS
 ```yaml
 protocol:
@@ -346,9 +354,12 @@ protocol:
   public_key: string           # Server's X25519 public key (base64url)
   short_id: string             # Your client ID (hex, 0-16 chars)
   sni_hostname: string         # SNI to send (must match server's reality_targets key)
+  cipher_suites: [string]      # Optional TLS 1.3 cipher suites (see below)
   vision: false                # Enable Vision (requires VLESS inner protocol)
   protocol: ClientProxyConfig  # Inner protocol (typically VLESS)
 ```
+
+**Reality cipher suites:** Valid values are `TLS_AES_128_GCM_SHA256`, `TLS_AES_256_GCM_SHA384`, `TLS_CHACHA20_POLY1305_SHA256`. If not specified, all three are offered/supported.
 
 ### ShadowTLS Client
 ```yaml
@@ -389,8 +400,40 @@ rules:
     action: allow | block
     # For action: allow
     override_address: string?  # Optional address override
-    client_proxy: string | ClientConfig | [ClientConfig]
+    client_chain: ClientChain | [ClientChain]  # Proxy chain(s) for routing
 ```
+
+### Client Chains
+
+Client chains define how traffic is routed through upstream proxies. Each chain is a sequence of "hops" - proxies that traffic passes through in order.
+
+```yaml
+# Single proxy (simplest form)
+client_chain: my-proxy-group           # Reference a named group
+client_chain:                          # Or inline config
+  address: "proxy.example.com:1080"
+  protocol:
+    type: socks
+
+# Multi-hop chain (traffic goes: client -> hop1 -> hop2 -> target)
+client_chain:
+  chain:
+    - first-proxy-group
+    - second-proxy-group
+
+# Multiple chains (round-robin selection)
+client_chains:
+  - us-proxy-group                     # Chain 1: single hop
+  - chain: [proxy1, proxy2]            # Chain 2: multi-hop
+
+# Load balancing at a hop (pool)
+client_chain:
+  chain:
+    - pool: [us-proxies, eu-proxies]   # Round-robin between pool members
+    - final-proxy
+```
+
+**Migration note:** The `client_proxy` / `client_proxies` fields still work but are deprecated. Please migrate to `client_chain` / `client_chains`.
 
 ### Mask Syntax
 ```yaml
@@ -421,7 +464,9 @@ rules:
   # Direct connection for local networks
   - masks: ["192.168.0.0/16", "10.0.0.0/8", "172.16.0.0/12"]
     action: allow
-    client_proxy: direct
+    client_chain:
+      protocol:
+        type: direct
 
   # Block specific domains
   - masks: ["*.ads.example.com", "tracking.example.com"]
@@ -430,7 +475,7 @@ rules:
   # Route through upstream proxy
   - masks: "0.0.0.0/0"
     action: allow
-    client_proxy:
+    client_chain:
       address: "proxy.example.com:1080"
       protocol:
         type: socks
@@ -441,7 +486,7 @@ rules:
 ### Client Proxy Group
 ```yaml
 - client_group: my-upstream
-  client_proxy:                # Or client_proxies for multiple
+  client_proxies:              # Define proxies in this group
     - address: "proxy1.example.com:1080"
       protocol:
         type: socks
@@ -456,7 +501,7 @@ rules:
   rules:
     - masks: "0.0.0.0/0"
       action: allow
-      client_proxy: my-upstream  # Reference by name
+      client_chain: my-upstream  # Reference by name
 ```
 
 ### Rule Group
@@ -465,10 +510,12 @@ rules:
   rules:
     - masks: ["192.168.0.0/16"]
       action: allow
-      client_proxy: direct
+      client_chain:
+        protocol:
+          type: direct
     - masks: "0.0.0.0/0"
       action: allow
-      client_proxy: my-upstream
+      client_chain: my-upstream
 
 # Reference in server config
 - address: "0.0.0.0:8080"
@@ -549,19 +596,33 @@ Automatically enabled for VMess and VLESS when `udp_enabled: true`. Multiplexes 
 
 ### Proxy Chaining
 
-Chain multiple proxies by nesting client protocols:
+**Protocol nesting** (wrap one protocol in another):
 
 ```yaml
-client_proxy:
-  address: "proxy1.example.com:1080"
+client_chain:
+  address: "proxy.example.com:443"
   protocol:
-    type: socks
+    type: tls
     protocol:
-      type: tls
+      type: vmess
+      cipher: aes-128-gcm
+      user_id: "uuid"
+```
+
+**Multi-hop chains** (route through multiple proxies sequentially):
+
+```yaml
+client_chain:
+  chain:
+    - address: "proxy1.example.com:1080"
       protocol:
-        type: vmess
-        cipher: aes-128-gcm
-        user_id: "uuid"
+        type: socks
+    - address: "proxy2.example.com:443"
+      protocol:
+        type: tls
+        protocol:
+          type: vless
+          user_id: "uuid"
 ```
 
 ### Hot Reloading
@@ -585,7 +646,7 @@ protocol:
       protocol: ...
 
 # Client side
-client_proxy:
+client_chain:
   address: "example.com:443"
   protocol:
     type: tls
@@ -605,8 +666,8 @@ OPTIONS:
   --no-reload          Disable hot-reloading
 
 COMMANDS:
-  generate-reality-keypair                  Generate Reality X25519 keypair
-  generate-shadowsocks-password <cipher>    Generate Shadowsocks password
+  generate-reality-keypair                       Generate Reality X25519 keypair
+  generate-shadowsocks-2022-password <cipher>    Generate Shadowsocks 2022 password
 ```
 
 ## Tips
@@ -618,9 +679,9 @@ COMMANDS:
 shoes generate-reality-keypair
 ```
 
-**Shadowsocks password:**
+**Shadowsocks 2022 password:**
 ```bash
-shoes generate-shadowsocks-password 2022-blake3-aes-256-gcm
+shoes generate-shadowsocks-2022-password 2022-blake3-aes-256-gcm
 ```
 
 **UUID:**

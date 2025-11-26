@@ -13,9 +13,9 @@
   rules:
     - mask: 1.2.3.4/32
       action: allow
-      override_ip: 192.168.0.1
-      client_proxy: direct
+      override_address: 192.168.0.1
+      client_chain: direct
     - mask: 0.0.0.0/0
       action: allow
       # Direct connection, don't forward requests through another proxy.
-      client_proxy: direct
+      client_chain: direct

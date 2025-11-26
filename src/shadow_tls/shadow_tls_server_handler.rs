@@ -6,7 +6,6 @@
 /// - https://tls13.xargs.org/#client-hello/annotated
 use std::fmt::Debug;
 use std::io::Cursor;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use tokio::io::AsyncWriteExt;
@@ -16,13 +15,12 @@ use super::shadow_tls_stream::ShadowTlsStream;
 use crate::address::NetLocation;
 use crate::async_stream::AsyncStream;
 use crate::buf_reader::BufReader;
+use crate::client_proxy_chain::ClientProxyChain;
 use crate::client_proxy_selector::ClientProxySelector;
-use crate::noop_stream::NoopStream;
 use crate::option_util::NoneOrOne;
 use crate::resolver::Resolver;
 use crate::rustls_connection_util::feed_rustls_server_connection;
 use crate::stream_reader::StreamReader;
-use crate::tcp_client_connector::TcpClientConnector;
 use crate::tcp_handler::{TcpServerHandler, TcpServerSetupResult};
 use crate::util::{allocate_vec, write_all};
 
@@ -41,7 +39,7 @@ pub struct ShadowTlsServerTarget {
     initial_xor_context: ShadowTlsXorContext,
     handshake: ShadowTlsServerTargetHandshake,
     handler: Box<dyn TcpServerHandler>,
-    override_proxy_provider: NoneOrOne<Arc<ClientProxySelector<TcpClientConnector>>>,
+    override_proxy_provider: NoneOrOne<Arc<ClientProxySelector>>,
 }
 
 impl ShadowTlsServerTarget {
@@ -49,7 +47,7 @@ impl ShadowTlsServerTarget {
         password: String,
         handshake: ShadowTlsServerTargetHandshake,
         handler: Box<dyn TcpServerHandler>,
-        override_proxy_provider: NoneOrOne<Arc<ClientProxySelector<TcpClientConnector>>>,
+        override_proxy_provider: NoneOrOne<Arc<ClientProxySelector>>,
     ) -> Self {
         let password_bytes = password.into_bytes();
         let hmac_key = aws_lc_rs::hmac::Key::new(
@@ -74,8 +72,7 @@ pub enum ShadowTlsServerTargetHandshake {
     Local(Arc<rustls::ServerConfig>),
     Remote {
         location: NetLocation,
-        client_connectors: Vec<TcpClientConnector>,
-        next_proxy_index: AtomicUsize,
+        client_chain: ClientProxyChain,
     },
 }
 
@@ -84,11 +81,10 @@ impl ShadowTlsServerTargetHandshake {
         ShadowTlsServerTargetHandshake::Local(server_config)
     }
 
-    pub fn new_remote(location: NetLocation, client_connectors: Vec<TcpClientConnector>) -> Self {
+    pub fn new_remote(location: NetLocation, client_chain: ClientProxyChain) -> Self {
         ShadowTlsServerTargetHandshake::Remote {
             location,
-            client_connectors,
-            next_proxy_index: AtomicUsize::new(0),
+            client_chain,
         }
     }
 }
@@ -142,7 +138,7 @@ pub async fn setup_shadowtls_server_stream(
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "client did not send a 32-byte session id",
-            ))
+            ));
         }
     };
 
@@ -190,24 +186,19 @@ pub async fn setup_shadowtls_server_stream(
     let shadow_tls_stream = match target.handshake {
         ShadowTlsServerTargetHandshake::Remote {
             ref location,
-            ref client_connectors,
-            ref next_proxy_index,
-        } => {
-            let index = next_proxy_index.fetch_add(1, Ordering::Relaxed);
-            let client_connector = &client_connectors[index % client_connectors.len()];
-            setup_remote_handshake(
-                server_stream,
-                client_reader,
-                client_hello_frame,
-                &target.initial_hmac,
-                &target.initial_xor_context,
-                location.clone(),
-                client_connector,
-                resolver,
-            )
-            .await
-            .map_err(|e| std::io::Error::other(format!("failed to setup remote handshake: {e}")))?
-        }
+            ref client_chain,
+        } => setup_remote_handshake(
+            server_stream,
+            client_reader,
+            client_hello_frame,
+            &target.initial_hmac,
+            &target.initial_xor_context,
+            location.clone(),
+            client_chain,
+            resolver,
+        )
+        .await
+        .map_err(|e| std::io::Error::other(format!("failed to setup remote handshake: {e}")))?,
         ShadowTlsServerTargetHandshake::Local(ref local_config) => setup_local_handshake(
             server_stream,
             client_reader,
@@ -554,12 +545,12 @@ pub fn parse_server_hello(server_hello_frame: &[u8]) -> std::io::Result<ParsedSe
             })?;
             if version_bytes[0] != 3 || version_bytes[1] != 4 {
                 return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!(
-                            "expected server supported version to be TLS 1.3 (0x0304), got 0x{:02x}{:02x}",
-                            version_bytes[0], version_bytes[1]
-                        ),
-                    ));
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "expected server supported version to be TLS 1.3 (0x0304), got 0x{:02x}{:02x}",
+                        version_bytes[0], version_bytes[1]
+                    ),
+                ));
             }
             server_has_supported_version = true;
         } else {
@@ -591,16 +582,17 @@ async fn setup_remote_handshake(
     initial_hmac: &ShadowTlsHmac,
     initial_xor_context: &ShadowTlsXorContext,
     remote_addr: NetLocation,
-    client_connector: &TcpClientConnector,
+    client_chain: &ClientProxyChain,
     resolver: &Arc<dyn Resolver>,
 ) -> std::io::Result<ShadowTlsStream> {
-    // there will not be any messages from a TLS server until we send ClientHello, so a noop stream
-    // is fine.
-    let mut noop_stream: Box<dyn AsyncStream> = Box::new(NoopStream);
+    use crate::tcp_handler::TcpClientSetupResult;
 
     // this is confusing, but the TLS server is called client_stream.
-    let mut client_stream = client_connector
-        .connect(&mut noop_stream, remote_addr, resolver)
+    let TcpClientSetupResult {
+        mut client_stream,
+        early_data: _,
+    } = client_chain
+        .connect_tcp(remote_addr, resolver)
         .await
         .map_err(|e| {
             std::io::Error::new(

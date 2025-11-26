@@ -7,11 +7,9 @@
     # allow connections to all ips
     mask: 0.0.0.0/0
     action: allow
-    client_proxy:
+    client_chain:
       address: 127.0.0.1:5432
       protocol:
         type: vmess
         cipher: aes-128-gcm
         user_id: bb0e80a62-8a51-47f0-91f1-f0f7faf8d9d4
-        # connect using AEAD mode (defaults to true)
-        aead: true

@@ -32,6 +32,14 @@
         # Prevents replay attacks by rejecting connections with old timestamps
         max_time_diff: 60000  # 1 minute
 
+        # Optional: Client version restrictions [major, minor, patch]
+        # min_client_version: [1, 8, 0]
+        # max_client_version: [2, 0, 0]
+
+        # Optional: TLS 1.3 cipher suites to support
+        # Valid: TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384, TLS_CHACHA20_POLY1305_SHA256
+        # cipher_suites: ["TLS_AES_256_GCM_SHA384", "TLS_CHACHA20_POLY1305_SHA256"]
+
         # Inner protocol - the actual proxy protocol used after Reality handshake
         protocol:
           type: vless

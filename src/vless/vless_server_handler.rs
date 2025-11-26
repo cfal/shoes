@@ -13,8 +13,8 @@ use crate::xudp::XudpMessageStream;
 use super::vision_stream::VisionStream;
 use super::vless_message_stream::VlessMessageStream;
 use super::vless_util::{
-    parse_addons_from_reader, parse_remote_location_from_reader, COMMAND_MUX, COMMAND_TCP,
-    COMMAND_UDP, XTLS_VISION_FLOW,
+    COMMAND_MUX, COMMAND_TCP, COMMAND_UDP, XTLS_VISION_FLOW, parse_addons_from_reader,
+    parse_remote_location_from_reader,
 };
 
 pub struct VlessTcpServerHandler {

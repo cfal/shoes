@@ -19,7 +19,7 @@ use std::io;
 
 use super::tls_deframer::TlsDeframer;
 use super::tls_handshake_util::{
-    find_tls_handshake_start, get_partial_tls_pattern_suffix_len, MIN_TLS_HANDSHAKE_PATTERN_LEN,
+    MIN_TLS_HANDSHAKE_PATTERN_LEN, find_tls_handshake_start, get_partial_tls_pattern_suffix_len,
 };
 
 /// Result of attempting to extract data from the fuzzy deframer

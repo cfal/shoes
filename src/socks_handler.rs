@@ -11,7 +11,7 @@ use crate::stream_reader::StreamReader;
 use crate::tcp_handler::{
     TcpClientHandler, TcpClientSetupResult, TcpServerHandler, TcpServerSetupResult,
 };
-use crate::uot::{UotV1Stream, UotV2Stream, UOT_V1_MAGIC_ADDRESS, UOT_V2_MAGIC_ADDRESS};
+use crate::uot::{UOT_V1_MAGIC_ADDRESS, UOT_V2_MAGIC_ADDRESS, UotV1Stream, UotV2Stream};
 use crate::util::write_all;
 
 pub const VER_SOCKS5: u8 = 0x05;
@@ -201,7 +201,7 @@ impl TcpServerHandler for SocksTcpServerHandler {
         let location = read_location(&mut server_stream, &mut stream_reader).await?;
 
         // Check for UDP-over-TCP (UoT) magic addresses
-        if let Address::Hostname(ref host) = location.address() {
+        if let Address::Hostname(host) = location.address() {
             if host == UOT_V1_MAGIC_ADDRESS {
                 // UoT V1: Multi-destination UDP
                 // Each packet has: ATYP + address + port + length + data
@@ -225,7 +225,6 @@ impl TcpServerHandler for SocksTcpServerHandler {
                     stream: Box::new(uot_stream),
                     need_initial_flush: false,
                     override_proxy_provider: NoneOrOne::Unspecified,
-                    num_sockets: 4,
                 });
             } else if host == UOT_V2_MAGIC_ADDRESS {
                 // UoT V2: Read request header first
@@ -272,7 +271,6 @@ impl TcpServerHandler for SocksTcpServerHandler {
                         stream: Box::new(uot_stream),
                         need_initial_flush: false,
                         override_proxy_provider: NoneOrOne::Unspecified,
-                        num_sockets: 4,
                     });
                 }
             }
@@ -329,9 +327,8 @@ impl SocksTcpClientHandler {
 
 #[async_trait]
 impl TcpClientHandler for SocksTcpClientHandler {
-    async fn setup_client_stream(
+    async fn setup_client_tcp_stream(
         &self,
-        server_stream: &mut Box<dyn AsyncStream>,
         mut client_stream: Box<dyn AsyncStream>,
         remote_location: NetLocation,
     ) -> std::io::Result<TcpClientSetupResult> {
@@ -404,13 +401,17 @@ impl TcpClientHandler for SocksTcpClientHandler {
         // Read the final location part of the connect response.
         read_location(&mut client_stream, &mut stream_reader).await?;
 
-        let unparsed_data = stream_reader.unparsed_data();
-        if !unparsed_data.is_empty() {
-            write_all(server_stream, unparsed_data).await?;
-            server_stream.flush().await?;
-        }
+        let early_data = stream_reader.unparsed_data();
+        let early_data = if early_data.is_empty() {
+            None
+        } else {
+            Some(early_data.to_vec())
+        };
 
-        Ok(TcpClientSetupResult { client_stream })
+        Ok(TcpClientSetupResult {
+            client_stream,
+            early_data,
+        })
     }
 }
 
