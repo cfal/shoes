@@ -866,7 +866,7 @@ impl RealityServerConnection {
         // SlideBuffer handles compaction internally via maybe_compact()
         // Compact before returning reader if we've consumed significant data
         self.plaintext_read_buf.maybe_compact(4096);
-        RealityReader::new(&mut self.plaintext_read_buf)
+        RealityReader::new(&mut self.plaintext_read_buf, self.received_close_notify)
     }
 
     /// Get a writer for buffering plaintext to be encrypted

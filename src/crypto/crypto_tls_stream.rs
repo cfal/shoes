@@ -240,28 +240,46 @@ where
                 Poll::Ready(Ok(()))
             }
             Ok(_) => {
-                // Empty buffer - check various conditions
+                // Empty buffer from fill_buf() means CloseNotify received (clean TLS EOF)
+                // This matches rustls behavior where Ok(&[]) signals clean shutdown
+                this.state.shutdown_read();
+                Poll::Ready(Ok(()))
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                // No data available, connection still active
                 if eof {
-                    // Mark read side as shut down
+                    // TCP EOF without CloseNotify - unclean shutdown
                     this.state.shutdown_read();
                     Poll::Ready(Ok(()))
                 } else if io_pending {
+                    // We tried to read and got WouldBlock - wait for more data
                     Poll::Pending
                 } else {
-                    // Edge case: wants_read() returned false but no data available.
-                    // Wake ourselves to retry (tokio-rustls pattern to prevent hangs).
-                    cx.waker().wake_by_ref();
-                    Poll::Pending
+                    // wants_read() returned false but no data - need to read from TCP
+                    // This can happen if we need to fetch more ciphertext
+                    // Try one read to register with reactor, then return Pending
+                    let mut adapter = SyncReadAdapter {
+                        io: &mut this.io,
+                        cx,
+                    };
+                    match this.session.read_tls(&mut adapter) {
+                        Ok(0) => {
+                            this.state.shutdown_read();
+                            Poll::Ready(Ok(()))
+                        }
+                        Ok(_) => {
+                            // Got data, process and wake to retry
+                            let _ = this.session.process_new_packets();
+                            cx.waker().wake_by_ref();
+                            Poll::Pending
+                        }
+                        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                            // Now properly registered with reactor
+                            Poll::Pending
+                        }
+                        Err(e) => Poll::Ready(Err(e)),
+                    }
                 }
-            }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                if !io_pending {
-                    // If wants_read() is satisfied, rustls will not return WouldBlock.
-                    // But if it does, we can try again. Wake ourselves to prevent hang.
-                    // Tokio's cooperative budget will prevent infinite wakeup.
-                    cx.waker().wake_by_ref();
-                }
-                Poll::Pending
             }
             Err(e) if e.kind() == io::ErrorKind::ConnectionAborted => {
                 // Connection aborted - mark read side as shut down
