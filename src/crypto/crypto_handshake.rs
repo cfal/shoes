@@ -207,6 +207,9 @@ pub async fn perform_crypto_handshake(
     // but wants_write is still true, and the early exit check at loop start
     // handles the case when neither wants_read nor wants_write.
 
+    // Final flush after handshake completion (tokio-rustls pattern)
+    stream.flush().await?;
+
     Ok(())
 }
 
