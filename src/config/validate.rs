@@ -6,26 +6,28 @@ use crate::address::NetLocationMask;
 use crate::option_util::{NoneOrSome, OneOrSome};
 use crate::reality::{decode_private_key, decode_short_id};
 use crate::thread_util::get_num_threads;
-use crate::util::parse_uuid;
+use crate::uuid_util::parse_uuid;
 
 use super::pem::{embed_optional_pem_from_map, embed_pem_from_map};
 use super::types::{
     ClientChain, ClientChainHop, ClientConfig, ClientProxyConfig, Config, ConfigSelection,
     DEFAULT_REALITY_SHORT_ID, PemSource, RuleActionConfig, RuleConfig, ServerConfig,
     ServerProxyConfig, ServerQuicConfig, ShadowTlsServerConfig, ShadowTlsServerHandshakeConfig,
-    ShadowsocksConfig, TlsServerConfig, Transport, WebsocketServerConfig, direct_allow_rule,
+    ShadowsocksConfig, TlsServerConfig, Transport, TunConfig, WebsocketServerConfig,
+    direct_allow_rule,
 };
 
 const MIN_TLS_BUFFER_SIZE: usize = 16 * 1024;
 
-/// Creates validated ServerConfigs from a list of Config entries.
+/// Validates configs and returns only the startable server configs.
 ///
 /// This function:
 /// - Builds client_groups and rule_groups from ClientConfigGroup and RuleConfigGroup entries
 /// - Resolves group references using topological sort
 /// - Collects named PEMs
-/// - Validates all ServerConfigs against the groups and PEMs
-pub async fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Vec<ServerConfig>> {
+/// - Validates all ServerConfigs and TunConfigs against the groups and PEMs
+/// - Returns only Config::Server and Config::TunServer variants (groups/pems are consumed)
+pub async fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Vec<Config>> {
     // First pass: collect raw groups with unresolved references
     let mut raw_client_groups: HashMap<String, OneOrSome<ConfigSelection<ClientConfig>>> =
         HashMap::new();
@@ -54,6 +56,7 @@ pub async fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<
     );
 
     let mut server_configs: Vec<ServerConfig> = vec![];
+    let mut tun_configs: Vec<TunConfig> = vec![];
     let mut named_pems: HashMap<String, String> = HashMap::new();
 
     for config in all_configs.into_iter() {
@@ -82,6 +85,9 @@ pub async fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<
             }
             Config::Server(server_config) => {
                 server_configs.push(server_config);
+            }
+            Config::TunServer(tun_config) => {
+                tun_configs.push(tun_config);
             }
             Config::NamedPem(pem) => {
                 let pem_data = match pem.source {
@@ -115,7 +121,16 @@ pub async fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<
         validate_server_config(config, &client_groups, &rule_groups, &named_pems)?;
     }
 
-    Ok(server_configs)
+    // Validate TUN configs
+    for config in tun_configs.iter_mut() {
+        validate_tun_config(config, &client_groups, &rule_groups)?;
+    }
+
+    // Combine into Config list (only Server and TunServer variants)
+    let mut result: Vec<Config> = server_configs.into_iter().map(Config::Server).collect();
+    result.extend(tun_configs.into_iter().map(Config::TunServer));
+
+    Ok(result)
 }
 
 /// Resolves client group references using topological sort.
@@ -338,6 +353,7 @@ fn validate_server_config(
         client_groups,
         rule_groups,
         named_pems,
+        false, // top-level, not inside TLS/Reality
     )?;
 
     Ok(())
@@ -628,8 +644,16 @@ fn validate_server_proxy_config(
     client_groups: &HashMap<String, Vec<ClientConfig>>,
     rule_groups: &HashMap<String, Vec<RuleConfig>>,
     named_pems: &HashMap<String, String>,
+    inside_tls_or_reality: bool,
 ) -> std::io::Result<()> {
     match server_proxy_config {
+        ServerProxyConfig::Naiveproxy { .. } if !inside_tls_or_reality => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "NaiveProxy must be used inside a TLS or Reality protocol. \
+                 Configure it as the inner protocol of tls: or reality: targets.",
+            ));
+        }
         ServerProxyConfig::Vless { user_id, .. } => {
             parse_uuid(user_id)?;
         }
@@ -669,7 +693,13 @@ fn validate_server_proxy_config(
 
                 validate_client_fingerprints(client_fingerprints)?;
 
-                validate_server_proxy_config(protocol, client_groups, rule_groups, named_pems)?;
+                validate_server_proxy_config(
+                    protocol,
+                    client_groups,
+                    rule_groups,
+                    named_pems,
+                    true,
+                )?;
 
                 ConfigSelection::replace_none_or_some_groups(override_rules, rule_groups)?;
 
@@ -693,7 +723,13 @@ fn validate_server_proxy_config(
                     ref mut override_rules,
                     ..
                 } = **tls_server_config;
-                validate_server_proxy_config(protocol, client_groups, rule_groups, named_pems)?;
+                validate_server_proxy_config(
+                    protocol,
+                    client_groups,
+                    rule_groups,
+                    named_pems,
+                    true,
+                )?;
 
                 ConfigSelection::replace_none_or_some_groups(override_rules, rule_groups)?;
 
@@ -727,7 +763,13 @@ fn validate_server_proxy_config(
                     validate_client_fingerprints(&mut local_handshake.client_fingerprints)?;
                 }
 
-                validate_server_proxy_config(protocol, client_groups, rule_groups, named_pems)?;
+                validate_server_proxy_config(
+                    protocol,
+                    client_groups,
+                    rule_groups,
+                    named_pems,
+                    true,
+                )?;
 
                 ConfigSelection::replace_none_or_some_groups(override_rules, rule_groups)?;
 
@@ -766,6 +808,7 @@ fn validate_server_proxy_config(
                     client_groups,
                     rule_groups,
                     named_pems,
+                    true,
                 )?;
 
                 ConfigSelection::replace_none_or_some_groups(
@@ -798,7 +841,13 @@ fn validate_server_proxy_config(
                     override_rules,
                     ..
                 } = websocket_server_config;
-                validate_server_proxy_config(protocol, client_groups, rule_groups, named_pems)?;
+                validate_server_proxy_config(
+                    protocol,
+                    client_groups,
+                    rule_groups,
+                    named_pems,
+                    false,
+                )?;
 
                 ConfigSelection::replace_none_or_some_groups(override_rules, rule_groups)?;
 
@@ -832,6 +881,62 @@ fn validate_server_proxy_config(
         }
         _ => (),
     }
+    Ok(())
+}
+
+/// Validates a TUN configuration.
+fn validate_tun_config(
+    config: &mut TunConfig,
+    client_groups: &HashMap<String, Vec<ClientConfig>>,
+    rule_groups: &HashMap<String, Vec<RuleConfig>>,
+) -> std::io::Result<()> {
+    // Validate ICMP requires TCP
+    if !config.tcp_enabled && config.icmp_enabled {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "TUN: TCP must be enabled for ICMP",
+        ));
+    }
+
+    // Validate that we have either Linux config (device_name/address) or mobile config (device_fd)
+    #[cfg(target_os = "linux")]
+    {
+        if config.device_fd.is_none() && (config.device_name.is_none() || config.address.is_none())
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "TUN on Linux requires either 'device_fd' or both 'device_name' and 'address'",
+            ));
+        }
+    }
+    #[cfg(target_os = "android")]
+    {
+        if config.device_fd.is_none() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "TUN on Android requires 'device_fd' from VpnService.Builder.establish()",
+            ));
+        }
+    }
+    #[cfg(target_os = "ios")]
+    {
+        if config.device_fd.is_none() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "TUN on iOS requires 'device_fd' from NEPacketTunnelProvider.packetFlow",
+            ));
+        }
+    }
+
+    // Resolve rule group references
+    ConfigSelection::replace_none_or_some_groups(&mut config.rules, rule_groups)?;
+
+    // Validate rules
+    for rule in config.rules.iter_mut() {
+        let rule = rule.unwrap_config_mut();
+        validate_rule_config(rule, client_groups, &HashMap::new())?;
+    }
+
     Ok(())
 }
 
@@ -958,15 +1063,7 @@ fn validate_and_expand_selection(
                     format!("Unknown client_group in chain: {group_name}"),
                 )
             })?;
-            // We can't directly replace a GroupName with multiple configs in the selection.
-            // The expansion happens at a higher level (in validate_client_chain_hop_expand).
-            // For now, just validate that the group exists.
-            // The actual expansion to multiple configs happens in tcp_handler_util.rs
-            // Wait - we need to expand here. Let me think...
-            //
-            // Actually, we need a different approach. The chain hop expansion should happen
-            // in a way that replaces the entire hop, not individual selections.
-            // Let's validate and then expand.
+            // Validate all configs in the group; expansion happens in expand_client_chain
             for mut config in group_configs.clone() {
                 validate_client_config(&mut config, named_pems)?;
             }
@@ -1050,7 +1147,7 @@ mod tests {
     use super::*;
     use crate::config::pem::convert_cert_paths;
 
-    async fn validate_configs_test(configs: Vec<Config>) -> std::io::Result<Vec<ServerConfig>> {
+    async fn validate_configs_test(configs: Vec<Config>) -> std::io::Result<Vec<Config>> {
         let (converted_configs, _) = convert_cert_paths(configs).await?;
         create_server_configs(converted_configs).await
     }
@@ -1282,7 +1379,7 @@ mod tests {
               protocol:
                 type: vmess
                 cipher: auto
-                user_id: "123e4567-e89b-12d3-a456-426614174000"
+                user_id: "123e4567-e89b-42d3-a456-426614174000"
     shadowtls_targets:
       "shadow.com":
         password: "shadowpass"
@@ -1325,8 +1422,10 @@ mod tests {
 
         assert_eq!(load_count, 11);
 
-        let server_configs = create_server_configs(converted_configs).await.unwrap();
-        let server_config = &server_configs[0];
+        let configs = create_server_configs(converted_configs).await.unwrap();
+        let Config::Server(server_config) = &configs[0] else {
+            panic!("expected Config::Server");
+        };
 
         let quic_settings = server_config.quic_settings.as_ref().unwrap();
         assert!(quic_settings.cert.contains("BEGIN CERTIFICATE"));
@@ -1349,10 +1448,6 @@ mod tests {
             }
         }
     }
-
-    // ============================================================================
-    // Tests for direct connector position validation
-    // ============================================================================
 
     #[test]
     fn test_direct_connector_at_hop_0_allowed() {
@@ -1500,5 +1595,115 @@ mod tests {
         ]);
 
         assert!(validate_direct_connector_positions(&hops, 0).is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_tun_config_parsing() {
+        let yaml = r#"
+- device_name: "tun0"
+  address: "10.0.0.1"
+  netmask: "255.255.255.0"
+  mtu: 1400
+  tcp_enabled: true
+  udp_enabled: true
+  icmp_enabled: false
+  rules:
+    - masks: "0.0.0.0/0"
+      action: allow
+      client_chain:
+        - protocol:
+            type: direct
+"#;
+        let configs: Vec<Config> = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(configs.len(), 1);
+
+        match &configs[0] {
+            Config::TunServer(tun) => {
+                assert_eq!(tun.device_name, Some("tun0".to_string()));
+                assert_eq!(tun.address, Some("10.0.0.1".parse().unwrap()));
+                assert_eq!(tun.netmask, Some("255.255.255.0".parse().unwrap()));
+                assert_eq!(tun.mtu, 1400);
+                assert!(tun.tcp_enabled);
+                assert!(tun.udp_enabled);
+                assert!(!tun.icmp_enabled);
+            }
+            _ => panic!("Expected TunServer config"),
+        }
+
+        // Validate the config
+        let result = validate_configs_test(configs).await;
+        assert!(result.is_ok(), "TUN config validation failed: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn test_tun_config_with_device_fd() {
+        let yaml = r#"
+- device_fd: 42
+  mtu: 1500
+  rules:
+    - masks: "0.0.0.0/0"
+      action: allow
+      client_chain:
+        - protocol:
+            type: direct
+"#;
+        let configs: Vec<Config> = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(configs.len(), 1);
+
+        match &configs[0] {
+            Config::TunServer(tun) => {
+                assert_eq!(tun.device_fd, Some(42));
+                assert_eq!(tun.device_name, None);
+                assert_eq!(tun.mtu, 1500);
+            }
+            _ => panic!("Expected TunServer config"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_tun_config_defaults() {
+        let yaml = r#"
+- device_name: "tun0"
+  address: "10.0.0.1"
+"#;
+        let configs: Vec<Config> = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(configs.len(), 1);
+
+        match &configs[0] {
+            Config::TunServer(tun) => {
+                // Check defaults
+                assert_eq!(tun.mtu, 1500); // default
+                assert!(tun.tcp_enabled); // default true
+                assert!(tun.udp_enabled); // default true
+                assert!(tun.icmp_enabled); // default true
+            }
+            _ => panic!("Expected TunServer config"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_tun_icmp_requires_tcp() {
+        // ICMP requires TCP to be enabled
+        let tun_config = TunConfig {
+            device_name: Some("tun0".to_string()),
+            device_fd: None,
+            address: Some("10.0.0.1".parse().unwrap()),
+            netmask: None,
+            destination: None,
+            mtu: 1500,
+            tcp_enabled: false, // TCP disabled
+            udp_enabled: true,
+            icmp_enabled: true, // but ICMP enabled - should fail
+            rules: NoneOrSome::Unspecified,
+        };
+
+        let configs = vec![Config::TunServer(tun_config)];
+        let result = validate_configs_test(configs).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("TCP must be enabled for ICMP"),
+            "Expected ICMP/TCP error, got: {err}"
+        );
     }
 }

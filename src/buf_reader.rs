@@ -13,6 +13,10 @@ impl<'a> BufReader<'a> {
         self.pos == self.buf.len()
     }
 
+    pub fn remaining(&self) -> usize {
+        self.buf.len() - self.pos
+    }
+
     pub fn position(&self) -> usize {
         self.pos
     }

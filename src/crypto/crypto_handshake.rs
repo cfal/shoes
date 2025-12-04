@@ -11,7 +11,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::async_stream::AsyncStream;
 use crate::crypto::{CryptoConnection, feed_crypto_connection};
-use crate::util;
+use crate::util::{allocate_vec, write_all};
 
 /// Perform a complete TLS handshake using the provided rustls connection and stream.
 ///
@@ -47,6 +47,8 @@ use crate::util;
 /// perform_crypto_handshake(&mut connection, &mut tcp_stream, 16384).await?;
 /// // Handshake complete, connection ready for application data
 /// ```
+///
+/// TODO: remove buffer_size parameter, use max tls frame size by default
 pub async fn perform_crypto_handshake(
     connection: &mut CryptoConnection,
     stream: &mut Box<dyn AsyncStream>,
@@ -58,7 +60,7 @@ pub async fn perform_crypto_handshake(
     let mut eof = false;
 
     // Pre-allocate read buffer once, reused across all iterations
-    let mut read_buf = vec![0u8; buffer_size];
+    let mut read_buf = allocate_vec(buffer_size).into_boxed_slice();
 
     // Infinite loop - we explicitly break when done
     // This matches tokio-rustls's structure: loop { ... return match ... }
@@ -230,7 +232,7 @@ async fn write_pending_data_no_flush(
 
     // Send to peer if we have data
     if !write_buf.is_empty() {
-        util::write_all(stream, &write_buf).await?;
+        write_all(stream, &write_buf).await?;
         Ok(true)
     } else {
         Ok(false)
@@ -300,7 +302,7 @@ async fn try_last_gasp_write(connection: &mut CryptoConnection, stream: &mut Box
             "TLS: sending last-gasp alert ({} bytes) before closing",
             alert_buf.len()
         );
-        let _ = util::write_all(stream, &alert_buf).await;
+        let _ = write_all(stream, &alert_buf).await;
         let _ = stream.flush().await;
     }
 }

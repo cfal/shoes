@@ -8,6 +8,7 @@ use super::client::ClientConfig;
 use super::rules::RuleConfig;
 use super::selection::ConfigSelection;
 use super::server::ServerConfig;
+use super::tun::TunConfig;
 
 /// A named group of client proxies.
 ///
@@ -148,6 +149,9 @@ impl Serialize for NamedPem {
 #[allow(clippy::large_enum_variant)]
 pub enum Config {
     Server(ServerConfig),
+    /// TUN device server - accepts IP packets from a TUN device.
+    /// This is separate from Server because TUN doesn't use bind_location or transport.
+    TunServer(TunConfig),
     ClientConfigGroup(ClientConfigGroup),
     RuleConfigGroup(RuleConfigGroup),
     NamedPem(NamedPem),
@@ -176,6 +180,13 @@ impl<'de> serde::de::Deserialize<'de> for Config {
         let has_path_field = map.contains_key(Value::String("path".to_string()));
         let has_pem = map.contains_key(Value::String("pem".to_string()));
 
+        // Check if this is a TUN config
+        // TUN configs have 'device_name' (Linux) or 'device_fd' (iOS/Android)
+        // These fields are unique to TUN and don't appear in other config types
+        let has_device_name = map.contains_key(Value::String("device_name".to_string()));
+        let has_device_fd = map.contains_key(Value::String("device_fd".to_string()));
+        let is_tun_config = has_device_name || has_device_fd;
+
         // Try to determine which variant based on fields
         if has_pem {
             // NamedPem (pem field is unique to NamedPem)
@@ -192,6 +203,11 @@ impl<'de> serde::de::Deserialize<'de> for Config {
             serde_yaml::from_value(value)
                 .map(Config::RuleConfigGroup)
                 .map_err(|e| Error::custom(format!("invalid rule config group: {e}")))
+        } else if is_tun_config {
+            // TunConfig - identified by having 'name' or 'raw_fd' without 'protocol' wrapper
+            serde_yaml::from_value(value)
+                .map(Config::TunServer)
+                .map_err(|e| Error::custom(format!("invalid TUN config: {e}")))
         } else if has_address || has_path_field {
             // ServerConfig - its custom deserializer validates unknown fields
             serde_yaml::from_value(value)
@@ -221,6 +237,7 @@ impl serde::ser::Serialize for Config {
     {
         match self {
             Config::Server(server) => server.serialize(serializer),
+            Config::TunServer(tun) => tun.serialize(serializer),
             Config::ClientConfigGroup(group) => group.serialize(serializer),
             Config::RuleConfigGroup(group) => group.serialize(serializer),
             Config::NamedPem(pem) => pem.serialize(serializer),

@@ -1,6 +1,6 @@
 use std::io::Cursor;
 
-#[inline(always)]
+#[inline]
 pub fn feed_rustls_server_connection(
     connection: &mut rustls::ServerConnection,
     data: &[u8],
@@ -29,7 +29,7 @@ pub fn feed_rustls_server_connection(
     Ok(())
 }
 
-#[inline(always)]
+#[inline]
 pub fn feed_rustls_client_connection(
     connection: &mut rustls::ClientConnection,
     data: &[u8],

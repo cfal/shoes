@@ -28,7 +28,6 @@ pub fn hkdf_expand(
     info: &[u8],
     length: usize,
 ) -> Result<Vec<u8>> {
-    // Get hash length from the algorithm's digest
     let hash_len = hmac_algorithm.digest_algorithm().output_len();
     let n = length.div_ceil(hash_len); // Number of iterations
 
@@ -107,7 +106,6 @@ fn hkdf_expand_label_with_algorithm(
 
     log::debug!("HKDF_LABEL_BYTES: {:02x?}", hkdf_label);
 
-    // Use HKDF expand with the specified algorithm
     hkdf_expand(hmac_algorithm, secret, &hkdf_label, length)
 }
 
@@ -167,8 +165,8 @@ pub fn derive_traffic_keys(
     let iv =
         hkdf_expand_label_with_algorithm(hmac_algorithm, traffic_secret, b"iv", b"", iv_length)?;
 
-    log::info!("TRAFFIC_KEY_DERIVE: key={:02x?}", key);
-    log::info!("TRAFFIC_KEY_DERIVE: iv={:02x?}", iv);
+    log::debug!("TRAFFIC_KEY_DERIVE: key={:02x?}", key);
+    log::debug!("TRAFFIC_KEY_DERIVE: iv={:02x?}", iv);
 
     Ok((key, iv))
 }
@@ -315,7 +313,7 @@ pub fn derive_application_secrets(
         "TLS13 DEBUG: Deriving application secrets (Phase 2) with {:?}...",
         cipher_suite
     );
-    log::info!(
+    log::debug!(
         "  handshake_hash (with Finished): {:?}",
         &handshake_hash[..8]
     );
@@ -332,7 +330,7 @@ pub fn derive_application_secrets(
         "  client_app_traffic: {:?}",
         &client_application_traffic_secret[..8]
     );
-    log::info!(
+    log::debug!(
         "DERIVE_APP_SECRETS: ClientAppSecret(full)={:02x?}",
         client_application_traffic_secret
     );
@@ -349,7 +347,7 @@ pub fn derive_application_secrets(
         "  server_app_traffic: {:?}",
         &server_application_traffic_secret[..8]
     );
-    log::info!(
+    log::debug!(
         "DERIVE_APP_SECRETS: ServerAppSecret(full)={:02x?}",
         server_application_traffic_secret
     );

@@ -118,9 +118,9 @@ pub fn construct_encrypted_extensions() -> Result<Vec<u8>> {
 /// Construct Certificate message with HMAC-signed Ed25519 certificate
 ///
 /// # Arguments
-/// * `cert_der` - DER-encoded certificate (with HMAC signature)
-pub fn construct_certificate(cert_der: &[u8]) -> Result<Vec<u8>> {
-    let mut certificate = Vec::new();
+/// * `cert` - Certificate from rcgen (takes ownership to avoid allocation)
+pub fn construct_certificate(cert: rcgen::Certificate) -> Result<Vec<u8>> {
+    let cert_der = cert.der();
 
     // Certificate structure:
     // - handshake_type (1 byte) = 11
@@ -131,44 +131,48 @@ pub fn construct_certificate(cert_der: &[u8]) -> Result<Vec<u8>> {
     //     - cert_data (3 bytes length + DER)
     //     - extensions (2 bytes length, usually empty)
 
-    let mut payload = Vec::new();
+    // Pre-calculate sizes to allocate exact capacity
+    // cert_list = 3 (len) + cert_der.len() + 2 (extensions)
+    let cert_list_len = 3 + cert_der.len() + 2;
+    // payload = 1 (context) + 3 (list len) + cert_list_len
+    let payload_len = 1 + 3 + cert_list_len;
+    // total = 1 (type) + 3 (payload len) + payload_len
+    let total_len = 1 + 3 + payload_len;
 
-    // Certificate request context (empty for server certificates)
-    payload.push(0x00);
-
-    // Certificate list
-    let mut cert_list = Vec::new();
-
-    // Certificate entry
-    // Cert data length (3 bytes)
-    cert_list.extend_from_slice(&[
-        ((cert_der.len() >> 16) & 0xff) as u8,
-        ((cert_der.len() >> 8) & 0xff) as u8,
-        (cert_der.len() & 0xff) as u8,
-    ]);
-    cert_list.extend_from_slice(cert_der);
-
-    // Extensions (empty)
-    cert_list.extend_from_slice(&[0x00, 0x00]);
-
-    // Certificate list length (3 bytes)
-    payload.extend_from_slice(&[
-        ((cert_list.len() >> 16) & 0xff) as u8,
-        ((cert_list.len() >> 8) & 0xff) as u8,
-        (cert_list.len() & 0xff) as u8,
-    ]);
-    payload.extend_from_slice(&cert_list);
+    let mut certificate = Vec::with_capacity(total_len);
 
     // Handshake header
     certificate.push(HANDSHAKE_TYPE_CERTIFICATE);
 
     // Payload length (3 bytes)
     certificate.extend_from_slice(&[
-        ((payload.len() >> 16) & 0xff) as u8,
-        ((payload.len() >> 8) & 0xff) as u8,
-        (payload.len() & 0xff) as u8,
+        ((payload_len >> 16) & 0xff) as u8,
+        ((payload_len >> 8) & 0xff) as u8,
+        (payload_len & 0xff) as u8,
     ]);
-    certificate.extend_from_slice(&payload);
+
+    // Certificate request context (empty for server certificates)
+    certificate.push(0x00);
+
+    // Certificate list length (3 bytes)
+    certificate.extend_from_slice(&[
+        ((cert_list_len >> 16) & 0xff) as u8,
+        ((cert_list_len >> 8) & 0xff) as u8,
+        (cert_list_len & 0xff) as u8,
+    ]);
+
+    // Certificate entry - cert data length (3 bytes)
+    certificate.extend_from_slice(&[
+        ((cert_der.len() >> 16) & 0xff) as u8,
+        ((cert_der.len() >> 8) & 0xff) as u8,
+        (cert_der.len() & 0xff) as u8,
+    ]);
+
+    // Certificate DER data
+    certificate.extend_from_slice(cert_der);
+
+    // Extensions (empty)
+    certificate.extend_from_slice(&[0x00, 0x00]);
 
     Ok(certificate)
 }
@@ -252,6 +256,9 @@ pub fn construct_finished(verify_data: &[u8]) -> Result<Vec<u8>> {
     Ok(finished)
 }
 
+/// Default ALPN protocols for REALITY client (matches browser fingerprints)
+pub const DEFAULT_ALPN_PROTOCOLS: &[&str] = &["h2", "http/1.1"];
+
 /// Construct TLS 1.3 ClientHello message
 ///
 /// Returns handshake message bytes (without record header)
@@ -262,12 +269,14 @@ pub fn construct_finished(verify_data: &[u8]) -> Result<Vec<u8>> {
 /// * `client_public_key` - X25519 public key bytes
 /// * `server_name` - SNI hostname
 /// * `cipher_suites` - Cipher suite IDs to offer (e.g., &[0x1301, 0x1302, 0x1303])
+/// * `alpn_protocols` - ALPN protocols to offer (e.g., &["h2", "http/1.1"])
 pub fn construct_client_hello(
     client_random: &[u8; 32],
     session_id: &[u8; 32],
     client_public_key: &[u8],
     server_name: &str,
     cipher_suites: &[u16],
+    alpn_protocols: &[&str],
 ) -> Result<Vec<u8>> {
     let mut hello = Vec::with_capacity(512);
 
@@ -304,7 +313,7 @@ pub fn construct_client_hello(
 
     let mut extensions = Vec::new();
 
-    // 1. server_name extension (type 0)
+    // server_name extension (type 0)
     {
         let server_name_bytes = server_name.as_bytes();
         let server_name_len = server_name_bytes.len();
@@ -318,7 +327,7 @@ pub fn construct_client_hello(
         extensions.extend_from_slice(server_name_bytes); // Server name
     }
 
-    // 2. supported_versions extension (type 43)
+    // supported_versions extension (type 43)
     {
         extensions.extend_from_slice(&[0x00, 0x2b]); // Extension type: supported_versions
         extensions.extend_from_slice(&[0x00, 0x03]); // Extension length: 3
@@ -326,7 +335,7 @@ pub fn construct_client_hello(
         extensions.extend_from_slice(&[0x03, 0x04]); // TLS 1.3
     }
 
-    // 3. supported_groups extension (type 10)
+    // supported_groups extension (type 10)
     {
         extensions.extend_from_slice(&[0x00, 0x0a]); // Extension type: supported_groups
         extensions.extend_from_slice(&[0x00, 0x04]); // Extension length: 4
@@ -334,7 +343,7 @@ pub fn construct_client_hello(
         extensions.extend_from_slice(&[0x00, 0x1d]); // x25519
     }
 
-    // 4. key_share extension (type 51)
+    // key_share extension (type 51)
     {
         extensions.extend_from_slice(&[0x00, 0x33]); // Extension type: key_share
         let key_share_len = 2 + 4 + client_public_key.len();
@@ -346,12 +355,36 @@ pub fn construct_client_hello(
         extensions.extend_from_slice(client_public_key); // Public key
     }
 
-    // 5. signature_algorithms extension (type 13)
+    // signature_algorithms extension (type 13)
     {
         extensions.extend_from_slice(&[0x00, 0x0d]); // Extension type: signature_algorithms
         extensions.extend_from_slice(&[0x00, 0x04]); // Extension length: 4
         extensions.extend_from_slice(&[0x00, 0x02]); // Signature algorithms length: 2
         extensions.extend_from_slice(&[0x08, 0x07]); // ed25519
+    }
+
+    // ALPN extension (type 16)
+    if !alpn_protocols.is_empty() {
+        extensions.extend_from_slice(&[0x00, 0x10]); // Extension type: ALPN (16)
+
+        // Calculate total length of protocol list
+        let protocols_list_len: usize = alpn_protocols
+            .iter()
+            .map(|p| 1 + p.len()) // 1 byte length prefix + protocol bytes
+            .sum();
+
+        // Extension length = 2 (list length field) + protocols_list_len
+        let ext_len = 2 + protocols_list_len;
+        extensions.extend_from_slice(&(ext_len as u16).to_be_bytes());
+
+        // Protocol list length
+        extensions.extend_from_slice(&(protocols_list_len as u16).to_be_bytes());
+
+        // Each protocol: 1 byte length + protocol string
+        for protocol in alpn_protocols {
+            extensions.push(protocol.len() as u8);
+            extensions.extend_from_slice(protocol.as_bytes());
+        }
     }
 
     // Write extensions length
@@ -412,8 +445,10 @@ mod tests {
 
     #[test]
     fn test_construct_certificate() {
-        let cert_der = vec![0xBBu8; 100];
-        let result = construct_certificate(&cert_der);
+        use crate::reality::reality_certificate::generate_hmac_certificate;
+        let auth_key = [0x42u8; 32];
+        let (cert, _) = generate_hmac_certificate(&auth_key, "test.example.com").unwrap();
+        let result = construct_certificate(cert);
         assert!(result.is_ok());
         let msg = result.unwrap();
         assert_eq!(msg[0], HANDSHAKE_TYPE_CERTIFICATE);

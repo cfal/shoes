@@ -1,12 +1,6 @@
-// Common constants and helpers shared between REALITY client and server implementations
-//
-// This module provides:
-// - TLS constants (content types, alert codes, version bytes, handshake types)
-// - Close notify alert construction
+// TLS constants and utilities for REALITY client/server implementations
 
-use super::reality_aead::encrypt_tls13_record;
-use super::reality_cipher_suite::CipherSuite;
-use std::io;
+use std::io::{self, Error, ErrorKind};
 
 // TLS ContentType values
 pub const CONTENT_TYPE_CHANGE_CIPHER_SPEC: u8 = 0x14;
@@ -18,9 +12,7 @@ pub const CONTENT_TYPE_APPLICATION_DATA: u8 = 0x17;
 pub const ALERT_LEVEL_WARNING: u8 = 0x01;
 pub const ALERT_DESC_CLOSE_NOTIFY: u8 = 0x00;
 
-// TLS version bytes (used on wire for compatibility)
-// TLS 1.2 version bytes: 0x03, 0x03
-// Used in TLS 1.3 for compatibility (appears in record layer)
+// TLS 1.2 version bytes (0x03, 0x03) used in TLS 1.3 record layer for compatibility
 pub const VERSION_TLS_1_2_MAJOR: u8 = 0x03;
 pub const VERSION_TLS_1_2_MINOR: u8 = 0x03;
 
@@ -77,66 +69,176 @@ pub const CIPHERTEXT_READ_BUF_CAPACITY: usize = TLS_MAX_RECORD_SIZE * 2;
 /// Buffer capacity for plaintext read
 pub const PLAINTEXT_READ_BUF_CAPACITY: usize = TLS_MAX_RECORD_SIZE * 2;
 
-/// Increment a TLS 1.3 sequence number, checking for overflow.
+/// Buffer capacity for outgoing data (matches rustls DEFAULT_BUFFER_LIMIT)
 ///
-/// Per RFC 8446 Section 5.3: "Sequence numbers MUST NOT wrap."
-/// This function returns an error if incrementing would cause wrap-around.
-#[inline(always)]
-pub fn increment_seq(seq: &mut u64) -> io::Result<()> {
-    if *seq == u64::MAX {
-        return Err(io::Error::other(
-            "TLS sequence number exhausted (RFC 8446 Section 5.3)",
+/// This controls the size of both the plaintext write buffer (pre-encryption)
+/// and ciphertext write buffer (post-encryption). rustls uses 64KB for both.
+pub const OUTGOING_BUFFER_LIMIT: usize = 64 * 1024;
+
+/// Strip TLS 1.3 content type trailer from decrypted plaintext slice.
+///
+/// TLS 1.3 format: content || type_byte
+/// Returns (content_type, valid_content_length) without modifying the slice.
+///
+/// This is the zero-allocation version for use with in-place decryption.
+/// NOTE: Does NOT strip padding zeros - our implementation doesn't add padding.
+#[inline]
+pub fn strip_content_type_slice(plaintext: &[u8]) -> io::Result<(u8, usize)> {
+    if plaintext.is_empty() {
+        return Err(Error::new(ErrorKind::InvalidData, "Empty plaintext"));
+    }
+
+    // No padding in our implementation
+    let content_type = plaintext[plaintext.len() - 1];
+
+    if content_type != CONTENT_TYPE_HANDSHAKE
+        && content_type != CONTENT_TYPE_APPLICATION_DATA
+        && content_type != CONTENT_TYPE_ALERT
+    {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!("Invalid content type: 0x{:02x}", content_type),
         ));
     }
-    *seq += 1;
-    Ok(())
+
+    Ok((content_type, plaintext.len() - 1))
 }
 
-/// Build an encrypted close_notify alert for TLS 1.3
+/// Strip TLS 1.3 content type trailer from decrypted plaintext.
 ///
-/// In TLS 1.3, alerts must be encrypted like application data.
-pub fn build_close_notify_alert(
-    cipher_suite: CipherSuite,
-    key: &[u8],
-    iv: &[u8],
-    seq_num: u64,
-) -> io::Result<Vec<u8>> {
-    // Build alert message: level(1) + description(0) + ContentType
-    let alert_with_type = vec![
-        ALERT_LEVEL_WARNING,
-        ALERT_DESC_CLOSE_NOTIFY,
-        CONTENT_TYPE_ALERT, // ContentType byte for TLS 1.3
-    ];
+/// TLS 1.3 format: content || type_byte
+/// Returns the actual content type and modifies plaintext to contain only content.
+///
+/// NOTE: This function does NOT strip padding zeros. Our REALITY implementation
+/// does not add padding, so stripping zeros could corrupt data that legitimately
+/// ends with zero bytes. Use `strip_content_type_with_padding` for messages from
+/// external implementations that may use padding.
+///
+/// Only used by tests - the hot path uses `strip_content_type_slice` for zero-allocation.
+#[cfg(test)]
+pub fn strip_content_type(plaintext: &mut Vec<u8>) -> io::Result<u8> {
+    let (content_type, valid_len) = strip_content_type_slice(plaintext)?;
+    plaintext.truncate(valid_len);
+    Ok(content_type)
+}
 
-    // Build TLS header with correct ciphertext length
-    let ciphertext_len = (alert_with_type.len() + 16) as u16; // plaintext + tag
-    let mut tls_header = [
-        CONTENT_TYPE_APPLICATION_DATA,
-        VERSION_TLS_1_2_MAJOR,
-        VERSION_TLS_1_2_MINOR,
-        0x00,
-        0x00, // Length will be set
-    ];
-    tls_header[3..5].copy_from_slice(&ciphertext_len.to_be_bytes());
+/// Strip TLS 1.3 content type trailer and padding from decrypted plaintext.
+///
+/// TLS 1.3 format: content || type_byte || padding_zeros
+/// Returns the actual content type and modifies plaintext to contain only content.
+///
+/// Use this for messages from external TLS implementations (e.g., sing-box) that
+/// may add optional padding per RFC 8446 Section 5.4.
+pub fn strip_content_type_with_padding(plaintext: &mut Vec<u8>) -> io::Result<u8> {
+    if plaintext.is_empty() {
+        return Err(Error::new(ErrorKind::InvalidData, "Empty plaintext"));
+    }
 
-    // Encrypt the alert
-    let ciphertext = encrypt_tls13_record(
-        cipher_suite,
-        key,
-        iv,
-        seq_num,
-        &alert_with_type,
-        &tls_header,
-    )?;
+    // Remove trailing zeros (padding) per RFC 8446 Section 5.4
+    while !plaintext.is_empty() && *plaintext.last().unwrap() == 0 {
+        plaintext.pop();
+    }
 
-    // Build complete TLS record
-    let mut record = Vec::with_capacity(5 + ciphertext.len());
-    record.push(CONTENT_TYPE_APPLICATION_DATA);
-    record.push(VERSION_TLS_1_2_MAJOR);
-    record.push(VERSION_TLS_1_2_MINOR);
-    record.push(((ciphertext.len() >> 8) & 0xff) as u8);
-    record.push((ciphertext.len() & 0xff) as u8);
-    record.extend_from_slice(&ciphertext);
+    if plaintext.is_empty() {
+        return Err(Error::new(ErrorKind::InvalidData, "Plaintext is all zeros"));
+    }
 
-    Ok(record)
+    let content_type = plaintext.pop().unwrap();
+
+    if content_type != CONTENT_TYPE_HANDSHAKE
+        && content_type != CONTENT_TYPE_APPLICATION_DATA
+        && content_type != CONTENT_TYPE_ALERT
+    {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!("Invalid content type: 0x{:02x}", content_type),
+        ));
+    }
+
+    Ok(content_type)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_strip_content_type_app_data() {
+        let mut plaintext = vec![0x01, 0x02, 0x03, CONTENT_TYPE_APPLICATION_DATA];
+        let ct = strip_content_type(&mut plaintext).unwrap();
+        assert_eq!(ct, CONTENT_TYPE_APPLICATION_DATA);
+        assert_eq!(plaintext, vec![0x01, 0x02, 0x03]);
+    }
+
+    #[test]
+    fn test_strip_content_type_handshake() {
+        let mut plaintext = vec![0xAA, 0xBB, CONTENT_TYPE_HANDSHAKE];
+        let ct = strip_content_type(&mut plaintext).unwrap();
+        assert_eq!(ct, CONTENT_TYPE_HANDSHAKE);
+        assert_eq!(plaintext, vec![0xAA, 0xBB]);
+    }
+
+    #[test]
+    fn test_strip_content_type_alert() {
+        let mut plaintext = vec![0x01, 0x00, CONTENT_TYPE_ALERT];
+        let ct = strip_content_type(&mut plaintext).unwrap();
+        assert_eq!(ct, CONTENT_TYPE_ALERT);
+        assert_eq!(plaintext, vec![0x01, 0x00]);
+    }
+
+    #[test]
+    fn test_strip_content_type_preserves_zeros() {
+        // Trailing zeros in data should be preserved (not treated as padding)
+        let mut plaintext = vec![0x01, 0x00, 0x00, CONTENT_TYPE_APPLICATION_DATA];
+        let ct = strip_content_type(&mut plaintext).unwrap();
+        assert_eq!(ct, CONTENT_TYPE_APPLICATION_DATA);
+        assert_eq!(plaintext, vec![0x01, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn test_strip_content_type_empty() {
+        let mut plaintext = Vec::new();
+        assert!(strip_content_type(&mut plaintext).is_err());
+    }
+
+    #[test]
+    fn test_strip_content_type_invalid() {
+        let mut plaintext = vec![0x01, 0xFF]; // 0xFF is invalid
+        assert!(strip_content_type(&mut plaintext).is_err());
+    }
+
+    #[test]
+    fn test_strip_with_padding_no_padding() {
+        let mut plaintext = vec![0x01, 0x02, CONTENT_TYPE_APPLICATION_DATA];
+        let ct = strip_content_type_with_padding(&mut plaintext).unwrap();
+        assert_eq!(ct, CONTENT_TYPE_APPLICATION_DATA);
+        assert_eq!(plaintext, vec![0x01, 0x02]);
+    }
+
+    #[test]
+    fn test_strip_with_padding_strips_zeros() {
+        // TLS 1.3 format: content || type || padding
+        let mut plaintext = vec![0x01, 0x02, CONTENT_TYPE_HANDSHAKE, 0x00, 0x00, 0x00];
+        let ct = strip_content_type_with_padding(&mut plaintext).unwrap();
+        assert_eq!(ct, CONTENT_TYPE_HANDSHAKE);
+        assert_eq!(plaintext, vec![0x01, 0x02]);
+    }
+
+    #[test]
+    fn test_strip_with_padding_empty() {
+        let mut plaintext = Vec::new();
+        assert!(strip_content_type_with_padding(&mut plaintext).is_err());
+    }
+
+    #[test]
+    fn test_strip_with_padding_all_zeros() {
+        let mut plaintext = vec![0x00, 0x00, 0x00];
+        assert!(strip_content_type_with_padding(&mut plaintext).is_err());
+    }
+
+    #[test]
+    fn test_strip_with_padding_invalid_type() {
+        let mut plaintext = vec![0x01, 0xFF, 0x00]; // 0xFF with padding
+        assert!(strip_content_type_with_padding(&mut plaintext).is_err());
+    }
 }

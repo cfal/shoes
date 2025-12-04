@@ -19,7 +19,7 @@ use std::io;
 
 use super::tls_deframer::TlsDeframer;
 use super::tls_handshake_util::{
-    MIN_TLS_HANDSHAKE_PATTERN_LEN, find_tls_handshake_start, get_partial_tls_pattern_suffix_len,
+    MIN_TLS_HANDSHAKE_PATTERN_LEN, find_potential_tls_suffix_len, find_tls_handshake_start,
 };
 
 /// Result of attempting to extract data from the fuzzy deframer
@@ -105,73 +105,69 @@ impl FuzzyTlsDeframer {
                     }
 
                     // Try to find complete TLS pattern (need at least 6 bytes)
-                    if self.search_buffer.len() >= MIN_TLS_HANDSHAKE_PATTERN_LEN {
-                        if let Some(offset) = find_tls_handshake_start(&self.search_buffer) {
-                            // Found complete pattern!
+                    if self.search_buffer.len() >= MIN_TLS_HANDSHAKE_PATTERN_LEN
+                        && let Some(offset) = find_tls_handshake_start(&self.search_buffer)
+                    {
+                        // Found complete pattern!
 
-                            if offset > 0 {
-                                // There's a prefix before the TLS pattern
-                                // Extract it and return as UnknownPrefix
-                                let prefix = self.search_buffer.split_to(offset).freeze();
-                                self.total_prefix_bytes += prefix.len();
+                        if offset > 0 {
+                            // There's a prefix before the TLS pattern
+                            // Extract it and return as UnknownPrefix
+                            let prefix = self.search_buffer.split_to(offset).freeze();
+                            self.total_prefix_bytes += prefix.len();
 
-                                // Feed remaining data (TLS) to inner deframer
-                                self.inner.feed(&self.search_buffer);
-                                self.search_buffer.clear();
+                            // Feed remaining data (TLS) to inner deframer
+                            self.inner.feed(&self.search_buffer);
+                            self.search_buffer.clear();
 
-                                // Transition to Deframing state
-                                self.state = FuzzyState::Deframing;
+                            // Transition to Deframing state
+                            self.state = FuzzyState::Deframing;
 
-                                log::debug!(
-                                    "FuzzyTlsDeframer: Found TLS pattern after {} byte prefix (total {} bytes discarded), transitioned to Deframing",
-                                    prefix.len(),
-                                    self.total_prefix_bytes
-                                );
+                            log::debug!(
+                                "FuzzyTlsDeframer: Found TLS pattern after {} byte prefix (total {} bytes discarded), transitioned to Deframing",
+                                prefix.len(),
+                                self.total_prefix_bytes
+                            );
 
-                                return Ok(DeframeResult::UnknownPrefix(prefix));
-                            } else {
-                                // offset == 0, pattern at start, no prefix
-                                self.inner.feed(&self.search_buffer);
-                                self.search_buffer.clear();
-                                self.state = FuzzyState::Deframing;
-
-                                log::debug!(
-                                    "FuzzyTlsDeframer: Found TLS pattern at offset 0 (total {} bytes discarded), transitioned to Deframing",
-                                    self.total_prefix_bytes
-                                );
-
-                                // Continue loop to try extracting a record from inner
-                                continue;
-                            }
+                            return Ok(DeframeResult::UnknownPrefix(prefix));
                         } else {
-                            // No complete pattern found, but we have enough bytes to check
-                            // Check if we can discard some prefix bytes
-                            let suffix_len =
-                                get_partial_tls_pattern_suffix_len(&self.search_buffer);
+                            // offset == 0, pattern at start, no prefix
+                            self.inner.feed(&self.search_buffer);
+                            self.search_buffer.clear();
+                            self.state = FuzzyState::Deframing;
 
-                            // Only discard if suffix is shorter than buffer
-                            // This means we have definite non-pattern bytes at the start
-                            if suffix_len < self.search_buffer.len() {
-                                let prefix_len = self.search_buffer.len() - suffix_len;
-                                let prefix = self.search_buffer.split_to(prefix_len).freeze();
-                                self.total_prefix_bytes += prefix.len();
+                            log::debug!(
+                                "FuzzyTlsDeframer: Found TLS pattern at offset 0 (total {} bytes discarded), transitioned to Deframing",
+                                self.total_prefix_bytes
+                            );
 
-                                log::debug!(
-                                    "FuzzyTlsDeframer: Returning {} byte UnknownPrefix (total {} bytes discarded, kept {} suffix bytes)",
-                                    prefix.len(),
-                                    self.total_prefix_bytes,
-                                    suffix_len
-                                );
-
-                                return Ok(DeframeResult::UnknownPrefix(prefix));
-                            }
+                            // Continue loop to try extracting a record from inner
+                            continue;
                         }
                     }
 
-                    // Either:
-                    // - Buffer too small (< 6 bytes) - need more data to check for complete pattern
-                    // - Buffer >= 6, no complete pattern, entire buffer might be partial pattern
-                    // Need more data in all cases
+                    // Check if we can discard some prefix bytes that definitely aren't TLS.
+                    // This works for both small (<6) and large (>=6) buffers.
+                    let suffix_len = find_potential_tls_suffix_len(&self.search_buffer);
+
+                    // Only discard if suffix is shorter than buffer
+                    // This means we have definite non-pattern bytes at the start
+                    if suffix_len < self.search_buffer.len() {
+                        let prefix_len = self.search_buffer.len() - suffix_len;
+                        let prefix = self.search_buffer.split_to(prefix_len).freeze();
+                        self.total_prefix_bytes += prefix.len();
+
+                        log::debug!(
+                            "FuzzyTlsDeframer: Returning {} byte UnknownPrefix (total {} bytes discarded, kept {} suffix bytes)",
+                            prefix.len(),
+                            self.total_prefix_bytes,
+                            suffix_len
+                        );
+
+                        return Ok(DeframeResult::UnknownPrefix(prefix));
+                    }
+
+                    // Buffer might be a valid TLS prefix, need more data
                     return Ok(DeframeResult::NeedData);
                 }
                 FuzzyState::Deframing => {
@@ -295,19 +291,21 @@ mod tests {
     }
 
     #[test]
-    fn test_small_prefix_not_returned_immediately() {
+    fn test_small_non_tls_prefix_returned_immediately() {
         let mut deframer = FuzzyTlsDeframer::new();
 
-        // Small prefix (3 bytes) that doesn't match any partial pattern
+        // Small prefix (3 bytes) that cannot be TLS (doesn't start with 0x16)
         deframer.feed(&[0x00, 0x01, 0x02]);
 
-        // Should wait for more data (buffer <= MAX_PARTIAL_SUFFIX_LEN)
+        // Should return as UnknownPrefix since it can never be TLS
         match deframer.next_record().unwrap() {
-            DeframeResult::NeedData => {}
-            other => panic!("Expected IncompleteRecord, got {:?}", other),
+            DeframeResult::UnknownPrefix(prefix) => {
+                assert_eq!(prefix.as_ref(), &[0x00, 0x01, 0x02]);
+            }
+            other => panic!("Expected UnknownPrefix, got {:?}", other),
         }
 
-        assert_eq!(deframer.pending_bytes(), 3);
+        assert_eq!(deframer.pending_bytes(), 0);
     }
 
     #[test]
@@ -415,24 +413,30 @@ mod tests {
         let mut deframer = FuzzyTlsDeframer::new();
 
         // Feed prefix + partial pattern in first call
+        // [0x00, 0x01, 0x02] is non-TLS, [0x16, 0x03] is valid TLS prefix
         deframer.feed(&[0x00, 0x01, 0x02, 0x16, 0x03]);
 
-        // Buffer too small, wait for more
+        // Should return the non-TLS prefix immediately, keeping [0x16, 0x03]
+        match deframer.next_record().unwrap() {
+            DeframeResult::UnknownPrefix(prefix) => {
+                assert_eq!(prefix.as_ref(), &[0x00, 0x01, 0x02]);
+            }
+            other => panic!("Expected UnknownPrefix, got {:?}", other),
+        }
+
+        // Should have [0x16, 0x03] buffered
+        assert_eq!(deframer.pending_bytes(), 2);
+
+        // Now need more data to complete the pattern
         match deframer.next_record().unwrap() {
             DeframeResult::NeedData => {}
-            other => panic!("Expected IncompleteRecord, got {:?}", other),
+            other => panic!("Expected NeedData, got {:?}", other),
         }
 
         // Feed rest of pattern + record
         deframer.feed(&[0x01, 0x00, 0x05, 0x01, b'H', b'e', b'l', b'l', b'o']);
 
-        // Now should get prefix
-        match deframer.next_record().unwrap() {
-            DeframeResult::UnknownPrefix(prefix) => assert_eq!(prefix.len(), 3),
-            other => panic!("Expected UnknownPrefix, got {:?}", other),
-        }
-
-        // Then the record
+        // Should get the complete TLS record
         match deframer.next_record().unwrap() {
             DeframeResult::TlsRecord(_) => {}
             other => panic!("Expected TlsRecord, got {:?}", other),
@@ -527,5 +531,107 @@ mod tests {
         }
 
         assert_eq!(deframer.state, FuzzyState::Searching);
+    }
+
+    #[test]
+    fn test_small_non_tls_data_returns_unknown_prefix() {
+        // 5 bytes of clearly non-TLS data should return UnknownPrefix, not NeedData
+        let mut deframer = FuzzyTlsDeframer::new();
+
+        // HTTP chunked terminator: "0\r\n\r\n" - clearly not TLS (starts with 0x30, not 0x16)
+        let chunked_terminator: &[u8] = &[0x30, 0x0d, 0x0a, 0x0d, 0x0a];
+        deframer.feed(chunked_terminator);
+
+        // Should return UnknownPrefix for all 5 bytes (no valid TLS suffix)
+        match deframer.next_record().unwrap() {
+            DeframeResult::UnknownPrefix(prefix) => {
+                assert_eq!(prefix.len(), 5);
+            }
+            other => panic!("Expected UnknownPrefix, got {:?}", other),
+        }
+
+        // Buffer should be empty now
+        assert_eq!(deframer.pending_bytes(), 0);
+    }
+
+    #[test]
+    fn test_small_data_with_tls_suffix_keeps_suffix() {
+        // Data ending with 0x16 should keep that byte as potential TLS start
+        let mut deframer = FuzzyTlsDeframer::new();
+
+        // [0x0a, 0x0b, 0x16] - last byte could be TLS start
+        deframer.feed(&[0x0a, 0x0b, 0x16]);
+
+        // Should return UnknownPrefix for first 2 bytes, keep 0x16
+        match deframer.next_record().unwrap() {
+            DeframeResult::UnknownPrefix(prefix) => {
+                assert_eq!(prefix.as_ref(), &[0x0a, 0x0b]);
+            }
+            other => panic!("Expected UnknownPrefix, got {:?}", other),
+        }
+
+        // Should have 1 byte (0x16) still buffered
+        assert_eq!(deframer.pending_bytes(), 1);
+        assert_eq!(deframer.remaining_data(), &[0x16]);
+    }
+
+    #[test]
+    fn test_small_valid_tls_prefix_returns_need_data() {
+        // A valid TLS prefix should return NeedData
+        let mut deframer = FuzzyTlsDeframer::new();
+
+        // [0x16, 0x03] - valid TLS prefix, need more data
+        deframer.feed(&[0x16, 0x03]);
+
+        match deframer.next_record().unwrap() {
+            DeframeResult::NeedData => {}
+            other => panic!("Expected NeedData, got {:?}", other),
+        }
+
+        // All data should still be buffered
+        assert_eq!(deframer.pending_bytes(), 2);
+    }
+
+    #[test]
+    fn test_small_invalid_tls_prefix_returns_unknown() {
+        // [0x16, 0x04] - starts with 0x16 but 0x04 is invalid major version
+        let mut deframer = FuzzyTlsDeframer::new();
+
+        deframer.feed(&[0x16, 0x04]);
+
+        // 0x16 alone could be TLS, but [0x16, 0x04] cannot
+        // Should return 0x16 as unknown and... wait, no.
+        // Actually [0x16] alone IS a valid prefix. The issue is [0x16, 0x04].
+        // After seeing 0x04, we know [0x16, 0x04] is not TLS.
+        // But we should check if any suffix could be TLS.
+        // [0x04] alone is not a valid TLS prefix (doesn't start with 0x16).
+        // So return both bytes as UnknownPrefix.
+        match deframer.next_record().unwrap() {
+            DeframeResult::UnknownPrefix(prefix) => {
+                assert_eq!(prefix.as_ref(), &[0x16, 0x04]);
+            }
+            other => panic!("Expected UnknownPrefix, got {:?}", other),
+        }
+
+        assert_eq!(deframer.pending_bytes(), 0);
+    }
+
+    #[test]
+    fn test_data_ending_with_valid_tls_prefix() {
+        // [0x00, 0x01, 0x16, 0x03, 0x03] - ends with valid TLS prefix
+        let mut deframer = FuzzyTlsDeframer::new();
+
+        deframer.feed(&[0x00, 0x01, 0x16, 0x03, 0x03]);
+
+        // Should return first 2 bytes as unknown, keep last 3 as potential TLS
+        match deframer.next_record().unwrap() {
+            DeframeResult::UnknownPrefix(prefix) => {
+                assert_eq!(prefix.as_ref(), &[0x00, 0x01]);
+            }
+            other => panic!("Expected UnknownPrefix, got {:?}", other),
+        }
+
+        assert_eq!(deframer.pending_bytes(), 3);
+        assert_eq!(deframer.remaining_data(), &[0x16, 0x03, 0x03]);
     }
 }

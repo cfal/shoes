@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -45,6 +46,34 @@ pub trait AsyncShutdownMessage {
         cx: &mut Context<'_>,
     ) -> Poll<std::io::Result<()>>;
 }
+
+/// Extension trait that provides an async `shutdown_message()` method for types
+/// implementing `AsyncShutdownMessage`. Similar to `AsyncWriteExt::shutdown()`.
+pub trait AsyncShutdownMessageExt: AsyncShutdownMessage {
+    /// Shuts down the message stream, signaling that no more messages will be sent.
+    fn shutdown_message(&mut self) -> ShutdownMessageFuture<'_, Self>
+    where
+        Self: Unpin,
+    {
+        ShutdownMessageFuture { stream: self }
+    }
+}
+
+/// Future returned by `AsyncShutdownMessageExt::shutdown_message()`.
+pub struct ShutdownMessageFuture<'a, T: ?Sized> {
+    stream: &'a mut T,
+}
+
+impl<T: AsyncShutdownMessage + Unpin + ?Sized> Future for ShutdownMessageFuture<'_, T> {
+    type Output = std::io::Result<()>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        Pin::new(&mut *self.stream).poll_shutdown_message(cx)
+    }
+}
+
+// Blanket implementation for all types that implement AsyncShutdownMessage
+impl<T: AsyncShutdownMessage + ?Sized> AsyncShutdownMessageExt for T {}
 
 pub trait AsyncReadTargetedMessage {
     fn poll_read_targeted_message(
@@ -141,7 +170,7 @@ impl AsyncShutdownMessage for UdpSocket {
     }
 }
 
-pub trait AsyncStream: AsyncRead + AsyncWrite + AsyncPing + Unpin + Send {}
+pub trait AsyncStream: AsyncRead + AsyncWrite + AsyncPing + Unpin + Send + Sync {}
 
 pub trait AsyncMessageStream:
     AsyncReadMessage

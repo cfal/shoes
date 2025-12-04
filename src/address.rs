@@ -94,7 +94,7 @@ impl NetLocation {
         Self { address, port }
     }
 
-    pub fn _is_unspecified(&self) -> bool {
+    pub fn is_unspecified(&self) -> bool {
         self == &Self::UNSPECIFIED
     }
 

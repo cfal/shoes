@@ -1,24 +1,27 @@
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use async_trait::async_trait;
 
 use crate::address::NetLocation;
 use crate::async_stream::AsyncStream;
-use crate::option_util::NoneOrOne;
-use crate::tcp_handler::{TcpClientHandler, TcpClientSetupResult};
-use crate::tcp_handler::{TcpServerHandler, TcpServerSetupResult};
+use crate::client_proxy_selector::ClientProxySelector;
+use crate::tcp::tcp_handler::{TcpClientHandler, TcpClientSetupResult};
+use crate::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult};
 
 #[derive(Debug)]
 pub struct PortForwardServerHandler {
     targets: Vec<NetLocation>,
     next_target_index: AtomicU32,
+    proxy_selector: Arc<ClientProxySelector>,
 }
 
 impl PortForwardServerHandler {
-    pub fn new(targets: Vec<NetLocation>) -> Self {
+    pub fn new(targets: Vec<NetLocation>, proxy_selector: Arc<ClientProxySelector>) -> Self {
         Self {
             targets,
             next_target_index: AtomicU32::new(0),
+            proxy_selector,
         }
     }
 }
@@ -42,7 +45,7 @@ impl TcpServerHandler for PortForwardServerHandler {
             need_initial_flush: true,
             connection_success_response: None,
             initial_remote_data: None,
-            override_proxy_provider: NoneOrOne::Unspecified,
+            proxy_selector: self.proxy_selector.clone(),
         })
     }
 }

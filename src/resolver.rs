@@ -60,6 +60,8 @@ pub async fn resolve_single_address(
     Ok(resolve_results[0])
 }
 
+// TODO: use this everywhere a Resolver is used
+// TODO: make it an LRU cache
 pub struct ResolverCache {
     resolver: Arc<dyn Resolver>,
     cache: FxHashMap<NetLocation, ResolveState>,

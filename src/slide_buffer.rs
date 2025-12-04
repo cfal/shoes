@@ -16,6 +16,8 @@
 
 use std::io::{BufRead, Read};
 
+use crate::util::allocate_vec;
+
 /// A fixed-capacity sliding buffer with zero-allocation read/write operations.
 ///
 /// This buffer maintains start and end offsets into a pre-allocated storage,
@@ -47,7 +49,7 @@ impl SlideBuffer {
     #[inline]
     pub fn new(capacity: usize) -> Self {
         Self {
-            data: vec![0u8; capacity].into_boxed_slice(),
+            data: allocate_vec(capacity).into_boxed_slice(),
             start: 0,
             end: 0,
         }
@@ -186,6 +188,15 @@ impl SlideBuffer {
             None
         }
     }
+
+    /// Get a mutable slice of the readable data for in-place modification.
+    ///
+    /// This allows callers to modify data in-place (e.g., for decryption)
+    /// without copying to a separate buffer.
+    #[inline]
+    pub fn slice_mut(&mut self, range: std::ops::Range<usize>) -> &mut [u8] {
+        &mut self.data[self.start + range.start..self.start + range.end]
+    }
 }
 
 impl Read for SlideBuffer {
@@ -211,7 +222,6 @@ impl BufRead for SlideBuffer {
     }
 }
 
-// Implement indexing for convenient access
 impl std::ops::Index<usize> for SlideBuffer {
     type Output = u8;
 
@@ -435,5 +445,25 @@ mod tests {
         buf.compact();
         assert_eq!(buf.as_slice(), b"world!!!");
         assert_eq!(buf.remaining_capacity(), 100 - 8);
+    }
+
+    #[test]
+    fn test_slice_mut() {
+        let mut buf = SlideBuffer::new(100);
+        buf.extend_from_slice(b"hello world");
+
+        // Modify middle portion
+        let slice = buf.slice_mut(6..11);
+        assert_eq!(slice, b"world");
+        slice[0] = b'W';
+        slice[4] = b'D';
+
+        assert_eq!(buf.as_slice(), b"hello WorlD");
+
+        // Test after consume
+        buf.consume(6);
+        let slice = buf.slice_mut(0..5);
+        slice.copy_from_slice(b"EARTH");
+        assert_eq!(buf.as_slice(), b"EARTH");
     }
 }

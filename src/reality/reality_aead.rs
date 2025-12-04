@@ -1,225 +1,194 @@
-// TLS 1.3 Encryption/Decryption Helpers
-//
-// AEAD encryption for TLS 1.3 records using aws-lc-rs
-// Supports AES-128-GCM, AES-256-GCM, and ChaCha20-Poly1305
+// TLS 1.3 AEAD encryption/decryption using aws-lc-rs.
+// Record framing is handled by reality_records.rs.
 
-use super::common::{
-    CONTENT_TYPE_ALERT, CONTENT_TYPE_APPLICATION_DATA, VERSION_TLS_1_2_MAJOR, VERSION_TLS_1_2_MINOR,
-};
-use super::reality_cipher_suite::CipherSuite;
 use aws_lc_rs::aead::{Aad, LessSafeKey, Nonce, UnboundKey};
-use std::io::{Error, ErrorKind, Result};
+use std::io::{self, Error, ErrorKind};
 
-/// Encrypt TLS 1.3 record using CipherSuite
+use super::common::strip_content_type_with_padding;
+use super::reality_cipher_suite::CipherSuite;
+
+/// AEAD key for TLS 1.3 encryption/decryption.
 ///
-/// # Arguments
-/// * `cipher_suite` - CipherSuite with AEAD algorithm
-/// * `key` - AEAD key (16 bytes for AES-128, 32 bytes for AES-256/ChaCha20)
-/// * `iv` - Base IV (12 bytes)
-/// * `sequence_number` - TLS record sequence number
-/// * `plaintext` - Plaintext data (including ContentType trailer)
-/// * `additional_data` - TLS record header for AEAD
-///
-/// # Returns
-/// Ciphertext with authentication tag appended
-pub fn encrypt_tls13_record(
-    cipher_suite: CipherSuite,
-    key: &[u8],
-    iv: &[u8],
-    sequence_number: u64,
-    plaintext: &[u8],
-    additional_data: &[u8],
-) -> Result<Vec<u8>> {
-    let algorithm = cipher_suite.algorithm();
-    let expected_key_len = cipher_suite.key_len();
+/// Wraps aws-lc-rs LessSafeKey and provides a cleaner API.
+/// Create once per connection direction and reuse for all records.
+pub struct AeadKey(LessSafeKey);
 
-    if key.len() != expected_key_len {
-        return Err(Error::new(
-            ErrorKind::InvalidInput,
-            format!(
-                "Invalid key length for {:?}: {} (expected {})",
-                cipher_suite,
-                key.len(),
-                expected_key_len
-            ),
-        ));
-    }
-    if iv.len() != 12 {
-        return Err(Error::new(
-            ErrorKind::InvalidInput,
-            format!("Invalid IV length: {} (expected 12)", iv.len()),
-        ));
+impl AeadKey {
+    /// Create a new AEAD key from raw key bytes.
+    pub fn new(cipher_suite: CipherSuite, key: &[u8]) -> io::Result<Self> {
+        let algorithm = cipher_suite.algorithm();
+        let expected_len = cipher_suite.key_len();
+
+        if key.len() != expected_len {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "Invalid key length for {:?}: {} (expected {})",
+                    cipher_suite,
+                    key.len(),
+                    expected_len
+                ),
+            ));
+        }
+
+        let unbound = UnboundKey::new(algorithm, key)
+            .map_err(|e| Error::new(ErrorKind::InvalidInput, format!("Invalid key: {:?}", e)))?;
+
+        Ok(Self(LessSafeKey::new(unbound)))
     }
 
-    // Construct nonce: IV XOR sequence_number
-    let mut nonce_bytes = [0u8; 12];
-    nonce_bytes.copy_from_slice(iv);
-
-    // XOR the last 8 bytes with the sequence number
-    let seq_bytes = sequence_number.to_be_bytes();
-    for i in 0..8 {
-        nonce_bytes[4 + i] ^= seq_bytes[i];
+    /// Encrypt in-place, appending 16-byte auth tag.
+    ///
+    /// The buffer is modified: plaintext -> ciphertext || tag
+    #[inline]
+    pub fn seal_in_place(
+        &self,
+        buf: &mut Vec<u8>,
+        iv: &[u8],
+        seq: u64,
+        aad: &[u8],
+    ) -> io::Result<()> {
+        let nonce = Self::make_nonce(iv, seq)?;
+        self.0
+            .seal_in_place_append_tag(nonce, Aad::from(aad), buf)
+            .map_err(|e| {
+                Error::new(
+                    ErrorKind::InvalidData,
+                    format!("Encryption failed: {:?}", e),
+                )
+            })
     }
 
-    // Create key and nonce for aws-lc-rs
-    let unbound_key = UnboundKey::new(algorithm, key)
-        .map_err(|e| Error::new(ErrorKind::InvalidInput, format!("Invalid key: {:?}", e)))?;
-    let sealing_key = LessSafeKey::new(unbound_key);
+    /// Encrypt with copy, returning new Vec containing ciphertext || tag.
+    ///
+    /// Use this for small buffers where allocation overhead doesn't matter.
+    #[inline]
+    #[cfg_attr(not(test), allow(dead_code))] // Used by test helpers
+    pub fn seal(&self, plaintext: &[u8], iv: &[u8], seq: u64, aad: &[u8]) -> io::Result<Vec<u8>> {
+        let mut buf = plaintext.to_vec();
+        self.seal_in_place(&mut buf, iv, seq, aad)?;
+        Ok(buf)
+    }
 
-    let nonce = Nonce::try_assume_unique_for_key(&nonce_bytes)
-        .map_err(|e| Error::new(ErrorKind::InvalidInput, format!("Invalid nonce: {:?}", e)))?;
+    /// Decrypt in-place on a mutable slice, returning the plaintext portion.
+    ///
+    /// This is the zero-allocation decryption API. The slice is decrypted in-place
+    /// and a sub-slice containing only the plaintext (without the auth tag) is returned.
+    ///
+    /// # Arguments
+    /// * `buf` - Mutable slice containing ciphertext + auth tag
+    /// * `iv` - 12-byte IV/nonce base
+    /// * `seq` - Sequence number to XOR with IV
+    /// * `aad` - Additional authenticated data
+    ///
+    /// # Returns
+    /// Sub-slice of `buf` containing only the decrypted plaintext
+    #[inline]
+    pub fn open_in_place_slice<'a>(
+        &self,
+        buf: &'a mut [u8],
+        iv: &[u8],
+        seq: u64,
+        aad: &[u8],
+    ) -> io::Result<&'a mut [u8]> {
+        let nonce = Self::make_nonce(iv, seq)?;
+        self.0
+            .open_in_place(nonce, Aad::from(aad), buf)
+            .map_err(|e| {
+                Error::new(
+                    ErrorKind::InvalidData,
+                    format!("Decryption failed: {:?}", e),
+                )
+            })
+    }
 
-    let aad = Aad::from(additional_data);
+    /// Decrypt with copy, returning new Vec containing plaintext.
+    ///
+    /// Used for handshake decryption and tests where allocation is acceptable.
+    #[inline]
+    pub fn open(&self, ciphertext: &[u8], iv: &[u8], seq: u64, aad: &[u8]) -> io::Result<Vec<u8>> {
+        let mut buf = ciphertext.to_vec();
+        let plaintext = self.open_in_place_slice(&mut buf, iv, seq, aad)?;
+        let plaintext_len = plaintext.len();
+        buf.truncate(plaintext_len);
+        Ok(buf)
+    }
 
-    // Note: The caller is responsible for adding the ContentType byte to plaintext
-    // For handshake: plaintext = handshake_msg || 0x16
-    // For app data: plaintext = app_data || 0x17
-    let mut in_out = plaintext.to_vec();
+    /// Construct TLS 1.3 nonce: IV XOR sequence_number
+    fn make_nonce(iv: &[u8], seq: u64) -> io::Result<Nonce> {
+        if iv.len() != 12 {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!("Invalid IV length: {} (expected 12)", iv.len()),
+            ));
+        }
 
-    sealing_key
-        .seal_in_place_append_tag(nonce, aad, &mut in_out)
-        .map_err(|e| {
-            Error::new(
-                ErrorKind::InvalidData,
-                format!("Encryption failed: {:?}", e),
-            )
-        })?;
+        let mut nonce_bytes = [0u8; 12];
+        nonce_bytes.copy_from_slice(iv);
 
-    Ok(in_out)
+        // XOR last 8 bytes with sequence number (big-endian)
+        let seq_bytes = seq.to_be_bytes();
+        for i in 0..8 {
+            nonce_bytes[4 + i] ^= seq_bytes[i];
+        }
+
+        Nonce::try_assume_unique_for_key(&nonce_bytes)
+            .map_err(|e| Error::new(ErrorKind::InvalidInput, format!("Invalid nonce: {:?}", e)))
+    }
 }
 
-/// Decrypt TLS 1.3 record using CipherSuite
+/// Decrypt a TLS 1.3 handshake message.
 ///
-/// # Arguments
-/// * `cipher_suite` - CipherSuite with AEAD algorithm
-/// * `key` - AEAD key (16 bytes for AES-128, 32 bytes for AES-256/ChaCha20)
-/// * `iv` - Base IV (12 bytes)
-/// * `sequence_number` - TLS record sequence number
-/// * `ciphertext` - Ciphertext with authentication tag
-/// * `additional_data` - TLS record header for AEAD
-///
-/// # Returns
-/// Plaintext data (including ContentType trailer)
-pub fn decrypt_tls13_record(
-    cipher_suite: CipherSuite,
-    key: &[u8],
-    iv: &[u8],
-    sequence_number: u64,
-    ciphertext: &[u8],
-    additional_data: &[u8],
-) -> Result<Vec<u8>> {
-    let algorithm = cipher_suite.algorithm();
-    let expected_key_len = cipher_suite.key_len();
-
-    if key.len() != expected_key_len {
-        return Err(Error::new(
-            ErrorKind::InvalidInput,
-            format!(
-                "Invalid key length for {:?}: {} (expected {})",
-                cipher_suite,
-                key.len(),
-                expected_key_len
-            ),
-        ));
-    }
-    if iv.len() != 12 {
-        return Err(Error::new(
-            ErrorKind::InvalidInput,
-            format!("Invalid IV length: {} (expected 12)", iv.len()),
-        ));
-    }
-
-    // Construct nonce: IV XOR sequence_number
-    let mut nonce_bytes = [0u8; 12];
-    nonce_bytes.copy_from_slice(iv);
-
-    // XOR the last 8 bytes with the sequence number
-    let seq_bytes = sequence_number.to_be_bytes();
-    for i in 0..8 {
-        nonce_bytes[4 + i] ^= seq_bytes[i];
-    }
-
-    // Create key and nonce for aws-lc-rs
-    let unbound_key = UnboundKey::new(algorithm, key)
-        .map_err(|e| Error::new(ErrorKind::InvalidInput, format!("Invalid key: {:?}", e)))?;
-    let opening_key = LessSafeKey::new(unbound_key);
-
-    let nonce = Nonce::try_assume_unique_for_key(&nonce_bytes)
-        .map_err(|e| Error::new(ErrorKind::InvalidInput, format!("Invalid nonce: {:?}", e)))?;
-
-    let aad = Aad::from(additional_data);
-
-    // aws-lc-rs requires in-place decryption
-    let mut in_out = ciphertext.to_vec();
-    let plaintext = opening_key
-        .open_in_place(nonce, aad, &mut in_out)
-        .map_err(|e| {
-            Error::new(
-                ErrorKind::InvalidData,
-                format!("Decryption failed: {:?}", e),
-            )
-        })?;
-
-    Ok(plaintext.to_vec())
-}
-
-/// Decrypt TLS 1.3 handshake message using CipherSuite
-///
-/// Decrypts and extracts handshake message, removing ContentType trailer
+/// Builds the AAD from the record length and decrypts.
+/// Returns plaintext with content type trailer stripped.
 pub fn decrypt_handshake_message(
     cipher_suite: CipherSuite,
     key: &[u8],
     iv: &[u8],
-    sequence_number: u64,
+    seq: u64,
     ciphertext: &[u8],
-    record_length: u16,
-) -> Result<Vec<u8>> {
-    // Additional data for decryption
-    let mut additional_data = Vec::new();
-    additional_data.push(0x17); // ApplicationData
-    additional_data.extend_from_slice(&[VERSION_TLS_1_2_MAJOR, VERSION_TLS_1_2_MINOR]); // TLS 1.2
-    additional_data.extend_from_slice(&record_length.to_be_bytes());
+    record_len: u16,
+) -> io::Result<Vec<u8>> {
+    // Build AAD: TLS record header
+    let aad = [
+        0x17, // ApplicationData
+        0x03,
+        0x03, // TLS 1.2 version
+        (record_len >> 8) as u8,
+        (record_len & 0xff) as u8,
+    ];
 
-    let mut plaintext = decrypt_tls13_record(
-        cipher_suite,
-        key,
-        iv,
-        sequence_number,
-        ciphertext,
-        &additional_data,
-    )?;
+    let aead_key = AeadKey::new(cipher_suite, key)?;
+    let mut plaintext = aead_key.open(ciphertext, iv, seq, &aad)?;
 
-    // Remove ContentType trailer
-    if plaintext.is_empty() {
-        return Err(Error::new(ErrorKind::InvalidData, "Empty plaintext"));
-    }
-
-    // TLS 1.3 has format: content | type_byte | padding (zeros)
-    // We need to find the type byte by removing trailing zeros first
-
-    // Remove trailing zeros (padding)
-    while !plaintext.is_empty() && plaintext[plaintext.len() - 1] == 0 {
-        plaintext.pop();
-    }
-
-    if plaintext.is_empty() {
-        return Err(Error::new(ErrorKind::InvalidData, "Plaintext is all zeros"));
-    }
-
-    // Now the last byte should be the content type
-    let content_type = plaintext.pop().unwrap();
-
-    if content_type != 0x16
-        && content_type != CONTENT_TYPE_APPLICATION_DATA
-        && content_type != CONTENT_TYPE_ALERT
-    {
-        return Err(Error::new(
-            ErrorKind::InvalidData,
-            format!("Invalid content type: 0x{:02x}", content_type),
-        ));
-    }
+    // Strip content type and optional padding (external implementations may pad)
+    let _ = strip_content_type_with_padding(&mut plaintext)?;
 
     Ok(plaintext)
+}
+
+#[cfg(test)]
+pub(crate) fn encrypt_tls13_record(
+    cipher_suite: CipherSuite,
+    key: &[u8],
+    iv: &[u8],
+    seq: u64,
+    plaintext: &[u8],
+    aad: &[u8],
+) -> io::Result<Vec<u8>> {
+    AeadKey::new(cipher_suite, key)?.seal(plaintext, iv, seq, aad)
+}
+
+#[cfg(test)]
+pub(crate) fn decrypt_tls13_record(
+    cipher_suite: CipherSuite,
+    key: &[u8],
+    iv: &[u8],
+    seq: u64,
+    ciphertext: &[u8],
+    aad: &[u8],
+) -> io::Result<Vec<u8>> {
+    AeadKey::new(cipher_suite, key)?.open(ciphertext, iv, seq, aad)
 }
 
 #[cfg(test)]
@@ -243,30 +212,33 @@ mod tests {
     }
 
     #[test]
-    fn test_roundtrip_handshake() {
-        let key = vec![0x11u8; 16];
-        let iv = vec![0x22u8; 12];
-        let handshake_msg = vec![0x33u8; 50];
+    fn test_aead_key_seal_open() {
+        let key = AeadKey::new(CS, &[0x42u8; 16]).unwrap();
+        let iv = [0x99u8; 12];
+        let plaintext = b"Test message";
+        let aad = b"aad";
 
-        // Manually encrypt like encrypt_handshake_to_records does
-        let mut plaintext = handshake_msg.clone();
-        plaintext.push(0x16); // ContentType: Handshake
+        let ciphertext = key.seal(plaintext, &iv, 0, aad).unwrap();
+        let decrypted = key.open(&ciphertext, &iv, 0, aad).unwrap();
 
-        let ciphertext_length = (plaintext.len() + 16) as u16;
-        let aad: [u8; 5] = [
-            0x17, // ApplicationData
-            0x03,
-            0x03, // TLS 1.2
-            (ciphertext_length >> 8) as u8,
-            (ciphertext_length & 0xff) as u8,
-        ];
+        assert_eq!(&decrypted[..], plaintext);
+    }
 
-        let ciphertext = encrypt_tls13_record(CS, &key, &iv, 0, &plaintext, &aad).unwrap();
+    #[test]
+    fn test_aead_key_in_place() {
+        let key = AeadKey::new(CS, &[0x42u8; 16]).unwrap();
+        let iv = [0x99u8; 12];
+        let plaintext = b"Test in-place";
+        let aad = b"aad";
 
-        let decrypted =
-            decrypt_handshake_message(CS, &key, &iv, 0, &ciphertext, ciphertext_length).unwrap();
+        let mut buf = plaintext.to_vec();
+        key.seal_in_place(&mut buf, &iv, 0, aad).unwrap();
 
-        assert_eq!(decrypted, handshake_msg);
+        // buf now contains ciphertext + tag
+        assert_eq!(buf.len(), plaintext.len() + 16);
+
+        let decrypted = key.open_in_place_slice(&mut buf, &iv, 0, aad).unwrap();
+        assert_eq!(decrypted, plaintext);
     }
 
     #[test]
@@ -392,5 +364,75 @@ mod tests {
         let decrypted = decrypt_tls13_record(CS, &key, &iv, 42, &ciphertext, aad).unwrap();
 
         assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn test_decrypt_handshake_message() {
+        use super::decrypt_handshake_message;
+        use crate::reality::common::CONTENT_TYPE_HANDSHAKE;
+
+        let key = vec![0x42u8; 16];
+        let iv = vec![0x99u8; 12];
+        let handshake_msg = vec![0xABu8; 100]; // Simulated handshake message
+
+        // Build plaintext: handshake_msg || content_type
+        let mut plaintext_with_type = handshake_msg.clone();
+        plaintext_with_type.push(CONTENT_TYPE_HANDSHAKE);
+
+        // Calculate ciphertext length for AAD
+        let ciphertext_len = (plaintext_with_type.len() + 16) as u16;
+
+        // Build AAD (TLS record header)
+        let aad = [
+            0x17, // ApplicationData
+            0x03,
+            0x03, // TLS 1.2 version
+            (ciphertext_len >> 8) as u8,
+            (ciphertext_len & 0xff) as u8,
+        ];
+
+        // Encrypt
+        let ciphertext =
+            encrypt_tls13_record(CS, &key, &iv, 0, &plaintext_with_type, &aad).unwrap();
+
+        // Decrypt using decrypt_handshake_message
+        let decrypted =
+            decrypt_handshake_message(CS, &key, &iv, 0, &ciphertext, ciphertext_len).unwrap();
+
+        assert_eq!(decrypted, handshake_msg);
+    }
+
+    #[test]
+    fn test_decrypt_handshake_message_with_padding() {
+        use super::decrypt_handshake_message;
+        use crate::reality::common::CONTENT_TYPE_HANDSHAKE;
+
+        let key = vec![0x42u8; 16];
+        let iv = vec![0x99u8; 12];
+        let handshake_msg = vec![0xCDu8; 50];
+
+        // Build plaintext with padding: handshake_msg || content_type || padding_zeros
+        let mut plaintext_with_type_and_padding = handshake_msg.clone();
+        plaintext_with_type_and_padding.push(CONTENT_TYPE_HANDSHAKE);
+        plaintext_with_type_and_padding.extend_from_slice(&[0x00, 0x00, 0x00]); // 3 bytes padding
+
+        let ciphertext_len = (plaintext_with_type_and_padding.len() + 16) as u16;
+
+        let aad = [
+            0x17,
+            0x03,
+            0x03,
+            (ciphertext_len >> 8) as u8,
+            (ciphertext_len & 0xff) as u8,
+        ];
+
+        let ciphertext =
+            encrypt_tls13_record(CS, &key, &iv, 0, &plaintext_with_type_and_padding, &aad).unwrap();
+
+        // Padding should be stripped
+        let decrypted =
+            decrypt_handshake_message(CS, &key, &iv, 0, &ciphertext, ciphertext_len).unwrap();
+
+        assert_eq!(decrypted, handshake_msg);
     }
 }

@@ -575,6 +575,12 @@ impl AsyncWriteSessionMessage for XudpMessageStream {
             ready!(self.as_mut().poll_flush_message(cx))?;
         }
 
+        // Check if this is a new session BEFORE looking up or creating entries.
+        // XUDP protocol requires first frame for a session to be StatusNew.
+        let is_new_session = !self
+            .session_to_original_destination
+            .contains_key(&session_id);
+
         // Use original destination (hostname) instead of resolved IP
         // Look up the original destination that the client requested.
         // If not found (e.g., XUDP-to-XUDP forwarding), use the target from the caller
@@ -615,17 +621,28 @@ impl AsyncWriteSessionMessage for XudpMessageStream {
             target
         );
 
-        // Build Keep frame with data
+        // Build frame with appropriate status (New for first frame, Keep for subsequent)
+        let status = if is_new_session {
+            log::debug!(
+                "[XUDP SESSION WRITE] Sending NEW frame for session {} (first write)",
+                session_id
+            );
+            SessionStatus::New
+        } else {
+            SessionStatus::Keep
+        };
+
         let metadata = FrameMetadata {
             session_id,
-            status: SessionStatus::Keep,
+            status,
             option: FrameOption::new().with_data(),
             target: Some(target_location.clone()), // Use ORIGINAL (hostname), not resolved IP!
             network: Some(TargetNetwork::Udp),
         };
 
         log::debug!(
-            "[XUDP SESSION WRITE] Encoding Keep frame: session_id={}, target={}, data_len={}",
+            "[XUDP SESSION WRITE] Encoding {:?} frame: session_id={}, target={}, data_len={}",
+            status,
             session_id,
             target_location,
             buf.len()

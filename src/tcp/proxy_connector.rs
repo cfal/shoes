@@ -19,8 +19,8 @@ use async_trait::async_trait;
 use std::fmt::Debug;
 
 use crate::address::NetLocation;
-use crate::async_stream::AsyncStream;
-use crate::tcp_handler::{TcpClientSetupResult, TcpClientUdpSetupResult, UdpStreamRequest};
+use crate::async_stream::{AsyncMessageStream, AsyncStream};
+use crate::tcp::tcp_handler::TcpClientSetupResult;
 
 /// Trait for proxy protocol connectors.
 ///
@@ -54,14 +54,17 @@ pub trait ProxyConnector: Send + Sync + Debug {
         target: &NetLocation,
     ) -> std::io::Result<TcpClientSetupResult>;
 
-    /// Setup UDP-over-TCP on existing stream.
+    /// Setup bidirectional UDP-over-TCP on existing stream.
     ///
     /// # Arguments
     /// * `stream` - Existing transport stream
-    /// * `request` - The type of UDP stream requested
-    async fn setup_udp_stream(
+    /// * `target` - The destination for all UDP packets
+    ///
+    /// # Returns
+    /// An AsyncMessageStream that sends/receives UDP packets to/from the target.
+    async fn setup_udp_bidirectional(
         &self,
         stream: Box<dyn AsyncStream>,
-        request: UdpStreamRequest,
-    ) -> std::io::Result<TcpClientUdpSetupResult>;
+        target: NetLocation,
+    ) -> std::io::Result<Box<dyn AsyncMessageStream>>;
 }

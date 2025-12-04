@@ -12,6 +12,14 @@ pub fn default_true() -> bool {
     true
 }
 
+pub fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+pub fn is_true(b: &bool) -> bool {
+    *b
+}
+
 pub fn default_reality_client_short_id() -> String {
     DEFAULT_REALITY_SHORT_ID.to_string()
 }

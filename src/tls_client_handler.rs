@@ -3,11 +3,10 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::address::NetLocation;
+use crate::async_stream::AsyncMessageStream;
 use crate::async_stream::AsyncStream;
 use crate::crypto::{CryptoConnection, CryptoTlsStream, perform_crypto_handshake};
-use crate::tcp_handler::{
-    TcpClientHandler, TcpClientSetupResult, TcpClientUdpSetupResult, UdpStreamRequest,
-};
+use crate::tcp::tcp_handler::{TcpClientHandler, TcpClientSetupResult};
 
 #[derive(Debug)]
 pub struct TlsClientHandler {
@@ -61,7 +60,6 @@ impl TcpClientHandler for TlsClientHandler {
         mut client_stream: Box<dyn AsyncStream>,
         remote_location: NetLocation,
     ) -> std::io::Result<TcpClientSetupResult> {
-        // Create rustls ClientConnection
         let mut client_conn =
             rustls::ClientConnection::new(self.client_config.clone(), self.server_name.clone())
                 .map_err(|e| {
@@ -71,18 +69,12 @@ impl TcpClientHandler for TlsClientHandler {
                     )
                 })?;
 
-        // Set buffer limits if configured
         if let Some(size) = self.tls_buffer_size {
             client_conn.set_buffer_limit(Some(size));
         }
 
         let mut connection = CryptoConnection::new_rustls_client(client_conn);
-
-        // Perform the TLS handshake using the generic helper
-        // This works for both TLS 1.2 and TLS 1.3
         perform_crypto_handshake(&mut connection, &mut client_stream, 16384).await?;
-
-        // Wrap in CryptoTlsStream
         let tls_stream = CryptoTlsStream::new(client_stream, connection);
 
         match &self.handler {
@@ -109,12 +101,11 @@ impl TcpClientHandler for TlsClientHandler {
         }
     }
 
-    async fn setup_client_udp_stream(
+    async fn setup_client_udp_bidirectional(
         &self,
         mut client_stream: Box<dyn AsyncStream>,
-        request: UdpStreamRequest,
-    ) -> std::io::Result<TcpClientUdpSetupResult> {
-        // Create rustls ClientConnection
+        target: NetLocation,
+    ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
         let mut client_conn =
             rustls::ClientConnection::new(self.client_config.clone(), self.server_name.clone())
                 .map_err(|e| {
@@ -124,29 +115,23 @@ impl TcpClientHandler for TlsClientHandler {
                     )
                 })?;
 
-        // Set buffer limits if configured
         if let Some(size) = self.tls_buffer_size {
             client_conn.set_buffer_limit(Some(size));
         }
 
         let mut connection = CryptoConnection::new_rustls_client(client_conn);
-
-        // Perform the TLS handshake
         perform_crypto_handshake(&mut connection, &mut client_stream, 16384).await?;
-
-        // Wrap in CryptoTlsStream
         let tls_stream = CryptoTlsStream::new(client_stream, connection);
 
         match &self.handler {
             TlsInnerClientHandler::Default(handler) => {
                 handler
-                    .setup_client_udp_stream(Box::new(tls_stream), request)
+                    .setup_client_udp_bidirectional(Box::new(tls_stream), target)
                     .await
             }
             TlsInnerClientHandler::VisionVless { uuid, .. } => {
-                // Vision VLESS UDP setup - use the VLESS handler's method
-                crate::vless::vless_client_handler::setup_vless_udp_stream(
-                    tls_stream, uuid, request,
+                crate::vless::vless_client_handler::setup_vless_udp_bidirectional(
+                    tls_stream, uuid, target,
                 )
                 .await
             }

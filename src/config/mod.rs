@@ -4,11 +4,14 @@
 //! - [`types`]: All configuration types (server, client, rules, etc.)
 //! - [`pem`]: PEM file handling and certificate loading
 //! - [`validate`]: Configuration validation and server config creation
+//! - [`singbox`]: Sing-box JSON configuration conversion
+//! - [`convert_util`]: Utilities for preprocessing JSON-like configs
 //!
 //! The main entry points are:
 //! - [`load_configs`]: Load config files from disk
 //! - [`convert_cert_paths`]: Convert PEM file paths to inline data
 //! - [`create_server_configs`]: Validate and create final server configs
+//! - [`singbox::convert_singbox_config`]: Convert sing-box configs to shoes format
 
 mod pem;
 mod types;
@@ -17,9 +20,6 @@ mod validate;
 pub use pem::convert_cert_paths;
 pub use types::*;
 pub use validate::create_server_configs;
-
-// Re-export ConfigSelection for use in pem.rs
-pub(crate) use types::ConfigSelection;
 
 /// Loads configuration files from the provided paths.
 ///
@@ -60,4 +60,15 @@ pub async fn load_configs(args: &Vec<String>) -> std::io::Result<Vec<Config>> {
     }
 
     Ok(all_configs)
+}
+
+/// Load config from a string (used by FFI targets)
+#[cfg(any(target_os = "android", target_os = "ios", feature = "ffi"))]
+pub fn load_config_str(config_str: &str) -> std::io::Result<Vec<Config>> {
+    serde_yaml::from_str::<Vec<Config>>(&config_str).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("Could not parse config string as config YAML: {e}"),
+        )
+    })
 }

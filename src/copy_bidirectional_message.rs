@@ -8,17 +8,17 @@ use std::task::{Context, Poll};
 use std::time::Instant;
 
 use crate::async_stream::AsyncMessageStream;
+use crate::util::allocate_vec;
 
 // Informed by https://stackoverflow.com/questions/14856639/udp-hole-punching-timeout
 pub const DEFAULT_ASSOCIATION_TIMEOUT_SECS: u32 = 200;
 
-#[derive(Debug)]
 struct CopyBuffer {
     read_done: bool,
     need_flush: bool,
     need_write_ping: bool,
     cache_length: usize,
-    buf: [u8; 65535],
+    buf: Box<[u8]>,
     read_count: usize,
 }
 
@@ -29,7 +29,7 @@ impl CopyBuffer {
             need_flush,
             need_write_ping: false,
             cache_length: 0,
-            buf: [0u8; 65535],
+            buf: allocate_vec(65535).into_boxed_slice(),
             read_count: 0,
         }
     }
@@ -44,15 +44,10 @@ impl CopyBuffer {
         R: AsyncMessageStream + ?Sized,
         W: AsyncMessageStream + ?Sized,
     {
-        loop {
-            // Make sure we flush any existing messages first.
-            // We don't want to read fast else bandwidth estimators will think we are able
-            // to handle all the messages and start sending even better quality.
-            //if self.need_flush {
-            //ready!(writer.as_mut().poll_flush_message(cx))?;
-            //self.need_flush = false;
-            //}
+        // Check tokio's cooperative budget to prevent task starvation
+        let coop = ready!(tokio::task::coop::poll_proceed(cx));
 
+        loop {
             let mut did_read = false;
             let mut did_write = false;
             let mut read_pending = false;
@@ -71,6 +66,7 @@ impl CopyBuffer {
                             self.cache_length = n;
                             did_read = true;
                             self.read_count = self.read_count.wrapping_add(n);
+                            coop.made_progress();
                         }
                     }
                     Poll::Pending => {
@@ -92,6 +88,7 @@ impl CopyBuffer {
                         // Don't bother writing ping, since we just wrote.
                         self.need_write_ping = false;
                         did_write = true;
+                        coop.made_progress();
                     }
                     Poll::Pending => {
                         write_pending = true;
@@ -106,6 +103,7 @@ impl CopyBuffer {
                         self.need_write_ping = false;
                         if written {
                             self.need_flush = true;
+                            coop.made_progress();
                         }
                     }
                     Poll::Pending => {
@@ -121,6 +119,7 @@ impl CopyBuffer {
             if self.need_flush {
                 ready!(writer.as_mut().poll_flush_message(cx))?;
                 self.need_flush = false;
+                coop.made_progress();
                 continue;
             }
 
@@ -129,13 +128,8 @@ impl CopyBuffer {
                 return Poll::Ready(Ok(()));
             }
 
-            // Previously we kept going until both read and write were pending, but
-            // this might starve other tasks.
+            // Return Pending to prevent task starvation
             if read_pending || write_pending {
-                // If we got here,
-                // 1) we hit read_pending on the current iteration.
-                // 2) all data has been written successfully
-                // 3) there is no data left to write and we need to read more.
                 return Poll::Pending;
             }
         }
@@ -196,7 +190,6 @@ where
     type Output = io::Result<()>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        // Unpack self into mut refs to each field to avoid borrow check issues.
         let CopyBidirectional {
             a,
             b,

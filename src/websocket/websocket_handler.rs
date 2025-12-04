@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use async_trait::async_trait;
 use aws_lc_rs::digest::{SHA1_FOR_LEGACY_USE_ONLY, digest};
@@ -9,14 +8,12 @@ use tokio::io::AsyncWriteExt;
 
 use super::websocket_stream::WebsocketStream;
 use crate::address::NetLocation;
+use crate::async_stream::AsyncMessageStream;
 use crate::async_stream::AsyncStream;
-use crate::client_proxy_selector::ClientProxySelector;
 use crate::config::WebsocketPingType;
-use crate::option_util::NoneOrOne;
 use crate::stream_reader::StreamReader;
-use crate::tcp_handler::{
-    TcpClientHandler, TcpClientSetupResult, TcpClientUdpSetupResult, TcpServerHandler,
-    TcpServerSetupResult, UdpStreamRequest,
+use crate::tcp::tcp_handler::{
+    TcpClientHandler, TcpClientSetupResult, TcpServerHandler, TcpServerSetupResult,
 };
 
 #[derive(Debug)]
@@ -25,7 +22,6 @@ pub struct WebsocketServerTarget {
     pub matching_headers: Option<FxHashMap<String, String>>,
     pub ping_type: WebsocketPingType,
     pub handler: Box<dyn TcpServerHandler>,
-    pub override_proxy_provider: NoneOrOne<Arc<ClientProxySelector>>,
 }
 
 #[derive(Debug)]
@@ -80,7 +76,6 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
                 matching_headers,
                 ping_type,
                 handler,
-                override_proxy_provider,
             } = server_target;
 
             if let Some(path) = matching_path
@@ -135,12 +130,11 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
             let mut target_setup_result = handler.setup_server_stream(websocket_stream).await;
 
             if let Ok(ref mut setup_result) = target_setup_result {
-                setup_result.set_need_initial_flush(true);
-                if setup_result.override_proxy_provider_unspecified()
-                    && !override_proxy_provider.is_unspecified()
-                {
-                    setup_result.set_override_proxy_provider(override_proxy_provider.clone());
+                if matches!(setup_result, TcpServerSetupResult::AlreadyHandled) {
+                    return target_setup_result;
                 }
+                setup_result.set_need_initial_flush(true);
+                // Inner handler already has effective_selector from construction
             }
 
             return target_setup_result;
@@ -254,14 +248,14 @@ impl TcpClientHandler for WebsocketTcpClientHandler {
         self.handler.supports_udp_over_tcp()
     }
 
-    async fn setup_client_udp_stream(
+    async fn setup_client_udp_bidirectional(
         &self,
         client_stream: Box<dyn AsyncStream>,
-        request: UdpStreamRequest,
-    ) -> std::io::Result<TcpClientUdpSetupResult> {
+        target: NetLocation,
+    ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
         let websocket_stream = self.setup_client_stream_common(client_stream).await?;
         self.handler
-            .setup_client_udp_stream(Box::new(websocket_stream), request)
+            .setup_client_udp_bidirectional(Box::new(websocket_stream), target)
             .await
     }
 }

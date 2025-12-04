@@ -19,36 +19,6 @@ pub fn new_udp_socket(
     into_tokio_udp_socket(socket)
 }
 
-pub fn new_reuse_udp_sockets(
-    is_ipv6: bool,
-    bind_interface: Option<String>,
-    count: usize,
-) -> std::io::Result<Vec<tokio::net::UdpSocket>> {
-    let mut sockets = Vec::with_capacity(count);
-    if count == 0 {
-        return Ok(sockets);
-    }
-
-    let socket = new_socket2_udp_socket(
-        is_ipv6,
-        bind_interface.clone(),
-        Some(get_unspecified_socket_addr(is_ipv6)),
-        true,
-    )?;
-
-    let local_addr = socket.local_addr()?.as_socket().unwrap();
-
-    sockets.push(into_tokio_udp_socket(socket)?);
-
-    for _ in 1..count {
-        let socket =
-            new_socket2_udp_socket(is_ipv6, bind_interface.clone(), Some(local_addr), true)?;
-        sockets.push(into_tokio_udp_socket(socket)?);
-    }
-
-    Ok(sockets)
-}
-
 fn get_unspecified_socket_addr(is_ipv6: bool) -> SocketAddr {
     if !is_ipv6 {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0)
@@ -63,10 +33,28 @@ pub fn new_socket2_udp_socket(
     bind_address: Option<SocketAddr>,
     reuse_port: bool,
 ) -> std::io::Result<socket2::Socket> {
+    new_socket2_udp_socket_with_buffer_size(is_ipv6, bind_interface, bind_address, reuse_port, None)
+}
+
+pub fn new_socket2_udp_socket_with_buffer_size(
+    is_ipv6: bool,
+    bind_interface: Option<String>,
+    bind_address: Option<SocketAddr>,
+    reuse_port: bool,
+    buffer_size: Option<usize>,
+) -> std::io::Result<socket2::Socket> {
     let domain = if is_ipv6 { Domain::IPV6 } else { Domain::IPV4 };
     let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
 
     socket.set_nonblocking(true)?;
+
+    // Set socket buffer sizes if specified.
+    // This helps prevent packet drops during bursts for high-throughput connections.
+    if let Some(size) = buffer_size {
+        // Ignore errors - kernel may cap the value
+        let _ = socket.set_recv_buffer_size(size);
+        let _ = socket.set_send_buffer_size(size);
+    }
 
     if reuse_port {
         #[cfg(all(unix, not(any(target_os = "solaris", target_os = "illumos"))))]

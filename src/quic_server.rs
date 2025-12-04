@@ -2,37 +2,32 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use log::{debug, error, warn};
+use log::{debug, error};
 use quinn::EndpointConfig;
 use tokio::io::AsyncWriteExt;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
 use crate::async_stream::AsyncStream;
-use crate::client_proxy_selector::{ClientProxySelector, ConnectDecision};
+use crate::client_proxy_selector::ConnectDecision;
 use crate::config::{
     BindLocation, ConfigSelection, ServerConfig, ServerProxyConfig, ServerQuicConfig,
 };
 use crate::copy_bidirectional::copy_bidirectional;
-use crate::copy_bidirectional_message::copy_bidirectional_message;
-use crate::copy_multidirectional_message::copy_multidirectional_message;
-use crate::copy_session_messages::copy_session_messages;
 use crate::quic_stream::QuicStream;
 use crate::resolver::{NativeResolver, Resolver};
+use crate::routing::{ServerStream, run_udp_routing};
 use crate::rustls_config_util::create_server_config;
 use crate::socket_util::new_socket2_udp_socket;
 use crate::tcp::tcp_client_handler_factory::create_tcp_client_proxy_selector;
+use crate::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult};
+use crate::tcp::tcp_server::{run_udp_copy, setup_client_tcp_stream};
 use crate::tcp::tcp_server_handler_factory::create_tcp_server_handler;
-use crate::tcp_handler::{
-    TcpClientUdpSetupResult, TcpServerHandler, TcpServerSetupResult, UdpStreamRequest,
-};
-use crate::tcp_server::setup_client_tcp_stream;
-use crate::util::parse_uuid;
+use crate::uuid_util::parse_uuid;
 
 async fn start_quic_server(
     bind_address: SocketAddr,
     quic_server_config: Arc<quinn::crypto::rustls::QuicServerConfig>,
-    client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
     server_handler: Arc<dyn TcpServerHandler>,
     num_endpoints: usize,
@@ -59,19 +54,14 @@ async fn start_quic_server(
             Arc::new(quinn::TokioRuntime),
         )?;
 
-        let client_proxy_selector = client_proxy_selector.clone();
         let resolver = resolver.clone();
         let server_handler = server_handler.clone();
         let join_handle = tokio::spawn(async move {
             while let Some(conn) = endpoint.accept().await {
-                let client_proxy_selector = client_proxy_selector.clone();
                 let resolver = resolver.clone();
                 let server_handler = server_handler.clone();
                 tokio::spawn(async move {
-                    if let Err(e) =
-                        process_connection(client_proxy_selector, resolver, server_handler, conn)
-                            .await
-                    {
+                    if let Err(e) = process_connection(resolver, server_handler, conn).await {
                         error!("Connection ended with error: {e}");
                     }
                 });
@@ -85,7 +75,6 @@ async fn start_quic_server(
 }
 
 async fn process_connection(
-    client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
     server_handler: Arc<dyn TcpServerHandler>,
     conn: quinn::Incoming,
@@ -103,13 +92,10 @@ async fn process_connection(
             }
             Ok(s) => s,
         };
-        let cloned_selector = client_proxy_selector.clone();
         let cloned_resolver = resolver.clone();
         let cloned_handler = server_handler.clone();
         tokio::spawn(async move {
-            if let Err(e) =
-                process_streams(cloned_selector, cloned_resolver, cloned_handler, stream).await
-            {
+            if let Err(e) = process_streams(cloned_resolver, cloned_handler, stream).await {
                 error!("Failed to process streams: {e}");
             }
         });
@@ -119,7 +105,6 @@ async fn process_connection(
 }
 
 async fn process_streams(
-    client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
     server_handler: Arc<dyn TcpServerHandler>,
     (send, recv): (quinn::SendStream, quinn::RecvStream),
@@ -152,21 +137,15 @@ async fn process_streams(
             remote_location,
             stream: mut server_stream,
             need_initial_flush: server_need_initial_flush,
-            override_proxy_provider,
+            proxy_selector,
             connection_success_response,
             initial_remote_data,
         } => {
-            let selected_proxy_provider = if override_proxy_provider.is_one() {
-                override_proxy_provider.unwrap()
-            } else {
-                client_proxy_selector
-            };
-
             let setup_client_stream_future = timeout(
                 Duration::from_secs(60),
                 setup_client_tcp_stream(
                     &mut server_stream,
-                    selected_proxy_provider,
+                    proxy_selector,
                     resolver,
                     remote_location.clone(),
                 ),
@@ -226,173 +205,60 @@ async fn process_streams(
             remote_location,
             stream: server_stream,
             need_initial_flush: server_need_initial_flush,
-            override_proxy_provider,
+            proxy_selector,
         } => {
-            let selected_proxy_provider = if override_proxy_provider.is_one() {
-                override_proxy_provider.unwrap()
-            } else {
-                client_proxy_selector
-            };
-
-            let action = selected_proxy_provider
-                .judge(remote_location, &resolver)
-                .await?;
+            let action = proxy_selector.judge(remote_location, &resolver).await?;
             match action {
                 ConnectDecision::Allow {
                     chain_group,
                     remote_location,
                 } => {
-                    // Use chain_group's UDP connection with Bidirectional mode
-                    // Pass server stream so handler can return matched pair
-                    let udp_result = chain_group
-                        .connect_udp(
-                            &resolver,
-                            UdpStreamRequest::Bidirectional {
-                                server_stream,
-                                target: remote_location,
-                            },
-                        )
+                    let client_stream = chain_group
+                        .connect_udp_bidirectional(&resolver, remote_location)
                         .await?;
 
-                    match udp_result {
-                        TcpClientUdpSetupResult::Bidirectional {
-                            mut server_stream,
-                            mut client_stream,
-                        } => {
-                            let copy_result = copy_bidirectional_message(
-                                &mut server_stream,
-                                &mut client_stream,
-                                server_need_initial_flush,
-                                false,
-                            )
-                            .await;
-                            copy_result?;
-                            Ok(())
-                        }
-                        _ => {
-                            // Handler should have returned Bidirectional or errored
-                            unreachable!(
-                                "Handler must return Bidirectional stream type when requested, or error"
-                            )
-                        }
-                    }
+                    run_udp_copy(
+                        server_stream,
+                        client_stream,
+                        server_need_initial_flush,
+                        false,
+                    )
+                    .await
                 }
-                ConnectDecision::Block => {
-                    // Must have been blocked.
-                    Ok(())
-                }
+                ConnectDecision::Block => Ok(()),
             }
         }
         TcpServerSetupResult::MultiDirectionalUdp {
             stream: server_stream,
-            need_initial_flush: server_need_initial_flush,
-            override_proxy_provider,
+            need_initial_flush,
+            proxy_selector,
         } => {
-            let selected_proxy_provider = if override_proxy_provider.is_one() {
-                override_proxy_provider.unwrap()
-            } else {
-                client_proxy_selector
-            };
-            let action = selected_proxy_provider.default_decision();
-            match action {
-                ConnectDecision::Allow {
-                    chain_group,
-                    remote_location: _,
-                } => {
-                    // Use chain_group's UDP connection with MultiDirectional mode
-                    // Pass server stream so handler can return matched pair
-                    let udp_result = chain_group
-                        .connect_udp(
-                            &resolver,
-                            UdpStreamRequest::MultiDirectional { server_stream },
-                        )
-                        .await?;
-
-                    match udp_result {
-                        TcpClientUdpSetupResult::MultiDirectional {
-                            mut server_stream,
-                            mut client_stream,
-                        } => {
-                            let copy_result = copy_multidirectional_message(
-                                &mut server_stream,
-                                &mut client_stream,
-                                server_need_initial_flush,
-                                false,
-                            )
-                            .await;
-
-                            copy_result?;
-                            Ok(())
-                        }
-                        _ => {
-                            // Handler should have returned MultiDirectional or errored
-                            unreachable!(
-                                "Handler must return MultiDirectional stream type when requested, or error"
-                            )
-                        }
-                    }
-                }
-                ConnectDecision::Block => {
-                    warn!(
-                        "Blocked multidirectional udp forward, because the default action is to block."
-                    );
-                    Ok(())
-                }
-            }
+            // Routes each packet based on its destination
+            run_udp_routing(
+                ServerStream::Targeted(server_stream),
+                proxy_selector,
+                resolver,
+                need_initial_flush,
+            )
+            .await
         }
         TcpServerSetupResult::SessionBasedUdp {
             stream: server_stream,
-            need_initial_flush: server_need_initial_flush,
-            override_proxy_provider,
+            need_initial_flush,
+            proxy_selector,
         } => {
-            let selected_proxy_provider = if override_proxy_provider.is_one() {
-                override_proxy_provider.unwrap()
-            } else {
-                client_proxy_selector
-            };
-            let action = selected_proxy_provider.default_decision();
-            match action {
-                ConnectDecision::Allow {
-                    chain_group,
-                    remote_location: _,
-                } => {
-                    // Use chain_group's UDP connection with SessionBased mode
-                    // Pass server stream so handler can return matched pair
-                    let udp_result = chain_group
-                        .connect_udp(&resolver, UdpStreamRequest::SessionBased { server_stream })
-                        .await?;
-
-                    match udp_result {
-                        TcpClientUdpSetupResult::SessionBased {
-                            mut server_stream,
-                            mut client_stream,
-                        } => {
-                            // Both server and client are session-based (XUDP) - use copy_session_messages
-                            let copy_result = copy_session_messages(
-                                &mut server_stream,
-                                &mut client_stream,
-                                server_need_initial_flush,
-                                false,
-                            )
-                            .await;
-                            copy_result?;
-                            Ok(())
-                        }
-                        _ => {
-                            // Handler should have returned SessionBased or errored
-                            unreachable!(
-                                "Handler must return SessionBased stream type when requested, or error"
-                            )
-                        }
-                    }
-                }
-                ConnectDecision::Block => {
-                    warn!(
-                        "Blocked session-based udp forward, because the default action is to block."
-                    );
-                    Ok(())
-                }
-            }
+            // Routes each session based on its destination
+            run_udp_routing(
+                ServerStream::Session(server_stream),
+                proxy_selector,
+                resolver,
+                need_initial_flush,
+            )
+            .await
+        }
+        TcpServerSetupResult::AlreadyHandled => {
+            // Connection already handled by a spawned task (e.g., Reality fallback)
+            Ok(())
         }
     }
 }
@@ -409,7 +275,7 @@ pub async fn start_quic_servers(config: ServerConfig) -> std::io::Result<Vec<Joi
     println!("Starting {} QUIC server at {}", &protocol, &bind_location);
 
     let rules = rules.map(ConfigSelection::unwrap_config).into_vec();
-    // We should always have a direct entry.
+    // A direct entry must always exist
     assert!(!rules.is_empty());
 
     let bind_addresses = match bind_location {
@@ -454,7 +320,7 @@ pub async fn start_quic_servers(config: ServerConfig) -> std::io::Result<Vec<Joi
     let quic_server_config = Arc::new(quic_server_config);
 
     let client_proxy_selector = Arc::new(create_tcp_client_proxy_selector(rules.clone()));
-    let resolver = Arc::new(NativeResolver::new());
+    let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
 
     let mut handles = vec![];
 
@@ -509,19 +375,19 @@ pub async fn start_quic_servers(config: ServerConfig) -> std::io::Result<Vec<Joi
             }
         }
         tcp_protocol => {
-            let mut rules_stack = vec![rules];
+            let bind_ip = bind_addresses.first().map(|addr| addr.ip());
+
             let tcp_handler: Arc<dyn TcpServerHandler> =
-                create_tcp_server_handler(tcp_protocol, &mut rules_stack).into();
+                create_tcp_server_handler(tcp_protocol, &client_proxy_selector, &resolver, bind_ip)
+                    .into();
 
             for bind_address in bind_addresses.into_iter() {
                 let quic_server_config = quic_server_config.clone();
-                let client_proxy_selector = client_proxy_selector.clone();
                 let resolver = resolver.clone();
                 let tcp_handler = tcp_handler.clone();
                 let quic_handles = start_quic_server(
                     bind_address,
                     quic_server_config,
-                    client_proxy_selector,
                     resolver,
                     tcp_handler,
                     num_endpoints,

@@ -1,0 +1,92 @@
+# NaiveProxy server and client examples
+# NaiveProxy uses HTTP/2 CONNECT with padding for censorship resistance
+
+# Basic NaiveProxy server over TLS
+- address: "0.0.0.0:443"
+  protocol:
+    type: tls
+    tls_targets:
+      "naive.example.com":
+        cert: "cert.pem"
+        key: "key.pem"
+        alpn_protocols: ["h2"]  # HTTP/2 required for NaiveProxy
+        protocol:
+          type: naiveproxy
+          users:
+            - username: user1
+              password: "secret123"
+          padding: true  # Enable padding (default)
+          udp_enabled: true  # Enable UDP over TCP (default)
+
+# NaiveProxy server with multiple users
+- address: "0.0.0.0:8443"
+  protocol:
+    type: tls
+    tls_targets:
+      "multi.example.com":
+        cert: "cert.pem"
+        key: "key.pem"
+        alpn_protocols: ["h2"]
+        protocol:
+          type: naiveproxy
+          users:
+            - name: alice
+              username: alice
+              password: "alice_password"
+            - name: bob
+              username: bob
+              password: "bob_password"
+            - name: charlie
+              username: charlie
+              password: "charlie_password"
+
+# NaiveProxy server with fallback for probe resistance
+# Serves static files when authentication fails
+- address: "0.0.0.0:9443"
+  protocol:
+    type: tls
+    tls_targets:
+      "camouflage.example.com":
+        cert: "cert.pem"
+        key: "key.pem"
+        alpn_protocols: ["h2"]
+        protocol:
+          type: naiveproxy
+          users:
+            - username: user1
+              password: "secret123"
+          fallback: "/var/www/html"  # Serve static files for failed auth
+
+# NaiveProxy over Reality
+- address: "0.0.0.0:443"
+  protocol:
+    type: tls
+    reality_targets:
+      "www.microsoft.com":
+        private_key: "YOUR_PRIVATE_KEY_HERE"
+        short_ids: ["0123456789abcdef", ""]
+        dest: "www.microsoft.com:443"
+        protocol:
+          type: naiveproxy
+          users:
+            - username: user1
+              password: "secret123"
+          udp_enabled: true
+
+# Local SOCKS5 client connecting to NaiveProxy server
+- address: "127.0.0.1:1080"
+  protocol:
+    type: socks
+  rules:
+    - masks: "0.0.0.0/0"
+      action: allow
+      client_chain:
+        address: "naive.example.com:443"
+        protocol:
+          type: tls
+          sni_hostname: "naive.example.com"
+          alpn_protocols: ["h2"]
+          protocol:
+            type: naiveproxy
+            username: user1
+            password: "secret123"

@@ -6,6 +6,7 @@ shoes uses YAML configuration files. Multiple configuration types can be combine
 - [Configuration Structure](#configuration-structure)
 - [Server Config](#server-config)
 - [Server Protocols](#server-protocols)
+- [TUN Config](#tun-config)
 - [Client Config](#client-config)
 - [Client Protocols](#client-protocols)
 - [Rules System](#rules-system)
@@ -19,6 +20,7 @@ shoes uses YAML configuration files. Multiple configuration types can be combine
 A configuration file is a YAML array containing one or more configuration entries. Each entry can be:
 
 - **Server Config** - Defines a proxy server instance
+- **TUN Config** - Defines a TUN/VPN device for transparent proxying
 - **Client Config Group** - Defines reusable upstream proxy configurations
 - **Rule Config Group** - Defines reusable routing rules
 - **Named PEM** - Defines reusable certificate/key data
@@ -27,6 +29,11 @@ A configuration file is a YAML array containing one or more configuration entrie
 # Server configs have 'address' or 'path'
 - address: "0.0.0.0:8080"
   protocol: ...
+
+# TUN configs have 'device_name' or 'device_fd'
+- device_name: "tun0"
+  address: "10.0.0.1"
+  ...
 
 # Client config groups have 'client_group'
 - client_group: my-upstream
@@ -91,7 +98,19 @@ protocol:
   type: socks                  # Aliases: socks5
   username: string?
   password: string?
+  udp_enabled: true            # Default: true (enables UDP ASSOCIATE)
 ```
+
+### Mixed (HTTP + SOCKS5)
+```yaml
+protocol:
+  type: mixed                  # Aliases: http+socks, socks+http
+  username: string?
+  password: string?
+  udp_enabled: true            # Default: true (enables UDP ASSOCIATE for SOCKS5)
+```
+
+Auto-detects HTTP or SOCKS5 protocol from the first byte of the connection.
 
 ### Shadowsocks
 ```yaml
@@ -126,6 +145,7 @@ protocol:
   type: vless
   user_id: string              # UUID
   udp_enabled: true            # Default: true (enables XUDP)
+  fallback: string?            # Optional fallback destination for failed auth (e.g., "127.0.0.1:80")
 ```
 
 ### Trojan
@@ -177,6 +197,7 @@ protocol:
       private_key: string      # X25519 private key (base64url)
       short_ids: [string]      # Valid client IDs (hex, 0-16 chars)
       dest: string             # Fallback destination (e.g., "example.com:443")
+      dest_client_chain: ClientChain?  # Optional proxy chain for reaching dest
       max_time_diff: 60000     # Max timestamp diff in ms (default: 60000)
       min_client_version: [1, 8, 0]  # Optional [major, minor, patch]
       max_client_version: [2, 0, 0]  # Optional [major, minor, patch]
@@ -241,6 +262,84 @@ protocol:
   uuid: string                 # UUID
   password: string
   zero_rtt_handshake: false    # Default: false (enables 0-RTT for lower latency)
+```
+
+### AnyTLS
+```yaml
+protocol:
+  type: anytls
+  users:                       # One or more users
+    - name: string?            # Optional display name
+      password: string         # User password
+  udp_enabled: true            # Default: true (enables UDP over TCP)
+  padding_scheme: [string]?    # Optional custom padding (e.g., ["stop=8", "0=30-30"])
+  fallback: string?            # Optional fallback destination for failed auth
+```
+
+AnyTLS is a TLS-based multiplexing proxy protocol with traffic obfuscation. Should be used within TLS or Reality.
+
+### NaiveProxy
+```yaml
+protocol:
+  type: naiveproxy             # Aliases: naive
+  users:                       # One or more users
+    - name: string?            # Optional display name
+      username: string         # Basic Auth username
+      password: string         # Basic Auth password
+  padding: true                # Default: true (enables padding protocol)
+  udp_enabled: true            # Default: true (enables UDP over TCP)
+  fallback: string?            # Optional path to serve static files for probe resistance
+```
+
+NaiveProxy implements HTTP/2 CONNECT with padding for censorship resistance. Should be used within TLS with `alpn_protocols: ["h2"]`.
+
+## TUN Config
+
+TUN (network TUNnel) devices operate at the IP layer (Layer 3), allowing shoes to act as a transparent VPN.
+
+```yaml
+# Linux: Create TUN device by name
+device_name: string            # Device name (e.g., "tun0")
+address: string                # Device IP address (e.g., "10.0.0.1")
+netmask: string?               # Netmask (e.g., "255.255.255.0")
+destination: string?           # Gateway/destination (Linux only)
+
+# iOS/Android: Use existing file descriptor
+device_fd: int                 # FD from VpnService (Android) or NEPacketTunnelProvider (iOS)
+
+# Common settings
+mtu: 1500                      # Default: 1500 (Linux), 9000 (Android), 4064 (iOS)
+tcp_enabled: true              # Default: true
+udp_enabled: true              # Default: true
+icmp_enabled: true             # Default: true
+
+# Routing rules
+rules: [RuleConfig]
+```
+
+**Platform notes:**
+- **Linux**: Requires root or `CAP_NET_ADMIN`. Creates device with specified name/address.
+- **Android**: Use `device_fd` from `VpnService.Builder.establish()`. Routes configured via VpnService.
+- **iOS**: Use `device_fd` from `NEPacketTunnelProvider.packetFlow`.
+
+**Example (Linux):**
+```yaml
+- device_name: "tun0"
+  address: "10.0.0.1"
+  netmask: "255.255.255.0"
+  mtu: 1500
+  tcp_enabled: true
+  udp_enabled: true
+  rules:
+    - masks: "0.0.0.0/0"
+      action: allow
+      client_chain:
+        address: "proxy.example.com:443"
+        protocol:
+          type: tls
+          protocol:
+            type: vless
+            user_id: "uuid"
 ```
 
 ## Client Config
@@ -388,6 +487,24 @@ protocol:
 ```
 
 Passes through the raw connection without protocol wrapping. Useful for testing or transparent proxying.
+
+### AnyTLS Client
+```yaml
+protocol:
+  type: anytls
+  password: string             # User password
+  udp_enabled: true            # Default: true (enables UDP over TCP)
+  padding_scheme: [string]?    # Optional custom padding scheme
+```
+
+### NaiveProxy Client
+```yaml
+protocol:
+  type: naiveproxy             # Aliases: naive
+  username: string             # Basic Auth username
+  password: string             # Basic Auth password
+  padding: true                # Default: true (enables padding protocol)
+```
 
 ## Rules System
 
