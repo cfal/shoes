@@ -295,17 +295,15 @@ where
             // Drain TLS output to TCP stream
             while self.session.wants_write() {
                 match self.write_tls_direct(cx) {
-                    Poll::Ready(Ok(0)) => {
-                        // WriteZero: underlying socket can't accept data
-                        return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
-                    }
-                    Poll::Pending => {
+                    // tokio-rustls pattern: treat Ok(0) same as Pending in poll_write
+                    // Data is safely buffered in session, will be sent on flush
+                    Poll::Ready(Ok(0)) | Poll::Pending => {
                         would_block = true;
-                        self.need_flush = true; // Mark that we have pending data
+                        self.need_flush = true;
                         break;
                     }
                     Poll::Ready(Ok(_)) => {
-                        self.need_flush = true; // Mark that we wrote something
+                        self.need_flush = true;
                     }
                     Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
                 }
