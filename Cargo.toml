@@ -36,7 +36,7 @@ quinn = { version = "*", default-features = false, features = ["log", "platform-
 rand = "*"
 rand_core = "*"
 rcgen = { version = "*", features = ["x509-parser"] }
-rustc-hash = "1"
+rustc-hash = "*"
 rustls = "*"
 serde = { version = "*", features = ["derive", "std"] }
 subtle = "*"
