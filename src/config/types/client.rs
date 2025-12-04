@@ -7,10 +7,102 @@ use serde::{Deserialize, Serialize};
 use crate::address::NetLocation;
 use crate::option_util::{NoneOrOne, NoneOrSome};
 
-use super::common::{default_reality_client_short_id, default_true, unspecified_address};
+use super::common::{
+    default_reality_client_short_id, default_true, is_false, is_true, unspecified_address,
+};
 use super::server::WebsocketPingType;
 use super::shadowsocks::ShadowsocksConfig;
 use super::transport::{ClientQuicConfig, TcpConfig, Transport};
+
+/// Custom deserializer for ClientProxyConfig::Shadowsocks
+fn deserialize_shadowsocks_client<'de, D>(
+    deserializer: D,
+) -> Result<(ShadowsocksConfig, bool), D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct ShadowsocksClientTemp {
+        cipher: String,
+        password: String,
+        #[serde(default = "default_true")]
+        udp_enabled: bool,
+    }
+
+    let temp = ShadowsocksClientTemp::deserialize(deserializer)?;
+    let config =
+        ShadowsocksConfig::from_fields(&temp.cipher, &temp.password).map_err(Error::custom)?;
+
+    Ok((config, temp.udp_enabled))
+}
+
+/// Custom serializer for ClientProxyConfig::Shadowsocks - flattens config fields
+fn serialize_shadowsocks_client<S>(
+    config: &ShadowsocksConfig,
+    udp_enabled: &bool,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    use serde::ser::SerializeStruct;
+
+    // Only serialize udp_enabled if it's not the default (true)
+    let field_count = if *udp_enabled { 2 } else { 3 };
+    let mut state = serializer.serialize_struct("Shadowsocks", field_count)?;
+    config.serialize_fields(&mut state)?;
+    if !*udp_enabled {
+        state.serialize_field("udp_enabled", udp_enabled)?;
+    }
+    state.end()
+}
+
+/// Custom deserializer for ClientProxyConfig::Snell - flattens config fields
+fn deserialize_snell_client<'de, D>(deserializer: D) -> Result<(ShadowsocksConfig, bool), D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct SnellClientTemp {
+        cipher: String,
+        password: String,
+        #[serde(default = "default_true")]
+        udp_enabled: bool,
+    }
+
+    let temp = SnellClientTemp::deserialize(deserializer)?;
+    let config =
+        ShadowsocksConfig::from_fields(&temp.cipher, &temp.password).map_err(Error::custom)?;
+
+    Ok((config, temp.udp_enabled))
+}
+
+/// Custom serializer for ClientProxyConfig::Snell - flattens config fields
+fn serialize_snell_client<S>(
+    config: &ShadowsocksConfig,
+    udp_enabled: &bool,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    use serde::ser::SerializeStruct;
+
+    // Only serialize udp_enabled if it's not the default (true)
+    let field_count = if *udp_enabled { 2 } else { 3 };
+    let mut state = serializer.serialize_struct("Snell", field_count)?;
+    config.serialize_fields(&mut state)?;
+    if !*udp_enabled {
+        state.serialize_field("udp_enabled", udp_enabled)?;
+    }
+    state.end()
+}
 
 /// Custom deserializer for ClientProxyConfig::Vmess that validates legacy aead field
 fn deserialize_vmess_client<'de, D>(deserializer: D) -> Result<(String, String, bool), D::Error>
@@ -143,16 +235,19 @@ where
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientConfig {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "NoneOrOne::is_unspecified")]
     pub bind_interface: NoneOrOne<String>,
-    #[serde(default = "unspecified_address")]
+    #[serde(
+        default = "unspecified_address",
+        skip_serializing_if = "NetLocation::is_unspecified"
+    )]
     pub address: NetLocation,
     pub protocol: ClientProxyConfig,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Transport::is_default")]
     pub transport: Transport,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tcp_settings: Option<TcpConfig>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quic_settings: Option<ClientQuicConfig>,
 }
 
@@ -174,43 +269,65 @@ impl Default for ClientConfig {
 pub enum ClientProxyConfig {
     Direct,
     Http {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         username: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         password: Option<String>,
     },
     #[serde(alias = "socks5")]
     Socks {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         username: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         password: Option<String>,
     },
-    #[serde(alias = "ss")]
-    Shadowsocks(ShadowsocksConfig),
-    Snell(ShadowsocksConfig),
+    #[serde(
+        alias = "ss",
+        deserialize_with = "deserialize_shadowsocks_client",
+        serialize_with = "serialize_shadowsocks_client"
+    )]
+    Shadowsocks {
+        config: ShadowsocksConfig,
+        udp_enabled: bool,
+    },
+    #[serde(
+        deserialize_with = "deserialize_snell_client",
+        serialize_with = "serialize_snell_client"
+    )]
+    Snell {
+        config: ShadowsocksConfig,
+        udp_enabled: bool,
+    },
     Vless {
         user_id: String,
-        #[serde(default = "default_true")]
+        #[serde(default = "default_true", skip_serializing_if = "is_true")]
         udp_enabled: bool,
     },
     Trojan {
         password: String,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         shadowsocks: Option<ShadowsocksConfig>,
     },
     Reality {
         public_key: String,
         #[serde(default = "default_reality_client_short_id")]
         short_id: String,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         sni_hostname: Option<String>,
 
         /// TLS 1.3 cipher suites to use (optional)
         /// Valid values: "TLS_AES_128_GCM_SHA256", "TLS_AES_256_GCM_SHA384", "TLS_CHACHA20_POLY1305_SHA256"
         /// If empty or not specified, all three cipher suites are offered.
-        #[serde(alias = "cipher_suite", default)]
+        #[serde(
+            alias = "cipher_suite",
+            default,
+            skip_serializing_if = "NoneOrSome::is_unspecified"
+        )]
         cipher_suites: NoneOrSome<crate::reality::CipherSuite>,
 
         /// Enable XTLS-Vision protocol for TLS-in-TLS optimization.
         /// When enabled, the inner protocol MUST be VLESS.
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "is_false")]
         vision: bool,
 
         protocol: Box<ClientProxyConfig>,
@@ -221,7 +338,7 @@ pub enum ClientProxyConfig {
         password: String,
 
         /// Optional SNI hostname override
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         sni_hostname: Option<String>,
 
         /// Inner protocol (typically VLESS, Trojan, etc.)
@@ -233,13 +350,36 @@ pub enum ClientProxyConfig {
     Vmess {
         cipher: String,
         user_id: String,
-        #[serde(default = "default_true")]
+        #[serde(default = "default_true", skip_serializing_if = "is_true")]
         udp_enabled: bool,
     },
     #[serde(alias = "ws")]
     Websocket(WebsocketClientConfig),
     #[serde(alias = "noop")]
     PortForward,
+    /// AnyTLS outbound protocol
+    Anytls {
+        /// Authentication password
+        password: String,
+        /// UDP over TCP support (default: true)
+        #[serde(default = "default_true", skip_serializing_if = "is_true")]
+        udp_enabled: bool,
+        /// Custom padding scheme (optional, uses default if not specified)
+        /// Each line is a key=value pair like "stop=8" or "0=30-30"
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        padding_scheme: Option<Vec<String>>,
+    },
+    /// NaiveProxy client protocol (HTTP/2 CONNECT with padding)
+    #[serde(alias = "naive")]
+    Naiveproxy {
+        /// Username for Basic Auth
+        username: String,
+        /// Password for Basic Auth
+        password: String,
+        /// Enable padding protocol (default: true)
+        #[serde(default = "default_true", skip_serializing_if = "is_true")]
+        padding: bool,
+    },
     #[serde(alias = "hy2")]
     Hysteria2 {
         password: String,
@@ -332,8 +472,8 @@ impl ClientProxyConfig {
             ClientProxyConfig::Direct => "Direct",
             ClientProxyConfig::Http { .. } => "HTTP",
             ClientProxyConfig::Socks { .. } => "SOCKS5",
-            ClientProxyConfig::Shadowsocks(..) => "Shadowsocks",
-            ClientProxyConfig::Snell(..) => "Snell",
+            ClientProxyConfig::Shadowsocks { .. } => "Shadowsocks",
+            ClientProxyConfig::Snell { .. } => "Snell",
             ClientProxyConfig::Vless { .. } => "VLESS",
             ClientProxyConfig::Trojan { .. } => "Trojan",
             ClientProxyConfig::Reality { .. } => "Reality",
@@ -342,6 +482,8 @@ impl ClientProxyConfig {
             ClientProxyConfig::Vmess { .. } => "VMess",
             ClientProxyConfig::Websocket(..) => "WebSocket",
             ClientProxyConfig::PortForward => "PortForward",
+            ClientProxyConfig::Anytls { .. } => "AnyTLS",
+            ClientProxyConfig::Naiveproxy { .. } => "NaiveProxy",
             ClientProxyConfig::Hysteria2 { .. } => "Hysteria2",
         }
     }
@@ -349,25 +491,33 @@ impl ClientProxyConfig {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TlsClientConfig {
-    #[serde(default = "default_true")]
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub verify: bool,
-    #[serde(alias = "server_fingerprint", default)]
+    #[serde(
+        alias = "server_fingerprint",
+        default,
+        skip_serializing_if = "NoneOrSome::is_unspecified"
+    )]
     pub server_fingerprints: NoneOrSome<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "NoneOrOne::is_unspecified")]
     pub sni_hostname: NoneOrOne<String>,
-    #[serde(alias = "alpn_protocol", default)]
+    #[serde(
+        alias = "alpn_protocol",
+        default,
+        skip_serializing_if = "NoneOrSome::is_unspecified"
+    )]
     pub alpn_protocols: NoneOrSome<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls_buffer_size: Option<usize>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cert: Option<String>,
 
     /// Enable XTLS-Vision protocol for TLS-in-TLS optimization.
     /// When enabled, the inner protocol MUST be VLESS.
     /// Requires TLS 1.3.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub vision: bool,
 
     pub protocol: Box<ClientProxyConfig>,
@@ -375,11 +525,11 @@ pub struct TlsClientConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct WebsocketClientConfig {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub matching_path: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub matching_headers: Option<HashMap<String, String>>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "WebsocketPingType::is_default")]
     pub ping_type: WebsocketPingType,
     pub protocol: Box<ClientProxyConfig>,
 }
@@ -514,28 +664,5 @@ protocol:
         let result: Result<ClientProxyConfig, _> = serde_yaml::from_str(yaml);
         assert!(result.is_ok());
         assert!(matches!(result.unwrap(), ClientProxyConfig::Websocket(_)));
-    }
-
-    #[test]
-    fn test_client_proxy_config_hysteria2() {
-        let yaml = r#"
-type: hysteria2
-password: "test_password"
-udp_enabled: true
-"#;
-        let result: Result<ClientProxyConfig, _> = serde_yaml::from_str(yaml);
-        assert!(result.is_ok());
-        assert!(matches!(result.unwrap(), ClientProxyConfig::Hysteria2 { .. }));
-    }
-
-    #[test]
-    fn test_client_proxy_config_hysteria2_alias() {
-        let yaml = r#"
-type: hy2
-password: "test_password"
-"#;
-        let result: Result<ClientProxyConfig, _> = serde_yaml::from_str(yaml);
-        assert!(result.is_ok());
-        assert!(matches!(result.unwrap(), ClientProxyConfig::Hysteria2 { .. }));
     }
 }

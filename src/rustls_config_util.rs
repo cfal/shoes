@@ -10,10 +10,16 @@ pub fn create_client_config(
     alpn_protocols: Vec<String>,
     enable_sni: bool,
     client_key_and_cert: Option<(Vec<u8>, Vec<u8>)>,
+    tls13_only: bool,
 ) -> rustls::ClientConfig {
-    let builder = rustls::ClientConfig::builder_with_provider(get_crypto_provider())
-        .with_safe_default_protocol_versions()
-        .unwrap();
+    let builder = rustls::ClientConfig::builder_with_provider(get_crypto_provider());
+    let builder = if tls13_only {
+        builder
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+    } else {
+        builder.with_safe_default_protocol_versions().unwrap()
+    };
 
     let builder = if verify_webpki {
         let webpki_verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
@@ -49,11 +55,10 @@ pub fn create_client_config(
 
     let mut config = match client_key_and_cert {
         Some((key_bytes, cert_bytes)) => {
-            let certs = vec![
-                rustls::pki_types::CertificateDer::from_pem_slice(&cert_bytes)
-                    .unwrap()
-                    .into_owned(),
-            ];
+            // Parse all certificates from the PEM file (client cert + intermediates if any)
+            let certs: Vec<_> = rustls::pki_types::CertificateDer::pem_slice_iter(&cert_bytes)
+                .map(|cert| cert.unwrap().into_owned())
+                .collect();
 
             let privkey = rustls::pki_types::PrivateKeyDer::from_pem_slice(&key_bytes).unwrap();
             builder
@@ -221,11 +226,15 @@ pub fn create_server_config(
     alpn_protocols: &[String],
     client_fingerprints: &[String],
 ) -> rustls::ServerConfig {
-    let certs = vec![
-        rustls::pki_types::CertificateDer::from_pem_slice(cert_bytes)
-            .unwrap()
-            .into_owned(),
-    ];
+    // Parse all certificates from the PEM file (server cert + intermediates)
+    let certs: Vec<_> = rustls::pki_types::CertificateDer::pem_slice_iter(cert_bytes)
+        .map(|cert| cert.unwrap().into_owned())
+        .collect();
+
+    log::debug!(
+        "TLS server config: loaded {} certificate(s) in chain",
+        certs.len()
+    );
 
     let privkey = rustls::pki_types::PrivateKeyDer::from_pem_slice(key_bytes).unwrap();
 

@@ -22,13 +22,14 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use log::{debug, info};
+use log::debug;
 
 use crate::address::NetLocation;
+use crate::async_stream::AsyncMessageStream;
 use crate::resolver::Resolver;
 use crate::tcp::proxy_connector::ProxyConnector;
 use crate::tcp::socket_connector::SocketConnector;
-use crate::tcp_handler::{TcpClientSetupResult, TcpClientUdpSetupResult, UdpStreamRequest};
+use crate::tcp::tcp_handler::TcpClientSetupResult;
 
 /// Entry in the initial hop (hop 0) pool.
 ///
@@ -224,7 +225,7 @@ impl ClientProxyChain {
         // Select proxy connectors for subsequent hops
         let subsequent_proxies = self.select_subsequent_proxies();
 
-        info!(
+        debug!(
             "Chain TCP connect: 1 initial + {} subsequent hop(s) -> {}",
             subsequent_proxies.len(),
             remote_location
@@ -303,12 +304,14 @@ impl ClientProxyChain {
         Ok(result)
     }
 
-    /// Connect for UDP traffic through the chain.
-    pub async fn connect_udp(
+    /// Connect for bidirectional UDP traffic through the chain.
+    ///
+    /// Returns an AsyncMessageStream that sends/receives UDP packets to the target.
+    pub async fn connect_udp_bidirectional(
         &self,
         resolver: &Arc<dyn Resolver>,
-        request: UdpStreamRequest,
-    ) -> std::io::Result<TcpClientUdpSetupResult> {
+        target: NetLocation,
+    ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
         // Check if UDP is supported
         if self.udp_final_hop_indices.is_empty() {
             return Err(std::io::Error::new(
@@ -326,15 +329,15 @@ impl ClientProxyChain {
             let pool_idx = self.udp_final_hop_indices[idx % self.udp_final_hop_indices.len()];
             let entry = &self.initial_hop[pool_idx];
 
-            info!(
-                "Chain UDP connect: 1 hop (initial IS final), request={}",
-                request
+            debug!(
+                "Chain UDP connect: 1 hop (initial IS final), target={}",
+                target
             );
 
             match entry {
                 InitialHopEntry::Direct(socket) => {
                     debug!("Chain UDP: Direct connection (native UDP)");
-                    socket.connect_udp(resolver, request).await
+                    socket.connect_udp_bidirectional(resolver, target).await
                 }
                 InitialHopEntry::Proxy { socket, proxy } => {
                     debug!(
@@ -342,7 +345,7 @@ impl ClientProxyChain {
                         proxy.proxy_location()
                     );
                     let stream = socket.connect(resolver, proxy.proxy_location()).await?;
-                    proxy.setup_udp_stream(stream, request).await
+                    proxy.setup_udp_bidirectional(stream, target).await
                 }
             }
         } else {
@@ -377,10 +380,10 @@ impl ClientProxyChain {
             let pool_idx = self.udp_final_hop_indices[idx % self.udp_final_hop_indices.len()];
             let final_proxy = final_hop_pool[pool_idx].as_ref();
 
-            info!(
-                "Chain UDP connect: 1 initial + {} intermediate + 1 final (UDP) hop(s), request={}",
+            debug!(
+                "Chain UDP connect: 1 initial + {} intermediate + 1 final (UDP) hop(s), target={}",
                 intermediate_proxies.len(),
-                request
+                target
             );
 
             // Build the chain: initial -> intermediates -> final (UDP)
@@ -398,7 +401,7 @@ impl ClientProxyChain {
 
                     // Process intermediate hops (all TCP)
                     for (i, proxy) in intermediate_proxies.iter().enumerate() {
-                        let target = intermediate_proxies
+                        let next_target = intermediate_proxies
                             .get(i + 1)
                             .map(|p| p.proxy_location())
                             .unwrap_or(final_proxy.proxy_location());
@@ -407,9 +410,9 @@ impl ClientProxyChain {
                             i + 1,
                             intermediate_proxies.len(),
                             proxy.proxy_location(),
-                            target
+                            next_target
                         );
-                        let result = proxy.setup_tcp_stream(stream, target).await?;
+                        let result = proxy.setup_tcp_stream(stream, next_target).await?;
                         stream = result.client_stream;
                     }
 
@@ -418,7 +421,7 @@ impl ClientProxyChain {
                         "Chain UDP final hop: {} (UDP)",
                         final_proxy.proxy_location()
                     );
-                    final_proxy.setup_udp_stream(stream, request).await
+                    final_proxy.setup_udp_bidirectional(stream, target).await
                 }
                 InitialHopEntry::Proxy { socket, proxy } => {
                     // Determine first target after initial hop
@@ -439,7 +442,7 @@ impl ClientProxyChain {
 
                     // Process intermediate hops (all TCP)
                     for (i, proxy) in intermediate_proxies.iter().enumerate() {
-                        let target = intermediate_proxies
+                        let next_target = intermediate_proxies
                             .get(i + 1)
                             .map(|p| p.proxy_location())
                             .unwrap_or(final_proxy.proxy_location());
@@ -448,9 +451,9 @@ impl ClientProxyChain {
                             i + 1,
                             intermediate_proxies.len(),
                             proxy.proxy_location(),
-                            target
+                            next_target
                         );
-                        let result = proxy.setup_tcp_stream(stream, target).await?;
+                        let result = proxy.setup_tcp_stream(stream, next_target).await?;
                         stream = result.client_stream;
                     }
 
@@ -459,7 +462,7 @@ impl ClientProxyChain {
                         "Chain UDP final hop: {} (UDP)",
                         final_proxy.proxy_location()
                     );
-                    final_proxy.setup_udp_stream(stream, request).await
+                    final_proxy.setup_udp_bidirectional(stream, target).await
                 }
             }
         }
@@ -515,11 +518,11 @@ impl ClientChainGroup {
         chain.connect_tcp(remote_location, resolver).await
     }
 
-    pub async fn connect_udp(
+    pub async fn connect_udp_bidirectional(
         &self,
         resolver: &Arc<dyn Resolver>,
-        request: UdpStreamRequest,
-    ) -> std::io::Result<TcpClientUdpSetupResult> {
+        target: NetLocation,
+    ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
         if self.udp_chain_indices.is_empty() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
@@ -530,7 +533,7 @@ impl ClientChainGroup {
         let idx = self.next_udp_index.fetch_add(1, Ordering::Relaxed) as usize;
         let chain_idx = self.udp_chain_indices[idx % self.udp_chain_indices.len()];
         let chain = &self.chains[chain_idx];
-        chain.connect_udp(resolver, request).await
+        chain.connect_udp_bidirectional(resolver, target).await
     }
 
     #[cfg(test)]
@@ -568,14 +571,14 @@ mod tests {
             ))
         }
 
-        async fn connect_udp(
+        async fn connect_udp_bidirectional(
             &self,
             _resolver: &Arc<dyn Resolver>,
-            _request: UdpStreamRequest,
-        ) -> std::io::Result<TcpClientUdpSetupResult> {
+            _target: NetLocation,
+        ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
             Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
-                "MockSocketConnector::connect_udp not implemented",
+                "MockSocketConnector::connect_udp_bidirectional not implemented",
             ))
         }
     }
@@ -617,14 +620,14 @@ mod tests {
             ))
         }
 
-        async fn setup_udp_stream(
+        async fn setup_udp_bidirectional(
             &self,
             _stream: Box<dyn AsyncStream>,
-            _request: UdpStreamRequest,
-        ) -> std::io::Result<TcpClientUdpSetupResult> {
+            _target: NetLocation,
+        ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
             Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
-                "MockProxyConnector::setup_udp_stream not implemented",
+                "MockProxyConnector::setup_udp_bidirectional not implemented",
             ))
         }
     }
@@ -648,8 +651,6 @@ mod tests {
         }
     }
 
-    // --- InitialHopEntry Tests ---
-
     #[test]
     fn test_initial_hop_entry_direct_supports_udp() {
         let entry = direct_entry(0);
@@ -667,8 +668,6 @@ mod tests {
         let entry = proxy_entry(0, 1080, false);
         assert!(!entry.supports_udp());
     }
-
-    // --- ClientProxyChain Tests ---
 
     #[test]
     fn test_chain_single_direct() {
@@ -779,8 +778,6 @@ mod tests {
     fn test_chain_empty_initial_hop_panics() {
         ClientProxyChain::new(vec![], vec![]);
     }
-
-    // --- ClientChainGroup Tests ---
 
     #[test]
     fn test_group_single_chain() {
@@ -926,8 +923,6 @@ mod tests {
         }
     }
 
-    // --- UDP Compatibility Fix Tests (Part 6) ---
-
     #[test]
     fn test_udp_selection_with_subsequent_hops() {
         // Test that when udp_uses_initial_hop = false, we select:
@@ -949,7 +944,7 @@ mod tests {
         assert_eq!(chain.udp_final_hop_indices, vec![1, 2]);
 
         // Verify that initial hop selection would use all entries (indices 0 and 1)
-        // We can't easily test this without calling connect_udp(), but we can verify
+        // We can't easily test this without calling connect_udp_bidirectional(), but we can verify
         // that the normal round-robin will cycle through both
         for i in 0..4 {
             let entry = chain.select_initial_hop_entry();

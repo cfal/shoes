@@ -1,8 +1,6 @@
-use aws_lc_rs::{
-    agreement,
-    rand::{SecureRandom, SystemRandom},
-};
+use aws_lc_rs::agreement;
 use base64::engine::{Engine as _, general_purpose::URL_SAFE_NO_PAD};
+use rand::RngCore;
 
 use super::reality_cipher_suite::CipherSuite;
 use crate::buf_reader::BufReader;
@@ -461,23 +459,21 @@ pub fn negotiate_cipher_suite(
 }
 
 pub fn generate_keypair() -> std::io::Result<(String, String)> {
-    // Step 1: Generate 32 random bytes for private key
-    let rng = SystemRandom::new();
+    // Generate 32 random bytes for private key
     let mut private_key_bytes = [0u8; 32];
-    rng.fill(&mut private_key_bytes)
-        .map_err(|_| std::io::Error::other("RNG failed"))?;
+    rand::rng().fill_bytes(&mut private_key_bytes);
 
-    // Step 2: Create X25519 private key from the random bytes
+    // Create X25519 private key from the random bytes
     let private_key =
         agreement::PrivateKey::from_private_key(&agreement::X25519, &private_key_bytes)
             .map_err(|_| std::io::Error::other("Failed to create X25519 key"))?;
 
-    // Step 3: Derive public key from private key
+    // Derive public key from private key
     let public_key_bytes = private_key
         .compute_public_key()
         .map_err(|_| std::io::Error::other("Failed to compute public key"))?;
 
-    // Step 4: Encode both keys as base64url (no padding)
+    // Encode both keys as base64url (no padding)
     let private_key_b64 = URL_SAFE_NO_PAD.encode(private_key_bytes);
     let public_key_b64 = URL_SAFE_NO_PAD.encode(public_key_bytes.as_ref());
 

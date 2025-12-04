@@ -129,6 +129,7 @@ pub fn build_client_proxy_chain(
                     alpn_protocols.into_vec(),
                     effective_sni.is_some(),
                     key_and_cert_bytes,
+                    true, // tls13_only - Hysteria2 requires TLS 1.3
                 );
 
                 let quic_client_config = quinn::crypto::rustls::QuicClientConfig::with_initial(

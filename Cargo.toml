@@ -1,6 +1,6 @@
 [package]
 name = "shoes"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2024"
 license = "MIT"
 description = "A multi-protocol proxy server."
@@ -10,14 +10,31 @@ readme = "README.md"
 keywords = ["proxy", "proxy-server", "shadowsocks", "v2ray", "vmess"]
 categories = ["command-line-utilities", "network-programming"]
 
+[lib]
+name = "shoes"
+# rlib = Rust library (for Rust dependencies)
+# cdylib = C dynamic library (.so on Linux/Android, .dylib on macOS)
+# staticlib = C static library (.a) - required for iOS
+crate-type = ["rlib", "cdylib", "staticlib"]
+
+[[bin]]
+name = "shoes"
+path = "src/main.rs"
+
+[features]
+default = []
+ffi = []  # Enable FFI module for non-Android builds
+
 [dependencies]
-aes = "*"
-argon2 = "*"
 async-trait = "*"
 aws-lc-rs = { version = "*", default-features = false }
 base64 = "*"
 blake3 = "*"
 bytes = "*"
+h2 = "*"
+hyper = { version = "*", features = ["server", "http1", "http2"] }
+hyper-util = { version = "*", features = ["tokio", "server"] }
+http-body-util = "*"
 dashmap = "*"
 digest = "*"
 env_logger = "*"
@@ -25,18 +42,21 @@ futures = "*"
 h3 = "*"
 h3-quinn = "*"
 http = "*"
+indexmap = "*"
 log = { version = "*", features = ["release_max_level_info"] }
 lru = "*"
 md-5 = "*"
 memchr = "*"
+mime_guess = "*"
 notify = "*"
 parking_lot = "*"
 percent-encoding = "*"
 quinn = { version = "*", default-features = false, features = ["log", "platform-verifier", "runtime-tokio", "rustls-aws-lc-rs"] }
 rand = "*"
 rand_core = "*"
-rcgen = { version = "*", features = ["x509-parser"] }
+rcgen = { version = "*", default-features = false, features = ["aws_lc_rs", "pem"] }
 rustc-hash = "*"
+rust-argon2 = "*"
 rustls = "*"
 serde = { version = "*", features = ["derive", "std"] }
 subtle = "*"
@@ -52,24 +72,36 @@ tokio = { version = "*", features = [
     "sync",
     "time",
 ] }
-tokio-util = "*"
+tokio-util = { version = "*", features = ["time"] }
 webpki-roots = { version = "*" }
-x509-parser = "*"
+
+# TUN device support (for VPN mode)
+tun = { version = "0.8", features = ["async"] }
+smoltcp = { version = "0.12", default-features = false, features = ["std", "log", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-icmp", "socket-udp", "socket-tcp", "socket-tcp-cubic", "phy-tuntap_interface", "assembler-max-segment-count-32"] }
+etherparse = "0.16"
+
+x509-parser = { version = "*", default-features = false, features = ["verify-aws"] }
+libc = "0.2.179"
 
 [dev-dependencies]
 tempfile = "*"
-hyper = { version = "1", features = ["server", "http1"] }
-hyper-util = { version = "0.1", features = ["tokio", "server"] }
-http-body-util = "0.1"
 rustls-pemfile = "*"
-rcgen = "*"
+rcgen = { version = "*", default-features = false, features = ["aws_lc_rs", "pem"] }
 tokio-rustls = "*"
 serde_json = "*"
 
-[target.'cfg(not(target_env = "msvc"))'.dependencies]
+# jemalloc for better memory performance (not supported on Windows MSVC or iOS)
+[target.'cfg(not(any(target_env = "msvc", target_os = "ios")))'.dependencies]
 tikv-jemallocator = "0.6"
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+android_logger = "0.14"
+ndk-sys = "0.6"
+chrono = "0.4"
 
 [profile.release]
 opt-level = 3
 lto = "fat"
 strip = true
+

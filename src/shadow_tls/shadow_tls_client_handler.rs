@@ -3,21 +3,20 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use rand::RngCore;
-use tokio::io::AsyncWriteExt; // For write_all // For random bytes
+use tokio::io::AsyncWriteExt;
 
 use crate::address::NetLocation;
+use crate::async_stream::AsyncMessageStream;
 use crate::async_stream::AsyncStream;
 use crate::buf_reader::BufReader;
 use crate::rustls_connection_util::feed_rustls_client_connection;
 use crate::shadow_tls::shadow_tls_hmac::ShadowTlsHmac;
 use crate::shadow_tls::shadow_tls_stream::ShadowTlsStream;
 use crate::stream_reader::StreamReader;
-use crate::tcp_handler::{
-    TcpClientHandler, TcpClientSetupResult, TcpClientUdpSetupResult, UdpStreamRequest,
-};
-use crate::util::{allocate_vec, write_all}; // Assuming write_all is from crate::util
+use crate::tcp::tcp_handler::{TcpClientHandler, TcpClientSetupResult};
+use crate::util::{allocate_vec, write_all};
 
-use super::shadow_tls_server_handler::parse_server_hello;
+use super::shadow_tls_server_handler::parse_validated_server_hello;
 
 // Constants from shadow_tls_server_handler
 // TODO: deduplicate consts
@@ -90,7 +89,7 @@ impl ShadowTlsClientHandler {
         let server_hello_frame =
             read_tls_frame(&mut remote_reader, &mut client_stream, &mut frame_buf).await?;
 
-        let parsed_server_hello = parse_server_hello(server_hello_frame)?;
+        let parsed_server_hello = parse_validated_server_hello(server_hello_frame)?;
 
         feed_rustls_client_connection(&mut client_conn, server_hello_frame)?;
         client_conn.process_new_packets().map_err(|e| {
@@ -132,12 +131,11 @@ impl ShadowTlsClientHandler {
             let content_type = server_frame[0];
 
             if content_type == CONTENT_TYPE_APPLICATION_DATA {
-                // since we are still handshaking, this must be an encrypted TLS 1.3 handshake record from
-                // the handshake server, so we expect it to pass the ServerRandom hmac check.
-                // once we get here, we are done with the initial handshake and can break.
+                // Encrypted TLS 1.3 handshake record from the handshake server.
+                // Validates HMAC and then breaks from handshake loop.
                 let payload_len = u16::from_be_bytes([server_frame[3], server_frame[4]]) as usize;
                 if payload_len < 4 + 1 {
-                    // must be at least 4 for the hmac digest and non-empty data after it
+                    // Requires at least 4 bytes for HMAC digest plus non-empty data.
                     // TODO: should this check for a larger record size?
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
@@ -184,7 +182,7 @@ impl ShadowTlsClientHandler {
             Some(hmac_server_random),
         )?;
 
-        // Feed any unconsumed data from StreamReader from handshake phase
+        // Feeds any unconsumed data from StreamReader from handshake phase
         let unparsed_handshake_data = remote_reader.unparsed_data();
         if !unparsed_handshake_data.is_empty() {
             shadow_tls_stream.feed_initial_read_data(unparsed_handshake_data)?;
@@ -211,14 +209,14 @@ impl TcpClientHandler for ShadowTlsClientHandler {
         self.handler.supports_udp_over_tcp()
     }
 
-    async fn setup_client_udp_stream(
+    async fn setup_client_udp_bidirectional(
         &self,
         client_stream: Box<dyn AsyncStream>,
-        request: UdpStreamRequest,
-    ) -> std::io::Result<TcpClientUdpSetupResult> {
+        target: NetLocation,
+    ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
         let shadow_tls_stream = self.setup_client_stream_common(client_stream).await?;
         self.handler
-            .setup_client_udp_stream(Box::new(shadow_tls_stream), request)
+            .setup_client_udp_bidirectional(Box::new(shadow_tls_stream), target)
             .await
     }
 }
@@ -356,7 +354,6 @@ async fn read_tls_frame<'a>(
 
     let payload_len = u16::from_be_bytes([header_bytes[3], header_bytes[4]]) as usize;
     if payload_len > TLS_FRAME_MAX_LEN - TLS_HEADER_LEN {
-        // Check against max possible payload
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "TLS frame payload too large",

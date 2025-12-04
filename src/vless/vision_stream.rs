@@ -2,9 +2,9 @@ use crate::crypto::CryptoConnection;
 /// VISION stream implementation
 ///
 /// VisionStream wraps an IO stream and TLS session, allowing it to:
-/// 1. Use TLS with VISION padding to hide protocol fingerprints
-/// 2. Detect TLS-in-TLS scenarios by analyzing traffic patterns
-/// 3. Switch to direct I/O mode, bypassing TLS for zero-copy performance
+/// - Use TLS with VISION padding to hide protocol fingerprints
+/// - Detect TLS-in-TLS scenarios by analyzing traffic patterns
+/// - Switch to direct I/O mode, bypassing TLS for zero-copy performance
 use bytes::{Buf, BytesMut};
 use futures::ready;
 use std::io::{self, BufRead, Write};
@@ -149,7 +149,6 @@ where
         user_uuid: [u8; 16],
         initial_read_data: &[u8],
     ) -> std::io::Result<Self> {
-        // Validate that this is a server connection
         if !session.is_server() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -173,7 +172,6 @@ where
 
     /// Create a new VisionStream for client-side connections with VLESS response handling
     pub fn new_client(tcp: IO, session: CryptoConnection, user_uuid: [u8; 16]) -> Self {
-        // Validate that this is a client connection
         if !session.is_client() {
             panic!("VisionStream::new_client requires a client-side connection");
         }
@@ -375,39 +373,42 @@ where
         self.pending_plain_writes = BytesMut::new();
     }
 
-    /// Drain pending plaintext writes to TLS session buffer
-    /// Returns Poll::Ready(Ok(())) when fully drained
-    /// Returns Poll::Pending if session buffer is full (needs TLS/TCP drain first)
-    fn drain_pending_plain_writes(&mut self, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    /// Drain pending plaintext writes to TLS session buffer.
+    ///
+    /// Returns the number of bytes successfully written to the session.
+    /// - If returned > 0: progress was made, wants_write() should be true
+    /// - If returned == 0 and pending_plain_writes not empty: no progress (buffer full)
+    /// - If returned == 0 and pending_plain_writes empty: nothing to do
+    fn drain_pending_plain_writes(&mut self) -> io::Result<usize> {
         if self.pending_plain_writes.is_empty() {
-            return Poll::Ready(Ok(()));
+            return Ok(0);
         }
 
-        log::debug!(
-            "VISION WRITE: Draining {} pending plaintext bytes",
-            self.pending_plain_writes.len()
-        );
+        let initial_len = self.pending_plain_writes.len();
 
         // Try to write pending plaintext to TLS session
         while !self.pending_plain_writes.is_empty() {
             match self.session.writer().write(&self.pending_plain_writes) {
+                Ok(0) => {
+                    // Session buffer full
+                    break;
+                }
                 Ok(n) => {
-                    if n == 0 {
-                        // Session buffer full - return Pending so drain_all_writes can drain TLS/TCP first
-                        log::debug!(
-                            "VISION WRITE: Session buffer full ({} plaintext bytes remaining), returning Pending",
-                            self.pending_plain_writes.len()
-                        );
-                        return Poll::Pending;
-                    }
-
                     self.pending_plain_writes.advance(n);
                 }
-                Err(e) => return Poll::Ready(Err(e)),
+                Err(e) => return Err(e),
             }
         }
 
-        Poll::Ready(Ok(()))
+        let written = initial_len - self.pending_plain_writes.len();
+        if written > 0 {
+            log::debug!(
+                "VISION WRITE: Drained {} plaintext bytes to session ({} remaining)",
+                written,
+                self.pending_plain_writes.len()
+            );
+        }
+        Ok(written)
     }
 
     /// Drain all pending writes in PaddingTls mode: plain → TLS → TCP
@@ -420,39 +421,42 @@ where
     /// Returns Poll::Pending if TCP blocks (backpressure - nothing else can make progress)
     fn drain_all_writes_padding(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         loop {
+            // Drain TLS session to TCP if there's data to send
             if self.session.wants_write() {
                 match self.write_tls_direct(cx) {
                     Poll::Ready(Ok(0)) => return Poll::Ready(Err(io::ErrorKind::WriteZero.into())),
                     Poll::Ready(Ok(_)) => {
-                        // Wrote some data. This might have freed up space in session buffer.
-                        // Loop back to try draining plaintext buffer again.
+                        // Wrote some data, freed up space in session buffer. Loop to continue.
                         continue;
                     }
                     Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                     Poll::Pending => {
-                        // TCP is blocked. We can't drain session, so we can't drain plain writes either.
+                        // TCP blocked - waker is registered, return Pending
                         return Poll::Pending;
                     }
                 }
             }
 
+            // Drain plaintext buffer to TLS session
             if !self.pending_plain_writes.is_empty() {
-                match self.drain_pending_plain_writes(cx) {
-                    Poll::Ready(Ok(())) => {
-                        // Drained plain writes, session now likely wants to write.
-                        continue;
-                    }
-                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                    Poll::Pending => {
-                        // Session buffer full. But we didn't drain session above (wants_write was false).
-                        // So we are stuck.
-                        // TODO: this is probably an error
-                        return Poll::Pending;
-                    }
+                let written = self.drain_pending_plain_writes()?;
+                if written > 0 {
+                    // Made progress - session now has data, wants_write() should be true
+                    continue;
+                } else {
+                    // No progress: session buffer was already full but wants_write() was false.
+                    // This shouldn't happen - if buffer is full, there should be data to send.
+                    log::error!(
+                        "DRAIN: stuck - couldn't write to session but wants_write=false, pending={}",
+                        self.pending_plain_writes.len()
+                    );
+                    return Poll::Ready(Err(io::Error::other(
+                        "drain stuck: session buffer full but wants_write is false",
+                    )));
                 }
             }
 
-            // If we are here, everything is empty.
+            // Both empty - done
             return Poll::Ready(Ok(()));
         }
     }
@@ -1250,10 +1254,14 @@ where
                     }
                 }
                 Ok(DeframeResult::NeedData) => {
-                    // need more data
-                    // TODO: investigate this case. it's possible that this is not TLS data and the deframer is waiting
-                    // for more writes from the caller to complete a full TLS record, but no more writes are coming.
-                    // do we need to change our deframer approach?
+                    // TODO: There's a theoretical edge case where non-TLS data ends with bytes
+                    // that look like a valid TLS record prefix (e.g., [0x16, 0x03, 0x03]).
+                    // The deframer would hold onto these bytes waiting for more data to
+                    // complete the "TLS record", but since it's not actually TLS, no more
+                    // data will come. This would cause a hang.
+                    //
+                    // This is extremely unlikely in practice, so we choose not to handle this edge
+                    // case to keep the code simple.
                     break;
                 }
                 Ok(DeframeResult::UnknownPrefix(prefix)) => {

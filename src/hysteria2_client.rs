@@ -1058,6 +1058,39 @@ impl crate::async_stream::AsyncShutdownMessage for HyUdpMessageStream {
 
 impl crate::async_stream::AsyncSourcedMessageStream for HyUdpMessageStream {}
 
+// Implement AsyncMessageStream for HyUdpMessageStream to support SocketConnector::connect_udp_bidirectional
+impl crate::async_stream::AsyncReadMessage for HyUdpMessageStream {
+    fn poll_read_message(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        // Delegate to AsyncReadSourcedMessage, ignoring the source address
+        match self.poll_read_sourced_message(cx, buf) {
+            Poll::Ready(Ok(_)) => Poll::Ready(Ok(())),
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl crate::async_stream::AsyncWriteMessage for HyUdpMessageStream {
+    fn poll_write_message(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        _buf: &[u8],
+    ) -> Poll<std::io::Result<()>> {
+        // For bidirectional UDP, we need a fixed target. This is a limitation -
+        // the caller should use the full multi-directional API if they need per-packet targets.
+        Poll::Ready(Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "HyUdpMessageStream requires explicit target address. Use AsyncTargetedMessageStream instead.",
+        )))
+    }
+}
+
+impl crate::async_stream::AsyncMessageStream for HyUdpMessageStream {}
+
 /// Hysteria2 TCP stream with optional Fast Open support.
 ///
 /// When Fast Open is enabled, the stream is returned immediately after sending

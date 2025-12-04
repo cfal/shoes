@@ -2,7 +2,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use futures::ready;
-use log::info;
+use log::debug;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::async_stream::{AsyncPing, AsyncStream};
@@ -73,7 +73,7 @@ where
             self.response_buffer.extend_from_slice(filled);
         }
 
-        info!(
+        debug!(
             "VLESS: Successfully read and consumed {} byte response header (version={}, addon_length={})",
             total_response_len, version, addon_length
         );

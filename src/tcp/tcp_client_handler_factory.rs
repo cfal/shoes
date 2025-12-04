@@ -4,12 +4,14 @@ use std::sync::Arc;
 
 use log::debug;
 
+use crate::anytls::{AnyTlsClientHandler, PaddingFactory};
 use crate::client_proxy_selector::{ClientProxySelector, ConnectAction, ConnectRule};
 use crate::config::{
     ClientProxyConfig, RuleActionConfig, RuleConfig, ShadowsocksConfig, TlsClientConfig,
     WebsocketClientConfig,
 };
 use crate::http_handler::HttpTcpClientHandler;
+use crate::naiveproxy::NaiveProxyTcpClientHandler;
 use crate::port_forward_handler::PortForwardClientHandler;
 use crate::rustls_config_util::create_client_config;
 use crate::shadow_tls::ShadowTlsClientHandler;
@@ -17,9 +19,10 @@ use crate::shadowsocks::ShadowsocksTcpHandler;
 use crate::snell::snell_handler::SnellClientHandler;
 use crate::socks_handler::SocksTcpClientHandler;
 use crate::tcp::chain_builder::build_client_chain_group;
-use crate::tcp_handler::TcpClientHandler;
+use crate::tcp::tcp_handler::TcpClientHandler;
 use crate::tls_client_handler::TlsClientHandler;
 use crate::trojan_handler::TrojanTcpHandler;
+use crate::uuid_util::parse_uuid;
 use crate::vless::vless_client_handler::VlessTcpClientHandler;
 use crate::vmess::VmessTcpClientHandler;
 use crate::websocket::WebsocketTcpClientHandler;
@@ -48,16 +51,25 @@ pub fn create_tcp_client_handler(
         ClientProxyConfig::Socks { username, password } => Box::new(SocksTcpClientHandler::new(
             create_auth_credentials(username, password),
         )),
-        ClientProxyConfig::Shadowsocks(ShadowsocksConfig::Legacy { cipher, password }) => {
-            Box::new(ShadowsocksTcpHandler::new(cipher, &password))
-        }
-        ClientProxyConfig::Shadowsocks(ShadowsocksConfig::Aead2022 { cipher, key_bytes }) => {
-            Box::new(ShadowsocksTcpHandler::new_aead2022(cipher, &key_bytes))
-        }
-        ClientProxyConfig::Snell(ShadowsocksConfig::Legacy { cipher, password }) => {
-            Box::new(SnellClientHandler::new(cipher, &password))
-        }
-        ClientProxyConfig::Snell(ShadowsocksConfig::Aead2022 { .. }) => {
+        ClientProxyConfig::Shadowsocks {
+            config,
+            udp_enabled,
+        } => match config {
+            ShadowsocksConfig::Legacy { cipher, password } => Box::new(
+                ShadowsocksTcpHandler::new_client(cipher, &password, udp_enabled),
+            ),
+            ShadowsocksConfig::Aead2022 { cipher, key_bytes } => Box::new(
+                ShadowsocksTcpHandler::new_aead2022_client(cipher, &key_bytes, udp_enabled),
+            ),
+        },
+        ClientProxyConfig::Snell {
+            config: ShadowsocksConfig::Legacy { cipher, password },
+            udp_enabled,
+        } => Box::new(SnellClientHandler::new(cipher, &password, udp_enabled)),
+        ClientProxyConfig::Snell {
+            config: ShadowsocksConfig::Aead2022 { .. },
+            ..
+        } => {
             panic!(
                 "Snell does not support shadowsocks 2022 ciphers (checked during config validation)"
             )
@@ -65,14 +77,11 @@ pub fn create_tcp_client_handler(
         ClientProxyConfig::Vless {
             user_id,
             udp_enabled,
-        } => {
-            // Plain VLESS without TLS
-            Box::new(VlessTcpClientHandler::new(&user_id, udp_enabled))
-        }
+        } => Box::new(VlessTcpClientHandler::new(&user_id, udp_enabled)),
         ClientProxyConfig::Trojan {
             password,
             shadowsocks,
-        } => Box::new(TrojanTcpHandler::new(&password, &shadowsocks)),
+        } => Box::new(TrojanTcpHandler::new_client(&password, &shadowsocks)),
         ClientProxyConfig::Tls(tls_client_config) => {
             let TlsClientConfig {
                 verify,
@@ -87,10 +96,10 @@ pub fn create_tcp_client_handler(
             } = tls_client_config;
 
             let sni_hostname = if sni_hostname.is_unspecified() {
-                if default_sni_hostname.is_some() {
+                if let Some(ref hostname) = default_sni_hostname {
                     debug!(
                         "Using default sni hostname for TLS client connection: {}",
-                        default_sni_hostname.as_ref().unwrap()
+                        hostname
                     );
                 }
                 default_sni_hostname
@@ -112,6 +121,7 @@ pub fn create_tcp_client_handler(
                 alpn_protocols.into_vec(),
                 sni_hostname.is_some(),
                 key_and_cert_bytes,
+                false, // tls13_only
             ));
 
             let server_name = match sni_hostname {
@@ -130,7 +140,7 @@ pub fn create_tcp_client_handler(
                     // Validated when loading config
                     unreachable!();
                 };
-                let user_id_bytes = crate::util::parse_uuid(user_id)
+                let user_id_bytes = parse_uuid(user_id)
                     .expect("Invalid user_id UUID")
                     .into_boxed_slice();
                 Box::new(TlsClientHandler::new_vision_vless(
@@ -159,8 +169,6 @@ pub fn create_tcp_client_handler(
             vision,
             protocol,
         } => {
-            eprintln!("========== CREATING REALITY CLIENT HANDLER ==========");
-
             // Decode public key from base64url
             let public_key_bytes =
                 crate::reality::decode_public_key(&public_key).expect("Invalid REALITY public key");
@@ -190,7 +198,7 @@ pub fn create_tcp_client_handler(
                 else {
                     unreachable!("Vision requires VLESS (should be validated during config load)")
                 };
-                let user_id_bytes = crate::util::parse_uuid(user_id)
+                let user_id_bytes = parse_uuid(user_id)
                     .expect("Invalid user_id UUID")
                     .into_boxed_slice();
                 Box::new(
@@ -219,7 +227,6 @@ pub fn create_tcp_client_handler(
             sni_hostname,
             protocol,
         } => {
-            // ShadowTLS client handler
             let sni_hostname = sni_hostname.or(default_sni_hostname);
             let enable_sni = sni_hostname.is_some();
 
@@ -228,16 +235,18 @@ pub fn create_tcp_client_handler(
                 None => "example.com".try_into().unwrap(), // Fallback
             };
 
-            // Create TLS config for ShadowTLS
-            // TODO: Ensure client_config is suitable for TLS 1.3.
-            // Rustls ClientConfig by default supports TLS 1.3 if server does.
-            // The server handler enforces TLS 1.3 from client and for negotiation.
+            // Create TLS config for ShadowTLS - must be TLS 1.3 only.
+            // ShadowTLS v3 requires TLS 1.3: we modify the ClientHello session_id to embed
+            // an HMAC tag, and rustls doesn't validate session_id echo for TLS 1.3 ServerHello.
+            // TLS 1.2 would fail anyway (no supported_versions extension), but restricting
+            // here provides defense in depth and fails fast at the TLS level.
             let client_config = Arc::new(create_client_config(
                 false,      // No WebPKI verification needed for ShadowTLS
                 Vec::new(), // No fingerprints
                 Vec::new(), // No ALPN
                 enable_sni, // Enable SNI if hostname provided
                 None,       // No client cert
+                true,       // tls13_only - required for ShadowTLS v3
             ));
 
             let handler = create_tcp_client_handler(*protocol, None);
@@ -275,6 +284,30 @@ pub fn create_tcp_client_handler(
         ClientProxyConfig::Hysteria2 { .. } => {
             panic!("Hysteria2 is a QUIC protocol and should be handled by the socket connector, not as a TCP client handler. Ensure Hysteria2 configs use transport: quic.")
         }
+        ClientProxyConfig::Anytls {
+            password,
+            udp_enabled,
+            padding_scheme,
+        } => {
+            let padding = match padding_scheme {
+                Some(lines) => {
+                    let scheme = lines.join("\n");
+                    Arc::new(
+                        PaddingFactory::new(scheme.as_bytes())
+                            .expect("Invalid padding scheme in AnyTLS config"),
+                    )
+                }
+                None => PaddingFactory::default_factory(),
+            };
+            Box::new(AnyTlsClientHandler::new(password, padding, udp_enabled))
+        }
+        ClientProxyConfig::Naiveproxy {
+            username,
+            password,
+            padding,
+        } => Box::new(NaiveProxyTcpClientHandler::new(
+            &username, &password, padding,
+        )),
     }
 }
 

@@ -1,4 +1,5 @@
 mod address;
+mod anytls;
 mod async_stream;
 mod buf_reader;
 mod client_proxy_chain;
@@ -6,13 +7,13 @@ mod client_proxy_selector;
 mod config;
 mod copy_bidirectional;
 mod copy_bidirectional_message;
-mod copy_multidirectional_message;
-mod copy_session_messages;
 mod crypto;
 mod http_handler;
 mod hysteria2_client;
 mod hysteria2_protocol;
 mod hysteria2_server;
+mod mixed_handler;
+mod naiveproxy;
 mod option_util;
 mod port_forward_handler;
 mod quic_server;
@@ -20,6 +21,7 @@ mod quic_stream;
 mod reality;
 mod reality_client_handler;
 mod resolver;
+mod routing;
 mod rustls_config_util;
 mod rustls_connection_util;
 mod shadow_tls;
@@ -37,20 +39,20 @@ mod tls_client_handler;
 mod tls_server_handler;
 mod trojan_handler;
 mod tuic_server;
+mod tun;
 mod udp_message_stream;
-mod udp_multi_message_stream;
-mod udp_session_message_stream;
 mod uot;
 mod util;
+mod uuid_util;
 mod vless;
 mod vmess;
 mod websocket;
 mod xudp;
 
-#[cfg(not(target_env = "msvc"))]
+#[cfg(not(any(target_env = "msvc", target_os = "ios")))]
 use tikv_jemallocator::Jemalloc;
 
-#[cfg(not(target_env = "msvc"))]
+#[cfg(not(any(target_env = "msvc", target_os = "ios")))]
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
 
@@ -61,13 +63,10 @@ use aws_lc_rs::rand::{SecureRandom, SystemRandom};
 use base64::engine::{Engine as _, general_purpose::STANDARD};
 use log::debug;
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use tcp_server::start_tcp_servers;
+use tcp_server::start_servers;
 use tokio::runtime::Builder;
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
-use tokio::task::JoinHandle;
 
-use crate::config::{ServerConfig, Transport};
-use crate::quic_server::start_quic_servers;
 use crate::reality::generate_keypair;
 use crate::shadowsocks::ShadowsocksCipher;
 use crate::thread_util::set_num_threads;
@@ -100,45 +99,6 @@ fn start_notify_thread(
     (watcher, rx)
 }
 
-async fn start_servers(config: ServerConfig) -> std::io::Result<Vec<JoinHandle<()>>> {
-    let mut join_handles = Vec::with_capacity(3);
-
-    match config.transport {
-        Transport::Tcp => match start_tcp_servers(config.clone()).await {
-            Ok(handles) => {
-                join_handles.extend(handles);
-            }
-            Err(e) => {
-                for join_handle in join_handles {
-                    join_handle.abort();
-                }
-                return Err(e);
-            }
-        },
-        Transport::Quic => match start_quic_servers(config.clone()).await {
-            Ok(handles) => {
-                join_handles.extend(handles);
-            }
-            Err(e) => {
-                for join_handle in join_handles {
-                    join_handle.abort();
-                }
-                return Err(e);
-            }
-        },
-        Transport::Udp => todo!(),
-    }
-
-    if join_handles.is_empty() {
-        return Err(std::io::Error::other(format!(
-            "failed to start servers at {}",
-            &config.bind_location
-        )));
-    }
-
-    Ok(join_handles)
-}
-
 fn print_usage_and_exit(arg0: String) {
     eprintln!("{arg0} [OPTIONS] <config.yaml> [config.yaml...]");
     eprintln!();
@@ -152,11 +112,41 @@ fn print_usage_and_exit(arg0: String) {
         "    generate-reality-keypair                       Generate a new Reality X25519 keypair"
     );
     eprintln!("    generate-shadowsocks-2022-password <cipher>    Generate a Shadowsocks password");
+    eprintln!(
+        "    generate-vless-user-id                         Generate a random VLESS/VMESS user ID (UUID v4)"
+    );
     std::process::exit(1);
 }
 
+fn get_debug_file_log_level() -> Option<log::LevelFilter> {
+    // Check for debug marker files in the same directory as the binary
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()));
+
+    if let Some(dir) = exe_dir {
+        if dir.join(".shoes-trace").exists() {
+            eprintln!("Found debug marker file .shoes-trace, setting log level to TRACE");
+            return Some(log::LevelFilter::Trace);
+        }
+        if dir.join(".shoes-debug").exists() {
+            eprintln!("Found debug marker file .shoes-debug, setting log level to DEBUG");
+            return Some(log::LevelFilter::Debug);
+        }
+    }
+    None
+}
+
 fn main() {
-    env_logger::builder()
+    let mut builder = env_logger::builder();
+
+    if let Some(level) = get_debug_file_log_level() {
+        builder.filter_level(level);
+    } else {
+        builder.parse_default_env();
+    }
+
+    builder
         .format(|buf, record| {
             let timestamp = buf.timestamp();
             let level_style = buf.default_level_style(record.level());
@@ -287,6 +277,18 @@ fn main() {
         return;
     }
 
+    if args.iter().any(|s| s == "generate-vless-user-id") {
+        let uuid = uuid_util::generate_uuid();
+        println!(
+            "--------------------------------------------------------------------------------"
+        );
+        println!("VLESS/VMESS User ID: {}", uuid);
+        println!(
+            "--------------------------------------------------------------------------------"
+        );
+        return;
+    }
+
     if args.is_empty() {
         println!("No config specified, assuming loading from file config.shoes.yaml");
         args.push("config.shoes.yaml".to_string())
@@ -391,7 +393,6 @@ fn main() {
 
             match reload_state.as_mut() {
                 Some((_watcher, rx)) => {
-                    // Wait for config change
                     rx.recv().await.unwrap();
 
                     println!("Configs changed, restarting servers in 3 seconds..");

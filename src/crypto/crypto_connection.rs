@@ -87,6 +87,32 @@ impl CryptoConnection {
         )
     }
 
+    /// Get the negotiated ALPN protocol, if any
+    ///
+    /// Returns the ALPN protocol that was negotiated during the handshake.
+    /// For REALITY connections, this always returns None since REALITY
+    /// does not perform real TLS negotiation.
+    pub fn alpn_protocol(&self) -> Option<&[u8]> {
+        match self {
+            CryptoConnection::RustlsServer(conn) => conn.alpn_protocol(),
+            CryptoConnection::RustlsClient(conn) => conn.alpn_protocol(),
+            // REALITY doesn't have real TLS ALPN negotiation
+            CryptoConnection::RealityServer(_) => None,
+            CryptoConnection::RealityClient(_) => None,
+        }
+    }
+
+    /// Check if this is a REALITY connection
+    ///
+    /// REALITY connections have already authenticated the client during
+    /// the handshake, so they can be trusted for protocol handling.
+    pub fn is_reality(&self) -> bool {
+        matches!(
+            self,
+            CryptoConnection::RealityServer(_) | CryptoConnection::RealityClient(_)
+        )
+    }
+
     /// Read TLS messages from `rd` into internal buffers
     ///
     /// Returns the number of bytes read, or 0 if the connection is closed.
@@ -239,7 +265,7 @@ impl CryptoConnection {
     }
 }
 
-#[inline(always)]
+#[inline]
 pub fn feed_crypto_connection(
     connection: &mut CryptoConnection,
     data: &[u8],

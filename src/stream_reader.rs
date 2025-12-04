@@ -18,7 +18,7 @@ impl StreamReader {
     }
 
     pub fn new_with_buffer_size(buffer_size: usize) -> Self {
-        // note that `buffer_size` also represents the maximum line length that can be read.
+        // The buffer_size also determines the maximum line length that can be read.
         Self {
             buf: allocate_vec(buffer_size).into_boxed_slice(),
             start_offset: 0usize,
@@ -56,7 +56,7 @@ impl StreamReader {
                             continue;
                         }
                     }
-                    // strip crlf
+                    // Strips CRLF.
                     let line = &mut self.buf[self.start_offset..newline_pos - 1];
                     let new_start_offset = newline_pos + 1;
                     if new_start_offset == search_end_offset {
@@ -73,9 +73,9 @@ impl StreamReader {
 
                     self.read(stream).await?;
 
-                    // Only search through new data.
+                    // Only searches through new data.
                     if previous_start_offset != self.start_offset {
-                        // this can only move to zero when reset_buf_offset is called.
+                        // Can only move to zero when reset_buf_offset is called.
                         assert!(self.start_offset == 0);
                         search_start_offset = search_end_offset - previous_start_offset;
                     } else {
@@ -117,6 +117,56 @@ impl StreamReader {
         Ok(value)
     }
 
+    /// Peek at the first byte without consuming it.
+    /// Ensures at least 1 byte is buffered, then returns it.
+    pub async fn peek_u8<T: AsyncReadExt + Unpin>(
+        &mut self,
+        stream: &mut T,
+    ) -> std::io::Result<u8> {
+        while self.end_offset - self.start_offset < 1 {
+            self.read(stream).await?;
+        }
+        // Returns the byte without advancing start_offset.
+        Ok(self.buf[self.start_offset])
+    }
+
+    /// Peek at the first `len` bytes without consuming them.
+    /// Ensures at least `len` bytes are buffered, then returns a reference to them.
+    pub async fn peek_slice<T: AsyncReadExt + Unpin + ?Sized>(
+        &mut self,
+        stream: &mut T,
+        len: usize,
+    ) -> std::io::Result<&[u8]> {
+        if len > self.buf.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "Requested length {} exceeds buffer size {}",
+                    len,
+                    self.buf.len()
+                ),
+            ));
+        }
+        while self.end_offset - self.start_offset < len {
+            self.read(stream).await?;
+        }
+        // Returns the slice without advancing start_offset.
+        Ok(&self.buf[self.start_offset..self.start_offset + len])
+    }
+
+    /// Consume (skip) `len` bytes that were previously peeked.
+    /// This advances the read position without returning any data.
+    pub fn consume(&mut self, len: usize) {
+        let new_start_offset = self.start_offset + len;
+        debug_assert!(new_start_offset <= self.end_offset);
+        if new_start_offset == self.end_offset {
+            self.start_offset = 0;
+            self.end_offset = 0;
+        } else {
+            self.start_offset = new_start_offset;
+        }
+    }
+
     pub async fn read_u16_be<T: AsyncReadExt + Unpin>(
         &mut self,
         stream: &mut T,
@@ -136,7 +186,7 @@ impl StreamReader {
         Ok(value)
     }
 
-    pub async fn read_slice<T: AsyncReadExt + Unpin>(
+    pub async fn read_slice<T: AsyncReadExt + Unpin + ?Sized>(
         &mut self,
         stream: &mut T,
         len: usize,
@@ -188,9 +238,11 @@ impl StreamReader {
         }
     }
 
-    async fn read<T: AsyncReadExt + Unpin>(&mut self, stream: &mut T) -> std::io::Result<()> {
-        // Note that read() needs to work for blocking I/O. So we need to return
-        // immediately after a single read() call.
+    async fn read<T: AsyncReadExt + Unpin + ?Sized>(
+        &mut self,
+        stream: &mut T,
+    ) -> std::io::Result<()> {
+        // Returns immediately after a single read() call to support blocking I/O.
         if self.is_cache_full() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::ConnectionAborted,
@@ -198,7 +250,7 @@ impl StreamReader {
             ));
         }
 
-        // Clear the offset so there's space for the next line.
+        // Clears the offset to make space for the next read.
         self.reset_buf_offset();
 
         loop {

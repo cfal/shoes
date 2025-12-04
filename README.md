@@ -6,23 +6,30 @@ shoes is a high-performance multi-protocol proxy server written in Rust.
 
 ### Proxy Protocols
 - **HTTP/HTTPS**
-- **SOCKS5**
+- **SOCKS5** (with UDP ASSOCIATE)
+- **Mixed** (auto-detect HTTP/SOCKS5)
 - **VMess AEAD**
-- **VLESS**
+- **VLESS** (with fallback support)
 - **Shadowsocks**
 - **Trojan**
 - **Snell v3**
 - **Hysteria2**
 - **TUIC v5**
+- **AnyTLS** (TLS-based multiplexing with traffic obfuscation)
+- **NaiveProxy** (HTTP/2 CONNECT with padding)
 
 ### Transport Protocols
 All server protocols plus:
-- **SagerNet UDP over TCP** (for Shadowsocks and SOCKS5)
+- **SagerNet UDP over TCP** (for Shadowsocks, SOCKS5, AnyTLS, NaiveProxy)
 - **ShadowTLS v3**
 - **TLS**
 - **WebSocket** (Shadowsocks SIP003)
 - **XTLS Reality**
 - **XTLS Vision** (for VLESS)
+
+### TUN/VPN Mode
+- **TUN device support** - Layer 3 VPN for transparent proxying
+- Supported platforms: Linux, Android, iOS
 
 ### Supported Ciphers
 - **VMess**: `aes-128-gcm`, `chacha20-poly1305`, `none`
@@ -187,6 +194,70 @@ See the [examples](./examples) directory for all examples.
     type: tuic
     uuid: d685aef3-b3c4-4932-9a9d-d0c2f6727dfa
     password: supersecret
+```
+
+### Mixed HTTP/SOCKS5 Server
+```yaml
+- address: 0.0.0.0:7890
+  protocol:
+    type: mixed
+    username: myuser
+    password: mypassword
+```
+
+### AnyTLS Server
+```yaml
+- address: 0.0.0.0:443
+  protocol:
+    type: tls
+    tls_targets:
+      "anytls.example.com":
+        cert: cert.pem
+        key: key.pem
+        protocol:
+          type: anytls
+          users:
+            - name: user1
+              password: secret123
+          udp_enabled: true
+```
+
+### NaiveProxy Server
+```yaml
+- address: 0.0.0.0:443
+  protocol:
+    type: tls
+    tls_targets:
+      "naive.example.com":
+        cert: cert.pem
+        key: key.pem
+        alpn_protocols: ["h2"]
+        protocol:
+          type: naiveproxy
+          users:
+            - username: user1
+              password: secret123
+          padding: true
+```
+
+### TUN VPN
+```yaml
+- device_name: tun0
+  address: 10.0.0.1
+  netmask: 255.255.255.0
+  mtu: 1500
+  tcp_enabled: true
+  udp_enabled: true
+  rules:
+    - masks: "0.0.0.0/0"
+      action: allow
+      client_chain:
+        address: "proxy.example.com:443"
+        protocol:
+          type: tls
+          protocol:
+            type: vless
+            user_id: b85798ef-e9dc-46a4-9a87-8da4499d36d0
 ```
 
 ## Similar Projects

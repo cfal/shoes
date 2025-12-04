@@ -22,17 +22,22 @@
 //! If isConnect=1, subsequent packets are length-prefixed only (V2 connect mode).
 //! If isConnect=0, subsequent packets use V1 format (multi-destination).
 //!
-//! ## ATYP Values (different from SOCKS5!)
+//! **Important:** The V2 Request header uses SOCKS5-style ATYP (0x01/0x03/0x04),
+//! NOT the AddrParser format below. Protocol handlers must use SOCKS5 address
+//! parsing for the V2 Request destination.
+//!
+//! ## ATYP Values (AddrParser format for packet payloads)
 //! - 0x00: IPv4 Address (4 bytes)
 //! - 0x01: IPv6 Address (16 bytes)
 //! - 0x02: Domain Name (1 byte length + domain)
 
-mod uot_v1_stream;
+pub mod uot_common;
+mod uot_v1_server_stream;
 
-pub use uot_v1_stream::UotV1Stream;
+pub use uot_v1_server_stream::UotV1ServerStream;
 
 /// UoT V2 connect mode stream - identical format to VlessMessageStream (length-prefixed u16be + data)
-pub type UotV2Stream = crate::vless::VlessMessageStream;
+pub type UotV2Stream<S> = crate::vless::VlessMessageStream<S>;
 
 /// Magic address used to signal UoT V1 mode (multi-destination)
 pub const UOT_V1_MAGIC_ADDRESS: &str = "sp.udp-over-tcp.arpa";

@@ -34,6 +34,13 @@ pub enum Transport {
     Udp,
 }
 
+impl Transport {
+    /// Returns true if this is the default transport (TCP)
+    pub fn is_default(&self) -> bool {
+        matches!(self, Transport::Tcp)
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TcpConfig {
     #[serde(default = "default_true")]

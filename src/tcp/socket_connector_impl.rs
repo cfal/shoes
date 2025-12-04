@@ -3,11 +3,16 @@
 //! Handles TCP and QUIC transports with bind_interface support.
 //! Created from the socket-related fields of any ClientConfig.
 
+use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::task::{Context, Poll};
 
 use async_trait::async_trait;
 use log::{debug, error};
+use tokio::io::ReadBuf;
+use tokio::net::UdpSocket;
 
 use crate::address::NetLocation;
 use crate::async_stream::AsyncStream;
@@ -15,13 +20,8 @@ use crate::config::{ClientConfig, ClientQuicConfig, Transport};
 use crate::quic_stream::QuicStream;
 use crate::resolver::{Resolver, resolve_single_address};
 use crate::rustls_config_util::create_client_config;
-use crate::socket_util::{
-    new_reuse_udp_sockets, new_tcp_socket, new_udp_socket, set_tcp_keepalive,
-};
-use crate::tcp_handler::{TcpClientUdpSetupResult, UdpStreamRequest};
+use crate::socket_util::{new_tcp_socket, new_udp_socket, set_tcp_keepalive};
 use crate::thread_util::get_num_threads;
-use crate::udp_multi_message_stream::UdpMultiMessageStream;
-use crate::udp_session_message_stream::{UdpSessionMessageStream, UdpSocketConfig};
 
 use super::socket_connector::SocketConnector;
 
@@ -103,10 +103,10 @@ impl SocketConnectorImpl {
                 } = config.quic_settings.clone().unwrap_or_default();
 
                 let sni_hostname = if sni_hostname.is_unspecified() {
-                    if default_sni_hostname.is_some() {
+                    if let Some(ref hostname) = default_sni_hostname {
                         debug!(
                             "Using default sni hostname for QUIC client connection: {}",
-                            default_sni_hostname.as_ref().unwrap()
+                            hostname
                         );
                     }
                     default_sni_hostname.clone()
@@ -134,6 +134,7 @@ impl SocketConnectorImpl {
                     alpn_protocols.into_vec(),
                     sni_hostname.is_some(),
                     key_and_cert_bytes,
+                    false, // tls13_only - QUIC enforces TLS 1.3 anyway
                 );
 
                 let quic_client_config = quinn::crypto::rustls::QuicClientConfig::with_initial(
@@ -270,55 +271,111 @@ impl SocketConnector for SocketConnectorImpl {
         }
     }
 
-    async fn connect_udp(
+    async fn connect_udp_bidirectional(
         &self,
         resolver: &Arc<dyn Resolver>,
-        request: UdpStreamRequest,
-    ) -> std::io::Result<TcpClientUdpSetupResult> {
-        debug!("[SocketConnector] connect_udp called, request: {}", request);
+        target: NetLocation,
+    ) -> std::io::Result<Box<dyn crate::async_stream::AsyncMessageStream>> {
+        debug!(
+            "[SocketConnector] connect_udp_bidirectional called, target: {}",
+            target
+        );
 
-        match request {
-            UdpStreamRequest::Bidirectional {
-                server_stream,
-                target,
-            } => {
-                let remote_addr = resolve_single_address(resolver, &target).await?;
-                let client_socket =
-                    new_udp_socket(remote_addr.is_ipv6(), self.bind_interface.clone())?;
-                client_socket.connect(remote_addr).await?;
-                Ok(TcpClientUdpSetupResult::Bidirectional {
-                    server_stream,
-                    client_stream: Box::new(client_socket),
-                })
-            }
+        let remote_addr = resolve_single_address(resolver, &target).await?;
+        let client_socket = new_udp_socket(remote_addr.is_ipv6(), self.bind_interface.clone())?;
 
-            UdpStreamRequest::MultiDirectional { server_stream } => {
-                const NUM_SOCKETS: usize = 4;
-                let client_sockets =
-                    new_reuse_udp_sockets(true, self.bind_interface.clone(), NUM_SOCKETS)?;
-                let client_sockets = client_sockets.into_iter().map(Arc::new).collect();
-                Ok(TcpClientUdpSetupResult::MultiDirectional {
-                    server_stream,
-                    client_stream: Box::new(UdpMultiMessageStream::new(
-                        client_sockets,
-                        resolver.clone(),
-                    )),
-                })
-            }
+        // Don't use connect() - wrap in UnconnectedUdpSocket instead.
+        // A connected UDP socket filters incoming packets by source address,
+        // which breaks when bind_interface causes packets to arrive from
+        // a different source than the target address.
+        Ok(Box::new(UnconnectedUdpSocket::new(
+            client_socket,
+            remote_addr,
+        )))
+    }
+}
 
-            UdpStreamRequest::SessionBased { server_stream } => {
-                let config = UdpSocketConfig {
-                    bind_interface: self.bind_interface.clone(),
-                };
-                let session_manager = UdpSessionMessageStream::new(config);
-                Ok(TcpClientUdpSetupResult::SessionBased {
-                    server_stream,
-                    client_stream: Box::new(session_manager),
-                })
-            }
+/// A UDP socket wrapper that tracks the destination and uses send_to/recv_from.
+/// Unlike a connected UDP socket, this accepts incoming packets from any source.
+struct UnconnectedUdpSocket {
+    socket: UdpSocket,
+    destination: SocketAddr,
+}
+
+impl UnconnectedUdpSocket {
+    fn new(socket: UdpSocket, destination: SocketAddr) -> Self {
+        Self {
+            socket,
+            destination,
         }
     }
 }
+
+impl crate::async_stream::AsyncReadMessage for UnconnectedUdpSocket {
+    fn poll_read_message(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        match this.socket.poll_recv_from(cx, buf) {
+            Poll::Ready(Ok(addr)) => {
+                log::debug!(
+                    "[UnconnectedUdp] Received {} bytes from {} (target: {})",
+                    buf.filled().len(),
+                    addr,
+                    this.destination
+                );
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl crate::async_stream::AsyncWriteMessage for UnconnectedUdpSocket {
+    fn poll_write_message(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        this.socket
+            .poll_send_to(cx, buf, this.destination)
+            .map(|r| r.map(|_| ()))
+    }
+}
+
+impl crate::async_stream::AsyncFlushMessage for UnconnectedUdpSocket {
+    fn poll_flush_message(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl crate::async_stream::AsyncShutdownMessage for UnconnectedUdpSocket {
+    fn poll_shutdown_message(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl crate::async_stream::AsyncPing for UnconnectedUdpSocket {
+    fn supports_ping(&self) -> bool {
+        false
+    }
+
+    fn poll_write_ping(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<bool>> {
+        Poll::Ready(Ok(false))
+    }
+}
+
+impl crate::async_stream::AsyncMessageStream for UnconnectedUdpSocket {}
 
 #[cfg(test)]
 mod tests {

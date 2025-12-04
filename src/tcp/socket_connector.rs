@@ -20,11 +20,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::async_stream::AsyncStream;
-use crate::resolver::Resolver;
-use crate::tcp_handler::{TcpClientUdpSetupResult, UdpStreamRequest};
-
 use crate::address::NetLocation;
+use crate::async_stream::{AsyncMessageStream, AsyncStream};
+use crate::resolver::Resolver;
 
 /// Trait for creating socket connections at hop 0.
 ///
@@ -43,16 +41,17 @@ pub trait SocketConnector: Send + Sync + Debug {
         address: &NetLocation,
     ) -> std::io::Result<Box<dyn AsyncStream>>;
 
-    /// Create UDP socket(s) for the given request type.
-    ///
-    /// Returns matched server/client stream pair ready for copying.
+    /// Create a UDP socket for bidirectional communication with a fixed target.
     ///
     /// # Arguments
     /// * `resolver` - DNS resolver for address resolution
-    /// * `request` - The type of UDP stream requested
-    async fn connect_udp(
+    /// * `target` - The destination for all UDP packets
+    ///
+    /// # Returns
+    /// An AsyncMessageStream connected to the target.
+    async fn connect_udp_bidirectional(
         &self,
         resolver: &Arc<dyn Resolver>,
-        request: UdpStreamRequest,
-    ) -> std::io::Result<TcpClientUdpSetupResult>;
+        target: NetLocation,
+    ) -> std::io::Result<Box<dyn AsyncMessageStream>>;
 }

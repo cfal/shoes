@@ -5,6 +5,7 @@
 // - Don't bother initializing buffer
 // - Read and write whenever there's a space
 // - Circular buffer
+// - Cooperative yielding via tokio's coop budget to prevent task starvation
 
 use futures::ready;
 use tokio::io::ReadBuf;
@@ -54,6 +55,11 @@ impl CopyBuffer {
         R: AsyncStream + ?Sized,
         W: AsyncStream + ?Sized,
     {
+        // Check tokio's cooperative budget at the start of each poll.
+        // This ensures we yield to the runtime periodically during heavy I/O,
+        // allowing other tasks (like QUIC keepalives) to run.
+        let coop = ready!(tokio::task::coop::poll_proceed(cx));
+
         loop {
             let mut read_pending = false;
             let mut write_pending = false;
@@ -82,6 +88,7 @@ impl CopyBuffer {
                             self.read_done = true;
                         } else {
                             self.cache_length += n;
+                            coop.made_progress();
                         }
                     }
                     Poll::Pending => {
@@ -100,6 +107,7 @@ impl CopyBuffer {
                             self.need_write_ping = false;
                             if written {
                                 self.need_flush = true;
+                                coop.made_progress();
                             }
                         }
                         Poll::Pending => {
@@ -140,6 +148,7 @@ impl CopyBuffer {
                                 self.start_index = (self.start_index + written) % self.size;
                             }
                             self.need_flush = true;
+                            coop.made_progress();
                         }
                     }
                     Poll::Pending => {
@@ -152,6 +161,7 @@ impl CopyBuffer {
             if self.need_flush {
                 ready!(writer.as_mut().poll_flush(cx))?;
                 self.need_flush = false;
+                coop.made_progress();
             }
 
             // If we've written all the data and we've seen EOF, finish the transfer.
@@ -159,13 +169,8 @@ impl CopyBuffer {
                 return Poll::Ready(Ok(()));
             }
 
-            // Previously we kept going until both read and write were pending, but
-            // this might starve other tasks.
+            // Return Pending to prevent task starvation
             if read_pending || write_pending {
-                // If we got here,
-                // 1) we hit read_pending on the current iteration.
-                // 2) all data has been written successfully
-                // 3) there is no data left to write and we need to read more.
                 return Poll::Pending;
             }
         }
@@ -225,7 +230,6 @@ where
     type Output = io::Result<()>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        // Unpack self into mut refs to each field to avoid borrow check issues.
         let CopyBidirectional {
             a,
             b,

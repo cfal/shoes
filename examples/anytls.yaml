@@ -1,0 +1,101 @@
+# AnyTLS server and client examples
+# AnyTLS is a TLS-based multiplexing proxy protocol with traffic obfuscation
+
+# Basic AnyTLS server over TLS
+- address: "0.0.0.0:443"
+  protocol:
+    type: tls
+    tls_targets:
+      "anytls.example.com":
+        cert: "cert.pem"
+        key: "key.pem"
+        protocol:
+          type: anytls
+          users:
+            - name: user1
+              password: "secret123"
+          udp_enabled: true
+
+# AnyTLS server with multiple users
+- address: "0.0.0.0:8443"
+  protocol:
+    type: tls
+    tls_targets:
+      "multi.example.com":
+        cert: "cert.pem"
+        key: "key.pem"
+        protocol:
+          type: anytls
+          users:
+            - name: alice
+              password: "alice_password"
+            - name: bob
+              password: "bob_password"
+            - name: charlie
+              password: "charlie_password"
+
+# AnyTLS server with custom padding scheme
+- address: "0.0.0.0:9443"
+  protocol:
+    type: tls
+    tls_targets:
+      "padded.example.com":
+        cert: "cert.pem"
+        key: "key.pem"
+        protocol:
+          type: anytls
+          users:
+            - name: user1
+              password: "secret123"
+          padding_scheme:
+            - "stop=8"
+            - "0=30-30"
+            - "1=50-100"
+
+# AnyTLS server with fallback for failed authentication
+- address: "0.0.0.0:10443"
+  protocol:
+    type: tls
+    tls_targets:
+      "fallback.example.com":
+        cert: "cert.pem"
+        key: "key.pem"
+        protocol:
+          type: anytls
+          users:
+            - name: user1
+              password: "secret123"
+          fallback: "127.0.0.1:80"  # Serve web content for invalid clients
+
+# AnyTLS over Reality (maximum censorship resistance)
+- address: "0.0.0.0:443"
+  protocol:
+    type: tls
+    reality_targets:
+      "www.microsoft.com":
+        private_key: "YOUR_PRIVATE_KEY_HERE"
+        short_ids: ["0123456789abcdef", ""]
+        dest: "www.microsoft.com:443"
+        protocol:
+          type: anytls
+          users:
+            - name: user1
+              password: "secret123"
+          udp_enabled: true
+
+# Local SOCKS5 client connecting to AnyTLS server
+- address: "127.0.0.1:1080"
+  protocol:
+    type: socks
+  rules:
+    - masks: "0.0.0.0/0"
+      action: allow
+      client_chain:
+        address: "anytls.example.com:443"
+        protocol:
+          type: tls
+          sni_hostname: "anytls.example.com"
+          protocol:
+            type: anytls
+            password: "secret123"
+            udp_enabled: true
