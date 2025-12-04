@@ -1604,7 +1604,7 @@ checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 
 [[package]]
 name = "shoes"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "aes",
  "argon2",
@@ -1632,7 +1632,7 @@ dependencies = [
  "percent-encoding",
  "quinn",
  "rand",
- "rand_core 0.9.3",
+ "rand_core 0.6.4",
  "rcgen",
  "rustc-hash",
  "rustls",
