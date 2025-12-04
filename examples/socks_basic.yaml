@@ -1,0 +1,58 @@
+# Basic SOCKS5 server examples
+
+# Simple SOCKS5 server (no authentication)
+- address: "0.0.0.0:1080"
+  protocol:
+    type: socks
+
+# SOCKS5 server with authentication
+- address: "0.0.0.0:1081"
+  protocol:
+    type: socks
+    username: "myuser"
+    password: "mypassword"
+
+# SOCKS5 server with UDP ASSOCIATE enabled (default)
+- address: "0.0.0.0:1082"
+  protocol:
+    type: socks
+    udp_enabled: true  # This is the default
+
+# SOCKS5 server with UDP disabled (TCP only)
+- address: "0.0.0.0:1083"
+  protocol:
+    type: socks
+    udp_enabled: false
+
+# SOCKS5 server with custom routing rules
+- address: "0.0.0.0:1084"
+  protocol:
+    type: socks
+    username: "admin"
+    password: "secure123"
+  rules:
+    # Direct connection for local networks
+    - masks: ["192.168.0.0/16", "10.0.0.0/8"]
+      action: allow
+      client_chain:
+        protocol:
+          type: direct
+    # Route everything else through upstream proxy
+    - masks: "0.0.0.0/0"
+      action: allow
+      client_chain:
+        address: "upstream.proxy.com:8080"
+        protocol:
+          type: http
+
+# SOCKS5 chained through another SOCKS5 proxy
+- address: "127.0.0.1:1085"
+  protocol:
+    type: socks
+  rules:
+    - masks: "0.0.0.0/0"
+      action: allow
+      client_chain:
+        address: "127.0.0.1:1080"
+        protocol:
+          type: socks

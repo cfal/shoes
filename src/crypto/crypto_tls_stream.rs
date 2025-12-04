@@ -111,6 +111,22 @@ where
         (self.io, self.session)
     }
 
+    /// Get the negotiated ALPN protocol, if any
+    ///
+    /// Returns the ALPN protocol that was negotiated during the TLS handshake.
+    /// For REALITY connections, this always returns None.
+    pub fn alpn_protocol(&self) -> Option<&[u8]> {
+        self.session.alpn_protocol()
+    }
+
+    /// Check if this is a REALITY connection
+    ///
+    /// REALITY connections have already authenticated the client during
+    /// the handshake, so they can be trusted for protocol handling.
+    pub fn is_reality(&self) -> bool {
+        self.session.is_reality()
+    }
+
     /// Write TLS data directly to the underlying stream
     ///
     /// Returns Poll::Ready(Ok(n)) with bytes written, or Poll::Pending if would block.

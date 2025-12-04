@@ -6,15 +6,12 @@
 use async_trait::async_trait;
 use log::debug;
 
+use super::proxy_connector::ProxyConnector;
 use super::tcp_client_handler_factory::create_tcp_client_handler;
 use crate::address::NetLocation;
-use crate::async_stream::AsyncStream;
+use crate::async_stream::{AsyncMessageStream, AsyncStream};
 use crate::config::ClientConfig;
-use crate::tcp_handler::{
-    TcpClientHandler, TcpClientSetupResult, TcpClientUdpSetupResult, UdpStreamRequest,
-};
-
-use super::proxy_connector::ProxyConnector;
+use crate::tcp::tcp_handler::{TcpClientHandler, TcpClientSetupResult};
 
 /// Implementation of ProxyConnector for proxy protocol setup.
 ///
@@ -81,17 +78,17 @@ impl ProxyConnector for ProxyConnectorImpl {
             .await
     }
 
-    async fn setup_udp_stream(
+    async fn setup_udp_bidirectional(
         &self,
         stream: Box<dyn AsyncStream>,
-        request: UdpStreamRequest,
-    ) -> std::io::Result<TcpClientUdpSetupResult> {
+        target: NetLocation,
+    ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
         debug!(
-            "[ProxyConnector] setup_udp_stream: {}, request: {}",
-            self.location, request
+            "[ProxyConnector] setup_udp_bidirectional: {} -> {}",
+            self.location, target
         );
         self.client_handler
-            .setup_client_udp_stream(stream, request)
+            .setup_client_udp_bidirectional(stream, target)
             .await
     }
 }

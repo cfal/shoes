@@ -1,22 +1,37 @@
 use std::sync::Arc;
-use std::sync::OnceLock;
 
-use argon2::Argon2;
+use argon2::{Config as Argon2Config, ThreadMode, Variant, Version};
 use async_trait::async_trait;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use super::snell_udp_stream::SnellUdpStream;
+use super::snell_fixed_target_stream::SnellFixedTargetStream;
+use super::snell_udp_stream::{SnellUdpClientStream, SnellUdpStream};
 use crate::address::{Address, NetLocation};
+use crate::async_stream::AsyncMessageStream;
 use crate::async_stream::AsyncStream;
-use crate::option_util::NoneOrOne;
+use crate::client_proxy_selector::ClientProxySelector;
 use crate::shadowsocks::{
     ShadowsocksCipher, ShadowsocksKey, ShadowsocksStream, ShadowsocksStreamType,
 };
 use crate::stream_reader::StreamReader;
-use crate::tcp_handler::{
+use crate::tcp::tcp_handler::{
     TcpClientHandler, TcpClientSetupResult, TcpServerHandler, TcpServerSetupResult,
 };
-use crate::util::{allocate_vec, write_all};
+use crate::util::write_all;
+
+// Snell protocol Argon2 parameters
+// ref: https://github.com/icpz/open-snell/blob/master/components/aead/cipher.go#L48
+const SNELL_ARGON2_CONFIG: Argon2Config<'static> = Argon2Config {
+    variant: Variant::Argon2id,
+    version: Version::Version13,
+    mem_cost: 8,  // 8 KB
+    time_cost: 3, // 3 iterations
+    lanes: 1,     // parallelism = 1
+    thread_mode: ThreadMode::Sequential,
+    secret: &[],
+    ad: &[],
+    hash_length: 32,
+};
 
 #[derive(Debug, Clone)]
 struct SnellKey {
@@ -35,18 +50,7 @@ impl SnellKey {
 
 impl ShadowsocksKey for SnellKey {
     fn create_session_key(&self, salt: &[u8]) -> Box<[u8]> {
-        static ARGON2: OnceLock<Argon2> = OnceLock::new();
-
-        let instance = ARGON2.get_or_init(|| {
-            // ref: https://github.com/icpz/open-snell/blob/master/components/aead/cipher.go#L48
-            let params = argon2::Params::new(8, 3, 1, Some(32)).unwrap();
-            Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params)
-        });
-
-        let mut output = allocate_vec(32);
-        instance
-            .hash_password_into(&self.password_bytes, salt, &mut output)
-            .unwrap();
+        let output = argon2::hash_raw(&self.password_bytes, salt, &SNELL_ARGON2_CONFIG).unwrap();
 
         if self.key_len == 32 {
             output.into_boxed_slice()
@@ -61,10 +65,16 @@ pub struct SnellServerHandler {
     cipher: ShadowsocksCipher,
     key: Arc<Box<dyn ShadowsocksKey>>,
     udp_enabled: bool,
+    proxy_selector: Arc<ClientProxySelector>,
 }
 
 impl SnellServerHandler {
-    pub fn new(cipher: ShadowsocksCipher, password: &str, udp_enabled: bool) -> Self {
+    pub fn new(
+        cipher: ShadowsocksCipher,
+        password: &str,
+        udp_enabled: bool,
+        proxy_selector: Arc<ClientProxySelector>,
+    ) -> Self {
         let key: Arc<Box<dyn ShadowsocksKey>> = Arc::new(Box::new(SnellKey::new(
             password,
             cipher.algorithm().key_len(),
@@ -73,6 +83,7 @@ impl SnellServerHandler {
             cipher,
             key,
             udp_enabled,
+            proxy_selector,
         }
     }
 }
@@ -169,10 +180,9 @@ impl TcpServerHandler for SnellServerHandler {
                 need_initial_flush: true,
                 connection_success_response: Some(TCP_TUNNEL_RESPONSE.to_vec().into_boxed_slice()),
                 initial_remote_data: stream_reader.unparsed_data_owned(),
-                override_proxy_provider: NoneOrOne::Unspecified,
+                proxy_selector: self.proxy_selector.clone(),
             })
         } else {
-            // write tunnel response.
             write_all(&mut server_stream, UDP_READY_RESPONSE).await?;
 
             let udp_stream = SnellUdpStream::new(
@@ -183,7 +193,7 @@ impl TcpServerHandler for SnellServerHandler {
             Ok(TcpServerSetupResult::MultiDirectionalUdp {
                 stream: Box::new(udp_stream),
                 need_initial_flush: true,
-                override_proxy_provider: NoneOrOne::Unspecified,
+                proxy_selector: self.proxy_selector.clone(),
             })
         }
     }
@@ -193,15 +203,20 @@ impl TcpServerHandler for SnellServerHandler {
 pub struct SnellClientHandler {
     cipher: ShadowsocksCipher,
     key: Arc<Box<dyn ShadowsocksKey>>,
+    udp_enabled: bool,
 }
 
 impl SnellClientHandler {
-    pub fn new(cipher: ShadowsocksCipher, password: &str) -> Self {
+    pub fn new(cipher: ShadowsocksCipher, password: &str, udp_enabled: bool) -> Self {
         let key: Arc<Box<dyn ShadowsocksKey>> = Arc::new(Box::new(SnellKey::new(
             password,
             cipher.algorithm().key_len(),
         )));
-        Self { cipher, key }
+        Self {
+            cipher,
+            key,
+            udp_enabled,
+        }
     }
 }
 
@@ -270,5 +285,59 @@ impl TcpClientHandler for SnellClientHandler {
             client_stream,
             early_data: None,
         })
+    }
+
+    fn supports_udp_over_tcp(&self) -> bool {
+        self.udp_enabled
+    }
+
+    async fn setup_client_udp_bidirectional(
+        &self,
+        client_stream: Box<dyn AsyncStream>,
+        target: NetLocation,
+    ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
+        let mut ss_stream = ShadowsocksStream::new(
+            client_stream,
+            ShadowsocksStreamType::Aead,
+            self.cipher.algorithm(),
+            self.cipher.salt_len(),
+            self.key.clone(),
+            None,
+        );
+
+        write_all(
+            &mut ss_stream,
+            &[
+                1, // snell version
+                6, // UDP command
+                0, // client id length
+            ],
+        )
+        .await?;
+        ss_stream.flush().await?;
+
+        let mut response = [0u8; 1];
+        let n = ss_stream.read(&mut response).await?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "unexpected EOF when reading UDP ready response",
+            ));
+        }
+
+        if response[0] != 0 {
+            return Err(std::io::Error::other(format!(
+                "Got non-UDP-ready response ({})",
+                response[0]
+            )));
+        }
+
+        // Wraps multi-directional Snell UDP with a fixed target adapter for single-target mode.
+        let max_payload_size = ShadowsocksStreamType::Aead.max_payload_len();
+        let snell_udp_client_stream =
+            SnellUdpClientStream::new(Box::new(ss_stream), max_payload_size);
+        let fixed_target_stream = SnellFixedTargetStream::new(snell_udp_client_stream, target);
+
+        Ok(Box::new(fixed_target_stream))
     }
 }

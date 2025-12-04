@@ -2,7 +2,7 @@ use log::{debug, error};
 use lru::LruCache;
 use parking_lot::RwLock;
 use std::hash::Hash;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
@@ -179,7 +179,6 @@ const CACHE_RULE_THRESHOLD: usize = 16;
 #[derive(Debug)]
 pub struct ClientProxySelector {
     rules: Vec<ConnectRule>,
-    default_rule_index: Option<usize>,
     /// If false, hostname rules will not trigger DNS resolution to match against IP-based
     /// destinations. This is useful when a huge blocklist or rule list is provided.
     /// However, this means that the user needs to make sure DNS resolutions are not done
@@ -243,28 +242,6 @@ impl ClientProxySelector {
         resolve_rule_hostnames: bool,
         cache_capacity: usize,
     ) -> Self {
-        let mut default_rule_index: Option<usize> = None;
-        // find a default rule which we'll use for multidirectional forwarding..
-        // TODO: ideally, we'd check the rule for each target during multidirectional forwarding
-        // and use the right one instead.
-        for (i, rule) in rules.iter().enumerate() {
-            // if it allows forwarding only to a single address, we don't want to use that as
-            // the default decision.
-            if let ConnectAction::Allow {
-                ref override_address,
-                ..
-            } = rule.action
-                && override_address.is_some()
-            {
-                continue;
-            }
-            let is_cover_rule = rule.masks.iter().any(|mask| mask.address_mask.netmask == 0);
-            if is_cover_rule {
-                default_rule_index = Some(i);
-                break;
-            }
-        }
-
         // Enable caching if:
         // 1. DNS resolution is enabled (expensive operation), OR
         // 2. Many rules (linear scan becomes expensive)
@@ -276,21 +253,8 @@ impl ClientProxySelector {
 
         Self {
             rules,
-            default_rule_index,
             resolve_rule_hostnames,
             cache,
-        }
-    }
-
-    pub fn default_decision(&self) -> ConnectDecision<'_> {
-        match self.default_rule_index {
-            Some(i) => {
-                let rule = &self.rules[i];
-                // the remote location is unused because we don't choose a default rule with
-                // an override_address, so just pass a port of 0.
-                rule.action.to_decision(NetLocation::UNSPECIFIED)
-            }
-            None => ConnectDecision::Block,
         }
     }
 
@@ -301,15 +265,19 @@ impl ClientProxySelector {
     ///
     /// Note: Caching is only enabled when `resolve_rule_hostnames` is true or there are
     /// more than 16 rules. For simple configurations, direct rule matching is faster.
-    pub async fn judge<'a>(
+    #[inline]
+    pub async fn judge_with_resolved_address<'a>(
         &'a self,
         location: NetLocation,
+        resolved_address: Option<SocketAddr>,
         resolver: &Arc<dyn Resolver>,
     ) -> std::io::Result<ConnectDecision<'a>> {
+        let resolved_ip = resolved_address.map(|addr| ip_to_u128(addr.ip()));
+
         // If caching is disabled, go directly to rule matching
         let cache = match &self.cache {
             Some(c) => c,
-            None => return self.judge_uncached(location, resolver).await,
+            None => return self.judge_uncached(location, resolved_ip, resolver).await,
         };
 
         // Fast path: check cache first
@@ -321,6 +289,7 @@ impl ClientProxySelector {
         match match_rule(
             &self.rules,
             &location,
+            resolved_ip,
             resolver,
             self.resolve_rule_hostnames,
         )
@@ -339,15 +308,28 @@ impl ClientProxySelector {
         }
     }
 
+    #[inline]
+    pub async fn judge<'a>(
+        &'a self,
+        location: NetLocation,
+        resolver: &Arc<dyn Resolver>,
+    ) -> std::io::Result<ConnectDecision<'a>> {
+        self.judge_with_resolved_address(location, None, resolver)
+            .await
+    }
+
     /// Judge without using the cache. Useful for testing or when cache bypass is needed.
+    #[inline]
     pub async fn judge_uncached<'a>(
         &'a self,
         location: NetLocation,
+        resolved_ip: Option<u128>,
         resolver: &Arc<dyn Resolver>,
     ) -> std::io::Result<ConnectDecision<'a>> {
         match match_rule(
             &self.rules,
             &location,
+            resolved_ip,
             resolver,
             self.resolve_rule_hostnames,
         )
@@ -430,12 +412,10 @@ fn matches_domain(base_domain: &str, hostname: &str) -> bool {
 async fn match_rule<'a>(
     rules: &'a [ConnectRule],
     location: &NetLocation,
+    mut resolved_ip: Option<u128>,
     resolver: &Arc<dyn Resolver>,
     resolve_rule_hostnames: bool,
 ) -> std::io::Result<Option<(usize, &'a ConnectRule)>> {
-    // We only resolve when necessary.
-    let mut resolved_ip: Option<u128> = None;
-
     for (rule_index, rule) in rules.iter().enumerate() {
         for mask in rule.masks.iter() {
             match match_mask(
@@ -568,10 +548,6 @@ mod tests {
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
     use std::pin::Pin;
 
-    // =========================================================================
-    // Test Infrastructure
-    // =========================================================================
-
     /// A mock resolver for testing that returns predefined results
     #[derive(Debug)]
     struct MockResolver {
@@ -671,10 +647,6 @@ mod tests {
         )
     }
 
-    // =========================================================================
-    // Domain Matching Tests (matches_domain function)
-    // =========================================================================
-
     #[test]
     fn test_matches_domain_exact_match() {
         assert!(matches_domain_for_test("example.com", "example.com"));
@@ -729,10 +701,6 @@ mod tests {
         assert!(!matches_domain_for_test("localhost", "notlocalhost"));
         assert!(!matches_domain_for_test("host", "localhost")); // partial suffix
     }
-
-    // =========================================================================
-    // IPv4 Address Matching Tests
-    // =========================================================================
 
     #[tokio::test]
     async fn test_ipv4_exact_match() {
@@ -867,10 +835,6 @@ mod tests {
         }
     }
 
-    // =========================================================================
-    // IPv6 Address Matching Tests
-    // =========================================================================
-
     #[tokio::test]
     async fn test_ipv6_exact_match() {
         let rules = vec![
@@ -922,10 +886,6 @@ mod tests {
             ConnectDecision::Block => panic!("Expected Allow"),
         }
     }
-
-    // =========================================================================
-    // Hostname/Domain Matching Tests
-    // =========================================================================
 
     #[tokio::test]
     async fn test_hostname_exact_match() {
@@ -1013,10 +973,6 @@ mod tests {
         }
     }
 
-    // =========================================================================
-    // Port Matching Tests
-    // =========================================================================
-
     #[tokio::test]
     async fn test_port_specific_rule() {
         let rules = vec![
@@ -1087,10 +1043,6 @@ mod tests {
         }
     }
 
-    // =========================================================================
-    // Rule Priority Tests (First Match Wins)
-    // =========================================================================
-
     #[tokio::test]
     async fn test_first_rule_wins() {
         let rules = vec![
@@ -1147,10 +1099,6 @@ mod tests {
         }
     }
 
-    // =========================================================================
-    // Block Action Tests
-    // =========================================================================
-
     #[tokio::test]
     async fn test_block_rule() {
         let rules = vec![
@@ -1203,10 +1151,6 @@ mod tests {
         }
     }
 
-    // =========================================================================
-    // Default Rule Tests
-    // =========================================================================
-
     #[tokio::test]
     async fn test_no_default_rule_blocks() {
         let rules = vec![allow_rule(vec!["192.168.1.0/24"], "lan")];
@@ -1221,56 +1165,6 @@ mod tests {
             ConnectDecision::Block => {} // Expected
         }
     }
-
-    #[tokio::test]
-    async fn test_default_decision() {
-        let rules = vec![
-            allow_rule(vec!["192.168.1.0/24"], "lan"),
-            allow_rule(vec!["0.0.0.0/0"], "default"),
-        ];
-        let selector = ClientProxySelector::new(rules);
-
-        // default_decision should return the catch-all rule
-        let decision = selector.default_decision();
-        match decision {
-            ConnectDecision::Allow { .. } => {}
-            ConnectDecision::Block => panic!("Expected Allow"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_default_decision_no_catchall() {
-        // Rules without a catch-all should return Block for default_decision
-        let rules = vec![allow_rule(vec!["192.168.1.0/24"], "lan")];
-        let selector = ClientProxySelector::new(rules);
-
-        let decision = selector.default_decision();
-        match decision {
-            ConnectDecision::Allow { .. } => panic!("Expected Block when no catch-all rule"),
-            ConnectDecision::Block => {} // Expected
-        }
-    }
-
-    #[tokio::test]
-    async fn test_default_decision_skips_override_rules() {
-        // Rules with override_address should not be used as default
-        let rules = vec![
-            allow_rule_with_override(vec!["0.0.0.0/0"], "redirect", "10.0.0.1:8080"),
-            allow_rule(vec!["192.168.0.0/16"], "fallback"),
-        ];
-        let selector = ClientProxySelector::new(rules);
-
-        // default_decision should skip the override rule and use the next catch-all
-        let decision = selector.default_decision();
-        match decision {
-            ConnectDecision::Allow { .. } => {}
-            ConnectDecision::Block => {} // Also acceptable if no valid default found
-        }
-    }
-
-    // =========================================================================
-    // Round-Robin Proxy Selection Tests
-    // =========================================================================
 
     #[tokio::test]
     async fn test_round_robin_proxy_selection() {
@@ -1311,10 +1205,6 @@ mod tests {
             }
         }
     }
-
-    // =========================================================================
-    // Address Override Tests
-    // =========================================================================
 
     #[tokio::test]
     async fn test_address_override() {
@@ -1362,10 +1252,6 @@ mod tests {
             ConnectDecision::Block => panic!("Expected Allow"),
         }
     }
-
-    // =========================================================================
-    // Multiple Masks Per Rule Tests
-    // =========================================================================
 
     #[tokio::test]
     async fn test_multiple_masks_in_rule() {
@@ -1432,10 +1318,6 @@ mod tests {
             }
         }
     }
-
-    // =========================================================================
-    // Edge Cases and Security Tests
-    // =========================================================================
 
     #[tokio::test]
     async fn test_empty_rules_blocks_all() {
@@ -1547,10 +1429,6 @@ mod tests {
         // If we got here without panic, concurrent access is safe
     }
 
-    // =========================================================================
-    // Regression Tests for Specific Scenarios
-    // =========================================================================
-
     #[tokio::test]
     async fn test_localhost_bypass() {
         // Common pattern: bypass proxy for localhost
@@ -1617,10 +1495,6 @@ mod tests {
             ConnectDecision::Block => panic!("Expected Allow"),
         }
     }
-
-    // =========================================================================
-    // Routing Cache Tests
-    // =========================================================================
 
     #[test]
     fn test_routing_cache_key_from_location_hostname() {
@@ -1936,7 +1810,7 @@ mod tests {
 
         // Use judge_uncached - should NOT populate cache
         let decision = selector
-            .judge_uncached(location.clone(), &resolver)
+            .judge_uncached(location.clone(), None, &resolver)
             .await
             .unwrap();
         match decision {
@@ -2127,5 +2001,26 @@ mod tests {
             ConnectDecision::Allow { .. } => {}
             _ => panic!("Expected subnet"),
         }
+    }
+
+    #[test]
+    fn test_netmask_value_for_cidr_0() {
+        // Verify that 0.0.0.0/0 actually produces netmask == 0
+        let mask = NetLocationMask::from("0.0.0.0/0").unwrap();
+        assert_eq!(
+            mask.address_mask.netmask, 0,
+            "0.0.0.0/0 should have netmask == 0, got {}",
+            mask.address_mask.netmask
+        );
+    }
+
+    #[test]
+    fn test_netmask_value_for_cidr_24() {
+        // Verify that /24 does NOT produce netmask == 0
+        let mask = NetLocationMask::from("172.17.0.0/24").unwrap();
+        assert_ne!(
+            mask.address_mask.netmask, 0,
+            "172.17.0.0/24 should have netmask != 0"
+        );
     }
 }

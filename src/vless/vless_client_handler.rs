@@ -2,18 +2,17 @@ use async_trait::async_trait;
 use tokio::io::AsyncWriteExt;
 
 use crate::address::{Address, NetLocation};
+use crate::async_stream::AsyncMessageStream;
 use crate::async_stream::AsyncStream;
 use crate::crypto::CryptoTlsStream;
-use crate::tcp_handler::{
-    TcpClientHandler, TcpClientSetupResult, TcpClientUdpSetupResult, UdpStreamRequest,
-};
-use crate::util::{allocate_vec, parse_uuid, write_all};
-use crate::xudp::XudpMessageStream;
+use crate::tcp::tcp_handler::{TcpClientHandler, TcpClientSetupResult};
+use crate::util::{allocate_vec, write_all};
+use crate::uuid_util::parse_uuid;
 
 use super::vision_stream::VisionStream;
 use super::vless_message_stream::VlessMessageStream;
 use super::vless_response_stream::VlessResponseStream;
-use super::vless_util::{COMMAND_MUX, COMMAND_TCP, COMMAND_UDP, vision_flow_addon_data};
+use super::vless_util::{COMMAND_TCP, COMMAND_UDP, vision_flow_addon_data};
 
 pub struct VlessTcpClientHandler {
     user_id: Box<[u8]>,
@@ -47,8 +46,6 @@ impl TcpClientHandler for VlessTcpClientHandler {
     ) -> std::io::Result<TcpClientSetupResult> {
         write_vless_header(&mut client_stream, &self.user_id, &[], &remote_location).await?;
         client_stream.flush().await?;
-
-        // Wrap stream to read VLESS response on first read
         let client_stream = Box::new(VlessResponseStream::new(client_stream));
 
         Ok(TcpClientSetupResult {
@@ -61,115 +58,34 @@ impl TcpClientHandler for VlessTcpClientHandler {
         self.udp_enabled // VLESS supports XUDP for UDP-over-TCP when enabled
     }
 
-    async fn setup_client_udp_stream(
+    async fn setup_client_udp_bidirectional(
         &self,
         mut client_stream: Box<dyn AsyncStream>,
-        request: UdpStreamRequest,
-    ) -> std::io::Result<TcpClientUdpSetupResult> {
-        match request {
-            UdpStreamRequest::SessionBased { server_stream } => {
-                // For XUDP (COMMAND_MUX), send a minimal VLESS header without destination.
-                // The destination comes in XUDP frames, not the VLESS header.
-                write_vless_mux_header(&mut client_stream, &self.user_id).await?;
-                client_stream.flush().await?;
-
-                // Wrap stream to read VLESS response on first read, then provide XUDP framing
-                let response_stream = Box::new(VlessResponseStream::new(client_stream));
-
-                // Wrap with XUDP message stream for session-based UDP multiplexing
-                let xudp_stream = XudpMessageStream::new(response_stream);
-
-                Ok(TcpClientUdpSetupResult::SessionBased {
-                    server_stream,
-                    client_stream: Box::new(xudp_stream),
-                })
-            }
-            UdpStreamRequest::Bidirectional {
-                server_stream,
-                target,
-            } => {
-                // VLESS COMMAND_UDP for single-target bidirectional UDP
-                // Send VLESS header with COMMAND_UDP and the destination
-                write_vless_udp_header(&mut client_stream, &self.user_id, &target).await?;
-                client_stream.flush().await?;
-
-                // Wrap stream to read VLESS response on first read
-                let response_stream = Box::new(VlessResponseStream::new(client_stream));
-
-                // Wrap with VlessMessageStream for length-prefixed message framing
-                let message_stream = VlessMessageStream::new(response_stream);
-
-                Ok(TcpClientUdpSetupResult::Bidirectional {
-                    server_stream,
-                    client_stream: Box::new(message_stream),
-                })
-            }
-            UdpStreamRequest::MultiDirectional { .. } => {
-                // VLESS doesn't have native MultiDirectional support
-                // Use SessionBased (XUDP) instead which provides per-packet destinations
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::Unsupported,
-                    "VLESS does not support MultiDirectional UDP. Use SessionBased instead.",
-                ))
-            }
-        }
+        target: NetLocation,
+    ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
+        write_vless_udp_header(&mut client_stream, &self.user_id, &target).await?;
+        client_stream.flush().await?;
+        let response_stream = Box::new(VlessResponseStream::new(client_stream));
+        let message_stream = VlessMessageStream::new(response_stream);
+        Ok(Box::new(message_stream))
     }
 }
 
-/// Helper function for setup_client_udp_stream that can be called from TlsClientHandler
+/// Helper function for setup_client_udp_bidirectional that can be called from TlsClientHandler
 /// for Vision VLESS or regular VLESS over TLS.
-pub async fn setup_vless_udp_stream<IO>(
+pub async fn setup_vless_udp_bidirectional<IO>(
     mut stream: CryptoTlsStream<IO>,
     user_id: &[u8],
-    request: UdpStreamRequest,
-) -> std::io::Result<TcpClientUdpSetupResult>
+    target: NetLocation,
+) -> std::io::Result<Box<dyn AsyncMessageStream>>
 where
     IO: crate::async_stream::AsyncStream + 'static,
 {
-    match request {
-        UdpStreamRequest::SessionBased { server_stream } => {
-            // For XUDP (COMMAND_MUX), send a minimal VLESS header without destination.
-            write_vless_mux_header(&mut stream, user_id).await?;
-            stream.flush().await?;
-
-            // Wrap stream to read VLESS response on first read
-            let response_stream = Box::new(VlessResponseStream::new(stream));
-
-            // Wrap with XUDP message stream for session-based UDP multiplexing
-            let xudp_stream = XudpMessageStream::new(response_stream);
-
-            Ok(TcpClientUdpSetupResult::SessionBased {
-                server_stream,
-                client_stream: Box::new(xudp_stream),
-            })
-        }
-        UdpStreamRequest::Bidirectional {
-            server_stream,
-            target,
-        } => {
-            // VLESS COMMAND_UDP for single-target bidirectional UDP
-            write_vless_udp_header(&mut stream, user_id, &target).await?;
-            stream.flush().await?;
-
-            // Wrap stream to read VLESS response on first read
-            let response_stream = Box::new(VlessResponseStream::new(stream));
-
-            // Wrap with VlessMessageStream for length-prefixed message framing
-            let message_stream = VlessMessageStream::new(response_stream);
-
-            Ok(TcpClientUdpSetupResult::Bidirectional {
-                server_stream,
-                client_stream: Box::new(message_stream),
-            })
-        }
-        UdpStreamRequest::MultiDirectional { .. } => {
-            // VLESS doesn't have native MultiDirectional support
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "VLESS does not support MultiDirectional UDP. Use SessionBased instead.",
-            ))
-        }
-    }
+    write_vless_udp_header(&mut stream, user_id, &target).await?;
+    stream.flush().await?;
+    let response_stream = Box::new(VlessResponseStream::new(stream));
+    let message_stream = VlessMessageStream::new(response_stream);
+    Ok(Box::new(message_stream))
 }
 
 pub async fn setup_custom_tls_vision_vless_client_stream<IO>(
@@ -180,7 +96,6 @@ pub async fn setup_custom_tls_vision_vless_client_stream<IO>(
 where
     IO: crate::async_stream::AsyncStream + 'static,
 {
-    // Write VLESS request header through TLS
     write_vless_header(
         &mut tls_stream,
         user_id,
@@ -190,11 +105,7 @@ where
     .await?;
     tls_stream.flush().await?;
 
-    // Create stream with VLESS response reading support
-    // CryptoTlsStream already wraps a Connection, so we don't need to wrap again
     let (io, connection) = tls_stream.into_inner();
-
-    // VisionStream will read VLESS response header on first read
     let mut user_uuid = [0u8; 16];
     user_uuid.copy_from_slice(user_id);
     let vision_stream = VisionStream::new_client(io, connection, user_uuid);
@@ -203,30 +114,6 @@ where
         client_stream: Box::new(vision_stream),
         early_data: None,
     })
-}
-
-/// Write VLESS MUX header for XUDP (COMMAND_MUX = 3).
-/// MUX header format is minimal: version + user_id + addon_length(0) + command(3)
-/// No destination is included - destinations come in XUDP frames.
-async fn write_vless_mux_header<S: AsyncWriteExt + Unpin>(
-    stream: &mut S,
-    user_id: &[u8],
-) -> std::io::Result<()> {
-    // MUX header: version (1) + user_id (16) + addon_length (1) + command (1) = 19 bytes
-    let mut header_bytes = [0u8; 19];
-
-    // version 0
-    header_bytes[0] = 0;
-    // Copy user_id
-    header_bytes[1..17].copy_from_slice(user_id);
-    // addon length = 0
-    header_bytes[17] = 0;
-    // command = MUX (3)
-    header_bytes[18] = COMMAND_MUX;
-
-    write_all(stream, &header_bytes).await?;
-
-    Ok(())
 }
 
 /// Write VLESS UDP header for single-target bidirectional UDP (COMMAND_UDP = 2).

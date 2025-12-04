@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
-use log::{error, warn};
+use log::{debug, error, warn};
 use rand::distr::Alphanumeric;
 use rand::{Rng, RngCore};
 use rustc_hash::FxHashMap;
@@ -25,15 +25,18 @@ const MAX_FRAGMENT_CACHE_SIZE: usize = 256;
 /// Default is 3 seconds per sing-box reference implementation.
 const AUTH_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// HTTP/3 error code for normal closure.
+/// Per official hysteria reference: https://github.com/apernet/hysteria/blob/master/core/server/server.go#L20
+const CLOSE_ERR_CODE_OK: u32 = 0x100; // HTTP3 ErrCodeNoError
+
 use crate::address::NetLocation;
 use crate::async_stream::AsyncStream;
 use crate::client_proxy_selector::{ClientProxySelector, ConnectDecision};
 use crate::copy_bidirectional::copy_bidirectional_with_sizes;
 use crate::quic_stream::QuicStream;
 use crate::resolver::{Resolver, ResolverCache};
-use crate::socket_util::new_socket2_udp_socket;
 use crate::stream_reader::StreamReader;
-use crate::tcp_server::setup_client_tcp_stream;
+use crate::tcp::tcp_server::setup_client_tcp_stream;
 use crate::util::allocate_vec;
 
 async fn process_connection(
@@ -62,8 +65,7 @@ async fn process_connection(
             .await
             .map_err(std::io::Error::other)?;
 
-    // Authentication with timeout - per sing-box reference, default 3 seconds.
-    // This prevents malicious clients from holding connections open without authenticating.
+    // Per sing-box reference, authentication timeout is 3 seconds
     match timeout(
         AUTH_TIMEOUT,
         auth_connection(&mut h3_conn, password, udp_enabled),
@@ -72,12 +74,12 @@ async fn process_connection(
     {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
-            connection.close(0u32.into(), b"auth failed");
+            connection.close(CLOSE_ERR_CODE_OK.into(), b"auth failed");
             return Err(e);
         }
         Err(_elapsed) => {
             error!("Authentication timeout");
-            connection.close(0u32.into(), b"auth timeout");
+            connection.close(CLOSE_ERR_CODE_OK.into(), b"auth timeout");
             return Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 "authentication timeout",
@@ -85,59 +87,65 @@ async fn process_connection(
         }
     }
 
-    let mut join_handles = vec![];
-    if udp_enabled {
-        let connection = connection.clone();
-        let client_proxy_selector = client_proxy_selector.clone();
-        let resolver = resolver.clone();
-        let cancel_token = cancel_token.clone();
-        join_handles.push(tokio::spawn(async move {
-            if let Err(e) = run_udp_local_to_remote_loop(
-                connection,
-                client_proxy_selector,
-                resolver,
-                cancel_token,
+    let udp_connection = connection.clone();
+    let udp_client_proxy_selector = client_proxy_selector.clone();
+    let udp_resolver = resolver.clone();
+    let udp_cancel_token = cancel_token.clone();
+
+    let uni_connection = connection.clone();
+
+    // Use try_join! to run all loops concurrently within the same task, like Quinn's perf example.
+    // This reduces task count and avoids spawning separate tasks for the main loops.
+    let udp_loop = async {
+        if udp_enabled {
+            run_udp_local_to_remote_loop(
+                udp_connection,
+                udp_client_proxy_selector,
+                udp_resolver,
+                udp_cancel_token,
             )
             .await
-            {
-                error!("UDP local-to-remote write loop ended with error: {e}");
-            }
-        }));
-    }
+        } else {
+            Ok(())
+        }
+    };
 
-    // depending on the client, unidirectional streams could still be sent, accept and drop.
-    {
-        let connection = connection.clone();
-        join_handles.push(tokio::spawn(async move {
-            loop {
-                match connection.accept_uni().await {
-                    Ok(mut recv_stream) => {
-                        let _ = recv_stream.stop(0u32.into());
-                    }
-                    Err(e) => {
-                        error!("Unidirectional loop ended with error: {e}");
-                        break;
-                    }
+    let uni_loop = async {
+        // Depending on the client, unidirectional streams could still be sent, accept and drop.
+        loop {
+            match uni_connection.accept_uni().await {
+                Ok(mut recv_stream) => {
+                    let _ = recv_stream.stop(0u32.into());
+                }
+                Err(quinn::ConnectionError::ApplicationClosed(_)) => break,
+                Err(quinn::ConnectionError::ConnectionClosed(_)) => break,
+                Err(e) => {
+                    return Err(std::io::Error::other(format!(
+                        "unidirectional loop error: {e}"
+                    )));
                 }
             }
-        }));
-    }
-    join_handles.push(tokio::spawn(async move {
-        if let Err(e) = run_tcp_loop(connection, client_proxy_selector, resolver).await {
-            error!("TCP loop ended with error: {e}");
         }
-    }));
+        Ok(())
+    };
 
-    // Use try_join to fail fast if any task errors
-    let results = futures::future::join_all(join_handles).await;
-    for result in results {
-        result?;
-    }
+    let tcp_connection = connection.clone();
+    let tcp_loop = run_tcp_loop(tcp_connection, client_proxy_selector, resolver);
 
-    // Cancel all remaining tasks (UDP session loops)
+    let result = tokio::try_join!(udp_loop, uni_loop, tcp_loop);
+
     cancel_token.cancel();
 
-    Ok(())
+    // Per sing-box reference (service.go:277-293), close connection on error
+    if let Err(ref e) = result {
+        error!("Connection failed: {e}");
+        connection.close(CLOSE_ERR_CODE_OK.into(), b"");
+    }
+
+    match result {
+        Ok(_) => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 fn validate_auth_request<T>(req: http::Request<T>, password: &str) -> std::io::Result<()> {
@@ -244,7 +252,6 @@ struct UdpSession {
     last_socket_addr: SocketAddr,
     override_remote_write_address: Option<SocketAddr>,
     last_activity: std::time::Instant,
-    // Cancellation token for this session's background task
     cancel_token: CancellationToken,
 }
 
@@ -322,13 +329,13 @@ async fn run_udp_remote_to_local_loop(
     };
 
     let mut next_packet_id: u16 = 0;
-    let mut buf = [0u8; 65535];
+    let mut buf = allocate_vec(65535);
+    let mut loop_count: u8 = 0;
 
     loop {
         let (payload_len, src_addr) = match socket.try_recv_from(&mut buf) {
             Ok(res) => res,
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                // Use select! to allow cancellation while waiting for socket to be readable
                 tokio::select! {
                     _ = cancel_token.cancelled() => {
                         return Ok(());
@@ -345,6 +352,13 @@ async fn run_udp_remote_to_local_loop(
                 )));
             }
         };
+
+        // Yield periodically to allow quinn's internal tasks to run (keepalives, ACKs, etc.)
+        // This prevents starvation during heavy UDP traffic.
+        loop_count = loop_count.wrapping_add(1);
+        if loop_count == 0 {
+            tokio::task::yield_now().await;
+        }
 
         let packet_id = next_packet_id;
         next_packet_id = next_packet_id.wrapping_add(1);
@@ -415,18 +429,18 @@ async fn run_udp_local_to_remote_loop(
     let mut sessions: FxHashMap<u32, UdpSession> = FxHashMap::default();
     let mut last_cleanup = std::time::Instant::now();
 
-    const CLEANUP_INTERVAL: Duration = Duration::from_secs(100);
-    const IDLE_TIMEOUT: Duration = Duration::from_secs(200);
+    // Match reference implementation defaults for UDP session management
+    const CLEANUP_INTERVAL: Duration = Duration::from_secs(10);
+    const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
     loop {
-        // Periodically clean up stale sessions
         let now = std::time::Instant::now();
         if (now - last_cleanup) > CLEANUP_INTERVAL {
             sessions.retain(|session_id, session| {
                 if session.last_activity.elapsed() > IDLE_TIMEOUT {
                     // Cancel the session's background task before removing
                     session.cancel_token.cancel();
-                    error!("Removing inactive UDP session {session_id}");
+                    debug!("Removing inactive UDP session {session_id}");
                     false
                 } else {
                     true
@@ -439,11 +453,12 @@ async fn run_udp_local_to_remote_loop(
             .read_datagram()
             .await
             .map_err(|err| std::io::Error::other(format!("failed to read datagram: {err}")))?;
+
+        // Per official hysteria reference (server.go:332-353), parse errors are ignored
+        // and we continue waiting for the next message. Only connection errors are fatal.
         if data.len() < 9 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "datagram length too short",
-            ));
+            debug!("Ignoring short datagram (len={})", data.len());
+            continue;
         }
         let session_id = u32::from_be_bytes(data[0..4].try_into().unwrap());
         let packet_id = u16::from_be_bytes(data[4..6].try_into().unwrap());
@@ -477,17 +492,18 @@ async fn run_udp_local_to_remote_loop(
         };
 
         if address_len == 0 {
-            error!("Ignoring packet with empty address");
+            debug!("Ignoring packet with empty address");
             continue;
         }
 
         if address_len > 2048 {
-            error!("Ignoring packet with address length {address_len}");
+            debug!("Ignoring packet with address length {address_len}");
             continue;
         }
 
         if data.len() < next_index + address_len {
-            return Err(std::io::Error::other("invalid address length"));
+            debug!("Ignoring datagram with truncated address");
+            continue;
         }
         let address_bytes = &data[next_index..next_index + address_len];
         let payload_fragment = data.slice(next_index + address_len..);
@@ -495,7 +511,7 @@ async fn run_udp_local_to_remote_loop(
         let addr_str = match str::from_utf8(address_bytes) {
             Ok(s) => s,
             Err(e) => {
-                error!("Invalid UTF-8 in address: {e}");
+                debug!("Invalid UTF-8 in address: {e}");
                 continue;
             }
         };
@@ -503,7 +519,7 @@ async fn run_udp_local_to_remote_loop(
         let remote_location = match NetLocation::from_str(addr_str, None) {
             Ok(loc) => loc,
             Err(e) => {
-                error!("Failed to parse remote location from {addr_str}: {e}");
+                debug!("Failed to parse address '{addr_str}': {e}");
                 continue;
             }
         };
@@ -592,11 +608,9 @@ async fn run_udp_local_to_remote_loop(
         } else if fragment_count == 1 {
             (payload_fragment, remote_location)
         } else {
-            // Check if we already have this packet in the LRU cache
             let is_new = !session.fragments.contains(&packet_id);
 
             if is_new {
-                // Insert new fragmented packet entry
                 session.fragments.put(
                     packet_id,
                     FragmentedPacket {
@@ -702,7 +716,6 @@ async fn run_udp_local_to_remote_loop(
             .await
         {
             error!("Failed to forward UDP payload for session {session_id}: {e}");
-            // Remove the failed session
             sessions.remove(&session_id);
         }
     }
@@ -878,19 +891,15 @@ async fn process_tcp_stream(
     };
     drop(stream_reader);
 
-    // unlike tokio's implementation, we read as much as possible to fill up the
-    // buffer size before sending. reduce the buffer sizes compared to tcp -> tcp.
-    // also see https://www.privateoctopus.com/2023/12/12/quic-performance.html
+    // Use 32KB buffers to match hysteria2/sing-box reference implementations
     let copy_result = copy_bidirectional_with_sizes(
         &mut server_stream,
         &mut client_stream,
         // no need to flush even through we wrote this response since it's quic
         false,
         client_requires_flush,
-        // quic -> tcp
-        8192,
-        // tcp -> quic
-        16384,
+        32768,
+        32768,
     )
     .await;
 
@@ -976,15 +985,31 @@ pub async fn start_hysteria2_server(
                 .max_concurrent_bidi_streams(4096_u32.into())
                 // required for HTTP/3 QPACK updates
                 .max_concurrent_uni_streams(1024_u32.into())
-                .max_idle_timeout(Some(Duration::from_secs(60).try_into().unwrap()))
-                .keep_alive_interval(Some(Duration::from_secs(15)))
+                .max_idle_timeout(Some(Duration::from_secs(30).try_into().unwrap()))
+                .keep_alive_interval(Some(Duration::from_secs(10)))
                 .send_window(16 * 1024 * 1024)
                 .receive_window((20u32 * 1024 * 1024).into())
-                .stream_receive_window((8u32 * 1024 * 1024).into());
+                .stream_receive_window((8u32 * 1024 * 1024).into())
+                // MTU settings per official TUIC reference
+                .initial_mtu(1200)
+                .min_mtu(1200)
+                // Enable MTU discovery for larger packets on capable networks
+                .mtu_discovery_config(Some(quinn::MtuDiscoveryConfig::default()))
+                // Enable GSO (Generic Segmentation Offload) for better throughput
+                .enable_segmentation_offload(true)
+                // Lower initial RTT estimate for faster initial window growth
+                .initial_rtt(Duration::from_millis(100));
 
-            let socket2_socket =
-                new_socket2_udp_socket(bind_address.is_ipv6(), None, Some(bind_address), true)
-                    .unwrap();
+            // Use 7.5MB socket buffers for high-throughput QUIC (8.625MB on BSD for 15% kernel overhead)
+            // https://github.com/quic-go/quic-go/wiki/UDP-Buffer-Sizes
+            let socket2_socket = crate::socket_util::new_socket2_udp_socket_with_buffer_size(
+                bind_address.is_ipv6(),
+                None,
+                Some(bind_address),
+                true,
+                Some(8_625_000),
+            )
+            .unwrap();
 
             let endpoint = quinn::Endpoint::new(
                 quinn::EndpointConfig::default(),

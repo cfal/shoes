@@ -1,4 +1,4 @@
-use crate::buf_reader::BufReader;
+use crate::shadow_tls::parse_server_hello;
 
 // TLS record types
 const TLS_CONTENT_TYPE_HANDSHAKE: u8 = 0x16;
@@ -9,9 +9,6 @@ const TLS_HANDSHAKE_TYPE_SERVER_HELLO: u8 = 0x02;
 
 // TLS ciphers
 const TLS13_CIPHER_AES_128_CCM_8_SHA256: u16 = 0x1305;
-
-/// TLS extension type for supported_versions
-const TLS_EXT_SUPPORTED_VERSIONS: u16 = 0x002b;
 
 /// VISION protocol filter state
 ///
@@ -126,7 +123,7 @@ impl VisionFilter {
                         parsed.cipher_suite
                     );
 
-                    if parsed.has_tls13_version {
+                    if parsed.is_tls13 {
                         log::debug!("VISION: Detected TLS 1.3 via supported_versions extension");
 
                         // Check if cipher is supported for XTLS
@@ -155,149 +152,6 @@ impl VisionFilter {
             }
         }
     }
-}
-
-/// Result of parsing a ServerHello message
-struct ParsedServerHello {
-    pub cipher_suite: u16,
-    pub has_tls13_version: bool,
-}
-
-/// Parse ServerHello structure following RFC 8446 format
-///
-/// ServerHello format:
-/// - TLS Record Header (5 bytes):
-///   - ContentType (1 byte): 0x16 (Handshake)
-///   - ProtocolVersion (2 bytes): 0x0303 (TLS 1.2 for compatibility)
-///   - Length (2 bytes): payload length
-/// - Handshake Header (4 bytes):
-///   - HandshakeType (1 byte): 0x02 (ServerHello)
-///   - Length (3 bytes): message length
-/// - ServerHello Content:
-///   - LegacyVersion (2 bytes): 0x0303 (TLS 1.2)
-///   - Random (32 bytes): server random
-///   - LegacySessionIdEcho (1 + N bytes): session ID length + session ID
-///   - CipherSuite (2 bytes): selected cipher
-///   - LegacyCompressionMethod (1 byte): 0x00
-///   - Extensions (2 + N bytes): extensions length + extensions
-///
-/// TODO: consolidate with ShadowTLS version
-fn parse_server_hello(data: &[u8]) -> std::io::Result<ParsedServerHello> {
-    // Minimum size: 5 (record header) + 4 (handshake header) + 2 (version) + 32 (random) + 1 (session id len) + 2 (cipher) + 1 (compression) = 47
-    if data.len() < 47 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "ServerHello too short",
-        ));
-    }
-
-    // Skip TLS record header (5 bytes) and handshake type (1 byte)
-    let mut reader = BufReader::new(&data[6..]);
-
-    // Read handshake message length (3 bytes)
-    let _message_len = reader.read_u24_be()?;
-
-    // Read legacy version (2 bytes) - should be 0x0303 for TLS 1.2
-    let legacy_version_major = reader.read_u8()?;
-    let legacy_version_minor = reader.read_u8()?;
-    if legacy_version_major != 3 || legacy_version_minor != 3 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!(
-                "expected TLS 1.2 (major/minor 3.3), got major/minor {}.{}",
-                legacy_version_major, legacy_version_minor
-            ),
-        ));
-    }
-
-    // Skip server random (32 bytes)
-    reader.skip(32)?;
-
-    // Read session ID length and skip session ID
-    let session_id_len = reader.read_u8()?;
-    if session_id_len > 0 {
-        reader.skip(session_id_len as usize)?;
-    }
-
-    // Read cipher suite (2 bytes)
-    let cipher_suite = reader.read_u16_be()?;
-
-    // Skip compression method (1 byte)
-    reader.skip(1)?;
-
-    // Check if we have extensions
-    if reader.is_consumed() {
-        // No extensions, assume not TLS 1.3
-        return Ok(ParsedServerHello {
-            cipher_suite,
-            has_tls13_version: false,
-        });
-    }
-
-    // Read extensions length
-    let extensions_len = match reader.read_u16_be() {
-        Ok(len) => len as usize,
-        Err(_) => {
-            // No extensions
-            return Ok(ParsedServerHello {
-                cipher_suite,
-                has_tls13_version: false,
-            });
-        }
-    };
-
-    // Parse extensions to find supported_versions
-    let mut has_tls13_version = false;
-    let extensions_data = match reader.read_slice(extensions_len) {
-        Ok(data) => data,
-        Err(_) => {
-            // Invalid extensions length
-            return Ok(ParsedServerHello {
-                cipher_suite,
-                has_tls13_version: false,
-            });
-        }
-    };
-
-    let mut ext_reader = BufReader::new(extensions_data);
-
-    while !ext_reader.is_consumed() {
-        let extension_type = match ext_reader.read_u16_be() {
-            Ok(t) => t,
-            Err(_) => break,
-        };
-        let extension_len = match ext_reader.read_u16_be() {
-            Ok(l) => l as usize,
-            Err(_) => break,
-        };
-
-        if extension_type == TLS_EXT_SUPPORTED_VERSIONS {
-            // supported_versions extension found
-            // In ServerHello, this is 2 bytes: the selected version
-            if extension_len == 2 {
-                match ext_reader.read_slice(2) {
-                    Ok(version_bytes) => {
-                        // TLS 1.3 is 0x0304
-                        if version_bytes[0] == 0x03 && version_bytes[1] == 0x04 {
-                            has_tls13_version = true;
-                            break;
-                        }
-                    }
-                    Err(_) => break,
-                }
-            } else if ext_reader.skip(extension_len).is_err() {
-                break;
-            }
-        } else if ext_reader.skip(extension_len).is_err() {
-            // Skip unknown extension
-            break;
-        }
-    }
-
-    Ok(ParsedServerHello {
-        cipher_suite,
-        has_tls13_version,
-    })
 }
 
 #[cfg(test)]

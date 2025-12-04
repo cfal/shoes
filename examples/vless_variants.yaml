@@ -95,3 +95,17 @@
           type: vless
           user_id: "b85798ef-e9dc-46a4-9a87-8da4499d36d0"
           udp_enabled: true
+
+# VLESS with fallback for failed authentication
+# Invalid clients are proxied to the fallback destination instead of rejected
+- address: "0.0.0.0:11443"
+  protocol:
+    type: tls
+    tls_targets:
+      "secure.example.com":
+        cert: "cert.pem"
+        key: "key.pem"
+        protocol:
+          type: vless
+          user_id: "b85798ef-e9dc-46a4-9a87-8da4499d36d0"
+          fallback: "127.0.0.1:80"  # Serve web content for invalid clients

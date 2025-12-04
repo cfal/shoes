@@ -1,28 +1,28 @@
 use std::io::{Error, ErrorKind, Result};
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::io::ReadBuf;
 
-// Assume these traits are defined in your M-bM-^@M-^\async_streamM-bM-^@M-^] module.
 use crate::async_stream::{
     AsyncFlushMessage, AsyncMessageStream, AsyncPing, AsyncReadMessage, AsyncShutdownMessage,
     AsyncStream, AsyncWriteMessage,
 };
+use crate::util::allocate_vec;
 
-pub struct VlessMessageStream {
-    stream: Box<dyn AsyncStream>,
-    read_buf: [u8; 65537],
+pub struct VlessMessageStream<S> {
+    stream: S,
+    read_buf: Box<[u8]>,
     read_end_index: usize,
     pending_write: Vec<u8>,
     write_offset: usize,
     is_eof: bool,
 }
 
-impl VlessMessageStream {
-    pub fn new(stream: Box<dyn AsyncStream>) -> Self {
+impl<S: AsyncStream> VlessMessageStream<S> {
+    pub fn new(stream: S) -> Self {
         Self {
             stream,
-            read_buf: [0u8; 65537],
+            read_buf: allocate_vec(65537).into_boxed_slice(),
             read_end_index: 0,
             pending_write: Vec::with_capacity(65537),
             write_offset: 0,
@@ -42,7 +42,7 @@ impl VlessMessageStream {
     }
 }
 
-impl AsyncReadMessage for VlessMessageStream {
+impl<S: AsyncStream> AsyncReadMessage for VlessMessageStream<S> {
     fn poll_read_message(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -104,7 +104,7 @@ impl AsyncReadMessage for VlessMessageStream {
     }
 }
 
-impl AsyncWriteMessage for VlessMessageStream {
+impl<S: AsyncStream> AsyncWriteMessage for VlessMessageStream<S> {
     fn poll_write_message(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -138,7 +138,7 @@ impl AsyncWriteMessage for VlessMessageStream {
     }
 }
 
-impl AsyncFlushMessage for VlessMessageStream {
+impl<S: AsyncStream> AsyncFlushMessage for VlessMessageStream<S> {
     fn poll_flush_message(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
         let this = self.get_mut();
         while this.write_offset < this.pending_write.len() {
@@ -170,7 +170,7 @@ impl AsyncFlushMessage for VlessMessageStream {
     }
 }
 
-impl AsyncShutdownMessage for VlessMessageStream {
+impl<S: AsyncStream> AsyncShutdownMessage for VlessMessageStream<S> {
     fn poll_shutdown_message(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
         let this = self.get_mut();
         match <Self as AsyncFlushMessage>::poll_flush_message(Pin::new(this), cx) {
@@ -181,7 +181,7 @@ impl AsyncShutdownMessage for VlessMessageStream {
     }
 }
 
-impl AsyncPing for VlessMessageStream {
+impl<S: AsyncStream> AsyncPing for VlessMessageStream<S> {
     fn supports_ping(&self) -> bool {
         self.stream.supports_ping()
     }
@@ -194,4 +194,4 @@ impl AsyncPing for VlessMessageStream {
     }
 }
 
-impl AsyncMessageStream for VlessMessageStream {}
+impl<S: AsyncStream> AsyncMessageStream for VlessMessageStream<S> {}

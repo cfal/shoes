@@ -7,16 +7,15 @@ use tokio::io::AsyncWriteExt;
 
 use crate::address::NetLocation;
 use crate::async_stream::AsyncStream;
+use crate::client_proxy_selector::ClientProxySelector;
 use crate::config::ShadowsocksConfig;
-use crate::option_util::NoneOrOne;
 use crate::shadowsocks::{
     DefaultKey, ShadowsocksCipher, ShadowsocksKey, ShadowsocksStream, ShadowsocksStreamType,
 };
 use crate::socks_handler::{CMD_CONNECT, CMD_UDP_ASSOCIATE, read_location, write_location_to_vec};
 use crate::stream_reader::StreamReader;
-use crate::tcp_handler::{
-    TcpClientHandler, TcpClientSetupResult, TcpClientUdpSetupResult, TcpServerHandler,
-    TcpServerSetupResult, UdpStreamRequest,
+use crate::tcp::tcp_handler::{
+    TcpClientHandler, TcpClientSetupResult, TcpServerHandler, TcpServerSetupResult,
 };
 use crate::util::write_all;
 
@@ -30,10 +29,30 @@ struct ShadowsocksData {
 pub struct TrojanTcpHandler {
     password_hash: Box<[u8]>,
     shadowsocks_data: Option<ShadowsocksData>,
+    /// Proxy selector for server handler use. None when used as client handler.
+    proxy_selector: Option<Arc<ClientProxySelector>>,
 }
 
 impl TrojanTcpHandler {
-    pub fn new(password: &str, shadowsocks_config: &Option<ShadowsocksConfig>) -> Self {
+    /// Create a new handler for server use (with proxy_selector for routing)
+    pub fn new_server(
+        password: &str,
+        shadowsocks_config: &Option<ShadowsocksConfig>,
+        proxy_selector: Arc<ClientProxySelector>,
+    ) -> Self {
+        Self::new_inner(password, shadowsocks_config, Some(proxy_selector))
+    }
+
+    /// Create a new handler for client use (no proxy_selector needed)
+    pub fn new_client(password: &str, shadowsocks_config: &Option<ShadowsocksConfig>) -> Self {
+        Self::new_inner(password, shadowsocks_config, None)
+    }
+
+    fn new_inner(
+        password: &str,
+        shadowsocks_config: &Option<ShadowsocksConfig>,
+        proxy_selector: Option<Arc<ClientProxySelector>>,
+    ) -> Self {
         let password_hash = create_password_hash(password);
         let shadowsocks_data = shadowsocks_config.as_ref().map(|config| match config {
             ShadowsocksConfig::Legacy {
@@ -57,6 +76,7 @@ impl TrojanTcpHandler {
         Self {
             password_hash,
             shadowsocks_data,
+            proxy_selector,
         }
     }
 }
@@ -132,7 +152,10 @@ impl TcpServerHandler for TrojanTcpHandler {
             need_initial_flush: false,
             connection_success_response: None,
             initial_remote_data: stream_reader.unparsed_data_owned(),
-            override_proxy_provider: NoneOrOne::Unspecified,
+            proxy_selector: self
+                .proxy_selector
+                .clone()
+                .expect("proxy_selector required for server handler"),
         })
     }
 }
@@ -175,41 +198,14 @@ impl TcpClientHandler for TrojanTcpHandler {
     }
 
     fn supports_udp_over_tcp(&self) -> bool {
-        // TODO: Return true once setup_client_udp_stream is implemented
+        // TODO: Return true once setup_client_udp_bidirectional is implemented
         false
     }
 
-    async fn setup_client_udp_stream(
-        &self,
-        _client_stream: Box<dyn AsyncStream>,
-        request: UdpStreamRequest,
-    ) -> std::io::Result<TcpClientUdpSetupResult> {
-        match request {
-            UdpStreamRequest::Bidirectional { .. } => {
-                // TODO: Implement Trojan UDP-over-TCP
-                // Trojan UDP uses a message-framed protocol where each packet has:
-                // ATYPE + Address + Port + Length(2 bytes) + CRLF + Payload
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::Unsupported,
-                    "Trojan Bidirectional UDP-over-TCP is not yet implemented",
-                ))
-            }
-            UdpStreamRequest::SessionBased { .. } => {
-                // Trojan doesn't support session-based multiplexing
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::Unsupported,
-                    "Trojan does not support SessionBased UDP streams",
-                ))
-            }
-            UdpStreamRequest::MultiDirectional { .. } => {
-                // Trojan doesn't support multi-directional UDP
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::Unsupported,
-                    "Trojan does not support MultiDirectional UDP streams",
-                ))
-            }
-        }
-    }
+    // TODO: Implement Trojan UDP-over-TCP
+    // Trojan UDP uses a message-framed protocol where each packet has:
+    // ATYPE + Address + Port + Length(2 bytes) + CRLF + Payload
+    // async fn setup_client_udp_bidirectional(...)
 }
 
 fn create_password_hash(password: &str) -> Box<[u8]> {

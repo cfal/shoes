@@ -1,0 +1,173 @@
+# TUN VPN Server Examples
+#
+# TUN (network TUNnel) devices operate at the IP layer (Layer 3), allowing
+# shoes to act as a transparent VPN that captures all IP traffic.
+#
+# IMPORTANT: TUN servers require root privileges on Linux.
+# Run with: sudo shoes -c examples/tun_vpn.yaml
+#
+# Platform Support:
+# - Linux: Creates TUN device with specified name/address (requires root)
+# - Android: Use device_fd from VpnService.Builder.establish()
+# - iOS: Use device_fd from NEPacketTunnelProvider.packetFlow
+
+# =============================================================================
+# Example 1: Basic TUN VPN (Direct Connection)
+# =============================================================================
+# Routes all traffic directly to the destination.
+# Useful for testing or as a base configuration.
+
+- device_name: "tun0"
+  address: "10.0.0.1"
+  netmask: "255.255.255.0"
+  mtu: 1500
+  tcp_enabled: true
+  udp_enabled: true
+  icmp_enabled: true
+  rules:
+    - masks: "0.0.0.0/0"
+      action: allow
+      client_chain:
+        - protocol:
+            type: direct
+
+# =============================================================================
+# Example 2: TUN VPN through VLESS Proxy
+# =============================================================================
+# Routes all TUN traffic through a VLESS server.
+# This is a typical VPN client setup.
+
+# - device_name: "tun_vless"
+#   address: "10.0.1.1"
+#   netmask: "255.255.255.0"
+#   mtu: 1500
+#   tcp_enabled: true
+#   udp_enabled: true
+#   icmp_enabled: true
+#   rules:
+#     - masks: "0.0.0.0/0"
+#       action: allow
+#       client_chain:
+#         - address: "your-vless-server.com:443"
+#           protocol:
+#             type: tls
+#             sni_hostname: "your-vless-server.com"
+#             protocol:
+#               type: vless
+#               user_id: "your-uuid-here"
+#               udp_enabled: true
+
+# =============================================================================
+# Example 3: TUN VPN with Split Tunneling
+# =============================================================================
+# Routes local networks directly, everything else through proxy.
+
+# - device_name: "tun_split"
+#   address: "10.0.2.1"
+#   netmask: "255.255.255.0"
+#   mtu: 1500
+#   tcp_enabled: true
+#   udp_enabled: true
+#   icmp_enabled: true
+#   rules:
+#     # Local/private networks go direct
+#     - masks: ["192.168.0.0/16", "10.0.0.0/8", "172.16.0.0/12"]
+#       action: allow
+#       client_chain:
+#         - protocol:
+#             type: direct
+#     # Everything else through Shadowsocks
+#     - masks: "0.0.0.0/0"
+#       action: allow
+#       client_chain:
+#         - address: "your-ss-server.com:8388"
+#           protocol:
+#             type: shadowsocks
+#             cipher: "2022-blake3-aes-256-gcm"
+#             password: "your-password-here"
+
+# =============================================================================
+# Example 4: TUN VPN through Trojan Proxy
+# =============================================================================
+# Routes TUN traffic through a Trojan server with TLS.
+
+# - device_name: "tun_trojan"
+#   address: "10.0.3.1"
+#   netmask: "255.255.255.0"
+#   mtu: 1500
+#   tcp_enabled: true
+#   udp_enabled: true
+#   icmp_enabled: false  # Disable ICMP if not needed
+#   rules:
+#     - masks: "0.0.0.0/0"
+#       action: allow
+#       client_chain:
+#         - address: "your-trojan-server.com:443"
+#           protocol:
+#             type: tls
+#             sni_hostname: "your-trojan-server.com"
+#             protocol:
+#               type: trojan
+#               password: "your-trojan-password"
+
+# =============================================================================
+# Example 5: TUN with TCP-only (No UDP/ICMP)
+# =============================================================================
+# Useful when you only need TCP traffic proxied.
+
+# - device_name: "tun_tcp"
+#   address: "10.0.4.1"
+#   netmask: "255.255.255.0"
+#   mtu: 1500
+#   tcp_enabled: true
+#   udp_enabled: false
+#   icmp_enabled: false
+#   rules:
+#     - masks: "0.0.0.0/0"
+#       action: allow
+#       client_chain:
+#         - protocol:
+#             type: direct
+
+# =============================================================================
+# Example 6: TUN with Custom MTU
+# =============================================================================
+# Lower MTU can help with some proxy protocols that add overhead.
+
+# - device_name: "tun_mtu"
+#   address: "10.0.5.1"
+#   netmask: "255.255.255.0"
+#   mtu: 1400  # Lower MTU for protocols with overhead
+#   tcp_enabled: true
+#   udp_enabled: true
+#   icmp_enabled: true
+#   rules:
+#     - masks: "0.0.0.0/0"
+#       action: allow
+#       client_chain:
+#         - protocol:
+#             type: direct
+
+# =============================================================================
+# Usage Notes
+# =============================================================================
+#
+# 1. After starting the TUN server, add routes to direct traffic to it:
+#    sudo ip route add <destination>/32 dev tun0
+#
+# 2. For full VPN mode, you may want to:
+#    - Set tun0 as the default gateway
+#    - Add a specific route to your proxy server via the original gateway
+#    - Configure DNS to use the TUN interface
+#
+# 3. Example routing setup:
+#    # Save original gateway
+#    ORIG_GW=$(ip route | grep default | awk '{print $3}')
+#    # Add route to proxy server via original gateway
+#    sudo ip route add <proxy-server-ip>/32 via $ORIG_GW
+#    # Set TUN as default gateway
+#    sudo ip route del default
+#    sudo ip route add default dev tun0
+#
+# 4. For Android/iOS, the device_fd is provided by the OS VPN service:
+#    - device_fd: 123  # FD from VpnService/NEPacketTunnelProvider

@@ -1,166 +1,123 @@
 use aws_lc_rs::hmac;
-use aws_lc_rs::signature::Ed25519KeyPair;
+use aws_lc_rs::signature::{Ed25519KeyPair, KeyPair};
+use rcgen::SignatureAlgorithm;
 use std::io::{Error, ErrorKind, Result};
 
-/// Generate a minimal Ed25519 certificate matching XTLS/REALITY reference size (~178 bytes)
+/// A signing key that computes HMAC-SHA512(auth_key, public_key) as the "signature".
 ///
-/// The reference implementation creates a minimal certificate with:
-/// - Empty Subject and Issuer
-/// - Serial number 0
-/// - No SAN (Subject Alternative Name)
-///
-/// This matches the reference: `x509.Certificate{SerialNumber: &big.Int{}}`
-fn generate_template_cert(_hostname: &str) -> (Vec<u8>, Ed25519KeyPair) {
-    // Generate Ed25519 keypair using rcgen
-    let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519)
-        .expect("Failed to generate Ed25519 key pair");
-
-    // Create minimal certificate params matching reference implementation
-    let mut params = rcgen::CertificateParams::default();
-
-    // No Subject Alternative Names (reference has empty DNSNames)
-    params.subject_alt_names = vec![];
-
-    // Empty distinguished name (reference has empty Subject/Issuer)
-    params.distinguished_name = rcgen::DistinguishedName::new();
-
-    // Serial number 0 (reference uses &big.Int{} which is 0)
-    params.serial_number = Some(rcgen::SerialNumber::from(vec![0u8]));
-
-    // Note: rcgen uses 1975-01-01 to 4096-01-01 by default
-    // Reference uses 0001-01-01 for both, but this is close enough
-    // and results in ~176 bytes (vs 178 bytes reference)
-
-    // Create self-signed certificate
-    let cert = params
-        .self_signed(&key_pair)
-        .expect("Failed to create self-signed certificate");
-
-    let cert_der = cert.der().to_vec();
-
-    // Create the Ed25519KeyPair from the PKCS#8 document
-    let signing_key = Ed25519KeyPair::from_pkcs8(key_pair.serialized_der())
-        .expect("Failed to parse generated key");
-
-    use aws_lc_rs::signature::KeyPair;
-    let public_key_bytes = signing_key.public_key().as_ref();
-
-    log::debug!(
-        "REALITY DEBUG: Generated minimal certificate ({} bytes, reference ~178 bytes)",
-        cert_der.len()
-    );
-    log::debug!(
-        "REALITY DEBUG: Using public key: {:02x?}",
-        &public_key_bytes[..16.min(public_key_bytes.len())]
-    );
-
-    (cert_der, signing_key)
+/// This implements rcgen's SigningKey trait but ignores the TBS (to-be-signed) data,
+/// instead computing the REALITY HMAC. This allows rcgen to place our HMAC directly
+/// into the certificate signature field.
+struct HmacSigningKey {
+    /// The HMAC key derived from auth_key
+    hmac_key: hmac::Key,
+    /// The Ed25519 public key bytes (32 bytes)
+    public_key: [u8; 32],
 }
 
-/// Generate HMAC-signed Ed25519 certificate
+impl rcgen::SigningKey for HmacSigningKey {
+    fn sign(&self, _msg: &[u8]) -> std::result::Result<Vec<u8>, rcgen::Error> {
+        // Ignore the TBS data - compute HMAC-SHA512(auth_key, public_key)
+        let tag = hmac::sign(&self.hmac_key, &self.public_key);
+        Ok(tag.as_ref().to_vec())
+    }
+}
+
+impl rcgen::PublicKeyData for HmacSigningKey {
+    fn der_bytes(&self) -> &[u8] {
+        &self.public_key
+    }
+
+    fn algorithm(&self) -> &'static SignatureAlgorithm {
+        &rcgen::PKCS_ED25519
+    }
+}
+
+/// Generate HMAC-signed Ed25519 certificate.
 ///
-/// This follows the uTLS approach:
-/// 1. Generate a certificate for the destination hostname
-/// 2. Replace the signature (last 64 bytes) with HMAC-SHA512(auth_key, ed25519_public_key)
+/// This creates a minimal X.509 certificate where:
+/// - The public key is a real Ed25519 public key
+/// - The signature is HMAC-SHA512(auth_key, public_key) instead of a real signature
 ///
-/// This is NOT a cryptographically valid certificate!
+/// The returned Ed25519KeyPair is used for:
+/// 1. Its public key goes in the certificate (and HMAC is computed over it)
+/// 2. Its private key signs the CertificateVerify message during TLS handshake
+///
+/// The client verifies both the HMAC and the CertificateVerify signature.
+///
+/// Returns the certificate (call `.der()` to get DER bytes) and the signing keypair.
 pub fn generate_hmac_certificate(
     auth_key: &[u8; 32],
     hostname: &str,
-) -> Result<(Vec<u8>, Ed25519KeyPair)> {
-    // Generate a new certificate for the destination hostname
-    let (cert_der, signing_key) = generate_template_cert(hostname);
+) -> Result<(rcgen::Certificate, Ed25519KeyPair)> {
+    // Keypair is needed for CertificateVerify signing
+    let ed25519_keypair = Ed25519KeyPair::generate()
+        .map_err(|_| Error::other("Failed to generate Ed25519 keypair"))?;
+
+    let public_key: [u8; 32] = ed25519_keypair
+        .public_key()
+        .as_ref()
+        .try_into()
+        .map_err(|_| Error::new(ErrorKind::InvalidData, "Ed25519 public key is not 32 bytes"))?;
+
+    let hmac_key = HmacSigningKey {
+        hmac_key: hmac::Key::new(hmac::HMAC_SHA512, auth_key),
+        public_key,
+    };
+
+    // Create minimal certificate params matching reference implementation
+    let mut params = rcgen::CertificateParams::default();
+    // Reference impl doesn't have a hostname, but we set it anyway
+    params.subject_alt_names =
+        vec![rcgen::SanType::DnsName(hostname.try_into().map_err(
+            |_| Error::new(ErrorKind::InvalidInput, "Invalid hostname"),
+        )?)];
+    params.distinguished_name = rcgen::DistinguishedName::new();
+    params.serial_number = Some(rcgen::SerialNumber::from(vec![0u8]));
+
+    let cert = params
+        .self_signed(&hmac_key)
+        .map_err(|e| Error::other(format!("Failed to create certificate: {e}")))?;
 
     log::debug!(
-        "REALITY DEBUG: Using template certificate ({} bytes)",
-        cert_der.len()
+        "REALITY: Generated HMAC certificate ({} bytes)",
+        cert.der().len()
     );
 
-    // Extract the Ed25519 public key from the signing key
-    use aws_lc_rs::signature::KeyPair;
-    let public_key_bytes = signing_key.public_key().as_ref();
-
-    // Replace signature with HMAC
-    let cert_with_hmac = replace_signature_with_hmac(cert_der, auth_key, public_key_bytes)?;
-
-    log::debug!("REALITY DEBUG: Replaced signature with HMAC");
-
-    // Return the HMAC-signed certificate with the signing key
-    Ok((cert_with_hmac, signing_key))
-}
-
-/// Replace the certificate signature with HMAC-SHA512(auth_key, ed25519_public_key)
-fn replace_signature_with_hmac(
-    mut cert_der: Vec<u8>,
-    auth_key: &[u8; 32],
-    public_key_bytes: &[u8],
-) -> Result<Vec<u8>> {
-    // The signature is the last BIT STRING in the certificate DER
-    // For Ed25519, it's always 64 bytes
-
-    // Find the signature BIT STRING tag
-    // It should be near the end of the certificate
-    // BIT STRING tag = 0x03
-    // Length = 0x41 (65 bytes: 1 byte unused bits + 64 bytes signature)
-
-    // Search backwards for BIT STRING tag
-    let mut sig_offset = None;
-    for i in (0..cert_der.len().saturating_sub(66)).rev() {
-        if cert_der[i] == 0x03 && cert_der[i + 1] == 0x41 && cert_der[i + 2] == 0x00 {
-            // Found it!
-            sig_offset = Some(i + 3); // Skip tag, length, unused bits
-            break;
-        }
-    }
-
-    let sig_offset = sig_offset.ok_or_else(|| {
-        Error::new(
-            ErrorKind::InvalidData,
-            "Could not find signature in certificate DER",
-        )
-    })?;
-
-    if sig_offset + 64 > cert_der.len() {
-        return Err(Error::new(
-            ErrorKind::InvalidData,
-            "Invalid signature offset",
-        ));
-    }
-
-    // Compute HMAC-SHA512(auth_key, ed25519_public_key)
-    let key = hmac::Key::new(hmac::HMAC_SHA512, auth_key);
-    let tag = hmac::sign(&key, public_key_bytes);
-    let hmac_bytes = tag.as_ref();
-
-    // Replace signature bytes with HMAC
-    cert_der[sig_offset..sig_offset + 64].copy_from_slice(hmac_bytes);
-
-    log::debug!(
-        "REALITY DEBUG: HMAC signature (first 16 bytes): {:?}",
-        &hmac_bytes[..16]
-    );
-
-    Ok(cert_der)
+    Ok((cert, ed25519_keypair))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aws_lc_rs::signature::KeyPair;
+
+    /// Find the signature bytes in a DER-encoded certificate.
+    /// Returns the offset where the 64-byte Ed25519 signature starts.
+    fn find_signature_offset(cert_der: &[u8]) -> Option<usize> {
+        // The signature is the last BIT STRING in the certificate DER
+        // For Ed25519, it's always 64 bytes
+        // BIT STRING tag = 0x03
+        // Length = 0x41 (65 bytes: 1 byte unused bits + 64 bytes signature)
+        for i in (0..cert_der.len().saturating_sub(66)).rev() {
+            if cert_der[i] == 0x03 && cert_der[i + 1] == 0x41 && cert_der[i + 2] == 0x00 {
+                return Some(i + 3); // Skip tag, length, unused bits
+            }
+        }
+        None
+    }
 
     #[test]
     fn test_generate_hmac_certificate() {
         let auth_key = [42u8; 32];
-        let hostname = "test.example.com";
-        let result = generate_hmac_certificate(&auth_key, hostname);
+        let result = generate_hmac_certificate(&auth_key, "test.example.com");
 
         assert!(result.is_ok());
 
-        let (cert_der, _signing_key) = result.unwrap();
+        let (cert, _signing_key) = result.unwrap();
+        let cert_der = cert.der();
 
-        // Print actual size for comparison with reference (178 bytes)
-        println!("shoes certificate size: {} bytes", cert_der.len());
-
-        // Certificate should be a reasonable size (few hundred bytes)
+        // Certificate should be a reasonable size
         assert!(cert_der.len() > 100);
         assert!(cert_der.len() < 1000);
 
@@ -169,58 +126,103 @@ mod tests {
     }
 
     #[test]
-    fn test_minimal_certificate_size() {
-        use rcgen::{DistinguishedName, SerialNumber};
+    fn test_hmac_placed_at_correct_offset() {
+        // This test verifies that our HmacSigningKey places the HMAC bytes
+        // at exactly the same location that find_signature_offset() identifies.
 
-        let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+        let auth_key = [0x42u8; 32];
 
-        // Try to create minimal params similar to Go's x509.Certificate{SerialNumber: &big.Int{}}
-        let mut params = rcgen::CertificateParams::default();
+        let (cert, signing_key) = generate_hmac_certificate(&auth_key, "test.example.com").unwrap();
+        let cert_der = cert.der();
 
-        // Clear subject_alt_names
-        params.subject_alt_names = vec![];
+        // Find where the signature should be
+        let sig_offset =
+            find_signature_offset(cert_der).expect("Should find signature offset in certificate");
 
-        // Empty distinguished name (no CN, etc.)
-        params.distinguished_name = DistinguishedName::new();
+        // Compute what the HMAC should be
+        let public_key_bytes = signing_key.public_key().as_ref();
+        let key = hmac::Key::new(hmac::HMAC_SHA512, &auth_key);
+        let expected_hmac = hmac::sign(&key, public_key_bytes);
 
-        // Serial number 0
-        params.serial_number = Some(SerialNumber::from(vec![0u8]));
+        // Extract the signature bytes from the certificate
+        let actual_signature = &cert_der[sig_offset..sig_offset + 64];
 
-        // Note: rcgen's default dates are 1975-01-01 to 4096-01-01
-        // The reference uses 0001-01-01 for both, which rcgen doesn't easily support
-        // This will make our cert slightly larger due to date encoding
-
-        let cert = params.self_signed(&key_pair).unwrap();
-        let cert_der = cert.der().to_vec();
-
-        println!(
-            "Minimal rcgen certificate size: {} bytes (reference: 178 bytes)",
-            cert_der.len()
+        // They should match exactly
+        assert_eq!(
+            actual_signature,
+            expected_hmac.as_ref(),
+            "HMAC signature should be placed at the correct offset in the certificate"
         );
-        println!("Certificate hex: {:02x?}", &cert_der);
-
-        // Let's see if we can get close to 178 bytes
-        // If not, we may need to use yasna directly
     }
 
     #[test]
-    fn test_hmac_signature_deterministic() {
+    fn test_different_keys_produce_different_hmacs() {
         let auth_key = [99u8; 32];
-        let hostname = "test.example.com";
 
-        let (cert1, key1) = generate_hmac_certificate(&auth_key, hostname).unwrap();
-        use aws_lc_rs::signature::KeyPair;
-        let public_key1 = key1.public_key().as_ref().to_vec();
-
-        // Generate another certificate with same auth_key
-        let (cert2, key2) = generate_hmac_certificate(&auth_key, hostname).unwrap();
-        let public_key2 = key2.public_key().as_ref().to_vec();
+        let (cert1, key1) = generate_hmac_certificate(&auth_key, "test.example.com").unwrap();
+        let (cert2, key2) = generate_hmac_certificate(&auth_key, "test.example.com").unwrap();
+        let cert1_der = cert1.der();
+        let cert2_der = cert2.der();
 
         // Different Ed25519 keys (random generation)
-        assert_ne!(public_key1, public_key2);
+        assert_ne!(
+            key1.public_key().as_ref(),
+            key2.public_key().as_ref(),
+            "Each call should generate a new random keypair"
+        );
 
-        // But certificates should have different signatures
-        // (because they're based on different public keys)
-        assert_ne!(cert1, cert2);
+        // Different certificates (different public keys -> different HMACs)
+        assert_ne!(cert1_der.as_ref(), cert2_der.as_ref());
+
+        // But both should have valid HMAC signatures
+        let sig_offset1 = find_signature_offset(cert1_der).unwrap();
+        let sig_offset2 = find_signature_offset(cert2_der).unwrap();
+
+        // Verify HMAC for cert1
+        let hmac_key = hmac::Key::new(hmac::HMAC_SHA512, &auth_key);
+        let expected1 = hmac::sign(&hmac_key, key1.public_key().as_ref());
+        assert_eq!(
+            &cert1_der[sig_offset1..sig_offset1 + 64],
+            expected1.as_ref()
+        );
+
+        // Verify HMAC for cert2
+        let expected2 = hmac::sign(&hmac_key, key2.public_key().as_ref());
+        assert_eq!(
+            &cert2_der[sig_offset2..sig_offset2 + 64],
+            expected2.as_ref()
+        );
+    }
+
+    #[test]
+    fn test_signature_offset_consistent() {
+        // Generate multiple certificates and verify the signature is always
+        // at the same relative position (since cert structure is identical)
+        let auth_key = [0xABu8; 32];
+
+        let mut offsets = Vec::new();
+        let mut sizes = Vec::new();
+
+        for _ in 0..5 {
+            let (cert, _) = generate_hmac_certificate(&auth_key, "example.com").unwrap();
+            let cert_der = cert.der();
+            let offset = find_signature_offset(cert_der).unwrap();
+            offsets.push(offset);
+            sizes.push(cert_der.len());
+        }
+
+        // All certificates should have the same size
+        assert!(
+            sizes.iter().all(|&s| s == sizes[0]),
+            "All certificates should have identical size: {:?}",
+            sizes
+        );
+
+        // All signatures should be at the same offset
+        assert!(
+            offsets.iter().all(|&o| o == offsets[0]),
+            "All signatures should be at the same offset: {:?}",
+            offsets
+        );
     }
 }

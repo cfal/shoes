@@ -1,14 +1,16 @@
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::sync::Arc;
 use std::time::SystemTime;
 
-use aes::Aes128;
-use aes::cipher::{BlockDecrypt, BlockEncrypt};
 use async_trait::async_trait;
 use aws_lc_rs::aead::{
     AES_128_GCM, Aad, BoundKey, CHACHA20_POLY1305, OpeningKey, SealingKey, UnboundKey,
 };
+use aws_lc_rs::cipher::{
+    AES_128, DecryptingKey as CipherDecryptingKey, DecryptionContext,
+    EncryptingKey as CipherEncryptingKey, EncryptionContext, UnboundCipherKey,
+};
 use bytes::BytesMut;
-use digest::KeyInit;
 use rand::{Rng, RngCore};
 use sha3::Shake128;
 use sha3::digest::{ExtendableOutput, Update};
@@ -19,14 +21,14 @@ use super::md5::{compute_md5, create_chacha_key};
 use super::nonce::{SingleUseNonce, VmessNonceSequence};
 use super::vmess_stream::{ReadHeaderInfo, VmessStream};
 use crate::address::{Address, NetLocation};
-use crate::async_stream::{AsyncMessageStream, AsyncSessionMessageStream, AsyncStream};
-use crate::option_util::NoneOrOne;
+use crate::async_stream::{AsyncMessageStream, AsyncStream};
+use crate::client_proxy_selector::ClientProxySelector;
 use crate::stream_reader::StreamReader;
-use crate::tcp_handler::{
-    TcpClientHandler, TcpClientSetupResult, TcpClientUdpSetupResult, TcpServerHandler,
-    TcpServerSetupResult, UdpStreamRequest,
+use crate::tcp::tcp_handler::{
+    TcpClientHandler, TcpClientSetupResult, TcpServerHandler, TcpServerSetupResult,
 };
-use crate::util::{allocate_vec, parse_uuid, write_all};
+use crate::util::{allocate_vec, write_all};
+use crate::uuid_util::parse_uuid;
 use crate::xudp::XudpMessageStream;
 
 const TAG_LEN: usize = 16;
@@ -58,28 +60,44 @@ impl From<&str> for DataCipher {
     }
 }
 
-#[derive(Debug)]
 pub struct VmessTcpServerHandler {
     data_cipher: DataCipher,
     instruction_key: [u8; 16],
-    aead_cipher: Aes128,
+    aead_decrypting_key: CipherDecryptingKey,
     udp_enabled: bool,
+    proxy_selector: Arc<ClientProxySelector>,
+}
+
+impl std::fmt::Debug for VmessTcpServerHandler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VmessTcpServerHandler")
+            .field("data_cipher", &self.data_cipher)
+            .field("udp_enabled", &self.udp_enabled)
+            .finish_non_exhaustive()
+    }
 }
 
 impl VmessTcpServerHandler {
-    pub fn new(cipher_name: &str, user_id: &str, udp_enabled: bool) -> Self {
+    pub fn new(
+        cipher_name: &str,
+        user_id: &str,
+        udp_enabled: bool,
+        proxy_selector: Arc<ClientProxySelector>,
+    ) -> Self {
         let mut user_id_bytes = parse_uuid(user_id).unwrap();
         user_id_bytes.extend(b"c48619fe-8f02-49e0-b9e9-edf763e17e21");
         let instruction_key: [u8; 16] = compute_md5(&user_id_bytes);
 
         let derived_key = super::sha2::kdf(&instruction_key, &[b"AES Auth ID Encryption"]);
-        let aead_cipher = Aes128::new((&derived_key[0..16]).into());
+        let unbound_key = UnboundCipherKey::new(&AES_128, &derived_key[0..16]).unwrap();
+        let aead_decrypting_key = CipherDecryptingKey::ecb(unbound_key).unwrap();
 
         Self {
             data_cipher: cipher_name.into(),
-            aead_cipher,
+            aead_decrypting_key,
             instruction_key,
             udp_enabled,
+            proxy_selector,
         }
     }
 }
@@ -102,7 +120,14 @@ impl TcpServerHandler for VmessTcpServerHandler {
         let mut aead_bytes = [0u8; 16];
         aead_bytes.copy_from_slice(&cert_hash);
 
-        self.aead_cipher.decrypt_block((&mut aead_bytes).into());
+        self.aead_decrypting_key
+            .decrypt(&mut aead_bytes, DecryptionContext::None)
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "AEAD auth ID decryption failed",
+                )
+            })?;
         let checksum = super::crc32::crc32c(&aead_bytes[0..12]);
         let expected_checksum = u32::from_be_bytes(aead_bytes[12..16].try_into().unwrap());
 
@@ -530,7 +555,7 @@ impl TcpServerHandler for VmessTcpServerHandler {
                     need_initial_flush: false,
                     connection_success_response: None,
                     initial_remote_data: None,
-                    override_proxy_provider: NoneOrOne::Unspecified,
+                    proxy_selector: self.proxy_selector.clone(),
                 })
             }
             COMMAND_UDP => {
@@ -563,7 +588,7 @@ impl TcpServerHandler for VmessTcpServerHandler {
                     remote_location,
                     stream: server_stream,
                     need_initial_flush: false,
-                    override_proxy_provider: NoneOrOne::Unspecified,
+                    proxy_selector: self.proxy_selector.clone(),
                 })
             }
             COMMAND_MUX => {
@@ -600,7 +625,7 @@ impl TcpServerHandler for VmessTcpServerHandler {
                 Ok(TcpServerSetupResult::SessionBasedUdp {
                     stream: Box::new(xudp_stream),
                     need_initial_flush: false,
-                    override_proxy_provider: NoneOrOne::Unspecified,
+                    proxy_selector: self.proxy_selector.clone(),
                 })
             }
             unknown_protocol_type => Err(std::io::Error::new(
@@ -630,12 +655,20 @@ impl AeadHeaderReader {
     }
 }
 
-#[derive(Debug)]
 pub struct VmessTcpClientHandler {
     data_cipher: DataCipher,
     instruction_key: [u8; 16],
-    aead_cipher: Aes128,
+    aead_encrypting_key: CipherEncryptingKey,
     udp_enabled: bool,
+}
+
+impl std::fmt::Debug for VmessTcpClientHandler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VmessTcpClientHandler")
+            .field("data_cipher", &self.data_cipher)
+            .field("udp_enabled", &self.udp_enabled)
+            .finish_non_exhaustive()
+    }
 }
 
 impl VmessTcpClientHandler {
@@ -645,11 +678,12 @@ impl VmessTcpClientHandler {
         let instruction_key: [u8; 16] = compute_md5(&user_id_bytes);
 
         let derived_key = super::sha2::kdf(&instruction_key, &[b"AES Auth ID Encryption"]);
-        let aead_cipher = Aes128::new((&derived_key[0..16]).into());
+        let unbound_key = UnboundCipherKey::new(&AES_128, &derived_key[0..16]).unwrap();
+        let aead_encrypting_key = CipherEncryptingKey::ecb(unbound_key).unwrap();
 
         Self {
             data_cipher: cipher_name.into(),
-            aead_cipher,
+            aead_encrypting_key,
             instruction_key,
             udp_enabled,
         }
@@ -679,7 +713,14 @@ impl TcpClientHandler for VmessTcpClientHandler {
         let checksum = checksum_value.to_be_bytes();
         aead_bytes[12..16].copy_from_slice(&checksum);
 
-        self.aead_cipher.encrypt_block((&mut aead_bytes).into());
+        self.aead_encrypting_key
+            .less_safe_encrypt(&mut aead_bytes, EncryptionContext::None)
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "AEAD auth ID encryption failed",
+                )
+            })?;
 
         let cert_hash = aead_bytes;
 
@@ -917,260 +958,25 @@ impl TcpClientHandler for VmessTcpClientHandler {
         self.udp_enabled // VMess supports UDP-over-TCP tunneling when enabled
     }
 
-    async fn setup_client_udp_stream(
+    async fn setup_client_udp_bidirectional(
         &self,
         client_stream: Box<dyn AsyncStream>,
-        request: UdpStreamRequest,
-    ) -> std::io::Result<TcpClientUdpSetupResult> {
-        match request {
-            UdpStreamRequest::SessionBased { server_stream } => {
-                // VMess XUDP/MUX mode: Send VMess header with COMMAND_MUX (3), no destination.
-                // Destinations come in XUDP frames.
-                self.setup_udp_stream_session_based(client_stream, server_stream)
-                    .await
-            }
-            UdpStreamRequest::Bidirectional {
-                server_stream,
-                target,
-            } => {
-                // VMess single-target UDP mode: Send VMess header with COMMAND_UDP (2)
-                // and destination address. Uses VmessStream with is_udp=true.
-                self.setup_udp_stream_bidirectional(client_stream, target, server_stream)
-                    .await
-            }
-            UdpStreamRequest::MultiDirectional { .. } => {
-                // VMess doesn't have native MultiDirectional support
-                // Use SessionBased (XUDP) instead
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::Unsupported,
-                    "VMess does not support MultiDirectional UDP. Use SessionBased instead.",
-                ))
-            }
-        }
+        target: NetLocation,
+    ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
+        // VMess single-target UDP mode: Send VMess header with COMMAND_UDP (2)
+        // and destination address. Uses VmessStream with is_udp=true.
+        self.setup_udp_stream_impl(client_stream, target).await
     }
 }
 
 impl VmessTcpClientHandler {
-    async fn setup_udp_stream_session_based(
-        &self,
-        mut client_stream: Box<dyn AsyncStream>,
-        server_stream: Box<dyn AsyncSessionMessageStream>,
-    ) -> std::io::Result<TcpClientUdpSetupResult> {
-        // VMess XUDP/MUX mode: Send VMess header with COMMAND_MUX (3), no destination.
-        // Destinations come in XUDP frames.
-
-        // AEAD allows 120 second delta from the current time.
-        let random_delta: u64 = rand::rng().random_range(0..241);
-        let time_secs: u64 =
-            SystemTime::UNIX_EPOCH.elapsed().unwrap().as_secs() - 120u64 + random_delta;
-
-        let mut aead_bytes = [0u8; 16];
-        let time_bytes = time_secs.to_be_bytes();
-        aead_bytes[0..8].copy_from_slice(&time_bytes);
-
-        rand::rng().fill_bytes(&mut aead_bytes[8..12]);
-
-        let checksum_value = super::crc32::crc32c(&aead_bytes[0..12]);
-        let checksum = checksum_value.to_be_bytes();
-        aead_bytes[12..16].copy_from_slice(&checksum);
-
-        self.aead_cipher.encrypt_block((&mut aead_bytes).into());
-
-        let cert_hash = aead_bytes;
-
-        // MUX header is shorter - no port/address: 38 (instructions without addr) + margin + fnv
-        // 38 = version(1) + keys(33) + opts(1) + padding|method(1) + reserved(1) + command(1)
-        let mut header_bytes = [0u8; 128 + TAG_LEN];
-
-        header_bytes[0] = 1; // version
-
-        // this fills:
-        // - data encryption iv (16 bytes)
-        // - data encryption key (16 bytes)
-        // - response authentication v (1 byte)
-        rand::rng().fill_bytes(&mut header_bytes[1..34]);
-
-        let data_encryption_iv: &[u8] = &header_bytes[1..17];
-        let data_encryption_key: &[u8] = &header_bytes[17..33];
-        let response_authentication_v = header_bytes[33];
-
-        // AEAD mode only - use SHA256 for response header keys
-        let mut truncated_iv = [0u8; 16];
-        let mut truncated_key = [0u8; 16];
-        truncated_iv.copy_from_slice(&super::sha2::compute_sha256(data_encryption_iv)[0..16]);
-        truncated_key.copy_from_slice(&super::sha2::compute_sha256(data_encryption_key)[0..16]);
-        let response_header_iv = truncated_iv;
-        let response_header_key = truncated_key;
-
-        let (read_length_shake_reader, write_length_shake_reader) = {
-            let mut request_hasher = Shake128::default();
-            request_hasher.update(data_encryption_iv);
-            let request_reader = request_hasher.finalize_xof();
-
-            let mut response_hasher = Shake128::default();
-            response_hasher.update(&response_header_iv);
-            let response_reader = response_hasher.finalize_xof();
-
-            (Some(response_reader), Some(request_reader))
-        };
-
-        let (encryption_method, unbound_keys) = match self.data_cipher {
-            DataCipher::Aes128Gcm => (
-                3u8,
-                Some((
-                    UnboundKey::new(&AES_128_GCM, &response_header_key).unwrap(),
-                    UnboundKey::new(&AES_128_GCM, data_encryption_key).unwrap(),
-                )),
-            ),
-            DataCipher::ChaCha20Poly1305 | DataCipher::Any => (
-                4u8,
-                Some((
-                    UnboundKey::new(&CHACHA20_POLY1305, &create_chacha_key(&response_header_key))
-                        .unwrap(),
-                    UnboundKey::new(&CHACHA20_POLY1305, &create_chacha_key(data_encryption_key))
-                        .unwrap(),
-                )),
-            ),
-            DataCipher::None => (5u8, None),
-        };
-
-        let data_keys = if let Some((unbound_opening_key, unbound_sealing_key)) = unbound_keys {
-            let opening_key = OpeningKey::new(
-                unbound_opening_key,
-                VmessNonceSequence::new(&response_header_iv),
-            );
-            let sealing_key = SealingKey::new(
-                unbound_sealing_key,
-                VmessNonceSequence::new(data_encryption_iv),
-            );
-            Some((opening_key, sealing_key))
-        } else {
-            None
-        };
-
-        // set options, standard format data stream and metadata obfuscation
-        header_bytes[34] = 0x01 | 0x04;
-
-        // only 4 bits for margin, generate this now before our first await.
-        let margin_len: u8 = rand::random::<u8>() & 0xf;
-        header_bytes[35] = (margin_len << 4) | encryption_method;
-
-        // reserved byte
-        header_bytes[36] = 0;
-
-        // MUX command (3) - no port/address follows
-        header_bytes[37] = COMMAND_MUX;
-
-        // cursor after command byte - MUX has no port/address
-        let mut cursor = 38;
-
-        if margin_len > 0 {
-            rand::rng().fill_bytes(&mut header_bytes[cursor..cursor + margin_len as usize]);
-            cursor += margin_len as usize;
-        }
-
-        let mut fnv_hasher = Fnv1aHasher::new();
-        fnv_hasher.write(&header_bytes[0..cursor]);
-        let check_bytes = fnv_hasher.finish().to_be_bytes();
-        header_bytes[cursor..cursor + 4].copy_from_slice(&check_bytes);
-        cursor += 4;
-
-        // AEAD mode only
-        let mut encrypted_payload_length = [0u8; 18];
-        let mut nonce = [0u8; 8];
-        rand::rng().fill_bytes(&mut nonce);
-
-        let header_length_aead_key = super::sha2::kdf(
-            &self.instruction_key,
-            &[b"VMess Header AEAD Key_Length", &cert_hash, &nonce],
-        );
-
-        let header_length_nonce = super::sha2::kdf(
-            &self.instruction_key,
-            &[b"VMess Header AEAD Nonce_Length", &cert_hash, &nonce],
-        );
-
-        let unbound_key = UnboundKey::new(&AES_128_GCM, &header_length_aead_key[0..16]).unwrap();
-
-        let mut sealing_key = SealingKey::new(
-            unbound_key,
-            SingleUseNonce::new(&header_length_nonce[0..12]),
-        );
-
-        encrypted_payload_length[0] = (cursor >> 8) as u8;
-        encrypted_payload_length[1] = (cursor & 0xff) as u8;
-
-        let tag = sealing_key
-            .seal_in_place_separate_tag(Aad::from(&cert_hash), &mut encrypted_payload_length[0..2])
-            .unwrap();
-
-        encrypted_payload_length[2..].copy_from_slice(tag.as_ref());
-
-        let header_aead_key = super::sha2::kdf(
-            &self.instruction_key,
-            &[b"VMess Header AEAD Key", &cert_hash, &nonce],
-        );
-
-        let header_nonce = super::sha2::kdf(
-            &self.instruction_key,
-            &[b"VMess Header AEAD Nonce", &cert_hash, &nonce],
-        );
-
-        let unbound_key = UnboundKey::new(&AES_128_GCM, &header_aead_key[0..16]).unwrap();
-        let mut sealing_key =
-            SealingKey::new(unbound_key, SingleUseNonce::new(&header_nonce[0..12]));
-        let tag = sealing_key
-            .seal_in_place_separate_tag(Aad::from(&cert_hash), &mut header_bytes[0..cursor])
-            .unwrap();
-
-        header_bytes[cursor..cursor + TAG_LEN].copy_from_slice(tag.as_ref());
-        cursor += TAG_LEN;
-
-        // Build complete AEAD request in a single buffer
-        let total_len = 16 + 18 + 8 + cursor;
-        let mut complete_request = Vec::with_capacity(total_len);
-        complete_request.extend_from_slice(&cert_hash);
-        complete_request.extend_from_slice(&encrypted_payload_length);
-        complete_request.extend_from_slice(&nonce);
-        complete_request.extend_from_slice(&header_bytes[0..cursor]);
-
-        write_all(&mut client_stream, &complete_request).await?;
-        client_stream.flush().await?;
-
-        // Info for reading the server response
-        let read_header_info = ReadHeaderInfo {
-            response_header_key,
-            response_header_iv,
-            response_authentication_v,
-        };
-
-        // Create VmessStream with is_udp=false since XUDP handles UDP multiplexing
-        let vmess_stream = VmessStream::new(
-            client_stream,
-            false, // XUDP handles UDP, VmessStream sees TCP-like stream
-            data_keys,
-            read_length_shake_reader,
-            write_length_shake_reader,
-            false,
-            None,
-            Some(read_header_info),
-        );
-
-        // Wrap with XUDP message stream for session-based multiplexing
-        let xudp_stream = XudpMessageStream::new(Box::new(vmess_stream));
-
-        Ok(TcpClientUdpSetupResult::SessionBased {
-            server_stream,
-            client_stream: Box::new(xudp_stream),
-        })
-    }
-
-    async fn setup_udp_stream_bidirectional(
+    /// Setup UDP stream for VMess single-target bidirectional UDP mode.
+    /// Sends VMess header with COMMAND_UDP (2) and the destination address.
+    async fn setup_udp_stream_impl(
         &self,
         mut client_stream: Box<dyn AsyncStream>,
         remote_location: NetLocation,
-        server_stream: Box<dyn AsyncMessageStream>,
-    ) -> std::io::Result<TcpClientUdpSetupResult> {
+    ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
         // VMess single-target UDP mode: Send VMess header with COMMAND_UDP (2).
         // Same as TCP setup but with command=2 and is_udp=true for VmessStream.
 
@@ -1189,7 +995,14 @@ impl VmessTcpClientHandler {
         let checksum = checksum_value.to_be_bytes();
         aead_bytes[12..16].copy_from_slice(&checksum);
 
-        self.aead_cipher.encrypt_block((&mut aead_bytes).into());
+        self.aead_encrypting_key
+            .less_safe_encrypt(&mut aead_bytes, EncryptionContext::None)
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "AEAD auth ID encryption failed",
+                )
+            })?;
 
         let cert_hash = aead_bytes;
 
@@ -1399,9 +1212,6 @@ impl VmessTcpClientHandler {
             Some(read_header_info),
         );
 
-        Ok(TcpClientUdpSetupResult::Bidirectional {
-            server_stream,
-            client_stream: Box::new(vmess_stream),
-        })
+        Ok(Box::new(vmess_stream))
     }
 }

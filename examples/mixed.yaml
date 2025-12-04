@@ -1,0 +1,58 @@
+# Mixed HTTP+SOCKS5 server examples
+# Auto-detects protocol from first byte - useful for clients that support both
+
+# Basic mixed server (no authentication)
+- address: "0.0.0.0:7890"
+  protocol:
+    type: mixed
+
+# Mixed server with authentication
+- address: "0.0.0.0:7891"
+  protocol:
+    type: mixed
+    username: "myuser"
+    password: "mypassword"
+
+# Mixed server with UDP disabled
+- address: "0.0.0.0:7892"
+  protocol:
+    type: mixed
+    udp_enabled: false
+
+# Mixed server with custom routing rules
+- address: "0.0.0.0:7893"
+  protocol:
+    type: mixed
+    username: "admin"
+    password: "secure123"
+    udp_enabled: true
+  rules:
+    # Direct connection for local networks
+    - masks: ["192.168.0.0/16", "10.0.0.0/8", "172.16.0.0/12"]
+      action: allow
+      client_chain:
+        protocol:
+          type: direct
+    # Block ad domains
+    - masks: ["*.doubleclick.net", "*.googlesyndication.com"]
+      action: block
+    # Route everything else through upstream
+    - masks: "0.0.0.0/0"
+      action: allow
+      client_chain:
+        address: "upstream.proxy.com:1080"
+        protocol:
+          type: socks
+
+# Mixed server over TLS (for secure local proxy)
+- address: "0.0.0.0:7894"
+  protocol:
+    type: tls
+    tls_targets:
+      "proxy.local":
+        cert: "cert.pem"
+        key: "key.pem"
+        protocol:
+          type: mixed
+          username: "secure_user"
+          password: "secure_pass"

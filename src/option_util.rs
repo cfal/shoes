@@ -15,24 +15,17 @@ impl<T> NoneOrOne<T> {
         matches!(self, NoneOrOne::Unspecified)
     }
 
-    pub fn is_one(&self) -> bool {
-        matches!(self, NoneOrOne::One(..))
-    }
-
-    pub fn unwrap(self) -> T {
-        match self {
-            NoneOrOne::One(item) => item,
-            _ => {
-                panic!("Tried to unwrap a non-one NoneOrOne");
-            }
-        }
-    }
-
     pub fn into_option(self) -> Option<T> {
         match self {
             NoneOrOne::One(item) => Some(item),
             _ => None,
         }
+    }
+
+    // Used on non-Linux platforms (macOS, Windows, iOS) for bind_interface validation
+    #[allow(dead_code)]
+    pub fn is_one(&self) -> bool {
+        matches!(self, NoneOrOne::One(_))
     }
 }
 

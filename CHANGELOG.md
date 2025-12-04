@@ -1,4 +1,163 @@
-# Changelog - v0.2.1
+# Changelog
+
+## v0.2.5
+
+### New Features
+
+#### AnyTLS Protocol
+
+**Server:**
+```yaml
+protocol:
+  type: tls
+  tls_targets:
+    "example.com":
+      cert: cert.pem
+      key: key.pem
+      protocol:
+        type: anytls
+        users:
+          - name: user1
+            password: secret123
+        udp_enabled: true
+        padding_scheme: ["stop=8", "0=30-30"]  # Optional custom padding
+        fallback: "127.0.0.1:80"               # Optional fallback
+```
+
+**Client:**
+```yaml
+client_chain:
+  address: "example.com:443"
+  protocol:
+    type: tls
+    protocol:
+      type: anytls
+      password: secret123
+```
+
+#### NaiveProxy Protocol
+
+**Server:**
+```yaml
+protocol:
+  type: tls
+  tls_targets:
+    "example.com":
+      cert: cert.pem
+      key: key.pem
+      alpn_protocols: ["h2"]
+      protocol:
+        type: naiveproxy
+        users:
+          - username: user1
+            password: secret123
+        padding: true
+        fallback: "/var/www/html"  # Optional static file fallback
+```
+
+**Client:**
+```yaml
+client_chain:
+  address: "example.com:443"
+  protocol:
+    type: tls
+    alpn_protocols: ["h2"]
+    protocol:
+      type: naiveproxy
+      username: user1
+      password: secret123
+```
+
+#### Mixed Port (HTTP + SOCKS5)
+Auto-detects HTTP or SOCKS5 protocol.
+
+```yaml
+- address: "0.0.0.0:7890"
+  protocol:
+    type: mixed
+    username: user
+    password: pass
+    udp_enabled: true  # Enable SOCKS5 UDP ASSOCIATE
+```
+
+#### TUN/VPN Support
+Layer 3 VPN mode using TUN devices for transparent proxying. Supports Linux, Android, and iOS.
+
+```yaml
+- device_name: "tun0"
+  address: "10.0.0.1"
+  netmask: "255.255.255.0"
+  mtu: 1500
+  tcp_enabled: true
+  udp_enabled: true
+  icmp_enabled: true
+  rules:
+    - masks: "0.0.0.0/0"
+      action: allow
+      client_chain:
+        address: "proxy.example.com:443"
+        protocol:
+          type: vless
+          user_id: "uuid"
+```
+
+**Platform support:**
+- Linux: Creates TUN device with specified name/address (requires root)
+- Android: Use `device_fd` from `VpnService.Builder.establish()`
+- iOS: Use `device_fd` from `NEPacketTunnelProvider.packetFlow`
+
+#### SOCKS5 UDP ASSOCIATE
+Full UDP support for SOCKS5 servers including UDP ASSOCIATE command. Enable with `udp_enabled: true` (default).
+
+```yaml
+protocol:
+  type: socks
+  udp_enabled: true  # Default: true
+```
+
+#### VLESS Fallback
+Route failed authentication attempts to a fallback destination instead of rejecting them.
+
+```yaml
+protocol:
+  type: vless
+  user_id: "uuid"
+  fallback: "127.0.0.1:80"  # Serve web content for invalid clients
+```
+
+#### Reality `dest_client_chain`
+Route Reality fallback (dest) connections through a proxy chain.
+
+```yaml
+reality_targets:
+  "www.example.com":
+    private_key: "..."
+    dest: "www.example.com:443"
+    dest_client_chain:
+      address: "proxy.example.com:1080"
+      protocol:
+        type: socks
+    protocol:
+      type: vless
+      user_id: "uuid"
+```
+
+### Improvements
+
+- **UDP routing**: Comprehensive rewrite of UDP session routing with better multiplexing support
+- **Reality**: Improved active probing resistance with TLS 1.3 verification
+- **Performance**: Optimized buffer handling and reduced allocations
+- **QUIC**: Better buffer sizing based on quic-go recommendations
+
+### Mobile Support
+
+- **iOS FFI**: Added iOS bindings via `NEPacketTunnelProvider` integration
+- **Android FFI**: Added Android bindings via `VpnService` integration
+- Library now builds as `rlib`, `cdylib`, and `staticlib` for mobile embedding
+
+---
+
+## v0.2.1
 
 ## New Features
 

@@ -10,7 +10,7 @@ use crate::address::NetLocation;
 use crate::async_stream::AsyncStream;
 use crate::crypto::{CryptoConnection, CryptoTlsStream, perform_crypto_handshake};
 use crate::reality::{CipherSuite, RealityClientConfig, RealityClientConnection};
-use crate::tcp_handler::{TcpClientHandler, TcpClientSetupResult};
+use crate::tcp::tcp_handler::{TcpClientHandler, TcpClientSetupResult};
 
 /// REALITY client handler using buffered Connection API
 ///
@@ -71,7 +71,6 @@ impl RealityClientHandler {
         &self,
         mut client_stream: Box<dyn AsyncStream>,
     ) -> std::io::Result<CryptoTlsStream<Box<dyn AsyncStream>>> {
-        // Extract server name as string
         let server_name_str = match &self.server_name {
             rustls::pki_types::ServerName::DnsName(name) => name.as_ref(),
             rustls::pki_types::ServerName::IpAddress(ip) => {
@@ -98,11 +97,9 @@ impl RealityClientHandler {
 
         let reality_conn = RealityClientConnection::new(reality_config)?;
 
-        // Wrap in Connection enum
         log::debug!("REALITY CLIENT: Creating Connection");
         let mut connection = CryptoConnection::new_reality_client(reality_conn);
 
-        // Perform the TLS handshake
         perform_crypto_handshake(&mut connection, &mut client_stream, 16384).await?;
         log::debug!("REALITY CLIENT: Handshake completed successfully");
 
@@ -143,23 +140,22 @@ impl TcpClientHandler for RealityClientHandler {
         }
     }
 
-    async fn setup_client_udp_stream(
+    async fn setup_client_udp_bidirectional(
         &self,
         client_stream: Box<dyn AsyncStream>,
-        request: crate::tcp_handler::UdpStreamRequest,
-    ) -> std::io::Result<crate::tcp_handler::TcpClientUdpSetupResult> {
+        target: NetLocation,
+    ) -> std::io::Result<Box<dyn crate::async_stream::AsyncMessageStream>> {
         let tls_stream = self.setup_client_stream_common(client_stream).await?;
 
         match &self.handler {
             RealityInnerClientHandler::Default(handler) => {
                 handler
-                    .setup_client_udp_stream(Box::new(tls_stream), request)
+                    .setup_client_udp_bidirectional(Box::new(tls_stream), target)
                     .await
             }
             RealityInnerClientHandler::VisionVless { uuid, .. } => {
-                // Vision VLESS UDP setup - use the VLESS handler's method
-                crate::vless::vless_client_handler::setup_vless_udp_stream(
-                    tls_stream, uuid, request,
+                crate::vless::vless_client_handler::setup_vless_udp_bidirectional(
+                    tls_stream, uuid, target,
                 )
                 .await
             }
