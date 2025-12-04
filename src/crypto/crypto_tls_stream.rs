@@ -1,10 +1,13 @@
-// CryptoTlsStream: Async wrapper around Connection enum
+// CryptoTlsStream: Async wrapper around CryptoConnection
 //
-// This provides AsyncRead + AsyncWrite for the Connection enum,
+// This provides AsyncRead + AsyncWrite for CryptoConnection (rustls or Reality),
 // allowing it to work with tokio-based async code.
 //
-// Based on VisionStream's TLS mode logic (non-padded), which itself
-// is adapted from tokio-rustls.
+// IMPORTANT: The TLS handshake must be completed via perform_crypto_handshake()
+// BEFORE wrapping in CryptoTlsStream. This stream handles only post-handshake
+// application data.
+//
+// Based on tokio-rustls's TlsStream pattern.
 
 use std::io::{self, BufRead, Write};
 use std::pin::Pin;
@@ -84,7 +87,14 @@ where
     IO: AsyncStream,
 {
     /// Create a new CryptoTlsStream
+    ///
+    /// IMPORTANT: The handshake must already be complete. Use perform_crypto_handshake()
+    /// before calling this constructor.
     pub fn new(io: IO, session: CryptoConnection) -> Self {
+        assert!(
+            !session.is_handshaking(),
+            "perform_crypto_handshake should have completed"
+        );
         CryptoTlsStream {
             io,
             session,
@@ -128,47 +138,13 @@ where
                     // WriteZero - can't make progress, but not fatal for drain
                     break;
                 }
-                Poll::Ready(Ok(_)) => {}
+                Poll::Ready(Ok(_)) => {
+                    self.need_flush = true;
+                }
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => return Poll::Pending,
             }
         }
-        Poll::Ready(Ok(()))
-    }
-
-    /// Complete handshake if needed
-    fn complete_handshake_if_needed(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        while self.session.is_handshaking() {
-            // Write any pending TLS data
-            match self.drain_all_writes(cx) {
-                Poll::Ready(Ok(())) => {}
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
-            }
-
-            // Read more data for handshake
-            let mut adapter = SyncReadAdapter {
-                io: &mut self.io,
-                cx,
-            };
-            match self.session.read_tls(&mut adapter) {
-                Ok(0) => {
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "EOF during handshake",
-                    )));
-                }
-                Ok(_) => {
-                    // Process the data
-                    self.session.process_new_packets()?;
-                }
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    return Poll::Pending;
-                }
-                Err(e) => return Poll::Ready(Err(e)),
-            }
-        }
-
         Poll::Ready(Ok(()))
     }
 }
@@ -189,14 +165,8 @@ where
             return Poll::Ready(Ok(()));
         }
 
-        // Complete handshake first if needed
-        if this.session.is_handshaking() {
-            match this.complete_handshake_if_needed(cx) {
-                Poll::Ready(Ok(())) => {}
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
-            }
-        }
+        // Note: Handshake is already complete - perform_crypto_handshake() is always
+        // called before CryptoTlsStream::new()
 
         // Track whether we did any I/O that returned Pending
         let mut io_pending = false;
@@ -308,14 +278,8 @@ where
             )));
         }
 
-        // Complete handshake first if needed
-        if self.session.is_handshaking() {
-            match self.complete_handshake_if_needed(cx) {
-                Poll::Ready(Ok(())) => {}
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
-            }
-        }
+        // Note: Handshake is already complete - perform_crypto_handshake() is always
+        // called before CryptoTlsStream::new()
 
         let mut pos = 0;
 
