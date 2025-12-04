@@ -954,7 +954,7 @@ impl RealityServerConnection {
         //
         // Note: If plaintext buffer has data, the caller should consume it first.
         // If ciphertext buffer has complete records, process_new_packets should be called.
-        self.plaintext_read_buf.len() == 0
+        self.plaintext_read_buf.is_empty()
     }
 
     /// Queue a close notification alert
