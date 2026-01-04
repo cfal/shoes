@@ -2,11 +2,12 @@
 
 use crate::client_proxy_chain::{ClientChainGroup, ClientProxyChain, InitialHopEntry};
 use crate::config::ConfigSelection;
-use crate::config::{ClientChainHop, ClientConfig};
+use crate::config::{ClientChainHop, ClientConfig, ClientProxyConfig, ClientQuicConfig};
 use crate::tcp::proxy_connector::ProxyConnector;
 use crate::tcp::proxy_connector_impl::ProxyConnectorImpl;
 use crate::tcp::socket_connector::SocketConnector;
 use crate::tcp::socket_connector_impl::SocketConnectorImpl;
+use crate::hysteria2_client::Hysteria2SocketConnector;
 
 /// Build a ClientProxyChain from a client_chain configuration.
 ///
@@ -54,7 +55,120 @@ pub fn build_client_proxy_chain(
     let initial_hop: Vec<InitialHopEntry> = hops[0]
         .iter()
         .map(|config| {
-            // Find the first proxy address for QUIC socket configuration
+            // Check if this is a Hysteria2 configuration
+            // Hysteria2 uses its own socket connector that handles QUIC + HTTP/3 auth
+            if matches!(config.protocol, ClientProxyConfig::Hysteria2 { .. }) {
+                // For Hysteria2, we need to extract the password and create a special socket connector
+                let (password, udp_enabled) = match &config.protocol {
+                    ClientProxyConfig::Hysteria2 { password, udp_enabled } => {
+                        (password.clone(), *udp_enabled)
+                    }
+                    _ => unreachable!(),
+                };
+
+                // Build Hysteria2 socket connector
+                let target_address = find_first_proxy_address(&hops, config)
+                    .expect("Hysteria2 requires a target address");
+
+                let bind_interface = config.bind_interface.clone().into_option();
+
+                // Get SNI hostname from quic_settings or use target address
+                let sni_hostname = config
+                    .quic_settings
+                    .as_ref()
+                    .and_then(|q| q.sni_hostname.clone().into_option())
+                    .or_else(|| target_address.address().hostname().map(|h| h.to_string()));
+
+                // Create QUIC endpoint for Hysteria2
+                let default_sni_hostname =
+                    target_address.address().hostname().map(ToString::to_string);
+
+                let effective_sni = sni_hostname.as_ref().or(default_sni_hostname.as_ref());
+
+                let ClientQuicConfig {
+                    verify,
+                    server_fingerprints,
+                    alpn_protocols,
+                    sni_hostname: _,
+                    key,
+                    cert,
+                } = config.quic_settings.clone().unwrap_or_default();
+
+                let tls13_suite =
+                    match rustls::crypto::aws_lc_rs::cipher_suite::TLS13_AES_128_GCM_SHA256 {
+                        rustls::SupportedCipherSuite::Tls13(t) => t,
+                        _ => {
+                            panic!("Could not retrieve Tls13CipherSuite");
+                        }
+                    };
+
+                let key_and_cert_bytes = key.zip(cert).map(|(key, cert)| {
+                    let cert_bytes = cert.as_bytes().to_vec();
+                    let key_bytes = key.as_bytes().to_vec();
+                    (key_bytes, cert_bytes)
+                });
+
+                use crate::rustls_config_util::create_client_config;
+                let rustls_client_config = create_client_config(
+                    verify,
+                    server_fingerprints.into_vec(),
+                    alpn_protocols.into_vec(),
+                    effective_sni.is_some(),
+                    key_and_cert_bytes,
+                );
+
+                let quic_client_config = quinn::crypto::rustls::QuicClientConfig::with_initial(
+                    std::sync::Arc::new(rustls_client_config),
+                    tls13_suite.quic_suite().unwrap(),
+                )
+                .unwrap();
+
+                let mut quinn_client_config =
+                    quinn::ClientConfig::new(std::sync::Arc::new(quic_client_config));
+
+                let mut transport_config = quinn::TransportConfig::default();
+                transport_config
+                    .max_concurrent_bidi_streams(256_u32.into())
+                    .max_concurrent_uni_streams(255_u8.into())
+                    .keep_alive_interval(Some(std::time::Duration::from_secs(15)))
+                    .max_idle_timeout(Some(std::time::Duration::from_secs(60).try_into().unwrap()));
+
+                quinn_client_config.transport_config(std::sync::Arc::new(transport_config));
+
+                let udp_socket = match crate::socket_util::new_udp_socket(
+                    target_address.address().is_ipv6(),
+                    bind_interface,
+                ) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        panic!("Failed to bind UDP socket for Hysteria2: {e}");
+                    }
+                };
+                let udp_socket = udp_socket.into_std().unwrap();
+
+                let mut endpoint = quinn::Endpoint::new(
+                    quinn::EndpointConfig::default(),
+                    None,
+                    udp_socket,
+                    std::sync::Arc::new(quinn::TokioRuntime),
+                )
+                .unwrap();
+                endpoint.set_default_client_config(quinn_client_config);
+
+                let socket = Box::new(Hysteria2SocketConnector::new(
+                    std::sync::Arc::new(endpoint),
+                    target_address.clone(),
+                    effective_sni.cloned(),
+                    password,
+                    udp_enabled,
+                )) as Box<dyn SocketConnector>;
+
+                // Hysteria2 is a direct protocol from the proxy chain perspective
+                // (no additional ProxyConnector needed)
+                return InitialHopEntry::Direct(socket);
+            }
+
+            // Standard path: create SocketConnector from config
             let target_address = find_first_proxy_address(&hops, config);
 
             let socket = SocketConnectorImpl::from_config(config, target_address)
