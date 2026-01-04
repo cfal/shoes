@@ -83,7 +83,6 @@ pub fn build_client_proxy_chain(
                         (0, 0)
                     }
                 };
-
                 // Build Hysteria2 socket connector
                 let target_address = find_first_proxy_address(&hops, config)
                     .expect("Hysteria2 requires a target address");
