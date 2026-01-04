@@ -272,6 +272,9 @@ pub fn create_tcp_client_handler(
             ))
         }
         ClientProxyConfig::PortForward => Box::new(PortForwardClientHandler),
+        ClientProxyConfig::Hysteria2 { .. } => {
+            panic!("Hysteria2 is a QUIC protocol and should be handled by the socket connector, not as a TCP client handler. Ensure Hysteria2 configs use transport: quic.")
+        }
     }
 }
 

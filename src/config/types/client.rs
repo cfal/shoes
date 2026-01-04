@@ -240,6 +240,12 @@ pub enum ClientProxyConfig {
     Websocket(WebsocketClientConfig),
     #[serde(alias = "noop")]
     PortForward,
+    #[serde(alias = "hy2")]
+    Hysteria2 {
+        password: String,
+        #[serde(default = "default_true")]
+        udp_enabled: bool,
+    },
 }
 
 impl ClientProxyConfig {
@@ -263,6 +269,7 @@ impl ClientProxyConfig {
             ClientProxyConfig::Vmess { .. } => "VMess",
             ClientProxyConfig::Websocket(..) => "WebSocket",
             ClientProxyConfig::PortForward => "PortForward",
+            ClientProxyConfig::Hysteria2 { .. } => "Hysteria2",
         }
     }
 }
@@ -434,5 +441,28 @@ protocol:
         let result: Result<ClientProxyConfig, _> = serde_yaml::from_str(yaml);
         assert!(result.is_ok());
         assert!(matches!(result.unwrap(), ClientProxyConfig::Websocket(_)));
+    }
+
+    #[test]
+    fn test_client_proxy_config_hysteria2() {
+        let yaml = r#"
+type: hysteria2
+password: "test_password"
+udp_enabled: true
+"#;
+        let result: Result<ClientProxyConfig, _> = serde_yaml::from_str(yaml);
+        assert!(result.is_ok());
+        assert!(matches!(result.unwrap(), ClientProxyConfig::Hysteria2 { .. }));
+    }
+
+    #[test]
+    fn test_client_proxy_config_hysteria2_alias() {
+        let yaml = r#"
+type: hy2
+password: "test_password"
+"#;
+        let result: Result<ClientProxyConfig, _> = serde_yaml::from_str(yaml);
+        assert!(result.is_ok());
+        assert!(matches!(result.unwrap(), ClientProxyConfig::Hysteria2 { .. }));
     }
 }
