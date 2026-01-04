@@ -464,6 +464,7 @@ pub fn resolve_hysteria2_bandwidth(bandwidth: &Option<Hysteria2Bandwidth>) -> st
         Ok((0, 0))
     }
 }
+}
 
 impl ClientProxyConfig {
     pub fn is_direct(&self) -> bool {
@@ -668,5 +669,28 @@ protocol:
         let result: Result<ClientProxyConfig, _> = serde_yaml::from_str(yaml);
         assert!(result.is_ok());
         assert!(matches!(result.unwrap(), ClientProxyConfig::Websocket(_)));
+    }
+
+    #[test]
+    fn test_client_proxy_config_hysteria2() {
+        let yaml = r#"
+type: hysteria2
+password: "test_password"
+udp_enabled: true
+"#;
+        let result: Result<ClientProxyConfig, _> = serde_yaml::from_str(yaml);
+        assert!(result.is_ok());
+        assert!(matches!(result.unwrap(), ClientProxyConfig::Hysteria2 { .. }));
+    }
+
+    #[test]
+    fn test_client_proxy_config_hysteria2_alias() {
+        let yaml = r#"
+type: hy2
+password: "test_password"
+"#;
+        let result: Result<ClientProxyConfig, _> = serde_yaml::from_str(yaml);
+        assert!(result.is_ok());
+        assert!(matches!(result.unwrap(), ClientProxyConfig::Hysteria2 { .. }));
     }
 }
