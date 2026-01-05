@@ -59,11 +59,25 @@ pub fn build_client_proxy_chain(
             // Hysteria2 uses its own socket connector that handles QUIC + HTTP/3 auth
             if matches!(config.protocol, ClientProxyConfig::Hysteria2 { .. }) {
                 // For Hysteria2, we need to extract the password and create a special socket connector
-                let (password, udp_enabled, fast_open) = match &config.protocol {
-                    ClientProxyConfig::Hysteria2 { password, udp_enabled, fast_open } => {
-                        (password.clone(), *udp_enabled, *fast_open)
+                let (password, udp_enabled, fast_open, bandwidth) = match &config.protocol {
+                    ClientProxyConfig::Hysteria2 { password, udp_enabled, fast_open, bandwidth } => {
+                        (password.clone(), *udp_enabled, *fast_open, bandwidth.clone())
                     }
                     _ => unreachable!(),
+                };
+
+                // Parse bandwidth configuration
+                use crate::config::resolve_hysteria2_bandwidth;
+                let (max_tx, max_rx) = match resolve_hysteria2_bandwidth(&bandwidth) {
+                    Ok((tx, rx)) => {
+                        eprintln!("DEBUG: Parsed bandwidth: up={} bytes/s ({} MB/s), down={} bytes/s ({} MB/s)",
+                            tx, tx / 1024 / 1024, rx, rx / 1024 / 1024);
+                        (tx, rx)
+                    }
+                    Err(e) => {
+                        eprintln!("DEBUG: Failed to parse bandwidth: {}, using 0", e);
+                        (0, 0)
+                    }
                 };
 
                 // Build Hysteria2 socket connector
@@ -162,6 +176,8 @@ pub fn build_client_proxy_chain(
                     password,
                     udp_enabled,
                     fast_open,
+                    max_tx,
+                    max_rx,
                 )) as Box<dyn SocketConnector>;
 
                 // Hysteria2 is a direct protocol from the proxy chain perspective

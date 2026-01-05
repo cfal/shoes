@@ -445,6 +445,10 @@ pub struct Hysteria2Client {
     pub udp_enabled: bool,
     /// Whether TCP Fast Open is enabled
     pub fast_open: bool,
+    /// Maximum upload rate in bytes per second (0 = unlimited)
+    pub max_tx: u64,
+    /// Maximum download rate in bytes per second (0 = unlimited)
+    pub max_rx: u64,
 }
 
 impl Hysteria2Client {
@@ -456,6 +460,8 @@ impl Hysteria2Client {
         password: String,
         udp_enabled: bool,
         fast_open: bool,
+        max_tx: u64,
+        max_rx: u64,
     ) -> Self {
         Self {
             endpoint,
@@ -464,6 +470,8 @@ impl Hysteria2Client {
             password,
             udp_enabled,
             fast_open,
+            max_tx,
+            max_rx,
         }
     }
 
@@ -471,7 +479,7 @@ impl Hysteria2Client {
     pub async fn connect_and_authenticate(
         &self,
         resolver: &Arc<dyn Resolver>,
-    ) -> std::io::Result<Hysteria2Connection> {
+    ) -> std::io::Result<(Hysteria2Connection, u64, bool)> {
         let server_addr = resolve_single_address(resolver, &self.server_address).await?;
 
         let domain = self
@@ -500,8 +508,8 @@ impl Hysteria2Client {
 
         debug!("[Hysteria2] QUIC connection established, performing authentication");
 
-        // Perform HTTP/3 authentication
-        timeout(AUTH_TIMEOUT, self.authenticate_connection(&connection))
+        // Perform HTTP/3 authentication and get congestion control info
+        let (tx, tx_auto) = timeout(AUTH_TIMEOUT, self.authenticate_connection(&connection))
             .await
             .map_err(|_| {
                 error!("[Hysteria2] Authentication timeout");
@@ -522,16 +530,20 @@ impl Hysteria2Client {
             None
         };
 
-        Ok(Hysteria2Connection {
+        let conn = Hysteria2Connection {
             connection,
             udp_enabled: self.udp_enabled,
             fast_open: self.fast_open,
             udp_manager,
-        })
+            tx,
+            tx_auto,
+        };
+
+        Ok((conn, tx, tx_auto))
     }
 
     /// Perform HTTP/3 authentication handshake
-    async fn authenticate_connection(&self, connection: &quinn::Connection) -> std::io::Result<()> {
+    async fn authenticate_connection(&self, connection: &quinn::Connection) -> std::io::Result<(u64, bool)> {
         debug!("[Hysteria2] Creating H3 connection for authentication");
         let h3_connection = h3_quinn::Connection::new(connection.clone());
         let (_h3_conn, mut h3_send) = h3::client::new(h3_connection)
@@ -544,15 +556,15 @@ impl Hysteria2Client {
         // :path: /auth
         // :host: hysteria
         // Hysteria-Auth: [password]
-        // Hysteria-CC-RX: [rx_rate]
+        // Hysteria-CC-RX: [rx_rate] - client's max receive rate
         // Hysteria-Padding: [random]
 
-        debug!("[Hysteria2] Building auth request");
+        debug!("[Hysteria2] Building auth request with CC-RX: {}", self.max_rx);
         let req = http::Request::builder()
             .method("POST")
             .uri("https://hysteria/auth")
             .header("Hysteria-Auth", &self.password)
-            .header("Hysteria-CC-RX", "0")
+            .header("Hysteria-CC-RX", self.max_rx.to_string())
             .header("Hysteria-Padding", generate_padding_string())
             .body(())
             .map_err(|e| std::io::Error::other(format!("Failed to build request: {e}")))?;
@@ -599,7 +611,47 @@ impl Hysteria2Client {
             }
         }
 
-        Ok(())
+        // Parse Hysteria-CC-RX header for congestion control
+        // Format: either "auto" or a number representing server's max receive rate
+        let (tx, tx_auto) = if let Some(cc_header) = resp.headers().get("Hysteria-CC-RX") {
+            let cc_str = cc_header
+                .to_str()
+                .map_err(|e| std::io::Error::other(format!("Invalid Hysteria-CC-RX header: {e}")))?;
+
+            if cc_str.eq_ignore_ascii_case("auto") {
+                debug!("[Hysteria2] Server requested auto bandwidth detection (BBR)");
+                (0, true) // tx = 0 means use BBR
+            } else {
+                let server_rx = cc_str.parse::<u64>()
+                    .map_err(|e| std::io::Error::other(format!("Invalid Hysteria-CC-RX value: {e}")))?;
+                debug!("[Hysteria2] Server max receive rate: {} bytes/s", server_rx);
+
+                // actualTx = min(serverRx, clientTx)
+                let mut actual_tx = server_rx;
+                if actual_tx == 0 || actual_tx > self.max_tx {
+                    // Server doesn't have a limit, or our clientTx is smaller than serverRx
+                    actual_tx = self.max_tx;
+                }
+                debug!("[Hysteria2] Negotiated upload rate: {} bytes/s", actual_tx);
+                (actual_tx, false)
+            }
+        } else {
+            // No Hysteria-CC-RX header, use client's max_tx
+            debug!("[Hysteria2] No Hysteria-CC-RX header from server, using client max_tx");
+            (self.max_tx, false)
+        };
+
+        // Store the negotiated values for later use
+        // Note: Quinn uses BBR by default, so we don't need to explicitly set it
+        if tx_auto {
+            debug!("[Hysteria2] Using BBR congestion control (server requested)");
+        } else if tx > 0 {
+            debug!("[Hysteria2] Using Brutal congestion control at {} bytes/s", tx);
+        } else {
+            debug!("[Hysteria2] No bandwidth limit (BBR/unlimited)");
+        }
+
+        Ok((tx, tx_auto))
     }
 }
 
@@ -614,6 +666,10 @@ pub struct Hysteria2Connection {
     pub fast_open: bool,
     /// UDP session manager (None if UDP is disabled)
     pub udp_manager: Option<Arc<UdpSessionManager>>,
+    /// Actual upload rate in bytes per second (0 = BBR/unlimited)
+    pub tx: u64,
+    /// Whether server requested auto bandwidth detection (BBR)
+    pub tx_auto: bool,
 }
 
 impl Hysteria2Connection {
@@ -1418,6 +1474,8 @@ impl Hysteria2SocketConnector {
         password: String,
         udp_enabled: bool,
         fast_open: bool,
+        max_tx: u64,
+        max_rx: u64,
     ) -> Self {
         Self {
             client: Arc::new(Hysteria2Client::new(
@@ -1427,6 +1485,8 @@ impl Hysteria2SocketConnector {
                 password,
                 udp_enabled,
                 fast_open,
+                max_tx,
+                max_rx,
             )),
             connection: Arc::new(Mutex::new(None)),
         }
@@ -1449,7 +1509,7 @@ impl Hysteria2SocketConnector {
         }
 
         // Need to create a new connection
-        let new_conn = self.client.connect_and_authenticate(resolver).await?;
+        let (new_conn, _tx, _tx_auto) = self.client.connect_and_authenticate(resolver).await?;
 
         // Store the new connection
         {

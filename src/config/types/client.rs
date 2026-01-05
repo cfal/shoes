@@ -247,7 +247,78 @@ pub enum ClientProxyConfig {
         udp_enabled: bool,
         #[serde(default)]
         fast_open: bool,
+        /// Bandwidth configuration
+        #[serde(default)]
+        bandwidth: Option<Hysteria2Bandwidth>,
     },
+}
+
+/// Bandwidth configuration for Hysteria2
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Hysteria2Bandwidth {
+    /// Upload bandwidth (e.g., "100 mbps", "1 gbps")
+    pub up: Option<String>,
+    /// Download bandwidth (e.g., "200 mbps", "1 gbps")
+    pub down: Option<String>,
+}
+
+impl Hysteria2Bandwidth {
+    /// Parse upload bandwidth to bytes per second
+    pub fn parse_up(&self) -> std::io::Result<u64> {
+        self.parse_bandwidth(&self.up, "up")
+    }
+
+    /// Parse download bandwidth to bytes per second
+    pub fn parse_down(&self) -> std::io::Result<u64> {
+        self.parse_bandwidth(&self.down, "down")
+    }
+
+    fn parse_bandwidth(&self, value: &Option<String>, field: &str) -> std::io::Result<u64> {
+        let s = value.as_ref().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("bandwidth {} not specified", field))
+        })?;
+
+        let s = s.trim().to_lowercase();
+        // Find first non-digit, non-dot, non-space character to separate number from unit
+        let mut num_end = 0;
+        for (i, c) in s.chars().enumerate() {
+            if c.is_ascii_digit() || c == '.' {
+                num_end = i + 1;
+            } else if !c.is_whitespace() {
+                break;
+            }
+        }
+
+        let num_str = s[..num_end].trim();
+        let unit = s[num_end..].trim();
+
+        let num: f64 = num_str.parse().map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("invalid bandwidth value: {}", s))
+        })?;
+
+        let multiplier = match unit {
+            "bps" => 1.0,
+            "kbps" | "k" => 1024.0,
+            "mbps" | "m" => 1024.0 * 1024.0,
+            "gbps" | "g" => 1024.0 * 1024.0 * 1024.0,
+            "tbps" | "t" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
+            "" => 1024.0 * 1024.0, // Default to mbps if no unit
+            _ => return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("unknown bandwidth unit: {}", unit))),
+        };
+
+        Ok((num * multiplier / 8.0) as u64) // Convert bits to bytes
+    }
+}
+
+/// Resolve bandwidth config to actual bytes per second values
+pub fn resolve_hysteria2_bandwidth(bandwidth: &Option<Hysteria2Bandwidth>) -> std::io::Result<(u64, u64)> {
+    if let Some(bw) = bandwidth {
+        let up = bw.parse_up().unwrap_or(0);
+        let down = bw.parse_down().unwrap_or(0);
+        Ok((up, down))
+    } else {
+        Ok((0, 0))
+    }
 }
 
 impl ClientProxyConfig {
