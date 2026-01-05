@@ -1,4 +1,5 @@
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::Arc;
 use std::sync::OnceLock;
 
 use async_trait::async_trait;
@@ -7,6 +8,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use crate::address::{Address, NetLocation};
 use crate::async_stream::AsyncStream;
 use crate::option_util::NoneOrOne;
+use crate::socks5_udp_relay::SocksUdpRelay;
+use crate::socket_util::new_udp_socket;
 use crate::stream_reader::StreamReader;
 use crate::tcp_handler::{
     TcpClientHandler, TcpClientSetupResult, TcpServerHandler, TcpServerSetupResult,
@@ -166,10 +169,42 @@ impl TcpServerHandler for SocksTcpServerHandler {
         }
 
         if connection_request[1] == CMD_UDP_ASSOCIATE {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "UDP associate command is not supported",
-            ));
+            // Handle UDP ASSOCIATE request
+            // Read the target address (client's intended UDP bind address)
+            let _target_addr = read_location(&mut server_stream, &mut stream_reader).await?;
+
+            // Create a UDP socket for relaying
+            let udp_socket = Arc::new(new_udp_socket(false, None)?);
+            let local_addr = udp_socket.local_addr()?;
+
+            // Build success response with the UDP socket's bound address
+            let mut response_bytes = vec![VER_SOCKS5, RESULT_SUCCESS, 0];
+            match local_addr {
+                SocketAddr::V4(v4) => {
+                    response_bytes.push(ADDR_TYPE_IPV4);
+                    response_bytes.extend_from_slice(&v4.ip().octets());
+                    response_bytes.push((v4.port() >> 8) as u8);
+                    response_bytes.push((v4.port() & 0xff) as u8);
+                }
+                SocketAddr::V6(_) => {
+                    // For IPv6, we still return IPv4 0.0.0.0 since we're binding to IPv4
+                    response_bytes.push(ADDR_TYPE_IPV4);
+                    response_bytes.extend_from_slice(&[0, 0, 0, 0]);
+                    response_bytes.push(0);
+                    response_bytes.push(0);
+                }
+            }
+            write_all(&mut server_stream, &response_bytes).await?;
+            server_stream.flush().await?;
+
+            // Create the UDP relay stream (TCP connection stays open for the duration)
+            let socks_udp_relay = SocksUdpRelay::new(udp_socket);
+
+            return Ok(TcpServerSetupResult::MultiDirectionalUdp {
+                stream: Box::new(socks_udp_relay),
+                need_initial_flush: false,
+                override_proxy_provider: NoneOrOne::Unspecified,
+            });
         }
 
         if connection_request[1] != CMD_CONNECT {
