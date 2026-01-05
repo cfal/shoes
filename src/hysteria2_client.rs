@@ -527,10 +527,12 @@ impl Hysteria2Client {
 
     /// Perform HTTP/3 authentication handshake
     async fn authenticate_connection(&self, connection: &quinn::Connection) -> std::io::Result<()> {
+        debug!("[Hysteria2] Creating H3 connection for authentication");
         let h3_connection = h3_quinn::Connection::new(connection.clone());
         let (_h3_conn, mut h3_send) = h3::client::new(h3_connection)
             .await
             .map_err(|e| std::io::Error::other(format!("Failed to create H3 client: {e}")))?;
+        debug!("[Hysteria2] H3 client created");
 
         // Build authentication request per protocol spec:
         // :method: POST
@@ -540,6 +542,7 @@ impl Hysteria2Client {
         // Hysteria-CC-RX: [rx_rate]
         // Hysteria-Padding: [random]
 
+        debug!("[Hysteria2] Building auth request");
         let req = http::Request::builder()
             .method("POST")
             .uri("https://hysteria/auth")
@@ -550,21 +553,25 @@ impl Hysteria2Client {
             .map_err(|e| std::io::Error::other(format!("Failed to build request: {e}")))?;
 
         // Send request and get the stream
+        debug!("[Hysteria2] Sending auth request");
         let mut stream = h3_send
             .send_request(req)
             .await
             .map_err(|e| std::io::Error::other(format!("Failed to send auth request: {e}")))?;
+        debug!("[Hysteria2] Auth request sent, finishing stream");
 
         stream
             .finish()
             .await
             .map_err(|e| std::io::Error::other(format!("Failed to finish auth request: {e}")))?;
+        debug!("[Hysteria2] Stream finished, waiting for response");
 
         // Receive response from the stream
         let resp = stream
             .recv_response()
             .await
             .map_err(|e| std::io::Error::other(format!("Failed to recv auth response: {e}")))?;
+        debug!("[Hysteria2] Received auth response, status: {}", resp.status());
 
         // Check status code - must be 233 (HyOK) per protocol spec
         let status = resp.status();
@@ -740,21 +747,20 @@ impl crate::async_stream::AsyncShutdownMessage for HyUdpConn {
 /// This implements AsyncSourcedMessageStream to support multiple destination addresses.
 /// Used for SOCKS5 UDP associate mode.
 pub struct HyUdpMessageStream {
-    /// Local UDP socket bound for SOCKS5 UDP relay
-    /// This socket is used to send responses back to the SOCKS5 client
-    local_socket: Arc<UdpSocket>,
     /// The QUIC connection to the Hysteria2 server
     connection: quinn::Connection,
     /// Maximum datagram size
     max_datagram_size: usize,
     /// Receiver for datagrams from the server
-    /// Contains (payload, target_address, _reserved)
+    /// Contains (payload, source_address)
     receive_ch: tokio::sync::mpsc::Receiver<(Vec<u8>, std::net::SocketAddr)>,
 }
 
 impl HyUdpMessageStream {
     /// Create a new HyUdpMessageStream
-    pub fn new(local_socket: Arc<UdpSocket>, connection: quinn::Connection) -> Self {
+    /// Note: The local_socket parameter is kept for API compatibility but is not used.
+    /// Hysteria2 sends/receives UDP packets directly via QUIC datagrams.
+    pub fn new(_local_socket: Arc<UdpSocket>, connection: quinn::Connection) -> Self {
         let max_datagram_size = connection
             .max_datagram_size()
             .unwrap_or(65535) as usize;
@@ -764,10 +770,12 @@ impl HyUdpMessageStream {
         // Spawn task to receive datagrams from the server
         let conn = connection.clone();
         tokio::spawn(async move {
-            let mut buf = vec![0u8; 65536];
+            debug!("[Hysteria2] UDP receive loop started");
             loop {
+                debug!("[Hysteria2] Waiting for datagram...");
                 match conn.read_datagram().await {
                     Ok(data) => {
+                        debug!("[Hysteria2] Received datagram: {} bytes", data.len());
                         if let Err(e) = process_received_datagram(&data, &tx) {
                             warn!("[Hysteria2] Failed to process received datagram: {}", e);
                         }
@@ -778,10 +786,10 @@ impl HyUdpMessageStream {
                     }
                 }
             }
+            warn!("[Hysteria2] UDP receive loop ended");
         });
 
         Self {
-            local_socket,
             connection,
             max_datagram_size,
             receive_ch: rx,
@@ -940,7 +948,8 @@ impl crate::async_stream::AsyncReadSourcedMessage for HyUdpMessageStream {
     ) -> Poll<std::io::Result<std::net::SocketAddr>> {
         let this = self.get_mut();
         match Pin::new(&mut this.receive_ch).poll_recv(cx) {
-            Poll::Ready(Some((data, _target_addr))) => {
+            Poll::Ready(Some((data, target_addr))) => {
+                debug!("[Hysteria2] poll_read_sourced_message: received {} bytes from {}", data.len(), target_addr);
                 if data.len() > buf.remaining() {
                     return Poll::Ready(Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
@@ -952,13 +961,10 @@ impl crate::async_stream::AsyncReadSourcedMessage for HyUdpMessageStream {
                     )));
                 }
                 buf.put_slice(&data);
-                // Return the local UDP socket address
-                // This is where responses should be sent - the SOCKS5 UDP relay will receive
-                // and forward to the appropriate client
-                let local_addr = this.local_socket.local_addr().unwrap_or_else(|_| {
-                    std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0)
-                });
-                Poll::Ready(Ok(local_addr))
+                // Return the target address from the Hysteria2 server
+                // This is the actual source of the data (e.g., 8.8.8.8:53 for DNS)
+                debug!("[Hysteria2] poll_read_sourced_message: returning source address {}", target_addr);
+                Poll::Ready(Ok(target_addr))
             }
             Poll::Ready(None) => Poll::Ready(Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
@@ -978,6 +984,8 @@ impl crate::async_stream::AsyncWriteTargetedMessage for HyUdpMessageStream {
     ) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
 
+        debug!("[Hysteria2] poll_write_targeted_message: writing {} bytes to target {:?}", buf.len(), target);
+
         // Resolve the target address
         let resolver = NativeResolver::new();
         let addrs = futures::executor::block_on(async {
@@ -989,6 +997,8 @@ impl crate::async_stream::AsyncWriteTargetedMessage for HyUdpMessageStream {
             .into_iter()
             .next()
             .ok_or_else(|| std::io::Error::other("No addresses resolved for target"))?;
+
+        debug!("[Hysteria2] poll_write_targeted_message: resolved to {}", addr);
 
         // Send through QUIC datagram
         futures::executor::block_on(this.send_packet(&buf, &addr))

@@ -47,6 +47,9 @@ pub struct SocksUdpRelay {
     recv_ch: mpsc::Receiver<(BytesMut, SocketAddr)>,
     /// Flag to indicate shutdown
     shutdown: Arc<std::sync::atomic::AtomicBool>,
+    /// The most recent client address we've received from
+    /// This is the address we should send responses back to
+    client_addr: std::sync::Mutex<Option<SocketAddr>>,
 }
 
 impl SocksUdpRelay {
@@ -58,6 +61,7 @@ impl SocksUdpRelay {
         let (tx, recv_ch) = mpsc::channel(128);
         let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let shutdown_clone = shutdown.clone();
+        let client_addr = std::sync::Mutex::new(None);
         let udp_socket_clone = udp_socket.clone();
 
         // Spawn task to read from UDP socket and send to channel
@@ -89,6 +93,7 @@ impl SocksUdpRelay {
             udp_socket,
             recv_ch,
             shutdown,
+            client_addr,
         }
     }
 
@@ -120,7 +125,10 @@ impl AsyncReadTargetedMessage for SocksUdpRelay {
 
         loop {
             match Pin::new(&mut this.recv_ch).poll_recv(cx) {
-                Poll::Ready(Some((data, _from_addr))) => {
+                Poll::Ready(Some((data, from_addr))) => {
+                    // Track the client address for sending responses back
+                    *this.client_addr.lock().unwrap() = Some(from_addr);
+
                     // Parse SOCKS5 datagram header to get destination address
                     // Header format: RSV(2) + FRAG(1) + ATYP + DST.ADDR + DST.PORT
                     if data.len() < 10 {
@@ -226,6 +234,13 @@ impl AsyncWriteSourcedMessage for SocksUdpRelay {
     ) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
 
+        // Get the client address to send the response to
+        let client_addr = this.client_addr.lock().unwrap();
+        let target_addr = client_addr.ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotConnected, "No client address available")
+        })?;
+        drop(client_addr);
+
         // Build SOCKS5 response datagram
         // Format: RSV(2) + FRAG(1) + ATYP + DST.ADDR + DST.PORT + DATA
         let mut response = Vec::with_capacity(65536);
@@ -235,6 +250,7 @@ impl AsyncWriteSourcedMessage for SocksUdpRelay {
         response.push(0);
         response.push(0);
 
+        // Use the source address (e.g., DNS server address 8.8.8.8:53) in the SOCKS5 header
         match source {
             SocketAddr::V4(addr) => {
                 response.push(ATYP_IPV4);
@@ -253,13 +269,11 @@ impl AsyncWriteSourcedMessage for SocksUdpRelay {
         // Data
         response.extend_from_slice(data);
 
-        // Send to the UDP socket
-        // Note: we need to send to the client that originally sent the datagram
-        // The `source` here is the address from the client, so we send back to it
+        // Send to the UDP socket using the tracked client address
         let send_result = std::pin::Pin::new(&*this.udp_socket).poll_send_to(
             _cx,
             &response,
-            *source,
+            target_addr,
         );
 
         match send_result {
