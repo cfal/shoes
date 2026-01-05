@@ -740,13 +740,15 @@ impl crate::async_stream::AsyncShutdownMessage for HyUdpConn {
 /// This implements AsyncSourcedMessageStream to support multiple destination addresses.
 /// Used for SOCKS5 UDP associate mode.
 pub struct HyUdpMessageStream {
-    /// Local UDP socket for receiving from SOCKS5 client
+    /// Local UDP socket bound for SOCKS5 UDP relay
+    /// This socket is used to send responses back to the SOCKS5 client
     local_socket: Arc<UdpSocket>,
     /// The QUIC connection to the Hysteria2 server
     connection: quinn::Connection,
     /// Maximum datagram size
     max_datagram_size: usize,
     /// Receiver for datagrams from the server
+    /// Contains (payload, target_address, _reserved)
     receive_ch: tokio::sync::mpsc::Receiver<(Vec<u8>, std::net::SocketAddr)>,
 }
 
@@ -870,96 +872,35 @@ fn process_received_datagram(
     let fragment_count = data[7];
 
     // Parse address length (varint starting at byte 8)
-    // Note: The varint includes the length byte itself, so address_section_len = decoded + 1
-    let (address_section_len, addr_end) = decode_varint(&data[8..])?;
-    let address_section_len = address_section_len as usize;
+    // The varint value is the length of the address string (e.g., "8.8.8.8:53" = 10 bytes)
+    let (address_str_len, varint_bytes_consumed) = decode_varint(&data[8..])?;
 
-    // Parse the address section
-    // Address section format: ATYP(1) + address + port(2)
-    let atyp = data[8 + addr_end];
-    let address_start = 8 + addr_end + 1;
-    let mut port_start = 0;
-    let mut domain_len = 0;
+    // Address string starts right after the varint
+    let address_start = 8 + varint_bytes_consumed;
+    let address_str_end = address_start + (address_str_len as usize);
 
-    let target_addr = match atyp {
-        0x01 => {
-            // IPv4: ATYP(1) + IP(4) + PORT(2) = 7 bytes
-            if data.len() < address_start + 7 {
-                warn!("[Hysteria2] Truncated IPv4 address");
-                return Ok(());
-            }
-            port_start = address_start + 5;
-            let ip = std::net::Ipv4Addr::new(
-                data[address_start],
-                data[address_start + 1],
-                data[address_start + 2],
-                data[address_start + 3],
-            );
-            let port = u16::from_be_bytes([data[port_start], data[port_start + 1]]);
-            debug!("[Hysteria2] IPv4: {:?}:{}", ip, port);
-            std::net::SocketAddr::new(std::net::IpAddr::V4(ip), port)
-        }
-        0x04 => {
-            // IPv6: ATYP(1) + IP(16) + PORT(2) = 19 bytes
-            if data.len() < address_start + 19 {
-                warn!("[Hysteria2] Truncated IPv6 address");
-                return Ok(());
-            }
-            port_start = address_start + 17;
-            let ip_bytes: [u8; 16] = data[address_start..address_start + 16].try_into().unwrap();
-            let ip = std::net::Ipv6Addr::from(ip_bytes);
-            let port = u16::from_be_bytes([data[port_start], data[port_start + 1]]);
-            debug!("[Hysteria2] IPv6: {:?}:{}", ip, port);
-            std::net::SocketAddr::new(std::net::IpAddr::V6(ip), port)
-        }
-        0x03 => {
-            // Domain: ATYP(1) + LEN(1) + DOMAIN + PORT(2)
-            if data.len() < address_start + 1 {
-                warn!("[Hysteria2] Truncated domain length");
-                return Ok(());
-            }
-            domain_len = data[address_start] as usize;
-            port_start = address_start + 1 + domain_len;
-            if data.len() < port_start + 2 {
-                warn!("[Hysteria2] Truncated domain");
-                return Ok(());
-            }
-            let domain = String::from_utf8_lossy(&data[address_start + 1..port_start]);
-            let port = u16::from_be_bytes([data[port_start], data[port_start + 1]]);
-            debug!("[Hysteria2] Domain: {}:{}", domain, port);
-            return Ok(()); // Need to resolve domain
-        }
-        _ => {
-            warn!("[Hysteria2] Unknown ATYP: 0x{:02x} at offset {}, data[{}]={}, full first 30: {:?}",
-                  atyp, address_start, 8 + addr_end, atyp, &data[..30]);
+    if data.len() < address_str_end {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "incomplete address in datagram",
+        ));
+    }
+
+    // Parse the address string (format: "IP:port" or "[IPv6]:port")
+    let address_str = String::from_utf8_lossy(&data[address_start..address_str_end]);
+    debug!("[Hysteria2] Received datagram address string: '{}'", address_str);
+
+    // Parse as SocketAddr
+    let target_addr: std::net::SocketAddr = match address_str.parse() {
+        Ok(addr) => addr,
+        Err(e) => {
+            warn!("[Hysteria2] Failed to parse address '{}': {}", address_str, e);
             return Ok(());
         }
     };
 
-    // Check if we have enough data for the address section
-    let address_section_size = match atyp {
-        0x01 => 7,  // ATYP(1) + IPv4(4) + PORT(2)
-        0x04 => 19, // ATYP(1) + IPv6(16) + PORT(2)
-        0x03 => {
-            if data.len() < address_start + 1 {
-                warn!("[Hysteria2] Truncated domain length");
-                return Ok(());
-            }
-            let domain_len = data[address_start] as usize;
-            1 + domain_len + 2 // ATYP(1) + LEN(1) + DOMAIN + PORT(2)
-        }
-        _ => {
-            return Ok(()); // Already warned in the match
-        }
-    };
-
-    if data.len() < address_start + address_section_size {
-        warn!("[Hysteria2] Truncated address section");
-        return Ok(());
-    }
-
-    // Extract the payload (everything after the address section)
-    let payload_start = address_start + address_section_size;
+    // Extract the payload (everything after the address string)
+    let payload_start = address_str_end;
     let payload = data[payload_start..].to_vec();
 
     if payload.is_empty() {
@@ -999,7 +940,7 @@ impl crate::async_stream::AsyncReadSourcedMessage for HyUdpMessageStream {
     ) -> Poll<std::io::Result<std::net::SocketAddr>> {
         let this = self.get_mut();
         match Pin::new(&mut this.receive_ch).poll_recv(cx) {
-            Poll::Ready(Some((data, from_addr))) => {
+            Poll::Ready(Some((data, _target_addr))) => {
                 if data.len() > buf.remaining() {
                     return Poll::Ready(Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
@@ -1011,7 +952,13 @@ impl crate::async_stream::AsyncReadSourcedMessage for HyUdpMessageStream {
                     )));
                 }
                 buf.put_slice(&data);
-                Poll::Ready(Ok(from_addr))
+                // Return the local UDP socket address
+                // This is where responses should be sent - the SOCKS5 UDP relay will receive
+                // and forward to the appropriate client
+                let local_addr = this.local_socket.local_addr().unwrap_or_else(|_| {
+                    std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0)
+                });
+                Poll::Ready(Ok(local_addr))
             }
             Poll::Ready(None) => Poll::Ready(Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
