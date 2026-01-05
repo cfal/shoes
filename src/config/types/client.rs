@@ -464,7 +464,6 @@ pub fn resolve_hysteria2_bandwidth(bandwidth: &Option<Hysteria2Bandwidth>) -> st
         Ok((0, 0))
     }
 }
-}
 
 impl ClientProxyConfig {
     pub fn is_direct(&self) -> bool {
