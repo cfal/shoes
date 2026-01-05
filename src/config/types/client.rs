@@ -245,6 +245,8 @@ pub enum ClientProxyConfig {
         password: String,
         #[serde(default = "default_true")]
         udp_enabled: bool,
+        #[serde(default)]
+        fast_open: bool,
     },
 }
 

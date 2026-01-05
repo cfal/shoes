@@ -59,9 +59,9 @@ pub fn build_client_proxy_chain(
             // Hysteria2 uses its own socket connector that handles QUIC + HTTP/3 auth
             if matches!(config.protocol, ClientProxyConfig::Hysteria2 { .. }) {
                 // For Hysteria2, we need to extract the password and create a special socket connector
-                let (password, udp_enabled) = match &config.protocol {
-                    ClientProxyConfig::Hysteria2 { password, udp_enabled } => {
-                        (password.clone(), *udp_enabled)
+                let (password, udp_enabled, fast_open) = match &config.protocol {
+                    ClientProxyConfig::Hysteria2 { password, udp_enabled, fast_open } => {
+                        (password.clone(), *udp_enabled, *fast_open)
                     }
                     _ => unreachable!(),
                 };
@@ -161,6 +161,7 @@ pub fn build_client_proxy_chain(
                     effective_sni.cloned(),
                     password,
                     udp_enabled,
+                    fast_open,
                 )) as Box<dyn SocketConnector>;
 
                 // Hysteria2 is a direct protocol from the proxy chain perspective

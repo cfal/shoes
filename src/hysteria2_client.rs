@@ -21,7 +21,7 @@ use log::{debug, error, warn};
 use lru::LruCache;
 use rand::distr::Alphanumeric;
 use rand::{Rng, RngCore};
-use tokio::io::ReadBuf;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::UdpSocket;
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinHandle;
@@ -443,6 +443,8 @@ pub struct Hysteria2Client {
     password: String,
     /// Whether UDP relay is enabled
     pub udp_enabled: bool,
+    /// Whether TCP Fast Open is enabled
+    pub fast_open: bool,
 }
 
 impl Hysteria2Client {
@@ -453,6 +455,7 @@ impl Hysteria2Client {
         sni_hostname: Option<String>,
         password: String,
         udp_enabled: bool,
+        fast_open: bool,
     ) -> Self {
         Self {
             endpoint,
@@ -460,6 +463,7 @@ impl Hysteria2Client {
             sni_hostname,
             password,
             udp_enabled,
+            fast_open,
         }
     }
 
@@ -521,6 +525,7 @@ impl Hysteria2Client {
         Ok(Hysteria2Connection {
             connection,
             udp_enabled: self.udp_enabled,
+            fast_open: self.fast_open,
             udp_manager,
         })
     }
@@ -605,6 +610,8 @@ pub struct Hysteria2Connection {
     pub connection: quinn::Connection,
     /// Whether UDP relay is enabled
     pub udp_enabled: bool,
+    /// Whether TCP Fast Open is enabled
+    pub fast_open: bool,
     /// UDP session manager (None if UDP is disabled)
     pub udp_manager: Option<Arc<UdpSessionManager>>,
 }
@@ -1030,6 +1037,207 @@ impl crate::async_stream::AsyncShutdownMessage for HyUdpMessageStream {
 
 impl crate::async_stream::AsyncSourcedMessageStream for HyUdpMessageStream {}
 
+/// Hysteria2 TCP stream with optional Fast Open support.
+///
+/// When Fast Open is enabled, the stream is returned immediately after sending
+/// the TCP request, without waiting for the server's response. The response
+/// is read and validated on the first Read() call.
+pub struct HyTcpStream {
+    /// QUIC send stream
+    send: quinn::SendStream,
+    /// QUIC receive stream
+    recv: quinn::RecvStream,
+    /// Whether the connection has been established (server response received)
+    established: Arc<std::sync::atomic::AtomicBool>,
+    /// Whether Fast Open is enabled
+    fast_open: bool,
+}
+
+impl HyTcpStream {
+    /// Create a new HyTcpStream.
+    ///
+    /// If fast_open is true, the stream is returned immediately after sending
+    /// the request, and the server response is deferred to the first Read() call.
+    pub fn new(
+        mut send: quinn::SendStream,
+        recv: quinn::RecvStream,
+        fast_open: bool,
+    ) -> Self {
+        Self {
+            send,
+            recv,
+            established: Arc::new(std::sync::atomic::AtomicBool::new(!fast_open)),
+            fast_open,
+        }
+    }
+
+    /// Ensure the connection is established by reading the server response.
+    /// This is called on the first Read() when Fast Open is enabled.
+    async fn ensure_established(&mut self) -> std::io::Result<()> {
+        if self.established.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(());
+        }
+
+        // Read response per protocol spec:
+        // [uint8] Status (0x00 = OK, 0x01 = Error)
+        // [varint] Message length
+        // [bytes] Message string
+        // [varint] Padding length
+        // [bytes] Random padding
+
+        let mut status_buf = [0u8; 1];
+        self.recv.read_exact(&mut status_buf).await.map_err(|e| {
+            std::io::Error::other(format!("Failed to read status: {e}"))
+        })?;
+
+        let status = status_buf[0];
+        if status != TCP_STATUS_OK {
+            // Read error message
+            let msg_len = read_varint_from_stream(&mut self.recv).await?;
+            if msg_len > 1024 {
+                return Err(std::io::Error::other(format!(
+                    "Server returned error status and message too long"
+                )));
+            }
+            let mut msg_buf = vec![0u8; msg_len as usize];
+            self.recv.read_exact(&mut msg_buf).await.map_err(|e| {
+                std::io::Error::other(format!("Failed to read error message: {e}"))
+            })?;
+            let msg = String::from_utf8_lossy(&msg_buf);
+            return Err(std::io::Error::other(format!(
+                "Server rejected connection: {}",
+                msg
+            )));
+        }
+
+        // Read and discard message length (should be 0 for OK status)
+        let msg_len = read_varint_from_stream(&mut self.recv).await?;
+        if msg_len > 0 {
+            let mut discard = vec![0u8; msg_len as usize];
+            self.recv.read_exact(&mut discard).await.map_err(|e| {
+                std::io::Error::other(format!("Failed to discard message: {e}"))
+            })?;
+        }
+
+        // Read and discard padding
+        let padding_len = read_varint_from_stream(&mut self.recv).await?;
+        if padding_len > 0 {
+            let mut discard = vec![0u8; padding_len as usize];
+            self.recv.read_exact(&mut discard).await.map_err(|e| {
+                std::io::Error::other(format!("Failed to discard padding: {e}"))
+            })?;
+        }
+
+        self.established.store(true, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+impl AsyncRead for HyTcpStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        // If using Fast Open and not yet established, we need to establish first
+        if !self.established.load(std::sync::atomic::Ordering::Relaxed) {
+            // Create a future to establish the connection
+            let establish_future = self.ensure_established();
+            // Pin the future locally
+            let pinned_future = std::pin::pin!(establish_future);
+            // Try to complete the future
+            let mut result = None;
+            let mut waker = Some(cx.waker().clone());
+            with_waker(&mut waker, |ctx| {
+                match pinned_future.poll(ctx) {
+                    Poll::Ready(Ok(())) => result = Some(Ok(())),
+                    Poll::Ready(Err(e)) => result = Some(Err(e)),
+                    Poll::Pending => {}
+                }
+            });
+            match result {
+                Some(Ok(())) => {}
+                Some(Err(e)) => return Poll::Ready(Err(e)),
+                None => return Poll::Pending,
+            }
+        }
+
+        // Connection is established, proceed with normal read
+        Pin::new(&mut self.recv).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for HyTcpStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.send)
+            .poll_write(cx, buf)
+            .map_err(|e| std::io::Error::other(format!("Write error: {}", e)))
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.send)
+            .poll_flush(cx)
+            .map_err(|e| std::io::Error::other(format!("Flush error: {}", e)))
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.send)
+            .poll_shutdown(cx)
+            .map_err(|e| std::io::Error::other(format!("Shutdown error: {}", e)))
+    }
+}
+
+impl AsyncStream for HyTcpStream {}
+
+impl AsyncPing for HyTcpStream {
+    fn supports_ping(&self) -> bool {
+        false
+    }
+
+    fn poll_write_ping(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<bool>> {
+        Poll::Ready(Ok(false))
+    }
+}
+
+// HyTcpStream is Unpin because all its fields are Unpin
+impl Unpin for HyTcpStream {}
+
+/// Helper to set a waker for a scope
+fn with_waker<F, R>(waker: &mut Option<std::task::Waker>, f: F) -> R
+where
+    F: FnOnce(&mut Context<'_>) -> R,
+{
+    if let Some(w) = waker.take() {
+        f(&mut Context::from_waker(&w))
+    } else {
+        // This shouldn't happen, but provide a no-op waker just in case
+        use std::task::{RawWaker, RawWakerVTable};
+        static VTABLE: RawWakerVTable = RawWakerVTable::new(
+            |_| { unreachable!() },           // clone
+            |_| {},                           // wake
+            |_| { unreachable!() },           // wake_by_ref
+            |_| {},                           // drop
+        );
+        let raw = RawWaker::new(std::ptr::null(), &VTABLE);
+        // SAFETY: The RawWaker is constructed from a null pointer with a VTable
+        // that does nothing. This is safe because we never actually call any
+        // methods that would dereference the pointer.
+        unsafe {
+            f(&mut Context::from_waker(&std::task::Waker::from_raw(raw)))
+        }
+    }
+}
+
 impl Hysteria2Connection {
     /// Create a new TCP stream through the Hysteria2 connection
     pub async fn create_tcp_stream(
@@ -1039,7 +1247,7 @@ impl Hysteria2Connection {
         debug!("[Hysteria2] Creating TCP stream to {}", target);
 
         // Open bidirectional stream
-        let (mut send, mut recv) = self
+        let (mut send, recv) = self
             .connection
             .open_bi()
             .await
@@ -1092,6 +1300,15 @@ impl Hysteria2Connection {
         send.write_all(&request)
             .await
             .map_err(|e| std::io::Error::other(format!("Failed to send TCP request: {e}")))?;
+
+        // If Fast Open is enabled, return the stream immediately without waiting for response
+        if self.fast_open {
+            debug!("[Hysteria2] Fast Open enabled, returning stream immediately");
+            return Ok(Box::new(HyTcpStream::new(send, recv, true)));
+        }
+
+        // Fast Open disabled, wait for server response before returning
+        let mut recv = recv;
 
         // Receive response per protocol spec:
         // [uint8] Status (0x00 = OK, 0x01 = Error)
@@ -1200,6 +1417,7 @@ impl Hysteria2SocketConnector {
         sni_hostname: Option<String>,
         password: String,
         udp_enabled: bool,
+        fast_open: bool,
     ) -> Self {
         Self {
             client: Arc::new(Hysteria2Client::new(
@@ -1208,6 +1426,7 @@ impl Hysteria2SocketConnector {
                 sni_hostname,
                 password,
                 udp_enabled,
+                fast_open,
             )),
             connection: Arc::new(Mutex::new(None)),
         }
