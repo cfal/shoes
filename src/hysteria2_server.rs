@@ -6,6 +6,11 @@ use std::str;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::hysteria2_protocol::{
+    header, tcp_status, AUTH_HOST, AUTH_METHOD, AUTH_PATH, FRAME_TYPE_TCP_REQUEST,
+    STATUS_AUTH_OK,
+};
+
 use bytes::{Bytes, BytesMut};
 use log::{error, warn};
 use rand::distr::Alphanumeric;
@@ -141,21 +146,37 @@ async fn process_connection(
 }
 
 fn validate_auth_request<T>(req: http::Request<T>, password: &str) -> std::io::Result<()> {
-    if req.uri() != "https://hysteria/auth" {
-        return Err(std::io::Error::other(format!(
-            "unexpected uri: {}",
-            req.uri()
-        )));
-    }
-    if req.method() != "POST" {
+    // Check HTTP method (similar to official implementation)
+    if req.method() != http::Method::POST {
         return Err(std::io::Error::other(format!(
             "unexpected method: {}",
             req.method()
         )));
     }
 
+    // Check URI path
+    if req.uri().path() != AUTH_PATH {
+        return Err(std::io::Error::other(format!(
+            "unexpected uri path: {}",
+            req.uri().path()
+        )));
+    }
+
     let headers = req.headers();
-    let auth_value = match headers.get("hysteria-auth") {
+
+    // Check Host header (optional per HTTP/3 spec, but recommended)
+    if let Some(host) = headers.get(http::header::HOST) {
+        let host_str = host.to_str().map_err(std::io::Error::other)?;
+        if host_str != AUTH_HOST {
+            return Err(std::io::Error::other(format!(
+                "unexpected host: {}",
+                host_str
+            )));
+        }
+    }
+
+    // Check Hysteria-Auth header
+    let auth_value = match headers.get(header::AUTH) {
         Some(h) => h,
         None => {
             return Err(std::io::Error::other("missing auth header"));
@@ -194,10 +215,10 @@ async fn auth_connection(
                 match validate_auth_request(req, password) {
                     Ok(()) => {
                         let resp = http::Response::builder()
-                            .status(http::status::StatusCode::from_u16(233).unwrap())
-                            .header("Hysteria-UDP", if udp_enabled { "true" } else { "false" })
-                            .header("Hysteria-CC-RX", "0")
-                            .header("Hysteria-Padding", generate_ascii_string())
+                            .status(http::status::StatusCode::from_u16(STATUS_AUTH_OK).unwrap())
+                            .header(header::UDP, if udp_enabled { "true" } else { "false" })
+                            .header(header::CC_RX, "0")
+                            .header(header::PADDING, generate_ascii_string())
                             .body(())
                             .unwrap();
 
@@ -742,10 +763,6 @@ async fn run_tcp_loop(
     Ok(())
 }
 
-/// TCP request frame type constant from Hysteria2 protocol.
-/// See: https://github.com/apernet/hysteria/blob/master/core/internal/protocol/proxy.go#L15
-const FRAME_TYPE_TCP_REQUEST: u64 = 0x401;
-
 async fn handle_tcp_header(
     send: &mut quinn::SendStream,
     recv: &mut quinn::RecvStream,
@@ -791,7 +808,7 @@ async fn handle_tcp_header(
 
         // first 3 bytes of status = 0x0, message length = 0, padding length
         let mut response_bytes = allocate_vec(3 + (padding_len as usize));
-        response_bytes[0] = 0;
+        response_bytes[0] = tcp_status::OK;
         response_bytes[1] = 0;
         response_bytes[2] = padding_len;
         rng.fill_bytes(&mut response_bytes[3..]);
@@ -1016,4 +1033,249 @@ pub async fn start_hysteria2_server(
     }
 
     Ok(join_handles)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hysteria2_protocol::{
+        header, tcp_status, AUTH_HOST, AUTH_PATH, FRAME_TYPE_TCP_REQUEST, STATUS_AUTH_OK,
+    };
+
+    // Helper function to decode a QUIC varint
+    fn test_decode_varint(data: &[u8]) -> std::io::Result<(u64, usize)> {
+        if data.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "incomplete varint",
+            ));
+        }
+
+        let first_byte = data[0];
+        let length_indicator = first_byte >> 6;
+        let mut value: u64 = (first_byte & 0b00111111) as u64;
+
+        let num_bytes = match length_indicator {
+            0 => 1,
+            1 => 2,
+            2 => 4,
+            3 => 8,
+            _ => unreachable!(),
+        };
+
+        if data.len() < num_bytes {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("incomplete varint: have {} bytes, need {}", data.len(), num_bytes),
+            ));
+        }
+
+        if num_bytes > 1 {
+            for byte in &data[1..num_bytes] {
+                value <<= 8;
+                value |= *byte as u64;
+            }
+        }
+
+        Ok((value, num_bytes))
+    }
+
+    #[test]
+    fn test_validate_auth_request_valid() {
+        // Test a valid authentication request
+        let req = http::Request::builder()
+            .method(http::Method::POST)
+            .uri(AUTH_PATH)
+            .header(http::header::HOST, AUTH_HOST)
+            .header(header::AUTH, "test_password")
+            .body(())
+            .unwrap();
+
+        let result = validate_auth_request(req, "test_password");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_auth_request_wrong_method() {
+        // Test request with wrong method
+        let req = http::Request::builder()
+            .method(http::Method::GET)
+            .uri(AUTH_PATH)
+            .header(http::header::HOST, AUTH_HOST)
+            .header(header::AUTH, "test_password")
+            .body(())
+            .unwrap();
+
+        let result = validate_auth_request(req, "test_password");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_auth_request_wrong_path() {
+        // Test request with wrong path
+        let req = http::Request::builder()
+            .method(http::Method::POST)
+            .uri("/wrong")
+            .header(http::header::HOST, AUTH_HOST)
+            .header(header::AUTH, "test_password")
+            .body(())
+            .unwrap();
+
+        let result = validate_auth_request(req, "test_password");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_auth_request_wrong_host() {
+        // Test request with wrong host
+        let req = http::Request::builder()
+            .method(http::Method::POST)
+            .uri(AUTH_PATH)
+            .header(http::header::HOST, "wrong.com")
+            .header(header::AUTH, "test_password")
+            .body(())
+            .unwrap();
+
+        let result = validate_auth_request(req, "test_password");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_auth_request_missing_header() {
+        // Test request without auth header
+        let req = http::Request::builder()
+            .method(http::Method::POST)
+            .uri(AUTH_PATH)
+            .header(http::header::HOST, AUTH_HOST)
+            .body(())
+            .unwrap();
+
+        let result = validate_auth_request(req, "test_password");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_auth_request_wrong_password() {
+        // Test request with wrong password
+        let req = http::Request::builder()
+            .method(http::Method::POST)
+            .uri(AUTH_PATH)
+            .header(http::header::HOST, AUTH_HOST)
+            .header(header::AUTH, "wrong_password")
+            .body(())
+            .unwrap();
+
+        let result = validate_auth_request(req, "test_password");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_auth_request_without_host() {
+        // Test request without Host header (should still pass validation since Host is optional)
+        let req = http::Request::builder()
+            .method(http::Method::POST)
+            .uri(AUTH_PATH)
+            .header(header::AUTH, "test_password")
+            .body(())
+            .unwrap();
+
+        let result = validate_auth_request(req, "test_password");
+        // Should pass because Host header check is optional
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_auth_request_with_empty_password() {
+        // Test with empty password - should succeed
+        let req = http::Request::builder()
+            .method(http::Method::POST)
+            .uri(AUTH_PATH)
+            .header(http::header::HOST, AUTH_HOST)
+            .header(header::AUTH, "")
+            .body(())
+            .unwrap();
+
+        let result = validate_auth_request(req, "");
+        assert!(result.is_ok());
+
+        // Test with wrong password - should fail
+        let req = http::Request::builder()
+            .method(http::Method::POST)
+            .uri(AUTH_PATH)
+            .header(http::header::HOST, AUTH_HOST)
+            .header(header::AUTH, "")
+            .body(())
+            .unwrap();
+
+        let result = validate_auth_request(req, "test_password");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_varint_boundary_values() {
+        // Test values at each encoding boundary
+        let boundary_tests = vec![
+            (0, 1),           // Minimum, single byte
+            (63, 1),          // Max single byte
+            (64, 2),          // Min two-byte
+            (16383, 2),       // Max two-byte
+            (16384, 4),       // Min four-byte
+            (1073741823, 4),  // Max four-byte
+            (1073741824, 8),  // Min eight-byte
+        ];
+
+        for (value, expected_bytes) in boundary_tests {
+            let encoded = encode_varint(value).unwrap();
+            assert_eq!(
+                encoded.len(),
+                expected_bytes,
+                "Value {} should encode to {} bytes",
+                value,
+                expected_bytes
+            );
+        }
+    }
+
+    #[test]
+    fn test_varint_max_value() {
+        // Test maximum encodable value (2^62 - 1)
+        let max_value = (1u64 << 62) - 1;
+        let encoded = encode_varint(max_value).unwrap();
+        assert_eq!(encoded.len(), 8);
+        let (decoded, _) = test_decode_varint(&encoded).unwrap();
+        assert_eq!(decoded, max_value);
+    }
+
+    #[test]
+    fn test_varint_too_large() {
+        // Value exceeding 62 bits should fail
+        let result = encode_varint(1u64 << 62);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_generate_ascii_string_properties() {
+        // Test various properties of generated ASCII strings
+        for _ in 0..50 {
+            let s = generate_ascii_string();
+            // Length should be in [1, 79]
+            assert!(s.len() >= 1 && s.len() < 80);
+            // Should be valid ASCII
+            assert!(s.is_ascii());
+            // Should contain only printable ASCII characters
+            assert!(s.chars().all(|c| c >= ' ' && c <= '~'));
+        }
+    }
+
+    #[test]
+    fn test_generate_ascii_string_uniqueness() {
+        // Generate multiple strings and verify they're likely unique
+        let mut strings = std::collections::HashSet::new();
+        for _ in 0..100 {
+            let s = generate_ascii_string();
+            strings.insert(s);
+        }
+        // With 100 random strings of length 1-79, extremely unlikely to have duplicates
+        assert!(strings.len() > 95, "Should have mostly unique strings");
+    }
 }

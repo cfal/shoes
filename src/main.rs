@@ -11,6 +11,7 @@ mod copy_session_messages;
 mod crypto;
 mod http_handler;
 mod hysteria2_client;
+mod hysteria2_protocol;
 mod hysteria2_server;
 mod option_util;
 mod port_forward_handler;

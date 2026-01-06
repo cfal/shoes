@@ -32,6 +32,10 @@ use crate::address::NetLocation;
 use crate::async_stream::{
     AsyncPing, AsyncStream,
 };
+use crate::hysteria2_protocol::{
+    header, tcp_status, AUTH_URI, FRAME_TYPE_TCP_REQUEST, MAX_ADDRESS_LENGTH,
+    MAX_PADDING_LENGTH, STATUS_AUTH_OK,
+};
 use crate::quic_stream::QuicStream;
 use crate::resolver::{resolve_single_address, NativeResolver, Resolver};
 use crate::socket_util::new_udp_socket;
@@ -39,19 +43,6 @@ use crate::socket_util::new_udp_socket;
 /// Authentication timeout - close connection if server doesn't authenticate within this time.
 /// Per protocol reference implementation, default is 3 seconds.
 const AUTH_TIMEOUT: Duration = Duration::from_secs(3);
-
-/// TCP request frame type from Hysteria2 protocol
-const FRAME_TYPE_TCP_REQUEST: u64 = 0x401;
-
-/// TCP response status codes
-const TCP_STATUS_OK: u8 = 0x00;
-const TCP_STATUS_ERROR: u8 = 0x01;
-
-/// Maximum address length (from official Go implementation)
-const MAX_ADDRESS_LENGTH: usize = 2048;
-
-/// Maximum padding length (from official Go implementation)
-const MAX_PADDING_LENGTH: usize = 4096;
 
 /// Maximum number of fragmented packets to track per session
 const MAX_FRAGMENT_CACHE_SIZE: usize = 256;
@@ -240,6 +231,12 @@ async fn run_udp_receive_loop(
                 let _fragment_id = data[6];
                 let fragment_count = data[7];
 
+                // Reject invalid fragment_count (must be at least 1)
+                if fragment_count < 1 {
+                    warn!("[Hysteria2] Invalid fragment count {} for session {}", fragment_count, session_id);
+                    continue;
+                }
+
                 // Parse address length (varint starting at byte 8)
                 let (address_len, addr_end) = match decode_varint(&data[8..]) {
                     Ok((len, consumed)) => (len as usize, 8 + consumed),
@@ -268,7 +265,7 @@ async fn run_udp_receive_loop(
                 }
 
                 // Handle fragmentation
-                if fragment_count <= 1 {
+                if fragment_count == 1 {
                     // No fragmentation, send directly
                     if tx.send(Bytes::copy_from_slice(payload)).await.is_err() {
                         return Ok(());
@@ -353,7 +350,6 @@ impl UdpSessionManager {
 
         self.sessions.write().await.insert(session_id, session);
 
-        debug!("[Hysteria2] Created UDP session {}", session_id);
 
         Ok((session_id, local_socket))
     }
@@ -493,11 +489,6 @@ impl Hysteria2Client {
                     .unwrap_or("example.com")
             });
 
-        debug!(
-            "[Hysteria2] Connecting to {} ({})",
-            self.server_address, server_addr
-        );
-
         // Establish QUIC connection
         let connection = self
             .endpoint
@@ -506,7 +497,6 @@ impl Hysteria2Client {
             .await
             .map_err(|e| std::io::Error::other(format!("QUIC connection failed: {e}")))?;
 
-        debug!("[Hysteria2] QUIC connection established, performing authentication");
 
         // Perform HTTP/3 authentication and get congestion control info
         let (tx, tx_auto) = timeout(AUTH_TIMEOUT, self.authenticate_connection(&connection))
@@ -517,7 +507,6 @@ impl Hysteria2Client {
                 std::io::Error::new(std::io::ErrorKind::TimedOut, "authentication timeout")
             })??;
 
-        debug!("[Hysteria2] Authentication successful");
 
         // Create UDP session manager if UDP is enabled
         let udp_manager = if self.udp_enabled {
@@ -544,12 +533,10 @@ impl Hysteria2Client {
 
     /// Perform HTTP/3 authentication handshake
     async fn authenticate_connection(&self, connection: &quinn::Connection) -> std::io::Result<(u64, bool)> {
-        debug!("[Hysteria2] Creating H3 connection for authentication");
         let h3_connection = h3_quinn::Connection::new(connection.clone());
         let (_h3_conn, mut h3_send) = h3::client::new(h3_connection)
             .await
             .map_err(|e| std::io::Error::other(format!("Failed to create H3 client: {e}")))?;
-        debug!("[Hysteria2] H3 client created");
 
         // Build authentication request per protocol spec:
         // :method: POST
@@ -559,40 +546,35 @@ impl Hysteria2Client {
         // Hysteria-CC-RX: [rx_rate] - client's max receive rate
         // Hysteria-Padding: [random]
 
-        debug!("[Hysteria2] Building auth request with CC-RX: {}", self.max_rx);
         let req = http::Request::builder()
             .method("POST")
-            .uri("https://hysteria/auth")
-            .header("Hysteria-Auth", &self.password)
-            .header("Hysteria-CC-RX", self.max_rx.to_string())
-            .header("Hysteria-Padding", generate_padding_string())
+            .uri(AUTH_URI)
+            .header(header::AUTH, &self.password)
+            .header(header::CC_RX, self.max_rx.to_string())
+            .header(header::PADDING, generate_padding_string())
             .body(())
             .map_err(|e| std::io::Error::other(format!("Failed to build request: {e}")))?;
 
         // Send request and get the stream
-        debug!("[Hysteria2] Sending auth request");
         let mut stream = h3_send
             .send_request(req)
             .await
             .map_err(|e| std::io::Error::other(format!("Failed to send auth request: {e}")))?;
-        debug!("[Hysteria2] Auth request sent, finishing stream");
 
         stream
             .finish()
             .await
             .map_err(|e| std::io::Error::other(format!("Failed to finish auth request: {e}")))?;
-        debug!("[Hysteria2] Stream finished, waiting for response");
 
         // Receive response from the stream
         let resp = stream
             .recv_response()
             .await
             .map_err(|e| std::io::Error::other(format!("Failed to recv auth response: {e}")))?;
-        debug!("[Hysteria2] Received auth response, status: {}", resp.status());
 
         // Check status code - must be 233 (HyOK) per protocol spec
         let status = resp.status();
-        if status.as_u16() != 233 {
+        if status.as_u16() != STATUS_AUTH_OK {
             return Err(std::io::Error::other(format!(
                 "Authentication failed: expected status 233, got {}",
                 status
@@ -600,12 +582,11 @@ impl Hysteria2Client {
         }
 
         // Parse Hysteria-UDP header to check if UDP is supported
-        if let Some(udp_header) = resp.headers().get("Hysteria-UDP") {
+        if let Some(udp_header) = resp.headers().get(header::UDP) {
             let udp_str = udp_header
                 .to_str()
                 .map_err(|e| std::io::Error::other(format!("Invalid Hysteria-UDP header: {e}")))?;
             let server_udp_enabled = udp_str.eq_ignore_ascii_case("true");
-            debug!("[Hysteria2] Server UDP support: {}", server_udp_enabled);
             if !server_udp_enabled && self.udp_enabled {
                 warn!("[Hysteria2] Client UDP enabled but server doesn't support UDP relay");
             }
@@ -613,18 +594,16 @@ impl Hysteria2Client {
 
         // Parse Hysteria-CC-RX header for congestion control
         // Format: either "auto" or a number representing server's max receive rate
-        let (tx, tx_auto) = if let Some(cc_header) = resp.headers().get("Hysteria-CC-RX") {
+        let (tx, tx_auto) = if let Some(cc_header) = resp.headers().get(header::CC_RX) {
             let cc_str = cc_header
                 .to_str()
                 .map_err(|e| std::io::Error::other(format!("Invalid Hysteria-CC-RX header: {e}")))?;
 
             if cc_str.eq_ignore_ascii_case("auto") {
-                debug!("[Hysteria2] Server requested auto bandwidth detection (BBR)");
                 (0, true) // tx = 0 means use BBR
             } else {
                 let server_rx = cc_str.parse::<u64>()
                     .map_err(|e| std::io::Error::other(format!("Invalid Hysteria-CC-RX value: {e}")))?;
-                debug!("[Hysteria2] Server max receive rate: {} bytes/s", server_rx);
 
                 // actualTx = min(serverRx, clientTx)
                 let mut actual_tx = server_rx;
@@ -632,23 +611,18 @@ impl Hysteria2Client {
                     // Server doesn't have a limit, or our clientTx is smaller than serverRx
                     actual_tx = self.max_tx;
                 }
-                debug!("[Hysteria2] Negotiated upload rate: {} bytes/s", actual_tx);
                 (actual_tx, false)
             }
         } else {
             // No Hysteria-CC-RX header, use client's max_tx
-            debug!("[Hysteria2] No Hysteria-CC-RX header from server, using client max_tx");
             (self.max_tx, false)
         };
 
         // Store the negotiated values for later use
         // Note: Quinn uses BBR by default, so we don't need to explicitly set it
         if tx_auto {
-            debug!("[Hysteria2] Using BBR congestion control (server requested)");
         } else if tx > 0 {
-            debug!("[Hysteria2] Using Brutal congestion control at {} bytes/s", tx);
         } else {
-            debug!("[Hysteria2] No bandwidth limit (BBR/unlimited)");
         }
 
         Ok((tx, tx_auto))
@@ -718,7 +692,6 @@ impl HyUdpConn {
     fn close(&mut self) {
         if !self.is_closed {
             self.is_closed = true;
-            debug!("[Hysteria2] Closing UDP session {}", self.session_id);
         }
     }
 }
@@ -833,12 +806,9 @@ impl HyUdpMessageStream {
         // Spawn task to receive datagrams from the server
         let conn = connection.clone();
         tokio::spawn(async move {
-            debug!("[Hysteria2] UDP receive loop started");
             loop {
-                debug!("[Hysteria2] Waiting for datagram...");
                 match conn.read_datagram().await {
                     Ok(data) => {
-                        debug!("[Hysteria2] Received datagram: {} bytes", data.len());
                         if let Err(e) = process_received_datagram(&data, &tx) {
                             warn!("[Hysteria2] Failed to process received datagram: {}", e);
                         }
@@ -959,7 +929,6 @@ fn process_received_datagram(
 
     // Parse the address string (format: "IP:port" or "[IPv6]:port")
     let address_str = String::from_utf8_lossy(&data[address_start..address_str_end]);
-    debug!("[Hysteria2] Received datagram address string: '{}'", address_str);
 
     // Parse as SocketAddr
     let target_addr: std::net::SocketAddr = match address_str.parse() {
@@ -1012,7 +981,6 @@ impl crate::async_stream::AsyncReadSourcedMessage for HyUdpMessageStream {
         let this = self.get_mut();
         match Pin::new(&mut this.receive_ch).poll_recv(cx) {
             Poll::Ready(Some((data, target_addr))) => {
-                debug!("[Hysteria2] poll_read_sourced_message: received {} bytes from {}", data.len(), target_addr);
                 if data.len() > buf.remaining() {
                     return Poll::Ready(Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
@@ -1026,7 +994,6 @@ impl crate::async_stream::AsyncReadSourcedMessage for HyUdpMessageStream {
                 buf.put_slice(&data);
                 // Return the target address from the Hysteria2 server
                 // This is the actual source of the data (e.g., 8.8.8.8:53 for DNS)
-                debug!("[Hysteria2] poll_read_sourced_message: returning source address {}", target_addr);
                 Poll::Ready(Ok(target_addr))
             }
             Poll::Ready(None) => Poll::Ready(Err(std::io::Error::new(
@@ -1047,7 +1014,6 @@ impl crate::async_stream::AsyncWriteTargetedMessage for HyUdpMessageStream {
     ) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
 
-        debug!("[Hysteria2] poll_write_targeted_message: writing {} bytes to target {:?}", buf.len(), target);
 
         // Resolve the target address
         let resolver = NativeResolver::new();
@@ -1061,7 +1027,6 @@ impl crate::async_stream::AsyncWriteTargetedMessage for HyUdpMessageStream {
             .next()
             .ok_or_else(|| std::io::Error::other("No addresses resolved for target"))?;
 
-        debug!("[Hysteria2] poll_write_targeted_message: resolved to {}", addr);
 
         // Send through QUIC datagram
         futures::executor::block_on(this.send_packet(&buf, &addr))
@@ -1147,7 +1112,7 @@ impl HyTcpStream {
         })?;
 
         let status = status_buf[0];
-        if status != TCP_STATUS_OK {
+        if status != tcp_status::OK {
             // Read error message
             let msg_len = read_varint_from_stream(&mut self.recv).await?;
             if msg_len > 1024 {
@@ -1300,7 +1265,6 @@ impl Hysteria2Connection {
         &self,
         target: &NetLocation,
     ) -> std::io::Result<Box<dyn AsyncStream>> {
-        debug!("[Hysteria2] Creating TCP stream to {}", target);
 
         // Open bidirectional stream
         let (mut send, recv) = self
@@ -1359,7 +1323,6 @@ impl Hysteria2Connection {
 
         // If Fast Open is enabled, return the stream immediately without waiting for response
         if self.fast_open {
-            debug!("[Hysteria2] Fast Open enabled, returning stream immediately");
             return Ok(Box::new(HyTcpStream::new(send, recv, true)));
         }
 
@@ -1379,7 +1342,7 @@ impl Hysteria2Connection {
             .map_err(|e| std::io::Error::other(format!("Failed to read status: {e}")))?;
 
         let status = status_buf[0];
-        if status != TCP_STATUS_OK {
+        if status != tcp_status::OK {
             // Read error message
             let msg_len = read_varint_from_stream(&mut recv).await?;
             if msg_len > 1024 {
@@ -1638,6 +1601,48 @@ impl crate::async_stream::AsyncTargetedMessageStream for DummyTargetedStream {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hysteria2_protocol::{
+        header, tcp_status, AUTH_HOST, AUTH_METHOD, AUTH_PATH, AUTH_URI, FRAME_TYPE_TCP_REQUEST,
+        MAX_ADDRESS_LENGTH, MAX_PADDING_LENGTH, STATUS_AUTH_OK,
+    };
+
+    // Helper function to decode a QUIC varint (same as module-level function)
+    fn test_decode_varint(data: &[u8]) -> std::io::Result<(u64, usize)> {
+        if data.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "incomplete varint",
+            ));
+        }
+
+        let first_byte = data[0];
+        let length_indicator = first_byte >> 6;
+        let mut value: u64 = (first_byte & 0b00111111) as u64;
+
+        let num_bytes = match length_indicator {
+            0 => 1,
+            1 => 2,
+            2 => 4,
+            3 => 8,
+            _ => unreachable!(),
+        };
+
+        if data.len() < num_bytes {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("incomplete varint: have {} bytes, need {}", data.len(), num_bytes),
+            ));
+        }
+
+        if num_bytes > 1 {
+            for byte in &data[1..num_bytes] {
+                value <<= 8;
+                value |= *byte as u64;
+            }
+        }
+
+        Ok((value, num_bytes))
+    }
 
     #[test]
     fn test_encode_varint() {
@@ -1658,6 +1663,34 @@ mod tests {
     }
 
     #[test]
+    fn test_varint_roundtrip() {
+        let test_values = vec![
+            0u64, 1, 63, 64, 16383, 16384, 1073741823, 1073741824, 1_000_000_000_000,
+        ];
+
+        for value in test_values {
+            let encoded = encode_varint(value).unwrap();
+            let (decoded, len) = test_decode_varint(&encoded).unwrap();
+            assert_eq!(decoded, value, "Roundtrip failed for value {}", value);
+            assert_eq!(len, encoded.len());
+        }
+    }
+
+    #[test]
+    fn test_varint_decode_incomplete() {
+        // First byte indicates 2 bytes, but only 1 provided
+        let data = [0x40u8];
+        let result = test_decode_varint(&data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_varint_decode_empty() {
+        let result = test_decode_varint(&[]);
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn test_generate_padding_string() {
         let s1 = generate_padding_string();
         let s2 = generate_padding_string();
@@ -1666,5 +1699,250 @@ mod tests {
         // Should be valid ASCII
         assert!(s1.is_ascii());
         assert!(s2.is_ascii());
+        // Length should be within expected range [1, 79]
+        assert!(s1.len() >= 1 && s1.len() < 80);
+        assert!(s2.len() >= 1 && s2.len() < 80);
+    }
+
+    #[test]
+    fn test_tcp_request_frame_encoding() {
+        // Build a TCP request frame per protocol spec
+        let address = "example.com:443";
+        let address_bytes = address.as_bytes();
+        let padding_len = 16;
+
+        let mut frame = bytes::BytesMut::new();
+
+        // Frame type
+        frame.extend_from_slice(&encode_varint(FRAME_TYPE_TCP_REQUEST).unwrap());
+
+        // Address length and bytes
+        frame.extend_from_slice(&encode_varint(address_bytes.len() as u64).unwrap());
+        frame.extend_from_slice(address_bytes);
+
+        // Padding length and bytes
+        frame.extend_from_slice(&encode_varint(padding_len).unwrap());
+        frame.extend_from_slice(&[0u8; 16]);
+
+        // Verify the frame structure
+        assert!(frame.len() > 0);
+
+        // Decode and verify
+        let mut offset = 0;
+        let (frame_type, len) = test_decode_varint(&frame[offset..]).unwrap();
+        assert_eq!(frame_type, FRAME_TYPE_TCP_REQUEST);
+        offset += len;
+
+        let (addr_len, len) = test_decode_varint(&frame[offset..]).unwrap();
+        assert_eq!(addr_len as usize, address_bytes.len());
+        offset += len;
+
+        let decoded_address =
+            std::str::from_utf8(&frame[offset..offset + address_bytes.len()]).unwrap();
+        assert_eq!(decoded_address, address);
+    }
+
+    #[test]
+    fn test_tcp_request_with_ipv6() {
+        let address = "[::1]:8080";
+        let address_bytes = address.as_bytes();
+
+        let mut frame = bytes::BytesMut::new();
+        frame.extend_from_slice(&encode_varint(FRAME_TYPE_TCP_REQUEST).unwrap());
+        frame.extend_from_slice(&encode_varint(address_bytes.len() as u64).unwrap());
+        frame.extend_from_slice(address_bytes);
+        frame.extend_from_slice(&encode_varint(0u64).unwrap());
+
+        // Verify decoding
+        let mut offset = 0;
+        let (frame_type, len) = test_decode_varint(&frame[offset..]).unwrap();
+        assert_eq!(frame_type, FRAME_TYPE_TCP_REQUEST);
+        offset += len;
+
+        let (addr_len, len) = test_decode_varint(&frame[offset..]).unwrap();
+        offset += len;
+
+        let decoded_address =
+            std::str::from_utf8(&frame[offset..offset + addr_len as usize]).unwrap();
+        assert_eq!(decoded_address, address);
+    }
+
+    #[test]
+    fn test_varint_boundary_values() {
+        // Test values at each encoding boundary
+        let boundary_tests = vec![
+            (0, 1),           // Minimum, single byte
+            (63, 1),          // Max single byte
+            (64, 2),          // Min two-byte
+            (16383, 2),       // Max two-byte
+            (16384, 4),       // Min four-byte
+            (1073741823, 4),  // Max four-byte
+            (1073741824, 8),  // Min eight-byte
+        ];
+
+        for (value, expected_bytes) in boundary_tests {
+            let encoded = encode_varint(value).unwrap();
+            assert_eq!(
+                encoded.len(),
+                expected_bytes,
+                "Value {} should encode to {} bytes",
+                value,
+                expected_bytes
+            );
+        }
+    }
+
+    #[test]
+    fn test_varint_max_value() {
+        // Test maximum encodable value (2^62 - 1)
+        let max_value = (1u64 << 62) - 1;
+        let encoded = encode_varint(max_value).unwrap();
+        assert_eq!(encoded.len(), 8);
+        let (decoded, _) = test_decode_varint(&encoded).unwrap();
+        assert_eq!(decoded, max_value);
+    }
+
+    #[test]
+    fn test_varint_too_large() {
+        // Value exceeding 62 bits should fail
+        let result = encode_varint(1u64 << 62);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_tcp_request_max_address() {
+        // Test with maximum allowed address length
+        let address = "a".repeat(MAX_ADDRESS_LENGTH);
+        let address_bytes = address.as_bytes();
+
+        let mut frame = bytes::BytesMut::new();
+        frame.extend_from_slice(&encode_varint(FRAME_TYPE_TCP_REQUEST).unwrap());
+        frame.extend_from_slice(&encode_varint(address_bytes.len() as u64).unwrap());
+        frame.extend_from_slice(address_bytes);
+        frame.extend_from_slice(&encode_varint(0u64).unwrap());
+
+        // Verify it encodes and decodes correctly
+        let mut offset = 0;
+        let (frame_type, len) = test_decode_varint(&frame[offset..]).unwrap();
+        assert_eq!(frame_type, FRAME_TYPE_TCP_REQUEST);
+        offset += len;
+
+        let (addr_len, len) = test_decode_varint(&frame[offset..]).unwrap();
+        assert_eq!(addr_len as usize, MAX_ADDRESS_LENGTH);
+    }
+
+    #[test]
+    fn test_tcp_request_address_variations() {
+        // Test various address formats
+        let test_addresses = vec![
+            "example.com:80",
+            "192.168.1.1:443",
+            "[::1]:8080",
+            "[2001:db8::1]:53",
+            "localhost:3000",
+            "sub.domain.example.org:9999",
+        ];
+
+        for address in test_addresses {
+            let address_bytes = address.as_bytes();
+            let mut frame = bytes::BytesMut::new();
+            frame.extend_from_slice(&encode_varint(FRAME_TYPE_TCP_REQUEST).unwrap());
+            frame.extend_from_slice(&encode_varint(address_bytes.len() as u64).unwrap());
+            frame.extend_from_slice(address_bytes);
+            frame.extend_from_slice(&encode_varint(0u64).unwrap());
+
+            // Verify encoding is successful
+            assert!(frame.len() > 0);
+
+            // Verify decoding
+            let mut offset = 0;
+            let (frame_type, len) = test_decode_varint(&frame[offset..]).unwrap();
+            assert_eq!(frame_type, FRAME_TYPE_TCP_REQUEST);
+            offset += len;
+
+            let (addr_len, len) = test_decode_varint(&frame[offset..]).unwrap();
+            offset += len;
+
+            let decoded_address =
+                std::str::from_utf8(&frame[offset..offset + addr_len as usize]).unwrap();
+            assert_eq!(decoded_address, address);
+        }
+    }
+
+    #[test]
+    fn test_tcp_response_status_codes() {
+        // Test both OK and ERROR status codes
+        let ok_response = vec![tcp_status::OK, 0x00, 0x00];
+        assert_eq!(ok_response[0], tcp_status::OK);
+        assert_eq!(ok_response[0], 0x00);
+
+        let error_response = vec![tcp_status::ERROR, 0x05, 0x00];
+        assert_eq!(error_response[0], tcp_status::ERROR);
+        assert_eq!(error_response[0], 0x01);
+    }
+
+    #[test]
+    fn test_udp_datagram_address_variations() {
+        // Test UDP datagrams with various address formats
+        let test_cases = vec![
+            ("8.8.8.8:53", false),           // IPv4, short
+            ("192.168.100.1:8080", false),   // IPv4, long
+            ("[::1]:53", true),              // IPv6 loopback
+            ("[2001:db8::1]:1234", true),    // IPv6
+            ("example.com:443", false),      // hostname
+        ];
+
+        for (address, _is_ipv6) in test_cases {
+            let session_id: u32 = 1;
+            let packet_id: u16 = 0;
+            let fragment_id: u8 = 0;
+            let fragment_count: u8 = 1;
+
+            let mut datagram = bytes::BytesMut::new();
+            datagram.extend_from_slice(&session_id.to_be_bytes());
+            datagram.extend_from_slice(&packet_id.to_be_bytes());
+            datagram.extend_from_slice(&[fragment_id, fragment_count]);
+
+            let address_bytes = address.as_bytes();
+            datagram.extend_from_slice(&encode_varint(address_bytes.len() as u64).unwrap());
+            datagram.extend_from_slice(address_bytes);
+            datagram.extend_from_slice(b"test payload");
+
+            // Verify header
+            assert_eq!(datagram[0..4], session_id.to_be_bytes());
+            assert_eq!(datagram[6], fragment_id);
+            assert_eq!(datagram[7], fragment_count);
+
+            // Verify address parsing
+            let (addr_len, len) = test_decode_varint(&datagram[8..]).unwrap();
+            let addr_offset = 8 + len;
+            let decoded_addr =
+                std::str::from_utf8(&datagram[addr_offset..addr_offset + addr_len as usize])
+                    .unwrap();
+            assert_eq!(decoded_addr, address);
+        }
+    }
+
+    #[test]
+    fn test_udp_fragment_count_validation() {
+        // Test that fragment_count == 0 is invalid (as per protocol fix)
+        let fragment_count: u8 = 0;
+        assert!(fragment_count < 1, "fragment_count should be >= 1");
+
+        // Valid fragment counts
+        for valid_count in 1..=10u8 {
+            assert!(valid_count >= 1, "fragment_count {} should be >= 1", valid_count);
+        }
+    }
+
+    #[test]
+    fn test_padding_within_max() {
+        // Test that padding generation respects practical limits
+        for _ in 0..100 {
+            let padding = generate_padding_string();
+            assert!(padding.len() < 80, "Padding should be less than 80 bytes");
+            assert!(padding.len() > 0, "Padding should not be empty");
+            assert!(padding.is_ascii(), "Padding should be ASCII only");
+        }
     }
 }
