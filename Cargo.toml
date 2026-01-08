@@ -1,6 +1,6 @@
 [package]
 name = "shoes"
-version = "0.2.3"
+version = "0.2.5"
 edition = "2024"
 license = "MIT"
 description = "A multi-protocol proxy server."
