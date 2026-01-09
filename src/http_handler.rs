@@ -8,6 +8,7 @@ use tokio::io::AsyncWriteExt;
 use crate::address::{Address, NetLocation};
 use crate::async_stream::AsyncStream;
 use crate::client_proxy_selector::ClientProxySelector;
+use crate::resolver::{resolve_single_address, Resolver};
 use crate::stream_reader::StreamReader;
 use crate::tcp::tcp_handler::{
     TcpClientHandler, TcpClientSetupResult, TcpServerHandler, TcpServerSetupResult,
@@ -320,16 +321,31 @@ fn create_http_auth_header_line(username: &str, password: &str) -> String {
     )
 }
 
-#[derive(Debug)]
 pub struct HttpTcpClientHandler {
     auth_header: Option<String>,
+    resolver: Option<Arc<dyn Resolver>>,
+}
+
+impl std::fmt::Debug for HttpTcpClientHandler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpTcpClientHandler")
+            .field("auth_header", &self.auth_header.as_ref().map(|_| "[redacted]"))
+            .field("resolver", &self.resolver.is_some())
+            .finish()
+    }
 }
 
 impl HttpTcpClientHandler {
-    pub fn new(auth_credentials: Option<(String, String)>) -> Self {
+    pub fn new(
+        auth_credentials: Option<(String, String)>,
+        resolver: Option<Arc<dyn Resolver>>,
+    ) -> Self {
         let auth_header = auth_credentials
             .map(|(username, password)| create_http_auth_header_line(&username, &password));
-        Self { auth_header }
+        Self {
+            auth_header,
+            resolver,
+        }
     }
 }
 
@@ -340,16 +356,48 @@ impl TcpClientHandler for HttpTcpClientHandler {
         mut client_stream: Box<dyn AsyncStream>,
         remote_location: NetLocation,
     ) -> std::io::Result<TcpClientSetupResult> {
-        // TODO: clean this up
-        let mut connect_str = match remote_location.address() {
+        // Resolve hostname to IP if resolver is configured.
+        // Bypasses DNS issues when the upstream proxy has DNS problems.
+        let resolved_location = if let Some(ref resolver) = self.resolver {
+            if remote_location.address().hostname().is_some() {
+                let socket_addr = resolve_single_address(resolver, &remote_location).await?;
+                debug!(
+                    "HTTP CONNECT resolved {} -> {}",
+                    remote_location, socket_addr
+                );
+                let address = match socket_addr.ip() {
+                    std::net::IpAddr::V4(ip) => Address::Ipv4(ip),
+                    std::net::IpAddr::V6(ip) => Address::Ipv6(ip),
+                };
+                NetLocation::new(address, socket_addr.port())
+            } else {
+                remote_location
+            }
+        } else {
+            remote_location
+        };
+
+        let mut connect_str = match resolved_location.address() {
             Address::Ipv6(addr) => {
-                format!("CONNECT {}:{} HTTP/1.1\r\n", addr, remote_location.port())
+                format!(
+                    "CONNECT [{}]:{} HTTP/1.1\r\n",
+                    addr,
+                    resolved_location.port()
+                )
             }
             Address::Ipv4(addr) => {
-                format!("CONNECT {}:{} HTTP/1.1\r\n", addr, remote_location.port())
+                format!(
+                    "CONNECT {}:{} HTTP/1.1\r\n",
+                    addr,
+                    resolved_location.port()
+                )
             }
             Address::Hostname(d) => {
-                format!("CONNECT {}:{} HTTP/1.1\r\n", d, remote_location.port())
+                format!(
+                    "CONNECT {}:{} HTTP/1.1\r\n",
+                    d,
+                    resolved_location.port()
+                )
             }
         };
 

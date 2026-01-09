@@ -3,6 +3,8 @@
 //! Handles protocol setup for proxy connections on existing streams.
 //! Created from the protocol-related fields of a ClientConfig.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use log::debug;
 
@@ -11,6 +13,7 @@ use super::tcp_client_handler_factory::create_tcp_client_handler;
 use crate::address::NetLocation;
 use crate::async_stream::{AsyncMessageStream, AsyncStream};
 use crate::config::ClientConfig;
+use crate::resolver::Resolver;
 use crate::tcp::tcp_handler::{TcpClientHandler, TcpClientSetupResult};
 
 /// Implementation of ProxyConnector for proxy protocol setup.
@@ -31,7 +34,7 @@ impl ProxyConnectorImpl {
     /// Create a ProxyConnector from a ClientConfig's protocol-related fields.
     ///
     /// Returns None for direct protocol (direct has no ProxyConnector).
-    pub fn from_config(config: ClientConfig) -> Option<Self> {
+    pub fn from_config(config: ClientConfig, resolver: Arc<dyn Resolver>) -> Option<Self> {
         if config.protocol.is_direct() {
             return None;
         }
@@ -40,7 +43,7 @@ impl ProxyConnectorImpl {
 
         Some(Self {
             location: config.address,
-            client_handler: create_tcp_client_handler(config.protocol, default_sni_hostname),
+            client_handler: create_tcp_client_handler(config.protocol, default_sni_hostname, resolver),
         })
     }
 
@@ -97,13 +100,18 @@ impl ProxyConnector for ProxyConnectorImpl {
 mod tests {
     use super::*;
     use crate::config::ClientProxyConfig;
+    use crate::resolver::NativeResolver;
     use std::net::{IpAddr, Ipv4Addr};
+
+    fn mock_resolver() -> Arc<dyn Resolver> {
+        Arc::new(NativeResolver::new())
+    }
 
     #[test]
     fn test_from_direct_config_returns_none() {
         let config = ClientConfig::default();
         assert!(config.protocol.is_direct());
-        assert!(ProxyConnectorImpl::from_config(config).is_none());
+        assert!(ProxyConnectorImpl::from_config(config, mock_resolver()).is_none());
     }
 
     #[test]
@@ -116,7 +124,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let connector = ProxyConnectorImpl::from_config(config);
+        let connector = ProxyConnectorImpl::from_config(config, mock_resolver());
         assert!(connector.is_some());
         let connector = connector.unwrap();
         assert_eq!(connector.proxy_location().port(), 1080);
