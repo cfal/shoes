@@ -302,6 +302,7 @@ mod tests {
                     protocol: ClientProxyConfig::Http {
                         username: None,
                         password: None,
+                        resolve_hostname: false,
                     },
                     transport: Transport::Tcp,
                     tcp_settings: None,

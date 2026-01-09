@@ -597,8 +597,10 @@ mod tests {
 
     /// Create a mock ClientChainGroup for testing (single chain with direct connector)
     fn mock_chain_group() -> ClientChainGroup {
+        use crate::resolver::NativeResolver;
         use crate::tcp::chain_builder::build_client_chain_group;
-        build_client_chain_group(crate::option_util::NoneOrSome::None)
+        let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+        build_client_chain_group(crate::option_util::NoneOrSome::None, resolver)
     }
 
     /// Helper to create an allow rule (for rule matching tests)

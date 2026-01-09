@@ -11,6 +11,7 @@ use crate::config::{
     WebsocketClientConfig,
 };
 use crate::http_handler::HttpTcpClientHandler;
+use crate::resolver::Resolver;
 use crate::naiveproxy::NaiveProxyTcpClientHandler;
 use crate::port_forward_handler::PortForwardClientHandler;
 use crate::rustls_config_util::create_client_config;
@@ -40,14 +41,27 @@ fn create_auth_credentials(
 pub fn create_tcp_client_handler(
     client_proxy_config: ClientProxyConfig,
     default_sni_hostname: Option<String>,
+    resolver: Arc<dyn Resolver>,
 ) -> Box<dyn TcpClientHandler> {
     match client_proxy_config {
         ClientProxyConfig::Direct => {
             panic!("Tried to create a direct tcp client handler");
         }
-        ClientProxyConfig::Http { username, password } => Box::new(HttpTcpClientHandler::new(
-            create_auth_credentials(username, password),
-        )),
+        ClientProxyConfig::Http {
+            username,
+            password,
+            resolve_hostname,
+        } => {
+            let http_resolver = if resolve_hostname {
+                Some(resolver.clone())
+            } else {
+                None
+            };
+            Box::new(HttpTcpClientHandler::new(
+                create_auth_credentials(username, password),
+                http_resolver,
+            ))
+        }
         ClientProxyConfig::Socks { username, password } => Box::new(SocksTcpClientHandler::new(
             create_auth_credentials(username, password),
         )),
@@ -151,7 +165,7 @@ pub fn create_tcp_client_handler(
                     *udp_enabled,
                 ))
             } else {
-                let handler = create_tcp_client_handler(*protocol, None);
+                let handler = create_tcp_client_handler(*protocol, None, resolver.clone());
 
                 Box::new(TlsClientHandler::new(
                     client_config,
@@ -212,7 +226,7 @@ pub fn create_tcp_client_handler(
                     ),
                 )
             } else {
-                let inner_handler = create_tcp_client_handler(*protocol, None);
+                let inner_handler = create_tcp_client_handler(*protocol, None, resolver.clone());
                 Box::new(crate::reality_client_handler::RealityClientHandler::new(
                     public_key_bytes,
                     short_id_bytes,
@@ -249,7 +263,7 @@ pub fn create_tcp_client_handler(
                 true,       // tls13_only - required for ShadowTLS v3
             ));
 
-            let handler = create_tcp_client_handler(*protocol, None);
+            let handler = create_tcp_client_handler(*protocol, None, resolver.clone());
 
             Box::new(ShadowTlsClientHandler::new(
                 password,
@@ -271,7 +285,7 @@ pub fn create_tcp_client_handler(
                 protocol,
             } = websocket_client_config;
 
-            let handler = create_tcp_client_handler(*protocol, None);
+            let handler = create_tcp_client_handler(*protocol, None, resolver.clone());
 
             Box::new(WebsocketTcpClientHandler::new(
                 matching_path,
@@ -308,7 +322,10 @@ pub fn create_tcp_client_handler(
     }
 }
 
-pub fn create_tcp_client_proxy_selector(rules: Vec<RuleConfig>) -> ClientProxySelector {
+pub fn create_tcp_client_proxy_selector(
+    rules: Vec<RuleConfig>,
+    resolver: Arc<dyn Resolver>,
+) -> ClientProxySelector {
     let rules = rules
         .into_iter()
         .map(|rule_config| {
@@ -318,7 +335,7 @@ pub fn create_tcp_client_proxy_selector(rules: Vec<RuleConfig>) -> ClientProxySe
                     override_address,
                     client_chains,
                 } => {
-                    let chain_group = build_client_chain_group(client_chains);
+                    let chain_group = build_client_chain_group(client_chains, resolver.clone());
                     ConnectAction::new_allow(override_address, chain_group)
                 }
                 RuleActionConfig::Block => ConnectAction::new_block(),

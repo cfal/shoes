@@ -1463,6 +1463,7 @@ mod tests {
         ClientProxyConfig::Http {
             username: None,
             password: None,
+            resolve_hostname: false,
         }
     }
 

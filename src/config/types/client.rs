@@ -273,6 +273,10 @@ pub enum ClientProxyConfig {
         username: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         password: Option<String>,
+        /// When true, resolve hostnames to IP addresses before passing to HTTP CONNECT.
+        /// Used when the upstream proxy blocks by hostname.
+        #[serde(default, skip_serializing_if = "is_false")]
+        resolve_hostname: bool,
     },
     #[serde(alias = "socks5")]
     Socks {

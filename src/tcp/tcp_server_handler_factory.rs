@@ -334,7 +334,7 @@ fn create_tls_server_target(
         let rules = override_rules
             .map(ConfigSelection::unwrap_config)
             .into_vec();
-        Arc::new(create_tcp_client_proxy_selector(rules))
+        Arc::new(create_tcp_client_proxy_selector(rules, resolver.clone()))
     } else {
         client_proxy_selector.clone()
     };
@@ -429,7 +429,8 @@ fn create_shadow_tls_server_target(
         ShadowTlsServerHandshakeConfig::Remote(handshake) => {
             // Build ClientProxyChain from client_chain
             // client_chain is guaranteed to be non-empty (defaults to direct hop)
-            let client_chain = build_client_proxy_chain(handshake.client_chain);
+            let client_chain =
+                build_client_proxy_chain(handshake.client_chain, resolver.clone());
             ShadowTlsServerTargetHandshake::new_remote(handshake.address, client_chain)
         }
     };
@@ -439,7 +440,7 @@ fn create_shadow_tls_server_target(
         let rules = override_rules
             .map(ConfigSelection::unwrap_config)
             .into_vec();
-        Arc::new(create_tcp_client_proxy_selector(rules))
+        Arc::new(create_tcp_client_proxy_selector(rules, resolver.clone()))
     } else {
         client_proxy_selector.clone()
     };
@@ -493,7 +494,7 @@ fn create_reality_server_target(
         let rules = override_rules
             .map(ConfigSelection::unwrap_config)
             .into_vec();
-        Arc::new(create_tcp_client_proxy_selector(rules))
+        Arc::new(create_tcp_client_proxy_selector(rules, resolver.clone()))
     } else {
         client_proxy_selector.clone()
     };
@@ -548,13 +549,19 @@ fn create_reality_server_target(
         let hops = dest_client_chain.into_vec();
         if hops.is_empty() {
             // Default to direct connection
-            build_client_proxy_chain(OneOrSome::One(ClientChainHop::Single(
-                ConfigSelection::Config(ClientConfig::default()),
-            )))
+            build_client_proxy_chain(
+                OneOrSome::One(ClientChainHop::Single(ConfigSelection::Config(
+                    ClientConfig::default(),
+                ))),
+                resolver.clone(),
+            )
         } else if hops.len() == 1 {
-            build_client_proxy_chain(OneOrSome::One(hops.into_iter().next().unwrap()))
+            build_client_proxy_chain(
+                OneOrSome::One(hops.into_iter().next().unwrap()),
+                resolver.clone(),
+            )
         } else {
-            build_client_proxy_chain(OneOrSome::Some(hops))
+            build_client_proxy_chain(OneOrSome::Some(hops), resolver.clone())
         }
     };
 
@@ -600,7 +607,7 @@ fn create_websocket_server_target(
         let rules = override_rules
             .map(ConfigSelection::unwrap_config)
             .into_vec();
-        Arc::new(create_tcp_client_proxy_selector(rules))
+        Arc::new(create_tcp_client_proxy_selector(rules, resolver.clone()))
     } else {
         client_proxy_selector.clone()
     };
