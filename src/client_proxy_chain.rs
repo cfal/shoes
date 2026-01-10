@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use log::debug;
 
-use crate::address::NetLocation;
+use crate::address::{NetLocation, ResolvedLocation};
 use crate::async_stream::AsyncMessageStream;
 use crate::resolver::Resolver;
 use crate::tcp::proxy_connector::ProxyConnector;
@@ -216,7 +216,7 @@ impl ClientProxyChain {
     /// Connect through the chain to the remote location for TCP traffic.
     pub async fn connect_tcp(
         &self,
-        remote_location: NetLocation,
+        remote_location: ResolvedLocation,
         resolver: &Arc<dyn Resolver>,
     ) -> std::io::Result<TcpClientSetupResult> {
         // Select initial hop entry (socket + optional proxy paired)
@@ -228,21 +228,21 @@ impl ClientProxyChain {
         debug!(
             "Chain TCP connect: 1 initial + {} subsequent hop(s) -> {}",
             subsequent_proxies.len(),
-            remote_location
+            remote_location.location()
         );
 
-        // Determine first target after initial hop
-        let first_subsequent_target = subsequent_proxies
+        // Determine first target after initial hop (proxy locations need wrapping)
+        let first_subsequent_target: ResolvedLocation = subsequent_proxies
             .first()
-            .map(|p| p.proxy_location())
-            .unwrap_or(&remote_location);
+            .map(|p| p.proxy_location().into())
+            .unwrap_or_else(|| remote_location.clone());
 
         // Connect based on initial hop type
         let mut result = match entry {
             InitialHopEntry::Direct(socket) => {
                 // Socket connects to first subsequent proxy (or final target)
-                debug!("Initial hop: Direct -> {}", first_subsequent_target);
-                let stream = socket.connect(resolver, first_subsequent_target).await?;
+                debug!("Initial hop: Direct -> {}", first_subsequent_target.location());
+                let stream = socket.connect(resolver, &first_subsequent_target).await?;
                 TcpClientSetupResult {
                     client_stream: stream,
                     early_data: None,
@@ -253,32 +253,33 @@ impl ClientProxyChain {
                 debug!(
                     "Initial hop: Proxy {} -> {}",
                     proxy.proxy_location(),
-                    first_subsequent_target
+                    first_subsequent_target.location()
                 );
-                let stream = socket.connect(resolver, proxy.proxy_location()).await?;
+                let proxy_loc = proxy.proxy_location().into();
+                let stream = socket.connect(resolver, &proxy_loc).await?;
                 // Protocol setup targeting first subsequent proxy (or final target)
                 proxy
-                    .setup_tcp_stream(stream, first_subsequent_target)
+                    .setup_tcp_stream(stream, &first_subsequent_target)
                     .await?
             }
         };
 
         // Process subsequent hops
         for (i, proxy) in subsequent_proxies.iter().enumerate() {
-            let target = subsequent_proxies
+            let target: ResolvedLocation = subsequent_proxies
                 .get(i + 1)
-                .map(|p| p.proxy_location())
-                .unwrap_or(&remote_location);
+                .map(|p| p.proxy_location().into())
+                .unwrap_or_else(|| remote_location.clone());
 
             debug!(
                 "Subsequent hop {}/{}: {} -> {}",
                 i + 1,
                 subsequent_proxies.len(),
                 proxy.proxy_location(),
-                target
+                target.location()
             );
 
-            result = proxy.setup_tcp_stream(result.client_stream, target).await?;
+            result = proxy.setup_tcp_stream(result.client_stream, &target).await?;
 
             // Early data from intermediate hops is unexpected
             if let Some(data) = &result.early_data
@@ -298,7 +299,7 @@ impl ClientProxyChain {
         debug!(
             "Chain TCP complete: {} total hop(s) to {}",
             1 + subsequent_proxies.len(),
-            remote_location
+            remote_location.location()
         );
 
         Ok(result)
@@ -310,7 +311,7 @@ impl ClientProxyChain {
     pub async fn connect_udp_bidirectional(
         &self,
         resolver: &Arc<dyn Resolver>,
-        target: NetLocation,
+        target: ResolvedLocation,
     ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
         // Check if UDP is supported
         if self.udp_final_hop_indices.is_empty() {
@@ -331,7 +332,7 @@ impl ClientProxyChain {
 
             debug!(
                 "Chain UDP connect: 1 hop (initial IS final), target={}",
-                target
+                target.location()
             );
 
             match entry {
@@ -344,7 +345,8 @@ impl ClientProxyChain {
                         "Chain UDP: Proxy {} (UDP, no subsequent)",
                         proxy.proxy_location()
                     );
-                    let stream = socket.connect(resolver, proxy.proxy_location()).await?;
+                    let proxy_loc = proxy.proxy_location().into();
+                    let stream = socket.connect(resolver, &proxy_loc).await?;
                     proxy.setup_udp_bidirectional(stream, target).await
                 }
             }
@@ -383,36 +385,36 @@ impl ClientProxyChain {
             debug!(
                 "Chain UDP connect: 1 initial + {} intermediate + 1 final (UDP) hop(s), target={}",
                 intermediate_proxies.len(),
-                target
+                target.location()
             );
 
             // Build the chain: initial -> intermediates -> final (UDP)
             match entry {
                 InitialHopEntry::Direct(socket) => {
                     // Determine first target after initial hop
-                    let first_target = if let Some(first) = intermediate_proxies.first() {
-                        first.proxy_location()
+                    let first_target: ResolvedLocation = if let Some(first) = intermediate_proxies.first() {
+                        first.proxy_location().into()
                     } else {
-                        final_proxy.proxy_location()
+                        final_proxy.proxy_location().into()
                     };
 
-                    debug!("Chain UDP: Direct -> {} (TCP)", first_target);
-                    let mut stream = socket.connect(resolver, first_target).await?;
+                    debug!("Chain UDP: Direct -> {} (TCP)", first_target.location());
+                    let mut stream = socket.connect(resolver, &first_target).await?;
 
                     // Process intermediate hops (all TCP)
                     for (i, proxy) in intermediate_proxies.iter().enumerate() {
-                        let next_target = intermediate_proxies
+                        let next_target: ResolvedLocation = intermediate_proxies
                             .get(i + 1)
-                            .map(|p| p.proxy_location())
-                            .unwrap_or(final_proxy.proxy_location());
+                            .map(|p| p.proxy_location().into())
+                            .unwrap_or_else(|| final_proxy.proxy_location().into());
                         debug!(
                             "Chain UDP intermediate hop {}/{}: {} -> {} (TCP)",
                             i + 1,
                             intermediate_proxies.len(),
                             proxy.proxy_location(),
-                            next_target
+                            next_target.location()
                         );
-                        let result = proxy.setup_tcp_stream(stream, next_target).await?;
+                        let result = proxy.setup_tcp_stream(stream, &next_target).await?;
                         stream = result.client_stream;
                     }
 
@@ -425,35 +427,36 @@ impl ClientProxyChain {
                 }
                 InitialHopEntry::Proxy { socket, proxy } => {
                     // Determine first target after initial hop
-                    let first_target = if let Some(first) = intermediate_proxies.first() {
-                        first.proxy_location()
+                    let first_target: ResolvedLocation = if let Some(first) = intermediate_proxies.first() {
+                        first.proxy_location().into()
                     } else {
-                        final_proxy.proxy_location()
+                        final_proxy.proxy_location().into()
                     };
 
                     debug!(
                         "Chain UDP: Proxy {} -> {} (TCP)",
                         proxy.proxy_location(),
-                        first_target
+                        first_target.location()
                     );
-                    let stream = socket.connect(resolver, proxy.proxy_location()).await?;
-                    let result = proxy.setup_tcp_stream(stream, first_target).await?;
+                    let proxy_loc = proxy.proxy_location().into();
+                    let stream = socket.connect(resolver, &proxy_loc).await?;
+                    let result = proxy.setup_tcp_stream(stream, &first_target).await?;
                     let mut stream = result.client_stream;
 
                     // Process intermediate hops (all TCP)
                     for (i, proxy) in intermediate_proxies.iter().enumerate() {
-                        let next_target = intermediate_proxies
+                        let next_target: ResolvedLocation = intermediate_proxies
                             .get(i + 1)
-                            .map(|p| p.proxy_location())
-                            .unwrap_or(final_proxy.proxy_location());
+                            .map(|p| p.proxy_location().into())
+                            .unwrap_or_else(|| final_proxy.proxy_location().into());
                         debug!(
                             "Chain UDP intermediate hop {}/{}: {} -> {} (TCP)",
                             i + 1,
                             intermediate_proxies.len(),
                             proxy.proxy_location(),
-                            next_target
+                            next_target.location()
                         );
-                        let result = proxy.setup_tcp_stream(stream, next_target).await?;
+                        let result = proxy.setup_tcp_stream(stream, &next_target).await?;
                         stream = result.client_stream;
                     }
 
@@ -510,7 +513,7 @@ impl ClientChainGroup {
 
     pub async fn connect_tcp(
         &self,
-        remote_location: NetLocation,
+        remote_location: ResolvedLocation,
         resolver: &Arc<dyn Resolver>,
     ) -> std::io::Result<TcpClientSetupResult> {
         let idx = self.next_tcp_index.fetch_add(1, Ordering::Relaxed) as usize;
@@ -521,7 +524,7 @@ impl ClientChainGroup {
     pub async fn connect_udp_bidirectional(
         &self,
         resolver: &Arc<dyn Resolver>,
-        target: NetLocation,
+        target: ResolvedLocation,
     ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
         if self.udp_chain_indices.is_empty() {
             return Err(std::io::Error::new(
@@ -563,7 +566,7 @@ mod tests {
         async fn connect(
             &self,
             _resolver: &Arc<dyn Resolver>,
-            _address: &NetLocation,
+            _address: &ResolvedLocation,
         ) -> std::io::Result<Box<dyn AsyncStream>> {
             Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
@@ -574,7 +577,7 @@ mod tests {
         async fn connect_udp_bidirectional(
             &self,
             _resolver: &Arc<dyn Resolver>,
-            _target: NetLocation,
+            _target: ResolvedLocation,
         ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
             Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
@@ -612,7 +615,7 @@ mod tests {
         async fn setup_tcp_stream(
             &self,
             _stream: Box<dyn AsyncStream>,
-            _target: &NetLocation,
+            _target: &ResolvedLocation,
         ) -> std::io::Result<TcpClientSetupResult> {
             Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
@@ -623,7 +626,7 @@ mod tests {
         async fn setup_udp_bidirectional(
             &self,
             _stream: Box<dyn AsyncStream>,
-            _target: NetLocation,
+            _target: ResolvedLocation,
         ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
             Err(std::io::Error::new(
                 std::io::ErrorKind::Other,

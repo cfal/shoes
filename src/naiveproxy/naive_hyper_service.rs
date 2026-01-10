@@ -515,7 +515,7 @@ async fn handle_naive_stream<S: AsyncStream + 'static>(
             if is_connect == 1 {
                 let uot_v2_stream = UotV2Stream::new(stream);
 
-                let action = proxy_selector.judge(destination.clone(), &resolver).await?;
+                let action = proxy_selector.judge(destination.clone().into(), &resolver).await?;
 
                 match action {
                     ConnectDecision::Allow {
@@ -562,7 +562,7 @@ async fn handle_naive_stream<S: AsyncStream + 'static>(
     );
 
     let action = proxy_selector
-        .judge(remote_location.clone(), &resolver)
+        .judge(remote_location.clone().into(), &resolver)
         .await?;
 
     let mut client_stream: Box<dyn AsyncStream> = match action {

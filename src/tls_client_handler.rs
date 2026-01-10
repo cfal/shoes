@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::address::NetLocation;
+use crate::address::ResolvedLocation;
 use crate::async_stream::AsyncMessageStream;
 use crate::async_stream::AsyncStream;
 use crate::crypto::{CryptoConnection, CryptoTlsStream, perform_crypto_handshake};
@@ -58,7 +58,7 @@ impl TcpClientHandler for TlsClientHandler {
     async fn setup_client_tcp_stream(
         &self,
         mut client_stream: Box<dyn AsyncStream>,
-        remote_location: NetLocation,
+        remote_location: ResolvedLocation,
     ) -> std::io::Result<TcpClientSetupResult> {
         let mut client_conn =
             rustls::ClientConnection::new(self.client_config.clone(), self.server_name.clone())
@@ -87,7 +87,7 @@ impl TcpClientHandler for TlsClientHandler {
                 crate::vless::vless_client_handler::setup_custom_tls_vision_vless_client_stream(
                     tls_stream,
                     uuid,
-                    &remote_location,
+                    remote_location.location(),
                 )
                 .await
             }
@@ -104,7 +104,7 @@ impl TcpClientHandler for TlsClientHandler {
     async fn setup_client_udp_bidirectional(
         &self,
         mut client_stream: Box<dyn AsyncStream>,
-        target: NetLocation,
+        target: ResolvedLocation,
     ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
         let mut client_conn =
             rustls::ClientConnection::new(self.client_config.clone(), self.server_name.clone())
@@ -131,7 +131,9 @@ impl TcpClientHandler for TlsClientHandler {
             }
             TlsInnerClientHandler::VisionVless { uuid, .. } => {
                 crate::vless::vless_client_handler::setup_vless_udp_bidirectional(
-                    tls_stream, uuid, target,
+                    tls_stream,
+                    uuid,
+                    target.into_location(),
                 )
                 .await
             }

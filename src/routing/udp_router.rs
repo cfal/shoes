@@ -25,7 +25,7 @@ use tokio::io::ReadBuf;
 use tokio::time::Instant;
 use tokio_util::time::{DelayQueue, delay_queue};
 
-use crate::address::{Address, NetLocation};
+use crate::address::{Address, NetLocation, ResolvedLocation};
 use crate::async_stream::{
     AsyncFlushMessage, AsyncMessageStream, AsyncPing, AsyncReadMessage, AsyncReadSessionMessage,
     AsyncReadTargetedMessage, AsyncSessionMessageStream, AsyncShutdownMessage,
@@ -1041,9 +1041,9 @@ impl<'a> UdpRouter<'a> {
 
         let future: SessionCreateFuture = Box::pin(async move {
             let resolved_addr = resolve_single_address(&resolver, &dest_for_future).await?;
-            let decision = selector
-                .judge_with_resolved_address(dest_for_future, Some(resolved_addr), &resolver)
-                .await?;
+            // Create ResolvedLocation with pre-resolved address
+            let resolved_location = ResolvedLocation::with_resolved(dest_for_future, resolved_addr);
+            let decision = selector.judge(resolved_location, &resolver).await?;
 
             match decision {
                 ConnectDecision::Allow {

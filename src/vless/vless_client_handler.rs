@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use tokio::io::AsyncWriteExt;
 
-use crate::address::{Address, NetLocation};
+use crate::address::{Address, NetLocation, ResolvedLocation};
 use crate::async_stream::AsyncMessageStream;
 use crate::async_stream::AsyncStream;
 use crate::crypto::CryptoTlsStream;
@@ -42,9 +42,10 @@ impl TcpClientHandler for VlessTcpClientHandler {
     async fn setup_client_tcp_stream(
         &self,
         mut client_stream: Box<dyn AsyncStream>,
-        remote_location: NetLocation,
+        remote_location: ResolvedLocation,
     ) -> std::io::Result<TcpClientSetupResult> {
-        write_vless_header(&mut client_stream, &self.user_id, &[], &remote_location).await?;
+        write_vless_header(&mut client_stream, &self.user_id, &[], remote_location.location())
+            .await?;
         client_stream.flush().await?;
         let client_stream = Box::new(VlessResponseStream::new(client_stream));
 
@@ -61,9 +62,9 @@ impl TcpClientHandler for VlessTcpClientHandler {
     async fn setup_client_udp_bidirectional(
         &self,
         mut client_stream: Box<dyn AsyncStream>,
-        target: NetLocation,
+        target: ResolvedLocation,
     ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
-        write_vless_udp_header(&mut client_stream, &self.user_id, &target).await?;
+        write_vless_udp_header(&mut client_stream, &self.user_id, target.location()).await?;
         client_stream.flush().await?;
         let response_stream = Box::new(VlessResponseStream::new(client_stream));
         let message_stream = VlessMessageStream::new(response_stream);

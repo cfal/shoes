@@ -7,7 +7,7 @@ use rustc_hash::FxHashMap;
 use tokio::io::AsyncWriteExt;
 
 use super::websocket_stream::WebsocketStream;
-use crate::address::NetLocation;
+use crate::address::ResolvedLocation;
 use crate::async_stream::AsyncMessageStream;
 use crate::async_stream::AsyncStream;
 use crate::config::WebsocketPingType;
@@ -236,7 +236,7 @@ impl TcpClientHandler for WebsocketTcpClientHandler {
     async fn setup_client_tcp_stream(
         &self,
         client_stream: Box<dyn AsyncStream>,
-        remote_location: NetLocation,
+        remote_location: ResolvedLocation,
     ) -> std::io::Result<TcpClientSetupResult> {
         let websocket_stream = self.setup_client_stream_common(client_stream).await?;
         self.handler
@@ -251,7 +251,7 @@ impl TcpClientHandler for WebsocketTcpClientHandler {
     async fn setup_client_udp_bidirectional(
         &self,
         client_stream: Box<dyn AsyncStream>,
-        target: NetLocation,
+        target: ResolvedLocation,
     ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
         let websocket_stream = self.setup_client_stream_common(client_stream).await?;
         self.handler

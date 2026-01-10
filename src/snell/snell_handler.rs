@@ -6,7 +6,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::snell_fixed_target_stream::SnellFixedTargetStream;
 use super::snell_udp_stream::{SnellUdpClientStream, SnellUdpStream};
-use crate::address::{Address, NetLocation};
+use crate::address::{Address, NetLocation, ResolvedLocation};
 use crate::async_stream::AsyncMessageStream;
 use crate::async_stream::AsyncStream;
 use crate::client_proxy_selector::ClientProxySelector;
@@ -225,7 +225,7 @@ impl TcpClientHandler for SnellClientHandler {
     async fn setup_client_tcp_stream(
         &self,
         client_stream: Box<dyn AsyncStream>,
-        remote_location: NetLocation,
+        remote_location: ResolvedLocation,
     ) -> std::io::Result<TcpClientSetupResult> {
         let mut client_stream: Box<dyn AsyncStream> = Box::new(ShadowsocksStream::new(
             client_stream,
@@ -255,7 +255,7 @@ impl TcpClientHandler for SnellClientHandler {
 
         write_all(&mut client_stream, &hostname_bytes).await?;
 
-        let port = remote_location.port();
+        let port = remote_location.location().port();
 
         write_all(
             &mut client_stream,
@@ -294,7 +294,7 @@ impl TcpClientHandler for SnellClientHandler {
     async fn setup_client_udp_bidirectional(
         &self,
         client_stream: Box<dyn AsyncStream>,
-        target: NetLocation,
+        target: ResolvedLocation,
     ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
         let mut ss_stream = ShadowsocksStream::new(
             client_stream,
@@ -336,7 +336,8 @@ impl TcpClientHandler for SnellClientHandler {
         let max_payload_size = ShadowsocksStreamType::Aead.max_payload_len();
         let snell_udp_client_stream =
             SnellUdpClientStream::new(Box::new(ss_stream), max_payload_size);
-        let fixed_target_stream = SnellFixedTargetStream::new(snell_udp_client_stream, target);
+        let fixed_target_stream =
+            SnellFixedTargetStream::new(snell_udp_client_stream, target.into_location());
 
         Ok(Box::new(fixed_target_stream))
     }

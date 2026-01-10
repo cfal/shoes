@@ -10,7 +10,7 @@ use log::debug;
 
 use super::proxy_connector::ProxyConnector;
 use super::tcp_client_handler_factory::create_tcp_client_handler;
-use crate::address::NetLocation;
+use crate::address::{NetLocation, ResolvedLocation};
 use crate::async_stream::{AsyncMessageStream, AsyncStream};
 use crate::config::ClientConfig;
 use crate::resolver::Resolver;
@@ -70,7 +70,7 @@ impl ProxyConnector for ProxyConnectorImpl {
     async fn setup_tcp_stream(
         &self,
         stream: Box<dyn AsyncStream>,
-        target: &NetLocation,
+        target: &ResolvedLocation,
     ) -> std::io::Result<TcpClientSetupResult> {
         debug!(
             "[ProxyConnector] setup_tcp_stream: {} -> {}",
@@ -84,7 +84,7 @@ impl ProxyConnector for ProxyConnectorImpl {
     async fn setup_udp_bidirectional(
         &self,
         stream: Box<dyn AsyncStream>,
-        target: NetLocation,
+        target: ResolvedLocation,
     ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
         debug!(
             "[ProxyConnector] setup_udp_bidirectional: {} -> {}",

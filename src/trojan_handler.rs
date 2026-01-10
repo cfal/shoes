@@ -5,7 +5,7 @@ use aws_lc_rs::digest::SHA224;
 use subtle::ConstantTimeEq;
 use tokio::io::AsyncWriteExt;
 
-use crate::address::NetLocation;
+use crate::address::ResolvedLocation;
 use crate::async_stream::AsyncStream;
 use crate::client_proxy_selector::ClientProxySelector;
 use crate::config::ShadowsocksConfig;
@@ -167,7 +167,7 @@ impl TcpClientHandler for TrojanTcpHandler {
     async fn setup_client_tcp_stream(
         &self,
         mut client_stream: Box<dyn AsyncStream>,
-        remote_location: NetLocation,
+        remote_location: ResolvedLocation,
     ) -> std::io::Result<TcpClientSetupResult> {
         if let Some(ShadowsocksData {
             ref cipher,
@@ -187,7 +187,7 @@ impl TcpClientHandler for TrojanTcpHandler {
         write_all(&mut client_stream, &self.password_hash).await?;
         write_all(&mut client_stream, &CRLF_BYTES).await?;
         write_all(&mut client_stream, &[CMD_CONNECT]).await?;
-        let location_bytes = write_location_to_vec(&remote_location);
+        let location_bytes = write_location_to_vec(remote_location.location());
         write_all(&mut client_stream, &location_bytes).await?;
         write_all(&mut client_stream, &CRLF_BYTES).await?;
         client_stream.flush().await?;

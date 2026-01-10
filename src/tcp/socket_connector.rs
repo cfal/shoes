@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::address::NetLocation;
+use crate::address::ResolvedLocation;
 use crate::async_stream::{AsyncMessageStream, AsyncStream};
 use crate::resolver::Resolver;
 
@@ -33,25 +33,25 @@ pub trait SocketConnector: Send + Sync + Debug {
     /// Create a TCP/QUIC connection to the given address.
     ///
     /// # Arguments
-    /// * `resolver` - DNS resolver for address resolution
-    /// * `address` - Target address to connect to
+    /// * `resolver` - DNS resolver for address resolution (used if address not pre-resolved)
+    /// * `address` - Target address to connect to, with optional pre-resolved SocketAddr
     async fn connect(
         &self,
         resolver: &Arc<dyn Resolver>,
-        address: &NetLocation,
+        address: &ResolvedLocation,
     ) -> std::io::Result<Box<dyn AsyncStream>>;
 
     /// Create a UDP socket for bidirectional communication with a fixed target.
     ///
     /// # Arguments
-    /// * `resolver` - DNS resolver for address resolution
-    /// * `target` - The destination for all UDP packets
+    /// * `resolver` - DNS resolver for address resolution (used if target not pre-resolved)
+    /// * `target` - The destination for all UDP packets, with optional pre-resolved SocketAddr
     ///
     /// # Returns
     /// An AsyncMessageStream connected to the target.
     async fn connect_udp_bidirectional(
         &self,
         resolver: &Arc<dyn Resolver>,
-        target: NetLocation,
+        target: ResolvedLocation,
     ) -> std::io::Result<Box<dyn AsyncMessageStream>>;
 }

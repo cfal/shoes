@@ -169,6 +169,88 @@ impl serde::ser::Serialize for NetLocation {
     }
 }
 
+/// A network location with optional pre-resolved socket address.
+///
+/// When `resolved_addr` is `Some`, consumers should use it directly
+/// instead of performing DNS resolution. This avoids duplicate DNS
+/// lookups when the same hostname is resolved multiple times in the
+/// connection pipeline (rule matching, socket connection, protocol setup).
+#[derive(Debug, Clone)]
+pub struct ResolvedLocation {
+    location: NetLocation,
+    resolved_addr: Option<SocketAddr>,
+}
+
+impl ResolvedLocation {
+    /// Create an unresolved location.
+    pub fn new(location: NetLocation) -> Self {
+        Self {
+            location,
+            resolved_addr: None,
+        }
+    }
+
+    /// Create a location with a pre-resolved address.
+    pub fn with_resolved(location: NetLocation, addr: SocketAddr) -> Self {
+        Self {
+            location,
+            resolved_addr: Some(addr),
+        }
+    }
+
+    /// Get the underlying NetLocation.
+    pub fn location(&self) -> &NetLocation {
+        &self.location
+    }
+
+    /// Consume self and return the underlying NetLocation.
+    pub fn into_location(self) -> NetLocation {
+        self.location
+    }
+
+    /// Get the pre-resolved address, if available.
+    pub fn resolved_addr(&self) -> Option<SocketAddr> {
+        self.resolved_addr
+    }
+
+    /// Get the port.
+    pub fn port(&self) -> u16 {
+        self.location.port()
+    }
+
+    /// Get the address.
+    pub fn address(&self) -> &Address {
+        self.location.address()
+    }
+
+    /// Set the resolved address directly.
+    /// Used by the resolver when performing lazy resolution.
+    pub fn set_resolved(&mut self, addr: SocketAddr) {
+        self.resolved_addr = Some(addr);
+    }
+}
+
+impl std::fmt::Display for ResolvedLocation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.resolved_addr {
+            Some(addr) => write!(f, "{} (resolved: {})", self.location, addr),
+            None => write!(f, "{}", self.location),
+        }
+    }
+}
+
+impl From<NetLocation> for ResolvedLocation {
+    fn from(location: NetLocation) -> Self {
+        Self::new(location)
+    }
+}
+
+impl From<&NetLocation> for ResolvedLocation {
+    fn from(location: &NetLocation) -> Self {
+        Self::new(location.clone())
+    }
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct NetLocationPortRange {
     address: Address,

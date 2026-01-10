@@ -7,7 +7,7 @@ use tokio::io::AsyncWriteExt;
 
 use super::salt_checker::SaltChecker;
 use super::timed_salt_checker::TimedSaltChecker;
-use crate::address::{Address, NetLocation};
+use crate::address::{Address, NetLocation, ResolvedLocation};
 use crate::async_stream::AsyncMessageStream;
 use crate::async_stream::AsyncStream;
 use crate::client_proxy_selector::ClientProxySelector;
@@ -264,7 +264,7 @@ impl TcpClientHandler for ShadowsocksTcpHandler {
     async fn setup_client_tcp_stream(
         &self,
         client_stream: Box<dyn AsyncStream>,
-        remote_location: NetLocation,
+        remote_location: ResolvedLocation,
     ) -> std::io::Result<TcpClientSetupResult> {
         let stream_type = if self.aead2022 {
             ShadowsocksStreamType::AEAD2022Client
@@ -281,7 +281,7 @@ impl TcpClientHandler for ShadowsocksTcpHandler {
             self.salt_checker.clone(),
         ));
 
-        let mut location_vec = write_location_to_vec(&remote_location);
+        let mut location_vec = write_location_to_vec(remote_location.location());
 
         if self.aead2022 {
             let location_len = location_vec.len();
@@ -312,7 +312,7 @@ impl TcpClientHandler for ShadowsocksTcpHandler {
     async fn setup_client_udp_bidirectional(
         &self,
         client_stream: Box<dyn AsyncStream>,
-        target: NetLocation,
+        target: ResolvedLocation,
     ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
         use crate::uot::{UOT_V2_MAGIC_ADDRESS, UotV2Stream};
 
@@ -351,7 +351,7 @@ impl TcpClientHandler for ShadowsocksTcpHandler {
         // Writes UoT V2 request header: isConnect(1) + SOCKS address
         let mut uot_header = Vec::with_capacity(64);
         uot_header.push(1u8); // isConnect = 1 (connect mode)
-        let target_bytes = write_location_to_vec(&target);
+        let target_bytes = write_location_to_vec(target.location());
         uot_header.extend_from_slice(&target_bytes);
         write_all(&mut client_stream, &uot_header).await?;
         client_stream.flush().await?;

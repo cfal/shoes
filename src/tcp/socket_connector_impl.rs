@@ -14,11 +14,11 @@ use log::{debug, error};
 use tokio::io::ReadBuf;
 use tokio::net::UdpSocket;
 
-use crate::address::NetLocation;
+use crate::address::{NetLocation, ResolvedLocation};
 use crate::async_stream::AsyncStream;
 use crate::config::{ClientConfig, ClientQuicConfig, Transport};
 use crate::quic_stream::QuicStream;
-use crate::resolver::{Resolver, resolve_single_address};
+use crate::resolver::{resolve_location, resolve_single_address, Resolver};
 use crate::rustls_config_util::create_client_config;
 use crate::socket_util::{new_tcp_socket, new_udp_socket, set_tcp_keepalive};
 use crate::thread_util::get_num_threads;
@@ -213,9 +213,12 @@ impl SocketConnector for SocketConnectorImpl {
     async fn connect(
         &self,
         resolver: &Arc<dyn Resolver>,
-        address: &NetLocation,
+        address: &ResolvedLocation,
     ) -> std::io::Result<Box<dyn AsyncStream>> {
-        let target_addr = resolve_single_address(resolver, address).await?;
+        let target_addr = match address.resolved_addr() {
+            Some(r) => r,
+            None => resolve_single_address(resolver, address.location()).await?,
+        };
 
         match &self.transport {
             TransportConfig::Tcp { no_delay } => {
@@ -274,14 +277,14 @@ impl SocketConnector for SocketConnectorImpl {
     async fn connect_udp_bidirectional(
         &self,
         resolver: &Arc<dyn Resolver>,
-        target: NetLocation,
+        mut target: ResolvedLocation,
     ) -> std::io::Result<Box<dyn crate::async_stream::AsyncMessageStream>> {
         debug!(
             "[SocketConnector] connect_udp_bidirectional called, target: {}",
-            target
+            target.location()
         );
 
-        let remote_addr = resolve_single_address(resolver, &target).await?;
+        let remote_addr = resolve_location(&mut target, resolver).await?;
         let client_socket = new_udp_socket(remote_addr.is_ipv6(), self.bind_interface.clone())?;
 
         // Don't use connect() - wrap in UnconnectedUdpSocket instead.

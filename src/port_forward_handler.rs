@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use async_trait::async_trait;
 
-use crate::address::NetLocation;
+use crate::address::{NetLocation, ResolvedLocation};
 use crate::async_stream::AsyncStream;
 use crate::client_proxy_selector::ClientProxySelector;
 use crate::tcp::tcp_handler::{TcpClientHandler, TcpClientSetupResult};
@@ -58,7 +58,7 @@ impl TcpClientHandler for PortForwardClientHandler {
     async fn setup_client_tcp_stream(
         &self,
         client_stream: Box<dyn AsyncStream>,
-        _remote_location: NetLocation,
+        _remote_location: ResolvedLocation,
     ) -> std::io::Result<TcpClientSetupResult> {
         Ok(TcpClientSetupResult {
             client_stream,

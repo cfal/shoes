@@ -10,7 +10,7 @@ use futures::future::FutureExt;
 use log::debug;
 use rustc_hash::FxHashMap;
 
-use crate::address::NetLocation;
+use crate::address::{NetLocation, ResolvedLocation};
 
 type ResolveFuture = Pin<Box<dyn Future<Output = std::io::Result<Vec<SocketAddr>>> + Send>>;
 
@@ -58,6 +58,21 @@ pub async fn resolve_single_address(
         )));
     }
     Ok(resolve_results[0])
+}
+
+/// Resolve a ResolvedLocation lazily. If already resolved, returns the cached
+/// address. Otherwise resolves, caches the result in the location, and returns it.
+/// This is the key function for the lazy resolution pattern.
+pub async fn resolve_location(
+    location: &mut ResolvedLocation,
+    resolver: &Arc<dyn Resolver>,
+) -> std::io::Result<SocketAddr> {
+    if let Some(addr) = location.resolved_addr() {
+        return Ok(addr);
+    }
+    let addr = resolve_single_address(resolver, location.location()).await?;
+    location.set_resolved(addr);
+    Ok(addr)
 }
 
 // TODO: use this everywhere a Resolver is used

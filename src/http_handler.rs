@@ -5,7 +5,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use log::debug;
 use tokio::io::AsyncWriteExt;
 
-use crate::address::{Address, NetLocation};
+use crate::address::{Address, NetLocation, ResolvedLocation};
 use crate::async_stream::AsyncStream;
 use crate::client_proxy_selector::ClientProxySelector;
 use crate::resolver::{resolve_single_address, Resolver};
@@ -354,16 +354,31 @@ impl TcpClientHandler for HttpTcpClientHandler {
     async fn setup_client_tcp_stream(
         &self,
         mut client_stream: Box<dyn AsyncStream>,
-        remote_location: NetLocation,
+        remote_location: ResolvedLocation,
     ) -> std::io::Result<TcpClientSetupResult> {
         // Resolve hostname to IP if resolver is configured.
         // Bypasses DNS issues when the upstream proxy has DNS problems.
-        let resolved_location = if let Some(ref resolver) = self.resolver {
-            if remote_location.address().hostname().is_some() {
-                let socket_addr = resolve_single_address(resolver, &remote_location).await?;
+        // Uses pre-resolved address if available, otherwise resolves here.
+        let connect_location = if let Some(ref resolver) = self.resolver {
+            if let Some(resolved_addr) = remote_location.resolved_addr() {
+                // Use pre-resolved address
+                debug!(
+                    "HTTP CONNECT using pre-resolved {} -> {}",
+                    remote_location.location(),
+                    resolved_addr
+                );
+                let address = match resolved_addr.ip() {
+                    std::net::IpAddr::V4(ip) => Address::Ipv4(ip),
+                    std::net::IpAddr::V6(ip) => Address::Ipv6(ip),
+                };
+                NetLocation::new(address, resolved_addr.port())
+            } else if remote_location.address().hostname().is_some() {
+                let socket_addr =
+                    resolve_single_address(resolver, remote_location.location()).await?;
                 debug!(
                     "HTTP CONNECT resolved {} -> {}",
-                    remote_location, socket_addr
+                    remote_location.location(),
+                    socket_addr
                 );
                 let address = match socket_addr.ip() {
                     std::net::IpAddr::V4(ip) => Address::Ipv4(ip),
@@ -371,32 +386,32 @@ impl TcpClientHandler for HttpTcpClientHandler {
                 };
                 NetLocation::new(address, socket_addr.port())
             } else {
-                remote_location
+                remote_location.into_location()
             }
         } else {
-            remote_location
+            remote_location.into_location()
         };
 
-        let mut connect_str = match resolved_location.address() {
+        let mut connect_str = match connect_location.address() {
             Address::Ipv6(addr) => {
                 format!(
                     "CONNECT [{}]:{} HTTP/1.1\r\n",
                     addr,
-                    resolved_location.port()
+                    connect_location.port()
                 )
             }
             Address::Ipv4(addr) => {
                 format!(
                     "CONNECT {}:{} HTTP/1.1\r\n",
                     addr,
-                    resolved_location.port()
+                    connect_location.port()
                 )
             }
             Address::Hostname(d) => {
                 format!(
                     "CONNECT {}:{} HTTP/1.1\r\n",
                     d,
-                    resolved_location.port()
+                    connect_location.port()
                 )
             }
         };

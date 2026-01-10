@@ -18,7 +18,7 @@
 use async_trait::async_trait;
 use std::fmt::Debug;
 
-use crate::address::NetLocation;
+use crate::address::{NetLocation, ResolvedLocation};
 use crate::async_stream::{AsyncMessageStream, AsyncStream};
 use crate::tcp::tcp_handler::TcpClientSetupResult;
 
@@ -48,10 +48,11 @@ pub trait ProxyConnector: Send + Sync + Debug {
     /// * `stream` - Existing transport stream
     /// * `target` - Where traffic should reach through this hop
     ///              (either the next proxy, or the final destination)
+    ///              May include pre-resolved address to avoid duplicate DNS lookups.
     async fn setup_tcp_stream(
         &self,
         stream: Box<dyn AsyncStream>,
-        target: &NetLocation,
+        target: &ResolvedLocation,
     ) -> std::io::Result<TcpClientSetupResult>;
 
     /// Setup bidirectional UDP-over-TCP on existing stream.
@@ -59,12 +60,13 @@ pub trait ProxyConnector: Send + Sync + Debug {
     /// # Arguments
     /// * `stream` - Existing transport stream
     /// * `target` - The destination for all UDP packets
+    ///              May include pre-resolved address to avoid duplicate DNS lookups.
     ///
     /// # Returns
     /// An AsyncMessageStream that sends/receives UDP packets to/from the target.
     async fn setup_udp_bidirectional(
         &self,
         stream: Box<dyn AsyncStream>,
-        target: NetLocation,
+        target: ResolvedLocation,
     ) -> std::io::Result<Box<dyn AsyncMessageStream>>;
 }

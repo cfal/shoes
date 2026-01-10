@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use rand::RngCore;
 use tokio::io::AsyncWriteExt;
 
-use crate::address::NetLocation;
+use crate::address::ResolvedLocation;
 use crate::async_stream::AsyncMessageStream;
 use crate::async_stream::AsyncStream;
 use crate::buf_reader::BufReader;
@@ -197,7 +197,7 @@ impl TcpClientHandler for ShadowTlsClientHandler {
     async fn setup_client_tcp_stream(
         &self,
         client_stream: Box<dyn AsyncStream>,
-        remote_location: NetLocation,
+        remote_location: ResolvedLocation,
     ) -> std::io::Result<TcpClientSetupResult> {
         let shadow_tls_stream = self.setup_client_stream_common(client_stream).await?;
         self.handler
@@ -212,7 +212,7 @@ impl TcpClientHandler for ShadowTlsClientHandler {
     async fn setup_client_udp_bidirectional(
         &self,
         client_stream: Box<dyn AsyncStream>,
-        target: NetLocation,
+        target: ResolvedLocation,
     ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
         let shadow_tls_stream = self.setup_client_stream_common(client_stream).await?;
         self.handler

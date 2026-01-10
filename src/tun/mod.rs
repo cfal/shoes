@@ -200,7 +200,7 @@ async fn handle_tcp_connection(
     resolver: Arc<dyn Resolver>,
 ) -> std::io::Result<()> {
     let decision = proxy_selector
-        .judge_with_resolved_address(target.clone(), None, &resolver)
+        .judge(target.into(), &resolver)
         .await?;
 
     match decision {
@@ -208,7 +208,7 @@ async fn handle_tcp_connection(
             chain_group,
             remote_location,
         } => {
-            debug!("TCP: connecting to {} via chain", remote_location);
+            debug!("TCP: connecting to {} via chain", remote_location.location());
 
             match chain_group
                 .connect_tcp(remote_location.clone(), &resolver)
@@ -217,7 +217,7 @@ async fn handle_tcp_connection(
                 Ok(setup_result) => {
                     debug!(
                         "TCP: connected to {}, starting bidirectional copy",
-                        remote_location
+                        remote_location.location()
                     );
 
                     let mut remote = setup_result.client_stream;
@@ -227,24 +227,24 @@ async fn handle_tcp_connection(
                         Ok((client_to_remote, remote_to_client)) => {
                             debug!(
                                 "TCP connection to {} completed: {} bytes sent, {} bytes received",
-                                remote_location, client_to_remote, remote_to_client
+                                remote_location.location(), client_to_remote, remote_to_client
                             );
                         }
                         Err(e) => {
-                            debug!("TCP connection to {} error: {}", remote_location, e);
+                            debug!("TCP connection to {} error: {}", remote_location.location(), e);
                         }
                     }
 
                     Ok(())
                 }
                 Err(e) => {
-                    warn!("Failed to connect to {}: {}", remote_location, e);
+                    warn!("Failed to connect to {}: {}", remote_location.location(), e);
                     Err(e)
                 }
             }
         }
         crate::client_proxy_selector::ConnectDecision::Block => {
-            debug!("TCP connection to {} blocked by rules", target);
+            debug!("TCP connection blocked by rules");
             Ok(())
         }
     }
