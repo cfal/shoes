@@ -8,7 +8,7 @@ use tokio::io::AsyncWriteExt;
 use crate::address::{Address, NetLocation};
 use crate::async_stream::AsyncStream;
 use crate::client_proxy_selector::ClientProxySelector;
-use crate::resolver::{resolve_single_address, Resolver};
+use crate::resolver::{Resolver, resolve_single_address};
 use crate::stream_reader::StreamReader;
 use crate::tcp::tcp_handler::{
     TcpClientHandler, TcpClientSetupResult, TcpServerHandler, TcpServerSetupResult,
@@ -329,7 +329,10 @@ pub struct HttpTcpClientHandler {
 impl std::fmt::Debug for HttpTcpClientHandler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HttpTcpClientHandler")
-            .field("auth_header", &self.auth_header.as_ref().map(|_| "[redacted]"))
+            .field(
+                "auth_header",
+                &self.auth_header.as_ref().map(|_| "[redacted]"),
+            )
             .field("resolver", &self.resolver.is_some())
             .finish()
     }
@@ -386,18 +389,10 @@ impl TcpClientHandler for HttpTcpClientHandler {
                 )
             }
             Address::Ipv4(addr) => {
-                format!(
-                    "CONNECT {}:{} HTTP/1.1\r\n",
-                    addr,
-                    resolved_location.port()
-                )
+                format!("CONNECT {}:{} HTTP/1.1\r\n", addr, resolved_location.port())
             }
             Address::Hostname(d) => {
-                format!(
-                    "CONNECT {}:{} HTTP/1.1\r\n",
-                    d,
-                    resolved_location.port()
-                )
+                format!("CONNECT {}:{} HTTP/1.1\r\n", d, resolved_location.port())
             }
         };
 

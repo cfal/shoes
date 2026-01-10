@@ -419,7 +419,10 @@ impl Hysteria2Bandwidth {
 
     fn parse_bandwidth(&self, value: &Option<String>, field: &str) -> std::io::Result<u64> {
         let s = value.as_ref().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("bandwidth {} not specified", field))
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("bandwidth {} not specified", field),
+            )
         })?;
 
         let s = s.trim().to_lowercase();
@@ -437,7 +440,10 @@ impl Hysteria2Bandwidth {
         let unit = s[num_end..].trim();
 
         let num: f64 = num_str.parse().map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("invalid bandwidth value: {}", s))
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("invalid bandwidth value: {}", s),
+            )
         })?;
 
         let multiplier = match unit {
@@ -447,7 +453,12 @@ impl Hysteria2Bandwidth {
             "gbps" | "g" => 1024.0 * 1024.0 * 1024.0,
             "tbps" | "t" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
             "" => 1024.0 * 1024.0, // Default to mbps if no unit
-            _ => return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("unknown bandwidth unit: {}", unit))),
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("unknown bandwidth unit: {}", unit),
+                ));
+            }
         };
 
         Ok((num * multiplier / 8.0) as u64) // Convert bits to bytes
@@ -455,7 +466,9 @@ impl Hysteria2Bandwidth {
 }
 
 /// Resolve bandwidth config to actual bytes per second values
-pub fn resolve_hysteria2_bandwidth(bandwidth: &Option<Hysteria2Bandwidth>) -> std::io::Result<(u64, u64)> {
+pub fn resolve_hysteria2_bandwidth(
+    bandwidth: &Option<Hysteria2Bandwidth>,
+) -> std::io::Result<(u64, u64)> {
     if let Some(bw) = bandwidth {
         let up = bw.parse_up().unwrap_or(0);
         let down = bw.parse_down().unwrap_or(0);
@@ -679,7 +692,10 @@ udp_enabled: true
 "#;
         let result: Result<ClientProxyConfig, _> = serde_yaml::from_str(yaml);
         assert!(result.is_ok());
-        assert!(matches!(result.unwrap(), ClientProxyConfig::Hysteria2 { .. }));
+        assert!(matches!(
+            result.unwrap(),
+            ClientProxyConfig::Hysteria2 { .. }
+        ));
     }
 
     #[test]
@@ -690,6 +706,9 @@ password: "test_password"
 "#;
         let result: Result<ClientProxyConfig, _> = serde_yaml::from_str(yaml);
         assert!(result.is_ok());
-        assert!(matches!(result.unwrap(), ClientProxyConfig::Hysteria2 { .. }));
+        assert!(matches!(
+            result.unwrap(),
+            ClientProxyConfig::Hysteria2 { .. }
+        ));
     }
 }

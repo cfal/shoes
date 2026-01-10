@@ -5,12 +5,12 @@ use std::sync::Arc;
 use crate::client_proxy_chain::{ClientChainGroup, ClientProxyChain, InitialHopEntry};
 use crate::config::ConfigSelection;
 use crate::config::{ClientChainHop, ClientConfig, ClientProxyConfig, ClientQuicConfig};
+use crate::hysteria2_client::Hysteria2SocketConnector;
 use crate::resolver::Resolver;
 use crate::tcp::proxy_connector::ProxyConnector;
 use crate::tcp::proxy_connector_impl::ProxyConnectorImpl;
 use crate::tcp::socket_connector::SocketConnector;
 use crate::tcp::socket_connector_impl::SocketConnectorImpl;
-use crate::hysteria2_client::Hysteria2SocketConnector;
 
 /// Build a ClientProxyChain from a client_chain configuration.
 ///
@@ -64,9 +64,17 @@ pub fn build_client_proxy_chain(
             if matches!(config.protocol, ClientProxyConfig::Hysteria2 { .. }) {
                 // For Hysteria2, we need to extract the password and create a special socket connector
                 let (password, udp_enabled, fast_open, bandwidth) = match &config.protocol {
-                    ClientProxyConfig::Hysteria2 { password, udp_enabled, fast_open, bandwidth } => {
-                        (password.clone(), *udp_enabled, *fast_open, bandwidth.clone())
-                    }
+                    ClientProxyConfig::Hysteria2 {
+                        password,
+                        udp_enabled,
+                        fast_open,
+                        bandwidth,
+                    } => (
+                        password.clone(),
+                        *udp_enabled,
+                        *fast_open,
+                        bandwidth.clone(),
+                    ),
                     _ => unreachable!(),
                 };
 

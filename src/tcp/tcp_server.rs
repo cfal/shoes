@@ -406,8 +406,10 @@ async fn start_tcp_servers(config: ServerConfig) -> std::io::Result<Vec<JoinHand
 
     let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
 
-    let client_proxy_selector =
-        Arc::new(create_tcp_client_proxy_selector(rules.clone(), resolver.clone()));
+    let client_proxy_selector = Arc::new(create_tcp_client_proxy_selector(
+        rules.clone(),
+        resolver.clone(),
+    ));
 
     // Extract bind_ip from bind_location for handlers that need it (e.g., SOCKS5 UDP ASSOCIATE)
     let bind_ip = match &bind_location {

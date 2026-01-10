@@ -7,8 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::hysteria2_protocol::{
-    header, tcp_status, AUTH_HOST, AUTH_PATH, FRAME_TYPE_TCP_REQUEST,
-    STATUS_AUTH_OK,
+    AUTH_HOST, AUTH_PATH, FRAME_TYPE_TCP_REQUEST, STATUS_AUTH_OK, header, tcp_status,
 };
 
 use bytes::{Bytes, BytesMut};
@@ -1064,7 +1063,7 @@ pub async fn start_hysteria2_server(
 mod tests {
     use super::*;
     use crate::hysteria2_protocol::{
-        header, tcp_status, AUTH_HOST, AUTH_PATH, FRAME_TYPE_TCP_REQUEST, STATUS_AUTH_OK,
+        AUTH_HOST, AUTH_PATH, FRAME_TYPE_TCP_REQUEST, STATUS_AUTH_OK, header, tcp_status,
     };
 
     // Helper function to decode a QUIC varint
@@ -1091,7 +1090,11 @@ mod tests {
         if data.len() < num_bytes {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
-                format!("incomplete varint: have {} bytes, need {}", data.len(), num_bytes),
+                format!(
+                    "incomplete varint: have {} bytes, need {}",
+                    data.len(),
+                    num_bytes
+                ),
             ));
         }
 
@@ -1240,13 +1243,13 @@ mod tests {
     fn test_varint_boundary_values() {
         // Test values at each encoding boundary
         let boundary_tests = vec![
-            (0, 1),           // Minimum, single byte
-            (63, 1),          // Max single byte
-            (64, 2),          // Min two-byte
-            (16383, 2),       // Max two-byte
-            (16384, 4),       // Min four-byte
-            (1073741823, 4),  // Max four-byte
-            (1073741824, 8),  // Min eight-byte
+            (0, 1),          // Minimum, single byte
+            (63, 1),         // Max single byte
+            (64, 2),         // Min two-byte
+            (16383, 2),      // Max two-byte
+            (16384, 4),      // Min four-byte
+            (1073741823, 4), // Max four-byte
+            (1073741824, 8), // Min eight-byte
         ];
 
         for (value, expected_bytes) in boundary_tests {
