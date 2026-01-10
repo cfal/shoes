@@ -320,8 +320,10 @@ pub async fn start_quic_servers(config: ServerConfig) -> std::io::Result<Vec<Joi
     let quic_server_config = Arc::new(quic_server_config);
 
     let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
-    let client_proxy_selector =
-        Arc::new(create_tcp_client_proxy_selector(rules.clone(), resolver.clone()));
+    let client_proxy_selector = Arc::new(create_tcp_client_proxy_selector(
+        rules.clone(),
+        resolver.clone(),
+    ));
 
     let mut handles = vec![];
 

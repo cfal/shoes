@@ -43,7 +43,11 @@ impl ProxyConnectorImpl {
 
         Some(Self {
             location: config.address,
-            client_handler: create_tcp_client_handler(config.protocol, default_sni_hostname, resolver),
+            client_handler: create_tcp_client_handler(
+                config.protocol,
+                default_sni_hostname,
+                resolver,
+            ),
         })
     }
 

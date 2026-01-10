@@ -429,8 +429,7 @@ fn create_shadow_tls_server_target(
         ShadowTlsServerHandshakeConfig::Remote(handshake) => {
             // Build ClientProxyChain from client_chain
             // client_chain is guaranteed to be non-empty (defaults to direct hop)
-            let client_chain =
-                build_client_proxy_chain(handshake.client_chain, resolver.clone());
+            let client_chain = build_client_proxy_chain(handshake.client_chain, resolver.clone());
             ShadowTlsServerTargetHandshake::new_remote(handshake.address, client_chain)
         }
     };
