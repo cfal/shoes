@@ -11,14 +11,14 @@
 //! | 2    | 1    | 1    | variable | 2        | variable |
 //! ```
 
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{Ipv4Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use bytes::BytesMut;
-use log::{debug, error, warn};
-use tokio::io::{AsyncReadExt, ReadBuf};
+use log::error;
+use tokio::io::ReadBuf;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
@@ -93,6 +93,7 @@ impl SocksUdpRelay {
     }
 
     /// Get the bound address of the UDP socket
+    #[allow(dead_code)]
     pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
         self.udp_socket.local_addr()
     }

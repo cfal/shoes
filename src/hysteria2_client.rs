@@ -9,84 +9,33 @@
 //! Protocol reference: https://v2.hysteria.network/zh/docs/developers/Protocol/
 //! Go client reference: https://github.com/apernet/hysteria/blob/master/core/client/client.go
 
-<<<<<<< HEAD
-use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use bytes::{Bytes, BytesMut};
-use log::{debug, error, warn};
-use lru::LruCache;
+use bytes::BytesMut;
+use log::{error, warn};
 use rand::distr::Alphanumeric;
 use rand::{Rng, RngCore};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::UdpSocket;
-use tokio::sync::{Mutex, RwLock};
-use tokio::task::JoinHandle;
+use tokio::sync::Mutex;
 use tokio::time::timeout;
-use tokio_util::sync::CancellationToken;
 
 use crate::address::NetLocation;
 use crate::async_stream::{
     AsyncPing, AsyncStream,
 };
 use crate::hysteria2_protocol::{
-    header, tcp_status, AUTH_URI, FRAME_TYPE_TCP_REQUEST, MAX_ADDRESS_LENGTH,
-    MAX_PADDING_LENGTH, STATUS_AUTH_OK,
+    header, tcp_status, AUTH_URI, FRAME_TYPE_TCP_REQUEST, MAX_ADDRESS_LENGTH, STATUS_AUTH_OK,
 };
 use crate::quic_stream::QuicStream;
 use crate::resolver::{resolve_single_address, NativeResolver, Resolver};
-use crate::socket_util::new_udp_socket;
-=======
-use std::sync::Arc;
-use std::time::Duration;
-
-use bytes::BytesMut;
-use log::{debug, error, warn};
-use rand::distr::Alphanumeric;
-use rand::{Rng, RngCore};
-use tokio::sync::Mutex;
-use tokio::time::timeout;
-
-use crate::address::NetLocation;
-use crate::async_stream::AsyncStream;
-use crate::quic_stream::QuicStream;
-use crate::resolver::{Resolver, resolve_single_address};
->>>>>>> 36398d8 (impl hysteria2 as client)
 
 /// Authentication timeout - close connection if server doesn't authenticate within this time.
 /// Per protocol reference implementation, default is 3 seconds.
 const AUTH_TIMEOUT: Duration = Duration::from_secs(3);
-
-<<<<<<< HEAD
-/// Maximum number of fragmented packets to track per session
-const MAX_FRAGMENT_CACHE_SIZE: usize = 256;
-
-/// UDP session cleanup interval
-const UDP_CLEANUP_INTERVAL: Duration = Duration::from_secs(100);
-
-/// UDP session idle timeout
-const UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(200);
-
-/// Channel size for UDP message passing
-const UDP_MESSAGE_CHAN_SIZE: usize = 1024;
-=======
-/// TCP request frame type from Hysteria2 protocol
-const FRAME_TYPE_TCP_REQUEST: u64 = 0x401;
-
-/// TCP response status codes
-const TCP_STATUS_OK: u8 = 0x00;
-const TCP_STATUS_ERROR: u8 = 0x01;
-
-/// Maximum address length (from official Go implementation)
-const MAX_ADDRESS_LENGTH: usize = 2048;
-
-/// Maximum padding length (from official Go implementation)
-const MAX_PADDING_LENGTH: usize = 4096;
->>>>>>> 36398d8 (impl hysteria2 as client)
 
 /// Generates a random ASCII string for Hysteria-Padding header
 fn generate_padding_string() -> String {
@@ -103,7 +52,6 @@ fn encode_varint(value: u64) -> std::io::Result<Box<[u8]>> {
     if value <= 0b00111111 {
         Ok(Box::new([value as u8]))
     } else if value < (1 << 14) {
-<<<<<<< HEAD
         let encoded: u16 = (0b01_u16 << 14) | value as u16;
         Ok(Box::new(encoded.to_be_bytes()))
     } else if value < (1 << 30) {
@@ -112,25 +60,11 @@ fn encode_varint(value: u64) -> std::io::Result<Box<[u8]>> {
     } else if value < (1 << 62) {
         let encoded: u64 = (0b11_u64 << 62) | value;
         Ok(Box::new(encoded.to_be_bytes()))
-=======
-        let mut bytes = (value as u16).to_be_bytes();
-        bytes[0] |= 0b01000000;
-        Ok(Box::new(bytes))
-    } else if value < (1 << 30) {
-        let mut bytes = (value as u32).to_be_bytes();
-        bytes[0] |= 0b10000000;
-        Ok(Box::new(bytes))
-    } else if value < (1 << 62) {
-        let mut bytes = value.to_be_bytes();
-        bytes[0] |= 0b11000000;
-        Ok(Box::new(bytes))
->>>>>>> 36398d8 (impl hysteria2 as client)
     } else {
         Err(std::io::Error::other("value too large to encode as varint"))
     }
 }
 
-<<<<<<< HEAD
 /// Decodes a QUIC varint from bytes, returns (value, bytes_consumed)
 fn decode_varint(data: &[u8]) -> std::io::Result<(u64, usize)> {
     if data.is_empty() {
@@ -169,312 +103,7 @@ fn decode_varint(data: &[u8]) -> std::io::Result<(u64, usize)> {
     Ok((value, num_bytes))
 }
 
-/// A fragmented packet being reassembled
-struct FragmentedPacket {
-    fragment_count: u8,
-    fragment_received: u8,
-    packet_len: usize,
-    received: Vec<Option<Bytes>>,
-}
 
-/// Represents a UDP session with the Hysteria2 server
-#[derive(Debug)]
-struct HyUdpSession {
-    /// Session ID
-    id: u32,
-    /// Defragger for incoming packets
-    defragger: LruCache<u16, FragmentedPacket>,
-    /// Channel for receiving messages from the server
-    receive_ch: tokio::sync::mpsc::Receiver<Bytes>,
-    /// Local UDP socket for communicating with the client
-    local_socket: Arc<UdpSocket>,
-    /// Last activity timestamp for idle timeout
-    last_activity: Instant,
-    /// Cancellation token for this session
-    cancel_token: CancellationToken,
-    /// Handle to the receive task
-    _task_handle: JoinHandle<()>,
-}
-
-impl HyUdpSession {
-    /// Create a new UDP session
-    fn new(
-        id: u32,
-        connection: quinn::Connection,
-        local_socket: Arc<UdpSocket>,
-        _resolver: Arc<dyn Resolver>,
-        cancel_token: CancellationToken,
-    ) -> Self {
-        let (tx, rx) = tokio::sync::mpsc::channel(UDP_MESSAGE_CHAN_SIZE);
-
-        let session_cancel_token = cancel_token.child_token();
-        let task_handle = tokio::spawn(async move {
-            if let Err(e) = run_udp_receive_loop(id, connection, tx, session_cancel_token).await {
-                error!("[Hysteria2] UDP receive loop for session {} ended with error: {}", id, e);
-            }
-        });
-
-        Self {
-            id,
-            defragger: LruCache::new(
-                std::num::NonZeroUsize::new(MAX_FRAGMENT_CACHE_SIZE).unwrap(),
-            ),
-            receive_ch: rx,
-            local_socket,
-            last_activity: Instant::now(),
-            cancel_token,
-            _task_handle: task_handle,
-        }
-    }
-
-    /// Check if the session has timed out
-    fn is_idle(&self) -> bool {
-        self.last_activity.elapsed() > UDP_IDLE_TIMEOUT
-    }
-
-    /// Update the last activity timestamp
-    fn refresh(&mut self) {
-        self.last_activity = Instant::now();
-    }
-}
-
-/// Handles receiving UDP datagrams from the server
-async fn run_udp_receive_loop(
-    session_id: u32,
-    connection: quinn::Connection,
-    tx: tokio::sync::mpsc::Sender<Bytes>,
-    cancel_token: CancellationToken,
-) -> std::io::Result<()> {
-    let max_datagram_size = connection
-        .max_datagram_size()
-        .ok_or_else(|| std::io::Error::other("datagram not supported by remote endpoint"))?;
-
-    let _buf = vec![0u8; max_datagram_size as usize];
-
-    loop {
-        tokio::select! {
-            _ = cancel_token.cancelled() => {
-                return Ok(());
-            }
-            result = connection.read_datagram() => {
-                let data = match result {
-                    Ok(d) => d,
-                    Err(e) => {
-                        return Err(std::io::Error::other(format!(
-                            "failed to read datagram for session {}: {}",
-                            session_id, e
-                        )));
-                    }
-                };
-
-                if data.len() < 9 {
-                    warn!("[Hysteria2] Received too short datagram for session {}", session_id);
-                    continue;
-                }
-
-                // Parse the datagram header
-                let _session_id = u32::from_be_bytes(data[0..4].try_into().unwrap());
-                let _packet_id = u16::from_be_bytes(data[4..6].try_into().unwrap());
-                let _fragment_id = data[6];
-                let fragment_count = data[7];
-
-                // Reject invalid fragment_count (must be at least 1)
-                if fragment_count < 1 {
-                    warn!("[Hysteria2] Invalid fragment count {} for session {}", fragment_count, session_id);
-                    continue;
-                }
-
-                // Parse address length (varint starting at byte 8)
-                let (address_len, addr_end) = match decode_varint(&data[8..]) {
-                    Ok((len, consumed)) => (len as usize, 8 + consumed),
-                    Err(e) => {
-                        warn!("[Hysteria2] Failed to parse address length: {}", e);
-                        continue;
-                    }
-                };
-
-                if address_len == 0 || address_len > MAX_ADDRESS_LENGTH {
-                    warn!("[Hysteria2] Invalid address length {}", address_len);
-                    continue;
-                }
-
-                if data.len() < addr_end + address_len {
-                    warn!("[Hysteria2] Incomplete address in datagram");
-                    continue;
-                }
-
-                // Skip address bytes
-                let payload_start = addr_end + address_len;
-                let payload = &data[payload_start..];
-
-                if payload.is_empty() {
-                    continue;
-                }
-
-                // Handle fragmentation
-                if fragment_count == 1 {
-                    // No fragmentation, send directly
-                    if tx.send(Bytes::copy_from_slice(payload)).await.is_err() {
-                        return Ok(());
-                    }
-                } else {
-                    // Fragmented packet - this would be handled by HyUdpSession
-                    // For now, we just pass it through
-                    if tx.send(Bytes::copy_from_slice(payload)).await.is_err() {
-                        return Ok(());
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Manages UDP sessions for a Hysteria2 connection
-#[derive(Debug)]
-struct UdpSessionManager {
-    /// The QUIC connection
-    connection: quinn::Connection,
-    /// Active sessions keyed by session ID
-    sessions: RwLock<HashMap<u32, HyUdpSession>>,
-    /// Next session ID to assign
-    next_session_id: AtomicU32,
-    /// Cancellation token for all sessions
-    cancel_token: CancellationToken,
-    /// Local resolver for address resolution
-    resolver: Arc<dyn Resolver>,
-    /// Maximum datagram size
-    max_datagram_size: usize,
-    /// Background cleanup task handle
-    _cleanup_task: JoinHandle<()>,
-}
-
-use std::sync::atomic::{AtomicU32, Ordering};
-
-impl UdpSessionManager {
-    /// Create a new UDP session manager
-    fn new(
-        connection: quinn::Connection,
-        resolver: Arc<dyn Resolver>,
-        cancel_token: CancellationToken,
-    ) -> Self {
-        let max_datagram_size = connection
-            .max_datagram_size()
-            .unwrap_or(65535) as usize;
-
-        let manager = Self {
-            connection,
-            sessions: RwLock::new(HashMap::new()),
-            next_session_id: AtomicU32::new(1),
-            cancel_token,
-            resolver,
-            max_datagram_size,
-            _cleanup_task: tokio::spawn(async move {
-                // Cleanup task implementation would go here
-                // For now, we rely on session-level cleanup
-            }),
-        };
-
-        manager
-    }
-
-    /// Create a new UDP session
-    async fn new_session(
-        &self,
-        _target: &NetLocation,
-    ) -> std::io::Result<(u32, Arc<UdpSocket>)> {
-        let session_id = self.next_session_id.fetch_add(1, Ordering::Relaxed);
-
-        // Create a local UDP socket for this session
-        let local_socket = Arc::new(new_udp_socket(true, None)?);
-
-        let session = HyUdpSession::new(
-            session_id,
-            self.connection.clone(),
-            local_socket.clone(),
-            self.resolver.clone(),
-            self.cancel_token.clone(),
-        );
-
-        self.sessions.write().await.insert(session_id, session);
-
-
-        Ok((session_id, local_socket))
-    }
-
-    /// Send a UDP packet to the server
-    async fn send_packet(
-        &self,
-        session_id: u32,
-        data: &[u8],
-        target: &SocketAddr,
-    ) -> std::io::Result<()> {
-        let address_str = target.to_string();
-        let address_bytes = address_str.as_bytes();
-        let address_len_bytes = encode_varint(address_bytes.len() as u64)?;
-
-        // Calculate header overhead
-        let header_overhead = 4 + 2 + 1 + 1 + address_len_bytes.len() + address_len_bytes.len() + address_bytes.len();
-        let effective_max_size = self.max_datagram_size.saturating_sub(header_overhead);
-
-        if data.len() <= effective_max_size {
-            // No fragmentation needed
-            let mut datagram = BytesMut::with_capacity(header_overhead + data.len());
-            datagram.extend_from_slice(&session_id.to_be_bytes());
-            datagram.extend_from_slice(&0u16.to_be_bytes()); // packet_id = 0 for no frag
-            datagram.extend_from_slice(&[0u8, 1u8]); // frag_id = 0, frag_count = 1
-            datagram.extend_from_slice(&address_len_bytes);
-            datagram.extend_from_slice(address_bytes);
-            datagram.extend_from_slice(data);
-
-            self.connection
-                .send_datagram(datagram.freeze())
-                .map_err(|e| std::io::Error::other(format!("Failed to send datagram: {}", e)))?;
-        } else {
-            // Fragmentation needed
-            let packet_id = rand::rng().random_range(1..u16::MAX) as u16 + 1;
-            let fragment_count = (data.len().div_ceil(effective_max_size)) as u8;
-
-            for frag_id in 0..fragment_count {
-                let start = (frag_id as usize) * effective_max_size;
-                let end = std::cmp::min(start + effective_max_size, data.len());
-                let fragment_data = &data[start..end];
-
-                let mut datagram = BytesMut::with_capacity(header_overhead + fragment_data.len());
-                datagram.extend_from_slice(&session_id.to_be_bytes());
-                datagram.extend_from_slice(&packet_id.to_be_bytes());
-                datagram.extend_from_slice(&[frag_id, fragment_count]);
-                datagram.extend_from_slice(&address_len_bytes);
-                datagram.extend_from_slice(address_bytes);
-                datagram.extend_from_slice(fragment_data);
-
-                self.connection
-                    .send_datagram(datagram.freeze())
-                    .map_err(|e| std::io::Error::other(format!(
-                        "Failed to send datagram fragment {}: {}",
-                        frag_id, e
-                    )))?;
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Get the count of active sessions
-    async fn session_count(&self) -> usize {
-        self.sessions.read().await.len()
-    }
-
-    /// Cleanup idle sessions
-    async fn cleanup_idle_sessions(&self) {
-        let mut sessions = self.sessions.write().await;
-        sessions.retain(|_id, session| {
-            !session.is_idle()
-        });
-    }
-}
-
-=======
->>>>>>> 36398d8 (impl hysteria2 as client)
 /// Hysteria2 client that manages a QUIC connection to the server
 #[derive(Debug)]
 pub struct Hysteria2Client {
@@ -488,15 +117,12 @@ pub struct Hysteria2Client {
     password: String,
     /// Whether UDP relay is enabled
     pub udp_enabled: bool,
-<<<<<<< HEAD
     /// Whether TCP Fast Open is enabled
     pub fast_open: bool,
     /// Maximum upload rate in bytes per second (0 = unlimited)
     pub max_tx: u64,
     /// Maximum download rate in bytes per second (0 = unlimited)
     pub max_rx: u64,
-=======
->>>>>>> 36398d8 (impl hysteria2 as client)
 }
 
 impl Hysteria2Client {
@@ -507,12 +133,9 @@ impl Hysteria2Client {
         sni_hostname: Option<String>,
         password: String,
         udp_enabled: bool,
-<<<<<<< HEAD
         fast_open: bool,
         max_tx: u64,
         max_rx: u64,
-=======
->>>>>>> 36398d8 (impl hysteria2 as client)
     ) -> Self {
         Self {
             endpoint,
@@ -520,12 +143,9 @@ impl Hysteria2Client {
             sni_hostname,
             password,
             udp_enabled,
-<<<<<<< HEAD
             fast_open,
             max_tx,
             max_rx,
-=======
->>>>>>> 36398d8 (impl hysteria2 as client)
         }
     }
 
@@ -533,11 +153,7 @@ impl Hysteria2Client {
     pub async fn connect_and_authenticate(
         &self,
         resolver: &Arc<dyn Resolver>,
-<<<<<<< HEAD
     ) -> std::io::Result<(Hysteria2Connection, u64, bool)> {
-=======
-    ) -> std::io::Result<Hysteria2Connection> {
->>>>>>> 36398d8 (impl hysteria2 as client)
         let server_addr = resolve_single_address(resolver, &self.server_address).await?;
 
         let domain = self
@@ -551,14 +167,6 @@ impl Hysteria2Client {
                     .unwrap_or("example.com")
             });
 
-<<<<<<< HEAD
-=======
-        debug!(
-            "[Hysteria2] Connecting to {} ({})",
-            self.server_address, server_addr
-        );
-
->>>>>>> 36398d8 (impl hysteria2 as client)
         // Establish QUIC connection
         let connection = self
             .endpoint
@@ -567,16 +175,9 @@ impl Hysteria2Client {
             .await
             .map_err(|e| std::io::Error::other(format!("QUIC connection failed: {e}")))?;
 
-<<<<<<< HEAD
 
         // Perform HTTP/3 authentication and get congestion control info
         let (tx, tx_auto) = timeout(AUTH_TIMEOUT, self.authenticate_connection(&connection))
-=======
-        debug!("[Hysteria2] QUIC connection established, performing authentication");
-
-        // Perform HTTP/3 authentication
-        timeout(AUTH_TIMEOUT, self.authenticate_connection(&connection))
->>>>>>> 36398d8 (impl hysteria2 as client)
             .await
             .map_err(|_| {
                 error!("[Hysteria2] Authentication timeout");
@@ -584,24 +185,11 @@ impl Hysteria2Client {
                 std::io::Error::new(std::io::ErrorKind::TimedOut, "authentication timeout")
             })??;
 
-<<<<<<< HEAD
-
-        // Create UDP session manager if UDP is enabled
-        let udp_manager = if self.udp_enabled {
-            Some(Arc::new(UdpSessionManager::new(
-                connection.clone(),
-                resolver.clone(),
-                CancellationToken::new(),
-            )))
-        } else {
-            None
-        };
 
         let conn = Hysteria2Connection {
             connection,
             udp_enabled: self.udp_enabled,
             fast_open: self.fast_open,
-            udp_manager,
             tx,
             tx_auto,
         };
@@ -611,18 +199,6 @@ impl Hysteria2Client {
 
     /// Perform HTTP/3 authentication handshake
     async fn authenticate_connection(&self, connection: &quinn::Connection) -> std::io::Result<(u64, bool)> {
-=======
-        debug!("[Hysteria2] Authentication successful");
-
-        Ok(Hysteria2Connection {
-            connection,
-            udp_enabled: self.udp_enabled,
-        })
-    }
-
-    /// Perform HTTP/3 authentication handshake
-    async fn authenticate_connection(&self, connection: &quinn::Connection) -> std::io::Result<()> {
->>>>>>> 36398d8 (impl hysteria2 as client)
         let h3_connection = h3_quinn::Connection::new(connection.clone());
         let (_h3_conn, mut h3_send) = h3::client::new(h3_connection)
             .await
@@ -633,26 +209,15 @@ impl Hysteria2Client {
         // :path: /auth
         // :host: hysteria
         // Hysteria-Auth: [password]
-<<<<<<< HEAD
         // Hysteria-CC-RX: [rx_rate] - client's max receive rate
-=======
-        // Hysteria-CC-RX: [rx_rate]
->>>>>>> 36398d8 (impl hysteria2 as client)
         // Hysteria-Padding: [random]
 
         let req = http::Request::builder()
             .method("POST")
-<<<<<<< HEAD
             .uri(AUTH_URI)
             .header(header::AUTH, &self.password)
             .header(header::CC_RX, self.max_rx.to_string())
             .header(header::PADDING, generate_padding_string())
-=======
-            .uri("https://hysteria/auth")
-            .header("Hysteria-Auth", &self.password)
-            .header("Hysteria-CC-RX", "0")
-            .header("Hysteria-Padding", generate_padding_string())
->>>>>>> 36398d8 (impl hysteria2 as client)
             .body(())
             .map_err(|e| std::io::Error::other(format!("Failed to build request: {e}")))?;
 
@@ -675,11 +240,7 @@ impl Hysteria2Client {
 
         // Check status code - must be 233 (HyOK) per protocol spec
         let status = resp.status();
-<<<<<<< HEAD
         if status.as_u16() != STATUS_AUTH_OK {
-=======
-        if status.as_u16() != 233 {
->>>>>>> 36398d8 (impl hysteria2 as client)
             return Err(std::io::Error::other(format!(
                 "Authentication failed: expected status 233, got {}",
                 status
@@ -687,25 +248,16 @@ impl Hysteria2Client {
         }
 
         // Parse Hysteria-UDP header to check if UDP is supported
-<<<<<<< HEAD
         if let Some(udp_header) = resp.headers().get(header::UDP) {
-=======
-        if let Some(udp_header) = resp.headers().get("Hysteria-UDP") {
->>>>>>> 36398d8 (impl hysteria2 as client)
             let udp_str = udp_header
                 .to_str()
                 .map_err(|e| std::io::Error::other(format!("Invalid Hysteria-UDP header: {e}")))?;
             let server_udp_enabled = udp_str.eq_ignore_ascii_case("true");
-<<<<<<< HEAD
-=======
-            debug!("[Hysteria2] Server UDP support: {}", server_udp_enabled);
->>>>>>> 36398d8 (impl hysteria2 as client)
             if !server_udp_enabled && self.udp_enabled {
                 warn!("[Hysteria2] Client UDP enabled but server doesn't support UDP relay");
             }
         }
 
-<<<<<<< HEAD
         // Parse Hysteria-CC-RX header for congestion control
         // Format: either "auto" or a number representing server's max receive rate
         let (tx, tx_auto) = if let Some(cc_header) = resp.headers().get(header::CC_RX) {
@@ -740,9 +292,6 @@ impl Hysteria2Client {
         }
 
         Ok((tx, tx_auto))
-=======
-        Ok(())
->>>>>>> 36398d8 (impl hysteria2 as client)
     }
 }
 
@@ -752,149 +301,16 @@ pub struct Hysteria2Connection {
     /// The underlying QUIC connection
     pub connection: quinn::Connection,
     /// Whether UDP relay is enabled
+    #[allow(dead_code)]
     pub udp_enabled: bool,
-<<<<<<< HEAD
     /// Whether TCP Fast Open is enabled
     pub fast_open: bool,
-    /// UDP session manager (None if UDP is disabled)
-    pub udp_manager: Option<Arc<UdpSessionManager>>,
     /// Actual upload rate in bytes per second (0 = BBR/unlimited)
+    #[allow(dead_code)]
     pub tx: u64,
     /// Whether server requested auto bandwidth detection (BBR)
+    #[allow(dead_code)]
     pub tx_auto: bool,
-}
-
-impl Hysteria2Connection {
-    /// Create a new UDP session and return the session stream
-    pub async fn create_udp_session(
-        &self,
-        _resolver: &Arc<dyn Resolver>,
-        target: &NetLocation,
-    ) -> std::io::Result<HyUdpConn> {
-        let manager = self.udp_manager.as_ref().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "UDP is not enabled on this connection",
-            )
-        })?;
-
-        let (session_id, local_socket) = manager.new_session(target).await?;
-
-        Ok(HyUdpConn {
-            session_id,
-            local_socket,
-            manager: manager.clone(),
-            target: target.clone(),
-            is_closed: false,
-        })
-    }
-}
-
-/// A UDP session connection for Hysteria2
-#[derive(Debug)]
-pub struct HyUdpConn {
-    /// Session ID
-    session_id: u32,
-    /// Local UDP socket for this session
-    local_socket: Arc<UdpSocket>,
-    /// Reference to the session manager
-    manager: Arc<UdpSessionManager>,
-    /// Target destination
-    target: NetLocation,
-    /// Whether this connection is closed
-    is_closed: bool,
-}
-
-impl HyUdpConn {
-    /// Close the UDP session
-    fn close(&mut self) {
-        if !self.is_closed {
-            self.is_closed = true;
-        }
-    }
-}
-
-impl AsyncPing for HyUdpConn {
-    fn supports_ping(&self) -> bool {
-        false
-    }
-
-    fn poll_write_ping(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<bool>> {
-        Poll::Ready(Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "UDP does not support ping",
-        )))
-    }
-}
-
-// HyUdpConn implements AsyncMessageStream through blanket impl for types with AsyncRead/AsyncWrite
-impl crate::async_stream::AsyncMessageStream for HyUdpConn {}
-
-impl crate::async_stream::AsyncReadMessage for HyUdpConn {
-    fn poll_read_message(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        let this = self.get_mut();
-        if this.is_closed {
-            return Poll::Ready(Err(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "UDP session is closed",
-            )));
-        }
-        let socket = Pin::new(&*this.local_socket);
-        socket.poll_recv(cx, buf)
-    }
-}
-
-impl crate::async_stream::AsyncWriteMessage for HyUdpConn {
-    fn poll_write_message(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<std::io::Result<()>> {
-        let this = self.get_mut();
-        if this.is_closed {
-            return Poll::Ready(Err(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "UDP session is closed",
-            )));
-        }
-
-        let resolver = NativeResolver::new();
-        let addrs = futures::executor::block_on(async {
-            resolver.resolve_location(&this.target).await
-        }).map_err(|e| std::io::Error::other(format!("Failed to resolve target: {}", e)))?;
-        let addr = addrs.into_iter().next().ok_or_else(|| {
-            std::io::Error::other("No addresses resolved for target")
-        })?;
-
-        let socket = &this.local_socket;
-        match Pin::new(socket).poll_send_to(cx, buf, addr) {
-            Poll::Ready(Ok(_)) => Poll::Ready(Ok(())),
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
-impl crate::async_stream::AsyncFlushMessage for HyUdpConn {
-    fn poll_flush_message(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-}
-
-impl crate::async_stream::AsyncShutdownMessage for HyUdpConn {
-    fn poll_shutdown_message(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
 }
 
 /// A multidirectional UDP message stream for Hysteria2.
@@ -1176,39 +592,6 @@ impl crate::async_stream::AsyncShutdownMessage for HyUdpMessageStream {
 
 impl crate::async_stream::AsyncSourcedMessageStream for HyUdpMessageStream {}
 
-// Implement AsyncMessageStream for HyUdpMessageStream to support SocketConnector::connect_udp_bidirectional
-impl crate::async_stream::AsyncReadMessage for HyUdpMessageStream {
-    fn poll_read_message(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        // Delegate to AsyncReadSourcedMessage, ignoring the source address
-        match self.poll_read_sourced_message(cx, buf) {
-            Poll::Ready(Ok(_)) => Poll::Ready(Ok(())),
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
-impl crate::async_stream::AsyncWriteMessage for HyUdpMessageStream {
-    fn poll_write_message(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-        _buf: &[u8],
-    ) -> Poll<std::io::Result<()>> {
-        // For bidirectional UDP, we need a fixed target. This is a limitation -
-        // the caller should use the full multi-directional API if they need per-packet targets.
-        Poll::Ready(Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "HyUdpMessageStream requires explicit target address. Use AsyncTargetedMessageStream instead.",
-        )))
-    }
-}
-
-impl crate::async_stream::AsyncMessageStream for HyUdpMessageStream {}
-
 /// Hysteria2 TCP stream with optional Fast Open support.
 ///
 /// When Fast Open is enabled, the stream is returned immediately after sending
@@ -1222,6 +605,7 @@ pub struct HyTcpStream {
     /// Whether the connection has been established (server response received)
     established: Arc<std::sync::atomic::AtomicBool>,
     /// Whether Fast Open is enabled
+    #[allow(dead_code)]
     fast_open: bool,
 }
 
@@ -1231,7 +615,7 @@ impl HyTcpStream {
     /// If fast_open is true, the stream is returned immediately after sending
     /// the request, and the server response is deferred to the first Read() call.
     pub fn new(
-        mut send: quinn::SendStream,
+        send: quinn::SendStream,
         recv: quinn::RecvStream,
         fast_open: bool,
     ) -> Self {
@@ -1408,8 +792,6 @@ where
             f(&mut Context::from_waker(&std::task::Waker::from_raw(raw)))
         }
     }
-=======
->>>>>>> 36398d8 (impl hysteria2 as client)
 }
 
 impl Hysteria2Connection {
@@ -1418,16 +800,9 @@ impl Hysteria2Connection {
         &self,
         target: &NetLocation,
     ) -> std::io::Result<Box<dyn AsyncStream>> {
-<<<<<<< HEAD
 
         // Open bidirectional stream
         let (mut send, recv) = self
-=======
-        debug!("[Hysteria2] Creating TCP stream to {}", target);
-
-        // Open bidirectional stream
-        let (mut send, mut recv) = self
->>>>>>> 36398d8 (impl hysteria2 as client)
             .connection
             .open_bi()
             .await
@@ -1481,7 +856,6 @@ impl Hysteria2Connection {
             .await
             .map_err(|e| std::io::Error::other(format!("Failed to send TCP request: {e}")))?;
 
-<<<<<<< HEAD
         // If Fast Open is enabled, return the stream immediately without waiting for response
         if self.fast_open {
             return Ok(Box::new(HyTcpStream::new(send, recv, true)));
@@ -1490,8 +864,6 @@ impl Hysteria2Connection {
         // Fast Open disabled, wait for server response before returning
         let mut recv = recv;
 
-=======
->>>>>>> 36398d8 (impl hysteria2 as client)
         // Receive response per protocol spec:
         // [uint8] Status (0x00 = OK, 0x01 = Error)
         // [varint] Message length
@@ -1505,11 +877,7 @@ impl Hysteria2Connection {
             .map_err(|e| std::io::Error::other(format!("Failed to read status: {e}")))?;
 
         let status = status_buf[0];
-<<<<<<< HEAD
         if status != tcp_status::OK {
-=======
-        if status != TCP_STATUS_OK {
->>>>>>> 36398d8 (impl hysteria2 as client)
             // Read error message
             let msg_len = read_varint_from_stream(&mut recv).await?;
             if msg_len > 1024 {
@@ -1603,12 +971,9 @@ impl Hysteria2SocketConnector {
         sni_hostname: Option<String>,
         password: String,
         udp_enabled: bool,
-<<<<<<< HEAD
         fast_open: bool,
         max_tx: u64,
         max_rx: u64,
-=======
->>>>>>> 36398d8 (impl hysteria2 as client)
     ) -> Self {
         Self {
             client: Arc::new(Hysteria2Client::new(
@@ -1617,12 +982,9 @@ impl Hysteria2SocketConnector {
                 sni_hostname,
                 password,
                 udp_enabled,
-<<<<<<< HEAD
                 fast_open,
                 max_tx,
                 max_rx,
-=======
->>>>>>> 36398d8 (impl hysteria2 as client)
             )),
             connection: Arc::new(Mutex::new(None)),
         }
@@ -1645,11 +1007,7 @@ impl Hysteria2SocketConnector {
         }
 
         // Need to create a new connection
-<<<<<<< HEAD
         let (new_conn, _tx, _tx_auto) = self.client.connect_and_authenticate(resolver).await?;
-=======
-        let new_conn = self.client.connect_and_authenticate(resolver).await?;
->>>>>>> 36398d8 (impl hysteria2 as client)
 
         // Store the new connection
         {
@@ -1673,115 +1031,126 @@ impl crate::tcp::socket_connector::SocketConnector for Hysteria2SocketConnector 
         conn.create_tcp_stream(address).await
     }
 
-    /// Create UDP socket(s) for Hysteria2 UDP relay
-    async fn connect_udp(
+    /// Create a bidirectional UDP stream through Hysteria2
+    ///
+    /// Note: Hysteria2's UDP relay is inherently multi-directional (supports multiple targets).
+    /// This method provides compatibility by creating a wrapper that works with the single-target
+    /// AsyncMessageStream interface.
+    async fn connect_udp_bidirectional(
         &self,
-<<<<<<< HEAD
         resolver: &Arc<dyn Resolver>,
-        request: crate::tcp_handler::UdpStreamRequest,
-    ) -> std::io::Result<crate::tcp_handler::TcpClientUdpSetupResult> {
-        use crate::tcp_handler::UdpStreamRequest;
+        target: NetLocation,
+    ) -> std::io::Result<Box<dyn crate::async_stream::AsyncMessageStream>> {
         use crate::socket_util::new_udp_socket;
 
         let conn = self.get_or_create_connection(resolver).await?;
 
-        match request {
-            UdpStreamRequest::MultiDirectional { server_stream } => {
-                // Create a local UDP socket for bidirectional communication
-                let local_socket = Arc::new(new_udp_socket(true, None)?);
+        // Create a local UDP socket for bidirectional communication
+        let local_socket = Arc::new(new_udp_socket(target.address().is_ipv6(), None)?);
 
-                // Create the Hysteria2 UDP message stream
-                let hy_udp_stream = HyUdpMessageStream::new(local_socket.clone(), conn.connection.clone());
+        // Create the Hysteria2 UDP message stream
+        let hy_udp_stream = HyUdpMessageStream::new(local_socket, conn.connection.clone());
 
-                Ok(crate::tcp_handler::TcpClientUdpSetupResult::MultiDirectional {
-                    server_stream,
-                    client_stream: Box::new(hy_udp_stream),
-                })
-            }
-            UdpStreamRequest::Bidirectional { server_stream: _, target: _ } => {
-                // Hysteria2 uses native UDP relay via QUIC datagrams,
-                // which supports multiple destinations by design.
-                // We always use MultiDirectional internally.
-                let local_socket = Arc::new(new_udp_socket(true, None)?);
-                let hy_udp_stream = HyUdpMessageStream::new(local_socket, conn.connection.clone());
+        // Wrap in a bidirectional adapter
+        Ok(Box::new(Hysteria2UdpAdapter::new(hy_udp_stream, target)))
+    }
+}
 
-                // Return a simple wrapped stream that discards the server_stream
-                // since Hysteria2 handles UDP directly via QUIC datagrams
-                Ok(crate::tcp_handler::TcpClientUdpSetupResult::MultiDirectional {
-                    server_stream: Box::new(DummyTargetedStream),
-                    client_stream: Box::new(hy_udp_stream),
-                })
-            }
-            UdpStreamRequest::SessionBased { server_stream: _ } => {
-                // Hysteria2 uses native UDP relay via QUIC datagrams,
-                // not XUDP-style sessions. Use MultiDirectional.
-                let local_socket = Arc::new(new_udp_socket(true, None)?);
-                let hy_udp_stream = HyUdpMessageStream::new(local_socket, conn.connection.clone());
+/// Adapter that converts Hysteria2's multi-directional UDP stream to a bidirectional AsyncMessageStream.
+///
+/// Hysteria2's UDP relay (`HyUdpMessageStream`) is multi-directional (can handle multiple targets),
+/// while `AsyncMessageStream` expects a single target. This adapter filters traffic to only
+/// the specified target.
+struct Hysteria2UdpAdapter {
+    inner: HyUdpMessageStream,
+    target: NetLocation,
+}
 
-                Ok(crate::tcp_handler::TcpClientUdpSetupResult::MultiDirectional {
-                    server_stream: Box::new(DummyTargetedStream),
-                    client_stream: Box::new(hy_udp_stream),
-                })
+impl Hysteria2UdpAdapter {
+    fn new(inner: HyUdpMessageStream, target: NetLocation) -> Self {
+        Self { inner, target }
+    }
+}
+
+// Implement Unpin since HyUdpMessageStream is Unpin
+impl Unpin for Hysteria2UdpAdapter {}
+
+// SAFETY: Hysteria2UdpAdapter only contains HyUdpMessageStream and NetLocation,
+// both of which are Send.
+unsafe impl Send for Hysteria2UdpAdapter {}
+
+// Explicitly implement AsyncMessageStream marker trait
+impl crate::async_stream::AsyncMessageStream for Hysteria2UdpAdapter {}
+
+impl crate::async_stream::AsyncPing for Hysteria2UdpAdapter {
+    fn supports_ping(&self) -> bool {
+        self.inner.supports_ping()
+    }
+
+    fn poll_write_ping(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<bool>> {
+        unsafe { Pin::new_unchecked(&mut self.inner).poll_write_ping(cx) }
+    }
+}
+
+impl crate::async_stream::AsyncReadMessage for Hysteria2UdpAdapter {
+    fn poll_read_message(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        use crate::async_stream::AsyncReadSourcedMessage;
+        unsafe {
+            match Pin::new_unchecked(&mut self.inner).poll_read_sourced_message(cx, buf) {
+                Poll::Ready(Ok(_)) => Poll::Ready(Ok(())),
+                Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+                Poll::Pending => Poll::Pending,
             }
         }
     }
 }
 
-/// A dummy AsyncTargetedMessageStream that does nothing.
-/// Used when Hysteria2 handles UDP directly without needing server stream processing.
-struct DummyTargetedStream;
-
-impl crate::async_stream::AsyncPing for DummyTargetedStream {
-    fn supports_ping(&self) -> bool {
-        false
-    }
-
-    fn poll_write_ping(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<bool>> {
-        Poll::Ready(Ok(false))
-    }
-}
-
-impl crate::async_stream::AsyncReadTargetedMessage for DummyTargetedStream {
-    fn poll_read_targeted_message(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-        _buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<NetLocation>> {
-        Poll::Ready(Ok(NetLocation::UNSPECIFIED))
-    }
-}
-
-impl crate::async_stream::AsyncWriteSourcedMessage for DummyTargetedStream {
-    fn poll_write_sourced_message(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-        _buf: &[u8],
-        _source: &std::net::SocketAddr,
+impl crate::async_stream::AsyncWriteMessage for Hysteria2UdpAdapter {
+    fn poll_write_message(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
     ) -> Poll<std::io::Result<()>> {
-        Poll::Ready(Ok(()))
+        use crate::async_stream::AsyncWriteTargetedMessage;
+        // Clone target before accessing inner to avoid borrow conflict
+        let target = self.target.clone();
+        // SAFETY: We're creating a pin to the inner field which is safe as long as
+        // Hysteria2UdpAdapter doesn't implement Drop and we don't move the inner field.
+        // The inner field is pinned when self is pinned.
+        unsafe { Pin::new_unchecked(&mut self.inner).poll_write_targeted_message(cx, buf, &target) }
     }
 }
 
-impl crate::async_stream::AsyncFlushMessage for DummyTargetedStream {
-    fn poll_flush_message(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Poll::Ready(Ok(()))
+impl crate::async_stream::AsyncFlushMessage for Hysteria2UdpAdapter {
+    fn poll_flush_message(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        unsafe { Pin::new_unchecked(&mut self.inner).poll_flush_message(cx) }
     }
 }
 
-impl crate::async_stream::AsyncShutdownMessage for DummyTargetedStream {
-    fn poll_shutdown_message(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Poll::Ready(Ok(()))
+impl crate::async_stream::AsyncShutdownMessage for Hysteria2UdpAdapter {
+    fn poll_shutdown_message(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        unsafe { Pin::new_unchecked(&mut self.inner).poll_shutdown_message(cx) }
     }
 }
-
-impl crate::async_stream::AsyncTargetedMessageStream for DummyTargetedStream {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::hysteria2_protocol::{
-        header, tcp_status, AUTH_HOST, AUTH_METHOD, AUTH_PATH, AUTH_URI, FRAME_TYPE_TCP_REQUEST,
-        MAX_ADDRESS_LENGTH, MAX_PADDING_LENGTH, STATUS_AUTH_OK,
+        tcp_status, FRAME_TYPE_TCP_REQUEST, MAX_ADDRESS_LENGTH,
     };
 
     // Helper function to decode a QUIC varint (same as module-level function)
@@ -1821,26 +1190,6 @@ mod tests {
 
         Ok((value, num_bytes))
     }
-=======
-        _resolver: &Arc<dyn Resolver>,
-        _request: crate::tcp_handler::UdpStreamRequest,
-    ) -> std::io::Result<crate::tcp_handler::TcpClientUdpSetupResult> {
-        // UDP implementation is not yet complete
-        // Full implementation would require:
-        // 1. Session management with unique session IDs
-        // 2. Fragmentation/reassembly for large packets
-        // 3. Background task to receive datagrams from server
-        // 4. Forwarding to local UDP sockets
-        Err(std::io::Error::other(
-            "Hysteria2 UDP support is not yet implemented. Please disable UDP in the configuration.",
-        ))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
->>>>>>> 36398d8 (impl hysteria2 as client)
 
     #[test]
     fn test_encode_varint() {
@@ -1849,7 +1198,6 @@ mod tests {
         assert_eq!(&*encode_varint(63).unwrap(), &[63]);
 
         // Two bytes (64-16383)
-<<<<<<< HEAD
         // For 64: encoded = (0b01 << 14) | 64 = 0x4000 | 0x40 = 0x4040 = [64, 64]
         assert_eq!(&*encode_varint(64).unwrap(), &[64, 64]);
         // For 16383: encoded = (0b01 << 14) | 16383 = 0x4000 | 0x3FFF = 0x7FFF = [127, 255]
@@ -1857,18 +1205,11 @@ mod tests {
 
         // Four bytes (16384-1073741823)
         // For 16384: encoded = (0b10 << 30) | 16384 = 0x40000000 | 0x4000 = 0x40004000
-=======
-        assert_eq!(&*encode_varint(64).unwrap(), &[0b01000000, 0]);
-        assert_eq!(&*encode_varint(16383).unwrap(), &[0b01111111, 255]);
-
-        // Four bytes (16384-1073741823)
->>>>>>> 36398d8 (impl hysteria2 as client)
         let result = encode_varint(16384).unwrap();
         assert_eq!(result[0] & 0b11000000, 0b10000000);
     }
 
     #[test]
-<<<<<<< HEAD
     fn test_varint_roundtrip() {
         let test_values = vec![
             0u64, 1, 63, 64, 16383, 16384, 1073741823, 1073741824, 1_000_000_000_000,
@@ -1897,8 +1238,6 @@ mod tests {
     }
 
     #[test]
-=======
->>>>>>> 36398d8 (impl hysteria2 as client)
     fn test_generate_padding_string() {
         let s1 = generate_padding_string();
         let s2 = generate_padding_string();
@@ -1907,7 +1246,6 @@ mod tests {
         // Should be valid ASCII
         assert!(s1.is_ascii());
         assert!(s2.is_ascii());
-<<<<<<< HEAD
         // Length should be within expected range [1, 79]
         assert!(s1.len() >= 1 && s1.len() < 80);
         assert!(s2.len() >= 1 && s2.len() < 80);
@@ -2036,7 +1374,7 @@ mod tests {
         assert_eq!(frame_type, FRAME_TYPE_TCP_REQUEST);
         offset += len;
 
-        let (addr_len, len) = test_decode_varint(&frame[offset..]).unwrap();
+        let (addr_len, _len) = test_decode_varint(&frame[offset..]).unwrap();
         assert_eq!(addr_len as usize, MAX_ADDRESS_LENGTH);
     }
 
@@ -2153,7 +1491,5 @@ mod tests {
             assert!(padding.len() > 0, "Padding should not be empty");
             assert!(padding.is_ascii(), "Padding should be ASCII only");
         }
-=======
->>>>>>> 36398d8 (impl hysteria2 as client)
     }
 }

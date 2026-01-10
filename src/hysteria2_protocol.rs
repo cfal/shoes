@@ -13,6 +13,7 @@ pub const AUTH_PATH: &str = "/auth";
 pub const AUTH_URI: &str = "https://hysteria/auth";
 
 /// HTTP/3 authentication request method
+#[allow(dead_code)]
 pub const AUTH_METHOD: &str = "POST";
 
 /// HTTP status code for successful authentication (HyOK)
@@ -38,6 +39,7 @@ pub mod tcp_status {
     /// Request accepted
     pub const OK: u8 = 0x00;
     /// Request rejected
+    #[allow(dead_code)]
     pub const ERROR: u8 = 0x01;
 }
 
@@ -45,8 +47,10 @@ pub mod tcp_status {
 pub const MAX_ADDRESS_LENGTH: usize = 2048;
 
 /// Maximum padding length (from official Go implementation)
+#[allow(dead_code)]
 pub const MAX_PADDING_LENGTH: usize = 4096;
 
 /// Authentication timeout - close connection if client doesn't authenticate within this time.
 /// Per protocol reference implementation, default is 3 seconds.
+#[allow(dead_code)]
 pub const AUTH_TIMEOUT_SECS: u64 = 3;

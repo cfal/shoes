@@ -73,13 +73,9 @@ pub fn build_client_proxy_chain(
                 // Parse bandwidth configuration
                 use crate::config::resolve_hysteria2_bandwidth;
                 let (max_tx, max_rx) = match resolve_hysteria2_bandwidth(&bandwidth) {
-                    Ok((tx, rx)) => {
-                        eprintln!("DEBUG: Parsed bandwidth: up={} bytes/s ({} MB/s), down={} bytes/s ({} MB/s)",
-                            tx, tx / 1024 / 1024, rx, rx / 1024 / 1024);
-                        (tx, rx)
-                    }
+                    Ok((tx, rx)) => (tx, rx),
                     Err(e) => {
-                        eprintln!("DEBUG: Failed to parse bandwidth: {}, using 0", e);
+                        eprintln!("Failed to parse bandwidth: {}, using 0", e);
                         (0, 0)
                     }
                 };

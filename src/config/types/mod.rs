@@ -25,7 +25,7 @@ pub mod tun;
 // Re-export all public types for convenience
 pub use client::{
     ClientConfig, ClientProxyConfig, TlsClientConfig, WebsocketClientConfig,
-    Hysteria2Bandwidth, resolve_hysteria2_bandwidth,
+    resolve_hysteria2_bandwidth,
 };
 pub use common::DEFAULT_REALITY_SHORT_ID;
 pub use groups::{ClientConfigGroup, Config, NamedPem, PemSource};

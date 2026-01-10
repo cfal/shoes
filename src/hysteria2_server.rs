@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::hysteria2_protocol::{
-    header, tcp_status, AUTH_HOST, AUTH_METHOD, AUTH_PATH, FRAME_TYPE_TCP_REQUEST,
+    header, tcp_status, AUTH_HOST, AUTH_PATH, FRAME_TYPE_TCP_REQUEST,
     STATUS_AUTH_OK,
 };
 
