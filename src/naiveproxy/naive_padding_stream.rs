@@ -105,6 +105,8 @@ const FRAGMENT_SIZE_MAX: usize = 300;
 ///
 /// Pads the first 8 reads and writes in each direction to obscure
 /// traffic fingerprints from initial handshakes.
+///
+/// Memory-optimized: decodes directly into user buffer without intermediate storage.
 pub struct NaivePaddingStream<S> {
     inner: S,
     padding_type: PaddingType,
@@ -117,27 +119,21 @@ pub struct NaivePaddingStream<S> {
     read_buffer: Box<[u8]>,
     read_buffer_start: usize,
     read_buffer_end: usize,
-    /// Pending frame info (payload_len, padding_len) when we've parsed header but need more data
-    pending_frame: Option<(usize, usize)>,
-    /// Pre-allocated buffer for decoded payload
-    decoded_buffer: Box<[u8]>,
-    decoded_start: usize,
-    decoded_end: usize,
+    /// Current frame state: (payload_len, padding_len, payload_delivered)
+    /// payload_delivered tracks how many payload bytes have been copied to user
+    current_frame: Option<(usize, usize, usize)>,
     /// Pre-allocated buffer for encoded frame writes
     write_buffer: Box<[u8]>,
     write_start: usize,
     write_end: usize,
     /// Original payload length for current write (to return correct count)
     write_payload_len: usize,
-    /// Current fragment limit for server-side write fragmentation (0 = no limit)
-    write_fragment_limit: usize,
 }
 
 impl<S> NaivePaddingStream<S> {
     pub fn new(inner: S, direction: PaddingDirection, padding_type: PaddingType) -> Self {
         // Pre-allocate buffers sized for maximum frame
         let read_buffer = allocate_vec(MAX_FRAME_SIZE).into_boxed_slice();
-        let decoded_buffer = allocate_vec(MAX_PAYLOAD_SIZE).into_boxed_slice();
         let write_buffer = allocate_vec(MAX_FRAME_SIZE).into_boxed_slice();
 
         Self {
@@ -149,15 +145,34 @@ impl<S> NaivePaddingStream<S> {
             read_buffer,
             read_buffer_start: 0,
             read_buffer_end: 0,
-            pending_frame: None,
-            decoded_buffer,
-            decoded_start: 0,
-            decoded_end: 0,
+            current_frame: None,
             write_buffer,
             write_start: 0,
             write_end: 0,
             write_payload_len: 0,
-            write_fragment_limit: 0,
+        }
+    }
+
+    /// Return buffered data to user, reset buffer if empty. Returns bytes copied.
+    #[inline]
+    fn drain_read_buffer(&mut self, buf: &mut ReadBuf<'_>) -> usize {
+        let available = self.read_buffer_end - self.read_buffer_start;
+        let to_copy = available.min(buf.remaining());
+        buf.put_slice(&self.read_buffer[self.read_buffer_start..self.read_buffer_start + to_copy]);
+        self.read_buffer_start += to_copy;
+        if self.read_buffer_start >= self.read_buffer_end {
+            self.read_buffer_start = 0;
+            self.read_buffer_end = 0;
+        }
+        to_copy
+    }
+
+    /// Reset buffer offsets if buffer is empty.
+    #[inline]
+    fn maybe_reset_read_buffer(&mut self) {
+        if self.read_buffer_start == self.read_buffer_end {
+            self.read_buffer_start = 0;
+            self.read_buffer_end = 0;
         }
     }
 
@@ -239,9 +254,6 @@ impl<S> NaivePaddingStream<S> {
         self.write_end = frame_size;
         self.write_payload_len = payload.len();
 
-        // Compute initial fragment limit for server-side fragmentation
-        self.write_fragment_limit = self.compute_fragment_limit(payload.len(), frame_size);
-
         Ok(())
     }
 
@@ -259,19 +271,20 @@ impl<S> NaivePaddingStream<S> {
         }
     }
 
-    /// Try to decode a frame from buffered data.
-    /// Returns true if a complete frame was decoded into decoded_buffer.
+    /// Try to decode payload directly into user's buffer.
+    /// Returns the number of bytes written to buf, or None if more data needed.
+    /// Streams partial payload as it becomes available (matching reference implementation).
     #[inline]
-    fn try_decode_frame(&mut self) -> bool {
+    fn try_decode_to_buf(&mut self, buf: &mut ReadBuf<'_>) -> Option<usize> {
         let available = self.read_buffer_end - self.read_buffer_start;
 
-        // Check if we have a pending frame (header already parsed)
-        let (payload_len, padding_len) = match self.pending_frame {
-            Some((pl, pd)) => (pl, pd),
+        // Get or parse current frame state
+        let (payload_len, padding_len, payload_delivered) = match self.current_frame {
+            Some((pl, pd, delivered)) => (pl, pd, delivered),
             None => {
                 // Need to parse header first
                 if available < PADDING_HEADER_SIZE {
-                    return false;
+                    return None;
                 }
 
                 let payload_len = u16::from_be_bytes([
@@ -281,39 +294,92 @@ impl<S> NaivePaddingStream<S> {
                 let padding_len = self.read_buffer[self.read_buffer_start + 2] as usize;
 
                 self.read_buffer_start += PADDING_HEADER_SIZE;
-                self.pending_frame = Some((payload_len, padding_len));
+                self.current_frame = Some((payload_len, padding_len, 0));
 
-                (payload_len, padding_len)
+                (payload_len, padding_len, 0)
             }
         };
 
-        // Check if we have enough data for payload + padding
-        let frame_data_len = payload_len + padding_len;
+        let payload_remaining = payload_len - payload_delivered;
         let available = self.read_buffer_end - self.read_buffer_start;
 
-        if available < frame_data_len {
-            return false;
+        // If we still need payload bytes
+        if payload_remaining > 0 {
+            // Check if we have data to deliver
+            if available == 0 {
+                return None; // Need more data from stream
+            }
+            // Note: can_deliver > 0 guaranteed because poll_read checks buf.remaining() > 0
+            let can_deliver = payload_remaining.min(available).min(buf.remaining());
+
+            buf.put_slice(
+                &self.read_buffer[self.read_buffer_start..self.read_buffer_start + can_deliver],
+            );
+            self.read_buffer_start += can_deliver;
+
+            let new_delivered = payload_delivered + can_deliver;
+            if new_delivered < payload_len {
+                // More payload to deliver later
+                self.current_frame = Some((payload_len, padding_len, new_delivered));
+                return Some(can_deliver);
+            }
+
+            // Payload complete, now skip padding
+            let available = self.read_buffer_end - self.read_buffer_start;
+            if available < padding_len {
+                // Need more data to skip padding
+                self.current_frame = Some((payload_len, padding_len, new_delivered));
+                return Some(can_deliver);
+            }
+
+            // Skip padding and complete frame
+            self.read_buffer_start += padding_len;
+            self.current_frame = None;
+            self.num_read_frames += 1;
+            self.maybe_reset_read_buffer();
+            return Some(can_deliver);
         }
 
-        // Copy payload to decoded buffer (skip padding)
-        self.decoded_buffer[0..payload_len].copy_from_slice(
-            &self.read_buffer[self.read_buffer_start..self.read_buffer_start + payload_len],
-        );
-        self.decoded_start = 0;
-        self.decoded_end = payload_len;
+        // Payload already delivered, just need to skip padding
+        if available < padding_len {
+            return None;
+        }
 
-        // Advance past payload + padding
-        self.read_buffer_start += frame_data_len;
-        self.pending_frame = None;
+        self.read_buffer_start += padding_len;
+        self.current_frame = None;
         self.num_read_frames += 1;
+        self.maybe_reset_read_buffer();
 
-        // Reset offsets if buffer is empty
-        if self.read_buffer_start == self.read_buffer_end {
-            self.read_buffer_start = 0;
-            self.read_buffer_end = 0;
+        // Frame complete but no data delivered this call (was a pure padding frame)
+        Some(0)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> NaivePaddingStream<S> {
+    /// Write buffered frame data to inner stream with fragmentation support.
+    /// Returns Ok(Some(payload_len)) when frame is complete, Ok(None) if partial.
+    fn poll_write_buffered(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Option<usize>>> {
+        let remaining = self.write_end - self.write_start;
+        if remaining == 0 {
+            return Poll::Ready(Ok(Some(self.write_payload_len)));
         }
 
-        true
+        let fragment_limit = self.compute_fragment_limit(self.write_payload_len, remaining);
+        let to_write = &self.write_buffer[self.write_start..self.write_start + fragment_limit];
+
+        match Pin::new(&mut self.inner).poll_write(cx, to_write) {
+            Poll::Ready(Ok(n)) => {
+                self.write_start += n;
+                if self.write_start >= self.write_end {
+                    self.num_written_frames += 1;
+                    Poll::Ready(Ok(Some(self.write_payload_len)))
+                } else {
+                    Poll::Ready(Ok(None))
+                }
+            }
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 
@@ -325,60 +391,40 @@ impl<S: AsyncRead + Unpin> AsyncRead for NaivePaddingStream<S> {
     ) -> Poll<io::Result<()>> {
         let this = &mut *self;
 
-        if this.decoded_end > this.decoded_start {
-            let available = this.decoded_end - this.decoded_start;
-            let to_copy = available.min(buf.remaining());
-            buf.put_slice(&this.decoded_buffer[this.decoded_start..this.decoded_start + to_copy]);
-            this.decoded_start += to_copy;
-
-            if this.decoded_start >= this.decoded_end {
-                this.decoded_start = 0;
-                this.decoded_end = 0;
-            }
+        // Handle zero-size buffer to avoid infinite loop
+        if buf.remaining() == 0 {
             return Poll::Ready(Ok(()));
         }
 
         if !this.should_pad_reads() {
             // Return leftover buffered data from padding phase before switching to passthrough
             if this.read_buffer_end > this.read_buffer_start {
-                let available = this.read_buffer_end - this.read_buffer_start;
-                let to_copy = available.min(buf.remaining());
-                buf.put_slice(
-                    &this.read_buffer[this.read_buffer_start..this.read_buffer_start + to_copy],
-                );
-                this.read_buffer_start += to_copy;
-
-                if this.read_buffer_start >= this.read_buffer_end {
-                    this.read_buffer_start = 0;
-                    this.read_buffer_end = 0;
-                }
+                this.drain_read_buffer(buf);
                 return Poll::Ready(Ok(()));
             }
-
             return Pin::new(&mut this.inner).poll_read(cx, buf);
         }
 
-        // Decode frames, skipping pure padding frames (payload_len == 0)
+        // Decode frames directly into user's buffer
         loop {
-            if this.try_decode_frame() {
-                if this.decoded_end > this.decoded_start {
-                    let available = this.decoded_end - this.decoded_start;
-                    let to_copy = available.min(buf.remaining());
-                    buf.put_slice(
-                        &this.decoded_buffer[this.decoded_start..this.decoded_start + to_copy],
-                    );
-                    this.decoded_start += to_copy;
-
-                    if this.decoded_start >= this.decoded_end {
-                        this.decoded_start = 0;
-                        this.decoded_end = 0;
-                    }
-
+            if let Some(n) = this.try_decode_to_buf(buf) {
+                if n > 0 {
                     return Poll::Ready(Ok(()));
+                }
+                // n == 0 means pure padding frame was skipped.
+                // Re-check if we've finished padding phase before continuing.
+                if !this.should_pad_reads() {
+                    // Transitioned to raw mode - return any buffered data
+                    if this.read_buffer_end > this.read_buffer_start {
+                        this.drain_read_buffer(buf);
+                        return Poll::Ready(Ok(()));
+                    }
+                    return Pin::new(&mut this.inner).poll_read(cx, buf);
                 }
                 continue;
             }
 
+            // Need more data
             if this.read_buffer_end >= this.read_buffer.len() {
                 this.reset_read_buffer_offset();
             }
@@ -418,22 +464,9 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for NaivePaddingStream<S> {
 
         // Finish writing buffered frame data first
         if this.write_start < this.write_end {
-            let remaining_bytes = this.write_end - this.write_start;
-            let write_limit = this.compute_fragment_limit(this.write_payload_len, remaining_bytes);
-            let to_write = &this.write_buffer[this.write_start..this.write_start + write_limit];
-
-            match Pin::new(&mut this.inner).poll_write(cx, to_write) {
-                Poll::Ready(Ok(n)) => {
-                    this.write_start += n;
-                    if this.write_start >= this.write_end {
-                        let payload_len = this.write_payload_len;
-                        this.write_start = 0;
-                        this.write_end = 0;
-                        this.write_payload_len = 0;
-                        this.write_fragment_limit = 0;
-                        this.num_written_frames += 1;
-                        return Poll::Ready(Ok(payload_len));
-                    }
+            match this.poll_write_buffered(cx) {
+                Poll::Ready(Ok(Some(payload_len))) => return Poll::Ready(Ok(payload_len)),
+                Poll::Ready(Ok(None)) => {
                     cx.waker().wake_by_ref();
                     return Poll::Pending;
                 }
@@ -450,25 +483,11 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for NaivePaddingStream<S> {
 
         this.encode_frame(payload)?;
 
-        let remaining_bytes = this.write_end - this.write_start;
-        let write_limit = this.compute_fragment_limit(this.write_payload_len, remaining_bytes);
-        let to_write = &this.write_buffer[this.write_start..this.write_start + write_limit];
-
-        match Pin::new(&mut this.inner).poll_write(cx, to_write) {
-            Poll::Ready(Ok(n)) => {
-                this.write_start += n;
-                if this.write_start >= this.write_end {
-                    let payload_len = this.write_payload_len;
-                    this.write_start = 0;
-                    this.write_end = 0;
-                    this.write_payload_len = 0;
-                    this.write_fragment_limit = 0;
-                    this.num_written_frames += 1;
-                    Poll::Ready(Ok(payload_len))
-                } else {
-                    cx.waker().wake_by_ref();
-                    Poll::Pending
-                }
+        match this.poll_write_buffered(cx) {
+            Poll::Ready(Ok(Some(payload_len))) => Poll::Ready(Ok(payload_len)),
+            Poll::Ready(Ok(None)) => {
+                cx.waker().wake_by_ref();
+                Poll::Pending
             }
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
             Poll::Pending => Poll::Pending,
@@ -476,11 +495,33 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for NaivePaddingStream<S> {
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
+        let this = &mut *self;
+
+        // Complete any pending buffered write first
+        while this.write_start < this.write_end {
+            match this.poll_write_buffered(cx) {
+                Poll::Ready(Ok(_)) => {}
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+
+        Pin::new(&mut this.inner).poll_flush(cx)
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_shutdown(cx)
+        let this = &mut *self;
+
+        // Complete any pending buffered write first
+        while this.write_start < this.write_end {
+            match this.poll_write_buffered(cx) {
+                Poll::Ready(Ok(_)) => {}
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+
+        Pin::new(&mut this.inner).poll_shutdown(cx)
     }
 }
 
@@ -720,6 +761,7 @@ mod tests {
     #[tokio::test]
     async fn test_read_partial_frame_payload() {
         // Split the frame payload across two reads
+        // Reference implementation streams partial payload as it arrives
         let payload = b"split payload data";
         let frame = encode_test_frame(payload, 5);
 
@@ -732,10 +774,21 @@ mod tests {
         let mut stream =
             NaivePaddingStream::new(mock, PaddingDirection::Client, PaddingType::Variant1);
 
-        let mut buf = vec![0u8; 100];
-        let n = stream.read(&mut buf).await.unwrap();
+        // Read all data (may take multiple reads due to streaming)
+        let mut result = Vec::new();
+        loop {
+            let mut buf = vec![0u8; 100];
+            let n = stream.read(&mut buf).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            result.extend_from_slice(&buf[..n]);
+            if result.len() >= payload.len() {
+                break;
+            }
+        }
 
-        assert_eq!(&buf[..n], payload);
+        assert_eq!(result, payload);
     }
 
     #[tokio::test]
@@ -808,6 +861,54 @@ mod tests {
         let mut buf = vec![0u8; 100];
         let n = stream.read(&mut buf).await.unwrap();
         assert_eq!(&buf[..n], b"RAWDATA", "coalesced raw data was lost!");
+    }
+
+    #[tokio::test]
+    async fn test_read_transition_after_pure_padding_frame() {
+        // Bug test: if frame 8 is pure padding (payload_len=0), we must still
+        // transition to raw mode correctly and not try to parse raw data as a frame.
+        let mut data = Vec::new();
+
+        // 7 frames with payload
+        for i in 0..7 {
+            let payload = format!("f{}", i);
+            data.extend(encode_test_frame(payload.as_bytes(), 3));
+        }
+
+        // Frame 8 is PURE PADDING (payload_len = 0)
+        data.extend(encode_test_frame(b"", 50));
+
+        // Raw data immediately after (would be misinterpreted as frame header if buggy)
+        data.extend_from_slice(b"RAWDATA");
+
+        let mock = MockStream::from_data(data);
+        let mut stream =
+            NaivePaddingStream::new(mock, PaddingDirection::Client, PaddingType::Variant1);
+
+        // Read first 7 frames
+        for i in 0..7 {
+            let mut buf = vec![0u8; 100];
+            let n = stream.read(&mut buf).await.unwrap();
+            let expected = format!("f{}", i);
+            assert_eq!(&buf[..n], expected.as_bytes(), "frame {} mismatch", i);
+        }
+
+        // Frame 8 is pure padding - this read should skip it and return raw data
+        // (or return empty and next read returns raw data)
+        let mut result = Vec::new();
+        loop {
+            let mut buf = vec![0u8; 100];
+            let n = stream.read(&mut buf).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            result.extend_from_slice(&buf[..n]);
+            if result == b"RAWDATA" {
+                break;
+            }
+        }
+
+        assert_eq!(result, b"RAWDATA", "raw data after pure padding frame 8 was corrupted!");
     }
 
     #[tokio::test]
