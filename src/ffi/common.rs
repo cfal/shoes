@@ -12,6 +12,7 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 use crate::config::{Config, convert_cert_paths, create_server_configs, load_config_str};
+use crate::dns::build_dns_registry;
 use crate::tcp::tcp_server::start_servers;
 use crate::tun::run_tun_from_config;
 
@@ -192,7 +193,13 @@ pub async fn start_from_config(
         info!("Loaded {} PEM files", pem_count);
     }
 
-    let validated_configs = create_server_configs(configs).await?;
+    let crate::config::ValidatedConfigs {
+        configs: validated_configs,
+        dns_groups,
+    } = create_server_configs(configs)?;
+
+    // Build DNS registry from expanded groups
+    let mut dns_registry = build_dns_registry(dns_groups).await?;
 
     // Separate TUN config from server configs, validate exactly one TUN with device_fd
     let mut tun_config = None;
@@ -238,7 +245,8 @@ pub async fn start_from_config(
     let mut join_handles: Vec<JoinHandle<()>> = Vec::new();
 
     for server_config in server_configs {
-        join_handles.extend(start_servers(Config::Server(server_config)).await?);
+        let resolver = dns_registry.get_for_server(server_config.dns.as_ref());
+        join_handles.extend(start_servers(Config::Server(server_config), resolver).await?);
     }
 
     // Run TUN server (blocks until shutdown). close_fd_on_drop = false because mobile owns the FD

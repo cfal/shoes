@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use crate::option_util::NoneOrSome;
 
 use super::common::default_true;
+use super::dns::DnsConfig;
 use super::rules::RuleConfig;
 use super::selection::ConfigSelection;
 
@@ -105,4 +106,9 @@ pub struct TunConfig {
         skip_serializing_if = "NoneOrSome::is_unspecified"
     )]
     pub rules: NoneOrSome<ConfigSelection<RuleConfig>>,
+
+    /// DNS configuration for this TUN server (optional).
+    /// Can reference a dns_group by name or specify inline DNS servers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns: Option<DnsConfig>,
 }

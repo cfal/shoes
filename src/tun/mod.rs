@@ -277,7 +277,10 @@ async fn handle_udp_packets(
 }
 
 /// Start TUN server based on the provided configuration.
-pub async fn start_tun_server(config: TunConfig) -> std::io::Result<JoinHandle<()>> {
+pub async fn start_tun_server(
+    config: TunConfig,
+    _resolver: std::sync::Arc<dyn crate::resolver::Resolver>,
+) -> std::io::Result<JoinHandle<()>> {
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
     let handle = tokio::spawn(async move {

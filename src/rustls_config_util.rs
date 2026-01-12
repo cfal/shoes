@@ -219,6 +219,16 @@ fn get_root_cert_store() -> Arc<rustls::RootCertStore> {
         .clone()
 }
 
+/// Creates a simple TLS ClientConfig with root CA verification.
+/// Used by hickory-resolver for DoT/DoH connections.
+pub fn create_dns_client_config() -> rustls::ClientConfig {
+    rustls::ClientConfig::builder_with_provider(get_crypto_provider())
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates((*get_root_cert_store()).clone())
+        .with_no_client_auth()
+}
+
 pub fn create_server_config(
     cert_bytes: &[u8],
     key_bytes: &[u8],

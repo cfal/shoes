@@ -32,6 +32,9 @@ base64 = "*"
 blake3 = "*"
 bytes = "*"
 h2 = "*"
+# Git version required for H3 disable_grease option (needed for Cloudflare).
+# See: https://github.com/hickory-dns/hickory-dns/pull/2085
+hickory-resolver = { git = "https://github.com/hickory-dns/hickory-dns", default-features = false, features = ["tokio", "tls-aws-lc-rs", "https-aws-lc-rs", "h3-aws-lc-rs"] }
 hyper = { version = "*", features = ["server", "http1", "http2"] }
 hyper-util = { version = "*", features = ["tokio", "server"] }
 http-body-util = "*"
@@ -73,6 +76,7 @@ tokio = { version = "*", features = [
     "time",
 ] }
 tokio-util = { version = "*", features = ["time"] }
+url = "*"
 webpki-roots = { version = "*" }
 
 # TUN device support (for VPN mode)

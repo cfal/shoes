@@ -296,6 +296,10 @@ impl SocketConnector for SocketConnectorImpl {
             remote_addr,
         )))
     }
+
+    fn bind_interface(&self) -> Option<&str> {
+        self.bind_interface.as_deref()
+    }
 }
 
 /// A UDP socket wrapper that tracks the destination and uses send_to/recv_from.

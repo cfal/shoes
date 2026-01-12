@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use log::debug;
 
-use crate::address::{NetLocation, ResolvedLocation};
+use crate::address::ResolvedLocation;
 use crate::async_stream::AsyncMessageStream;
 use crate::resolver::Resolver;
 use crate::tcp::proxy_connector::ProxyConnector;
@@ -184,6 +184,31 @@ impl ClientProxyChain {
     /// Returns true if this chain supports UDP connections.
     pub fn supports_udp(&self) -> bool {
         !self.udp_final_hop_indices.is_empty()
+    }
+
+    /// Returns true if this chain is "direct-only": all initial hops are Direct
+    /// and there are no subsequent hops. Such chains can be used for UDP/QUIC
+    /// DNS while still supporting bind_interface.
+    pub fn is_direct_only(&self) -> bool {
+        if !self.subsequent_hops.is_empty() {
+            return false;
+        }
+        self.initial_hop
+            .iter()
+            .all(|entry| matches!(entry, InitialHopEntry::Direct(_)))
+    }
+
+    /// Returns the bind_interface from a direct-only chain.
+    /// Returns None if not direct-only or if no bind_interface is configured.
+    pub fn get_bind_interface(&self) -> Option<&str> {
+        if !self.is_direct_only() {
+            return None;
+        }
+        // All entries should have the same bind_interface, return from the first.
+        self.initial_hop.first().and_then(|entry| match entry {
+            InitialHopEntry::Direct(socket) => socket.bind_interface(),
+            InitialHopEntry::Proxy { .. } => None,
+        })
     }
 
     /// Select an initial hop entry (round-robin).
@@ -543,6 +568,21 @@ impl ClientChainGroup {
     pub fn supports_udp(&self) -> bool {
         !self.udp_chain_indices.is_empty()
     }
+
+    /// Returns true if all chains are direct-only.
+    pub fn is_direct_only(&self) -> bool {
+        self.chains.iter().all(|chain| chain.is_direct_only())
+    }
+
+    /// Returns the bind_interface if all chains are direct-only and share
+    /// the same bind_interface (or all have None).
+    pub fn get_bind_interface(&self) -> Option<&str> {
+        if !self.is_direct_only() {
+            return None;
+        }
+        // Return bind_interface from first chain (all should be the same in a group).
+        self.chains.first().and_then(|chain| chain.get_bind_interface())
+    }
 }
 
 #[cfg(test)]
@@ -551,6 +591,7 @@ mod tests {
     use async_trait::async_trait;
     use std::net::{IpAddr, Ipv4Addr};
 
+    use crate::address::NetLocation;
     use crate::async_stream::AsyncStream;
     use crate::tcp::proxy_connector::ProxyConnector;
     use crate::tcp::socket_connector::SocketConnector;
@@ -583,6 +624,10 @@ mod tests {
                 std::io::ErrorKind::Other,
                 "MockSocketConnector::connect_udp_bidirectional not implemented",
             ))
+        }
+
+        fn bind_interface(&self) -> Option<&str> {
+            None
         }
     }
 

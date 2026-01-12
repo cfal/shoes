@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::option_util::OneOrSome;
 
 use super::client::ClientConfig;
+use super::dns::DnsConfigGroup;
 use super::rules::RuleConfig;
 use super::selection::ConfigSelection;
 use super::server::ServerConfig;
@@ -154,6 +155,7 @@ pub enum Config {
     TunServer(TunConfig),
     ClientConfigGroup(ClientConfigGroup),
     RuleConfigGroup(RuleConfigGroup),
+    DnsConfigGroup(DnsConfigGroup),
     NamedPem(NamedPem),
 }
 
@@ -176,6 +178,7 @@ impl<'de> serde::de::Deserialize<'de> for Config {
         // Look for discriminating fields
         let has_client_group = map.contains_key(Value::String("client_group".to_string()));
         let has_rule_group = map.contains_key(Value::String("rule_group".to_string()));
+        let has_dns_group = map.contains_key(Value::String("dns_group".to_string()));
         let has_address = map.contains_key(Value::String("address".to_string()));
         let has_path_field = map.contains_key(Value::String("path".to_string()));
         let has_pem = map.contains_key(Value::String("pem".to_string()));
@@ -203,6 +206,11 @@ impl<'de> serde::de::Deserialize<'de> for Config {
             serde_yaml::from_value(value)
                 .map(Config::RuleConfigGroup)
                 .map_err(|e| Error::custom(format!("invalid rule config group: {e}")))
+        } else if has_dns_group {
+            // DnsConfigGroup
+            serde_yaml::from_value(value)
+                .map(Config::DnsConfigGroup)
+                .map_err(|e| Error::custom(format!("invalid DNS config group: {e}")))
         } else if is_tun_config {
             // TunConfig - identified by having 'name' or 'raw_fd' without 'protocol' wrapper
             serde_yaml::from_value(value)
@@ -224,7 +232,8 @@ impl<'de> serde::de::Deserialize<'de> for Config {
                 "Unable to determine config type. Found fields: {found_fields:?}. Expected one of:\n\
                 - Server config: must have 'address' or 'path' field\n\
                 - Client config group: must have 'client_group' field\n\
-                - Rule config group: must have 'rule_group' field"
+                - Rule config group: must have 'rule_group' field\n\
+                - DNS config group: must have 'dns_group' field"
             )))
         }
     }
@@ -240,6 +249,7 @@ impl serde::ser::Serialize for Config {
             Config::TunServer(tun) => tun.serialize(serializer),
             Config::ClientConfigGroup(group) => group.serialize(serializer),
             Config::RuleConfigGroup(group) => group.serialize(serializer),
+            Config::DnsConfigGroup(group) => group.serialize(serializer),
             Config::NamedPem(pem) => pem.serialize(serializer),
         }
     }

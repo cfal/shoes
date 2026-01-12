@@ -11,9 +11,11 @@
 //! - [`client`]: Client-side protocol configurations
 //! - [`rules`]: Rule configurations for traffic routing
 //! - [`groups`]: Top-level configuration groups and the Config enum
+//! - [`dns`]: DNS server configuration
 
 pub mod client;
 pub mod common;
+pub mod dns;
 pub mod groups;
 pub mod rules;
 pub mod selection;
@@ -36,3 +38,4 @@ pub use server::{
 pub use shadowsocks::ShadowsocksConfig;
 pub use transport::{BindLocation, ClientQuicConfig, ServerQuicConfig, TcpConfig, Transport};
 pub use tun::TunConfig;
+pub use dns::{DnsConfig, DnsConfigGroup, DnsServerSpec, ExpandedDnsGroup, ExpandedDnsSpec};

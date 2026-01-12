@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::address::NetLocationMask;
+use crate::dns::ParsedDnsUrl;
 use crate::option_util::{NoneOrSome, OneOrSome};
 use crate::reality::{decode_private_key, decode_short_id};
 use crate::thread_util::get_num_threads;
@@ -11,23 +12,32 @@ use crate::uuid_util::parse_uuid;
 use super::pem::{embed_optional_pem_from_map, embed_pem_from_map};
 use super::types::{
     ClientChain, ClientChainHop, ClientConfig, ClientProxyConfig, Config, ConfigSelection,
-    DEFAULT_REALITY_SHORT_ID, PemSource, RuleActionConfig, RuleConfig, ServerConfig,
-    ServerProxyConfig, ServerQuicConfig, ShadowTlsServerConfig, ShadowTlsServerHandshakeConfig,
-    ShadowsocksConfig, TlsServerConfig, Transport, TunConfig, WebsocketServerConfig,
-    direct_allow_rule,
+    DEFAULT_REALITY_SHORT_ID, DnsConfig, DnsConfigGroup, DnsServerSpec, ExpandedDnsGroup,
+    ExpandedDnsSpec, PemSource, RuleActionConfig, RuleConfig, ServerConfig, ServerProxyConfig,
+    ServerQuicConfig, ShadowTlsServerConfig, ShadowTlsServerHandshakeConfig, ShadowsocksConfig,
+    TlsServerConfig, Transport, TunConfig, WebsocketServerConfig, direct_allow_rule,
 };
 
 const MIN_TLS_BUFFER_SIZE: usize = 16 * 1024;
 
-/// Validates configs and returns only the startable server configs.
+/// Result of config validation containing server configs and expanded DNS groups.
+/// DNS resolvers are built at runtime from the expanded groups.
+pub struct ValidatedConfigs {
+    pub configs: Vec<Config>,
+    /// Expanded DNS groups in topological order (bootstrap deps first).
+    pub dns_groups: Vec<ExpandedDnsGroup>,
+}
+
+/// Validates configs and returns startable server configs with expanded DNS groups.
 ///
 /// This function:
 /// - Builds client_groups and rule_groups from ClientConfigGroup and RuleConfigGroup entries
 /// - Resolves group references using topological sort
 /// - Collects named PEMs
+/// - Expands DNS groups (composition, client chains) and validates them
 /// - Validates all ServerConfigs and TunConfigs against the groups and PEMs
-/// - Returns only Config::Server and Config::TunServer variants (groups/pems are consumed)
-pub async fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Vec<Config>> {
+/// - Returns ValidatedConfigs containing configs and expanded DNS groups
+pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<ValidatedConfigs> {
     // First pass: collect raw groups with unresolved references
     let mut raw_client_groups: HashMap<String, OneOrSome<ConfigSelection<ClientConfig>>> =
         HashMap::new();
@@ -58,6 +68,7 @@ pub async fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<
     let mut server_configs: Vec<ServerConfig> = vec![];
     let mut tun_configs: Vec<TunConfig> = vec![];
     let mut named_pems: HashMap<String, String> = HashMap::new();
+    let mut dns_groups: HashMap<String, DnsConfigGroup> = HashMap::new();
 
     for config in all_configs.into_iter() {
         match config {
@@ -104,6 +115,15 @@ pub async fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<
                     ));
                 }
             }
+            Config::DnsConfigGroup(group) => {
+                let group_name = group.dns_group.clone();
+                if dns_groups.insert(group_name.clone(), group).is_some() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("dns group already exists: {}", group_name),
+                    ));
+                }
+            }
         }
     }
 
@@ -117,20 +137,57 @@ pub async fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<
         }
     }
 
+    // Extract inline DNS configs from server/tun configs into dns_groups.
+    // This replaces inline specs with group name references.
+    let mut inline_dns_counter = 0u32;
     for config in server_configs.iter_mut() {
-        validate_server_config(config, &client_groups, &rule_groups, &named_pems)?;
+        extract_inline_dns(&mut config.dns, &mut dns_groups, &mut inline_dns_counter)?;
+    }
+    for config in tun_configs.iter_mut() {
+        extract_inline_dns(&mut config.dns, &mut dns_groups, &mut inline_dns_counter)?;
     }
 
-    // Validate TUN configs
+    // Expand DNS group composition references for ALL groups (named + inline).
+    let expanded_dns_groups = expand_dns_groups_composition(dns_groups)?;
+
+    // Topological sort by bootstrap dependencies and detect errors
+    // This is necessary if we have a DNS group A with bootstrap set to DNS group B, we need
+    // to know to build DNS group B first.
+    let dns_group_order = topological_sort_dns_groups_by_bootstrap(&expanded_dns_groups)?;
+
+    // Expand and validate DNS specs (client chains, protocol compatibility).
+    let mut final_dns_groups: Vec<ExpandedDnsGroup> = Vec::new();
+    let group_names: HashSet<&str> = expanded_dns_groups.keys().map(|s| s.as_str()).collect();
+
+    for name in dns_group_order {
+        let specs = expanded_dns_groups.get(&name).unwrap();
+        let expanded_specs = expand_dns_specs(specs, &client_groups, &named_pems, &group_names)?;
+        final_dns_groups.push(ExpandedDnsGroup {
+            name,
+            specs: expanded_specs,
+        });
+    }
+
+    // Validate server configs (DNS is now just a group reference).
+    for config in server_configs.iter_mut() {
+        validate_server_config(config, &client_groups, &rule_groups, &named_pems)?;
+        validate_dns_group_ref(&config.dns, &group_names)?;
+    }
+
+    // Validate TUN configs.
     for config in tun_configs.iter_mut() {
         validate_tun_config(config, &client_groups, &rule_groups)?;
+        validate_dns_group_ref(&config.dns, &group_names)?;
     }
 
     // Combine into Config list (only Server and TunServer variants)
     let mut result: Vec<Config> = server_configs.into_iter().map(Config::Server).collect();
     result.extend(tun_configs.into_iter().map(Config::TunServer));
 
-    Ok(result)
+    Ok(ValidatedConfigs {
+        configs: result,
+        dns_groups: final_dns_groups,
+    })
 }
 
 /// Resolves client group references using topological sort.
@@ -275,6 +332,294 @@ fn topological_sort(dependencies: &HashMap<String, Vec<String>>) -> std::io::Res
     }
 
     Ok(result)
+}
+
+/// Phase 1: Expand DNS group composition references.
+/// Returns a map of group name to flat list of server specs (no group references).
+fn expand_dns_groups_composition(
+    dns_groups: HashMap<String, DnsConfigGroup>,
+) -> std::io::Result<HashMap<String, Vec<DnsServerSpec>>> {
+    // Build composition dependency graph and validate references
+    let mut dependencies: HashMap<String, Vec<String>> = HashMap::new();
+
+    for (group_name, group) in &dns_groups {
+        let deps: Vec<String> = group
+            .dns_servers
+            .iter()
+            .filter_map(|spec| {
+                spec.as_group_ref().map(|ref_name| {
+                    if !dns_groups.contains_key(ref_name) {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            format!(
+                                "DNS group '{}' references unknown group '{}'",
+                                group_name, ref_name
+                            ),
+                        ))
+                    } else {
+                        Ok(ref_name.to_string())
+                    }
+                })
+            })
+            .collect::<std::io::Result<Vec<_>>>()?;
+        dependencies.insert(group_name.clone(), deps);
+    }
+
+    // Topological sort by composition dependencies
+    let order = topological_sort(&dependencies).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            e.to_string()
+                .replace("client groups", "DNS groups (composition)"),
+        )
+    })?;
+
+    // Expand in topological order
+    let mut expanded: HashMap<String, Vec<DnsServerSpec>> = HashMap::new();
+
+    for name in order {
+        let group = dns_groups.get(&name).unwrap();
+        let specs: Vec<DnsServerSpec> = group
+            .dns_servers
+            .iter()
+            .flat_map(|spec| match spec.as_group_ref() {
+                Some(ref_name) => expanded.get(ref_name).unwrap().clone(),
+                None => vec![spec.clone()],
+            })
+            .collect();
+        expanded.insert(name, specs);
+    }
+
+    Ok(expanded)
+}
+
+/// Phase 2: Topological sort on expanded DNS groups based on bootstrap_url dependencies.
+/// Returns groups in order such that bootstrap dependencies come before dependents.
+fn topological_sort_dns_groups_by_bootstrap(
+    expanded_groups: &HashMap<String, Vec<DnsServerSpec>>,
+) -> std::io::Result<Vec<String>> {
+    // Build dependency graph: for each group, collect which groups it references via bootstrap_url
+    let dependencies: HashMap<String, Vec<String>> = expanded_groups
+        .iter()
+        .map(|(group_name, specs)| {
+            let deps: Vec<String> = specs
+                .iter()
+                .filter_map(|spec| spec.bootstrap_url())
+                .filter(|url| expanded_groups.contains_key(*url))
+                .map(String::from)
+                .collect();
+            (group_name.clone(), deps)
+        })
+        .collect();
+
+    topological_sort(&dependencies).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            e.to_string()
+                .replace("client groups", "DNS groups (bootstrap)"),
+        )
+    })
+}
+
+/// Extracts inline DNS specs from a config into dns_groups with a generated name.
+/// Replaces config.dns.servers with a single group name reference.
+/// If servers is already a single group reference or empty, does nothing.
+fn extract_inline_dns(
+    dns: &mut Option<DnsConfig>,
+    dns_groups: &mut HashMap<String, DnsConfigGroup>,
+    counter: &mut u32,
+) -> std::io::Result<()> {
+    let Some(config) = dns else {
+        return Ok(());
+    };
+
+    // Empty means use default resolver - nothing to extract
+    if config.servers.is_empty() {
+        return Ok(());
+    }
+
+    // Already a single group reference - nothing to extract
+    if let NoneOrSome::One(spec) = &config.servers {
+        if spec.as_group_ref().is_some() {
+            return Ok(());
+        }
+    }
+
+    // Generate unique name and extract specs into a new group
+    let generated_name = format!("__inline_dns_{}", *counter);
+    *counter += 1;
+
+    let group = DnsConfigGroup {
+        dns_group: generated_name.clone(),
+        dns_servers: std::mem::replace(&mut config.servers, NoneOrSome::Unspecified),
+    };
+    dns_groups.insert(generated_name.clone(), group);
+
+    // Replace servers with the group reference
+    config.servers = NoneOrSome::One(DnsServerSpec::Simple(generated_name));
+
+    Ok(())
+}
+
+/// Validates that DNS config references an existing group.
+fn validate_dns_group_ref(
+    dns: &Option<DnsConfig>,
+    group_names: &HashSet<&str>,
+) -> std::io::Result<()> {
+    let Some(config) = dns else {
+        return Ok(());
+    };
+
+    // Empty means use default resolver
+    if config.servers.is_empty() {
+        return Ok(());
+    }
+
+    // After extraction, servers should be a single group reference
+    if let NoneOrSome::One(spec) = &config.servers {
+        if let Some(group_name) = spec.as_group_ref() {
+            if !group_names.contains(group_name) {
+                return Err(std::io::Error::other(format!(
+                    "unknown dns_group in server config: '{}'",
+                    group_name
+                )));
+            }
+            return Ok(());
+        }
+    }
+
+    // Should not reach here after extract_inline_dns
+    Err(std::io::Error::other(
+        "DNS servers should be a single group reference after extraction",
+    ))
+}
+
+/// Expand and validate DNS specs.
+///
+/// Expands client chains (resolves group refs to configs) and validates:
+/// - Inline client configs (PEMs, etc.)
+/// - Protocol compatibility (system doesn't support chains, UDP/H3 only direct chains)
+/// - Bootstrap URL validity (must be a known group or valid IP-only URL)
+fn expand_dns_specs(
+    specs: &[DnsServerSpec],
+    client_groups: &HashMap<String, Vec<ClientConfig>>,
+    named_pems: &HashMap<String, String>,
+    dns_group_names: &HashSet<&str>,
+) -> std::io::Result<Vec<ExpandedDnsSpec>> {
+    let mut result = Vec::new();
+
+    for spec in specs {
+        let url_str = spec.url();
+        let server_name_override = spec.server_name();
+
+        // Parse URL to validate and check protocol
+        let parsed_url = ParsedDnsUrl::parse_with_server_name(url_str, server_name_override)
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+
+        // Expand and validate client chains
+        let client_chains_raw = spec.client_chains();
+        let mut expanded_chains: Vec<ClientChain> = Vec::new();
+
+        for chain_selection in client_chains_raw.iter() {
+            let mut chain = match chain_selection {
+                ConfigSelection::Config(chain) => chain.clone(),
+                ConfigSelection::GroupName(name) => ClientChain {
+                    hops: OneOrSome::One(ClientChainHop::Single(ConfigSelection::GroupName(
+                        name.clone(),
+                    ))),
+                },
+            };
+            // Validate inline client configs before expanding
+            for hop in chain.hops.iter_mut() {
+                validate_client_chain_hop(hop, client_groups, named_pems)?;
+            }
+            expand_client_chain(&mut chain.hops, client_groups)?;
+            expanded_chains.push(chain);
+        }
+
+        // Validate protocol compatibility with chains
+        if !expanded_chains.is_empty() {
+            // System DNS never supports client_chain
+            if matches!(&parsed_url, ParsedDnsUrl::System) {
+                return Err(std::io::Error::other(
+                    "client_chain is not supported for system DNS resolver",
+                ));
+            }
+
+            // Check if all chains are direct-only (for UDP/H3 validation)
+            let all_direct = expanded_chains
+                .iter()
+                .all(|chain| is_chain_direct_only(chain));
+
+            if !all_direct {
+                match &parsed_url {
+                    ParsedDnsUrl::Udp { .. } => {
+                        return Err(std::io::Error::other(
+                            "UDP DNS only supports direct client_chain (for bind_interface)",
+                        ));
+                    }
+                    ParsedDnsUrl::H3 { .. } => {
+                        return Err(std::io::Error::other(
+                            "H3 DNS only supports direct client_chain (for bind_interface)",
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Validate bootstrap_url
+        if let Some(bootstrap_url) = spec.bootstrap_url() {
+            // Must be either a known group name or a valid IP-only URL
+            if !dns_group_names.contains(bootstrap_url) {
+                let bootstrap_parsed = ParsedDnsUrl::parse(bootstrap_url).map_err(|e| {
+                    std::io::Error::other(format!(
+                        "invalid bootstrap_url '{}': {}",
+                        bootstrap_url, e
+                    ))
+                })?;
+
+                if bootstrap_parsed.has_hostname() {
+                    return Err(std::io::Error::other(format!(
+                        "bootstrap_url '{}' contains hostname - must use IP address or dns_group name",
+                        bootstrap_url
+                    )));
+                }
+            }
+        }
+
+        result.push(ExpandedDnsSpec {
+            url: url_str.to_string(),
+            server_name: server_name_override.map(String::from),
+            client_chains: expanded_chains,
+            bootstrap_url: spec.bootstrap_url().map(String::from),
+            ip_strategy: spec.ip_strategy(),
+        });
+    }
+
+    Ok(result)
+}
+
+/// Check if a client chain is direct-only (single hop with all direct protocol configs).
+fn is_chain_direct_only(chain: &ClientChain) -> bool {
+    // Must have exactly one hop (OneOrSome::One variant)
+    let hop = match &chain.hops {
+        OneOrSome::One(hop) => hop,
+        OneOrSome::Some(_) => return false, // Multiple hops
+    };
+
+    // The single hop must be all direct configs
+    match hop {
+        ClientChainHop::Single(ConfigSelection::Config(config)) => config.protocol.is_direct(),
+        ClientChainHop::Single(ConfigSelection::GroupName(_)) => {
+            // Should not happen after expansion
+            false
+        }
+        ClientChainHop::Pool(selections) => selections.iter().all(|sel| match sel {
+            ConfigSelection::Config(config) => config.protocol.is_direct(),
+            ConfigSelection::GroupName(_) => false,
+        }),
+    }
 }
 
 fn validate_server_config(
@@ -1146,10 +1491,12 @@ fn expand_selection(
 mod tests {
     use super::*;
     use crate::config::pem::convert_cert_paths;
+    use crate::dns::IpStrategy;
 
     async fn validate_configs_test(configs: Vec<Config>) -> std::io::Result<Vec<Config>> {
         let (converted_configs, _) = convert_cert_paths(configs).await?;
-        create_server_configs(converted_configs).await
+        let validated = create_server_configs(converted_configs)?;
+        Ok(validated.configs)
     }
 
     #[tokio::test]
@@ -1422,8 +1769,8 @@ mod tests {
 
         assert_eq!(load_count, 11);
 
-        let configs = create_server_configs(converted_configs).await.unwrap();
-        let Config::Server(server_config) = &configs[0] else {
+        let validated = create_server_configs(converted_configs).unwrap();
+        let Config::Server(server_config) = &validated.configs[0] else {
             panic!("expected Config::Server");
         };
 
@@ -1696,6 +2043,7 @@ mod tests {
             udp_enabled: true,
             icmp_enabled: true, // but ICMP enabled - should fail
             rules: NoneOrSome::Unspecified,
+            dns: None,
         };
 
         let configs = vec![Config::TunServer(tun_config)];
@@ -1705,6 +2053,579 @@ mod tests {
         assert!(
             err.contains("TCP must be enabled for ICMP"),
             "Expected ICMP/TCP error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dns_system_with_client_chain_rejected() {
+        let configs = vec![Config::DnsConfigGroup(DnsConfigGroup {
+            dns_group: "test-dns".to_string(),
+            dns_servers: NoneOrSome::One(DnsServerSpec::WithOptions {
+                url: "system".to_string(),
+                client_chain: NoneOrSome::One(ConfigSelection::Config(ClientChain::default())),
+                bootstrap_url: None,
+                server_name: None,
+                ip_strategy: IpStrategy::default(),
+            }),
+        })];
+
+        let result = validate_configs_test(configs).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("client_chain is not supported for system DNS"),
+            "Expected system DNS client_chain error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dns_udp_with_proxy_chain_rejected() {
+        use crate::config::types::{ClientConfigGroup, ClientProxyConfig};
+
+        // Create a non-direct (socks5) chain - should be rejected for UDP.
+        let mut socks_config = ClientConfig::default();
+        socks_config.protocol = ClientProxyConfig::Socks {
+            username: None,
+            password: None,
+        };
+
+        let configs = vec![
+            Config::ClientConfigGroup(ClientConfigGroup {
+                client_group: "test-proxy".to_string(),
+                client_proxies: OneOrSome::One(ConfigSelection::Config(socks_config)),
+            }),
+            Config::DnsConfigGroup(DnsConfigGroup {
+                dns_group: "test-dns".to_string(),
+                dns_servers: NoneOrSome::One(DnsServerSpec::WithOptions {
+                    url: "udp://8.8.8.8".to_string(),
+                    client_chain: NoneOrSome::One(ConfigSelection::GroupName(
+                        "test-proxy".to_string(),
+                    )),
+                    bootstrap_url: None,
+                    server_name: None,
+                    ip_strategy: IpStrategy::default(),
+                }),
+            }),
+        ];
+
+        let result = validate_configs_test(configs).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("UDP DNS only supports direct client_chain"),
+            "Expected UDP DNS client_chain error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dns_udp_with_direct_chain_allowed() {
+        use crate::config::types::ClientConfigGroup;
+
+        // Create a direct chain - should be allowed for UDP (for bind_interface).
+        let configs = vec![
+            Config::ClientConfigGroup(ClientConfigGroup {
+                client_group: "direct-chain".to_string(),
+                client_proxies: OneOrSome::One(ConfigSelection::Config(ClientConfig::default())),
+            }),
+            Config::DnsConfigGroup(DnsConfigGroup {
+                dns_group: "test-dns".to_string(),
+                dns_servers: NoneOrSome::One(DnsServerSpec::WithOptions {
+                    url: "udp://8.8.8.8".to_string(),
+                    client_chain: NoneOrSome::One(ConfigSelection::GroupName(
+                        "direct-chain".to_string(),
+                    )),
+                    bootstrap_url: None,
+                    server_name: None,
+                    ip_strategy: IpStrategy::default(),
+                }),
+            }),
+        ];
+
+        assert!(validate_configs_test(configs).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_dns_h3_with_proxy_chain_rejected() {
+        use crate::config::types::{ClientConfigGroup, ClientProxyConfig};
+
+        // Create a non-direct (socks5) chain - should be rejected for H3.
+        let mut socks_config = ClientConfig::default();
+        socks_config.protocol = ClientProxyConfig::Socks {
+            username: None,
+            password: None,
+        };
+
+        let configs = vec![
+            Config::ClientConfigGroup(ClientConfigGroup {
+                client_group: "test-proxy".to_string(),
+                client_proxies: OneOrSome::One(ConfigSelection::Config(socks_config)),
+            }),
+            Config::DnsConfigGroup(DnsConfigGroup {
+                dns_group: "test-dns".to_string(),
+                dns_servers: NoneOrSome::One(DnsServerSpec::WithOptions {
+                    url: "h3://1.1.1.1/dns-query".to_string(),
+                    client_chain: NoneOrSome::One(ConfigSelection::GroupName(
+                        "test-proxy".to_string(),
+                    )),
+                    bootstrap_url: None,
+                    server_name: None,
+                    ip_strategy: IpStrategy::default(),
+                }),
+            }),
+        ];
+
+        let result = validate_configs_test(configs).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("H3 DNS only supports direct client_chain"),
+            "Expected H3 DNS client_chain error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dns_h3_with_direct_chain_allowed() {
+        use crate::config::types::ClientConfigGroup;
+
+        // Create a direct chain - should be allowed for H3 (for bind_interface).
+        let configs = vec![
+            Config::ClientConfigGroup(ClientConfigGroup {
+                client_group: "direct-chain".to_string(),
+                client_proxies: OneOrSome::One(ConfigSelection::Config(ClientConfig::default())),
+            }),
+            Config::DnsConfigGroup(DnsConfigGroup {
+                dns_group: "test-dns".to_string(),
+                dns_servers: NoneOrSome::One(DnsServerSpec::WithOptions {
+                    url: "h3://1.1.1.1/dns-query".to_string(),
+                    client_chain: NoneOrSome::One(ConfigSelection::GroupName(
+                        "direct-chain".to_string(),
+                    )),
+                    bootstrap_url: None,
+                    server_name: None,
+                    ip_strategy: IpStrategy::default(),
+                }),
+            }),
+        ];
+
+        assert!(validate_configs_test(configs).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_dns_tcp_with_client_chain_allowed() {
+        use crate::config::types::ClientConfigGroup;
+
+        let configs = vec![
+            Config::ClientConfigGroup(ClientConfigGroup {
+                client_group: "test-proxy".to_string(),
+                client_proxies: OneOrSome::One(ConfigSelection::Config(ClientConfig::default())),
+            }),
+            Config::DnsConfigGroup(DnsConfigGroup {
+                dns_group: "test-dns".to_string(),
+                dns_servers: NoneOrSome::One(DnsServerSpec::WithOptions {
+                    url: "tcp://8.8.8.8".to_string(),
+                    client_chain: NoneOrSome::One(ConfigSelection::GroupName(
+                        "test-proxy".to_string(),
+                    )),
+                    bootstrap_url: None,
+                    server_name: None,
+                    ip_strategy: IpStrategy::default(),
+                }),
+            }),
+        ];
+
+        // TCP with client_chain should be allowed
+        assert!(validate_configs_test(configs).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_dns_tls_with_client_chain_allowed() {
+        use crate::config::types::ClientConfigGroup;
+
+        let configs = vec![
+            Config::ClientConfigGroup(ClientConfigGroup {
+                client_group: "test-proxy".to_string(),
+                client_proxies: OneOrSome::One(ConfigSelection::Config(ClientConfig::default())),
+            }),
+            Config::DnsConfigGroup(DnsConfigGroup {
+                dns_group: "test-dns".to_string(),
+                dns_servers: NoneOrSome::One(DnsServerSpec::WithOptions {
+                    url: "tls://1.1.1.1".to_string(),
+                    client_chain: NoneOrSome::One(ConfigSelection::GroupName(
+                        "test-proxy".to_string(),
+                    )),
+                    bootstrap_url: None,
+                    server_name: None,
+                    ip_strategy: IpStrategy::default(),
+                }),
+            }),
+        ];
+
+        // TLS with client_chain should be allowed
+        assert!(validate_configs_test(configs).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_dns_https_with_client_chain_allowed() {
+        use crate::config::types::ClientConfigGroup;
+
+        let configs = vec![
+            Config::ClientConfigGroup(ClientConfigGroup {
+                client_group: "test-proxy".to_string(),
+                client_proxies: OneOrSome::One(ConfigSelection::Config(ClientConfig::default())),
+            }),
+            Config::DnsConfigGroup(DnsConfigGroup {
+                dns_group: "test-dns".to_string(),
+                dns_servers: NoneOrSome::One(DnsServerSpec::WithOptions {
+                    url: "https://1.1.1.1/dns-query".to_string(),
+                    client_chain: NoneOrSome::One(ConfigSelection::GroupName(
+                        "test-proxy".to_string(),
+                    )),
+                    bootstrap_url: None,
+                    server_name: None,
+                    ip_strategy: IpStrategy::default(),
+                }),
+            }),
+        ];
+
+        // HTTPS with client_chain should be allowed
+        assert!(validate_configs_test(configs).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_dns_group_composition_basic() {
+        // Group full-dns includes base-dns
+        let configs = vec![
+            Config::DnsConfigGroup(DnsConfigGroup {
+                dns_group: "base-dns".to_string(),
+                dns_servers: NoneOrSome::Some(vec![
+                    DnsServerSpec::Simple("udp://8.8.8.8".to_string()),
+                    DnsServerSpec::Simple("udp://8.8.4.4".to_string()),
+                ]),
+            }),
+            Config::DnsConfigGroup(DnsConfigGroup {
+                dns_group: "full-dns".to_string(),
+                dns_servers: NoneOrSome::Some(vec![
+                    DnsServerSpec::Simple("base-dns".to_string()), // Group reference
+                    DnsServerSpec::Simple("tls://1.1.1.1".to_string()),
+                ]),
+            }),
+        ];
+
+        let result = validate_configs_test(configs).await;
+        assert!(
+            result.is_ok(),
+            "composition should work: {:?}",
+            result.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dns_group_composition_multi_level() {
+        // C includes B, B includes A
+        let configs = vec![
+            Config::DnsConfigGroup(DnsConfigGroup {
+                dns_group: "level-a".to_string(),
+                dns_servers: NoneOrSome::One(DnsServerSpec::Simple("udp://8.8.8.8".to_string())),
+            }),
+            Config::DnsConfigGroup(DnsConfigGroup {
+                dns_group: "level-b".to_string(),
+                dns_servers: NoneOrSome::Some(vec![
+                    DnsServerSpec::Simple("level-a".to_string()),
+                    DnsServerSpec::Simple("udp://1.1.1.1".to_string()),
+                ]),
+            }),
+            Config::DnsConfigGroup(DnsConfigGroup {
+                dns_group: "level-c".to_string(),
+                dns_servers: NoneOrSome::Some(vec![
+                    DnsServerSpec::Simple("level-b".to_string()),
+                    DnsServerSpec::Simple("system".to_string()),
+                ]),
+            }),
+        ];
+
+        let result = validate_configs_test(configs).await;
+        assert!(
+            result.is_ok(),
+            "multi-level composition should work: {:?}",
+            result.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dns_group_composition_cycle_detected() {
+        // A includes B, B includes A - cycle!
+        let configs = vec![
+            Config::DnsConfigGroup(DnsConfigGroup {
+                dns_group: "group-a".to_string(),
+                dns_servers: NoneOrSome::One(DnsServerSpec::Simple("group-b".to_string())),
+            }),
+            Config::DnsConfigGroup(DnsConfigGroup {
+                dns_group: "group-b".to_string(),
+                dns_servers: NoneOrSome::One(DnsServerSpec::Simple("group-a".to_string())),
+            }),
+        ];
+
+        let result = validate_configs_test(configs).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Circular dependency") || err.contains("cycle"),
+            "Expected cycle error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dns_group_composition_unknown_ref() {
+        // Reference to non-existent group
+        let configs = vec![Config::DnsConfigGroup(DnsConfigGroup {
+            dns_group: "my-dns".to_string(),
+            dns_servers: NoneOrSome::One(DnsServerSpec::Simple("nonexistent".to_string())),
+        })];
+
+        let result = validate_configs_test(configs).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("unknown group") || err.contains("nonexistent"),
+            "Expected unknown group error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dns_group_composition_with_bootstrap() {
+        // Composition and bootstrap work together
+        // Note: Using IP-based URLs to avoid network calls during tests
+        let configs = vec![
+            Config::DnsConfigGroup(DnsConfigGroup {
+                dns_group: "bootstrap-dns".to_string(),
+                dns_servers: NoneOrSome::One(DnsServerSpec::Simple("udp://8.8.8.8".to_string())),
+            }),
+            Config::DnsConfigGroup(DnsConfigGroup {
+                dns_group: "base-dns".to_string(),
+                dns_servers: NoneOrSome::One(DnsServerSpec::Simple("tls://1.1.1.1".to_string())),
+            }),
+            Config::DnsConfigGroup(DnsConfigGroup {
+                dns_group: "full-dns".to_string(),
+                dns_servers: NoneOrSome::Some(vec![
+                    DnsServerSpec::Simple("base-dns".to_string()), // Composition reference
+                    DnsServerSpec::WithOptions {
+                        url: "tls://8.8.4.4".to_string(), // IP-based, no resolution needed
+                        client_chain: NoneOrSome::None,
+                        bootstrap_url: Some("bootstrap-dns".to_string()), // Bootstrap reference (not used since URL is IP)
+                        server_name: Some("dns.google".to_string()),      // SNI override
+                        ip_strategy: IpStrategy::default(),
+                    },
+                ]),
+            }),
+        ];
+
+        let result = validate_configs_test(configs).await;
+        assert!(
+            result.is_ok(),
+            "composition with bootstrap should work: {:?}",
+            result.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_server_dns_with_group_ref() {
+        use crate::address::NetLocationPortRange;
+        use crate::config::types::dns::DnsConfig;
+        use crate::config::types::transport::BindLocation;
+
+        // Server config references an existing dns_group
+        let configs = vec![
+            Config::DnsConfigGroup(DnsConfigGroup {
+                dns_group: "my-dns".to_string(),
+                dns_servers: NoneOrSome::One(DnsServerSpec::Simple("udp://8.8.8.8".to_string())),
+            }),
+            Config::Server(ServerConfig {
+                bind_location: BindLocation::Address(
+                    NetLocationPortRange::new(
+                        crate::address::Address::Ipv4(std::net::Ipv4Addr::LOCALHOST),
+                        vec![1234],
+                    )
+                    .unwrap(),
+                ),
+                protocol: ServerProxyConfig::Http {
+                    username: None,
+                    password: None,
+                },
+                transport: Transport::Tcp,
+                tcp_settings: None,
+                quic_settings: None,
+                rules: direct_allow_rule(),
+                dns: Some(DnsConfig {
+                    servers: NoneOrSome::One(DnsServerSpec::Simple("my-dns".to_string())),
+                }),
+            }),
+        ];
+
+        let result = validate_configs_test(configs).await;
+        assert!(
+            result.is_ok(),
+            "server with dns group ref should work: {:?}",
+            result.err()
+        );
+
+        // Verify servers is still the group name (not expanded)
+        let validated = result.unwrap();
+        if let Config::Server(s) = &validated[0] {
+            assert_eq!(s.dns.as_ref().unwrap().resolved_group(), Some("my-dns"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_server_dns_with_mixed_group_and_url() {
+        use crate::address::NetLocationPortRange;
+        use crate::config::types::dns::DnsConfig;
+        use crate::config::types::transport::BindLocation;
+
+        // Server config with both group ref and URL in servers
+        let configs = vec![
+            Config::DnsConfigGroup(DnsConfigGroup {
+                dns_group: "base-dns".to_string(),
+                dns_servers: NoneOrSome::One(DnsServerSpec::Simple("udp://8.8.8.8".to_string())),
+            }),
+            Config::Server(ServerConfig {
+                bind_location: BindLocation::Address(
+                    NetLocationPortRange::new(
+                        crate::address::Address::Ipv4(std::net::Ipv4Addr::LOCALHOST),
+                        vec![1234],
+                    )
+                    .unwrap(),
+                ),
+                protocol: ServerProxyConfig::Http {
+                    username: None,
+                    password: None,
+                },
+                transport: Transport::Tcp,
+                tcp_settings: None,
+                quic_settings: None,
+                rules: direct_allow_rule(),
+                dns: Some(DnsConfig {
+                    servers: NoneOrSome::Some(vec![
+                        DnsServerSpec::Simple("base-dns".to_string()), // group ref
+                        DnsServerSpec::Simple("udp://1.1.1.1".to_string()), // URL
+                    ]),
+                }),
+            }),
+        ];
+
+        let result = validate_configs_test(configs).await;
+        assert!(
+            result.is_ok(),
+            "server with mixed dns should work: {:?}",
+            result.err()
+        );
+
+        // Verify servers was expanded to an inline group name
+        let validated = result.unwrap();
+        if let Config::Server(s) = &validated[0] {
+            let group = s.dns.as_ref().unwrap().resolved_group().unwrap();
+            assert!(
+                group.starts_with("__inline_dns_"),
+                "should be inline group: {}",
+                group
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_server_dns_with_multiple_group_refs() {
+        use crate::address::NetLocationPortRange;
+        use crate::config::types::dns::DnsConfig;
+        use crate::config::types::transport::BindLocation;
+
+        // Server config with multiple group refs that need expansion
+        let configs = vec![
+            Config::DnsConfigGroup(DnsConfigGroup {
+                dns_group: "fast-dns".to_string(),
+                dns_servers: NoneOrSome::One(DnsServerSpec::Simple("udp://8.8.8.8".to_string())),
+            }),
+            Config::DnsConfigGroup(DnsConfigGroup {
+                dns_group: "secure-dns".to_string(),
+                dns_servers: NoneOrSome::One(DnsServerSpec::Simple("tcp://1.1.1.1".to_string())),
+            }),
+            Config::Server(ServerConfig {
+                bind_location: BindLocation::Address(
+                    NetLocationPortRange::new(
+                        crate::address::Address::Ipv4(std::net::Ipv4Addr::LOCALHOST),
+                        vec![1234],
+                    )
+                    .unwrap(),
+                ),
+                protocol: ServerProxyConfig::Http {
+                    username: None,
+                    password: None,
+                },
+                transport: Transport::Tcp,
+                tcp_settings: None,
+                quic_settings: None,
+                rules: direct_allow_rule(),
+                dns: Some(DnsConfig {
+                    servers: NoneOrSome::Some(vec![
+                        DnsServerSpec::Simple("fast-dns".to_string()),
+                        DnsServerSpec::Simple("secure-dns".to_string()),
+                    ]),
+                }),
+            }),
+        ];
+
+        let result = validate_configs_test(configs).await;
+        assert!(
+            result.is_ok(),
+            "server with multiple group refs should work: {:?}",
+            result.err()
+        );
+
+        // Verify servers was expanded to an inline group name
+        let validated = result.unwrap();
+        if let Config::Server(s) = &validated[0] {
+            let group = s.dns.as_ref().unwrap().resolved_group().unwrap();
+            assert!(
+                group.starts_with("__inline_dns_"),
+                "should be inline group: {}",
+                group
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_server_dns_unknown_group_ref() {
+        use crate::address::NetLocationPortRange;
+        use crate::config::types::dns::DnsConfig;
+        use crate::config::types::transport::BindLocation;
+
+        // Server config references non-existent dns_group
+        let configs = vec![Config::Server(ServerConfig {
+            bind_location: BindLocation::Address(
+                NetLocationPortRange::new(
+                    crate::address::Address::Ipv4(std::net::Ipv4Addr::LOCALHOST),
+                    vec![1234],
+                )
+                .unwrap(),
+            ),
+            protocol: ServerProxyConfig::Http {
+                username: None,
+                password: None,
+            },
+            transport: Transport::Tcp,
+            tcp_settings: None,
+            quic_settings: None,
+            rules: direct_allow_rule(),
+            dns: Some(DnsConfig {
+                servers: NoneOrSome::One(DnsServerSpec::Simple("nonexistent-dns".to_string())),
+            }),
+        })];
+
+        let result = validate_configs_test(configs).await;
+        assert!(result.is_err(), "unknown dns group should fail");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("nonexistent-dns"),
+            "error should mention group name: {}",
+            err
         );
     }
 }

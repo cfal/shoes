@@ -54,4 +54,7 @@ pub trait SocketConnector: Send + Sync + Debug {
         resolver: &Arc<dyn Resolver>,
         target: ResolvedLocation,
     ) -> std::io::Result<Box<dyn AsyncMessageStream>>;
+
+    /// Returns the bind interface configured for this socket connector, if any.
+    fn bind_interface(&self) -> Option<&str>;
 }

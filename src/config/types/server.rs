@@ -8,6 +8,7 @@ use crate::address::NetLocation;
 use crate::option_util::{NoneOrSome, OneOrSome};
 
 use super::common::{default_reality_server_short_ids, default_reality_time_diff, default_true};
+use super::dns::DnsConfig;
 use super::rules::{ClientChainHop, RuleConfig};
 use super::selection::ConfigSelection;
 use super::shadowsocks::ShadowsocksConfig;
@@ -174,6 +175,10 @@ pub struct ServerConfig {
         skip_serializing_if = "NoneOrSome::is_unspecified"
     )]
     pub rules: NoneOrSome<ConfigSelection<RuleConfig>>,
+    /// DNS configuration for this server (optional).
+    /// Can reference a dns_group by name or specify inline DNS servers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns: Option<DnsConfig>,
 }
 
 impl<'de> serde::de::Deserialize<'de> for ServerConfig {
@@ -188,7 +193,7 @@ impl<'de> serde::de::Deserialize<'de> for ServerConfig {
             .as_mapping()
             .ok_or_else(|| Error::custom("ServerConfig must be a YAML mapping"))?;
 
-        // Valid fields: address/path (bind_location), protocol, transport, tcp_settings, quic_settings, rules/rule
+        // Valid fields: address/path (bind_location), protocol, transport, tcp_settings, quic_settings, rules/rule, dns
         const VALID_FIELDS: &[&str] = &[
             "address",
             "path", // BindLocation (flattened)
@@ -198,6 +203,7 @@ impl<'de> serde::de::Deserialize<'de> for ServerConfig {
             "quic_settings",
             "rules",
             "rule",
+            "dns",
         ];
 
         // Check for unknown fields
@@ -271,6 +277,14 @@ impl<'de> serde::de::Deserialize<'de> for ServerConfig {
             .map_err(|e| Error::custom(format!("invalid rules: {e}")))?
             .unwrap_or_else(direct_allow_rule);
 
+        // Parse dns (optional)
+        let dns: Option<DnsConfig> = map
+            .get("dns")
+            .filter(|v| !v.is_null())
+            .map(|v| serde_yaml::from_value(v.clone()))
+            .transpose()
+            .map_err(|e| Error::custom(format!("invalid dns: {e}")))?;
+
         Ok(ServerConfig {
             bind_location,
             protocol,
@@ -278,6 +292,7 @@ impl<'de> serde::de::Deserialize<'de> for ServerConfig {
             tcp_settings,
             quic_settings,
             rules,
+            dns,
         })
     }
 }
@@ -835,6 +850,7 @@ mod tests {
             tcp_settings: Some(TcpConfig { no_delay: true }),
             quic_settings: None,
             rules: NoneOrSome::None,
+            dns: None,
         }
     }
 
@@ -852,6 +868,7 @@ mod tests {
             tcp_settings: None,
             quic_settings: None,
             rules: NoneOrSome::None,
+            dns: None,
         }
     }
 
@@ -869,6 +886,7 @@ mod tests {
             tcp_settings: None,
             quic_settings: None,
             rules: NoneOrSome::None,
+            dns: None,
         }
     }
 
@@ -894,6 +912,7 @@ mod tests {
                 num_endpoints: 1,
             }),
             rules: NoneOrSome::None,
+            dns: None,
         }
     }
 
@@ -913,6 +932,7 @@ mod tests {
             tcp_settings: None,
             quic_settings: None,
             rules: NoneOrSome::None,
+            dns: None,
         }
     }
 
@@ -962,6 +982,7 @@ mod tests {
             tcp_settings: None,
             quic_settings: None,
             rules: NoneOrSome::None,
+            dns: None,
         }
     }
 
@@ -979,6 +1000,7 @@ mod tests {
             tcp_settings: None,
             quic_settings: None,
             rules: NoneOrSome::None,
+            dns: None,
         }
     }
 
@@ -1003,6 +1025,7 @@ mod tests {
             tcp_settings: None,
             quic_settings: None,
             rules: NoneOrSome::None,
+            dns: None,
         }
     }
 
@@ -1021,6 +1044,7 @@ mod tests {
             tcp_settings: None,
             quic_settings: None,
             rules: NoneOrSome::None,
+            dns: None,
         }
     }
 
@@ -1044,6 +1068,7 @@ mod tests {
                 num_endpoints: 1,
             }),
             rules: NoneOrSome::None,
+            dns: None,
         }
     }
 
@@ -1068,6 +1093,7 @@ mod tests {
                 num_endpoints: 1,
             }),
             rules: NoneOrSome::None,
+            dns: None,
         }
     }
 

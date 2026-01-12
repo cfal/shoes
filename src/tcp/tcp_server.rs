@@ -19,7 +19,7 @@ use crate::config::{BindLocation, Config, ConfigSelection, ServerConfig, TcpConf
 use crate::copy_bidirectional::copy_bidirectional;
 use crate::copy_bidirectional_message::copy_bidirectional_message;
 use crate::quic_server::start_quic_servers;
-use crate::resolver::{NativeResolver, Resolver};
+use crate::resolver::Resolver;
 use crate::routing::{ServerStream, run_udp_routing};
 use crate::socket_util::{new_tcp_listener, set_tcp_keepalive};
 use crate::tcp::tcp_handler::{TcpClientSetupResult, TcpServerHandler, TcpServerSetupResult};
@@ -340,19 +340,29 @@ pub async fn run_udp_copy(
     copy_result
 }
 
-pub async fn start_servers(config: Config) -> std::io::Result<Vec<JoinHandle<()>>> {
+pub async fn start_servers(
+    config: Config,
+    resolver: Arc<dyn Resolver>,
+) -> std::io::Result<Vec<JoinHandle<()>>> {
     match config {
-        Config::TunServer(tun_config) => start_tun_server(tun_config).await.map(|t| vec![t]),
-        Config::Server(server_config) => start_tcp_or_quic_servers(server_config).await,
+        Config::TunServer(tun_config) => {
+            start_tun_server(tun_config, resolver).await.map(|t| vec![t])
+        }
+        Config::Server(server_config) => {
+            start_tcp_or_quic_servers(server_config, resolver).await
+        }
         _ => unreachable!("create_server_configs only returns Server and TunServer"),
     }
 }
 
-async fn start_tcp_or_quic_servers(config: ServerConfig) -> std::io::Result<Vec<JoinHandle<()>>> {
+async fn start_tcp_or_quic_servers(
+    config: ServerConfig,
+    resolver: Arc<dyn Resolver>,
+) -> std::io::Result<Vec<JoinHandle<()>>> {
     let mut join_handles = Vec::with_capacity(3);
 
     match config.transport {
-        Transport::Tcp => match start_tcp_servers(config.clone()).await {
+        Transport::Tcp => match start_tcp_servers(config.clone(), resolver).await {
             Ok(handles) => {
                 join_handles.extend(handles);
             }
@@ -363,7 +373,7 @@ async fn start_tcp_or_quic_servers(config: ServerConfig) -> std::io::Result<Vec<
                 return Err(e);
             }
         },
-        Transport::Quic => match start_quic_servers(config.clone()).await {
+        Transport::Quic => match start_quic_servers(config.clone(), resolver).await {
             Ok(handles) => {
                 join_handles.extend(handles);
             }
@@ -387,7 +397,10 @@ async fn start_tcp_or_quic_servers(config: ServerConfig) -> std::io::Result<Vec<
     Ok(join_handles)
 }
 
-async fn start_tcp_servers(config: ServerConfig) -> std::io::Result<Vec<JoinHandle<()>>> {
+async fn start_tcp_servers(
+    config: ServerConfig,
+    resolver: Arc<dyn Resolver>,
+) -> std::io::Result<Vec<JoinHandle<()>>> {
     let ServerConfig {
         bind_location,
         tcp_settings,
@@ -403,8 +416,6 @@ async fn start_tcp_servers(config: ServerConfig) -> std::io::Result<Vec<JoinHand
     assert!(!rules.is_empty());
 
     let tcp_config = tcp_settings.unwrap_or_else(TcpConfig::default);
-
-    let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
 
     let client_proxy_selector =
         Arc::new(create_tcp_client_proxy_selector(rules.clone(), resolver.clone()));
