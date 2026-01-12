@@ -20,6 +20,7 @@ use tokio::io::AsyncWriteExt;
 use crate::address::{Address, NetLocation};
 use crate::async_stream::{AsyncMessageStream, AsyncStream};
 use crate::client_proxy_selector::ClientProxySelector;
+use crate::copy_bidirectional::copy_bidirectional_with_sizes;
 use crate::crypto::CryptoTlsStream;
 use crate::resolver::Resolver;
 use crate::routing::{ServerStream, run_udp_routing};
@@ -581,9 +582,11 @@ async fn handle_naive_stream<S: AsyncStream + 'static>(
 
     // Use larger buffers for better throughput (default 8KB is too small)
     const COPY_BUF_SIZE: usize = 256 * 1024;
-    let result = tokio::io::copy_bidirectional_with_sizes(
+    let result = copy_bidirectional_with_sizes(
         &mut stream,
         &mut client_stream,
+        false,
+        false,
         COPY_BUF_SIZE,
         COPY_BUF_SIZE,
     )
