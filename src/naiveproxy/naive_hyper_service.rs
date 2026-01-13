@@ -148,8 +148,9 @@ pub(super) async fn run_naive_hyper_service<IO: AsyncStream + 'static>(
                 async move { naive_service(req, config).await }
             });
 
-            // Use larger window/frame sizes for better throughput
-            const WINDOW_SIZE: u32 = 16 * 1024 * 1024; // 16 MB
+            // H2 settings tuned for reasonable throughput without excessive memory
+            // Reference naiveproxy uses ~64KB default, we use 256 KB for better throughput
+            const WINDOW_SIZE: u32 = 256 * 1024; // 256 KB (was 16 MB)
             const MAX_FRAME_SIZE: u32 = (1 << 24) - 1; // ~16 MB (max allowed by HTTP/2)
 
             let result = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
@@ -157,6 +158,7 @@ pub(super) async fn run_naive_hyper_service<IO: AsyncStream + 'static>(
                 .initial_stream_window_size(WINDOW_SIZE)
                 .initial_connection_window_size(WINDOW_SIZE)
                 .max_frame_size(MAX_FRAME_SIZE)
+                .max_concurrent_streams(1024)
                 .serve_connection(io, service)
                 .await;
 
@@ -516,7 +518,9 @@ async fn handle_naive_stream<S: AsyncStream + 'static>(
             if is_connect == 1 {
                 let uot_v2_stream = UotV2Stream::new(stream);
 
-                let action = proxy_selector.judge(destination.clone().into(), &resolver).await?;
+                let action = proxy_selector
+                    .judge(destination.clone().into(), &resolver)
+                    .await?;
 
                 match action {
                     ConnectDecision::Allow {
@@ -596,11 +600,8 @@ async fn handle_naive_stream<S: AsyncStream + 'static>(
     let _ = client_stream.shutdown().await;
 
     match result {
-        Ok((to_client, to_remote)) => {
-            debug!(
-                "NaiveProxy stream (user: {}): done, {} bytes to client, {} bytes to remote",
-                user_name, to_client, to_remote
-            );
+        Ok(()) => {
+            debug!("NaiveProxy stream (user: {}): done", user_name);
             Ok(())
         }
         Err(e) => {
