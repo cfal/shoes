@@ -31,21 +31,23 @@ aws-lc-rs = { version = "*", default-features = false }
 base64 = "*"
 blake3 = "*"
 bytes = "*"
-h2 = "*"
-# Git version required for H3 disable_grease option (needed for Cloudflare).
-# See: https://github.com/hickory-dns/hickory-dns/pull/2085
-hickory-resolver = { git = "https://github.com/hickory-dns/hickory-dns", default-features = false, features = ["tokio", "tls-aws-lc-rs", "https-aws-lc-rs", "h3-aws-lc-rs"] }
-hyper = { version = "*", features = ["server", "http1", "http2"] }
-hyper-util = { version = "*", features = ["tokio", "server"] }
-http-body-util = "*"
 dashmap = "*"
 digest = "*"
 env_logger = "*"
+etherparse = "*"
 futures = "*"
+h2 = "*"
 h3 = "*"
 h3-quinn = "*"
+# Git version required for H3 disable_grease option (needed for Cloudflare).
+# See: https://github.com/hickory-dns/hickory-dns/pull/2085
+hickory-resolver = { git = "https://github.com/hickory-dns/hickory-dns", default-features = false, features = ["tokio", "tls-aws-lc-rs", "https-aws-lc-rs", "h3-aws-lc-rs"] }
 http = "*"
+http-body-util = "*"
+hyper = { version = "*", features = ["server", "http1", "http2"] }
+hyper-util = { version = "*", features = ["tokio", "server"] }
 indexmap = "*"
+libc = "*"
 log = { version = "*", features = ["release_max_level_info"] }
 lru = "*"
 md-5 = "*"
@@ -58,14 +60,15 @@ quinn = { version = "*", default-features = false, features = ["log", "platform-
 rand = "*"
 rand_core = "*"
 rcgen = { version = "*", default-features = false, features = ["aws_lc_rs", "pem"] }
-rustc-hash = "*"
 rust-argon2 = "*"
+rustc-hash = "*"
 rustls = "*"
 serde = { version = "*", features = ["derive", "std"] }
-subtle = "*"
 serde_yaml = "*"
 sha3 = "*"
+smoltcp = { version = "*", default-features = false, features = ["std", "log", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-icmp", "socket-udp", "socket-tcp", "socket-tcp-cubic", "phy-tuntap_interface", "assembler-max-segment-count-32"] }
 socket2 = "*"
+subtle = "*"
 tokio = { version = "*", features = [
     "fs",
     "io-util",
@@ -76,36 +79,29 @@ tokio = { version = "*", features = [
     "time",
 ] }
 tokio-util = { version = "*", features = ["time"] }
+tun = { version = "*", features = ["async"] }
 url = "*"
 webpki-roots = { version = "*" }
-
-# TUN device support (for VPN mode)
-tun = { version = "0.8", features = ["async"] }
-smoltcp = { version = "0.12", default-features = false, features = ["std", "log", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-icmp", "socket-udp", "socket-tcp", "socket-tcp-cubic", "phy-tuntap_interface", "assembler-max-segment-count-32"] }
-etherparse = "0.16"
-
 x509-parser = { version = "*", default-features = false, features = ["verify-aws"] }
-libc = "0.2.179"
 
 [dev-dependencies]
-tempfile = "*"
-rustls-pemfile = "*"
 rcgen = { version = "*", default-features = false, features = ["aws_lc_rs", "pem"] }
-tokio-rustls = "*"
+rustls-pemfile = "*"
 serde_json = "*"
+tempfile = "*"
+tokio-rustls = "*"
 
 # jemalloc for better memory performance (not supported on Windows MSVC or iOS)
 [target.'cfg(not(any(target_env = "msvc", target_os = "ios")))'.dependencies]
 tikv-jemallocator = "0.6"
 
 [target.'cfg(target_os = "android")'.dependencies]
-jni = "0.21"
 android_logger = "0.14"
-ndk-sys = "0.6"
 chrono = "0.4"
+jni = "0.21"
+ndk-sys = "0.6"
 
 [profile.release]
 opt-level = 3
 lto = "fat"
 strip = true
-
