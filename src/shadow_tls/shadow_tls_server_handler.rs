@@ -199,7 +199,7 @@ async fn shadowtls_fallback_to_handshake_server(
         client_stream: mut handshake_stream,
         early_data,
     } = client_chain
-        .connect_tcp(location.clone(), resolver)
+        .connect_tcp(location.clone().into(), resolver)
         .await
         .map_err(|e| {
             std::io::Error::new(
@@ -695,7 +695,7 @@ async fn setup_remote_handshake(
         mut client_stream,
         early_data: _,
     } = client_chain
-        .connect_tcp(remote_addr, resolver)
+        .connect_tcp(remote_addr.into(), resolver)
         .await
         .map_err(|e| {
             std::io::Error::new(

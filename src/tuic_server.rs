@@ -585,7 +585,7 @@ impl UdpSession {
                     (self.last_socket_addr, false)
                 } else {
                     let action = client_proxy_selector
-                        .judge(location.clone(), resolver)
+                        .judge(location.clone().into(), resolver)
                         .await?;
 
                     let updated_location = match action {
@@ -600,7 +600,7 @@ impl UdpSession {
                         }
                     };
                     let updated_address =
-                        match resolve_single_address(resolver, &updated_location).await {
+                        match resolve_single_address(resolver, updated_location.location()).await {
                             Ok(s) => s,
                             Err(e) => {
                                 error!("Failed to resolve updated remote location {location}: {e}");
@@ -1026,7 +1026,7 @@ async fn process_udp_packet(
                 let remote_location = remote_location.clone().unwrap();
 
                 let action = client_proxy_selector
-                    .judge(remote_location.clone(), resolver)
+                    .judge(remote_location.clone().into(), resolver)
                     .await;
 
                 let (_chain_group, updated_location) = match action {
@@ -1046,11 +1046,12 @@ async fn process_udp_packet(
                     }
                 };
 
-                let resolved_address = resolve_single_address(resolver, &updated_location)
+                let resolved_address = resolve_single_address(resolver, updated_location.location())
                     .await
                     .map_err(|e| {
                         std::io::Error::other(format!(
-                            "Failed to resolve initial remote location {updated_location}: {e}"
+                            "Failed to resolve initial remote location {}: {e}",
+                            updated_location.location()
                         ))
                     })?;
 

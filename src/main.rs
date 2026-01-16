@@ -8,6 +8,7 @@ mod config;
 mod copy_bidirectional;
 mod copy_bidirectional_message;
 mod crypto;
+mod dns;
 mod http_handler;
 mod hysteria2_client;
 mod hysteria2_protocol;
@@ -366,7 +367,7 @@ fn main() {
             debug!("================================================================================");
 
             if dry_run {
-                if let Err(e) = config::create_server_configs(configs).await {
+                if let Err(e) = config::create_server_configs(configs) {
                     eprintln!("Dry run failed, could not create server configs: {e}\n");
                 } else {
                     println!("Finishing dry run, config parsed successfully.");
@@ -376,7 +377,7 @@ fn main() {
 
             let mut join_handles = vec![];
 
-            let server_configs = match config::create_server_configs(configs).await {
+            let server_configs = match config::create_server_configs(configs) {
                 Ok(c) => c,
                 Err(e) => {
                     eprintln!("Failed to create server configs: {e}\n");
@@ -385,10 +386,32 @@ fn main() {
                 }
             };
 
+            let config::ValidatedConfigs {
+                configs: server_configs,
+                dns_groups,
+            } = server_configs;
+
+            // Build DNS registry from expanded groups (async - resolves hostnames)
+            let mut dns_registry = match dns::build_dns_registry(dns_groups).await {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("Failed to build DNS registry: {e}\n");
+                    print_usage_and_exit(arg0);
+                    return;
+                }
+            };
+
             println!("\nStarting {} server(s)..", server_configs.len());
 
             for server_config in server_configs {
-                join_handles.extend(start_servers(server_config).await.unwrap());
+                // Get the resolver for this server from the registry
+                let dns_ref = match &server_config {
+                    config::Config::Server(s) => s.dns.as_ref(),
+                    config::Config::TunServer(t) => t.dns.as_ref(),
+                    _ => None,
+                };
+                let resolver = dns_registry.get_for_server(dns_ref);
+                join_handles.extend(start_servers(server_config, resolver).await.unwrap());
             }
 
             match reload_state.as_mut() {

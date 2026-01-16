@@ -386,7 +386,7 @@ async fn create_connection(
     resolver: &Arc<dyn Resolver>,
 ) -> io::Result<Box<dyn AsyncMessageStream>> {
     let decision = proxy_selector
-        .judge_with_resolved_address(dest.clone(), None, resolver)
+        .judge(dest.into(), resolver)
         .await?;
 
     match decision {

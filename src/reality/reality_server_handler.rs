@@ -70,7 +70,7 @@ pub async fn setup_reality_server_stream(
         early_data,
     } = target
         .dest_client_chain
-        .connect_tcp(target.dest.clone(), resolver)
+        .connect_tcp(target.dest.clone().into(), resolver)
         .await
         .map_err(|e| {
             std::io::Error::new(

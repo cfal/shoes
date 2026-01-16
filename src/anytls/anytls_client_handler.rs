@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 
-use crate::address::{Address, NetLocation};
+use crate::address::{Address, NetLocation, ResolvedLocation};
 use crate::anytls::anytls_client_session::AnyTlsClientSession;
 use crate::anytls::anytls_padding::PaddingFactory;
 use crate::async_stream::AsyncMessageStream;
@@ -60,13 +60,13 @@ impl TcpClientHandler for AnyTlsClientHandler {
     async fn setup_client_tcp_stream(
         &self,
         client_stream: Box<dyn AsyncStream>,
-        remote_location: NetLocation,
+        remote_location: ResolvedLocation,
     ) -> std::io::Result<TcpClientSetupResult> {
         let session =
             AnyTlsClientSession::new(client_stream, &self.password, Arc::clone(&self.padding))
                 .await?;
 
-        let stream = session.open_stream(remote_location).await?;
+        let stream = session.open_stream(remote_location.into_location()).await?;
 
         Ok(TcpClientSetupResult {
             client_stream: Box::new(stream),
@@ -81,7 +81,7 @@ impl TcpClientHandler for AnyTlsClientHandler {
     async fn setup_client_udp_bidirectional(
         &self,
         client_stream: Box<dyn AsyncStream>,
-        target: NetLocation,
+        target: ResolvedLocation,
     ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
         if !self.udp_enabled {
             return Err(std::io::Error::new(
@@ -100,7 +100,7 @@ impl TcpClientHandler for AnyTlsClientHandler {
 
         // UoT V2 header: isConnect(1) + destination
         stream.write_u8(1).await?;
-        stream.write_all(&encode_socks_address(&target)).await?;
+        stream.write_all(&encode_socks_address(target.location())).await?;
         stream.flush().await?;
 
         let message_stream = VlessMessageStream::new(stream);

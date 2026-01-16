@@ -69,14 +69,16 @@ impl NaiveClientSession {
     ///
     /// Performs H2 handshake and spawns the connection driver.
     pub async fn new(stream: Box<dyn AsyncStream>) -> io::Result<Self> {
-        // Use larger window/frame sizes for better throughput
-        const WINDOW_SIZE: u32 = 16 * 1024 * 1024; // 16 MB
+        // H2 settings tuned for reasonable throughput without excessive memory
+        // Reference naiveproxy uses ~64KB default, we use 256 KB for better throughput
+        const WINDOW_SIZE: u32 = 256 * 1024; // 256 KB (was 16 MB)
         const MAX_FRAME_SIZE: u32 = (1 << 24) - 1; // ~16 MB (max allowed by HTTP/2)
 
         let (send_request, connection) = h2::client::Builder::new()
             .initial_window_size(WINDOW_SIZE)
             .initial_connection_window_size(WINDOW_SIZE)
             .max_frame_size(MAX_FRAME_SIZE)
+            .max_concurrent_streams(1024)
             .handshake(stream)
             .await
             .map_err(|e| io::Error::other(format!("H2 client handshake failed: {}", e)))?;

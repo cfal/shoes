@@ -5,7 +5,7 @@ use std::sync::OnceLock;
 use async_trait::async_trait;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::address::{Address, NetLocation};
+use crate::address::{Address, NetLocation, ResolvedLocation};
 use crate::async_stream::AsyncStream;
 use crate::client_proxy_selector::ClientProxySelector;
 use crate::resolver::Resolver;
@@ -559,10 +559,10 @@ impl TcpClientHandler for SocksTcpClientHandler {
     async fn setup_client_tcp_stream(
         &self,
         mut client_stream: Box<dyn AsyncStream>,
-        remote_location: NetLocation,
+        remote_location: ResolvedLocation,
     ) -> std::io::Result<TcpClientSetupResult> {
         write_all(&mut client_stream, &self.prefix_data).await?;
-        let location_bytes = write_location_to_vec(&remote_location);
+        let location_bytes = write_location_to_vec(remote_location.location());
         write_all(&mut client_stream, &location_bytes).await?;
         client_stream.flush().await?;
 

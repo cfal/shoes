@@ -15,7 +15,7 @@ use crate::config::{
 };
 use crate::copy_bidirectional::copy_bidirectional;
 use crate::quic_stream::QuicStream;
-use crate::resolver::{NativeResolver, Resolver};
+use crate::resolver::Resolver;
 use crate::routing::{ServerStream, run_udp_routing};
 use crate::rustls_config_util::create_server_config;
 use crate::socket_util::new_socket2_udp_socket;
@@ -207,7 +207,7 @@ async fn process_streams(
             need_initial_flush: server_need_initial_flush,
             proxy_selector,
         } => {
-            let action = proxy_selector.judge(remote_location, &resolver).await?;
+            let action = proxy_selector.judge(remote_location.into(), &resolver).await?;
             match action {
                 ConnectDecision::Allow {
                     chain_group,
@@ -263,7 +263,10 @@ async fn process_streams(
     }
 }
 
-pub async fn start_quic_servers(config: ServerConfig) -> std::io::Result<Vec<JoinHandle<()>>> {
+pub async fn start_quic_servers(
+    config: ServerConfig,
+    resolver: Arc<dyn Resolver>,
+) -> std::io::Result<Vec<JoinHandle<()>>> {
     let ServerConfig {
         bind_location,
         quic_settings,
@@ -319,11 +322,8 @@ pub async fn start_quic_servers(config: ServerConfig) -> std::io::Result<Vec<Joi
 
     let quic_server_config = Arc::new(quic_server_config);
 
-    let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
-    let client_proxy_selector = Arc::new(create_tcp_client_proxy_selector(
-        rules.clone(),
-        resolver.clone(),
-    ));
+    let client_proxy_selector =
+        Arc::new(create_tcp_client_proxy_selector(rules.clone(), resolver.clone()));
 
     let mut handles = vec![];
 

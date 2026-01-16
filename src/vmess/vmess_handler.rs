@@ -20,7 +20,7 @@ use super::fnv1a::Fnv1aHasher;
 use super::md5::{compute_md5, create_chacha_key};
 use super::nonce::{SingleUseNonce, VmessNonceSequence};
 use super::vmess_stream::{ReadHeaderInfo, VmessStream};
-use crate::address::{Address, NetLocation};
+use crate::address::{Address, NetLocation, ResolvedLocation};
 use crate::async_stream::{AsyncMessageStream, AsyncStream};
 use crate::client_proxy_selector::ClientProxySelector;
 use crate::stream_reader::StreamReader;
@@ -695,7 +695,7 @@ impl TcpClientHandler for VmessTcpClientHandler {
     async fn setup_client_tcp_stream(
         &self,
         mut client_stream: Box<dyn AsyncStream>,
-        remote_location: NetLocation,
+        remote_location: ResolvedLocation,
     ) -> std::io::Result<TcpClientSetupResult> {
         // AEAD allows 120 second delta from the current time.
         // See authid.go in v2ray-core.
@@ -822,7 +822,7 @@ impl TcpClientHandler for VmessTcpClientHandler {
         // specify tcp protocol
         header_bytes[37] = 1;
 
-        let (remote_address, remote_port) = remote_location.unwrap_components();
+        let (remote_address, remote_port) = remote_location.into_location().unwrap_components();
 
         header_bytes[38] = (remote_port >> 8) as u8;
         header_bytes[39] = (remote_port & 0xff) as u8;
@@ -961,11 +961,12 @@ impl TcpClientHandler for VmessTcpClientHandler {
     async fn setup_client_udp_bidirectional(
         &self,
         client_stream: Box<dyn AsyncStream>,
-        target: NetLocation,
+        target: ResolvedLocation,
     ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
         // VMess single-target UDP mode: Send VMess header with COMMAND_UDP (2)
         // and destination address. Uses VmessStream with is_udp=true.
-        self.setup_udp_stream_impl(client_stream, target).await
+        self.setup_udp_stream_impl(client_stream, target.into_location())
+            .await
     }
 }
 

@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::address::NetLocation;
+use crate::address::{NetLocation, ResolvedLocation};
 use crate::async_stream::{AsyncMessageStream, AsyncStream, AsyncTargetedMessageStream};
 use crate::client_proxy_selector::ClientProxySelector;
 
@@ -91,7 +91,8 @@ pub trait TcpClientHandler: Send + Sync + Debug {
     ///
     /// # Arguments
     /// * `client_stream` - The transport stream to the proxy server
-    /// * `remote_location` - The destination to connect to through the proxy
+    /// * `remote_location` - The destination to connect to through the proxy.
+    ///                       May include pre-resolved address to avoid duplicate DNS lookups.
     ///
     /// # Returns
     /// * `client_stream` - The wrapped stream ready for application data
@@ -99,7 +100,7 @@ pub trait TcpClientHandler: Send + Sync + Debug {
     async fn setup_client_tcp_stream(
         &self,
         client_stream: Box<dyn AsyncStream>,
-        remote_location: NetLocation,
+        remote_location: ResolvedLocation,
     ) -> std::io::Result<TcpClientSetupResult>;
 
     /// Returns true if this handler supports UDP-over-TCP tunneling.
@@ -112,14 +113,15 @@ pub trait TcpClientHandler: Send + Sync + Debug {
     ///
     /// # Arguments
     /// * `client_stream` - The transport stream to the proxy server
-    /// * `target` - The destination for UDP packets
+    /// * `target` - The destination for UDP packets.
+    ///              May include pre-resolved address to avoid duplicate DNS lookups.
     ///
     /// # Returns
     /// A message stream for sending/receiving UDP packets to the target.
     async fn setup_client_udp_bidirectional(
         &self,
         _client_stream: Box<dyn AsyncStream>,
-        _target: NetLocation,
+        _target: ResolvedLocation,
     ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,

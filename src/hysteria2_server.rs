@@ -548,7 +548,7 @@ async fn run_udp_local_to_remote_loop(
         let session = match session_entry {
             Entry::Vacant(entry) => {
                 let action = client_proxy_selector
-                    .judge(remote_location.clone(), &resolver)
+                    .judge(remote_location.clone().into(), &resolver)
                     .await;
 
                 let (_chain_group, updated_location) = match action {
@@ -583,7 +583,7 @@ async fn run_udp_local_to_remote_loop(
                 // ref: https://github.com/apernet/hysteria/blob/5520bcc405ee11a47c164c75bae5c40fc2b1d99d/core/server/udp.go#L137
 
                 let resolved_address = match resolver_cache
-                    .resolve_location(&updated_location)
+                    .resolve_location(updated_location.location())
                     .await
                 {
                     Ok(s) => s,
@@ -695,7 +695,7 @@ async fn run_udp_local_to_remote_loop(
                         remote_location.clone()
                     );
                     let action = client_proxy_selector
-                        .judge(remote_location.clone(), &resolver)
+                        .judge(remote_location.clone().into(), &resolver)
                         .await;
                     let updated_location = match action {
                         Ok(ConnectDecision::Allow {
@@ -712,18 +712,19 @@ async fn run_udp_local_to_remote_loop(
                         }
                     };
                     let updated_socket_addr = match resolver_cache
-                        .resolve_location(&updated_location)
+                        .resolve_location(updated_location.location())
                         .await
                     {
                         Ok(s) => s,
                         Err(e) => {
                             error!(
-                                "Failed to resolve updated remote location {updated_location}: {e}"
+                                "Failed to resolve updated remote location {}: {e}",
+                                updated_location.location()
                             );
                             continue;
                         }
                     };
-                    session.last_location = updated_location;
+                    session.last_location = updated_location.into_location();
                     session.last_socket_addr = updated_socket_addr;
                     updated_socket_addr
                 }

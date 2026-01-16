@@ -24,7 +24,7 @@ use base64::engine::{Engine as _, general_purpose::STANDARD as BASE64};
 use log::debug;
 use tokio::sync::Mutex;
 
-use crate::address::NetLocation;
+use crate::address::ResolvedLocation;
 use crate::async_stream::AsyncStream;
 use crate::tcp::tcp_handler::{TcpClientHandler, TcpClientSetupResult};
 
@@ -80,12 +80,12 @@ impl TcpClientHandler for NaiveProxyTcpClientHandler {
     async fn setup_client_tcp_stream(
         &self,
         client_stream: Box<dyn AsyncStream>,
-        remote_location: NetLocation,
+        remote_location: ResolvedLocation,
     ) -> io::Result<TcpClientSetupResult> {
         let mut session = self.get_or_create_session(client_stream).await?;
 
         let stream = session
-            .open_stream(&remote_location, &self.auth_header, self.padding_enabled)
+            .open_stream(remote_location.location(), &self.auth_header, self.padding_enabled)
             .await?;
 
         Ok(TcpClientSetupResult {

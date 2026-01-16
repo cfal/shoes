@@ -265,6 +265,12 @@ fn find_first_proxy_address<'a>(
     None
 }
 
+/// Build a "direct" ClientChainGroup (no proxy, just socket connection).
+/// Uses the same pattern as build_client_chain_group with no chains configured.
+pub fn build_direct_chain_group(resolver: Arc<dyn Resolver>) -> ClientChainGroup {
+    build_client_chain_group(crate::option_util::NoneOrSome::None, resolver)
+}
+
 /// Build a ClientChainGroup from config chains.
 pub fn build_client_chain_group(
     client_chains: crate::option_util::NoneOrSome<crate::config::ClientChain>,

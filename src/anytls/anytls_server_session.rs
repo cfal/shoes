@@ -700,7 +700,7 @@ impl AnyTlsSession {
 
         let action = self
             .proxy_provider
-            .judge(destination.clone(), &self.resolver)
+            .judge(destination.clone().into(), &self.resolver)
             .await?;
 
         match action {
@@ -838,7 +838,7 @@ impl AnyTlsSession {
         // Use ClientProxySelector for routing
         let action = self
             .proxy_provider
-            .judge(destination.clone(), &self.resolver)
+            .judge(destination.clone().into(), &self.resolver)
             .await?;
 
         match action {
