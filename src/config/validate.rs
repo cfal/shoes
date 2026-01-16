@@ -911,6 +911,16 @@ fn validate_client_config(
         ));
     }
 
+    // Hysteria2 must use QUIC transport
+    if matches!(client_config.protocol, ClientProxyConfig::Hysteria2 { .. })
+        && client_config.transport != Transport::Quic
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Hysteria2 protocol requires transport: quic",
+        ));
+    }
+
     validate_client_proxy_config(&mut client_config.protocol, named_pems)?;
 
     Ok(())

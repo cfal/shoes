@@ -10,6 +10,8 @@ mod copy_bidirectional_message;
 mod crypto;
 mod dns;
 mod http_handler;
+mod hysteria2_client;
+mod hysteria2_protocol;
 mod hysteria2_server;
 mod mixed_handler;
 mod naiveproxy;

@@ -27,6 +27,156 @@ use super::socket_connector::SocketConnector;
 
 const MAX_QUIC_ENDPOINTS: usize = 32;
 
+/// Configuration for creating a QUIC endpoint.
+#[derive(Debug, Clone)]
+pub struct QuicEndpointConfig {
+    pub verify: bool,
+    pub server_fingerprints: Vec<String>,
+    pub alpn_protocols: Vec<String>,
+    pub sni_hostname: Option<String>,
+    pub key: Option<String>,
+    pub cert: Option<String>,
+    pub tls13_only: bool,
+    pub transport_config: Option<Arc<quinn::TransportConfig>>,
+}
+
+impl QuicEndpointConfig {
+    pub fn from_client_config(
+        config: ClientQuicConfig,
+        default_sni_hostname: Option<String>,
+    ) -> Self {
+        let ClientQuicConfig {
+            verify,
+            server_fingerprints,
+            alpn_protocols,
+            sni_hostname,
+            key,
+            cert,
+            ..
+        } = config;
+
+        let sni_hostname = if sni_hostname.is_unspecified() {
+            if let Some(ref hostname) = default_sni_hostname {
+                debug!(
+                    "Using default sni hostname for QUIC client connection: {}",
+                    hostname
+                );
+            }
+            default_sni_hostname
+        } else {
+            sni_hostname.into_option()
+        };
+
+        Self {
+            verify,
+            server_fingerprints: server_fingerprints.into_vec(),
+            alpn_protocols: alpn_protocols.into_vec(),
+            sni_hostname,
+            key,
+            cert,
+            tls13_only: false,
+            transport_config: None,
+        }
+    }
+
+    pub fn with_tls13_only(mut self, tls13_only: bool) -> Self {
+        self.tls13_only = tls13_only;
+        self
+    }
+
+    pub fn with_transport_config(
+        mut self,
+        max_concurrent_bidi_streams: u32,
+        max_concurrent_uni_streams: u32,
+        keep_alive_interval_secs: u64,
+        max_idle_timeout_secs: u64,
+    ) -> Self {
+        let mut transport_config = quinn::TransportConfig::default();
+        transport_config
+            .max_concurrent_bidi_streams(max_concurrent_bidi_streams.into())
+            .max_concurrent_uni_streams(max_concurrent_uni_streams.into())
+            .keep_alive_interval(Some(std::time::Duration::from_secs(keep_alive_interval_secs)))
+            .max_idle_timeout(Some(
+                std::time::Duration::from_secs(max_idle_timeout_secs)
+                    .try_into()
+                    .unwrap(),
+            ));
+        self.transport_config = Some(Arc::new(transport_config));
+        self
+    }
+}
+
+/// Create a single QUIC endpoint.
+pub fn create_quic_endpoint(
+    config: &QuicEndpointConfig,
+    is_ipv6: bool,
+    bind_interface: Option<String>,
+) -> std::io::Result<Arc<quinn::Endpoint>> {
+    let tls13_suite =
+        match rustls::crypto::aws_lc_rs::cipher_suite::TLS13_AES_128_GCM_SHA256 {
+            rustls::SupportedCipherSuite::Tls13(t) => t,
+            _ => {
+                panic!("Could not retrieve Tls13CipherSuite");
+            }
+        };
+
+    let key_and_cert_bytes = config.key.clone().zip(config.cert.clone()).map(|(key, cert)| {
+        let cert_bytes = cert.as_bytes().to_vec();
+        let key_bytes = key.as_bytes().to_vec();
+        (key_bytes, cert_bytes)
+    });
+
+    let rustls_client_config = create_client_config(
+        config.verify,
+        config.server_fingerprints.clone(),
+        config.alpn_protocols.clone(),
+        config.sni_hostname.is_some(),
+        key_and_cert_bytes,
+        config.tls13_only,
+    );
+
+    let quic_client_config = quinn::crypto::rustls::QuicClientConfig::with_initial(
+        Arc::new(rustls_client_config),
+        tls13_suite.quic_suite().unwrap(),
+    )
+    .unwrap();
+
+    let mut quinn_client_config = quinn::ClientConfig::new(Arc::new(quic_client_config));
+
+    if let Some(transport_config) = &config.transport_config {
+        quinn_client_config.transport_config(transport_config.clone());
+    } else {
+        // Default transport config
+        let mut transport_config = quinn::TransportConfig::default();
+        transport_config
+            .max_concurrent_bidi_streams(0_u32.into())
+            .max_concurrent_uni_streams(0_u8.into())
+            .keep_alive_interval(Some(std::time::Duration::from_secs(15)))
+            .max_idle_timeout(Some(std::time::Duration::from_secs(30).try_into().unwrap()));
+        quinn_client_config.transport_config(Arc::new(transport_config));
+    }
+
+    let udp_socket = match new_udp_socket(is_ipv6, bind_interface) {
+        Ok(s) => s,
+        Err(e) => {
+            return Err(std::io::Error::other(format!(
+                "Failed to bind new UDP socket for QUIC: {e}"
+            )));
+        }
+    };
+    let udp_socket = udp_socket.into_std().unwrap();
+
+    let mut endpoint = quinn::Endpoint::new(
+        quinn::EndpointConfig::default(),
+        None,
+        udp_socket,
+        Arc::new(quinn::TokioRuntime),
+    )
+    .unwrap();
+    endpoint.set_default_client_config(quinn_client_config);
+    Ok(Arc::new(endpoint))
+}
+
 #[derive(Debug)]
 enum TransportConfig {
     Tcp {
@@ -93,93 +243,28 @@ impl SocketConnectorImpl {
                     "QUIC transport requires target_address (direct protocol should use TCP)",
                 );
 
-                let ClientQuicConfig {
-                    verify,
-                    server_fingerprints,
-                    alpn_protocols,
-                    sni_hostname,
-                    key,
-                    cert,
-                } = config.quic_settings.clone().unwrap_or_default();
-
-                let sni_hostname = if sni_hostname.is_unspecified() {
-                    if let Some(ref hostname) = default_sni_hostname {
-                        debug!(
-                            "Using default sni hostname for QUIC client connection: {}",
-                            hostname
-                        );
-                    }
-                    default_sni_hostname.clone()
-                } else {
-                    sni_hostname.into_option()
-                };
-
-                let tls13_suite =
-                    match rustls::crypto::aws_lc_rs::cipher_suite::TLS13_AES_128_GCM_SHA256 {
-                        rustls::SupportedCipherSuite::Tls13(t) => t,
-                        _ => {
-                            panic!("Could not retrieve Tls13CipherSuite");
-                        }
-                    };
-
-                let key_and_cert_bytes = key.zip(cert).map(|(key, cert)| {
-                    let cert_bytes = cert.as_bytes().to_vec();
-                    let key_bytes = key.as_bytes().to_vec();
-                    (key_bytes, cert_bytes)
-                });
-
-                let rustls_client_config = create_client_config(
-                    verify,
-                    server_fingerprints.into_vec(),
-                    alpn_protocols.into_vec(),
-                    sni_hostname.is_some(),
-                    key_and_cert_bytes,
-                    false, // tls13_only - QUIC enforces TLS 1.3 anyway
+                let quic_config = QuicEndpointConfig::from_client_config(
+                    config.quic_settings.clone().unwrap_or_default(),
+                    default_sni_hostname,
                 );
 
-                let quic_client_config = quinn::crypto::rustls::QuicClientConfig::with_initial(
-                    Arc::new(rustls_client_config),
-                    tls13_suite.quic_suite().unwrap(),
-                )
-                .unwrap();
-
-                let mut quinn_client_config =
-                    quinn::ClientConfig::new(Arc::new(quic_client_config));
-
-                let mut transport_config = quinn::TransportConfig::default();
-                transport_config
-                    .max_concurrent_bidi_streams(0_u32.into())
-                    .max_concurrent_uni_streams(0_u8.into())
-                    .keep_alive_interval(Some(std::time::Duration::from_secs(15)))
-                    .max_idle_timeout(Some(std::time::Duration::from_secs(30).try_into().unwrap()));
-
-                quinn_client_config.transport_config(Arc::new(transport_config));
+                let sni_hostname = quic_config.sni_hostname.clone();
 
                 let endpoints_len = std::cmp::min(get_num_threads(), MAX_QUIC_ENDPOINTS);
                 let mut endpoints = Vec::with_capacity(endpoints_len);
 
                 for _ in 0..endpoints_len {
-                    let udp_socket = match new_udp_socket(
+                    if let Ok(endpoint) = create_quic_endpoint(
+                        &quic_config,
                         target_address.address().is_ipv6(),
                         bind_interface.clone(),
                     ) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            error!("Failed to bind new UDP socket for QUIC: {e}");
-                            return None;
-                        }
-                    };
-                    let udp_socket = udp_socket.into_std().unwrap();
-
-                    let mut endpoint = quinn::Endpoint::new(
-                        quinn::EndpointConfig::default(),
-                        None,
-                        udp_socket,
-                        Arc::new(quinn::TokioRuntime),
-                    )
-                    .unwrap();
-                    endpoint.set_default_client_config(quinn_client_config.clone());
-                    endpoints.push(Arc::new(endpoint));
+                        endpoints.push(endpoint);
+                    } else {
+                         // error logged in create_quic_endpoint? No, it returns Result.
+                         error!("Failed to create QUIC endpoint");
+                         return None;
+                    }
                 }
 
                 TransportConfig::Quic {

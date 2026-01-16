@@ -10,7 +10,7 @@ use crate::async_stream::AsyncStream;
 use crate::client_proxy_selector::ClientProxySelector;
 use crate::resolver::Resolver;
 use crate::routing::{ServerStream, run_udp_routing};
-use crate::socks5_udp_relay::Socks5UdpRelayStream;
+use crate::socks5_udp_relay::SocksUdpRelay;
 use crate::stream_reader::StreamReader;
 use crate::tcp::tcp_handler::{
     TcpClientHandler, TcpClientSetupResult, TcpServerHandler, TcpServerSetupResult,
@@ -415,7 +415,7 @@ async fn handle_udp_associate(
                 return Err(e);
             }
         };
-    let udp_socket = tokio::net::UdpSocket::from_std(udp_socket)?;
+    let udp_socket = Arc::new(tokio::net::UdpSocket::from_std(udp_socket)?);
 
     let bound_addr = udp_socket.local_addr()?;
     log::info!("SOCKS5 UDP ASSOCIATE: bound UDP relay at {}", bound_addr);
@@ -424,7 +424,7 @@ async fn handle_udp_associate(
     write_all(&mut server_stream, &response).await?;
     server_stream.flush().await?;
 
-    let relay_stream = Socks5UdpRelayStream::new(udp_socket);
+    let relay_stream = SocksUdpRelay::new(udp_socket);
     let proxy_selector = proxy_selector.clone();
     let resolver = resolver.clone();
 
@@ -484,7 +484,7 @@ fn build_udp_associate_response(bound_addr: SocketAddr) -> Vec<u8> {
 /// When the TCP connection closes, the UDP relay is terminated.
 async fn run_udp_associate(
     mut tcp_stream: Box<dyn AsyncStream>,
-    relay_stream: Socks5UdpRelayStream,
+    relay_stream: SocksUdpRelay,
     proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
 ) -> std::io::Result<()> {

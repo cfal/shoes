@@ -4,7 +4,8 @@ use std::sync::Arc;
 
 use crate::client_proxy_chain::{ClientChainGroup, ClientProxyChain, InitialHopEntry};
 use crate::config::ConfigSelection;
-use crate::config::{ClientChainHop, ClientConfig};
+use crate::config::{ClientChainHop, ClientConfig, ClientProxyConfig};
+use crate::hysteria2_client::Hysteria2SocketConnector;
 use crate::resolver::Resolver;
 use crate::tcp::proxy_connector::ProxyConnector;
 use crate::tcp::proxy_connector_impl::ProxyConnectorImpl;
@@ -58,7 +59,82 @@ pub fn build_client_proxy_chain(
     let initial_hop: Vec<InitialHopEntry> = hops[0]
         .iter()
         .map(|config| {
-            // Find the first proxy address for QUIC socket configuration
+            // Check if this is a Hysteria2 configuration
+            // Hysteria2 uses its own socket connector that handles QUIC + HTTP/3 auth
+            if matches!(config.protocol, ClientProxyConfig::Hysteria2 { .. }) {
+                // For Hysteria2, we need to extract the password and create a special socket connector
+                let (password, udp_enabled, fast_open, bandwidth) = match &config.protocol {
+                    ClientProxyConfig::Hysteria2 {
+                        password,
+                        udp_enabled,
+                        fast_open,
+                        bandwidth,
+                    } => (
+                        password.clone(),
+                        *udp_enabled,
+                        *fast_open,
+                        bandwidth.clone(),
+                    ),
+                    _ => unreachable!(),
+                };
+
+                // Parse bandwidth configuration
+                use crate::config::resolve_hysteria2_bandwidth;
+                let (max_tx, max_rx) = match resolve_hysteria2_bandwidth(&bandwidth) {
+                    Ok((tx, rx)) => (tx, rx),
+                    Err(e) => {
+                        eprintln!("Failed to parse bandwidth: {}, using 0", e);
+                        (0, 0)
+                    }
+                };
+                // Build Hysteria2 socket connector
+                let target_address = find_first_proxy_address(&hops, config)
+                    .expect("Hysteria2 requires a target address");
+
+                let bind_interface = config.bind_interface.clone().into_option();
+
+                // Get SNI hostname from quic_settings or use target address
+                let default_sni_hostname = target_address.address().hostname().map(ToString::to_string);
+
+                let mut quic_config = crate::tcp::socket_connector_impl::QuicEndpointConfig::from_client_config(
+                    config.quic_settings.clone().unwrap_or_default(),
+                    default_sni_hostname,
+                )
+                .with_tls13_only(true)
+                .with_transport_config(256, 255, 15, 60);
+
+                // Add "h3" ALPN if not present, as it is required by Hysteria2
+                let h3 = "h3".to_string();
+                if !quic_config.alpn_protocols.contains(&h3) {
+                    quic_config.alpn_protocols.push(h3);
+                }
+
+                let effective_sni = quic_config.sni_hostname.clone();
+
+                let endpoint = crate::tcp::socket_connector_impl::create_quic_endpoint(
+                    &quic_config,
+                    target_address.address().is_ipv6(),
+                    bind_interface.clone(),
+                ).expect("Failed to create QUIC endpoint for Hysteria2");
+
+                let socket = Box::new(Hysteria2SocketConnector::new(
+                    endpoint,
+                    target_address.clone(),
+                    effective_sni,
+                    password,
+                    udp_enabled,
+                    fast_open,
+                    max_tx,
+                    max_rx,
+                    bind_interface,
+                )) as Box<dyn SocketConnector>;
+
+                // Hysteria2 is a direct protocol from the proxy chain perspective
+                // (no additional ProxyConnector needed)
+                return InitialHopEntry::Direct(socket);
+            }
+
+            // Standard path: create SocketConnector from config
             let target_address = find_first_proxy_address(&hops, config);
 
             let socket = SocketConnectorImpl::from_config(config, target_address)

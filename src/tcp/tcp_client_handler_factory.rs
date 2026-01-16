@@ -11,9 +11,9 @@ use crate::config::{
     WebsocketClientConfig,
 };
 use crate::http_handler::HttpTcpClientHandler;
-use crate::resolver::Resolver;
 use crate::naiveproxy::NaiveProxyTcpClientHandler;
 use crate::port_forward_handler::PortForwardClientHandler;
+use crate::resolver::Resolver;
 use crate::rustls_config_util::create_client_config;
 use crate::shadow_tls::ShadowTlsClientHandler;
 use crate::shadowsocks::ShadowsocksTcpHandler;
@@ -295,6 +295,9 @@ pub fn create_tcp_client_handler(
             ))
         }
         ClientProxyConfig::PortForward => Box::new(PortForwardClientHandler),
+        ClientProxyConfig::Hysteria2 { .. } => {
+            panic!("Hysteria2 is a QUIC protocol and should be handled by the socket connector, not as a TCP client handler. Ensure Hysteria2 configs use transport: quic.")
+        }
         ClientProxyConfig::Anytls {
             password,
             udp_enabled,

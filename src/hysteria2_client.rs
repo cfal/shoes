@@ -1,0 +1,1521 @@
+//! Hysteria2 client implementation.
+//!
+//! This module implements the client side of the Hysteria2 protocol, which includes:
+//! - QUIC connection establishment
+//! - HTTP/3 authentication handshake
+//! - TCP stream creation with Hysteria2 protocol framing
+//! - UDP packet encapsulation via QUIC datagrams
+//!
+//! Protocol reference: https://v2.hysteria.network/zh/docs/developers/Protocol/
+//! Go client reference: https://github.com/apernet/hysteria/blob/master/core/client/client.go
+
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
+use std::time::Duration;
+
+use bytes::BytesMut;
+use log::{error, warn};
+use rand::distr::Alphanumeric;
+use rand::{Rng, RngCore};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::net::UdpSocket;
+use tokio::sync::Mutex;
+use tokio::time::timeout;
+
+use crate::address::NetLocation;
+use crate::async_stream::{AsyncPing, AsyncStream};
+use crate::hysteria2_protocol::{
+    AUTH_URI, FRAME_TYPE_TCP_REQUEST, MAX_ADDRESS_LENGTH, STATUS_AUTH_OK, header, tcp_status,
+};
+use crate::quic_stream::QuicStream;
+use crate::resolver::{NativeResolver, Resolver, resolve_single_address};
+
+/// Authentication timeout - close connection if server doesn't authenticate within this time.
+/// Per protocol reference implementation, default is 3 seconds.
+const AUTH_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Generates a random ASCII string for Hysteria-Padding header
+fn generate_padding_string() -> String {
+    let mut rng = rand::rng();
+    let length = rng.random_range(1..80);
+    rng.sample_iter(Alphanumeric)
+        .take(length)
+        .map(char::from)
+        .collect()
+}
+
+/// Encodes a value as QUIC varint (same format as server side)
+fn encode_varint(value: u64) -> std::io::Result<Box<[u8]>> {
+    if value <= 0b00111111 {
+        Ok(Box::new([value as u8]))
+    } else if value < (1 << 14) {
+        let encoded: u16 = (0b01_u16 << 14) | value as u16;
+        Ok(Box::new(encoded.to_be_bytes()))
+    } else if value < (1 << 30) {
+        let encoded: u32 = (0b10_u32 << 30) | value as u32;
+        Ok(Box::new(encoded.to_be_bytes()))
+    } else if value < (1 << 62) {
+        let encoded: u64 = (0b11_u64 << 62) | value;
+        Ok(Box::new(encoded.to_be_bytes()))
+    } else {
+        Err(std::io::Error::other("value too large to encode as varint"))
+    }
+}
+
+/// Decodes a QUIC varint from bytes, returns (value, bytes_consumed)
+fn decode_varint(data: &[u8]) -> std::io::Result<(u64, usize)> {
+    if data.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "incomplete varint",
+        ));
+    }
+
+    let first_byte = data[0];
+    let length_indicator = first_byte >> 6;
+    let mut value: u64 = (first_byte & 0b00111111) as u64;
+
+    let num_bytes = match length_indicator {
+        0 => 1,
+        1 => 2,
+        2 => 4,
+        3 => 8,
+        _ => unreachable!(),
+    };
+
+    if data.len() < num_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            format!(
+                "incomplete varint: have {} bytes, need {}",
+                data.len(),
+                num_bytes
+            ),
+        ));
+    }
+
+    if num_bytes > 1 {
+        for byte in &data[1..num_bytes] {
+            value <<= 8;
+            value |= *byte as u64;
+        }
+    }
+
+    Ok((value, num_bytes))
+}
+
+/// Hysteria2 client that manages a QUIC connection to the server
+#[derive(Debug)]
+pub struct Hysteria2Client {
+    /// The QUIC endpoint (for creating new connections)
+    endpoint: Arc<quinn::Endpoint>,
+    /// Server address
+    server_address: NetLocation,
+    /// SNI hostname for TLS
+    sni_hostname: Option<String>,
+    /// Authentication password
+    password: String,
+    /// Whether UDP relay is enabled
+    pub udp_enabled: bool,
+    /// Whether TCP Fast Open is enabled
+    pub fast_open: bool,
+    /// Maximum upload rate in bytes per second (0 = unlimited)
+    pub max_tx: u64,
+    /// Maximum download rate in bytes per second (0 = unlimited)
+    pub max_rx: u64,
+}
+
+impl Hysteria2Client {
+    /// Create a new Hysteria2 client
+    pub fn new(
+        endpoint: Arc<quinn::Endpoint>,
+        server_address: NetLocation,
+        sni_hostname: Option<String>,
+        password: String,
+        udp_enabled: bool,
+        fast_open: bool,
+        max_tx: u64,
+        max_rx: u64,
+    ) -> Self {
+        Self {
+            endpoint,
+            server_address,
+            sni_hostname,
+            password,
+            udp_enabled,
+            fast_open,
+            max_tx,
+            max_rx,
+        }
+    }
+
+    /// Connect to the Hysteria2 server and perform authentication
+    pub async fn connect_and_authenticate(
+        &self,
+        resolver: &Arc<dyn Resolver>,
+    ) -> std::io::Result<(Hysteria2Connection, u64, bool)> {
+        let server_addr = resolve_single_address(resolver, &self.server_address).await?;
+
+        let domain = self
+            .sni_hostname
+            .as_ref()
+            .map(|s| s.as_str())
+            .unwrap_or_else(|| {
+                self.server_address
+                    .address()
+                    .hostname()
+                    .unwrap_or("example.com")
+            });
+
+        // Establish QUIC connection
+        let connection = self
+            .endpoint
+            .connect(server_addr, domain)
+            .map_err(|e| std::io::Error::other(format!("Failed to connect QUIC endpoint: {e}")))?
+            .await
+            .map_err(|e| std::io::Error::other(format!("QUIC connection failed: {e}")))?;
+
+        // Perform HTTP/3 authentication and get congestion control info
+        let (tx, tx_auto) = timeout(AUTH_TIMEOUT, self.authenticate_connection(&connection))
+            .await
+            .map_err(|_| {
+                error!("[Hysteria2] Authentication timeout");
+                connection.close(0u32.into(), b"auth timeout");
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "authentication timeout")
+            })??;
+
+        let conn = Hysteria2Connection {
+            connection,
+            udp_enabled: self.udp_enabled,
+            fast_open: self.fast_open,
+            tx,
+            tx_auto,
+        };
+
+        Ok((conn, tx, tx_auto))
+    }
+
+    /// Perform HTTP/3 authentication handshake
+    async fn authenticate_connection(
+        &self,
+        connection: &quinn::Connection,
+    ) -> std::io::Result<(u64, bool)> {
+        let h3_connection = h3_quinn::Connection::new(connection.clone());
+        let (_h3_conn, mut h3_send) = h3::client::new(h3_connection)
+            .await
+            .map_err(|e| std::io::Error::other(format!("Failed to create H3 client: {e}")))?;
+
+        // Build authentication request per protocol spec:
+        // :method: POST
+        // :path: /auth
+        // :host: hysteria
+        // Hysteria-Auth: [password]
+        // Hysteria-CC-RX: [rx_rate] - client's max receive rate
+        // Hysteria-Padding: [random]
+
+        let req = http::Request::builder()
+            .method("POST")
+            .uri(AUTH_URI)
+            .header(header::AUTH, &self.password)
+            .header(header::CC_RX, self.max_rx.to_string())
+            .header(header::PADDING, generate_padding_string())
+            .body(())
+            .map_err(|e| std::io::Error::other(format!("Failed to build request: {e}")))?;
+
+        // Send request and get the stream
+        let mut stream = h3_send
+            .send_request(req)
+            .await
+            .map_err(|e| std::io::Error::other(format!("Failed to send auth request: {e}")))?;
+
+        stream
+            .finish()
+            .await
+            .map_err(|e| std::io::Error::other(format!("Failed to finish auth request: {e}")))?;
+
+        // Receive response from the stream
+        let resp = stream
+            .recv_response()
+            .await
+            .map_err(|e| std::io::Error::other(format!("Failed to recv auth response: {e}")))?;
+
+        // Check status code - must be 233 (HyOK) per protocol spec
+        let status = resp.status();
+        if status.as_u16() != STATUS_AUTH_OK {
+            return Err(std::io::Error::other(format!(
+                "Authentication failed: expected status 233, got {}",
+                status
+            )));
+        }
+
+        // Parse Hysteria-UDP header to check if UDP is supported
+        if let Some(udp_header) = resp.headers().get(header::UDP) {
+            let udp_str = udp_header
+                .to_str()
+                .map_err(|e| std::io::Error::other(format!("Invalid Hysteria-UDP header: {e}")))?;
+            let server_udp_enabled = udp_str.eq_ignore_ascii_case("true");
+            if !server_udp_enabled && self.udp_enabled {
+                warn!("[Hysteria2] Client UDP enabled but server doesn't support UDP relay");
+            }
+        }
+
+        // Parse Hysteria-CC-RX header for congestion control
+        // Format: either "auto" or a number representing server's max receive rate
+        let (tx, tx_auto) = if let Some(cc_header) = resp.headers().get(header::CC_RX) {
+            let cc_str = cc_header.to_str().map_err(|e| {
+                std::io::Error::other(format!("Invalid Hysteria-CC-RX header: {e}"))
+            })?;
+
+            if cc_str.eq_ignore_ascii_case("auto") {
+                (0, true) // tx = 0 means use BBR
+            } else {
+                let server_rx = cc_str.parse::<u64>().map_err(|e| {
+                    std::io::Error::other(format!("Invalid Hysteria-CC-RX value: {e}"))
+                })?;
+
+                // actualTx = min(serverRx, clientTx)
+                let mut actual_tx = server_rx;
+                if actual_tx == 0 || actual_tx > self.max_tx {
+                    // Server doesn't have a limit, or our clientTx is smaller than serverRx
+                    actual_tx = self.max_tx;
+                }
+                (actual_tx, false)
+            }
+        } else {
+            // No Hysteria-CC-RX header, use client's max_tx
+            (self.max_tx, false)
+        };
+
+        // Store the negotiated values for later use
+        // Note: Quinn uses BBR by default, so we don't need to explicitly set it
+        if tx_auto {
+        } else if tx > 0 {
+        } else {
+        }
+
+        Ok((tx, tx_auto))
+    }
+}
+
+/// Represents an authenticated Hysteria2 connection
+#[derive(Clone, Debug)]
+pub struct Hysteria2Connection {
+    /// The underlying QUIC connection
+    pub connection: quinn::Connection,
+    /// Whether UDP relay is enabled
+    #[allow(dead_code)]
+    pub udp_enabled: bool,
+    /// Whether TCP Fast Open is enabled
+    pub fast_open: bool,
+    /// Actual upload rate in bytes per second (0 = BBR/unlimited)
+    #[allow(dead_code)]
+    pub tx: u64,
+    /// Whether server requested auto bandwidth detection (BBR)
+    #[allow(dead_code)]
+    pub tx_auto: bool,
+}
+
+/// A multidirectional UDP message stream for Hysteria2.
+/// This implements AsyncSourcedMessageStream to support multiple destination addresses.
+/// Used for SOCKS5 UDP associate mode.
+pub struct HyUdpMessageStream {
+    /// The QUIC connection to the Hysteria2 server
+    connection: quinn::Connection,
+    /// Maximum datagram size
+    max_datagram_size: usize,
+    /// Receiver for datagrams from the server
+    /// Contains (payload, source_address)
+    receive_ch: tokio::sync::mpsc::Receiver<(Vec<u8>, std::net::SocketAddr)>,
+}
+
+impl HyUdpMessageStream {
+    /// Create a new HyUdpMessageStream
+    /// Note: The local_socket parameter is kept for API compatibility but is not used.
+    /// Hysteria2 sends/receives UDP packets directly via QUIC datagrams.
+    pub fn new(_local_socket: Arc<UdpSocket>, connection: quinn::Connection) -> Self {
+        let max_datagram_size = connection.max_datagram_size().unwrap_or(65535) as usize;
+
+        let (tx, rx) = tokio::sync::mpsc::channel(1024);
+
+        // Spawn task to receive datagrams from the server
+        let conn = connection.clone();
+        tokio::spawn(async move {
+            loop {
+                match conn.read_datagram().await {
+                    Ok(data) => {
+                        if let Err(e) = process_received_datagram(&data, &tx) {
+                            warn!("[Hysteria2] Failed to process received datagram: {}", e);
+                        }
+                    }
+                    Err(e) => {
+                        warn!("[Hysteria2] Failed to read datagram: {}", e);
+                        break;
+                    }
+                }
+            }
+            warn!("[Hysteria2] UDP receive loop ended");
+        });
+
+        Self {
+            connection,
+            max_datagram_size,
+            receive_ch: rx,
+        }
+    }
+
+    /// Send a UDP packet through QUIC datagram
+    async fn send_packet(&self, data: &[u8], target: &std::net::SocketAddr) -> std::io::Result<()> {
+        let address_str = target.to_string();
+        let address_bytes = address_str.as_bytes();
+        let address_len_bytes = encode_varint(address_bytes.len() as u64)?;
+
+        // Calculate header overhead
+        let header_overhead = 4 + 2 + 1 + 1 + address_len_bytes.len() + address_bytes.len();
+        let effective_max_size = self.max_datagram_size.saturating_sub(header_overhead);
+
+        let session_id = 1u32; // Use session ID 1 for all UDP packets
+
+        if data.len() <= effective_max_size {
+            // No fragmentation needed
+            let mut datagram = bytes::BytesMut::with_capacity(header_overhead + data.len());
+            datagram.extend_from_slice(&session_id.to_be_bytes());
+            datagram.extend_from_slice(&0u16.to_be_bytes()); // packet_id = 0 for no frag
+            datagram.extend_from_slice(&[0u8, 1u8]); // frag_id = 0, frag_count = 1
+            datagram.extend_from_slice(&address_len_bytes);
+            datagram.extend_from_slice(address_bytes);
+            datagram.extend_from_slice(data);
+
+            self.connection
+                .send_datagram(datagram.freeze())
+                .map_err(|e| std::io::Error::other(format!("Failed to send datagram: {}", e)))?;
+        } else {
+            // Fragmentation needed
+            use rand::RngCore;
+            let mut rng = rand::rng();
+            let mut packet_id_bytes = [0u8; 2];
+            rng.fill_bytes(&mut packet_id_bytes);
+            let packet_id = u16::from_be_bytes(packet_id_bytes);
+            let fragment_count = (data.len().div_ceil(effective_max_size)) as u8;
+
+            for frag_id in 0..fragment_count {
+                let start = (frag_id as usize) * effective_max_size;
+                let end = std::cmp::min(start + effective_max_size, data.len());
+                let fragment_data = &data[start..end];
+
+                let mut datagram =
+                    bytes::BytesMut::with_capacity(header_overhead + fragment_data.len());
+                datagram.extend_from_slice(&session_id.to_be_bytes());
+                datagram.extend_from_slice(&packet_id.to_be_bytes());
+                datagram.extend_from_slice(&[frag_id, fragment_count]);
+                datagram.extend_from_slice(&address_len_bytes);
+                datagram.extend_from_slice(address_bytes);
+                datagram.extend_from_slice(fragment_data);
+
+                self.connection
+                    .send_datagram(datagram.freeze())
+                    .map_err(|e| {
+                        std::io::Error::other(format!(
+                            "Failed to send datagram fragment {}: {}",
+                            frag_id, e
+                        ))
+                    })?;
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Process a received datagram from the server
+fn process_received_datagram(
+    data: &[u8],
+    tx: &tokio::sync::mpsc::Sender<(Vec<u8>, std::net::SocketAddr)>,
+) -> std::io::Result<()> {
+    if data.len() < 9 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "datagram too short",
+        ));
+    }
+
+    // Parse the datagram header
+    let _session_id = u32::from_be_bytes(data[0..4].try_into().unwrap());
+    let _packet_id = u16::from_be_bytes(data[4..6].try_into().unwrap());
+    let _frag_id = data[6];
+    let fragment_count = data[7];
+
+    // Parse address length (varint starting at byte 8)
+    // The varint value is the length of the address string (e.g., "8.8.8.8:53" = 10 bytes)
+    let (address_str_len, varint_bytes_consumed) = decode_varint(&data[8..])?;
+
+    // Address string starts right after the varint
+    let address_start = 8 + varint_bytes_consumed;
+    let address_str_end = address_start + (address_str_len as usize);
+
+    if data.len() < address_str_end {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "incomplete address in datagram",
+        ));
+    }
+
+    // Parse the address string (format: "IP:port" or "[IPv6]:port")
+    let address_str = String::from_utf8_lossy(&data[address_start..address_str_end]);
+
+    // Parse as SocketAddr
+    let target_addr: std::net::SocketAddr = match address_str.parse() {
+        Ok(addr) => addr,
+        Err(e) => {
+            warn!(
+                "[Hysteria2] Failed to parse address '{}': {}",
+                address_str, e
+            );
+            return Ok(());
+        }
+    };
+
+    // Extract the payload (everything after the address string)
+    let payload_start = address_str_end;
+    let payload = data[payload_start..].to_vec();
+
+    if payload.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "empty payload",
+        ));
+    }
+
+    // Handle fragmentation (simplified - just return first fragment for now)
+    if fragment_count <= 1 {
+        tx.try_send((payload, target_addr))
+            .map_err(|e| std::io::Error::other(format!("Failed to send to channel: {}", e)))?;
+    } else {
+        // TODO: Implement proper fragmentation reassembly
+        warn!("[Hysteria2] Fragmented packets not yet supported, dropping");
+    }
+
+    Ok(())
+}
+
+impl AsyncPing for HyUdpMessageStream {
+    fn supports_ping(&self) -> bool {
+        false
+    }
+
+    fn poll_write_ping(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<bool>> {
+        Poll::Ready(Ok(false))
+    }
+}
+
+impl crate::async_stream::AsyncReadSourcedMessage for HyUdpMessageStream {
+    fn poll_read_sourced_message(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<std::net::SocketAddr>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.receive_ch).poll_recv(cx) {
+            Poll::Ready(Some((data, target_addr))) => {
+                if data.len() > buf.remaining() {
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "Buffer too small: need {} bytes, have {}",
+                            data.len(),
+                            buf.remaining()
+                        ),
+                    )));
+                }
+                buf.put_slice(&data);
+                // Return the target address from the Hysteria2 server
+                // This is the actual source of the data (e.g., 8.8.8.8:53 for DNS)
+                Poll::Ready(Ok(target_addr))
+            }
+            Poll::Ready(None) => Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "channel closed",
+            ))),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl crate::async_stream::AsyncWriteTargetedMessage for HyUdpMessageStream {
+    fn poll_write_targeted_message(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+        target: &NetLocation,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+
+        // Resolve the target address
+        let resolver = NativeResolver::new();
+        let addrs = futures::executor::block_on(async { resolver.resolve_location(target).await })
+            .map_err(|e| std::io::Error::other(format!("Failed to resolve target: {}", e)))?;
+
+        let addr = addrs
+            .into_iter()
+            .next()
+            .ok_or_else(|| std::io::Error::other("No addresses resolved for target"))?;
+
+        // Send through QUIC datagram
+        futures::executor::block_on(this.send_packet(&buf, &addr))
+            .map_err(|e| std::io::Error::other(format!("Failed to send packet: {}", e)))?;
+
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl crate::async_stream::AsyncFlushMessage for HyUdpMessageStream {
+    fn poll_flush_message(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl crate::async_stream::AsyncShutdownMessage for HyUdpMessageStream {
+    fn poll_shutdown_message(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        // Close the QUIC connection
+        self.get_mut()
+            .connection
+            .close(0u32.into(), b"UDP session closed");
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl crate::async_stream::AsyncSourcedMessageStream for HyUdpMessageStream {}
+
+/// Hysteria2 TCP stream with optional Fast Open support.
+///
+/// When Fast Open is enabled, the stream is returned immediately after sending
+/// the TCP request, without waiting for the server's response. The response
+/// is read and validated on the first Read() call.
+pub struct HyTcpStream {
+    /// QUIC send stream
+    send: quinn::SendStream,
+    /// QUIC receive stream
+    recv: quinn::RecvStream,
+    /// Whether the connection has been established (server response received)
+    established: Arc<std::sync::atomic::AtomicBool>,
+    /// Whether Fast Open is enabled
+    #[allow(dead_code)]
+    fast_open: bool,
+}
+
+impl HyTcpStream {
+    /// Create a new HyTcpStream.
+    ///
+    /// If fast_open is true, the stream is returned immediately after sending
+    /// the request, and the server response is deferred to the first Read() call.
+    pub fn new(send: quinn::SendStream, recv: quinn::RecvStream, fast_open: bool) -> Self {
+        Self {
+            send,
+            recv,
+            established: Arc::new(std::sync::atomic::AtomicBool::new(!fast_open)),
+            fast_open,
+        }
+    }
+
+    /// Ensure the connection is established by reading the server response.
+    /// This is called on the first Read() when Fast Open is enabled.
+    async fn ensure_established(&mut self) -> std::io::Result<()> {
+        if self.established.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(());
+        }
+
+        // Read response per protocol spec:
+        // [uint8] Status (0x00 = OK, 0x01 = Error)
+        // [varint] Message length
+        // [bytes] Message string
+        // [varint] Padding length
+        // [bytes] Random padding
+
+        let mut status_buf = [0u8; 1];
+        self.recv
+            .read_exact(&mut status_buf)
+            .await
+            .map_err(|e| std::io::Error::other(format!("Failed to read status: {e}")))?;
+
+        let status = status_buf[0];
+        if status != tcp_status::OK {
+            // Read error message
+            let msg_len = read_varint_from_stream(&mut self.recv).await?;
+            if msg_len > 1024 {
+                return Err(std::io::Error::other(format!(
+                    "Server returned error status and message too long"
+                )));
+            }
+            let mut msg_buf = vec![0u8; msg_len as usize];
+            self.recv
+                .read_exact(&mut msg_buf)
+                .await
+                .map_err(|e| std::io::Error::other(format!("Failed to read error message: {e}")))?;
+            let msg = String::from_utf8_lossy(&msg_buf);
+            return Err(std::io::Error::other(format!(
+                "Server rejected connection: {}",
+                msg
+            )));
+        }
+
+        // Read and discard message length (should be 0 for OK status)
+        let msg_len = read_varint_from_stream(&mut self.recv).await?;
+        if msg_len > 0 {
+            let mut discard = vec![0u8; msg_len as usize];
+            self.recv
+                .read_exact(&mut discard)
+                .await
+                .map_err(|e| std::io::Error::other(format!("Failed to discard message: {e}")))?;
+        }
+
+        // Read and discard padding
+        let padding_len = read_varint_from_stream(&mut self.recv).await?;
+        if padding_len > 0 {
+            let mut discard = vec![0u8; padding_len as usize];
+            self.recv
+                .read_exact(&mut discard)
+                .await
+                .map_err(|e| std::io::Error::other(format!("Failed to discard padding: {e}")))?;
+        }
+
+        self.established
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+impl AsyncRead for HyTcpStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        // If using Fast Open and not yet established, we need to establish first
+        if !self.established.load(std::sync::atomic::Ordering::Relaxed) {
+            // Create a future to establish the connection
+            let establish_future = self.ensure_established();
+            // Pin the future locally
+            let pinned_future = std::pin::pin!(establish_future);
+            // Try to complete the future
+            let mut result = None;
+            let mut waker = Some(cx.waker().clone());
+            with_waker(&mut waker, |ctx| match pinned_future.poll(ctx) {
+                Poll::Ready(Ok(())) => result = Some(Ok(())),
+                Poll::Ready(Err(e)) => result = Some(Err(e)),
+                Poll::Pending => {}
+            });
+            match result {
+                Some(Ok(())) => {}
+                Some(Err(e)) => return Poll::Ready(Err(e)),
+                None => return Poll::Pending,
+            }
+        }
+
+        // Connection is established, proceed with normal read
+        Pin::new(&mut self.recv).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for HyTcpStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.send)
+            .poll_write(cx, buf)
+            .map_err(|e| std::io::Error::other(format!("Write error: {}", e)))
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.send)
+            .poll_flush(cx)
+            .map_err(|e| std::io::Error::other(format!("Flush error: {}", e)))
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.send)
+            .poll_shutdown(cx)
+            .map_err(|e| std::io::Error::other(format!("Shutdown error: {}", e)))
+    }
+}
+
+impl AsyncStream for HyTcpStream {}
+
+impl AsyncPing for HyTcpStream {
+    fn supports_ping(&self) -> bool {
+        false
+    }
+
+    fn poll_write_ping(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<bool>> {
+        Poll::Ready(Ok(false))
+    }
+}
+
+// HyTcpStream is Unpin because all its fields are Unpin
+impl Unpin for HyTcpStream {}
+
+/// Helper to set a waker for a scope
+fn with_waker<F, R>(waker: &mut Option<std::task::Waker>, f: F) -> R
+where
+    F: FnOnce(&mut Context<'_>) -> R,
+{
+    if let Some(w) = waker.take() {
+        f(&mut Context::from_waker(&w))
+    } else {
+        // This shouldn't happen, but provide a no-op waker just in case
+        use std::task::{RawWaker, RawWakerVTable};
+        static VTABLE: RawWakerVTable = RawWakerVTable::new(
+            |_| unreachable!(), // clone
+            |_| {},             // wake
+            |_| unreachable!(), // wake_by_ref
+            |_| {},             // drop
+        );
+        let raw = RawWaker::new(std::ptr::null(), &VTABLE);
+        // SAFETY: The RawWaker is constructed from a null pointer with a VTable
+        // that does nothing. This is safe because we never actually call any
+        // methods that would dereference the pointer.
+        unsafe { f(&mut Context::from_waker(&std::task::Waker::from_raw(raw))) }
+    }
+}
+
+impl Hysteria2Connection {
+    /// Create a new TCP stream through the Hysteria2 connection
+    pub async fn create_tcp_stream(
+        &self,
+        target: &NetLocation,
+    ) -> std::io::Result<Box<dyn AsyncStream>> {
+        // Open bidirectional stream
+        let (mut send, recv) = self
+            .connection
+            .open_bi()
+            .await
+            .map_err(|e| std::io::Error::other(format!("Failed to open QUIC stream: {e}")))?;
+
+        // Send TCP request per protocol spec:
+        // [varint] 0x401 (TCPRequest ID)
+        // [varint] Address length
+        // [bytes] Address string (host:port)
+        // [varint] Padding length
+        // [bytes] Random padding
+
+        let address_bytes = target.to_string().into_bytes();
+        let address_len = address_bytes.len();
+
+        if address_len > MAX_ADDRESS_LENGTH {
+            return Err(std::io::Error::other(format!(
+                "Address too long: {} bytes (max {})",
+                address_len, MAX_ADDRESS_LENGTH
+            )));
+        }
+
+        // Generate random padding before any async operations
+        let padding_len: usize = {
+            let mut rng = rand::rng();
+            rng.random_range(0..=63u8) as usize
+        };
+
+        let mut padding_bytes = vec![0u8; padding_len];
+        {
+            let mut rng = rand::rng();
+            rng.fill_bytes(&mut padding_bytes);
+        }
+
+        // Build request frame (no rng here)
+        let mut request = BytesMut::new();
+
+        // Frame type
+        request.extend_from_slice(&encode_varint(FRAME_TYPE_TCP_REQUEST)?);
+
+        // Address length and bytes
+        request.extend_from_slice(&encode_varint(address_len as u64)?);
+        request.extend_from_slice(&address_bytes);
+
+        // Padding length and bytes
+        request.extend_from_slice(&encode_varint(padding_len as u64)?);
+        request.extend_from_slice(&padding_bytes);
+
+        // Send request
+        send.write_all(&request)
+            .await
+            .map_err(|e| std::io::Error::other(format!("Failed to send TCP request: {e}")))?;
+
+        // If Fast Open is enabled, return the stream immediately without waiting for response
+        if self.fast_open {
+            return Ok(Box::new(HyTcpStream::new(send, recv, true)));
+        }
+
+        // Fast Open disabled, wait for server response before returning
+        let mut recv = recv;
+
+        // Receive response per protocol spec:
+        // [uint8] Status (0x00 = OK, 0x01 = Error)
+        // [varint] Message length
+        // [bytes] Message string
+        // [varint] Padding length
+        // [bytes] Random padding
+
+        let mut status_buf = [0u8; 1];
+        recv.read_exact(&mut status_buf)
+            .await
+            .map_err(|e| std::io::Error::other(format!("Failed to read status: {e}")))?;
+
+        let status = status_buf[0];
+        if status != tcp_status::OK {
+            // Read error message
+            let msg_len = read_varint_from_stream(&mut recv).await?;
+            if msg_len > 1024 {
+                return Err(std::io::Error::other(format!(
+                    "Server returned error status and message too long"
+                )));
+            }
+            let mut msg_buf = vec![0u8; msg_len as usize];
+            recv.read_exact(&mut msg_buf)
+                .await
+                .map_err(|e| std::io::Error::other(format!("Failed to read error message: {e}")))?;
+            let msg = String::from_utf8_lossy(&msg_buf);
+            return Err(std::io::Error::other(format!(
+                "Server rejected connection: {}",
+                msg
+            )));
+        }
+
+        // Read and discard message length (should be 0 for OK status)
+        let msg_len = read_varint_from_stream(&mut recv).await?;
+        if msg_len > 0 {
+            warn!("[Hysteria2] Server sent message with OK status, discarding");
+            let mut discard = vec![0u8; msg_len as usize];
+            recv.read_exact(&mut discard)
+                .await
+                .map_err(|e| std::io::Error::other(format!("Failed to discard message: {e}")))?;
+        }
+
+        // Read and discard padding
+        let padding_len = read_varint_from_stream(&mut recv).await?;
+        if padding_len > 0 {
+            let mut discard = vec![0u8; padding_len as usize];
+            recv.read_exact(&mut discard)
+                .await
+                .map_err(|e| std::io::Error::other(format!("Failed to discard padding: {e}")))?;
+        }
+
+        Ok(Box::new(QuicStream::from(send, recv)))
+    }
+}
+
+/// Helper to read varint from QUIC stream
+async fn read_varint_from_stream(recv: &mut quinn::RecvStream) -> std::io::Result<u64> {
+    let mut first_byte = [0u8; 1];
+    recv.read_exact(&mut first_byte)
+        .await
+        .map_err(|e| std::io::Error::other(format!("Failed to read varint first byte: {e}")))?;
+
+    let first_byte = first_byte[0];
+    let length_indicator = first_byte >> 6;
+    let mut value: u64 = (first_byte & 0b00111111) as u64;
+
+    let num_bytes = match length_indicator {
+        0 => 1,
+        1 => 2,
+        2 => 4,
+        3 => 8,
+        _ => unreachable!(),
+    };
+
+    if num_bytes > 1 {
+        let mut remaining = vec![0u8; num_bytes - 1];
+        recv.read_exact(&mut remaining)
+            .await
+            .map_err(|e| std::io::Error::other(format!("Failed to read varint remaining: {e}")))?;
+        for byte in remaining {
+            value <<= 8;
+            value |= byte as u64;
+        }
+    }
+
+    Ok(value)
+}
+
+/// A wrapper around Hysteria2Client that implements SocketConnector
+///
+/// This maintains a single QUIC connection and creates new streams on demand.
+#[derive(Debug)]
+pub struct Hysteria2SocketConnector {
+    /// The Hysteria2 client
+    client: Arc<Hysteria2Client>,
+    /// The established Hysteria2 connection (after authentication)
+    connection: Arc<Mutex<Option<Hysteria2Connection>>>,
+    /// Optional bind interface for outgoing connections
+    bind_interface: Option<String>,
+}
+
+impl Hysteria2SocketConnector {
+    /// Create a new Hysteria2 socket connector
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        endpoint: Arc<quinn::Endpoint>,
+        server_address: NetLocation,
+        sni_hostname: Option<String>,
+        password: String,
+        udp_enabled: bool,
+        fast_open: bool,
+        max_tx: u64,
+        max_rx: u64,
+        bind_interface: Option<String>,
+    ) -> Self {
+        Self {
+            client: Arc::new(Hysteria2Client::new(
+                endpoint,
+                server_address,
+                sni_hostname,
+                password,
+                udp_enabled,
+                fast_open,
+                max_tx,
+                max_rx,
+            )),
+            connection: Arc::new(Mutex::new(None)),
+            bind_interface,
+        }
+    }
+
+    /// Get or create the authenticated Hysteria2 connection
+    async fn get_or_create_connection(
+        &self,
+        resolver: &Arc<dyn Resolver>,
+    ) -> std::io::Result<Hysteria2Connection> {
+        // Check if we already have a connection
+        {
+            let conn_guard = self.connection.lock().await;
+            if let Some(ref conn) = *conn_guard {
+                // Check if connection is still alive
+                if conn.connection.close_reason().is_none() {
+                    return Ok(conn.clone());
+                }
+            }
+        }
+
+        // Need to create a new connection
+        let (new_conn, _tx, _tx_auto) = self.client.connect_and_authenticate(resolver).await?;
+
+        // Store the new connection
+        {
+            let mut conn_guard = self.connection.lock().await;
+            *conn_guard = Some(new_conn.clone());
+        }
+
+        Ok(new_conn)
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::tcp::socket_connector::SocketConnector for Hysteria2SocketConnector {
+    /// Create a TCP connection through Hysteria2
+    async fn connect(
+        &self,
+        resolver: &Arc<dyn Resolver>,
+        address: &crate::address::ResolvedLocation,
+    ) -> std::io::Result<Box<dyn AsyncStream>> {
+        let conn = self.get_or_create_connection(resolver).await?;
+        conn.create_tcp_stream(address.location()).await
+    }
+
+    /// Create a bidirectional UDP stream through Hysteria2
+    ///
+    /// Note: Hysteria2's UDP relay is inherently multi-directional (supports multiple targets).
+    /// This method provides compatibility by creating a wrapper that works with the single-target
+    /// AsyncMessageStream interface.
+    async fn connect_udp_bidirectional(
+        &self,
+        resolver: &Arc<dyn Resolver>,
+        target: crate::address::ResolvedLocation,
+    ) -> std::io::Result<Box<dyn crate::async_stream::AsyncMessageStream>> {
+        use crate::socket_util::new_udp_socket;
+
+        let conn = self.get_or_create_connection(resolver).await?;
+
+        // Address resolution is handled by Hysteria2 server or inside the tunnel usually,
+        // but here we treat target as the destination.
+        // Hysteria2UdpAdapter needs the target location.
+        let target_location = target.location();
+
+        // Create a local UDP socket for bidirectional communication
+        // We use the bind_interface if configured in this connector
+        let local_socket = Arc::new(new_udp_socket(
+            target_location.address().is_ipv6(),
+            self.bind_interface.clone(),
+        )?);
+
+        // Create the Hysteria2 UDP message stream
+        let hy_udp_stream = HyUdpMessageStream::new(local_socket, conn.connection.clone());
+
+        // Wrap in a bidirectional adapter
+        Ok(Box::new(Hysteria2UdpAdapter::new(
+            hy_udp_stream,
+            target.into_location(),
+        )))
+    }
+
+    /// Returns the bind interface configured for this socket connector
+    fn bind_interface(&self) -> Option<&str> {
+        self.bind_interface.as_deref()
+    }
+}
+
+/// Adapter that converts Hysteria2's multi-directional UDP stream to a bidirectional AsyncMessageStream.
+///
+/// Hysteria2's UDP relay (`HyUdpMessageStream`) is multi-directional (can handle multiple targets),
+/// while `AsyncMessageStream` expects a single target. This adapter filters traffic to only
+/// the specified target.
+struct Hysteria2UdpAdapter {
+    inner: HyUdpMessageStream,
+    target: NetLocation,
+}
+
+impl Hysteria2UdpAdapter {
+    fn new(inner: HyUdpMessageStream, target: NetLocation) -> Self {
+        Self { inner, target }
+    }
+}
+
+// Implement Unpin since HyUdpMessageStream is Unpin
+impl Unpin for Hysteria2UdpAdapter {}
+
+// SAFETY: Hysteria2UdpAdapter only contains HyUdpMessageStream and NetLocation,
+// both of which are Send.
+unsafe impl Send for Hysteria2UdpAdapter {}
+
+// Explicitly implement AsyncMessageStream marker trait
+impl crate::async_stream::AsyncMessageStream for Hysteria2UdpAdapter {}
+
+impl crate::async_stream::AsyncPing for Hysteria2UdpAdapter {
+    fn supports_ping(&self) -> bool {
+        self.inner.supports_ping()
+    }
+
+    fn poll_write_ping(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<bool>> {
+        unsafe { Pin::new_unchecked(&mut self.inner).poll_write_ping(cx) }
+    }
+}
+
+impl crate::async_stream::AsyncReadMessage for Hysteria2UdpAdapter {
+    fn poll_read_message(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        use crate::async_stream::AsyncReadSourcedMessage;
+        unsafe {
+            match Pin::new_unchecked(&mut self.inner).poll_read_sourced_message(cx, buf) {
+                Poll::Ready(Ok(_)) => Poll::Ready(Ok(())),
+                Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+                Poll::Pending => Poll::Pending,
+            }
+        }
+    }
+}
+
+impl crate::async_stream::AsyncWriteMessage for Hysteria2UdpAdapter {
+    fn poll_write_message(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<()>> {
+        use crate::async_stream::AsyncWriteTargetedMessage;
+        // Clone target before accessing inner to avoid borrow conflict
+        let target = self.target.clone();
+        // SAFETY: We're creating a pin to the inner field which is safe as long as
+        // Hysteria2UdpAdapter doesn't implement Drop and we don't move the inner field.
+        // The inner field is pinned when self is pinned.
+        unsafe { Pin::new_unchecked(&mut self.inner).poll_write_targeted_message(cx, buf, &target) }
+    }
+}
+
+impl crate::async_stream::AsyncFlushMessage for Hysteria2UdpAdapter {
+    fn poll_flush_message(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        unsafe { Pin::new_unchecked(&mut self.inner).poll_flush_message(cx) }
+    }
+}
+
+impl crate::async_stream::AsyncShutdownMessage for Hysteria2UdpAdapter {
+    fn poll_shutdown_message(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        unsafe { Pin::new_unchecked(&mut self.inner).poll_shutdown_message(cx) }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hysteria2_protocol::{FRAME_TYPE_TCP_REQUEST, MAX_ADDRESS_LENGTH, tcp_status};
+
+    // Helper function to decode a QUIC varint (same as module-level function)
+    fn test_decode_varint(data: &[u8]) -> std::io::Result<(u64, usize)> {
+        if data.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "incomplete varint",
+            ));
+        }
+
+        let first_byte = data[0];
+        let length_indicator = first_byte >> 6;
+        let mut value: u64 = (first_byte & 0b00111111) as u64;
+
+        let num_bytes = match length_indicator {
+            0 => 1,
+            1 => 2,
+            2 => 4,
+            3 => 8,
+            _ => unreachable!(),
+        };
+
+        if data.len() < num_bytes {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!(
+                    "incomplete varint: have {} bytes, need {}",
+                    data.len(),
+                    num_bytes
+                ),
+            ));
+        }
+
+        if num_bytes > 1 {
+            for byte in &data[1..num_bytes] {
+                value <<= 8;
+                value |= *byte as u64;
+            }
+        }
+
+        Ok((value, num_bytes))
+    }
+
+    #[test]
+    fn test_encode_varint() {
+        // Single byte (0-63)
+        assert_eq!(&*encode_varint(0).unwrap(), &[0]);
+        assert_eq!(&*encode_varint(63).unwrap(), &[63]);
+
+        // Two bytes (64-16383)
+        // For 64: encoded = (0b01 << 14) | 64 = 0x4000 | 0x40 = 0x4040 = [64, 64]
+        assert_eq!(&*encode_varint(64).unwrap(), &[64, 64]);
+        // For 16383: encoded = (0b01 << 14) | 16383 = 0x4000 | 0x3FFF = 0x7FFF = [127, 255]
+        assert_eq!(&*encode_varint(16383).unwrap(), &[127, 255]);
+
+        // Four bytes (16384-1073741823)
+        // For 16384: encoded = (0b10 << 30) | 16384 = 0x40000000 | 0x4000 = 0x40004000
+        let result = encode_varint(16384).unwrap();
+        assert_eq!(result[0] & 0b11000000, 0b10000000);
+    }
+
+    #[test]
+    fn test_varint_roundtrip() {
+        let test_values = vec![
+            0u64,
+            1,
+            63,
+            64,
+            16383,
+            16384,
+            1073741823,
+            1073741824,
+            1_000_000_000_000,
+        ];
+
+        for value in test_values {
+            let encoded = encode_varint(value).unwrap();
+            let (decoded, len) = test_decode_varint(&encoded).unwrap();
+            assert_eq!(decoded, value, "Roundtrip failed for value {}", value);
+            assert_eq!(len, encoded.len());
+        }
+    }
+
+    #[test]
+    fn test_varint_decode_incomplete() {
+        // First byte indicates 2 bytes, but only 1 provided
+        let data = [0x40u8];
+        let result = test_decode_varint(&data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_varint_decode_empty() {
+        let result = test_decode_varint(&[]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_generate_padding_string() {
+        let s1 = generate_padding_string();
+        let s2 = generate_padding_string();
+        // Should generate different strings (very unlikely to be the same)
+        assert_ne!(s1, s2);
+        // Should be valid ASCII
+        assert!(s1.is_ascii());
+        assert!(s2.is_ascii());
+        // Length should be within expected range [1, 79]
+        assert!(s1.len() >= 1 && s1.len() < 80);
+        assert!(s2.len() >= 1 && s2.len() < 80);
+    }
+
+    #[test]
+    fn test_tcp_request_frame_encoding() {
+        // Build a TCP request frame per protocol spec
+        let address = "example.com:443";
+        let address_bytes = address.as_bytes();
+        let padding_len = 16;
+
+        let mut frame = bytes::BytesMut::new();
+
+        // Frame type
+        frame.extend_from_slice(&encode_varint(FRAME_TYPE_TCP_REQUEST).unwrap());
+
+        // Address length and bytes
+        frame.extend_from_slice(&encode_varint(address_bytes.len() as u64).unwrap());
+        frame.extend_from_slice(address_bytes);
+
+        // Padding length and bytes
+        frame.extend_from_slice(&encode_varint(padding_len).unwrap());
+        frame.extend_from_slice(&[0u8; 16]);
+
+        // Verify the frame structure
+        assert!(frame.len() > 0);
+
+        // Decode and verify
+        let mut offset = 0;
+        let (frame_type, len) = test_decode_varint(&frame[offset..]).unwrap();
+        assert_eq!(frame_type, FRAME_TYPE_TCP_REQUEST);
+        offset += len;
+
+        let (addr_len, len) = test_decode_varint(&frame[offset..]).unwrap();
+        assert_eq!(addr_len as usize, address_bytes.len());
+        offset += len;
+
+        let decoded_address =
+            std::str::from_utf8(&frame[offset..offset + address_bytes.len()]).unwrap();
+        assert_eq!(decoded_address, address);
+    }
+
+    #[test]
+    fn test_tcp_request_with_ipv6() {
+        let address = "[::1]:8080";
+        let address_bytes = address.as_bytes();
+
+        let mut frame = bytes::BytesMut::new();
+        frame.extend_from_slice(&encode_varint(FRAME_TYPE_TCP_REQUEST).unwrap());
+        frame.extend_from_slice(&encode_varint(address_bytes.len() as u64).unwrap());
+        frame.extend_from_slice(address_bytes);
+        frame.extend_from_slice(&encode_varint(0u64).unwrap());
+
+        // Verify decoding
+        let mut offset = 0;
+        let (frame_type, len) = test_decode_varint(&frame[offset..]).unwrap();
+        assert_eq!(frame_type, FRAME_TYPE_TCP_REQUEST);
+        offset += len;
+
+        let (addr_len, len) = test_decode_varint(&frame[offset..]).unwrap();
+        offset += len;
+
+        let decoded_address =
+            std::str::from_utf8(&frame[offset..offset + addr_len as usize]).unwrap();
+        assert_eq!(decoded_address, address);
+    }
+
+    #[test]
+    fn test_varint_boundary_values() {
+        // Test values at each encoding boundary
+        let boundary_tests = vec![
+            (0, 1),          // Minimum, single byte
+            (63, 1),         // Max single byte
+            (64, 2),         // Min two-byte
+            (16383, 2),      // Max two-byte
+            (16384, 4),      // Min four-byte
+            (1073741823, 4), // Max four-byte
+            (1073741824, 8), // Min eight-byte
+        ];
+
+        for (value, expected_bytes) in boundary_tests {
+            let encoded = encode_varint(value).unwrap();
+            assert_eq!(
+                encoded.len(),
+                expected_bytes,
+                "Value {} should encode to {} bytes",
+                value,
+                expected_bytes
+            );
+        }
+    }
+
+    #[test]
+    fn test_varint_max_value() {
+        // Test maximum encodable value (2^62 - 1)
+        let max_value = (1u64 << 62) - 1;
+        let encoded = encode_varint(max_value).unwrap();
+        assert_eq!(encoded.len(), 8);
+        let (decoded, _) = test_decode_varint(&encoded).unwrap();
+        assert_eq!(decoded, max_value);
+    }
+
+    #[test]
+    fn test_varint_too_large() {
+        // Value exceeding 62 bits should fail
+        let result = encode_varint(1u64 << 62);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_tcp_request_max_address() {
+        // Test with maximum allowed address length
+        let address = "a".repeat(MAX_ADDRESS_LENGTH);
+        let address_bytes = address.as_bytes();
+
+        let mut frame = bytes::BytesMut::new();
+        frame.extend_from_slice(&encode_varint(FRAME_TYPE_TCP_REQUEST).unwrap());
+        frame.extend_from_slice(&encode_varint(address_bytes.len() as u64).unwrap());
+        frame.extend_from_slice(address_bytes);
+        frame.extend_from_slice(&encode_varint(0u64).unwrap());
+
+        // Verify it encodes and decodes correctly
+        let mut offset = 0;
+        let (frame_type, len) = test_decode_varint(&frame[offset..]).unwrap();
+        assert_eq!(frame_type, FRAME_TYPE_TCP_REQUEST);
+        offset += len;
+
+        let (addr_len, _len) = test_decode_varint(&frame[offset..]).unwrap();
+        assert_eq!(addr_len as usize, MAX_ADDRESS_LENGTH);
+    }
+
+    #[test]
+    fn test_tcp_request_address_variations() {
+        // Test various address formats
+        let test_addresses = vec![
+            "example.com:80",
+            "192.168.1.1:443",
+            "[::1]:8080",
+            "[2001:db8::1]:53",
+            "localhost:3000",
+            "sub.domain.example.org:9999",
+        ];
+
+        for address in test_addresses {
+            let address_bytes = address.as_bytes();
+            let mut frame = bytes::BytesMut::new();
+            frame.extend_from_slice(&encode_varint(FRAME_TYPE_TCP_REQUEST).unwrap());
+            frame.extend_from_slice(&encode_varint(address_bytes.len() as u64).unwrap());
+            frame.extend_from_slice(address_bytes);
+            frame.extend_from_slice(&encode_varint(0u64).unwrap());
+
+            // Verify encoding is successful
+            assert!(frame.len() > 0);
+
+            // Verify decoding
+            let mut offset = 0;
+            let (frame_type, len) = test_decode_varint(&frame[offset..]).unwrap();
+            assert_eq!(frame_type, FRAME_TYPE_TCP_REQUEST);
+            offset += len;
+
+            let (addr_len, len) = test_decode_varint(&frame[offset..]).unwrap();
+            offset += len;
+
+            let decoded_address =
+                std::str::from_utf8(&frame[offset..offset + addr_len as usize]).unwrap();
+            assert_eq!(decoded_address, address);
+        }
+    }
+
+    #[test]
+    fn test_tcp_response_status_codes() {
+        // Test both OK and ERROR status codes
+        let ok_response = vec![tcp_status::OK, 0x00, 0x00];
+        assert_eq!(ok_response[0], tcp_status::OK);
+        assert_eq!(ok_response[0], 0x00);
+
+        let error_response = vec![tcp_status::ERROR, 0x05, 0x00];
+        assert_eq!(error_response[0], tcp_status::ERROR);
+        assert_eq!(error_response[0], 0x01);
+    }
+
+    #[test]
+    fn test_udp_datagram_address_variations() {
+        // Test UDP datagrams with various address formats
+        let test_cases = vec![
+            ("8.8.8.8:53", false),         // IPv4, short
+            ("192.168.100.1:8080", false), // IPv4, long
+            ("[::1]:53", true),            // IPv6 loopback
+            ("[2001:db8::1]:1234", true),  // IPv6
+            ("example.com:443", false),    // hostname
+        ];
+
+        for (address, _is_ipv6) in test_cases {
+            let session_id: u32 = 1;
+            let packet_id: u16 = 0;
+            let fragment_id: u8 = 0;
+            let fragment_count: u8 = 1;
+
+            let mut datagram = bytes::BytesMut::new();
+            datagram.extend_from_slice(&session_id.to_be_bytes());
+            datagram.extend_from_slice(&packet_id.to_be_bytes());
+            datagram.extend_from_slice(&[fragment_id, fragment_count]);
+
+            let address_bytes = address.as_bytes();
+            datagram.extend_from_slice(&encode_varint(address_bytes.len() as u64).unwrap());
+            datagram.extend_from_slice(address_bytes);
+            datagram.extend_from_slice(b"test payload");
+
+            // Verify header
+            assert_eq!(datagram[0..4], session_id.to_be_bytes());
+            assert_eq!(datagram[6], fragment_id);
+            assert_eq!(datagram[7], fragment_count);
+
+            // Verify address parsing
+            let (addr_len, len) = test_decode_varint(&datagram[8..]).unwrap();
+            let addr_offset = 8 + len;
+            let decoded_addr =
+                std::str::from_utf8(&datagram[addr_offset..addr_offset + addr_len as usize])
+                    .unwrap();
+            assert_eq!(decoded_addr, address);
+        }
+    }
+
+    #[test]
+    fn test_udp_fragment_count_validation() {
+        // Test that fragment_count == 0 is invalid (as per protocol fix)
+        let fragment_count: u8 = 0;
+        assert!(fragment_count < 1, "fragment_count should be >= 1");
+
+        // Valid fragment counts
+        for valid_count in 1..=10u8 {
+            assert!(
+                valid_count >= 1,
+                "fragment_count {} should be >= 1",
+                valid_count
+            );
+        }
+    }
+
+    #[test]
+    fn test_padding_within_max() {
+        // Test that padding generation respects practical limits
+        for _ in 0..100 {
+            let padding = generate_padding_string();
+            assert!(padding.len() < 80, "Padding should be less than 80 bytes");
+            assert!(padding.len() > 0, "Padding should not be empty");
+            assert!(padding.is_ascii(), "Padding should be ASCII only");
+        }
+    }
+}

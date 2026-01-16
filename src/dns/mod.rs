@@ -16,5 +16,5 @@ mod hickory_resolver;
 mod parsed;
 mod proxy_runtime;
 
-pub use builder::{build_dns_registry, build_resolver, DnsRegistry};
-pub use parsed::{IpStrategy, ParsedDnsServerEntry, ParsedDnsUrl};
+pub use builder::build_dns_registry;
+pub use parsed::{IpStrategy, ParsedDnsUrl};
