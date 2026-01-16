@@ -214,6 +214,7 @@ impl ResolvedLocation {
     }
 
     /// Get the port.
+    #[allow(dead_code)]
     pub fn port(&self) -> u16 {
         self.location.port()
     }

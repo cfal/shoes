@@ -951,10 +951,13 @@ pub struct Hysteria2SocketConnector {
     client: Arc<Hysteria2Client>,
     /// The established Hysteria2 connection (after authentication)
     connection: Arc<Mutex<Option<Hysteria2Connection>>>,
+    /// Optional bind interface for outgoing connections
+    bind_interface: Option<String>,
 }
 
 impl Hysteria2SocketConnector {
     /// Create a new Hysteria2 socket connector
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         endpoint: Arc<quinn::Endpoint>,
         server_address: NetLocation,
@@ -964,6 +967,7 @@ impl Hysteria2SocketConnector {
         fast_open: bool,
         max_tx: u64,
         max_rx: u64,
+        bind_interface: Option<String>,
     ) -> Self {
         Self {
             client: Arc::new(Hysteria2Client::new(
@@ -977,6 +981,7 @@ impl Hysteria2SocketConnector {
                 max_rx,
             )),
             connection: Arc::new(Mutex::new(None)),
+            bind_interface,
         }
     }
 
@@ -1015,10 +1020,10 @@ impl crate::tcp::socket_connector::SocketConnector for Hysteria2SocketConnector 
     async fn connect(
         &self,
         resolver: &Arc<dyn Resolver>,
-        address: &NetLocation,
+        address: &crate::address::ResolvedLocation,
     ) -> std::io::Result<Box<dyn AsyncStream>> {
         let conn = self.get_or_create_connection(resolver).await?;
-        conn.create_tcp_stream(address).await
+        conn.create_tcp_stream(address.location()).await
     }
 
     /// Create a bidirectional UDP stream through Hysteria2
@@ -1029,20 +1034,37 @@ impl crate::tcp::socket_connector::SocketConnector for Hysteria2SocketConnector 
     async fn connect_udp_bidirectional(
         &self,
         resolver: &Arc<dyn Resolver>,
-        target: NetLocation,
+        target: crate::address::ResolvedLocation,
     ) -> std::io::Result<Box<dyn crate::async_stream::AsyncMessageStream>> {
         use crate::socket_util::new_udp_socket;
 
         let conn = self.get_or_create_connection(resolver).await?;
 
+        // Address resolution is handled by Hysteria2 server or inside the tunnel usually,
+        // but here we treat target as the destination.
+        // Hysteria2UdpAdapter needs the target location.
+        let target_location = target.location();
+
         // Create a local UDP socket for bidirectional communication
-        let local_socket = Arc::new(new_udp_socket(target.address().is_ipv6(), None)?);
+        // We use the bind_interface if configured in this connector
+        let local_socket = Arc::new(new_udp_socket(
+            target_location.address().is_ipv6(),
+            self.bind_interface.clone(),
+        )?);
 
         // Create the Hysteria2 UDP message stream
         let hy_udp_stream = HyUdpMessageStream::new(local_socket, conn.connection.clone());
 
         // Wrap in a bidirectional adapter
-        Ok(Box::new(Hysteria2UdpAdapter::new(hy_udp_stream, target)))
+        Ok(Box::new(Hysteria2UdpAdapter::new(
+            hy_udp_stream,
+            target.into_location(),
+        )))
+    }
+
+    /// Returns the bind interface configured for this socket connector
+    fn bind_interface(&self) -> Option<&str> {
+        self.bind_interface.as_deref()
     }
 }
 

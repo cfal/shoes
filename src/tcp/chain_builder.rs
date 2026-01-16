@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use crate::client_proxy_chain::{ClientChainGroup, ClientProxyChain, InitialHopEntry};
 use crate::config::ConfigSelection;
-use crate::config::{ClientChainHop, ClientConfig, ClientProxyConfig, ClientQuicConfig};
+use crate::config::{ClientChainHop, ClientConfig, ClientProxyConfig};
 use crate::hysteria2_client::Hysteria2SocketConnector;
 use crate::resolver::Resolver;
 use crate::tcp::proxy_connector::ProxyConnector;
@@ -94,98 +94,39 @@ pub fn build_client_proxy_chain(
                 let bind_interface = config.bind_interface.clone().into_option();
 
                 // Get SNI hostname from quic_settings or use target address
-                let sni_hostname = config
-                    .quic_settings
-                    .as_ref()
-                    .and_then(|q| q.sni_hostname.clone().into_option())
-                    .or_else(|| target_address.address().hostname().map(|h| h.to_string()));
+                let default_sni_hostname = target_address.address().hostname().map(ToString::to_string);
 
-                // Create QUIC endpoint for Hysteria2
-                let default_sni_hostname =
-                    target_address.address().hostname().map(ToString::to_string);
-
-                let effective_sni = sni_hostname.as_ref().or(default_sni_hostname.as_ref());
-
-                let ClientQuicConfig {
-                    verify,
-                    server_fingerprints,
-                    alpn_protocols,
-                    sni_hostname: _,
-                    key,
-                    cert,
-                } = config.quic_settings.clone().unwrap_or_default();
-
-                let tls13_suite =
-                    match rustls::crypto::aws_lc_rs::cipher_suite::TLS13_AES_128_GCM_SHA256 {
-                        rustls::SupportedCipherSuite::Tls13(t) => t,
-                        _ => {
-                            panic!("Could not retrieve Tls13CipherSuite");
-                        }
-                    };
-
-                let key_and_cert_bytes = key.zip(cert).map(|(key, cert)| {
-                    let cert_bytes = cert.as_bytes().to_vec();
-                    let key_bytes = key.as_bytes().to_vec();
-                    (key_bytes, cert_bytes)
-                });
-
-                use crate::rustls_config_util::create_client_config;
-                let rustls_client_config = create_client_config(
-                    verify,
-                    server_fingerprints.into_vec(),
-                    alpn_protocols.into_vec(),
-                    effective_sni.is_some(),
-                    key_and_cert_bytes,
-                    true, // tls13_only - Hysteria2 requires TLS 1.3
-                );
-
-                let quic_client_config = quinn::crypto::rustls::QuicClientConfig::with_initial(
-                    std::sync::Arc::new(rustls_client_config),
-                    tls13_suite.quic_suite().unwrap(),
+                let mut quic_config = crate::tcp::socket_connector_impl::QuicEndpointConfig::from_client_config(
+                    config.quic_settings.clone().unwrap_or_default(),
+                    default_sni_hostname,
                 )
-                .unwrap();
+                .with_tls13_only(true)
+                .with_transport_config(256, 255, 15, 60);
 
-                let mut quinn_client_config =
-                    quinn::ClientConfig::new(std::sync::Arc::new(quic_client_config));
+                // Add "h3" ALPN if not present, as it is required by Hysteria2
+                let h3 = "h3".to_string();
+                if !quic_config.alpn_protocols.contains(&h3) {
+                    quic_config.alpn_protocols.push(h3);
+                }
 
-                let mut transport_config = quinn::TransportConfig::default();
-                transport_config
-                    .max_concurrent_bidi_streams(256_u32.into())
-                    .max_concurrent_uni_streams(255_u8.into())
-                    .keep_alive_interval(Some(std::time::Duration::from_secs(15)))
-                    .max_idle_timeout(Some(std::time::Duration::from_secs(60).try_into().unwrap()));
+                let effective_sni = quic_config.sni_hostname.clone();
 
-                quinn_client_config.transport_config(std::sync::Arc::new(transport_config));
-
-                let udp_socket = match crate::socket_util::new_udp_socket(
+                let endpoint = crate::tcp::socket_connector_impl::create_quic_endpoint(
+                    &quic_config,
                     target_address.address().is_ipv6(),
-                    bind_interface,
-                ) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        panic!("Failed to bind UDP socket for Hysteria2: {e}");
-                    }
-                };
-                let udp_socket = udp_socket.into_std().unwrap();
-
-                let mut endpoint = quinn::Endpoint::new(
-                    quinn::EndpointConfig::default(),
-                    None,
-                    udp_socket,
-                    std::sync::Arc::new(quinn::TokioRuntime),
-                )
-                .unwrap();
-                endpoint.set_default_client_config(quinn_client_config);
+                    bind_interface.clone(),
+                ).expect("Failed to create QUIC endpoint for Hysteria2");
 
                 let socket = Box::new(Hysteria2SocketConnector::new(
-                    std::sync::Arc::new(endpoint),
+                    endpoint,
                     target_address.clone(),
-                    effective_sni.cloned(),
+                    effective_sni,
                     password,
                     udp_enabled,
                     fast_open,
                     max_tx,
                     max_rx,
+                    bind_interface,
                 )) as Box<dyn SocketConnector>;
 
                 // Hysteria2 is a direct protocol from the proxy chain perspective
