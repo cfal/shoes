@@ -24,9 +24,14 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Mutex, RwLock, mpsc};
+use tokio::task::JoinHandle;
 
 /// Timeout for control frame writes (matches reference implementation)
 const CONTROL_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Maximum lifetime for a single stream handler (5 minutes)
+/// Prevents memory leaks from hung streams (slow DNS, stuck connections, etc.)
+const STREAM_HANDLER_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// AnyTLS Session manages multiplexed streams over a connection
 pub struct AnyTlsSession {
@@ -36,6 +41,9 @@ pub struct AnyTlsSession {
 
     /// Stream management (bounded channels for backpressure)
     streams: RwLock<HashMap<u32, mpsc::Sender<Bytes>>>,
+
+    /// Active stream handler tasks (for cancellation on session close)
+    stream_tasks: Mutex<HashMap<u32, JoinHandle<()>>>,
 
     /// Channel for receiving outgoing data from streams (bounded for backpressure)
     outgoing_rx: Mutex<mpsc::Receiver<(u32, Bytes)>>,
@@ -110,6 +118,7 @@ impl AnyTlsSession {
             reader: Mutex::new(Box::new(reader)),
             writer: Mutex::new(Box::new(writer)),
             streams: RwLock::new(HashMap::new()),
+            stream_tasks: Mutex::new(HashMap::new()),
             outgoing_rx: Mutex::new(outgoing_rx),
             outgoing_tx,
             is_closed: Arc::new(AtomicBool::new(false)),
@@ -159,6 +168,7 @@ impl AnyTlsSession {
             reader: Mutex::new(Box::new(reader)),
             writer: Mutex::new(Box::new(writer)),
             streams: RwLock::new(HashMap::new()),
+            stream_tasks: Mutex::new(HashMap::new()),
             outgoing_rx: Mutex::new(outgoing_rx),
             outgoing_tx,
             is_closed: Arc::new(AtomicBool::new(false)),
@@ -191,7 +201,17 @@ impl AnyTlsSession {
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)
             .is_ok()
         {
-            // Clear all streams
+            // Abort all active stream handler tasks first
+            // This prevents memory leaks from hung tasks holding Arc<Self>
+            {
+                let mut tasks = self.stream_tasks.lock().await;
+                for (stream_id, handle) in tasks.drain() {
+                    log::trace!("Aborting stream task {}", stream_id);
+                    handle.abort();
+                }
+            }
+
+            // Clear all streams (drops senders, signals EOF to any remaining receivers)
             let mut streams = self.streams.write().await;
             streams.clear();
 
@@ -373,14 +393,45 @@ impl AnyTlsSession {
                     }
                 };
 
-                // Handle the new stream internally
+                // Handle the new stream internally with timeout and task tracking
                 if let Some(stream) = stream_opt {
                     let session = Arc::clone(self);
-                    tokio::spawn(async move {
-                        if let Err(e) = session.handle_new_stream(stream).await {
-                            log::debug!("AnyTLS stream error: {}", e);
+                    let stream_id_for_cleanup = stream_id;
+                    let session_for_cleanup = Arc::clone(self);
+
+                    let handle = tokio::spawn(async move {
+                        // Apply timeout to entire stream handler lifetime
+                        // This prevents memory leaks from hung streams
+                        let result = tokio::time::timeout(
+                            STREAM_HANDLER_TIMEOUT,
+                            session.handle_new_stream(stream),
+                        )
+                        .await;
+
+                        match result {
+                            Ok(Ok(())) => {
+                                log::trace!("AnyTLS stream {} completed", stream_id_for_cleanup);
+                            }
+                            Ok(Err(e)) => {
+                                log::debug!("AnyTLS stream {} error: {}", stream_id_for_cleanup, e);
+                            }
+                            Err(_) => {
+                                log::warn!(
+                                    "AnyTLS stream {} timed out after {:?}",
+                                    stream_id_for_cleanup,
+                                    STREAM_HANDLER_TIMEOUT
+                                );
+                            }
                         }
+
+                        // Remove self from stream_tasks on completion
+                        let mut tasks = session_for_cleanup.stream_tasks.lock().await;
+                        tasks.remove(&stream_id_for_cleanup);
                     });
+
+                    // Track the task for cancellation on session close
+                    let mut tasks = self.stream_tasks.lock().await;
+                    tasks.insert(stream_id, handle);
                 }
             }
 
@@ -594,28 +645,34 @@ impl AnyTlsSession {
                 let padding_len = size.saturating_sub(remain_payload_len + FRAME_HEADER_SIZE);
 
                 if padding_len > 0 {
-                    // Create padding frame - use put_bytes to avoid vec allocation
-                    let mut padding_frame =
-                        BytesMut::with_capacity(FRAME_HEADER_SIZE + padding_len);
-                    padding_frame.put_u8(Command::Waste as u8);
-                    padding_frame.put_u32(0); // stream_id = 0
-                    padding_frame.put_u16(padding_len as u16);
-                    padding_frame.put_bytes(0, padding_len); // Zero-fill without allocation
-
-                    data.extend_from_slice(&padding_frame);
+                    // Append padding frame directly to data buffer (no intermediate allocation)
+                    data.reserve(FRAME_HEADER_SIZE + padding_len);
+                    data.put_u8(Command::Waste as u8);
+                    data.put_u32(0); // stream_id = 0
+                    data.put_u16(padding_len as u16);
+                    data.put_bytes(0, padding_len); // Zero-fill without allocation
                 }
 
                 writer.write_all(&data).await?;
                 data.clear();
             } else {
-                // This packet is all padding - use put_bytes to avoid vec allocation
-                let mut padding_frame = BytesMut::with_capacity(FRAME_HEADER_SIZE + size);
-                padding_frame.put_u8(Command::Waste as u8);
-                padding_frame.put_u32(0);
-                padding_frame.put_u16(size as u16);
-                padding_frame.put_bytes(0, size); // Zero-fill without allocation
-
-                writer.write_all(&padding_frame).await?;
+                // This packet is all padding - write directly without intermediate buffer
+                // Use a small stack buffer for the header
+                let header = [
+                    Command::Waste as u8,
+                    0, 0, 0, 0, // stream_id = 0
+                    (size >> 8) as u8,
+                    size as u8,
+                ];
+                writer.write_all(&header).await?;
+                // Write zeros for padding body - use a static buffer for small sizes
+                const ZERO_BUF: [u8; 1024] = [0u8; 1024];
+                let mut remaining = size;
+                while remaining > 0 {
+                    let chunk = remaining.min(ZERO_BUF.len());
+                    writer.write_all(&ZERO_BUF[..chunk]).await?;
+                    remaining -= chunk;
+                }
             }
         }
 

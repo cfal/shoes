@@ -30,6 +30,10 @@ use tokio_util::sync::PollSender;
 /// 16 messages = up to ~1MB buffered per direction per stream
 pub const STREAM_CHANNEL_BUFFER: usize = 16;
 
+/// Maximum data payload per frame (u16::MAX = 65535)
+/// Writes larger than this must be chunked into multiple frames
+const MAX_FRAME_DATA_SIZE: usize = 65535;
+
 /// AnyTlsStream represents a multiplexed stream within an AnyTLS session
 ///
 /// Reads come from data pushed by the session's recv loop.
@@ -45,8 +49,11 @@ pub struct AnyTlsStream {
     /// The session's recv loop pushes PSH frame data here
     data_rx: mpsc::Receiver<Bytes>,
 
-    /// Buffer for partial reads
-    read_buffer: Vec<u8>,
+    /// Buffer for partial reads - uses Bytes for O(1) advance without memmove
+    read_buffer: Bytes,
+
+    /// Offset into read_buffer for partial consumption
+    read_offset: usize,
 
     /// Poll-based sender for outgoing data to session (bounded with backpressure)
     /// Data sent here will be framed as PSH and written to the connection.
@@ -88,7 +95,8 @@ impl AnyTlsStream {
         Self {
             id,
             data_rx,
-            read_buffer: Vec::new(),
+            read_buffer: Bytes::new(),
+            read_offset: 0,
             data_tx: PollSender::new(data_tx),
             session_closed,
             stream_closed: false,
@@ -112,7 +120,8 @@ impl AnyTlsStream {
         Self {
             id,
             data_rx,
-            read_buffer: Vec::new(),
+            read_buffer: Bytes::new(),
+            read_offset: 0,
             data_tx: PollSender::new(data_tx),
             session_closed,
             stream_closed: false,
@@ -157,15 +166,23 @@ impl AsyncRead for AnyTlsStream {
         }
 
         // Check EOF with empty buffer
-        if self.eof && self.read_buffer.is_empty() {
+        let remaining_in_buffer = self.read_buffer.len() - self.read_offset;
+        if self.eof && remaining_in_buffer == 0 {
             return Poll::Ready(Ok(()));
         }
 
-        // First, drain any buffered data
-        if !self.read_buffer.is_empty() {
-            let n = std::cmp::min(self.read_buffer.len(), buf.remaining());
-            buf.put_slice(&self.read_buffer[..n]);
-            self.read_buffer.drain(..n);
+        // First, drain any buffered data (O(1) advance, no memmove)
+        if remaining_in_buffer > 0 {
+            let n = std::cmp::min(remaining_in_buffer, buf.remaining());
+            buf.put_slice(&self.read_buffer[self.read_offset..self.read_offset + n]);
+            self.read_offset += n;
+
+            // Release buffer when fully consumed (allows memory to be freed)
+            if self.read_offset >= self.read_buffer.len() {
+                self.read_buffer = Bytes::new();
+                self.read_offset = 0;
+            }
+
             return Poll::Ready(Ok(()));
         }
 
@@ -181,9 +198,10 @@ impl AsyncRead for AnyTlsStream {
                 let n = std::cmp::min(data.len(), buf.remaining());
                 buf.put_slice(&data[..n]);
 
-                // Buffer remaining data
+                // Buffer remaining data (O(1) - just keep the Bytes reference)
                 if n < data.len() {
-                    self.read_buffer.extend_from_slice(&data[n..]);
+                    self.read_buffer = data;
+                    self.read_offset = n;
                 }
 
                 Poll::Ready(Ok(()))
@@ -228,11 +246,13 @@ impl AsyncWrite for AnyTlsStream {
         // Use poll_reserve for backpressure - this will return Pending if channel is full
         match self.data_tx.poll_reserve(cx) {
             Poll::Ready(Ok(())) => {
-                // We have capacity - send the data
-                let data = Bytes::copy_from_slice(buf);
+                // Limit write size to max frame payload (u16::MAX = 65535)
+                // This prevents protocol corruption from length field truncation
+                let write_len = buf.len().min(MAX_FRAME_DATA_SIZE);
+                let data = Bytes::copy_from_slice(&buf[..write_len]);
                 let id = self.id;
                 match self.data_tx.send_item((id, data)) {
-                    Ok(()) => Poll::Ready(Ok(buf.len())),
+                    Ok(()) => Poll::Ready(Ok(write_len)),
                     Err(_) => Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::BrokenPipe,
                         "session channel closed",

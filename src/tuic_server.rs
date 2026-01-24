@@ -1046,14 +1046,15 @@ async fn process_udp_packet(
                     }
                 };
 
-                let resolved_address = resolve_single_address(resolver, updated_location.location())
-                    .await
-                    .map_err(|e| {
-                        std::io::Error::other(format!(
-                            "Failed to resolve initial remote location {}: {e}",
-                            updated_location.location()
-                        ))
-                    })?;
+                let resolved_address =
+                    resolve_single_address(resolver, updated_location.location())
+                        .await
+                        .map_err(|e| {
+                            std::io::Error::other(format!(
+                                "Failed to resolve initial remote location {}: {e}",
+                                updated_location.location()
+                            ))
+                        })?;
 
                 let (override_remote_write_address, override_local_write_location) =
                     if resolved_address.to_string() != remote_location.to_string() {

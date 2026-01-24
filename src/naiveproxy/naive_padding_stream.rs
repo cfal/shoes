@@ -908,7 +908,10 @@ mod tests {
             }
         }
 
-        assert_eq!(result, b"RAWDATA", "raw data after pure padding frame 8 was corrupted!");
+        assert_eq!(
+            result, b"RAWDATA",
+            "raw data after pure padding frame 8 was corrupted!"
+        );
     }
 
     #[tokio::test]

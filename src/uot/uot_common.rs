@@ -1,13 +1,37 @@
-//! Common UoT address parsing and writing utilities
+//! Common address parsing utilities for h2mux packet_addr mode
+//!
+//! ## Address Format: SOCKS5
+//!
+//! This module uses SOCKS5 address format:
+//! - 0x01: IPv4 (4 bytes)
+//! - 0x03: Domain (1 byte length + domain string)
+//! - 0x04: IPv6 (16 bytes)
+//!
+//! ## Usage
+//!
+//! This module is used by:
+//! - **h2mux packet_addr mode**: Per-packet UDP addressing in h2mux streams
+//!
+//! ## Important Note on UoT Formats
+//!
+//! sing-box defines TWO different address formats:
+//!
+//! 1. **SOCKS5 format** (SocksaddrSerializer) - 0x01/0x03/0x04
+//!    - Used by: h2mux packet_addr, UoT V2 request headers
+//!
+//! 2. **AddrParser format** - 0x00/0x01/0x02
+//!    - Used by: UoT V1 packet payloads, UoT V2 non-connect mode payloads
+//!
+//! This module implements SOCKS5 format since that's what h2mux uses.
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use crate::address::{Address, NetLocation};
 
-/// ATYP values for UoT (different from SOCKS5!)
-pub const ATYP_IPV4: u8 = 0x00;
-pub const ATYP_IPV6: u8 = 0x01;
-pub const ATYP_DOMAIN: u8 = 0x02;
+/// SOCKS5 ATYP values (used by h2mux packet_addr mode)
+pub const ATYP_IPV4: u8 = 0x01;
+pub const ATYP_DOMAIN: u8 = 0x03;
+pub const ATYP_IPV6: u8 = 0x04;
 
 /// Parse UoT address format (ATYP + address + port)
 /// Returns Ok(Some((NetLocation, bytes consumed))) on success.
@@ -88,8 +112,8 @@ mod tests {
 
     #[test]
     fn test_parse_uot_ipv4_address() {
-        // ATYP=0x00, IP=192.168.1.1, Port=8080
-        let data = [0x00, 192, 168, 1, 1, 0x1F, 0x90];
+        // SOCKS5 format: ATYP=0x01 for IPv4, IP=192.168.1.1, Port=8080
+        let data = [ATYP_IPV4, 192, 168, 1, 1, 0x1F, 0x90];
         let (location, len) = parse_uot_address(&data).unwrap().unwrap();
         assert_eq!(len, 7);
         assert_eq!(location.port(), 8080);
@@ -101,7 +125,7 @@ mod tests {
 
     #[test]
     fn test_parse_uot_ipv6_address() {
-        // ATYP=0x01, IP=::1, Port=443
+        // SOCKS5 format: ATYP=0x04 for IPv6, IP=::1, Port=443
         let mut data = vec![ATYP_IPV6];
         data.extend_from_slice(&Ipv6Addr::LOCALHOST.octets());
         data.extend_from_slice(&443u16.to_be_bytes());
@@ -117,7 +141,7 @@ mod tests {
 
     #[test]
     fn test_parse_uot_domain_address() {
-        // ATYP=0x02, Domain="example.com", Port=53
+        // SOCKS5 format: ATYP=0x03 for Domain, Domain="example.com", Port=53
         let domain = b"example.com";
         let mut data = vec![ATYP_DOMAIN, domain.len() as u8];
         data.extend_from_slice(domain);

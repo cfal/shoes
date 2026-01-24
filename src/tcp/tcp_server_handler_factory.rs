@@ -110,6 +110,7 @@ pub fn create_tcp_server_handler(
                     &password,
                     udp_enabled,
                     client_proxy_selector.clone(),
+                    resolver.clone(),
                 ))
             }
             ShadowsocksConfig::Aead2022 { cipher, key_bytes } => {
@@ -118,6 +119,7 @@ pub fn create_tcp_server_handler(
                     &key_bytes,
                     udp_enabled,
                     client_proxy_selector.clone(),
+                    resolver.clone(),
                 ))
             }
         },
@@ -130,6 +132,7 @@ pub fn create_tcp_server_handler(
             &password,
             udp_enabled,
             client_proxy_selector.clone(),
+            resolver.clone(),
         )),
         ServerProxyConfig::Vless {
             user_id,
@@ -149,6 +152,7 @@ pub fn create_tcp_server_handler(
             &password,
             &shadowsocks,
             client_proxy_selector.clone(),
+            resolver.clone(),
         )),
         ServerProxyConfig::Tls {
             tls_targets,
@@ -215,6 +219,7 @@ pub fn create_tcp_server_handler(
             &user_id,
             udp_enabled,
             client_proxy_selector.clone(),
+            resolver.clone(),
         )),
         ServerProxyConfig::Websocket { targets } => {
             let server_targets: Vec<WebsocketServerTarget> = targets

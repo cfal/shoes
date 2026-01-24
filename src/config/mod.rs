@@ -19,7 +19,7 @@ mod validate;
 
 pub use pem::convert_cert_paths;
 pub use types::*;
-pub use validate::{create_server_configs, ValidatedConfigs};
+pub use validate::{ValidatedConfigs, create_server_configs};
 
 /// Loads configuration files from the provided paths.
 ///

@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::address::NetLocation;
+use crate::h2mux::{H2MuxOptions, MuxProtocol};
 use crate::option_util::{NoneOrOne, NoneOrSome};
 
 use super::common::{
@@ -13,6 +14,43 @@ use super::common::{
 use super::server::WebsocketPingType;
 use super::shadowsocks::ShadowsocksConfig;
 use super::transport::{ClientQuicConfig, TcpConfig, Transport};
+
+/// Configuration for h2mux (HTTP/2 multiplexing) on protocols that support it.
+///
+/// H2MUX multiplexes multiple proxy streams over a single HTTP/2 connection,
+/// reducing connection overhead and improving performance for many concurrent streams.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct H2MuxConfig {
+    /// Maximum number of connections to maintain
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_connections: Option<u32>,
+
+    /// Minimum number of streams before opening a new connection
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_streams: Option<u32>,
+
+    /// Maximum number of streams per connection (0 = unlimited)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_streams: Option<u32>,
+
+    /// Enable padding for traffic obfuscation
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub padding: bool,
+}
+
+impl H2MuxConfig {
+    /// Converts this config to H2MuxOptions for the client handler.
+    pub fn to_options(&self) -> H2MuxOptions {
+        H2MuxOptions {
+            protocol: MuxProtocol::H2Mux,
+            max_connections: self.max_connections.unwrap_or(4),
+            min_streams: self.min_streams.unwrap_or(4),
+            max_streams: self.max_streams.unwrap_or(0),
+            padding: self.padding,
+        }
+    }
+}
 
 /// Custom deserializer for ClientProxyConfig::Shadowsocks
 fn deserialize_shadowsocks_client<'de, D>(
@@ -105,7 +143,9 @@ where
 }
 
 /// Custom deserializer for ClientProxyConfig::Vmess that validates legacy aead field
-fn deserialize_vmess_client<'de, D>(deserializer: D) -> Result<(String, String, bool), D::Error>
+fn deserialize_vmess_client<'de, D>(
+    deserializer: D,
+) -> Result<(String, String, bool, Option<H2MuxConfig>), D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -120,6 +160,8 @@ where
         aead: Option<bool>,
         #[serde(default = "default_true")]
         udp_enabled: bool,
+        #[serde(default)]
+        h2mux: Option<H2MuxConfig>,
     }
 
     let temp = VmessClientTemp::deserialize(deserializer)?;
@@ -139,7 +181,7 @@ where
         );
     }
 
-    Ok((temp.cipher, temp.user_id, temp.udp_enabled))
+    Ok((temp.cipher, temp.user_id, temp.udp_enabled, temp.h2mux))
 }
 
 /// Custom deserializer for TlsClientConfig that handles deprecated shadowtls_password field
@@ -306,11 +348,17 @@ pub enum ClientProxyConfig {
         user_id: String,
         #[serde(default = "default_true", skip_serializing_if = "is_true")]
         udp_enabled: bool,
+        /// H2MUX multiplexing configuration
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        h2mux: Option<H2MuxConfig>,
     },
     Trojan {
         password: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         shadowsocks: Option<ShadowsocksConfig>,
+        /// H2MUX multiplexing configuration
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        h2mux: Option<H2MuxConfig>,
     },
     Reality {
         public_key: String,
@@ -356,6 +404,9 @@ pub enum ClientProxyConfig {
         user_id: String,
         #[serde(default = "default_true", skip_serializing_if = "is_true")]
         udp_enabled: bool,
+        /// H2MUX multiplexing configuration
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        h2mux: Option<H2MuxConfig>,
     },
     #[serde(alias = "ws")]
     Websocket(WebsocketClientConfig),

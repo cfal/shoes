@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use log::debug;
 use parking_lot::Mutex;
 use rand::{Rng, RngCore};
 use tokio::io::AsyncWriteExt;
@@ -11,6 +12,8 @@ use crate::address::{Address, NetLocation, ResolvedLocation};
 use crate::async_stream::AsyncMessageStream;
 use crate::async_stream::AsyncStream;
 use crate::client_proxy_selector::ClientProxySelector;
+use crate::h2mux::{MUX_DESTINATION_HOST, MUX_DESTINATION_PORT, handle_h2mux_session};
+use crate::resolver::Resolver;
 use crate::socks_handler::{read_location, write_location_to_vec};
 use crate::stream_reader::StreamReader;
 use crate::tcp::tcp_handler::{
@@ -35,6 +38,8 @@ pub struct ShadowsocksTcpHandler {
     udp_enabled: bool,
     /// Proxy selector for server handler use. None when used as client handler.
     proxy_selector: Option<Arc<ClientProxySelector>>,
+    /// DNS resolver for h2mux sessions. None when used as client handler.
+    resolver: Option<Arc<dyn Resolver>>,
 }
 
 impl ShadowsocksTcpHandler {
@@ -44,6 +49,7 @@ impl ShadowsocksTcpHandler {
         password: &str,
         udp_enabled: bool,
         proxy_selector: Arc<ClientProxySelector>,
+        resolver: Arc<dyn Resolver>,
     ) -> Self {
         let key: Arc<Box<dyn ShadowsocksKey>> = Arc::new(Box::new(DefaultKey::new(
             password,
@@ -56,6 +62,7 @@ impl ShadowsocksTcpHandler {
             salt_checker: None,
             udp_enabled,
             proxy_selector: Some(proxy_selector),
+            resolver: Some(resolver),
         }
     }
 
@@ -72,6 +79,7 @@ impl ShadowsocksTcpHandler {
             salt_checker: None,
             udp_enabled,
             proxy_selector: None,
+            resolver: None,
         }
     }
 
@@ -81,6 +89,7 @@ impl ShadowsocksTcpHandler {
         key_bytes: &[u8],
         udp_enabled: bool,
         proxy_selector: Arc<ClientProxySelector>,
+        resolver: Arc<dyn Resolver>,
     ) -> Self {
         let key: Arc<Box<dyn ShadowsocksKey>> = Arc::new(Box::new(Blake3Key::new(
             key_bytes.to_vec().into_boxed_slice(),
@@ -93,6 +102,7 @@ impl ShadowsocksTcpHandler {
             salt_checker: Some(Arc::new(Mutex::new(TimedSaltChecker::new(60)))),
             udp_enabled,
             proxy_selector: Some(proxy_selector),
+            resolver: Some(resolver),
         }
     }
 
@@ -113,6 +123,7 @@ impl ShadowsocksTcpHandler {
             salt_checker: Some(Arc::new(Mutex::new(TimedSaltChecker::new(60)))),
             udp_enabled,
             proxy_selector: None,
+            resolver: None,
         }
     }
 }
@@ -156,6 +167,36 @@ impl TcpServerHandler for ShadowsocksTcpHandler {
                 stream_reader
                     .read_slice(&mut server_stream, padding_len as usize)
                     .await?;
+            }
+        }
+
+        // Checks for h2mux magic destination
+        if let Address::Hostname(host) = remote_location.address() {
+            if host == MUX_DESTINATION_HOST && remote_location.port() == MUX_DESTINATION_PORT {
+                let proxy_selector = self
+                    .proxy_selector
+                    .clone()
+                    .expect("proxy_selector required for server handler");
+                let resolver = self.resolver.clone().expect("resolver required for h2mux");
+                let udp_enabled = self.udp_enabled;
+
+                let initial_data = stream_reader.unparsed_data_owned();
+
+                tokio::spawn(async move {
+                    if let Err(e) = handle_h2mux_session(
+                        server_stream,
+                        initial_data,
+                        udp_enabled,
+                        proxy_selector,
+                        resolver,
+                    )
+                    .await
+                    {
+                        debug!("Shadowsocks h2mux session ended: {}", e);
+                    }
+                });
+
+                return Ok(TcpServerSetupResult::AlreadyHandled);
             }
         }
 

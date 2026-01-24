@@ -1,11 +1,13 @@
-use crate::crypto::CryptoConnection;
-/// VISION stream implementation
-///
-/// VisionStream wraps an IO stream and TLS session, allowing it to:
-/// - Use TLS with VISION padding to hide protocol fingerprints
-/// - Detect TLS-in-TLS scenarios by analyzing traffic patterns
-/// - Switch to direct I/O mode, bypassing TLS for zero-copy performance
+//! VISION stream implementation
+//!
+//! VisionStream wraps an IO stream and TLS session, allowing it to:
+//! - Use TLS with VISION padding to hide protocol fingerprints
+//! - Detect TLS-in-TLS scenarios by analyzing traffic patterns
+//! - Switch to direct I/O mode, bypassing TLS for zero-copy performance
+
 use bytes::{Buf, BytesMut};
+
+use crate::crypto::CryptoConnection;
 use futures::ready;
 use std::io::{self, BufRead, Write};
 use std::pin::Pin;
@@ -21,6 +23,11 @@ use super::tls_deframer::TlsDeframer;
 use super::tls_fuzzy_deframer::{DeframeResult, FuzzyTlsDeframer};
 use super::vision_filter::VisionFilter;
 use super::vision_unpad::{UnpadCommand, UnpadResult, VisionUnpadder};
+
+// TODO: consider combining with UnpadCommand
+const COMMAND_CONTINUE: u8 = 0x00;
+const COMMAND_END: u8 = 0x01;
+const COMMAND_DIRECT: u8 = 0x02;
 
 #[inline]
 fn feed_and_process_crypto_connection(
@@ -970,7 +977,7 @@ where
                 let remaining = outer_read_deframer.into_remaining_data();
 
                 // The `remaining` data from the deframer is ENCRYPTED TLS record bytes
-                // We need to feed it to the TLS session for decryption, not append to unpadded
+                // We need to feed it to the TLS session for decryption
                 if !remaining.is_empty() {
                     // This should only be a partial TLS record so there should be no new plaintext
                     // to read
@@ -1168,10 +1175,10 @@ where
                         // Toggle mode switch flag, if `non_tls_filtering_ended`, it never supports XTLS
                         let command = if self.filter.supports_xtls() {
                             self.pending_direct_mode_switch = true;
-                            0x02
+                            COMMAND_DIRECT
                         } else {
                             self.pending_tls_mode_switch = true;
-                            0x01
+                            COMMAND_END
                         };
 
                         let final_padded_packet = if self.write_first_packet {
@@ -1223,13 +1230,13 @@ where
                         super::vision_pad::pad_with_uuid_and_command(
                             &record,
                             &self.user_uuid,
-                            0x00, // CONTINUE
+                            COMMAND_CONTINUE,
                             self.filter.is_tls(),
                         )
                     } else {
                         super::vision_pad::pad_with_command(
                             &record,
-                            0x00, // CONTINUE
+                            COMMAND_CONTINUE,
                             self.filter.is_tls(),
                         )
                     };
@@ -1280,11 +1287,15 @@ where
                             super::vision_pad::pad_with_uuid_and_command(
                                 &prefix,
                                 &self.user_uuid,
-                                0x0,
+                                COMMAND_CONTINUE,
                                 self.filter.is_tls(),
                             )
                         } else {
-                            super::vision_pad::pad_with_command(&prefix, 0x0, self.filter.is_tls())
+                            super::vision_pad::pad_with_command(
+                                &prefix,
+                                COMMAND_CONTINUE,
+                                self.filter.is_tls(),
+                            )
                         };
 
                         self.write_to_session(&padded_packet)?;
@@ -1304,11 +1315,15 @@ where
                             super::vision_pad::pad_with_uuid_and_command(
                                 &prefix,
                                 &self.user_uuid,
-                                0x1,
+                                COMMAND_END,
                                 self.filter.is_tls(),
                             )
                         } else {
-                            super::vision_pad::pad_with_command(&prefix, 0x1, self.filter.is_tls())
+                            super::vision_pad::pad_with_command(
+                                &prefix,
+                                COMMAND_END,
+                                self.filter.is_tls(),
+                            )
                         };
 
                         // Clear deframe, not really necessary since deallocate will occur and this
@@ -1343,6 +1358,8 @@ where
                         e
                     );
 
+                    self.pending_tls_mode_switch = true;
+
                     self.filter
                         .stop_filtering("write invalid TLS data".to_string());
 
@@ -1353,13 +1370,13 @@ where
                         super::vision_pad::pad_with_uuid_and_command(
                             remaining_data,
                             &self.user_uuid,
-                            0x1,
+                            COMMAND_END,
                             self.filter.is_tls(),
                         )
                     } else {
                         super::vision_pad::pad_with_command(
                             remaining_data,
-                            0x1,
+                            COMMAND_END,
                             self.filter.is_tls(),
                         )
                     };
@@ -1371,6 +1388,8 @@ where
                         Poll::Ready(Ok(())) => {}
                         Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                     }
+
+                    self.inner_write_deframer.clear();
 
                     return Poll::Ready(Ok(buf.len()));
                 }

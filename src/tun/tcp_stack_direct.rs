@@ -35,7 +35,7 @@ use smoltcp::{
 };
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
-use super::tcp_conn::{TcpConnection, TcpConnectionControl};
+use super::tcp_conn::{TcpConnection, TcpConnectionControl, TcpSocketState};
 
 pub type PacketBuffer = Vec<u8>;
 
@@ -532,14 +532,30 @@ fn run_direct_stack_thread(
             let control = &socket_info.control;
             let socket = socket_set.get_mut::<TcpSocket>(handle);
 
-            let state = socket.state();
-            if state == TcpState::Closed {
+            // Remove socket only when smoltcp reports Closed state
+            if socket.state() == TcpState::Closed {
                 sockets_to_remove.push(handle);
                 control.set_closed();
                 trace!("socket {:?} closed", handle);
                 continue;
             }
 
+            // Handle SHUT_WR: Close -> Closing transition
+            // Must check send_queue() to ensure smoltcp has transmitted all data
+            if control.send_state() == TcpSocketState::Close
+                && socket.send_queue() == 0
+                && control.send_buffer_empty()
+            {
+                trace!(
+                    "socket {:?}: closing write half, state={:?}",
+                    handle,
+                    socket.state()
+                );
+                socket.close();
+                control.set_send_state(TcpSocketState::Closing);
+            }
+
+            // Receive data from smoltcp into our buffer
             let mut wake_receiver = false;
             while socket.can_recv() && !control.recv_buffer_full() {
                 match socket.recv(|data| {
@@ -551,25 +567,41 @@ fn run_direct_stack_thread(
                     }
                     Ok(_) => break,
                     Err(e) => {
-                        error!("socket recv error: {:?}", e);
+                        error!(
+                            "socket {:?} recv error: {:?}, state={:?}",
+                            handle,
+                            e,
+                            socket.state()
+                        );
                         socket.abort();
-                        control.set_closed();
+                        if control.recv_state() == TcpSocketState::Normal {
+                            control.set_recv_state(TcpSocketState::Closed);
+                        }
                         wake_receiver = true;
                         break;
                     }
                 }
             }
 
-            let state = socket.state();
-            if !socket.may_recv()
-                && !socket.can_recv()
-                && (state == TcpState::CloseWait
-                    || state == TcpState::LastAck
-                    || state == TcpState::Closed
-                    || state == TcpState::TimeWait)
-                && control.set_recv_closed()
+            // Detect recv half close using negative state matching.
+            // If socket can't receive and is not in an active receiving state, mark recv closed.
+            if control.recv_state() == TcpSocketState::Normal
+                && !socket.may_recv()
+                && !matches!(
+                    socket.state(),
+                    TcpState::Listen
+                        | TcpState::SynReceived
+                        | TcpState::Established
+                        | TcpState::FinWait1
+                        | TcpState::FinWait2
+                )
             {
-                trace!("socket {:?} recv closed (state={:?})", handle, state);
+                trace!(
+                    "socket {:?}: recv half closed, state={:?}",
+                    handle,
+                    socket.state()
+                );
+                control.set_recv_state(TcpSocketState::Closed);
                 wake_receiver = true;
             }
 
@@ -577,6 +609,7 @@ fn run_direct_stack_thread(
                 control.wake_receiver();
             }
 
+            // Send data from our buffer to smoltcp
             let mut wake_sender = false;
             while socket.can_send() && !control.send_buffer_empty() {
                 match socket.send(|buf| {
@@ -588,23 +621,20 @@ fn run_direct_stack_thread(
                     }
                     Ok(_) => break,
                     Err(e) => {
-                        error!("socket send error: {:?}", e);
+                        error!(
+                            "socket {:?} send error: {:?}, state={:?}",
+                            handle,
+                            e,
+                            socket.state()
+                        );
                         socket.abort();
-                        control.set_closed();
+                        if control.send_state() == TcpSocketState::Normal {
+                            control.set_send_state(TcpSocketState::Closed);
+                        }
                         wake_sender = true;
                         break;
                     }
                 }
-            }
-
-            if control.should_close_send()
-                && !control.is_send_closed()
-                && control.send_buffer_empty()
-            {
-                trace!("socket {:?}: initiating close", handle);
-                socket.close();
-                control.set_send_closed();
-                wake_sender = true;
             }
 
             if wake_sender {
@@ -678,7 +708,8 @@ fn create_tcp_connection(
     // Matched to netstack-smoltcp settings for optimal performance
     socket.set_congestion_control(CongestionControl::Cubic);
     socket.set_keep_alive(Some(SmolDuration::from_secs(28)));
-    socket.set_timeout(Some(SmolDuration::from_secs(300)));
+    // 7200s matches Linux default (tcp_keepalive_time) and shadowsocks-rust
+    socket.set_timeout(Some(SmolDuration::from_secs(7200)));
     socket.set_nagle_enabled(false);
     socket.set_ack_delay(None);
 

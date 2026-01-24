@@ -1,0 +1,46 @@
+# Example: H2MUX multiplexing client
+#
+# H2MUX multiplexes multiple proxy streams over a single HTTP/2 connection,
+# reducing connection overhead and improving performance for many concurrent streams.
+# Compatible with sing-box h2mux.
+#
+# Server does not require any special configuration - h2mux is auto-detected.
+
+# Local SOCKS5 proxy that routes through a VMess server with h2mux
+- address: 127.0.0.1:1080
+  protocol:
+    type: socks
+    udp_enabled: true
+  rules:
+    - masks: "0.0.0.0/0"
+      action: allow
+      client_chain:
+        address: "example.com:443"
+        protocol:
+          type: tls
+          sni_hostname: "example.com"
+          protocol:
+            type: vmess
+            cipher: aes-128-gcm
+            user_id: b0e80a62-8a51-47f0-91f1-f0f7faf8d9d4
+            h2mux:
+              max_connections: 4     # Max HTTP/2 connections to maintain
+              min_streams: 4         # Min streams before opening new connection
+              max_streams: 0         # Max streams per connection (0 = unlimited)
+              padding: true          # Enable padding for traffic obfuscation
+
+# H2MUX is also available for VLESS and Trojan:
+#
+# VLESS with h2mux:
+#   protocol:
+#     type: vless
+#     user_id: "uuid"
+#     h2mux:
+#       padding: true
+#
+# Trojan with h2mux:
+#   protocol:
+#     type: trojan
+#     password: "secret"
+#     h2mux:
+#       padding: true

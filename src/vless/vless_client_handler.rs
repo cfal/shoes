@@ -44,8 +44,13 @@ impl TcpClientHandler for VlessTcpClientHandler {
         mut client_stream: Box<dyn AsyncStream>,
         remote_location: ResolvedLocation,
     ) -> std::io::Result<TcpClientSetupResult> {
-        write_vless_header(&mut client_stream, &self.user_id, &[], remote_location.location())
-            .await?;
+        write_vless_header(
+            &mut client_stream,
+            &self.user_id,
+            &[],
+            remote_location.location(),
+        )
+        .await?;
         client_stream.flush().await?;
         let client_stream = Box::new(VlessResponseStream::new(client_stream));
 

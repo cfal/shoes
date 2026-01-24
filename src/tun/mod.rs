@@ -199,16 +199,17 @@ async fn handle_tcp_connection(
     proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
 ) -> std::io::Result<()> {
-    let decision = proxy_selector
-        .judge(target.into(), &resolver)
-        .await?;
+    let decision = proxy_selector.judge(target.into(), &resolver).await?;
 
     match decision {
         crate::client_proxy_selector::ConnectDecision::Allow {
             chain_group,
             remote_location,
         } => {
-            debug!("TCP: connecting to {} via chain", remote_location.location());
+            debug!(
+                "TCP: connecting to {} via chain",
+                remote_location.location()
+            );
 
             match chain_group
                 .connect_tcp(remote_location.clone(), &resolver)
@@ -227,11 +228,17 @@ async fn handle_tcp_connection(
                         Ok((client_to_remote, remote_to_client)) => {
                             debug!(
                                 "TCP connection to {} completed: {} bytes sent, {} bytes received",
-                                remote_location.location(), client_to_remote, remote_to_client
+                                remote_location.location(),
+                                client_to_remote,
+                                remote_to_client
                             );
                         }
                         Err(e) => {
-                            debug!("TCP connection to {} error: {}", remote_location.location(), e);
+                            debug!(
+                                "TCP connection to {} error: {}",
+                                remote_location.location(),
+                                e
+                            );
                         }
                     }
 

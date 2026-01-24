@@ -7,8 +7,10 @@ use std::fmt::Debug;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use hickory_resolver::config::{ConnectionConfig, NameServerConfig, ProtocolConfig, ResolverConfig};
 use hickory_resolver::Resolver;
+use hickory_resolver::config::{
+    ConnectionConfig, NameServerConfig, ProtocolConfig, ResolverConfig,
+};
 
 use crate::address::NetLocation;
 use crate::client_proxy_chain::ClientChainGroup;
@@ -154,7 +156,8 @@ impl HickoryResolver {
 
         let mut builder = Resolver::builder_with_config(config, provider);
         builder.options_mut().ip_strategy = ip_strategy.to_hickory();
-        let builder = builder.with_tls_config(crate::rustls_config_util::create_dns_client_config());
+        let builder =
+            builder.with_tls_config(crate::rustls_config_util::create_dns_client_config());
         let resolver = builder
             .build()
             .map_err(|e| std::io::Error::other(format!("failed to build resolver: {e}")))?;
@@ -170,9 +173,8 @@ impl ShoesResolver for HickoryResolver {
     fn resolve_location(
         &self,
         location: &NetLocation,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = std::io::Result<Vec<SocketAddr>>> + Send>,
-    > {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<Vec<SocketAddr>>> + Send>>
+    {
         // Fast path: if already an IP address, return immediately without DNS lookup
         if let Some(socket_addr) = location.to_socket_addr_nonblocking() {
             return Box::pin(std::future::ready(Ok(vec![socket_addr])));

@@ -109,6 +109,12 @@ impl<S: AsyncStream> AsyncReadTargetedMessage for UotV1ServerStream<S> {
     ) -> Poll<std::io::Result<NetLocation>> {
         let this = self.get_mut();
 
+        log::trace!(
+            "UotV1ServerStream::poll_read_targeted_message: is_eof={}, buf_len={}",
+            this.is_eof,
+            this.read_buf.len()
+        );
+
         if this.is_eof {
             return Poll::Ready(Ok(NetLocation::UNSPECIFIED));
         }
@@ -124,9 +130,21 @@ impl<S: AsyncStream> AsyncReadTargetedMessage for UotV1ServerStream<S> {
                     let total_consumed = payload_start + payload_len;
                     this.read_buf.consume(total_consumed);
 
+                    log::trace!(
+                        "UotV1ServerStream: parsed packet to {}, payload_len={}",
+                        location,
+                        payload_len
+                    );
                     return Poll::Ready(Ok(location));
                 }
                 None => {
+                    let data = this.read_buf.as_slice();
+                    let preview: Vec<u8> = data.iter().take(20).copied().collect();
+                    log::trace!(
+                        "UotV1ServerStream: incomplete packet, buf_len={}, first_bytes={:02x?}",
+                        this.read_buf.len(),
+                        preview
+                    );
                     // Need more data - continue below
                 }
             }
@@ -147,6 +165,7 @@ impl<S: AsyncStream> AsyncReadTargetedMessage for UotV1ServerStream<S> {
             match Pin::new(&mut this.stream).poll_read(cx, &mut read_buf) {
                 Poll::Ready(Ok(())) => {
                     let bytes_read = read_buf.filled().len();
+                    log::trace!("UotV1ServerStream: read {} bytes from stream", bytes_read);
                     if bytes_read == 0 {
                         this.is_eof = true;
                         return Poll::Ready(Ok(NetLocation::UNSPECIFIED));
@@ -154,8 +173,14 @@ impl<S: AsyncStream> AsyncReadTargetedMessage for UotV1ServerStream<S> {
                     this.read_buf.advance_write(bytes_read);
                     // Loop to try parsing again
                 }
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(e)) => {
+                    log::trace!("UotV1ServerStream: read error: {}", e);
+                    return Poll::Ready(Err(e));
+                }
+                Poll::Pending => {
+                    log::trace!("UotV1ServerStream: poll_read pending");
+                    return Poll::Pending;
+                }
             }
         }
     }

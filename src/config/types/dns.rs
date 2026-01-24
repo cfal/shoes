@@ -7,6 +7,11 @@ use crate::config::types::selection::ConfigSelection;
 use crate::dns::IpStrategy;
 use crate::option_util::NoneOrSome;
 
+/// Default timeout for DNS resolution in seconds.
+fn default_timeout_secs() -> u32 {
+    5
+}
+
 /// A DNS server specification in config.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
@@ -29,6 +34,9 @@ pub enum DnsServerSpec {
         /// IP lookup strategy for DNS resolution. Defaults to ipv4_then_ipv6.
         #[serde(default)]
         ip_strategy: IpStrategy,
+        /// Timeout for DNS resolution in seconds. Defaults to 10. Set to 0 to disable.
+        #[serde(default = "default_timeout_secs")]
+        timeout_secs: u32,
     },
 }
 
@@ -96,6 +104,16 @@ impl DnsServerSpec {
             IpStrategy::default()
         }
     }
+
+    /// Get the timeout in seconds (defaults to 10 for Simple variant).
+    /// Returns 0 if timeout is disabled.
+    pub fn timeout_secs(&self) -> u32 {
+        if let Self::WithOptions { timeout_secs, .. } = self {
+            *timeout_secs
+        } else {
+            default_timeout_secs()
+        }
+    }
 }
 
 /// DNS group configuration.
@@ -146,6 +164,8 @@ pub struct ExpandedDnsSpec {
     /// Bootstrap resolver URL or group name. Groups are resolved at runtime.
     pub bootstrap_url: Option<String>,
     pub ip_strategy: IpStrategy,
+    /// Timeout for DNS resolution in seconds. 0 means no timeout.
+    pub timeout_secs: u32,
 }
 
 /// A DNS group with all specs expanded.
@@ -312,6 +332,7 @@ servers: my-dns-group
             bootstrap_url: None,
             server_name: None,
             ip_strategy: IpStrategy::default(),
+            timeout_secs: default_timeout_secs(),
         };
         assert!(!spec.as_group_ref().is_some());
         assert!(spec.as_group_ref().is_none());

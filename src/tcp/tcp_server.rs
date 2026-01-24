@@ -221,7 +221,9 @@ where
             need_initial_flush: server_need_initial_flush,
             proxy_selector,
         } => {
-            let action = proxy_selector.judge(remote_location.into(), &resolver).await?;
+            let action = proxy_selector
+                .judge(remote_location.into(), &resolver)
+                .await?;
             match action {
                 ConnectDecision::Allow {
                     chain_group,
@@ -345,12 +347,10 @@ pub async fn start_servers(
     resolver: Arc<dyn Resolver>,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
     match config {
-        Config::TunServer(tun_config) => {
-            start_tun_server(tun_config, resolver).await.map(|t| vec![t])
-        }
-        Config::Server(server_config) => {
-            start_tcp_or_quic_servers(server_config, resolver).await
-        }
+        Config::TunServer(tun_config) => start_tun_server(tun_config, resolver)
+            .await
+            .map(|t| vec![t]),
+        Config::Server(server_config) => start_tcp_or_quic_servers(server_config, resolver).await,
         _ => unreachable!("create_server_configs only returns Server and TunServer"),
     }
 }
@@ -417,8 +417,10 @@ async fn start_tcp_servers(
 
     let tcp_config = tcp_settings.unwrap_or_else(TcpConfig::default);
 
-    let client_proxy_selector =
-        Arc::new(create_tcp_client_proxy_selector(rules.clone(), resolver.clone()));
+    let client_proxy_selector = Arc::new(create_tcp_client_proxy_selector(
+        rules.clone(),
+        resolver.clone(),
+    ));
 
     // Extract bind_ip from bind_location for handlers that need it (e.g., SOCKS5 UDP ASSOCIATE)
     let bind_ip = match &bind_location {

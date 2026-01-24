@@ -1,35 +1,42 @@
 //! SagerNet UDP-over-TCP (UoT) protocol implementation
 //!
 //! This module implements the sing-box UoT protocol for tunneling UDP over TCP.
-//! It supports both V1 and V2 formats.
+//! It supports both V1 (legacy) and V2 formats.
 //!
-//! ## Magic Addresses
-//! - V1: `sp.udp-over-tcp.arpa` - Multi-destination mode, each packet has full address
-//! - V2: `sp.v2.udp-over-tcp.arpa` - Optional connect mode for single destination
+//! ## Protocol Versions
 //!
-//! ## V1 Packet Format
-//! ```text
-//! | ATYP | address  | port  | length | data     |
-//! | u8   | variable | u16be | u16be  | variable |
-//! ```
+//! ### UoT V1 (Legacy)
+//! - Magic address: `sp.udp-over-tcp.arpa`
+//! - Mode: Multi-destination (each packet includes its target address)
+//! - Packet format: `[AddrParser address][length:u16be][data]`
 //!
-//! ## V2 Request Format
-//! ```text
-//! | isConnect | ATYP | address  | port  |
-//! | u8        | u8   | variable | u16be |
-//! ```
+//! ### UoT V2
+//! - Magic address: `sp.v2.udp-over-tcp.arpa`
+//! - Request header: `[isConnect:u8][SOCKS5 address]`
+//! - Two modes based on `isConnect` byte:
 //!
-//! If isConnect=1, subsequent packets are length-prefixed only (V2 connect mode).
-//! If isConnect=0, subsequent packets use V1 format (multi-destination).
+//! #### V2 Connect Mode (isConnect=1)
+//! - Single destination specified in request header
+//! - Subsequent packets: `[length:u16be][data]` (no address per packet)
+//! - Uses VlessMessageStream format
 //!
-//! **Important:** The V2 Request header uses SOCKS5-style ATYP (0x01/0x03/0x04),
-//! NOT the AddrParser format below. Protocol handlers must use SOCKS5 address
-//! parsing for the V2 Request destination.
+//! #### V2 Non-Connect Mode (isConnect=0)
+//! - Multi-destination mode (same as V1)
+//! - Subsequent packets: `[AddrParser address][length:u16be][data]`
 //!
-//! ## ATYP Values (AddrParser format for packet payloads)
-//! - 0x00: IPv4 Address (4 bytes)
-//! - 0x01: IPv6 Address (16 bytes)
-//! - 0x02: Domain Name (1 byte length + domain)
+//! ## Address Formats (IMPORTANT!)
+//!
+//! Two different address formats are used:
+//!
+//! ### SOCKS5 Format (used in V2 request header)
+//! - 0x01: IPv4 (4 bytes)
+//! - 0x03: Domain (1 byte length + domain)
+//! - 0x04: IPv6 (16 bytes)
+//!
+//! ### AddrParser Format (used in V1/V2 packet payloads)
+//! - 0x00: IPv4 (4 bytes)
+//! - 0x01: IPv6 (16 bytes)
+//! - 0x02: Domain (1 byte length + domain)
 
 pub mod uot_common;
 mod uot_v1_server_stream;

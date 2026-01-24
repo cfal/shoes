@@ -6,10 +6,11 @@ use subtle::ConstantTimeEq;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
-use crate::address::NetLocation;
+use crate::address::{Address, NetLocation};
 use crate::async_stream::AsyncStream;
 use crate::client_proxy_selector::ClientProxySelector;
 use crate::crypto::CryptoTlsStream;
+use crate::h2mux::{MUX_DESTINATION_HOST, MUX_DESTINATION_PORT, handle_h2mux_session};
 use crate::resolver::Resolver;
 use crate::stream_reader::StreamReader;
 use crate::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult};
@@ -183,6 +184,40 @@ impl TcpServerHandler for VlessTcpServerHandler {
                 let remote_location =
                     parse_remote_location_from_reader(&mut stream_reader, &mut server_stream)
                         .await?;
+
+                // Check for h2mux magic destination
+                if let Address::Hostname(host) = remote_location.address() {
+                    if host == MUX_DESTINATION_HOST
+                        && remote_location.port() == MUX_DESTINATION_PORT
+                    {
+                        // Send VLESS success response before spawning h2mux session
+                        write_all(&mut server_stream, SERVER_RESPONSE_HEADER).await?;
+
+                        let proxy_selector = self.proxy_selector.clone();
+                        let resolver = self.resolver.clone();
+                        let udp_enabled = self.udp_enabled;
+
+                        // Pass any unparsed data for the h2mux session
+                        let initial_data = stream_reader.unparsed_data_owned();
+
+                        tokio::spawn(async move {
+                            if let Err(e) = handle_h2mux_session(
+                                server_stream,
+                                initial_data,
+                                udp_enabled,
+                                proxy_selector,
+                                resolver,
+                            )
+                            .await
+                            {
+                                debug!("H2MUX session ended: {}", e);
+                            }
+                        });
+
+                        return Ok(TcpServerSetupResult::AlreadyHandled);
+                    }
+                }
+
                 let unparsed_data = stream_reader.unparsed_data();
 
                 Ok(TcpServerSetupResult::TcpForward {

@@ -17,6 +17,9 @@ use crate::client_proxy_chain::ClientChainGroup;
 use crate::resolver::Resolver;
 use crate::socket_util::new_udp_socket;
 
+/// Default connection timeout for DNS server connections. Matches hickory-dns CONNECT_TIMEOUT.
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// RuntimeProvider that routes TCP connections through a proxy chain.
 /// For direct-only chains, UDP and QUIC use the configured bind_interface.
 #[derive(Clone)]
@@ -77,10 +80,11 @@ impl RuntimeProvider for ProxyRuntimeProvider {
         &self,
         server_addr: SocketAddr,
         _bind_addr: Option<SocketAddr>,
-        _timeout: Option<Duration>,
+        timeout: Option<Duration>,
     ) -> Pin<Box<dyn Send + Future<Output = Result<Self::Tcp, io::Error>>>> {
         let chain_group = self.chain_group.clone();
         let resolver = self.bootstrap_resolver.clone();
+        let timeout = timeout.unwrap_or(DEFAULT_CONNECT_TIMEOUT);
 
         Box::pin(async move {
             let address = match server_addr.ip() {
@@ -89,8 +93,15 @@ impl RuntimeProvider for ProxyRuntimeProvider {
             };
             let target = NetLocation::new(address, server_addr.port());
 
-            let result = chain_group.connect_tcp(target.into(), &resolver).await?;
-            Ok(AsyncIoTokioAsStd(result.client_stream))
+            let connect_future = chain_group.connect_tcp(target.into(), &resolver);
+            match tokio::time::timeout(timeout, connect_future).await {
+                Ok(Ok(result)) => Ok(AsyncIoTokioAsStd(result.client_stream)),
+                Ok(Err(e)) => Err(e),
+                Err(_) => Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("DNS server connection to {server_addr} timed out after {timeout:?}"),
+                )),
+            }
         })
     }
 
@@ -193,7 +204,11 @@ mod tests {
 
         // UDP DNS works directly (not through proxy)
         let result = provider.bind_udp(local_addr, server_addr).await;
-        assert!(result.is_ok(), "bind_udp should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "bind_udp should succeed: {:?}",
+            result.err()
+        );
     }
 
     #[tokio::test]
@@ -226,5 +241,76 @@ mod tests {
         let chain_group = Arc::new(build_direct_chain_group(resolver.clone()));
         let provider = ProxyRuntimeProvider::with_bootstrap(chain_group, resolver);
         assert!(provider.quic_binder().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_connect_tcp_respects_timeout() {
+        let resolver = Arc::new(NativeResolver::new());
+        let chain_group = Arc::new(build_direct_chain_group(resolver.clone()));
+        let provider = ProxyRuntimeProvider::with_bootstrap(chain_group, resolver);
+
+        // Use an address that will hang (black hole) rather than refuse immediately.
+        // 10.255.255.1 is a non-routable address that should cause the connection to hang.
+        let server_addr: SocketAddr = "10.255.255.1:53".parse().unwrap();
+
+        let start = std::time::Instant::now();
+        let result = provider
+            .connect_tcp(server_addr, None, Some(Duration::from_millis(100)))
+            .await;
+        let elapsed = start.elapsed();
+
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("connection should fail"),
+        };
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::TimedOut,
+            "should be timeout error"
+        );
+
+        // Verify timeout was respected (should complete in ~100ms, not 5+ seconds)
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "timeout should fire quickly, but took {:?}",
+            elapsed
+        );
+    }
+
+    #[tokio::test]
+    async fn test_connect_tcp_uses_default_timeout_when_none() {
+        let resolver = Arc::new(NativeResolver::new());
+        let chain_group = Arc::new(build_direct_chain_group(resolver.clone()));
+        let provider = ProxyRuntimeProvider::with_bootstrap(chain_group, resolver);
+
+        // Use a black hole address
+        let server_addr: SocketAddr = "10.255.255.1:53".parse().unwrap();
+
+        let start = std::time::Instant::now();
+        let result = provider.connect_tcp(server_addr, None, None).await;
+        let elapsed = start.elapsed();
+
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("connection should fail"),
+        };
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::TimedOut,
+            "should be timeout error"
+        );
+
+        // Default timeout is 5 seconds; verify it's bounded (less than 10 seconds)
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "default timeout should apply, but took {:?}",
+            elapsed
+        );
+        // Also verify it waited at least close to 5 seconds (with some tolerance)
+        assert!(
+            elapsed >= Duration::from_secs(4),
+            "should wait for default timeout (~5s), but only waited {:?}",
+            elapsed
+        );
     }
 }

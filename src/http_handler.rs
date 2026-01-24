@@ -404,18 +404,10 @@ impl TcpClientHandler for HttpTcpClientHandler {
                 )
             }
             Address::Ipv4(addr) => {
-                format!(
-                    "CONNECT {}:{} HTTP/1.1\r\n",
-                    addr,
-                    connect_location.port()
-                )
+                format!("CONNECT {}:{} HTTP/1.1\r\n", addr, connect_location.port())
             }
             Address::Hostname(d) => {
-                format!(
-                    "CONNECT {}:{} HTTP/1.1\r\n",
-                    d,
-                    connect_location.port()
-                )
+                format!("CONNECT {}:{} HTTP/1.1\r\n", d, connect_location.port())
             }
         };
 

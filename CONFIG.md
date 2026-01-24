@@ -410,6 +410,11 @@ protocol:
   type: vmess
   cipher: string
   user_id: string
+  h2mux:                         # Optional h2mux multiplexing (see below)
+    max_connections: 4
+    min_streams: 4
+    max_streams: 0
+    padding: false
 ```
 
 **Note:** VMess AEAD mode is always enabled. The legacy `aead` field is deprecated.
@@ -419,6 +424,11 @@ protocol:
 protocol:
   type: vless
   user_id: string
+  h2mux:                         # Optional h2mux multiplexing (see below)
+    max_connections: 4
+    min_streams: 4
+    max_streams: 0
+    padding: false
 ```
 
 ### Trojan
@@ -429,7 +439,26 @@ protocol:
   shadowsocks:                 # Optional
     cipher: string
     password: string
+  h2mux:                         # Optional h2mux multiplexing (see below)
+    max_connections: 4
+    min_streams: 4
+    max_streams: 0
+    padding: false
 ```
+
+### H2MUX Multiplexing
+
+H2MUX multiplexes multiple proxy streams over a single HTTP/2 connection, reducing connection overhead. Compatible with sing-box. Available for VMess, VLESS, and Trojan client protocols.
+
+```yaml
+h2mux:
+  max_connections: 4           # Maximum connections to maintain (default: 4)
+  min_streams: 4               # Min streams before opening new connection (default: 4)
+  max_streams: 0               # Max streams per connection, 0 = unlimited (default: 0)
+  padding: false               # Enable padding for traffic obfuscation (default: false)
+```
+
+**Server support:** H2MUX is auto-detected on servers. No configuration needed.
 
 ### TLS Client
 ```yaml

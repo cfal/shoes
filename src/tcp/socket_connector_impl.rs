@@ -18,7 +18,7 @@ use crate::address::{NetLocation, ResolvedLocation};
 use crate::async_stream::AsyncStream;
 use crate::config::{ClientConfig, ClientQuicConfig, Transport};
 use crate::quic_stream::QuicStream;
-use crate::resolver::{resolve_location, resolve_single_address, Resolver};
+use crate::resolver::{Resolver, resolve_location, resolve_single_address};
 use crate::rustls_config_util::create_client_config;
 use crate::socket_util::{new_tcp_socket, new_udp_socket, set_tcp_keepalive};
 use crate::thread_util::get_num_threads;

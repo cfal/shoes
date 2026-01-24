@@ -385,9 +385,7 @@ async fn create_connection(
     proxy_selector: &Arc<ClientProxySelector>,
     resolver: &Arc<dyn Resolver>,
 ) -> io::Result<Box<dyn AsyncMessageStream>> {
-    let decision = proxy_selector
-        .judge(dest.into(), resolver)
-        .await?;
+    let decision = proxy_selector.judge(dest.into(), resolver).await?;
 
     match decision {
         ConnectDecision::Allow {

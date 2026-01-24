@@ -207,7 +207,9 @@ async fn process_streams(
             need_initial_flush: server_need_initial_flush,
             proxy_selector,
         } => {
-            let action = proxy_selector.judge(remote_location.into(), &resolver).await?;
+            let action = proxy_selector
+                .judge(remote_location.into(), &resolver)
+                .await?;
             match action {
                 ConnectDecision::Allow {
                     chain_group,
@@ -322,8 +324,10 @@ pub async fn start_quic_servers(
 
     let quic_server_config = Arc::new(quic_server_config);
 
-    let client_proxy_selector =
-        Arc::new(create_tcp_client_proxy_selector(rules.clone(), resolver.clone()));
+    let client_proxy_selector = Arc::new(create_tcp_client_proxy_selector(
+        rules.clone(),
+        resolver.clone(),
+    ));
 
     let mut handles = vec![];
 

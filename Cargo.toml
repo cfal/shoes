@@ -1,6 +1,6 @@
 [package]
 name = "shoes"
-version = "0.2.5"
+version = "0.2.7"
 edition = "2024"
 license = "MIT"
 description = "A multi-protocol proxy server."
@@ -93,13 +93,13 @@ tokio-rustls = "*"
 
 # jemalloc for better memory performance (not supported on Windows MSVC or iOS)
 [target.'cfg(not(any(target_env = "msvc", target_os = "ios")))'.dependencies]
-tikv-jemallocator = "0.6"
+tikv-jemallocator = "*"
 
 [target.'cfg(target_os = "android")'.dependencies]
-android_logger = "0.14"
-chrono = "0.4"
-jni = "0.21"
-ndk-sys = "0.6"
+android_logger = "*"
+chrono = "*"
+jni = "*"
+ndk-sys = "*"
 
 [profile.release]
 opt-level = 3

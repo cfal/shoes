@@ -14,7 +14,7 @@ use crate::resolver::Resolver;
 use crate::shadow_tls::{ParsedClientHello, parse_server_hello};
 use crate::tcp::tcp_handler::{TcpClientSetupResult, TcpServerSetupResult};
 use crate::tls_server_handler::InnerProtocol;
-use crate::util::allocate_vec;
+use crate::util::{allocate_vec, write_all};
 use crate::vless::tls_deframer::TlsDeframer;
 
 use super::{RealityServerConfig, RealityServerConnection};
@@ -90,12 +90,16 @@ pub async fn setup_reality_server_stream(
         client_hello_frame.len()
     );
 
-    dest_stream.write_all(client_hello_frame).await?;
+    write_all(&mut dest_stream, client_hello_frame).await?;
     dest_stream.flush().await?;
 
     if !parsed_client_hello.supports_tls13 {
         log::warn!("REALITY: Client does not support TLS 1.3, falling back to dest");
-        return forward_to_dest_and_copy(server_stream, dest_stream, vec![], Bytes::new()).await;
+        start_forward_to_dest(server_stream, dest_stream, vec![], Bytes::new());
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "REALITY: Client does not support TLS 1.3, forwarding to dest",
+        ));
     }
 
     let reality_config = RealityServerConfig {
@@ -158,19 +162,32 @@ pub async fn setup_reality_server_stream(
                             "REALITY: Dest {} is TLS 1.2, falling back to transparent forward",
                             target.dest
                         );
-                        return forward_to_dest_and_copy(
+                        start_forward_to_dest(
                             server_stream,
                             dest_stream,
-                            dest_records,
+                            new_records,
                             deframer.into_remaining_data(),
-                        )
-                        .await;
+                        );
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::Unsupported,
+                            format!(
+                                "REALITY: Dest {} does not support TLS 1.3, forwarding to dest",
+                                target.dest
+                            ),
+                        ));
                     }
                     log::debug!("REALITY: Dest confirmed TLS 1.3");
                 }
                 Err(e) => {
+                    log::error!("REALITY: Failed to parse dest ServerHello: {}", e);
+                    start_forward_to_dest(
+                        server_stream,
+                        dest_stream,
+                        new_records,
+                        deframer.into_remaining_data(),
+                    );
                     return Err(std::io::Error::other(format!(
-                        "REALITY: Failed to parse dest ServerHello: {}",
+                        "REALITY: Failed to parse dest ServerHello: {}, forwarding to dest",
                         e
                     )));
                 }
@@ -212,8 +229,11 @@ pub async fn setup_reality_server_stream(
             "REALITY: Dest handshake failed (got {} records), falling back to transparent forward",
             dest_records.len()
         );
-        return forward_to_dest_and_copy(server_stream, dest_stream, dest_records, remaining_data)
-            .await;
+        start_forward_to_dest(server_stream, dest_stream, dest_records, remaining_data);
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "REALITY: Dest TLS handshake incomplete, forwarding to dest",
+        ));
     }
 
     log::debug!(
@@ -230,13 +250,14 @@ pub async fn setup_reality_server_stream(
                 "REALITY: Auth failed ({}), forwarding to dest transparently",
                 e
             );
-            return forward_to_dest_and_copy(
-                server_stream,
-                dest_stream,
-                dest_records,
-                remaining_data,
-            )
-            .await;
+            start_forward_to_dest(server_stream, dest_stream, dest_records, remaining_data);
+
+            // Return auth error with forwarding note so clients see a meaningful error
+            // instead of connecting to the camouflage site and getting "reality verification failed".
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("REALITY: Auth failed ({}), forwarding to dest", e),
+            ));
         }
 
         Err(e) => {
@@ -283,51 +304,57 @@ pub async fn setup_reality_server_stream(
     }
 }
 
-/// Forward dest records to client and spawn bidirectional copy
+/// Forward dest records to client and spawn bidirectional copy.
 ///
 /// Used when Reality auth fails or client doesn't support TLS 1.3.
 /// Forwards any already-read dest records to the client, then spawns
 /// bidirectional copy for the rest of the connection.
-async fn forward_to_dest_and_copy(
+fn start_forward_to_dest(
     mut client_stream: Box<dyn AsyncStream>,
     mut dest_stream: Box<dyn AsyncStream>,
     dest_records: Vec<Bytes>,
     remaining_data: Bytes,
-) -> std::io::Result<TcpServerSetupResult> {
-    for record in &dest_records {
-        client_stream.write_all(record).await?;
-    }
-
-    if !remaining_data.is_empty() {
-        client_stream.write_all(&remaining_data).await?;
-    }
-
-    client_stream.flush().await?;
-
-    log::debug!(
-        "REALITY FALLBACK: Forwarded {} records + {} remaining bytes, spawning bidirectional copy",
-        dest_records.len(),
-        remaining_data.len()
-    );
-
+) {
     tokio::spawn(async move {
+        for record in &dest_records {
+            if let Err(e) = write_all(&mut client_stream, record).await {
+                log::debug!("REALITY FALLBACK: Error forwarding record: {}", e);
+                let _ = futures::join!(client_stream.shutdown(), dest_stream.shutdown());
+                return;
+            }
+            if let Err(e) = client_stream.flush().await {
+                log::debug!("REALITY FALLBACK: Error flushing record: {}", e);
+                let _ = futures::join!(client_stream.shutdown(), dest_stream.shutdown());
+                return;
+            }
+        }
+
+        if !remaining_data.is_empty() {
+            if let Err(e) = write_all(&mut client_stream, &remaining_data).await {
+                log::debug!("REALITY FALLBACK: Error forwarding remaining data: {}", e);
+                let _ = futures::join!(client_stream.shutdown(), dest_stream.shutdown());
+                return;
+            }
+        }
+
+        log::debug!(
+            "REALITY FALLBACK: Forwarded {} records + {} remaining bytes, starting bidirectional copy",
+            dest_records.len(),
+            remaining_data.len()
+        );
+
         let result = crate::copy_bidirectional::copy_bidirectional(
             &mut *client_stream,
             &mut dest_stream,
-            false, // client doesn't need initial flush
-            false, // dest doesn't need initial flush
+            !remaining_data.is_empty(), // flush the client if we wrote remaining data
+            false,
         )
         .await;
 
-        let _ = client_stream.shutdown().await;
-        let _ = dest_stream.shutdown().await;
+        let _ = futures::join!(client_stream.shutdown(), dest_stream.shutdown());
 
         if let Err(e) = result {
-            log::debug!("REALITY FALLBACK: Connection ended: {}", e);
-        } else {
-            log::debug!("REALITY FALLBACK: Connection completed");
+            log::debug!("REALITY FALLBACK: Connection ended with error: {}", e);
         }
     });
-
-    Ok(TcpServerSetupResult::AlreadyHandled)
 }

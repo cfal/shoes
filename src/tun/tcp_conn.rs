@@ -18,6 +18,21 @@ use parking_lot::Mutex;
 use smoltcp::storage::RingBuffer;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
+/// TCP socket state machine.
+///
+/// Follows shadowsocks-rust patterns for proper connection lifecycle management.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TcpSocketState {
+    /// Active connection
+    Normal,
+    /// Close requested by application
+    Close,
+    /// socket.close() called, waiting for FIN-ACK
+    Closing,
+    /// Fully closed
+    Closed,
+}
+
 /// Internal state for TCP connection control.
 ///
 /// Shared between the async connection handle and the stack thread.
@@ -34,12 +49,10 @@ struct TcpConnectionInner {
     recv_buffer: RingBuffer<'static, u8>,
     /// Waker to notify when recv buffer has data
     recv_waker: Option<Waker>,
-    /// Whether receive side is closed
-    recv_closed: bool,
-    /// Whether send side is closed
-    send_closed: bool,
-    /// Whether close has been requested
-    close_requested: bool,
+    /// Receive side state
+    recv_state: TcpSocketState,
+    /// Send side state
+    send_state: TcpSocketState,
 }
 
 impl TcpConnectionControl {
@@ -51,9 +64,8 @@ impl TcpConnectionControl {
                 send_waker: None,
                 recv_buffer: RingBuffer::new(vec![0u8; recv_buffer_size]),
                 recv_waker: None,
-                recv_closed: false,
-                send_closed: false,
-                close_requested: false,
+                recv_state: TcpSocketState::Normal,
+                send_state: TcpSocketState::Normal,
             }),
         }
     }
@@ -96,11 +108,43 @@ impl TcpConnectionControl {
         }
     }
 
-    /// Mark connection as fully closed.
+    /// Get current send state.
+    pub fn send_state(&self) -> TcpSocketState {
+        self.inner.lock().send_state
+    }
+
+    /// Get current recv state.
+    pub fn recv_state(&self) -> TcpSocketState {
+        self.inner.lock().recv_state
+    }
+
+    /// Set send state. Returns true if state changed.
+    pub fn set_send_state(&self, state: TcpSocketState) -> bool {
+        let mut inner = self.inner.lock();
+        if inner.send_state != state {
+            inner.send_state = state;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Set recv state. Returns true if state changed.
+    pub fn set_recv_state(&self, state: TcpSocketState) -> bool {
+        let mut inner = self.inner.lock();
+        if inner.recv_state != state {
+            inner.recv_state = state;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Mark connection as fully closed (both directions).
     pub fn set_closed(&self) {
         let mut inner = self.inner.lock();
-        inner.recv_closed = true;
-        inner.send_closed = true;
+        inner.recv_state = TcpSocketState::Closed;
+        inner.send_state = TcpSocketState::Closed;
 
         let recv_waker = inner.recv_waker.take();
         let send_waker = inner.send_waker.take();
@@ -112,32 +156,6 @@ impl TcpConnectionControl {
         if let Some(w) = send_waker {
             w.wake();
         }
-    }
-
-    /// Mark receive side as closed. Returns true if state changed.
-    pub fn set_recv_closed(&self) -> bool {
-        let mut inner = self.inner.lock();
-        if !inner.recv_closed {
-            inner.recv_closed = true;
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Mark send side as closed.
-    pub fn set_send_closed(&self) {
-        self.inner.lock().send_closed = true;
-    }
-
-    /// Check if close has been requested.
-    pub fn should_close_send(&self) -> bool {
-        self.inner.lock().close_requested
-    }
-
-    /// Check if send side is already closed.
-    pub fn is_send_closed(&self) -> bool {
-        self.inner.lock().send_closed
     }
 }
 
@@ -163,13 +181,12 @@ impl TcpConnection {
 
 impl Drop for TcpConnection {
     fn drop(&mut self) {
-        // Request close when connection is dropped
         let mut inner = self.control.inner.lock();
-        if !inner.send_closed {
-            inner.close_requested = true;
+        if matches!(inner.recv_state, TcpSocketState::Normal) {
+            inner.recv_state = TcpSocketState::Close;
         }
-        if !inner.recv_closed {
-            inner.recv_closed = true;
+        if matches!(inner.send_state, TcpSocketState::Normal) {
+            inner.send_state = TcpSocketState::Close;
         }
         drop(inner);
         self.notify();
@@ -184,12 +201,12 @@ impl AsyncRead for TcpConnection {
     ) -> Poll<io::Result<()>> {
         let mut inner = self.control.inner.lock();
 
+        // Try to read from buffer first
         if !inner.recv_buffer.is_empty() {
             let unfilled = buf.initialize_unfilled();
             let n = inner.recv_buffer.dequeue_slice(unfilled);
             buf.advance(n);
 
-            // Notify stack that we freed buffer space (can receive more data)
             if n > 0 {
                 drop(inner);
                 self.notify();
@@ -197,18 +214,18 @@ impl AsyncRead for TcpConnection {
             return Poll::Ready(Ok(()));
         }
 
-        if inner.recv_closed {
-            return Poll::Ready(Ok(())); // EOF
+        // If recv is closed, return EOF
+        if matches!(inner.recv_state, TcpSocketState::Closed) {
+            return Poll::Ready(Ok(()));
         }
 
         // Register waker and wait
-        let new_waker = cx.waker();
         if let Some(ref old_waker) = inner.recv_waker {
-            if !old_waker.will_wake(new_waker) {
-                inner.recv_waker = Some(new_waker.clone());
+            if !old_waker.will_wake(cx.waker()) {
+                inner.recv_waker = Some(cx.waker().clone());
             }
         } else {
-            inner.recv_waker = Some(new_waker.clone());
+            inner.recv_waker = Some(cx.waker().clone());
         }
 
         Poll::Pending
@@ -223,14 +240,13 @@ impl AsyncWrite for TcpConnection {
     ) -> Poll<io::Result<usize>> {
         let mut inner = self.control.inner.lock();
 
-        if inner.send_closed || inner.close_requested {
+        // If send state is not Normal, connection is closing/closed
+        if !matches!(inner.send_state, TcpSocketState::Normal) {
             return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
         }
 
         if !inner.send_buffer.is_full() {
             let n = inner.send_buffer.enqueue_slice(buf);
-
-            // Notify stack that we have data to send
             if n > 0 {
                 drop(inner);
                 self.notify();
@@ -238,44 +254,42 @@ impl AsyncWrite for TcpConnection {
             return Poll::Ready(Ok(n));
         }
 
-        // Buffer full - register waker and wait
-        let new_waker = cx.waker();
+        // Buffer full - register waker
         if let Some(ref old_waker) = inner.send_waker {
-            if !old_waker.will_wake(new_waker) {
-                inner.send_waker = Some(new_waker.clone());
+            if !old_waker.will_wake(cx.waker()) {
+                inner.send_waker = Some(cx.waker().clone());
             }
         } else {
-            inner.send_waker = Some(new_waker.clone());
+            inner.send_waker = Some(cx.waker().clone());
         }
 
         Poll::Pending
     }
 
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        // Don't notify - stack polls regularly
         Poll::Ready(Ok(()))
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let mut inner = self.control.inner.lock();
 
-        if inner.send_closed {
+        // Already fully closed
+        if matches!(inner.send_state, TcpSocketState::Closed) {
             return Poll::Ready(Ok(()));
         }
 
-        inner.close_requested = true;
+        // Request close (Normal -> Close)
+        if matches!(inner.send_state, TcpSocketState::Normal) {
+            inner.send_state = TcpSocketState::Close;
+        }
 
-        // We must wait for the stack thread to actually call socket.close()
-        // and set send_closed=true. This ensures the FIN packet is sent.
-
-        // Register waker to be notified when send_closed becomes true
-        let new_waker = cx.waker();
+        // Register waker to be notified when Closed
         if let Some(ref old_waker) = inner.send_waker {
-            if !old_waker.will_wake(new_waker) {
-                inner.send_waker = Some(new_waker.clone());
+            if !old_waker.will_wake(cx.waker()) {
+                inner.send_waker = Some(cx.waker().clone());
             }
         } else {
-            inner.send_waker = Some(new_waker.clone());
+            inner.send_waker = Some(cx.waker().clone());
         }
 
         drop(inner);
@@ -302,5 +316,26 @@ mod tests {
         let n = control.inner.lock().recv_buffer.dequeue_slice(&mut buf);
         assert_eq!(n, data.len());
         assert_eq!(&buf[..n], data);
+    }
+
+    #[test]
+    fn test_state_transitions() {
+        let control = TcpConnectionControl::new(1024, 1024);
+
+        assert_eq!(control.send_state(), TcpSocketState::Normal);
+        assert_eq!(control.recv_state(), TcpSocketState::Normal);
+
+        assert!(control.set_send_state(TcpSocketState::Close));
+        assert_eq!(control.send_state(), TcpSocketState::Close);
+
+        // Setting same state returns false
+        assert!(!control.set_send_state(TcpSocketState::Close));
+
+        assert!(control.set_send_state(TcpSocketState::Closing));
+        assert_eq!(control.send_state(), TcpSocketState::Closing);
+
+        control.set_closed();
+        assert_eq!(control.send_state(), TcpSocketState::Closed);
+        assert_eq!(control.recv_state(), TcpSocketState::Closed);
     }
 }

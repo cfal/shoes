@@ -594,6 +594,7 @@ fn expand_dns_specs(
             client_chains: expanded_chains,
             bootstrap_url: spec.bootstrap_url().map(String::from),
             ip_strategy: spec.ip_strategy(),
+            timeout_secs: spec.timeout_secs(),
         });
     }
 
@@ -2076,6 +2077,7 @@ mod tests {
                 bootstrap_url: None,
                 server_name: None,
                 ip_strategy: IpStrategy::default(),
+                timeout_secs: 10,
             }),
         })];
 
@@ -2114,6 +2116,7 @@ mod tests {
                     bootstrap_url: None,
                     server_name: None,
                     ip_strategy: IpStrategy::default(),
+                    timeout_secs: 10,
                 }),
             }),
         ];
@@ -2147,6 +2150,7 @@ mod tests {
                     bootstrap_url: None,
                     server_name: None,
                     ip_strategy: IpStrategy::default(),
+                    timeout_secs: 10,
                 }),
             }),
         ];
@@ -2180,6 +2184,7 @@ mod tests {
                     bootstrap_url: None,
                     server_name: None,
                     ip_strategy: IpStrategy::default(),
+                    timeout_secs: 10,
                 }),
             }),
         ];
@@ -2213,6 +2218,7 @@ mod tests {
                     bootstrap_url: None,
                     server_name: None,
                     ip_strategy: IpStrategy::default(),
+                    timeout_secs: 10,
                 }),
             }),
         ];
@@ -2239,6 +2245,7 @@ mod tests {
                     bootstrap_url: None,
                     server_name: None,
                     ip_strategy: IpStrategy::default(),
+                    timeout_secs: 10,
                 }),
             }),
         ];
@@ -2266,6 +2273,7 @@ mod tests {
                     bootstrap_url: None,
                     server_name: None,
                     ip_strategy: IpStrategy::default(),
+                    timeout_secs: 10,
                 }),
             }),
         ];
@@ -2293,6 +2301,7 @@ mod tests {
                     bootstrap_url: None,
                     server_name: None,
                     ip_strategy: IpStrategy::default(),
+                    timeout_secs: 10,
                 }),
             }),
         ];
@@ -2424,6 +2433,7 @@ mod tests {
                         bootstrap_url: Some("bootstrap-dns".to_string()), // Bootstrap reference (not used since URL is IP)
                         server_name: Some("dns.google".to_string()),      // SNI override
                         ip_strategy: IpStrategy::default(),
+                        timeout_secs: 10,
                     },
                 ]),
             }),

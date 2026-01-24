@@ -266,7 +266,10 @@ impl ClientProxyChain {
         let mut result = match entry {
             InitialHopEntry::Direct(socket) => {
                 // Socket connects to first subsequent proxy (or final target)
-                debug!("Initial hop: Direct -> {}", first_subsequent_target.location());
+                debug!(
+                    "Initial hop: Direct -> {}",
+                    first_subsequent_target.location()
+                );
                 let stream = socket.connect(resolver, &first_subsequent_target).await?;
                 TcpClientSetupResult {
                     client_stream: stream,
@@ -304,7 +307,9 @@ impl ClientProxyChain {
                 target.location()
             );
 
-            result = proxy.setup_tcp_stream(result.client_stream, &target).await?;
+            result = proxy
+                .setup_tcp_stream(result.client_stream, &target)
+                .await?;
 
             // Early data from intermediate hops is unexpected
             if let Some(data) = &result.early_data
@@ -417,11 +422,12 @@ impl ClientProxyChain {
             match entry {
                 InitialHopEntry::Direct(socket) => {
                     // Determine first target after initial hop
-                    let first_target: ResolvedLocation = if let Some(first) = intermediate_proxies.first() {
-                        first.proxy_location().into()
-                    } else {
-                        final_proxy.proxy_location().into()
-                    };
+                    let first_target: ResolvedLocation =
+                        if let Some(first) = intermediate_proxies.first() {
+                            first.proxy_location().into()
+                        } else {
+                            final_proxy.proxy_location().into()
+                        };
 
                     debug!("Chain UDP: Direct -> {} (TCP)", first_target.location());
                     let mut stream = socket.connect(resolver, &first_target).await?;
@@ -452,11 +458,12 @@ impl ClientProxyChain {
                 }
                 InitialHopEntry::Proxy { socket, proxy } => {
                     // Determine first target after initial hop
-                    let first_target: ResolvedLocation = if let Some(first) = intermediate_proxies.first() {
-                        first.proxy_location().into()
-                    } else {
-                        final_proxy.proxy_location().into()
-                    };
+                    let first_target: ResolvedLocation =
+                        if let Some(first) = intermediate_proxies.first() {
+                            first.proxy_location().into()
+                        } else {
+                            final_proxy.proxy_location().into()
+                        };
 
                     debug!(
                         "Chain UDP: Proxy {} -> {} (TCP)",
@@ -581,7 +588,9 @@ impl ClientChainGroup {
             return None;
         }
         // Return bind_interface from first chain (all should be the same in a group).
-        self.chains.first().and_then(|chain| chain.get_bind_interface())
+        self.chains
+            .first()
+            .and_then(|chain| chain.get_bind_interface())
     }
 }
 

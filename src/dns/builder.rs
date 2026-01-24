@@ -1,6 +1,7 @@
 //! DNS resolver builder and registry.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use rustc_hash::FxHashMap;
 
@@ -9,7 +10,7 @@ use crate::dns::composite_resolver::CompositeResolver;
 use crate::dns::hickory_resolver::HickoryResolver;
 use crate::dns::parsed::{ParsedDnsServer, ParsedDnsServerEntry, ParsedDnsUrl};
 use crate::option_util::NoneOrSome;
-use crate::resolver::{CachingNativeResolver, NativeResolver, Resolver};
+use crate::resolver::{CachingNativeResolver, NativeResolver, Resolver, TimeoutResolver};
 use crate::tcp::chain_builder::{build_client_chain_group, build_direct_chain_group};
 
 /// Registry of resolved DNS groups with lazy default resolver.
@@ -66,6 +67,19 @@ impl Default for DnsRegistry {
     }
 }
 
+/// Wrap a resolver with optional timeout and return as Arc<dyn Resolver>.
+/// Wraps in TimeoutResolver before Arc to avoid double indirection.
+fn wrap_resolver<T: Resolver + 'static>(resolver: T, timeout_secs: u32) -> Arc<dyn Resolver> {
+    if timeout_secs > 0 {
+        Arc::new(TimeoutResolver::with_timeout(
+            resolver,
+            Duration::from_secs(timeout_secs as u64),
+        ))
+    } else {
+        Arc::new(resolver)
+    }
+}
+
 /// Build a resolver from parsed DNS server entries.
 pub fn build_resolver(entries: Vec<ParsedDnsServerEntry>) -> std::io::Result<Arc<dyn Resolver>> {
     if entries.is_empty() {
@@ -78,31 +92,42 @@ pub fn build_resolver(entries: Vec<ParsedDnsServerEntry>) -> std::io::Result<Arc
         let bootstrap = entry.bootstrap_resolver;
         let chain = entry.client_chain;
         let ip_strategy = entry.ip_strategy;
+        let timeout_secs = entry.timeout_secs;
 
         let resolver: Arc<dyn Resolver> = match entry.server {
             // System resolver uses NativeResolver (ignores chain_group, bootstrap, ip_strategy)
-            ParsedDnsServer::System => Arc::new(NativeResolver::new()),
+            ParsedDnsServer::System => wrap_resolver(NativeResolver::new(), timeout_secs),
             // All other protocols use HickoryResolver with chain_group, bootstrap, and ip_strategy
-            ParsedDnsServer::Udp { addr } => {
-                Arc::new(HickoryResolver::udp(addr, chain, bootstrap, ip_strategy)?)
-            }
-            ParsedDnsServer::Tcp { addr } => {
-                Arc::new(HickoryResolver::tcp(addr, chain, bootstrap, ip_strategy)?)
-            }
-            ParsedDnsServer::Tls { addr, server_name } => {
-                Arc::new(HickoryResolver::tls(addr, server_name, chain, bootstrap, ip_strategy)?)
-            }
+            ParsedDnsServer::Udp { addr } => wrap_resolver(
+                HickoryResolver::udp(addr, chain, bootstrap, ip_strategy)?,
+                timeout_secs,
+            ),
+            ParsedDnsServer::Tcp { addr } => wrap_resolver(
+                HickoryResolver::tcp(addr, chain, bootstrap, ip_strategy)?,
+                timeout_secs,
+            ),
+            ParsedDnsServer::Tls { addr, server_name } => wrap_resolver(
+                HickoryResolver::tls(addr, server_name, chain, bootstrap, ip_strategy)?,
+                timeout_secs,
+            ),
             ParsedDnsServer::Https {
                 addr,
                 server_name,
                 path,
-            } => Arc::new(HickoryResolver::https(addr, server_name, path, chain, bootstrap, ip_strategy)?),
+            } => wrap_resolver(
+                HickoryResolver::https(addr, server_name, path, chain, bootstrap, ip_strategy)?,
+                timeout_secs,
+            ),
             ParsedDnsServer::H3 {
                 addr,
                 server_name,
                 path,
-            } => Arc::new(HickoryResolver::h3(addr, server_name, path, chain, bootstrap, ip_strategy)?),
+            } => wrap_resolver(
+                HickoryResolver::h3(addr, server_name, path, chain, bootstrap, ip_strategy)?,
+                timeout_secs,
+            ),
         };
+
         resolvers.push(resolver);
     }
 
@@ -181,10 +206,12 @@ async fn build_entry_from_spec(
                 resolver
             } else {
                 // Parse as URL and build a simple resolver
-                let bootstrap_parsed = ParsedDnsUrl::parse(bootstrap_url)
-                    .map_err(|e| std::io::Error::other(format!(
-                        "invalid bootstrap_url '{}': {}", bootstrap_url, e
-                    )))?;
+                let bootstrap_parsed = ParsedDnsUrl::parse(bootstrap_url).map_err(|e| {
+                    std::io::Error::other(format!(
+                        "invalid bootstrap_url '{}': {}",
+                        bootstrap_url, e
+                    ))
+                })?;
 
                 let bootstrap_server = bootstrap_parsed
                     .to_parsed_server(None)
@@ -192,11 +219,13 @@ async fn build_entry_from_spec(
 
                 let native = Arc::new(NativeResolver::new());
                 let direct_chain = Arc::new(build_direct_chain_group(native.clone()));
+                // Bootstrap resolvers use default timeout (10s)
                 let bootstrap_entry = ParsedDnsServerEntry::new(
                     bootstrap_server,
                     direct_chain,
                     native,
                     super::IpStrategy::default(),
+                    10, // Default timeout for bootstrap
                 );
                 build_resolver(vec![bootstrap_entry])?
             }
@@ -215,9 +244,12 @@ async fn build_entry_from_spec(
             let addrs = bootstrap_resolver
                 .resolve_location(&location)
                 .await
-                .map_err(|e| std::io::Error::other(format!(
-                    "failed to resolve DNS server hostname '{}': {}", hostname, e
-                )))?;
+                .map_err(|e| {
+                    std::io::Error::other(format!(
+                        "failed to resolve DNS server hostname '{}': {}",
+                        hostname, e
+                    ))
+                })?;
 
             Some(addrs[0].ip())
         }
@@ -229,5 +261,11 @@ async fn build_entry_from_spec(
         .to_parsed_server(resolved_ip)
         .map_err(|e| std::io::Error::other(e.to_string()))?;
 
-    Ok(ParsedDnsServerEntry::new(server, chain_group, bootstrap_resolver, spec.ip_strategy))
+    Ok(ParsedDnsServerEntry::new(
+        server,
+        chain_group,
+        bootstrap_resolver,
+        spec.ip_strategy,
+        spec.timeout_secs,
+    ))
 }

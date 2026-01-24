@@ -9,7 +9,7 @@ use std::sync::Arc;
 use crate::address::{Address, NetLocation, ResolvedLocation};
 use crate::address::{AddressMask, NetLocationMask};
 use crate::client_proxy_chain::ClientChainGroup;
-use crate::resolver::{resolve_location, Resolver};
+use crate::resolver::{Resolver, resolve_location};
 
 /// Cache key for routing decisions.
 /// We cache based on the destination address and port.
@@ -351,9 +351,15 @@ impl ClientProxySelector {
 
     /// Convert a cached decision back to a ConnectDecision.
     #[inline]
-    fn cached_to_decision(&self, cached: CachedDecision, location: ResolvedLocation) -> ConnectDecision<'_> {
+    fn cached_to_decision(
+        &self,
+        cached: CachedDecision,
+        location: ResolvedLocation,
+    ) -> ConnectDecision<'_> {
         match cached {
-            CachedDecision::Allow(rule_index) => self.rules[rule_index].action.to_decision(location),
+            CachedDecision::Allow(rule_index) => {
+                self.rules[rule_index].action.to_decision(location)
+            }
             CachedDecision::Block => ConnectDecision::Block,
         }
     }
@@ -433,7 +439,10 @@ async fn match_rule(
             {
                 Ok(is_match) => {
                     if is_match {
-                        debug!("Found matching mask for {} -> {mask:?}", location.location());
+                        debug!(
+                            "Found matching mask for {} -> {mask:?}",
+                            location.location()
+                        );
                         return Ok(Some(rule_index));
                     }
                 }
@@ -1754,7 +1763,10 @@ mod tests {
 
         // First call - cache miss
         assert_eq!(selector.cache_size(), 0);
-        let decision = selector.judge(location.clone().into(), &resolver).await.unwrap();
+        let decision = selector
+            .judge(location.clone().into(), &resolver)
+            .await
+            .unwrap();
         match decision {
             ConnectDecision::Allow { .. } => {}
             ConnectDecision::Block => panic!("Expected Allow"),
@@ -1786,7 +1798,10 @@ mod tests {
         let location = NetLocation::new(Address::Ipv4(Ipv4Addr::new(192, 168, 1, 100)), 80);
 
         // First call - cache miss, should block
-        let decision = selector.judge(location.clone().into(), &resolver).await.unwrap();
+        let decision = selector
+            .judge(location.clone().into(), &resolver)
+            .await
+            .unwrap();
         assert!(matches!(decision, ConnectDecision::Block));
         assert_eq!(selector.cache_size(), 1);
 
@@ -1850,12 +1865,18 @@ mod tests {
         let loc_private = NetLocation::new(Address::Ipv4(Ipv4Addr::new(10, 0, 0, 1)), 80);
         let loc_public = NetLocation::new(Address::Ipv4(Ipv4Addr::new(8, 8, 8, 8)), 80);
 
-        let d1 = selector.judge(loc_lan.clone().into(), &resolver).await.unwrap();
+        let d1 = selector
+            .judge(loc_lan.clone().into(), &resolver)
+            .await
+            .unwrap();
         let d2 = selector
             .judge(loc_private.clone().into(), &resolver)
             .await
             .unwrap();
-        let d3 = selector.judge(loc_public.clone().into(), &resolver).await.unwrap();
+        let d3 = selector
+            .judge(loc_public.clone().into(), &resolver)
+            .await
+            .unwrap();
 
         // Verify correct routing (all should be Allow decisions)
         assert!(
@@ -1893,7 +1914,10 @@ mod tests {
 
         // Hostname match
         let loc_google = NetLocation::new(Address::Hostname("www.google.com".to_string()), 443);
-        let decision = selector.judge(loc_google.clone().into(), &resolver).await.unwrap();
+        let decision = selector
+            .judge(loc_google.clone().into(), &resolver)
+            .await
+            .unwrap();
         match decision {
             ConnectDecision::Allow { .. } => {}
             _ => panic!("Expected google"),
@@ -1905,7 +1929,10 @@ mod tests {
         // Case-insensitive cache hit
         let loc_google_upper =
             NetLocation::new(Address::Hostname("WWW.GOOGLE.COM".to_string()), 443);
-        let decision = selector.judge(loc_google_upper.into(), &resolver).await.unwrap();
+        let decision = selector
+            .judge(loc_google_upper.into(), &resolver)
+            .await
+            .unwrap();
         match decision {
             ConnectDecision::Allow { .. } => {}
             _ => panic!("Expected google from cache"),
@@ -2001,7 +2028,10 @@ mod tests {
         }
 
         // Verify from cache - should still be "specific"
-        let decision_cached = selector.judge(loc_specific.into(), &resolver).await.unwrap();
+        let decision_cached = selector
+            .judge(loc_specific.into(), &resolver)
+            .await
+            .unwrap();
         match decision_cached {
             ConnectDecision::Allow { .. } => {}
             _ => panic!("Expected specific from cache"),

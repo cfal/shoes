@@ -10,6 +10,7 @@ use crate::config::{
     ClientProxyConfig, RuleActionConfig, RuleConfig, ShadowsocksConfig, TlsClientConfig,
     WebsocketClientConfig,
 };
+use crate::h2mux::H2MuxClientHandler;
 use crate::http_handler::HttpTcpClientHandler;
 use crate::naiveproxy::NaiveProxyTcpClientHandler;
 use crate::port_forward_handler::PortForwardClientHandler;
@@ -91,11 +92,35 @@ pub fn create_tcp_client_handler(
         ClientProxyConfig::Vless {
             user_id,
             udp_enabled,
-        } => Box::new(VlessTcpClientHandler::new(&user_id, udp_enabled)),
+            h2mux,
+        } => {
+            let handler: Box<dyn TcpClientHandler> =
+                Box::new(VlessTcpClientHandler::new(&user_id, udp_enabled));
+            if let Some(h2mux_config) = h2mux {
+                Box::new(H2MuxClientHandler::new(
+                    Arc::from(handler),
+                    h2mux_config.to_options(),
+                ))
+            } else {
+                handler
+            }
+        }
         ClientProxyConfig::Trojan {
             password,
             shadowsocks,
-        } => Box::new(TrojanTcpHandler::new_client(&password, &shadowsocks)),
+            h2mux,
+        } => {
+            let handler: Box<dyn TcpClientHandler> =
+                Box::new(TrojanTcpHandler::new_client(&password, &shadowsocks));
+            if let Some(h2mux_config) = h2mux {
+                Box::new(H2MuxClientHandler::new(
+                    Arc::from(handler),
+                    h2mux_config.to_options(),
+                ))
+            } else {
+                handler
+            }
+        }
         ClientProxyConfig::Tls(tls_client_config) => {
             let TlsClientConfig {
                 verify,
@@ -149,6 +174,7 @@ pub fn create_tcp_client_handler(
                 let ClientProxyConfig::Vless {
                     user_id,
                     udp_enabled,
+                    h2mux: _, // h2mux not supported with vision
                 } = protocol.as_ref()
                 else {
                     // Validated when loading config
@@ -208,6 +234,7 @@ pub fn create_tcp_client_handler(
                 let ClientProxyConfig::Vless {
                     user_id,
                     udp_enabled,
+                    h2mux: _, // h2mux not supported with vision
                 } = protocol.as_ref()
                 else {
                     unreachable!("Vision requires VLESS (should be validated during config load)")
@@ -276,7 +303,19 @@ pub fn create_tcp_client_handler(
             cipher,
             user_id,
             udp_enabled,
-        } => Box::new(VmessTcpClientHandler::new(&cipher, &user_id, udp_enabled)),
+            h2mux,
+        } => {
+            let handler: Box<dyn TcpClientHandler> =
+                Box::new(VmessTcpClientHandler::new(&cipher, &user_id, udp_enabled));
+            if let Some(h2mux_config) = h2mux {
+                Box::new(H2MuxClientHandler::new(
+                    Arc::from(handler),
+                    h2mux_config.to_options(),
+                ))
+            } else {
+                handler
+            }
+        }
         ClientProxyConfig::Websocket(websocket_client_config) => {
             let WebsocketClientConfig {
                 matching_path,

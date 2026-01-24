@@ -100,7 +100,9 @@ impl TcpClientHandler for AnyTlsClientHandler {
 
         // UoT V2 header: isConnect(1) + destination
         stream.write_u8(1).await?;
-        stream.write_all(&encode_socks_address(target.location())).await?;
+        stream
+            .write_all(&encode_socks_address(target.location()))
+            .await?;
         stream.flush().await?;
 
         let message_stream = VlessMessageStream::new(stream);

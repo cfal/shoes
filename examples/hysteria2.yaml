@@ -1,12 +1,26 @@
-- address: 0.0.0.0:443
+# Hysteria2 server examples
+
+# Listen on all IPv4 and IPv6 addresses
+- address: "[::]:443"
   transport: quic
   quic_settings:
     cert: cert.pem
-    key: cert.pem
+    key: key.pem
     alpn_protocols:
-    - h3
+      - h3
   protocol:
     type: hysteria2
-    password: abc128459
-  rules:
-    - allow-all-direct
+    password: supersecret
+    udp_enabled: true
+
+# IPv4 only
+- address: "0.0.0.0:8443"
+  transport: quic
+  quic_settings:
+    cert: cert.pem
+    key: key.pem
+    alpn_protocols:
+      - h3
+  protocol:
+    type: hysteria2
+    password: supersecret

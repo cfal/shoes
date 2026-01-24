@@ -85,7 +85,11 @@ impl TcpClientHandler for NaiveProxyTcpClientHandler {
         let mut session = self.get_or_create_session(client_stream).await?;
 
         let stream = session
-            .open_stream(remote_location.location(), &self.auth_header, self.padding_enabled)
+            .open_stream(
+                remote_location.location(),
+                &self.auth_header,
+                self.padding_enabled,
+            )
             .await?;
 
         Ok(TcpClientSetupResult {
