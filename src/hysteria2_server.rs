@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use log::{debug, error, warn};
+use quinn::congestion::BbrConfig;
 use rand::distr::Alphanumeric;
 use rand::{Rng, RngCore};
 use rustc_hash::FxHashMap;
@@ -999,7 +1000,9 @@ pub async fn start_hysteria2_server(
                 // Enable GSO (Generic Segmentation Offload) for better throughput
                 .enable_segmentation_offload(true)
                 // Lower initial RTT estimate for faster initial window growth
-                .initial_rtt(Duration::from_millis(100));
+                .initial_rtt(Duration::from_millis(100))
+                // Enable BBR congestion control for better performance
+                .congestion_controller_factory(BbrConfig::default().into());
 
             // Use 7.5MB socket buffers for high-throughput QUIC (8.625MB on BSD for 15% kernel overhead)
             // https://github.com/quic-go/quic-go/wiki/UDP-Buffer-Sizes
