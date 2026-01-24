@@ -28,6 +28,7 @@ pub mod tun;
 #[allow(unused_imports)]
 pub use client::{
     ClientConfig, ClientProxyConfig, H2MuxConfig, TlsClientConfig, WebsocketClientConfig,
+    Hysteria2Bandwidth, resolve_hysteria2_bandwidth,
 };
 pub use common::DEFAULT_REALITY_SHORT_ID;
 pub use dns::{DnsConfig, DnsConfigGroup, DnsServerSpec, ExpandedDnsGroup, ExpandedDnsSpec};
