@@ -1,5 +1,6 @@
 use std::mem::ManuallyDrop;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+#[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
 use std::path::Path;
 
@@ -80,10 +81,18 @@ pub fn new_socket2_udp_socket_with_buffer_size(
     Ok(socket)
 }
 
+#[cfg(unix)]
 fn into_tokio_udp_socket(socket: socket2::Socket) -> std::io::Result<tokio::net::UdpSocket> {
     let raw_fd = socket.into_raw_fd();
     let std_udp_socket = unsafe { std::net::UdpSocket::from_raw_fd(raw_fd) };
     tokio::net::UdpSocket::from_std(std_udp_socket)
+}
+
+#[cfg(not(unix))]
+fn into_tokio_udp_socket(socket: socket2::Socket) -> std::io::Result<tokio::net::UdpSocket> {
+    // On Windows, convert to std::net::UdpSocket first, then to tokio
+    let std_socket: std::net::UdpSocket = socket.into();
+    tokio::net::UdpSocket::from_std(std_socket)
 }
 
 pub fn new_tcp_socket(
@@ -108,6 +117,7 @@ pub fn new_tcp_socket(
     Ok(tcp_socket)
 }
 
+#[cfg(unix)]
 pub fn set_tcp_keepalive(
     tcp_stream: &tokio::net::TcpStream,
     idle_time: std::time::Duration,
@@ -124,6 +134,16 @@ pub fn set_tcp_keepalive(
         socket2_socket.set_keepalive(true)?;
         socket2_socket.set_tcp_keepalive(&keepalive)?;
     }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub fn set_tcp_keepalive(
+    _tcp_stream: &tokio::net::TcpStream,
+    _idle_time: std::time::Duration,
+    _send_interval: std::time::Duration,
+) -> std::io::Result<()> {
+    // TODO: Implement Windows TCP keepalive using socket2
     Ok(())
 }
 
