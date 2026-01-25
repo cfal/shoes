@@ -29,9 +29,9 @@ use std::{
 };
 
 use bytes::BytesMut;
-use log::{debug, error, info, trace, warn};
+use log::{debug, error, info, warn};
 use smoltcp::{
-    iface::{Config as InterfaceConfig, Interface, PollResult, SocketHandle, SocketSet},
+    iface::{Config as InterfaceConfig, Interface, SocketHandle, SocketSet},
     phy::{Checksum, Device, DeviceCapabilities, Medium, RxToken, TxToken},
     socket::tcp::{CongestionControl, Socket as TcpSocket, SocketBuffer as TcpSocketBuffer, State as TcpState},
     time::{Duration as SmolDuration, Instant as SmolInstant},
@@ -312,7 +312,7 @@ impl TcpStackAsync {
             thread::Builder::new()
                 .name("shoes-smoltcp-async".to_owned())
                 .spawn(move || {
-                    let mut device = VirtTunDevice::new(mtu, tun_to_stack_rx, stack_to_tun_tx);
+                    let device = VirtTunDevice::new(mtu, tun_to_stack_rx, stack_to_tun_tx);
                     run_stack_thread(device, mtu, udp_tx, running, shared_state);
                 })
                 .expect("failed to spawn smoltcp async thread")
@@ -386,7 +386,7 @@ struct SocketInfo {
 /// Run the smoltcp stack thread with virtual device.
 fn run_stack_thread(
     mut device: VirtTunDevice,
-    mtu: usize,
+    _mtu: usize,
     udp_tx: UnboundedSender<PacketBuffer>,
     running: Arc<AtomicBool>,
     shared_state: Arc<Mutex<SharedState>>,

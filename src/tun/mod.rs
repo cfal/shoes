@@ -12,9 +12,9 @@
 //! └─────────────────┘     └─────────────────┘     └─────────────────┘
 //! ```
 //!
-//! The smoltcp stack runs in a dedicated OS thread. On Unix platforms, it uses
-//! direct fd access with `select()` for efficient event-driven I/O. On Windows,
-//! it uses async I/O with the WinTUN driver.
+//! The smoltcp stack runs in a dedicated OS thread, using async I/O with
+//! virtual device channels to communicate with the async TUN device.
+//! This unified approach works across all platforms (Windows, Linux, macOS, Android, iOS).
 //!
 //! # Platform Support
 //!
@@ -34,8 +34,6 @@
 
 mod tcp_conn;
 mod tcp_stack_async;
-#[cfg(unix)]
-mod tcp_stack_direct;
 mod tun_server;
 mod udp_handler;
 mod udp_manager;
@@ -53,8 +51,6 @@ pub use platform::{
 pub use tun_server::TunServerConfig;
 
 use std::net::SocketAddr;
-#[cfg(unix)]
-use std::os::unix::io::IntoRawFd;
 use std::sync::Arc;
 
 use log::{debug, info, warn};
@@ -70,139 +66,19 @@ use crate::resolver::{NativeResolver, Resolver};
 use crate::tcp::tcp_client_handler_factory::create_tcp_client_proxy_selector;
 
 use tcp_stack_async::{NewTcpConnection, TcpStackAsync, PooledBuffer};
-#[cfg(unix)]
-use tcp_stack_direct::{NewTcpConnection as NewTcpConnectionDirect, TcpStackDirect};
 use udp_manager::TunUdpManager;
 
 type PacketBuffer = Vec<u8>;
 
-/// Run the TUN server with the given configuration (Unix only).
+/// Run the TUN server with async device support (cross-platform).
 ///
 /// This function:
-/// 1. Creates/wraps a TUN device
-/// 2. Sets up our smoltcp-based TCP/IP stack with direct fd access
-/// 3. The stack thread reads packets directly from TUN using select()
-/// 4. Handles TCP connections through the proxy chain
-/// 5. Handles UDP packets through tokio (forwarded from stack thread)
-#[cfg(unix)]
-pub async fn run_tun_server(
-    config: TunServerConfig,
-    proxy_selector: Arc<ClientProxySelector>,
-    resolver: Arc<dyn Resolver>,
-    mut shutdown_rx: oneshot::Receiver<()>,
-) -> std::io::Result<()> {
-    info!(
-        "Starting TUN server (direct mode): mtu={}, tcp={}, udp={}, icmp={}",
-        config.mtu, config.tcp_enabled, config.udp_enabled, config.icmp_enabled
-    );
-
-    let fd = if let Some(fd) = config.raw_fd {
-        info!("Using provided raw FD: {}", fd);
-        fd
-    } else {
-        let tun_device = config.create_sync_device()?;
-        let fd = tun_device.into_raw_fd();
-        info!("Created TUN device with FD: {}", fd);
-        fd
-    };
-
-    let mtu = config.mtu as usize;
-
-    // Create the direct TCP stack (runs smoltcp in dedicated thread with select())
-    let mut tcp_stack = TcpStackDirect::new(fd, mtu);
-
-    // Get UDP receiver (stack thread filters UDP and sends here)
-    let udp_from_stack_rx = tcp_stack.take_udp_rx().expect("udp_rx already taken");
-
-    // Channel for sending UDP responses back (stack thread will write to TUN)
-    let (udp_to_stack_tx, udp_to_stack_rx) = mpsc::unbounded_channel::<PacketBuffer>();
-    tcp_stack.set_udp_response_tx(udp_to_stack_rx);
-
-    let (tcp_conn_tx, mut tcp_conn_rx) = mpsc::unbounded_channel::<NewTcpConnection>();
-    tcp_stack.set_new_conn_tx(tcp_conn_tx);
-
-    let tcp_task: Option<JoinHandle<()>> = if config.tcp_enabled {
-        let proxy_selector = proxy_selector.clone();
-        let resolver = resolver.clone();
-
-        Some(tokio::spawn(async move {
-            info!("Starting TCP connection handler");
-
-            while let Some(new_conn) = tcp_conn_rx.recv().await {
-                let proxy_selector = proxy_selector.clone();
-                let resolver = resolver.clone();
-
-                tokio::spawn(async move {
-                    let remote_addr = new_conn.remote_addr;
-                    let target = socket_addr_to_net_location(remote_addr);
-
-                    debug!("Handling TCP connection to {:?}", target);
-
-                    if let Err(e) =
-                        handle_tcp_connection(new_conn.connection, target, proxy_selector, resolver)
-                            .await
-                    {
-                        debug!("TCP connection to {} failed: {}", remote_addr, e);
-                    }
-                });
-            }
-
-            debug!("TCP connection handler ended");
-        }))
-    } else {
-        None
-    };
-
-    let udp_task = if config.udp_enabled {
-        let proxy_selector = proxy_selector.clone();
-        let resolver = resolver.clone();
-
-        Some(tokio::spawn(async move {
-            handle_udp_packets(udp_from_stack_rx, udp_to_stack_tx, proxy_selector, resolver).await;
-        }))
-    } else {
-        None
-    };
-
-    info!("TUN server started successfully");
-
-    // Wait for shutdown signal or stack thread exit
-    tokio::select! {
-        _ = &mut shutdown_rx => {
-            info!("TUN server shutdown requested");
-        }
-        _ = async {
-            // Poll until stack stops running
-            while tcp_stack.is_running() {
-                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-            }
-        } => {
-            warn!("Stack thread ended unexpectedly");
-        }
-    }
-
-    if let Some(t) = tcp_task {
-        t.abort();
-    }
-    if let Some(t) = udp_task {
-        t.abort();
-    }
-
-    // tcp_stack is dropped here, which stops the stack thread
-
-    info!("TUN server stopped");
-    Ok(())
-}
-
-/// Run the TUN server with async device support (cross-platform including Windows).
-///
-/// This function:
-/// 1. Creates an async TUN device (works with WinTUN on Windows)
+/// 1. Creates an async TUN device (works with WinTUN on Windows, Linux, macOS, Android, iOS)
 /// 2. Sets up our smoltcp-based TCP/IP stack with virtual device
 /// 3. Uses tokio for reading/writing to the TUN device
 /// 4. Handles TCP connections through the proxy chain
 /// 5. Handles UDP packets through tokio
-pub async fn run_tun_server_async(
+pub async fn run_tun_server(
     config: TunServerConfig,
     proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
@@ -489,26 +365,12 @@ pub async fn run_tun_from_config(
     let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
     let client_proxy_selector = Arc::new(create_tcp_client_proxy_selector(rules, resolver.clone()));
 
-    // Use async mode on Windows, direct mode on Unix
-    #[cfg(target_os = "windows")]
-    {
-        run_tun_server_async(
-            tun_server_config,
-            client_proxy_selector,
-            resolver,
-            shutdown_rx,
-        )
-        .await
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        run_tun_server(
-            tun_server_config,
-            client_proxy_selector,
-            resolver,
-            shutdown_rx,
-        )
-        .await
-    }
+    // Unified async mode for all platforms
+    run_tun_server(
+        tun_server_config,
+        client_proxy_selector,
+        resolver,
+        shutdown_rx,
+    )
+    .await
 }

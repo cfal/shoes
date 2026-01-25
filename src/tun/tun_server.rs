@@ -37,7 +37,7 @@
 use std::net::IpAddr;
 
 use log::info;
-use tun::{AsyncDevice, Configuration as TunConfiguration, Device};
+use tun::{AsyncDevice, Configuration as TunConfiguration};
 
 /// Configuration for the TUN server.
 ///
@@ -204,76 +204,6 @@ impl TunServerConfig {
     pub fn icmp_enabled(mut self, enabled: bool) -> Self {
         self.icmp_enabled = enabled;
         self
-    }
-
-    /// Create a synchronous TUN device from this configuration.
-    ///
-    /// This is used by the direct mode stack which reads/writes directly
-    /// from the TUN fd using select() for event-driven I/O.
-    pub fn create_sync_device(&self) -> std::io::Result<Device> {
-        let mut config = TunConfiguration::default();
-        config.mtu(self.mtu);
-
-        #[cfg(target_os = "linux")]
-        {
-            if let Some(ref name) = self.tun_name {
-                config.tun_name(name);
-            }
-            if let Some(addr) = self.address {
-                config.address(addr);
-            }
-            if let Some(mask) = self.netmask {
-                config.netmask(mask);
-            }
-            if let Some(dest) = self.destination {
-                config.destination(dest);
-            }
-            config.platform_config(|p| {
-                p.ensure_root_privileges(true);
-            });
-            config.up();
-        }
-
-        #[cfg(target_os = "ios")]
-        {
-            config.platform_config(|p| {
-                p.packet_information(self.packet_information);
-            });
-        }
-
-        #[cfg(target_os = "android")]
-        {
-            // Android requires raw_fd from VpnService.Builder.establish()
-            if self.raw_fd.is_none() {
-                return Err(std::io::Error::other(
-                    "Android requires raw_fd from VpnService.Builder.establish()",
-                ));
-            }
-            if let Some(addr) = self.address {
-                config.address(addr);
-            }
-            if let Some(mask) = self.netmask {
-                config.netmask(mask);
-            }
-        }
-
-        if let Some(fd) = self.raw_fd {
-            info!("Creating TUN device from raw FD: {}", fd);
-            #[cfg(unix)]
-            {
-                config.raw_fd(fd);
-                config.close_fd_on_drop(self.close_fd_on_drop);
-            }
-            #[cfg(not(unix))]
-            {
-                return Err(std::io::Error::other(
-                    "raw_fd is only supported on Unix platforms",
-                ));
-            }
-        }
-
-        tun::create(&config)
-            .map_err(|e| std::io::Error::other(format!("Failed to create TUN device: {}", e)))
     }
 
     /// Create an asynchronous TUN device from this configuration.
