@@ -106,6 +106,7 @@ fn print_usage_and_exit(arg0: String) {
     eprintln!("    -t, --threads NUM    Set the number of worker threads (default: CPU count)");
     eprintln!("    -d, --dry-run        Parse the config and exit");
     eprintln!("    --no-reload          Disable automatic config reloading on file changes");
+    eprintln!("    -V, --version        Print version information and exit");
     eprintln!();
     eprintln!("COMMANDS:");
     eprintln!(
@@ -200,6 +201,9 @@ fn main() {
         } else if args[0] == "--no-reload" {
             args.remove(0);
             no_reload = true;
+        } else if args[0] == "--version" || args[0] == "-V" {
+            println!("shoes {}", env!("CARGO_PKG_VERSION"));
+            return;
         } else {
             eprintln!("Invalid argument: {}", args[0]);
             print_usage_and_exit(arg0);
