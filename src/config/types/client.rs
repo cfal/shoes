@@ -327,6 +327,10 @@ pub enum ClientProxyConfig {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         password: Option<String>,
     },
+    Socks4 {
+        #[serde(default, skip_serializing_if = "is_false")]
+        dns_enabled: bool,
+    },
     #[serde(
         alias = "ss",
         deserialize_with = "deserialize_shadowsocks_client",
@@ -448,6 +452,7 @@ impl ClientProxyConfig {
             ClientProxyConfig::Direct => "Direct",
             ClientProxyConfig::Http { .. } => "HTTP",
             ClientProxyConfig::Socks { .. } => "SOCKS5",
+            ClientProxyConfig::Socks4 { .. } => "SOCKS4",
             ClientProxyConfig::Shadowsocks { .. } => "Shadowsocks",
             ClientProxyConfig::Snell { .. } => "Snell",
             ClientProxyConfig::Vless { .. } => "VLESS",
