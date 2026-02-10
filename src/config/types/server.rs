@@ -879,6 +879,20 @@ mod tests {
         }
     }
 
+    fn create_test_server_config_socks4() -> ServerConfig {
+        ServerConfig {
+            bind_location: BindLocation::Address(
+                NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 1080).into(),
+            ),
+            protocol: ServerProxyConfig::Socks4 { dns_enabled: false },
+            transport: Transport::Tcp,
+            tcp_settings: None,
+            quic_settings: None,
+            rules: NoneOrSome::None,
+            dns: None,
+        }
+    }
+
     fn create_test_server_config_shadowsocks() -> ServerConfig {
         ServerConfig {
             bind_location: BindLocation::Path(PathBuf::from("/tmp/ss.sock")),
@@ -1127,6 +1141,18 @@ mod tests {
         assert!(matches!(
             deserialized.protocol,
             ServerProxyConfig::Socks { .. }
+        ));
+    }
+
+    #[test]
+    fn test_server_config_socks4() {
+        let original = create_test_server_config_socks4();
+        let yaml_str = serde_yaml::to_string(&original).expect("Failed to serialize");
+        let deserialized: ServerConfig =
+            serde_yaml::from_str(&yaml_str).expect("Failed to deserialize");
+        assert!(matches!(
+            deserialized.protocol,
+            ServerProxyConfig::Socks4 { .. }
         ));
     }
 

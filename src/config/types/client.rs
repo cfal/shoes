@@ -624,6 +624,17 @@ password: "pass"
     }
 
     #[test]
+    fn test_client_proxy_config_socks4() {
+        let yaml = r#"
+type: socks4
+dns_enabled: true
+"#;
+        let result: Result<ClientProxyConfig, _> = serde_yaml::from_str(yaml);
+        assert!(result.is_ok());
+        assert!(matches!(result.unwrap(), ClientProxyConfig::Socks4 { .. }));
+    }
+
+    #[test]
     fn test_client_proxy_config_http() {
         let yaml = r#"
 type: http
