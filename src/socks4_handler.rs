@@ -25,6 +25,8 @@ const VER_REPLY: u8 = 0x00;
 const CD_GRANTED: u8 = 0x5A;
 const CD_REJECTED: u8 = 0x5B;
 
+const MAX_VAR_SIZE: u8 = 255;
+
 #[derive(Debug)]
 pub struct Socks4TcpServerHandler {
     /// Enable DNS functionality (SOCKS4a)
@@ -121,7 +123,7 @@ async fn socks4_server_stream_inner(
         address_bytes[5],
     );
 
-    let _ = read_null_terminated_bytes(&mut stream_reader, &mut server_stream).await?;
+    let _ = read_var_bytes(&mut stream_reader, &mut server_stream).await?;
 
     let octets = &v4addr.octets(); // unstable: v4addr.as_octets()
     let address = if octets[0] == 0 && octets[1] == 0 && octets[2] == 0 && octets[3] != 0 {
@@ -142,7 +144,7 @@ async fn socks4_server_stream_inner(
             ));
         }
 
-        let domain = read_null_terminated(&mut stream_reader, &mut server_stream).await?;
+        let domain = read_var(&mut stream_reader, &mut server_stream).await?;
         Address::from(domain)?
     } else {
         Address::Ipv4(v4addr)
@@ -280,29 +282,36 @@ async fn resolve_ipv4(
     Ok(None)
 }
 
-async fn read_null_terminated_bytes<'a, T: AsyncReadExt + Unpin>(
+async fn read_var_bytes<'a, T: AsyncReadExt + Unpin>(
     reader: &'a mut StreamReader,
     stream: &mut T,
 ) -> std::io::Result<&'a [u8]> {
-    let buf = reader.unparsed_data();
+    loop {
+        let buf = reader.unparsed_data();
 
-    if let Some(pos) = memchr(b'\0', buf) {
-        let bytes = reader.read_slice(stream, pos + 1).await?;
-        // Strips NULL.
-        Ok(&bytes[..pos])
-    } else {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "Stream is not terminated by NULL",
-        ))
+        if let Some(pos) = memchr(b'\0', buf) {
+            let bytes = reader.read_slice(stream, pos + 1).await?;
+            // Strips NULL.
+            return Ok(&bytes[..pos]);
+        }
+
+        if buf.len() > MAX_VAR_SIZE as usize {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Variable length field exceeds allowed size",
+            ));
+        }
+
+        let peek_len = buf.len().saturating_add(1);
+        let _ = reader.peek_slice(stream, peek_len).await?;
     }
 }
 
-async fn read_null_terminated<'a, T: AsyncReadExt + Unpin>(
+async fn read_var<'a, T: AsyncReadExt + Unpin>(
     reader: &'a mut StreamReader,
     stream: &mut T,
 ) -> std::io::Result<&'a str> {
-    let bytes = read_null_terminated_bytes(reader, stream).await?;
+    let bytes = read_var_bytes(reader, stream).await?;
     std::str::from_utf8(bytes).map_err(|e| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
