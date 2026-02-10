@@ -8,7 +8,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use crate::address::{Address, NetLocation, ResolvedLocation};
 use crate::async_stream::AsyncStream;
 use crate::client_proxy_selector::ClientProxySelector;
-use crate::resolver::{resolve_single_address, Resolver};
+use crate::resolver::Resolver;
 use crate::stream_reader::StreamReader;
 use crate::tcp::tcp_handler::{
     TcpClientHandler, TcpClientSetupResult, TcpServerHandler, TcpServerSetupResult,
@@ -185,12 +185,9 @@ impl TcpClientHandler for Socks4TcpClientHandler {
             Some(ip) => ip,
             None => match self.resolver {
                 Some(ref resolver) => {
-                    let socket_addr =
-                        resolve_single_address(resolver, remote_location.location()).await?;
-                    match socket_addr.ip() {
-                        // Use manually resolved IPv4 address.
-                        IpAddr::V4(ip) => ip,
-                        IpAddr::V6(_) => {
+                    match resolve_ipv4(resolver, remote_location.location()).await? {
+                        Some(ip) => ip,
+                        None => {
                             return Err(std::io::Error::new(
                                 std::io::ErrorKind::InvalidInput,
                                 "Invalid address type: IPv6",
@@ -254,6 +251,35 @@ impl TcpClientHandler for Socks4TcpClientHandler {
     }
 }
 
+fn resolved_ipv4(resolved_location: &ResolvedLocation) -> Option<Ipv4Addr> {
+    if let Some(resolved_addr) = resolved_location.resolved_addr() {
+        if let IpAddr::V4(ip) = resolved_addr.ip() {
+            return Some(ip);
+        }
+    }
+
+    if let Address::Ipv4(ip) = resolved_location.location().address() {
+        return Some(*ip);
+    }
+
+    None
+}
+
+async fn resolve_ipv4(
+    resolver: &Arc<dyn Resolver>,
+    location: &NetLocation,
+) -> std::io::Result<Option<Ipv4Addr>> {
+    let socket_addrs = resolver.resolve_location(location).await?;
+
+    for socket_addr in socket_addrs {
+        if let IpAddr::V4(ip) = socket_addr.ip() {
+            return Ok(Some(ip));
+        }
+    }
+
+    Ok(None)
+}
+
 async fn read_null_terminated_bytes<'a, T: AsyncReadExt + Unpin>(
     reader: &'a mut StreamReader,
     stream: &mut T,
@@ -267,23 +293,9 @@ async fn read_null_terminated_bytes<'a, T: AsyncReadExt + Unpin>(
     } else {
         Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            "Bytes is not terminated by NULL",
+            "Stream is not terminated by NULL",
         ))
     }
-}
-
-fn resolved_ipv4(resolved_location: &ResolvedLocation) -> Option<Ipv4Addr> {
-    if let Some(resolved_addr) = resolved_location.resolved_addr() {
-        if let IpAddr::V4(ip) = resolved_addr.ip() {
-            return Some(ip);
-        }
-    }
-
-    if let Address::Ipv4(ip) = resolved_location.location().address() {
-        return Some(*ip);
-    }
-
-    None
 }
 
 async fn read_null_terminated<'a, T: AsyncReadExt + Unpin>(
