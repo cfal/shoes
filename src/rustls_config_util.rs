@@ -270,6 +270,8 @@ pub fn create_server_config(
     let builder = rustls::ServerConfig::builder_with_provider(get_crypto_provider())
         .with_safe_default_protocol_versions()
         .unwrap();
+    // Always wraps in ClientFingerprintVerifier even for CA-only auth, because
+    // WebPkiClientVerifier's root_hint_subjects() leaks CA names to unauthenticated clients.
     let builder = if client_fingerprints.is_empty() && webpki_verifier.is_none() {
         builder.with_no_client_auth()
     } else {
@@ -343,6 +345,7 @@ impl rustls::server::danger::ClientCertVerifier for ClientFingerprintVerifier {
     }
 
     fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
+        // Avoids leaking trusted CA names to unauthenticated clients.
         &[]
     }
 
