@@ -77,6 +77,8 @@ pub struct TunServerConfig {
     /// - **Linux**: Optional (if not set, creates a new TUN device)
     /// - **Android**: Required (from `VpnService.Builder.establish()`)
     /// - **iOS**: Required (from `NEPacketTunnelProvider.packetFlow`)
+    ///
+    /// Note: on Unix platforms this is still routed through `create_async_device()`.
     pub raw_fd: Option<i32>,
     /// Whether to close the FD when the device is dropped.
     /// Default: true
@@ -209,6 +211,7 @@ impl TunServerConfig {
     /// Create an asynchronous TUN device from this configuration.
     ///
     /// This method supports all platforms including Windows (via WinTUN).
+    /// On Unix, `raw_fd` is applied to the async device configuration.
     pub fn create_async_device(&self) -> std::io::Result<AsyncDevice> {
         let mut config = TunConfiguration::default();
         config.mtu(self.mtu);

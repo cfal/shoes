@@ -33,7 +33,7 @@
 //!   directly, or `false` if using the readPackets/writePackets API.
 
 mod tcp_conn;
-mod tcp_stack_async;
+mod tcp_stack_direct;
 mod tun_server;
 mod udp_handler;
 mod udp_manager;
@@ -65,7 +65,7 @@ use crate::config::selection::ConfigSelection;
 use crate::resolver::{NativeResolver, Resolver};
 use crate::tcp::tcp_client_handler_factory::create_tcp_client_proxy_selector;
 
-use tcp_stack_async::{NewTcpConnection, TcpStackAsync, PooledBuffer};
+use tcp_stack_direct::{NewTcpConnection, PooledBuffer, TcpStackDirect};
 use udp_manager::TunUdpManager;
 
 type PacketBuffer = Vec<u8>;
@@ -95,8 +95,9 @@ pub async fn run_tun_server(
 
     info!("Async TUN device created: mtu={}", mtu);
 
-    // Create the async TCP stack
-    let mut tcp_stack = TcpStackAsync::new(mtu);
+    // Keep a unified async data path for all platforms:
+    // Windows has no Unix-style raw fd, so we bridge via channels everywhere.
+    let mut tcp_stack = TcpStackDirect::new(mtu);
 
     // Get channels
     let tun_to_stack_tx = tcp_stack.tun_to_stack_tx();
@@ -165,6 +166,7 @@ pub async fn run_tun_server(
                     Ok(n) => n,
                     Err(e) => {
                         warn!("TUN read error: {}", e);
+                        tcp_stack.stop();
                         break;
                     }
                 };
@@ -172,7 +174,11 @@ pub async fn run_tun_server(
                 if n > 0 {
                     let mut pkt = PooledBuffer::with_capacity(n);
                     pkt.extend_from_slice(&buffer[..n]);
-                    let _ = tun_to_stack_tx.send(pkt);
+                    if tun_to_stack_tx.send(pkt).is_err() {
+                        warn!("TUN input channel closed, stopping stack");
+                        tcp_stack.stop();
+                        break;
+                    }
                 }
             }
 
@@ -184,6 +190,7 @@ pub async fn run_tun_server(
 
             _ = &mut shutdown_rx => {
                 info!("TUN server shutdown requested");
+                tcp_stack.stop();
                 break;
             }
 

@@ -1,7 +1,7 @@
-//! Async TCP Stack Manager for cross-platform TUN support.
+//! TCP Stack Manager for cross-platform TUN support.
 //!
-//! This module provides an alternative implementation that works with async TUN devices,
-//! supporting Windows via WinTUN as well as Unix platforms.
+//! This keeps the historical `tcp_stack_direct` module name used upstream while
+//! running a unified async TUN data path internally.
 //!
 //! # Architecture
 //!
@@ -40,10 +40,7 @@ use smoltcp::{
         Ipv6Packet, TcpPacket,
     },
 };
-use tokio::{
-    sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
-    task::JoinHandle as TokioJoinHandle,
-};
+use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use super::tcp_conn::{TcpConnection, TcpConnectionControl, TcpSocketState};
 
@@ -247,10 +244,10 @@ impl TxToken for VirtTxToken<'_> {
     }
 }
 
-/// Async TCP Stack Manager.
+/// TCP Stack Manager.
 ///
-/// Manages the smoltcp interface with async TUN device support.
-pub struct TcpStackAsync {
+/// Manages the smoltcp interface with the unified async TUN path.
+pub struct TcpStackDirect {
     /// Handle to the stack thread
     thread_handle: Option<JoinHandle<()>>,
     /// Thread handle for waking the stack thread
@@ -265,25 +262,13 @@ pub struct TcpStackAsync {
     tun_to_stack_tx: UnboundedSender<PooledBuffer>,
     /// Receiver for packets from stack to TUN
     stack_to_tun_rx: Option<UnboundedReceiver<PacketBuffer>>,
-    /// Tokio task handle for reading from TUN
-    read_task: Option<TokioJoinHandle<()>>,
-    /// Tokio task handle for writing to TUN
-    write_task: Option<TokioJoinHandle<()>>,
 }
 
-impl Drop for TcpStackAsync {
+impl Drop for TcpStackDirect {
     fn drop(&mut self) {
         // Signal thread to stop
         self.running.store(false, Ordering::Relaxed);
         self.stack_thread.unpark();
-
-        // Abort tokio tasks
-        if let Some(task) = self.read_task.take() {
-            task.abort();
-        }
-        if let Some(task) = self.write_task.take() {
-            task.abort();
-        }
 
         // Wait for thread to finish
         if let Some(handle) = self.thread_handle.take() {
@@ -292,16 +277,14 @@ impl Drop for TcpStackAsync {
     }
 }
 
-impl TcpStackAsync {
-    /// Create a new async TCP stack.
+impl TcpStackDirect {
+    /// Create a new TCP stack.
     ///
     /// # Arguments
     /// * `mtu` - Maximum transmission unit
     ///
-    /// This spawns:
-    /// 1. A dedicated OS thread for running the smoltcp interface
-    /// 2. A tokio task for reading from the async TUN device
-    /// 3. A tokio task for writing to the async TUN device
+    /// This spawns a dedicated OS thread for running the smoltcp interface.
+    /// The thread communicates with the async TUN loop through channels.
     pub fn new(mtu: usize) -> Self {
         let (tun_to_stack_tx, tun_to_stack_rx) = mpsc::unbounded_channel();
         let (stack_to_tun_tx, stack_to_tun_rx) = mpsc::unbounded_channel();
@@ -318,12 +301,12 @@ impl TcpStackAsync {
             let shared_state = shared_state.clone();
 
             thread::Builder::new()
-                .name("shoes-smoltcp-async".to_owned())
+                .name("shoes-smoltcp-direct".to_owned())
                 .spawn(move || {
                     let device = VirtTunDevice::new(mtu, tun_to_stack_rx, stack_to_tun_tx);
                     run_stack_thread(device, mtu, udp_tx, running, shared_state);
                 })
-                .expect("failed to spawn smoltcp async thread")
+                .expect("failed to spawn smoltcp stack thread")
         };
 
         let stack_thread = thread_handle.thread().clone();
@@ -336,8 +319,6 @@ impl TcpStackAsync {
             shared_state,
             tun_to_stack_tx,
             stack_to_tun_rx: Some(stack_to_tun_rx),
-            read_task: None,
-            write_task: None,
         }
     }
 
@@ -365,6 +346,12 @@ impl TcpStackAsync {
     /// Check if the stack thread is still running.
     pub fn is_running(&self) -> bool {
         self.running.load(Ordering::Relaxed)
+    }
+
+    /// Request the stack thread to stop.
+    pub fn stop(&self) {
+        self.running.store(false, Ordering::Relaxed);
+        self.stack_thread.unpark();
     }
 
     /// Get the sender for packets from TUN to stack.
@@ -399,7 +386,7 @@ fn run_stack_thread(
     running: Arc<AtomicBool>,
     shared_state: Arc<Mutex<SharedState>>,
 ) {
-    info!("smoltcp async stack thread initializing...");
+    info!("smoltcp stack thread initializing...");
 
     let mut iface_config = InterfaceConfig::new(HardwareAddress::Ip);
     iface_config.random_seed = rand::random();
@@ -437,7 +424,7 @@ fn run_stack_thread(
 
     let stack_thread = thread::current();
 
-    info!("smoltcp async stack thread started");
+    info!("smoltcp stack thread started");
 
     while running.load(Ordering::Relaxed) {
         // Check for UDP responses
@@ -640,7 +627,7 @@ fn run_stack_thread(
         }
     }
 
-    info!("smoltcp async stack thread stopped");
+    info!("smoltcp stack thread stopped");
 }
 
 /// Result of creating a TCP connection.
@@ -801,5 +788,87 @@ fn should_filter_packet(packet: &[u8]) -> bool {
             }
         }
         _ => true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn virt_tun_device_try_recv_empty_is_non_fatal() {
+        let (_tx, rx) = mpsc::unbounded_channel::<PooledBuffer>();
+        let (out_tx, _out_rx) = mpsc::unbounded_channel::<PacketBuffer>();
+        let mut device = VirtTunDevice::new(1500, rx, out_tx);
+
+        assert!(matches!(device.try_recv(), Ok(None)));
+    }
+
+    #[test]
+    fn virt_tun_device_try_recv_disconnected_is_error() {
+        let (tx, rx) = mpsc::unbounded_channel::<PooledBuffer>();
+        drop(tx);
+
+        let (out_tx, _out_rx) = mpsc::unbounded_channel::<PacketBuffer>();
+        let mut device = VirtTunDevice::new(1500, rx, out_tx);
+
+        match device.try_recv() {
+            Err(err) => assert_eq!(err.kind(), io::ErrorKind::BrokenPipe),
+            _ => panic!("expected BrokenPipe error"),
+        }
+    }
+
+    #[test]
+    fn stack_thread_exits_on_input_channel_disconnect() {
+        let (tx, rx) = mpsc::unbounded_channel::<PooledBuffer>();
+        drop(tx);
+
+        let (out_tx, _out_rx) = mpsc::unbounded_channel::<PacketBuffer>();
+        let (udp_tx, _udp_rx) = mpsc::unbounded_channel::<PacketBuffer>();
+        let running = Arc::new(AtomicBool::new(true));
+        let shared_state = Arc::new(Mutex::new(SharedState {
+            udp_response_rx: None,
+            new_conn_tx: None,
+        }));
+
+        let thread_running = running.clone();
+        let handle = thread::spawn(move || {
+            let device = VirtTunDevice::new(1500, rx, out_tx);
+            run_stack_thread(device, 1500, udp_tx, thread_running, shared_state);
+        });
+
+        handle.join().expect("stack thread should exit cleanly");
+        assert!(
+            !running.load(Ordering::Relaxed),
+            "stack should stop after input channel disconnects"
+        );
+    }
+
+    #[test]
+    fn stack_thread_keeps_running_with_empty_input_channel() {
+        let (tx, rx) = mpsc::unbounded_channel::<PooledBuffer>();
+        let (out_tx, _out_rx) = mpsc::unbounded_channel::<PacketBuffer>();
+        let (udp_tx, _udp_rx) = mpsc::unbounded_channel::<PacketBuffer>();
+        let running = Arc::new(AtomicBool::new(true));
+        let shared_state = Arc::new(Mutex::new(SharedState {
+            udp_response_rx: None,
+            new_conn_tx: None,
+        }));
+
+        let thread_running = running.clone();
+        let handle = thread::spawn(move || {
+            let device = VirtTunDevice::new(1500, rx, out_tx);
+            run_stack_thread(device, 1500, udp_tx, thread_running, shared_state);
+        });
+
+        thread::sleep(Duration::from_millis(50));
+        assert!(
+            running.load(Ordering::Relaxed),
+            "empty input channel should not be treated as fatal"
+        );
+
+        running.store(false, Ordering::Relaxed);
+        handle.join().expect("stack thread should stop when requested");
+        drop(tx);
     }
 }
