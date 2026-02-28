@@ -48,6 +48,7 @@ mod vless;
 mod vmess;
 mod websocket;
 mod xudp;
+mod logging;
 
 #[cfg(not(any(target_env = "msvc", target_os = "ios")))]
 use tikv_jemallocator::Jemalloc;
@@ -56,7 +57,6 @@ use tikv_jemallocator::Jemalloc;
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
 
-use std::io::Write;
 use std::path::Path;
 
 use aws_lc_rs::rand::{SecureRandom, SystemRandom};
@@ -104,8 +104,10 @@ fn print_usage_and_exit(arg0: String) {
     eprintln!();
     eprintln!("OPTIONS:");
     eprintln!("    -t, --threads NUM    Set the number of worker threads (default: CPU count)");
+    eprintln!("    -l, --log-file PATH  Log to file (repeatable; \"-\" means stderr; default: stderr)");
     eprintln!("    -d, --dry-run        Parse the config and exit");
     eprintln!("    --no-reload          Disable automatic config reloading on file changes");
+    eprintln!("    -V, --version        Print version information and exit");
     eprintln!();
     eprintln!("COMMANDS:");
     eprintln!(
@@ -118,65 +120,13 @@ fn print_usage_and_exit(arg0: String) {
     std::process::exit(1);
 }
 
-fn get_debug_file_log_level() -> Option<log::LevelFilter> {
-    // Check for debug marker files in the same directory as the binary
-    let exe_dir = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|p| p.to_path_buf()));
-
-    if let Some(dir) = exe_dir {
-        if dir.join(".shoes-trace").exists() {
-            eprintln!("Found debug marker file .shoes-trace, setting log level to TRACE");
-            return Some(log::LevelFilter::Trace);
-        }
-        if dir.join(".shoes-debug").exists() {
-            eprintln!("Found debug marker file .shoes-debug, setting log level to DEBUG");
-            return Some(log::LevelFilter::Debug);
-        }
-    }
-    None
-}
-
 fn main() {
-    let mut builder = env_logger::builder();
-
-    if let Some(level) = get_debug_file_log_level() {
-        builder.filter_level(level);
-    } else {
-        builder.parse_default_env();
-    }
-
-    builder
-        .format(|buf, record| {
-            let timestamp = buf.timestamp();
-            let level_style = buf.default_level_style(record.level());
-            let sanitized_args = format!("{}", record.args())
-                .chars()
-                .map(|c| {
-                    if c.is_ascii_graphic() || c == ' ' {
-                        c
-                    } else {
-                        '?'
-                    }
-                })
-                .collect::<String>();
-
-            writeln!(
-                buf,
-                "[{} {level_style}{}{level_style:#} {}] {}",
-                timestamp,
-                record.level(),
-                record.target(),
-                sanitized_args
-            )
-        })
-        .init();
-
     let mut args: Vec<String> = std::env::args().collect();
     let arg0 = args.remove(0);
     let mut num_threads = 0usize;
     let mut dry_run = false;
     let mut no_reload = false;
+    let mut log_files: Vec<String> = Vec::new();
 
     while !args.is_empty() && args[0].starts_with("-") {
         if args[0] == "--threads" || args[0] == "-t" {
@@ -194,18 +144,50 @@ fn main() {
                     return;
                 }
             };
+        } else if args[0] == "--log-file" || args[0] == "-l" {
+            args.remove(0);
+            if args.is_empty() {
+                eprintln!("Missing log-file argument.");
+                print_usage_and_exit(arg0);
+                return;
+            }
+            log_files.push(args.remove(0));
         } else if args[0] == "--dry-run" || args[0] == "-d" {
             args.remove(0);
             dry_run = true;
         } else if args[0] == "--no-reload" {
             args.remove(0);
             no_reload = true;
+        } else if args[0] == "--version" || args[0] == "-V" {
+            println!("shoes {}", env!("CARGO_PKG_VERSION"));
+            return;
         } else {
             eprintln!("Invalid argument: {}", args[0]);
             print_usage_and_exit(arg0);
             return;
         }
     }
+
+    let directives = logging::resolve_directives();
+    let mut writers: Vec<Box<dyn logging::LogWriter>> = Vec::new();
+
+    if log_files.is_empty() || log_files.iter().any(|p| p == "-") {
+        writers.push(Box::new(logging::StderrWriter));
+    }
+    for path in &log_files {
+        if path == "-" {
+            continue;
+        }
+        match logging::FileLogWriter::new(path) {
+            Ok(w) => writers.push(Box::new(w)),
+            Err(e) => {
+                eprintln!("Failed to open log file {path}: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    logging::init_multi_logger(writers, directives);
 
     if args.iter().any(|s| s == "generate-reality-keypair") {
         let (private_key, public_key) = generate_keypair().unwrap();

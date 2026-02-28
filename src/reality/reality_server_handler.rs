@@ -329,12 +329,12 @@ fn start_forward_to_dest(
             }
         }
 
-        if !remaining_data.is_empty() {
-            if let Err(e) = write_all(&mut client_stream, &remaining_data).await {
-                log::debug!("REALITY FALLBACK: Error forwarding remaining data: {}", e);
-                let _ = futures::join!(client_stream.shutdown(), dest_stream.shutdown());
-                return;
-            }
+        if !remaining_data.is_empty()
+            && let Err(e) = write_all(&mut client_stream, &remaining_data).await
+        {
+            log::debug!("REALITY FALLBACK: Error forwarding remaining data: {}", e);
+            let _ = futures::join!(client_stream.shutdown(), dest_stream.shutdown());
+            return;
         }
 
         log::debug!(

@@ -530,7 +530,10 @@ mod tests {
         let encoded = resp.encode();
 
         // Verify varint is multi-byte (message len 200 requires 2 bytes)
-        assert!(encoded[1] & 0x80 != 0, "varint should be multi-byte for len > 127");
+        assert!(
+            encoded[1] & 0x80 != 0,
+            "varint should be multi-byte for len > 127"
+        );
 
         let mut cursor = std::io::Cursor::new(encoded);
         let decoded = StreamResponse::decode(&mut cursor).await.unwrap();

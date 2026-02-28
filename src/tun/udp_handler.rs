@@ -65,6 +65,18 @@ pub struct UdpWriter {
     to_tun_tx: UnboundedSender<PacketBuffer>,
 }
 
+impl UdpWriter {
+    /// Synchronous send that builds the UDP packet and sends it directly
+    /// on the unbounded channel, avoiding the need for an async runtime.
+    pub fn send_sync(&self, message: UdpMessage) -> io::Result<()> {
+        let (payload, src_addr, dst_addr) = message;
+        let packet = build_udp_packet(&payload, src_addr, dst_addr)?;
+        self.to_tun_tx
+            .send(packet)
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "channel closed"))
+    }
+}
+
 impl Stream for UdpReader {
     type Item = UdpMessage;
 

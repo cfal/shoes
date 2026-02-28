@@ -13,7 +13,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use crate::async_stream::{AsyncPing, AsyncStream};
 use crate::util::write_all;
 
-use super::h2mux_protocol::{StreamResponse, STATUS_SUCCESS};
+use super::h2mux_protocol::{STATUS_SUCCESS, StreamResponse};
 use super::h2mux_stream::H2MuxStream;
 
 /// Server stream wrapper that prepends status response to first write.

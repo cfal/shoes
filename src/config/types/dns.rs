@@ -15,6 +15,7 @@ fn default_timeout_secs() -> u32 {
 /// A DNS server specification in config.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
+#[allow(clippy::large_enum_variant)]
 pub enum DnsServerSpec {
     /// Simple URL string: "system", "udp://8.8.8.8", etc.
     /// Must be IP-based (no hostnames). Cannot have bootstrap_url.
@@ -48,10 +49,10 @@ impl DnsServerSpec {
 
     /// Get the group name if this is a group reference.
     pub fn as_group_ref(&self) -> Option<&str> {
-        if let Self::Simple(s) = self {
-            if !Self::is_url_string(s) {
-                return Some(s);
-            }
+        if let Self::Simple(s) = self
+            && !Self::is_url_string(s)
+        {
+            return Some(s);
         }
         None
     }

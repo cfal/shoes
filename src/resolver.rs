@@ -26,8 +26,10 @@ pub struct TimeoutResolver<T> {
 }
 
 impl<T: Resolver> TimeoutResolver<T> {
+    #[allow(dead_code)]
     pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
+    #[allow(dead_code)]
     pub fn new(inner: T) -> Self {
         Self {
             inner,
@@ -76,7 +78,7 @@ impl<T: Resolver> Resolver for TimeoutResolver<T> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct NativeResolver;
 
 impl NativeResolver {
@@ -180,13 +182,12 @@ impl Resolver for CachingNativeResolver {
         // Check cache first
         {
             let cache = self.cache.lock();
-            if let Some(cached) = cache.get(location) {
-                if Instant::now().duration_since(cached.timestamp)
+            if let Some(cached) = cache.get(location)
+                && Instant::now().duration_since(cached.timestamp)
                     <= Duration::from_secs(self.result_timeout_secs)
-                {
-                    let addr = cached.addr;
-                    return Box::pin(async move { Ok(vec![addr]) });
-                }
+            {
+                let addr = cached.addr;
+                return Box::pin(async move { Ok(vec![addr]) });
             }
         }
 

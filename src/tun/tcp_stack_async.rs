@@ -154,11 +154,19 @@ impl VirtTunDevice {
     }
 
     /// Try to get a packet from the input channel.
-    fn try_recv(&mut self) -> Option<PooledBuffer> {
+    /// Returns an error when the channel is closed so the stack thread can exit.
+    fn try_recv(&mut self) -> io::Result<Option<PooledBuffer>> {
         if let Some(pkt) = self.pending_rx.take() {
-            return Some(pkt);
+            return Ok(Some(pkt));
         }
-        self.in_rx.try_recv().ok()
+        match self.in_rx.try_recv() {
+            Ok(pkt) => Ok(Some(pkt)),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => Ok(None),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "tun input channel closed",
+            )),
+        }
     }
 
     /// Store a packet for later processing.
@@ -449,8 +457,13 @@ fn run_stack_thread(
 
         while packets_read < MAX_PACKET_BATCH {
             let pkt = match device.try_recv() {
-                Some(p) => p,
-                None => break,
+                Ok(Some(p)) => p,
+                Ok(None) => break,
+                Err(e) => {
+                    error!("TUN input channel read failed: {}. Stack thread stopping.", e);
+                    running.store(false, Ordering::Relaxed);
+                    break;
+                }
             };
             packets_read += 1;
 
@@ -508,6 +521,10 @@ fn run_stack_thread(
                     _ => {}
                 }
             }
+        }
+
+        if !running.load(Ordering::Relaxed) {
+            break;
         }
 
         // Process packets through smoltcp

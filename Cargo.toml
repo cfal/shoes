@@ -1,6 +1,6 @@
 [package]
 name = "shoes"
-version = "0.2.7"
+version = "0.2.8"
 edition = "2024"
 license = "MIT"
 description = "A multi-protocol proxy server."
@@ -31,9 +31,9 @@ aws-lc-rs = { version = "*", default-features = false }
 base64 = "*"
 blake3 = "*"
 bytes = "*"
+chrono = "*"
 dashmap = "*"
 digest = "*"
-env_logger = "*"
 etherparse = "*"
 futures = "*"
 h2 = "*"
@@ -48,7 +48,7 @@ hyper = { version = "*", features = ["server", "http1", "http2"] }
 hyper-util = { version = "*", features = ["tokio", "server"] }
 indexmap = "*"
 libc = "*"
-log = { version = "*", features = ["release_max_level_info"] }
+log = { version = "*", features = ["std", "release_max_level_info"] }
 lru = "*"
 md-5 = "*"
 memchr = "*"
@@ -97,7 +97,6 @@ tikv-jemallocator = "*"
 
 [target.'cfg(target_os = "android")'.dependencies]
 android_logger = "*"
-chrono = "*"
 jni = "*"
 ndk-sys = "*"
 

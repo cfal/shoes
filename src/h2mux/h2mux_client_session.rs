@@ -119,12 +119,7 @@ impl H2MuxClientSession {
             .max_concurrent_streams(1024)
             .handshake(conn)
             .await
-            .map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("H2 client handshake failed: {}", e),
-                )
-            })?;
+            .map_err(|e| io::Error::other(format!("H2 client handshake failed: {}", e)))?;
 
         // Take ping_pong handle before spawning - can only be called once
         let ping_pong = connection.ping_pong();
@@ -269,12 +264,7 @@ impl H2MuxClientSession {
         let (response_future, send_stream) = self
             .send_request
             .send_request(http_request, false)
-            .map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("Failed to send CONNECT: {}", e),
-                )
-            })?;
+            .map_err(|e| io::Error::other(format!("Failed to send CONNECT: {}", e)))?;
 
         // Create unified client stream with lazy response resolution
         let client_stream =

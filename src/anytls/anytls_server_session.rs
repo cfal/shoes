@@ -660,7 +660,10 @@ impl AnyTlsSession {
                 // Use a small stack buffer for the header
                 let header = [
                     Command::Waste as u8,
-                    0, 0, 0, 0, // stream_id = 0
+                    0,
+                    0,
+                    0,
+                    0, // stream_id = 0
                     (size >> 8) as u8,
                     size as u8,
                 ];

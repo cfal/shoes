@@ -106,6 +106,9 @@ mod xudp;
 /// Configuration types.
 pub mod config;
 
+/// Multi-output logging infrastructure.
+pub mod logging;
+
 /// TUN device support for VPN mode.
 pub mod tun;
 

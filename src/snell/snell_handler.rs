@@ -179,34 +179,35 @@ impl TcpServerHandler for SnellServerHandler {
             let remote_location = NetLocation::new(Address::from(hostname_str)?, port);
 
             // Checks for h2mux magic destination
-            if let Address::Hostname(host) = remote_location.address() {
-                if host == MUX_DESTINATION_HOST && remote_location.port() == MUX_DESTINATION_PORT {
-                    // Send Snell success response before spawning h2mux session
-                    write_all(&mut server_stream, TCP_TUNNEL_RESPONSE).await?;
-                    server_stream.flush().await?;
+            if let Address::Hostname(host) = remote_location.address()
+                && host == MUX_DESTINATION_HOST
+                && remote_location.port() == MUX_DESTINATION_PORT
+            {
+                // Send Snell success response before spawning h2mux session
+                write_all(&mut server_stream, TCP_TUNNEL_RESPONSE).await?;
+                server_stream.flush().await?;
 
-                    let proxy_selector = self.proxy_selector.clone();
-                    let resolver = self.resolver.clone();
-                    let udp_enabled = self.udp_enabled;
+                let proxy_selector = self.proxy_selector.clone();
+                let resolver = self.resolver.clone();
+                let udp_enabled = self.udp_enabled;
 
-                    let initial_data = stream_reader.unparsed_data_owned();
+                let initial_data = stream_reader.unparsed_data_owned();
 
-                    tokio::spawn(async move {
-                        if let Err(e) = handle_h2mux_session(
-                            server_stream,
-                            initial_data,
-                            udp_enabled,
-                            proxy_selector,
-                            resolver,
-                        )
-                        .await
-                        {
-                            debug!("Snell h2mux session ended: {}", e);
-                        }
-                    });
+                tokio::spawn(async move {
+                    if let Err(e) = handle_h2mux_session(
+                        server_stream,
+                        initial_data,
+                        udp_enabled,
+                        proxy_selector,
+                        resolver,
+                    )
+                    .await
+                    {
+                        debug!("Snell h2mux session ended: {}", e);
+                    }
+                });
 
-                    return Ok(TcpServerSetupResult::AlreadyHandled);
-                }
+                return Ok(TcpServerSetupResult::AlreadyHandled);
             }
 
             Ok(TcpServerSetupResult::TcpForward {

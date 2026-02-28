@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 
 use async_trait::async_trait;
+use subtle::ConstantTimeEq;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::address::{Address, NetLocation, ResolvedLocation};
@@ -178,24 +179,8 @@ pub async fn setup_socks_server_stream_inner(
         let username = stream_reader
             .read_slice(&mut server_stream, username_len)
             .await?;
-
-        let username_str = match std::str::from_utf8(username) {
-            Ok(s) => s,
-            Err(e) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("Failed to decode username: {e}"),
-                ));
-            }
-        };
-
-        // TODO: consider reading both username and password before checking.
-        if target_username != username_str {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "SOCKS username does not match",
-            ));
-        }
+        // Copy to owned buffer to release the borrow on stream_reader
+        let username_bytes = username.to_vec();
 
         let password_len = stream_reader.read_u8(&mut server_stream).await? as usize;
         if password_len == 0 {
@@ -209,20 +194,16 @@ pub async fn setup_socks_server_stream_inner(
             .read_slice(&mut server_stream, password_len)
             .await?;
 
-        let password_str = match std::str::from_utf8(password) {
-            Ok(s) => s,
-            Err(e) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("Failed to decode password: {e}"),
-                ));
-            }
-        };
+        // Use constant-time comparison to prevent timing attacks.
+        // Both username and password are compared together to avoid leaking
+        // which one is incorrect.
+        let username_match = target_username.as_bytes().ct_eq(&username_bytes);
+        let password_match = target_password.as_bytes().ct_eq(password);
 
-        if target_password != password_str {
+        if username_match.unwrap_u8() == 0 || password_match.unwrap_u8() == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "SOCKS password does not match",
+                "SOCKS authentication failed",
             ));
         }
 

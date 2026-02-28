@@ -65,7 +65,9 @@ async fn process_connection(
     // to replay attacks, though for incoming server connections it's 0.5-RTT which
     // is safer but still shouldn't be used for client-authenticated data).
     let connection = if zero_rtt_handshake {
-        let connecting = conn.accept().map_err(std::io::Error::other)?;
+        let connecting = conn
+            .accept()
+            .map_err(|e| std::io::Error::other(format!("QUIC accept failed: {e}")))?;
         // For incoming connections, into_0rtt() always succeeds per quinn docs
         let (connection, _zero_rtt_accepted) = connecting
             .into_0rtt()
@@ -695,7 +697,7 @@ async fn run_udp_remote_to_local_stream_loop(
             let count = send_stream
                 .write(&buf[i..end_offset])
                 .await
-                .map_err(std::io::Error::other)?;
+                .map_err(|e| std::io::Error::other(format!("TUIC stream write failed: {e}")))?;
             i += count;
         }
     }

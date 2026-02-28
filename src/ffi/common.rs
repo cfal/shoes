@@ -5,9 +5,9 @@
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 
-use log::{LevelFilter, Log, Metadata, Record, info};
+use log::info;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
@@ -17,7 +17,7 @@ use crate::tcp::tcp_server::start_servers;
 use crate::tun::run_tun_from_config;
 
 /// Global log file handle for file-based logging.
-pub static LOG_FILE: OnceLock<Mutex<Option<File>>> = OnceLock::new();
+pub static LOG_FILE: OnceLock<parking_lot::Mutex<Option<File>>> = OnceLock::new();
 
 /// Global flag to track if logger has been initialized.
 pub static LOGGER_INITIALIZED: AtomicBool = AtomicBool::new(false);
@@ -38,38 +38,17 @@ pub struct TunServiceHandle {
     pub running: Arc<AtomicBool>,
 }
 
-/// Parse log level string to LevelFilter.
-pub fn parse_log_level(level_str: &str) -> LevelFilter {
-    match level_str.to_lowercase().as_str() {
-        "error" => LevelFilter::Error,
-        "warn" => LevelFilter::Warn,
-        "info" => LevelFilter::Info,
-        "debug" => LevelFilter::Debug,
-        "trace" => LevelFilter::Trace,
-        _ => LevelFilter::Info,
-    }
-}
-
 /// Set up log file for file-based logging.
 ///
 /// Returns 0 on success, -1 on error.
 pub fn setup_log_file(path_str: &str) -> i32 {
-    let file_mutex = LOG_FILE.get_or_init(|| Mutex::new(None));
+    let file_mutex = LOG_FILE.get_or_init(|| parking_lot::Mutex::new(None));
 
     match OpenOptions::new().create(true).append(true).open(path_str) {
         Ok(file) => {
-            let result = if let Ok(mut guard) = file_mutex.lock() {
-                *guard = Some(file);
-                true
-            } else {
-                false
-            };
-            if result {
-                info!("Log file set to: {}", path_str);
-                0
-            } else {
-                -1
-            }
+            *file_mutex.lock() = Some(file);
+            info!("Log file set to: {}", path_str);
+            0
         }
         Err(_) => -1,
     }
@@ -78,11 +57,9 @@ pub fn setup_log_file(path_str: &str) -> i32 {
 /// Write a log message to the log file if configured.
 pub fn write_to_log_file(level: log::Level, target: &str, message: &str) {
     if let Some(file_mutex) = LOG_FILE.get() {
-        if let Ok(mut guard) = file_mutex.lock() {
-            if let Some(ref mut file) = *guard {
-                let _ = writeln!(file, "{} [{}] {}", level, target, message);
-                let _ = file.flush();
-            }
+        let mut guard = file_mutex.lock();
+        if let Some(ref mut writer) = *guard {
+            let _ = writeln!(writer, "{} [{}] {}", level, target, message);
         }
     }
 }
@@ -90,43 +67,10 @@ pub fn write_to_log_file(level: log::Level, target: &str, message: &str) {
 /// Flush the log file.
 pub fn flush_log_file() {
     if let Some(file_mutex) = LOG_FILE.get() {
-        if let Ok(mut guard) = file_mutex.lock() {
-            if let Some(ref mut file) = *guard {
-                let _ = file.flush();
-            }
+        let mut guard = file_mutex.lock();
+        if let Some(ref mut writer) = *guard {
+            let _ = writer.flush();
         }
-    }
-}
-
-/// Base logger that handles file logging.
-/// Platform-specific loggers can wrap this and add their own output.
-pub struct FileLogger {
-    level: LevelFilter,
-}
-
-impl FileLogger {
-    pub fn new(level: LevelFilter) -> Self {
-        Self { level }
-    }
-}
-
-impl Log for FileLogger {
-    fn enabled(&self, metadata: &Metadata) -> bool {
-        metadata.level() <= self.level
-    }
-
-    fn log(&self, record: &Record) {
-        if self.enabled(record.metadata()) {
-            write_to_log_file(
-                record.level(),
-                record.target(),
-                &format!("{}", record.args()),
-            );
-        }
-    }
-
-    fn flush(&self) {
-        flush_log_file();
     }
 }
 

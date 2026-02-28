@@ -59,7 +59,9 @@ impl AsyncRead for H2MultiStream {
 
                 Poll::Ready(Ok(()))
             }
-            Poll::Ready(Some(Err(e))) => Poll::Ready(Err(io::Error::other(e))),
+            Poll::Ready(Some(Err(e))) => {
+                Poll::Ready(Err(io::Error::other(format!("H2 recv error: {e}"))))
+            }
             Poll::Ready(None) => Poll::Ready(Ok(())),
             Poll::Pending => Poll::Pending,
         }
@@ -82,10 +84,12 @@ impl AsyncWrite for H2MultiStream {
                 let to_send = buf.len().min(capacity);
                 self.send
                     .send_data(Bytes::copy_from_slice(&buf[..to_send]), false)
-                    .map_err(io::Error::other)?;
+                    .map_err(|e| io::Error::other(format!("H2 send_data failed: {e}")))?;
                 Poll::Ready(Ok(to_send))
             }
-            Poll::Ready(Some(Err(e))) => Poll::Ready(Err(io::Error::other(e))),
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Err(io::Error::other(format!(
+                "H2 poll_capacity error: {e}"
+            )))),
             Poll::Ready(None) => Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "H2 stream closed",
@@ -103,7 +107,11 @@ impl AsyncWrite for H2MultiStream {
         if !self.shutdown_sent {
             match self.send.send_data(Bytes::new(), true) {
                 Ok(()) => self.shutdown_sent = true,
-                Err(e) => return Poll::Ready(Err(io::Error::other(e))),
+                Err(e) => {
+                    return Poll::Ready(Err(io::Error::other(format!(
+                        "H2 send END_STREAM failed: {e}"
+                    ))));
+                }
             }
         }
 

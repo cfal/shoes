@@ -536,47 +536,46 @@ impl TcpServerHandler for VmessTcpServerHandler {
         match command {
             COMMAND_TCP => {
                 // Check for h2mux magic destination
-                if let Address::Hostname(host) = remote_location.address() {
-                    if host == MUX_DESTINATION_HOST
-                        && remote_location.port() == MUX_DESTINATION_PORT
-                    {
-                        // Create VMess stream with response header for h2mux
-                        let mut vmess_stream = VmessStream::new(
-                            server_stream,
-                            false,
-                            data_keys,
-                            read_length_shake_reader,
-                            write_length_shake_reader,
-                            enable_global_padding,
-                            Some(prefix_bytes),
-                            None,
-                        );
+                if let Address::Hostname(host) = remote_location.address()
+                    && host == MUX_DESTINATION_HOST
+                    && remote_location.port() == MUX_DESTINATION_PORT
+                {
+                    // Create VMess stream with response header for h2mux
+                    let mut vmess_stream = VmessStream::new(
+                        server_stream,
+                        false,
+                        data_keys,
+                        read_length_shake_reader,
+                        write_length_shake_reader,
+                        enable_global_padding,
+                        Some(prefix_bytes),
+                        None,
+                    );
 
-                        let unparsed_data = stream_reader.unparsed_data();
-                        if !unparsed_data.is_empty() {
-                            vmess_stream.feed_initial_read_data(unparsed_data)?;
-                        }
-
-                        let proxy_selector = self.proxy_selector.clone();
-                        let resolver = self.resolver.clone();
-                        let udp_enabled = self.udp_enabled;
-
-                        tokio::spawn(async move {
-                            if let Err(e) = handle_h2mux_session(
-                                Box::new(vmess_stream),
-                                None, // initial data already fed to vmess_stream
-                                udp_enabled,
-                                proxy_selector,
-                                resolver,
-                            )
-                            .await
-                            {
-                                log::debug!("VMess h2mux session ended: {}", e);
-                            }
-                        });
-
-                        return Ok(TcpServerSetupResult::AlreadyHandled);
+                    let unparsed_data = stream_reader.unparsed_data();
+                    if !unparsed_data.is_empty() {
+                        vmess_stream.feed_initial_read_data(unparsed_data)?;
                     }
+
+                    let proxy_selector = self.proxy_selector.clone();
+                    let resolver = self.resolver.clone();
+                    let udp_enabled = self.udp_enabled;
+
+                    tokio::spawn(async move {
+                        if let Err(e) = handle_h2mux_session(
+                            Box::new(vmess_stream),
+                            None, // initial data already fed to vmess_stream
+                            udp_enabled,
+                            proxy_selector,
+                            resolver,
+                        )
+                        .await
+                        {
+                            log::debug!("VMess h2mux session ended: {}", e);
+                        }
+                    });
+
+                    return Ok(TcpServerSetupResult::AlreadyHandled);
                 }
 
                 let mut vmess_stream = VmessStream::new(

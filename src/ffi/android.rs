@@ -25,49 +25,29 @@ use std::sync::atomic::Ordering;
 use jni::JNIEnv;
 use jni::objects::{JClass, JObject, JString, JValue};
 use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jint, jlong};
-use log::{LevelFilter, Log, Metadata, Record, error, info};
+use log::{Record, error, info};
 use tokio::runtime::Runtime;
 use tokio::sync::oneshot;
 
+use crate::logging::{DynamicFileLogWriter, LogWriter};
 use crate::tun::{FnSocketProtector, set_global_socket_protector};
 
 use super::common::{
-    self, LOG_FILE, LOGGER_INITIALIZED, TUN_SERVICE, TunServiceHandle, flush_log_file,
-    parse_log_level, setup_log_file,
+    self, LOG_FILE, LOGGER_INITIALIZED, TUN_SERVICE, TunServiceHandle, setup_log_file,
 };
 
-/// Android logger that writes to both logcat and file.
-struct AndroidLogger {
-    level: LevelFilter,
-}
+/// Writes to Android logcat. Uses the `record` arg for level mapping;
+/// logcat has its own formatting so the pre-formatted string is ignored.
+struct LogcatWriter;
 
-impl AndroidLogger {
-    fn new(level: LevelFilter) -> Self {
-        Self { level }
-    }
-}
-
-impl Log for AndroidLogger {
-    fn enabled(&self, metadata: &Metadata) -> bool {
-        metadata.level() <= self.level
-    }
-
-    fn log(&self, record: &Record) {
-        if !self.enabled(record.metadata()) {
-            return;
-        }
-
-        let level = record.level();
-        let target = record.target();
-        let message = format!("{}", record.args());
-
-        // Write to Android logcat
+impl LogWriter for LogcatWriter {
+    fn write_log(&self, record: &Record, _formatted: &str) {
         #[cfg(target_os = "android")]
         {
             use std::ffi::CString;
             let tag = CString::new("shoes").unwrap_or_default();
-            let msg = CString::new(message.as_str()).unwrap_or_default();
-            let priority = match level {
+            let msg = CString::new(format!("{}", record.args())).unwrap_or_default();
+            let priority = match record.level() {
                 log::Level::Error => 6, // ANDROID_LOG_ERROR
                 log::Level::Warn => 5,  // ANDROID_LOG_WARN
                 log::Level::Info => 4,  // ANDROID_LOG_INFO
@@ -78,23 +58,11 @@ impl Log for AndroidLogger {
                 ndk_sys::__android_log_write(priority as i32, tag.as_ptr(), msg.as_ptr());
             }
         }
-
-        // Write to log file if configured (with timestamp for Android)
-        if let Some(file_mutex) = LOG_FILE.get() {
-            if let Ok(mut guard) = file_mutex.lock() {
-                if let Some(ref mut file) = *guard {
-                    use std::io::Write;
-                    let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
-                    let _ = writeln!(file, "{} {} [{}] {}", timestamp, level, target, message);
-                    let _ = file.flush();
-                }
-            }
-        }
+        #[cfg(not(target_os = "android"))]
+        let _ = record;
     }
 
-    fn flush(&self) {
-        flush_log_file();
-    }
+    fn flush(&self) {}
 }
 
 /// Initialize the shoes library.
@@ -121,16 +89,19 @@ pub extern "system" fn Java_com_shoesproxy_ShoesNative_init(
         }
     };
 
-    let level = parse_log_level(&level_str);
+    let level = crate::logging::parse_log_level(&level_str)
+        .unwrap_or(log::LevelFilter::Info);
 
     // Initialize logger (only once)
     if !LOGGER_INITIALIZED.swap(true, Ordering::SeqCst) {
-        LOG_FILE.get_or_init(|| std::sync::Mutex::new(None));
+        LOG_FILE.get_or_init(|| parking_lot::Mutex::new(None));
 
-        let logger = AndroidLogger::new(level);
-        if log::set_boxed_logger(Box::new(logger)).is_ok() {
-            log::set_max_level(level);
-        }
+        let writers: Vec<Box<dyn LogWriter>> = vec![
+            Box::new(LogcatWriter),
+            Box::new(DynamicFileLogWriter::new(&LOG_FILE)),
+        ];
+        let directives = vec![crate::logging::Directive { name: None, level }];
+        crate::logging::init_multi_logger(writers, directives);
     }
 
     info!("shoes initialized with log level: {}", level_str);

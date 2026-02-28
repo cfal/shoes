@@ -3,8 +3,8 @@
 //! Tracks the last time activity occurred on a connection to support idle timeout.
 //! Uses atomic operations for lock-free performance.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// Timeout constants matching sing-mux behavior.

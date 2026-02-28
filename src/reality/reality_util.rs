@@ -53,7 +53,7 @@ pub fn decode_private_key(encoded: &str) -> Result<[u8; 32], std::io::Error> {
 /// Decodes a hex-encoded short ID with zero-padding
 ///
 /// Short IDs can be 0-16 hex characters (0-8 bytes).
-/// If shorter than 16 characters, they are left-padded with zeros.
+/// If shorter than 16 characters, they are right-padded with zeros.
 pub fn decode_short_id(hex: &str) -> Result<[u8; 8], std::io::Error> {
     if hex.len() > 16 {
         return Err(std::io::Error::new(
@@ -62,8 +62,8 @@ pub fn decode_short_id(hex: &str) -> Result<[u8; 8], std::io::Error> {
         ));
     }
 
-    // Left-pad with zeros to make 16 chars
-    let padded = format!("{:0>16}", hex);
+    // Right-pad with zeros to make 16 chars (compatible with other REALITY clients)
+    let padded = format!("{:0<16}", hex);
 
     let mut short_id = [0u8; 8];
     decode_hex_to_slice(&padded, &mut short_id).map_err(|e| {
@@ -490,9 +490,9 @@ mod tests {
         let short_id = decode_short_id("0123456789abcdef").unwrap();
         assert_eq!(short_id, [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef]);
 
-        // Partial hex (should be zero-padded on left)
+        // Partial hex (should be zero-padded on right)
         let short_id2 = decode_short_id("abcdef").unwrap();
-        assert_eq!(short_id2, [0x00, 0x00, 0x00, 0x00, 0x00, 0xab, 0xcd, 0xef]);
+        assert_eq!(short_id2, [0xab, 0xcd, 0xef, 0x00, 0x00, 0x00, 0x00, 0x00]);
 
         // Empty (all zeros)
         let short_id3 = decode_short_id("").unwrap();

@@ -231,19 +231,8 @@ impl TunUdpManager {
         src_addr: SocketAddr,
         dst_addr: SocketAddr,
     ) -> io::Result<()> {
-        use futures::SinkExt;
-
-        // Build IP packet: src=remote_server, dst=local_app
         let message = (payload.to_vec(), src_addr, dst_addr);
-
-        // Use blocking send since we're in an async context but
-        // the UdpWriter is an unbounded channel
-        futures::executor::block_on(async {
-            Pin::new(&mut self.writer)
-                .send(message)
-                .await
-                .map_err(io::Error::other)
-        })
+        self.writer.send_sync(message)
     }
 
     /// Clean up expired and dead sessions.

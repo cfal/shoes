@@ -439,10 +439,10 @@ fn extract_inline_dns(
     }
 
     // Already a single group reference - nothing to extract
-    if let NoneOrSome::One(spec) = &config.servers {
-        if spec.as_group_ref().is_some() {
-            return Ok(());
-        }
+    if let NoneOrSome::One(spec) = &config.servers
+        && spec.as_group_ref().is_some()
+    {
+        return Ok(());
     }
 
     // Generate unique name and extract specs into a new group
@@ -476,16 +476,16 @@ fn validate_dns_group_ref(
     }
 
     // After extraction, servers should be a single group reference
-    if let NoneOrSome::One(spec) = &config.servers {
-        if let Some(group_name) = spec.as_group_ref() {
-            if !group_names.contains(group_name) {
-                return Err(std::io::Error::other(format!(
-                    "unknown dns_group in server config: '{}'",
-                    group_name
-                )));
-            }
-            return Ok(());
+    if let NoneOrSome::One(spec) = &config.servers
+        && let Some(group_name) = spec.as_group_ref()
+    {
+        if !group_names.contains(group_name) {
+            return Err(std::io::Error::other(format!(
+                "unknown dns_group in server config: '{}'",
+                group_name
+            )));
         }
+        return Ok(());
     }
 
     // Should not reach here after extract_inline_dns
@@ -547,9 +547,7 @@ fn expand_dns_specs(
             }
 
             // Check if all chains are direct-only (for UDP/H3 validation)
-            let all_direct = expanded_chains
-                .iter()
-                .all(|chain| is_chain_direct_only(chain));
+            let all_direct = expanded_chains.iter().all(is_chain_direct_only);
 
             if !all_direct {
                 match &parsed_url {

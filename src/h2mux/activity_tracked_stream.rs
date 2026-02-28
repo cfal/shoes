@@ -38,10 +38,10 @@ impl<S: AsyncRead + Unpin> AsyncRead for ActivityTrackedStream<S> {
         let result = Pin::new(&mut self.inner).poll_read(cx, buf);
 
         // Record activity on successful read with data
-        if let Poll::Ready(Ok(())) = &result {
-            if buf.filled().len() > filled_before {
-                self.activity.record_activity();
-            }
+        if let Poll::Ready(Ok(())) = &result
+            && buf.filled().len() > filled_before
+        {
+            self.activity.record_activity();
         }
 
         result
@@ -57,10 +57,10 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for ActivityTrackedStream<S> {
         let result = Pin::new(&mut self.inner).poll_write(cx, buf);
 
         // Record activity on successful write
-        if let Poll::Ready(Ok(n)) = &result {
-            if *n > 0 {
-                self.activity.record_activity();
-            }
+        if let Poll::Ready(Ok(n)) = &result
+            && *n > 0
+        {
+            self.activity.record_activity();
         }
 
         result

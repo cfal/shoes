@@ -63,7 +63,7 @@ async fn process_connection(
     let mut h3_conn: h3::server::Connection<h3_quinn::Connection, bytes::Bytes> =
         h3::server::Connection::new(h3_quinn_connection)
             .await
-            .map_err(std::io::Error::other)?;
+            .map_err(|e| std::io::Error::other(format!("H3 connection setup failed: {e}")))?;
 
     // Per sing-box reference, authentication timeout is 3 seconds
     match timeout(
@@ -169,7 +169,9 @@ fn validate_auth_request<T>(req: http::Request<T>, password: &str) -> std::io::R
             return Err(std::io::Error::other("missing auth header"));
         }
     };
-    let auth_str = auth_value.to_str().map_err(std::io::Error::other)?;
+    let auth_str = auth_value
+        .to_str()
+        .map_err(|e| std::io::Error::other(format!("invalid auth header value: {e}")))?;
     if auth_str != password {
         return Err(std::io::Error::other(format!(
             "incorrect auth password: {auth_str}"
@@ -194,7 +196,11 @@ async fn auth_connection(
     udp_enabled: bool,
 ) -> std::io::Result<()> {
     loop {
-        match h3_conn.accept().await.map_err(std::io::Error::other)? {
+        match h3_conn
+            .accept()
+            .await
+            .map_err(|e| std::io::Error::other(format!("H3 accept failed: {e}")))?
+        {
             Some(resolver) => {
                 let (req, mut stream) = resolver.resolve_request().await.map_err(|err| {
                     std::io::Error::other(format!("Failed to resolve request: {err}"))
@@ -209,12 +215,13 @@ async fn auth_connection(
                             .body(())
                             .unwrap();
 
-                        stream
-                            .send_response(resp)
-                            .await
-                            .map_err(std::io::Error::other)?;
+                        stream.send_response(resp).await.map_err(|e| {
+                            std::io::Error::other(format!("failed to send auth response: {e}"))
+                        })?;
 
-                        stream.finish().await.map_err(std::io::Error::other)?;
+                        stream.finish().await.map_err(|e| {
+                            std::io::Error::other(format!("failed to finish auth stream: {e}"))
+                        })?;
 
                         return Ok(());
                     }
@@ -224,11 +231,12 @@ async fn auth_connection(
                             .status(http::status::StatusCode::NOT_FOUND)
                             .body(())
                             .unwrap();
-                        stream
-                            .send_response(resp)
-                            .await
-                            .map_err(std::io::Error::other)?;
-                        stream.finish().await.map_err(std::io::Error::other)?;
+                        stream.send_response(resp).await.map_err(|e| {
+                            std::io::Error::other(format!("failed to send reject response: {e}"))
+                        })?;
+                        stream.finish().await.map_err(|e| {
+                            std::io::Error::other(format!("failed to finish reject stream: {e}"))
+                        })?;
                     }
                 }
             }
@@ -782,7 +790,8 @@ async fn handle_tcp_header(
         return Err(std::io::Error::other("invalid address length"));
     }
     let address_bytes = stream_reader.read_slice(recv, address_len as usize).await?;
-    let address = std::str::from_utf8(address_bytes).map_err(std::io::Error::other)?;
+    let address = std::str::from_utf8(address_bytes)
+        .map_err(|e| std::io::Error::other(format!("invalid address encoding: {e}")))?;
     let remote_location = NetLocation::from_str(address, None)?;
 
     let padding_len = read_varint(recv, &mut stream_reader).await?;
@@ -819,7 +828,7 @@ async fn handle_tcp_header(
         let count = send
             .write(&response_bytes[i..len])
             .await
-            .map_err(std::io::Error::other)?;
+            .map_err(|e| std::io::Error::other(format!("H3 stream write failed: {e}")))?;
         i += count;
     }
 
@@ -885,7 +894,7 @@ async fn process_tcp_stream(
             let count = client_stream
                 .write(&unparsed_data[i..len])
                 .await
-                .map_err(std::io::Error::other)?;
+                .map_err(|e| std::io::Error::other(format!("H3 stream write failed: {e}")))?;
             i += count;
         }
         true

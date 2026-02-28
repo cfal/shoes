@@ -138,8 +138,7 @@ impl H2MuxClientHandler {
         // that needs a new session will create one on-demand. The caller must provide
         // the transport stream.
 
-        Err(io::Error::new(
-            io::ErrorKind::Other,
+        Err(io::Error::other(
             "H2MuxClientHandler requires transport stream to be provided",
         ))
     }

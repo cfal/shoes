@@ -237,7 +237,7 @@ async fn build_entry_from_spec(
     let resolved_ip = match parsed_url.hostname() {
         Some(hostname) => {
             let location = crate::address::NetLocation::new(
-                crate::address::Address::Hostname(hostname.to_string().into()),
+                crate::address::Address::Hostname(hostname.to_string()),
                 0,
             );
 

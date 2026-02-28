@@ -171,33 +171,34 @@ impl TcpServerHandler for ShadowsocksTcpHandler {
         }
 
         // Checks for h2mux magic destination
-        if let Address::Hostname(host) = remote_location.address() {
-            if host == MUX_DESTINATION_HOST && remote_location.port() == MUX_DESTINATION_PORT {
-                let proxy_selector = self
-                    .proxy_selector
-                    .clone()
-                    .expect("proxy_selector required for server handler");
-                let resolver = self.resolver.clone().expect("resolver required for h2mux");
-                let udp_enabled = self.udp_enabled;
+        if let Address::Hostname(host) = remote_location.address()
+            && host == MUX_DESTINATION_HOST
+            && remote_location.port() == MUX_DESTINATION_PORT
+        {
+            let proxy_selector = self
+                .proxy_selector
+                .clone()
+                .expect("proxy_selector required for server handler");
+            let resolver = self.resolver.clone().expect("resolver required for h2mux");
+            let udp_enabled = self.udp_enabled;
 
-                let initial_data = stream_reader.unparsed_data_owned();
+            let initial_data = stream_reader.unparsed_data_owned();
 
-                tokio::spawn(async move {
-                    if let Err(e) = handle_h2mux_session(
-                        server_stream,
-                        initial_data,
-                        udp_enabled,
-                        proxy_selector,
-                        resolver,
-                    )
-                    .await
-                    {
-                        debug!("Shadowsocks h2mux session ended: {}", e);
-                    }
-                });
+            tokio::spawn(async move {
+                if let Err(e) = handle_h2mux_session(
+                    server_stream,
+                    initial_data,
+                    udp_enabled,
+                    proxy_selector,
+                    resolver,
+                )
+                .await
+                {
+                    debug!("Shadowsocks h2mux session ended: {}", e);
+                }
+            });
 
-                return Ok(TcpServerSetupResult::AlreadyHandled);
-            }
+            return Ok(TcpServerSetupResult::AlreadyHandled);
         }
 
         // Checks for UDP-over-TCP (UoT) magic addresses

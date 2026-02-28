@@ -214,6 +214,7 @@ impl ResolvedLocation {
     }
 
     /// Get the port.
+    #[cfg(test)]
     pub fn port(&self) -> u16 {
         self.location.port()
     }

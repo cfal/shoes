@@ -23,14 +23,15 @@ use std::ffi::{CStr, c_char, c_int, c_long};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use log::{Level, LevelFilter, Log, Metadata, Record, error, info};
+use log::{error, info};
 use parking_lot::Mutex;
 use std::sync::OnceLock;
 use tokio::sync::oneshot;
 
+use crate::logging::{DynamicFileLogWriter, LogWriter};
+
 use super::common::{
-    self, INITIALIZED, LOG_FILE, LOGGER_INITIALIZED, TUN_SERVICE, TunServiceHandle, flush_log_file,
-    parse_log_level, setup_log_file, write_to_log_file,
+    self, INITIALIZED, LOG_FILE, LOGGER_INITIALIZED, TUN_SERVICE, TunServiceHandle, setup_log_file,
 };
 
 /// Socket protector callback type.
@@ -40,53 +41,6 @@ pub type ProtectSocketCallback = extern "C" fn(fd: c_int) -> bool;
 
 /// Global socket protector callback.
 static PROTECT_CALLBACK: OnceLock<Mutex<Option<ProtectSocketCallback>>> = OnceLock::new();
-
-/// iOS logger that writes to both file and stderr (captured by Console.app).
-struct IosLogger {
-    level: LevelFilter,
-}
-
-impl IosLogger {
-    fn new(level: LevelFilter) -> Self {
-        Self { level }
-    }
-}
-
-impl Log for IosLogger {
-    fn enabled(&self, metadata: &Metadata) -> bool {
-        metadata.level() <= self.level
-    }
-
-    fn log(&self, record: &Record) {
-        if !self.enabled(record.metadata()) {
-            return;
-        }
-
-        let level = record.level();
-        let target = record.target();
-        let message = format!("{}", record.args());
-
-        // Write to log file if configured
-        write_to_log_file(level, target, &message);
-
-        // Write to stderr (captured by Console.app on iOS)
-        #[cfg(target_os = "ios")]
-        {
-            let level_str = match level {
-                Level::Error => "ERROR",
-                Level::Warn => "WARN",
-                Level::Info => "INFO",
-                Level::Debug => "DEBUG",
-                Level::Trace => "TRACE",
-            };
-            eprintln!("[shoes] {} [{}] {}", level_str, target, message);
-        }
-    }
-
-    fn flush(&self) {
-        flush_log_file();
-    }
-}
 
 /// Socket protector implementation for iOS.
 struct IosSocketProtector;
@@ -136,15 +90,17 @@ pub unsafe extern "C" fn shoes_init(log_level: *const c_char) -> c_int {
         }
     };
 
-    let filter = parse_log_level(level_str);
+    let filter = crate::logging::parse_log_level(level_str)
+        .unwrap_or(log::LevelFilter::Info);
 
     if !LOGGER_INITIALIZED.swap(true, Ordering::SeqCst) {
-        LOG_FILE.get_or_init(|| std::sync::Mutex::new(None));
+        LOG_FILE.get_or_init(|| parking_lot::Mutex::new(None));
 
-        let logger = IosLogger::new(filter);
-        if log::set_boxed_logger(Box::new(logger)).is_ok() {
-            log::set_max_level(filter);
-        }
+        // File-only logging on iOS (no stderr output)
+        let writers: Vec<Box<dyn LogWriter>> =
+            vec![Box::new(DynamicFileLogWriter::new(&LOG_FILE))];
+        let directives = vec![crate::logging::Directive { name: None, level: filter }];
+        crate::logging::init_multi_logger(writers, directives);
     }
 
     TUN_SERVICE.get_or_init(|| Mutex::new(None));
