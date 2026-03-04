@@ -36,6 +36,10 @@ const MAX_SESSIONS: usize = 256;
 /// Channel buffer size for session and destination packets
 const CHANNEL_SIZE: usize = 64;
 
+/// Response channel buffer size. Bounds memory growth when destination
+/// tasks produce responses faster than the manager can write to TUN.
+const RESPONSE_CHANNEL_SIZE: usize = 512;
+
 /// Per-destination connection timeout (self-enforced by destination tasks)
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -64,9 +68,9 @@ pub struct TunUdpManager {
     proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
     /// Receives responses from destination tasks (across all sessions)
-    response_rx: mpsc::UnboundedReceiver<UdpMessage>,
+    response_rx: mpsc::Receiver<UdpMessage>,
     /// Cloned into each session, then into each destination task
-    response_tx: mpsc::UnboundedSender<UdpMessage>,
+    response_tx: mpsc::Sender<UdpMessage>,
 }
 
 /// A UDP session for a single local (app) address.
@@ -83,13 +87,6 @@ impl Session {
     fn is_alive(&self) -> bool {
         !self.handle.is_finished()
     }
-
-    async fn send(&self, dest: SocketAddr, payload: Vec<u8>) -> io::Result<()> {
-        self.tx
-            .send((dest, payload))
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "session closed"))
-    }
 }
 
 impl TunUdpManager {
@@ -100,7 +97,7 @@ impl TunUdpManager {
         proxy_selector: Arc<ClientProxySelector>,
         resolver: Arc<dyn Resolver>,
     ) -> Self {
-        let (response_tx, response_rx) = mpsc::unbounded_channel();
+        let (response_tx, response_rx) = mpsc::channel(RESPONSE_CHANNEL_SIZE);
 
         Self {
             reader,
@@ -142,7 +139,7 @@ impl TunUdpManager {
                                 local_addr, remote_addr, payload.len()
                             );
 
-                            if let Err(e) = self.handle_packet(local_addr, remote_addr, payload).await {
+                            if let Err(e) = self.handle_packet(local_addr, remote_addr, payload) {
                                 debug!("[TunUdpManager] Failed to handle packet: {}", e);
                             }
                         }
@@ -165,13 +162,16 @@ impl TunUdpManager {
     }
 
     /// Handle an incoming UDP packet from the TUN.
-    async fn handle_packet(
+    ///
+    /// Uses try_send to avoid blocking the manager event loop on a single
+    /// overloaded session (prevents head-of-line blocking at the manager level).
+    fn handle_packet(
         &mut self,
         local_addr: SocketAddr,
         remote_addr: SocketAddr,
         payload: Vec<u8>,
     ) -> io::Result<()> {
-        let session = if let Some(session) = self.sessions.get_mut(&local_addr) {
+        if let Some(session) = self.sessions.get_mut(&local_addr) {
             session.last_active = Instant::now();
 
             if !session.is_alive() {
@@ -181,16 +181,35 @@ impl TunUdpManager {
                 );
                 self.sessions.pop(&local_addr);
                 self.create_session(local_addr)?;
-                self.sessions.get_mut(&local_addr).unwrap()
-            } else {
-                session
             }
         } else {
             self.create_session(local_addr)?;
-            self.sessions.get_mut(&local_addr).unwrap()
-        };
+        }
 
-        session.send(remote_addr, payload).await
+        let session = self.sessions.get_mut(&local_addr).unwrap();
+        match session.tx.try_send((remote_addr, payload)) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                debug!(
+                    "[TunUdpManager] Session queue full for {}, dropping packet",
+                    local_addr
+                );
+                Ok(())
+            }
+            Err(mpsc::error::TrySendError::Closed(pkt)) => {
+                debug!(
+                    "[TunUdpManager] Session for {} closed, recreating",
+                    local_addr
+                );
+                self.sessions.pop(&local_addr);
+                self.create_session(local_addr)?;
+                // Retry once on the fresh session
+                if let Some(session) = self.sessions.get_mut(&local_addr) {
+                    let _ = session.tx.try_send(pkt);
+                }
+                Ok(())
+            }
+        }
     }
 
     /// Create a new session for a local address.
@@ -278,7 +297,7 @@ impl Drop for DestinationEntry {
 async fn session_task(
     peer_addr: SocketAddr,
     mut rx: mpsc::Receiver<(SocketAddr, Vec<u8>)>,
-    response_tx: mpsc::UnboundedSender<UdpMessage>,
+    response_tx: mpsc::Sender<UdpMessage>,
     proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
 ) {
@@ -342,14 +361,24 @@ async fn session_task(
                     }
                 }
 
-                // Forward payload to destination task
+                // Forward payload to destination task. Uses try_send to avoid
+                // blocking the session loop on a single slow destination.
                 let entry = destinations.get(&dest).unwrap();
-                if entry.write_tx.send(payload).await.is_err() {
-                    debug!(
-                        "[TunUdpSession {}] Destination task for {} died on send",
-                        peer_addr, dest
-                    );
-                    destinations.remove(&dest);
+                match entry.write_tx.try_send(payload) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        debug!(
+                            "[TunUdpSession {}] Destination queue full for {}, dropping packet",
+                            peer_addr, dest
+                        );
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        debug!(
+                            "[TunUdpSession {}] Destination task for {} died on send",
+                            peer_addr, dest
+                        );
+                        destinations.remove(&dest);
+                    }
                 }
             }
 
@@ -384,7 +413,7 @@ async fn destination_task(
     source_addr: SocketAddr,
     mut stream: Box<dyn AsyncMessageStream>,
     mut write_rx: mpsc::Receiver<Vec<u8>>,
-    response_tx: mpsc::UnboundedSender<UdpMessage>,
+    response_tx: mpsc::Sender<UdpMessage>,
 ) {
     let mut read_buf = vec![0u8; 65535];
     let sleep = tokio::time::sleep(CONNECTION_TIMEOUT);
@@ -423,7 +452,12 @@ async fn destination_task(
                 );
 
                 // (payload, src=remote, dst=local_app)
-                let _ = response_tx.send((buf.filled().to_vec(), source_addr, peer_addr));
+                if response_tx.try_send((buf.filled().to_vec(), source_addr, peer_addr)).is_err() {
+                    debug!(
+                        "[TunUdpSession {}] Response channel full, dropping response from {}",
+                        peer_addr, source_addr
+                    );
+                }
             }
             Action::Read(Err(e)) => {
                 debug!(
