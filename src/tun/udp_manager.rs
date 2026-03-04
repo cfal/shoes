@@ -1,6 +1,9 @@
 //! TUN UDP Session Manager.
 //!
-//! This module provides session-based UDP handling for TUN devices.
+//! Provides session-based UDP handling for TUN devices. Each destination
+//! connection runs in its own task, blocking on reads and processing writes
+//! via channel. This eliminates the busy-polling loop that previously caused
+//! CPU runaway under high-churn UDP workloads.
 
 use std::collections::HashMap;
 use std::io;
@@ -30,11 +33,16 @@ const SESSION_TIMEOUT: Duration = Duration::from_secs(300);
 /// Maximum number of sessions (LRU eviction when exceeded)
 const MAX_SESSIONS: usize = 256;
 
-/// Channel buffer size for session packets
-const SESSION_CHANNEL_SIZE: usize = 64;
+/// Channel buffer size for session and destination packets
+const CHANNEL_SIZE: usize = 64;
 
-/// Per-destination connection timeout
+/// Per-destination connection timeout (self-enforced by destination tasks)
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Maximum time to wait for a single write to complete before treating
+/// the connection as dead. Bounds orphan lifetime if the underlying
+/// stream stalls (e.g. unresponsive remote, full TCP send buffer).
+const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Convert a SocketAddr to a NetLocation.
 fn socket_addr_to_net_location(addr: SocketAddr) -> NetLocation {
@@ -50,19 +58,14 @@ fn socket_addr_to_net_location(addr: SocketAddr) -> NetLocation {
 /// Sessions are keyed by the local (app) address, ensuring each app's
 /// traffic is handled independently and responses are routed correctly.
 pub struct TunUdpManager {
-    /// Reader for packets from TUN
     reader: UdpReader,
-    /// Writer for packets to TUN
     writer: UdpWriter,
-    /// Sessions keyed by local (app) address
     sessions: LruCache<SocketAddr, Session>,
-    /// Proxy selector for routing decisions
     proxy_selector: Arc<ClientProxySelector>,
-    /// DNS resolver
     resolver: Arc<dyn Resolver>,
-    /// Receiver for responses from sessions
+    /// Receives responses from destination tasks (across all sessions)
     response_rx: mpsc::UnboundedReceiver<UdpMessage>,
-    /// Sender cloned into each session for responses
+    /// Cloned into each session, then into each destination task
     response_tx: mpsc::UnboundedSender<UdpMessage>,
 }
 
@@ -77,12 +80,10 @@ struct Session {
 }
 
 impl Session {
-    /// Check if the session is still alive
     fn is_alive(&self) -> bool {
         !self.handle.is_finished()
     }
 
-    /// Send a packet through this session
     async fn send(&self, dest: SocketAddr, payload: Vec<u8>) -> io::Result<()> {
         self.tx
             .send((dest, payload))
@@ -120,17 +121,13 @@ impl TunUdpManager {
 
         loop {
             tokio::select! {
-                biased;
-
-                // Handle responses from sessions (write to TUN)
+                // Handle responses from destination tasks (write to TUN)
                 Some((payload, src_addr, dst_addr)) = self.response_rx.recv() => {
                     debug!(
                         "[TunUdpManager] Response: {} -> {} ({} bytes)",
                         src_addr, dst_addr, payload.len()
                     );
 
-                    // Build and send IP packet to TUN
-                    // Note: src_addr is the remote server, dst_addr is the local app
                     if let Err(e) = self.write_to_tun(&payload, src_addr, dst_addr) {
                         debug!("[TunUdpManager] Failed to write response to TUN: {}", e);
                     }
@@ -174,12 +171,9 @@ impl TunUdpManager {
         remote_addr: SocketAddr,
         payload: Vec<u8>,
     ) -> io::Result<()> {
-        // Get or create session for this local address
         let session = if let Some(session) = self.sessions.get_mut(&local_addr) {
-            // Update last active time
             session.last_active = Instant::now();
 
-            // Check if session task is still alive
             if !session.is_alive() {
                 debug!(
                     "[TunUdpManager] Session for {} died, recreating",
@@ -196,7 +190,6 @@ impl TunUdpManager {
             self.sessions.get_mut(&local_addr).unwrap()
         };
 
-        // Send packet through session
         session.send(remote_addr, payload).await
     }
 
@@ -204,7 +197,7 @@ impl TunUdpManager {
     fn create_session(&mut self, peer_addr: SocketAddr) -> io::Result<()> {
         debug!("[TunUdpManager] Creating session for {}", peer_addr);
 
-        let (tx, rx) = mpsc::channel(SESSION_CHANNEL_SIZE);
+        let (tx, rx) = mpsc::channel(CHANNEL_SIZE);
 
         let handle = tokio::spawn(session_task(
             peer_addr,
@@ -260,16 +253,28 @@ impl TunUdpManager {
     }
 }
 
-/// Per-destination connection state.
-struct DestinationConn {
-    remote: Box<dyn AsyncMessageStream>,
-    last_active: Instant,
+/// Per-destination state tracked by the session task.
+///
+/// Aborts the destination task on drop, ensuring child tasks are cleaned
+/// up in all exit paths: graceful shutdown, LRU eviction, abort cancellation.
+struct DestinationEntry {
+    /// Sends write requests to the destination task
+    write_tx: mpsc::Sender<Vec<u8>>,
+    /// Aborted on drop to terminate the destination task immediately
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for DestinationEntry {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
 }
 
 /// Session task - handles UDP traffic for one local (app) address.
 ///
-/// Receives packets destined for various remote servers, routes each through
-/// the appropriate proxy connection, and sends responses back to the peer.
+/// Routes outbound packets to per-destination tasks and lets those tasks
+/// forward responses directly to the TUN manager. The select loop is fully
+/// event-driven with no polling.
 async fn session_task(
     peer_addr: SocketAddr,
     mut rx: mpsc::Receiver<(SocketAddr, Vec<u8>)>,
@@ -279,20 +284,11 @@ async fn session_task(
 ) {
     debug!("[TunUdpSession {}] Starting", peer_addr);
 
-    // Per-destination connections
-    let mut connections: HashMap<NetLocation, DestinationConn> = HashMap::new();
-
-    // Buffer for reading responses
-    let mut read_buf = vec![0u8; 65535];
-
-    // Cleanup interval for stale connections
+    let mut destinations: HashMap<NetLocation, DestinationEntry> = HashMap::new();
     let mut cleanup_interval = interval(Duration::from_secs(30));
 
     loop {
         tokio::select! {
-            biased;
-
-            // Receive outgoing packets
             packet = rx.recv() => {
                 let Some((dest_addr, payload)) = packet else {
                     debug!("[TunUdpSession {}] Channel closed", peer_addr);
@@ -301,75 +297,177 @@ async fn session_task(
 
                 let dest = socket_addr_to_net_location(dest_addr);
 
-                // Get or create connection for this destination
-                let conn = match connections.get_mut(&dest) {
-                    Some(c) => {
-                        c.last_active = Instant::now();
-                        c
+                // Remove dead destination entry so we recreate below
+                if let Some(entry) = destinations.get(&dest) {
+                    if entry.handle.is_finished() {
+                        debug!(
+                            "[TunUdpSession {}] Destination task for {} died, recreating",
+                            peer_addr, dest
+                        );
+                        destinations.remove(&dest);
                     }
-                    None => {
-                        match create_connection(&dest, &proxy_selector, &resolver).await {
-                            Ok(remote) => {
-                                debug!(
-                                    "[TunUdpSession {}] Created connection to {}",
-                                    peer_addr, dest
-                                );
-                                connections.insert(
-                                    dest.clone(),
-                                    DestinationConn {
-                                        remote,
-                                        last_active: Instant::now(),
-                                    },
-                                );
-                                connections.get_mut(&dest).unwrap()
-                            }
-                            Err(e) => {
-                                debug!(
-                                    "[TunUdpSession {}] Failed to connect to {}: {}",
-                                    peer_addr, dest, e
-                                );
-                                continue;
-                            }
+                }
+
+                // Create destination task if absent
+                if !destinations.contains_key(&dest) {
+                    match create_connection(&dest, &proxy_selector, &resolver).await {
+                        Ok(stream) => {
+                            let source_addr = match dest.to_socket_addr_nonblocking() {
+                                Some(addr) => addr,
+                                None => continue,
+                            };
+
+                            let (write_tx, write_rx) = mpsc::channel(CHANNEL_SIZE);
+                            let handle = tokio::spawn(destination_task(
+                                peer_addr,
+                                source_addr,
+                                stream,
+                                write_rx,
+                                response_tx.clone(),
+                            ));
+
+                            debug!(
+                                "[TunUdpSession {}] Created destination task for {}",
+                                peer_addr, dest
+                            );
+                            destinations.insert(dest.clone(), DestinationEntry { write_tx, handle });
+                        }
+                        Err(e) => {
+                            debug!(
+                                "[TunUdpSession {}] Failed to connect to {}: {}",
+                                peer_addr, dest, e
+                            );
+                            continue;
                         }
                     }
-                };
+                }
 
-                // Send packet
-                if let Err(e) = send_message(&mut conn.remote, &payload).await {
+                // Forward payload to destination task
+                let entry = destinations.get(&dest).unwrap();
+                if entry.write_tx.send(payload).await.is_err() {
                     debug!(
-                        "[TunUdpSession {}] Send error to {}: {}",
-                        peer_addr, dest, e
+                        "[TunUdpSession {}] Destination task for {} died on send",
+                        peer_addr, dest
                     );
-                    connections.remove(&dest);
+                    destinations.remove(&dest);
                 }
             }
 
-            // Poll connections for responses (round-robin to be fair)
-            _ = poll_and_forward_responses(
-                peer_addr,
-                &mut connections,
-                &mut read_buf,
-                &response_tx,
-            ) => {}
-
-            // Cleanup stale connections
+            // Remove entries whose tasks have exited (timeout, error, etc.)
             _ = cleanup_interval.tick() => {
-                let now = Instant::now();
-                connections.retain(|dest, conn| {
-                    let keep = now.duration_since(conn.last_active) < CONNECTION_TIMEOUT;
-                    if !keep {
+                destinations.retain(|dest, entry| {
+                    let alive = !entry.handle.is_finished();
+                    if !alive {
                         debug!(
-                            "[TunUdpSession {}] Removing stale connection to {}",
+                            "[TunUdpSession {}] Removing finished destination {}",
                             peer_addr, dest
                         );
                     }
-                    keep
+                    alive
                 });
             }
         }
     }
 
+    // `destinations` is dropped here, aborting all destination tasks via
+    // DestinationEntry::Drop. This also fires when the session is
+    // abort-cancelled, since tokio drops task locals on cancellation.
     debug!("[TunUdpSession {}] Stopping", peer_addr);
+}
+
+/// Per-destination task. Owns the proxy stream exclusively, handling both
+/// reads (blocking) and writes (via channel). Self-terminates after
+/// CONNECTION_TIMEOUT of inactivity. Sends responses directly to the
+/// TUN manager, bypassing the session task.
+async fn destination_task(
+    peer_addr: SocketAddr,
+    source_addr: SocketAddr,
+    mut stream: Box<dyn AsyncMessageStream>,
+    mut write_rx: mpsc::Receiver<Vec<u8>>,
+    response_tx: mpsc::UnboundedSender<UdpMessage>,
+) {
+    let mut read_buf = vec![0u8; 65535];
+    let sleep = tokio::time::sleep(CONNECTION_TIMEOUT);
+    tokio::pin!(sleep);
+
+    loop {
+        let mut buf = ReadBuf::new(&mut read_buf);
+
+        // All branches return an Action value, deferring stream/buf access
+        // to after the select block where all future borrows are released.
+        enum Action {
+            Read(io::Result<()>),
+            Write(Option<Vec<u8>>),
+            Timeout,
+        }
+
+        let action = tokio::select! {
+            result = std::future::poll_fn(|cx| {
+                Pin::new(&mut *stream).poll_read_message(cx, &mut buf)
+            }) => Action::Read(result),
+            msg = write_rx.recv() => Action::Write(msg),
+            _ = &mut sleep => Action::Timeout,
+        };
+
+        match action {
+            Action::Read(Ok(())) => {
+                let len = buf.filled().len();
+                if len == 0 {
+                    break;
+                }
+                sleep.as_mut().reset(Instant::now() + CONNECTION_TIMEOUT);
+
+                debug!(
+                    "[TunUdpSession {}] Response from {}: {} bytes",
+                    peer_addr, source_addr, len
+                );
+
+                // (payload, src=remote, dst=local_app)
+                let _ = response_tx.send((buf.filled().to_vec(), source_addr, peer_addr));
+            }
+            Action::Read(Err(e)) => {
+                debug!(
+                    "[TunUdpSession {}] Read error from {}: {}",
+                    peer_addr, source_addr, e
+                );
+                break;
+            }
+            Action::Write(Some(payload)) => {
+                sleep.as_mut().reset(Instant::now() + CONNECTION_TIMEOUT);
+
+                match tokio::time::timeout(
+                    WRITE_TIMEOUT,
+                    send_message(&mut stream, &payload),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        debug!(
+                            "[TunUdpSession {}] Send error to {}: {}",
+                            peer_addr, source_addr, e
+                        );
+                        break;
+                    }
+                    Err(_) => {
+                        debug!(
+                            "[TunUdpSession {}] Send timeout to {}",
+                            peer_addr, source_addr
+                        );
+                        break;
+                    }
+                }
+            }
+            Action::Write(None) => break,
+            Action::Timeout => {
+                debug!(
+                    "[TunUdpSession {}] Idle timeout for {}",
+                    peer_addr, source_addr
+                );
+                break;
+            }
+        }
+    }
 }
 
 /// Create a connection to a destination through the proxy chain.
@@ -399,62 +497,7 @@ async fn create_connection(
 
 /// Send a UDP message through a stream.
 async fn send_message(stream: &mut Box<dyn AsyncMessageStream>, data: &[u8]) -> io::Result<()> {
-    // Poll-based write
     std::future::poll_fn(|cx| Pin::new(&mut **stream).poll_write_message(cx, data)).await?;
-
-    // Flush
     std::future::poll_fn(|cx| Pin::new(&mut **stream).poll_flush_message(cx)).await?;
-
     Ok(())
-}
-
-/// Poll all connections for responses and forward to the response channel.
-async fn poll_and_forward_responses(
-    peer_addr: SocketAddr,
-    connections: &mut HashMap<NetLocation, DestinationConn>,
-    read_buf: &mut [u8],
-    response_tx: &mpsc::UnboundedSender<UdpMessage>,
-) {
-    // Use tokio::select! to poll all connections
-    // For simplicity, we do a quick non-blocking poll of each
-    for (dest, conn) in connections.iter_mut() {
-        let mut buf = ReadBuf::new(read_buf);
-
-        let result =
-            std::future::poll_fn(|cx| Pin::new(&mut *conn.remote).poll_read_message(cx, &mut buf));
-
-        // Use a short timeout to avoid blocking
-        match tokio::time::timeout(Duration::from_millis(1), result).await {
-            Ok(Ok(())) => {
-                let len = buf.filled().len();
-                if len > 0 {
-                    conn.last_active = Instant::now();
-
-                    // Convert destination back to SocketAddr for the response
-                    let source_addr = match dest.to_socket_addr_nonblocking() {
-                        Some(addr) => addr,
-                        None => continue, // Hostname - shouldn't happen for TUN
-                    };
-
-                    debug!(
-                        "[TunUdpSession {}] Response from {}: {} bytes",
-                        peer_addr, source_addr, len
-                    );
-
-                    // Send response: (payload, src=remote, dst=peer_addr)
-                    // Uses stored peer_addr for correct response routing
-                    let _ = response_tx.send((buf.filled().to_vec(), source_addr, peer_addr));
-                }
-            }
-            Ok(Err(e)) => {
-                debug!(
-                    "[TunUdpSession {}] Read error from {}: {}",
-                    peer_addr, dest, e
-                );
-            }
-            Err(_) => {
-                // Timeout - no data ready, continue
-            }
-        }
-    }
 }
