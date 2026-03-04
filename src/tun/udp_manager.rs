@@ -220,7 +220,11 @@ impl TunUdpManager {
             last_active: Instant::now(),
         };
 
-        self.sessions.put(peer_addr, session);
+        // If LRU insertion evicts an old session, abort its task to avoid
+        // detached background loops accumulating over time.
+        if let Some(evicted_session) = self.sessions.put(peer_addr, session) {
+            evicted_session.handle.abort();
+        }
         Ok(())
     }
 
