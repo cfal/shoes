@@ -37,7 +37,7 @@
 use std::net::IpAddr;
 
 use log::info;
-use tun::{Configuration as TunConfiguration, Device};
+use tun::{AsyncDevice, Configuration as TunConfiguration};
 
 /// Configuration for the TUN server.
 ///
@@ -77,6 +77,8 @@ pub struct TunServerConfig {
     /// - **Linux**: Optional (if not set, creates a new TUN device)
     /// - **Android**: Required (from `VpnService.Builder.establish()`)
     /// - **iOS**: Required (from `NEPacketTunnelProvider.packetFlow`)
+    ///
+    /// Note: on Unix platforms this is still routed through `create_async_device()`.
     pub raw_fd: Option<i32>,
     /// Whether to close the FD when the device is dropped.
     /// Default: true
@@ -206,13 +208,14 @@ impl TunServerConfig {
         self
     }
 
-    /// Create a synchronous TUN device from this configuration.
+    /// Create an asynchronous TUN device from this configuration.
     ///
-    /// This is used by the direct mode stack which reads/writes directly
-    /// from the TUN fd using select() for event-driven I/O.
-    pub fn create_sync_device(&self) -> std::io::Result<Device> {
+    /// This method supports all platforms including Windows (via WinTUN).
+    /// On Unix, `raw_fd` is applied to the async device configuration.
+    pub fn create_async_device(&self) -> std::io::Result<AsyncDevice> {
         let mut config = TunConfiguration::default();
         config.mtu(self.mtu);
+        config.layer(tun::Layer::L3);
 
         #[cfg(target_os = "linux")]
         {
@@ -231,7 +234,23 @@ impl TunServerConfig {
             config.platform_config(|p| {
                 p.ensure_root_privileges(true);
             });
-            config.up();
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            // Windows TUN configuration
+            if let Some(ref name) = self.tun_name {
+                config.tun_name(name);
+            }
+            if let Some(addr) = self.address {
+                config.address(addr);
+            }
+            if let Some(mask) = self.netmask {
+                config.netmask(mask);
+            }
+            if let Some(dest) = self.destination {
+                config.destination(dest);
+            }
         }
 
         #[cfg(target_os = "ios")]
@@ -257,8 +276,23 @@ impl TunServerConfig {
             }
         }
 
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(ref name) = self.tun_name {
+                config.tun_name(name);
+            }
+            if let Some(addr) = self.address {
+                config.address(addr);
+            }
+            if let Some(mask) = self.netmask {
+                config.netmask(mask);
+            }
+        }
+
+        config.up();
+
         if let Some(fd) = self.raw_fd {
-            info!("Creating TUN device from raw FD: {}", fd);
+            info!("Creating async TUN device from raw FD: {}", fd);
             #[cfg(unix)]
             {
                 config.raw_fd(fd);
@@ -272,7 +306,7 @@ impl TunServerConfig {
             }
         }
 
-        tun::create(&config)
-            .map_err(|e| std::io::Error::other(format!("Failed to create TUN device: {}", e)))
+        tun::create_as_async(&config)
+            .map_err(|e| std::io::Error::other(format!("Failed to create async TUN device: {}", e)))
     }
 }

@@ -1,15 +1,25 @@
-//! Direct TCP Stack Manager for smoltcp integration.
+//! TCP Stack Manager for cross-platform TUN support.
 //!
-//! This module manages the smoltcp TCP/IP stack in a dedicated OS thread,
-//! using `select()` on the TUN fd for event-driven I/O instead of polling.
+//! This keeps the historical `tcp_stack_direct` module name used upstream while
+//! running a unified async TUN data path internally.
+//!
+//! # Architecture
+//!
+//! ```text
+//! ┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
+//! │  Async TUN      │ ←→  │  Virtual Device │ ←→  │  smoltcp Stack  │
+//! │  (WinTUN/*nix)  │     │  (channels)     │     │  (dedicated     │
+//! │                 │     │                 │     │   thread)       │
+//! └─────────────────┘     └─────────────────┘     └─────────────────┘
+//!         ↓                         ↓
+//!    tokio runtime            tokio runtime
+//! ```
 
 use std::{
     collections::HashMap,
-    io, mem,
+    io,
+    mem,
     net::SocketAddr,
-    ops::{Deref, DerefMut},
-    os::unix::io::RawFd,
-    panic::{self, AssertUnwindSafe},
     sync::{
         Arc, LazyLock, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -19,14 +29,11 @@ use std::{
 };
 
 use bytes::BytesMut;
-
-use log::{debug, error, info, trace, warn};
+use log::{debug, error, info, warn};
 use smoltcp::{
     iface::{Config as InterfaceConfig, Interface, SocketHandle, SocketSet},
-    phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken, wait as phy_wait},
-    socket::tcp::{
-        CongestionControl, Socket as TcpSocket, SocketBuffer as TcpSocketBuffer, State as TcpState,
-    },
+    phy::{Checksum, Device, DeviceCapabilities, Medium, RxToken, TxToken},
+    socket::tcp::{CongestionControl, Socket as TcpSocket, SocketBuffer as TcpSocketBuffer, State as TcpState},
     time::{Duration as SmolDuration, Instant as SmolInstant},
     wire::{
         HardwareAddress, IpAddress, IpCidr, IpProtocol, Ipv4Address, Ipv4Packet, Ipv6Address,
@@ -40,12 +47,10 @@ use super::tcp_conn::{TcpConnection, TcpConnectionControl, TcpSocketState};
 pub type PacketBuffer = Vec<u8>;
 
 /// Maximum number of buffers cached globally.
-/// Each buffer has capacity ~65536, so 64 * 65536 = 4MB max.
 const BUFFER_POOL_MAX_SIZE: usize = 64;
-
 static BUFFER_POOL: LazyLock<Mutex<Vec<BytesMut>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 
-/// Pooled buffer that returns to pool on drop instead of deallocating.
+/// Pooled buffer that returns to pool on drop.
 pub struct PooledBuffer {
     buffer: BytesMut,
 }
@@ -64,7 +69,6 @@ impl Drop for PooledBuffer {
 }
 
 impl PooledBuffer {
-    /// Get a buffer from the pool or create a new one.
     pub fn with_capacity(cap: usize) -> Self {
         if let Ok(mut pool) = BUFFER_POOL.lock()
             && let Some(mut buffer) = pool.pop()
@@ -76,36 +80,43 @@ impl PooledBuffer {
             buffer: BytesMut::with_capacity(cap),
         }
     }
+
+    pub fn extend_from_slice(&mut self, data: &[u8]) {
+        self.buffer.extend_from_slice(data);
+    }
+
+    pub fn len(&self) -> usize {
+        self.buffer.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.buffer.is_empty()
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        &self.buffer
+    }
+
+    pub fn to_vec(&self) -> Vec<u8> {
+        self.buffer.to_vec()
+    }
 }
 
-impl Deref for PooledBuffer {
-    type Target = BytesMut;
+impl std::ops::Deref for PooledBuffer {
+    type Target = [u8];
 
     fn deref(&self) -> &Self::Target {
         &self.buffer
     }
 }
 
-impl DerefMut for PooledBuffer {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.buffer
-    }
-}
-
-/// Tracks socket info including addresses for proper cleanup.
-struct SocketInfo {
-    control: Arc<TcpConnectionControl>,
-    src_addr: SocketAddr,
-    dst_addr: SocketAddr,
-}
-
-/// Information about a new TCP connection from the stack.
+/// Information about a new TCP connection.
 pub struct NewTcpConnection {
     pub connection: TcpConnection,
     pub remote_addr: SocketAddr,
 }
 
-/// Shared state for communication between main thread and stack thread.
+/// Shared state for communication between tokio and stack thread.
 struct SharedState {
     /// Channel for UDP responses to write to TUN
     udp_response_rx: Option<UnboundedReceiver<PacketBuffer>>,
@@ -113,9 +124,129 @@ struct SharedState {
     new_conn_tx: Option<UnboundedSender<NewTcpConnection>>,
 }
 
-/// Direct TCP Stack Manager.
+/// Virtual TUN device using channels for async/sync bridge.
 ///
-/// Manages the smoltcp interface with direct fd access for efficient I/O.
+/// This allows smoltcp (which is synchronous) to work with async TUN devices.
+struct VirtTunDevice {
+    mtu: usize,
+    /// Packets from TUN device (to be processed by smoltcp)
+    in_rx: UnboundedReceiver<PooledBuffer>,
+    /// Packets from smoltcp (to be written to TUN device)
+    out_tx: UnboundedSender<PacketBuffer>,
+    pending_rx: Option<PooledBuffer>,
+}
+
+impl VirtTunDevice {
+    fn new(
+        mtu: usize,
+        in_rx: UnboundedReceiver<PooledBuffer>,
+        out_tx: UnboundedSender<PacketBuffer>,
+    ) -> Self {
+        Self {
+            mtu,
+            in_rx,
+            out_tx,
+            pending_rx: None,
+        }
+    }
+
+    /// Try to get a packet from the input channel.
+    /// Returns an error when the channel is closed so the stack thread can exit.
+    fn try_recv(&mut self) -> io::Result<Option<PooledBuffer>> {
+        if let Some(pkt) = self.pending_rx.take() {
+            return Ok(Some(pkt));
+        }
+        match self.in_rx.try_recv() {
+            Ok(pkt) => Ok(Some(pkt)),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => Ok(None),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "tun input channel closed",
+            )),
+        }
+    }
+
+    /// Store a packet for later processing.
+    fn store_packet(&mut self, pkt: PooledBuffer) {
+        self.pending_rx = Some(pkt);
+    }
+
+    /// Write a packet to the output channel.
+    fn write_packet(&self, data: &[u8]) -> io::Result<()> {
+        self.out_tx
+            .send(data.to_vec())
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "channel closed"))
+    }
+}
+
+impl Device for VirtTunDevice {
+    type RxToken<'a> = VirtRxToken;
+    type TxToken<'a> = VirtTxToken<'a>;
+
+    fn receive(
+        &mut self,
+        _timestamp: SmolInstant,
+    ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        if let Some(buffer) = self.pending_rx.take() {
+            let rx = VirtRxToken { buffer };
+            let tx = VirtTxToken { device: self };
+            Some((rx, tx))
+        } else {
+            None
+        }
+    }
+
+    fn transmit(&mut self, _timestamp: SmolInstant) -> Option<Self::TxToken<'_>> {
+        Some(VirtTxToken { device: self })
+    }
+
+    fn capabilities(&self) -> DeviceCapabilities {
+        let mut caps = DeviceCapabilities::default();
+        caps.medium = Medium::Ip;
+        caps.max_transmission_unit = self.mtu;
+        caps.checksum.ipv4 = Checksum::Tx;
+        caps.checksum.tcp = Checksum::Tx;
+        caps.checksum.udp = Checksum::Tx;
+        caps.checksum.icmpv4 = Checksum::Tx;
+        caps.checksum.icmpv6 = Checksum::Tx;
+        caps
+    }
+}
+
+struct VirtRxToken {
+    buffer: PooledBuffer,
+}
+
+impl RxToken for VirtRxToken {
+    fn consume<R, F>(self, f: F) -> R
+    where
+        F: FnOnce(&[u8]) -> R,
+    {
+        f(&self.buffer)
+    }
+}
+
+struct VirtTxToken<'a> {
+    device: &'a VirtTunDevice,
+}
+
+impl TxToken for VirtTxToken<'_> {
+    fn consume<R, F>(self, len: usize, f: F) -> R
+    where
+        F: FnOnce(&mut [u8]) -> R,
+    {
+        let mut buffer = vec![0u8; len];
+        let result = f(&mut buffer);
+        if let Err(e) = self.device.write_packet(&buffer) {
+            warn!("Failed to write packet: {}", e);
+        }
+        result
+    }
+}
+
+/// TCP Stack Manager.
+///
+/// Manages the smoltcp interface with the unified async TUN path.
 pub struct TcpStackDirect {
     /// Handle to the stack thread
     thread_handle: Option<JoinHandle<()>>,
@@ -127,8 +258,10 @@ pub struct TcpStackDirect {
     udp_rx: Option<UnboundedReceiver<PacketBuffer>>,
     /// Shared state with the stack thread
     shared_state: Arc<Mutex<SharedState>>,
-    /// TUN file descriptor (owned, will be closed on drop)
-    tun_fd: RawFd,
+    /// Sender for packets from TUN to stack
+    tun_to_stack_tx: UnboundedSender<PooledBuffer>,
+    /// Receiver for packets from stack to TUN
+    stack_to_tun_rx: Option<UnboundedReceiver<PacketBuffer>>,
 }
 
 impl Drop for TcpStackDirect {
@@ -141,24 +274,20 @@ impl Drop for TcpStackDirect {
         if let Some(handle) = self.thread_handle.take() {
             let _ = handle.join();
         }
-
-        // Close the TUN fd
-        unsafe {
-            libc::close(self.tun_fd);
-        }
     }
 }
 
 impl TcpStackDirect {
-    /// Create a new direct TCP stack.
+    /// Create a new TCP stack.
     ///
     /// # Arguments
-    /// * `fd` - Raw file descriptor for the TUN device
     /// * `mtu` - Maximum transmission unit
     ///
     /// This spawns a dedicated OS thread for running the smoltcp interface.
-    /// The thread uses `select()` on the fd for efficient event-driven I/O.
-    pub fn new(fd: RawFd, mtu: usize) -> Self {
+    /// The thread communicates with the async TUN loop through channels.
+    pub fn new(mtu: usize) -> Self {
+        let (tun_to_stack_tx, tun_to_stack_rx) = mpsc::unbounded_channel();
+        let (stack_to_tun_tx, stack_to_tun_rx) = mpsc::unbounded_channel();
         let (udp_tx, udp_rx) = mpsc::unbounded_channel();
 
         let running = Arc::new(AtomicBool::new(true));
@@ -174,29 +303,10 @@ impl TcpStackDirect {
             thread::Builder::new()
                 .name("shoes-smoltcp-direct".to_owned())
                 .spawn(move || {
-                    let result = panic::catch_unwind(AssertUnwindSafe(|| {
-                        run_direct_stack_thread(fd, mtu, udp_tx, running.clone(), shared_state);
-                    }));
-
-                    match result {
-                        Ok(()) => {
-                            info!("smoltcp direct stack thread exited normally");
-                        }
-                        Err(panic_info) => {
-                            let msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
-                                s.to_string()
-                            } else if let Some(s) = panic_info.downcast_ref::<String>() {
-                                s.clone()
-                            } else {
-                                "Unknown panic".to_string()
-                            };
-                            error!("smoltcp direct stack thread PANICKED: {}", msg);
-                        }
-                    }
-
-                    running.store(false, Ordering::Relaxed);
+                    let device = VirtTunDevice::new(mtu, tun_to_stack_rx, stack_to_tun_tx);
+                    run_stack_thread(device, mtu, udp_tx, running, shared_state);
                 })
-                .expect("failed to spawn smoltcp direct thread")
+                .expect("failed to spawn smoltcp stack thread")
         };
 
         let stack_thread = thread_handle.thread().clone();
@@ -207,16 +317,17 @@ impl TcpStackDirect {
             running,
             udp_rx: Some(udp_rx),
             shared_state,
-            tun_fd: fd,
+            tun_to_stack_tx,
+            stack_to_tun_rx: Some(stack_to_tun_rx),
         }
     }
 
-    /// Take the receiver for UDP packets (filtered from TUN by the stack).
+    /// Take the receiver for UDP packets.
     pub fn take_udp_rx(&mut self) -> Option<UnboundedReceiver<PacketBuffer>> {
         self.udp_rx.take()
     }
 
-    /// Set the channel for UDP responses to write back to TUN.
+    /// Set the channel for UDP responses.
     pub fn set_udp_response_tx(&mut self, rx: UnboundedReceiver<PacketBuffer>) {
         if let Ok(mut state) = self.shared_state.lock() {
             state.udp_response_rx = Some(rx);
@@ -224,7 +335,7 @@ impl TcpStackDirect {
         self.stack_thread.unpark();
     }
 
-    /// Set the channel for notifying about new TCP connections.
+    /// Set the channel for new TCP connections.
     pub fn set_new_conn_tx(&mut self, tx: UnboundedSender<NewTcpConnection>) {
         if let Ok(mut state) = self.shared_state.lock() {
             state.new_conn_tx = Some(tx);
@@ -236,163 +347,46 @@ impl TcpStackDirect {
     pub fn is_running(&self) -> bool {
         self.running.load(Ordering::Relaxed)
     }
-}
 
-/// Direct TUN device that reads/writes directly to fd.
-struct DirectDevice {
-    fd: RawFd,
-    mtu: usize,
-    pending_rx: Option<PooledBuffer>,
-}
-
-impl DirectDevice {
-    fn new(fd: RawFd, mtu: usize) -> Self {
-        Self {
-            fd,
-            mtu,
-            pending_rx: None,
-        }
+    /// Request the stack thread to stop.
+    pub fn stop(&self) {
+        self.running.store(false, Ordering::Relaxed);
+        self.stack_thread.unpark();
     }
 
-    /// Try to read a packet (non-blocking) using pooled buffer.
-    /// Returns:
-    /// - Ok(Some(packet)) if a packet was read
-    /// - Ok(None) if no packet was available (WouldBlock)
-    /// - Err(e) if a fatal error occurred (including EOF)
-    fn try_recv(&mut self) -> io::Result<Option<PooledBuffer>> {
-        if let Some(pkt) = self.pending_rx.take() {
-            return Ok(Some(pkt));
-        }
-
-        // Get a buffer from the pool
-        let mut buffer = PooledBuffer::with_capacity(self.mtu + 4);
-        buffer.resize(self.mtu + 4, 0);
-
-        match read_nonblocking(self.fd, &mut buffer) {
-            Ok(n) if n > 0 => {
-                buffer.truncate(n);
-                Ok(Some(buffer))
-            }
-            Ok(_) => {
-                // n == 0 means EOF
-                Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "TUN device closed (EOF)",
-                ))
-            }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                // Buffer is returned to pool when dropped
-                Ok(None)
-            }
-            Err(e) => {
-                // Fatal error
-                Err(e)
-            }
-        }
+    /// Get the sender for packets from TUN to stack.
+    pub fn tun_to_stack_tx(&self) -> UnboundedSender<PooledBuffer> {
+        self.tun_to_stack_tx.clone()
     }
 
-    /// Store a packet for later processing by smoltcp.
-    fn store_packet(&mut self, pkt: PooledBuffer) {
-        self.pending_rx = Some(pkt);
-    }
-
-    /// Write a packet to TUN.
-    fn write_packet(&self, data: &[u8]) -> io::Result<()> {
-        write_all(self.fd, data)
+    /// Get the receiver for packets from stack to TUN.
+    pub fn take_stack_to_tun_rx(&mut self) -> UnboundedReceiver<PacketBuffer> {
+        self.stack_to_tun_rx.take().expect("already taken")
     }
 }
 
-impl Device for DirectDevice {
-    type RxToken<'a> = DirectRxToken;
-    type TxToken<'a> = DirectTxToken;
+// Buffer sizes matched to netstack-smoltcp
+const TCP_SEND_BUFFER_SIZE: usize = 0x3FFF * 20;
+const TCP_RECV_BUFFER_SIZE: usize = 0x3FFF * 20;
+const MAX_PACKET_BATCH: usize = 64;
+const MAX_CONCURRENT_CONNECTIONS: usize = 1024;
 
-    fn receive(
-        &mut self,
-        _timestamp: SmolInstant,
-    ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        if let Some(buffer) = self.pending_rx.take() {
-            let rx = DirectRxToken { buffer };
-            let tx = DirectTxToken { fd: self.fd };
-            Some((rx, tx))
-        } else {
-            None
-        }
-    }
-
-    fn transmit(&mut self, _timestamp: SmolInstant) -> Option<Self::TxToken<'_>> {
-        Some(DirectTxToken { fd: self.fd })
-    }
-
-    fn capabilities(&self) -> DeviceCapabilities {
-        let mut caps = DeviceCapabilities::default();
-        caps.medium = Medium::Ip;
-        caps.max_transmission_unit = self.mtu;
-        caps.checksum.ipv4 = smoltcp::phy::Checksum::Tx;
-        caps.checksum.tcp = smoltcp::phy::Checksum::Tx;
-        caps.checksum.udp = smoltcp::phy::Checksum::Tx;
-        caps.checksum.icmpv4 = smoltcp::phy::Checksum::Tx;
-        caps.checksum.icmpv6 = smoltcp::phy::Checksum::Tx;
-        caps
-    }
+/// Tracks socket info including addresses for proper cleanup.
+struct SocketInfo {
+    control: Arc<TcpConnectionControl>,
+    src_addr: SocketAddr,
+    dst_addr: SocketAddr,
 }
 
-struct DirectRxToken {
-    buffer: PooledBuffer,
-}
-
-impl RxToken for DirectRxToken {
-    fn consume<R, F>(self, f: F) -> R
-    where
-        F: FnOnce(&[u8]) -> R,
-    {
-        f(&self.buffer)
-        // buffer is returned to pool when dropped
-    }
-}
-
-struct DirectTxToken {
-    fd: RawFd,
-}
-
-impl TxToken for DirectTxToken {
-    fn consume<R, F>(self, len: usize, f: F) -> R
-    where
-        F: FnOnce(&mut [u8]) -> R,
-    {
-        let mut buffer = vec![0u8; len];
-        let result = f(&mut buffer);
-
-        if let Err(e) = write_all(self.fd, &buffer) {
-            warn!("Failed to write to TUN: {}", e);
-        }
-
-        result
-    }
-}
-
-// Buffer sizes matched to netstack-smoltcp: 0x3FFF * 20 = 327,660 bytes (~320KB)
-const TCP_SEND_BUFFER_SIZE: usize = 0x3FFF * 20; // ~320KB for high throughput
-const TCP_RECV_BUFFER_SIZE: usize = 0x3FFF * 20; // ~320KB
-const MAX_PACKET_BATCH: usize = 64; // Process more packets per poll iteration
-const MAX_CONCURRENT_CONNECTIONS: usize = 1024; // Limit concurrent connections like gvisor
-
-/// Run the direct smoltcp stack thread.
-fn run_direct_stack_thread(
-    fd: RawFd,
-    mtu: usize,
+/// Run the smoltcp stack thread with virtual device.
+fn run_stack_thread(
+    mut device: VirtTunDevice,
+    _mtu: usize,
     udp_tx: UnboundedSender<PacketBuffer>,
     running: Arc<AtomicBool>,
     shared_state: Arc<Mutex<SharedState>>,
 ) {
-    info!("smoltcp direct stack thread initializing...");
-
-    // Sets fd to non-blocking mode once at startup for performance.
-    if let Err(e) = set_nonblocking(fd) {
-        error!("Failed to set TUN fd to non-blocking: {}", e);
-        return;
-    }
-
-    let mut device = DirectDevice::new(fd, mtu);
+    info!("smoltcp stack thread initializing...");
 
     let mut iface_config = InterfaceConfig::new(HardwareAddress::Ip);
     iface_config.random_seed = rand::random();
@@ -428,29 +422,23 @@ fn run_direct_stack_thread(
     let mut active_connections: std::collections::HashSet<(SocketAddr, SocketAddr)> =
         std::collections::HashSet::new();
 
-    let mut poll_count: u64 = 0;
-    let mut last_log_time = std::time::Instant::now();
-
     let stack_thread = thread::current();
 
-    let mut phy_wait_error_count: u32 = 0;
-    const MAX_PHY_WAIT_ERRORS: u32 = 10;
-
-    info!("smoltcp direct stack thread started, entering main loop");
+    info!("smoltcp stack thread started");
 
     while running.load(Ordering::Relaxed) {
-        // Checks for UDP responses to write to TUN.
+        // Check for UDP responses
         if let Ok(mut state) = shared_state.try_lock()
             && let Some(ref mut udp_rx) = state.udp_response_rx
         {
             while let Ok(pkt) = udp_rx.try_recv() {
                 if let Err(e) = device.write_packet(&pkt) {
-                    warn!("Failed to write UDP response to TUN: {}", e);
+                    warn!("Failed to write UDP response: {}", e);
                 }
             }
         }
 
-        // Reads packets from TUN and filters by protocol (batch processing).
+        // Read packets from virtual TUN device
         let mut tcp_packets: Vec<PooledBuffer> = Vec::new();
         let mut packets_read = 0;
 
@@ -459,8 +447,7 @@ fn run_direct_stack_thread(
                 Ok(Some(p)) => p,
                 Ok(None) => break,
                 Err(e) => {
-                    // Critical error reading from TUN (EOF or EIO)
-                    error!("TUN device read failed: {}. Stack thread stopping.", e);
+                    error!("TUN input channel read failed: {}. Stack thread stopping.", e);
                     running.store(false, Ordering::Relaxed);
                     break;
                 }
@@ -468,90 +455,66 @@ fn run_direct_stack_thread(
             packets_read += 1;
 
             if should_filter_packet(&pkt) {
-                trace!("Filtered packet, len={}", pkt.len());
                 continue;
             }
 
             if let Some(protocol) = get_ip_protocol(&pkt) {
-                trace!(
-                    "Received packet: protocol={:?}, len={}",
-                    protocol,
-                    pkt.len()
-                );
                 match protocol {
                     IpProtocol::Tcp => {
-                        match extract_tcp_info(&pkt) {
-                            Some((src_addr, dst_addr, is_syn)) => {
-                                trace!("TCP packet: {} -> {}, SYN={}", src_addr, dst_addr, is_syn);
-                                if is_syn && !active_connections.contains(&(src_addr, dst_addr)) {
-                                    // Check connection limit
-                                    if sockets.len() >= MAX_CONCURRENT_CONNECTIONS {
-                                        warn!(
-                                            "Connection limit reached ({}), dropping SYN from {}",
-                                            MAX_CONCURRENT_CONNECTIONS, src_addr
-                                        );
-                                        continue;
-                                    }
+                        if let Some((src_addr, dst_addr, is_syn)) = extract_tcp_info(&pkt) {
+                            if is_syn && !active_connections.contains(&(src_addr, dst_addr)) {
+                                if sockets.len() >= MAX_CONCURRENT_CONNECTIONS {
+                                    warn!(
+                                        "Connection limit reached, dropping SYN from {}",
+                                        src_addr
+                                    );
+                                    continue;
+                                }
 
-                                    info!("New TCP SYN: {} -> {}", src_addr, dst_addr);
+                                info!("New TCP SYN: {} -> {}", src_addr, dst_addr);
 
-                                    if let Some((new_conn, control)) = create_tcp_connection(
-                                        src_addr,
-                                        dst_addr,
-                                        &mut socket_set,
-                                        &stack_thread,
-                                    ) {
-                                        sockets.insert(
-                                            new_conn.handle,
-                                            SocketInfo {
-                                                control,
-                                                src_addr,
-                                                dst_addr,
-                                            },
-                                        );
-                                        active_connections.insert((src_addr, dst_addr));
+                                if let Some((new_conn, control)) = create_tcp_connection(
+                                    src_addr,
+                                    dst_addr,
+                                    &mut socket_set,
+                                    &stack_thread,
+                                ) {
+                                    sockets.insert(
+                                        new_conn.handle,
+                                        SocketInfo {
+                                            control,
+                                            src_addr,
+                                            dst_addr,
+                                        },
+                                    );
+                                    active_connections.insert((src_addr, dst_addr));
 
-                                        if let Ok(state) = shared_state.try_lock()
-                                            && let Some(ref tx) = state.new_conn_tx
-                                        {
-                                            let _ = tx.send(new_conn.new_tcp_conn);
-                                        }
+                                    if let Ok(state) = shared_state.try_lock()
+                                        && let Some(ref tx) = state.new_conn_tx
+                                    {
+                                        let _ = tx.send(new_conn.new_tcp_conn);
                                     }
                                 }
                             }
-                            None => {
-                                warn!("Failed to parse TCP packet, len={}", pkt.len());
-                            }
                         }
-
                         tcp_packets.push(pkt);
                     }
                     IpProtocol::Icmp | IpProtocol::Icmpv6 => {
-                        // ICMP goes to smoltcp immediately
                         tcp_packets.push(pkt);
                     }
                     IpProtocol::Udp => {
-                        // UDP goes to tokio - convert to Vec since it leaves our pool
                         let _ = udp_tx.send(pkt.to_vec());
                     }
-                    _ => {
-                        trace!("ignoring packet with protocol {:?}", protocol);
-                    }
+                    _ => {}
                 }
             }
         }
 
-        if packets_read > 0 {
-            phy_wait_error_count = 0;
-        }
-
-        // Skip remaining work if a fatal read error was detected above.
         if !running.load(Ordering::Relaxed) {
             break;
         }
 
-        // Processes batched TCP/ICMP packets through smoltcp.
-        let has_tcp_packet = !tcp_packets.is_empty();
+        // Process packets through smoltcp
         for pkt in tcp_packets {
             device.store_packet(pkt);
             let now = SmolInstant::now();
@@ -568,30 +531,20 @@ fn run_direct_stack_thread(
             let control = &socket_info.control;
             let socket = socket_set.get_mut::<TcpSocket>(handle);
 
-            // Remove socket only when smoltcp reports Closed state
             if socket.state() == TcpState::Closed {
                 sockets_to_remove.push(handle);
                 control.set_closed();
-                trace!("socket {:?} closed", handle);
                 continue;
             }
 
-            // Handle SHUT_WR: Close -> Closing transition
-            // Must check send_queue() to ensure smoltcp has transmitted all data
             if control.send_state() == TcpSocketState::Close
                 && socket.send_queue() == 0
                 && control.send_buffer_empty()
             {
-                trace!(
-                    "socket {:?}: closing write half, state={:?}",
-                    handle,
-                    socket.state()
-                );
                 socket.close();
                 control.set_send_state(TcpSocketState::Closing);
             }
 
-            // Receive data from smoltcp into our buffer
             let mut wake_receiver = false;
             while socket.can_recv() && !control.recv_buffer_full() {
                 match socket.recv(|data| {
@@ -603,12 +556,7 @@ fn run_direct_stack_thread(
                     }
                     Ok(_) => break,
                     Err(e) => {
-                        error!(
-                            "socket {:?} recv error: {:?}, state={:?}",
-                            handle,
-                            e,
-                            socket.state()
-                        );
+                        error!("socket {:?} recv error: {:?}", handle, e);
                         socket.abort();
                         if control.recv_state() == TcpSocketState::Normal {
                             control.set_recv_state(TcpSocketState::Closed);
@@ -619,24 +567,13 @@ fn run_direct_stack_thread(
                 }
             }
 
-            // Detect recv half close using negative state matching.
-            // If socket can't receive and is not in an active receiving state, mark recv closed.
             if control.recv_state() == TcpSocketState::Normal
                 && !socket.may_recv()
                 && !matches!(
                     socket.state(),
-                    TcpState::Listen
-                        | TcpState::SynReceived
-                        | TcpState::Established
-                        | TcpState::FinWait1
-                        | TcpState::FinWait2
+                    TcpState::Listen | TcpState::SynReceived | TcpState::Established | TcpState::FinWait1 | TcpState::FinWait2
                 )
             {
-                trace!(
-                    "socket {:?}: recv half closed, state={:?}",
-                    handle,
-                    socket.state()
-                );
                 control.set_recv_state(TcpSocketState::Closed);
                 wake_receiver = true;
             }
@@ -645,7 +582,6 @@ fn run_direct_stack_thread(
                 control.wake_receiver();
             }
 
-            // Send data from our buffer to smoltcp
             let mut wake_sender = false;
             while socket.can_send() && !control.send_buffer_empty() {
                 match socket.send(|buf| {
@@ -657,12 +593,7 @@ fn run_direct_stack_thread(
                     }
                     Ok(_) => break,
                     Err(e) => {
-                        error!(
-                            "socket {:?} send error: {:?}, state={:?}",
-                            handle,
-                            e,
-                            socket.state()
-                        );
+                        error!("socket {:?} send error: {:?}", handle, e);
                         socket.abort();
                         if control.send_state() == TcpSocketState::Normal {
                             control.set_send_state(TcpSocketState::Closed);
@@ -681,62 +612,22 @@ fn run_direct_stack_thread(
         for handle in sockets_to_remove {
             if let Some(socket_info) = sockets.remove(&handle) {
                 active_connections.remove(&(socket_info.src_addr, socket_info.dst_addr));
-                trace!(
-                    "Cleaned up connection: {} -> {}",
-                    socket_info.src_addr, socket_info.dst_addr
-                );
             }
             socket_set.remove(handle);
         }
 
-        poll_count += 1;
-        if last_log_time.elapsed() >= Duration::from_secs(30) {
-            debug!(
-                "smoltcp direct stack: polls={}, active_sockets={}",
-                poll_count,
-                sockets.len()
-            );
-            last_log_time = std::time::Instant::now();
-        }
-
-        // Polls again after data transfer (critical for performance).
-        let after_transfer = SmolInstant::now();
-        iface.poll(after_transfer, &mut device, &mut socket_set);
-
-        // Wait for data using select() - this is the key for event-driven I/O
-        if !has_tcp_packet && device.pending_rx.is_none() {
-            // Cap poll_delay at 10ms to balance CPU usage vs throughput
-            let delay = iface.poll_delay(after_transfer, &socket_set);
-            let wait_duration = delay.map(|d| {
-                let millis = d.total_millis().min(10);
-                SmolDuration::from_millis(millis)
-            });
-
-            // phy_wait calls select() on the TUN fd to sleep until data
-            // arrives. If the fd becomes invalid (e.g. device removed),
-            // select() returns EBADF immediately with no sleep, creating a
-            // hot spin loop. The try_recv path usually catches this first,
-            // but this counter acts as a backstop: after 10 consecutive
-            // non-EINTR errors with no successful reads in between, treat
-            // the fd as dead.
-            if let Err(e) = phy_wait(fd, wait_duration)
-                && e.kind() != io::ErrorKind::Interrupted
-            {
-                phy_wait_error_count += 1;
-                if phy_wait_error_count >= MAX_PHY_WAIT_ERRORS {
-                    error!(
-                        "select() failed {} consecutive times (last: {}). Stack thread stopping.",
-                        phy_wait_error_count, e
-                    );
-                    running.store(false, Ordering::Relaxed);
-                } else {
-                    warn!("select() error ({}): {}", phy_wait_error_count, e);
-                }
+        // Wait for next poll
+        let now = SmolInstant::now();
+        if let Some(delay) = iface.poll_delay(now, &socket_set) {
+            if delay != SmolDuration::ZERO {
+                thread::park_timeout(Duration::from_millis(delay.total_millis().min(10) as u64));
             }
+        } else {
+            thread::park_timeout(Duration::from_millis(5));
         }
     }
 
-    info!("smoltcp direct stack thread stopped");
+    info!("smoltcp stack thread stopped");
 }
 
 /// Result of creating a TCP connection.
@@ -757,10 +648,8 @@ fn create_tcp_connection(
         TcpSocketBuffer::new(vec![0u8; TCP_SEND_BUFFER_SIZE]),
     );
 
-    // Matched to netstack-smoltcp settings for optimal performance
     socket.set_congestion_control(CongestionControl::Cubic);
     socket.set_keep_alive(Some(SmolDuration::from_secs(28)));
-    // 7200s matches Linux default (tcp_keepalive_time) and shadowsocks-rust
     socket.set_timeout(Some(SmolDuration::from_secs(7200)));
     socket.set_nagle_enabled(false);
     socket.set_ack_delay(None);
@@ -872,27 +761,14 @@ fn should_filter_packet(packet: &[u8]) -> bool {
                 let src_bytes = src.octets();
                 let dst_bytes = dst.octets();
 
-                // Filter unspecified source
-                if src_bytes == [0, 0, 0, 0] {
+                if src_bytes == [0, 0, 0, 0]
+                    || (src_bytes[0] >= 224 && src_bytes[0] <= 239)
+                    || dst_bytes == [255, 255, 255, 255]
+                    || (dst_bytes[0] >= 224 && dst_bytes[0] <= 239)
+                    || dst_bytes == [0, 0, 0, 0]
+                {
                     return true;
                 }
-                // Filter multicast source
-                if src_bytes[0] >= 224 && src_bytes[0] <= 239 {
-                    return true;
-                }
-                // Filter broadcast destination
-                if dst_bytes == [255, 255, 255, 255] {
-                    return true;
-                }
-                // Filter multicast destination
-                if dst_bytes[0] >= 224 && dst_bytes[0] <= 239 {
-                    return true;
-                }
-                // Filter unspecified destination
-                if dst_bytes == [0, 0, 0, 0] {
-                    return true;
-                }
-
                 false
             } else {
                 true
@@ -900,25 +776,12 @@ fn should_filter_packet(packet: &[u8]) -> bool {
         }
         6 => {
             if let Ok(ip) = Ipv6Packet::new_checked(packet) {
-                let src = ip.src_addr();
-                let dst = ip.dst_addr();
+                let src_bytes = ip.src_addr().octets();
+                let dst_bytes = ip.dst_addr().octets();
 
-                let src_bytes = src.octets();
-                let dst_bytes = dst.octets();
-
-                // Filter unspecified source
-                if src_bytes == [0u8; 16] {
+                if src_bytes == [0u8; 16] || dst_bytes[0] == 0xff || dst_bytes == [0u8; 16] {
                     return true;
                 }
-                // Filter multicast destination
-                if dst_bytes[0] == 0xff {
-                    return true;
-                }
-                // Filter unspecified destination
-                if dst_bytes == [0u8; 16] {
-                    return true;
-                }
-
                 false
             } else {
                 true
@@ -928,178 +791,84 @@ fn should_filter_packet(packet: &[u8]) -> bool {
     }
 }
 
-/// Set a file descriptor to non-blocking mode (call once at startup).
-fn set_nonblocking(fd: RawFd) -> io::Result<()> {
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if flags < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    if (flags & libc::O_NONBLOCK) == 0
-        && unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
-    {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-/// Non-blocking read from a file descriptor (fd must already be non-blocking).
-/// Returns Err(WouldBlock) when no data is available, so callers can
-/// distinguish it from Ok(0) which indicates EOF.
-fn read_nonblocking(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
-    let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-    if n < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(n as usize)
-    }
-}
-
-/// Write all data to a file descriptor.
-fn write_all(fd: RawFd, buf: &[u8]) -> io::Result<()> {
-    let mut written = 0;
-    while written < buf.len() {
-        let n = unsafe {
-            libc::write(
-                fd,
-                buf[written..].as_ptr() as *const libc::c_void,
-                buf.len() - written,
-            )
-        };
-        if n < 0 {
-            let err = io::Error::last_os_error();
-            if err.raw_os_error() == Some(libc::ENOBUFS) || err.kind() == io::ErrorKind::WouldBlock
-            {
-                trace!("TUN write {}, packet dropped", err);
-                return Ok(());
-            }
-            return Err(err);
-        }
-        written += n as usize;
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::io::IntoRawFd;
-    use std::os::unix::net::UnixStream;
 
     #[test]
-    fn test_stack_shutdown_on_eof() {
-        let (server, client) = UnixStream::pair().expect("Failed to create socket pair");
-        let client_fd = client.into_raw_fd();
+    fn virt_tun_device_try_recv_empty_is_non_fatal() {
+        let (_tx, rx) = mpsc::unbounded_channel::<PooledBuffer>();
+        let (out_tx, _out_rx) = mpsc::unbounded_channel::<PacketBuffer>();
+        let mut device = VirtTunDevice::new(1500, rx, out_tx);
 
-        let stack = TcpStackDirect::new(client_fd, 1500);
+        assert!(matches!(device.try_recv(), Ok(None)));
+    }
 
-        thread::sleep(Duration::from_millis(100));
-        assert!(stack.is_running(), "Stack thread should be running");
+    #[test]
+    fn virt_tun_device_try_recv_disconnected_is_error() {
+        let (tx, rx) = mpsc::unbounded_channel::<PooledBuffer>();
+        drop(tx);
 
-        // Closing the writer end triggers EOF on the reader.
-        drop(server);
+        let (out_tx, _out_rx) = mpsc::unbounded_channel::<PacketBuffer>();
+        let mut device = VirtTunDevice::new(1500, rx, out_tx);
 
-        let start = std::time::Instant::now();
-        let timeout = Duration::from_secs(2);
-
-        while stack.is_running() {
-            if start.elapsed() > timeout {
-                panic!("Stack thread did not exit after EOF on FD");
-            }
-            thread::sleep(Duration::from_millis(50));
+        match device.try_recv() {
+            Err(err) => assert_eq!(err.kind(), io::ErrorKind::BrokenPipe),
+            _ => panic!("expected BrokenPipe error"),
         }
     }
 
     #[test]
-    fn test_stack_shutdown_on_closed_fd() {
-        let (server, client) = UnixStream::pair().expect("Failed to create socket pair");
-        let client_fd = client.into_raw_fd();
+    fn stack_thread_exits_on_input_channel_disconnect() {
+        let (tx, rx) = mpsc::unbounded_channel::<PooledBuffer>();
+        drop(tx);
 
-        let stack = TcpStackDirect::new(client_fd, 1500);
+        let (out_tx, _out_rx) = mpsc::unbounded_channel::<PacketBuffer>();
+        let (udp_tx, _udp_rx) = mpsc::unbounded_channel::<PacketBuffer>();
+        let running = Arc::new(AtomicBool::new(true));
+        let shared_state = Arc::new(Mutex::new(SharedState {
+            udp_response_rx: None,
+            new_conn_tx: None,
+        }));
 
-        thread::sleep(Duration::from_millis(100));
-        assert!(stack.is_running(), "Stack thread should be running");
+        let thread_running = running.clone();
+        let handle = thread::spawn(move || {
+            let device = VirtTunDevice::new(1500, rx, out_tx);
+            run_stack_thread(device, 1500, udp_tx, thread_running, shared_state);
+        });
 
-        // Externally close the fd to produce EBADF on both read and select.
-        unsafe { libc::close(client_fd) };
-        // Also drop the writer so there's no other holder.
-        drop(server);
-
-        let start = std::time::Instant::now();
-        let timeout = Duration::from_secs(5);
-
-        while stack.is_running() {
-            if start.elapsed() > timeout {
-                panic!("Stack thread did not exit after closed FD");
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-    }
-
-    #[test]
-    fn test_stack_exits_promptly() {
-        // Verifies the stack exits within 1 second of EOF, catching
-        // regressions that would cause CPU spin on a dead fd.
-        let (server, client) = UnixStream::pair().expect("Failed to create socket pair");
-        let client_fd = client.into_raw_fd();
-
-        let stack = TcpStackDirect::new(client_fd, 1500);
-
-        thread::sleep(Duration::from_millis(100));
-        assert!(stack.is_running());
-
-        drop(server);
-
-        let start = std::time::Instant::now();
-        let timeout = Duration::from_secs(1);
-
-        while stack.is_running() {
-            if start.elapsed() > timeout {
-                panic!("Stack thread took >1s to exit after EOF (possible spin)");
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
-    }
-
-    #[test]
-    fn test_write_all_eagain() {
-        // Fill a non-blocking socket's write buffer, then verify write_all
-        // treats EAGAIN the same as ENOBUFS (drops the packet, returns Ok).
-        let (reader, writer) = UnixStream::pair().expect("Failed to create socket pair");
-        let writer_fd = writer.into_raw_fd();
-
-        set_nonblocking(writer_fd).expect("set_nonblocking");
-
-        // Fill the write buffer until WouldBlock
-        let big_buf = vec![0u8; 65536];
-        loop {
-            let n = unsafe {
-                libc::write(
-                    writer_fd,
-                    big_buf.as_ptr() as *const libc::c_void,
-                    big_buf.len(),
-                )
-            };
-            if n < 0 {
-                let err = io::Error::last_os_error();
-                assert_eq!(
-                    err.kind(),
-                    io::ErrorKind::WouldBlock,
-                    "unexpected error: {}",
-                    err
-                );
-                break;
-            }
-        }
-
-        // Now write_all should drop the packet gracefully
-        let result = write_all(writer_fd, &[1, 2, 3]);
+        handle.join().expect("stack thread should exit cleanly");
         assert!(
-            result.is_ok(),
-            "write_all should return Ok on EAGAIN, got {:?}",
-            result
+            !running.load(Ordering::Relaxed),
+            "stack should stop after input channel disconnects"
+        );
+    }
+
+    #[test]
+    fn stack_thread_keeps_running_with_empty_input_channel() {
+        let (tx, rx) = mpsc::unbounded_channel::<PooledBuffer>();
+        let (out_tx, _out_rx) = mpsc::unbounded_channel::<PacketBuffer>();
+        let (udp_tx, _udp_rx) = mpsc::unbounded_channel::<PacketBuffer>();
+        let running = Arc::new(AtomicBool::new(true));
+        let shared_state = Arc::new(Mutex::new(SharedState {
+            udp_response_rx: None,
+            new_conn_tx: None,
+        }));
+
+        let thread_running = running.clone();
+        let handle = thread::spawn(move || {
+            let device = VirtTunDevice::new(1500, rx, out_tx);
+            run_stack_thread(device, 1500, udp_tx, thread_running, shared_state);
+        });
+
+        thread::sleep(Duration::from_millis(50));
+        assert!(
+            running.load(Ordering::Relaxed),
+            "empty input channel should not be treated as fatal"
         );
 
-        unsafe { libc::close(writer_fd) };
-        drop(reader);
+        running.store(false, Ordering::Relaxed);
+        handle.join().expect("stack thread should stop when requested");
+        drop(tx);
     }
 }
