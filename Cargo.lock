@@ -2165,6 +2165,7 @@ dependencies = [
  "parking_lot",
  "percent-encoding",
  "quinn",
+ "quinn-udp",
  "rand",
  "rand_core",
  "rcgen",
