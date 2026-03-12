@@ -1,6 +1,11 @@
-use std::mem::ManuallyDrop;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+#[cfg(unix)]
+use std::mem::ManuallyDrop;
+
+#[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
+#[cfg(target_family = "unix")]
 use std::path::Path;
 
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
@@ -81,9 +86,17 @@ pub fn new_socket2_udp_socket_with_buffer_size(
 }
 
 fn into_tokio_udp_socket(socket: socket2::Socket) -> std::io::Result<tokio::net::UdpSocket> {
-    let raw_fd = socket.into_raw_fd();
-    let std_udp_socket = unsafe { std::net::UdpSocket::from_raw_fd(raw_fd) };
-    tokio::net::UdpSocket::from_std(std_udp_socket)
+    #[cfg(unix)]
+    {
+        let raw_fd = socket.into_raw_fd();
+        let std_udp_socket = unsafe { std::net::UdpSocket::from_raw_fd(raw_fd) };
+        tokio::net::UdpSocket::from_std(std_udp_socket)
+    }
+    #[cfg(windows)]
+    {
+        let std_udp_socket: std::net::UdpSocket = socket.into();
+        tokio::net::UdpSocket::from_std(std_udp_socket)
+    }
 }
 
 pub fn new_tcp_socket(
@@ -113,18 +126,26 @@ pub fn set_tcp_keepalive(
     idle_time: std::time::Duration,
     send_interval: std::time::Duration,
 ) -> std::io::Result<()> {
-    let raw_fd = tcp_stream.as_raw_fd();
-    let socket2_socket = ManuallyDrop::new(unsafe { Socket::from_raw_fd(raw_fd) });
-    if idle_time.is_zero() && send_interval.is_zero() {
-        socket2_socket.set_keepalive(false)?;
-    } else {
-        let keepalive = socket2::TcpKeepalive::new()
-            .with_time(idle_time)
-            .with_interval(send_interval);
-        socket2_socket.set_keepalive(true)?;
-        socket2_socket.set_tcp_keepalive(&keepalive)?;
+    #[cfg(unix)]
+    {
+        let raw_fd = tcp_stream.as_raw_fd();
+        let socket2_socket = ManuallyDrop::new(unsafe { Socket::from_raw_fd(raw_fd) });
+        if idle_time.is_zero() && send_interval.is_zero() {
+            socket2_socket.set_keepalive(false)?;
+        } else {
+            let keepalive = socket2::TcpKeepalive::new()
+                .with_time(idle_time)
+                .with_interval(send_interval);
+            socket2_socket.set_keepalive(true)?;
+            socket2_socket.set_tcp_keepalive(&keepalive)?;
+        }
+        Ok(())
     }
-    Ok(())
+    #[cfg(windows)]
+    {
+        let _ = (tcp_stream, idle_time, send_interval);
+        Ok(())
+    }
 }
 
 // TODO: change backlog to Option<u32> and make configuration, backlog -1 uses somaxconn on linux
