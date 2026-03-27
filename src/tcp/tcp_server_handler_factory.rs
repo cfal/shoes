@@ -24,6 +24,7 @@ use crate::shadow_tls::{ShadowTlsServerTarget, ShadowTlsServerTargetHandshake};
 use crate::shadowsocks::ShadowsocksTcpHandler;
 use crate::snell::snell_handler::SnellServerHandler;
 use crate::socks_handler::SocksTcpServerHandler;
+use crate::socks4_handler::Socks4TcpServerHandler;
 use crate::tcp::chain_builder::build_client_proxy_chain;
 use crate::tcp::tcp_handler::TcpServerHandler;
 use crate::tls_server_handler::NaiveConfig;
@@ -85,6 +86,10 @@ pub fn create_tcp_server_handler(
                 resolver.clone(),
             ))
         }
+        ServerProxyConfig::Socks4 { dns_enabled } => Box::new(Socks4TcpServerHandler::new(
+            dns_enabled,
+            client_proxy_selector.clone(),
+        )),
         ServerProxyConfig::Mixed {
             username,
             password,
