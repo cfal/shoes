@@ -11,6 +11,7 @@ mod crypto;
 mod dns;
 mod h2mux;
 mod http_handler;
+mod hysteria2_client;
 mod hysteria2_server;
 mod mixed_handler;
 mod naiveproxy;
@@ -38,8 +39,10 @@ mod thread_util;
 mod tls_client_handler;
 mod tls_server_handler;
 mod trojan_handler;
+mod tuic_client;
 mod tuic_server;
 mod tun;
+mod udp_hop_socket;
 mod udp_message_stream;
 mod uot;
 mod util;
@@ -56,6 +59,61 @@ use tikv_jemallocator::Jemalloc;
 #[cfg(not(any(target_env = "msvc", target_os = "ios")))]
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
+
+/// Spawn a background task that dumps jemalloc memory stats on SIGUSR1.
+/// Usage: `kill -USR1 <pid>` to trigger a heap profile dump.
+#[cfg(all(unix, not(any(target_env = "msvc", target_os = "ios"))))]
+fn spawn_memory_profiler() {
+    tokio::spawn(async move {
+        let mut sigusr1 = tokio::signal::unix::signal(
+            tokio::signal::unix::SignalKind::user_defined1(),
+        )
+        .expect("Failed to register SIGUSR1 handler");
+
+        let mut dump_count = 0u32;
+        loop {
+            sigusr1.recv().await;
+            dump_count += 1;
+
+            // Advance jemalloc epoch to get fresh stats
+            tikv_jemalloc_ctl::epoch::advance().unwrap();
+
+            let allocated = tikv_jemalloc_ctl::stats::allocated::read().unwrap();
+            let active = tikv_jemalloc_ctl::stats::active::read().unwrap();
+            let resident = tikv_jemalloc_ctl::stats::resident::read().unwrap();
+            let mapped = tikv_jemalloc_ctl::stats::mapped::read().unwrap();
+            let retained = tikv_jemalloc_ctl::stats::retained::read().unwrap();
+
+            eprintln!("======== jemalloc memory stats (dump #{}) ========", dump_count);
+            eprintln!("  allocated: {:>10.2} MB  (app is using this)", allocated as f64 / 1_048_576.0);
+            eprintln!("  active:    {:>10.2} MB  (pages with live data)", active as f64 / 1_048_576.0);
+            eprintln!("  resident:  {:>10.2} MB  (RSS, mapped + in RAM)", resident as f64 / 1_048_576.0);
+            eprintln!("  mapped:    {:>10.2} MB  (total mmap'd)", mapped as f64 / 1_048_576.0);
+            eprintln!("  retained:  {:>10.2} MB  (freed but not returned to OS)", retained as f64 / 1_048_576.0);
+
+            // Try to dump heap profile (requires _RJEM_MALLOC_CONF=prof:true)
+            let filename = format!("shoes_heap.{}.heap", dump_count);
+            let c_filename = std::ffi::CString::new(filename.clone()).unwrap();
+            let c_filename_ptr = c_filename.as_ptr();
+            let result = unsafe {
+                tikv_jemalloc_ctl::raw::write(
+                    b"prof.dump\0",
+                    c_filename_ptr,
+                )
+            };
+            match result {
+                Ok(_) => eprintln!("  heap profile dumped to: {}", filename),
+                Err(e) => eprintln!("  heap profile dump failed (run with _RJEM_MALLOC_CONF=prof:true): {}", e),
+            }
+            eprintln!("==================================================");
+        }
+    });
+}
+
+#[cfg(not(all(unix, not(any(target_env = "msvc", target_os = "ios")))))]
+fn spawn_memory_profiler() {
+    // No-op on unsupported platforms
+}
 
 use std::path::Path;
 
@@ -384,6 +442,9 @@ fn main() {
 
             println!("\nStarting {} server(s)..", server_configs.len());
 
+            // Start memory profiler (dump stats with: kill -USR1 <pid>)
+            spawn_memory_profiler();
+
             for server_config in server_configs {
                 // Get the resolver for this server from the registry
                 let dns_ref = match &server_config {
@@ -397,24 +458,60 @@ fn main() {
 
             match reload_state.as_mut() {
                 Some((_watcher, rx)) => {
-                    rx.recv().await.unwrap();
+                    #[cfg(unix)]
+                    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
+                    #[cfg(not(unix))]
+                    let mut sigterm = futures::future::pending::<()>();
 
-                    println!("Configs changed, restarting servers in 3 seconds..");
+                    tokio::select! {
+                        _ = rx.recv() => {
+                            println!("Configs changed, restarting servers in 3 seconds..");
 
-                    for join_handle in join_handles {
-                        join_handle.abort();
+                            for join_handle in join_handles {
+                                join_handle.abort();
+                            }
+
+                            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+                            // Remove any extra events
+                            while rx.try_recv().is_ok() {}
+                        }
+                        _ = tokio::signal::ctrl_c() => {
+                            println!("Received Ctrl-C, shutting down gracefully...");
+                            break;
+                        }
+                        _ = async {
+                            #[cfg(unix)]
+                            sigterm.recv().await;
+                            #[cfg(not(unix))]
+                            sigterm.await;
+                        } => {
+                            println!("Received SIGTERM, shutting down gracefully...");
+                            break;
+                        }
                     }
-
-                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-
-                    // Remove any extra events
-                    while rx.try_recv().is_ok() {}
                 }
                 None => {
-                    // No reload mode - wait forever
-                    // TODO: signal handling?
-                    futures::future::pending::<()>().await;
-                    unreachable!();
+                    #[cfg(unix)]
+                    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
+                    #[cfg(not(unix))]
+                    let mut sigterm = futures::future::pending::<()>();
+
+                    tokio::select! {
+                        _ = tokio::signal::ctrl_c() => {
+                            println!("Received Ctrl-C, shutting down gracefully...");
+                            break;
+                        }
+                        _ = async {
+                            #[cfg(unix)]
+                            sigterm.recv().await;
+                            #[cfg(not(unix))]
+                            sigterm.await;
+                        } => {
+                            println!("Received SIGTERM, shutting down gracefully...");
+                            break;
+                        }
+                    }
                 }
             }
         }

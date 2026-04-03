@@ -57,6 +57,7 @@ notify = "*"
 parking_lot = "*"
 percent-encoding = "*"
 quinn = { version = "*", default-features = false, features = ["log", "platform-verifier", "runtime-tokio", "rustls-aws-lc-rs"] }
+quinn-udp = "*"
 rand = "*"
 rand_core = "*"
 rcgen = { version = "*", default-features = false, features = ["aws_lc_rs", "pem"] }
@@ -75,6 +76,7 @@ tokio = { version = "*", features = [
     "macros",
     "net",
     "rt-multi-thread",
+    "signal",
     "sync",
     "time",
 ] }
@@ -93,7 +95,8 @@ tokio-rustls = "*"
 
 # jemalloc for better memory performance (not supported on Windows MSVC or iOS)
 [target.'cfg(not(any(target_env = "msvc", target_os = "ios")))'.dependencies]
-tikv-jemallocator = "*"
+tikv-jemallocator = { version = "*", features = ["profiling", "unprefixed_malloc_on_supported_platforms"] }
+tikv-jemalloc-ctl = { version = "*", features = ["stats"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
 android_logger = "*"
@@ -103,4 +106,5 @@ ndk-sys = "*"
 [profile.release]
 opt-level = 3
 lto = "fat"
-strip = true
+# strip = true  # disabled temporarily for memory profiling
+debug = 1       # line tables for jeprof
