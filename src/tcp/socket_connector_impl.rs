@@ -71,8 +71,10 @@ impl SocketConnectorImpl {
         let default_sni_hostname =
             target_address.and_then(|addr| addr.address().hostname().map(ToString::to_string));
 
-        // Direct protocol only supports TCP (no proxy server to connect via QUIC)
-        let effective_transport = if config.protocol.is_direct() {
+        // Direct protocol only supports TCP (no proxy server to connect via QUIC).
+        // Protocols that manage their own transport (Hysteria2, TUIC) also skip
+        // QUIC endpoint creation here — they create their own QUIC connections internally.
+        let effective_transport = if config.protocol.is_direct() || config.protocol.manages_own_transport() {
             &Transport::Tcp
         } else {
             &config.transport
@@ -383,6 +385,91 @@ impl crate::async_stream::AsyncPing for UnconnectedUdpSocket {
 }
 
 impl crate::async_stream::AsyncMessageStream for UnconnectedUdpSocket {}
+
+/// A no-op socket connector for protocols that manage their own transport.
+///
+/// Hysteria2 and TUIC create their own QUIC connections internally.
+/// Their `TcpClientHandler::setup_client_tcp_stream()` ignores the incoming
+/// stream parameter entirely. This connector provides a dummy stream to
+/// satisfy the chain interface without making any actual network connection.
+#[derive(Debug)]
+pub struct NullSocketConnector;
+
+#[async_trait]
+impl SocketConnector for NullSocketConnector {
+    async fn connect(
+        &self,
+        _resolver: &Arc<dyn Resolver>,
+        _address: &ResolvedLocation,
+    ) -> std::io::Result<Box<dyn AsyncStream>> {
+        // Return a dummy stream. Protocols using NullSocketConnector
+        // (Hysteria2, TUIC) ignore this stream and create their own QUIC connections.
+        Ok(Box::new(NullStream))
+    }
+
+    async fn connect_udp_bidirectional(
+        &self,
+        _resolver: &Arc<dyn Resolver>,
+        _target: ResolvedLocation,
+    ) -> std::io::Result<Box<dyn crate::async_stream::AsyncMessageStream>> {
+        Err(std::io::Error::other(
+            "NullSocketConnector does not support UDP",
+        ))
+    }
+
+    fn bind_interface(&self) -> Option<&str> {
+        None
+    }
+}
+
+/// A no-op stream used by NullSocketConnector.
+/// Never actually read/written — protocols that use this create their own connections.
+struct NullStream;
+
+impl tokio::io::AsyncRead for NullStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        _buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(())) // EOF
+    }
+}
+
+impl tokio::io::AsyncWrite for NullStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Poll::Ready(Ok(buf.len())) // discard
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl Unpin for NullStream {}
+
+impl crate::async_stream::AsyncPing for NullStream {
+    fn supports_ping(&self) -> bool {
+        false
+    }
+    fn poll_write_ping(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<bool>> {
+        Poll::Ready(Ok(false))
+    }
+}
+
+// SAFETY: NullStream has no interior mutability
+unsafe impl Send for NullStream {}
+unsafe impl Sync for NullStream {}
+
+impl AsyncStream for NullStream {}
 
 #[cfg(test)]
 mod tests {

@@ -978,6 +978,14 @@ fn validate_client_proxy_config(
             validate_client_proxy_config(&mut ws_config.protocol, named_pems)?;
         }
 
+        ClientProxyConfig::Tuic { uuid, .. } => {
+            parse_uuid(uuid)?;
+        }
+
+        ClientProxyConfig::Hysteria2 { .. } => {
+            // No special validation needed; password is just a string.
+        }
+
         _ => {}
     }
     Ok(())

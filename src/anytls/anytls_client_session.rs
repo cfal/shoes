@@ -48,6 +48,9 @@ pub struct AnyTlsClientSession {
     streams: RwLock<HashMap<u32, mpsc::Sender<Bytes>>>,
     stream_id_counter: AtomicU32,
 
+    /// Atomic count of active streams (for lock-free pool queries)
+    stream_count: AtomicU32,
+
     /// Unified channel for all outgoing messages (control frames and data)
     /// Using a single channel ensures proper ordering of SYN/data frames
     outgoing_tx: mpsc::UnboundedSender<OutgoingMessage>,
@@ -74,6 +77,12 @@ pub struct AnyTlsClientSession {
     /// Once taken (by first open_stream), this is None and subsequent streams
     /// are sent normally through the channel.
     initial_buffer: std::sync::Mutex<Option<BytesMut>>,
+
+    /// Notify to break reader/writer loops when session is dropped.
+    /// This is necessary because the writer task would otherwise block forever
+    /// on `outgoing_rx.recv()` — the channel sender (`outgoing_tx`) lives inside
+    /// the Session, creating a circular dependency.
+    close_notify: Arc<tokio::sync::Notify>,
 }
 
 impl std::fmt::Debug for AnyTlsClientSession {
@@ -85,7 +94,24 @@ impl std::fmt::Debug for AnyTlsClientSession {
     }
 }
 
+impl Drop for AnyTlsClientSession {
+    fn drop(&mut self) {
+        log::debug!("AnyTlsClientSession dropped, notifying background tasks");
+        self.close_notify.notify_waiters();
+    }
+}
+
 impl AnyTlsClientSession {
+    /// Check if this session is usable for opening new streams.
+    pub fn is_usable(&self) -> bool {
+        !self.is_closed.load(Ordering::Relaxed)
+    }
+
+    /// Get the number of active streams on this session (lock-free).
+    pub fn active_stream_count(&self) -> u32 {
+        self.stream_count.load(Ordering::Relaxed)
+    }
+
     /// Create a new client session on the given transport.
     ///
     /// This performs:
@@ -120,6 +146,7 @@ impl AnyTlsClientSession {
         let session = Arc::new(Self {
             streams: RwLock::new(HashMap::new()),
             stream_id_counter: AtomicU32::new(0),
+            stream_count: AtomicU32::new(0),
             outgoing_tx,
             is_closed: Arc::new(AtomicBool::new(false)),
             padding: Arc::clone(&padding),
@@ -128,6 +155,7 @@ impl AnyTlsClientSession {
             send_padding: AtomicBool::new(true),
             pkt_counter: AtomicU32::new(0), // Start at 0, incremented before use
             initial_buffer: std::sync::Mutex::new(Some(initial_buffer)),
+            close_notify: Arc::new(tokio::sync::Notify::new()),
         });
 
         // NOTE: Settings is NOT sent here - it's in initial_buffer and will be
@@ -199,6 +227,16 @@ impl AnyTlsClientSession {
     }
 
     /// Spawn reader and writer tasks
+    ///
+    /// IMPORTANT: Both tasks hold `Weak<Self>` (not `Arc<Self>`) to avoid
+    /// a circular reference that would prevent the session from ever being
+    /// dropped. The cycle would be:
+    ///   writer task Arc<Session> → Session.outgoing_tx → writer blocks on outgoing_rx
+    ///   → recv() returns None only when outgoing_tx drops → only when Session drops
+    ///   → only when writer's Arc drops → NEVER
+    ///
+    /// With Weak, when the last external Arc (from AnyTlsStream._session_keepalive)
+    /// is dropped, Session::drop fires close_notify, waking the writer so it exits.
     fn spawn_tasks<R, W>(
         session: Arc<Self>,
         reader: R,
@@ -208,18 +246,20 @@ impl AnyTlsClientSession {
         R: tokio::io::AsyncRead + Send + Unpin + 'static,
         W: tokio::io::AsyncWrite + Send + Unpin + 'static,
     {
-        // Writer task - handles all outgoing messages (control and data)
-        let session_writer = Arc::clone(&session);
+        // Writer task - uses Weak to break Arc cycle
+        let session_weak_w = Arc::downgrade(&session);
+        let close_notify_w = Arc::clone(&session.close_notify);
         tokio::spawn(async move {
-            if let Err(e) = Self::writer_loop(session_writer, writer, outgoing_rx).await {
+            if let Err(e) = Self::writer_loop(session_weak_w, writer, outgoing_rx, close_notify_w).await {
                 log::debug!("AnyTLS client writer ended: {}", e);
             }
         });
 
-        // Reader task
-        let session_reader = Arc::clone(&session);
+        // Reader task - uses Weak to break Arc cycle
+        let session_weak_r = Arc::downgrade(&session);
+        let close_notify_r = Arc::clone(&session.close_notify);
         tokio::spawn(async move {
-            if let Err(e) = Self::reader_loop(session_reader, reader).await {
+            if let Err(e) = Self::reader_loop(session_weak_r, reader, close_notify_r).await {
                 log::debug!("AnyTLS client reader ended: {}", e);
             }
         });
@@ -236,9 +276,10 @@ impl AnyTlsClientSession {
     /// - Padding frames concatenated with payload before write (single syscall)
     /// - Zero-allocation padding using put_bytes()
     async fn writer_loop<W>(
-        session: Arc<Self>,
+        session_weak: std::sync::Weak<Self>,
         mut writer: W,
         mut outgoing_rx: mpsc::UnboundedReceiver<OutgoingMessage>,
+        close_notify: Arc<tokio::sync::Notify>,
     ) -> io::Result<()>
     where
         W: tokio::io::AsyncWrite + Send + Unpin,
@@ -253,7 +294,30 @@ impl AnyTlsClientSession {
         // Used to ensure single write() call per padding segment
         let mut padding_buf = BytesMut::with_capacity(65536 + FRAME_HEADER_SIZE * 2 + 64);
 
-        while let Some(msg) = outgoing_rx.recv().await {
+        loop {
+            // Wait for a message OR close_notify (session dropped)
+            let msg = tokio::select! {
+                m = outgoing_rx.recv() => m,
+                _ = close_notify.notified() => {
+                    log::debug!("AnyTLS client writer loop: close_notify triggered");
+                    break;
+                }
+            };
+
+            let msg = match msg {
+                Some(m) => m,
+                None => break, // channel closed
+            };
+
+            // Temporarily upgrade Weak to Arc for the duration of processing this message
+            let session = match session_weak.upgrade() {
+                Some(s) => s,
+                None => {
+                    log::debug!("AnyTLS client writer loop: session dropped, exiting");
+                    break;
+                }
+            };
+
             if session.is_closed.load(Ordering::Relaxed) {
                 break;
             }
@@ -303,10 +367,14 @@ impl AnyTlsClientSession {
 
                     let mut streams = session.streams.write().await;
                     streams.remove(&stream_id);
+                    drop(streams);
+                    session.stream_count.fetch_sub(1, Ordering::Relaxed);
                 }
             }
+            // `session` (strong Arc) is dropped here at end of loop iteration,
+            // so it does NOT prevent the session from being dropped between iterations.
         }
-        log::debug!("AnyTLS client writer loop: channel closed, exiting");
+        log::debug!("AnyTLS client writer loop: exiting");
         Ok(())
     }
 
@@ -422,7 +490,17 @@ impl AnyTlsClientSession {
     }
 
     /// Reader loop - receives frames from the transport
-    async fn reader_loop<R>(session: Arc<Self>, mut reader: R) -> io::Result<()>
+    ///
+    /// Uses `Weak<Self>` to avoid preventing session cleanup.
+    /// The strong Arc is only held temporarily while processing frames,
+    /// and is dropped before blocking on `read_buf()`. This ensures the
+    /// session can be dropped (and close_notify fired) even while the
+    /// reader is waiting for data.
+    async fn reader_loop<R>(
+        session_weak: std::sync::Weak<Self>,
+        mut reader: R,
+        close_notify: Arc<tokio::sync::Notify>,
+    ) -> io::Result<()>
     where
         R: tokio::io::AsyncRead + Send + Unpin,
     {
@@ -430,30 +508,55 @@ impl AnyTlsClientSession {
         let mut buffer = BytesMut::with_capacity(8192);
 
         loop {
-            if session.is_closed.load(Ordering::Relaxed) {
-                log::debug!("AnyTLS client reader loop: session closed, exiting");
-                return Ok(());
-            }
+            // Temporarily upgrade to strong Arc for frame processing
+            {
+                let session = match session_weak.upgrade() {
+                    Some(s) => s,
+                    None => {
+                        log::debug!("AnyTLS client reader loop: session dropped, exiting");
+                        return Ok(());
+                    }
+                };
 
-            // Decode any frames already in buffer
-            while let Some(frame) = FrameCodec::decode(&mut buffer)? {
-                log::debug!(
-                    "AnyTLS client received frame: {:?} stream={} len={}",
-                    frame.cmd,
-                    frame.stream_id,
-                    frame.data.len()
-                );
-                if let Err(e) = session.handle_frame(frame).await {
-                    log::warn!("AnyTLS client error handling frame: {}", e);
-                    return Err(e);
+                if session.is_closed.load(Ordering::Relaxed) {
+                    log::debug!("AnyTLS client reader loop: session closed, exiting");
+                    return Ok(());
                 }
+
+                // Decode any frames already in buffer
+                while let Some(frame) = FrameCodec::decode(&mut buffer)? {
+                    log::debug!(
+                        "AnyTLS client received frame: {:?} stream={} len={}",
+                        frame.cmd,
+                        frame.stream_id,
+                        frame.data.len()
+                    );
+                    if let Err(e) = session.handle_frame(frame).await {
+                        log::warn!("AnyTLS client error handling frame: {}", e);
+                        return Err(e);
+                    }
+                }
+                // `session` (strong Arc) dropped here — MUST NOT hold across read_buf().await
             }
 
-            // Read more data
-            let n = reader.read_buf(&mut buffer).await?;
+            // Read more data — no strong Arc held here, so session can be dropped
+            let read_result = tokio::select! {
+                res = reader.read_buf(&mut buffer) => res,
+                _ = close_notify.notified() => {
+                    log::debug!("AnyTLS client reader loop: close_notify triggered");
+                    return Ok(());
+                }
+            };
+
+            let n = read_result?;
             if n == 0 {
                 log::debug!("AnyTLS client reader loop: connection closed (EOF)");
-                return Ok(()); // Connection closed
+                // Signal the writer task to exit too
+                if let Some(session) = session_weak.upgrade() {
+                    session.is_closed.store(true, Ordering::Relaxed);
+                    session.close_notify.notify_waiters();
+                }
+                return Ok(());
             }
             log::debug!("AnyTLS client reader: read {} bytes", n);
         }
@@ -488,6 +591,10 @@ impl AnyTlsClientSession {
                     let mut streams = self.streams.write().await;
                     streams.remove(&frame.stream_id)
                 };
+
+                if tx.is_some() {
+                    self.stream_count.fetch_sub(1, Ordering::Relaxed);
+                }
 
                 // Signal EOF
                 if let Some(tx) = tx {
@@ -605,6 +712,7 @@ impl AnyTlsClientSession {
             let mut streams = self.streams.write().await;
             streams.insert(stream_id, data_tx);
         }
+        self.stream_count.fetch_add(1, Ordering::Relaxed);
 
         // Set up SYNACK receiver if v2
         let synack_rx = if self.peer_version.load(Ordering::Relaxed) >= 2 {
@@ -662,6 +770,8 @@ impl AnyTlsClientSession {
                     // Remove stream on error
                     let mut streams = self.streams.write().await;
                     streams.remove(&stream_id);
+                    drop(streams);
+                    self.stream_count.fetch_sub(1, Ordering::Relaxed);
                     return Err(io::Error::new(
                         io::ErrorKind::ConnectionRefused,
                         format!("Stream open failed: {}", error),
@@ -671,6 +781,8 @@ impl AnyTlsClientSession {
                     // Sender dropped
                     let mut streams = self.streams.write().await;
                     streams.remove(&stream_id);
+                    drop(streams);
+                    self.stream_count.fetch_sub(1, Ordering::Relaxed);
                     return Err(io::Error::new(
                         io::ErrorKind::ConnectionAborted,
                         "Stream open cancelled",
@@ -684,6 +796,8 @@ impl AnyTlsClientSession {
                     }
                     let mut streams = self.streams.write().await;
                     streams.remove(&stream_id);
+                    drop(streams);
+                    self.stream_count.fetch_sub(1, Ordering::Relaxed);
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         "Stream open timeout",

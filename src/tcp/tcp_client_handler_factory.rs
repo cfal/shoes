@@ -358,6 +358,12 @@ pub fn create_tcp_client_handler(
         } => Box::new(NaiveProxyTcpClientHandler::new(
             &username, &password, padding,
         )),
+        ClientProxyConfig::Tuic { .. } => {
+            panic!("TUIC client handler must be created via ProxyConnectorImpl::from_config(), not create_tcp_client_handler()")
+        }
+        ClientProxyConfig::Hysteria2 { .. } => {
+            panic!("Hysteria2 client handler must be created via ProxyConnectorImpl::from_config(), not create_tcp_client_handler()")
+        }
     }
 }
 

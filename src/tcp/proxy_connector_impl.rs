@@ -41,13 +41,76 @@ impl ProxyConnectorImpl {
 
         let default_sni_hostname = config.address.address().hostname().map(ToString::to_string);
 
+        // QUIC-based protocols (TUIC, Hysteria2) need the full config (address,
+        // quic_settings, bind_interface) because they manage their own QUIC connections.
+        let client_handler =
+            if let crate::config::ClientProxyConfig::Tuic {
+                ref uuid,
+                ref password,
+                ref ports,
+                ref hop_interval,
+            } = config.protocol
+            {
+                let quic_config = config.quic_settings.clone().unwrap_or_default();
+                let bind_interface = config.bind_interface.clone().into_option();
+
+                let port_hop = ports.as_ref().map(|port_str| {
+                    let port_list = crate::hysteria2_client::parse_port_range(port_str)
+                        .unwrap_or_else(|e| panic!("Invalid TUIC port range: {e}"));
+                    let interval = hop_interval
+                        .map(|s| std::time::Duration::from_secs(s))
+                        .unwrap_or(std::time::Duration::from_secs(30));
+                    crate::hysteria2_client::PortHopConfig {
+                        ports: port_list,
+                        hop_interval: interval,
+                    }
+                });
+
+                Box::new(crate::tuic_client::TuicTcpClientHandler::new(
+                    config.address.clone(),
+                    uuid,
+                    password,
+                    quic_config,
+                    bind_interface,
+                    resolver.clone(),
+                    port_hop,
+                )) as Box<dyn TcpClientHandler>
+            } else if let crate::config::ClientProxyConfig::Hysteria2 {
+                ref password,
+                ref ports,
+                ref hop_interval,
+            } = config.protocol
+            {
+                let quic_config = config.quic_settings.clone().unwrap_or_default();
+                let bind_interface = config.bind_interface.clone().into_option();
+
+                let port_hop = ports.as_ref().map(|port_str| {
+                    let port_list = crate::hysteria2_client::parse_port_range(port_str)
+                        .unwrap_or_else(|e| panic!("Invalid Hysteria2 port range: {e}"));
+                    let interval = hop_interval
+                        .map(|s| std::time::Duration::from_secs(s))
+                        .unwrap_or(std::time::Duration::from_secs(30));
+                    crate::hysteria2_client::PortHopConfig {
+                        ports: port_list,
+                        hop_interval: interval,
+                    }
+                });
+
+                Box::new(crate::hysteria2_client::Hysteria2TcpClientHandler::new(
+                    config.address.clone(),
+                    password,
+                    quic_config,
+                    bind_interface,
+                    resolver.clone(),
+                    port_hop,
+                )) as Box<dyn TcpClientHandler>
+            } else {
+                create_tcp_client_handler(config.protocol, default_sni_hostname, resolver)
+            };
+
         Some(Self {
             location: config.address,
-            client_handler: create_tcp_client_handler(
-                config.protocol,
-                default_sni_hostname,
-                resolver,
-            ),
+            client_handler,
         })
     }
 

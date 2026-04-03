@@ -9,7 +9,7 @@ use crate::resolver::Resolver;
 use crate::tcp::proxy_connector::ProxyConnector;
 use crate::tcp::proxy_connector_impl::ProxyConnectorImpl;
 use crate::tcp::socket_connector::SocketConnector;
-use crate::tcp::socket_connector_impl::SocketConnectorImpl;
+use crate::tcp::socket_connector_impl::{NullSocketConnector, SocketConnectorImpl};
 
 /// Build a ClientProxyChain from a client_chain configuration.
 ///
@@ -58,18 +58,27 @@ pub fn build_client_proxy_chain(
     let initial_hop: Vec<InitialHopEntry> = hops[0]
         .iter()
         .map(|config| {
-            // Find the first proxy address for QUIC socket configuration
-            let target_address = find_first_proxy_address(&hops, config);
-
-            let socket = SocketConnectorImpl::from_config(config, target_address)
-                .map(|s| Box::new(s) as Box<dyn SocketConnector>)
-                .expect("Failed to create SocketConnector");
-
             if config.protocol.is_direct() {
                 // Direct: socket only, no proxy
+                let target_address = find_first_proxy_address(&hops, config);
+                let socket = SocketConnectorImpl::from_config(config, target_address)
+                    .map(|s| Box::new(s) as Box<dyn SocketConnector>)
+                    .expect("Failed to create SocketConnector");
                 InitialHopEntry::Direct(socket)
+            } else if config.protocol.manages_own_transport() {
+                // Hysteria2/TUIC: these protocols manage their own QUIC connections.
+                // Use NullSocketConnector — protocol handler ignores the socket stream.
+                let socket = Box::new(NullSocketConnector) as Box<dyn SocketConnector>;
+                let proxy = ProxyConnectorImpl::from_config(config.clone(), resolver.clone())
+                    .map(|p| Box::new(p) as Box<dyn ProxyConnector>)
+                    .expect("Failed to create ProxyConnector for self-transport config");
+                InitialHopEntry::Proxy { socket, proxy }
             } else {
-                // Proxy: socket + proxy paired
+                // Normal proxy: socket + proxy paired
+                let target_address = find_first_proxy_address(&hops, config);
+                let socket = SocketConnectorImpl::from_config(config, target_address)
+                    .map(|s| Box::new(s) as Box<dyn SocketConnector>)
+                    .expect("Failed to create SocketConnector");
                 let proxy = ProxyConnectorImpl::from_config(config.clone(), resolver.clone())
                     .map(|p| Box::new(p) as Box<dyn ProxyConnector>)
                     .expect("Failed to create ProxyConnector for non-direct config");

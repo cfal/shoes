@@ -2,16 +2,15 @@
 //!
 //! Implements TcpClientHandler for AnyTLS protocol outbound connections.
 //!
-//! TODO: Implement session pooling to enable real multiplexing.
-//! Currently each request creates a new TLS connection + AnyTLS session with a single stream.
-//! To benefit from AnyTLS multiplexing:
-//! - Pool/reuse AnyTlsClientSession instances across multiple client requests
-//! - Open multiple streams on the same session for different destinations
-//! - Add config options like idle_session_timeout, min_idle_session (similar to sing-box)
+//! Uses session pooling to multiplex multiple streams over a single TLS
+//! connection. Each incoming request either reuses an existing session
+//! (if one is available and under the stream limit) or creates a new
+//! session from the provided transport.
 
 use async_trait::async_trait;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
+use tokio::sync::Mutex;
 
 use crate::address::{Address, NetLocation, ResolvedLocation};
 use crate::anytls::anytls_client_session::AnyTlsClientSession;
@@ -22,10 +21,15 @@ use crate::tcp::tcp_handler::{TcpClientHandler, TcpClientSetupResult};
 use crate::uot::UOT_V2_MAGIC_ADDRESS;
 use crate::vless::VlessMessageStream;
 
+/// Maximum number of concurrent streams per session before creating a new one.
+/// Keep this small to limit head-of-line blocking on a single TLS connection.
+const MAX_STREAMS_PER_SESSION: u32 = 8;
+
 /// AnyTLS client handler implementing TcpClientHandler.
 ///
-/// Creates an AnyTLS session on the provided transport (expected to be TLS-wrapped),
-/// opens multiplexed streams to destinations, and supports UDP-over-TCP via UoT magic addresses.
+/// Maintains a pool of AnyTLS sessions for connection multiplexing.
+/// Each session wraps a single TLS connection and supports multiple
+/// concurrent streams (up to MAX_STREAMS_PER_SESSION).
 #[derive(Clone)]
 pub struct AnyTlsClientHandler {
     /// Authentication password
@@ -34,6 +38,8 @@ pub struct AnyTlsClientHandler {
     padding: Arc<PaddingFactory>,
     /// UDP enabled
     udp_enabled: bool,
+    /// Pool of active sessions available for stream multiplexing
+    session_pool: Arc<Mutex<Vec<Arc<AnyTlsClientSession>>>>,
 }
 
 impl std::fmt::Debug for AnyTlsClientHandler {
@@ -51,7 +57,67 @@ impl AnyTlsClientHandler {
             password,
             padding,
             udp_enabled,
+            session_pool: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// Get or create a session for opening a new stream.
+    ///
+    /// Strategy:
+    /// 1. Remove dead sessions from the pool
+    /// 2. Try to reuse the session with the fewest active streams (if under limit)
+    /// 3. If no reusable session, create a new one from the provided transport
+    ///
+    /// The provided `transport` is ONLY consumed when a new session is needed.
+    /// If an existing session is reused, the transport is dropped (unused).
+    async fn get_or_create_session(
+        &self,
+        transport: Box<dyn AsyncStream>,
+    ) -> std::io::Result<Arc<AnyTlsClientSession>> {
+        let mut pool = self.session_pool.lock().await;
+
+        // Remove dead sessions
+        pool.retain(|s| s.is_usable());
+
+        // Find the session with the fewest streams that's under the limit
+        let mut best: Option<(usize, u32)> = None;
+        for (i, session) in pool.iter().enumerate() {
+            let count = session.active_stream_count();
+            if count < MAX_STREAMS_PER_SESSION {
+                match best {
+                    None => best = Some((i, count)),
+                    Some((_, best_count)) if count < best_count => {
+                        best = Some((i, count));
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        if let Some((idx, count)) = best {
+            let session = Arc::clone(&pool[idx]);
+            log::debug!(
+                "AnyTLS: reusing session (streams={}, pool={})",
+                count,
+                pool.len()
+            );
+            return Ok(session);
+        }
+
+        // No reusable session — create a new one
+        // Release lock before the potentially slow TLS handshake
+        drop(pool);
+
+        log::debug!("AnyTLS: creating new session");
+        let session =
+            AnyTlsClientSession::new(transport, &self.password, Arc::clone(&self.padding)).await?;
+
+        // Add to pool
+        let mut pool = self.session_pool.lock().await;
+        pool.push(Arc::clone(&session));
+        log::debug!("AnyTLS: pool size = {}", pool.len());
+
+        Ok(session)
     }
 }
 
@@ -62,11 +128,11 @@ impl TcpClientHandler for AnyTlsClientHandler {
         client_stream: Box<dyn AsyncStream>,
         remote_location: ResolvedLocation,
     ) -> std::io::Result<TcpClientSetupResult> {
-        let session =
-            AnyTlsClientSession::new(client_stream, &self.password, Arc::clone(&self.padding))
-                .await?;
+        let session = self.get_or_create_session(client_stream).await?;
 
-        let stream = session.open_stream(remote_location.into_location()).await?;
+        let stream = session
+            .open_stream(remote_location.into_location())
+            .await?;
 
         Ok(TcpClientSetupResult {
             client_stream: Box::new(stream),
@@ -90,9 +156,7 @@ impl TcpClientHandler for AnyTlsClientHandler {
             ));
         }
 
-        let session =
-            AnyTlsClientSession::new(client_stream, &self.password, Arc::clone(&self.padding))
-                .await?;
+        let session = self.get_or_create_session(client_stream).await?;
 
         // UoT V2 Connect Mode: single destination via magic address
         let uot_dest = NetLocation::new(Address::Hostname(UOT_V2_MAGIC_ADDRESS.to_string()), 0);

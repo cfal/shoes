@@ -435,11 +435,50 @@ pub enum ClientProxyConfig {
         #[serde(default = "default_true", skip_serializing_if = "is_true")]
         padding: bool,
     },
+    /// TUIC v5 client protocol (over QUIC)
+    #[serde(alias = "tuic_v5")]
+    Tuic {
+        uuid: String,
+        password: String,
+        /// Port range for port hopping, e.g. "50001-55000" or "443,8443"
+        /// If not specified, uses the address port.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ports: Option<String>,
+        /// Port hopping interval in seconds (default: 30s, minimum: 5s).
+        /// Only used when `ports` is specified.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hop_interval: Option<u64>,
+    },
+    /// Hysteria2 client protocol (over QUIC/HTTP3)
+    Hysteria2 {
+        password: String,
+        /// Port range for port hopping, e.g. "20000-50000" or "443,8443"
+        /// If not specified, uses the address port.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ports: Option<String>,
+        /// Port hopping interval in seconds (default: 30s, minimum: 5s).
+        /// Only used when `ports` is specified.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hop_interval: Option<u64>,
+    },
 }
 
 impl ClientProxyConfig {
     pub fn is_direct(&self) -> bool {
         matches!(self, ClientProxyConfig::Direct)
+    }
+
+    /// Whether this protocol manages its own transport layer (QUIC connections).
+    ///
+    /// Hysteria2 and TUIC create and manage their own QUIC endpoints internally,
+    /// so the SocketConnector should NOT create redundant QUIC endpoints for them.
+    /// Instead, a simple TCP socket connector is used as a placeholder (it won't
+    /// actually be used for transport — the protocol handler handles everything).
+    pub fn manages_own_transport(&self) -> bool {
+        matches!(
+            self,
+            ClientProxyConfig::Hysteria2 { .. } | ClientProxyConfig::Tuic { .. }
+        )
     }
 
     /// Returns the protocol name for display/error messages
@@ -460,6 +499,8 @@ impl ClientProxyConfig {
             ClientProxyConfig::PortForward => "PortForward",
             ClientProxyConfig::Anytls { .. } => "AnyTLS",
             ClientProxyConfig::Naiveproxy { .. } => "NaiveProxy",
+            ClientProxyConfig::Tuic { .. } => "TUIC",
+            ClientProxyConfig::Hysteria2 { .. } => "Hysteria2",
         }
     }
 }
