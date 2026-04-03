@@ -95,37 +95,42 @@ pub fn build_resolver(entries: Vec<ParsedDnsServerEntry>) -> std::io::Result<Arc
         let timeout_secs = entry.timeout_secs;
 
         let resolver: Arc<dyn Resolver> = match entry.server {
-            // System resolver uses NativeResolver (ignores chain_group, bootstrap, ip_strategy)
+            // System resolver keeps the outer timeout wrapper.
             ParsedDnsServer::System => wrap_resolver(NativeResolver::new(), timeout_secs),
-            // All other protocols use HickoryResolver with chain_group, bootstrap, and ip_strategy
-            ParsedDnsServer::Udp { addr } => wrap_resolver(
-                HickoryResolver::udp(addr, chain, bootstrap, ip_strategy)?,
-                timeout_secs,
-            ),
-            ParsedDnsServer::Tcp { addr } => wrap_resolver(
-                HickoryResolver::tcp(addr, chain, bootstrap, ip_strategy)?,
-                timeout_secs,
-            ),
-            ParsedDnsServer::Tls { addr, server_name } => wrap_resolver(
-                HickoryResolver::tls(addr, server_name, chain, bootstrap, ip_strategy)?,
-                timeout_secs,
-            ),
+            // Hickory-backed resolvers use hickory's own internal timeout handling.
+            ParsedDnsServer::Udp { addr } => {
+                Arc::new(HickoryResolver::udp(addr, chain, bootstrap, ip_strategy)?)
+            }
+            ParsedDnsServer::Tcp { addr } => {
+                Arc::new(HickoryResolver::tcp(addr, chain, bootstrap, ip_strategy)?)
+            }
+            ParsedDnsServer::Tls { addr, server_name } => {
+                Arc::new(HickoryResolver::tls(addr, server_name, chain, bootstrap, ip_strategy)?)
+            }
             ParsedDnsServer::Https {
                 addr,
                 server_name,
                 path,
-            } => wrap_resolver(
-                HickoryResolver::https(addr, server_name, path, chain, bootstrap, ip_strategy)?,
-                timeout_secs,
-            ),
+            } => Arc::new(HickoryResolver::https(
+                addr,
+                server_name,
+                path,
+                chain,
+                bootstrap,
+                ip_strategy,
+            )?),
             ParsedDnsServer::H3 {
                 addr,
                 server_name,
                 path,
-            } => wrap_resolver(
-                HickoryResolver::h3(addr, server_name, path, chain, bootstrap, ip_strategy)?,
-                timeout_secs,
-            ),
+            } => Arc::new(HickoryResolver::h3(
+                addr,
+                server_name,
+                path,
+                chain,
+                bootstrap,
+                ip_strategy,
+            )?),
         };
 
         resolvers.push(resolver);

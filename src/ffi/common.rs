@@ -14,6 +14,7 @@ use tokio::task::JoinHandle;
 use crate::config::{Config, convert_cert_paths, create_server_configs, load_config_str};
 use crate::dns::build_dns_registry;
 use crate::tcp::tcp_server::start_servers;
+#[cfg(unix)]
 use crate::tun::run_tun_from_config;
 
 /// Global log file handle for file-based logging.
@@ -194,7 +195,13 @@ pub async fn start_from_config(
     }
 
     // Run TUN server (blocks until shutdown). close_fd_on_drop = false because mobile owns the FD
+    #[cfg(unix)]
     let result = run_tun_from_config(tun_config, shutdown_rx, false).await;
+    #[cfg(not(unix))]
+    let result = Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "TUN is not supported on this platform",
+    ));
 
     // Cleanup any servers when TUN stops
     for handle in join_handles {

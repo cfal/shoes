@@ -23,6 +23,7 @@ use crate::resolver::Resolver;
 use crate::routing::{ServerStream, run_udp_routing};
 use crate::socket_util::{new_tcp_listener, set_tcp_keepalive};
 use crate::tcp::tcp_handler::{TcpClientSetupResult, TcpServerHandler, TcpServerSetupResult};
+#[cfg(unix)]
 use crate::tun::start_tun_server;
 use crate::util::write_all;
 
@@ -347,9 +348,15 @@ pub async fn start_servers(
     resolver: Arc<dyn Resolver>,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
     match config {
+        #[cfg(unix)]
         Config::TunServer(tun_config) => start_tun_server(tun_config, resolver)
             .await
             .map(|t| vec![t]),
+        #[cfg(not(unix))]
+        Config::TunServer(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "TUN server is not supported on this platform",
+        )),
         Config::Server(server_config) => start_tcp_or_quic_servers(server_config, resolver).await,
         _ => unreachable!("create_server_configs only returns Server and TunServer"),
     }
