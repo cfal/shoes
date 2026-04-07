@@ -18,7 +18,7 @@ use crate::address::{NetLocation, ResolvedLocation};
 use crate::async_stream::AsyncStream;
 use crate::config::{ClientConfig, ClientQuicConfig, Transport};
 use crate::quic_stream::QuicStream;
-use crate::resolver::{Resolver, resolve_location, resolve_single_address};
+use crate::resolver::{Resolver, resolve_addresses, resolve_location, resolve_single_address};
 use crate::rustls_config_util::create_client_config;
 use crate::socket_util::{new_tcp_socket, new_udp_socket, set_tcp_keepalive};
 use crate::thread_util::get_num_threads;
@@ -215,30 +215,48 @@ impl SocketConnector for SocketConnectorImpl {
         resolver: &Arc<dyn Resolver>,
         address: &ResolvedLocation,
     ) -> std::io::Result<Box<dyn AsyncStream>> {
-        let target_addr = match address.resolved_addr() {
-            Some(r) => r,
-            None => resolve_single_address(resolver, address.location()).await?,
+        let target_addrs = match address.resolved_addr() {
+            Some(r) => vec![r],
+            None => resolve_addresses(resolver, address.location()).await?,
         };
 
         match &self.transport {
             TransportConfig::Tcp { no_delay } => {
-                let tcp_socket =
-                    new_tcp_socket(self.bind_interface.clone(), target_addr.is_ipv6())?;
-                let stream = tcp_socket.connect(target_addr).await?;
-
-                if let Err(e) = set_tcp_keepalive(
-                    &stream,
-                    std::time::Duration::from_secs(120),
-                    std::time::Duration::from_secs(30),
-                ) {
-                    error!("Failed to set TCP keepalive: {e}");
+                let mut last_err = None;
+                for (i, target_addr) in target_addrs.iter().enumerate() {
+                    let tcp_socket =
+                        new_tcp_socket(self.bind_interface.clone(), target_addr.is_ipv6())?;
+                    match tcp_socket.connect(*target_addr).await {
+                        Ok(stream) => {
+                            if i > 0 {
+                                debug!(
+                                    "TCP connect succeeded on address #{} ({}) after {} failures",
+                                    i, target_addr, i
+                                );
+                            }
+                            if let Err(e) = set_tcp_keepalive(
+                                &stream,
+                                std::time::Duration::from_secs(120),
+                                std::time::Duration::from_secs(30),
+                            ) {
+                                error!("Failed to set TCP keepalive: {e}");
+                            }
+                            if *no_delay {
+                                if let Err(e) = stream.set_nodelay(true) {
+                                    error!("Failed to set TCP no-delay: {e}");
+                                }
+                            }
+                            return Ok(Box::new(stream));
+                        }
+                        Err(e) => {
+                            debug!("TCP connect to {} failed: {}, trying next", target_addr, e);
+                            last_err = Some(e);
+                        }
+                    }
                 }
-
-                if *no_delay && let Err(e) = stream.set_nodelay(true) {
-                    error!("Failed to set TCP no-delay: {e}");
-                }
-
-                Ok(Box::new(stream))
+                Err(last_err.unwrap_or_else(|| {
+                    std::io::Error::other("no resolved addresses succeeded")
+                }))
             }
             TransportConfig::Quic {
                 endpoints,
@@ -250,26 +268,52 @@ impl SocketConnector for SocketConnectorImpl {
                     None => address.address().hostname().unwrap_or("example.com"),
                 };
 
-                let endpoint = if endpoints.len() == 1 {
-                    &endpoints[0]
-                } else {
-                    let idx = next_endpoint_index.fetch_add(1, Ordering::Relaxed) as usize;
-                    &endpoints[idx % endpoints.len()]
-                };
+                let mut last_err = None;
+                for (i, target_addr) in target_addrs.iter().enumerate() {
+                    let endpoint = if endpoints.len() == 1 {
+                        &endpoints[0]
+                    } else {
+                        let idx = next_endpoint_index.fetch_add(1, Ordering::Relaxed) as usize;
+                        &endpoints[idx % endpoints.len()]
+                    };
 
-                let conn = endpoint
-                    .connect(target_addr, domain)
-                    .map_err(|e| {
-                        std::io::Error::other(format!("Failed to connect to QUIC endpoint: {e}"))
-                    })?
-                    .await
-                    .map_err(|e| std::io::Error::other(format!("QUIC connection failed: {e}")))?;
-
-                let (send, recv) = conn.open_bi().await.map_err(|e| {
-                    std::io::Error::other(format!("Failed to open QUIC stream: {e}"))
-                })?;
-
-                Ok(Box::new(QuicStream::from(send, recv)))
+                    match endpoint.connect(*target_addr, domain) {
+                        Ok(connecting) => match connecting.await {
+                            Ok(conn) => match conn.open_bi().await {
+                                Ok((send, recv)) => {
+                                    if i > 0 {
+                                        debug!(
+                                            "QUIC connect succeeded on address #{} ({}) after {} failures",
+                                            i, target_addr, i
+                                        );
+                                    }
+                                    return Ok(Box::new(QuicStream::from(send, recv)));
+                                }
+                                Err(e) => {
+                                    debug!("QUIC open_bi to {} failed: {}", target_addr, e);
+                                    last_err = Some(std::io::Error::other(format!(
+                                        "Failed to open QUIC stream: {e}"
+                                    )));
+                                }
+                            },
+                            Err(e) => {
+                                debug!("QUIC connection to {} failed: {}", target_addr, e);
+                                last_err = Some(std::io::Error::other(format!(
+                                    "QUIC connection failed: {e}"
+                                )));
+                            }
+                        },
+                        Err(e) => {
+                            debug!("QUIC connect to {} failed: {}", target_addr, e);
+                            last_err = Some(std::io::Error::other(format!(
+                                "Failed to connect to QUIC endpoint: {e}"
+                            )));
+                        }
+                    }
+                }
+                Err(last_err.unwrap_or_else(|| {
+                    std::io::Error::other("no resolved addresses succeeded")
+                }))
             }
         }
     }

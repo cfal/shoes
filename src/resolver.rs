@@ -328,6 +328,25 @@ pub async fn resolve_single_address(
     Ok(resolve_results[0])
 }
 
+/// Resolve all addresses for a location. Returns a single-element vec
+/// for IP literals, or the full set from the resolver.
+pub async fn resolve_addresses(
+    resolver: &Arc<dyn Resolver>,
+    location: &NetLocation,
+) -> std::io::Result<Vec<SocketAddr>> {
+    if let Some(socket_addr) = location.to_socket_addr_nonblocking() {
+        return Ok(vec![socket_addr]);
+    }
+
+    let addrs = resolver.resolve_location(location).await?;
+    if addrs.is_empty() {
+        return Err(std::io::Error::other(format!(
+            "could not resolve location: {location}"
+        )));
+    }
+    Ok(addrs)
+}
+
 /// Resolve a ResolvedLocation lazily. If already resolved, returns the cached
 /// address. Otherwise resolves, caches the result in the location, and returns it.
 /// This is the key function for the lazy resolution pattern.
