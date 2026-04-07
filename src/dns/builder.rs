@@ -7,7 +7,7 @@ use rustc_hash::FxHashMap;
 
 use crate::config::{DnsConfig, ExpandedDnsGroup, ExpandedDnsSpec};
 use crate::dns::composite_resolver::CompositeResolver;
-use crate::dns::hickory_resolver::HickoryResolver;
+use crate::dns::hickory_resolver::{HickoryResolver, HickoryResolverOptions};
 use crate::dns::parsed::{ParsedDnsServer, ParsedDnsServerEntry, ParsedDnsUrl};
 use crate::option_util::NoneOrSome;
 use crate::resolver::{CachingNativeResolver, NativeResolver, Resolver, TimeoutResolver};
@@ -91,45 +91,41 @@ pub fn build_resolver(entries: Vec<ParsedDnsServerEntry>) -> std::io::Result<Arc
     for entry in entries {
         let bootstrap = entry.bootstrap_resolver;
         let chain = entry.client_chain;
-        let ip_strategy = entry.ip_strategy;
         let timeout_secs = entry.timeout_secs;
+
+        let options = HickoryResolverOptions {
+            ip_strategy: entry.ip_strategy,
+            request_timeout: (timeout_secs > 0)
+                .then(|| Duration::from_secs(timeout_secs as u64)),
+            attempts: entry.attempts,
+        };
 
         let resolver: Arc<dyn Resolver> = match entry.server {
             // System resolver keeps the outer timeout wrapper.
             ParsedDnsServer::System => wrap_resolver(NativeResolver::new(), timeout_secs),
             // Hickory-backed resolvers use hickory's own internal timeout handling.
             ParsedDnsServer::Udp { addr } => {
-                Arc::new(HickoryResolver::udp(addr, chain, bootstrap, ip_strategy)?)
+                Arc::new(HickoryResolver::udp(addr, chain, bootstrap, options)?)
             }
             ParsedDnsServer::Tcp { addr } => {
-                Arc::new(HickoryResolver::tcp(addr, chain, bootstrap, ip_strategy)?)
+                Arc::new(HickoryResolver::tcp(addr, chain, bootstrap, options)?)
             }
             ParsedDnsServer::Tls { addr, server_name } => {
-                Arc::new(HickoryResolver::tls(addr, server_name, chain, bootstrap, ip_strategy)?)
+                Arc::new(HickoryResolver::tls(addr, server_name, chain, bootstrap, options)?)
             }
             ParsedDnsServer::Https {
                 addr,
                 server_name,
                 path,
             } => Arc::new(HickoryResolver::https(
-                addr,
-                server_name,
-                path,
-                chain,
-                bootstrap,
-                ip_strategy,
+                addr, server_name, path, chain, bootstrap, options,
             )?),
             ParsedDnsServer::H3 {
                 addr,
                 server_name,
                 path,
             } => Arc::new(HickoryResolver::h3(
-                addr,
-                server_name,
-                path,
-                chain,
-                bootstrap,
-                ip_strategy,
+                addr, server_name, path, chain, bootstrap, options,
             )?),
         };
 
@@ -224,13 +220,14 @@ async fn build_entry_from_spec(
 
                 let native = Arc::new(NativeResolver::new());
                 let direct_chain = Arc::new(build_direct_chain_group(native.clone()));
-                // Bootstrap resolvers use default timeout (10s)
+                // Bootstrap resolvers use default timeout (10s) and 2 attempts
                 let bootstrap_entry = ParsedDnsServerEntry::new(
                     bootstrap_server,
                     direct_chain,
                     native,
                     super::IpStrategy::default(),
                     10, // Default timeout for bootstrap
+                    2,  // Default attempts for bootstrap
                 );
                 build_resolver(vec![bootstrap_entry])?
             }
@@ -272,5 +269,6 @@ async fn build_entry_from_spec(
         bootstrap_resolver,
         spec.ip_strategy,
         spec.timeout_secs,
+        spec.attempts,
     ))
 }

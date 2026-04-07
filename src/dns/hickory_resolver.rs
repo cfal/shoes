@@ -6,6 +6,7 @@
 use std::fmt::Debug;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use hickory_resolver::Resolver;
 use hickory_resolver::config::{
@@ -17,6 +18,27 @@ use crate::client_proxy_chain::ClientChainGroup;
 use crate::dns::parsed::IpStrategy;
 use crate::dns::proxy_runtime::ProxyRuntimeProvider;
 use crate::resolver::Resolver as ShoesResolver;
+
+/// Tuning options for hickory-backed resolvers.
+#[derive(Debug, Clone, Copy)]
+pub struct HickoryResolverOptions {
+    pub ip_strategy: IpStrategy,
+    /// Per-request timeout passed to hickory's ResolverOpts.timeout.
+    /// None means use hickory's default.
+    pub request_timeout: Option<Duration>,
+    /// Number of retry attempts for failed queries.
+    pub attempts: usize,
+}
+
+impl Default for HickoryResolverOptions {
+    fn default() -> Self {
+        Self {
+            ip_strategy: IpStrategy::default(),
+            request_timeout: Some(Duration::from_secs(5)),
+            attempts: 2,
+        }
+    }
+}
 
 /// Resolver implementation using hickory-dns.
 /// Uses ProxyRuntimeProvider for all connections (both direct and proxied).
@@ -40,7 +62,7 @@ impl HickoryResolver {
         addr: SocketAddr,
         chain_group: Arc<ClientChainGroup>,
         bootstrap: Arc<dyn ShoesResolver>,
-        ip_strategy: IpStrategy,
+        options: HickoryResolverOptions,
     ) -> std::io::Result<Self> {
         let mut conn_config = ConnectionConfig::udp();
         conn_config.port = addr.port();
@@ -49,7 +71,7 @@ impl HickoryResolver {
             conn_config,
             chain_group,
             bootstrap,
-            ip_strategy,
+            options,
             format!("udp://{}", addr),
         )
     }
@@ -59,7 +81,7 @@ impl HickoryResolver {
         addr: SocketAddr,
         chain_group: Arc<ClientChainGroup>,
         bootstrap: Arc<dyn ShoesResolver>,
-        ip_strategy: IpStrategy,
+        options: HickoryResolverOptions,
     ) -> std::io::Result<Self> {
         let mut conn_config = ConnectionConfig::tcp();
         conn_config.port = addr.port();
@@ -68,7 +90,7 @@ impl HickoryResolver {
             conn_config,
             chain_group,
             bootstrap,
-            ip_strategy,
+            options,
             format!("tcp://{}", addr),
         )
     }
@@ -79,7 +101,7 @@ impl HickoryResolver {
         server_name: Arc<str>,
         chain_group: Arc<ClientChainGroup>,
         bootstrap: Arc<dyn ShoesResolver>,
-        ip_strategy: IpStrategy,
+        options: HickoryResolverOptions,
     ) -> std::io::Result<Self> {
         let mut conn_config = ConnectionConfig::tls(server_name.clone());
         conn_config.port = addr.port();
@@ -88,7 +110,7 @@ impl HickoryResolver {
             conn_config,
             chain_group,
             bootstrap,
-            ip_strategy,
+            options,
             format!("tls://{}#{}", addr, server_name),
         )
     }
@@ -100,7 +122,7 @@ impl HickoryResolver {
         path: Arc<str>,
         chain_group: Arc<ClientChainGroup>,
         bootstrap: Arc<dyn ShoesResolver>,
-        ip_strategy: IpStrategy,
+        options: HickoryResolverOptions,
     ) -> std::io::Result<Self> {
         let mut conn_config = ConnectionConfig::https(server_name.clone(), Some(path));
         conn_config.port = addr.port();
@@ -109,7 +131,7 @@ impl HickoryResolver {
             conn_config,
             chain_group,
             bootstrap,
-            ip_strategy,
+            options,
             format!("https://{}", server_name),
         )
     }
@@ -121,7 +143,7 @@ impl HickoryResolver {
         path: Arc<str>,
         chain_group: Arc<ClientChainGroup>,
         bootstrap: Arc<dyn ShoesResolver>,
-        ip_strategy: IpStrategy,
+        options: HickoryResolverOptions,
     ) -> std::io::Result<Self> {
         // Cloudflare has a broken GREASE implementation.
         // See: https://github.com/hyperium/h3/issues/206
@@ -137,7 +159,7 @@ impl HickoryResolver {
             conn_config,
             chain_group,
             bootstrap,
-            ip_strategy,
+            options,
             format!("h3://{}", server_name),
         )
     }
@@ -147,7 +169,7 @@ impl HickoryResolver {
         conn_config: ConnectionConfig,
         chain_group: Arc<ClientChainGroup>,
         bootstrap: Arc<dyn ShoesResolver>,
-        ip_strategy: IpStrategy,
+        options: HickoryResolverOptions,
         description: String,
     ) -> std::io::Result<Self> {
         let ns_config = NameServerConfig::new(ip, true, vec![conn_config]);
@@ -155,7 +177,12 @@ impl HickoryResolver {
         let provider = ProxyRuntimeProvider::with_bootstrap(chain_group, bootstrap);
 
         let mut builder = Resolver::builder_with_config(config, provider);
-        builder.options_mut().ip_strategy = ip_strategy.to_hickory();
+        let resolver_opts = builder.options_mut();
+        resolver_opts.ip_strategy = options.ip_strategy.to_hickory();
+        if let Some(timeout) = options.request_timeout {
+            resolver_opts.timeout = timeout;
+        }
+        resolver_opts.attempts = options.attempts;
         let builder =
             builder.with_tls_config(crate::rustls_config_util::create_dns_client_config());
         let resolver = builder

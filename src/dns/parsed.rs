@@ -52,16 +52,19 @@ pub struct ParsedDnsServerEntry {
     pub ip_strategy: IpStrategy,
     /// Timeout for DNS resolution in seconds. 0 means no timeout.
     pub timeout_secs: u32,
+    /// Number of retry attempts for failed queries.
+    pub attempts: usize,
 }
 
 impl ParsedDnsServerEntry {
-    /// Create entry with the given chain group, bootstrap resolver, IP strategy, and timeout.
+    /// Create entry with the given chain group, bootstrap resolver, IP strategy, timeout, and attempts.
     pub fn new(
         server: ParsedDnsServer,
         chain: Arc<ClientChainGroup>,
         bootstrap: Arc<dyn Resolver>,
         ip_strategy: IpStrategy,
         timeout_secs: u32,
+        attempts: usize,
     ) -> Self {
         Self {
             server,
@@ -69,6 +72,7 @@ impl ParsedDnsServerEntry {
             bootstrap_resolver: bootstrap,
             ip_strategy,
             timeout_secs,
+            attempts,
         }
     }
 }

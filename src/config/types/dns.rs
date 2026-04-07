@@ -12,6 +12,12 @@ fn default_timeout_secs() -> u32 {
     5
 }
 
+/// Default number of retry attempts for custom DNS groups.
+/// Lower than hickory's default to avoid turning transient failures into slow successes.
+fn default_attempts() -> usize {
+    1
+}
+
 /// A DNS server specification in config.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
@@ -35,9 +41,12 @@ pub enum DnsServerSpec {
         /// IP lookup strategy for DNS resolution. Defaults to ipv4_then_ipv6.
         #[serde(default)]
         ip_strategy: IpStrategy,
-        /// Timeout for DNS resolution in seconds. Defaults to 10. Set to 0 to disable.
+        /// Timeout for DNS resolution in seconds. Defaults to 5. Set to 0 to disable.
         #[serde(default = "default_timeout_secs")]
         timeout_secs: u32,
+        /// Number of retry attempts for failed queries. Defaults to 1.
+        #[serde(default = "default_attempts")]
+        attempts: usize,
     },
 }
 
@@ -106,13 +115,22 @@ impl DnsServerSpec {
         }
     }
 
-    /// Get the timeout in seconds (defaults to 10 for Simple variant).
+    /// Get the timeout in seconds (defaults to 5 for Simple variant).
     /// Returns 0 if timeout is disabled.
     pub fn timeout_secs(&self) -> u32 {
         if let Self::WithOptions { timeout_secs, .. } = self {
             *timeout_secs
         } else {
             default_timeout_secs()
+        }
+    }
+
+    /// Get the number of retry attempts (defaults to 1 for Simple variant).
+    pub fn attempts(&self) -> usize {
+        if let Self::WithOptions { attempts, .. } = self {
+            *attempts
+        } else {
+            default_attempts()
         }
     }
 }
@@ -167,6 +185,8 @@ pub struct ExpandedDnsSpec {
     pub ip_strategy: IpStrategy,
     /// Timeout for DNS resolution in seconds. 0 means no timeout.
     pub timeout_secs: u32,
+    /// Number of retry attempts for failed queries.
+    pub attempts: usize,
 }
 
 /// A DNS group with all specs expanded.
@@ -334,6 +354,7 @@ servers: my-dns-group
             server_name: None,
             ip_strategy: IpStrategy::default(),
             timeout_secs: default_timeout_secs(),
+            attempts: default_attempts(),
         };
         assert!(!spec.as_group_ref().is_some());
         assert!(spec.as_group_ref().is_none());
