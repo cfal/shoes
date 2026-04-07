@@ -97,8 +97,11 @@ struct HickoryResolverPlan {
 
 impl HickoryResolverPlan {
     /// Build a fresh resolver, re-resolving hostname upstreams if needed.
+    /// Build a fresh resolver, re-resolving hostname upstreams if needed.
+    /// When a hostname resolves to multiple IPs, all are expanded into
+    /// nameserver configs inside a single pooled hickory resolver.
     async fn build(&self) -> std::io::Result<Arc<dyn Resolver>> {
-        let resolved_ip = match self.parsed_url.hostname() {
+        let resolved_ips = match self.parsed_url.hostname() {
             Some(hostname) => {
                 let location = crate::address::NetLocation::new(
                     crate::address::Address::Hostname(hostname.to_string()),
@@ -114,11 +117,50 @@ impl HickoryResolverPlan {
                             hostname, e
                         ))
                     })?;
-                Some(addrs[0].ip())
+                if addrs.is_empty() {
+                    return Err(std::io::Error::other(format!(
+                        "bootstrap lookup returned no addresses for '{}'",
+                        hostname
+                    )));
+                }
+                let ips: Vec<std::net::IpAddr> = addrs.into_iter().map(|a| a.ip()).collect();
+                log::debug!(
+                    "HickoryResolverPlan ({}): resolved {} to {:?}",
+                    self.description,
+                    hostname,
+                    ips
+                );
+                ips
             }
-            None => None,
+            None => vec![],
         };
 
+        // For hostname-based upstreams with multiple IPs, build a pooled resolver.
+        if resolved_ips.len() > 1 {
+            let mut ns_pairs = Vec::with_capacity(resolved_ips.len());
+            for ip in &resolved_ips {
+                let server = self
+                    .parsed_url
+                    .to_parsed_server(Some(*ip))
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+                if let Some(pair) = server_to_ns_config(&server) {
+                    ns_pairs.push(pair);
+                }
+            }
+            if !ns_pairs.is_empty() {
+                let resolver = HickoryResolver::build_pooled(
+                    ns_pairs,
+                    self.chain_group.clone(),
+                    self.bootstrap_resolver.clone(),
+                    self.options,
+                    self.description.clone(),
+                )?;
+                return Ok(Arc::new(resolver));
+            }
+        }
+
+        // Single IP or IP-literal upstream: build normally.
+        let resolved_ip = resolved_ips.first().copied();
         let server = self
             .parsed_url
             .to_parsed_server(resolved_ip)
