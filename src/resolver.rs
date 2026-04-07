@@ -223,6 +223,69 @@ impl Resolver for RefreshingResolver {
     }
 }
 
+/// Short-TTL shared cache above the inner resolver. Placed outside
+/// RefreshingResolver so a refresh does not destroy cached results.
+/// Caches full Vec<SocketAddr> results, preserving all addresses.
+pub struct SharedCachingResolver {
+    inner: Arc<dyn Resolver>,
+    ttl: Duration,
+    cache: Arc<Mutex<FxHashMap<NetLocation, CachedAddrs>>>,
+}
+
+struct CachedAddrs {
+    timestamp: Instant,
+    addrs: Vec<SocketAddr>,
+}
+
+impl Debug for SharedCachingResolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedCachingResolver")
+            .field("ttl", &self.ttl)
+            .finish()
+    }
+}
+
+impl SharedCachingResolver {
+    pub fn new(inner: Arc<dyn Resolver>, ttl: Duration) -> Self {
+        Self {
+            inner,
+            ttl,
+            cache: Arc::new(Mutex::new(FxHashMap::default())),
+        }
+    }
+}
+
+impl Resolver for SharedCachingResolver {
+    fn resolve_location(&self, location: &NetLocation) -> ResolveFuture {
+        if let Some(socket_addr) = location.to_socket_addr_nonblocking() {
+            return Box::pin(async move { Ok(vec![socket_addr]) });
+        }
+
+        if let Some(entry) = self.cache.lock().get(location) {
+            if entry.timestamp.elapsed() <= self.ttl {
+                let addrs = entry.addrs.clone();
+                return Box::pin(async move { Ok(addrs) });
+            }
+        }
+
+        let location = location.clone();
+        let inner = self.inner.clone();
+        let cache = self.cache.clone();
+
+        Box::pin(async move {
+            let addrs = inner.resolve_location(&location).await?;
+            cache.lock().insert(
+                location,
+                CachedAddrs {
+                    timestamp: Instant::now(),
+                    addrs: addrs.clone(),
+                },
+            );
+            Ok(addrs)
+        })
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct NativeResolver;
 

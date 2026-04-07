@@ -12,7 +12,7 @@ use crate::dns::parsed::{ParsedDnsServer, ParsedDnsServerEntry, ParsedDnsUrl};
 use crate::option_util::NoneOrSome;
 use crate::resolver::{
     CachingNativeResolver, NativeResolver, RefreshPolicy, RefreshingResolver, Resolver,
-    ResolverFactory, TimeoutResolver,
+    ResolverFactory, SharedCachingResolver, TimeoutResolver,
 };
 use crate::tcp::chain_builder::{build_client_chain_group, build_direct_chain_group};
 
@@ -428,7 +428,12 @@ async fn build_resolver_from_specs(
 
         let refreshing =
             RefreshingResolver::new(factory, policy, description).await?;
-        Ok(Arc::new(refreshing))
+        // Cache outside RefreshingResolver so refresh doesn't destroy cached results.
+        let cached = SharedCachingResolver::new(
+            Arc::new(refreshing),
+            Duration::from_secs(30),
+        );
+        Ok(Arc::new(cached))
     } else {
         Ok(resolver)
     }
