@@ -213,10 +213,19 @@ impl ShoesResolver for HickoryResolver {
         let resolver = self.inner.clone();
 
         Box::pin(async move {
+            let started = std::time::Instant::now();
+
             let response = resolver
                 .lookup_ip(&name)
                 .await
-                .map_err(|e| std::io::Error::other(format!("DNS lookup failed: {e}")))?;
+                .map_err(|e| {
+                    let elapsed = started.elapsed();
+                    log::warn!(
+                        "DNS lookup failed via {}: {}:{} in {:?}: {}",
+                        description, name, port, elapsed, e
+                    );
+                    std::io::Error::other(format!("DNS lookup failed: {e}"))
+                })?;
 
             let addrs: Vec<SocketAddr> = response
                 .iter()
@@ -230,10 +239,18 @@ impl ShoesResolver for HickoryResolver {
                 )));
             }
 
-            log::debug!(
-                "HickoryResolver ({}) resolved {name}:{port} -> {addrs:?}",
-                description
-            );
+            let elapsed = started.elapsed();
+            if elapsed > Duration::from_millis(500) {
+                log::info!(
+                    "slow DNS lookup via {}: {}:{} -> {:?} in {:?}",
+                    description, name, port, addrs, elapsed
+                );
+            } else {
+                log::debug!(
+                    "DNS lookup via {}: {}:{} -> {:?} in {:?}",
+                    description, name, port, addrs, elapsed
+                );
+            }
             Ok(addrs)
         })
     }

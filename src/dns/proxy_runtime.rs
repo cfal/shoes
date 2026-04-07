@@ -93,14 +93,39 @@ impl RuntimeProvider for ProxyRuntimeProvider {
             };
             let target = NetLocation::new(address, server_addr.port());
 
+            let started = std::time::Instant::now();
             let connect_future = chain_group.connect_tcp(target.into(), &resolver);
             match tokio::time::timeout(timeout, connect_future).await {
-                Ok(Ok(result)) => Ok(AsyncIoTokioAsStd(result.client_stream)),
-                Ok(Err(e)) => Err(e),
-                Err(_) => Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    format!("DNS server connection to {server_addr} timed out after {timeout:?}"),
-                )),
+                Ok(Ok(result)) => {
+                    log::debug!(
+                        "DNS upstream connect to {} succeeded in {:?}",
+                        server_addr,
+                        started.elapsed()
+                    );
+                    Ok(AsyncIoTokioAsStd(result.client_stream))
+                }
+                Ok(Err(e)) => {
+                    log::warn!(
+                        "DNS upstream connect to {} failed in {:?}: {}",
+                        server_addr,
+                        started.elapsed(),
+                        e
+                    );
+                    Err(e)
+                }
+                Err(_) => {
+                    log::warn!(
+                        "DNS upstream connect to {} timed out in {:?}",
+                        server_addr,
+                        started.elapsed()
+                    );
+                    Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!(
+                            "DNS server connection to {server_addr} timed out after {timeout:?}"
+                        ),
+                    ))
+                }
             }
         })
     }

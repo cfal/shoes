@@ -39,14 +39,29 @@ impl Resolver for CompositeResolver {
         Box::pin(async move {
             let mut last_error = None;
 
-            for resolver in &resolvers {
+            for (i, resolver) in resolvers.iter().enumerate() {
                 match resolver.resolve_location(&location).await {
-                    Ok(addrs) if !addrs.is_empty() => return Ok(addrs),
+                    Ok(addrs) if !addrs.is_empty() => {
+                        if i > 0 {
+                            log::info!(
+                                "CompositeResolver: resolved {} via resolver #{} ({:?}) after {} failures",
+                                location, i, resolver, i
+                            );
+                        }
+                        return Ok(addrs);
+                    }
                     Ok(_) => {
+                        log::debug!(
+                            "CompositeResolver: resolver #{} ({:?}) returned empty for {}, trying next",
+                            i, resolver, location
+                        );
                         last_error = Some(std::io::Error::other("empty response"));
                     }
                     Err(e) => {
-                        log::debug!("DNS resolver failed, trying next: {e}");
+                        log::debug!(
+                            "CompositeResolver: resolver #{} ({:?}) failed for {}: {}, trying next",
+                            i, resolver, location, e
+                        );
                         last_error = Some(e);
                     }
                 }
