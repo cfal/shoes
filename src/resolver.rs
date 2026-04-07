@@ -8,7 +8,9 @@ use std::time::{Duration, Instant};
 
 use futures::future::{FutureExt, Shared};
 use log::debug;
+use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
+use tokio::sync::{Mutex as AsyncMutex, RwLock};
 
 use crate::address::{NetLocation, ResolvedLocation};
 
@@ -73,6 +75,149 @@ impl<T: Resolver> Resolver for TimeoutResolver<T> {
                         location_str, timeout_duration
                     ),
                 )),
+            }
+        })
+    }
+}
+
+type ResolverFactoryFuture =
+    Pin<Box<dyn Future<Output = std::io::Result<Arc<dyn Resolver>>> + Send>>;
+
+pub type ResolverFactory = Arc<dyn Fn() -> ResolverFactoryFuture + Send + Sync>;
+
+/// Policy controlling when a RefreshingResolver rebuilds its inner resolver.
+#[derive(Debug, Clone, Copy)]
+pub struct RefreshPolicy {
+    /// Rebuild the inner resolver if it has been idle longer than this.
+    pub max_idle: Duration,
+    /// After a refreshable error, rebuild and retry the lookup once.
+    pub retry_once_after_refresh: bool,
+}
+
+/// Resolver wrapper that rebuilds its inner resolver on idle timeout or
+/// connection-related errors. Targets stale pooled connection state in
+/// hickory-backed resolvers.
+pub struct RefreshingResolver {
+    factory: ResolverFactory,
+    inner: Arc<RwLock<Arc<dyn Resolver>>>,
+    refresh_lock: Arc<AsyncMutex<()>>,
+    last_success_at: Arc<Mutex<Option<Instant>>>,
+    policy: RefreshPolicy,
+    description: String,
+}
+
+impl Debug for RefreshingResolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RefreshingResolver")
+            .field("description", &self.description)
+            .field("max_idle", &self.policy.max_idle)
+            .finish()
+    }
+}
+
+impl RefreshingResolver {
+    pub async fn new(
+        factory: ResolverFactory,
+        policy: RefreshPolicy,
+        description: String,
+    ) -> std::io::Result<Self> {
+        let inner = factory().await?;
+        Ok(Self {
+            factory,
+            inner: Arc::new(RwLock::new(inner)),
+            refresh_lock: Arc::new(AsyncMutex::new(())),
+            last_success_at: Arc::new(Mutex::new(None)),
+            policy,
+            description,
+        })
+    }
+
+    fn should_refresh_for_error(err: &std::io::Error) -> bool {
+        matches!(
+            err.kind(),
+            std::io::ErrorKind::TimedOut
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::UnexpectedEof
+                | std::io::ErrorKind::NotConnected
+        )
+    }
+}
+
+impl Resolver for RefreshingResolver {
+    fn resolve_location(&self, location: &NetLocation) -> ResolveFuture {
+        if let Some(socket_addr) = location.to_socket_addr_nonblocking() {
+            return Box::pin(async move { Ok(vec![socket_addr]) });
+        }
+
+        let location = location.clone();
+        let inner = self.inner.clone();
+        let refresh_lock = self.refresh_lock.clone();
+        let factory = self.factory.clone();
+        let last_success_at = self.last_success_at.clone();
+        let policy = self.policy;
+        let description = self.description.clone();
+
+        Box::pin(async move {
+            // Refresh if idle too long (double-checked locking).
+            if matches!(*last_success_at.lock(), Some(last) if last.elapsed() > policy.max_idle) {
+                let _guard = refresh_lock.lock().await;
+                if matches!(*last_success_at.lock(), Some(last) if last.elapsed() > policy.max_idle)
+                {
+                    log::info!(
+                        "RefreshingResolver ({}): rebuilding after idle timeout ({:?})",
+                        description,
+                        policy.max_idle
+                    );
+                    match factory().await {
+                        Ok(fresh) => *inner.write().await = fresh,
+                        Err(e) => {
+                            log::warn!(
+                                "RefreshingResolver ({}): idle refresh failed: {}",
+                                description,
+                                e
+                            );
+                        }
+                    }
+                }
+            }
+
+            let current = inner.read().await.clone();
+            match current.resolve_location(&location).await {
+                Ok(addrs) => {
+                    *last_success_at.lock() = Some(Instant::now());
+                    Ok(addrs)
+                }
+                Err(err)
+                    if policy.retry_once_after_refresh
+                        && RefreshingResolver::should_refresh_for_error(&err) =>
+                {
+                    log::info!(
+                        "RefreshingResolver ({}): refresh-on-error ({}) for {}",
+                        description,
+                        err.kind(),
+                        location
+                    );
+                    let _guard = refresh_lock.lock().await;
+                    match factory().await {
+                        Ok(fresh) => {
+                            *inner.write().await = fresh.clone();
+                            let addrs = fresh.resolve_location(&location).await?;
+                            *last_success_at.lock() = Some(Instant::now());
+                            Ok(addrs)
+                        }
+                        Err(factory_err) => {
+                            log::warn!(
+                                "RefreshingResolver ({}): error-refresh factory failed: {}",
+                                description,
+                                factory_err
+                            );
+                            Err(err)
+                        }
+                    }
+                }
+                Err(err) => Err(err),
             }
         })
     }
