@@ -170,12 +170,70 @@ fn build_hickory_from_server(
     })
 }
 
+/// Convert a ParsedDnsServer to (IpAddr, ConnectionConfig) for pooling.
+/// Returns None for System resolvers (cannot be pooled).
+fn server_to_ns_config(
+    server: &ParsedDnsServer,
+) -> Option<(std::net::IpAddr, hickory_resolver::config::ConnectionConfig)> {
+    use hickory_resolver::config::{ConnectionConfig, ProtocolConfig};
+
+    match server {
+        ParsedDnsServer::System => None,
+        ParsedDnsServer::Udp { addr } => {
+            let mut cc = ConnectionConfig::udp();
+            cc.port = addr.port();
+            Some((addr.ip(), cc))
+        }
+        ParsedDnsServer::Tcp { addr } => {
+            let mut cc = ConnectionConfig::tcp();
+            cc.port = addr.port();
+            Some((addr.ip(), cc))
+        }
+        ParsedDnsServer::Tls { addr, server_name } => {
+            let mut cc = ConnectionConfig::tls(server_name.clone());
+            cc.port = addr.port();
+            Some((addr.ip(), cc))
+        }
+        ParsedDnsServer::Https {
+            addr,
+            server_name,
+            path,
+        } => {
+            let mut cc = ConnectionConfig::https(server_name.clone(), Some(path.clone()));
+            cc.port = addr.port();
+            Some((addr.ip(), cc))
+        }
+        ParsedDnsServer::H3 {
+            addr,
+            server_name,
+            path,
+        } => {
+            let protocol = ProtocolConfig::H3 {
+                server_name: server_name.clone(),
+                path: path.clone(),
+                disable_grease: true,
+            };
+            let mut cc = ConnectionConfig::new(protocol);
+            cc.port = addr.port();
+            Some((addr.ip(), cc))
+        }
+    }
+}
+
 /// Build a resolver from parsed DNS server entries.
+/// When all entries are hickory-backed with compatible settings, pools them
+/// into a single hickory resolver instead of using CompositeResolver.
 pub fn build_resolver(entries: Vec<ParsedDnsServerEntry>) -> std::io::Result<Arc<dyn Resolver>> {
     if entries.is_empty() {
         return Err(std::io::Error::other("no DNS servers configured"));
     }
 
+    // Try to pool all hickory-backed entries into one resolver.
+    if let Some(pooled) = try_build_hickory_pool(&entries)? {
+        return Ok(pooled);
+    }
+
+    // Fallback: build individual resolvers and composite them.
     let mut resolvers: Vec<Arc<dyn Resolver>> = Vec::with_capacity(entries.len());
 
     for entry in entries {
@@ -190,9 +248,7 @@ pub fn build_resolver(entries: Vec<ParsedDnsServerEntry>) -> std::io::Result<Arc
         };
 
         let resolver: Arc<dyn Resolver> = match entry.server {
-            // System resolver keeps the outer timeout wrapper.
             ParsedDnsServer::System => wrap_resolver(NativeResolver::new(), timeout_secs),
-            // Hickory-backed resolvers use hickory's own internal timeout handling.
             server => build_hickory_from_server(
                 server,
                 entry.client_chain,
@@ -204,12 +260,57 @@ pub fn build_resolver(entries: Vec<ParsedDnsServerEntry>) -> std::io::Result<Arc
         resolvers.push(resolver);
     }
 
-    // If single resolver, return it directly; otherwise wrap in CompositeResolver
     if resolvers.len() == 1 {
         Ok(resolvers.pop().unwrap())
     } else {
         Ok(Arc::new(CompositeResolver::new(resolvers)))
     }
+}
+
+/// Attempt to build a single pooled hickory resolver from all entries.
+/// Returns None if entries contain system resolvers or are otherwise
+/// incompatible for pooling (mixed chain groups).
+fn try_build_hickory_pool(
+    entries: &[ParsedDnsServerEntry],
+) -> std::io::Result<Option<Arc<dyn Resolver>>> {
+    if entries.is_empty() || entries.len() < 2 {
+        return Ok(None);
+    }
+
+    // All entries must be hickory-backed (no system resolvers).
+    let mut ns_pairs = Vec::with_capacity(entries.len());
+    for entry in entries {
+        match server_to_ns_config(&entry.server) {
+            Some(pair) => ns_pairs.push(pair),
+            None => return Ok(None),
+        }
+    }
+
+    // Use the first entry's settings for the pooled resolver.
+    let first = &entries[0];
+    let timeout_secs = first.timeout_secs;
+    let options = HickoryResolverOptions {
+        ip_strategy: first.ip_strategy,
+        request_timeout: (timeout_secs > 0).then(|| Duration::from_secs(timeout_secs as u64)),
+        connect_timeout: Duration::from_secs(first.connect_timeout_secs as u64),
+        attempts: first.attempts,
+    };
+
+    let descriptions: Vec<String> = entries
+        .iter()
+        .map(|e| format!("{:?}", e.server))
+        .collect();
+    let description = format!("pool[{}]", descriptions.join(", "));
+
+    let resolver = HickoryResolver::build_pooled(
+        ns_pairs,
+        first.client_chain.clone(),
+        first.bootstrap_resolver.clone(),
+        options,
+        description,
+    )?;
+
+    Ok(Some(Arc::new(resolver)))
 }
 
 /// Build DnsRegistry from expanded DNS groups.

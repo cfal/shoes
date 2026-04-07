@@ -167,6 +167,24 @@ impl HickoryResolver {
         )
     }
 
+    /// Create a resolver with multiple nameservers in a single hickory pool.
+    /// Hickory's NameServerPool handles ordering and parallelism internally,
+    /// avoiding the sequential fallback behavior of CompositeResolver.
+    pub fn build_pooled(
+        servers: Vec<(std::net::IpAddr, ConnectionConfig)>,
+        chain_group: Arc<ClientChainGroup>,
+        bootstrap: Arc<dyn ShoesResolver>,
+        options: HickoryResolverOptions,
+        description: String,
+    ) -> std::io::Result<Self> {
+        let ns_configs: Vec<NameServerConfig> = servers
+            .into_iter()
+            .map(|(ip, conn_config)| NameServerConfig::new(ip, true, vec![conn_config]))
+            .collect();
+
+        Self::build_with_ns_configs(ns_configs, chain_group, bootstrap, options, description)
+    }
+
     fn build(
         ip: std::net::IpAddr,
         conn_config: ConnectionConfig,
@@ -176,7 +194,23 @@ impl HickoryResolver {
         description: String,
     ) -> std::io::Result<Self> {
         let ns_config = NameServerConfig::new(ip, true, vec![conn_config]);
-        let config = ResolverConfig::from_parts(None, vec![], vec![ns_config]);
+        Self::build_with_ns_configs(
+            vec![ns_config],
+            chain_group,
+            bootstrap,
+            options,
+            description,
+        )
+    }
+
+    fn build_with_ns_configs(
+        ns_configs: Vec<NameServerConfig>,
+        chain_group: Arc<ClientChainGroup>,
+        bootstrap: Arc<dyn ShoesResolver>,
+        options: HickoryResolverOptions,
+        description: String,
+    ) -> std::io::Result<Self> {
+        let config = ResolverConfig::from_parts(None, vec![], ns_configs);
         let provider =
             ProxyRuntimeProvider::with_bootstrap(chain_group, bootstrap, options.connect_timeout);
 
