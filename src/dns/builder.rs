@@ -185,6 +185,7 @@ pub fn build_resolver(entries: Vec<ParsedDnsServerEntry>) -> std::io::Result<Arc
             ip_strategy: entry.ip_strategy,
             request_timeout: (timeout_secs > 0)
                 .then(|| Duration::from_secs(timeout_secs as u64)),
+            connect_timeout: Duration::from_secs(entry.connect_timeout_secs as u64),
             attempts: entry.attempts,
         };
 
@@ -341,6 +342,7 @@ async fn build_entry_and_plan(
                     native,
                     super::IpStrategy::default(),
                     10, // Default timeout for bootstrap
+                    5,  // Default connect timeout for bootstrap
                     2,  // Default attempts for bootstrap
                 );
                 build_resolver(vec![bootstrap_entry])?
@@ -353,6 +355,7 @@ async fn build_entry_and_plan(
     let options = HickoryResolverOptions {
         ip_strategy: spec.ip_strategy,
         request_timeout: (timeout_secs > 0).then(|| Duration::from_secs(timeout_secs as u64)),
+        connect_timeout: Duration::from_secs(spec.connect_timeout_secs as u64),
         attempts: spec.attempts,
     };
 
@@ -403,6 +406,7 @@ async fn build_entry_and_plan(
         bootstrap_resolver,
         spec.ip_strategy,
         spec.timeout_secs,
+        spec.connect_timeout_secs,
         spec.attempts,
     );
 

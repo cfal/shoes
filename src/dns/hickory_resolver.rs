@@ -26,6 +26,8 @@ pub struct HickoryResolverOptions {
     /// Per-request timeout passed to hickory's ResolverOpts.timeout.
     /// None means use hickory's default.
     pub request_timeout: Option<Duration>,
+    /// Timeout for establishing TCP/TLS connections to DNS upstreams.
+    pub connect_timeout: Duration,
     /// Number of retry attempts for failed queries.
     pub attempts: usize,
 }
@@ -35,6 +37,7 @@ impl Default for HickoryResolverOptions {
         Self {
             ip_strategy: IpStrategy::default(),
             request_timeout: Some(Duration::from_secs(5)),
+            connect_timeout: Duration::from_secs(5),
             attempts: 2,
         }
     }
@@ -174,7 +177,8 @@ impl HickoryResolver {
     ) -> std::io::Result<Self> {
         let ns_config = NameServerConfig::new(ip, true, vec![conn_config]);
         let config = ResolverConfig::from_parts(None, vec![], vec![ns_config]);
-        let provider = ProxyRuntimeProvider::with_bootstrap(chain_group, bootstrap);
+        let provider =
+            ProxyRuntimeProvider::with_bootstrap(chain_group, bootstrap, options.connect_timeout);
 
         let mut builder = Resolver::builder_with_config(config, provider);
         let resolver_opts = builder.options_mut();
