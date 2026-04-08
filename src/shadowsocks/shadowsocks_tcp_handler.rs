@@ -212,7 +212,7 @@ impl TcpServerHandler for ShadowsocksTcpHandler {
             if host == UOT_V1_MAGIC_ADDRESS {
                 // UoT V1: Multi-destination UDP
                 // Each packet has: ATYP + address + port + length + data
-                let mut uot_stream = UotV1ServerStream::new(server_stream);
+                let mut uot_stream = UotV1ServerStream::new_uot(server_stream);
 
                 // Feeds unparsed data since first UoT packet might be in same TCP segment
                 let unparsed_data = stream_reader.unparsed_data();
@@ -264,7 +264,7 @@ impl TcpServerHandler for ShadowsocksTcpHandler {
                     });
                 } else {
                     // V2 Non-connect mode: Same as V1 (multi-destination)
-                    let mut uot_stream = UotV1ServerStream::new(server_stream);
+                    let mut uot_stream = UotV1ServerStream::new_uot(server_stream);
                     let unparsed_data = stream_reader.unparsed_data();
                     if !unparsed_data.is_empty() {
                         log::debug!(

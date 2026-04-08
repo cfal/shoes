@@ -282,7 +282,7 @@ pub async fn setup_socks_server_stream_inner(
             write_all(&mut server_stream, connection_success_response).await?;
             server_stream.flush().await?;
 
-            let mut uot_stream = UotV1ServerStream::new(server_stream);
+            let mut uot_stream = UotV1ServerStream::new_uot(server_stream);
 
             // Feeds unparsed data since first UoT packet might be in same TCP segment.
             let unparsed_data = stream_reader.unparsed_data();
@@ -333,7 +333,7 @@ pub async fn setup_socks_server_stream_inner(
                 });
             } else {
                 // V2 Non-connect mode: Same as V1 (multi-destination)
-                let mut uot_stream = UotV1ServerStream::new(server_stream);
+                let mut uot_stream = UotV1ServerStream::new_uot(server_stream);
 
                 let unparsed_data = stream_reader.unparsed_data();
                 if !unparsed_data.is_empty() {

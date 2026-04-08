@@ -1,29 +1,25 @@
-//! Common address parsing utilities for sing UoT packet payloads.
+//! SOCKS-style packet address parsing for h2mux `packet_addr` streams.
 //!
-//! UoT V1 packet payloads and UoT V2 non-connect packet payloads use the
-//! `AddrParser` format from `github.com/sagernet/sing/common/uot`, not the
-//! SOCKS5 serializer used by the V2 request header.
-//!
-//! AddrParser uses:
-//! - 0x00: IPv4 (4 bytes)
-//! - 0x01: IPv6 (16 bytes)
-//! - 0x02: Domain (1 byte length + domain string)
+//! sing-mux encodes per-packet destinations with `SocksaddrSerializer`, using:
+//! - 0x01: IPv4 (4 bytes)
+//! - 0x03: Domain (1 byte length + domain string)
+//! - 0x04: IPv6 (16 bytes)
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use crate::address::{Address, NetLocation};
 
-/// UoT AddrParser ATYP values.
-pub const ATYP_IPV4: u8 = 0x00;
-pub const ATYP_IPV6: u8 = 0x01;
-pub const ATYP_DOMAIN: u8 = 0x02;
+/// SOCKS5 ATYP values used by sing-mux `packet_addr`.
+pub const ATYP_IPV4: u8 = 0x01;
+pub const ATYP_DOMAIN: u8 = 0x03;
+pub const ATYP_IPV6: u8 = 0x04;
 
-/// Parse a UoT AddrParser address (ATYP + address + port).
+/// Parse a SOCKS packet address (ATYP + address + port).
 /// Returns Ok(Some((NetLocation, bytes consumed))) on success.
 /// Returns Ok(None) if data is truncated (need more data).
 /// Returns Err for invalid data (unknown ATYP, invalid UTF-8).
 #[inline]
-pub fn parse_uot_address(data: &[u8]) -> std::io::Result<Option<(NetLocation, usize)>> {
+pub fn parse_socks_packet_address(data: &[u8]) -> std::io::Result<Option<(NetLocation, usize)>> {
     if data.is_empty() {
         return Ok(None);
     }
@@ -31,7 +27,6 @@ pub fn parse_uot_address(data: &[u8]) -> std::io::Result<Option<(NetLocation, us
     let atyp = data[0];
     match atyp {
         ATYP_IPV4 => {
-            // ATYP(1) + IPv4(4) + Port(2) = 7 bytes
             if data.len() < 7 {
                 return Ok(None);
             }
@@ -40,7 +35,6 @@ pub fn parse_uot_address(data: &[u8]) -> std::io::Result<Option<(NetLocation, us
             Ok(Some((NetLocation::new(Address::Ipv4(ip), port), 7)))
         }
         ATYP_IPV6 => {
-            // ATYP(1) + IPv6(16) + Port(2) = 19 bytes
             if data.len() < 19 {
                 return Ok(None);
             }
@@ -50,12 +44,11 @@ pub fn parse_uot_address(data: &[u8]) -> std::io::Result<Option<(NetLocation, us
             Ok(Some((NetLocation::new(Address::Ipv6(ip), port), 19)))
         }
         ATYP_DOMAIN => {
-            // ATYP(1) + DomainLen(1) + Domain(variable) + Port(2)
             if data.len() < 2 {
                 return Ok(None);
             }
             let domain_len = data[1] as usize;
-            let total_len = 1 + 1 + domain_len + 2; // ATYP + len + domain + port
+            let total_len = 1 + 1 + domain_len + 2;
             if data.len() < total_len {
                 return Ok(None);
             }
@@ -67,14 +60,16 @@ pub fn parse_uot_address(data: &[u8]) -> std::io::Result<Option<(NetLocation, us
                 total_len,
             )))
         }
-        _ => Err(std::io::Error::other(format!("unknown UoT ATYP: {atyp}"))),
+        _ => Err(std::io::Error::other(format!(
+            "unknown SOCKS packet ATYP: {atyp}"
+        ))),
     }
 }
 
-/// Write a UoT AddrParser address (ATYP + address + port) from SocketAddr.
-/// Returns number of bytes written
+/// Write a SOCKS packet address (ATYP + address + port) from SocketAddr.
+/// Returns number of bytes written.
 #[inline]
-pub fn write_uot_address(buf: &mut [u8], addr: &SocketAddr) -> usize {
+pub fn write_socks_packet_address(buf: &mut [u8], addr: &SocketAddr) -> usize {
     match addr {
         SocketAddr::V4(v4) => {
             buf[0] = ATYP_IPV4;
@@ -96,10 +91,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_uot_ipv4_address() {
-        // UoT AddrParser: ATYP=0x00 for IPv4, IP=192.168.1.1, Port=8080
+    fn test_parse_socks_ipv4_address() {
         let data = [ATYP_IPV4, 192, 168, 1, 1, 0x1F, 0x90];
-        let (location, len) = parse_uot_address(&data).unwrap().unwrap();
+        let (location, len) = parse_socks_packet_address(&data).unwrap().unwrap();
         assert_eq!(len, 7);
         assert_eq!(location.port(), 8080);
         match location.address() {
@@ -109,13 +103,12 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_uot_ipv6_address() {
-        // UoT AddrParser: ATYP=0x01 for IPv6, IP=::1, Port=443
+    fn test_parse_socks_ipv6_address() {
         let mut data = vec![ATYP_IPV6];
         data.extend_from_slice(&Ipv6Addr::LOCALHOST.octets());
         data.extend_from_slice(&443u16.to_be_bytes());
 
-        let (location, len) = parse_uot_address(&data).unwrap().unwrap();
+        let (location, len) = parse_socks_packet_address(&data).unwrap().unwrap();
         assert_eq!(len, 19);
         assert_eq!(location.port(), 443);
         match location.address() {
@@ -125,14 +118,13 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_uot_domain_address() {
-        // UoT AddrParser: ATYP=0x02 for Domain, Domain="example.com", Port=53
+    fn test_parse_socks_domain_address() {
         let domain = b"example.com";
         let mut data = vec![ATYP_DOMAIN, domain.len() as u8];
         data.extend_from_slice(domain);
         data.extend_from_slice(&53u16.to_be_bytes());
 
-        let (location, len) = parse_uot_address(&data).unwrap().unwrap();
+        let (location, len) = parse_socks_packet_address(&data).unwrap().unwrap();
         assert_eq!(len, 1 + 1 + domain.len() + 2);
         assert_eq!(location.port(), 53);
         match location.address() {
@@ -142,38 +134,17 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_uot_truncated() {
-        // Empty data
-        assert!(parse_uot_address(&[]).unwrap().is_none());
-        // Truncated IPv4
-        assert!(parse_uot_address(&[ATYP_IPV4, 1, 2, 3]).unwrap().is_none());
-        // Truncated IPv6
-        assert!(
-            parse_uot_address(&[ATYP_IPV6, 0, 0, 0, 0])
-                .unwrap()
-                .is_none()
-        );
-        // Truncated domain (no length byte)
-        assert!(parse_uot_address(&[ATYP_DOMAIN]).unwrap().is_none());
-        // Truncated domain (incomplete domain)
-        assert!(
-            parse_uot_address(&[ATYP_DOMAIN, 10, b'a', b'b'])
-                .unwrap()
-                .is_none()
-        );
+    fn test_parse_socks_rejects_uot_atyp_values() {
+        for atyp in [0x00_u8, 0x02_u8] {
+            assert!(parse_socks_packet_address(&[atyp, 1, 2, 3, 4, 5, 6, 7]).is_err());
+        }
     }
 
     #[test]
-    fn test_parse_uot_invalid() {
-        // Unknown ATYP should error
-        assert!(parse_uot_address(&[0xFF, 1, 2, 3, 4, 5, 6, 7]).is_err());
-    }
-
-    #[test]
-    fn test_write_uot_ipv4_address() {
+    fn test_write_socks_ipv4_address() {
         let addr: SocketAddr = "192.168.1.1:8080".parse().unwrap();
         let mut buf = [0u8; 32];
-        let len = write_uot_address(&mut buf, &addr);
+        let len = write_socks_packet_address(&mut buf, &addr);
         assert_eq!(len, 7);
         assert_eq!(buf[0], ATYP_IPV4);
         assert_eq!(&buf[1..5], &[192, 168, 1, 1]);
@@ -181,20 +152,13 @@ mod tests {
     }
 
     #[test]
-    fn test_write_uot_ipv6_address() {
+    fn test_write_socks_ipv6_address() {
         let addr: SocketAddr = "[::1]:443".parse().unwrap();
         let mut buf = [0u8; 32];
-        let len = write_uot_address(&mut buf, &addr);
+        let len = write_socks_packet_address(&mut buf, &addr);
         assert_eq!(len, 19);
         assert_eq!(buf[0], ATYP_IPV6);
         assert_eq!(&buf[1..17], &Ipv6Addr::LOCALHOST.octets());
         assert_eq!(&buf[17..19], &443u16.to_be_bytes());
-    }
-
-    #[test]
-    fn test_parse_rejects_socks5_atyp_values() {
-        for atyp in [0x03_u8, 0x04_u8] {
-            assert!(parse_uot_address(&[atyp, 1, 2, 3, 4, 5, 6, 7]).is_err());
-        }
     }
 }

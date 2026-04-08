@@ -978,7 +978,7 @@ impl AnyTlsSession {
 
         // Wrap AnyTlsStream as AsyncTargetedMessageStream (UotV1ServerStream)
         let server_stream: Box<dyn AsyncTargetedMessageStream> =
-            Box::new(UotV1ServerStream::new(stream));
+            Box::new(UotV1ServerStream::new_uot(stream));
 
         // Send successful SYNACK (protocol v2)
         let _ = self.send_synack(stream_id, None).await;

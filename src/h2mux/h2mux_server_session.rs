@@ -19,7 +19,7 @@ use crate::copy_bidirectional::copy_bidirectional;
 use crate::resolver::Resolver;
 use crate::routing::{ServerStream, run_udp_routing};
 use crate::tcp::tcp_server::run_udp_copy;
-use crate::uot::UotV1ServerStream;
+use crate::uot::SocksPacketAddrStream;
 use crate::vless::VlessMessageStream;
 
 use super::MuxProtocol;
@@ -504,12 +504,12 @@ async fn handle_h2mux_udp_packet_addr(
 ) -> io::Result<()> {
     debug!("H2MUX UDP packet_addr mode - entering");
 
-    // Use UoT V1 stream for per-packet addressing
-    let uot_stream = UotV1ServerStream::new(Box::new(stream));
+    // Uses the sing-mux SOCKS packet serializer for h2mux `packet_addr`.
+    let packet_stream = SocksPacketAddrStream::new_socks(Box::new(stream));
 
     debug!("H2MUX UDP packet_addr mode - starting routing");
     let result = run_udp_routing(
-        ServerStream::Targeted(Box::new(uot_stream)),
+        ServerStream::Targeted(Box::new(packet_stream)),
         proxy_selector,
         resolver,
         false,

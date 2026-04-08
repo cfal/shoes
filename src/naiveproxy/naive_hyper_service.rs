@@ -489,7 +489,7 @@ async fn handle_naive_stream<S: AsyncStream + 'static>(
             }
 
             debug!("NaiveProxy stream (user: {}): UoT V1 mode", user_name);
-            let uot_stream = UotV1ServerStream::new(stream);
+            let uot_stream = UotV1ServerStream::new_uot(stream);
 
             return run_udp_routing(
                 ServerStream::Targeted(Box::new(uot_stream)),
@@ -548,7 +548,7 @@ async fn handle_naive_stream<S: AsyncStream + 'static>(
                 }
             } else {
                 // V2 non-connect mode (same as V1)
-                let uot_stream = UotV1ServerStream::new(stream);
+                let uot_stream = UotV1ServerStream::new_uot(stream);
 
                 return run_udp_routing(
                     ServerStream::Targeted(Box::new(uot_stream)),
