@@ -1,0 +1,14 @@
+- address: 127.0.0.1:50000
+  protocol:
+    type: socks4
+- address: 127.0.0.1:50001
+  protocol:
+    type: socks4
+  rules:
+    # allow connections to all ips
+    mask: 0.0.0.0/0
+    action: allow
+    client_chain:
+      address: 127.0.0.1:50000
+      protocol:
+        type: socks4

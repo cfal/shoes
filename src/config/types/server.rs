@@ -655,6 +655,12 @@ pub enum ServerProxyConfig {
         #[serde(default = "default_true")]
         udp_enabled: bool,
     },
+    Socks4 {
+        /// Enable DNS functionality (SOCKS4a).
+        /// When false, SOCKS4 returns "request rejected".
+        #[serde(default = "default_true")]
+        dns_enabled: bool,
+    },
     #[serde(
         alias = "ss",
         deserialize_with = "deserialize_shadowsocks_server",
@@ -787,6 +793,7 @@ impl std::fmt::Display for ServerProxyConfig {
         match self {
             Self::Http { .. } => write!(f, "HTTP"),
             Self::Socks { .. } => write!(f, "SOCKS"),
+            Self::Socks4 { .. } => write!(f, "SOCKS4"),
             Self::Shadowsocks { .. } => write!(f, "Shadowsocks"),
             Self::Snell { .. } => write!(f, "Snell"),
             Self::Vless { .. } => write!(f, "Vless"),
@@ -864,6 +871,20 @@ mod tests {
                 password: None,
                 udp_enabled: false,
             },
+            transport: Transport::Tcp,
+            tcp_settings: None,
+            quic_settings: None,
+            rules: NoneOrSome::None,
+            dns: None,
+        }
+    }
+
+    fn create_test_server_config_socks4() -> ServerConfig {
+        ServerConfig {
+            bind_location: BindLocation::Address(
+                NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 1080).into(),
+            ),
+            protocol: ServerProxyConfig::Socks4 { dns_enabled: false },
             transport: Transport::Tcp,
             tcp_settings: None,
             quic_settings: None,
@@ -1120,6 +1141,18 @@ mod tests {
         assert!(matches!(
             deserialized.protocol,
             ServerProxyConfig::Socks { .. }
+        ));
+    }
+
+    #[test]
+    fn test_server_config_socks4() {
+        let original = create_test_server_config_socks4();
+        let yaml_str = serde_yaml::to_string(&original).expect("Failed to serialize");
+        let deserialized: ServerConfig =
+            serde_yaml::from_str(&yaml_str).expect("Failed to deserialize");
+        assert!(matches!(
+            deserialized.protocol,
+            ServerProxyConfig::Socks4 { .. }
         ));
     }
 
