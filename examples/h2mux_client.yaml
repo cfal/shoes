@@ -6,28 +6,54 @@
 #
 # Server does not require any special configuration - h2mux is auto-detected.
 
-# Local SOCKS5 proxy that routes through a VMess server with h2mux
+# Reusable upstream chain for both traffic and DNS.
+- client_group: h2mux-exit
+  client_proxies:
+    - address: "example.com:443"
+      protocol:
+        type: tls
+        sni_hostname: "example.com"
+        protocol:
+          type: vmess
+          cipher: aes-128-gcm
+          user_id: b0e80a62-8a51-47f0-91f1-f0f7faf8d9d4
+          h2mux:
+            max_connections: 4     # Max HTTP/2 connections to maintain
+            min_streams: 4         # Min streams before opening new connection
+            max_streams: 0         # Max streams per connection (0 = unlimited)
+            padding: true          # Enable padding for traffic obfuscation
+
+# DNS group that uses the same h2mux tunnel.
+# timeout_secs controls the overall hickory lookup budget.
+# connect_timeout_secs caps TCP/TLS setup time to the upstream resolver.
+# attempts controls hickory retry count for failed lookups.
+- dns_group: h2mux-dns
+  dns_servers:
+    - url: tls://1.1.1.1
+      server_name: cloudflare-dns.com
+      client_chain: h2mux-exit
+      ip_strategy: ipv4_only
+      timeout_secs: 4
+      connect_timeout_secs: 2
+      attempts: 1
+    - url: tcp://8.8.8.8
+      client_chain: h2mux-exit
+      ip_strategy: ipv4_only
+      timeout_secs: 3
+      connect_timeout_secs: 1
+      attempts: 1
+
+# Local SOCKS5 proxy that routes through a VMess server with h2mux.
 - address: 127.0.0.1:1080
+  dns:
+    servers: h2mux-dns
   protocol:
     type: socks
     udp_enabled: true
   rules:
     - masks: "0.0.0.0/0"
       action: allow
-      client_chain:
-        address: "example.com:443"
-        protocol:
-          type: tls
-          sni_hostname: "example.com"
-          protocol:
-            type: vmess
-            cipher: aes-128-gcm
-            user_id: b0e80a62-8a51-47f0-91f1-f0f7faf8d9d4
-            h2mux:
-              max_connections: 4     # Max HTTP/2 connections to maintain
-              min_streams: 4         # Min streams before opening new connection
-              max_streams: 0         # Max streams per connection (0 = unlimited)
-              padding: true          # Enable padding for traffic obfuscation
+      client_chain: h2mux-exit
 
 # H2MUX is also available for VLESS and Trojan:
 #

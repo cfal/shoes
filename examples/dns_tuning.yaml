@@ -1,0 +1,73 @@
+# DNS resolver examples
+#
+# Shows the hickory-backed per-upstream tuning knobs:
+# - timeout_secs: overall lookup timeout inside hickory
+# - connect_timeout_secs: connection setup timeout for TCP/TLS/HTTPS/H3 upstreams
+# - attempts: retry count for failed queries
+
+# Direct DNS group with fast-fail tuning.
+- dns_group: tuned-direct-dns
+  dns_servers:
+    - url: tcp://1.1.1.1
+      ip_strategy: ipv4_only
+      timeout_secs: 3
+      connect_timeout_secs: 1
+      attempts: 1
+    - url: tls://8.8.8.8
+      server_name: dns.google
+      ip_strategy: ipv4_only
+      timeout_secs: 4
+      connect_timeout_secs: 2
+      attempts: 1
+
+# HTTP proxy using the tuned direct DNS group.
+- address: "127.0.0.1:8080"
+  dns:
+    servers: tuned-direct-dns
+  protocol:
+    type: http
+
+# Reusable proxy tunnel for remote DNS resolution.
+- client_group: dns-tunnel
+  client_proxies:
+    - address: "edge.example.com:443"
+      protocol:
+        type: tls
+        sni_hostname: "edge.example.com"
+        protocol:
+          type: vmess
+          cipher: aes-128-gcm
+          user_id: "b85798ef-e9dc-46a4-9a87-8da4499d36d0"
+          h2mux:
+            max_connections: 2
+            min_streams: 4
+            padding: true
+
+# DNS group that sends queries through the named tunnel.
+- dns_group: tuned-proxied-dns
+  dns_servers:
+    - url: tls://1.1.1.1
+      server_name: cloudflare-dns.com
+      client_chain: dns-tunnel
+      ip_strategy: ipv4_only
+      timeout_secs: 4
+      connect_timeout_secs: 2
+      attempts: 1
+    - url: tcp://8.8.8.8
+      client_chain: dns-tunnel
+      ip_strategy: ipv4_only
+      timeout_secs: 3
+      connect_timeout_secs: 1
+      attempts: 1
+
+# SOCKS5 proxy using the proxied DNS group and the same tunnel for traffic.
+- address: "127.0.0.1:1080"
+  dns:
+    servers: tuned-proxied-dns
+  protocol:
+    type: socks
+    udp_enabled: true
+  rules:
+    - masks: "0.0.0.0/0"
+      action: allow
+      client_chain: dns-tunnel
