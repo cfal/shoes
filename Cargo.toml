@@ -42,7 +42,7 @@ h3-quinn = "*"
 # Git version required for H3 disable_grease option (needed for Cloudflare).
 # Also pinned past older resolver active-request cleanup behavior.
 # See: https://github.com/hickory-dns/hickory-dns/pull/2085
-hickory-resolver = { git = "https://github.com/hickory-dns/hickory-dns", rev = "a1f77f52409a5225120988e2d3518be446328f6c", default-features = false, features = ["tokio", "tls-aws-lc-rs", "https-aws-lc-rs", "h3-aws-lc-rs"] }
+hickory-resolver = { git = "https://github.com/hickory-dns/hickory-dns", rev = "e6ac966867ad6adcc77919f2f82fe4e5e793bb9d", default-features = false, features = ["tokio", "tls-aws-lc-rs", "https-aws-lc-rs", "h3-aws-lc-rs"] }
 http = "*"
 http-body-util = "*"
 hyper = { version = "*", features = ["server", "http1", "http2"] }
