@@ -9,7 +9,7 @@ use std::time::Duration;
 use bytes::{Bytes, BytesMut};
 use log::{debug, error, warn};
 use rand::distr::Alphanumeric;
-use rand::{Rng, RngCore};
+use rand::{Rng, RngExt};
 use rustc_hash::FxHashMap;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UdpSocket;

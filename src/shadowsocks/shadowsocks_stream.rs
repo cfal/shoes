@@ -9,7 +9,7 @@ use aws_lc_rs::aead::{
 use aws_lc_rs::error::Unspecified;
 use futures::ready;
 use parking_lot::Mutex;
-use rand::RngCore;
+use rand::Rng;
 use subtle::ConstantTimeEq;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 

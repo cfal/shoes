@@ -11,7 +11,7 @@ use aws_lc_rs::cipher::{
     EncryptingKey as CipherEncryptingKey, EncryptionContext, UnboundCipherKey,
 };
 use bytes::BytesMut;
-use rand::{Rng, RngCore};
+use rand::{Rng, RngExt};
 use sha3::Shake128;
 use sha3::digest::{ExtendableOutput, Update};
 use tokio::io::AsyncWriteExt;

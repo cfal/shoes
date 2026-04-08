@@ -3,7 +3,7 @@
 use std::io::{self, Read, Write};
 
 use aws_lc_rs::{agreement, digest};
-use rand::RngCore;
+use rand::Rng;
 
 use super::common::{
     ALERT_DESC_CLOSE_NOTIFY, ALERT_LEVEL_WARNING, CIPHERTEXT_READ_BUF_CAPACITY, CONTENT_TYPE_ALERT,

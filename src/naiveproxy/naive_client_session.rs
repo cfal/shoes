@@ -21,7 +21,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use http::{Method, Request, Version};
 use log::debug;
-use rand::Rng;
+use rand::{Rng, RngExt};
 
 use crate::address::{Address, NetLocation};
 use crate::async_stream::AsyncStream;

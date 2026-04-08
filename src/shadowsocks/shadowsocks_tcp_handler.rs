@@ -3,7 +3,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use log::debug;
 use parking_lot::Mutex;
-use rand::{Rng, RngCore};
+use rand::{Rng, RngExt};
 use tokio::io::AsyncWriteExt;
 
 use super::salt_checker::SaltChecker;

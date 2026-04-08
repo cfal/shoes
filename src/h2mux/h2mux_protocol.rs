@@ -5,7 +5,7 @@
 use std::io;
 
 use bytes::{Buf, BufMut, BytesMut};
-use rand::Rng;
+use rand::{Rng, RngExt};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::address::{Address, NetLocation};

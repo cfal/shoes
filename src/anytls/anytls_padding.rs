@@ -5,7 +5,7 @@
 
 use crate::anytls::anytls_types::StringMap;
 use md5::{Digest, Md5};
-use rand::Rng;
+use rand::{Rng, RngExt};
 use std::sync::Arc;
 
 /// Check mark constant - indicates "stop if no more data" in padding scheme
