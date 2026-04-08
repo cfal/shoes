@@ -563,3 +563,282 @@ impl ResolverCache {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::address::Address;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A mock resolver that returns configurable results, tracking call count.
+    #[derive(Debug)]
+    struct MockResolver {
+        addrs: Vec<SocketAddr>,
+        call_count: AtomicUsize,
+        error_kind: Option<std::io::ErrorKind>,
+    }
+
+    impl MockResolver {
+        fn with_addrs(addrs: Vec<SocketAddr>) -> Self {
+            Self {
+                addrs,
+                call_count: AtomicUsize::new(0),
+                error_kind: None,
+            }
+        }
+
+        fn with_error(kind: std::io::ErrorKind) -> Self {
+            Self {
+                addrs: vec![],
+                call_count: AtomicUsize::new(0),
+                error_kind: Some(kind),
+            }
+        }
+
+        fn count(&self) -> usize {
+            self.call_count.load(Ordering::Relaxed)
+        }
+    }
+
+    impl Resolver for MockResolver {
+        fn resolve_location(&self, _location: &NetLocation) -> ResolveFuture {
+            self.call_count.fetch_add(1, Ordering::Relaxed);
+            let addrs = self.addrs.clone();
+            let error_kind = self.error_kind;
+            Box::pin(async move {
+                if let Some(kind) = error_kind {
+                    Err(std::io::Error::new(kind, "mock error"))
+                } else {
+                    Ok(addrs)
+                }
+            })
+        }
+    }
+
+    /// A mock resolver that fails the first N calls then succeeds.
+    #[derive(Debug)]
+    struct FlakyResolver {
+        fail_count: AtomicUsize,
+        fails_remaining: AtomicUsize,
+        error_kind: std::io::ErrorKind,
+        success_addrs: Vec<SocketAddr>,
+    }
+
+    impl FlakyResolver {
+        fn new(
+            fail_first_n: usize,
+            error_kind: std::io::ErrorKind,
+            success_addrs: Vec<SocketAddr>,
+        ) -> Self {
+            Self {
+                fail_count: AtomicUsize::new(0),
+                fails_remaining: AtomicUsize::new(fail_first_n),
+                error_kind,
+                success_addrs,
+            }
+        }
+    }
+
+    impl Resolver for FlakyResolver {
+        fn resolve_location(&self, _location: &NetLocation) -> ResolveFuture {
+            let remaining = self.fails_remaining.fetch_sub(1, Ordering::Relaxed);
+            if remaining > 0 {
+                self.fail_count.fetch_add(1, Ordering::Relaxed);
+                let kind = self.error_kind;
+                Box::pin(async move { Err(std::io::Error::new(kind, "flaky error")) })
+            } else {
+                let addrs = self.success_addrs.clone();
+                Box::pin(async move { Ok(addrs) })
+            }
+        }
+    }
+
+    fn test_location() -> NetLocation {
+        NetLocation::new(Address::Hostname("example.com".to_string()), 80)
+    }
+
+    fn test_addrs() -> Vec<SocketAddr> {
+        vec!["127.0.0.1:80".parse().unwrap()]
+    }
+
+    #[tokio::test]
+    async fn test_refreshing_resolver_retries_after_timeout() {
+        let success_addrs = test_addrs();
+        let call_count = Arc::new(AtomicUsize::new(0));
+
+        let call_count_clone = call_count.clone();
+        let addrs = success_addrs.clone();
+        let factory: ResolverFactory = Arc::new(move || {
+            let n = call_count_clone.fetch_add(1, Ordering::Relaxed);
+            let addrs = addrs.clone();
+            Box::pin(async move {
+                if n == 0 {
+                    // First build: return a resolver that times out
+                    Ok(Arc::new(MockResolver::with_error(
+                        std::io::ErrorKind::TimedOut,
+                    )) as Arc<dyn Resolver>)
+                } else {
+                    // Refresh build: return a resolver that succeeds
+                    Ok(Arc::new(MockResolver::with_addrs(addrs)) as Arc<dyn Resolver>)
+                }
+            })
+        });
+
+        let policy = RefreshPolicy {
+            max_idle: Duration::from_secs(60),
+            retry_once_after_refresh: true,
+        };
+
+        let resolver = RefreshingResolver::new(factory, policy, "test".to_string())
+            .await
+            .unwrap();
+
+        let result = resolver.resolve_location(&test_location()).await.unwrap();
+        assert_eq!(result, success_addrs);
+        // Factory called twice: initial build + refresh-on-error
+        assert_eq!(call_count.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn test_refreshing_resolver_no_retry_on_non_refreshable_error() {
+        let call_count = Arc::new(AtomicUsize::new(0));
+
+        let call_count_clone = call_count.clone();
+        let factory: ResolverFactory = Arc::new(move || {
+            call_count_clone.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async move {
+                // Return a resolver that returns a non-refreshable error
+                Ok(Arc::new(MockResolver::with_error(
+                    std::io::ErrorKind::Other,
+                )) as Arc<dyn Resolver>)
+            })
+        });
+
+        let policy = RefreshPolicy {
+            max_idle: Duration::from_secs(60),
+            retry_once_after_refresh: true,
+        };
+
+        let resolver = RefreshingResolver::new(factory, policy, "test".to_string())
+            .await
+            .unwrap();
+
+        let result = resolver.resolve_location(&test_location()).await;
+        assert!(result.is_err());
+        // Factory called only once (initial build, no refresh for non-refreshable errors)
+        assert_eq!(call_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn test_refreshing_resolver_idle_refresh() {
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let addrs = test_addrs();
+
+        let call_count_clone = call_count.clone();
+        let addrs_clone = addrs.clone();
+        let factory: ResolverFactory = Arc::new(move || {
+            call_count_clone.fetch_add(1, Ordering::Relaxed);
+            let addrs = addrs_clone.clone();
+            Box::pin(async move {
+                Ok(Arc::new(MockResolver::with_addrs(addrs)) as Arc<dyn Resolver>)
+            })
+        });
+
+        let policy = RefreshPolicy {
+            max_idle: Duration::from_millis(50),
+            retry_once_after_refresh: true,
+        };
+
+        let resolver = RefreshingResolver::new(factory, policy, "test".to_string())
+            .await
+            .unwrap();
+
+        // First resolve succeeds, sets last_success_at
+        let result = resolver.resolve_location(&test_location()).await.unwrap();
+        assert_eq!(result, addrs);
+        assert_eq!(call_count.load(Ordering::Relaxed), 1);
+
+        // Wait for idle timeout
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Second resolve triggers idle refresh
+        let result = resolver.resolve_location(&test_location()).await.unwrap();
+        assert_eq!(result, addrs);
+        // Factory called twice: initial + idle refresh
+        assert_eq!(call_count.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn test_shared_caching_resolver_caches_results() {
+        let inner = Arc::new(MockResolver::with_addrs(test_addrs()));
+        let resolver = SharedCachingResolver::new(inner.clone(), Duration::from_secs(60));
+
+        let loc = test_location();
+
+        // First call hits the inner resolver
+        let result1 = resolver.resolve_location(&loc).await.unwrap();
+        assert_eq!(result1, test_addrs());
+        assert_eq!(inner.count(), 1);
+
+        // Second call hits the cache
+        let result2 = resolver.resolve_location(&loc).await.unwrap();
+        assert_eq!(result2, test_addrs());
+        assert_eq!(inner.count(), 1); // Still 1, cache hit
+
+        // IP literals bypass cache
+        let ip_loc = NetLocation::new(Address::Ipv4("1.2.3.4".parse().unwrap()), 80);
+        let result3 = resolver.resolve_location(&ip_loc).await.unwrap();
+        assert_eq!(result3[0], "1.2.3.4:80".parse::<SocketAddr>().unwrap());
+        assert_eq!(inner.count(), 1); // Still 1, IP bypass
+    }
+
+    #[tokio::test]
+    async fn test_shared_caching_resolver_expires() {
+        let inner = Arc::new(MockResolver::with_addrs(test_addrs()));
+        let resolver = SharedCachingResolver::new(inner.clone(), Duration::from_millis(50));
+
+        let loc = test_location();
+
+        resolver.resolve_location(&loc).await.unwrap();
+        assert_eq!(inner.count(), 1);
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        resolver.resolve_location(&loc).await.unwrap();
+        assert_eq!(inner.count(), 2); // Cache expired, hit inner again
+    }
+
+    #[tokio::test]
+    async fn test_resolve_addresses_returns_all() {
+        let addrs: Vec<SocketAddr> = vec![
+            "1.1.1.1:80".parse().unwrap(),
+            "2.2.2.2:80".parse().unwrap(),
+            "3.3.3.3:80".parse().unwrap(),
+        ];
+        let inner: Arc<dyn Resolver> = Arc::new(MockResolver::with_addrs(addrs.clone()));
+        let loc = test_location();
+
+        let result = resolve_addresses(&inner, &loc).await.unwrap();
+        assert_eq!(result, addrs);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_addresses_ip_literal() {
+        let inner: Arc<dyn Resolver> = Arc::new(MockResolver::with_addrs(vec![]));
+        let loc = NetLocation::new(Address::Ipv4("1.2.3.4".parse().unwrap()), 443);
+
+        let result = resolve_addresses(&inner, &loc).await.unwrap();
+        assert_eq!(result, vec!["1.2.3.4:443".parse::<SocketAddr>().unwrap()]);
+    }
+
+    #[tokio::test]
+    async fn test_timeout_resolver_ip_bypass() {
+        let inner = MockResolver::with_addrs(test_addrs());
+        let resolver = TimeoutResolver::with_timeout(inner, Duration::from_millis(1));
+
+        // IP literals should return immediately without timeout
+        let loc = NetLocation::new(Address::Ipv4("1.2.3.4".parse().unwrap()), 80);
+        let result = resolver.resolve_location(&loc).await.unwrap();
+        assert_eq!(result[0], "1.2.3.4:80".parse::<SocketAddr>().unwrap());
+    }
+}

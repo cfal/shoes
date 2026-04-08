@@ -302,3 +302,40 @@ impl ShoesResolver for HickoryResolver {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_hickory_resolver_options_default() {
+        let opts = HickoryResolverOptions::default();
+        assert_eq!(opts.ip_strategy, IpStrategy::default());
+        assert_eq!(opts.request_timeout, Some(Duration::from_secs(5)));
+        assert_eq!(opts.connect_timeout, Duration::from_secs(5));
+        assert_eq!(opts.attempts, 2);
+    }
+
+    #[test]
+    fn test_hickory_resolver_options_zero_timeout() {
+        let opts = HickoryResolverOptions {
+            request_timeout: None,
+            ..Default::default()
+        };
+        assert!(opts.request_timeout.is_none());
+    }
+
+    #[test]
+    fn test_hickory_resolver_options_custom() {
+        let opts = HickoryResolverOptions {
+            ip_strategy: IpStrategy::Ipv4Only,
+            request_timeout: Some(Duration::from_secs(3)),
+            connect_timeout: Duration::from_secs(1),
+            attempts: 1,
+        };
+        assert_eq!(opts.ip_strategy, IpStrategy::Ipv4Only);
+        assert_eq!(opts.request_timeout, Some(Duration::from_secs(3)));
+        assert_eq!(opts.connect_timeout, Duration::from_secs(1));
+        assert_eq!(opts.attempts, 1);
+    }
+}

@@ -407,4 +407,64 @@ dns_servers:
         assert_eq!(servers[1].as_group_ref(), Some("fast-dns"));
         assert!(!servers[2].as_group_ref().is_some());
     }
+
+    #[test]
+    fn test_dns_server_spec_attempts_default() {
+        let yaml = r#"udp://8.8.8.8"#;
+        let spec: DnsServerSpec = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(spec.attempts(), 1);
+    }
+
+    #[test]
+    fn test_dns_server_spec_attempts_custom() {
+        let yaml = r#"
+url: tls://8.8.8.8
+server_name: dns.google
+attempts: 3
+"#;
+        let spec: DnsServerSpec = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(spec.attempts(), 3);
+    }
+
+    #[test]
+    fn test_dns_server_spec_connect_timeout_default() {
+        let yaml = r#"udp://8.8.8.8"#;
+        let spec: DnsServerSpec = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(spec.connect_timeout_secs(), 5);
+    }
+
+    #[test]
+    fn test_dns_server_spec_connect_timeout_custom() {
+        let yaml = r#"
+url: tls://8.8.8.8
+connect_timeout_secs: 2
+"#;
+        let spec: DnsServerSpec = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(spec.connect_timeout_secs(), 2);
+    }
+
+    #[test]
+    fn test_dns_server_spec_timeout_secs_default() {
+        let yaml = r#"udp://8.8.8.8"#;
+        let spec: DnsServerSpec = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(spec.timeout_secs(), 5);
+    }
+
+    #[test]
+    fn test_dns_server_spec_full_options() {
+        let yaml = r#"
+url: https://1.1.1.1/dns-query
+server_name: cloudflare-dns.com
+timeout_secs: 3
+connect_timeout_secs: 1
+attempts: 1
+ip_strategy: ipv4_only
+"#;
+        let spec: DnsServerSpec = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(spec.timeout_secs(), 3);
+        assert_eq!(spec.connect_timeout_secs(), 1);
+        assert_eq!(spec.attempts(), 1);
+        assert_eq!(spec.ip_strategy(), IpStrategy::Ipv4Only);
+        assert_eq!(spec.server_name(), Some("cloudflare-dns.com"));
+    }
 }
