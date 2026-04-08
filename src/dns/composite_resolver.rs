@@ -45,7 +45,10 @@ impl Resolver for CompositeResolver {
                         if i > 0 {
                             log::info!(
                                 "CompositeResolver: resolved {} via resolver #{} ({:?}) after {} failures",
-                                location, i, resolver, i
+                                location,
+                                i,
+                                resolver,
+                                i
                             );
                         }
                         return Ok(addrs);
@@ -53,14 +56,19 @@ impl Resolver for CompositeResolver {
                     Ok(_) => {
                         log::debug!(
                             "CompositeResolver: resolver #{} ({:?}) returned empty for {}, trying next",
-                            i, resolver, location
+                            i,
+                            resolver,
+                            location
                         );
                         last_error = Some(std::io::Error::other("empty response"));
                     }
                     Err(e) => {
                         log::debug!(
                             "CompositeResolver: resolver #{} ({:?}) failed for {}: {}, trying next",
-                            i, resolver, location, e
+                            i,
+                            resolver,
+                            location,
+                            e
                         );
                         last_error = Some(e);
                     }

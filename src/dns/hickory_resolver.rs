@@ -20,7 +20,7 @@ use crate::dns::proxy_runtime::ProxyRuntimeProvider;
 use crate::resolver::Resolver as ShoesResolver;
 
 /// Tuning options for hickory-backed resolvers.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HickoryResolverOptions {
     pub ip_strategy: IpStrategy,
     /// Per-request timeout passed to hickory's ResolverOpts.timeout.
@@ -253,17 +253,18 @@ impl ShoesResolver for HickoryResolver {
         Box::pin(async move {
             let started = std::time::Instant::now();
 
-            let response = resolver
-                .lookup_ip(&name)
-                .await
-                .map_err(|e| {
-                    let elapsed = started.elapsed();
-                    log::warn!(
-                        "DNS lookup failed via {}: {}:{} in {:?}: {}",
-                        description, name, port, elapsed, e
-                    );
-                    std::io::Error::other(format!("DNS lookup failed: {e}"))
-                })?;
+            let response = resolver.lookup_ip(&name).await.map_err(|e| {
+                let elapsed = started.elapsed();
+                log::warn!(
+                    "DNS lookup failed via {}: {}:{} in {:?}: {}",
+                    description,
+                    name,
+                    port,
+                    elapsed,
+                    e
+                );
+                std::io::Error::other(format!("DNS lookup failed: {e}"))
+            })?;
 
             let addrs: Vec<SocketAddr> = response
                 .iter()
@@ -281,12 +282,20 @@ impl ShoesResolver for HickoryResolver {
             if elapsed > Duration::from_millis(500) {
                 log::info!(
                     "slow DNS lookup via {}: {}:{} -> {:?} in {:?}",
-                    description, name, port, addrs, elapsed
+                    description,
+                    name,
+                    port,
+                    addrs,
+                    elapsed
                 );
             } else {
                 log::debug!(
                     "DNS lookup via {}: {}:{} -> {:?} in {:?}",
-                    description, name, port, addrs, elapsed
+                    description,
+                    name,
+                    port,
+                    addrs,
+                    elapsed
                 );
             }
             Ok(addrs)

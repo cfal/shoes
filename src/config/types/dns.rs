@@ -51,6 +51,9 @@ pub enum DnsServerSpec {
         timeout_secs: u32,
         /// Timeout for establishing connections to DNS upstreams in seconds.
         /// Defaults to 5. Separate from timeout_secs which covers the full request.
+        /// For plain `tcp://` upstreams, hickory also passes the request timeout
+        /// into `connect_tcp`, so the runtime uses the shorter of that value and
+        /// this connect timeout.
         #[serde(default = "default_connect_timeout_secs")]
         connect_timeout_secs: u32,
         /// Number of retry attempts for failed queries. Defaults to 1.

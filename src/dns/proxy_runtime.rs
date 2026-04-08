@@ -88,7 +88,9 @@ impl RuntimeProvider for ProxyRuntimeProvider {
     ) -> Pin<Box<dyn Send + Future<Output = Result<Self::Tcp, io::Error>>>> {
         let chain_group = self.chain_group.clone();
         let resolver = self.bootstrap_resolver.clone();
-        let timeout = timeout.unwrap_or(self.connect_timeout);
+        let timeout = timeout
+            .map(|timeout| timeout.min(self.connect_timeout))
+            .unwrap_or(self.connect_timeout);
 
         Box::pin(async move {
             let address = match server_addr.ip() {
@@ -308,6 +310,33 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(1),
             "timeout should fire quickly, but took {:?}",
+            elapsed
+        );
+    }
+
+    #[tokio::test]
+    async fn test_connect_tcp_caps_passed_timeout_by_configured_connect_timeout() {
+        let resolver = Arc::new(NativeResolver::new());
+        let chain_group = Arc::new(build_direct_chain_group(resolver.clone()));
+        let provider =
+            ProxyRuntimeProvider::with_bootstrap(chain_group, resolver, Duration::from_millis(100));
+
+        let server_addr: SocketAddr = "10.255.255.1:53".parse().unwrap();
+
+        let start = std::time::Instant::now();
+        let result = provider
+            .connect_tcp(server_addr, None, Some(Duration::from_secs(5)))
+            .await;
+        let elapsed = start.elapsed();
+
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("connection should fail"),
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "configured connect timeout should cap a longer request timeout, but took {:?}",
             elapsed
         );
     }
