@@ -90,16 +90,17 @@ pub unsafe extern "C" fn shoes_init(log_level: *const c_char) -> c_int {
         }
     };
 
-    let filter = crate::logging::parse_log_level(level_str)
-        .unwrap_or(log::LevelFilter::Info);
+    let filter = crate::logging::parse_log_level(level_str).unwrap_or(log::LevelFilter::Info);
 
     if !LOGGER_INITIALIZED.swap(true, Ordering::SeqCst) {
         LOG_FILE.get_or_init(|| parking_lot::Mutex::new(None));
 
         // File-only logging on iOS (no stderr output)
-        let writers: Vec<Box<dyn LogWriter>> =
-            vec![Box::new(DynamicFileLogWriter::new(&LOG_FILE))];
-        let directives = vec![crate::logging::Directive { name: None, level: filter }];
+        let writers: Vec<Box<dyn LogWriter>> = vec![Box::new(DynamicFileLogWriter::new(&LOG_FILE))];
+        let directives = vec![crate::logging::Directive {
+            name: None,
+            level: filter,
+        }];
         crate::logging::init_multi_logger(writers, directives);
     }
 

@@ -24,7 +24,13 @@ impl LogWriter for StderrWriter {
     fn write_log(&self, _record: &Record, formatted: &str) {
         let sanitized: String = formatted
             .chars()
-            .map(|c| if c.is_ascii_graphic() || c == ' ' { c } else { '?' })
+            .map(|c| {
+                if c.is_ascii_graphic() || c == ' ' {
+                    c
+                } else {
+                    '?'
+                }
+            })
             .collect();
         let _ = writeln!(std::io::stderr(), "{sanitized}");
     }
@@ -69,9 +75,7 @@ pub struct DynamicFileLogWriter {
 }
 
 impl DynamicFileLogWriter {
-    pub fn new(
-        file: &'static std::sync::OnceLock<parking_lot::Mutex<Option<File>>>,
-    ) -> Self {
+    pub fn new(file: &'static std::sync::OnceLock<parking_lot::Mutex<Option<File>>>) -> Self {
         Self { file }
     }
 }
@@ -316,9 +320,15 @@ mod tests {
         // Should contain a blanket warn and two targeted directives
         let blanket = dirs.iter().find(|d| d.name.is_none()).unwrap();
         assert_eq!(blanket.level, LevelFilter::Warn);
-        let shoes = dirs.iter().find(|d| d.name.as_deref() == Some("shoes")).unwrap();
+        let shoes = dirs
+            .iter()
+            .find(|d| d.name.as_deref() == Some("shoes"))
+            .unwrap();
         assert_eq!(shoes.level, LevelFilter::Info);
-        let quinn = dirs.iter().find(|d| d.name.as_deref() == Some("quinn")).unwrap();
+        let quinn = dirs
+            .iter()
+            .find(|d| d.name.as_deref() == Some("quinn"))
+            .unwrap();
         assert_eq!(quinn.level, LevelFilter::Error);
     }
 

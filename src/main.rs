@@ -12,6 +12,7 @@ mod dns;
 mod h2mux;
 mod http_handler;
 mod hysteria2_server;
+mod logging;
 mod mixed_handler;
 mod naiveproxy;
 mod option_util;
@@ -49,7 +50,6 @@ mod vless;
 mod vmess;
 mod websocket;
 mod xudp;
-mod logging;
 
 #[cfg(not(any(target_env = "msvc", target_os = "ios")))]
 use tikv_jemallocator::Jemalloc;
@@ -105,7 +105,9 @@ fn print_usage_and_exit(arg0: String) {
     eprintln!();
     eprintln!("OPTIONS:");
     eprintln!("    -t, --threads NUM    Set the number of worker threads (default: CPU count)");
-    eprintln!("    -l, --log-file PATH  Log to file (repeatable; \"-\" means stderr; default: stderr)");
+    eprintln!(
+        "    -l, --log-file PATH  Log to file (repeatable; \"-\" means stderr; default: stderr)"
+    );
     eprintln!("    -d, --dry-run        Parse the config and exit");
     eprintln!("    --no-reload          Disable automatic config reloading on file changes");
     eprintln!("    -V, --version        Print version information and exit");

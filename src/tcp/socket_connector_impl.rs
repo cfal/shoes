@@ -254,9 +254,8 @@ impl SocketConnector for SocketConnectorImpl {
                         }
                     }
                 }
-                Err(last_err.unwrap_or_else(|| {
-                    std::io::Error::other("no resolved addresses succeeded")
-                }))
+                Err(last_err
+                    .unwrap_or_else(|| std::io::Error::other("no resolved addresses succeeded")))
             }
             TransportConfig::Quic {
                 endpoints,
@@ -311,9 +310,8 @@ impl SocketConnector for SocketConnectorImpl {
                         }
                     }
                 }
-                Err(last_err.unwrap_or_else(|| {
-                    std::io::Error::other("no resolved addresses succeeded")
-                }))
+                Err(last_err
+                    .unwrap_or_else(|| std::io::Error::other("no resolved addresses succeeded")))
             }
         }
     }

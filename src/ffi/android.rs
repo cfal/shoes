@@ -89,8 +89,7 @@ pub extern "system" fn Java_com_shoesproxy_ShoesNative_init(
         }
     };
 
-    let level = crate::logging::parse_log_level(&level_str)
-        .unwrap_or(log::LevelFilter::Info);
+    let level = crate::logging::parse_log_level(&level_str).unwrap_or(log::LevelFilter::Info);
 
     // Initialize logger (only once)
     if !LOGGER_INITIALIZED.swap(true, Ordering::SeqCst) {
