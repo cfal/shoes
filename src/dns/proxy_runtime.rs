@@ -18,6 +18,7 @@ use crate::resolver::Resolver;
 use crate::socket_util::new_udp_socket;
 
 /// Default connection timeout for DNS server connections. Matches hickory-dns CONNECT_TIMEOUT.
+#[cfg(test)]
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// RuntimeProvider that routes TCP connections through a proxy chain.

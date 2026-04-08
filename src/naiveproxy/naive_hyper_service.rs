@@ -14,7 +14,7 @@ use http_body_util::{BodyExt, Empty, Full, combinators::BoxBody};
 use hyper::body::Incoming;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use log::debug;
-use rand::{Rng, RngExt};
+use rand::RngExt;
 use tokio::io::AsyncWriteExt;
 
 use crate::address::{Address, NetLocation};

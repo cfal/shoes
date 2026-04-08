@@ -317,14 +317,14 @@ async fn session_task(
                 let dest = socket_addr_to_net_location(dest_addr);
 
                 // Remove dead destination entry so we recreate below
-                if let Some(entry) = destinations.get(&dest) {
-                    if entry.handle.is_finished() {
-                        debug!(
-                            "[TunUdpSession {}] Destination task for {} died, recreating",
-                            peer_addr, dest
-                        );
-                        destinations.remove(&dest);
-                    }
+                if let Some(entry) = destinations.get(&dest)
+                    && entry.handle.is_finished()
+                {
+                    debug!(
+                        "[TunUdpSession {}] Destination task for {} died, recreating",
+                        peer_addr, dest
+                    );
+                    destinations.remove(&dest);
                 }
 
                 // Create destination task if absent

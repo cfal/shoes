@@ -2,7 +2,7 @@ use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use rand::{Rng, RngExt};
+use rand::RngExt;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::async_stream::{AsyncPing, AsyncStream};

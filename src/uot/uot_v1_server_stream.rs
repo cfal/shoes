@@ -30,8 +30,10 @@ use crate::util::allocate_vec;
 /// Buffer size for reading and writing packet-address frames.
 const BUFFER_SIZE: usize = 65535;
 
+type ParseFn = fn(&[u8]) -> std::io::Result<Option<(NetLocation, usize)>>;
+
 struct AddressCodec {
-    parse: fn(&[u8]) -> std::io::Result<Option<(NetLocation, usize)>>,
+    parse: ParseFn,
     write: fn(&mut [u8], &SocketAddr) -> usize,
 }
 

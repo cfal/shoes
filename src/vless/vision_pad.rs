@@ -1,5 +1,5 @@
 use bytes::{BufMut, Bytes, BytesMut};
-use rand::{Rng, RngExt};
+use rand::RngExt;
 
 // Padding parameters
 const LONG_PADDING_MIN: usize = 900;

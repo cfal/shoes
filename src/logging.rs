@@ -70,10 +70,14 @@ impl LogWriter for FileLogWriter {
 
 /// Writes to a file that may be set after logger init (FFI use case).
 /// References a global `OnceLock<parking_lot::Mutex<Option<File>>>`.
+// Used by iOS/Android FFI targets (ffi/ios.rs, ffi/android.rs).
+#[allow(dead_code)]
 pub struct DynamicFileLogWriter {
     file: &'static std::sync::OnceLock<parking_lot::Mutex<Option<File>>>,
 }
 
+// Used by iOS/Android FFI targets (ffi/ios.rs, ffi/android.rs).
+#[allow(dead_code)]
 impl DynamicFileLogWriter {
     pub fn new(file: &'static std::sync::OnceLock<parking_lot::Mutex<Option<File>>>) -> Self {
         Self { file }

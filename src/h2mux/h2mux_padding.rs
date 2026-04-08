@@ -17,7 +17,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use bytes::{BufMut, BytesMut};
-use rand::{Rng, RngExt};
+use rand::RngExt;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::async_stream::{AsyncPing, AsyncStream};

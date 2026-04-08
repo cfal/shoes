@@ -18,7 +18,7 @@ use crate::address::{NetLocation, ResolvedLocation};
 use crate::async_stream::AsyncStream;
 use crate::config::{ClientConfig, ClientQuicConfig, Transport};
 use crate::quic_stream::QuicStream;
-use crate::resolver::{Resolver, resolve_addresses, resolve_location, resolve_single_address};
+use crate::resolver::{Resolver, resolve_addresses, resolve_location};
 use crate::rustls_config_util::create_client_config;
 use crate::socket_util::{new_tcp_socket, new_udp_socket, set_tcp_keepalive};
 use crate::thread_util::get_num_threads;
@@ -241,10 +241,8 @@ impl SocketConnector for SocketConnectorImpl {
                             ) {
                                 error!("Failed to set TCP keepalive: {e}");
                             }
-                            if *no_delay {
-                                if let Err(e) = stream.set_nodelay(true) {
-                                    error!("Failed to set TCP no-delay: {e}");
-                                }
+                            if *no_delay && let Err(e) = stream.set_nodelay(true) {
+                                error!("Failed to set TCP no-delay: {e}");
                             }
                             return Ok(Box::new(stream));
                         }
