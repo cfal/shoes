@@ -12,6 +12,8 @@ mod dns;
 mod h2mux;
 mod http_handler;
 mod hysteria2_server;
+mod kcp_server;
+mod kcp_stream;
 mod logging;
 mod mixed_handler;
 mod naiveproxy;

@@ -12,7 +12,7 @@ use super::dns::DnsConfig;
 use super::rules::{ClientChainHop, RuleConfig};
 use super::selection::ConfigSelection;
 use super::shadowsocks::ShadowsocksConfig;
-use super::transport::{BindLocation, ServerQuicConfig, TcpConfig, Transport};
+use super::transport::{BindLocation, KcpSettings, ServerQuicConfig, TcpConfig, Transport};
 
 /// AnyTLS user configuration
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -169,6 +169,8 @@ pub struct ServerConfig {
     pub tcp_settings: Option<TcpConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quic_settings: Option<ServerQuicConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kcp_settings: Option<KcpSettings>,
     #[serde(
         alias = "rule",
         default = "direct_allow_rule",
@@ -193,7 +195,7 @@ impl<'de> serde::de::Deserialize<'de> for ServerConfig {
             .as_mapping()
             .ok_or_else(|| Error::custom("ServerConfig must be a YAML mapping"))?;
 
-        // Valid fields: address/path (bind_location), protocol, transport, tcp_settings, quic_settings, rules/rule, dns
+        // Valid fields: address/path (bind_location), protocol, transport, tcp_settings, quic_settings, kcp_settings, rules/rule, dns
         const VALID_FIELDS: &[&str] = &[
             "address",
             "path", // BindLocation (flattened)
@@ -201,6 +203,7 @@ impl<'de> serde::de::Deserialize<'de> for ServerConfig {
             "transport",
             "tcp_settings",
             "quic_settings",
+            "kcp_settings",
             "rules",
             "rule",
             "dns",
@@ -267,6 +270,14 @@ impl<'de> serde::de::Deserialize<'de> for ServerConfig {
             .transpose()
             .map_err(|e| Error::custom(format!("invalid quic_settings: {e}")))?;
 
+        // Parse kcp_settings (optional, skip if null)
+        let kcp_settings: Option<KcpSettings> = map
+            .get("kcp_settings")
+            .filter(|v| !v.is_null())
+            .map(|v| serde_yaml::from_value(v.clone()))
+            .transpose()
+            .map_err(|e| Error::custom(format!("invalid kcp_settings: {e}")))?;
+
         // Parse rules (optional, with alias "rule", default to direct_allow_rule, skip if null)
         let rules: NoneOrSome<ConfigSelection<RuleConfig>> = map
             .get("rules")
@@ -291,6 +302,7 @@ impl<'de> serde::de::Deserialize<'de> for ServerConfig {
             transport,
             tcp_settings,
             quic_settings,
+            kcp_settings,
             rules,
             dns,
         })

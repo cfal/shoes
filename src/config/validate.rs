@@ -671,6 +671,17 @@ fn validate_server_config(
         ));
     }
 
+    if server_config.transport == Transport::Kcp && server_config.kcp_settings.is_none() {
+        // Default KCP settings are fine — nothing to validate
+    } else if server_config.kcp_settings.is_some()
+        && server_config.transport != Transport::Kcp
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "KCP transport is not selected but KCP settings specified",
+        ));
+    }
+
     if let super::types::BindLocation::Path(_) = server_config.bind_location
         && server_config.transport != Transport::Tcp
     {
@@ -902,6 +913,13 @@ fn validate_client_config(
             ));
         }
         validate_server_fingerprints(server_fingerprints)?;
+    }
+
+    if client_config.kcp_settings.is_some() && client_config.transport != Transport::Kcp {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "KCP transport is not selected but KCP settings specified",
+        ));
     }
 
     #[cfg(not(any(target_os = "android", target_os = "fuchsia", target_os = "linux")))]
