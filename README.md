@@ -27,6 +27,7 @@ All server protocols plus:
 - **WebSocket** (Shadowsocks SIP003)
 - **XTLS Reality**
 - **XTLS Vision** (for VLESS)
+- **KCP** (UDP-based ARQ transport via [kcp-tokio](https://github.com/leihuxi/rust-kcp))
 
 ### TUN/VPN Mode
 - **TUN device support** - Layer 3 VPN for transparent proxying
@@ -39,7 +40,7 @@ All server protocols plus:
 
 ## Features
 
-- **Multi-transport**: TCP or QUIC for all protocols
+- **Multi-transport**: TCP, QUIC, or KCP for all protocols
 - **TLS with SNI routing**: Route by Server Name Indication
 - **Upstream proxy chaining**: Multi-hop chains with load balancing
 - **Rule-based routing**: Route by IP/CIDR or hostname masks
@@ -260,6 +261,106 @@ See the [examples](./examples) directory for all examples.
             type: vless
             user_id: b85798ef-e9dc-46a4-9a87-8da4499d36d0
 ```
+
+### KCP + VLESS Server
+
+KCP runs over UDP and provides ARQ (Automatic Repeat reQuest) reliability with lower latency
+than TCP on lossy networks. Any TCP-based protocol can be wrapped with KCP transport.
+
+```yaml
+- address: 0.0.0.0:16823
+  transport: kcp
+  kcp_settings:
+    mode: fast        # normal | fast | turbo | gaming | file_transfer
+    send_window: 128  # packets
+    recv_window: 128  # packets
+    mtu: 1400         # bytes
+  protocol:
+    type: vless
+    user_id: b85798ef-e9dc-46a4-9a87-8da4499d36d0
+    udp_enabled: true
+```
+
+### KCP + VLESS Client
+
+```yaml
+- address: 127.0.0.1:1080
+  protocol:
+    type: socks
+  rules:
+    - masks: "0.0.0.0/0"
+      action: allow
+      client_chain:
+        address: "server.example.com:16823"
+        transport: kcp
+        kcp_settings:
+          mode: fast
+          send_window: 128
+          recv_window: 128
+          mtu: 1400
+        protocol:
+          type: vless
+          user_id: b85798ef-e9dc-46a4-9a87-8da4499d36d0
+```
+
+### KCP + Reality Server
+
+KCP can be combined with Reality to disguise traffic as a legitimate TLS handshake while
+benefiting from KCP's UDP-based low-latency transport.
+
+```yaml
+- address: 0.0.0.0:8443
+  transport: kcp
+  kcp_settings:
+    mode: fast
+    mtu: 1400
+  protocol:
+    type: tls
+    reality_targets:
+      "www.example.com":
+        private_key: "YOUR_BASE64URL_PRIVATE_KEY"
+        short_ids: ["0123456789abcdef", ""]
+        dest: "www.example.com:443"
+        protocol:
+          type: vless
+          user_id: b85798ef-e9dc-46a4-9a87-8da4499d36d0
+          udp_enabled: true
+```
+
+### KCP + Reality Client
+
+```yaml
+- address: 127.0.0.1:1080
+  protocol:
+    type: socks
+  rules:
+    - masks: "0.0.0.0/0"
+      action: allow
+      client_chain:
+        address: "server.example.com:8443"
+        transport: kcp
+        kcp_settings:
+          mode: fast
+          mtu: 1400
+        protocol:
+          type: reality
+          public_key: "SERVER_PUBLIC_KEY"
+          short_id: "0123456789abcdef"
+          sni_hostname: "www.example.com"
+          protocol:
+            type: vless
+            user_id: b85798ef-e9dc-46a4-9a87-8da4499d36d0
+```
+
+#### KCP mode reference
+
+| Mode | Update interval | Resend | NodeDelay | Use case |
+|------|----------------|--------|-----------|----------|
+| `normal` | 40 ms | 0 | yes | General purpose (default) |
+| `fast` | 8 ms | 2 | yes | Low-latency proxying |
+| `turbo` | 4 ms | 1 | no | Maximum throughput |
+| `gaming` | 3 ms | 1 | no | Real-time / interactive |
+| `file_transfer` | — | — | — | Reliable bulk transfer |
 
 ## Similar Projects
 
