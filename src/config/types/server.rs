@@ -861,6 +861,7 @@ mod tests {
             transport: Transport::Tcp,
             tcp_settings: Some(TcpConfig { no_delay: true }),
             quic_settings: None,
+            kcp_settings: None,
             rules: NoneOrSome::None,
             dns: None,
         }
@@ -879,6 +880,7 @@ mod tests {
             transport: Transport::Tcp,
             tcp_settings: None,
             quic_settings: None,
+            kcp_settings: None,
             rules: NoneOrSome::None,
             dns: None,
         }
@@ -897,6 +899,7 @@ mod tests {
             transport: Transport::Tcp,
             tcp_settings: None,
             quic_settings: None,
+            kcp_settings: None,
             rules: NoneOrSome::None,
             dns: None,
         }
@@ -923,6 +926,7 @@ mod tests {
                 client_fingerprints: NoneOrSome::None,
                 num_endpoints: 1,
             }),
+            kcp_settings: None,
             rules: NoneOrSome::None,
             dns: None,
         }
@@ -943,6 +947,7 @@ mod tests {
             transport: Transport::Tcp,
             tcp_settings: None,
             quic_settings: None,
+            kcp_settings: None,
             rules: NoneOrSome::None,
             dns: None,
         }
@@ -993,6 +998,7 @@ mod tests {
             transport: Transport::Tcp,
             tcp_settings: None,
             quic_settings: None,
+            kcp_settings: None,
             rules: NoneOrSome::None,
             dns: None,
         }
@@ -1011,6 +1017,7 @@ mod tests {
             transport: Transport::Tcp,
             tcp_settings: None,
             quic_settings: None,
+            kcp_settings: None,
             rules: NoneOrSome::None,
             dns: None,
         }
@@ -1036,6 +1043,7 @@ mod tests {
             transport: Transport::Tcp,
             tcp_settings: None,
             quic_settings: None,
+            kcp_settings: None,
             rules: NoneOrSome::None,
             dns: None,
         }
@@ -1055,6 +1063,7 @@ mod tests {
             transport: Transport::Tcp,
             tcp_settings: None,
             quic_settings: None,
+            kcp_settings: None,
             rules: NoneOrSome::None,
             dns: None,
         }
@@ -1079,6 +1088,7 @@ mod tests {
                 client_fingerprints: NoneOrSome::None,
                 num_endpoints: 1,
             }),
+            kcp_settings: None,
             rules: NoneOrSome::None,
             dns: None,
         }
@@ -1104,6 +1114,7 @@ mod tests {
                 client_fingerprints: NoneOrSome::None,
                 num_endpoints: 1,
             }),
+            kcp_settings: None,
             rules: NoneOrSome::None,
             dns: None,
         }

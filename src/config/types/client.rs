@@ -528,6 +528,7 @@ mod tests {
             transport: Transport::Tcp,
             tcp_settings: None,
             quic_settings: None,
+            kcp_settings: None,
         }
     }
 

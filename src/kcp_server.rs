@@ -27,6 +27,12 @@ pub fn build_kcp_config(settings: Option<&KcpSettings>) -> KcpConfig {
         KcpMode::FileTransfer => KcpConfig::file_transfer(),
     };
 
+    // Stream mode delivers data as a continuous byte stream without message boundaries.
+    // FileTransfer already enables it via KcpConfig::file_transfer().
+    // For other modes we leave it at the kcp-tokio default (false = message mode).
+    // In message mode KCP delivers data only when a complete segment is received,
+    // which is fine for proxy operation since TLS records are self-framed.
+
     if let Some(s) = settings {
         if let (Some(snd), Some(rcv)) = (s.send_window, s.recv_window) {
             cfg = cfg.window_size(snd, rcv);

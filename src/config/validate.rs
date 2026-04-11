@@ -2500,6 +2500,7 @@ mod tests {
                 transport: Transport::Tcp,
                 tcp_settings: None,
                 quic_settings: None,
+                kcp_settings: None,
                 rules: direct_allow_rule(),
                 dns: Some(DnsConfig {
                     servers: NoneOrSome::One(DnsServerSpec::Simple("my-dns".to_string())),
@@ -2548,6 +2549,7 @@ mod tests {
                 transport: Transport::Tcp,
                 tcp_settings: None,
                 quic_settings: None,
+                kcp_settings: None,
                 rules: direct_allow_rule(),
                 dns: Some(DnsConfig {
                     servers: NoneOrSome::Some(vec![
@@ -2608,6 +2610,7 @@ mod tests {
                 transport: Transport::Tcp,
                 tcp_settings: None,
                 quic_settings: None,
+                kcp_settings: None,
                 rules: direct_allow_rule(),
                 dns: Some(DnsConfig {
                     servers: NoneOrSome::Some(vec![
@@ -2659,6 +2662,7 @@ mod tests {
             transport: Transport::Tcp,
             tcp_settings: None,
             quic_settings: None,
+            kcp_settings: None,
             rules: direct_allow_rule(),
             dns: Some(DnsConfig {
                 servers: NoneOrSome::One(DnsServerSpec::Simple("nonexistent-dns".to_string())),
