@@ -32,6 +32,7 @@ pub enum Transport {
     Tcp,
     Quic,
     Udp,
+    Kcp,
 }
 
 impl Transport {
@@ -101,4 +102,38 @@ impl From<NetLocation> for BindLocation {
     fn from(loc: NetLocation) -> Self {
         BindLocation::Address(loc.into())
     }
+}
+
+/// KCP performance mode presets.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum KcpMode {
+    /// General purpose (40ms update interval).
+    #[default]
+    Normal,
+    /// Low latency (8ms update interval).
+    Fast,
+    /// Maximum speed (4ms update interval).
+    Turbo,
+    /// Real-time games (3ms update interval).
+    Gaming,
+    /// Reliable file transfer.
+    FileTransfer,
+}
+
+/// KCP transport settings (server and client share the same struct).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct KcpSettings {
+    /// KCP performance preset.
+    #[serde(default)]
+    pub mode: KcpMode,
+    /// Send window size (in packets). Uses kcp-tokio default when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub send_window: Option<u32>,
+    /// Receive window size (in packets). Uses kcp-tokio default when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recv_window: Option<u32>,
+    /// Maximum transmission unit (bytes). Uses kcp-tokio default when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mtu: Option<u16>,
 }
