@@ -32,6 +32,9 @@ jobs:
         with:
           key: ios
 
+      - name: Install cbindgen
+        run: cargo install cbindgen
+
       - name: Build XCFramework
         run: bash scripts/build-ios.sh
 

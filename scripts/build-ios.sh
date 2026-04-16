@@ -18,6 +18,13 @@ LIB_NAME="libshoes.a"
 
 cd "$ROOT_DIR"
 
+echo "==> Generating C header via cbindgen"
+if command -v cbindgen &>/dev/null; then
+    cbindgen --config "$ROOT_DIR/cbindgen.toml" --output "$ROOT_DIR/include/shoes.h"
+else
+    echo "  cbindgen not found, using existing include/shoes.h"
+fi
+
 echo "==> Cleaning output directory"
 rm -rf "$OUTPUT_DIR"
 mkdir -p "$OUTPUT_DIR/device" "$OUTPUT_DIR/sim"
