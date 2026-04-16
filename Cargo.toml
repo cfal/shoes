@@ -98,7 +98,7 @@ tikv-jemallocator = "*"
 
 [target.'cfg(target_os = "android")'.dependencies]
 android_logger = "*"
-jni = "*"
+jni = "0.22"
 ndk-sys = "*"
 
 [profile.release]
