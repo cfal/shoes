@@ -93,7 +93,7 @@ jobs:
             -t armeabi-v7a \
             -P 21 \
             -o android/src/main/jniLibs \
-            -- build --release --lib
+            -- build --release --lib --locked
 
       - name: Build AAR
         working-directory: android
