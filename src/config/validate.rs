@@ -1217,13 +1217,11 @@ fn validate_server_proxy_config(
                 ));
             }
         }
-        ServerProxyConfig::Snell { cipher, .. } => {
-            if cipher.starts_with("2022-blake3-") {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "Snell does not support shadowsocks 2022 ciphers",
-                ));
-            }
+        ServerProxyConfig::Snell { cipher, .. } if cipher.starts_with("2022-blake3-") => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Snell does not support shadowsocks 2022 ciphers",
+            ));
         }
         _ => (),
     }

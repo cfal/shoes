@@ -979,8 +979,7 @@ async fn setup_local_handshake(
     write_all(&mut server_stream, server_hello_frame).await?;
 
     // The server sends multiple frames after ServerHello; process remaining data.
-    let remaining_server_data_len =
-        server_data_len - TLS_HEADER_LEN - server_hello_payload_size as usize;
+    let remaining_server_data_len = server_data_len - TLS_HEADER_LEN - server_hello_payload_size;
     if remaining_server_data_len > 0 {
         server_data.copy_within(
             TLS_HEADER_LEN + server_hello_payload_size

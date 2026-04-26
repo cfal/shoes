@@ -1,0 +1,141 @@
+name: Build Mobile Libraries
+
+on:
+  push:
+    branches: [ master ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ master ]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ──────────────────────────────────────────────────────────────────────────
+  # iOS — universal XCFramework (device arm64 + simulator arm64/x86_64)
+  # ──────────────────────────────────────────────────────────────────────────
+  ios:
+    name: Build iOS XCFramework
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ios
+
+      - name: Install cbindgen
+        run: cargo install cbindgen
+
+      - name: Build XCFramework
+        run: bash scripts/build-ios.sh
+
+      - name: Upload XCFramework
+        uses: actions/upload-artifact@v4
+        with:
+          name: Shoes.xcframework
+          path: output/ios/Shoes.xcframework
+          if-no-files-found: error
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Android — AAR with JNI .so for arm64-v8a, armeabi-v7a, x86_64, x86
+  # ──────────────────────────────────────────────────────────────────────────
+  android:
+    name: Build Android AAR
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: android
+
+      - name: Cache cargo-ndk binary
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-ndk
+          key: cargo-ndk-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-ndk-${{ runner.os }}-
+
+      - name: Install cargo-ndk
+        run: command -v cargo-ndk || cargo install cargo-ndk
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.6'
+
+      - name: Set NDK path
+        run: echo "ANDROID_NDK_HOME=$ANDROID_NDK_LATEST_HOME" >> "$GITHUB_ENV"
+
+      - name: Build JNI native libraries
+        run: |
+          cargo ndk \
+            -t arm64-v8a \
+            -t armeabi-v7a \
+            -P 21 \
+            -o android/src/main/jniLibs \
+            -- build --release --lib --locked
+
+      - name: Build AAR
+        working-directory: android
+        run: gradle assembleRelease --no-daemon
+
+      - name: Upload AAR
+        uses: actions/upload-artifact@v4
+        with:
+          name: shoes-android
+          path: android/build/outputs/aar/shoes-release.aar
+          if-no-files-found: error
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Release — attach artifacts to GitHub releases on tag pushes
+  # ──────────────────────────────────────────────────────────────────────────
+  release:
+    name: Attach to Release
+    needs: [ ios, android ]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Zip XCFramework
+        run: |
+          cd artifacts
+          zip -r Shoes.xcframework.zip Shoes.xcframework/
+
+      - name: Attach to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/Shoes.xcframework.zip
+            artifacts/shoes-android/shoes-release.aar
+          draft: true
+          generate_release_notes: false

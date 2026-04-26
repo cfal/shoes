@@ -22,9 +22,9 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use jni::JNIEnv;
-use jni::objects::{JClass, JObject, JString, JValue};
+use jni::objects::{Global, JClass, JObject, JString, JValue};
 use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jint, jlong};
+use jni::{EnvUnowned, Outcome};
 use log::{Record, error, info};
 use tokio::runtime::Runtime;
 use tokio::sync::oneshot;
@@ -68,7 +68,7 @@ impl LogWriter for LogcatWriter {
 /// Initialize the shoes library.
 ///
 /// # Arguments
-/// * `env` - JNI environment
+/// * `unowned` - JNI environment
 /// * `_class` - Java class (unused)
 /// * `log_level` - Log level string ("error", "warn", "info", "debug", "trace")
 ///
@@ -76,17 +76,21 @@ impl LogWriter for LogcatWriter {
 /// * 0 on success
 /// * -1 on error
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_com_shoesproxy_ShoesNative_init(
-    mut env: JNIEnv,
-    _class: JClass,
-    log_level: JString,
+pub extern "system" fn Java_com_shoesproxy_ShoesNative_init<'local>(
+    mut unowned: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    log_level: JString<'local>,
 ) -> jint {
-    let level_str: String = match env.get_string(&log_level) {
-        Ok(s) => s.into(),
-        Err(e) => {
+    let level_str: String = match unowned
+        .with_env(|env| env.get_string(&log_level).map(|s| s.to_string()))
+        .into_outcome()
+    {
+        Outcome::Ok(s) => s,
+        Outcome::Err(e) => {
             eprintln!("Failed to get log level string: {}", e);
             return -1;
         }
+        Outcome::Panic(_) => return -1,
     };
 
     let level = crate::logging::parse_log_level(&level_str).unwrap_or(log::LevelFilter::Info);
@@ -113,18 +117,24 @@ pub extern "system" fn Java_com_shoesproxy_ShoesNative_init(
 /// * Version string from Cargo.toml (e.g., "0.1.0")
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_shoesproxy_ShoesNative_getVersion<'local>(
-    env: JNIEnv<'local>,
+    mut unowned: EnvUnowned<'local>,
     _class: JClass<'local>,
 ) -> JString<'local> {
     let version = env!("CARGO_PKG_VERSION");
-    env.new_string(version)
-        .unwrap_or_else(|_| JObject::null().into())
+    match unowned
+        .with_env(|env| env.new_string(version))
+        .into_outcome()
+    {
+        Outcome::Ok(s) => s,
+        // Can fail under JVM OOM; return null to avoid panicking across FFI.
+        _ => JString::null(),
+    }
 }
 
 /// Set the log file path for file-based logging.
 ///
 /// # Arguments
-/// * `env` - JNI environment
+/// * `unowned` - JNI environment
 /// * `_class` - Java class (unused)
 /// * `log_path` - Absolute path to the log file
 ///
@@ -132,17 +142,21 @@ pub extern "system" fn Java_com_shoesproxy_ShoesNative_getVersion<'local>(
 /// * 0 on success
 /// * -1 on error
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_com_shoesproxy_ShoesNative_setLogFile(
-    mut env: JNIEnv,
-    _class: JClass,
-    log_path: JString,
+pub extern "system" fn Java_com_shoesproxy_ShoesNative_setLogFile<'local>(
+    mut unowned: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    log_path: JString<'local>,
 ) -> jint {
-    let path_str: String = match env.get_string(&log_path) {
-        Ok(s) => s.into(),
-        Err(e) => {
+    let path_str: String = match unowned
+        .with_env(|env| env.get_string(&log_path).map(|s| s.to_string()))
+        .into_outcome()
+    {
+        Outcome::Ok(s) => s,
+        Outcome::Err(e) => {
             error!("Failed to get log path string: {}", e);
             return -1;
         }
+        Outcome::Panic(_) => return -1,
     };
 
     setup_log_file(&path_str)
@@ -151,7 +165,7 @@ pub extern "system" fn Java_com_shoesproxy_ShoesNative_setLogFile(
 /// Start the shoes service.
 ///
 /// # Arguments
-/// * `env` - JNI environment
+/// * `unowned` - JNI environment
 /// * `_class` - Java class (unused)
 /// * `config_yaml` - YAML configuration string (includes TUN config with device_fd and optional Server configs like mixed)
 /// * `protect_callback` - Java object with protect(int fd) method
@@ -161,70 +175,59 @@ pub extern "system" fn Java_com_shoesproxy_ShoesNative_setLogFile(
 /// * -1 on error
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_shoesproxy_ShoesNative_start<'local>(
-    mut env: JNIEnv<'local>,
+    mut unowned: EnvUnowned<'local>,
     _class: JClass<'local>,
     config_yaml: JString<'local>,
     protect_callback: JObject<'local>,
 ) -> jlong {
     info!("Starting shoes service");
 
-    let config_str: String = match env.get_string(&config_yaml) {
-        Ok(s) => s.into(),
-        Err(e) => {
-            error!("Failed to get config string: {}", e);
-            return -1;
-        }
-    };
+    let result = unowned
+        .with_env(
+            |env| -> jni::errors::Result<(String, Global<JObject<'static>>, jni::JavaVM)> {
+                let config_str: String = env.get_string(&config_yaml).map(|s| s.to_string())?;
+                let callback_ref = env.new_global_ref(protect_callback)?;
+                let jvm = env.get_java_vm()?;
+                Ok((config_str, callback_ref, jvm))
+            },
+        )
+        .into_outcome();
 
-    let callback_ref = match env.new_global_ref(protect_callback) {
-        Ok(r) => r,
-        Err(e) => {
-            error!("Failed to create global ref for callback: {}", e);
+    let (config_str, callback_ref, jvm) = match result {
+        Outcome::Ok(v) => v,
+        Outcome::Err(e) => {
+            error!("Failed to extract JNI values for start: {}", e);
             return -1;
         }
+        Outcome::Panic(_) => return -1,
     };
-
-    let jvm = match env.get_java_vm() {
-        Ok(vm) => Arc::new(vm),
-        Err(e) => {
-            error!("Failed to get JavaVM: {}", e);
-            return -1;
-        }
-    };
+    let jvm: Arc<jni::JavaVM> = Arc::new(jvm);
 
     // Socket protector calls VpnService.protect() to exempt sockets from VPN routing
-    let callback_ref = Arc::new(callback_ref);
+    let callback_ref: Arc<Global<JObject<'static>>> = Arc::new(callback_ref);
     let jvm_clone = jvm.clone();
     let callback_clone = callback_ref.clone();
 
     let protector = FnSocketProtector::new(move |fd: i32| {
-        let mut env = match jvm_clone.attach_current_thread() {
-            Ok(env) => env,
-            Err(e) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("Failed to attach to JVM: {}", e),
-                ));
-            }
-        };
+        let protect_ok = jvm_clone
+            .attach_current_thread(|env: &mut jni::Env| -> jni::errors::Result<bool> {
+                let v = env.call_method(
+                    &*callback_clone,
+                    jni::jni_str!("protect"),
+                    jni::jni_sig!("(I)Z"),
+                    &[JValue::Int(fd)],
+                )?;
+                Ok(v.z().unwrap_or(false))
+            })
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{}", e)))?;
 
-        let result = env.call_method(&*callback_clone, "protect", "(I)Z", &[JValue::Int(fd)]);
-
-        match result {
-            Ok(v) => {
-                if v.z().unwrap_or(false) {
-                    Ok(())
-                } else {
-                    Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        "VpnService.protect() returned false",
-                    ))
-                }
-            }
-            Err(e) => Err(std::io::Error::new(
+        if protect_ok {
+            Ok(())
+        } else {
+            Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
-                format!("Failed to call protect(): {}", e),
-            )),
+                "VpnService.protect() returned false",
+            ))
         }
     });
 
@@ -269,12 +272,12 @@ pub extern "system" fn Java_com_shoesproxy_ShoesNative_start<'local>(
 /// Stop the TUN service.
 ///
 /// # Arguments
-/// * `env` - JNI environment
+/// * `_env` - JNI environment (unused)
 /// * `_class` - Java class (unused)
 /// * `handle` - Handle returned by startTun (currently unused, we use global state)
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_shoesproxy_ShoesNative_stop(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _class: JClass,
     _handle: jlong,
 ) {
@@ -288,7 +291,7 @@ pub extern "system" fn Java_com_shoesproxy_ShoesNative_stop(
 /// * JNI_FALSE if not running
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_shoesproxy_ShoesNative_isRunning(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _class: JClass,
 ) -> jboolean {
     if common::is_service_running() {
