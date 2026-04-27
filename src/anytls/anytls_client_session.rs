@@ -74,6 +74,9 @@ pub struct AnyTlsClientSession {
     /// Once taken (by first open_stream), this is None and subsequent streams
     /// are sent normally through the channel.
     initial_buffer: std::sync::Mutex<Option<BytesMut>>,
+
+    /// Notify to break reader/writer loops when session is dropped
+    close_notify: Arc<tokio::sync::Notify>,
 }
 
 impl std::fmt::Debug for AnyTlsClientSession {
@@ -82,6 +85,12 @@ impl std::fmt::Debug for AnyTlsClientSession {
             .field("is_closed", &self.is_closed.load(Ordering::Relaxed))
             .field("peer_version", &self.peer_version.load(Ordering::Relaxed))
             .finish()
+    }
+}
+
+impl Drop for AnyTlsClientSession {
+    fn drop(&mut self) {
+        self.close_notify.notify_waiters();
     }
 }
 
@@ -128,6 +137,7 @@ impl AnyTlsClientSession {
             send_padding: AtomicBool::new(true),
             pkt_counter: AtomicU32::new(0), // Start at 0, incremented before use
             initial_buffer: std::sync::Mutex::new(Some(initial_buffer)),
+            close_notify: Arc::new(tokio::sync::Notify::new()),
         });
 
         // NOTE: Settings is NOT sent here - it's in initial_buffer and will be
@@ -209,17 +219,21 @@ impl AnyTlsClientSession {
         W: tokio::io::AsyncWrite + Send + Unpin + 'static,
     {
         // Writer task - handles all outgoing messages (control and data)
-        let session_writer = Arc::clone(&session);
+        let session_weak_w = Arc::downgrade(&session);
+        let close_notify_w = Arc::clone(&session.close_notify);
         tokio::spawn(async move {
-            if let Err(e) = Self::writer_loop(session_writer, writer, outgoing_rx).await {
+            if let Err(e) =
+                Self::writer_loop(session_weak_w, writer, outgoing_rx, close_notify_w).await
+            {
                 log::debug!("AnyTLS client writer ended: {}", e);
             }
         });
 
         // Reader task
-        let session_reader = Arc::clone(&session);
+        let session_weak_r = Arc::downgrade(&session);
+        let close_notify_r = Arc::clone(&session.close_notify);
         tokio::spawn(async move {
-            if let Err(e) = Self::reader_loop(session_reader, reader).await {
+            if let Err(e) = Self::reader_loop(session_weak_r, reader, close_notify_r).await {
                 log::debug!("AnyTLS client reader ended: {}", e);
             }
         });
@@ -236,9 +250,10 @@ impl AnyTlsClientSession {
     /// - Padding frames concatenated with payload before write (single syscall)
     /// - Zero-allocation padding using put_bytes()
     async fn writer_loop<W>(
-        session: Arc<Self>,
+        session_weak: std::sync::Weak<Self>,
         mut writer: W,
         mut outgoing_rx: mpsc::UnboundedReceiver<OutgoingMessage>,
+        close_notify: Arc<tokio::sync::Notify>,
     ) -> io::Result<()>
     where
         W: tokio::io::AsyncWrite + Send + Unpin,
@@ -253,7 +268,28 @@ impl AnyTlsClientSession {
         // Used to ensure single write() call per padding segment
         let mut padding_buf = BytesMut::with_capacity(65536 + FRAME_HEADER_SIZE * 2 + 64);
 
-        while let Some(msg) = outgoing_rx.recv().await {
+        loop {
+            let msg = tokio::select! {
+                m = outgoing_rx.recv() => m,
+                _ = close_notify.notified() => {
+                    log::debug!("AnyTLS client writer loop: close_notify triggered");
+                    break;
+                }
+            };
+
+            let msg = match msg {
+                Some(m) => m,
+                None => break,
+            };
+
+            let session = match session_weak.upgrade() {
+                Some(s) => s,
+                None => {
+                    log::debug!("AnyTLS client writer loop: session dropped, exiting");
+                    break;
+                }
+            };
+
             if session.is_closed.load(Ordering::Relaxed) {
                 break;
             }
@@ -422,7 +458,11 @@ impl AnyTlsClientSession {
     }
 
     /// Reader loop - receives frames from the transport
-    async fn reader_loop<R>(session: Arc<Self>, mut reader: R) -> io::Result<()>
+    async fn reader_loop<R>(
+        session_weak: std::sync::Weak<Self>,
+        mut reader: R,
+        close_notify: Arc<tokio::sync::Notify>,
+    ) -> io::Result<()>
     where
         R: tokio::io::AsyncRead + Send + Unpin,
     {
@@ -430,29 +470,62 @@ impl AnyTlsClientSession {
         let mut buffer = BytesMut::with_capacity(8192);
 
         loop {
-            if session.is_closed.load(Ordering::Relaxed) {
-                log::debug!("AnyTLS client reader loop: session closed, exiting");
+            // Scope for the strong reference to session
+            let has_closed = {
+                let session = match session_weak.upgrade() {
+                    Some(s) => s,
+                    None => {
+                        log::debug!("AnyTLS client reader loop: session dropped, exiting");
+                        return Ok(());
+                    }
+                };
+
+                if session.is_closed.load(Ordering::Relaxed) {
+                    log::debug!("AnyTLS client reader loop: session closed, exiting");
+                    return Ok(());
+                }
+
+                // Decode any frames already in buffer
+                while let Some(frame) = FrameCodec::decode(&mut buffer)? {
+                    log::debug!(
+                        "AnyTLS client received frame: {:?} stream={} len={}",
+                        frame.cmd,
+                        frame.stream_id,
+                        frame.data.len()
+                    );
+                    if let Err(e) = session.handle_frame(frame).await {
+                        log::warn!("AnyTLS client error handling frame: {}", e);
+                        return Err(e);
+                    }
+                }
+
+                false
+            };
+
+            if has_closed {
                 return Ok(());
             }
 
-            // Decode any frames already in buffer
-            while let Some(frame) = FrameCodec::decode(&mut buffer)? {
-                log::debug!(
-                    "AnyTLS client received frame: {:?} stream={} len={}",
-                    frame.cmd,
-                    frame.stream_id,
-                    frame.data.len()
-                );
-                if let Err(e) = session.handle_frame(frame).await {
-                    log::warn!("AnyTLS client error handling frame: {}", e);
-                    return Err(e);
+            // DO NOT hold `session` (strong Arc) across `reader.read_buf().await`.
+            // Because if we hold the Arc, the Drop impl will never be called when the stream disconnects!
+            // Wait for new data or close_notify
+            let read_result = tokio::select! {
+                res = reader.read_buf(&mut buffer) => res,
+                _ = close_notify.notified() => {
+                    log::debug!("AnyTLS client reader loop: close_notify triggered");
+                    return Ok(());
                 }
-            }
+            };
 
-            // Read more data
-            let n = reader.read_buf(&mut buffer).await?;
+            let n = read_result?;
             if n == 0 {
                 log::debug!("AnyTLS client reader loop: connection closed (EOF)");
+                // Once reader gets EOF from upstream, TLS connection is dead.
+                // Re-upgrade to signal writer loop
+                if let Some(session) = session_weak.upgrade() {
+                    session.is_closed.store(true, Ordering::Relaxed);
+                    session.close_notify.notify_waiters();
+                }
                 return Ok(()); // Connection closed
             }
             log::debug!("AnyTLS client reader: read {} bytes", n);
