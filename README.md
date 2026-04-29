@@ -19,6 +19,9 @@ shoes is a high-performance multi-protocol proxy server written in Rust.
 - **NaiveProxy**
 - **H2MUX** (supported with VMess, VLESS, Trojan, Shadowsocks, Snell)
 
+### Outbound Tunnel Protocols
+- **AmneziaWG 2.0** (client/outbound only — UDP-backed L3 tunnel with obfuscation)
+
 ### Transport Protocols
 All server protocols plus:
 - **SagerNet UDP over TCP** (for Shadowsocks, SOCKS5, AnyTLS, NaiveProxy)
@@ -260,6 +263,72 @@ See the [examples](./examples) directory for all examples.
             type: vless
             user_id: b85798ef-e9dc-46a4-9a87-8da4499d36d0
 ```
+
+### AmneziaWG 2.0 Client (SOCKS5 inbound)
+```yaml
+- address: 127.0.0.1:1080
+  protocol:
+    type: socks
+  rules:
+    - masks: "0.0.0.0/0"
+      action: allow
+      client_chain:
+        address: "awg.example.com:51820"
+        protocol:
+          type: amneziawg
+          private_key: "CLIENT_PRIVATE_KEY_BASE64"
+          peer_public_key: "SERVER_PUBLIC_KEY_BASE64"
+          preshared_key: "OPTIONAL_PRESHARED_KEY_BASE64"
+          local_addresses:
+            - "10.8.0.2/32"
+          allowed_ips:
+            - "0.0.0.0/0"
+            - "::/0"
+          persistent_keepalive: 25
+          mtu: 1280
+          awg:
+            jc: 4
+            jmin: 64
+            jmax: 256
+            s1: 32
+            s2: 32
+            s3: 16
+            s4: 16
+            h1: "1000000-1000999"
+            h2: "1001000-1001999"
+            h3: "1002000-1002999"
+            h4: "1003000-1003999"
+```
+
+### AmneziaWG 2.0 Client (TUN VPN)
+```yaml
+- device_name: tun0
+  address: 10.0.0.1
+  netmask: 255.255.255.0
+  mtu: 1500
+  tcp_enabled: true
+  udp_enabled: true
+  rules:
+    - masks: "0.0.0.0/0"
+      action: allow
+      client_chain:
+        address: "awg.example.com:51820"
+        protocol:
+          type: amneziawg
+          private_key: "CLIENT_PRIVATE_KEY_BASE64"
+          peer_public_key: "SERVER_PUBLIC_KEY_BASE64"
+          local_addresses: "10.8.0.2/32"
+          allowed_ips: "0.0.0.0/0"
+          persistent_keepalive: 25
+          mtu: 1280
+          awg:
+            h1: "1000000-1000999"
+            h2: "1001000-1001999"
+            h3: "1002000-1002999"
+            h4: "1003000-1003999"
+```
+
+> **Note:** AmneziaWG is client/outbound only. It creates a UDP-backed L3 tunnel with AmneziaWG 2.0 obfuscation (dynamic headers, padding, junk packets, init packets). The `awg` section parameters must match your AmneziaWG server configuration. AmneziaWG must be the only hop in a chain — multi-hop chains through AmneziaWG are not yet supported.
 
 ## Similar Projects
 
