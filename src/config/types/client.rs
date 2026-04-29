@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::address::NetLocation;
 use crate::h2mux::{H2MuxOptions, MuxProtocol};
-use crate::option_util::{NoneOrOne, NoneOrSome};
+use crate::option_util::{NoneOrOne, NoneOrSome, OneOrSome};
 
 use super::common::{
     default_reality_client_short_id, default_true, is_false, is_true, unspecified_address,
@@ -50,6 +50,61 @@ impl H2MuxConfig {
             padding: self.padding,
         }
     }
+}
+
+fn default_amneziawg_mtu() -> u16 {
+    1280
+}
+
+/// AmneziaWG 2.0 client configuration.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AmneziaWgClientConfig {
+    pub private_key: String,
+    pub peer_public_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preshared_key: Option<String>,
+    pub local_addresses: OneOrSome<String>,
+    pub allowed_ips: OneOrSome<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persistent_keepalive: Option<u16>,
+    #[serde(default = "default_amneziawg_mtu")]
+    pub mtu: u16,
+    pub awg: AmneziaWg2Config,
+}
+
+/// AmneziaWG 2.0 obfuscation parameters.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AmneziaWg2Config {
+    #[serde(default)]
+    pub jc: u8,
+    #[serde(default)]
+    pub jmin: u16,
+    #[serde(default)]
+    pub jmax: u16,
+    #[serde(default)]
+    pub s1: u8,
+    #[serde(default)]
+    pub s2: u8,
+    #[serde(default)]
+    pub s3: u8,
+    #[serde(default)]
+    pub s4: u8,
+    pub h1: String,
+    pub h2: String,
+    pub h3: String,
+    pub h4: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub i1: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub i2: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub i3: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub i4: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub i5: Option<String>,
 }
 
 /// Custom deserializer for ClientProxyConfig::Shadowsocks
@@ -435,11 +490,18 @@ pub enum ClientProxyConfig {
         #[serde(default = "default_true", skip_serializing_if = "is_true")]
         padding: bool,
     },
+    /// AmneziaWG 2.0 client outbound (UDP-backed L3 tunnel)
+    #[serde(alias = "awg")]
+    AmneziaWg(AmneziaWgClientConfig),
 }
 
 impl ClientProxyConfig {
     pub fn is_direct(&self) -> bool {
         matches!(self, ClientProxyConfig::Direct)
+    }
+
+    pub fn is_amneziawg(&self) -> bool {
+        matches!(self, ClientProxyConfig::AmneziaWg(_))
     }
 
     /// Returns the protocol name for display/error messages
@@ -460,6 +522,7 @@ impl ClientProxyConfig {
             ClientProxyConfig::PortForward => "PortForward",
             ClientProxyConfig::Anytls { .. } => "AnyTLS",
             ClientProxyConfig::Naiveproxy { .. } => "NaiveProxy",
+            ClientProxyConfig::AmneziaWg(..) => "AmneziaWG",
         }
     }
 }

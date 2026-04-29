@@ -912,6 +912,29 @@ fn validate_client_config(
         ));
     }
 
+    // AmneziaWG uses its own UDP transport; reject incompatible settings
+    if client_config.protocol.is_amneziawg() {
+        if client_config.transport != Transport::Tcp {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "AmneziaWG uses its own UDP transport. \
+                 Do not set 'transport' on an AmneziaWG client config.",
+            ));
+        }
+        if client_config.tcp_settings.is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "tcp_settings is not valid for AmneziaWG protocol.",
+            ));
+        }
+        if client_config.quic_settings.is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "quic_settings is not valid for AmneziaWG protocol.",
+            ));
+        }
+    }
+
     validate_client_proxy_config(&mut client_config.protocol, named_pems)?;
 
     Ok(())
@@ -980,9 +1003,108 @@ fn validate_client_proxy_config(
             validate_client_proxy_config(&mut ws_config.protocol, named_pems)?;
         }
 
+        ClientProxyConfig::AmneziaWg(awg_config) => {
+            validate_amneziawg_config(awg_config)?;
+        }
+
         _ => {}
     }
     Ok(())
+}
+
+fn validate_amneziawg_config(
+    config: &super::types::AmneziaWgClientConfig,
+) -> std::io::Result<()> {
+    // Validate private key (base64 -> 32 bytes)
+    validate_wg_key(&config.private_key, "private_key")?;
+    validate_wg_key(&config.peer_public_key, "peer_public_key")?;
+    if let Some(ref psk) = config.preshared_key {
+        validate_wg_key(psk, "preshared_key")?;
+    }
+
+    // Validate local_addresses are valid IP prefixes
+    for addr_str in config.local_addresses.iter() {
+        parse_ip_prefix(addr_str).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("AmneziaWG invalid local_address '{}': {}", addr_str, e),
+            )
+        })?;
+    }
+
+    // Validate allowed_ips
+    for ip_str in config.allowed_ips.iter() {
+        parse_ip_prefix(ip_str).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("AmneziaWG invalid allowed_ip '{}': {}", ip_str, e),
+            )
+        })?;
+    }
+
+    // Validate MTU
+    if config.mtu < 576 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "AmneziaWG mtu {} is too small (minimum 576)",
+                config.mtu
+            ),
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_wg_key(key_b64: &str, field_name: &str) -> std::io::Result<()> {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(key_b64)
+        .map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("AmneziaWG {}: invalid base64: {}", field_name, e),
+            )
+        })?;
+    if bytes.len() != 32 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "AmneziaWG {}: key must be 32 bytes, got {}",
+                field_name,
+                bytes.len()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn parse_ip_prefix(s: &str) -> Result<(std::net::IpAddr, u8), String> {
+    if let Some((addr_str, prefix_str)) = s.split_once('/') {
+        let addr: std::net::IpAddr = addr_str
+            .parse()
+            .map_err(|e| format!("invalid IP address: {}", e))?;
+        let prefix: u8 = prefix_str
+            .parse()
+            .map_err(|e| format!("invalid prefix length: {}", e))?;
+        let max_prefix = if addr.is_ipv4() { 32 } else { 128 };
+        if prefix > max_prefix {
+            return Err(format!(
+                "prefix length {} exceeds maximum {} for {}",
+                prefix,
+                max_prefix,
+                if addr.is_ipv4() { "IPv4" } else { "IPv6" }
+            ));
+        }
+        Ok((addr, prefix))
+    } else {
+        // Allow bare IP address (treat as /32 or /128)
+        let addr: std::net::IpAddr = s
+            .parse()
+            .map_err(|e| format!("invalid IP address or CIDR: {}", e))?;
+        let prefix = if addr.is_ipv4() { 32 } else { 128 };
+        Ok((addr, prefix))
+    }
 }
 
 fn validate_server_proxy_config(
@@ -1317,6 +1439,8 @@ fn validate_rule_config(
             expand_client_chain(&mut chain.hops, client_groups)?;
             // Validate that direct connectors only appear at hop 0
             validate_direct_connector_positions(&chain.hops, chain_index)?;
+            // Validate AmneziaWG is the only hop in its chain
+            validate_amneziawg_chain_position(&chain.hops, chain_index)?;
         }
     }
 
@@ -1367,6 +1491,71 @@ fn validate_direct_connector_positions(
                 ),
             ));
         }
+    }
+
+    Ok(())
+}
+
+/// Validates that AmneziaWG is only used as a single-hop terminal outbound.
+/// AmneziaWG is a virtual network tunnel, not a stream wrapper, so it cannot
+/// be mixed with other hops in a chain.
+fn validate_amneziawg_chain_position(
+    hops: &OneOrSome<ClientChainHop>,
+    chain_index: usize,
+) -> std::io::Result<()> {
+    let has_amneziawg = hops.iter().any(|hop| {
+        let configs = match hop {
+            ClientChainHop::Single(ConfigSelection::Config(config)) => {
+                vec![config]
+            }
+            ClientChainHop::Pool(selections) => selections
+                .iter()
+                .filter_map(|s| match s {
+                    ConfigSelection::Config(config) => Some(config),
+                    _ => None,
+                })
+                .collect(),
+            _ => vec![],
+        };
+        configs.iter().any(|c| c.protocol.is_amneziawg())
+    });
+
+    if !has_amneziawg {
+        return Ok(());
+    }
+
+    // AmneziaWG must be the only hop
+    if hops.iter().count() != 1 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "Chain {}: AmneziaWG must be the only hop in a chain. \
+                 Multi-hop chains with AmneziaWG are not supported.",
+                chain_index
+            ),
+        ));
+    }
+
+    // In a pool at hop 0, all entries must be AmneziaWG (no mixing with other protocols)
+    let hop = hops.iter().next().unwrap();
+    match hop {
+        ClientChainHop::Pool(selections) => {
+            let all_awg = selections.iter().all(|s| match s {
+                ConfigSelection::Config(config) => config.protocol.is_amneziawg(),
+                _ => false,
+            });
+            if !all_awg {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "Chain {}: AmneziaWG cannot be mixed with other protocols in a pool. \
+                         All entries in a pool must be AmneziaWG, or none of them.",
+                        chain_index
+                    ),
+                ));
+            }
+        }
+        _ => {}
     }
 
     Ok(())

@@ -358,6 +358,10 @@ pub fn create_tcp_client_handler(
         } => Box::new(NaiveProxyTcpClientHandler::new(
             &username, &password, padding,
         )),
+        ClientProxyConfig::AmneziaWg(..) => {
+            panic!("AmneziaWG is a virtual network outbound and should not use TcpClientHandler. \
+                    It must be handled as a VirtualNetworkConnector in the chain builder.")
+        }
     }
 }
 

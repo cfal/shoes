@@ -27,7 +27,8 @@ pub mod tun;
 // Re-export all public types for convenience
 #[allow(unused_imports)]
 pub use client::{
-    ClientConfig, ClientProxyConfig, H2MuxConfig, TlsClientConfig, WebsocketClientConfig,
+    AmneziaWg2Config, AmneziaWgClientConfig, ClientConfig, ClientProxyConfig, H2MuxConfig,
+    TlsClientConfig, WebsocketClientConfig,
 };
 pub use common::DEFAULT_REALITY_SHORT_ID;
 pub use dns::{DnsConfig, DnsConfigGroup, DnsServerSpec, ExpandedDnsGroup, ExpandedDnsSpec};
