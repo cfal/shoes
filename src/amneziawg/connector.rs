@@ -1,29 +1,119 @@
 //! AmneziaWG virtual network connector implementation.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use log::{debug, info};
+use tokio::sync::{Mutex, mpsc, oneshot};
 
-use crate::address::{NetLocation, ResolvedLocation};
+use crate::address::{Address, NetLocation, ResolvedLocation};
 use crate::async_stream::AsyncMessageStream;
 use crate::config::AmneziaWgClientConfig;
-use crate::resolver::Resolver;
+use crate::resolver::{self, Resolver};
 use crate::tcp::tcp_handler::TcpClientSetupResult;
 use crate::tcp::virtual_network_connector::VirtualNetworkConnector;
+
+use super::config::AwgRuntimeConfig;
+use super::netstack::{NetStackRequest, VirtualNetStack};
+use super::tunnel::TunnelRuntime;
+
+/// State of the lazily-initialized tunnel.
+struct TunnelState {
+    _runtime: Arc<TunnelRuntime>,
+    request_tx: mpsc::Sender<NetStackRequest>,
+}
 
 /// AmneziaWG virtual network connector.
 ///
 /// Owns a long-lived AmneziaWG tunnel and exposes TCP/UDP dialing through
 /// its virtual network stack. The tunnel is initialized lazily on first use.
-#[derive(Debug)]
 pub struct AmneziaWgConnector {
     config: AmneziaWgClientConfig,
     endpoint: NetLocation,
+    state: Mutex<Option<TunnelState>>,
+}
+
+impl std::fmt::Debug for AmneziaWgConnector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AmneziaWgConnector")
+            .field("endpoint", &self.endpoint)
+            .finish()
+    }
 }
 
 impl AmneziaWgConnector {
     pub fn new(config: AmneziaWgClientConfig, endpoint: NetLocation) -> Self {
-        Self { config, endpoint }
+        Self {
+            config,
+            endpoint,
+            state: Mutex::new(None),
+        }
+    }
+
+    /// Ensure the tunnel is initialized, returning the request channel.
+    async fn ensure_initialized(
+        &self,
+        resolver: &Arc<dyn Resolver>,
+    ) -> std::io::Result<mpsc::Sender<NetStackRequest>> {
+        let mut state = self.state.lock().await;
+        if let Some(ref s) = *state {
+            return Ok(s.request_tx.clone());
+        }
+
+        info!("AmneziaWG: initializing tunnel to {}", self.endpoint);
+
+        // Parse config
+        let runtime_config = AwgRuntimeConfig::from_client_config(&self.config)?;
+
+        // Resolve endpoint
+        let endpoint_addr = resolve_endpoint(resolver, &self.endpoint).await?;
+
+        // Start tunnel runtime (UDP socket + boringtun)
+        let tunnel_runtime = TunnelRuntime::start(
+            runtime_config.private_key,
+            runtime_config.peer_public_key,
+            runtime_config.preshared_key,
+            runtime_config.persistent_keepalive,
+            runtime_config.amnezia,
+            endpoint_addr,
+        )
+        .await?;
+
+        // Take the IP-from-tunnel receiver
+        let ip_from_tunnel_rx = tunnel_runtime
+            .ip_from_tunnel_rx
+            .lock()
+            .take()
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "AmneziaWG tunnel already initialized",
+                )
+            })?;
+
+        // Create netstack
+        let netstack = VirtualNetStack::new(
+            &runtime_config.local_addresses,
+            runtime_config.mtu,
+            tunnel_runtime.ip_to_tunnel_tx.clone(),
+            ip_from_tunnel_rx,
+        );
+
+        // Create request channel
+        let (request_tx, request_rx) = mpsc::channel::<NetStackRequest>(64);
+
+        // Spawn netstack polling task
+        tokio::spawn(async move {
+            netstack.run(request_rx).await;
+        });
+
+        *state = Some(TunnelState {
+            _runtime: tunnel_runtime,
+            request_tx: request_tx.clone(),
+        });
+
+        Ok(request_tx)
     }
 }
 
@@ -31,23 +121,102 @@ impl AmneziaWgConnector {
 impl VirtualNetworkConnector for AmneziaWgConnector {
     async fn connect_tcp(
         &self,
-        _resolver: &Arc<dyn Resolver>,
-        _target: ResolvedLocation,
+        resolver: &Arc<dyn Resolver>,
+        target: ResolvedLocation,
     ) -> std::io::Result<TcpClientSetupResult> {
+        let request_tx = self.ensure_initialized(resolver).await?;
+
+        // Resolve target to SocketAddr
+        let target_addr = resolve_target(resolver, &target).await?;
+
+        debug!("AmneziaWG: TCP connect to {}", target_addr);
+
+        // Send connect request to netstack
+        let (reply_tx, reply_rx) = oneshot::channel();
+        request_tx
+            .send(NetStackRequest::ConnectTcp {
+                target: target_addr,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "AmneziaWG netstack task stopped",
+                )
+            })?;
+
+        let _stream = reply_rx.await.map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "AmneziaWG netstack did not reply",
+            )
+        })??;
+
+        // TODO: Wrap VirtualTcpStream into AsyncStream for the caller
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
-            "AmneziaWG TCP support not yet implemented",
+            "AmneziaWG TCP stream wrapping not yet fully implemented",
         ))
     }
 
     async fn connect_udp_bidirectional(
         &self,
-        _resolver: &Arc<dyn Resolver>,
-        _target: ResolvedLocation,
+        resolver: &Arc<dyn Resolver>,
+        target: ResolvedLocation,
     ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
+        let request_tx = self.ensure_initialized(resolver).await?;
+
+        let target_addr = resolve_target(resolver, &target).await?;
+
+        debug!("AmneziaWG: UDP connect to {}", target_addr);
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        request_tx
+            .send(NetStackRequest::ConnectUdp {
+                target: target_addr,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "AmneziaWG netstack task stopped",
+                )
+            })?;
+
+        let _session = reply_rx.await.map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "AmneziaWG netstack did not reply",
+            )
+        })??;
+
+        // TODO: Wrap VirtualUdpSession into AsyncMessageStream
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
-            "AmneziaWG UDP support not yet implemented",
+            "AmneziaWG UDP stream wrapping not yet fully implemented",
         ))
     }
+}
+
+async fn resolve_endpoint(
+    resolver: &Arc<dyn Resolver>,
+    endpoint: &NetLocation,
+) -> std::io::Result<SocketAddr> {
+    let addr = resolver::resolve_single_address(resolver, endpoint).await?;
+    Ok(addr)
+}
+
+async fn resolve_target(
+    resolver: &Arc<dyn Resolver>,
+    target: &ResolvedLocation,
+) -> std::io::Result<SocketAddr> {
+    // If already resolved, use it
+    if let Some(addr) = target.resolved_addr() {
+        return Ok(addr);
+    }
+    let location = target.location();
+    let addr = resolver::resolve_single_address(resolver, location).await?;
+    Ok(addr)
 }
