@@ -56,6 +56,7 @@
 // Modules are declared here (mirroring main.rs) so the library crate can
 // expose them for FFI/mobile integration.
 mod address;
+mod amneziawg;
 mod anytls;
 mod async_stream;
 mod buf_reader;

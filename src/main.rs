@@ -1,4 +1,5 @@
 mod address;
+mod amneziawg;
 mod anytls;
 mod async_stream;
 mod buf_reader;
