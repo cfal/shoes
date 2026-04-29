@@ -25,6 +25,7 @@ use crate::async_stream::AsyncMessageStream;
 use crate::client_proxy_selector::{ClientProxySelector, ConnectDecision};
 use crate::resolver::Resolver;
 
+use super::traffic;
 use super::udp_handler::{UdpMessage, UdpReader, UdpWriter};
 
 /// Session timeout - sessions without activity are expired
@@ -444,6 +445,7 @@ async fn destination_task(
                 if len == 0 {
                     break;
                 }
+                traffic::add_download_bytes(len as u64);
                 sleep.as_mut().reset(Instant::now() + CONNECTION_TIMEOUT);
 
                 debug!(
@@ -471,10 +473,13 @@ async fn destination_task(
             }
             Action::Write(Some(payload)) => {
                 sleep.as_mut().reset(Instant::now() + CONNECTION_TIMEOUT);
+                let payload_len = payload.len() as u64;
 
                 match tokio::time::timeout(WRITE_TIMEOUT, send_message(&mut stream, &payload)).await
                 {
-                    Ok(Ok(())) => {}
+                    Ok(Ok(())) => {
+                        traffic::add_upload_bytes(payload_len);
+                    }
                     Ok(Err(e)) => {
                         debug!(
                             "[TunUdpSession {}] Send error to {}: {}",

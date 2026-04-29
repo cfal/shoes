@@ -30,6 +30,7 @@
 
 mod tcp_conn;
 mod tcp_stack_direct;
+pub mod traffic;
 mod tun_server;
 mod udp_handler;
 mod udp_manager;
@@ -155,6 +156,16 @@ pub async fn run_tun_server(
 
     info!("TUN server started successfully");
 
+    // Periodic traffic stats reporting (every 1 second)
+    let traffic_task = tokio::spawn(async {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
+        interval.tick().await; // skip immediate first tick
+        loop {
+            interval.tick().await;
+            traffic::report_traffic();
+        }
+    });
+
     // Wait for shutdown signal or stack thread exit
     tokio::select! {
         _ = &mut shutdown_rx => {
@@ -169,6 +180,8 @@ pub async fn run_tun_server(
             warn!("Stack thread ended unexpectedly");
         }
     }
+
+    traffic_task.abort();
 
     if let Some(t) = tcp_task {
         t.abort();
@@ -194,7 +207,7 @@ fn socket_addr_to_net_location(addr: SocketAddr) -> NetLocation {
 
 /// Handle a TCP connection by forwarding it through the proxy chain.
 async fn handle_tcp_connection(
-    mut connection: tcp_conn::TcpConnection,
+    connection: tcp_conn::TcpConnection,
     target: NetLocation,
     proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
@@ -222,7 +235,10 @@ async fn handle_tcp_connection(
                     );
 
                     let mut remote = setup_result.client_stream;
-                    let result = tokio::io::copy_bidirectional(&mut connection, &mut remote).await;
+                    // Wrap the local connection with traffic counting so bytes
+                    // are reported in real time, not only after the stream closes.
+                    let mut counting = traffic::TrafficCountingStream::new(connection);
+                    let result = tokio::io::copy_bidirectional(&mut counting, &mut remote).await;
 
                     match result {
                         Ok((client_to_remote, remote_to_client)) => {
