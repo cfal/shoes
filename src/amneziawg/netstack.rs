@@ -3,35 +3,45 @@
 //! Uses smoltcp to provide a virtual TCP/IP stack that emits IP packets
 //! for the AmneziaWG tunnel to encapsulate, and accepts decapsulated
 //! IP packets from the tunnel.
+//!
+//! TCP connections use the TcpConnectionControl ring-buffer+waker pattern
+//! (from tun/tcp_conn.rs) for bridging smoltcp's synchronous sockets to
+//! tokio's async traits.
 
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::io;
+use std::net::{IpAddr, SocketAddr};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll, Waker};
 
-use log::{debug, error, warn};
+use log::{debug, trace, warn};
+use parking_lot::Mutex;
 use smoltcp::iface::{Config as InterfaceConfig, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::socket::tcp::{
-    CongestionControl, Socket as TcpSocket, SocketBuffer as TcpSocketBuffer, State as TcpState,
+    CongestionControl, Socket as SmolTcpSocket, SocketBuffer as TcpSocketBuffer,
+    State as TcpState,
 };
-use smoltcp::socket::udp::{
-    PacketBuffer as UdpPacketBuffer, PacketMetadata as UdpPacketMetadata, Socket as UdpSocket,
-};
-use smoltcp::time::{Duration as SmolDuration, Instant as SmolInstant};
+use smoltcp::socket::udp::Socket as SmolUdpSocket;
+use smoltcp::socket::udp::{PacketBuffer as UdpPacketBuffer, PacketMetadata as UdpPacketMetadata};
+use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, IpEndpoint};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc;
+use tokio::sync::Notify;
 
-use super::tunnel::TunnelRuntime;
+use crate::async_stream::{
+    AsyncFlushMessage, AsyncMessageStream, AsyncPing, AsyncReadMessage, AsyncShutdownMessage,
+    AsyncStream, AsyncWriteMessage,
+};
 
-/// TCP send/recv buffer size.
-const TCP_BUFFER_SIZE: usize = 256 * 1024;
+// ---------------------------------------------------------------------------
+// Virtual smoltcp device
+// ---------------------------------------------------------------------------
 
-/// Virtual device that queues IP packets instead of sending them on a wire.
 struct VirtualDevice {
-    /// Packets received from the tunnel (to inject into smoltcp).
     rx_queue: Vec<Vec<u8>>,
-    /// Packets emitted by smoltcp (to send through the tunnel).
     tx_queue: Vec<Vec<u8>>,
     mtu: usize,
 }
@@ -50,12 +60,14 @@ impl Device for VirtualDevice {
     type RxToken<'a> = VirtualRxToken;
     type TxToken<'a> = VirtualTxToken;
 
-    fn receive(&mut self, _timestamp: SmolInstant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+    fn receive(
+        &mut self,
+        _timestamp: SmolInstant,
+    ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         if self.rx_queue.is_empty() {
             return None;
         }
         let packet = self.rx_queue.remove(0);
-        // Collect tx_queue pointer for deferred push
         Some((
             VirtualRxToken { buffer: packet },
             VirtualTxToken {
@@ -102,8 +114,7 @@ impl TxToken for VirtualTxToken {
     {
         let mut buffer = vec![0u8; len];
         let result = f(&mut buffer);
-        // SAFETY: The tx_queue pointer is valid for the duration of the Device::receive/transmit
-        // call, and VirtualTxToken is consumed within that scope by smoltcp's poll().
+        // SAFETY: pointer is valid for the duration of Device::receive/transmit
         unsafe {
             (*self.tx_queue).push(buffer);
         }
@@ -111,34 +122,92 @@ impl TxToken for VirtualTxToken {
     }
 }
 
-/// Virtual network stack manager.
-///
-/// Runs in a tokio task, polling smoltcp and bridging IP packets
-/// to/from the tunnel runtime.
+// ---------------------------------------------------------------------------
+// TCP: shared control buffer (ring-buffer + waker pattern)
+// ---------------------------------------------------------------------------
+
+const TCP_SEND_BUF: usize = 256 * 1024;
+const TCP_RECV_BUF: usize = 256 * 1024;
+
+/// Shared state between the smoltcp poll loop and the async VirtualTcpStream.
+struct TcpControl {
+    /// Data written by async side, consumed by smoltcp send.
+    send_buf: smoltcp::storage::RingBuffer<'static, u8>,
+    send_waker: Option<Waker>,
+    send_closed: bool,
+
+    /// Data written by smoltcp recv, consumed by async side.
+    recv_buf: smoltcp::storage::RingBuffer<'static, u8>,
+    recv_waker: Option<Waker>,
+    recv_closed: bool,
+}
+
+// ---------------------------------------------------------------------------
+// UDP: shared channel pair
+// ---------------------------------------------------------------------------
+
+struct UdpControl {
+    /// Target endpoint for outgoing packets.
+    target: IpEndpoint,
+    /// Packets to send (async -> smoltcp).
+    outgoing_tx: mpsc::Sender<Vec<u8>>,
+    outgoing_rx: mpsc::Receiver<Vec<u8>>,
+    /// Packets received (smoltcp -> async).
+    incoming_tx: mpsc::Sender<Vec<u8>>,
+    incoming_rx: mpsc::Receiver<Vec<u8>>,
+}
+
+// ---------------------------------------------------------------------------
+// Netstack requests
+// ---------------------------------------------------------------------------
+
+pub enum NetStackRequest {
+    ConnectTcp {
+        target: SocketAddr,
+        reply: tokio::sync::oneshot::Sender<std::io::Result<VirtualTcpStream>>,
+    },
+    ConnectUdp {
+        target: SocketAddr,
+        reply: tokio::sync::oneshot::Sender<std::io::Result<VirtualUdpStream>>,
+    },
+}
+
+// ---------------------------------------------------------------------------
+// Tracking structs inside the poll loop
+// ---------------------------------------------------------------------------
+
+struct ActiveTcp {
+    control: Arc<Mutex<TcpControl>>,
+    notify: Arc<Notify>,
+    connected: bool,
+}
+
+struct ActiveUdp {
+    target: IpEndpoint,
+    outgoing_rx: mpsc::Receiver<Vec<u8>>,
+    incoming_tx: mpsc::Sender<Vec<u8>>,
+}
+
+struct PendingTcp {
+    control: Arc<Mutex<TcpControl>>,
+    notify: Arc<Notify>,
+    reply: tokio::sync::oneshot::Sender<std::io::Result<VirtualTcpStream>>,
+    target: SocketAddr,
+}
+
+// ---------------------------------------------------------------------------
+// VirtualNetStack
+// ---------------------------------------------------------------------------
+
 pub struct VirtualNetStack {
-    /// Send IP packets from smoltcp to tunnel for encapsulation.
     ip_to_tunnel: mpsc::Sender<Vec<u8>>,
-    /// Receive decapsulated IP packets from tunnel.
     ip_from_tunnel: mpsc::Receiver<Vec<u8>>,
-    /// The smoltcp interface.
     iface: Interface,
-    /// The virtual device.
     device: VirtualDevice,
-    /// Socket set.
     sockets: SocketSet<'static>,
-    /// Active TCP connections waiting for completion.
-    pending_tcp: HashMap<SocketHandle, PendingTcpConn>,
-    /// Active UDP sockets.
-    pending_udp: HashMap<SocketHandle, PendingUdpSession>,
-}
-
-struct PendingTcpConn {
-    tx: tokio::sync::oneshot::Sender<std::io::Result<VirtualTcpStream>>,
-    target: SocketAddr,
-}
-
-struct PendingUdpSession {
-    target: SocketAddr,
+    pending_tcp: HashMap<SocketHandle, PendingTcp>,
+    active_tcp: HashMap<SocketHandle, ActiveTcp>,
+    active_udp: HashMap<SocketHandle, ActiveUdp>,
 }
 
 impl VirtualNetStack {
@@ -154,7 +223,6 @@ impl VirtualNetStack {
         config.random_seed = rand::random();
         let mut iface = Interface::new(config, &mut device, SmolInstant::now());
 
-        // Add local addresses to the interface
         let cidrs: Vec<IpCidr> = local_addresses
             .iter()
             .map(|(addr, prefix)| {
@@ -172,7 +240,6 @@ impl VirtualNetStack {
             }
         });
 
-        // Add default routes
         for (addr, _) in local_addresses {
             match addr {
                 IpAddr::V4(_) => {
@@ -192,104 +259,229 @@ impl VirtualNetStack {
             }
         }
 
-        let sockets = SocketSet::new(vec![]);
-
         Self {
             ip_to_tunnel,
             ip_from_tunnel,
             iface,
             device,
-            sockets,
+            sockets: SocketSet::new(vec![]),
             pending_tcp: HashMap::new(),
-            pending_udp: HashMap::new(),
+            active_tcp: HashMap::new(),
+            active_udp: HashMap::new(),
         }
     }
 
-    /// Run the netstack polling loop. This is the main event loop.
+    // ------------------------------------------------------------------
+    // Main event loop
+    // ------------------------------------------------------------------
+
     pub async fn run(mut self, mut conn_rx: mpsc::Receiver<NetStackRequest>) {
         let mut poll_interval = tokio::time::interval(std::time::Duration::from_millis(1));
 
         loop {
             tokio::select! {
-                // Process new connection requests
                 request = conn_rx.recv() => {
                     match request {
                         Some(NetStackRequest::ConnectTcp { target, reply }) => {
-                            self.initiate_tcp_connect(target, reply);
+                            self.initiate_tcp(target, reply);
                         }
                         Some(NetStackRequest::ConnectUdp { target, reply }) => {
-                            self.initiate_udp_connect(target, reply);
+                            self.initiate_udp(target, reply);
                         }
                         None => {
-                            debug!("AmneziaWG netstack: request channel closed, stopping");
+                            debug!("AmneziaWG netstack: request channel closed");
                             break;
                         }
                     }
                 }
-                // Receive decapsulated IP packets from tunnel
                 Some(packet) = self.ip_from_tunnel.recv() => {
                     self.device.rx_queue.push(packet);
                 }
-                // Periodic poll
                 _ = poll_interval.tick() => {}
             }
 
             // Poll smoltcp
             let now = SmolInstant::now();
-            let changed = self.iface.poll(now, &mut self.device, &mut self.sockets);
+            self.iface.poll(now, &mut self.device, &mut self.sockets);
 
-            // Send any outbound IP packets to the tunnel
+            // Flush outbound IP packets to tunnel
             for packet in self.device.tx_queue.drain(..) {
                 if self.ip_to_tunnel.try_send(packet).is_err() {
-                    warn!("AmneziaWG netstack: tunnel TX channel full, dropping packet");
+                    warn!("AmneziaWG netstack: tunnel TX full, dropping packet");
                 }
             }
 
-            // Check TCP connection states
-            self.check_tcp_connections();
+            // Service TCP connections
+            self.service_pending_tcp();
+            self.service_active_tcp();
+
+            // Service UDP sockets
+            self.service_active_udp();
         }
     }
 
-    fn initiate_tcp_connect(
+    // ------------------------------------------------------------------
+    // TCP initiation
+    // ------------------------------------------------------------------
+
+    fn initiate_tcp(
         &mut self,
         target: SocketAddr,
         reply: tokio::sync::oneshot::Sender<std::io::Result<VirtualTcpStream>>,
     ) {
-        let mut rx_buf = TcpSocketBuffer::new(vec![0u8; TCP_BUFFER_SIZE]);
-        let mut tx_buf = TcpSocketBuffer::new(vec![0u8; TCP_BUFFER_SIZE]);
-        let mut socket = TcpSocket::new(rx_buf, tx_buf);
+        let rx_buf = TcpSocketBuffer::new(vec![0u8; TCP_SEND_BUF]);
+        let tx_buf = TcpSocketBuffer::new(vec![0u8; TCP_RECV_BUF]);
+        let mut socket = SmolTcpSocket::new(rx_buf, tx_buf);
         socket.set_nagle_enabled(false);
         socket.set_congestion_control(CongestionControl::Cubic);
 
         let local_port = allocate_ephemeral_port();
-        let remote = IpEndpoint::new(
-            match target.ip() {
-                IpAddr::V4(v4) => IpAddress::Ipv4(smoltcp::wire::Ipv4Address::from(v4)),
-                IpAddr::V6(v6) => IpAddress::Ipv6(smoltcp::wire::Ipv6Address::from(v6)),
-            },
-            target.port(),
-        );
+        let remote = to_smol_endpoint(target);
 
-        if let Err(e) = socket.connect(
-            self.iface.context(),
-            remote,
-            local_port,
-        ) {
-            let _ = reply.send(Err(std::io::Error::new(
-                std::io::ErrorKind::ConnectionRefused,
-                format!("smoltcp connect error: {}", e),
+        if let Err(e) = socket.connect(self.iface.context(), remote, local_port) {
+            let _ = reply.send(Err(io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                format!("smoltcp connect: {}", e),
             )));
             return;
         }
 
+        let control = Arc::new(Mutex::new(TcpControl {
+            send_buf: smoltcp::storage::RingBuffer::new(vec![0u8; TCP_SEND_BUF]),
+            send_waker: None,
+            send_closed: false,
+            recv_buf: smoltcp::storage::RingBuffer::new(vec![0u8; TCP_RECV_BUF]),
+            recv_waker: None,
+            recv_closed: false,
+        }));
+        let notify = Arc::new(Notify::new());
+
         let handle = self.sockets.add(socket);
-        self.pending_tcp.insert(handle, PendingTcpConn { tx: reply, target });
+        self.pending_tcp.insert(
+            handle,
+            PendingTcp {
+                control,
+                notify,
+                reply,
+                target,
+            },
+        );
     }
 
-    fn initiate_udp_connect(
+    fn service_pending_tcp(&mut self) {
+        let mut completed = Vec::new();
+
+        for (handle, pending) in &self.pending_tcp {
+            let socket = self.sockets.get::<SmolTcpSocket>(*handle);
+            match socket.state() {
+                TcpState::Established => completed.push((*handle, true)),
+                TcpState::Closed | TcpState::TimeWait => completed.push((*handle, false)),
+                _ => {}
+            }
+        }
+
+        for (handle, success) in completed {
+            let pending = self.pending_tcp.remove(&handle).unwrap();
+            if success {
+                let stream = VirtualTcpStream {
+                    control: pending.control.clone(),
+                    notify: pending.notify.clone(),
+                };
+                self.active_tcp.insert(
+                    handle,
+                    ActiveTcp {
+                        control: pending.control,
+                        notify: pending.notify,
+                        connected: true,
+                    },
+                );
+                let _ = pending.reply.send(Ok(stream));
+            } else {
+                let _ = pending.reply.send(Err(io::Error::new(
+                    io::ErrorKind::ConnectionRefused,
+                    format!("TCP to {} failed", pending.target),
+                )));
+                self.sockets.remove(handle);
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // TCP data transfer
+    // ------------------------------------------------------------------
+
+    fn service_active_tcp(&mut self) {
+        let mut to_remove = Vec::new();
+
+        for (handle, active) in &self.active_tcp {
+            let socket = self.sockets.get_mut::<SmolTcpSocket>(*handle);
+            let mut ctrl = active.control.lock();
+
+            // smoltcp recv -> ctrl.recv_buf (data for the async reader)
+            if socket.can_recv() && !ctrl.recv_buf.is_full() {
+                let _ = socket.recv(|data| {
+                    let n = ctrl.recv_buf.enqueue_slice(data);
+                    (n, ())
+                });
+                // Wake the async reader
+                if let Some(w) = ctrl.recv_waker.take() {
+                    w.wake();
+                }
+            }
+
+            // ctrl.send_buf -> smoltcp send (data from the async writer)
+            if socket.can_send() && !ctrl.send_buf.is_empty() {
+                let _ = socket.send(|buf| {
+                    let n = ctrl.send_buf.dequeue_slice(buf);
+                    (n, ())
+                });
+                // Wake the async writer (buffer space freed)
+                if let Some(w) = ctrl.send_waker.take() {
+                    w.wake();
+                }
+            }
+
+            // Handle send-side close: async side requested shutdown
+            if ctrl.send_closed && ctrl.send_buf.is_empty() && socket.send_queue() == 0 {
+                socket.close();
+            }
+
+            // Detect recv-side close from remote
+            if !socket.may_recv() && !ctrl.recv_closed {
+                ctrl.recv_closed = true;
+                if let Some(w) = ctrl.recv_waker.take() {
+                    w.wake();
+                }
+            }
+
+            // Detect fully closed
+            if socket.state() == TcpState::Closed || socket.state() == TcpState::TimeWait {
+                ctrl.recv_closed = true;
+                ctrl.send_closed = true;
+                if let Some(w) = ctrl.recv_waker.take() {
+                    w.wake();
+                }
+                if let Some(w) = ctrl.send_waker.take() {
+                    w.wake();
+                }
+                to_remove.push(*handle);
+            }
+        }
+
+        for handle in to_remove {
+            self.active_tcp.remove(&handle);
+            self.sockets.remove(handle);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // UDP initiation + data transfer
+    // ------------------------------------------------------------------
+
+    fn initiate_udp(
         &mut self,
         target: SocketAddr,
-        reply: tokio::sync::oneshot::Sender<std::io::Result<VirtualUdpSession>>,
+        reply: tokio::sync::oneshot::Sender<std::io::Result<VirtualUdpStream>>,
     ) {
         let rx_buf = UdpPacketBuffer::new(
             vec![UdpPacketMetadata::EMPTY; 64],
@@ -299,110 +491,259 @@ impl VirtualNetStack {
             vec![UdpPacketMetadata::EMPTY; 64],
             vec![0u8; 65536],
         );
-        let mut socket = UdpSocket::new(rx_buf, tx_buf);
+        let mut socket = SmolUdpSocket::new(rx_buf, tx_buf);
 
         let local_port = allocate_ephemeral_port();
         if let Err(e) = socket.bind(local_port) {
-            let _ = reply.send(Err(std::io::Error::new(
-                std::io::ErrorKind::AddrInUse,
-                format!("smoltcp UDP bind error: {}", e),
+            let _ = reply.send(Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                format!("smoltcp UDP bind: {}", e),
             )));
             return;
         }
 
         let handle = self.sockets.add(socket);
+        let endpoint = to_smol_endpoint(target);
 
-        // Create the UDP session with channels
-        let (send_tx, send_rx) = mpsc::channel::<Vec<u8>>(128);
-        let (recv_tx, recv_rx) = mpsc::channel::<Vec<u8>>(128);
+        let (outgoing_tx, outgoing_rx) = mpsc::channel::<Vec<u8>>(128);
+        let (incoming_tx, incoming_rx) = mpsc::channel::<Vec<u8>>(128);
 
-        self.pending_udp.insert(handle, PendingUdpSession { target });
-
-        let session = VirtualUdpSession {
+        self.active_udp.insert(
             handle,
-            target,
-            send_tx,
-            recv_rx,
+            ActiveUdp {
+                target: endpoint,
+                outgoing_rx,
+                incoming_tx,
+            },
+        );
+
+        let stream = VirtualUdpStream {
+            send_tx: outgoing_tx,
+            recv_rx: incoming_rx,
         };
 
-        let _ = reply.send(Ok(session));
+        let _ = reply.send(Ok(stream));
     }
 
-    fn check_tcp_connections(&mut self) {
-        let mut completed = Vec::new();
+    fn service_active_udp(&mut self) {
+        let mut to_remove = Vec::new();
 
-        for (handle, pending) in &self.pending_tcp {
-            let socket = self.sockets.get::<TcpSocket>(*handle);
-            match socket.state() {
-                TcpState::Established => {
-                    completed.push(*handle);
+        for (handle, active) in &mut self.active_udp {
+            let socket = self.sockets.get_mut::<SmolUdpSocket>(*handle);
+
+            // Drain outgoing packets from async side -> smoltcp send
+            while let Ok(data) = active.outgoing_rx.try_recv() {
+                if socket.can_send() {
+                    if let Err(e) = socket.send_slice(&data, active.target) {
+                        debug!("AmneziaWG UDP send error: {}", e);
+                    }
                 }
-                TcpState::Closed | TcpState::Closing | TcpState::TimeWait => {
-                    completed.push(*handle);
+            }
+
+            // Drain incoming packets from smoltcp recv -> async side
+            while socket.can_recv() {
+                match socket.recv() {
+                    Ok((data, _endpoint)) => {
+                        let _ = active.incoming_tx.try_send(data.to_vec());
+                    }
+                    Err(_) => break,
                 }
-                _ => {}
+            }
+
+            // If the sender was dropped, mark for cleanup
+            if active.outgoing_rx.is_closed() && active.incoming_tx.is_closed() {
+                to_remove.push(*handle);
             }
         }
 
-        for handle in completed {
-            if let Some(pending) = self.pending_tcp.remove(&handle) {
-                let socket = self.sockets.get::<TcpSocket>(handle);
-                if socket.state() == TcpState::Established {
-                    // Create channels for the TCP stream
-                    let (send_tx, send_rx) = mpsc::channel::<Vec<u8>>(64);
-                    let (recv_tx, recv_rx) = mpsc::channel::<Vec<u8>>(64);
-
-                    let stream = VirtualTcpStream {
-                        handle,
-                        send_tx,
-                        recv_rx,
-                    };
-
-                    let _ = pending.tx.send(Ok(stream));
-                } else {
-                    let _ = pending.tx.send(Err(std::io::Error::new(
-                        std::io::ErrorKind::ConnectionRefused,
-                        format!(
-                            "TCP connection to {} failed (state: {:?})",
-                            pending.target,
-                            socket.state()
-                        ),
-                    )));
-                    self.sockets.remove(handle);
-                }
-            }
+        for handle in to_remove {
+            self.active_udp.remove(&handle);
+            self.sockets.remove(handle);
         }
     }
 }
 
-/// Request to the netstack.
-pub enum NetStackRequest {
-    ConnectTcp {
-        target: SocketAddr,
-        reply: tokio::sync::oneshot::Sender<std::io::Result<VirtualTcpStream>>,
-    },
-    ConnectUdp {
-        target: SocketAddr,
-        reply: tokio::sync::oneshot::Sender<std::io::Result<VirtualUdpSession>>,
-    },
-}
+// ---------------------------------------------------------------------------
+// VirtualTcpStream: AsyncRead + AsyncWrite + AsyncPing => AsyncStream
+// ---------------------------------------------------------------------------
 
-/// A virtual TCP stream backed by a smoltcp TCP socket.
 pub struct VirtualTcpStream {
-    handle: SocketHandle,
+    control: Arc<Mutex<TcpControl>>,
+    notify: Arc<Notify>,
+}
+
+impl AsyncRead for VirtualTcpStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let mut ctrl = self.control.lock();
+
+        if !ctrl.recv_buf.is_empty() {
+            let unfilled = buf.initialize_unfilled();
+            let n = ctrl.recv_buf.dequeue_slice(unfilled);
+            buf.advance(n);
+            // Notify netstack that buffer space is available
+            drop(ctrl);
+            self.notify.notify_waiters();
+            return Poll::Ready(Ok(()));
+        }
+
+        if ctrl.recv_closed {
+            return Poll::Ready(Ok(())); // EOF
+        }
+
+        // Register waker
+        ctrl.recv_waker = Some(cx.waker().clone());
+        Poll::Pending
+    }
+}
+
+impl AsyncWrite for VirtualTcpStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let mut ctrl = self.control.lock();
+
+        if ctrl.send_closed {
+            return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
+        }
+
+        if !ctrl.send_buf.is_full() {
+            let n = ctrl.send_buf.enqueue_slice(buf);
+            drop(ctrl);
+            self.notify.notify_waiters();
+            return Poll::Ready(Ok(n));
+        }
+
+        ctrl.send_waker = Some(cx.waker().clone());
+        Poll::Pending
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let mut ctrl = self.control.lock();
+        ctrl.send_closed = true;
+        drop(ctrl);
+        self.notify.notify_waiters();
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl AsyncPing for VirtualTcpStream {
+    fn supports_ping(&self) -> bool {
+        false
+    }
+    fn poll_write_ping(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
+        Poll::Ready(Ok(false))
+    }
+}
+
+impl Unpin for VirtualTcpStream {}
+unsafe impl Send for VirtualTcpStream {}
+unsafe impl Sync for VirtualTcpStream {}
+
+impl AsyncStream for VirtualTcpStream {}
+
+// ---------------------------------------------------------------------------
+// VirtualUdpStream: AsyncMessageStream
+// ---------------------------------------------------------------------------
+
+pub struct VirtualUdpStream {
     send_tx: mpsc::Sender<Vec<u8>>,
     recv_rx: mpsc::Receiver<Vec<u8>>,
 }
 
-/// A virtual UDP session backed by a smoltcp UDP socket.
-pub struct VirtualUdpSession {
-    handle: SocketHandle,
-    target: SocketAddr,
-    send_tx: mpsc::Sender<Vec<u8>>,
-    recv_rx: mpsc::Receiver<Vec<u8>>,
+impl AsyncReadMessage for VirtualUdpStream {
+    fn poll_read_message(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        match this.recv_rx.poll_recv(cx) {
+            Poll::Ready(Some(data)) => {
+                let unfilled = buf.initialize_unfilled();
+                let n = data.len().min(unfilled.len());
+                unfilled[..n].copy_from_slice(&data[..n]);
+                buf.advance(n);
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(None) => Poll::Ready(Err(io::ErrorKind::BrokenPipe.into())),
+            Poll::Pending => Poll::Pending,
+        }
+    }
 }
 
-/// Port allocator for ephemeral ports.
+impl AsyncWriteMessage for VirtualUdpStream {
+    fn poll_write_message(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        match this.send_tx.try_send(buf.to_vec()) {
+            Ok(()) => Poll::Ready(Ok(())),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                // Drop the packet — UDP is lossy
+                warn!("AmneziaWG: UDP send buffer full, dropping packet");
+                Poll::Ready(Ok(()))
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()))
+            }
+        }
+    }
+}
+
+impl AsyncFlushMessage for VirtualUdpStream {
+    fn poll_flush_message(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl AsyncShutdownMessage for VirtualUdpStream {
+    fn poll_shutdown_message(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl AsyncPing for VirtualUdpStream {
+    fn supports_ping(&self) -> bool {
+        false
+    }
+    fn poll_write_ping(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
+        Poll::Ready(Ok(false))
+    }
+}
+
+impl Unpin for VirtualUdpStream {}
+
+impl AsyncMessageStream for VirtualUdpStream {}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn to_smol_endpoint(addr: SocketAddr) -> IpEndpoint {
+    IpEndpoint::new(
+        match addr.ip() {
+            IpAddr::V4(v4) => IpAddress::Ipv4(smoltcp::wire::Ipv4Address::from(v4)),
+            IpAddr::V6(v6) => IpAddress::Ipv6(smoltcp::wire::Ipv6Address::from(v6)),
+        },
+        addr.port(),
+    )
+}
+
 static NEXT_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(40000);
 
 fn allocate_ephemeral_port() -> u16 {
