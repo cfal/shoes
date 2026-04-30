@@ -53,19 +53,18 @@ pub fn build_client_proxy_chain(
         panic!("Client chain must have at least one hop");
     }
 
-    // Check if this is an AmneziaWG virtual network chain.
-    // AmneziaWG must be a single hop (validated during config validation).
+    // Check if this is a virtual network tunnel chain (WireGuard/AmneziaWG).
+    // Must be a single hop (validated during config validation).
     if hops.len() == 1
         && hops[0].len() == 1
-        && hops[0][0].protocol.is_amneziawg()
+        && hops[0][0].protocol.is_virtual_network()
     {
         let config = hops.into_iter().next().unwrap().into_iter().next().unwrap();
-        if let ClientProxyConfig::AmneziaWg(awg_config) = config.protocol {
-            let connector =
-                crate::amneziawg::AmneziaWgConnector::new(awg_config, config.address);
-            return ClientProxyChain::new_virtual(std::sync::Arc::new(connector));
-        }
-        unreachable!();
+        let connector = crate::amneziawg::AmneziaWgConnector::from_client_config(
+            config.protocol,
+            config.address,
+        );
+        return ClientProxyChain::new_virtual(std::sync::Arc::new(connector));
     }
 
     // Build initial hop entries from hop 0.

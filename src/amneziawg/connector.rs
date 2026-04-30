@@ -9,7 +9,7 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 
 use crate::address::{NetLocation, ResolvedLocation};
 use crate::async_stream::AsyncMessageStream;
-use crate::config::AmneziaWgClientConfig;
+use crate::config::{AmneziaWgClientConfig, ClientProxyConfig, WireGuardClientConfig};
 use crate::resolver::{self, Resolver};
 use crate::tcp::tcp_handler::TcpClientSetupResult;
 use crate::tcp::virtual_network_connector::VirtualNetworkConnector;
@@ -23,8 +23,16 @@ struct TunnelState {
     request_tx: mpsc::Sender<NetStackRequest>,
 }
 
+/// Tunnel protocol variant for display purposes.
+#[derive(Debug, Clone, Copy)]
+enum TunnelProtocol {
+    WireGuard,
+    AmneziaWg,
+}
+
 pub struct AmneziaWgConnector {
     config: AmneziaWgClientConfig,
+    protocol: TunnelProtocol,
     endpoint: NetLocation,
     state: Mutex<Option<TunnelState>>,
 }
@@ -32,15 +40,63 @@ pub struct AmneziaWgConnector {
 impl std::fmt::Debug for AmneziaWgConnector {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AmneziaWgConnector")
+            .field("protocol", &self.protocol)
             .field("endpoint", &self.endpoint)
             .finish()
     }
 }
 
 impl AmneziaWgConnector {
-    pub fn new(config: AmneziaWgClientConfig, endpoint: NetLocation) -> Self {
+    /// Create from a `ClientProxyConfig::Wireguard` or `ClientProxyConfig::AmneziaWg`.
+    pub fn from_client_config(proxy_config: ClientProxyConfig, endpoint: NetLocation) -> Self {
+        match proxy_config {
+            ClientProxyConfig::Wireguard(wg) => Self::from_wireguard(wg, endpoint),
+            ClientProxyConfig::AmneziaWg(awg) => Self::from_amneziawg(awg, endpoint),
+            _ => panic!("AmneziaWgConnector: expected Wireguard or AmneziaWg config"),
+        }
+    }
+
+    fn from_amneziawg(config: AmneziaWgClientConfig, endpoint: NetLocation) -> Self {
         Self {
             config,
+            protocol: TunnelProtocol::AmneziaWg,
+            endpoint,
+            state: Mutex::new(None),
+        }
+    }
+
+    fn from_wireguard(wg: WireGuardClientConfig, endpoint: NetLocation) -> Self {
+        // Convert WireGuard config to AmneziaWG config with default (no-op) obfuscation
+        let config = AmneziaWgClientConfig {
+            private_key: wg.private_key,
+            peer_public_key: wg.peer_public_key,
+            preshared_key: wg.preshared_key,
+            local_addresses: wg.local_addresses,
+            allowed_ips: wg.allowed_ips,
+            persistent_keepalive: wg.persistent_keepalive,
+            mtu: wg.mtu,
+            awg: crate::config::AmneziaWg2Config {
+                jc: 0,
+                jmin: 0,
+                jmax: 0,
+                s1: 0,
+                s2: 0,
+                s3: 0,
+                s4: 0,
+                h1: "1".to_string(),
+                h2: "2".to_string(),
+                h3: "3".to_string(),
+                h4: "4".to_string(),
+                i1: None,
+                i2: None,
+                i3: None,
+                i4: None,
+                i5: None,
+            },
+        };
+        Self {
+            config,
+            protocol: TunnelProtocol::WireGuard,
             endpoint,
             state: Mutex::new(None),
         }
@@ -55,7 +111,7 @@ impl AmneziaWgConnector {
             return Ok(s.request_tx.clone());
         }
 
-        info!("AmneziaWG: initializing tunnel to {}", self.endpoint);
+        info!("{:?}: initializing tunnel to {}", self.protocol, self.endpoint);
 
         let runtime_config = AwgRuntimeConfig::from_client_config(&self.config)?;
         let endpoint_addr = resolver::resolve_single_address(resolver, &self.endpoint).await?;

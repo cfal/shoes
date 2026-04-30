@@ -56,6 +56,22 @@ fn default_amneziawg_mtu() -> u16 {
     1280
 }
 
+/// WireGuard client configuration.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WireGuardClientConfig {
+    pub private_key: String,
+    pub peer_public_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preshared_key: Option<String>,
+    pub local_addresses: OneOrSome<String>,
+    pub allowed_ips: OneOrSome<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persistent_keepalive: Option<u16>,
+    #[serde(default = "default_amneziawg_mtu")]
+    pub mtu: u16,
+}
+
 /// AmneziaWG 2.0 client configuration.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -490,7 +506,10 @@ pub enum ClientProxyConfig {
         #[serde(default = "default_true", skip_serializing_if = "is_true")]
         padding: bool,
     },
-    /// AmneziaWG 2.0 client outbound (UDP-backed L3 tunnel)
+    /// WireGuard client outbound (UDP-backed L3 tunnel)
+    #[serde(alias = "wg")]
+    Wireguard(WireGuardClientConfig),
+    /// AmneziaWG 2.0 client outbound (UDP-backed L3 tunnel with obfuscation)
     #[serde(alias = "awg")]
     AmneziaWg(AmneziaWgClientConfig),
 }
@@ -500,8 +519,12 @@ impl ClientProxyConfig {
         matches!(self, ClientProxyConfig::Direct)
     }
 
-    pub fn is_amneziawg(&self) -> bool {
-        matches!(self, ClientProxyConfig::AmneziaWg(_))
+    /// Returns true for protocols that use a virtual network tunnel (WireGuard/AmneziaWG).
+    pub fn is_virtual_network(&self) -> bool {
+        matches!(
+            self,
+            ClientProxyConfig::Wireguard(_) | ClientProxyConfig::AmneziaWg(_)
+        )
     }
 
     /// Returns the protocol name for display/error messages
@@ -522,6 +545,7 @@ impl ClientProxyConfig {
             ClientProxyConfig::PortForward => "PortForward",
             ClientProxyConfig::Anytls { .. } => "AnyTLS",
             ClientProxyConfig::Naiveproxy { .. } => "NaiveProxy",
+            ClientProxyConfig::Wireguard(..) => "WireGuard",
             ClientProxyConfig::AmneziaWg(..) => "AmneziaWG",
         }
     }

@@ -912,25 +912,25 @@ fn validate_client_config(
         ));
     }
 
-    // AmneziaWG uses its own UDP transport; reject incompatible settings
-    if client_config.protocol.is_amneziawg() {
+    // WireGuard/AmneziaWG use their own UDP transport; reject incompatible settings
+    if client_config.protocol.is_virtual_network() {
+        let proto = client_config.protocol.protocol_name();
         if client_config.transport != Transport::Tcp {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "AmneziaWG uses its own UDP transport. \
-                 Do not set 'transport' on an AmneziaWG client config.",
+                format!("{proto} uses its own UDP transport. Do not set 'transport'."),
             ));
         }
         if client_config.tcp_settings.is_some() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "tcp_settings is not valid for AmneziaWG protocol.",
+                format!("tcp_settings is not valid for {proto} protocol."),
             ));
         }
         if client_config.quic_settings.is_some() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "quic_settings is not valid for AmneziaWG protocol.",
+                format!("quic_settings is not valid for {proto} protocol."),
             ));
         }
     }
@@ -1003,11 +1003,48 @@ fn validate_client_proxy_config(
             validate_client_proxy_config(&mut ws_config.protocol, named_pems)?;
         }
 
+        ClientProxyConfig::Wireguard(wg_config) => {
+            validate_wireguard_config(wg_config)?;
+        }
+
         ClientProxyConfig::AmneziaWg(awg_config) => {
             validate_amneziawg_config(awg_config)?;
         }
 
         _ => {}
+    }
+    Ok(())
+}
+
+fn validate_wireguard_config(
+    config: &super::types::WireGuardClientConfig,
+) -> std::io::Result<()> {
+    validate_wg_key(&config.private_key, "private_key")?;
+    validate_wg_key(&config.peer_public_key, "peer_public_key")?;
+    if let Some(ref psk) = config.preshared_key {
+        validate_wg_key(psk, "preshared_key")?;
+    }
+    for addr_str in config.local_addresses.iter() {
+        parse_ip_prefix(addr_str).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("WireGuard invalid local_address '{}': {}", addr_str, e),
+            )
+        })?;
+    }
+    for ip_str in config.allowed_ips.iter() {
+        parse_ip_prefix(ip_str).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("WireGuard invalid allowed_ip '{}': {}", ip_str, e),
+            )
+        })?;
+    }
+    if config.mtu < 576 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("WireGuard mtu {} is too small (minimum 576)", config.mtu),
+        ));
     }
     Ok(())
 }
@@ -1496,14 +1533,14 @@ fn validate_direct_connector_positions(
     Ok(())
 }
 
-/// Validates that AmneziaWG is only used as a single-hop terminal outbound.
-/// AmneziaWG is a virtual network tunnel, not a stream wrapper, so it cannot
-/// be mixed with other hops in a chain.
+/// Validates that virtual network tunnels (WireGuard/AmneziaWG) are only used
+/// as a single-hop terminal outbound. They are L3 tunnels, not stream wrappers,
+/// so they cannot be mixed with other hops in a chain.
 fn validate_amneziawg_chain_position(
     hops: &OneOrSome<ClientChainHop>,
     chain_index: usize,
 ) -> std::io::Result<()> {
-    let has_amneziawg = hops.iter().any(|hop| {
+    let has_tunnel = hops.iter().any(|hop| {
         let configs = match hop {
             ClientChainHop::Single(ConfigSelection::Config(config)) => {
                 vec![config]
@@ -1517,39 +1554,36 @@ fn validate_amneziawg_chain_position(
                 .collect(),
             _ => vec![],
         };
-        configs.iter().any(|c| c.protocol.is_amneziawg())
+        configs.iter().any(|c| c.protocol.is_virtual_network())
     });
 
-    if !has_amneziawg {
+    if !has_tunnel {
         return Ok(());
     }
 
-    // AmneziaWG must be the only hop
     if hops.iter().count() != 1 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!(
-                "Chain {}: AmneziaWG must be the only hop in a chain. \
-                 Multi-hop chains with AmneziaWG are not supported.",
+                "Chain {}: WireGuard/AmneziaWG must be the only hop in a chain. \
+                 Multi-hop chains are not supported.",
                 chain_index
             ),
         ));
     }
 
-    // In a pool at hop 0, all entries must be AmneziaWG (no mixing with other protocols)
     let hop = hops.iter().next().unwrap();
     match hop {
         ClientChainHop::Pool(selections) => {
-            let all_awg = selections.iter().all(|s| match s {
-                ConfigSelection::Config(config) => config.protocol.is_amneziawg(),
+            let all_tunnel = selections.iter().all(|s| match s {
+                ConfigSelection::Config(config) => config.protocol.is_virtual_network(),
                 _ => false,
             });
-            if !all_awg {
+            if !all_tunnel {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     format!(
-                        "Chain {}: AmneziaWG cannot be mixed with other protocols in a pool. \
-                         All entries in a pool must be AmneziaWG, or none of them.",
+                        "Chain {}: WireGuard/AmneziaWG cannot be mixed with other protocols in a pool.",
                         chain_index
                     ),
                 ));

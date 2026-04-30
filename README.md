@@ -20,7 +20,8 @@ shoes is a high-performance multi-protocol proxy server written in Rust.
 - **H2MUX** (supported with VMess, VLESS, Trojan, Shadowsocks, Snell)
 
 ### Outbound Tunnel Protocols
-- **AmneziaWG 2.0** (client/outbound only — UDP-backed L3 tunnel with obfuscation)
+- **WireGuard** (client/outbound only — UDP-backed L3 tunnel)
+- **AmneziaWG 2.0** (client/outbound only — WireGuard with obfuscation)
 
 ### Transport Protocols
 All server protocols plus:
@@ -264,6 +265,27 @@ See the [examples](./examples) directory for all examples.
             user_id: b85798ef-e9dc-46a4-9a87-8da4499d36d0
 ```
 
+### WireGuard Client
+```yaml
+- address: 127.0.0.1:1080
+  protocol:
+    type: socks
+  rules:
+    - masks: "0.0.0.0/0"
+      action: allow
+      client_chain:
+        address: "wg.example.com:51820"
+        protocol:
+          type: wireguard
+          private_key: "CLIENT_PRIVATE_KEY_BASE64"
+          peer_public_key: "SERVER_PUBLIC_KEY_BASE64"
+          preshared_key: "OPTIONAL_PRESHARED_KEY_BASE64"
+          local_addresses: "10.0.0.2/32"
+          allowed_ips:
+            - "0.0.0.0/0"
+          persistent_keepalive: 25
+```
+
 ### AmneziaWG 2.0 Client (SOCKS5 inbound)
 ```yaml
 - address: 127.0.0.1:1080
@@ -328,7 +350,7 @@ See the [examples](./examples) directory for all examples.
             h4: "1003000-1003999"
 ```
 
-> **Note:** AmneziaWG is client/outbound only. It creates a UDP-backed L3 tunnel with AmneziaWG 2.0 obfuscation (dynamic headers, padding, junk packets, init packets). The `awg` section parameters must match your AmneziaWG server configuration. AmneziaWG must be the only hop in a chain — multi-hop chains through AmneziaWG are not yet supported.
+> **Note:** WireGuard and AmneziaWG are client/outbound only. They create a UDP-backed L3 tunnel through a WireGuard (or AmneziaWG 2.0) server. For AmneziaWG, the `awg` section parameters must match your server configuration. Both must be the only hop in a chain — multi-hop chains are not yet supported.
 
 ## Similar Projects
 

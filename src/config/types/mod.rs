@@ -28,7 +28,7 @@ pub mod tun;
 #[allow(unused_imports)]
 pub use client::{
     AmneziaWg2Config, AmneziaWgClientConfig, ClientConfig, ClientProxyConfig, H2MuxConfig,
-    TlsClientConfig, WebsocketClientConfig,
+    TlsClientConfig, WebsocketClientConfig, WireGuardClientConfig,
 };
 pub use common::DEFAULT_REALITY_SHORT_ID;
 pub use dns::{DnsConfig, DnsConfigGroup, DnsServerSpec, ExpandedDnsGroup, ExpandedDnsSpec};
