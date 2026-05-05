@@ -59,6 +59,12 @@ cargo ndk \
     -o "$JNI_LIBS_DIR" \
     -- build --release --lib
 
+# cargo-ndk copies every cdylib in the graph, including boringtun's. Nothing
+# loads it — its hashed filename is not even a valid System.loadLibrary name —
+# so it is pure weight in the AAR.
+echo "==> Dropping cdylibs other than libshoes.so"
+find "$JNI_LIBS_DIR" -name "*.so" ! -name "libshoes.so" -delete
+
 echo "==> Built libraries:"
 find "$JNI_LIBS_DIR" -name "*.so" | sort | sed 's|^|  |'
 
