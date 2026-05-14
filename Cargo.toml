@@ -92,8 +92,8 @@ serde_json = "*"
 tempfile = "*"
 tokio-rustls = "*"
 
-# jemalloc for better memory performance (not supported on Windows MSVC or iOS)
-[target.'cfg(not(any(target_env = "msvc", target_os = "ios")))'.dependencies]
+# jemalloc for better memory performance (not supported on Windows MSVC, iOS, or Android)
+[target.'cfg(not(any(target_env = "msvc", target_os = "ios", target_os = "android")))'.dependencies]
 tikv-jemallocator = "*"
 
 [target.'cfg(target_os = "android")'.dependencies]
