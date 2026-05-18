@@ -153,3 +153,46 @@ fn parse_ip_prefix(s: &str) -> std::io::Result<(IpAddr, u8)> {
 fn ioerr(msg: &str) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidInput, msg.to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_ip_prefix_v4_with_prefix() {
+        let (addr, prefix) = parse_ip_prefix("10.0.0.1/24").unwrap();
+        assert_eq!(addr, "10.0.0.1".parse::<IpAddr>().unwrap());
+        assert_eq!(prefix, 24);
+    }
+
+    #[test]
+    fn test_parse_ip_prefix_v4_without_prefix() {
+        let (addr, prefix) = parse_ip_prefix("192.168.1.1").unwrap();
+        assert_eq!(addr, "192.168.1.1".parse::<IpAddr>().unwrap());
+        assert_eq!(prefix, 32);
+    }
+
+    #[test]
+    fn test_parse_ip_prefix_v6_with_prefix() {
+        let (addr, prefix) = parse_ip_prefix("fd00::1/64").unwrap();
+        assert_eq!(addr, "fd00::1".parse::<IpAddr>().unwrap());
+        assert_eq!(prefix, 64);
+    }
+
+    #[test]
+    fn test_parse_ip_prefix_v6_without_prefix() {
+        let (addr, prefix) = parse_ip_prefix("::1").unwrap();
+        assert_eq!(addr, "::1".parse::<IpAddr>().unwrap());
+        assert_eq!(prefix, 128);
+    }
+
+    #[test]
+    fn test_parse_ip_prefix_invalid_addr() {
+        assert!(parse_ip_prefix("not-an-ip/24").is_err());
+    }
+
+    #[test]
+    fn test_parse_ip_prefix_invalid_prefix() {
+        assert!(parse_ip_prefix("10.0.0.1/abc").is_err());
+    }
+}

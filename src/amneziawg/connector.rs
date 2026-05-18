@@ -48,11 +48,20 @@ impl std::fmt::Debug for AmneziaWgConnector {
 
 impl AmneziaWgConnector {
     /// Create from a `ClientProxyConfig::Wireguard` or `ClientProxyConfig::AmneziaWg`.
-    pub fn from_client_config(proxy_config: ClientProxyConfig, endpoint: NetLocation) -> Self {
+    pub fn from_client_config(
+        proxy_config: ClientProxyConfig,
+        endpoint: NetLocation,
+    ) -> std::io::Result<Self> {
         match proxy_config {
-            ClientProxyConfig::Wireguard(wg) => Self::from_wireguard(wg, endpoint),
-            ClientProxyConfig::AmneziaWg(awg) => Self::from_amneziawg(awg, endpoint),
-            _ => panic!("AmneziaWgConnector: expected Wireguard or AmneziaWg config"),
+            ClientProxyConfig::Wireguard(wg) => Ok(Self::from_wireguard(wg, endpoint)),
+            ClientProxyConfig::AmneziaWg(awg) => Ok(Self::from_amneziawg(awg, endpoint)),
+            other => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "AmneziaWgConnector: expected Wireguard or AmneziaWg config, got {:?}",
+                    std::mem::discriminant(&other)
+                ),
+            )),
         }
     }
 
@@ -111,7 +120,10 @@ impl AmneziaWgConnector {
             return Ok(s.request_tx.clone());
         }
 
-        info!("{:?}: initializing tunnel to {}", self.protocol, self.endpoint);
+        info!(
+            "{:?}: initializing tunnel to {}",
+            self.protocol, self.endpoint
+        );
 
         let runtime_config = AwgRuntimeConfig::from_client_config(&self.config)?;
         let endpoint_addr = resolver::resolve_single_address(resolver, &self.endpoint).await?;
@@ -126,16 +138,17 @@ impl AmneziaWgConnector {
         )
         .await?;
 
-        let ip_from_tunnel_rx = tunnel_runtime
-            .ip_from_tunnel_rx
-            .lock()
-            .take()
-            .ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "AmneziaWG tunnel already initialized",
-                )
-            })?;
+        let ip_from_tunnel_rx =
+            tunnel_runtime
+                .ip_from_tunnel_rx
+                .lock()
+                .take()
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "AmneziaWG tunnel already initialized",
+                    )
+                })?;
 
         let netstack = VirtualNetStack::new(
             &runtime_config.local_addresses,
@@ -179,10 +192,7 @@ impl VirtualNetworkConnector for AmneziaWgConnector {
             })
             .await
             .map_err(|_| {
-                std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    "AmneziaWG netstack stopped",
-                )
+                std::io::Error::new(std::io::ErrorKind::BrokenPipe, "AmneziaWG netstack stopped")
             })?;
 
         let stream = reply_rx.await.map_err(|_| {
@@ -216,10 +226,7 @@ impl VirtualNetworkConnector for AmneziaWgConnector {
             })
             .await
             .map_err(|_| {
-                std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    "AmneziaWG netstack stopped",
-                )
+                std::io::Error::new(std::io::ErrorKind::BrokenPipe, "AmneziaWG netstack stopped")
             })?;
 
         let stream = reply_rx.await.map_err(|_| {

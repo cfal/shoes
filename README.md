@@ -20,8 +20,8 @@ shoes is a high-performance multi-protocol proxy server written in Rust.
 - **H2MUX** (supported with VMess, VLESS, Trojan, Shadowsocks, Snell)
 
 ### Outbound Tunnel Protocols
-- **WireGuard** (client/outbound only — UDP-backed L3 tunnel)
-- **AmneziaWG 2.0** (client/outbound only — WireGuard with obfuscation)
+- **WireGuard** (outbound L3 tunnel over UDP)
+- **AmneziaWG 2.0** (WireGuard with traffic obfuscation)
 
 ### Transport Protocols
 All server protocols plus:
@@ -350,7 +350,7 @@ See the [examples](./examples) directory for all examples.
             h4: "1003000-1003999"
 ```
 
-> **Note:** WireGuard and AmneziaWG are client/outbound only. They create a UDP-backed L3 tunnel through a WireGuard (or AmneziaWG 2.0) server. For AmneziaWG, the `awg` section parameters must match your server configuration. Both must be the only hop in a chain — multi-hop chains are not yet supported.
+> **Note:** WireGuard and AmneziaWG work as client/outbound only — each creates a UDP-backed L3 tunnel to the server. The `awg` parameters must match your AmneziaWG server configuration. Neither supports multi-hop chains yet; they must be the sole hop.
 
 ## Similar Projects
 

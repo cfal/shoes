@@ -56,15 +56,19 @@ impl TunnelRuntime {
             None,
             amnezia,
         )
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("AmneziaWG tunnel config error: {}", e)))?;
+        .map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("AmneziaWG tunnel config error: {}", e),
+            )
+        })?;
         let tunn = Arc::new(ParkingMutex::new(tunn));
 
         // Create endpoint UDP socket
-        let is_ipv6 = endpoint_addr.is_ipv6();
-        let bind_addr: SocketAddr = if is_ipv6 {
-            "[::]:0".parse().unwrap()
+        let bind_addr = if endpoint_addr.is_ipv6() {
+            SocketAddr::from(([0u8; 16], 0u16))
         } else {
-            "0.0.0.0:0".parse().unwrap()
+            SocketAddr::from(([0u8; 4], 0u16))
         };
         let udp_socket = UdpSocket::bind(bind_addr).await?;
         udp_socket.connect(endpoint_addr).await?;
@@ -196,10 +200,7 @@ async fn drain_queued_packets(
     }
 }
 
-async fn drain_outgoing_packets(
-    tunn: &Arc<ParkingMutex<Tunn>>,
-    udp: &Arc<UdpSocket>,
-) {
+async fn drain_outgoing_packets(tunn: &Arc<ParkingMutex<Tunn>>, udp: &Arc<UdpSocket>) {
     loop {
         let packet = {
             let mut tunn = tunn.lock();
@@ -253,10 +254,7 @@ async fn encapsulate_loop(
     }
 }
 
-async fn timer_loop(
-    tunn: Arc<ParkingMutex<Tunn>>,
-    udp: Arc<UdpSocket>,
-) {
+async fn timer_loop(tunn: Arc<ParkingMutex<Tunn>>, udp: Arc<UdpSocket>) {
     let mut out = vec![0u8; MAX_UDP_SIZE];
 
     loop {

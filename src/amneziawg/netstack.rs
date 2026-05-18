@@ -8,6 +8,7 @@
 //! (from tun/tcp_conn.rs) for bridging smoltcp's synchronous sockets to
 //! tokio's async traits.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -20,16 +21,15 @@ use parking_lot::Mutex;
 use smoltcp::iface::{Config as InterfaceConfig, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::socket::tcp::{
-    CongestionControl, Socket as SmolTcpSocket, SocketBuffer as TcpSocketBuffer,
-    State as TcpState,
+    CongestionControl, Socket as SmolTcpSocket, SocketBuffer as TcpSocketBuffer, State as TcpState,
 };
 use smoltcp::socket::udp::Socket as SmolUdpSocket;
 use smoltcp::socket::udp::{PacketBuffer as UdpPacketBuffer, PacketMetadata as UdpPacketMetadata};
 use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, IpEndpoint};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::mpsc;
 use tokio::sync::Notify;
+use tokio::sync::mpsc;
 
 use crate::async_stream::{
     AsyncFlushMessage, AsyncMessageStream, AsyncPing, AsyncReadMessage, AsyncShutdownMessage,
@@ -42,7 +42,11 @@ use crate::async_stream::{
 
 struct VirtualDevice {
     rx_queue: Vec<Vec<u8>>,
-    tx_queue: Vec<Vec<u8>>,
+    /// RefCell avoids a raw pointer: smoltcp's `receive()` needs to hand out
+    /// both an RxToken (consuming from rx_queue) and a TxToken (pushing to
+    /// tx_queue) simultaneously.  RefCell lets us borrow tx_queue separately
+    /// through a shared reference while rx_queue is being mutated.
+    tx_queue: RefCell<Vec<Vec<u8>>>,
     mtu: usize,
 }
 
@@ -50,15 +54,20 @@ impl VirtualDevice {
     fn new(mtu: usize) -> Self {
         Self {
             rx_queue: Vec::new(),
-            tx_queue: Vec::new(),
+            tx_queue: RefCell::new(Vec::new()),
             mtu,
         }
+    }
+
+    /// Drain transmitted packets.
+    fn drain_tx(&self) -> Vec<Vec<u8>> {
+        self.tx_queue.borrow_mut().drain(..).collect()
     }
 }
 
 impl Device for VirtualDevice {
     type RxToken<'a> = VirtualRxToken;
-    type TxToken<'a> = VirtualTxToken;
+    type TxToken<'a> = VirtualTxToken<'a>;
 
     fn receive(
         &mut self,
@@ -71,14 +80,14 @@ impl Device for VirtualDevice {
         Some((
             VirtualRxToken { buffer: packet },
             VirtualTxToken {
-                tx_queue: std::ptr::from_mut(&mut self.tx_queue),
+                tx_queue: &self.tx_queue,
             },
         ))
     }
 
     fn transmit(&mut self, _timestamp: SmolInstant) -> Option<Self::TxToken<'_>> {
         Some(VirtualTxToken {
-            tx_queue: std::ptr::from_mut(&mut self.tx_queue),
+            tx_queue: &self.tx_queue,
         })
     }
 
@@ -103,21 +112,18 @@ impl RxToken for VirtualRxToken {
     }
 }
 
-struct VirtualTxToken {
-    tx_queue: *mut Vec<Vec<u8>>,
+struct VirtualTxToken<'a> {
+    tx_queue: &'a RefCell<Vec<Vec<u8>>>,
 }
 
-impl TxToken for VirtualTxToken {
+impl TxToken for VirtualTxToken<'_> {
     fn consume<R, F>(self, len: usize, f: F) -> R
     where
         F: FnOnce(&mut [u8]) -> R,
     {
         let mut buffer = vec![0u8; len];
         let result = f(&mut buffer);
-        // SAFETY: pointer is valid for the duration of Device::receive/transmit
-        unsafe {
-            (*self.tx_queue).push(buffer);
-        }
+        self.tx_queue.borrow_mut().push(buffer);
         result
     }
 }
@@ -276,9 +282,17 @@ impl VirtualNetStack {
     // ------------------------------------------------------------------
 
     pub async fn run(mut self, mut conn_rx: mpsc::Receiver<NetStackRequest>) {
-        let mut poll_interval = tokio::time::interval(std::time::Duration::from_millis(1));
-
         loop {
+            // Use smoltcp's poll_delay to determine how long to sleep,
+            // capped at 10ms to balance CPU usage vs throughput (matches
+            // the existing TUN stack in tcp_stack_direct.rs).
+            let delay = self
+                .iface
+                .poll_delay(SmolInstant::now(), &self.sockets)
+                .map(|d| std::time::Duration::from_millis(d.total_millis().min(10)))
+                .unwrap_or(std::time::Duration::from_millis(10));
+            let sleep = tokio::time::sleep(delay);
+
             tokio::select! {
                 request = conn_rx.recv() => {
                     match request {
@@ -297,7 +311,7 @@ impl VirtualNetStack {
                 Some(packet) = self.ip_from_tunnel.recv() => {
                     self.device.rx_queue.push(packet);
                 }
-                _ = poll_interval.tick() => {}
+                _ = sleep => {}
             }
 
             // Poll smoltcp
@@ -305,7 +319,7 @@ impl VirtualNetStack {
             self.iface.poll(now, &mut self.device, &mut self.sockets);
 
             // Flush outbound IP packets to tunnel
-            for packet in self.device.tx_queue.drain(..) {
+            for packet in self.device.drain_tx() {
                 if self.ip_to_tunnel.try_send(packet).is_err() {
                     warn!("AmneziaWG netstack: tunnel TX full, dropping packet");
                 }
@@ -483,14 +497,8 @@ impl VirtualNetStack {
         target: SocketAddr,
         reply: tokio::sync::oneshot::Sender<std::io::Result<VirtualUdpStream>>,
     ) {
-        let rx_buf = UdpPacketBuffer::new(
-            vec![UdpPacketMetadata::EMPTY; 64],
-            vec![0u8; 65536],
-        );
-        let tx_buf = UdpPacketBuffer::new(
-            vec![UdpPacketMetadata::EMPTY; 64],
-            vec![0u8; 65536],
-        );
+        let rx_buf = UdpPacketBuffer::new(vec![UdpPacketMetadata::EMPTY; 64], vec![0u8; 65536]);
+        let tx_buf = UdpPacketBuffer::new(vec![UdpPacketMetadata::EMPTY; 64], vec![0u8; 65536]);
         let mut socket = SmolUdpSocket::new(rx_buf, tx_buf);
 
         let local_port = allocate_ephemeral_port();
@@ -646,8 +654,6 @@ impl AsyncPing for VirtualTcpStream {
 }
 
 impl Unpin for VirtualTcpStream {}
-unsafe impl Send for VirtualTcpStream {}
-unsafe impl Sync for VirtualTcpStream {}
 
 impl AsyncStream for VirtualTcpStream {}
 
@@ -709,10 +715,7 @@ impl AsyncFlushMessage for VirtualUdpStream {
 }
 
 impl AsyncShutdownMessage for VirtualUdpStream {
-    fn poll_shutdown_message(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-    ) -> Poll<io::Result<()>> {
+    fn poll_shutdown_message(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Poll::Ready(Ok(()))
     }
 }
@@ -753,5 +756,39 @@ fn allocate_ephemeral_port() -> u16 {
         40000
     } else {
         port
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_to_smol_endpoint_v4() {
+        let addr: SocketAddr = "1.2.3.4:443".parse().unwrap();
+        let ep = to_smol_endpoint(addr);
+        assert_eq!(ep.port, 443);
+        assert_eq!(
+            ep.addr,
+            IpAddress::Ipv4(smoltcp::wire::Ipv4Address::new(1, 2, 3, 4))
+        );
+    }
+
+    #[test]
+    fn test_to_smol_endpoint_v6() {
+        let addr: SocketAddr = "[::1]:8080".parse().unwrap();
+        let ep = to_smol_endpoint(addr);
+        assert_eq!(ep.port, 8080);
+        assert_eq!(
+            ep.addr,
+            IpAddress::Ipv6(smoltcp::wire::Ipv6Address::new(0, 0, 0, 0, 0, 0, 0, 1))
+        );
+    }
+
+    #[test]
+    fn test_allocate_ephemeral_port_increments() {
+        let p1 = allocate_ephemeral_port();
+        let p2 = allocate_ephemeral_port();
+        assert_eq!(p2, p1 + 1);
     }
 }

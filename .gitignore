@@ -2,3 +2,4 @@
 /output
 /*.yaml
 *.pem
+.claude/
