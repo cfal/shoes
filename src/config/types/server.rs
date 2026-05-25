@@ -836,7 +836,7 @@ impl std::fmt::Display for ServerProxyConfig {
             Self::Mixed { .. } => write!(f, "Mixed (HTTP+SOCKS5)"),
             Self::Anytls { .. } => write!(f, "AnyTLS"),
             Self::Naiveproxy { .. } => write!(f, "NaiveProxy"),
-            Self::Tproxy { .. } => write!(f, "Tproxy"),
+            Self::Tproxy { .. } => write!(f, "TPROXY"),
         }
     }
 }
@@ -1654,6 +1654,6 @@ protocol:
     #[test]
     fn tproxy_display() {
         let p = ServerProxyConfig::Tproxy { tcp_enabled: true, udp_enabled: true };
-        assert_eq!(format!("{p}"), "Tproxy");
+        assert_eq!(format!("{p}"), "TPROXY");
     }
 }
