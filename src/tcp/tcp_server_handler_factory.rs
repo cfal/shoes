@@ -278,6 +278,9 @@ pub fn create_tcp_server_handler(
                  config validation should have rejected this"
             )
         }
+        ServerProxyConfig::Tproxy { .. } => {
+            unreachable!("tproxy handled by start_tproxy_servers; see Task 4/8")
+        }
         unknown_config => {
             panic!("Unsupported TCP proxy config: {unknown_config:?}")
         }

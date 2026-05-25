@@ -780,6 +780,15 @@ pub enum ServerProxyConfig {
         #[serde(default = "default_true")]
         udp_enabled: bool,
     },
+    /// Linux transparent proxy inbound (TPROXY).
+    /// Accepts TCP/UDP traffic redirected via iptables `-j TPROXY` + `ip rule`.
+    /// Original destination is recovered from the kernel.
+    Tproxy {
+        #[serde(default = "default_true")]
+        tcp_enabled: bool,
+        #[serde(default = "default_true")]
+        udp_enabled: bool,
+    },
 }
 
 impl std::fmt::Display for ServerProxyConfig {
@@ -827,6 +836,7 @@ impl std::fmt::Display for ServerProxyConfig {
             Self::Mixed { .. } => write!(f, "Mixed (HTTP+SOCKS5)"),
             Self::Anytls { .. } => write!(f, "AnyTLS"),
             Self::Naiveproxy { .. } => write!(f, "NaiveProxy"),
+            Self::Tproxy { .. } => write!(f, "Tproxy"),
         }
     }
 }
@@ -1603,5 +1613,47 @@ client_chain:
         println!("Serialized:\n{serialized}");
         let deserialized: ShadowTlsRemoteHandshake = serde_yaml::from_str(&serialized).unwrap();
         assert_eq!(deserialized.client_chain.len(), original.client_chain.len());
+    }
+
+    #[test]
+    fn tproxy_default_yaml_roundtrip() {
+        let yaml = r#"
+address: "0.0.0.0:7895"
+protocol:
+  type: tproxy
+"#;
+        let cfg: ServerConfig = serde_yaml::from_str(yaml).unwrap();
+        match cfg.protocol {
+            ServerProxyConfig::Tproxy { tcp_enabled, udp_enabled } => {
+                assert!(tcp_enabled);
+                assert!(udp_enabled);
+            }
+            _ => panic!("expected Tproxy variant"),
+        }
+    }
+
+    #[test]
+    fn tproxy_explicit_flags_yaml_roundtrip() {
+        let yaml = r#"
+address: "0.0.0.0:7895"
+protocol:
+  type: tproxy
+  tcp_enabled: true
+  udp_enabled: false
+"#;
+        let cfg: ServerConfig = serde_yaml::from_str(yaml).unwrap();
+        match cfg.protocol {
+            ServerProxyConfig::Tproxy { tcp_enabled, udp_enabled } => {
+                assert!(tcp_enabled);
+                assert!(!udp_enabled);
+            }
+            _ => panic!("expected Tproxy variant"),
+        }
+    }
+
+    #[test]
+    fn tproxy_display() {
+        let p = ServerProxyConfig::Tproxy { tcp_enabled: true, udp_enabled: true };
+        assert_eq!(format!("{p}"), "Tproxy");
     }
 }
