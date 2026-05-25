@@ -7,4 +7,5 @@
 //!
 //! Linux-only.
 
+pub mod cmsg;
 pub mod listener;
