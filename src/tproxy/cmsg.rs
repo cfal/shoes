@@ -60,6 +60,12 @@ fn recv_with_orig_dst_blocking(
     }
     let n = n as usize;
 
+    if msg.msg_flags & libc::MSG_CTRUNC != 0 {
+        return Err(io::Error::other(
+            "tproxy recvmsg control buffer truncated; orig_dst cmsg may be incomplete",
+        ));
+    }
+
     let client_src = sockaddr_to_socket_addr(
         src_storage.as_ptr() as *const libc::sockaddr,
         msg.msg_namelen,
@@ -85,7 +91,7 @@ fn parse_orig_dst_cmsg(msg: &libc::msghdr) -> io::Result<Option<SocketAddr>> {
                 let addr = Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
                 return Ok(Some(SocketAddr::V4(SocketAddrV4::new(addr, port))));
             }
-            (libc::IPPROTO_IPV6, libc::IPV6_RECVORIGDSTADDR) => {
+            (libc::IPPROTO_IPV6, libc::IPV6_ORIGDSTADDR) => {
                 let data_ptr = unsafe { libc::CMSG_DATA(cmsg) } as *const libc::sockaddr_in6;
                 let sin6 = unsafe { std::ptr::read_unaligned(data_ptr) };
                 let port = u16::from_be(sin6.sin6_port);
@@ -167,5 +173,6 @@ mod tests {
         assert_eq!(peer.ip(), client_addr.ip());
         assert_eq!(peer.port(), client_addr.port());
         assert_eq!(orig_dst.port(), bind_addr.port());
+        assert_eq!(orig_dst.ip(), bind_addr.ip());
     }
 }
