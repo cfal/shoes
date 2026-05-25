@@ -66,7 +66,6 @@ pub fn new_tproxy_tcp_listener(bind: SocketAddr) -> std::io::Result<tokio::net::
     socket.bind(&SockAddr::from(bind))?;
     socket.listen(4096)?;
     let std_listener: std::net::TcpListener = socket.into();
-    std_listener.set_nonblocking(true)?;
     tokio::net::TcpListener::from_std(std_listener)
 }
 
@@ -80,7 +79,6 @@ pub fn new_tproxy_udp_socket(bind: SocketAddr) -> std::io::Result<tokio::net::Ud
     set_recv_orig_dst_addr(&socket, bind.is_ipv6())?;
     socket.bind(&SockAddr::from(bind))?;
     let std_sock: std::net::UdpSocket = socket.into();
-    std_sock.set_nonblocking(true)?;
     tokio::net::UdpSocket::from_std(std_sock)
 }
 
@@ -91,12 +89,11 @@ pub fn new_tproxy_udp_send_socket(orig_dst: SocketAddr) -> std::io::Result<tokio
     let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
     socket.set_nonblocking(true)?;
     socket.set_reuse_address(true)?;
-    // SO_REUSEPORT improves cache reuse across threads (Linux supports it on UDP).
+    // SO_REUSEPORT lets multiple per-orig_dst sockets coexist on the same local address.
     socket.set_reuse_port(true)?;
     set_ip_transparent(&socket, orig_dst.is_ipv6())?;
     socket.bind(&SockAddr::from(orig_dst))?;
     let std_sock: std::net::UdpSocket = socket.into();
-    std_sock.set_nonblocking(true)?;
     tokio::net::UdpSocket::from_std(std_sock)
 }
 
