@@ -118,35 +118,10 @@ where
     server_handler.setup_server_stream(server_stream).await
 }
 
-pub async fn process_stream<AS>(
-    stream: AS,
-    server_handler: Arc<dyn TcpServerHandler>,
+pub async fn process_setup_result(
+    setup_result: TcpServerSetupResult,
     resolver: Arc<dyn Resolver>,
-) -> std::io::Result<()>
-where
-    AS: AsyncStream + 'static,
-{
-    let setup_server_stream_future = timeout(
-        Duration::from_secs(60),
-        setup_server_stream(stream, server_handler),
-    );
-
-    let setup_result = match setup_server_stream_future.await {
-        Ok(Ok(r)) => r,
-        Ok(Err(e)) => {
-            return Err(std::io::Error::new(
-                e.kind(),
-                format!("failed to setup server stream: {e}"),
-            ));
-        }
-        Err(elapsed) => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                format!("server setup timed out: {elapsed}"),
-            ));
-        }
-    };
-
+) -> std::io::Result<()> {
     match setup_result {
         TcpServerSetupResult::TcpForward {
             remote_location,
@@ -282,6 +257,38 @@ where
             Ok(())
         }
     }
+}
+
+pub async fn process_stream<AS>(
+    stream: AS,
+    server_handler: Arc<dyn TcpServerHandler>,
+    resolver: Arc<dyn Resolver>,
+) -> std::io::Result<()>
+where
+    AS: AsyncStream + 'static,
+{
+    let setup_server_stream_future = timeout(
+        Duration::from_secs(60),
+        setup_server_stream(stream, server_handler),
+    );
+
+    let setup_result = match setup_server_stream_future.await {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => {
+            return Err(std::io::Error::new(
+                e.kind(),
+                format!("failed to setup server stream: {e}"),
+            ));
+        }
+        Err(elapsed) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("server setup timed out: {elapsed}"),
+            ));
+        }
+    };
+
+    process_setup_result(setup_result, resolver).await
 }
 
 pub async fn setup_client_tcp_stream(
