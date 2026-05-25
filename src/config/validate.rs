@@ -2701,6 +2701,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn tproxy_rejects_quic_transport() {
         let yaml = r#"
@@ -2718,6 +2719,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn tproxy_rejects_unix_socket_bind() {
         let yaml = r#"
@@ -2734,6 +2736,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn tproxy_rejects_both_disabled() {
         let yaml = r#"
@@ -2749,6 +2752,23 @@ mod tests {
             err.to_lowercase().contains("tcp_enabled") || err.to_lowercase().contains("udp_enabled"),
             "got: {err}"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tproxy_rejects_quic_settings() {
+        let yaml = r#"
+- address: "0.0.0.0:7895"
+  quic_settings:
+    cert: "/tmp/does-not-exist.crt"
+    key: "/tmp/does-not-exist.key"
+  protocol:
+    type: tproxy
+"#;
+        let configs: Vec<Config> = serde_yaml::from_str(yaml).unwrap();
+        let err = tproxy_err(configs);
+        assert!(err.to_lowercase().contains("tproxy"), "got: {err}");
+        assert!(err.to_lowercase().contains("quic_settings"), "got: {err}");
     }
 
     #[cfg(not(target_os = "linux"))]
