@@ -279,7 +279,7 @@ pub fn create_tcp_server_handler(
             )
         }
         ServerProxyConfig::Tproxy { .. } => {
-            unreachable!("tproxy handled by start_tproxy_servers; see Task 4/8")
+            panic!("tproxy is handled by crate::tproxy::start_tproxy_servers, not the handler factory")
         }
         unknown_config => {
             panic!("Unsupported TCP proxy config: {unknown_config:?}")

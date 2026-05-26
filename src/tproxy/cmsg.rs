@@ -1,8 +1,5 @@
 //! `recvmsg` with `IP_RECVORIGDSTADDR` / `IPV6_RECVORIGDSTADDR` cmsg parsing.
 
-// Functions are pub API consumed by Task 7; suppress dead-code lint until wiring is in place.
-#![allow(dead_code)]
-
 use std::io;
 use std::mem::MaybeUninit;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};

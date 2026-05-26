@@ -1,9 +1,5 @@
 //! Socket factories that apply the IP_TRANSPARENT family of options.
 
-// Functions are pub API consumed by Task 8 (wiring); suppress dead-code lint
-// until that wiring is in place.
-#![allow(dead_code)]
-
 use std::net::SocketAddr;
 
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};

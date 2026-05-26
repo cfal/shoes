@@ -1,7 +1,5 @@
 //! TPROXY UDP relay: session-based, with kernel-level source spoofing on reply.
 
-#![allow(dead_code)]
-
 use std::future::poll_fn;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
