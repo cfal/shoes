@@ -293,6 +293,27 @@ protocol:
 
 NaiveProxy implements HTTP/2 CONNECT with padding for censorship resistance. Should be used within TLS with `alpn_protocols: ["h2"]`.
 
+### TPROXY (transparent proxy, Linux-only)
+
+Accepts traffic redirected to shoes by `iptables/nftables -j TPROXY` + `ip rule`.
+The original destination is recovered from the kernel and forwarded through
+the outbound proxy chain.
+
+```yaml
+protocol:
+  type: tproxy
+  tcp_enabled: true   # default true
+  udp_enabled: true   # default true
+```
+
+Requires:
+- **Linux** with `CAP_NET_ADMIN` (or root) on the shoes process.
+- `iptables -t mangle -j TPROXY` (or nftables equivalent) and an `ip rule`
+  + `ip route` pair pointing the marked traffic at the local loopback.
+
+See `examples/tproxy.yaml` for a complete worked example, including the
+required iptables setup.
+
 ## TUN Config
 
 TUN (network TUNnel) devices operate at the IP layer (Layer 3), allowing shoes to act as a transparent VPN.

@@ -1,0 +1,38 @@
+# TPROXY Inbound Example (Linux-only)
+#
+# TPROXY is a transparent proxy mode: traffic is redirected to shoes by the
+# kernel (via iptables/nftables + ip rule), shoes recovers the original
+# destination and forwards it through the outbound chain.
+#
+# IMPORTANT: tproxy listeners require CAP_NET_ADMIN (or root).
+# Run with: sudo shoes examples/tproxy.yaml
+#
+# ---------------------------------------------------------------------------
+# Kernel-side setup (run once, as root):
+# ---------------------------------------------------------------------------
+# # Mark and route packets destined for proxied IPs into a local table.
+# ip rule add fwmark 1 lookup 100
+# ip route add local 0.0.0.0/0 dev lo table 100
+#
+# # iptables rules: redirect TCP+UDP via TPROXY to port 7895.
+# iptables -t mangle -N SHOES
+# iptables -t mangle -A SHOES -d 127.0.0.0/8 -j RETURN
+# iptables -t mangle -A SHOES -d 10.0.0.0/8 -j RETURN
+# iptables -t mangle -A SHOES -d 192.168.0.0/16 -j RETURN
+# iptables -t mangle -A SHOES -d 172.16.0.0/12 -j RETURN
+# iptables -t mangle -A SHOES -p tcp -j TPROXY --on-port 7895 --tproxy-mark 1
+# iptables -t mangle -A SHOES -p udp -j TPROXY --on-port 7895 --tproxy-mark 1
+# iptables -t mangle -A PREROUTING -j SHOES
+# ---------------------------------------------------------------------------
+
+- address: "0.0.0.0:7895"
+  protocol:
+    type: tproxy
+    tcp_enabled: true
+    udp_enabled: true
+  rules:
+    - masks: "0.0.0.0/0"
+      action: allow
+      client_chain:
+        protocol:
+          type: direct
