@@ -12,6 +12,15 @@ use tokio::net::UdpSocket;
 /// Generously sized to absorb alignment + future options.
 const CMSG_BUF_SIZE: usize = 128;
 
+/// Alignment-correct backing storage for cmsg control data.
+/// `recvmsg` writes `cmsghdr` records into this; reading them via
+/// `*mut cmsghdr` would be UB if the buffer had only u8 alignment.
+#[repr(C)]
+union CmsgBuffer {
+    bytes: [u8; CMSG_BUF_SIZE],
+    _align: libc::cmsghdr,
+}
+
 /// `recvmsg` from the socket, returning the bytes read, the peer (client_src),
 /// and the original destination decoded from `IP_RECVORIGDSTADDR` /
 /// `IPV6_RECVORIGDSTADDR` cmsg.
@@ -41,15 +50,17 @@ fn recv_with_orig_dst_blocking(
     };
 
     let mut src_storage: MaybeUninit<libc::sockaddr_in6> = MaybeUninit::zeroed();
-    let mut cmsg_buf = [0u8; CMSG_BUF_SIZE];
+    // SAFETY: zeroed bytes are a valid bit-pattern for the bytes field; the
+    // union exists purely to give the byte buffer cmsghdr alignment.
+    let mut cmsg_buf = CmsgBuffer { bytes: [0u8; CMSG_BUF_SIZE] };
 
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
     msg.msg_name = src_storage.as_mut_ptr() as *mut libc::c_void;
     msg.msg_namelen = std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t;
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
-    msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
-    msg.msg_controllen = cmsg_buf.len() as _;
+    msg.msg_control = unsafe { cmsg_buf.bytes.as_mut_ptr() } as *mut libc::c_void;
+    msg.msg_controllen = CMSG_BUF_SIZE as _;
 
     let n = unsafe { libc::recvmsg(fd, &mut msg, 0) };
     if n < 0 {

@@ -39,6 +39,7 @@ pub async fn start_tproxy_servers(
         }
     };
 
+    let bind_display = config.bind_location.to_string();
     let bind_addrs = match &config.bind_location {
         BindLocation::Address(range) => range.to_socket_addrs()?,
         BindLocation::Path(_) => {
@@ -82,6 +83,13 @@ pub async fn start_tproxy_servers(
                 }
             }));
         }
+    }
+
+    if handles.is_empty() {
+        return Err(std::io::Error::other(format!(
+            "failed to start tproxy servers at {} (no resolved bind addresses or both tcp/udp disabled — should have been rejected by validation)",
+            bind_display
+        )));
     }
 
     Ok(handles)
