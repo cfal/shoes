@@ -119,8 +119,23 @@ impl UdpRelay {
 
         let mut buf = vec![0u8; RECV_BUF_SIZE];
         loop {
-            let (n, client_src, orig_dst) =
-                recv_with_orig_dst(&self.recv_socket, &mut buf).await?;
+            let (n, client_src, orig_dst) = match recv_with_orig_dst(&self.recv_socket, &mut buf).await {
+                Ok(v) => v,
+                Err(e) => {
+                    // Per-packet anomalies (MSG_CTRUNC, missing cmsg) come back as InvalidData/Other.
+                    // Don't tear down the relay over one bad packet — log and keep going.
+                    match e.kind() {
+                        std::io::ErrorKind::InvalidData | std::io::ErrorKind::Other => {
+                            debug!("tproxy udp recv (dropping packet): {e}");
+                            continue;
+                        }
+                        _ => {
+                            warn!("tproxy udp recv failed: {e}");
+                            return Err(e);
+                        }
+                    }
+                }
+            };
             let key = SessionKey { client_src, orig_dst };
             let data = buf[..n].to_vec();
 
@@ -130,9 +145,25 @@ impl UdpRelay {
                 continue;
             }
 
-            match self.spawn_session(key.clone(), data).await {
-                Ok(Some(session)) => {
-                    self.sessions.insert(key, session);
+            // Borrow the initial packet's data once so we can hand it to whichever session wins the race.
+            let initial = data;
+            match self.spawn_session(key.clone(), initial.clone()).await {
+                Ok(Some(new_session)) => {
+                    use dashmap::mapref::entry::Entry;
+                    match self.sessions.entry(key) {
+                        Entry::Occupied(occupied) => {
+                            // Another packet for the same flow finished session setup first.
+                            // Hand our initial packet to the winning session; drop our newly-built
+                            // session (its Drop aborts the task we just spawned).
+                            let existing = occupied.get().clone();
+                            existing.touch();
+                            let _ = existing.tx.try_send(initial);
+                            drop(new_session);
+                        }
+                        Entry::Vacant(vacant) => {
+                            vacant.insert(new_session);
+                        }
+                    }
                 }
                 Ok(None) => {
                     // Blocked by rules — drop.
