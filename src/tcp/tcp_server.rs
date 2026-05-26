@@ -365,12 +365,10 @@ pub async fn start_servers(
             "TUN server is not supported on this platform",
         )),
         Config::Server(server_config) => {
-            #[cfg(target_os = "linux")]
             if matches!(server_config.protocol, crate::config::ServerProxyConfig::Tproxy { .. }) {
+                #[cfg(target_os = "linux")]
                 return crate::tproxy::start_tproxy_servers(server_config, resolver).await;
-            }
-            #[cfg(not(target_os = "linux"))]
-            if matches!(server_config.protocol, crate::config::ServerProxyConfig::Tproxy { .. }) {
+                #[cfg(not(target_os = "linux"))]
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::Unsupported,
                     "tproxy protocol is only supported on Linux",
