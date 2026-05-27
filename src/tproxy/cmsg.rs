@@ -121,7 +121,7 @@ fn parse_orig_dst_cmsg(msg: &libc::msghdr) -> io::Result<Option<SocketAddr>> {
 /// Shim for `CMSG_FIRSTHDR` (libc exposes `CMSG_NXTHDR` but not always `CMSG_FIRSTHDR`).
 #[inline]
 unsafe fn libc_cmsg_firsthdr(msg: &libc::msghdr) -> *mut libc::cmsghdr {
-    if msg.msg_controllen < std::mem::size_of::<libc::cmsghdr>() {
+    if (msg.msg_controllen as usize) < std::mem::size_of::<libc::cmsghdr>() {
         std::ptr::null_mut()
     } else {
         msg.msg_control as *mut libc::cmsghdr
