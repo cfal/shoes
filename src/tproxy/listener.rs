@@ -103,7 +103,7 @@ mod tests {
         let listener = match new_tproxy_tcp_listener(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0)) {
             Ok(l) => l,
             Err(e) if e.raw_os_error() == Some(libc::EPERM) => {
-                eprintln!("skipping: tproxy listener bind requires CAP_NET_ADMIN");
+                eprintln!("skipping: tproxy listener bind requires CAP_NET_RAW or CAP_NET_ADMIN");
                 return;
             }
             Err(e) => panic!("listener bind failed: {e}"),
@@ -125,7 +125,7 @@ mod tests {
         let socket = match new_tproxy_udp_socket(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0)) {
             Ok(s) => s,
             Err(e) if e.raw_os_error() == Some(libc::EPERM) => {
-                eprintln!("skipping: tproxy udp bind requires CAP_NET_ADMIN");
+                eprintln!("skipping: tproxy udp bind requires CAP_NET_RAW or CAP_NET_ADMIN");
                 return;
             }
             Err(e) => panic!("udp bind failed: {e}"),

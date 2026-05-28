@@ -4,8 +4,37 @@
 # kernel (via iptables/nftables + ip rule), shoes recovers the original
 # destination and forwards it through the outbound chain.
 #
-# IMPORTANT: tproxy listeners require CAP_NET_ADMIN (or root).
-# Run with: sudo shoes examples/tproxy.yaml
+# ---------------------------------------------------------------------------
+# Privileges
+# ---------------------------------------------------------------------------
+# Setting IP_TRANSPARENT on a socket is a kernel-side privileged operation.
+# The kernel accepts EITHER CAP_NET_RAW or CAP_NET_ADMIN — prefer CAP_NET_RAW
+# (narrower scope: no right to reconfigure interfaces, routes, netfilter, etc.).
+#
+# Quick start (development):
+#   sudo shoes examples/tproxy.yaml
+#
+# Single-binary capability (no sudo at runtime):
+#   sudo setcap cap_net_raw=+ep /usr/local/bin/shoes
+#   shoes examples/tproxy.yaml
+#
+# systemd (recommended for production — runs as unprivileged user):
+#   # /etc/systemd/system/shoes.service
+#   [Unit]
+#   Description=shoes proxy
+#   After=network.target
+#
+#   [Service]
+#   ExecStart=/usr/local/bin/shoes /etc/shoes/tproxy.yaml
+#   User=shoes
+#   Group=shoes
+#   AmbientCapabilities=CAP_NET_RAW
+#   CapabilityBoundingSet=CAP_NET_RAW
+#   NoNewPrivileges=true
+#   Restart=on-failure
+#
+#   [Install]
+#   WantedBy=multi-user.target
 #
 # ---------------------------------------------------------------------------
 # Kernel-side setup (run once, as root):
