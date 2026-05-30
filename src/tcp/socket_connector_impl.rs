@@ -17,6 +17,8 @@ use tokio::net::UdpSocket;
 use crate::address::{NetLocation, ResolvedLocation};
 use crate::async_stream::AsyncStream;
 use crate::config::{ClientConfig, ClientQuicConfig, Transport};
+use crate::kcp_server::build_kcp_config;
+use crate::kcp_stream::KcpStreamWrapper;
 use crate::quic_stream::QuicStream;
 use crate::resolver::{Resolver, resolve_addresses, resolve_location};
 use crate::rustls_config_util::create_client_config;
@@ -36,6 +38,9 @@ enum TransportConfig {
         sni_hostname: Option<String>,
         endpoints: Vec<Arc<quinn::Endpoint>>,
         next_endpoint_index: AtomicU8,
+    },
+    Kcp {
+        kcp_config: kcp_tokio::KcpConfig,
     },
 }
 
@@ -188,6 +193,10 @@ impl SocketConnectorImpl {
                     next_endpoint_index: AtomicU8::new(0),
                 }
             }
+            Transport::Kcp => {
+                let kcp_config = build_kcp_config(config.kcp_settings.as_ref());
+                TransportConfig::Kcp { kcp_config }
+            }
         };
 
         Some(Self {
@@ -304,6 +313,30 @@ impl SocketConnector for SocketConnectorImpl {
                             debug!("QUIC connect to {} failed: {}", target_addr, e);
                             last_err = Some(std::io::Error::other(format!(
                                 "Failed to connect to QUIC endpoint: {e}"
+                            )));
+                        }
+                    }
+                }
+                Err(last_err
+                    .unwrap_or_else(|| std::io::Error::other("no resolved addresses succeeded")))
+            }
+            TransportConfig::Kcp { kcp_config } => {
+                let mut last_err: Option<std::io::Error> = None;
+                for (i, target_addr) in target_addrs.iter().enumerate() {
+                    match kcp_tokio::KcpStream::connect(*target_addr, kcp_config.clone()).await {
+                        Ok(stream) => {
+                            if i > 0 {
+                                debug!(
+                                    "KCP connect succeeded on address #{} ({}) after {} failures",
+                                    i, target_addr, i
+                                );
+                            }
+                            return Ok(Box::new(KcpStreamWrapper::new(stream)));
+                        }
+                        Err(e) => {
+                            debug!("KCP connect to {} failed: {}", target_addr, e);
+                            last_err = Some(std::io::Error::other(format!(
+                                "KCP connect to {target_addr} failed: {e}"
                             )));
                         }
                     }

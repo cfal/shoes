@@ -40,5 +40,5 @@ pub use server::{
     direct_allow_rule,
 };
 pub use shadowsocks::ShadowsocksConfig;
-pub use transport::{BindLocation, ClientQuicConfig, ServerQuicConfig, TcpConfig, Transport};
+pub use transport::{BindLocation, ClientQuicConfig, KcpMode, KcpSettings, ServerQuicConfig, TcpConfig, Transport};
 pub use tun::TunConfig;

@@ -18,6 +18,7 @@ use crate::client_proxy_selector::{ClientProxySelector, ConnectDecision};
 use crate::config::{BindLocation, Config, ConfigSelection, ServerConfig, TcpConfig, Transport};
 use crate::copy_bidirectional::copy_bidirectional;
 use crate::copy_bidirectional_message::copy_bidirectional_message;
+use crate::kcp_server::start_kcp_servers;
 use crate::quic_server::start_quic_servers;
 use crate::resolver::Resolver;
 use crate::routing::{ServerStream, run_udp_routing};
@@ -381,6 +382,17 @@ async fn start_tcp_or_quic_servers(
             }
         },
         Transport::Quic => match start_quic_servers(config.clone(), resolver).await {
+            Ok(handles) => {
+                join_handles.extend(handles);
+            }
+            Err(e) => {
+                for join_handle in join_handles {
+                    join_handle.abort();
+                }
+                return Err(e);
+            }
+        },
+        Transport::Kcp => match start_kcp_servers(config.clone(), resolver).await {
             Ok(handles) => {
                 join_handles.extend(handles);
             }

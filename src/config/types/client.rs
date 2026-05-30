@@ -13,7 +13,7 @@ use super::common::{
 };
 use super::server::WebsocketPingType;
 use super::shadowsocks::ShadowsocksConfig;
-use super::transport::{ClientQuicConfig, TcpConfig, Transport};
+use super::transport::{ClientQuicConfig, KcpSettings, TcpConfig, Transport};
 
 /// Configuration for h2mux (HTTP/2 multiplexing) on protocols that support it.
 ///
@@ -291,6 +291,8 @@ pub struct ClientConfig {
     pub tcp_settings: Option<TcpConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quic_settings: Option<ClientQuicConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kcp_settings: Option<KcpSettings>,
 }
 
 impl Default for ClientConfig {
@@ -302,6 +304,7 @@ impl Default for ClientConfig {
             transport: Transport::default(),
             tcp_settings: None,
             quic_settings: None,
+            kcp_settings: None,
         }
     }
 }
@@ -525,6 +528,7 @@ mod tests {
             transport: Transport::Tcp,
             tcp_settings: None,
             quic_settings: None,
+            kcp_settings: None,
         }
     }
 

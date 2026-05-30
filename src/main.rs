@@ -12,6 +12,8 @@ mod dns;
 mod h2mux;
 mod http_handler;
 mod hysteria2_server;
+mod kcp_server;
+mod kcp_stream;
 mod logging;
 mod mixed_handler;
 mod naiveproxy;
@@ -191,6 +193,14 @@ fn main() {
     }
 
     logging::init_multi_logger(writers, directives);
+    // Forward kcp-tokio/kcp-core tracing events to stderr.
+    // Use RUST_LOG=kcp_tokio=trace,kcp_core=trace to see internal KCP events.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"))
+        )
+        .try_init();
 
     if args.iter().any(|s| s == "generate-reality-keypair") {
         let (private_key, public_key) = generate_keypair().unwrap();
