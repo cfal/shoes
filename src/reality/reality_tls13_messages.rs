@@ -356,11 +356,21 @@ pub fn construct_client_hello(
     }
 
     // signature_algorithms extension (type 13)
+    // Matches the Chrome 133 uTLS fingerprints used by Xray-core and sing-box.
+    // https://github.com/refraction-networking/utls/blob/aa6edf4b11af82e110eea845bb2983d30138d651/u_parrots.go#L935-L944
+    // https://github.com/metacubex/utls/blob/cf49b0864331e156689feec6363ef9bf518a5ac7/u_parrots.go#L925-L934
     {
         extensions.extend_from_slice(&[0x00, 0x0d]); // Extension type: signature_algorithms
-        extensions.extend_from_slice(&[0x00, 0x04]); // Extension length: 4
-        extensions.extend_from_slice(&[0x00, 0x02]); // Signature algorithms length: 2
-        extensions.extend_from_slice(&[0x08, 0x07]); // ed25519
+        extensions.extend_from_slice(&[0x00, 0x12]); // Extension length: 18
+        extensions.extend_from_slice(&[0x00, 0x10]); // Signature algorithms length: 16
+        extensions.extend_from_slice(&[0x04, 0x03]); // ecdsa_secp256r1_sha256
+        extensions.extend_from_slice(&[0x08, 0x04]); // rsa_pss_rsae_sha256
+        extensions.extend_from_slice(&[0x04, 0x01]); // rsa_pkcs1_sha256
+        extensions.extend_from_slice(&[0x05, 0x03]); // ecdsa_secp384r1_sha384
+        extensions.extend_from_slice(&[0x08, 0x05]); // rsa_pss_rsae_sha384
+        extensions.extend_from_slice(&[0x05, 0x01]); // rsa_pkcs1_sha384
+        extensions.extend_from_slice(&[0x08, 0x06]); // rsa_pss_rsae_sha512
+        extensions.extend_from_slice(&[0x06, 0x01]); // rsa_pkcs1_sha512
     }
 
     // ALPN extension (type 16)
@@ -472,5 +482,61 @@ mod tests {
         assert_eq!(header[1], 0x03); // TLS 1.2
         assert_eq!(header[2], 0x03);
         assert_eq!(u16::from_be_bytes([header[3], header[4]]), 100);
+    }
+
+    #[test]
+    fn test_client_hello_signature_algorithms_match_chrome_utls() {
+        let client_random = [0u8; 32];
+        let session_id = [0u8; 32];
+        let client_public_key = [0u8; 32];
+
+        let hello = construct_client_hello(
+            &client_random,
+            &session_id,
+            &client_public_key,
+            "example.com",
+            &[0x1301],
+            &["h2"],
+        )
+        .unwrap();
+
+        let mut offset = 1 + 3 + 2 + 32;
+        let session_id_len = hello[offset] as usize;
+        offset += 1 + session_id_len;
+        let cipher_suites_len = u16::from_be_bytes([hello[offset], hello[offset + 1]]) as usize;
+        offset += 2 + cipher_suites_len;
+        let compression_methods_len = hello[offset] as usize;
+        offset += 1 + compression_methods_len;
+        let extensions_len = u16::from_be_bytes([hello[offset], hello[offset + 1]]) as usize;
+        offset += 2;
+        let extensions_end = offset + extensions_len;
+
+        let mut signature_algorithms = None;
+        while offset < extensions_end {
+            let extension_type = u16::from_be_bytes([hello[offset], hello[offset + 1]]);
+            let extension_len = u16::from_be_bytes([hello[offset + 2], hello[offset + 3]]) as usize;
+            offset += 4;
+            if extension_type == 0x000d {
+                signature_algorithms = Some(&hello[offset..offset + extension_len]);
+                break;
+            }
+            offset += extension_len;
+        }
+
+        let extension = signature_algorithms.expect("missing signature_algorithms extension");
+        assert_eq!(u16::from_be_bytes([extension[0], extension[1]]), 16);
+        assert_eq!(
+            &extension[2..],
+            &[
+                0x04, 0x03, // ecdsa_secp256r1_sha256
+                0x08, 0x04, // rsa_pss_rsae_sha256
+                0x04, 0x01, // rsa_pkcs1_sha256
+                0x05, 0x03, // ecdsa_secp384r1_sha384
+                0x08, 0x05, // rsa_pss_rsae_sha384
+                0x05, 0x01, // rsa_pkcs1_sha384
+                0x08, 0x06, // rsa_pss_rsae_sha512
+                0x06, 0x01, // rsa_pkcs1_sha512
+            ]
+        );
     }
 }

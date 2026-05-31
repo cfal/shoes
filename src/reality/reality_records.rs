@@ -6,12 +6,11 @@
 // - Building TLS record headers
 // - Managing sequence numbers
 
-use std::io::{self, Error};
+use std::io::{self, Error, ErrorKind};
 
 use super::common::{
     CONTENT_TYPE_ALERT, CONTENT_TYPE_APPLICATION_DATA, CONTENT_TYPE_HANDSHAKE,
     MAX_TLS_CIPHERTEXT_LEN, MAX_TLS_PLAINTEXT_LEN, TLS_RECORD_HEADER_SIZE,
-    strip_content_type_slice,
 };
 use super::reality_aead::AeadKey;
 #[cfg(test)]
@@ -301,10 +300,30 @@ impl<'a> RecordDecryptor<'a> {
             .checked_add(1)
             .ok_or_else(|| Error::other("TLS sequence number exhausted"))?;
 
-        // Strip content type (returns content_type and valid length)
-        let (content_type, valid_len) = strip_content_type_slice(plaintext)?;
+        // TLSInnerPlaintext is content || ContentType || zeros*.
+        // Reference REALITY implementations may add trailing zero padding.
+        let mut valid_end = plaintext.len();
+        while valid_end > 0 && plaintext[valid_end - 1] == 0 {
+            valid_end -= 1;
+        }
+        if valid_end == 0 {
+            return Err(Error::new(ErrorKind::InvalidData, "Plaintext is all zeros"));
+        }
 
-        Ok((content_type, &plaintext[..valid_len]))
+        let content_type = plaintext[valid_end - 1];
+        valid_end -= 1;
+
+        if content_type != CONTENT_TYPE_HANDSHAKE
+            && content_type != CONTENT_TYPE_APPLICATION_DATA
+            && content_type != CONTENT_TYPE_ALERT
+        {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!("Invalid content type: 0x{:02x}", content_type),
+            ));
+        }
+
+        Ok((content_type, &plaintext[..valid_end]))
     }
 }
 
@@ -916,6 +935,49 @@ mod tests {
         let result = decrypt_record(&mut decryptor, ciphertext, record_len);
         // Will fail either due to decryption (wrong nonce) or seq exhaustion
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_decrypt_record_with_zero_padding() {
+        let key = [0x01u8; 16];
+        let iv = [0x02u8; 12];
+        let aead_key = AeadKey::new(CS, &key).unwrap();
+
+        let content = vec![0xAAu8; 50];
+        let mut padded = content.clone();
+        padded.push(CONTENT_TYPE_HANDSHAKE);
+        padded.extend_from_slice(&[0x00u8; 5]);
+
+        let ciphertext_len = padded.len() + 16;
+        let aad = make_record_header(ciphertext_len);
+        let ciphertext = aead_key.seal(&padded, &iv, 0, &aad).unwrap();
+
+        let mut dec_seq = 0u64;
+        let mut decryptor = RecordDecryptor::new(&aead_key, &iv, &mut dec_seq);
+        let (content_type, plaintext) =
+            decrypt_record(&mut decryptor, &ciphertext, ciphertext_len as u16).unwrap();
+
+        assert_eq!(content_type, CONTENT_TYPE_HANDSHAKE);
+        assert_eq!(plaintext, content);
+    }
+
+    #[test]
+    fn test_decrypt_all_zeros_plaintext_fails() {
+        let key = [0x03u8; 16];
+        let iv = [0x04u8; 12];
+        let aead_key = AeadKey::new(CS, &key).unwrap();
+
+        let all_zeros = vec![0x00u8; 16];
+        let ciphertext_len = all_zeros.len() + 16;
+        let aad = make_record_header(ciphertext_len);
+        let ciphertext = aead_key.seal(&all_zeros, &iv, 0, &aad).unwrap();
+
+        let mut dec_seq = 0u64;
+        let mut decryptor = RecordDecryptor::new(&aead_key, &iv, &mut dec_seq);
+        let result = decrypt_record(&mut decryptor, &ciphertext, ciphertext_len as u16);
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("all zeros"));
     }
 
     #[test]
