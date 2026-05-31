@@ -10,6 +10,7 @@ shoes uses YAML configuration files. Multiple configuration types can be combine
 - [Client Config](#client-config)
 - [Client Protocols](#client-protocols)
 - [Rules System](#rules-system)
+- [Fake IP](#fake-ip)
 - [Named Groups](#named-groups)
 - [Named PEMs](#named-pems)
 - [Advanced Features](#advanced-features)
@@ -625,6 +626,15 @@ rules:
       address: "proxy.example.com:1080"
       protocol:
         type: socks
+```
+
+## Fake IP
+
+The global `fake_ip` configuration can optionally be provided to dynamically allocate a pseudo-IP to avoid waiting for initial DNS resolution for TUN and HTTP/SOCKS proxies.
+
+```yaml
+- fake_ip:
+    network: 198.18.0.0/16
 ```
 
 ## Named Groups

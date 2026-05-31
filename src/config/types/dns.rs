@@ -23,6 +23,24 @@ fn default_attempts() -> usize {
     1
 }
 
+/// Fake IP configuration.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct FakeIpConfig {
+    pub fake_ip: FakeIpSettings,
+}
+
+/// Fake IP settings.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct FakeIpSettings {
+    /// The IPv4 network range, e.g. "198.18.0.0/16"
+    pub network: String,
+    
+    /// Address to bind the built-in Fake IP DNS server.
+    /// E.g., "127.0.0.1:53". If not provided, FakeIP only works via TUN mode.
+    #[serde(default)]
+    pub bind_address: Option<String>,
+}
+
 /// A DNS server specification in config.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]

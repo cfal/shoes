@@ -198,6 +198,20 @@ impl ResolvedLocation {
         }
     }
 
+    /// Rewrites the location if it is a Fake IP, restoring its original Hostname.
+    pub fn restore_fake_ip(&mut self) {
+        if let Address::Ipv4(ip) = self.location.address {
+            if let Some(manager) = crate::dns::fake_ip::GLOBAL_FAKE_IP_MANAGER.get() {
+                if manager.is_fake_ip(ip) {
+                    if let Some(domain) = manager.lookup_ip(ip) {
+                        self.location.address = Address::Hostname(domain);
+                        self.resolved_addr = None;
+                    }
+                }
+            }
+        }
+    }
+
     /// Get the underlying NetLocation.
     pub fn location(&self) -> &NetLocation {
         &self.location

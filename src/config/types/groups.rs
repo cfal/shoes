@@ -157,6 +157,7 @@ pub enum Config {
     RuleConfigGroup(RuleConfigGroup),
     DnsConfigGroup(DnsConfigGroup),
     NamedPem(NamedPem),
+    FakeIp(crate::config::types::dns::FakeIpConfig),
 }
 
 impl<'de> serde::de::Deserialize<'de> for Config {
@@ -182,6 +183,7 @@ impl<'de> serde::de::Deserialize<'de> for Config {
         let has_address = map.contains_key(Value::String("address".to_string()));
         let has_path_field = map.contains_key(Value::String("path".to_string()));
         let has_pem = map.contains_key(Value::String("pem".to_string()));
+        let has_fake_ip = map.contains_key(Value::String("fake_ip".to_string()));
 
         // Check if this is a TUN config
         // TUN configs have 'device_name' (Linux) or 'device_fd' (iOS/Android)
@@ -211,6 +213,11 @@ impl<'de> serde::de::Deserialize<'de> for Config {
             serde_yaml::from_value(value)
                 .map(Config::DnsConfigGroup)
                 .map_err(|e| Error::custom(format!("invalid DNS config group: {e}")))
+        } else if has_fake_ip {
+            // FakeIp configuration
+            serde_yaml::from_value(value)
+                .map(Config::FakeIp)
+                .map_err(|e| Error::custom(format!("invalid fake_ip config: {e}")))
         } else if is_tun_config {
             // TunConfig - identified by having 'name' or 'raw_fd' without 'protocol' wrapper
             serde_yaml::from_value(value)
@@ -251,6 +258,7 @@ impl serde::ser::Serialize for Config {
             Config::RuleConfigGroup(group) => group.serialize(serializer),
             Config::DnsConfigGroup(group) => group.serialize(serializer),
             Config::NamedPem(pem) => pem.serialize(serializer),
+            Config::FakeIp(fake_ip) => fake_ip.serialize(serializer),
         }
     }
 }

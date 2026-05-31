@@ -282,9 +282,11 @@ impl ClientProxySelector {
     #[inline]
     pub async fn judge<'a>(
         &'a self,
-        location: ResolvedLocation,
+        mut location: ResolvedLocation,
         resolver: &Arc<dyn Resolver>,
     ) -> std::io::Result<ConnectDecision<'a>> {
+        location.restore_fake_ip();
+
         // Derive resolved_ip from any pre-resolved address
         let resolved_ip = location.resolved_addr().map(|addr| ip_to_u128(addr.ip()));
 
@@ -335,6 +337,7 @@ impl ClientProxySelector {
         resolver: &Arc<dyn Resolver>,
     ) -> std::io::Result<ConnectDecision<'a>> {
         let mut location = location;
+        
         match match_rule(
             &self.rules,
             &mut location,
