@@ -24,7 +24,10 @@ struct FakeIpState {
 impl FakeIpManager {
     /// Creates a new FakeIpManager given an IPv4 network and a prefix length (e.g., 198.18.0.0, 16)
     pub fn new(network: Ipv4Addr, prefix_len: u8) -> Arc<Self> {
-        assert!(prefix_len <= 30 && prefix_len >= 8, "Prefix length must be between 8 and 30");
+        assert!(
+            (8..=30).contains(&prefix_len),
+            "Prefix length must be between 8 and 30"
+        );
         let net_u32 = u32::from(network);
         let mask = !0u32 << (32 - prefix_len);
         let network_addr = net_u32 & mask;
@@ -94,7 +97,7 @@ mod tests {
     fn test_fake_ip_manager() {
         // 198.18.0.0/30 has only 2 usable IPs: 198.18.0.1 and .2
         let mgr = FakeIpManager::new(Ipv4Addr::new(198, 18, 0, 0), 30);
-        
+
         let ip1 = mgr.lookup_domain("google.com");
         assert_eq!(ip1, Ipv4Addr::new(198, 18, 0, 1));
         assert!(mgr.is_fake_ip(ip1));
@@ -107,7 +110,10 @@ mod tests {
         assert_eq!(ip3, Ipv4Addr::new(198, 18, 0, 1));
 
         // Now google.com is gone
-        assert_eq!(mgr.lookup_ip(Ipv4Addr::new(198, 18, 0, 1)), Some("facebook.com".to_string()));
+        assert_eq!(
+            mgr.lookup_ip(Ipv4Addr::new(198, 18, 0, 1)),
+            Some("facebook.com".to_string())
+        );
 
         // Lookup youtube again to make it recently used
         let ip2_again = mgr.lookup_domain("youtube.com");
@@ -116,6 +122,9 @@ mod tests {
         // Now evict again, it should pop facebook.com because youtube.com is recently used
         let ip4 = mgr.lookup_domain("twitter.com");
         assert_eq!(ip4, Ipv4Addr::new(198, 18, 0, 1));
-        assert_eq!(mgr.lookup_ip(Ipv4Addr::new(198, 18, 0, 1)), Some("twitter.com".to_string()));
+        assert_eq!(
+            mgr.lookup_ip(Ipv4Addr::new(198, 18, 0, 1)),
+            Some("twitter.com".to_string())
+        );
     }
 }

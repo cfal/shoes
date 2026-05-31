@@ -337,7 +337,7 @@ impl ClientProxySelector {
         resolver: &Arc<dyn Resolver>,
     ) -> std::io::Result<ConnectDecision<'a>> {
         let mut location = location;
-        
+
         match match_rule(
             &self.rules,
             &mut location,

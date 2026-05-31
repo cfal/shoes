@@ -34,7 +34,7 @@ pub struct FakeIpConfig {
 pub struct FakeIpSettings {
     /// The IPv4 network range, e.g. "198.18.0.0/16"
     pub network: String,
-    
+
     /// Address to bind the built-in Fake IP DNS server.
     /// E.g., "127.0.0.1:53". If not provided, FakeIP only works via TUN mode.
     #[serde(default)]

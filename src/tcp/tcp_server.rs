@@ -1,5 +1,4 @@
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -461,7 +460,7 @@ async fn start_tcp_servers(
                 handles.push(handle);
             }
         }
-        BindLocation::Path(path_buf) => {
+        BindLocation::Path(_path_buf) => {
             #[cfg(target_family = "unix")]
             {
                 let tcp_handler = tcp_handler.clone();
@@ -474,8 +473,7 @@ async fn start_tcp_servers(
             }
             #[cfg(not(target_family = "unix"))]
             {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
+                return Err(std::io::Error::other(
                     "Unix sockets are not supported on this platform",
                 ));
             }

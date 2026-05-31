@@ -400,7 +400,7 @@ fn main() {
                             return;
                         }
                     };
-                    
+
                     let fake_ip_manager = dns::FakeIpManager::new(ip, prefix);
                     crate::dns::fake_ip::GLOBAL_FAKE_IP_MANAGER.set(fake_ip_manager.clone()).ok();
 
