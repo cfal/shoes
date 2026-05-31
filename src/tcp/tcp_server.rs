@@ -71,7 +71,7 @@ async fn run_tcp_server(
 
 #[cfg(target_family = "unix")]
 async fn run_unix_server(
-    path_buf: PathBuf,
+    path_buf: std::path::PathBuf,
     resolver: Arc<dyn Resolver>,
     server_handler: Arc<dyn TcpServerHandler>,
 ) -> std::io::Result<()> {
@@ -460,7 +460,8 @@ async fn start_tcp_servers(
                 handles.push(handle);
             }
         }
-        BindLocation::Path(_path_buf) => {
+        #[allow(unused_variables)]
+        BindLocation::Path(path_buf) => {
             #[cfg(target_family = "unix")]
             {
                 let tcp_handler = tcp_handler.clone();
