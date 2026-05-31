@@ -385,10 +385,15 @@ async fn run_udp_remote_to_local_loop(
         // session_id(4) + packet_id(2) + fragment id(1) + fragment count(1) + address length varint + address bytes
         let header_overhead = 4 + 2 + 1 + 1 + address_len_bytes.len() + address_bytes.len();
 
-        assert!(
-            max_datagram_size > header_overhead,
-            "max datagram size ({max_datagram_size}) is smaller than header overhead ({header_overhead})"
-        );
+        // `max_datagram_size` is reported by the remote QUIC endpoint and can be
+        // attacker-influenced; a value at/below the header overhead must not panic
+        // (and would underflow `max_datagram_size - header_overhead` below). Bail
+        // on this connection instead of asserting on remote input.
+        if max_datagram_size <= header_overhead {
+            return Err(std::io::Error::other(format!(
+                "datagram too small: max datagram size ({max_datagram_size}) <= header overhead ({header_overhead})"
+            )));
+        }
 
         if header_overhead + payload_len <= max_datagram_size {
             let mut datagram = BytesMut::with_capacity(header_overhead + payload_len);
@@ -489,6 +494,14 @@ async fn run_udp_local_to_remote_loop(
             };
             let mut next_index = 9;
             if num_bytes > 1 {
+                // A small/truncated datagram could make this varint claim more
+                // bytes than are present; slicing past the end would panic on
+                // attacker-controlled input. Per the reference, malformed
+                // datagrams are ignored -- skip rather than crash.
+                if data.len() < 9 + (num_bytes - 1) {
+                    debug!("Ignoring datagram with truncated varint address length");
+                    continue;
+                }
                 let remaining = &data[9..9 + (num_bytes - 1)];
                 for byte in remaining {
                     value <<= 8;
