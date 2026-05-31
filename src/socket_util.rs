@@ -69,7 +69,8 @@ pub fn new_socket2_udp_socket_with_buffer_size(
         panic!("Cannot support reuse sockets");
     }
 
-    if let Some(_interface) = bind_interface {
+    #[allow(unused_variables)]
+    if let Some(interface) = bind_interface {
         #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
         socket.bind_device(Some(interface.as_bytes()))?;
 
@@ -165,7 +166,8 @@ pub fn new_tcp_listener(
     socket.set_nonblocking(true)?;
     socket.set_reuse_address(true)?;
 
-    if let Some(_interface) = bind_interface {
+    #[allow(unused_variables)]
+    if let Some(interface) = bind_interface {
         #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
         socket.bind_device(Some(interface.as_bytes()))?;
 

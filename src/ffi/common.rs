@@ -141,6 +141,7 @@ pub async fn start_from_config(
     let crate::config::ValidatedConfigs {
         configs: validated_configs,
         dns_groups,
+        fake_ip: _,
     } = create_server_configs(configs)?;
 
     // Build DNS registry from expanded groups
