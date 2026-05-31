@@ -425,7 +425,7 @@ mod tests {
         let mut state = VisionUnpadder::new(user_uuid);
 
         // Data that's less than 16 bytes (too short to check UUID)
-        let short_data = vec![1, 2, 3, 4, 5];
+        let short_data = [1, 2, 3, 4, 5];
         let result = state.unpad(&short_data[..]).unwrap();
         assert!(result.content.is_empty()); // Need more data
         assert!(result.command.is_none());

@@ -381,7 +381,7 @@ servers: my-dns-group
         ] {
             let spec = DnsServerSpec::Simple(url.to_string());
             assert!(
-                !spec.as_group_ref().is_some(),
+                spec.as_group_ref().is_none(),
                 "{} should not be a group ref",
                 url
             );
@@ -402,7 +402,7 @@ servers: my-dns-group
             connect_timeout_secs: default_connect_timeout_secs(),
             attempts: default_attempts(),
         };
-        assert!(!spec.as_group_ref().is_some());
+        assert!(spec.as_group_ref().is_none());
         assert!(spec.as_group_ref().is_none());
     }
 
@@ -423,7 +423,7 @@ dns_servers:
         assert_eq!(servers[0].as_group_ref(), Some("base-dns"));
         assert!(servers[1].as_group_ref().is_some());
         assert_eq!(servers[1].as_group_ref(), Some("fast-dns"));
-        assert!(!servers[2].as_group_ref().is_some());
+        assert!(servers[2].as_group_ref().is_none());
     }
 
     #[test]
