@@ -3,6 +3,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use log::debug;
+use subtle::ConstantTimeEq;
 use tokio::io::AsyncWriteExt;
 
 use crate::address::{Address, NetLocation, ResolvedLocation};
@@ -20,6 +21,11 @@ const PROXY_CONNECTION_HEADER_PREFIX: &str = "proxy-connection: ";
 
 fn create_http_auth_token(username: &str, password: &str) -> String {
     BASE64.encode(format!("{username}:{password}"))
+}
+
+#[inline]
+fn http_auth_token_matches(expected: &str, actual: &str) -> bool {
+    expected.as_bytes().ct_eq(actual.as_bytes()).unwrap_u8() == 1
 }
 
 #[derive(Debug)]
@@ -130,11 +136,11 @@ pub async fn setup_http_server_stream_inner(
                     && line[0..PROXY_AUTH_HEADER_PREFIX.len()].to_ascii_lowercase()
                         == PROXY_AUTH_HEADER_PREFIX
                 {
-                    if &line[PROXY_AUTH_HEADER_PREFIX.len()..] != auth_token.unwrap() {
-                        debug!(
-                            "Received incorrect HTTP CONNECT authentication: {}",
-                            &line[PROXY_AUTH_HEADER_PREFIX.len()..]
-                        );
+                    if !http_auth_token_matches(
+                        auth_token.unwrap(),
+                        &line[PROXY_AUTH_HEADER_PREFIX.len()..],
+                    ) {
+                        debug!("Received incorrect HTTP CONNECT authentication");
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidInput,
                             "Incorrect HTTP CONNECT authentication",
@@ -232,11 +238,11 @@ pub async fn setup_http_server_stream_inner(
                     && lowercase_line.starts_with(PROXY_AUTH_HEADER_PREFIX)
                 {
                     if need_auth {
-                        if &line[PROXY_AUTH_HEADER_PREFIX.len()..] != auth_token.unwrap() {
-                            debug!(
-                                "Received incorrect HTTP GET authentication: {}",
-                                &line[PROXY_AUTH_HEADER_PREFIX.len()..]
-                            );
+                        if !http_auth_token_matches(
+                            auth_token.unwrap(),
+                            &line[PROXY_AUTH_HEADER_PREFIX.len()..],
+                        ) {
+                            debug!("Received incorrect HTTP GET authentication");
                             return Err(std::io::Error::new(
                                 std::io::ErrorKind::InvalidInput,
                                 "Incorrect HTTP GET authentication",
@@ -447,5 +453,18 @@ impl TcpClientHandler for HttpTcpClientHandler {
             client_stream,
             early_data,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auth_token_match_requires_exact_token() {
+        let token = create_http_auth_token("user", "pass");
+
+        assert!(http_auth_token_matches(&token, &token));
+        assert!(!http_auth_token_matches(&token, "bad-token"));
     }
 }

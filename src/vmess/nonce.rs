@@ -2,7 +2,7 @@ use aws_lc_rs::aead::{Nonce, NonceSequence};
 use aws_lc_rs::error::Unspecified;
 
 pub struct VmessNonceSequence {
-    count: u16,
+    count: u32,
     nonce: [u8; 12],
 }
 
@@ -16,12 +16,16 @@ impl VmessNonceSequence {
 
 impl NonceSequence for VmessNonceSequence {
     fn advance(&mut self) -> Result<Nonce, Unspecified> {
-        // the nonce is correct for the first packet since the first two
-        // bytes are already zero.
+        if self.count > u16::MAX as u32 {
+            return Err(Unspecified);
+        }
+
+        let count = self.count as u16;
+        self.nonce[0] = (count >> 8) as u8;
+        self.nonce[1] = (count & 0xff) as u8;
+
         let ret = Nonce::assume_unique_for_key(self.nonce);
-        self.count = self.count.wrapping_add(1);
-        self.nonce[0] = (self.count >> 8) as u8;
-        self.nonce[1] = (self.count & 0xff) as u8;
+        self.count += 1;
         Ok(ret)
     }
 }
@@ -116,21 +120,16 @@ mod tests {
     }
 
     #[test]
-    fn test_vmess_nonce_sequence_wrapping() {
-        // Test that counter wraps around at u16::MAX
+    fn test_vmess_nonce_sequence_rejects_counter_exhaustion() {
         let data = [0x00u8; 12];
         let mut seq = VmessNonceSequence::new(&data);
+        seq.count = u16::MAX as u32;
 
-        // Set internal state to just before wraparound
-        // We need to advance 65535 times, but that's slow
-        // Instead, just verify the wraparound behavior conceptually
-        // by checking a few iterations work correctly
-        for i in 0..10 {
-            let nonce = seq.advance().unwrap();
-            let nonce_bytes = nonce_to_bytes(nonce);
-            let counter = ((nonce_bytes[0] as u16) << 8) | (nonce_bytes[1] as u16);
-            assert_eq!(counter, i);
-        }
+        let nonce = seq.advance().unwrap();
+        let nonce_bytes = nonce_to_bytes(nonce);
+        assert_eq!(&nonce_bytes[0..2], &[0xff, 0xff]);
+
+        assert!(seq.advance().is_err());
     }
 
     #[test]

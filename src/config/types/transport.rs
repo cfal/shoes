@@ -1,6 +1,6 @@
 //! Transport-related configuration types.
 
-use std::path::PathBuf;
+use std::{fmt, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -8,6 +8,8 @@ use crate::address::{NetLocation, NetLocationPortRange};
 use crate::option_util::{NoneOrOne, NoneOrSome};
 
 use super::common::default_true;
+
+const REDACTED: &str = "<redacted>";
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -53,7 +55,7 @@ impl Default for TcpConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct ServerQuicConfig {
     pub cert: String,
     pub key: String,
@@ -68,7 +70,20 @@ pub struct ServerQuicConfig {
     pub num_endpoints: usize,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+impl fmt::Debug for ServerQuicConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ServerQuicConfig")
+            .field("cert", &"<present>")
+            .field("key", &REDACTED)
+            .field("alpn_protocols", &self.alpn_protocols)
+            .field("client_ca_certs", &self.client_ca_certs)
+            .field("client_fingerprints", &self.client_fingerprints)
+            .field("num_endpoints", &self.num_endpoints)
+            .finish()
+    }
+}
+
+#[derive(Clone, Deserialize, Serialize)]
 pub struct ClientQuicConfig {
     #[serde(default = "default_true")]
     pub verify: bool,
@@ -82,6 +97,19 @@ pub struct ClientQuicConfig {
     pub key: Option<String>,
     #[serde(default)]
     pub cert: Option<String>,
+}
+
+impl fmt::Debug for ClientQuicConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClientQuicConfig")
+            .field("verify", &self.verify)
+            .field("server_fingerprints", &self.server_fingerprints)
+            .field("sni_hostname", &self.sni_hostname)
+            .field("alpn_protocols", &self.alpn_protocols)
+            .field("key", &self.key.as_ref().map(|_| REDACTED))
+            .field("cert", &self.cert.as_ref().map(|_| "<present>"))
+            .finish()
+    }
 }
 
 impl Default for ClientQuicConfig {

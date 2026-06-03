@@ -7,6 +7,7 @@ use aws_lc_rs::{agreement, digest};
 use rand::Rng;
 use std::io::{self, Read, Write};
 use subtle::ConstantTimeEq;
+use zeroize::{Zeroize, Zeroizing};
 
 use super::common::{
     ALERT_DESC_CLOSE_NOTIFY, ALERT_LEVEL_WARNING, CIPHERTEXT_READ_BUF_CAPACITY, CONTENT_TYPE_ALERT,
@@ -56,6 +57,12 @@ pub struct RealityServerConfig {
     pub cipher_suites: Vec<CipherSuite>,
 }
 
+impl Drop for RealityServerConfig {
+    fn drop(&mut self) {
+        self.private_key.zeroize();
+    }
+}
+
 /// Handshake state machine for REALITY server
 enum HandshakeState {
     /// Initial state, waiting for ClientHello
@@ -87,6 +94,12 @@ pub struct ClientHelloInfo {
     pub cipher_suite: CipherSuite,
     /// Raw ClientHello handshake bytes (for transcript hash)
     pub client_hello_handshake: Vec<u8>,
+}
+
+impl Drop for ClientHelloInfo {
+    fn drop(&mut self) {
+        self.auth_key.zeroize();
+    }
 }
 
 /// REALITY server-side connection implementing rustls-compatible API
@@ -304,12 +317,15 @@ impl RealityServerConnection {
         );
 
         // Perform ECDH to derive auth key
-        let shared_secret = perform_ecdh(&self.config.private_key, &client_public_key)
+        let mut shared_secret = perform_ecdh(&self.config.private_key, &client_public_key)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
         let salt = &client_random[0..20];
-        let auth_key = derive_auth_key(&shared_secret, salt, b"REALITY")
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        let auth_key = Zeroizing::new(
+            derive_auth_key(&shared_secret, salt, b"REALITY")
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?,
+        );
+        shared_secret.zeroize();
 
         // Validate session ID (contains encrypted metadata)
         if session_id.len() != 32 {
@@ -339,7 +355,7 @@ impl RealityServerConnection {
         .map_err(|e| {
             io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                format!("Session ID decrypt failed: {:?}", e),
+                format!("REALITY authentication failed: {e}"),
             )
         })?;
 
@@ -355,7 +371,6 @@ impl RealityServerConnection {
 
         log::debug!("REALITY: Client version: {:?}", client_version);
         log::debug!("REALITY: Client timestamp: {}", client_timestamp);
-        log::debug!("REALITY: Client short_id: {:02x?}", client_short_id);
 
         // Validate short ID using constant-time comparison
         let mut client_short_id_arr = [0u8; 8];
@@ -365,13 +380,11 @@ impl RealityServerConnection {
         });
 
         if !short_id_ok {
-            log::warn!(
-                "REALITY: Client short_id {:02x?} not in configured list",
-                client_short_id
-            );
+            log::warn!("TLS handshake failed, forwarding to dest");
+            log::debug!("REALITY: Client short_id not in configured list");
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                format!("Invalid short_id: {:02x?}", client_short_id),
+                "Invalid REALITY authentication metadata",
             ));
         }
 
@@ -386,19 +399,11 @@ impl RealityServerConnection {
             let max_diff_secs = max_diff_ms / 1000;
 
             if time_diff_secs > max_diff_secs {
-                log::warn!(
-                    "REALITY: Client timestamp {} differs from server {} by {} seconds (max: {} seconds)",
-                    client_timestamp,
-                    now,
-                    time_diff_secs,
-                    max_diff_secs
-                );
+                log::warn!("TLS handshake failed, forwarding to dest");
+                log::debug!("REALITY: Client timestamp outside accepted window");
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
-                    format!(
-                        "Timestamp difference {} seconds exceeds maximum {} seconds",
-                        time_diff_secs, max_diff_secs
-                    ),
+                    "REALITY timestamp outside accepted window",
                 ));
             }
         }
@@ -407,17 +412,11 @@ impl RealityServerConnection {
         if let Some(min_ver) = &self.config.min_client_version
             && client_version < &min_ver[..]
         {
-            log::warn!(
-                "REALITY: Client version {:?} is below minimum {:?}",
-                client_version,
-                min_ver
-            );
+            log::warn!("TLS handshake failed, forwarding to dest");
+            log::debug!("REALITY: Client version below configured minimum");
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                format!(
-                    "Client version {:?} is below minimum {:?}",
-                    client_version, min_ver
-                ),
+                "REALITY client version outside accepted range",
             ));
         }
 
@@ -425,26 +424,15 @@ impl RealityServerConnection {
         if let Some(max_ver) = &self.config.max_client_version
             && client_version > &max_ver[..]
         {
-            log::warn!(
-                "REALITY: Client version {:?} is above maximum {:?}",
-                client_version,
-                max_ver
-            );
+            log::warn!("TLS handshake failed, forwarding to dest");
+            log::debug!("REALITY: Client version above configured maximum");
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                format!(
-                    "Client version {:?} is above maximum {:?}",
-                    client_version, max_ver
-                ),
+                "REALITY client version outside accepted range",
             ));
         }
 
-        log::debug!(
-            "REALITY: Client authentication successful - short_id: {:02x?}, version: {:?}, timestamp: {}",
-            client_short_id,
-            client_version,
-            client_timestamp
-        );
+        log::debug!("REALITY: Client authentication successful");
 
         // Negotiate cipher suite with client
         let client_cipher_suites = extract_client_cipher_suites(client_hello)?;
@@ -471,7 +459,7 @@ impl RealityServerConnection {
             info: ClientHelloInfo {
                 session_id: session_id.to_vec(),
                 client_public_key,
-                auth_key,
+                auth_key: *auth_key,
                 cipher_suite,
                 client_hello_handshake: client_hello_handshake.to_vec(),
             },
@@ -486,18 +474,21 @@ impl RealityServerConnection {
         let HandshakeState::ClientHelloValidated { info } =
             std::mem::replace(&mut self.handshake_state, HandshakeState::Initial)
         else {
-            unreachable!()
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "build_server_response called in wrong state",
+            ));
         };
 
         let cipher_suite = info.cipher_suite;
 
         // Generate our server X25519 keypair
         let mut rng = rand::rng();
-        let mut our_private_bytes = [0u8; 32];
-        rng.fill_bytes(&mut our_private_bytes);
+        let mut our_private_bytes = Zeroizing::new([0u8; 32]);
+        rng.fill_bytes(&mut *our_private_bytes);
 
         let our_private_key =
-            agreement::PrivateKey::from_private_key(&agreement::X25519, &our_private_bytes)
+            agreement::PrivateKey::from_private_key(&agreement::X25519, &*our_private_bytes)
                 .map_err(|_| io::Error::other("Failed to create X25519 key"))?;
         let our_public_key_bytes = our_private_key
             .compute_public_key()
@@ -532,7 +523,7 @@ impl RealityServerConnection {
         // Perform ECDH for TLS 1.3 key derivation
         let peer_public_key =
             agreement::UnparsedPublicKey::new(&agreement::X25519, &info.client_public_key);
-        let mut tls_shared_secret = [0u8; 32];
+        let mut tls_shared_secret = Zeroizing::new([0u8; 32]);
         agreement::agree(
             &our_private_key,
             peer_public_key,
@@ -546,7 +537,7 @@ impl RealityServerConnection {
         // Derive TLS 1.3 keys
         let hs_keys = derive_handshake_keys(
             cipher_suite,
-            &tls_shared_secret,
+            &*tls_shared_secret,
             client_hello_hash.as_ref(),
             server_hello_hash.as_ref(),
         )?;
@@ -767,14 +758,30 @@ impl RealityServerConnection {
         // NOW we're committed to processing - take ownership of handshake state
         // This avoids cloning Vec<u8> fields
         let old_state = std::mem::replace(&mut self.handshake_state, HandshakeState::Complete);
-        let HandshakeState::ServerHelloSent {
+        let (
             client_handshake_traffic_secret,
             master_secret,
             cipher_suite,
             handshake_hash_with_server_finished,
-        } = old_state
-        else {
-            unreachable!()
+        ) = match old_state {
+            HandshakeState::ServerHelloSent {
+                client_handshake_traffic_secret,
+                master_secret,
+                cipher_suite,
+                handshake_hash_with_server_finished,
+            } => (
+                client_handshake_traffic_secret,
+                master_secret,
+                cipher_suite,
+                handshake_hash_with_server_finished,
+            ),
+            other => {
+                self.handshake_state = other;
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "process_client_finished called in wrong state",
+                ));
+            }
         };
 
         // Extract the encrypted Finished record (copy to Vec for decryption)
@@ -876,7 +883,12 @@ impl RealityServerConnection {
         // Check if we have application keys
         let (app_read_key, app_read_iv) = match (&self.app_read_key, &self.app_read_iv) {
             (Some(key), Some(iv)) => (key, iv),
-            _ => unreachable!(), // Wrong state
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Application keys not available",
+                ));
+            }
         };
 
         // Process all complete TLS records in the buffer
@@ -905,7 +917,10 @@ impl RealityServerConnection {
             match content_type {
                 CONTENT_TYPE_APPLICATION_DATA => {
                     // Compact plaintext buffer if needed before extending
-                    self.plaintext_read_buf.maybe_compact(4096);
+                    self.plaintext_read_buf.maybe_compact(0);
+                    if self.plaintext_read_buf.remaining_capacity() < plaintext.len() {
+                        return Err(io::Error::other("plaintext buffer full"));
+                    }
                     self.plaintext_read_buf.extend_from_slice(plaintext);
                 }
                 CONTENT_TYPE_ALERT => {
@@ -936,12 +951,12 @@ impl RealityServerConnection {
                         }
                     }
                 }
-                // CONTENT_TYPE_HANDSHAKE is invalid after handshake complete
-                // strip_content_type() validates and returns error for invalid types
-                _ => unreachable!(
-                    "strip_content_type validates content type; unexpected: 0x{:02x}",
-                    content_type
-                ),
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("Unexpected TLS content type: 0x{content_type:02x}"),
+                    ));
+                }
             }
 
             // Consume the processed record from the buffer (after plaintext borrow ends)

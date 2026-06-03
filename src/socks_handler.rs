@@ -150,7 +150,7 @@ pub async fn setup_socks_server_stream_inner(
     };
 
     if !methods.contains(&supported_method) {
-        // TODO: consider writing response: [VER_SOCKS5, METHOD_INVALID]
+        let _ = write_all(&mut server_stream, &[VER_SOCKS5, METHOD_INVALID]).await;
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "Supported SOCKS method not found",

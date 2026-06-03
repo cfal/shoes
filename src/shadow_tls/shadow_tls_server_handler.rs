@@ -8,6 +8,7 @@ use std::fmt::Debug;
 use std::io::Cursor;
 use std::sync::Arc;
 
+use subtle::ConstantTimeEq;
 use tokio::io::AsyncWriteExt;
 
 use super::shadow_tls_hmac::ShadowTlsHmac;
@@ -106,6 +107,11 @@ const RETRY_REQUEST_RANDOM_BYTES: [u8; 32] = [
     0xC2, 0xA2, 0x11, 0x16, 0x7A, 0xBB, 0x8C, 0x5E, 0x07, 0x9E, 0x09, 0xE2, 0xC8, 0xA8, 0x33, 0x9C,
 ];
 
+#[inline]
+fn hmac_tag_matches(actual: &[u8], expected: [u8; 4]) -> bool {
+    actual.len() == 4 && expected.as_ref().ct_eq(actual).unwrap_u8() == 1
+}
+
 /// Validates the ClientHello for ShadowTLS authentication.
 /// Returns Ok(()) on success, or Err with PermissionDenied on auth failure.
 fn validate_shadowtls_client_hello(
@@ -167,7 +173,7 @@ fn validate_shadowtls_client_hello(
     hmac.update(&[0; 4]);
     hmac.update(&client_hello_frame[digest.client_hello_digest_end_index..]);
 
-    if digest.client_hello_digest != hmac.finalized_digest() {
+    if !hmac_tag_matches(&digest.client_hello_digest, hmac.finalized_digest()) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "HMAC tag mismatch",
@@ -869,11 +875,11 @@ async fn setup_remote_handshake(
                         format!("failed to read TLS payload from client during handshake (size {client_payload_size}): {e}")
                     ))?;
 
-                if client_content_type == CONTENT_TYPE_APPLICATION_DATA {
+                if client_content_type == CONTENT_TYPE_APPLICATION_DATA && client_payload_bytes.len() >= 4 {
                     let mut tmp_hmac = hmac_client_data.clone();
                     tmp_hmac.update(&client_payload_bytes[4..]);
 
-                    if tmp_hmac.finalized_digest() == client_payload_bytes[..4] {
+                    if hmac_tag_matches(&client_payload_bytes[..4], tmp_hmac.finalized_digest()) {
                         let initial_client_data = &client_payload_bytes[4..];
 
                         hmac_client_data.update(initial_client_data);
@@ -1115,11 +1121,11 @@ async fn setup_local_handshake(
             .read_slice(&mut server_stream, client_payload_size as usize)
             .await?;
 
-        if client_content_type == CONTENT_TYPE_APPLICATION_DATA {
+        if client_content_type == CONTENT_TYPE_APPLICATION_DATA && client_payload_bytes.len() >= 4 {
             let mut tmp_hmac = hmac_client_data.clone();
             tmp_hmac.update(&client_payload_bytes[4..]);
 
-            if tmp_hmac.finalized_digest() == client_payload_bytes[..4] {
+            if hmac_tag_matches(&client_payload_bytes[..4], tmp_hmac.finalized_digest()) {
                 let initial_client_data = &client_payload_bytes[4..];
 
                 hmac_client_data.update(initial_client_data);
@@ -1172,6 +1178,22 @@ fn read_server_connection(
             })?;
     }
     Ok(server_data_cursor.position() as usize)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hmac_tag_match_rejects_short_actual_tag() {
+        assert!(!hmac_tag_matches(&[], [0, 0, 0, 0]));
+        assert!(!hmac_tag_matches(&[0, 0, 0], [0, 0, 0, 0]));
+    }
+
+    #[test]
+    fn hmac_tag_match_accepts_exact_match() {
+        assert!(hmac_tag_matches(&[1, 2, 3, 4], [1, 2, 3, 4]));
+    }
 }
 
 #[inline]

@@ -102,10 +102,10 @@ impl SlideBuffer {
     /// Extend the buffer with data from a slice.
     ///
     /// # Panics
-    /// Panics in debug mode if there isn't enough capacity.
+    /// Panics if there isn't enough capacity.
     #[inline]
     pub fn extend_from_slice(&mut self, data: &[u8]) {
-        debug_assert!(
+        assert!(
             self.remaining_capacity() >= data.len(),
             "SlideBuffer overflow: need {} bytes, have {}",
             data.len(),
@@ -119,7 +119,7 @@ impl SlideBuffer {
     /// Mark n bytes as written (after writing to `write_slice()`).
     #[inline]
     pub fn advance_write(&mut self, n: usize) {
-        debug_assert!(
+        assert!(
             self.end + n <= self.data.len(),
             "SlideBuffer advance_write overflow: end={}, n={}, capacity={}",
             self.end,
@@ -132,10 +132,10 @@ impl SlideBuffer {
     /// Consume n bytes from the front of the buffer.
     ///
     /// # Panics
-    /// Panics in debug mode if n exceeds the available data.
+    /// Panics if n exceeds the available data.
     #[inline]
     pub fn consume(&mut self, n: usize) {
-        debug_assert!(
+        assert!(
             n <= self.len(),
             "SlideBuffer consume underflow: n={}, len={}",
             n,

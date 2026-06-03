@@ -180,7 +180,7 @@ pub unsafe extern "C" fn shoes_start(
         runtime,
     };
 
-    let mut guard = TUN_SERVICE.get().unwrap().lock();
+    let mut guard = TUN_SERVICE.get_or_init(|| Mutex::new(None)).lock();
     *guard = Some(handle);
 
     1

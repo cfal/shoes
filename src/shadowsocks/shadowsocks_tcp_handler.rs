@@ -29,6 +29,8 @@ use super::shadowsocks_key::ShadowsocksKey;
 use super::shadowsocks_stream::ShadowsocksStream;
 use super::shadowsocks_stream_type::ShadowsocksStreamType;
 
+const AEAD2022_MAX_PADDING_LEN: u16 = 900;
+
 #[derive(Debug)]
 pub struct ShadowsocksTcpHandler {
     cipher: ShadowsocksCipher,
@@ -128,6 +130,17 @@ impl ShadowsocksTcpHandler {
     }
 }
 
+fn validate_aead2022_tcp_padding_len(padding_len: u16) -> std::io::Result<()> {
+    if padding_len > AEAD2022_MAX_PADDING_LEN {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid padding length: {padding_len}"),
+        ));
+    }
+
+    Ok(())
+}
+
 #[async_trait]
 impl TcpServerHandler for ShadowsocksTcpHandler {
     async fn setup_server_stream(
@@ -157,17 +170,10 @@ impl TcpServerHandler for ShadowsocksTcpHandler {
         if self.aead2022 {
             let padding_len = stream_reader.read_u16_be(&mut server_stream).await?;
 
-            if padding_len > 0 {
-                if padding_len > 900 {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!("invalid padding length: {padding_len}"),
-                    ));
-                }
-                stream_reader
-                    .read_slice(&mut server_stream, padding_len as usize)
-                    .await?;
-            }
+            validate_aead2022_tcp_padding_len(padding_len)?;
+            stream_reader
+                .read_slice(&mut server_stream, padding_len as usize)
+                .await?;
         }
 
         // Checks for h2mux magic destination
@@ -329,7 +335,7 @@ impl TcpClientHandler for ShadowsocksTcpHandler {
             let location_len = location_vec.len();
 
             let mut rng = rand::rng();
-            let padding_len: usize = rng.random_range(1..=900);
+            let padding_len: usize = rng.random_range(1..=AEAD2022_MAX_PADDING_LEN as usize);
             location_vec.resize(location_len + padding_len + 2, 0);
 
             let padding_len_bytes = (padding_len as u16).to_be_bytes();
@@ -381,7 +387,7 @@ impl TcpClientHandler for ShadowsocksTcpHandler {
         if self.aead2022 {
             let location_len = location_vec.len();
             let mut rng = rand::rng();
-            let padding_len: usize = rng.random_range(1..=900);
+            let padding_len: usize = rng.random_range(1..=AEAD2022_MAX_PADDING_LEN as usize);
             location_vec.resize(location_len + padding_len + 2, 0);
             let padding_len_bytes = (padding_len as u16).to_be_bytes();
             location_vec[location_len..location_len + 2].copy_from_slice(&padding_len_bytes);
@@ -402,5 +408,27 @@ impl TcpClientHandler for ShadowsocksTcpHandler {
         let message_stream = UotV2Stream::new(client_stream);
 
         Ok(Box::new(message_stream))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn aead2022_tcp_padding_accepts_zero_len() {
+        assert!(validate_aead2022_tcp_padding_len(0).is_ok());
+    }
+
+    #[test]
+    fn aead2022_tcp_padding_rejects_oversized_len() {
+        let err = validate_aead2022_tcp_padding_len(AEAD2022_MAX_PADDING_LEN + 1).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn aead2022_tcp_padding_accepts_expected_len_range() {
+        assert!(validate_aead2022_tcp_padding_len(1).is_ok());
+        assert!(validate_aead2022_tcp_padding_len(AEAD2022_MAX_PADDING_LEN).is_ok());
     }
 }

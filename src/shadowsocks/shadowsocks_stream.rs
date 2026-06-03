@@ -441,21 +441,17 @@ impl ShadowsocksStream {
 
                 let timestamp_bytes = &self.unprocessed_buf[self.salt_len + 1..self.salt_len + 9];
                 let timestamp_secs = u64::from_be_bytes(timestamp_bytes.try_into().unwrap());
-                let current_time_secs = current_time_secs();
-                if current_time_secs >= timestamp_secs {
-                    if current_time_secs - timestamp_secs > 30 {
-                        return Err(std::io::Error::other(
-                            "timestamp is greater than 30 seconds",
-                        ));
-                    }
-                } else {
-                    // Make sure times aren't too far in the future.
-                    if timestamp_secs - current_time_secs > 2 {
-                        return Err(std::io::Error::other(format!(
-                            "timestamp is {} seconds in the future",
-                            timestamp_secs - current_time_secs
-                        )));
-                    }
+                let current_time_secs = current_time_secs()?;
+                // SIP022 (Shadowsocks 2022 Edition) requires rejecting any header
+                // whose timestamp is more than 30 seconds away from the current
+                // time, in either direction. Enforce the same symmetric window so
+                // peers with a fast clock (NTP drift, virtualized hosts) aren't
+                // rejected for being more than a couple of seconds ahead.
+                let time_diff_secs = current_time_secs.abs_diff(timestamp_secs);
+                if time_diff_secs > 30 {
+                    return Err(std::io::Error::other(format!(
+                        "timestamp is {time_diff_secs} seconds away from the current time"
+                    )));
                 }
 
                 let decrypt_iv = &self.unprocessed_buf[0..self.salt_len];
@@ -508,21 +504,17 @@ impl ShadowsocksStream {
 
                 let timestamp_bytes = &self.unprocessed_buf[self.salt_len + 1..self.salt_len + 9];
                 let timestamp_secs = u64::from_be_bytes(timestamp_bytes.try_into().unwrap());
-                let current_time_secs = current_time_secs();
-                if current_time_secs >= timestamp_secs {
-                    if current_time_secs - timestamp_secs > 30 {
-                        return Err(std::io::Error::other(
-                            "timestamp is greater than 30 seconds",
-                        ));
-                    }
-                } else {
-                    // Make sure times aren't too far in the future.
-                    if timestamp_secs - current_time_secs > 2 {
-                        return Err(std::io::Error::other(format!(
-                            "timestamp is {} seconds in the future",
-                            timestamp_secs - current_time_secs
-                        )));
-                    }
+                let current_time_secs = current_time_secs()?;
+                // SIP022 (Shadowsocks 2022 Edition) requires rejecting any header
+                // whose timestamp is more than 30 seconds away from the current
+                // time, in either direction. Enforce the same symmetric window so
+                // peers with a fast clock (NTP drift, virtualized hosts) aren't
+                // rejected for being more than a couple of seconds ahead.
+                let time_diff_secs = current_time_secs.abs_diff(timestamp_secs);
+                if time_diff_secs > 30 {
+                    return Err(std::io::Error::other(format!(
+                        "timestamp is {time_diff_secs} seconds away from the current time"
+                    )));
                 }
 
                 if let Some(salt_checker) = &self.salt_checker {
@@ -590,7 +582,7 @@ impl ShadowsocksStream {
 
                 // HeaderTypeServerStream = 1
                 response_header[0] = 1;
-                response_header[1..9].copy_from_slice(&current_time_secs().to_be_bytes());
+                response_header[1..9].copy_from_slice(&current_time_secs()?.to_be_bytes());
                 response_header[9..9 + self.salt_len].copy_from_slice(&decrypt_iv);
 
                 let handled_len = std::cmp::min(
@@ -623,7 +615,7 @@ impl ShadowsocksStream {
 
                 // HeaderTypeClientStream = 0
                 request_header[0] = 0;
-                request_header[1..9].copy_from_slice(&current_time_secs().to_be_bytes());
+                request_header[1..9].copy_from_slice(&current_time_secs()?.to_be_bytes());
 
                 // This is a bit hacky. We expect/know that the first packet will be the "variable-length header"
                 // with the address and padding, and we need to send it all off in a single packet.
@@ -909,6 +901,9 @@ impl AsyncStream for ShadowsocksStream {}
 impl AsyncMessageStream for ShadowsocksStream {}
 
 #[inline]
-fn current_time_secs() -> u64 {
-    SystemTime::UNIX_EPOCH.elapsed().unwrap().as_secs()
+fn current_time_secs() -> std::io::Result<u64> {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .map_err(|e| std::io::Error::other(format!("system time before unix epoch: {e}")))
 }

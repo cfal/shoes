@@ -100,7 +100,7 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
             };
 
             let websocket_version_response_header =
-                match request_headers.get("sec-websocket_version") {
+                match request_headers.get("sec-websocket-version") {
                     Some(v) => format!("Sec-WebSocket-Version: {v}\r\n"),
                     None => "".to_string(),
                 };

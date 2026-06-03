@@ -5,7 +5,9 @@ use serde::Deserialize;
 
 use crate::shadowsocks::ShadowsocksCipher;
 
-#[derive(Debug, Clone)]
+const REDACTED: &str = "<redacted>";
+
+#[derive(Clone)]
 pub enum ShadowsocksConfig {
     Legacy {
         cipher: ShadowsocksCipher,
@@ -15,6 +17,24 @@ pub enum ShadowsocksConfig {
         cipher: ShadowsocksCipher,
         key_bytes: Box<[u8]>,
     },
+}
+
+impl std::fmt::Debug for ShadowsocksConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ShadowsocksConfig::Legacy { cipher, .. } => f
+                .debug_struct("Legacy")
+                .field("cipher", cipher)
+                .field("password", &REDACTED)
+                .finish(),
+            ShadowsocksConfig::Aead2022 { cipher, key_bytes } => f
+                .debug_struct("Aead2022")
+                .field("cipher", cipher)
+                .field("key_bytes", &REDACTED)
+                .field("key_len", &key_bytes.len())
+                .finish(),
+        }
+    }
 }
 
 impl ShadowsocksConfig {

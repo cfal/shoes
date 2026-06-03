@@ -12,19 +12,25 @@
 //! By limiting the number of spawned tasks to a fixed pool size (e.g., 4-8 workers),
 //! the connection driver has much less competition for scheduler time.
 
-use futures::stream::FuturesUnordered;
 use futures::StreamExt;
+use futures::stream::FuturesUnordered;
 use log::{debug, error};
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::mpsc;
 
 /// Type alias for boxed futures that the worker pool processes.
 /// Returns `std::io::Result<()>` to match copy_bidirectional and other copy utilities.
 pub type BoxedFuture = Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'static>>;
+
+/// Maximum queued submissions per worker.
+const WORKER_CHANNEL_CAPACITY: usize = 256;
+
+/// Maximum in-flight futures each worker will keep in its local FuturesUnordered.
+const MAX_IN_FLIGHT_PER_WORKER: usize = 256;
 
 /// A pool of worker tasks that process futures without spawning per-future tasks.
 ///
@@ -36,7 +42,7 @@ pub type BoxedFuture = Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'sta
 /// the same pool.
 pub struct StreamWorkerPool {
     /// Senders to each worker, for round-robin distribution
-    senders: Vec<mpsc::UnboundedSender<BoxedFuture>>,
+    senders: Vec<mpsc::Sender<BoxedFuture>>,
     /// Counter for round-robin distribution
     next_worker: AtomicUsize,
 }
@@ -58,7 +64,7 @@ impl StreamWorkerPool {
         let mut senders = Vec::with_capacity(num_workers);
 
         for worker_id in 0..num_workers {
-            let (tx, rx) = mpsc::unbounded_channel::<BoxedFuture>();
+            let (tx, rx) = mpsc::channel::<BoxedFuture>(WORKER_CHANNEL_CAPACITY);
             senders.push(tx);
 
             tokio::spawn(worker_loop(worker_id, rx));
@@ -77,14 +83,14 @@ impl StreamWorkerPool {
     /// and other copy utilities. Errors are logged by the worker.
     ///
     /// Returns `true` if the future was successfully submitted, `false` if
-    /// the worker channel is closed (worker task has terminated).
+    /// the worker channel is full or closed.
     pub fn submit<F>(&self, future: F) -> bool
     where
         F: Future<Output = io::Result<()>> + Send + 'static,
     {
         // Round-robin distribution
         let worker_idx = self.next_worker.fetch_add(1, Ordering::Relaxed) % self.senders.len();
-        self.senders[worker_idx].send(Box::pin(future)).is_ok()
+        self.senders[worker_idx].try_send(Box::pin(future)).is_ok()
     }
 
     /// Returns the number of workers in the pool.
@@ -94,7 +100,7 @@ impl StreamWorkerPool {
 }
 
 /// The worker loop that processes futures from the channel.
-async fn worker_loop(worker_id: usize, mut rx: mpsc::UnboundedReceiver<BoxedFuture>) {
+async fn worker_loop(worker_id: usize, mut rx: mpsc::Receiver<BoxedFuture>) {
     let mut futures: FuturesUnordered<BoxedFuture> = FuturesUnordered::new();
     let mut yield_counter: u8 = 0;
 
@@ -115,7 +121,7 @@ async fn worker_loop(worker_id: usize, mut rx: mpsc::UnboundedReceiver<BoxedFutu
                 }
             }
             // Accept new futures from the channel (lower priority)
-            Some(future) = rx.recv() => {
+            Some(future) = rx.recv(), if futures.len() < MAX_IN_FLIGHT_PER_WORKER => {
                 futures.push(future);
             }
             // Channel closed and no more futures to process

@@ -19,8 +19,14 @@ pub async fn write_all<T: AsyncWriteExt + Unpin>(
     let mut i = 0;
     let n = buf.len();
     while i < n {
-        let n = stream.write(&buf[i..]).await?;
-        i += n;
+        let written = stream.write(&buf[i..]).await?;
+        if written == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "write_all: write returned 0 bytes",
+            ));
+        }
+        i += written;
     }
     Ok(())
 }

@@ -423,6 +423,16 @@ impl VmessStream {
                     ));
                 }
 
+                if padding_len > data_len.saturating_sub(self.tag_len) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "padding length ({}) exceeds encrypted data length ({}) minus tag length ({})",
+                            padding_len, data_len, self.tag_len
+                        ),
+                    ));
+                }
+
                 if self.tag_len > 0 && (data_len - padding_len) < self.tag_len {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
@@ -541,7 +551,7 @@ impl VmessStream {
         }
     }
 
-    fn create_write_packet(&mut self) -> bool {
+    fn create_write_packet(&mut self) -> std::io::Result<bool> {
         // If we have a pending prefix, prepend it to the write_packet buffer
         // so that the response header and first data packet go out together.
         if let Some(prefix) = self.pending_prefix_write.take() {
@@ -561,7 +571,7 @@ impl VmessStream {
 
         let max_metadata_size = 2 + max_padding_len + self.tag_len;
         if max_metadata_size >= write_packet_space {
-            return false;
+            return Ok(false);
         }
 
         // TODO: allow peeking so that we don't need to use MAX_PADDING_LEN above.
@@ -579,6 +589,9 @@ impl VmessStream {
 
         let write_packet_size: usize = data_size + padding_len + self.tag_len;
         assert!(write_packet_size + 2 <= self.write_packet.len());
+        if write_packet_size > u16::MAX as usize {
+            return Err(std::io::Error::other("VMess frame is too large"));
+        }
 
         let mut next_index = self.write_packet_end_offset;
 
@@ -592,13 +605,14 @@ impl VmessStream {
 
         match self.sealing_key {
             Some(ref mut sealing_key) => {
-                // TODO: don't unwrap here.
                 let tag = sealing_key
                     .seal_in_place_separate_tag(
                         Aad::empty(),
                         &mut self.write_packet[next_index..next_index + data_size],
                     )
-                    .unwrap();
+                    .map_err(|err| {
+                        std::io::Error::other(format!("failed to seal packet: {err}"))
+                    })?;
                 next_index += data_size;
 
                 self.write_packet[next_index..next_index + self.tag_len]
@@ -626,7 +640,12 @@ impl VmessStream {
             self.write_cache_size -= data_size;
         }
 
-        true
+        Ok(true)
+    }
+
+    fn create_write_packets_from_cache(&mut self) -> std::io::Result<()> {
+        while self.write_cache_size > 0 && self.create_write_packet()? {}
+        Ok(())
     }
 
     #[inline]
@@ -810,7 +829,9 @@ impl AsyncWrite for VmessStream {
         let mut cache_space = this.write_cache.len().saturating_sub(this.write_cache_size);
 
         if cache_space == 0 {
-            while this.write_cache_size > 0 && this.create_write_packet() {}
+            if let Err(e) = this.create_write_packets_from_cache() {
+                return Poll::Ready(Err(e));
+            }
             match this.do_write_packet(cx) {
                 Ok(all_written) => {
                     if !all_written {
@@ -823,7 +844,9 @@ impl AsyncWrite for VmessStream {
             }
             // now that we've written out all the packet data, create more packets to free up cache
             // space.
-            while this.write_cache_size > 0 && this.create_write_packet() {}
+            if let Err(e) = this.create_write_packets_from_cache() {
+                return Poll::Ready(Err(e));
+            }
             cache_space = this.write_cache.len().saturating_sub(this.write_cache_size);
             assert!(cache_space > 0);
         }
@@ -849,7 +872,9 @@ impl AsyncWrite for VmessStream {
 
         // Create a new write frame when flush is called when we don't have one.
         while this.write_cache_size > 0 || this.write_packet_end_offset > 0 {
-            while this.write_cache_size > 0 && this.create_write_packet() {}
+            if let Err(e) = this.create_write_packets_from_cache() {
+                return Poll::Ready(Err(e));
+            }
             match this.do_write_packet(cx) {
                 Ok(all_written) => {
                     if !all_written {
@@ -876,15 +901,23 @@ impl AsyncWrite for VmessStream {
                 ShutdownState::WriteRemainingData => {
                     if this.write_cache_size > 0 {
                         // create data packets.
-                        while this.write_cache_size > 0 && this.create_write_packet() {}
+                        if let Err(e) = this.create_write_packets_from_cache() {
+                            return Poll::Ready(Err(e));
+                        }
                     }
 
                     // create the empty packet.
                     // it's possible that the write_packet buffer contains the server response,
                     // and the empty shutdown packet together, ready to send off together.
-                    if this.write_cache_size == 0 && this.create_write_packet() {
-                        this.shutdown_state = ShutdownState::WriteEmptyPacket;
-                        continue;
+                    if this.write_cache_size == 0 {
+                        let created_empty_packet = match this.create_write_packet() {
+                            Ok(created) => created,
+                            Err(e) => return Poll::Ready(Err(e)),
+                        };
+                        if created_empty_packet {
+                            this.shutdown_state = ShutdownState::WriteEmptyPacket;
+                            continue;
+                        }
                     }
                     // if we cannot create the empty packet, the write_packet buffer must
                     // be too full, so flush and try again.
@@ -1091,6 +1124,9 @@ impl AsyncWriteMessage for VmessStream {
         }
 
         let write_packet_size = buf.len() + padding_len + this.tag_len;
+        if write_packet_size > u16::MAX as usize {
+            return Poll::Ready(Err(std::io::Error::other("VMess UDP frame is too large")));
+        }
         let write_packet_size = (write_packet_size as u16) ^ length_mask;
 
         this.write_packet[0] = (write_packet_size >> 8) as u8;
@@ -1107,6 +1143,11 @@ impl AsyncWriteMessage for VmessStream {
             this.write_packet[end_index..end_index + this.tag_len].copy_from_slice(tag.as_ref());
 
             end_index += this.tag_len;
+        }
+
+        if padding_len > 0 {
+            rand::rng().fill_bytes(&mut this.write_packet[end_index..end_index + padding_len]);
+            end_index += padding_len;
         }
 
         this.write_packet_end_offset = end_index;
@@ -1158,14 +1199,75 @@ impl AsyncMessageStream for VmessStream {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::async_stream::AsyncPing;
     use aws_lc_rs::aead::{CHACHA20_POLY1305, UnboundKey};
     use sha3::Shake128;
     use sha3::digest::{ExtendableOutput, Update};
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+    struct TestStream;
+
+    impl AsyncRead for TestStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for TestStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncPing for TestStream {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+
+        fn poll_write_ping(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+
+    impl AsyncStream for TestStream {}
 
     fn create_shake128_reader(iv: &[u8]) -> VmessReader {
         let mut hasher = Shake128::default();
         hasher.update(iv);
         hasher.finalize_xof()
+    }
+
+    fn find_length_mask_with_padding() -> ([u8; 16], usize, u16) {
+        for seed in 0u8..=u8::MAX {
+            let iv = [seed; 16];
+            let mut mask = LengthMask::new(create_shake128_reader(&iv), true);
+            let (padding_len, length_mask) = mask.next_values();
+            if padding_len > 1 {
+                return (iv, padding_len, length_mask);
+            }
+        }
+        panic!("failed to find deterministic VMess length mask with padding");
     }
 
     #[test]
@@ -1367,6 +1469,93 @@ mod tests {
                 MAX_PADDING_LEN
             );
         }
+    }
+
+    #[test]
+    fn test_try_decrypt_rejects_padding_larger_than_data_len() {
+        let (iv, padding_len, length_mask) = find_length_mask_with_padding();
+        let data_len = padding_len - 1;
+        let masked_len = (data_len as u16) ^ length_mask;
+
+        let mut stream = VmessStream::new(
+            Box::new(TestStream),
+            false,
+            None,
+            Some(create_shake128_reader(&iv)),
+            None,
+            true,
+            None,
+            None,
+        );
+        stream.unprocessed_buf[..2].copy_from_slice(&masked_len.to_be_bytes());
+        stream.unprocessed_end_offset = 2;
+
+        let err = match stream.try_decrypt() {
+            Ok(_) => panic!("expected padding length validation error"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("padding length"));
+    }
+
+    #[test]
+    fn test_udp_write_message_appends_global_padding() {
+        let (iv, padding_len, length_mask) = find_length_mask_with_padding();
+        let mut stream = VmessStream::new(
+            Box::new(TestStream),
+            true,
+            None,
+            None,
+            Some(create_shake128_reader(&iv)),
+            true,
+            None,
+            None,
+        );
+
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        match Pin::new(&mut stream).poll_write_message(&mut cx, b"ping") {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(err)) => panic!("unexpected write error: {err}"),
+            Poll::Pending => panic!("unexpected pending write"),
+        }
+
+        let masked_len = u16::from_be_bytes([stream.write_packet[0], stream.write_packet[1]]);
+        let data_len = (masked_len ^ length_mask) as usize;
+        assert_eq!(data_len, b"ping".len() + padding_len);
+        assert_eq!(
+            stream.write_packet_end_offset,
+            2 + b"ping".len() + padding_len
+        );
+        assert_eq!(&stream.write_packet[2..2 + b"ping".len()], b"ping");
+    }
+
+    #[test]
+    fn test_udp_write_message_rejects_u16_length_overflow() {
+        let (iv, padding_len, _) = find_length_mask_with_padding();
+        let mut stream = VmessStream::new(
+            Box::new(TestStream),
+            true,
+            None,
+            None,
+            Some(create_shake128_reader(&iv)),
+            true,
+            None,
+            None,
+        );
+        let payload = vec![0u8; u16::MAX as usize];
+
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let err = match Pin::new(&mut stream).poll_write_message(&mut cx, &payload) {
+            Poll::Ready(Ok(())) => panic!("expected length overflow error"),
+            Poll::Ready(Err(err)) => err,
+            Poll::Pending => panic!("unexpected pending write"),
+        };
+
+        assert!(padding_len > 0);
+        assert_eq!(err.kind(), std::io::ErrorKind::Other);
+        assert!(err.to_string().contains("too large"));
     }
 
     #[test]

@@ -58,10 +58,22 @@ pub async fn parse_addons_from_reader<S: AsyncReadExt + Unpin>(
             ));
         }
         let (field_length, bytes_used) = read_varint(&addon_bytes[addon_cursor..])?;
+        let field_length = usize::try_from(field_length).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Addon field length does not fit in usize",
+            )
+        })?;
         addon_cursor += bytes_used;
 
         // Validate field_length is within bounds
-        if addon_cursor + field_length as usize > addon_bytes.len() {
+        let field_end = addon_cursor.checked_add(field_length).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Addon field length overflow",
+            )
+        })?;
+        if field_end > addon_bytes.len() {
             return Err(std::io::Error::other(format!(
                 "Field {} length {} exceeds remaining addon bytes (cursor: {}, total: {})",
                 field_number,
@@ -72,8 +84,8 @@ pub async fn parse_addons_from_reader<S: AsyncReadExt + Unpin>(
         }
 
         // Read field data
-        let field_data = &addon_bytes[addon_cursor..addon_cursor + field_length as usize];
-        addon_cursor += field_length as usize;
+        let field_data = &addon_bytes[addon_cursor..field_end];
+        addon_cursor = field_end;
 
         match field_number {
             1 => {
@@ -168,21 +180,21 @@ pub fn vision_flow_addon_data() -> &'static [u8] {
 }
 
 fn read_varint(data: &[u8]) -> std::io::Result<(u64, usize)> {
-    let mut cursor = 0usize;
     let mut length = 0u64;
-    loop {
-        let byte = data[cursor];
-        if (byte & 0b10000000) != 0 {
-            length = (length << 8) | ((byte ^ 0b10000000) as u64);
-        } else {
-            length = (length << 8) | (byte as u64);
-            return Ok((length, cursor + 1));
+
+    for (i, &byte) in data.iter().enumerate().take(10) {
+        let value = (byte & 0x7f) as u64;
+        length |= value << (i * 7);
+
+        if (byte & 0x80) == 0 {
+            return Ok((length, i + 1));
         }
-        if cursor == 7 || cursor == data.len() {
-            return Err(std::io::Error::other("Varint is too long"));
-        }
-        cursor += 1;
     }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "Varint is too long or truncated",
+    ))
 }
 
 /// Encode a flow string as protobuf addon data
@@ -211,4 +223,25 @@ fn encode_flow_addon(flow: &str) -> std::io::Result<Vec<u8>> {
     result.extend_from_slice(flow_bytes);
 
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_varint_decodes_protobuf_base128() {
+        assert_eq!(read_varint(&[0xac, 0x02]).unwrap(), (300, 2));
+    }
+
+    #[test]
+    fn read_varint_rejects_empty_and_truncated_input() {
+        assert!(read_varint(&[]).is_err());
+        assert!(read_varint(&[0x80]).is_err());
+    }
+
+    #[test]
+    fn read_varint_rejects_overlong_input() {
+        assert!(read_varint(&[0x80; 10]).is_err());
+    }
 }

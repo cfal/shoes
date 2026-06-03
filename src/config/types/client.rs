@@ -15,6 +15,8 @@ use super::server::WebsocketPingType;
 use super::shadowsocks::ShadowsocksConfig;
 use super::transport::{ClientQuicConfig, TcpConfig, Transport};
 
+const REDACTED: &str = "<redacted>";
+
 /// Configuration for h2mux (HTTP/2 multiplexing) on protocols that support it.
 ///
 /// H2MUX multiplexes multiple proxy streams over a single HTTP/2 connection,
@@ -306,7 +308,7 @@ impl Default for ClientConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ClientProxyConfig {
     Direct,
@@ -437,6 +439,122 @@ pub enum ClientProxyConfig {
     },
 }
 
+impl std::fmt::Debug for ClientProxyConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ClientProxyConfig::Direct => f.write_str("Direct"),
+            ClientProxyConfig::Http {
+                username,
+                password,
+                resolve_hostname,
+            } => f
+                .debug_struct("Http")
+                .field("username", username)
+                .field("password", &password.as_ref().map(|_| REDACTED))
+                .field("resolve_hostname", resolve_hostname)
+                .finish(),
+            ClientProxyConfig::Socks { username, password } => f
+                .debug_struct("Socks")
+                .field("username", username)
+                .field("password", &password.as_ref().map(|_| REDACTED))
+                .finish(),
+            ClientProxyConfig::Shadowsocks {
+                config,
+                udp_enabled,
+            } => f
+                .debug_struct("Shadowsocks")
+                .field("config", config)
+                .field("udp_enabled", udp_enabled)
+                .finish(),
+            ClientProxyConfig::Snell {
+                config,
+                udp_enabled,
+            } => f
+                .debug_struct("Snell")
+                .field("config", config)
+                .field("udp_enabled", udp_enabled)
+                .finish(),
+            ClientProxyConfig::Vless {
+                udp_enabled, h2mux, ..
+            } => f
+                .debug_struct("Vless")
+                .field("user_id", &REDACTED)
+                .field("udp_enabled", udp_enabled)
+                .field("h2mux", h2mux)
+                .finish(),
+            ClientProxyConfig::Trojan {
+                shadowsocks, h2mux, ..
+            } => f
+                .debug_struct("Trojan")
+                .field("password", &REDACTED)
+                .field("shadowsocks", shadowsocks)
+                .field("h2mux", h2mux)
+                .finish(),
+            ClientProxyConfig::Reality {
+                public_key,
+                sni_hostname,
+                cipher_suites,
+                vision,
+                protocol,
+                ..
+            } => f
+                .debug_struct("Reality")
+                .field("public_key", public_key)
+                .field("short_id", &REDACTED)
+                .field("sni_hostname", sni_hostname)
+                .field("cipher_suites", cipher_suites)
+                .field("vision", vision)
+                .field("protocol", protocol)
+                .finish(),
+            ClientProxyConfig::ShadowTls {
+                sni_hostname,
+                protocol,
+                ..
+            } => f
+                .debug_struct("ShadowTls")
+                .field("password", &REDACTED)
+                .field("sni_hostname", sni_hostname)
+                .field("protocol", protocol)
+                .finish(),
+            ClientProxyConfig::Tls(tls_config) => f.debug_tuple("Tls").field(tls_config).finish(),
+            ClientProxyConfig::Vmess {
+                cipher,
+                udp_enabled,
+                h2mux,
+                ..
+            } => f
+                .debug_struct("Vmess")
+                .field("cipher", cipher)
+                .field("user_id", &REDACTED)
+                .field("udp_enabled", udp_enabled)
+                .field("h2mux", h2mux)
+                .finish(),
+            ClientProxyConfig::Websocket(ws_config) => {
+                f.debug_tuple("Websocket").field(ws_config).finish()
+            }
+            ClientProxyConfig::PortForward => f.write_str("PortForward"),
+            ClientProxyConfig::Anytls {
+                udp_enabled,
+                padding_scheme,
+                ..
+            } => f
+                .debug_struct("Anytls")
+                .field("password", &REDACTED)
+                .field("udp_enabled", udp_enabled)
+                .field("padding_scheme", padding_scheme)
+                .finish(),
+            ClientProxyConfig::Naiveproxy {
+                username, padding, ..
+            } => f
+                .debug_struct("Naiveproxy")
+                .field("username", username)
+                .field("password", &REDACTED)
+                .field("padding", padding)
+                .finish(),
+        }
+    }
+}
+
 impl ClientProxyConfig {
     pub fn is_direct(&self) -> bool {
         matches!(self, ClientProxyConfig::Direct)
@@ -464,7 +582,7 @@ impl ClientProxyConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Clone, Serialize)]
 pub struct TlsClientConfig {
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub verify: bool,
@@ -496,6 +614,22 @@ pub struct TlsClientConfig {
     pub vision: bool,
 
     pub protocol: Box<ClientProxyConfig>,
+}
+
+impl std::fmt::Debug for TlsClientConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TlsClientConfig")
+            .field("verify", &self.verify)
+            .field("server_fingerprints", &self.server_fingerprints)
+            .field("sni_hostname", &self.sni_hostname)
+            .field("alpn_protocols", &self.alpn_protocols)
+            .field("tls_buffer_size", &self.tls_buffer_size)
+            .field("key", &self.key.as_ref().map(|_| REDACTED))
+            .field("cert", &self.cert.as_ref().map(|_| "<present>"))
+            .field("vision", &self.vision)
+            .field("protocol", &self.protocol)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -539,6 +673,19 @@ mod tests {
             deserialized.protocol,
             ClientProxyConfig::Socks { .. }
         ));
+    }
+
+    #[test]
+    fn test_client_config_debug_redacts_secrets() {
+        let config = ClientProxyConfig::Socks {
+            username: Some("client_user".to_string()),
+            password: Some("client_pass".to_string()),
+        };
+
+        let debug = format!("{config:?}");
+
+        assert!(debug.contains(REDACTED));
+        assert!(!debug.contains("client_pass"));
     }
 
     #[test]

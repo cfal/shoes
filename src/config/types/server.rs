@@ -1,6 +1,6 @@
 //! Server configuration types.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, fmt};
 
 use serde::{Deserialize, Serialize};
 
@@ -14,8 +14,10 @@ use super::selection::ConfigSelection;
 use super::shadowsocks::ShadowsocksConfig;
 use super::transport::{BindLocation, ServerQuicConfig, TcpConfig, Transport};
 
+const REDACTED: &str = "<redacted>";
+
 /// AnyTLS user configuration
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AnyTlsUserConfig {
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -23,14 +25,33 @@ pub struct AnyTlsUserConfig {
     pub password: String,
 }
 
+impl fmt::Debug for AnyTlsUserConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AnyTlsUserConfig")
+            .field("name", &self.name)
+            .field("password", &REDACTED)
+            .finish()
+    }
+}
+
 /// NaiveProxy user configuration
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct NaiveUserConfig {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub name: String,
     pub username: String,
     pub password: String,
+}
+
+impl fmt::Debug for NaiveUserConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NaiveUserConfig")
+            .field("name", &self.name)
+            .field("username", &self.username)
+            .field("password", &REDACTED)
+            .finish()
+    }
 }
 
 /// NaiveProxy fallback configuration for probe resistance
@@ -297,7 +318,7 @@ impl<'de> serde::de::Deserialize<'de> for ServerConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct RealityServerConfig {
     /// X25519 private key (32 bytes, base64url encoded)
     pub private_key: String,
@@ -346,7 +367,25 @@ pub struct RealityServerConfig {
     pub override_rules: NoneOrSome<ConfigSelection<RuleConfig>>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+impl fmt::Debug for RealityServerConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RealityServerConfig")
+            .field("private_key", &REDACTED)
+            .field("short_ids", &REDACTED)
+            .field("dest", &self.dest)
+            .field("max_time_diff", &self.max_time_diff)
+            .field("min_client_version", &self.min_client_version)
+            .field("max_client_version", &self.max_client_version)
+            .field("cipher_suites", &self.cipher_suites)
+            .field("vision", &self.vision)
+            .field("protocol", &self.protocol)
+            .field("dest_client_chain", &self.dest_client_chain)
+            .field("override_rules", &self.override_rules)
+            .finish()
+    }
+}
+
+#[derive(Clone, Deserialize, Serialize)]
 pub struct TlsServerConfig {
     pub cert: String,
     pub key: String,
@@ -388,7 +427,22 @@ pub struct TlsServerConfig {
     pub override_rules: NoneOrSome<ConfigSelection<RuleConfig>>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+impl fmt::Debug for TlsServerConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TlsServerConfig")
+            .field("cert", &"<present>")
+            .field("key", &REDACTED)
+            .field("alpn_protocols", &self.alpn_protocols)
+            .field("client_ca_certs", &self.client_ca_certs)
+            .field("client_fingerprints", &self.client_fingerprints)
+            .field("vision", &self.vision)
+            .field("protocol", &self.protocol)
+            .field("override_rules", &self.override_rules)
+            .finish()
+    }
+}
+
+#[derive(Clone, Deserialize, Serialize)]
 pub struct ShadowTlsServerConfig {
     pub password: String,
     pub handshake: ShadowTlsServerHandshakeConfig,
@@ -397,7 +451,18 @@ pub struct ShadowTlsServerConfig {
     pub override_rules: NoneOrSome<ConfigSelection<RuleConfig>>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+impl fmt::Debug for ShadowTlsServerConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ShadowTlsServerConfig")
+            .field("password", &REDACTED)
+            .field("handshake", &self.handshake)
+            .field("protocol", &self.protocol)
+            .field("override_rules", &self.override_rules)
+            .finish()
+    }
+}
+
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ShadowTlsLocalHandshake {
     pub cert: String,
@@ -420,6 +485,18 @@ pub struct ShadowTlsLocalHandshake {
         skip_serializing_if = "NoneOrSome::is_unspecified"
     )]
     pub client_fingerprints: NoneOrSome<String>,
+}
+
+impl fmt::Debug for ShadowTlsLocalHandshake {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ShadowTlsLocalHandshake")
+            .field("cert", &"<present>")
+            .field("key", &REDACTED)
+            .field("alpn_protocols", &self.alpn_protocols)
+            .field("client_ca_certs", &self.client_ca_certs)
+            .field("client_fingerprints", &self.client_fingerprints)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -517,7 +594,7 @@ impl Serialize for ShadowTlsRemoteHandshake {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 #[allow(clippy::large_enum_variant)]
 pub enum ShadowTlsServerHandshakeConfig {
     // Do the handshake locally with the provided TLS config.
@@ -525,6 +602,19 @@ pub enum ShadowTlsServerHandshakeConfig {
     // the provided certificate must be signed by a trusted CA.
     Local(ShadowTlsLocalHandshake),
     Remote(ShadowTlsRemoteHandshake),
+}
+
+impl fmt::Debug for ShadowTlsServerHandshakeConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ShadowTlsServerHandshakeConfig::Local(handshake) => {
+                f.debug_tuple("Local").field(handshake).finish()
+            }
+            ShadowTlsServerHandshakeConfig::Remote(handshake) => {
+                f.debug_tuple("Remote").field(handshake).finish()
+            }
+        }
+    }
 }
 
 impl<'de> serde::de::Deserialize<'de> for ShadowTlsServerHandshakeConfig {
@@ -635,7 +725,7 @@ impl WebsocketPingType {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ServerProxyConfig {
     Http {
@@ -782,6 +872,140 @@ pub enum ServerProxyConfig {
     },
 }
 
+impl fmt::Debug for ServerProxyConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ServerProxyConfig::Http { username, password } => f
+                .debug_struct("Http")
+                .field("username", username)
+                .field("password", &password.as_ref().map(|_| REDACTED))
+                .finish(),
+            ServerProxyConfig::Socks {
+                username,
+                password,
+                udp_enabled,
+            } => f
+                .debug_struct("Socks")
+                .field("username", username)
+                .field("password", &password.as_ref().map(|_| REDACTED))
+                .field("udp_enabled", udp_enabled)
+                .finish(),
+            ServerProxyConfig::Shadowsocks {
+                config,
+                udp_enabled,
+            } => f
+                .debug_struct("Shadowsocks")
+                .field("config", config)
+                .field("udp_enabled", udp_enabled)
+                .finish(),
+            ServerProxyConfig::Snell {
+                cipher,
+                udp_enabled,
+                ..
+            } => f
+                .debug_struct("Snell")
+                .field("cipher", cipher)
+                .field("password", &REDACTED)
+                .field("udp_enabled", udp_enabled)
+                .finish(),
+            ServerProxyConfig::Vless {
+                udp_enabled,
+                fallback,
+                ..
+            } => f
+                .debug_struct("Vless")
+                .field("user_id", &REDACTED)
+                .field("udp_enabled", udp_enabled)
+                .field("fallback", fallback)
+                .finish(),
+            ServerProxyConfig::Trojan { shadowsocks, .. } => f
+                .debug_struct("Trojan")
+                .field("password", &REDACTED)
+                .field("shadowsocks", shadowsocks)
+                .finish(),
+            ServerProxyConfig::Tls {
+                tls_targets,
+                default_tls_target,
+                shadowtls_targets,
+                reality_targets,
+                tls_buffer_size,
+            } => f
+                .debug_struct("Tls")
+                .field("tls_targets", tls_targets)
+                .field("default_tls_target", default_tls_target)
+                .field("shadowtls_targets", shadowtls_targets)
+                .field("reality_targets", reality_targets)
+                .field("tls_buffer_size", tls_buffer_size)
+                .finish(),
+            ServerProxyConfig::Vmess {
+                cipher,
+                udp_enabled,
+                ..
+            } => f
+                .debug_struct("Vmess")
+                .field("cipher", cipher)
+                .field("user_id", &REDACTED)
+                .field("udp_enabled", udp_enabled)
+                .finish(),
+            ServerProxyConfig::Anytls {
+                users,
+                padding_scheme,
+                udp_enabled,
+                fallback,
+            } => f
+                .debug_struct("Anytls")
+                .field("users", users)
+                .field("padding_scheme", padding_scheme)
+                .field("udp_enabled", udp_enabled)
+                .field("fallback", fallback)
+                .finish(),
+            ServerProxyConfig::Websocket { targets } => f
+                .debug_struct("Websocket")
+                .field("targets", targets)
+                .finish(),
+            ServerProxyConfig::PortForward { targets } => f
+                .debug_struct("PortForward")
+                .field("targets", targets)
+                .finish(),
+            ServerProxyConfig::Hysteria2 { udp_enabled, .. } => f
+                .debug_struct("Hysteria2")
+                .field("password", &REDACTED)
+                .field("udp_enabled", udp_enabled)
+                .finish(),
+            ServerProxyConfig::TuicV5 {
+                zero_rtt_handshake, ..
+            } => f
+                .debug_struct("TuicV5")
+                .field("uuid", &REDACTED)
+                .field("password", &REDACTED)
+                .field("zero_rtt_handshake", zero_rtt_handshake)
+                .finish(),
+            ServerProxyConfig::Mixed {
+                username,
+                password,
+                udp_enabled,
+            } => f
+                .debug_struct("Mixed")
+                .field("username", username)
+                .field("password", &password.as_ref().map(|_| REDACTED))
+                .field("udp_enabled", udp_enabled)
+                .finish(),
+            ServerProxyConfig::Naiveproxy {
+                users,
+                padding,
+                fallback,
+                udp_enabled,
+            } => f
+                .debug_struct("Naiveproxy")
+                .field("users", users)
+                .field("padding", padding)
+                .field("fallback", fallback)
+                .field("udp_enabled", udp_enabled)
+                .finish(),
+        }
+    }
+}
+
 impl std::fmt::Display for ServerProxyConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -852,6 +1076,21 @@ mod tests {
             rules: NoneOrSome::None,
             dns: None,
         }
+    }
+
+    #[test]
+    fn test_server_config_debug_redacts_secrets() {
+        let config = ServerProxyConfig::TuicV5 {
+            uuid: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+            password: "tuic_password".to_string(),
+            zero_rtt_handshake: false,
+        };
+
+        let debug = format!("{config:?}");
+
+        assert!(debug.contains(REDACTED));
+        assert!(!debug.contains("550e8400-e29b-41d4-a716-446655440000"));
+        assert!(!debug.contains("tuic_password"));
     }
 
     fn create_test_server_config_socks() -> ServerConfig {
