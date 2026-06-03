@@ -88,6 +88,7 @@ mod socket_util;
 mod socks5_udp_relay;
 mod socks_handler;
 mod stream_reader;
+mod stream_worker_pool;
 mod sync_adapter;
 mod tcp;
 mod thread_util;

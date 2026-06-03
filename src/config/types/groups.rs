@@ -11,6 +11,8 @@ use super::selection::ConfigSelection;
 use super::server::ServerConfig;
 use super::tun::TunConfig;
 
+const REDACTED: &str = "<redacted>";
+
 /// A named group of client proxies.
 ///
 /// Groups can reference other groups using `ConfigSelection::GroupName`.
@@ -31,16 +33,34 @@ pub struct RuleConfigGroup {
     pub rules: OneOrSome<RuleConfig>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct NamedPem {
     pub pem: String, // The name identifier
     pub source: PemSource,
 }
 
-#[derive(Debug, Clone)]
+impl std::fmt::Debug for NamedPem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NamedPem")
+            .field("pem", &self.pem)
+            .field("source", &self.source)
+            .finish()
+    }
+}
+
+#[derive(Clone)]
 pub enum PemSource {
     Path(String),
     Data(String),
+}
+
+impl std::fmt::Debug for PemSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PemSource::Path(path) => f.debug_tuple("Path").field(path).finish(),
+            PemSource::Data(_) => f.debug_tuple("Data").field(&REDACTED).finish(),
+        }
+    }
 }
 
 impl<'de> Deserialize<'de> for NamedPem {
@@ -463,6 +483,19 @@ client_proxies:
             }
             _ => panic!("Expected Data source"),
         }
+    }
+
+    #[test]
+    fn test_named_pem_debug_redacts_inline_data() {
+        let pem = NamedPem {
+            pem: "server_key".to_string(),
+            source: PemSource::Data("inline-secret-key".to_string()),
+        };
+
+        let debug = format!("{pem:?}");
+
+        assert!(debug.contains(REDACTED));
+        assert!(!debug.contains("inline-secret-key"));
     }
 
     #[test]

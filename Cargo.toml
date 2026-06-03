@@ -1,6 +1,6 @@
 [package]
 name = "shoes"
-version = "0.2.8"
+version = "0.2.9"
 edition = "2024"
 license = "MIT"
 description = "A multi-protocol proxy server."
@@ -84,6 +84,7 @@ tun = { version = "*", features = ["async"] }
 url = "*"
 webpki-roots = { version = "*" }
 x509-parser = { version = "*", default-features = false, features = ["verify-aws"] }
+zeroize = "1"
 
 [dev-dependencies]
 rcgen = { version = "*", default-features = false, features = ["aws_lc_rs", "pem"] }

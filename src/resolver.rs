@@ -1,6 +1,7 @@
 use std::fmt::Debug;
 use std::future::Future;
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -8,13 +9,17 @@ use std::time::{Duration, Instant};
 
 use futures::future::{FutureExt, Shared};
 use log::debug;
+use lru::LruCache;
 use parking_lot::Mutex;
-use rustc_hash::FxHashMap;
 use tokio::sync::{Mutex as AsyncMutex, RwLock};
 
 use crate::address::{NetLocation, ResolvedLocation};
 
 type ResolveFuture = Pin<Box<dyn Future<Output = std::io::Result<Vec<SocketAddr>>> + Send>>;
+
+const CACHING_NATIVE_RESOLVER_CACHE_CAPACITY: usize = 65_536;
+const RESOLVER_CACHE_CAPACITY: usize = 4_096;
+const RESOLVER_PENDING_CAPACITY: usize = 256;
 
 pub trait Resolver: Send + Sync + Debug {
     fn resolve_location(&self, location: &NetLocation) -> ResolveFuture;
@@ -303,7 +308,7 @@ pub async fn resolve_location(
 /// Uses tokio::net::lookup_host (OS resolver) with TTL-based cache.
 /// This is used as the default resolver when no DNS config is specified.
 pub struct CachingNativeResolver {
-    cache: Arc<parking_lot::Mutex<FxHashMap<NetLocation, CachedResolveResult>>>,
+    cache: Arc<parking_lot::Mutex<LruCache<NetLocation, CachedResolveResult>>>,
     result_timeout_secs: u64,
 }
 
@@ -329,7 +334,9 @@ impl CachingNativeResolver {
 
     pub fn with_timeout(result_timeout_secs: u64) -> Self {
         Self {
-            cache: Arc::new(parking_lot::Mutex::new(FxHashMap::default())),
+            cache: Arc::new(parking_lot::Mutex::new(LruCache::new(
+                NonZeroUsize::new(CACHING_NATIVE_RESOLVER_CACHE_CAPACITY).unwrap(),
+            ))),
             result_timeout_secs,
         }
     }
@@ -345,7 +352,7 @@ impl Resolver for CachingNativeResolver {
     fn resolve_location(&self, location: &NetLocation) -> ResolveFuture {
         // Check cache first
         {
-            let cache = self.cache.lock();
+            let mut cache = self.cache.lock();
             if let Some(cached) = cache.get(location)
                 && Instant::now().duration_since(cached.timestamp)
                     <= Duration::from_secs(self.result_timeout_secs)
@@ -353,6 +360,7 @@ impl Resolver for CachingNativeResolver {
                 let addr = cached.addr;
                 return Box::pin(async move { Ok(vec![addr]) });
             }
+            cache.pop(location);
         }
 
         let location = location.clone();
@@ -373,7 +381,7 @@ impl Resolver for CachingNativeResolver {
             }
 
             // Cache the first result
-            cache.lock().insert(
+            cache.lock().put(
                 location,
                 CachedResolveResult {
                     timestamp: Instant::now(),
@@ -398,9 +406,9 @@ type SharedResolveFuture =
 pub struct ResolverCache {
     resolver: Arc<dyn Resolver>,
     /// Completed resolution results with timestamps
-    cache: FxHashMap<NetLocation, (Instant, SocketAddr)>,
+    cache: LruCache<NetLocation, (Instant, SocketAddr)>,
     /// In-flight resolutions using Shared futures for proper waker handling
-    pending: FxHashMap<NetLocation, SharedResolveFuture>,
+    pending: LruCache<NetLocation, SharedResolveFuture>,
     result_timeout_secs: u64,
 }
 
@@ -414,8 +422,8 @@ impl ResolverCache {
     pub fn new_with_timeout(resolver: Arc<dyn Resolver>, result_timeout_secs: u64) -> Self {
         Self {
             resolver,
-            cache: FxHashMap::default(),
-            pending: FxHashMap::default(),
+            cache: LruCache::new(NonZeroUsize::new(RESOLVER_CACHE_CAPACITY).unwrap()),
+            pending: LruCache::new(NonZeroUsize::new(RESOLVER_PENDING_CAPACITY).unwrap()),
             result_timeout_secs,
         }
     }
@@ -432,7 +440,7 @@ impl ResolverCache {
             if Instant::now().duration_since(*ts) <= Duration::from_secs(self.result_timeout_secs) {
                 return Ok(*addr);
             }
-            self.cache.remove(target);
+            self.cache.pop(target);
         }
 
         // Resolve
@@ -443,7 +451,7 @@ impl ResolverCache {
             )));
         }
         let addr = addrs[0];
-        self.cache.insert(target.clone(), (Instant::now(), addr));
+        self.cache.put(target.clone(), (Instant::now(), addr));
         Ok(addr)
     }
 
@@ -464,36 +472,42 @@ impl ResolverCache {
             if Instant::now().duration_since(*ts) <= Duration::from_secs(self.result_timeout_secs) {
                 return Poll::Ready(Ok(*addr));
             }
-            self.cache.remove(target);
+            self.cache.pop(target);
         }
 
         // Get or create shared future for this target
-        let mut shared_fut = self
-            .pending
-            .entry(target.clone())
-            .or_insert_with(|| {
+        let mut shared_fut = if let Some(shared_fut) = self.pending.get(target).cloned() {
+            shared_fut
+        } else {
+            if self.pending.len() >= RESOLVER_PENDING_CAPACITY {
+                return Poll::Ready(Err(std::io::Error::other("resolver pending cache full")));
+            }
+
+            let shared_fut = {
                 let fut = self.resolver.resolve_location(target);
                 // Wrap error in Arc for Clone requirement, then make shared
                 fut.map(|r| r.map_err(Arc::new)).boxed().shared()
-            })
-            .clone();
+            };
+            self.pending.put(target.clone(), shared_fut.clone());
+            shared_fut
+        };
 
         // Poll the shared future
         match shared_fut.poll_unpin(cx) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Ok(addrs)) => {
-                self.pending.remove(target);
+                self.pending.pop(target);
                 if addrs.is_empty() {
                     return Poll::Ready(Err(std::io::Error::other(format!(
                         "DNS lookup returned no addresses for {target}"
                     ))));
                 }
                 let addr = addrs[0];
-                self.cache.insert(target.clone(), (Instant::now(), addr));
+                self.cache.put(target.clone(), (Instant::now(), addr));
                 Poll::Ready(Ok(addr))
             }
             Poll::Ready(Err(e)) => {
-                self.pending.remove(target);
+                self.pending.pop(target);
                 // Convert Arc<Error> back to Error
                 Poll::Ready(Err(std::io::Error::new(e.kind(), e.to_string())))
             }

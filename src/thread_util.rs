@@ -7,5 +7,5 @@ pub fn set_num_threads(num_threads: usize) {
 }
 
 pub fn get_num_threads() -> usize {
-    *NUM_THREADS.get().unwrap()
+    NUM_THREADS.get().copied().unwrap_or(1).max(1)
 }

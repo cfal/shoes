@@ -255,7 +255,11 @@ where
                         }
                         Ok(_) => {
                             // Got data, process and wake to retry
-                            let _ = this.session.process_new_packets();
+                            if let Err(e) = this.session.process_new_packets() {
+                                // Try last-gasp write to send any pending TLS alerts (tokio-rustls pattern)
+                                let _ = this.drain_all_writes(cx);
+                                return Poll::Ready(Err(e));
+                            }
                             cx.waker().wake_by_ref();
                             Poll::Pending
                         }

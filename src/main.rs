@@ -33,6 +33,7 @@ mod socket_util;
 mod socks5_udp_relay;
 mod socks_handler;
 mod stream_reader;
+mod stream_worker_pool;
 mod sync_adapter;
 mod tcp;
 mod thread_util;
@@ -62,7 +63,7 @@ use std::path::Path;
 
 use aws_lc_rs::rand::{SecureRandom, SystemRandom};
 use base64::engine::{Engine as _, general_purpose::STANDARD};
-use log::debug;
+use log::{debug, error, warn};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tcp_server::start_servers;
 use tokio::runtime::Builder;
@@ -78,26 +79,23 @@ struct ConfigChanged;
 
 fn start_notify_thread(
     config_paths: Vec<String>,
-) -> (RecommendedWatcher, UnboundedReceiver<ConfigChanged>) {
+) -> notify::Result<(RecommendedWatcher, UnboundedReceiver<ConfigChanged>)> {
     let (tx, rx) = unbounded_channel();
 
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<Event>| match res {
         Ok(event) => {
             if matches!(event.kind, EventKind::Modify(..)) {
-                tx.send(ConfigChanged {}).unwrap();
+                let _ = tx.send(ConfigChanged {});
             }
         }
         Err(e) => println!("watch error: {e:?}"),
-    })
-    .unwrap();
+    })?;
 
     for config_path in config_paths {
-        watcher
-            .watch(Path::new(&config_path), RecursiveMode::NonRecursive)
-            .unwrap();
+        watcher.watch(Path::new(&config_path), RecursiveMode::NonRecursive)?;
     }
 
-    (watcher, rx)
+    Ok((watcher, rx))
 }
 
 fn print_usage_and_exit(arg0: String) {
@@ -317,8 +315,13 @@ fn main() {
         let mut reload_state = if no_reload {
             None
         } else {
-            let (watcher, rx) = start_notify_thread(args.clone());
-            Some((watcher, rx))
+            match start_notify_thread(args.clone()) {
+                Ok((watcher, rx)) => Some((watcher, rx)),
+                Err(e) => {
+                    eprintln!("Failed to start config watcher: {e}");
+                    return;
+                }
+            }
         };
 
         loop {
@@ -341,7 +344,7 @@ fn main() {
             };
 
             if load_file_count > 0 {
-                    println!("Loaded {load_file_count} certs/keys from files");
+                println!("Loaded {load_file_count} certs/keys from files");
             }
 
             for config in configs.iter() {
@@ -387,6 +390,7 @@ fn main() {
 
             println!("\nStarting {} server(s)..", server_configs.len());
 
+            let mut start_failed = false;
             for server_config in server_configs {
                 // Get the resolver for this server from the registry
                 let dns_ref = match &server_config {
@@ -395,12 +399,48 @@ fn main() {
                     _ => None,
                 };
                 let resolver = dns_registry.get_for_server(dns_ref);
-                join_handles.extend(start_servers(server_config, resolver).await.unwrap());
+                match start_servers(server_config, resolver).await {
+                    Ok(handles) => join_handles.extend(handles),
+                    Err(e) => {
+                        error!("Failed to start server: {e}");
+                        start_failed = true;
+                        break;
+                    }
+                }
+            }
+
+            if start_failed {
+                for join_handle in join_handles {
+                    join_handle.abort();
+                }
+
+                match reload_state.as_mut() {
+                    Some((_watcher, rx)) => {
+                        warn!("Waiting for config change before retrying server start");
+                        match rx.recv().await {
+                            Some(_) => {
+                                while rx.try_recv().is_ok() {}
+                                continue;
+                            }
+                            None => {
+                                warn!("Config watcher exited");
+                                break;
+                            }
+                        }
+                    }
+                    None => return,
+                }
             }
 
             match reload_state.as_mut() {
                 Some((_watcher, rx)) => {
-                    rx.recv().await.unwrap();
+                    match rx.recv().await {
+                        Some(_) => {}
+                        None => {
+                            warn!("Config watcher exited");
+                            break;
+                        }
+                    }
 
                     println!("Configs changed, restarting servers in 3 seconds..");
 

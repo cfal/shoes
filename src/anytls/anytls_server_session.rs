@@ -33,6 +33,9 @@ const CONTROL_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
 /// Prevents memory leaks from hung streams (slow DNS, stuck connections, etc.)
 const STREAM_HANDLER_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Maximum concurrently handled streams per AnyTLS session.
+const MAX_ANYTLS_STREAMS_PER_SESSION: usize = 256;
+
 /// AnyTLS Session manages multiplexed streams over a connection
 pub struct AnyTlsSession {
     /// Underlying connection (split into reader/writer)
@@ -370,6 +373,8 @@ impl AnyTlsSession {
 
                 // Check if stream already exists and register atomically
                 // This prevents race conditions with duplicate SYNs
+                let mut reject_reason = None;
+                let mut tasks = self.stream_tasks.lock().await;
                 let stream_opt = {
                     let mut streams = self.streams.write().await;
                     use std::collections::hash_map::Entry;
@@ -379,16 +384,26 @@ impl AnyTlsSession {
                             None
                         }
                         Entry::Vacant(entry) => {
-                            // Create new stream with bounded channel for backpressure
-                            let (data_tx, data_rx) = mpsc::channel(STREAM_CHANNEL_BUFFER);
-                            let stream = AnyTlsStream::new(
-                                stream_id,
-                                data_rx,
-                                self.outgoing_tx.clone(),
-                                Arc::clone(&self.is_closed),
-                            );
-                            entry.insert(data_tx);
-                            Some(stream)
+                            if tasks.len() >= MAX_ANYTLS_STREAMS_PER_SESSION {
+                                log::warn!(
+                                    "Rejecting AnyTLS stream {}: session stream limit reached ({})",
+                                    stream_id,
+                                    MAX_ANYTLS_STREAMS_PER_SESSION
+                                );
+                                reject_reason = Some("too many concurrent streams");
+                                None
+                            } else {
+                                // Create new stream with bounded channel for backpressure
+                                let (data_tx, data_rx) = mpsc::channel(STREAM_CHANNEL_BUFFER);
+                                let stream = AnyTlsStream::new(
+                                    stream_id,
+                                    data_rx,
+                                    self.outgoing_tx.clone(),
+                                    Arc::clone(&self.is_closed),
+                                );
+                                entry.insert(data_tx);
+                                Some(stream)
+                            }
                         }
                     }
                 };
@@ -430,8 +445,12 @@ impl AnyTlsSession {
                     });
 
                     // Track the task for cancellation on session close
-                    let mut tasks = self.stream_tasks.lock().await;
                     tasks.insert(stream_id, handle);
+                }
+                drop(tasks);
+
+                if let Some(reason) = reject_reason {
+                    self.send_synack(stream_id, Some(reason)).await?;
                 }
             }
 

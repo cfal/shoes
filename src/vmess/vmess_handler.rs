@@ -1,3 +1,4 @@
+use std::collections::{HashMap, VecDeque};
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -11,6 +12,7 @@ use aws_lc_rs::cipher::{
     EncryptingKey as CipherEncryptingKey, EncryptionContext, UnboundCipherKey,
 };
 use bytes::BytesMut;
+use parking_lot::Mutex;
 use rand::{Rng, RngExt};
 use sha3::Shake128;
 use sha3::digest::{ExtendableOutput, Update};
@@ -34,6 +36,9 @@ use crate::uuid_util::parse_uuid;
 use crate::xudp::XudpMessageStream;
 
 const TAG_LEN: usize = 16;
+const MIN_AEAD_HEADER_PAYLOAD_LEN: usize = 38;
+const VMESS_AUTH_ID_TIME_WINDOW_SECS: u64 = 120;
+const VMESS_AUTH_ID_REPLAY_CACHE_CAPACITY: usize = 4096;
 
 // VMess protocol command types
 const COMMAND_TCP: u8 = 1;
@@ -66,6 +71,7 @@ pub struct VmessTcpServerHandler {
     data_cipher: DataCipher,
     instruction_key: [u8; 16],
     aead_decrypting_key: CipherDecryptingKey,
+    auth_id_replay_cache: Mutex<AuthIdReplayCache>,
     udp_enabled: bool,
     proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
@@ -77,6 +83,59 @@ impl std::fmt::Debug for VmessTcpServerHandler {
             .field("data_cipher", &self.data_cipher)
             .field("udp_enabled", &self.udp_enabled)
             .finish_non_exhaustive()
+    }
+}
+
+struct AuthIdReplayCache {
+    seen: HashMap<[u8; 16], u64>,
+    order: VecDeque<[u8; 16]>,
+    capacity: usize,
+}
+
+impl AuthIdReplayCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            seen: HashMap::with_capacity(capacity),
+            order: VecDeque::with_capacity(capacity),
+            capacity,
+        }
+    }
+
+    fn check_and_insert(
+        &mut self,
+        auth_id: [u8; 16],
+        timestamp_secs: u64,
+        current_time_secs: u64,
+        window_secs: u64,
+    ) -> bool {
+        self.prune_expired(current_time_secs, window_secs);
+
+        if self.seen.contains_key(&auth_id) {
+            return false;
+        }
+
+        while self.seen.len() >= self.capacity {
+            if let Some(evicted) = self.order.pop_front() {
+                self.seen.remove(&evicted);
+            } else {
+                break;
+            }
+        }
+
+        self.seen.insert(auth_id, timestamp_secs);
+        self.order.push_back(auth_id);
+        true
+    }
+
+    fn prune_expired(&mut self, current_time_secs: u64, window_secs: u64) {
+        self.seen
+            .retain(|_, timestamp_secs| timestamp_secs.abs_diff(current_time_secs) <= window_secs);
+        self.order.retain(|auth_id| self.seen.contains_key(auth_id));
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.seen.len()
     }
 }
 
@@ -99,12 +158,22 @@ impl VmessTcpServerHandler {
         Self {
             data_cipher: cipher_name.into(),
             aead_decrypting_key,
+            auth_id_replay_cache: Mutex::new(AuthIdReplayCache::new(
+                VMESS_AUTH_ID_REPLAY_CACHE_CAPACITY,
+            )),
             instruction_key,
             udp_enabled,
             proxy_selector,
             resolver,
         }
     }
+}
+
+fn unix_epoch_elapsed_secs() -> u64 {
+    SystemTime::UNIX_EPOCH
+        .elapsed()
+        .unwrap_or_default()
+        .as_secs()
 }
 
 #[async_trait]
@@ -144,12 +213,23 @@ impl TcpServerHandler for VmessTcpServerHandler {
         }
 
         let time_secs = u64::from_be_bytes(aead_bytes[0..8].try_into().unwrap());
-        let current_time_secs = SystemTime::UNIX_EPOCH.elapsed().unwrap().as_secs();
+        let current_time_secs = unix_epoch_elapsed_secs();
         let time_delta = time_secs.abs_diff(current_time_secs);
-        if time_delta > 120 {
+        if time_delta > VMESS_AUTH_ID_TIME_WINDOW_SECS {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("Hash timestamp is too old ({time_secs} is {time_delta} seconds old)"),
+            ));
+        }
+        if !self.auth_id_replay_cache.lock().check_and_insert(
+            cert_hash,
+            time_secs,
+            current_time_secs,
+            VMESS_AUTH_ID_TIME_WINDOW_SECS,
+        ) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "AEAD auth ID replay detected",
             ));
         }
 
@@ -190,7 +270,14 @@ impl TcpServerHandler for VmessTcpServerHandler {
             ));
         }
 
-        let payload_length = u16::from_be_bytes(encrypted_payload_length[0..2].try_into().unwrap());
+        let payload_length =
+            u16::from_be_bytes(encrypted_payload_length[0..2].try_into().unwrap()) as usize;
+        if payload_length < MIN_AEAD_HEADER_PAYLOAD_LEN {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("VMess header payload too short: {payload_length}"),
+            ));
+        }
 
         let header_aead_key = super::sha2::kdf(
             &self.instruction_key,
@@ -202,8 +289,7 @@ impl TcpServerHandler for VmessTcpServerHandler {
             &[b"VMess Header AEAD Nonce", &cert_hash, &nonce],
         );
 
-        let mut encrypted_header =
-            allocate_vec(payload_length as usize + TAG_LEN).into_boxed_slice();
+        let mut encrypted_header = allocate_vec(payload_length + TAG_LEN).into_boxed_slice();
 
         stream_reader
             .read_slice_into(&mut server_stream, &mut encrypted_header)
@@ -225,6 +311,7 @@ impl TcpServerHandler for VmessTcpServerHandler {
         let mut header_reader = AeadHeaderReader {
             server_stream,
             decrypted_header: encrypted_header,
+            payload_len: payload_length,
             cursor: 0,
         };
 
@@ -687,14 +774,30 @@ impl TcpServerHandler for VmessTcpServerHandler {
 struct AeadHeaderReader {
     server_stream: Box<dyn AsyncStream>,
     decrypted_header: Box<[u8]>,
+    payload_len: usize,
     cursor: usize,
 }
 
 impl AeadHeaderReader {
     fn read_slice_into(&mut self, data: &mut [u8]) -> std::io::Result<()> {
         let len = data.len();
+        let end = self.cursor.checked_add(len).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "VMess AEAD header read offset overflow",
+            )
+        })?;
+        if end > self.payload_len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "VMess AEAD header truncated: need {} bytes, payload length is {}",
+                    end, self.payload_len
+                ),
+            ));
+        }
         data.copy_from_slice(&self.decrypted_header[self.cursor..self.cursor + len]);
-        self.cursor += len;
+        self.cursor = end;
         Ok(())
     }
 
@@ -738,6 +841,114 @@ impl VmessTcpClientHandler {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::async_stream::AsyncPing;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+    struct TestStream;
+
+    impl AsyncRead for TestStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for TestStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncPing for TestStream {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+
+        fn poll_write_ping(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+
+    impl AsyncStream for TestStream {}
+
+    #[test]
+    fn auth_id_replay_cache_rejects_duplicate_inside_window() {
+        let mut cache = AuthIdReplayCache::new(16);
+        let auth_id = [0x42u8; 16];
+
+        assert!(cache.check_and_insert(auth_id, 1_000, 1_000, VMESS_AUTH_ID_TIME_WINDOW_SECS));
+        assert!(!cache.check_and_insert(auth_id, 1_000, 1_000, VMESS_AUTH_ID_TIME_WINDOW_SECS));
+    }
+
+    #[test]
+    fn auth_id_replay_cache_prunes_entries_outside_window() {
+        let mut cache = AuthIdReplayCache::new(16);
+        let auth_id = [0x42u8; 16];
+
+        assert!(cache.check_and_insert(auth_id, 1_000, 1_000, VMESS_AUTH_ID_TIME_WINDOW_SECS));
+        assert!(cache.check_and_insert(
+            auth_id,
+            1_000,
+            1_000 + VMESS_AUTH_ID_TIME_WINDOW_SECS + 1,
+            VMESS_AUTH_ID_TIME_WINDOW_SECS,
+        ));
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn auth_id_replay_cache_stays_bounded() {
+        let mut cache = AuthIdReplayCache::new(2);
+
+        assert!(cache.check_and_insert([1u8; 16], 1_000, 1_000, VMESS_AUTH_ID_TIME_WINDOW_SECS));
+        assert!(cache.check_and_insert([2u8; 16], 1_000, 1_000, VMESS_AUTH_ID_TIME_WINDOW_SECS));
+        assert!(cache.check_and_insert([3u8; 16], 1_000, 1_000, VMESS_AUTH_ID_TIME_WINDOW_SECS));
+
+        assert_eq!(cache.len(), 2);
+        assert!(cache.check_and_insert([1u8; 16], 1_000, 1_000, VMESS_AUTH_ID_TIME_WINDOW_SECS));
+    }
+
+    #[test]
+    fn aead_header_reader_rejects_reads_past_payload_len() {
+        let mut reader = AeadHeaderReader {
+            server_stream: Box::new(TestStream),
+            decrypted_header: vec![0u8; 4 + TAG_LEN].into_boxed_slice(),
+            payload_len: 4,
+            cursor: 0,
+        };
+
+        let mut payload = [0u8; 4];
+        reader.read_slice_into(&mut payload).unwrap();
+
+        let mut extra = [0u8; 1];
+        let err = reader.read_slice_into(&mut extra).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("truncated"));
+    }
+}
+
 #[async_trait]
 impl TcpClientHandler for VmessTcpClientHandler {
     async fn setup_client_tcp_stream(
@@ -748,8 +959,9 @@ impl TcpClientHandler for VmessTcpClientHandler {
         // AEAD allows 120 second delta from the current time.
         // See authid.go in v2ray-core.
         let random_delta: u64 = rand::rng().random_range(0..241);
-        let time_secs: u64 =
-            SystemTime::UNIX_EPOCH.elapsed().unwrap().as_secs() - 120u64 + random_delta;
+        let time_secs: u64 = unix_epoch_elapsed_secs()
+            .saturating_sub(VMESS_AUTH_ID_TIME_WINDOW_SECS)
+            .saturating_add(random_delta);
 
         let mut aead_bytes = [0u8; 16];
         let time_bytes = time_secs.to_be_bytes();
@@ -1031,8 +1243,9 @@ impl VmessTcpClientHandler {
 
         // AEAD allows 120 second delta from the current time.
         let random_delta: u64 = rand::rng().random_range(0..241);
-        let time_secs: u64 =
-            SystemTime::UNIX_EPOCH.elapsed().unwrap().as_secs() - 120u64 + random_delta;
+        let time_secs: u64 = unix_epoch_elapsed_secs()
+            .saturating_sub(VMESS_AUTH_ID_TIME_WINDOW_SECS)
+            .saturating_add(random_delta);
 
         let mut aead_bytes = [0u8; 16];
         let time_bytes = time_secs.to_be_bytes();
