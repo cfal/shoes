@@ -101,9 +101,14 @@ pub struct RefreshingResolver {
     factory: ResolverFactory,
     inner: Arc<RwLock<Arc<dyn Resolver>>>,
     refresh_lock: Arc<AsyncMutex<()>>,
-    last_success_at: Arc<Mutex<Option<Instant>>>,
+    refresh_state: Arc<Mutex<RefreshState>>,
     policy: RefreshPolicy,
     description: String,
+}
+
+struct RefreshState {
+    last_activity_at: Option<Instant>,
+    generation: u64,
 }
 
 impl Debug for RefreshingResolver {
@@ -126,7 +131,10 @@ impl RefreshingResolver {
             factory,
             inner: Arc::new(RwLock::new(inner)),
             refresh_lock: Arc::new(AsyncMutex::new(())),
-            last_success_at: Arc::new(Mutex::new(None)),
+            refresh_state: Arc::new(Mutex::new(RefreshState {
+                last_activity_at: None,
+                generation: 0,
+            })),
             policy,
             description,
         })
@@ -155,15 +163,16 @@ impl Resolver for RefreshingResolver {
         let inner = self.inner.clone();
         let refresh_lock = self.refresh_lock.clone();
         let factory = self.factory.clone();
-        let last_success_at = self.last_success_at.clone();
+        let refresh_state = self.refresh_state.clone();
         let policy = self.policy;
         let description = self.description.clone();
 
         Box::pin(async move {
-            // Refresh if idle too long (double-checked locking).
-            if matches!(*last_success_at.lock(), Some(last) if last.elapsed() > policy.max_idle) {
+            // Refreshes if idle too long using double-checked locking.
+            if matches!(refresh_state.lock().last_activity_at, Some(last) if last.elapsed() > policy.max_idle)
+            {
                 let _guard = refresh_lock.lock().await;
-                if matches!(*last_success_at.lock(), Some(last) if last.elapsed() > policy.max_idle)
+                if matches!(refresh_state.lock().last_activity_at, Some(last) if last.elapsed() > policy.max_idle)
                 {
                     log::info!(
                         "RefreshingResolver ({}): rebuilding after idle timeout ({:?})",
@@ -171,7 +180,12 @@ impl Resolver for RefreshingResolver {
                         policy.max_idle
                     );
                     match factory().await {
-                        Ok(fresh) => *inner.write().await = fresh,
+                        Ok(fresh) => {
+                            *inner.write().await = fresh;
+                            let mut state = refresh_state.lock();
+                            state.last_activity_at = Some(Instant::now());
+                            state.generation = state.generation.wrapping_add(1);
+                        }
                         Err(e) => {
                             log::warn!(
                                 "RefreshingResolver ({}): idle refresh failed: {}",
@@ -183,28 +197,39 @@ impl Resolver for RefreshingResolver {
                 }
             }
 
+            let current_generation = refresh_state.lock().generation;
             let current = inner.read().await.clone();
             match current.resolve_location(&location).await {
                 Ok(addrs) => {
-                    *last_success_at.lock() = Some(Instant::now());
+                    refresh_state.lock().last_activity_at = Some(Instant::now());
                     Ok(addrs)
                 }
                 Err(err)
                     if policy.retry_once_after_refresh
                         && RefreshingResolver::should_refresh_for_error(&err) =>
                 {
+                    let _guard = refresh_lock.lock().await;
+                    if refresh_state.lock().generation != current_generation {
+                        let current = inner.read().await.clone();
+                        let addrs = current.resolve_location(&location).await?;
+                        refresh_state.lock().last_activity_at = Some(Instant::now());
+                        return Ok(addrs);
+                    }
                     log::info!(
                         "RefreshingResolver ({}): refresh-on-error ({}) for {}",
                         description,
                         err.kind(),
                         location
                     );
-                    let _guard = refresh_lock.lock().await;
                     match factory().await {
                         Ok(fresh) => {
                             *inner.write().await = fresh.clone();
+                            {
+                                let mut state = refresh_state.lock();
+                                state.generation = state.generation.wrapping_add(1);
+                            }
                             let addrs = fresh.resolve_location(&location).await?;
-                            *last_success_at.lock() = Some(Instant::now());
+                            refresh_state.lock().last_activity_at = Some(Instant::now());
                             Ok(addrs)
                         }
                         Err(factory_err) => {
@@ -506,6 +531,7 @@ mod tests {
     use super::*;
     use crate::address::Address;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::Barrier;
 
     /// A mock resolver that returns configurable results, tracking call count.
     #[derive(Debug)]
@@ -692,7 +718,7 @@ mod tests {
             .await
             .unwrap();
 
-        // First resolve succeeds, sets last_success_at
+        // First resolve records activity.
         let result = resolver.resolve_location(&test_location()).await.unwrap();
         assert_eq!(result, addrs);
         assert_eq!(call_count.load(Ordering::Relaxed), 1);
@@ -704,6 +730,57 @@ mod tests {
         let result = resolver.resolve_location(&test_location()).await.unwrap();
         assert_eq!(result, addrs);
         // Factory called twice: initial + idle refresh
+        assert_eq!(call_count.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn test_refreshing_resolver_coalesces_concurrent_idle_refresh() {
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let addrs = test_addrs();
+
+        let call_count_clone = call_count.clone();
+        let addrs_clone = addrs.clone();
+        let factory: ResolverFactory = Arc::new(move || {
+            call_count_clone.fetch_add(1, Ordering::Relaxed);
+            let addrs = addrs_clone.clone();
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                Ok(Arc::new(MockResolver::with_addrs(addrs)) as Arc<dyn Resolver>)
+            })
+        });
+
+        let policy = RefreshPolicy {
+            max_idle: Duration::from_millis(20),
+            retry_once_after_refresh: true,
+        };
+
+        let resolver = Arc::new(
+            RefreshingResolver::new(factory, policy, "test".to_string())
+                .await
+                .unwrap(),
+        );
+
+        let result = resolver.resolve_location(&test_location()).await.unwrap();
+        assert_eq!(result, addrs);
+        assert_eq!(call_count.load(Ordering::Relaxed), 1);
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let concurrency = 32;
+        let barrier = Arc::new(Barrier::new(concurrency));
+        let tasks = (0..concurrency).map(|_| {
+            let resolver = resolver.clone();
+            let barrier = barrier.clone();
+            let location = test_location();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                resolver.resolve_location(&location).await
+            })
+        });
+
+        for result in futures::future::join_all(tasks).await {
+            assert_eq!(result.unwrap().unwrap(), addrs);
+        }
         assert_eq!(call_count.load(Ordering::Relaxed), 2);
     }
 
