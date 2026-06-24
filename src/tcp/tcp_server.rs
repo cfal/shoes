@@ -21,6 +21,7 @@ use crate::copy_bidirectional_message::copy_bidirectional_message;
 use crate::quic_server::start_quic_servers;
 use crate::resolver::Resolver;
 use crate::routing::{ServerStream, run_udp_routing};
+use crate::shadowquic_server::start_shadowquic_servers;
 use crate::socket_util::{new_tcp_listener, set_tcp_keepalive};
 use crate::tcp::tcp_handler::{TcpClientSetupResult, TcpServerHandler, TcpServerSetupResult};
 #[cfg(unix)]
@@ -391,7 +392,17 @@ async fn start_tcp_or_quic_servers(
                 return Err(e);
             }
         },
-        Transport::Udp => todo!(),
+        Transport::Udp => match start_shadowquic_servers(config.clone(), resolver).await {
+            Ok(handles) => {
+                join_handles.extend(handles);
+            }
+            Err(e) => {
+                for join_handle in join_handles {
+                    join_handle.abort();
+                }
+                return Err(e);
+            }
+        },
     }
 
     if join_handles.is_empty() {

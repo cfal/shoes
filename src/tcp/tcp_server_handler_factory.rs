@@ -278,6 +278,11 @@ pub fn create_tcp_server_handler(
                  config validation should have rejected this"
             )
         }
+        ServerProxyConfig::Shadowquic { .. } => {
+            unreachable!(
+                "ShadowQUIC uses its own UDP/QUIC server - config validation should not route it through TCP handlers"
+            )
+        }
         unknown_config => {
             panic!("Unsupported TCP proxy config: {unknown_config:?}")
         }

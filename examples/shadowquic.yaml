@@ -1,0 +1,22 @@
+# ShadowQUIC server example.
+#
+# ShadowQUIC is its own QUIC/JLS transport and does not use quic_settings.
+# The server-name should match the client server-name and the JLS upstream SNI.
+
+- address: 0.0.0.0:1443
+  protocol:
+    type: shadowquic
+    users:
+      - username: "87654321"
+        password: "12345678"
+      - username: "admin"
+        password: "hello"
+    jls_upstream:
+      addr: "cloudflare.com:443"
+    server_name: "cloudflare.com"
+    alpn: ["h3"]
+    congestion_control: bbr
+    zero_rtt: true
+    gso: true
+  rules:
+    - allow-all-direct

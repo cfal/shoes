@@ -18,6 +18,7 @@ use crate::address::{Address, NetLocation};
 use crate::async_stream::AsyncStream;
 use crate::client_proxy_selector::{ClientProxySelector, ConnectDecision};
 use crate::copy_bidirectional::copy_bidirectional_with_sizes;
+use crate::quic_config_util::use_bbr_congestion_control;
 use crate::quic_stream::QuicStream;
 use crate::resolver::{Resolver, resolve_single_address};
 use crate::stream_reader::StreamReader;
@@ -1410,8 +1411,8 @@ pub async fn start_tuic_server(
         let join_handle = tokio::spawn(async move {
             let mut server_config = quinn::ServerConfig::with_crypto(quic_server_config);
 
-            Arc::get_mut(&mut server_config.transport)
-                .unwrap()
+            let transport_config = Arc::get_mut(&mut server_config.transport).unwrap();
+            use_bbr_congestion_control(transport_config)
                 .max_concurrent_bidi_streams(4096_u32.into())
                 .max_concurrent_uni_streams(4096_u32.into())
                 .max_idle_timeout(Some(Duration::from_secs(60).try_into().unwrap()))

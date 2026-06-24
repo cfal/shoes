@@ -35,9 +35,9 @@ pub use groups::{ClientConfigGroup, Config, NamedPem, PemSource};
 pub use rules::{ClientChain, ClientChainHop, RuleActionConfig, RuleConfig};
 pub use selection::ConfigSelection;
 pub use server::{
-    RealityServerConfig, ServerConfig, ServerProxyConfig, ShadowTlsServerConfig,
-    ShadowTlsServerHandshakeConfig, TlsServerConfig, WebsocketPingType, WebsocketServerConfig,
-    direct_allow_rule,
+    RealityServerConfig, ServerConfig, ServerProxyConfig, ShadowQuicCongestionControl,
+    ShadowQuicServerConfig, ShadowTlsServerConfig, ShadowTlsServerHandshakeConfig, TlsServerConfig,
+    WebsocketPingType, WebsocketServerConfig, direct_allow_rule,
 };
 pub use shadowsocks::ShadowsocksConfig;
 pub use transport::{BindLocation, ClientQuicConfig, ServerQuicConfig, TcpConfig, Transport};
