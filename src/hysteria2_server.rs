@@ -33,6 +33,7 @@ use crate::address::NetLocation;
 use crate::async_stream::AsyncStream;
 use crate::client_proxy_selector::{ClientProxySelector, ConnectDecision};
 use crate::copy_bidirectional::copy_bidirectional_with_sizes;
+use crate::quic_config_util::use_bbr_congestion_control;
 use crate::quic_stream::QuicStream;
 use crate::resolver::{Resolver, ResolverCache};
 use crate::stream_reader::StreamReader;
@@ -990,8 +991,8 @@ pub async fn start_hysteria2_server(
             let mut server_config = quinn::ServerConfig::with_crypto(quic_server_config);
 
             // values estimated from https://github.com/apernet/hysteria/blob/5520bcc405ee11a47c164c75bae5c40fc2b1d99d/core/server/config.go#L16
-            Arc::get_mut(&mut server_config.transport)
-                .unwrap()
+            let transport_config = Arc::get_mut(&mut server_config.transport).unwrap();
+            use_bbr_congestion_control(transport_config)
                 .max_concurrent_bidi_streams(4096_u32.into())
                 // required for HTTP/3 QPACK updates
                 .max_concurrent_uni_streams(1024_u32.into())

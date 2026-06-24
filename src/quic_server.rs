@@ -14,6 +14,7 @@ use crate::config::{
     BindLocation, ConfigSelection, ServerConfig, ServerProxyConfig, ServerQuicConfig,
 };
 use crate::copy_bidirectional::copy_bidirectional;
+use crate::quic_config_util::use_bbr_congestion_control;
 use crate::quic_stream::QuicStream;
 use crate::resolver::Resolver;
 use crate::routing::{ServerStream, run_udp_routing};
@@ -32,17 +33,10 @@ async fn start_quic_server(
     server_handler: Arc<dyn TcpServerHandler>,
     num_endpoints: usize,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
-    // TODO: consider setting transport config
-    //   Arc::get_mut(&mut server_config.transport)
-    //     .unwrap()
-    //     .max_concurrent_bidi_streams(1024_u32.into())
-    //     .max_concurrent_uni_streams(0_u8.into())
-    //     .keep_alive_interval(Some(Duration::from_secs(15)))
-    //     .max_idle_timeout(Some(Duration::from_secs(30).try_into().unwrap()));
-
     let mut join_handles = vec![];
     for _ in 0..num_endpoints {
-        let server_config = quinn::ServerConfig::with_crypto(quic_server_config.clone());
+        let mut server_config = quinn::ServerConfig::with_crypto(quic_server_config.clone());
+        use_bbr_congestion_control(Arc::get_mut(&mut server_config.transport).unwrap());
 
         let socket2_socket =
             new_socket2_udp_socket(bind_address.is_ipv6(), None, Some(bind_address), true).unwrap();

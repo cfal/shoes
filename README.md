@@ -197,6 +197,19 @@ See the [examples](./examples) directory for all examples.
     password: supersecret
 ```
 
+### ShadowQUIC Server
+```yaml
+- address: 0.0.0.0:1443
+  protocol:
+    type: shadowquic
+    users:
+      - username: "87654321"
+        password: "12345678"
+    jls_upstream:
+      addr: "cloudflare.com:443"
+    server_name: "cloudflare.com"
+```
+
 ### Mixed HTTP/SOCKS5 Server
 ```yaml
 - address: 0.0.0.0:7890

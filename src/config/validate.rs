@@ -664,6 +664,13 @@ fn validate_server_config(
                 ));
             }
         }
+    } else if server_config.transport == Transport::Udp {
+        if !matches!(server_config.protocol, ServerProxyConfig::Shadowquic { .. }) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "UDP transport is only supported by ShadowQUIC server protocol",
+            ));
+        }
     } else if server_config.quic_settings.is_some() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -999,6 +1006,48 @@ fn validate_server_proxy_config(
                 "NaiveProxy must be used inside a TLS or Reality protocol. \
                  Configure it as the inner protocol of tls: or reality: targets.",
             ));
+        }
+        ServerProxyConfig::Shadowquic(config) => {
+            if inside_tls_or_reality {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "ShadowQUIC is a top-level QUIC/JLS inbound protocol and cannot be nested inside TLS/Reality",
+                ));
+            }
+            if config.users.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "ShadowQUIC requires at least one user",
+                ));
+            }
+            if config
+                .users
+                .iter()
+                .any(|user| user.username.is_empty() || user.password.is_empty())
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "ShadowQUIC user username/password must not be empty",
+                ));
+            }
+            if config.jls_upstream.addr.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "ShadowQUIC jls_upstream.addr must not be empty",
+                ));
+            }
+            if config.initial_mtu < 1200 || config.min_mtu < 1200 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "ShadowQUIC MTU values must be at least 1200",
+                ));
+            }
+            if config.initial_mtu < config.min_mtu {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "ShadowQUIC initial_mtu must be greater than or equal to min_mtu",
+                ));
+            }
         }
         ServerProxyConfig::Vless { user_id, .. } => {
             parse_uuid(user_id)?;

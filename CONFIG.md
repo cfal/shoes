@@ -63,7 +63,7 @@ path: "/tmp/shoes.sock"
 protocol: ServerProxyConfig
 
 # Transport layer (default: tcp)
-transport: tcp | quic
+transport: tcp | quic | udp
 
 # TCP settings (only when transport: tcp)
 tcp_settings:
@@ -77,6 +77,9 @@ quic_settings:
   client_ca_certs: [string]    # Optional client CA certificates
   client_fingerprints: [string] # Optional client certificate fingerprints
   num_endpoints: int           # Optional, 0 = auto (based on thread count)
+
+# ShadowQUIC is a special UDP/QUIC transport. Use protocol type shadowquic;
+# transport defaults to udp and quic_settings is not used.
 
 # Routing rules (default: allow-all-direct)
 rules: string | [RuleConfig]
@@ -262,6 +265,27 @@ protocol:
   uuid: string                 # UUID
   password: string
   zero_rtt_handshake: false    # Default: false (enables 0-RTT for lower latency)
+```
+
+### ShadowQUIC
+```yaml
+protocol:
+  type: shadowquic
+  users:
+    - username: string
+      password: string
+  jls_upstream:
+    addr: string                # Camouflage upstream, e.g. "cloudflare.com:443"
+    rate_limit: int             # Optional, default unlimited
+  server_name: string?          # Optional, usually same hostname as jls_upstream
+  alpn: [string]                # Default: ["h3"]
+  congestion_control: bbr       # bbr | cubic | new-reno | bbr3
+  zero_rtt: true                # Default: true
+  initial_mtu: 1300             # Default: 1300
+  min_mtu: 1290                 # Default: 1290
+  gso: true                     # Default: true
+  mtu_discovery: true           # Default: true
+  blackhole_detection: false    # Default: false
 ```
 
 ### AnyTLS

@@ -7,7 +7,12 @@ use serde::{Deserialize, Serialize};
 use crate::address::NetLocation;
 use crate::option_util::{NoneOrSome, OneOrSome};
 
-use super::common::{default_reality_server_short_ids, default_reality_time_diff, default_true};
+use super::common::{
+    default_reality_server_short_ids, default_reality_time_diff, default_true,
+    shadowquic_default_alpn, shadowquic_default_blackhole_detection,
+    shadowquic_default_congestion_control, shadowquic_default_gso, shadowquic_default_initial_mtu,
+    shadowquic_default_min_mtu, shadowquic_default_mtu_discovery, shadowquic_default_zero_rtt,
+};
 use super::dns::DnsConfig;
 use super::rules::{ClientChainHop, RuleConfig};
 use super::selection::ConfigSelection;
@@ -31,6 +36,63 @@ pub struct NaiveUserConfig {
     pub name: String,
     pub username: String,
     pub password: String,
+}
+
+/// ShadowQUIC user configuration.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShadowQuicUserConfig {
+    pub username: String,
+    pub password: String,
+}
+
+/// ShadowQUIC JLS camouflage upstream configuration.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShadowQuicJlsUpstreamConfig {
+    pub addr: String,
+    #[serde(default = "shadowquic_default_rate_limit")]
+    pub rate_limit: u64,
+}
+
+pub fn shadowquic_default_rate_limit() -> u64 {
+    u64::MAX
+}
+
+/// ShadowQUIC congestion control algorithm.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ShadowQuicCongestionControl {
+    Bbr,
+    Cubic,
+    NewReno,
+    Bbr3,
+}
+
+/// ShadowQUIC inbound protocol configuration.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShadowQuicServerConfig {
+    pub users: Vec<ShadowQuicUserConfig>,
+    pub jls_upstream: ShadowQuicJlsUpstreamConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_name: Option<String>,
+    #[serde(default = "shadowquic_default_alpn")]
+    pub alpn: Vec<String>,
+    #[serde(default = "shadowquic_default_zero_rtt")]
+    pub zero_rtt: bool,
+    #[serde(default = "shadowquic_default_congestion_control")]
+    pub congestion_control: ShadowQuicCongestionControl,
+    #[serde(default = "shadowquic_default_initial_mtu")]
+    pub initial_mtu: u16,
+    #[serde(default = "shadowquic_default_min_mtu")]
+    pub min_mtu: u16,
+    #[serde(default = "shadowquic_default_gso")]
+    pub gso: bool,
+    #[serde(default = "shadowquic_default_mtu_discovery")]
+    pub mtu_discovery: bool,
+    #[serde(default = "shadowquic_default_blackhole_detection")]
+    pub blackhole_detection: bool,
 }
 
 /// NaiveProxy fallback configuration for probe resistance
@@ -243,13 +305,14 @@ impl<'de> serde::de::Deserialize<'de> for ServerConfig {
                     .map_err(|e| Error::custom(format!("invalid protocol: {e}")))
             })?;
 
-        // Parse transport (optional, default)
-        let transport: Transport = map
-            .get("transport")
-            .map(|v| serde_yaml::from_value(v.clone()))
-            .transpose()
-            .map_err(|e| Error::custom(format!("invalid transport: {e}")))?
-            .unwrap_or_default();
+        // Parse transport (optional, default). ShadowQUIC owns its QUIC/JLS
+        // transport and defaults to UDP when the field is omitted.
+        let transport: Transport = match map.get("transport") {
+            Some(v) => serde_yaml::from_value(v.clone())
+                .map_err(|e| Error::custom(format!("invalid transport: {e}")))?,
+            None if matches!(protocol, ServerProxyConfig::Shadowquic { .. }) => Transport::Udp,
+            None => Transport::default(),
+        };
 
         // Parse tcp_settings (optional, skip if null)
         let tcp_settings: Option<TcpConfig> = map
@@ -750,6 +813,8 @@ pub enum ServerProxyConfig {
         #[serde(default)]
         zero_rtt_handshake: bool,
     },
+    #[serde(alias = "shadow-quic")]
+    Shadowquic(ShadowQuicServerConfig),
     /// Mixed HTTP+SOCKS5 server (auto-detects protocol from first byte)
     /// Similar to mihomo's mixed-port feature.
     #[serde(alias = "http+socks", alias = "socks+http")]
@@ -824,6 +889,7 @@ impl std::fmt::Display for ServerProxyConfig {
             Self::PortForward { .. } => write!(f, "Portforward"),
             Self::Hysteria2 { .. } => write!(f, "Hysteria2"),
             Self::TuicV5 { .. } => write!(f, "TuicV5"),
+            Self::Shadowquic { .. } => write!(f, "ShadowQUIC"),
             Self::Mixed { .. } => write!(f, "Mixed (HTTP+SOCKS5)"),
             Self::Anytls { .. } => write!(f, "AnyTLS"),
             Self::Naiveproxy { .. } => write!(f, "NaiveProxy"),
@@ -1230,6 +1296,25 @@ mod tests {
             deserialized.protocol,
             ServerProxyConfig::TuicV5 { .. }
         ));
+    }
+
+    #[test]
+    fn test_server_config_shadowquic_defaults_to_udp_transport() {
+        let yaml = r#"
+address: 0.0.0.0:1443
+protocol:
+  type: shadowquic
+  users:
+    - username: "user"
+      password: "pass"
+  jls_upstream:
+    addr: "cloudflare.com:443"
+"#;
+
+        let config: ServerConfig = serde_yaml::from_str(yaml).expect("Failed to deserialize");
+        assert_eq!(config.transport, Transport::Udp);
+        assert!(config.quic_settings.is_none());
+        assert!(matches!(config.protocol, ServerProxyConfig::Shadowquic(_)));
     }
 
     #[test]

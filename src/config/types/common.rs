@@ -5,11 +5,45 @@ use serde::{Deserialize, Serialize};
 use crate::address::{NetLocation, NetLocationMask, NetLocationPortRange};
 use crate::option_util::OneOrSome;
 
+use super::server::ShadowQuicCongestionControl;
+
 /// Default Reality short_id: all zeros (16 hex chars = 8 bytes of zeros)
 pub const DEFAULT_REALITY_SHORT_ID: &str = "0000000000000000";
 
 pub fn default_true() -> bool {
     true
+}
+
+pub fn shadowquic_default_alpn() -> Vec<String> {
+    vec!["h3".to_string()]
+}
+
+pub fn shadowquic_default_zero_rtt() -> bool {
+    true
+}
+
+pub fn shadowquic_default_congestion_control() -> ShadowQuicCongestionControl {
+    ShadowQuicCongestionControl::Bbr
+}
+
+pub fn shadowquic_default_initial_mtu() -> u16 {
+    1300
+}
+
+pub fn shadowquic_default_min_mtu() -> u16 {
+    1290
+}
+
+pub fn shadowquic_default_gso() -> bool {
+    true
+}
+
+pub fn shadowquic_default_mtu_discovery() -> bool {
+    true
+}
+
+pub fn shadowquic_default_blackhole_detection() -> bool {
+    false
 }
 
 pub fn is_false(b: &bool) -> bool {
