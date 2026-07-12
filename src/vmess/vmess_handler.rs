@@ -12,8 +12,8 @@ use aws_lc_rs::cipher::{
 };
 use bytes::BytesMut;
 use rand::{Rng, RngExt};
-use sha3::Shake128;
-use sha3::digest::{ExtendableOutput, Update};
+use shake::Shake128;
+use shake::digest::{ExtendableOutput, Update};
 use tokio::io::AsyncWriteExt;
 
 use super::fnv1a::Fnv1aHasher;

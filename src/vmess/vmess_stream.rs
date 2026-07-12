@@ -1159,8 +1159,8 @@ impl AsyncMessageStream for VmessStream {}
 mod tests {
     use super::*;
     use aws_lc_rs::aead::{CHACHA20_POLY1305, UnboundKey};
-    use sha3::Shake128;
-    use sha3::digest::{ExtendableOutput, Update};
+    use shake::Shake128;
+    use shake::digest::{ExtendableOutput, Update};
 
     fn create_shake128_reader(iv: &[u8]) -> VmessReader {
         let mut hasher = Shake128::default();

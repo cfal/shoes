@@ -1,1 +1,1 @@
-pub type VmessReader = sha3::Shake128Reader;
+pub type VmessReader = shake::Shake128Reader;
