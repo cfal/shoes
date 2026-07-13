@@ -334,7 +334,12 @@ pub struct CachingNativeResolver {
 
 struct CachedResolveResult {
     timestamp: Instant,
-    addr: SocketAddr,
+    /// All addresses the hostname resolved to, in resolver order. The full list
+    /// is cached (not just the first) so a cache hit preserves the multi-address
+    /// connect fallback: callers like `SocketConnectorImpl::connect` try each
+    /// address in turn, so a dual-stack host whose first record is unreachable
+    /// still connects via a later record.
+    addrs: Vec<SocketAddr>,
 }
 
 impl std::fmt::Debug for CachingNativeResolver {
@@ -375,8 +380,11 @@ impl Resolver for CachingNativeResolver {
                 && Instant::now().duration_since(cached.timestamp)
                     <= Duration::from_secs(self.result_timeout_secs)
             {
-                let addr = cached.addr;
-                return Box::pin(async move { Ok(vec![addr]) });
+                // Return the full cached list (clone), not just the first
+                // address, so the caller's per-address connect fallback survives
+                // a cache hit (symmetric with the cache-miss path below).
+                let addrs = cached.addrs.clone();
+                return Box::pin(async move { Ok(addrs) });
             }
         }
 
@@ -397,12 +405,13 @@ impl Resolver for CachingNativeResolver {
                 )));
             }
 
-            // Cache the first result
+            // Cache the full resolved list so a later cache hit still feeds the
+            // multi-address connect fallback (e.g. dual-stack hosts).
             cache.lock().insert(
                 location,
                 CachedResolveResult {
                     timestamp: Instant::now(),
-                    addr: addrs[0],
+                    addrs: addrs.clone(),
                 },
             );
 
@@ -816,5 +825,24 @@ mod tests {
         let loc = NetLocation::new(Address::Ipv4("1.2.3.4".parse().unwrap()), 80);
         let result = resolver.resolve_location(&loc).await.unwrap();
         assert_eq!(result[0], "1.2.3.4:80".parse::<SocketAddr>().unwrap());
+    }
+
+    /// Regression: a `CachingNativeResolver` cache hit must return the same full
+    /// address list as the initial cache miss, not just the first address.
+    #[tokio::test]
+    async fn test_caching_native_resolver_hit_returns_full_list() {
+        let resolver = CachingNativeResolver::new();
+        let loc = NetLocation::new(Address::Hostname("localhost".to_string()), 9);
+
+        // First call: cache miss, returns the full resolved list.
+        let miss = resolver.resolve_location(&loc).await.unwrap();
+        assert!(!miss.is_empty(), "localhost must resolve to >= 1 address");
+
+        // Second call: cache hit, must return the same full list (not addrs[0]).
+        let hit = resolver.resolve_location(&loc).await.unwrap();
+        assert_eq!(
+            hit, miss,
+            "cache hit must return the full resolved list, not just the first address"
+        );
     }
 }
