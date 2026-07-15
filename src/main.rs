@@ -373,7 +373,57 @@ fn main() {
             let config::ValidatedConfigs {
                 configs: server_configs,
                 dns_groups,
+                fake_ip: fake_ip_config,
             } = server_configs;
+
+            let _fake_ip_manager = match fake_ip_config {
+                Some(config) => {
+                    let parts: Vec<&str> = config.fake_ip.network.split('/').collect();
+                    if parts.len() != 2 {
+                        eprintln!("Invalid fake_ip network format. Expected IP/PREFIX\n");
+                        print_usage_and_exit(arg0);
+                        return;
+                    }
+                    let ip = match parts[0].parse() {
+                        Ok(v) => v,
+                        Err(e) => {
+                            eprintln!("Invalid FakeIP IP address: {e}\n");
+                            print_usage_and_exit(arg0);
+                            return;
+                        }
+                    };
+                    let prefix = match parts[1].parse() {
+                        Ok(v) => v,
+                        Err(e) => {
+                            eprintln!("Invalid FakeIP prefix length: {e}\n");
+                            print_usage_and_exit(arg0);
+                            return;
+                        }
+                    };
+
+                    let fake_ip_manager = dns::FakeIpManager::new(ip, prefix);
+                    crate::dns::fake_ip::GLOBAL_FAKE_IP_MANAGER.set(fake_ip_manager.clone()).ok();
+
+                    if let Some(bind_addr_str) = config.fake_ip.bind_address {
+                        let bind_addr: std::net::SocketAddr = match bind_addr_str.parse() {
+                            Ok(addr) => addr,
+                            Err(e) => {
+                                eprintln!("Invalid FakeIP bind_address: {e}\n");
+                                print_usage_and_exit(arg0);
+                                return;
+                            }
+                        };
+                        let server = dns::fake_ip_server::FakeIpServer::new(bind_addr, fake_ip_manager.clone());
+                        join_handles.push(tokio::spawn(async move {
+                            if let Err(e) = server.start().await {
+                                log::error!("Fake IP server error: {}", e);
+                            }
+                        }));
+                    }
+                    Some(fake_ip_manager)
+                }
+                None => None,
+            };
 
             // Build DNS registry from expanded groups (async - resolves hostnames)
             let mut dns_registry = match dns::build_dns_registry(dns_groups).await {

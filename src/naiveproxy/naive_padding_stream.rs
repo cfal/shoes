@@ -575,7 +575,7 @@ mod tests {
         frame.extend_from_slice(&payload_len.to_be_bytes());
         frame.push(padding_len);
         frame.extend_from_slice(payload);
-        frame.extend(std::iter::repeat(0u8).take(padding_len as usize));
+        frame.extend(std::iter::repeat_n(0u8, padding_len as usize));
         frame
     }
 
@@ -594,7 +594,7 @@ mod tests {
     fn test_frame_encoding_empty_payload() {
         // Pure padding frame (payload_len = 0)
         let frame = encode_test_frame(b"", 50);
-        assert_eq!(frame.len(), 3 + 0 + 50);
+        assert_eq!(frame.len(), 3 + 50);
         assert_eq!(&frame[0..2], &[0x00, 0x00]); // payload_len = 0
         assert_eq!(frame[2], 50); // padding_len
     }

@@ -26,6 +26,8 @@ pub struct ValidatedConfigs {
     pub configs: Vec<Config>,
     /// Expanded DNS groups in topological order (bootstrap deps first).
     pub dns_groups: Vec<ExpandedDnsGroup>,
+    /// Fake IP configuration if specified
+    pub fake_ip: Option<crate::config::types::FakeIpConfig>,
 }
 
 /// Validates configs and returns startable server configs with expanded DNS groups.
@@ -69,6 +71,7 @@ pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Valida
     let mut tun_configs: Vec<TunConfig> = vec![];
     let mut named_pems: HashMap<String, String> = HashMap::new();
     let mut dns_groups: HashMap<String, DnsConfigGroup> = HashMap::new();
+    let mut fake_ip: Option<crate::config::types::FakeIpConfig> = None;
 
     for config in all_configs.into_iter() {
         match config {
@@ -123,6 +126,15 @@ pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Valida
                         format!("dns group already exists: {}", group_name),
                     ));
                 }
+            }
+            Config::FakeIp(fake_ip_config) => {
+                if fake_ip.is_some() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "multiple fake_ip configs found",
+                    ));
+                }
+                fake_ip = Some(fake_ip_config);
             }
         }
     }
@@ -187,6 +199,7 @@ pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Valida
     Ok(ValidatedConfigs {
         configs: result,
         dns_groups: final_dns_groups,
+        fake_ip,
     })
 }
 
@@ -1750,17 +1763,17 @@ mod tests {
             protocol:
               type: http
 "#,
-            cert_dir.display(),
-            cert_dir.display(),
-            cert_dir.display(),
-            cert_dir.display(),
-            cert_dir.display(),
-            cert_dir.display(),
-            cert_dir.display(),
-            cert_dir.display(),
-            cert_dir.display(),
-            cert_dir.display(),
-            cert_dir.display()
+            cert_dir.display().to_string().replace('\\', "/"),
+            cert_dir.display().to_string().replace('\\', "/"),
+            cert_dir.display().to_string().replace('\\', "/"),
+            cert_dir.display().to_string().replace('\\', "/"),
+            cert_dir.display().to_string().replace('\\', "/"),
+            cert_dir.display().to_string().replace('\\', "/"),
+            cert_dir.display().to_string().replace('\\', "/"),
+            cert_dir.display().to_string().replace('\\', "/"),
+            cert_dir.display().to_string().replace('\\', "/"),
+            cert_dir.display().to_string().replace('\\', "/"),
+            cert_dir.display().to_string().replace('\\', "/")
         );
 
         let configs: Vec<Config> = serde_yaml::from_str(&config_yaml).unwrap();

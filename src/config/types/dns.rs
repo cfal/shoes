@@ -23,6 +23,24 @@ fn default_attempts() -> usize {
     1
 }
 
+/// Fake IP configuration.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct FakeIpConfig {
+    pub fake_ip: FakeIpSettings,
+}
+
+/// Fake IP settings.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct FakeIpSettings {
+    /// The IPv4 network range, e.g. "198.18.0.0/16"
+    pub network: String,
+
+    /// Address to bind the built-in Fake IP DNS server.
+    /// E.g., "127.0.0.1:53". If not provided, FakeIP only works via TUN mode.
+    #[serde(default)]
+    pub bind_address: Option<String>,
+}
+
 /// A DNS server specification in config.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
@@ -363,7 +381,7 @@ servers: my-dns-group
         ] {
             let spec = DnsServerSpec::Simple(url.to_string());
             assert!(
-                !spec.as_group_ref().is_some(),
+                spec.as_group_ref().is_none(),
                 "{} should not be a group ref",
                 url
             );
@@ -384,7 +402,7 @@ servers: my-dns-group
             connect_timeout_secs: default_connect_timeout_secs(),
             attempts: default_attempts(),
         };
-        assert!(!spec.as_group_ref().is_some());
+        assert!(spec.as_group_ref().is_none());
         assert!(spec.as_group_ref().is_none());
     }
 
@@ -405,7 +423,7 @@ dns_servers:
         assert_eq!(servers[0].as_group_ref(), Some("base-dns"));
         assert!(servers[1].as_group_ref().is_some());
         assert_eq!(servers[1].as_group_ref(), Some("fast-dns"));
-        assert!(!servers[2].as_group_ref().is_some());
+        assert!(servers[2].as_group_ref().is_none());
     }
 
     #[test]

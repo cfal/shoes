@@ -83,6 +83,7 @@ pub const OUTGOING_BUFFER_LIMIT: usize = 64 * 1024;
 /// This is the zero-allocation version for use with in-place decryption.
 /// NOTE: Does NOT strip padding zeros - our implementation doesn't add padding.
 #[inline]
+#[allow(dead_code)]
 pub fn strip_content_type_slice(plaintext: &[u8]) -> io::Result<(u8, usize)> {
     if plaintext.is_empty() {
         return Err(Error::new(ErrorKind::InvalidData, "Empty plaintext"));

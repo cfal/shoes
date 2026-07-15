@@ -30,7 +30,9 @@ pub use client::{
     ClientConfig, ClientProxyConfig, H2MuxConfig, TlsClientConfig, WebsocketClientConfig,
 };
 pub use common::DEFAULT_REALITY_SHORT_ID;
-pub use dns::{DnsConfig, DnsConfigGroup, DnsServerSpec, ExpandedDnsGroup, ExpandedDnsSpec};
+pub use dns::{
+    DnsConfig, DnsConfigGroup, DnsServerSpec, ExpandedDnsGroup, ExpandedDnsSpec, FakeIpConfig,
+};
 pub use groups::{ClientConfigGroup, Config, NamedPem, PemSource};
 pub use rules::{ClientChain, ClientChainHop, RuleActionConfig, RuleConfig};
 pub use selection::ConfigSelection;

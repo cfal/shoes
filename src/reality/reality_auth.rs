@@ -247,7 +247,7 @@ mod tests {
         let mut shared_a_bytes = [0u8; 32];
         agreement::agree(
             &priv_a,
-            &agreement::UnparsedPublicKey::new(&agreement::X25519, pub_b.as_ref()),
+            agreement::UnparsedPublicKey::new(&agreement::X25519, pub_b.as_ref()),
             (),
             |key_material| {
                 shared_a_bytes.copy_from_slice(key_material);
@@ -259,7 +259,7 @@ mod tests {
         let mut shared_b_bytes = [0u8; 32];
         agreement::agree(
             &priv_b,
-            &agreement::UnparsedPublicKey::new(&agreement::X25519, pub_a.as_ref()),
+            agreement::UnparsedPublicKey::new(&agreement::X25519, pub_a.as_ref()),
             (),
             |key_material| {
                 shared_b_bytes.copy_from_slice(key_material);

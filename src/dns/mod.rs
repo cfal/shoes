@@ -12,9 +12,12 @@
 
 mod builder;
 mod composite_resolver;
+pub mod fake_ip;
+pub mod fake_ip_server;
 mod hickory_resolver;
 mod parsed;
 mod proxy_runtime;
 
 pub use builder::build_dns_registry;
+pub use fake_ip::FakeIpManager;
 pub use parsed::{IpStrategy, ParsedDnsUrl};

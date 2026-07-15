@@ -618,8 +618,7 @@ mod tests {
             _resolver: &Arc<dyn Resolver>,
             _address: &ResolvedLocation,
         ) -> std::io::Result<Box<dyn AsyncStream>> {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            Err(std::io::Error::other(
                 "MockSocketConnector::connect not implemented",
             ))
         }
@@ -629,8 +628,7 @@ mod tests {
             _resolver: &Arc<dyn Resolver>,
             _target: ResolvedLocation,
         ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            Err(std::io::Error::other(
                 "MockSocketConnector::connect_udp_bidirectional not implemented",
             ))
         }
@@ -671,8 +669,7 @@ mod tests {
             _stream: Box<dyn AsyncStream>,
             _target: &ResolvedLocation,
         ) -> std::io::Result<TcpClientSetupResult> {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            Err(std::io::Error::other(
                 "MockProxyConnector::setup_tcp_stream not implemented",
             ))
         }
@@ -682,8 +679,7 @@ mod tests {
             _stream: Box<dyn AsyncStream>,
             _target: ResolvedLocation,
         ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            Err(std::io::Error::other(
                 "MockProxyConnector::setup_udp_bidirectional not implemented",
             ))
         }
