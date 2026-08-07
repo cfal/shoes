@@ -19,6 +19,16 @@ use crate::anytls::anytls_types::{Command, FRAME_HEADER_SIZE, Frame, FrameCodec,
 use crate::async_stream::AsyncStream;
 use crate::socks_handler::write_location_to_vec;
 
+/// Capacity of the unified outgoing-message channel.
+///
+/// Every queued message owns a `Bytes` that can reach a full frame, so the
+/// capacity is a memory ceiling, not just a queue depth. An iOS packet-tunnel
+/// extension gets roughly 50 MB in total, so this is sized to bound the queue
+/// at a few MB rather than the hundreds a per-stream multiple would allow —
+/// deep enough that the writer loop is never the bottleneck in normal use, and
+/// shallow enough that backpressure arrives long before the memory limit does.
+const OUTGOING_CHANNEL_CAPACITY: usize = 256;
+
 /// Outgoing message types for the unified writer channel
 enum OutgoingMessage {
     /// Buffered frames (Settings + SYN + destination) - sent as single TLS record
@@ -49,8 +59,14 @@ pub struct AnyTlsClientSession {
     stream_id_counter: AtomicU32,
 
     /// Unified channel for all outgoing messages (control frames and data)
-    /// Using a single channel ensures proper ordering of SYN/data frames
-    outgoing_tx: mpsc::UnboundedSender<OutgoingMessage>,
+    /// Using a single channel ensures proper ordering of SYN/data frames.
+    ///
+    /// Bounded (not unbounded) on purpose: if the writer loop exits while the
+    /// session is still referenced by streams, a bounded sender applies
+    /// backpressure instead of silently queueing messages forever. An unbounded
+    /// channel here caused unbounded memory growth (RAM slowly climbing) after
+    /// the session's transport was closed but streams were still alive.
+    outgoing_tx: mpsc::Sender<OutgoingMessage>,
 
     /// Session state
     is_closed: Arc<AtomicBool>,
@@ -119,8 +135,9 @@ impl AnyTlsClientSession {
         // Send authentication (this is packet 0, sent separately)
         Self::send_auth(&mut transport, &password_hash, &padding).await?;
 
-        // Create unified channel for all outgoing messages
-        let (outgoing_tx, outgoing_rx) = mpsc::unbounded_channel();
+        // Create unified channel for all outgoing messages.
+        // Bounded: a closed/dead writer must backpressure, never accumulate.
+        let (outgoing_tx, outgoing_rx) = mpsc::channel(OUTGOING_CHANNEL_CAPACITY);
 
         // Pre-encode Settings frame into initial buffer
         // This will be sent together with first SYN + destination as one TLS record
@@ -191,20 +208,27 @@ impl AnyTlsClientSession {
     }
 
     /// Send a control frame through the writer channel (zero-copy)
-    fn send_control_frame(&self, cmd: Command, stream_id: u32, data: Bytes) -> io::Result<()> {
+    async fn send_control_frame(
+        &self,
+        cmd: Command,
+        stream_id: u32,
+        data: Bytes,
+    ) -> io::Result<()> {
         self.outgoing_tx
             .send(OutgoingMessage::Control {
                 cmd,
                 stream_id,
                 data,
             })
+            .await
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "Session writer closed"))
     }
 
     /// Send buffered frames (Settings + SYN + destination) as single message
-    fn send_buffered(&self, data: Bytes) -> io::Result<()> {
+    async fn send_buffered(&self, data: Bytes) -> io::Result<()> {
         self.outgoing_tx
             .send(OutgoingMessage::Buffered { data })
+            .await
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "Session writer closed"))
     }
 
@@ -213,7 +237,7 @@ impl AnyTlsClientSession {
         session: Arc<Self>,
         reader: R,
         writer: W,
-        outgoing_rx: mpsc::UnboundedReceiver<OutgoingMessage>,
+        outgoing_rx: mpsc::Receiver<OutgoingMessage>,
     ) where
         R: tokio::io::AsyncRead + Send + Unpin + 'static,
         W: tokio::io::AsyncWrite + Send + Unpin + 'static,
@@ -252,7 +276,7 @@ impl AnyTlsClientSession {
     async fn writer_loop<W>(
         session_weak: std::sync::Weak<Self>,
         mut writer: W,
-        mut outgoing_rx: mpsc::UnboundedReceiver<OutgoingMessage>,
+        mut outgoing_rx: mpsc::Receiver<OutgoingMessage>,
         close_notify: Arc<tokio::sync::Notify>,
     ) -> io::Result<()>
     where
@@ -626,8 +650,9 @@ impl AnyTlsClientSession {
 
             Command::HeartRequest => {
                 // Respond to heartbeat
-                let _ =
-                    self.send_control_frame(Command::HeartResponse, frame.stream_id, Bytes::new());
+                let _ = self
+                    .send_control_frame(Command::HeartResponse, frame.stream_id, Bytes::new())
+                    .await;
             }
 
             Command::HeartResponse => {
@@ -717,11 +742,13 @@ impl AnyTlsClientSession {
                 data.len(),
                 stream_id
             );
-            self.send_buffered(data)?;
+            self.send_buffered(data).await?;
         } else {
             // Subsequent streams: send SYN and destination normally
-            self.send_control_frame(Command::Syn, stream_id, Bytes::new())?;
-            self.send_control_frame(Command::Psh, stream_id, Bytes::from(dest_data))?;
+            self.send_control_frame(Command::Syn, stream_id, Bytes::new())
+                .await?;
+            self.send_control_frame(Command::Psh, stream_id, Bytes::from(dest_data))
+                .await?;
         }
 
         // Wait for SYNACK if v2
@@ -771,11 +798,21 @@ impl AnyTlsClientSession {
             mpsc::channel::<(u32, Bytes)>(STREAM_CHANNEL_BUFFER);
 
         // Spawn forwarding task: bounded channel -> unified channel
-        // Converts stream writes to OutgoingMessage variants
+        // Converts stream writes to OutgoingMessage variants.
+        // Selects on close_notify so it never blocks on a dead writer (the
+        // unified channel is bounded, so a gone writer would otherwise hang here).
         let outgoing_tx = self.outgoing_tx.clone();
         let is_closed = Arc::clone(&self.is_closed);
+        let close_notify_fwd = Arc::clone(&self.close_notify);
         tokio::spawn(async move {
-            while let Some((sid, data)) = stream_write_rx.recv().await {
+            loop {
+                let received = tokio::select! {
+                    r = stream_write_rx.recv() => r,
+                    _ = close_notify_fwd.notified() => None,
+                };
+                let Some((sid, data)) = received else {
+                    break;
+                };
                 if is_closed.load(Ordering::Relaxed) {
                     break;
                 }
@@ -788,7 +825,7 @@ impl AnyTlsClientSession {
                         data,
                     }
                 };
-                if outgoing_tx.send(msg).is_err() {
+                if outgoing_tx.send(msg).await.is_err() {
                     break;
                 }
             }
