@@ -40,7 +40,12 @@ use super::common::{
 pub type ProtectSocketCallback = extern "C" fn(fd: c_int) -> bool;
 
 /// Traffic statistics callback type.
-/// Called periodically with cumulative upload and download byte counts.
+/// Called about once a second with cumulative byte counts since `shoes_start`.
+///
+/// * `upload_bytes` - total bytes sent from the device to the proxy.
+/// * `download_bytes` - total bytes received from the proxy to the device.
+///
+/// Invoked from a Rust worker thread, not the caller's thread.
 pub type ShoesTrafficCallback = extern "C" fn(upload_bytes: u64, download_bytes: u64);
 
 /// Global socket protector callback.
@@ -88,7 +93,9 @@ pub unsafe extern "C" fn shoes_init(log_level: *const c_char) -> c_int {
     let level_str = if log_level.is_null() {
         "info"
     } else {
-        match CStr::from_ptr(log_level).to_str() {
+        // SAFETY: the caller guarantees a valid null-terminated C string,
+        // and we checked for null above.
+        match unsafe { CStr::from_ptr(log_level) }.to_str() {
             Ok(s) => s,
             Err(_) => "info",
         }
@@ -120,6 +127,8 @@ pub unsafe extern "C" fn shoes_init(log_level: *const c_char) -> c_int {
 /// # Arguments
 /// * `config_yaml` - YAML configuration string (must include device_fd in TUN config)
 /// * `protect_callback` - Callback function to protect sockets from VPN routing
+/// * `traffic_callback` - Callback invoked about once a second with cumulative
+///   upload and download byte counts
 ///
 /// # Returns
 /// * Handle (> 0) on success
@@ -138,7 +147,17 @@ pub unsafe extern "C" fn shoes_start(
         return -1;
     }
 
-    let config_str = match CStr::from_ptr(config_yaml).to_str() {
+    // Overwriting a live handle would drop its Runtime on this thread, which
+    // blocks until the old tasks finish while they still own the TUN fd.
+    if common::is_service_running() {
+        error!("shoes_start: service already running, call shoes_stop first");
+        common::set_last_error("service already running".to_string());
+        return -1;
+    }
+
+    // SAFETY: the caller guarantees a valid null-terminated C string, and we
+    // checked for null above.
+    let config_str = match unsafe { CStr::from_ptr(config_yaml) }.to_str() {
         Ok(s) => s.to_string(),
         Err(e) => {
             error!("shoes_start: invalid UTF-8 in config_yaml: {}", e);
@@ -197,7 +216,9 @@ pub unsafe extern "C" fn shoes_start(
         runtime,
     };
 
-    let mut guard = TUN_SERVICE.get().unwrap().lock();
+    // get_or_init, not get().unwrap(): a caller that reaches shoes_start
+    // without shoes_init would otherwise panic across the FFI boundary.
+    let mut guard = TUN_SERVICE.get_or_init(|| Mutex::new(None)).lock();
     *guard = Some(handle);
 
     1
@@ -254,7 +275,9 @@ pub unsafe extern "C" fn shoes_set_log_file(path: *const c_char) -> c_int {
         return -1;
     }
 
-    let path_str = match CStr::from_ptr(path).to_str() {
+    // SAFETY: the caller guarantees a valid null-terminated C string, and we
+    // checked for null above.
+    let path_str = match unsafe { CStr::from_ptr(path) }.to_str() {
         Ok(s) => s,
         Err(_) => return -1,
     };
@@ -288,6 +311,8 @@ pub extern "C" fn shoes_get_last_error() -> *mut c_char {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn shoes_free_string(ptr: *mut c_char) {
     if !ptr.is_null() {
-        drop(CString::from_raw(ptr));
+        // SAFETY: the caller guarantees `ptr` came from `into_raw` in
+        // `shoes_get_last_error` and has not already been freed.
+        drop(unsafe { CString::from_raw(ptr) });
     }
 }

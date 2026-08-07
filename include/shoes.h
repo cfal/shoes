@@ -21,10 +21,12 @@ typedef bool (*ProtectSocketCallback)(int fd);
 
 /**
  * Traffic statistics callback type.
- * Called periodically (every ~1 second) with cumulative byte counts.
+ * Called about once a second with cumulative byte counts since `shoes_start`.
  *
- * @param upload_bytes   Total bytes sent from device to proxy since start.
- * @param download_bytes Total bytes received from proxy to device since start.
+ * * `upload_bytes` - total bytes sent from the device to the proxy.
+ * * `download_bytes` - total bytes received from the proxy to the device.
+ *
+ * Invoked from a Rust worker thread, not the caller's thread.
  */
 typedef void (*ShoesTrafficCallback)(uint64_t upload_bytes, uint64_t download_bytes);
 
@@ -49,7 +51,8 @@ int shoes_init(const char *log_level);
  * # Arguments
  * * `config_yaml` - YAML configuration string (must include device_fd in TUN config)
  * * `protect_callback` - Callback function to protect sockets from VPN routing
- * * `traffic_callback` - Callback function for periodic traffic statistics
+ * * `traffic_callback` - Callback invoked about once a second with cumulative
+ *   upload and download byte counts
  *
  * # Returns
  * * Handle (> 0) on success
@@ -105,11 +108,12 @@ int shoes_set_log_file(const char *path);
 /**
  * Get the last error message from the shoes service.
  *
- * Returns a heap-allocated null-terminated string containing the error,
+ * Returns a null-terminated C string containing the error message,
  * or NULL if no error has occurred. The caller must free the returned
  * string using `shoes_free_string()`.
  *
- * Thread-safe. The returned string is a copy.
+ * Thread-safe. The returned string is a copy — safe to use after
+ * subsequent shoes API calls.
  */
 char *shoes_get_last_error(void);
 

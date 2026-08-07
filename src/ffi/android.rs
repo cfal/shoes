@@ -82,7 +82,7 @@ pub extern "system" fn Java_com_shoesproxy_ShoesNative_init<'local>(
     log_level: JString<'local>,
 ) -> jint {
     let level_str: String = match unowned
-        .with_env(|env| env.get_string(&log_level).map(|s| s.to_string()))
+        .with_env(|env| log_level.try_to_string(env))
         .into_outcome()
     {
         Outcome::Ok(s) => s,
@@ -148,7 +148,7 @@ pub extern "system" fn Java_com_shoesproxy_ShoesNative_setLogFile<'local>(
     log_path: JString<'local>,
 ) -> jint {
     let path_str: String = match unowned
-        .with_env(|env| env.get_string(&log_path).map(|s| s.to_string()))
+        .with_env(|env| log_path.try_to_string(env))
         .into_outcome()
     {
         Outcome::Ok(s) => s,
@@ -183,6 +183,14 @@ pub extern "system" fn Java_com_shoesproxy_ShoesNative_start<'local>(
 ) -> jlong {
     info!("Starting shoes service");
 
+    // Overwriting a live handle would drop its Runtime on this thread, which
+    // blocks until the old tasks finish while they still own the TUN fd.
+    if common::is_service_running() {
+        error!("start: service already running, call stop first");
+        common::set_last_error("service already running".to_string());
+        return -1;
+    }
+
     let result = unowned
         .with_env(
             |env| -> jni::errors::Result<(
@@ -191,7 +199,7 @@ pub extern "system" fn Java_com_shoesproxy_ShoesNative_start<'local>(
                 Global<JObject<'static>>,
                 jni::JavaVM,
             )> {
-                let config_str: String = env.get_string(&config_yaml).map(|s| s.to_string())?;
+                let config_str: String = config_yaml.try_to_string(env)?;
                 let protect_ref = env.new_global_ref(protect_callback)?;
                 let traffic_ref = env.new_global_ref(traffic_callback)?;
                 let jvm = env.get_java_vm()?;
