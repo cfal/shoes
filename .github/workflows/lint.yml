@@ -2,56 +2,126 @@ name: Lint
 
 on:
   push:
-    branches: [ master ]
+    branches: [ master, mobile ]
+    tags: [ 'v*' ]
   pull_request:
-    branches: [ master ]
+    branches: [ master, mobile ]
+  workflow_dispatch:
+
+# Read-only by default. The only job that needs more is the release step in
+# build.yml / mobile.yml, which asks for it explicitly.
+permissions:
+  contents: read
+
+# A second push to the same ref makes the first run pointless. Cancelling it
+# matters most for the macOS runners in mobile.yml, which bill at ten times the
+# Linux rate.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
+  # Clippy is pinned rather than tracked on stable. A new clippy release adds
+  # lints, and with -D warnings that turns the tree red for reasons unrelated
+  # to whatever was pushed -- which is exactly how the backlog cleared in
+  # 9478d10 accumulated unnoticed. Raise this deliberately.
+  LINT_TOOLCHAIN: '1.97'
 
 jobs:
   fmt:
     name: Format
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-    - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-    - name: Install Rust
-      uses: dtolnay/rust-toolchain@stable
-      with:
-        components: rustfmt
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: ${{ env.LINT_TOOLCHAIN }}
+          components: rustfmt
 
-    - name: Check formatting
-      run: cargo fmt -- --check
+      - name: Check formatting
+        run: cargo fmt --all -- --check
 
   clippy:
-    name: Clippy
+    name: Clippy (host)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-    - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-    - name: Install Rust
-      uses: dtolnay/rust-toolchain@stable
-      with:
-        components: clippy
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: ${{ env.LINT_TOOLCHAIN }}
+          components: clippy
 
-    - name: Cache cargo registry
-      uses: actions/cache@v4
-      with:
-        path: ~/.cargo/registry
-        key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: clippy-host
 
-    - name: Cache cargo index
-      uses: actions/cache@v4
-      with:
-        path: ~/.cargo/git
-        key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+      # Scoped to lib and bins on purpose. --all-targets currently reports
+      # around fifteen further lints in test code; widening this needs that
+      # cleared first, or it lands red.
+      - name: Run clippy
+        run: cargo clippy --locked -- -D warnings
 
-    - name: Cache cargo build
-      uses: actions/cache@v4
-      with:
-        path: target
-        key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+  clippy-android:
+    name: Clippy (aarch64-linux-android)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
 
-    - name: Run clippy
-      run: cargo clippy -- -D warnings
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: ${{ env.LINT_TOOLCHAIN }}
+          targets: aarch64-linux-android
+          components: clippy
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: clippy-android
+
+      - name: Install cargo-ndk
+        uses: taiki-e/install-action@6c6fd71fe4fb72c3697d269963d0e15df8adedad # v2
+        with:
+          tool: cargo-ndk
+
+      # Both, and to the same NDK: the runner presets ANDROID_NDK_ROOT to an
+      # older install than ANDROID_NDK_LATEST_HOME, and cargo-ndk warns when
+      # the two disagree.
+      - name: Set NDK path
+        run: |
+          echo "ANDROID_NDK_HOME=$ANDROID_NDK_LATEST_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$ANDROID_NDK_LATEST_HOME" >> "$GITHUB_ENV"
+
+      # Linting for the real target is what makes the FFI surface visible.
+      # On a host build src/ffi/android.rs is cfg'd out, so the re-exports in
+      # src/tun/mod.rs read as dead code -- clippy --fix acted on exactly that
+      # and would have broken this build. Here the consumers compile.
+      - name: Run clippy for Android
+        run: cargo ndk -t arm64-v8a -- clippy --locked --lib -- -D warnings
+
+  audit:
+    name: Security advisories
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@6c6fd71fe4fb72c3697d269963d0e15df8adedad # v2
+        with:
+          tool: cargo-audit
+
+      # Every dependency in Cargo.toml is declared as "*", so the lockfile is
+      # the only thing deciding what actually ships. Worth knowing when
+      # something in it picks up an advisory.
+      - name: Check for vulnerable dependencies
+        run: cargo audit --deny warnings
