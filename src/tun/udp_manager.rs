@@ -20,13 +20,14 @@ use tokio::io::ReadBuf;
 use tokio::sync::mpsc;
 use tokio::time::{Instant, interval};
 
-use crate::address::{Address, NetLocation};
+use crate::address::NetLocation;
 use crate::async_stream::AsyncMessageStream;
 use crate::client_proxy_selector::{ClientProxySelector, ConnectDecision};
 use crate::resolver::Resolver;
 
 use super::traffic;
 use super::udp_handler::{UdpMessage, UdpReader, UdpWriter};
+use crate::dns::fake_ip::{self, DNS_PORT, DnsDecision, FakeIpPool, FakeIpResponder};
 
 /// Session timeout - sessions without activity are expired
 const SESSION_TIMEOUT: Duration = Duration::from_secs(300);
@@ -49,15 +50,6 @@ const CONNECTION_TIMEOUT: Duration = Duration::from_secs(120);
 /// stream stalls (e.g. unresponsive remote, full TCP send buffer).
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Convert a SocketAddr to a NetLocation.
-fn socket_addr_to_net_location(addr: SocketAddr) -> NetLocation {
-    let address = match addr.ip() {
-        std::net::IpAddr::V4(v4) => Address::Ipv4(v4),
-        std::net::IpAddr::V6(v6) => Address::Ipv6(v6),
-    };
-    NetLocation::new(address, addr.port())
-}
-
 /// TUN UDP Manager - handles all UDP traffic through the TUN.
 ///
 /// Sessions are keyed by the local (app) address, ensuring each app's
@@ -72,6 +64,8 @@ pub struct TunUdpManager {
     response_rx: mpsc::Receiver<UdpMessage>,
     /// Cloned into each session, then into each destination task
     response_tx: mpsc::Sender<UdpMessage>,
+    /// Answers DNS queries locally when Fake IP is enabled.
+    fake_ip: Option<Arc<FakeIpResponder>>,
 }
 
 /// A UDP session for a single local (app) address.
@@ -97,6 +91,7 @@ impl TunUdpManager {
         writer: UdpWriter,
         proxy_selector: Arc<ClientProxySelector>,
         resolver: Arc<dyn Resolver>,
+        fake_ip: Option<Arc<FakeIpResponder>>,
     ) -> Self {
         let (response_tx, response_rx) = mpsc::channel(RESPONSE_CHANNEL_SIZE);
 
@@ -108,6 +103,52 @@ impl TunUdpManager {
             resolver,
             response_rx,
             response_tx,
+            fake_ip,
+        }
+    }
+
+    /// Answer a DNS query locally if Fake IP claims it.
+    ///
+    /// Runs before session routing and matches on the destination *port*, not
+    /// the destination address, so a query is intercepted whether the app
+    /// follows the system resolver settings or hardcodes a public resolver.
+    /// That is what makes this close the DNS leak rather than merely shorten
+    /// the path.
+    ///
+    /// Returns true if the query was answered and needs no further handling.
+    fn try_answer_dns(
+        &mut self,
+        local_addr: SocketAddr,
+        remote_addr: SocketAddr,
+        payload: &[u8],
+    ) -> bool {
+        if remote_addr.port() != DNS_PORT {
+            return false;
+        }
+
+        let Some(ref responder) = self.fake_ip else {
+            return false;
+        };
+
+        // Answering is a pair of in-memory map operations, so doing it inline
+        // on the manager loop costs less than handing it to another task.
+        match responder.handle_query(payload) {
+            DnsDecision::Answer(response) => {
+                debug!(
+                    "[TunUdpManager] Answered DNS query from {} locally ({} bytes)",
+                    local_addr,
+                    response.len()
+                );
+                // Source and destination swap: the reply comes from the
+                // resolver the client addressed.
+                if let Err(e) = self.write_to_tun(&response, remote_addr, local_addr) {
+                    debug!("[TunUdpManager] Failed to write DNS response to TUN: {}", e);
+                }
+                true
+            }
+            // Not an A/AAAA query, or a bypassed domain. Let it take the normal
+            // proxied path so it still resolves, and still inside the tunnel.
+            DnsDecision::Forward => false,
         }
     }
 
@@ -139,6 +180,10 @@ impl TunUdpManager {
                                 "[TunUdpManager] Packet: {} -> {} ({} bytes)",
                                 local_addr, remote_addr, payload.len()
                             );
+
+                            if self.try_answer_dns(local_addr, remote_addr, &payload) {
+                                continue;
+                            }
 
                             if let Err(e) = self.handle_packet(local_addr, remote_addr, payload) {
                                 debug!("[TunUdpManager] Failed to handle packet: {}", e);
@@ -225,6 +270,9 @@ impl TunUdpManager {
             self.response_tx.clone(),
             self.proxy_selector.clone(),
             self.resolver.clone(),
+            self.fake_ip
+                .as_ref()
+                .map(|responder| responder.pool().clone()),
         ));
 
         let session = Session {
@@ -301,6 +349,7 @@ async fn session_task(
     response_tx: mpsc::Sender<UdpMessage>,
     proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
+    fake_ip_pool: Option<Arc<FakeIpPool>>,
 ) {
     debug!("[TunUdpSession {}] Starting", peer_addr);
 
@@ -315,7 +364,7 @@ async fn session_task(
                     break;
                 };
 
-                let dest = socket_addr_to_net_location(dest_addr);
+                let dest = fake_ip::destination_to_net_location(dest_addr, fake_ip_pool.as_ref());
 
                 // Remove dead destination entry so we recreate below
                 if let Some(entry) = destinations.get(&dest)

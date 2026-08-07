@@ -318,9 +318,48 @@ tcp_enabled: true              # Default: true
 udp_enabled: true              # Default: true
 icmp_enabled: true             # Default: true
 
+# Fake IP (optional, off by default)
+fake_ip:
+  network: string              # IPv4 CIDR, prefix 8-30. Default: "198.18.0.0/16"
+  max_entries: int             # Live mapping ceiling. Default: 8192
+  bypass_domains: [string]     # Globs that must resolve for real. Default: none
+
 # Routing rules
 rules: [RuleConfig]
 ```
+
+### Fake IP
+
+DNS queries arriving over the TUN are answered from `network` instead of being
+resolved, and the address is turned back into the domain when the connection
+arrives — so the name is resolved at the far end of the proxy, not on the
+device.
+
+Queries are intercepted by destination **port**, not destination address, so an
+app that hardcodes a public resolver is caught along with one that follows the
+system settings.
+
+| Query type | Behaviour |
+|---|---|
+| `A` | Answered with an address from `network`, TTL 1 |
+| `AAAA` | NODATA (`NOERROR`, no answers), so the client falls back to `A` |
+| `HTTPS`/`SVCB`, `SRV`, `TXT`, `MX`, everything else | Forwarded, so it gets a real answer |
+| Any type for a `bypass_domains` match | Forwarded |
+
+Notes:
+
+- Requires `udp_enabled: true`; DNS arrives over UDP.
+- `network` must be a range that is not routed for real. The default sits in
+  `198.18.0.0/15`, reserved for benchmarking by RFC 2544.
+- Past `max_entries` the least recently used mapping is recycled. The 1-second
+  answer TTL keeps active domains being refreshed, so they are not recycled
+  while in use.
+- `bypass_domains` patterns are globs matched case-insensitively, where `*`
+  spans dots: `*.local`, `captive.apple.com`, `time.*.apple.com`. Use it for
+  anything that must reach a host outside the tunnel — captive-portal probes,
+  NTP, STUN, and names the tunnel does not carry.
+- Restoration happens before routing rules are evaluated, so hostname rules
+  match TUN traffic.
 
 **Platform notes:**
 - **Linux**: Requires root or `CAP_NET_ADMIN`. Creates device with specified name/address.
@@ -346,6 +385,8 @@ rules: [RuleConfig]
             type: vless
             user_id: "uuid"
 ```
+
+**Example (Fake IP):** see `examples/tun_fake_ip.yaml`.
 
 ## Client Config
 

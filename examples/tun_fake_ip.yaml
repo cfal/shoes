@@ -1,0 +1,65 @@
+# TUN with Fake IP.
+#
+# DNS queries arriving over the TUN are answered locally from a private address
+# pool instead of being resolved. When the client then connects to one of those
+# addresses, the TUN turns it back into the original domain before routing, so
+# the name travels to the proxy and is resolved at the far end.
+#
+# Interception matches on destination *port*, not destination address, so an app
+# that hardcodes 8.8.8.8 is caught the same as one that follows the system
+# resolver settings. That is what makes this close the DNS leak rather than only
+# save a round trip.
+#
+# Because routing sees the domain rather than an address, hostname rules work
+# for TUN traffic — see the `masks` rule below.
+
+- device_name: tun0
+  address: 10.0.0.1
+  netmask: 255.255.255.0
+  mtu: 1500
+  tcp_enabled: true
+  udp_enabled: true # required: DNS queries arrive over UDP
+
+  fake_ip:
+    # IPv4 CIDR the fake addresses come from. 198.18.0.0/15 is reserved for
+    # benchmarking (RFC 2544), so it is unlikely to collide with anything the
+    # device really needs to reach. Do not use a range you route for real.
+    network: "198.18.0.0/16"
+
+    # Ceiling on live domain mappings. Past this the pool recycles the least
+    # recently used one. The default is 8192; lower it to trade recall for
+    # memory on a constrained device.
+    max_entries: 8192
+
+    # Domains that must resolve for real. A fake address is useless to anything
+    # that has to reach the host outside the tunnel, or that compares the answer
+    # against something. Globs are matched case-insensitively; `*` spans dots.
+    bypass_domains:
+      # Names the tunnel does not carry
+      - "*.local"
+      - "*.lan"
+      - "*.home.arpa"
+      # Captive portal detection
+      - "captive.apple.com"
+      - "connectivitycheck.gstatic.com"
+      - "www.msftconnecttest.com"
+      # Time sync, which cannot use a proxied address
+      - "*.pool.ntp.org"
+      - "time.*.apple.com"
+
+  rules:
+    # Fake IP restores the domain before rules are evaluated, so this matches
+    # even though the client connected to 198.18.x.x.
+    - masks: "example.com"
+      action: allow
+      client_chain:
+        address: "proxy.example.com:443"
+        protocol:
+          type: socks
+
+    - masks: "0.0.0.0/0"
+      action: allow
+      client_chain:
+        address: "proxy.example.com:443"
+        protocol:
+          type: socks

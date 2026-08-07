@@ -1399,6 +1399,22 @@ fn validate_tun_config(
         ));
     }
 
+    if let Some(ref fake_ip) = config.fake_ip {
+        // Build the pool now and discard it: a bad CIDR or a zero max_entries
+        // becomes a startup error here rather than a failure inside the VPN
+        // data path, where the only symptom would be DNS quietly not working.
+        let network = crate::dns::fake_ip::FakeIpNetwork::parse(&fake_ip.network)?;
+        crate::dns::fake_ip::FakeIpPool::new(network, fake_ip.max_entries)?;
+
+        // Fake addresses only ever reach us over the TUN's UDP path.
+        if !config.udp_enabled {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "TUN: fake_ip requires udp_enabled, since DNS queries arrive over UDP",
+            ));
+        }
+    }
+
     // Validate that we have either Linux config (device_name/address) or mobile config (device_fd)
     #[cfg(target_os = "linux")]
     {
@@ -2261,6 +2277,7 @@ mod tests {
             icmp_enabled: true, // but ICMP enabled - should fail
             rules: NoneOrSome::Unspecified,
             dns: None,
+            fake_ip: None,
         };
 
         let configs = vec![Config::TunServer(tun_config)];
@@ -2270,6 +2287,79 @@ mod tests {
         assert!(
             err.contains("TCP must be enabled for ICMP"),
             "Expected ICMP/TCP error, got: {err}"
+        );
+    }
+
+    fn tun_config_with_fake_ip(fake_ip: crate::config::types::FakeIpConfig) -> TunConfig {
+        TunConfig {
+            device_name: Some("tun0".to_string()),
+            device_fd: None,
+            address: Some("10.0.0.1".parse().unwrap()),
+            netmask: None,
+            destination: None,
+            mtu: 1500,
+            tcp_enabled: true,
+            udp_enabled: true,
+            icmp_enabled: false,
+            rules: NoneOrSome::Unspecified,
+            dns: None,
+            fake_ip: Some(fake_ip),
+        }
+    }
+
+    fn fake_ip_config(network: &str) -> crate::config::types::FakeIpConfig {
+        crate::config::types::FakeIpConfig {
+            network: network.to_string(),
+            max_entries: 1024,
+            bypass_domains: NoneOrSome::Unspecified,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_tun_fake_ip_accepts_a_valid_network() {
+        let configs = vec![Config::TunServer(tun_config_with_fake_ip(fake_ip_config(
+            "198.18.0.0/16",
+        )))];
+        assert!(validate_configs_test(configs).await.is_ok());
+    }
+
+    /// A bad CIDR must be a startup error. If it reached the data path it would
+    /// have to either panic inside the VPN or disable DNS without saying so.
+    #[tokio::test]
+    async fn test_tun_fake_ip_rejects_a_bad_network() {
+        for bad in ["198.18.0.0", "198.18.0.0/31", "not-a-network/16"] {
+            let configs = vec![Config::TunServer(tun_config_with_fake_ip(fake_ip_config(
+                bad,
+            )))];
+            assert!(
+                validate_configs_test(configs).await.is_err(),
+                "expected fake_ip network '{bad}' to be rejected"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_tun_fake_ip_rejects_zero_max_entries() {
+        let mut fake_ip = fake_ip_config("198.18.0.0/16");
+        fake_ip.max_entries = 0;
+        let configs = vec![Config::TunServer(tun_config_with_fake_ip(fake_ip))];
+        assert!(validate_configs_test(configs).await.is_err());
+    }
+
+    /// DNS queries arrive over UDP, so Fake IP with UDP disabled would accept
+    /// the config and then never intercept anything.
+    #[tokio::test]
+    async fn test_tun_fake_ip_requires_udp() {
+        let mut tun_config = tun_config_with_fake_ip(fake_ip_config("198.18.0.0/16"));
+        tun_config.udp_enabled = false;
+        let configs = vec![Config::TunServer(tun_config)];
+        let err = validate_configs_test(configs)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("fake_ip requires udp_enabled"),
+            "Expected fake_ip/UDP error, got: {err}"
         );
     }
 

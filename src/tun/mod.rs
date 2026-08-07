@@ -47,7 +47,6 @@ pub use platform::{
 
 pub use tun_server::TunServerConfig;
 
-use std::net::SocketAddr;
 use std::os::unix::io::IntoRawFd;
 use std::sync::Arc;
 
@@ -55,10 +54,11 @@ use log::{debug, info, warn};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
-use crate::address::{Address, NetLocation};
+use crate::address::NetLocation;
 use crate::client_proxy_selector::ClientProxySelector;
-use crate::config::TunConfig;
 use crate::config::selection::ConfigSelection;
+use crate::config::{FakeIpConfig, TunConfig};
+use crate::dns::fake_ip::{self, BypassList, FakeIpNetwork, FakeIpPool, FakeIpResponder};
 use crate::resolver::{NativeResolver, Resolver};
 use crate::tcp::tcp_client_handler_factory::create_tcp_client_proxy_selector;
 
@@ -79,6 +79,7 @@ pub async fn run_tun_server(
     config: TunServerConfig,
     proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
+    fake_ip: Option<Arc<FakeIpResponder>>,
     mut shutdown_rx: oneshot::Receiver<()>,
 ) -> std::io::Result<()> {
     info!(
@@ -114,6 +115,7 @@ pub async fn run_tun_server(
     let tcp_task: Option<JoinHandle<()>> = if config.tcp_enabled {
         let proxy_selector = proxy_selector.clone();
         let resolver = resolver.clone();
+        let fake_ip_pool = fake_ip.as_ref().map(|responder| responder.pool().clone());
 
         Some(tokio::spawn(async move {
             info!("Starting TCP connection handler");
@@ -121,10 +123,13 @@ pub async fn run_tun_server(
             while let Some(new_conn) = tcp_conn_rx.recv().await {
                 let proxy_selector = proxy_selector.clone();
                 let resolver = resolver.clone();
+                let fake_ip_pool = fake_ip_pool.clone();
 
                 tokio::spawn(async move {
                     let remote_addr = new_conn.remote_addr;
-                    let target = socket_addr_to_net_location(remote_addr);
+                    // Restore before routing, so hostname rules see the domain.
+                    let target =
+                        fake_ip::destination_to_net_location(remote_addr, fake_ip_pool.as_ref());
 
                     debug!("Handling TCP connection to {:?}", target);
 
@@ -148,7 +153,14 @@ pub async fn run_tun_server(
         let resolver = resolver.clone();
 
         Some(tokio::spawn(async move {
-            handle_udp_packets(udp_from_stack_rx, udp_to_stack_tx, proxy_selector, resolver).await;
+            handle_udp_packets(
+                udp_from_stack_rx,
+                udp_to_stack_tx,
+                proxy_selector,
+                resolver,
+                fake_ip,
+            )
+            .await;
         }))
     } else {
         None
@@ -197,14 +209,6 @@ pub async fn run_tun_server(
 }
 
 /// Convert a SocketAddr to a NetLocation.
-fn socket_addr_to_net_location(addr: SocketAddr) -> NetLocation {
-    let address = match addr.ip() {
-        std::net::IpAddr::V4(v4) => Address::Ipv4(v4),
-        std::net::IpAddr::V6(v6) => Address::Ipv6(v6),
-    };
-    NetLocation::new(address, addr.port())
-}
-
 /// Handle a TCP connection by forwarding it through the proxy chain.
 async fn handle_tcp_connection(
     connection: tcp_conn::TcpConnection,
@@ -284,13 +288,14 @@ async fn handle_udp_packets(
     to_stack_tx: mpsc::UnboundedSender<PacketBuffer>,
     proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
+    fake_ip: Option<Arc<FakeIpResponder>>,
 ) {
     info!("Starting UDP handler (session-based)");
 
     let udp_handler = udp_handler::UdpHandler::new(from_stack_rx, to_stack_tx);
     let (reader, writer) = udp_handler.split();
 
-    let manager = TunUdpManager::new(reader, writer, proxy_selector, resolver);
+    let manager = TunUdpManager::new(reader, writer, proxy_selector, resolver, fake_ip);
 
     if let Err(e) = manager.run().await {
         warn!("UDP handler error: {}", e);
@@ -314,6 +319,26 @@ pub async fn start_tun_server(
     });
 
     Ok(handle)
+}
+
+/// Build the Fake IP responder for one TUN session.
+///
+/// Errors here are config errors and are reported as such; `validate` already
+/// rejects the same inputs, so reaching an error at this point means the config
+/// was not validated.
+fn build_fake_ip_responder(config: &FakeIpConfig) -> std::io::Result<Arc<FakeIpResponder>> {
+    let network = FakeIpNetwork::parse(&config.network)?;
+    let pool = Arc::new(FakeIpPool::new(network, config.max_entries)?);
+    let bypass = BypassList::new(config.bypass_domains.iter());
+
+    info!(
+        "Fake IP enabled: network={}, capacity={}, bypass_patterns={}",
+        network,
+        pool.capacity(),
+        config.bypass_domains.len()
+    );
+
+    Ok(Arc::new(FakeIpResponder::new(pool, bypass)))
 }
 
 /// Run TUN server from config with external shutdown control.
@@ -351,6 +376,16 @@ pub async fn run_tun_from_config(
         tun_server_config = tun_server_config.destination(dest);
     }
 
+    // Built here rather than in run_tun_server so it lives exactly as long as
+    // one TUN session. A process-lifetime singleton would carry one VPN
+    // session's mappings into the next, which on mobile means a restart could
+    // resolve a stale address to the wrong domain.
+    let fake_ip_responder = config
+        .fake_ip
+        .as_ref()
+        .map(build_fake_ip_responder)
+        .transpose()?;
+
     let rules = config.rules.map(ConfigSelection::unwrap_config).into_vec();
     let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
     let client_proxy_selector = Arc::new(create_tcp_client_proxy_selector(rules, resolver.clone()));
@@ -359,6 +394,7 @@ pub async fn run_tun_from_config(
         tun_server_config,
         client_proxy_selector,
         resolver,
+        fake_ip_responder,
         shutdown_rx,
     )
     .await

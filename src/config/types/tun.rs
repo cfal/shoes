@@ -111,4 +111,48 @@ pub struct TunConfig {
     /// Can reference a dns_group by name or specify inline DNS servers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dns: Option<DnsConfig>,
+
+    /// Fake IP: answer A queries from a private pool and map the address back
+    /// to the domain when the connection arrives (optional, off by default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fake_ip: Option<FakeIpConfig>,
+}
+
+fn default_fake_ip_network() -> String {
+    // 198.18.0.0/15 is reserved for benchmarking (RFC 2544) and is what Clash
+    // and sing-box use for the same purpose, so it is unlikely to collide with
+    // anything a device can actually reach.
+    "198.18.0.0/16".to_string()
+}
+
+fn default_fake_ip_max_entries() -> usize {
+    crate::dns::fake_ip::DEFAULT_MAX_ENTRIES
+}
+
+/// Fake IP settings for a TUN server.
+///
+/// With this set, DNS queries arriving over the TUN are intercepted no matter
+/// which server they are addressed to — including an app that hardcodes a
+/// public resolver — so nothing resolves outside the tunnel.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FakeIpConfig {
+    /// IPv4 CIDR that fake addresses are drawn from.
+    /// Must not overlap any range the device really needs to reach.
+    #[serde(default = "default_fake_ip_network")]
+    pub network: String,
+
+    /// Ceiling on live domain mappings. The pool recycles the least recently
+    /// used mapping past this point. Lower it to trade recall for memory.
+    #[serde(default = "default_fake_ip_max_entries")]
+    pub max_entries: usize,
+
+    /// Domains that must resolve for real, as glob patterns matched
+    /// case-insensitively (`*.local`, `time.*.apple.com`).
+    ///
+    /// A fake address is useless to anything that has to reach the host outside
+    /// the tunnel or compare the answer against something: captive-portal
+    /// probes, NTP, STUN, and names the tunnel does not carry.
+    #[serde(default, skip_serializing_if = "NoneOrSome::is_unspecified")]
+    pub bypass_domains: NoneOrSome<String>,
 }

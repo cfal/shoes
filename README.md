@@ -34,6 +34,7 @@ All server protocols plus:
 
 ### TUN/VPN Mode
 - **TUN device support** - Layer 3 VPN for transparent proxying
+- **Fake IP** - answers DNS locally from a private pool, so nothing resolves on the device
 - Supported platforms: Linux, Android, iOS
 
 ### Supported Ciphers
@@ -264,6 +265,49 @@ See the [examples](./examples) directory for all examples.
             type: vless
             user_id: b85798ef-e9dc-46a4-9a87-8da4499d36d0
 ```
+
+### TUN VPN with Fake IP
+
+A DNS query arriving over the TUN is answered from a private address pool instead of being resolved. The client connects to that address, and the TUN restores the original domain before routing, so the name is resolved at the far end of the proxy rather than on the device.
+
+```yaml
+- device_name: tun0
+  address: 10.0.0.1
+  netmask: 255.255.255.0
+  mtu: 1500
+  tcp_enabled: true
+  udp_enabled: true      # required: DNS arrives over UDP
+  fake_ip:
+    network: "198.18.0.0/16"
+    max_entries: 8192
+    bypass_domains:
+      - "*.local"
+      - "captive.apple.com"
+      - "*.pool.ntp.org"
+      - "time.*.apple.com"
+  rules:
+    # Fake IP restores the domain before rules run, so hostname rules match
+    # even though the client connected to 198.18.x.x.
+    - masks: "example.com"
+      action: allow
+      client_chain:
+        address: "proxy.example.com:443"
+        protocol:
+          type: socks
+```
+
+What it buys you:
+
+- **No DNS leak.** Interception matches on destination *port*, not destination address, so an app that hardcodes `8.8.8.8` is caught the same as one that follows the system resolver. Queries that are not answered locally still travel through the tunnel rather than to a local resolver.
+- **One less round trip.** The client never waits for a real resolution before it can connect.
+- **Hostname routing for TUN traffic.** Rules see the domain rather than an address.
+
+Details worth knowing:
+
+- Only `A` is answered with a fake address. `AAAA` gets NODATA so the client falls back to `A` — handing out a fake IPv6 would be worse, since the client would prefer it and the tunnel may not carry IPv6. `HTTPS`/`SVCB`, `SRV`, `TXT`, `MX` and the rest are forwarded so they get real answers; blackholing them would cost ECH, ALPN hints and service discovery.
+- `network` must be a range you do not route for real. `198.18.0.0/15` is reserved for benchmarking (RFC 2544), which is why it is the default.
+- Past `max_entries` the pool recycles the least recently used mapping. Answers carry a 1-second TTL so an active domain keeps being refreshed and is not recycled while in use.
+- `bypass_domains` exists because a fake address is useless to anything that must reach the host outside the tunnel: captive-portal probes, NTP, STUN, and `.local`/`.lan` names.
 
 ### WireGuard Client
 ```yaml

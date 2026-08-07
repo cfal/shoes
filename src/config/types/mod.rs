@@ -42,4 +42,4 @@ pub use server::{
 };
 pub use shadowsocks::ShadowsocksConfig;
 pub use transport::{BindLocation, ClientQuicConfig, ServerQuicConfig, TcpConfig, Transport};
-pub use tun::TunConfig;
+pub use tun::{FakeIpConfig, TunConfig};
