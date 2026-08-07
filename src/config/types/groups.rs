@@ -1,5 +1,7 @@
 //! Configuration group types (top-level Config, groups, and NamedPem).
 
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 
 use crate::option_util::OneOrSome;
@@ -37,10 +39,25 @@ pub struct NamedPem {
     pub source: PemSource,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum PemSource {
     Path(String),
     Data(String),
+}
+
+/// Hand-written: `Data` is the contents of a loaded PEM file, which for a key
+/// file is the private key itself. The path stays visible — it is a filename,
+/// and it is the useful half for diagnosing a config.
+impl fmt::Debug for PemSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PemSource::Path(path) => f.debug_tuple("PemSource::Path").field(path).finish(),
+            PemSource::Data(_) => f
+                .debug_tuple("PemSource::Data")
+                .field(&"<redacted>")
+                .finish(),
+        }
+    }
 }
 
 impl<'de> Deserialize<'de> for NamedPem {
@@ -273,7 +290,7 @@ mod tests {
             address: NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 1080),
             protocol: ClientProxyConfig::Socks {
                 username: Some("client_user".to_string()),
-                password: Some("client_pass".to_string()),
+                password: Some("client_pass".into()),
             },
             transport: Transport::Tcp,
             tcp_settings: None,

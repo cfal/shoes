@@ -4,6 +4,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use super::redacted::Redacted;
+
 use crate::address::NetLocation;
 use crate::option_util::{NoneOrSome, OneOrSome};
 
@@ -20,7 +22,7 @@ use super::transport::{BindLocation, ServerQuicConfig, TcpConfig, Transport};
 pub struct AnyTlsUserConfig {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub name: String,
-    pub password: String,
+    pub password: Redacted<String>,
 }
 
 /// NaiveProxy user configuration
@@ -30,7 +32,7 @@ pub struct NaiveUserConfig {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub name: String,
     pub username: String,
-    pub password: String,
+    pub password: Redacted<String>,
 }
 
 /// NaiveProxy fallback configuration for probe resistance
@@ -83,7 +85,7 @@ where
     #[serde(deny_unknown_fields)]
     struct ShadowsocksServerTemp {
         cipher: String,
-        password: String,
+        password: Redacted<String>,
         #[serde(default = "default_true")]
         udp_enabled: bool,
     }
@@ -113,7 +115,9 @@ where
 }
 
 /// Custom deserializer for ServerProxyConfig::Vmess that validates legacy force_aead field
-fn deserialize_vmess_server<'de, D>(deserializer: D) -> Result<(String, String, bool), D::Error>
+fn deserialize_vmess_server<'de, D>(
+    deserializer: D,
+) -> Result<(String, Redacted<String>, bool), D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -123,7 +127,7 @@ where
     #[serde(deny_unknown_fields)]
     struct VmessServerTemp {
         cipher: String,
-        user_id: String,
+        user_id: Redacted<String>,
         #[serde(default = "default_true")]
         udp_enabled: bool,
         #[serde(default)]
@@ -300,7 +304,7 @@ impl<'de> serde::de::Deserialize<'de> for ServerConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RealityServerConfig {
     /// X25519 private key (32 bytes, base64url encoded)
-    pub private_key: String,
+    pub private_key: Redacted<String>,
 
     /// List of valid short IDs (hex strings, 0-16 chars each)
     #[serde(alias = "short_id", default = "default_reality_server_short_ids")]
@@ -349,7 +353,8 @@ pub struct RealityServerConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TlsServerConfig {
     pub cert: String,
-    pub key: String,
+    /// Holds the inlined PEM private key once cert paths are resolved.
+    pub key: Redacted<String>,
     #[serde(alias = "alpn_protocol", default)]
     pub alpn_protocols: NoneOrSome<String>,
 
@@ -390,7 +395,7 @@ pub struct TlsServerConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ShadowTlsServerConfig {
-    pub password: String,
+    pub password: Redacted<String>,
     pub handshake: ShadowTlsServerHandshakeConfig,
     pub protocol: ServerProxyConfig,
     #[serde(alias = "override_rule", default)]
@@ -401,7 +406,8 @@ pub struct ShadowTlsServerConfig {
 #[serde(deny_unknown_fields)]
 pub struct ShadowTlsLocalHandshake {
     pub cert: String,
-    pub key: String,
+    /// Holds the inlined PEM private key once cert paths are resolved.
+    pub key: Redacted<String>,
     #[serde(
         alias = "alpn_protocol",
         default,
@@ -642,14 +648,14 @@ pub enum ServerProxyConfig {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         username: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        password: Option<String>,
+        password: Option<Redacted<String>>,
     },
     #[serde(alias = "socks5")]
     Socks {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         username: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        password: Option<String>,
+        password: Option<Redacted<String>>,
         /// Enable UDP functionality (UDP ASSOCIATE and UDP-over-TCP).
         /// When false (default), UDP ASSOCIATE returns "command not supported".
         #[serde(default = "default_true")]
@@ -667,12 +673,12 @@ pub enum ServerProxyConfig {
     },
     Snell {
         cipher: String,
-        password: String,
+        password: Redacted<String>,
         #[serde(default = "default_true")]
         udp_enabled: bool,
     },
     Vless {
-        user_id: String,
+        user_id: Redacted<String>,
         #[serde(default = "default_true")]
         udp_enabled: bool,
         /// Fallback destination for failed authentication (optional)
@@ -681,7 +687,7 @@ pub enum ServerProxyConfig {
         fallback: Option<NetLocation>,
     },
     Trojan {
-        password: String,
+        password: Redacted<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         shadowsocks: Option<ShadowsocksConfig>,
     },
@@ -707,7 +713,7 @@ pub enum ServerProxyConfig {
     #[serde(deserialize_with = "deserialize_vmess_server")]
     Vmess {
         cipher: String,
-        user_id: String,
+        user_id: Redacted<String>,
         #[serde(default = "default_true")]
         udp_enabled: bool,
     },
@@ -736,14 +742,14 @@ pub enum ServerProxyConfig {
         targets: OneOrSome<NetLocation>,
     },
     Hysteria2 {
-        password: String,
+        password: Redacted<String>,
         #[serde(default = "default_true")]
         udp_enabled: bool,
     },
     #[serde(alias = "tuic")]
     TuicV5 {
         uuid: String,
-        password: String,
+        password: Redacted<String>,
         /// Enable 0-RTT (0.5-RTT for server) handshake for faster connection establishment.
         /// Default is false for security - 0-RTT data is vulnerable to replay attacks.
         /// See: https://blog.cloudflare.com/even-faster-connection-establishment-with-quic-0-rtt-resumption/
@@ -757,7 +763,7 @@ pub enum ServerProxyConfig {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         username: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        password: Option<String>,
+        password: Option<Redacted<String>>,
         /// Enable UDP functionality for SOCKS5 (UDP ASSOCIATE and UDP-over-TCP)
         #[serde(default = "default_true")]
         udp_enabled: bool,
@@ -843,7 +849,7 @@ mod tests {
                 .into(),
             protocol: ServerProxyConfig::Http {
                 username: Some("user".to_string()),
-                password: Some("pass".to_string()),
+                password: Some("pass".into()),
             },
             transport: Transport::Tcp,
             tcp_settings: Some(TcpConfig { no_delay: true }),
@@ -876,7 +882,7 @@ mod tests {
             protocol: ServerProxyConfig::Shadowsocks {
                 config: ShadowsocksConfig::Legacy {
                     cipher: "aes-256-gcm".try_into().unwrap(),
-                    password: "secret123".to_string(),
+                    password: "secret123".into(),
                 },
                 udp_enabled: true,
             },
@@ -896,7 +902,7 @@ mod tests {
             )
             .into(),
             protocol: ServerProxyConfig::Vless {
-                user_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+                user_id: "550e8400-e29b-41d4-a716-446655440000".into(),
                 udp_enabled: true,
                 fallback: None,
             },
@@ -904,7 +910,7 @@ mod tests {
             tcp_settings: None,
             quic_settings: Some(ServerQuicConfig {
                 cert: "server.crt".to_string(),
-                key: "server.key".to_string(),
+                key: "server.key".into(),
                 alpn_protocols: NoneOrSome::Some(vec!["h3".to_string()]),
                 client_ca_certs: NoneOrSome::None,
                 client_fingerprints: NoneOrSome::None,
@@ -923,10 +929,10 @@ mod tests {
             )
             .into(),
             protocol: ServerProxyConfig::Trojan {
-                password: "trojan_password".to_string(),
+                password: "trojan_password".into(),
                 shadowsocks: Some(ShadowsocksConfig::Legacy {
                     cipher: "chacha20-poly1305".try_into().unwrap(),
-                    password: "ss_password".to_string(),
+                    password: "ss_password".into(),
                 }),
             },
             transport: Transport::Tcp,
@@ -943,7 +949,7 @@ mod tests {
             "example.com".to_string(),
             TlsServerConfig {
                 cert: "example.crt".to_string(),
-                key: "example.key".to_string(),
+                key: "example.key".into(),
                 alpn_protocols: NoneOrSome::Some(vec!["h2".to_string(), "http/1.1".to_string()]),
                 client_ca_certs: NoneOrSome::One("ca.crt".to_string()),
                 client_fingerprints: NoneOrSome::One("abc123".to_string()),
@@ -963,7 +969,7 @@ mod tests {
                 tls_targets,
                 default_tls_target: Some(Box::new(TlsServerConfig {
                     cert: "default.crt".to_string(),
-                    key: "default.key".to_string(),
+                    key: "default.key".into(),
                     alpn_protocols: NoneOrSome::None,
                     client_ca_certs: NoneOrSome::None,
                     client_fingerprints: NoneOrSome::None,
@@ -995,7 +1001,7 @@ mod tests {
             .into(),
             protocol: ServerProxyConfig::Vmess {
                 cipher: "aes-128-gcm".to_string(),
-                user_id: "b831381d-6324-4d53-ad4f-8cda48b30811".to_string(),
+                user_id: "b831381d-6324-4d53-ad4f-8cda48b30811".into(),
                 udp_enabled: false,
             },
             transport: Transport::Tcp,
@@ -1053,14 +1059,14 @@ mod tests {
             bind_location: NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 443)
                 .into(),
             protocol: ServerProxyConfig::Hysteria2 {
-                password: "hysteria_pass".to_string(),
+                password: "hysteria_pass".into(),
                 udp_enabled: true,
             },
             transport: Transport::Quic,
             tcp_settings: None,
             quic_settings: Some(ServerQuicConfig {
                 cert: "hysteria.crt".to_string(),
-                key: "hysteria.key".to_string(),
+                key: "hysteria.key".into(),
                 alpn_protocols: NoneOrSome::One("hysteria".to_string()),
                 client_ca_certs: NoneOrSome::None,
                 client_fingerprints: NoneOrSome::None,
@@ -1077,14 +1083,14 @@ mod tests {
                 .into(),
             protocol: ServerProxyConfig::TuicV5 {
                 uuid: "550e8400-e29b-41d4-a716-446655440000".to_string(),
-                password: "tuic_password".to_string(),
+                password: "tuic_password".into(),
                 zero_rtt_handshake: false,
             },
             transport: Transport::Quic,
             tcp_settings: None,
             quic_settings: Some(ServerQuicConfig {
                 cert: "tuic.crt".to_string(),
-                key: "tuic.key".to_string(),
+                key: "tuic.key".into(),
                 alpn_protocols: NoneOrSome::None,
                 client_ca_certs: NoneOrSome::None,
                 client_fingerprints: NoneOrSome::None,
@@ -1445,7 +1451,7 @@ protocol:
         // Test local handshake with minimal fields
         let local = ShadowTlsLocalHandshake {
             cert: "server.crt".to_string(),
-            key: "server.key".to_string(),
+            key: "server.key".into(),
             alpn_protocols: NoneOrSome::Unspecified,
             client_ca_certs: NoneOrSome::Unspecified,
             client_fingerprints: NoneOrSome::Unspecified,

@@ -4,6 +4,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use super::redacted::Redacted;
+
 use crate::address::NetLocation;
 use crate::h2mux::{H2MuxOptions, MuxProtocol};
 use crate::option_util::{NoneOrOne, NoneOrSome, OneOrSome};
@@ -60,10 +62,10 @@ fn default_amneziawg_mtu() -> u16 {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct WireGuardClientConfig {
-    pub private_key: String,
+    pub private_key: Redacted<String>,
     pub peer_public_key: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub preshared_key: Option<String>,
+    pub preshared_key: Option<Redacted<String>>,
     pub local_addresses: OneOrSome<String>,
     pub allowed_ips: OneOrSome<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -76,10 +78,10 @@ pub struct WireGuardClientConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AmneziaWgClientConfig {
-    pub private_key: String,
+    pub private_key: Redacted<String>,
     pub peer_public_key: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub preshared_key: Option<String>,
+    pub preshared_key: Option<Redacted<String>>,
     pub local_addresses: OneOrSome<String>,
     pub allowed_ips: OneOrSome<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -144,7 +146,7 @@ pub struct AmneziaWgParams {
     /// Requires `s1`-`s4` to each be at least 12, since the nonce is read from
     /// the padding prefix.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub header_protection_key: Option<String>,
+    pub header_protection_key: Option<Redacted<String>>,
     /// Extra random padding added inside the AEAD envelope of transport
     /// packets, in bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -193,7 +195,7 @@ where
     #[serde(deny_unknown_fields)]
     struct ShadowsocksClientTemp {
         cipher: String,
-        password: String,
+        password: Redacted<String>,
         #[serde(default = "default_true")]
         udp_enabled: bool,
     }
@@ -237,7 +239,7 @@ where
     #[serde(deny_unknown_fields)]
     struct SnellClientTemp {
         cipher: String,
-        password: String,
+        password: Redacted<String>,
         #[serde(default = "default_true")]
         udp_enabled: bool,
     }
@@ -270,10 +272,11 @@ where
     state.end()
 }
 
+/// What `deserialize_vmess_client` hands back: cipher, user id, udp flag, h2mux.
+type VmessClientFields = (String, Redacted<String>, bool, Option<H2MuxConfig>);
+
 /// Custom deserializer for ClientProxyConfig::Vmess that validates legacy aead field
-fn deserialize_vmess_client<'de, D>(
-    deserializer: D,
-) -> Result<(String, String, bool, Option<H2MuxConfig>), D::Error>
+fn deserialize_vmess_client<'de, D>(deserializer: D) -> Result<VmessClientFields, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -283,7 +286,7 @@ where
     #[serde(deny_unknown_fields)]
     struct VmessClientTemp {
         cipher: String,
-        user_id: String,
+        user_id: Redacted<String>,
         #[serde(default, alias = "force_aead")]
         aead: Option<bool>,
         #[serde(default = "default_true")]
@@ -337,7 +340,7 @@ where
         #[serde(default)]
         cert: Option<String>,
         #[serde(default)]
-        shadowtls_password: Option<String>,
+        shadowtls_password: Option<Redacted<String>>,
         #[serde(default)]
         vision: bool,
         protocol: Box<ClientProxyConfig>,
@@ -442,7 +445,7 @@ pub enum ClientProxyConfig {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         username: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        password: Option<String>,
+        password: Option<Redacted<String>>,
         /// When true, resolve hostnames to IP addresses before passing to HTTP CONNECT.
         /// Used when the upstream proxy blocks by hostname.
         #[serde(default, skip_serializing_if = "is_false")]
@@ -453,7 +456,7 @@ pub enum ClientProxyConfig {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         username: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        password: Option<String>,
+        password: Option<Redacted<String>>,
     },
     #[serde(
         alias = "ss",
@@ -473,7 +476,7 @@ pub enum ClientProxyConfig {
         udp_enabled: bool,
     },
     Vless {
-        user_id: String,
+        user_id: Redacted<String>,
         #[serde(default = "default_true", skip_serializing_if = "is_true")]
         udp_enabled: bool,
         /// H2MUX multiplexing configuration
@@ -481,7 +484,7 @@ pub enum ClientProxyConfig {
         h2mux: Option<H2MuxConfig>,
     },
     Trojan {
-        password: String,
+        password: Redacted<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         shadowsocks: Option<ShadowsocksConfig>,
         /// H2MUX multiplexing configuration
@@ -515,7 +518,7 @@ pub enum ClientProxyConfig {
     #[serde(alias = "shadowtls")]
     ShadowTls {
         /// ShadowTLS password for authentication
-        password: String,
+        password: Redacted<String>,
 
         /// Optional SNI hostname override
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -529,7 +532,7 @@ pub enum ClientProxyConfig {
     #[serde(deserialize_with = "deserialize_vmess_client")]
     Vmess {
         cipher: String,
-        user_id: String,
+        user_id: Redacted<String>,
         #[serde(default = "default_true", skip_serializing_if = "is_true")]
         udp_enabled: bool,
         /// H2MUX multiplexing configuration
@@ -543,7 +546,7 @@ pub enum ClientProxyConfig {
     /// AnyTLS outbound protocol
     Anytls {
         /// Authentication password
-        password: String,
+        password: Redacted<String>,
         /// UDP over TCP support (default: true)
         #[serde(default = "default_true", skip_serializing_if = "is_true")]
         udp_enabled: bool,
@@ -558,7 +561,7 @@ pub enum ClientProxyConfig {
         /// Username for Basic Auth
         username: String,
         /// Password for Basic Auth
-        password: String,
+        password: Redacted<String>,
         /// Enable padding protocol (default: true)
         #[serde(default = "default_true", skip_serializing_if = "is_true")]
         padding: bool,
@@ -665,7 +668,7 @@ mod tests {
             address: NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 1080),
             protocol: ClientProxyConfig::Socks {
                 username: Some("client_user".to_string()),
-                password: Some("client_pass".to_string()),
+                password: Some("client_pass".into()),
             },
             transport: Transport::Tcp,
             tcp_settings: None,

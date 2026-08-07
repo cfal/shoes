@@ -5,7 +5,7 @@ use serde::Deserialize;
 
 use crate::shadowsocks::ShadowsocksCipher;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum ShadowsocksConfig {
     Legacy {
         cipher: ShadowsocksCipher,
@@ -15,6 +15,27 @@ pub enum ShadowsocksConfig {
         cipher: ShadowsocksCipher,
         key_bytes: Box<[u8]>,
     },
+}
+
+/// Hand-written so the cipher stays visible while the credential does not.
+///
+/// Both variants carry key material — `password` directly, and `key_bytes` as
+/// the decoded PSK — so neither can be derived.
+impl std::fmt::Debug for ShadowsocksConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ShadowsocksConfig::Legacy { cipher, .. } => f
+                .debug_struct("ShadowsocksConfig::Legacy")
+                .field("cipher", cipher)
+                .field("password", &"<redacted>")
+                .finish(),
+            ShadowsocksConfig::Aead2022 { cipher, .. } => f
+                .debug_struct("ShadowsocksConfig::Aead2022")
+                .field("cipher", cipher)
+                .field("key_bytes", &"<redacted>")
+                .finish(),
+        }
+    }
 }
 
 impl ShadowsocksConfig {

@@ -345,7 +345,8 @@ pub async fn start_quic_servers(
             udp_enabled,
         } => {
             // TODO: hash password instead of passing directly
-            let hysteria2_password: &'static str = Box::leak(password.into_boxed_str());
+            let hysteria2_password: &'static str =
+                Box::leak(password.into_inner().into_boxed_str());
 
             for bind_address in bind_addresses.into_iter() {
                 let quic_server_config = quic_server_config.clone();
@@ -370,7 +371,7 @@ pub async fn start_quic_servers(
             zero_rtt_handshake,
         } => {
             let uuid: &'static [u8] = Box::leak(parse_uuid(&uuid)?.into_boxed_slice());
-            let password: &'static str = Box::leak(password.into_boxed_str());
+            let password: &'static str = Box::leak(password.into_inner().into_boxed_str());
             for bind_address in bind_addresses.into_iter() {
                 let quic_server_config = quic_server_config.clone();
                 let client_proxy_selector = client_proxy_selector.clone();

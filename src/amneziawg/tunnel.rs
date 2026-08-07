@@ -330,7 +330,9 @@ mod tests {
             i4: Some("<r 34>".to_string()),
             i5: Some("<t><r 16>".to_string()),
             header_protection_key: Some(
-                base64::engine::general_purpose::STANDARD.encode([0x5au8; 32]),
+                base64::engine::general_purpose::STANDARD
+                    .encode([0x5au8; 32])
+                    .into(),
             ),
             content_padding_addition: Some("0-64".to_string()),
             rekey_after_time: Some("123-156".to_string()),
@@ -536,8 +538,11 @@ mod tests {
         };
 
         let mut wrong_params = real_world_params();
-        wrong_params.header_protection_key =
-            Some(base64::engine::general_purpose::STANDARD.encode([0x77u8; 32]));
+        wrong_params.header_protection_key = Some(
+            base64::engine::general_purpose::STANDARD
+                .encode([0x77u8; 32])
+                .into(),
+        );
         let wrong_config = convert_amnezia_config(&wrong_params, 1420).unwrap();
 
         assert!(

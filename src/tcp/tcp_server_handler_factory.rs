@@ -7,6 +7,7 @@ use rustc_hash::FxHashMap;
 
 use crate::anytls::{AnyTlsServerHandler, PaddingFactory};
 use crate::client_proxy_selector::ClientProxySelector;
+use crate::config::Redacted;
 use crate::config::{ClientChainHop, ClientConfig};
 use crate::config::{
     ConfigSelection, RealityServerConfig, ServerProxyConfig, ShadowTlsServerConfig,
@@ -67,7 +68,7 @@ pub fn create_tcp_server_handler(
 ) -> Box<dyn TcpServerHandler> {
     match server_proxy_config {
         ServerProxyConfig::Http { username, password } => Box::new(HttpTcpServerHandler::new(
-            create_auth_credentials(username, password),
+            create_auth_credentials(username, password.map(Redacted::into_inner)),
             client_proxy_selector.clone(),
         )),
         ServerProxyConfig::Socks {
@@ -78,7 +79,7 @@ pub fn create_tcp_server_handler(
             // Use 0.0.0.0 as default if bind_ip not provided
             let ip = bind_ip.unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
             Box::new(SocksTcpServerHandler::new(
-                create_auth_credentials(username, password),
+                create_auth_credentials(username, password.map(Redacted::into_inner)),
                 udp_enabled,
                 ip,
                 client_proxy_selector.clone(),
@@ -93,7 +94,7 @@ pub fn create_tcp_server_handler(
             // Use 0.0.0.0 as default if bind_ip not provided
             let ip = bind_ip.unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
             Box::new(MixedTcpServerHandler::new(
-                create_auth_credentials(username, password),
+                create_auth_credentials(username, password.map(Redacted::into_inner)),
                 udp_enabled,
                 ip,
                 client_proxy_selector.clone(),
@@ -247,7 +248,7 @@ pub fn create_tcp_server_handler(
             let users: Vec<(String, String)> = users
                 .into_vec()
                 .into_iter()
-                .map(|u| (u.name, u.password))
+                .map(|u| (u.name, u.password.into_inner()))
                 .collect();
 
             let padding = if let Some(scheme_lines) = padding_scheme {
@@ -356,7 +357,7 @@ fn create_tls_server_target(
         let users_vec: Vec<(String, String, String)> = users
             .into_vec()
             .into_iter()
-            .map(|u| (u.name, u.username, u.password))
+            .map(|u| (u.name, u.username, u.password.into_inner()))
             .collect();
 
         InnerProtocol::Naive(NaiveConfig {
@@ -452,7 +453,7 @@ fn create_shadow_tls_server_target(
     let handler = create_tcp_server_handler(protocol, &effective_selector, resolver, bind_ip);
 
     TlsServerTarget::ShadowTls(ShadowTlsServerTarget::new(
-        password,
+        password.into_inner(),
         target_handshake,
         handler,
     ))
@@ -515,7 +516,7 @@ fn create_reality_server_target(
         let users_vec: Vec<(String, String, String)> = users
             .into_vec()
             .into_iter()
-            .map(|u| (u.name, u.username, u.password))
+            .map(|u| (u.name, u.username, u.password.into_inner()))
             .collect();
 
         InnerProtocol::Naive(NaiveConfig {

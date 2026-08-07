@@ -72,3 +72,114 @@ pub fn load_config_str(config_str: &str) -> std::io::Result<Vec<Config>> {
         )
     })
 }
+
+#[cfg(test)]
+mod redaction_tests {
+    use super::*;
+
+    /// A config touching every kind of secret the parser accepts. Each value is
+    /// distinctive so a leak is unambiguous rather than a coincidental substring.
+    const CONFIG_WITH_SECRETS: &str = r#"
+- address: "127.0.0.1:1080"
+  protocol:
+    type: socks
+    username: alice
+    password: LEAK-socks-inbound-password
+  rules:
+    - masks: "0.0.0.0/0"
+      action: allow
+      client_chain:
+        address: "wg.example.com:51820"
+        protocol:
+          type: amneziawg
+          private_key: "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA="
+          peer_public_key: "ISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0A="
+          preshared_key: "ERERERERERERERERERERERERERERERERERERERERERE="
+          local_addresses: "10.8.0.2/32"
+          allowed_ips: "0.0.0.0/0"
+          awg:
+            s1: 20
+            s2: 20
+            s3: 20
+            s4: 20
+            header_protection_key: "IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI="
+- address: "127.0.0.1:8388"
+  protocol:
+    type: shadowsocks
+    cipher: chacha20-ietf-poly1305
+    password: LEAK-shadowsocks-password
+- address: "127.0.0.1:1443"
+  protocol:
+    type: trojan
+    password: LEAK-trojan-password
+- address: "127.0.0.1:2443"
+  protocol:
+    type: vless
+    user_id: 11111111-2222-3333-4444-555555555555
+"#;
+
+    /// Every secret above, as it appears in the YAML.
+    const SECRET_VALUES: &[&str] = &[
+        "LEAK-socks-inbound-password",
+        "LEAK-shadowsocks-password",
+        "LEAK-trojan-password",
+        "11111111-2222-3333-4444-555555555555",
+        "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=", // private key
+        "ERERERERERERERERERERERERERERERERERERERERERE=", // preshared key
+        "IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI=", // header protection key
+    ];
+
+    /// `load_config_str` is gated to the FFI targets; this is the same parse.
+    fn parse(yaml: &str) -> Vec<Config> {
+        serde_yaml::from_str::<Vec<Config>>(yaml).expect("config must parse")
+    }
+
+    /// The CLI dumps every parsed config at debug level. That dump must not
+    /// carry credentials: with `--log-file` it lands on disk in cleartext, and
+    /// logs get pasted into bug reports.
+    #[test]
+    fn the_config_debug_dump_contains_no_secrets() {
+        let configs = parse(CONFIG_WITH_SECRETS);
+        assert!(!configs.is_empty());
+
+        // Exactly what main.rs writes for each config.
+        let dump = configs
+            .iter()
+            .map(|config| format!("{config:#?}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        for secret in SECRET_VALUES {
+            assert!(
+                !dump.contains(secret),
+                "the debug dump leaked a secret: {secret}\n\ndump:\n{dump}"
+            );
+        }
+
+        // The dump is still worth having: non-secret fields survive.
+        assert!(dump.contains("alice"), "usernames should remain visible");
+        assert!(
+            dump.contains("wg.example.com"),
+            "endpoints should remain visible"
+        );
+        assert!(
+            dump.contains("<redacted>"),
+            "secrets should be marked, not dropped"
+        );
+    }
+
+    /// Redaction must not corrupt the config. Re-serializing has to reproduce
+    /// the real values, or a round-trip would silently destroy credentials.
+    #[test]
+    fn secrets_survive_a_serde_round_trip() {
+        let configs = parse(CONFIG_WITH_SECRETS);
+        let yaml = serde_yaml::to_string(&configs).expect("config must re-serialize");
+
+        for secret in SECRET_VALUES {
+            assert!(
+                yaml.contains(secret),
+                "re-serializing lost a secret: {secret}"
+            );
+        }
+    }
+}

@@ -28,7 +28,7 @@ impl AwgRuntimeConfig {
 
         // Decode private key
         let private_key_bytes: [u8; 32] = b64
-            .decode(&config.private_key)
+            .decode(config.private_key.expose())
             .map_err(|e| ioerr(&format!("invalid private_key base64: {}", e)))?
             .try_into()
             .map_err(|_| ioerr("private_key must be 32 bytes"))?;
@@ -48,7 +48,7 @@ impl AwgRuntimeConfig {
             .as_ref()
             .map(|psk| {
                 let bytes: [u8; 32] = b64
-                    .decode(psk)
+                    .decode(psk.expose())
                     .map_err(|e| ioerr(&format!("invalid preshared_key base64: {}", e)))?
                     .try_into()
                     .map_err(|_| ioerr("preshared_key must be 32 bytes"))?;
@@ -122,8 +122,8 @@ pub fn convert_amnezia_config(awg: &AmneziaWgParams, mtu: u16) -> std::io::Resul
 
     config.header_protection_key = awg
         .header_protection_key
-        .as_deref()
-        .map(parse_header_protection_key)
+        .as_ref()
+        .map(|key| parse_header_protection_key(key.expose()))
         .transpose()?
         // An all-zero key means "off", the same as omitting it.
         .filter(|key| key.iter().any(|byte| *byte != 0));
@@ -346,7 +346,7 @@ mod tests {
             params.s2 = 12;
             params.s3 = 12;
             params.s4 = 12;
-            params.header_protection_key = Some(source);
+            params.header_protection_key = Some(source.into());
             params
         };
 
@@ -359,8 +359,11 @@ mod tests {
     #[test]
     fn all_zero_header_protection_key_disables_it() {
         let mut params = empty_params();
-        params.header_protection_key =
-            Some(base64::engine::general_purpose::STANDARD.encode([0u8; 32]));
+        params.header_protection_key = Some(
+            base64::engine::general_purpose::STANDARD
+                .encode([0u8; 32])
+                .into(),
+        );
 
         let config = convert_amnezia_config(&params, 1280).unwrap();
         assert_eq!(config.header_protection_key, None);
@@ -370,8 +373,11 @@ mod tests {
     fn header_protection_rejects_padding_below_the_nonce_size() {
         let mut params = empty_params();
         params.s1 = 11;
-        params.header_protection_key =
-            Some(base64::engine::general_purpose::STANDARD.encode([0x22u8; 32]));
+        params.header_protection_key = Some(
+            base64::engine::general_purpose::STANDARD
+                .encode([0x22u8; 32])
+                .into(),
+        );
 
         assert!(convert_amnezia_config(&params, 1280).is_err());
     }

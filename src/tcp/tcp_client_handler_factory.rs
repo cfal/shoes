@@ -6,6 +6,7 @@ use log::debug;
 
 use crate::anytls::{AnyTlsClientHandler, PaddingFactory};
 use crate::client_proxy_selector::{ClientProxySelector, ConnectAction, ConnectRule};
+use crate::config::Redacted;
 use crate::config::{
     ClientProxyConfig, RuleActionConfig, RuleConfig, ShadowsocksConfig, TlsClientConfig,
     WebsocketClientConfig,
@@ -59,12 +60,12 @@ pub fn create_tcp_client_handler(
                 None
             };
             Box::new(HttpTcpClientHandler::new(
-                create_auth_credentials(username, password),
+                create_auth_credentials(username, password.map(Redacted::into_inner)),
                 http_resolver,
             ))
         }
         ClientProxyConfig::Socks { username, password } => Box::new(SocksTcpClientHandler::new(
-            create_auth_credentials(username, password),
+            create_auth_credentials(username, password.map(Redacted::into_inner)),
         )),
         ClientProxyConfig::Shadowsocks {
             config,
@@ -293,7 +294,7 @@ pub fn create_tcp_client_handler(
             let handler = create_tcp_client_handler(*protocol, None, resolver.clone());
 
             Box::new(ShadowTlsClientHandler::new(
-                password,
+                password.into_inner(),
                 client_config,
                 server_name,
                 handler,
@@ -349,7 +350,11 @@ pub fn create_tcp_client_handler(
                 }
                 None => PaddingFactory::default_factory(),
             };
-            Box::new(AnyTlsClientHandler::new(password, padding, udp_enabled))
+            Box::new(AnyTlsClientHandler::new(
+                password.into_inner(),
+                padding,
+                udp_enabled,
+            ))
         }
         ClientProxyConfig::Naiveproxy {
             username,
