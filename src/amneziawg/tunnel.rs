@@ -71,15 +71,24 @@ impl TunnelRuntime {
             SocketAddr::from(([0u8; 4], 0u16))
         };
         let udp_socket = UdpSocket::bind(bind_addr).await?;
-        udp_socket.connect(endpoint_addr).await?;
-        let udp_socket = Arc::new(udp_socket);
 
-        // Protect socket on mobile platforms
-        #[cfg(target_os = "android")]
+        // Exclude the endpoint socket from the VPN route before connecting.
+        // Without this the tunnel's own UDP is captured by the TUN interface it
+        // feeds, and every packet loops back into itself. No-op where no
+        // protector is installed, so it covers iOS as well as Android.
+        #[cfg(all(unix, any(target_os = "android", target_os = "ios", feature = "ffi")))]
         {
             use std::os::fd::AsRawFd;
-            crate::tun::protect_socket(udp_socket.as_raw_fd());
+            crate::tun::protect_socket(udp_socket.as_raw_fd()).map_err(|e| {
+                std::io::Error::other(format!(
+                    "failed to protect AmneziaWG endpoint socket: {}",
+                    e
+                ))
+            })?;
         }
+
+        udp_socket.connect(endpoint_addr).await?;
+        let udp_socket = Arc::new(udp_socket);
 
         info!("AmneziaWG tunnel started, endpoint={}", endpoint_addr);
 
