@@ -252,7 +252,7 @@ fn gather_pem_file_paths_from_server_proxy(
             }
 
             // Process ShadowTLS targets
-            for (_, shadowtls_config) in shadowtls_targets.iter_mut() {
+            for shadowtls_config in shadowtls_targets.values_mut() {
                 if let ShadowTlsServerHandshakeConfig::Local(ref mut handshake) =
                     shadowtls_config.handshake
                 {

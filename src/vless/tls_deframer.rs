@@ -22,7 +22,7 @@ const TLS_RECORD_HEADER_SIZE: usize = 5;
 const MAX_TLS_CIPHERTEXT_LEN: usize = 16384 + 2048; // 18,432 bytes (TLS 1.2 limit)
 
 /// Maximum TLS record size (ciphertext + header)
-pub const TLS_MAX_RECORD_SIZE: usize = MAX_TLS_CIPHERTEXT_LEN + TLS_RECORD_HEADER_SIZE;
+const TLS_MAX_RECORD_SIZE: usize = MAX_TLS_CIPHERTEXT_LEN + TLS_RECORD_HEADER_SIZE;
 
 /// TLS protocol versions we expect (0x0303 = TLS 1.2 for compatibility)
 const TLS_PROTOCOL_VERSION_MAJOR: u8 = 0x03;

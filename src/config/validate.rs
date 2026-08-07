@@ -1180,7 +1180,7 @@ fn validate_server_proxy_config(
                     "TLS server has no entries",
                 ));
             }
-            for (_, tls_server_config) in tls_targets.iter_mut() {
+            for tls_server_config in tls_targets.values_mut() {
                 embed_pem_from_map(&mut tls_server_config.cert, named_pems);
                 embed_pem_from_map(&mut tls_server_config.key, named_pems);
                 for cert in tls_server_config.client_ca_certs.iter_mut() {

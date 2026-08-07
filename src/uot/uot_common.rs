@@ -13,10 +13,10 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use crate::address::{Address, NetLocation};
 
-/// UoT AddrParser ATYP values.
-pub const ATYP_IPV4: u8 = 0x00;
-pub const ATYP_IPV6: u8 = 0x01;
-pub const ATYP_DOMAIN: u8 = 0x02;
+/// UoT AddrParser ATYP values (different from SOCKS5 — see socks_addr.rs).
+const ATYP_IPV4: u8 = 0x00;
+const ATYP_IPV6: u8 = 0x01;
+const ATYP_DOMAIN: u8 = 0x02;
 
 /// Parse a UoT AddrParser address (ATYP + address + port).
 /// Returns Ok(Some((NetLocation, bytes consumed))) on success.

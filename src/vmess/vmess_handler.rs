@@ -341,7 +341,7 @@ impl TcpServerHandler for VmessTcpServerHandler {
 
         let mut check_bytes = [0u8; 4];
         header_reader.read_slice_into(&mut check_bytes)?;
-        log::info!("VMess check_bytes: {:?}", &check_bytes);
+        log::info!("VMess check_bytes: {:?}", check_bytes);
 
         let expected_check_value = u32::from_be_bytes(check_bytes[0..4].try_into().unwrap());
         let actual_check_value = fnv_hasher.finish();

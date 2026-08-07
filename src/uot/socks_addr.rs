@@ -9,10 +9,10 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use crate::address::{Address, NetLocation};
 
-/// SOCKS5 ATYP values used by sing-mux `packet_addr`.
-pub const ATYP_IPV4: u8 = 0x01;
-pub const ATYP_DOMAIN: u8 = 0x03;
-pub const ATYP_IPV6: u8 = 0x04;
+/// SOCKS5 ATYP values used by sing-mux `packet_addr` (different from AddrParser — see uot_common.rs).
+const ATYP_IPV4: u8 = 0x01;
+const ATYP_DOMAIN: u8 = 0x03;
+const ATYP_IPV6: u8 = 0x04;
 
 /// Parse a SOCKS packet address (ATYP + address + port).
 /// Returns Ok(Some((NetLocation, bytes consumed))) on success.

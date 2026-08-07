@@ -55,7 +55,7 @@ impl LogWriter for LogcatWriter {
                 log::Level::Trace => 2, // ANDROID_LOG_VERBOSE
             };
             unsafe {
-                ndk_sys::__android_log_write(priority as i32, tag.as_ptr(), msg.as_ptr());
+                ndk_sys::__android_log_write(priority, tag.as_ptr(), msg.as_ptr());
             }
         }
         #[cfg(not(target_os = "android"))]
@@ -234,15 +234,12 @@ pub extern "system" fn Java_com_shoesproxy_ShoesNative_start<'local>(
                 )?;
                 Ok(v.z().unwrap_or(false))
             })
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{}", e)))?;
+            .map_err(|e| std::io::Error::other(format!("{}", e)))?;
 
         if protect_ok {
             Ok(())
         } else {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "VpnService.protect() returned false",
-            ))
+            Err(std::io::Error::other("VpnService.protect() returned false"))
         }
     });
 

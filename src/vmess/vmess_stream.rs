@@ -1186,11 +1186,11 @@ mod tests {
         let reader = create_shake128_reader(&[0u8; 16]);
         let mut mask = LengthMask::new(reader, true);
 
-        let (padding, length_mask) = mask.next_values();
+        let (padding, _length_mask) = mask.next_values();
         // Padding should be less than MAX_PADDING_LEN (64)
         assert!(padding < MAX_PADDING_LEN);
-        // Length mask is just a u16
-        assert!(length_mask <= u16::MAX);
+        // The length mask is a u16, so every value it can hold is in range and
+        // there is nothing to assert about it here.
     }
 
     #[test]
@@ -1234,17 +1234,15 @@ mod tests {
         let mut mask = LengthMask::new(reader, true);
 
         // Get first pair
-        let (padding1, length_mask1) = mask.next_values();
+        let (padding1, _length_mask1) = mask.next_values();
         // Get second pair
-        let (padding2, length_mask2) = mask.next_values();
+        let (padding2, _length_mask2) = mask.next_values();
 
         // Values should be different (SHAKE128 produces pseudo-random output)
-        // Though in rare cases they could be equal, so we just check they're valid
+        // Though in rare cases they could be equal, so we just check they're valid.
+        // The length masks are u16 and so are in range by construction.
         assert!(padding1 < MAX_PADDING_LEN);
         assert!(padding2 < MAX_PADDING_LEN);
-        // Length masks can be any u16 value
-        assert!(length_mask1 <= u16::MAX);
-        assert!(length_mask2 <= u16::MAX);
     }
 
     #[test]
