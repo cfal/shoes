@@ -27,7 +27,7 @@ pub mod tun;
 // Re-export all public types for convenience
 #[allow(unused_imports)]
 pub use client::{
-    AmneziaWg2Config, AmneziaWgClientConfig, ClientConfig, ClientProxyConfig, H2MuxConfig,
+    AmneziaWgClientConfig, AmneziaWgParams, ClientConfig, ClientProxyConfig, H2MuxConfig,
     TlsClientConfig, WebsocketClientConfig, WireGuardClientConfig,
 };
 pub use common::DEFAULT_REALITY_SHORT_ID;

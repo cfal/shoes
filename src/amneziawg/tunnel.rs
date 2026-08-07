@@ -6,7 +6,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use boringtun::amnezia::Amnezia2Config;
+use boringtun::amnezia::Amnezia3Config;
 use boringtun::noise::{Tunn, TunnResult};
 use boringtun::x25519;
 use log::{debug, error, info, warn};
@@ -43,11 +43,11 @@ impl TunnelRuntime {
         peer_public_key: x25519::PublicKey,
         preshared_key: Option<[u8; 32]>,
         persistent_keepalive: Option<u16>,
-        amnezia: Amnezia2Config,
+        amnezia: Amnezia3Config,
         endpoint_addr: SocketAddr,
     ) -> std::io::Result<Arc<Self>> {
         // Create the boringtun tunnel
-        let tunn = Tunn::new_with_amnezia(
+        let tunn = Tunn::new_with_amnezia3(
             private_key,
             peer_public_key,
             preshared_key,

@@ -16,7 +16,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 
-use log::{debug, trace, warn};
+use log::{debug, warn};
 use parking_lot::Mutex;
 use smoltcp::iface::{Config as InterfaceConfig, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
@@ -149,21 +149,6 @@ struct TcpControl {
 }
 
 // ---------------------------------------------------------------------------
-// UDP: shared channel pair
-// ---------------------------------------------------------------------------
-
-struct UdpControl {
-    /// Target endpoint for outgoing packets.
-    target: IpEndpoint,
-    /// Packets to send (async -> smoltcp).
-    outgoing_tx: mpsc::Sender<Vec<u8>>,
-    outgoing_rx: mpsc::Receiver<Vec<u8>>,
-    /// Packets received (smoltcp -> async).
-    incoming_tx: mpsc::Sender<Vec<u8>>,
-    incoming_rx: mpsc::Receiver<Vec<u8>>,
-}
-
-// ---------------------------------------------------------------------------
 // Netstack requests
 // ---------------------------------------------------------------------------
 
@@ -184,8 +169,6 @@ pub enum NetStackRequest {
 
 struct ActiveTcp {
     control: Arc<Mutex<TcpControl>>,
-    notify: Arc<Notify>,
-    connected: bool,
 }
 
 struct ActiveUdp {
@@ -233,8 +216,8 @@ impl VirtualNetStack {
             .iter()
             .map(|(addr, prefix)| {
                 let ip = match addr {
-                    IpAddr::V4(v4) => IpAddress::Ipv4(smoltcp::wire::Ipv4Address::from(*v4)),
-                    IpAddr::V6(v6) => IpAddress::Ipv6(smoltcp::wire::Ipv6Address::from(*v6)),
+                    IpAddr::V4(v4) => IpAddress::Ipv4(*v4),
+                    IpAddr::V6(v6) => IpAddress::Ipv6(*v6),
                 };
                 IpCidr::new(ip, *prefix)
             })
@@ -385,7 +368,7 @@ impl VirtualNetStack {
     fn service_pending_tcp(&mut self) {
         let mut completed = Vec::new();
 
-        for (handle, pending) in &self.pending_tcp {
+        for handle in self.pending_tcp.keys() {
             let socket = self.sockets.get::<SmolTcpSocket>(*handle);
             match socket.state() {
                 TcpState::Established => completed.push((*handle, true)),
@@ -405,8 +388,6 @@ impl VirtualNetStack {
                     handle,
                     ActiveTcp {
                         control: pending.control,
-                        notify: pending.notify,
-                        connected: true,
                     },
                 );
                 let _ = pending.reply.send(Ok(stream));
@@ -541,10 +522,10 @@ impl VirtualNetStack {
 
             // Drain outgoing packets from async side -> smoltcp send
             while let Ok(data) = active.outgoing_rx.try_recv() {
-                if socket.can_send() {
-                    if let Err(e) = socket.send_slice(&data, active.target) {
-                        debug!("AmneziaWG UDP send error: {}", e);
-                    }
+                if socket.can_send()
+                    && let Err(e) = socket.send_slice(&data, active.target)
+                {
+                    debug!("AmneziaWG UDP send error: {}", e);
                 }
             }
 
@@ -740,8 +721,8 @@ impl AsyncMessageStream for VirtualUdpStream {}
 fn to_smol_endpoint(addr: SocketAddr) -> IpEndpoint {
     IpEndpoint::new(
         match addr.ip() {
-            IpAddr::V4(v4) => IpAddress::Ipv4(smoltcp::wire::Ipv4Address::from(v4)),
-            IpAddr::V6(v6) => IpAddress::Ipv6(smoltcp::wire::Ipv6Address::from(v6)),
+            IpAddr::V4(v4) => IpAddress::Ipv4(v4),
+            IpAddr::V6(v6) => IpAddress::Ipv6(v6),
         },
         addr.port(),
     )
@@ -751,7 +732,7 @@ static NEXT_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::n
 
 fn allocate_ephemeral_port() -> u16 {
     let port = NEXT_PORT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if port == 0 || port >= 65535 {
+    if port == 0 || port == u16::MAX {
         NEXT_PORT.store(40000, std::sync::atomic::Ordering::Relaxed);
         40000
     } else {

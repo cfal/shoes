@@ -53,8 +53,8 @@ impl AmneziaWgConnector {
         endpoint: NetLocation,
     ) -> std::io::Result<Self> {
         match proxy_config {
-            ClientProxyConfig::Wireguard(wg) => Ok(Self::from_wireguard(wg, endpoint)),
-            ClientProxyConfig::AmneziaWg(awg) => Ok(Self::from_amneziawg(awg, endpoint)),
+            ClientProxyConfig::Wireguard(wg) => Ok(Self::from_wireguard(*wg, endpoint)),
+            ClientProxyConfig::AmneziaWg(awg) => Ok(Self::from_amneziawg(*awg, endpoint)),
             other => Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!(
@@ -84,7 +84,7 @@ impl AmneziaWgConnector {
             allowed_ips: wg.allowed_ips,
             persistent_keepalive: wg.persistent_keepalive,
             mtu: wg.mtu,
-            awg: crate::config::AmneziaWg2Config {
+            awg: crate::config::AmneziaWgParams {
                 jc: 0,
                 jmin: 0,
                 jmax: 0,
@@ -92,15 +92,23 @@ impl AmneziaWgConnector {
                 s2: 0,
                 s3: 0,
                 s4: 0,
-                h1: "1".to_string(),
-                h2: "2".to_string(),
-                h3: "3".to_string(),
-                h4: "4".to_string(),
+                h1: None,
+                h2: None,
+                h3: None,
+                h4: None,
                 i1: None,
                 i2: None,
                 i3: None,
                 i4: None,
                 i5: None,
+                header_protection_key: None,
+                content_padding_addition: None,
+                rekey_after_time: None,
+                rekey_timeout: None,
+                reject_after_time: None,
+                keepalive_timeout: None,
+                max_handshake_attempts: None,
+                persistent_keepalive_interval: None,
             },
         };
         Self {
@@ -120,10 +128,12 @@ impl AmneziaWgConnector {
             return Ok(s.request_tx.clone());
         }
 
-        info!(
-            "{:?}: initializing tunnel to {}",
-            self.protocol, self.endpoint
-        );
+        let variant = match self.protocol {
+            TunnelProtocol::WireGuard => "WireGuard",
+            TunnelProtocol::AmneziaWg if self.config.awg.uses_awg3() => "AmneziaWG 3.0",
+            TunnelProtocol::AmneziaWg => "AmneziaWG 2.0",
+        };
+        info!("{}: initializing tunnel to {}", variant, self.endpoint);
 
         let runtime_config = AwgRuntimeConfig::from_client_config(&self.config)?;
         let endpoint_addr = resolver::resolve_single_address(resolver, &self.endpoint).await?;
@@ -138,17 +148,11 @@ impl AmneziaWgConnector {
         )
         .await?;
 
-        let ip_from_tunnel_rx =
-            tunnel_runtime
-                .ip_from_tunnel_rx
-                .lock()
-                .take()
-                .ok_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        "AmneziaWG tunnel already initialized",
-                    )
-                })?;
+        let ip_from_tunnel_rx = tunnel_runtime
+            .ip_from_tunnel_rx
+            .lock()
+            .take()
+            .ok_or_else(|| std::io::Error::other("AmneziaWG tunnel already initialized"))?;
 
         let netstack = VirtualNetStack::new(
             &runtime_config.local_addresses,

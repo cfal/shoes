@@ -1016,9 +1016,7 @@ fn validate_client_proxy_config(
     Ok(())
 }
 
-fn validate_wireguard_config(
-    config: &super::types::WireGuardClientConfig,
-) -> std::io::Result<()> {
+fn validate_wireguard_config(config: &super::types::WireGuardClientConfig) -> std::io::Result<()> {
     validate_wg_key(&config.private_key, "private_key")?;
     validate_wg_key(&config.peer_public_key, "peer_public_key")?;
     if let Some(ref psk) = config.preshared_key {
@@ -1049,9 +1047,7 @@ fn validate_wireguard_config(
     Ok(())
 }
 
-fn validate_amneziawg_config(
-    config: &super::types::AmneziaWgClientConfig,
-) -> std::io::Result<()> {
+fn validate_amneziawg_config(config: &super::types::AmneziaWgClientConfig) -> std::io::Result<()> {
     // Validate private key (base64 -> 32 bytes)
     validate_wg_key(&config.private_key, "private_key")?;
     validate_wg_key(&config.peer_public_key, "peer_public_key")?;
@@ -1083,12 +1079,14 @@ fn validate_amneziawg_config(
     if config.mtu < 576 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            format!(
-                "AmneziaWG mtu {} is too small (minimum 576)",
-                config.mtu
-            ),
+            format!("AmneziaWG mtu {} is too small (minimum 576)", config.mtu),
         ));
     }
+
+    // Parse and validate the obfuscation parameters now, so a bad H-range or a
+    // header protection key with too little padding is a startup error rather
+    // than a tunnel that silently never completes a handshake.
+    crate::amneziawg::convert_amnezia_config(&config.awg, config.mtu)?;
 
     Ok(())
 }
@@ -1573,23 +1571,20 @@ fn validate_amneziawg_chain_position(
     }
 
     let hop = hops.iter().next().unwrap();
-    match hop {
-        ClientChainHop::Pool(selections) => {
-            let all_tunnel = selections.iter().all(|s| match s {
-                ConfigSelection::Config(config) => config.protocol.is_virtual_network(),
-                _ => false,
-            });
-            if !all_tunnel {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!(
-                        "Chain {}: WireGuard/AmneziaWG cannot be mixed with other protocols in a pool.",
-                        chain_index
-                    ),
-                ));
-            }
+    if let ClientChainHop::Pool(selections) = hop {
+        let all_tunnel = selections.iter().all(|s| match s {
+            ConfigSelection::Config(config) => config.protocol.is_virtual_network(),
+            _ => false,
+        });
+        if !all_tunnel {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "Chain {}: WireGuard/AmneziaWG cannot be mixed with other protocols in a pool.",
+                    chain_index
+                ),
+            ));
         }
-        _ => {}
     }
 
     Ok(())

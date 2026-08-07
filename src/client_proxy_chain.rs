@@ -115,10 +115,7 @@ impl std::fmt::Debug for ClientProxyChain {
                 .field("initial_hop_count", &initial_hop.len())
                 .field(
                     "subsequent_hops",
-                    &subsequent_hops
-                        .iter()
-                        .map(|h| h.len())
-                        .collect::<Vec<_>>(),
+                    &subsequent_hops.iter().map(|h| h.len()).collect::<Vec<_>>(),
                 )
                 .field("udp_final_hop_indices", udp_final_hop_indices)
                 .field("udp_uses_initial_hop", udp_uses_initial_hop)
@@ -379,8 +376,7 @@ impl ClientProxyChain {
 
                 if *udp_uses_initial_hop {
                     let idx = udp_final_hop_next_index.fetch_add(1, Ordering::Relaxed) as usize;
-                    let pool_idx =
-                        udp_final_hop_indices[idx % udp_final_hop_indices.len()];
+                    let pool_idx = udp_final_hop_indices[idx % udp_final_hop_indices.len()];
                     let entry = &initial_hop[pool_idx];
 
                     debug!(
@@ -414,8 +410,7 @@ impl ClientProxyChain {
                             if hop.len() == 1 {
                                 hop[0].as_ref()
                             } else {
-                                let idx = subsequent_next_indices[i]
-                                    .fetch_add(1, Ordering::Relaxed)
+                                let idx = subsequent_next_indices[i].fetch_add(1, Ordering::Relaxed)
                                     as usize;
                                 hop[idx % hop.len()].as_ref()
                             }
@@ -424,8 +419,7 @@ impl ClientProxyChain {
 
                     let final_hop_pool = subsequent_hops.last().unwrap();
                     let idx = udp_final_hop_next_index.fetch_add(1, Ordering::Relaxed) as usize;
-                    let pool_idx =
-                        udp_final_hop_indices[idx % udp_final_hop_indices.len()];
+                    let pool_idx = udp_final_hop_indices[idx % udp_final_hop_indices.len()];
                     let final_proxy = final_hop_pool[pool_idx].as_ref();
 
                     debug!(
@@ -459,8 +453,7 @@ impl ClientProxyChain {
                             );
                             let proxy_loc = proxy.proxy_location().into();
                             let raw_stream = socket.connect(resolver, &proxy_loc).await?;
-                            let result =
-                                proxy.setup_tcp_stream(raw_stream, &first_target).await?;
+                            let result = proxy.setup_tcp_stream(raw_stream, &first_target).await?;
                             result.client_stream
                         }
                     };
@@ -529,10 +522,7 @@ impl ClientProxyChain {
     }
 }
 
-fn select_from_pool<'a>(
-    pool: &'a [InitialHopEntry],
-    index: &AtomicU32,
-) -> &'a InitialHopEntry {
+fn select_from_pool<'a>(pool: &'a [InitialHopEntry], index: &AtomicU32) -> &'a InitialHopEntry {
     if pool.len() == 1 {
         &pool[0]
     } else {
@@ -975,8 +965,7 @@ mod tests {
             vec![],
         );
 
-        let (initial_hop, _, _, udp_indices, udp_next, udp_uses_initial) =
-            chain.as_stream_chain();
+        let (initial_hop, _, _, udp_indices, udp_next, udp_uses_initial) = chain.as_stream_chain();
         assert!(udp_uses_initial);
         assert_eq!(*udp_indices, vec![1, 2]);
 
@@ -1004,10 +993,7 @@ mod tests {
     #[test]
     fn test_udp_selection_with_subsequent_hops() {
         let chain = ClientProxyChain::new(
-            vec![
-                proxy_entry(0, 1080, false),
-                proxy_entry(1, 1081, false),
-            ],
+            vec![proxy_entry(0, 1080, false), proxy_entry(1, 1081, false)],
             vec![vec![
                 mock_proxy(8080, false),
                 mock_proxy(443, true),
@@ -1015,8 +1001,14 @@ mod tests {
             ]],
         );
 
-        let (initial_hop, initial_hop_next, subsequent_hops, udp_indices, udp_next, udp_uses_initial) =
-            chain.as_stream_chain();
+        let (
+            initial_hop,
+            initial_hop_next,
+            subsequent_hops,
+            udp_indices,
+            udp_next,
+            udp_uses_initial,
+        ) = chain.as_stream_chain();
         assert!(!udp_uses_initial);
         assert_eq!(*udp_indices, vec![1, 2]);
 
@@ -1052,10 +1044,7 @@ mod tests {
     #[test]
     fn test_chain_with_subsequent_hops_uses_final_hop_indices() {
         let chain = ClientProxyChain::new(
-            vec![
-                proxy_entry(0, 1080, false),
-                proxy_entry(1, 1081, true),
-            ],
+            vec![proxy_entry(0, 1080, false), proxy_entry(1, 1081, true)],
             vec![vec![
                 mock_proxy(8080, false),
                 mock_proxy(443, true),
@@ -1075,10 +1064,7 @@ mod tests {
     fn test_chain_intermediate_hop_no_udp_final_hop_has_udp() {
         let chain = ClientProxyChain::new(
             vec![direct_entry(0)],
-            vec![
-                vec![mock_proxy(8080, false)],
-                vec![mock_proxy(443, true)],
-            ],
+            vec![vec![mock_proxy(8080, false)], vec![mock_proxy(443, true)]],
         );
         assert_eq!(chain.num_hops(), 3);
         assert!(chain.supports_udp());
@@ -1102,10 +1088,7 @@ mod tests {
     fn test_chain_intermediate_has_udp_final_no_udp() {
         let chain = ClientProxyChain::new(
             vec![direct_entry(0)],
-            vec![
-                vec![mock_proxy(443, true)],
-                vec![mock_proxy(8080, false)],
-            ],
+            vec![vec![mock_proxy(443, true)], vec![mock_proxy(8080, false)]],
         );
         assert_eq!(chain.num_hops(), 3);
         assert!(!chain.supports_udp());
@@ -1129,10 +1112,7 @@ mod tests {
     fn test_chain_pooled_final_hop_no_udp() {
         let chain = ClientProxyChain::new(
             vec![direct_entry(0)],
-            vec![vec![
-                mock_proxy(8080, false),
-                mock_proxy(1080, false),
-            ]],
+            vec![vec![mock_proxy(8080, false), mock_proxy(1080, false)]],
         );
         assert_eq!(chain.num_hops(), 2);
         assert!(!chain.supports_udp());
@@ -1145,10 +1125,7 @@ mod tests {
             vec![
                 vec![mock_proxy(8080, false)],
                 vec![mock_proxy(1080, false)],
-                vec![
-                    mock_proxy(8081, false),
-                    mock_proxy(443, true),
-                ],
+                vec![mock_proxy(8081, false), mock_proxy(443, true)],
             ],
         );
         assert_eq!(chain.num_hops(), 4);

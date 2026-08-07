@@ -21,7 +21,7 @@ shoes is a high-performance multi-protocol proxy server written in Rust.
 
 ### Outbound Tunnel Protocols
 - **WireGuard** (outbound L3 tunnel over UDP)
-- **AmneziaWG 2.0** (WireGuard with traffic obfuscation)
+- **AmneziaWG 2.0 / 3.0** (WireGuard with traffic obfuscation; 3.0 adds header protection, content padding and randomized timings)
 
 ### Transport Protocols
 All server protocols plus:
@@ -286,7 +286,7 @@ See the [examples](./examples) directory for all examples.
           persistent_keepalive: 25
 ```
 
-### AmneziaWG 2.0 Client (SOCKS5 inbound)
+### AmneziaWG Client (SOCKS5 inbound)
 ```yaml
 - address: 127.0.0.1:1080
   protocol:
@@ -322,7 +322,7 @@ See the [examples](./examples) directory for all examples.
             h4: "1003000-1003999"
 ```
 
-### AmneziaWG 2.0 Client (TUN VPN)
+### AmneziaWG Client (TUN VPN)
 ```yaml
 - device_name: tun0
   address: 10.0.0.1
@@ -350,7 +350,46 @@ See the [examples](./examples) directory for all examples.
             h4: "1003000-1003999"
 ```
 
-> **Note:** WireGuard and AmneziaWG work as client/outbound only — each creates a UDP-backed L3 tunnel to the server. The `awg` parameters must match your AmneziaWG server configuration. Neither supports multi-hop chains yet; they must be the sole hop.
+### AmneziaWG 3.0 Client
+
+AmneziaWG 3.0 adds three things on top of the 2.0 parameters above, all in the same `awg` block. Set any of them and the tunnel runs as 3.0; omit them all and it stays 2.0.
+
+```yaml
+          awg:
+            # 2.0 parameters as usual. Header protection reads its nonce from
+            # the padding prefix, so s1-s4 must each be at least 12.
+            jc: 4
+            jmin: 64
+            jmax: 256
+            s1: 32
+            s2: 32
+            s3: 16
+            s4: 16
+            h1: "1000000-1000999"
+            h2: "1001000-1001999"
+            h3: "1002000-1002999"
+            h4: "1003000-1003999"
+
+            # 3.0: ChaCha20 over the message header. Base64 as an AmneziaWG
+            # .conf writes it, or 64 hex characters as UAPI does.
+            header_protection_key: "HEADER_PROTECTION_KEY_BASE64"
+            # 3.0: extra random padding inside the AEAD envelope, in bytes.
+            content_padding_addition: "0-64"
+            # 3.0: randomized WireGuard timings, in seconds. Each is optional;
+            # unset keeps the standard WireGuard constant.
+            rekey_after_time: "110-130"
+            rekey_timeout: "5"
+            reject_after_time: "170-190"
+            keepalive_timeout: "8-12"
+            max_handshake_attempts: "18-20"
+            persistent_keepalive_interval: "20-30"
+```
+
+Every value that shapes the wire format has to match the server exactly — `h1`-`h4`, `s1`-`s4`, the junk parameters, the header protection key and the content padding. A mismatch is not reported by either end; the peer simply cannot recognise the packets as WireGuard, and the handshake never completes. The timing ranges are local: they only shape when this peer acts, so the two ends may differ.
+
+`h1`-`h4` may be omitted entirely, in which case the standard WireGuard message types (1, 2, 3, 4) are used — useful for a tunnel that wants only the 3.0 features.
+
+> **Note:** WireGuard and AmneziaWG work as client/outbound only — each creates a UDP-backed L3 tunnel to the server. Neither supports multi-hop chains yet; they must be the sole hop. All three modes share one code path: plain WireGuard is AmneziaWG with every obfuscation parameter left at its default.
 
 ## Similar Projects
 

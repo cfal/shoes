@@ -72,7 +72,7 @@ pub struct WireGuardClientConfig {
     pub mtu: u16,
 }
 
-/// AmneziaWG 2.0 client configuration.
+/// AmneziaWG client configuration (2.0 and 3.0).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AmneziaWgClientConfig {
@@ -86,13 +86,23 @@ pub struct AmneziaWgClientConfig {
     pub persistent_keepalive: Option<u16>,
     #[serde(default = "default_amneziawg_mtu")]
     pub mtu: u16,
-    pub awg: AmneziaWg2Config,
+    pub awg: AmneziaWgParams,
 }
 
-/// AmneziaWG 2.0 obfuscation parameters.
+/// AmneziaWG obfuscation parameters.
+///
+/// The 2.0 set (`jc`/`jmin`/`jmax`, `s1`-`s4`, `h1`-`h4`, `i1`-`i5`) and the
+/// 3.0 additions (`header_protection_key`, `content_padding_addition` and the
+/// randomized timing ranges) share one block, matching the single `[Interface]`
+/// section an AmneziaWG `.conf` uses. Leave the 3.0 fields unset for a 2.0
+/// tunnel; leave everything unset for plain WireGuard framing.
+///
+/// Range fields accept either a single number (`"7"`) or an inclusive range
+/// (`"5-15"`). Both peers must agree on every value that shapes the wire
+/// format — a mismatch looks exactly like an unreachable server.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct AmneziaWg2Config {
+pub struct AmneziaWgParams {
     #[serde(default)]
     pub jc: u8,
     #[serde(default)]
@@ -107,10 +117,16 @@ pub struct AmneziaWg2Config {
     pub s3: u8,
     #[serde(default)]
     pub s4: u8,
-    pub h1: String,
-    pub h2: String,
-    pub h3: String,
-    pub h4: String,
+    /// Message-type header ranges. Omit all four for the standard WireGuard
+    /// values (1, 2, 3, 4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub h1: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub h2: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub h3: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub h4: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub i1: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -121,6 +137,47 @@ pub struct AmneziaWg2Config {
     pub i4: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub i5: Option<String>,
+
+    // --- AmneziaWG 3.0 ---
+    /// ChaCha20 key protecting the message header, base64 (32 bytes) as an
+    /// AmneziaWG `.conf` writes it, or 64 hex characters as UAPI writes it.
+    /// Requires `s1`-`s4` to each be at least 12, since the nonce is read from
+    /// the padding prefix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header_protection_key: Option<String>,
+    /// Extra random padding added inside the AEAD envelope of transport
+    /// packets, in bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_padding_addition: Option<String>,
+    /// Randomized WireGuard timings, in seconds (except
+    /// `max_handshake_attempts`, a count). Unset keeps the standard constant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rekey_after_time: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rekey_timeout: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reject_after_time: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keepalive_timeout: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_handshake_attempts: Option<String>,
+    /// Randomized replacement for the scalar `persistent_keepalive` above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persistent_keepalive_interval: Option<String>,
+}
+
+impl AmneziaWgParams {
+    /// True when any 3.0-only parameter is set.
+    pub fn uses_awg3(&self) -> bool {
+        self.header_protection_key.is_some()
+            || self.content_padding_addition.is_some()
+            || self.rekey_after_time.is_some()
+            || self.rekey_timeout.is_some()
+            || self.reject_after_time.is_some()
+            || self.keepalive_timeout.is_some()
+            || self.max_handshake_attempts.is_some()
+            || self.persistent_keepalive_interval.is_some()
+    }
 }
 
 /// Custom deserializer for ClientProxyConfig::Shadowsocks
@@ -506,12 +563,13 @@ pub enum ClientProxyConfig {
         #[serde(default = "default_true", skip_serializing_if = "is_true")]
         padding: bool,
     },
-    /// WireGuard client outbound (UDP-backed L3 tunnel)
+    /// WireGuard client outbound (UDP-backed L3 tunnel).
+    /// Boxed: these carry far more fields than any other variant.
     #[serde(alias = "wg")]
-    Wireguard(WireGuardClientConfig),
-    /// AmneziaWG 2.0 client outbound (UDP-backed L3 tunnel with obfuscation)
+    Wireguard(Box<WireGuardClientConfig>),
+    /// AmneziaWG 2.0/3.0 client outbound (UDP-backed L3 tunnel with obfuscation)
     #[serde(alias = "awg")]
-    AmneziaWg(AmneziaWgClientConfig),
+    AmneziaWg(Box<AmneziaWgClientConfig>),
 }
 
 impl ClientProxyConfig {

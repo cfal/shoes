@@ -359,8 +359,10 @@ pub fn create_tcp_client_handler(
             &username, &password, padding,
         )),
         ClientProxyConfig::Wireguard(..) | ClientProxyConfig::AmneziaWg(..) => {
-            panic!("WireGuard/AmneziaWG is a virtual network outbound and should not use TcpClientHandler. \
-                    It must be handled as a VirtualNetworkConnector in the chain builder.")
+            panic!(
+                "WireGuard/AmneziaWG is a virtual network outbound and should not use TcpClientHandler. \
+                    It must be handled as a VirtualNetworkConnector in the chain builder."
+            )
         }
     }
 }
