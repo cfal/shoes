@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::time::{Instant, timeout_at};
+use tokio::time::{timeout, Instant, timeout_at};
 
 use crate::address::NetLocation;
 use crate::async_stream::AsyncStream;
@@ -18,6 +18,16 @@ use crate::util::{allocate_vec, write_all};
 use crate::vless::tls_deframer::TlsDeframer;
 
 use super::{RealityServerConfig, RealityServerConnection};
+
+/// Maximum lifetime of a Reality/TLS fallback transparent-proxy task.
+///
+/// When Reality auth fails (or the client/TLS conditions aren't met), we transparently
+/// proxy the connection to the camouflage `dest` so the server stays indistinguishable.
+/// These fallback tasks previously ran `copy_bidirectional` with no timeout, so a
+/// half-open (dropped/errored) client would keep the task, both sockets, and the copy
+/// buffers alive until TCP keepalive finally fired — allowing memory to climb without
+/// bound under connection churn. This cap guarantees every fallback task terminates.
+const FALLBACK_COPY_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Debug)]
 pub struct RealityServerTarget {
@@ -343,13 +353,23 @@ fn start_forward_to_dest(
             remaining_data.len()
         );
 
-        let result = crate::copy_bidirectional::copy_bidirectional(
+        let copy_future = crate::copy_bidirectional::copy_bidirectional(
             &mut *client_stream,
             &mut dest_stream,
             !remaining_data.is_empty(), // flush the client if we wrote remaining data
             false,
-        )
-        .await;
+        );
+
+        let result = match timeout(FALLBACK_COPY_TIMEOUT, copy_future).await {
+            Ok(r) => r,
+            Err(_) => {
+                log::debug!(
+                    "REALITY FALLBACK: Connection timed out after {}s, closing",
+                    FALLBACK_COPY_TIMEOUT.as_secs()
+                );
+                Ok(())
+            }
+        };
 
         let _ = futures::join!(client_stream.shutdown(), dest_stream.shutdown());
 
