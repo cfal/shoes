@@ -69,10 +69,7 @@ pub const CIPHERTEXT_READ_BUF_CAPACITY: usize = TLS_MAX_RECORD_SIZE * 2;
 /// Buffer capacity for plaintext read
 pub const PLAINTEXT_READ_BUF_CAPACITY: usize = TLS_MAX_RECORD_SIZE * 2;
 
-/// Buffer capacity for outgoing data (matches rustls DEFAULT_BUFFER_LIMIT)
-///
-/// This controls the size of both the plaintext write buffer (pre-encryption)
-/// and ciphertext write buffer (post-encryption). rustls uses 64KB for both.
+/// Combined limit for queued plaintext and ciphertext (matches rustls DEFAULT_BUFFER_LIMIT)
 pub const OUTGOING_BUFFER_LIMIT: usize = 64 * 1024;
 
 /// Strip TLS 1.3 content type trailer from decrypted plaintext slice.

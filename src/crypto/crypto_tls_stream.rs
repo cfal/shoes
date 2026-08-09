@@ -435,3 +435,90 @@ where
 
 // Implement AsyncStream blanket trait
 impl<IO> crate::async_stream::AsyncStream for CryptoTlsStream<IO> where IO: AsyncStream {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::address::{Address, NetLocation};
+    use crate::reality::{RealityServerConfig, RealityServerConnection};
+    use futures::task::noop_waker_ref;
+
+    struct PendingWriteIo;
+
+    impl AsyncRead for PendingWriteIo {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for PendingWriteIo {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Pending
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncPing for PendingWriteIo {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+
+        fn poll_write_ping(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+
+    impl AsyncStream for PendingWriteIo {}
+
+    #[test]
+    fn reality_stream_stops_accepting_plaintext_when_tls_output_is_blocked() {
+        let config = RealityServerConfig {
+            private_key: [0; 32],
+            short_ids: vec![[0; 8]],
+            dest: NetLocation::new(Address::UNSPECIFIED, 443),
+            max_time_diff: None,
+            min_client_version: None,
+            max_client_version: None,
+            cipher_suites: Vec::new(),
+        };
+        let connection = RealityServerConnection::new(config)
+            .unwrap()
+            .complete_for_test()
+            .unwrap();
+        let mut stream = CryptoTlsStream::new(
+            PendingWriteIo,
+            CryptoConnection::new_reality_server(connection),
+        );
+        let mut cx = Context::from_waker(noop_waker_ref());
+        let data = [0u8; 16 * 1024];
+        let mut accepted = 0;
+
+        for _ in 0..16 {
+            match Pin::new(&mut stream).poll_write(&mut cx, &data) {
+                Poll::Ready(Ok(written)) => accepted += written,
+                Poll::Pending => break,
+                Poll::Ready(Err(error)) => panic!("unexpected write error: {error}"),
+            }
+        }
+
+        assert!(
+            accepted <= 64 * 1024,
+            "blocked REALITY stream accepted {accepted} plaintext bytes"
+        );
+    }
+}

@@ -1,5 +1,6 @@
 use std::io::{BufRead, Read, Write};
 
+use super::common::OUTGOING_BUFFER_LIMIT;
 use crate::slide_buffer::SlideBuffer;
 
 /// Reader for accessing decrypted plaintext from REALITY connections
@@ -60,18 +61,26 @@ impl<'a> BufRead for RealityReader<'a> {
 /// Writer for buffering plaintext to be encrypted in REALITY connections
 pub struct RealityWriter<'a> {
     buffer: &'a mut Vec<u8>,
+    pending_tls_bytes: usize,
 }
 
 impl<'a> RealityWriter<'a> {
-    pub fn new(buffer: &'a mut Vec<u8>) -> Self {
-        RealityWriter { buffer }
+    pub fn new(buffer: &'a mut Vec<u8>, pending_tls_bytes: usize) -> Self {
+        RealityWriter {
+            buffer,
+            pending_tls_bytes,
+        }
     }
 }
 
 impl<'a> Write for RealityWriter<'a> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.buffer.extend_from_slice(buf);
-        Ok(buf.len())
+        let pending_bytes = self.pending_tls_bytes.saturating_add(self.buffer.len());
+        let accepted = buf
+            .len()
+            .min(OUTGOING_BUFFER_LIMIT.saturating_sub(pending_bytes));
+        self.buffer.extend_from_slice(&buf[..accepted]);
+        Ok(accepted)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
@@ -146,10 +155,20 @@ mod tests {
     #[test]
     fn test_reality_crypto_writer() {
         let mut buffer = Vec::new();
-        let mut writer = RealityWriter::new(&mut buffer);
+        let mut writer = RealityWriter::new(&mut buffer, 0);
 
         assert_eq!(writer.write(b"hello").unwrap(), 5);
         assert_eq!(writer.write(b" world").unwrap(), 6);
         assert_eq!(buffer.as_slice(), b"hello world");
+    }
+
+    #[test]
+    fn test_reality_crypto_writer_counts_pending_tls_output() {
+        let mut buffer = Vec::new();
+        let mut writer = RealityWriter::new(&mut buffer, OUTGOING_BUFFER_LIMIT - 3);
+
+        assert_eq!(writer.write(b"hello").unwrap(), 3);
+        assert_eq!(writer.write(b"world").unwrap(), 0);
+        assert_eq!(buffer.as_slice(), b"hel");
     }
 }
