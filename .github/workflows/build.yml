@@ -138,6 +138,16 @@ jobs:
             "$bin" --dry-run "examples/$cfg.yaml"
           done
 
+          # rule_set.yaml names two .srs files that are not kept in examples/.
+          # The test fixtures are the same lists under the same names, so
+          # copying them in covers the rule-set path -- which reads and parses
+          # a binary format at startup, and is worth exercising on the release
+          # binary rather than only in unit tests.
+          cp tests/data/rule_sets/geosite-google.srs tests/data/rule_sets/geoip-ru.srs examples/
+          echo "==> dry run: examples/rule_set.yaml"
+          "$bin" --dry-run examples/rule_set.yaml
+          rm -f examples/geosite-google.srs examples/geoip-ru.srs
+
       # No `strip` here: the release profile already sets strip = true
       # (Cargo.toml), so running it again was a no-op that could only fail.
       - name: Package binary

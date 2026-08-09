@@ -1,0 +1,41 @@
+# Route domains and addresses listed in a rule-set directly, and everything
+# else through an upstream proxy.
+#
+# Fetch the lists first, into this directory:
+#   curl -O https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-google.srs
+#   curl -O https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-ru.srs
+#
+# Paths are relative to this file, so the directory can be moved intact.
+
+- rule_set: geosite-google
+  path: geosite-google.srs
+
+- rule_set: geoip-ru
+  path: geoip-ru.srs
+
+- address: 0.0.0.0:1080
+  protocol:
+    type: socks
+  rules:
+    # Local networks never leave the machine.
+    - masks: ["192.168.0.0/16", "10.0.0.0/8", "127.0.0.0/8"]
+      action: allow
+      client_chain:
+        protocol:
+          type: direct
+
+    # A rule matches on any of its masks OR any of its rule-sets, so `masks`
+    # can be left out entirely here.
+    - rule_sets: [geosite-google, geoip-ru]
+      action: allow
+      client_chain:
+        protocol:
+          type: direct
+
+    # Everything else goes upstream.
+    - masks: "0.0.0.0/0"
+      action: allow
+      client_chain:
+        address: "proxy.example.com:1080"
+        protocol:
+          type: socks

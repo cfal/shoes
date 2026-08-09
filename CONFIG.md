@@ -10,6 +10,7 @@ shoes uses YAML configuration files. Multiple configuration types can be combine
 - [Client Config](#client-config)
 - [Client Protocols](#client-protocols)
 - [Rules System](#rules-system)
+  - [Rule-sets](#rule-sets)
 - [Named Groups](#named-groups)
 - [Named PEMs](#named-pems)
 - [Advanced Features](#advanced-features)
@@ -649,6 +650,64 @@ masks:
 ### Built-in Rule Groups
 - `allow-all-direct` - Allow all connections, direct routing
 - `block-all` - Block all connections
+
+### Rule-sets
+
+A rule-set is a compiled list of domains or IP ranges in sing-box's `.srs`
+format. Declare it once at the top level and reference it by name:
+
+```yaml
+- rule_set: geosite-ru
+  path: /etc/shoes/geosite-ru.srs
+
+- rule_set: geoip-ru
+  path: /etc/shoes/geoip-ru.srs
+```
+
+Relative paths resolve against the directory of the config file that declared
+them, so a config directory can be moved intact.
+
+Reference rule-sets from a rule with `rule_sets`. A rule matches if **any** of
+its masks matches **or** any of its rule-sets does, so `masks` may be omitted
+when a rule matches purely through a rule-set:
+
+```yaml
+rules:
+  - rule_sets: [geosite-ru, geoip-ru]
+    action: allow
+    client_chain:
+      protocol:
+        type: direct
+
+  - masks: "0.0.0.0/0"
+    action: allow
+    client_chain: my-proxy
+```
+
+Compiled lists are published at
+[SagerNet/sing-geosite](https://github.com/SagerNet/sing-geosite) and
+[SagerNet/sing-geoip](https://github.com/SagerNet/sing-geoip), on their
+`rule-set` branches:
+
+```bash
+curl -O https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-google.srs
+curl -O https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-ru.srs
+```
+
+**Supported matchers:** `domain`, `domain_suffix`, `domain_keyword`,
+`domain_regex` and `ip_cidr`. Anything else a `.srs` file can carry --
+`process_name`, `package_name`, port matchers, the network and Wi-Fi families,
+AdGuard matchers, `source_ip_cidr`, and `type: logical` rules -- is refused at
+startup with a message naming the field. A rule-set that loads is one that
+matches exactly what it says.
+
+Files are read and checked while the config is validated, so `--dry-run` catches
+a bad path or a corrupt file. Editing a `.srs` triggers the same reload a config
+edit does.
+
+Domain matching lowercases the destination and ignores a trailing dot. `ip_cidr`
+is compared against a resolved address only when the server resolves rule
+hostnames; otherwise a hostname destination is matched on its name alone.
 
 ### Example Rules
 ```yaml

@@ -48,6 +48,7 @@ All server protocols plus:
 - **TLS with SNI routing**: Route by Server Name Indication
 - **Upstream proxy chaining**: Multi-hop chains with load balancing
 - **Rule-based routing**: Route by IP/CIDR or hostname masks
+- **Rule-sets**: Match against sing-box `.srs` domain and IP lists (geosite, geoip)
 - **Named PEM certificates**: Define once, reference everywhere
 - **TLS fingerprint authentication**: Certificate pinning for TLS/QUIC
 - **Hot reloading**: Apply config changes without restart
