@@ -379,7 +379,12 @@ pub fn create_tcp_client_proxy_selector(
     let rules = rules
         .into_iter()
         .map(|rule_config| {
-            let RuleConfig { masks, action, .. } = rule_config;
+            let RuleConfig {
+                masks,
+                loaded_rule_sets,
+                action,
+                ..
+            } = rule_config;
             let connect_action = match action {
                 RuleActionConfig::Allow {
                     override_address,
@@ -390,7 +395,7 @@ pub fn create_tcp_client_proxy_selector(
                 }
                 RuleActionConfig::Block => ConnectAction::new_block(),
             };
-            ConnectRule::new(masks.into_vec(), connect_action)
+            ConnectRule::new(masks.into_vec(), loaded_rule_sets, connect_action)
         })
         .collect::<Vec<_>>();
     ClientProxySelector::new(rules)

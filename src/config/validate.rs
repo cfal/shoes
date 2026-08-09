@@ -142,6 +142,7 @@ pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Valida
                 // Read and parse now, so a bad file is a startup error that
                 // --dry-run catches rather than a surprise at first connection.
                 let loaded = RuleSet::load(&config.rule_set, Path::new(&config.path))?;
+                log::debug!("Loaded rule-set {} from {}", loaded.name(), config.path);
                 rule_sets.insert(config.rule_set.clone(), loaded);
             }
         }

@@ -10,6 +10,7 @@ use crate::address::{Address, NetLocation, ResolvedLocation};
 use crate::address::{AddressMask, NetLocationMask};
 use crate::client_proxy_chain::ClientChainGroup;
 use crate::resolver::{Resolver, resolve_location};
+use crate::rule_set::{MatchTarget, RuleSet, normalize_domain};
 
 /// Cache key for routing decisions.
 /// We cache based on the destination address and port.
@@ -113,12 +114,22 @@ impl RoutingCache {
 #[derive(Debug)]
 pub struct ConnectRule {
     pub masks: Vec<NetLocationMask>,
+    /// Consulted only when no mask on this rule matched.
+    pub rule_sets: Vec<Arc<RuleSet>>,
     pub action: ConnectAction,
 }
 
 impl ConnectRule {
-    pub fn new(masks: Vec<NetLocationMask>, action: ConnectAction) -> Self {
-        Self { masks, action }
+    pub fn new(
+        masks: Vec<NetLocationMask>,
+        rule_sets: Vec<Arc<RuleSet>>,
+        action: ConnectAction,
+    ) -> Self {
+        Self {
+            masks,
+            rule_sets,
+            action,
+        }
     }
 }
 
@@ -255,8 +266,12 @@ impl ClientProxySelector {
     ) -> Self {
         // Enable caching if:
         // 1. DNS resolution is enabled (expensive operation), OR
-        // 2. Many rules (linear scan becomes expensive)
-        let cache = if resolve_rule_hostnames || rules.len() > CACHE_RULE_THRESHOLD {
+        // 2. Many rules (linear scan becomes expensive), OR
+        // 3. Any rule carries a rule-set, which is unconditionally more
+        //    expensive to evaluate than a handful of masks.
+        let has_rule_sets = rules.iter().any(|rule| !rule.rule_sets.is_empty());
+        let cache = if resolve_rule_hostnames || rules.len() > CACHE_RULE_THRESHOLD || has_rule_sets
+        {
             Some(RoutingCache::new(cache_capacity.max(1)))
         } else {
             None
@@ -460,8 +475,73 @@ async fn match_rule(
                 }
             }
         }
+
+        if !rule.rule_sets.is_empty()
+            && match_rule_sets(
+                &rule.rule_sets,
+                location,
+                &mut resolved_ip,
+                resolver,
+                resolve_rule_hostnames,
+            )
+            .await?
+        {
+            debug!(
+                "Found matching rule-set for {} in rule {rule_index}",
+                location.location()
+            );
+            return Ok(Some(rule_index));
+        }
     }
     Ok(None)
+}
+
+/// Match a rule's rule-sets against the location.
+///
+/// Masks are tried first by the caller because they are cheaper and usually
+/// more specific. Resolution obeys `resolve_rule_hostnames`, the same flag the
+/// mask path uses, so a rule-set behaves like another mask rather than like a
+/// subsystem with its own rules.
+async fn match_rule_sets(
+    rule_sets: &[Arc<RuleSet>],
+    location: &mut ResolvedLocation,
+    resolved_ip: &mut Option<u128>,
+    resolver: &Arc<dyn Resolver>,
+    resolve_rule_hostnames: bool,
+) -> std::io::Result<bool> {
+    // Taken by value so the immutable borrow of `location` ends before the
+    // resolution below needs it mutably. The allocation only happens on a
+    // RoutingCache miss.
+    let domain: Option<String> = match location.location().address() {
+        Address::Hostname(hostname) => Some(normalize_domain(hostname).into_owned()),
+        _ => None,
+    };
+
+    let literal_ip = match location.location().address() {
+        Address::Ipv4(addr) => Some(ipv4_to_u128(*addr)),
+        Address::Ipv6(addr) => Some(ipv6_to_u128(*addr)),
+        Address::Hostname(_) => None,
+    };
+
+    let ip = match literal_ip {
+        Some(ip) => Some(ip),
+        None => match *resolved_ip {
+            Some(ip) => Some(ip),
+            None if resolve_rule_hostnames => {
+                let socket_addr = resolve_location(location, resolver).await?;
+                let ip = ip_to_u128(socket_addr.ip());
+                resolved_ip.replace(ip);
+                Some(ip)
+            }
+            None => None,
+        },
+    };
+
+    let target = MatchTarget {
+        domain: domain.as_deref(),
+        ip,
+    };
+    Ok(rule_sets.iter().any(|rule_set| rule_set.matches(&target)))
 }
 
 enum MatchMaskError {
@@ -630,7 +710,11 @@ mod tests {
             .map(|s| NetLocationMask::from(s).unwrap())
             .collect();
         // For tests, we just use a mock chain group since we're testing rule matching
-        ConnectRule::new(masks, ConnectAction::new_allow(None, mock_chain_group()))
+        ConnectRule::new(
+            masks,
+            vec![],
+            ConnectAction::new_allow(None, mock_chain_group()),
+        )
     }
 
     /// Helper to create an allow rule with multiple proxies (for rule matching tests)
@@ -640,7 +724,11 @@ mod tests {
             .map(|s| NetLocationMask::from(s).unwrap())
             .collect();
         // For tests, we just use a mock chain group since we're testing rule matching
-        ConnectRule::new(masks, ConnectAction::new_allow(None, mock_chain_group()))
+        ConnectRule::new(
+            masks,
+            vec![],
+            ConnectAction::new_allow(None, mock_chain_group()),
+        )
     }
 
     /// Helper to create a block rule
@@ -649,7 +737,7 @@ mod tests {
             .into_iter()
             .map(|s| NetLocationMask::from(s).unwrap())
             .collect();
-        ConnectRule::new(masks, ConnectAction::new_block())
+        ConnectRule::new(masks, vec![], ConnectAction::new_block())
     }
 
     /// Helper to create an allow rule with address override
@@ -665,8 +753,111 @@ mod tests {
         let override_location = NetLocation::from_str(override_addr, Some(0)).unwrap();
         ConnectRule::new(
             masks,
+            vec![],
             ConnectAction::new_allow(Some(override_location), mock_chain_group()),
         )
+    }
+
+    fn telegram_rule_set() -> Arc<crate::rule_set::RuleSet> {
+        let bytes = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/data/rule_sets/geosite-telegram.srs"
+        ))
+        .unwrap();
+        crate::rule_set::RuleSet::from_bytes("telegram", &bytes).unwrap()
+    }
+
+    fn hostname(host: &str) -> ResolvedLocation {
+        ResolvedLocation::new(NetLocation::new(Address::Hostname(host.to_string()), 443))
+    }
+
+    #[tokio::test]
+    async fn a_rule_set_matches_when_the_masks_do_not() {
+        let resolver = mock_resolver();
+        let selector = ClientProxySelector::new(vec![
+            ConnectRule::new(
+                vec![],
+                vec![telegram_rule_set()],
+                ConnectAction::new_block(),
+            ),
+            ConnectRule::new(
+                vec![NetLocationMask::ANY],
+                vec![],
+                ConnectAction::new_allow(None, mock_chain_group()),
+            ),
+        ]);
+
+        assert!(matches!(
+            selector
+                .judge(hostname("api.telegram.org"), &resolver)
+                .await
+                .unwrap(),
+            ConnectDecision::Block
+        ));
+        assert!(matches!(
+            selector
+                .judge(hostname("example.invalid"), &resolver)
+                .await
+                .unwrap(),
+            ConnectDecision::Allow { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn rule_set_matching_is_case_insensitive() {
+        let resolver = mock_resolver();
+        let selector = ClientProxySelector::new(vec![ConnectRule::new(
+            vec![],
+            vec![telegram_rule_set()],
+            ConnectAction::new_block(),
+        )]);
+
+        assert!(matches!(
+            selector
+                .judge(hostname("API.Telegram.ORG."), &resolver)
+                .await
+                .unwrap(),
+            ConnectDecision::Block
+        ));
+    }
+
+    #[tokio::test]
+    async fn masks_are_tried_before_rule_sets_within_a_rule() {
+        // The mask matches everything, so the rule-set must never be consulted;
+        // the rule still fires.
+        let resolver = mock_resolver();
+        let selector = ClientProxySelector::new(vec![ConnectRule::new(
+            vec![NetLocationMask::ANY],
+            vec![telegram_rule_set()],
+            ConnectAction::new_block(),
+        )]);
+
+        assert!(matches!(
+            selector
+                .judge(hostname("nothing.like.telegram"), &resolver)
+                .await
+                .unwrap(),
+            ConnectDecision::Block
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_rule_carrying_a_rule_set_turns_the_routing_cache_on() {
+        // Two rules is far below CACHE_RULE_THRESHOLD, so without the rule-set
+        // clause the cache would stay off.
+        let selector = ClientProxySelector::new(vec![ConnectRule::new(
+            vec![],
+            vec![telegram_rule_set()],
+            ConnectAction::new_block(),
+        )]);
+        assert!(selector.is_cache_enabled());
+
+        let without = ClientProxySelector::new(vec![ConnectRule::new(
+            vec![NetLocationMask::ANY],
+            vec![],
+            ConnectAction::new_block(),
+        )]);
+        assert!(!without.is_cache_enabled());
     }
 
     #[test]

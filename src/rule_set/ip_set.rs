@@ -35,10 +35,13 @@ impl IpSet {
         index > 0 && self.ranges[index - 1].1 >= ip
     }
 
+    /// Test-only: production code only ever asks `contains`.
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.ranges.len()
     }
 
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.ranges.is_empty()
     }

@@ -161,6 +161,7 @@ impl AnyTlsSession {
         // use the full constructor with proper dependencies
         let proxy_provider = Arc::new(ClientProxySelector::new(vec![ConnectRule::new(
             vec![],
+            vec![],
             crate::client_proxy_selector::ConnectAction::Block,
         )]));
 
