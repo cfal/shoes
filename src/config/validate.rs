@@ -1,11 +1,14 @@
 //! Configuration validation - validates configs and creates final ServerConfigs.
 
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
+use std::sync::Arc;
 
 use crate::address::NetLocationMask;
 use crate::dns::ParsedDnsUrl;
 use crate::option_util::{NoneOrSome, OneOrSome};
 use crate::reality::{decode_private_key, decode_short_id};
+use crate::rule_set::RuleSet;
 use crate::thread_util::get_num_threads;
 use crate::uuid_util::parse_uuid;
 
@@ -73,6 +76,7 @@ pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Valida
     let mut tun_configs: Vec<TunConfig> = vec![];
     let mut named_pems: HashMap<String, String> = HashMap::new();
     let mut dns_groups: HashMap<String, DnsConfigGroup> = HashMap::new();
+    let mut rule_sets: HashMap<String, Arc<RuleSet>> = HashMap::new();
 
     for config in all_configs.into_iter() {
         match config {
@@ -128,8 +132,17 @@ pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Valida
                     ));
                 }
             }
-            Config::RuleSet(_) => {
-                // Loading happens in the next commit; see the rule-set plan.
+            Config::RuleSet(config) => {
+                if rule_sets.contains_key(&config.rule_set) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("rule_set already exists: {}", config.rule_set),
+                    ));
+                }
+                // Read and parse now, so a bad file is a startup error that
+                // --dry-run catches rather than a surprise at first connection.
+                let loaded = RuleSet::load(&config.rule_set, Path::new(&config.path))?;
+                rule_sets.insert(config.rule_set.clone(), loaded);
             }
         }
     }
@@ -177,13 +190,19 @@ pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Valida
 
     // Validate server configs (DNS is now just a group reference).
     for config in server_configs.iter_mut() {
-        validate_server_config(config, &client_groups, &rule_groups, &named_pems)?;
+        validate_server_config(
+            config,
+            &client_groups,
+            &rule_groups,
+            &named_pems,
+            &rule_sets,
+        )?;
         validate_dns_group_ref(&config.dns, &group_names)?;
     }
 
     // Validate TUN configs.
     for config in tun_configs.iter_mut() {
-        validate_tun_config(config, &client_groups, &rule_groups)?;
+        validate_tun_config(config, &client_groups, &rule_groups, &rule_sets)?;
         validate_dns_group_ref(&config.dns, &group_names)?;
     }
 
@@ -635,6 +654,7 @@ fn validate_server_config(
     client_groups: &HashMap<String, Vec<ClientConfig>>,
     rule_groups: &HashMap<String, Vec<RuleConfig>>,
     named_pems: &HashMap<String, String>,
+    rule_sets: &HashMap<String, Arc<RuleSet>>,
 ) -> std::io::Result<()> {
     // First handle QUIC settings certificates
     if let Some(ref mut quic_settings) = server_config.quic_settings {
@@ -698,6 +718,7 @@ fn validate_server_config(
             rule_config_selection.unwrap_config_mut(),
             client_groups,
             named_pems,
+            rule_sets,
         )?;
     }
 
@@ -706,6 +727,7 @@ fn validate_server_config(
         client_groups,
         rule_groups,
         named_pems,
+        rule_sets,
         false, // top-level, not inside TLS/Reality
     )?;
 
@@ -1154,6 +1176,7 @@ fn validate_server_proxy_config(
     client_groups: &HashMap<String, Vec<ClientConfig>>,
     rule_groups: &HashMap<String, Vec<RuleConfig>>,
     named_pems: &HashMap<String, String>,
+    rule_sets: &HashMap<String, Arc<RuleSet>>,
     inside_tls_or_reality: bool,
 ) -> std::io::Result<()> {
     match server_proxy_config {
@@ -1208,6 +1231,7 @@ fn validate_server_proxy_config(
                     client_groups,
                     rule_groups,
                     named_pems,
+                    rule_sets,
                     true,
                 )?;
 
@@ -1218,6 +1242,7 @@ fn validate_server_proxy_config(
                         rule_config_selection.unwrap_config_mut(),
                         client_groups,
                         named_pems,
+                        rule_sets,
                     )?;
                 }
             }
@@ -1238,6 +1263,7 @@ fn validate_server_proxy_config(
                     client_groups,
                     rule_groups,
                     named_pems,
+                    rule_sets,
                     true,
                 )?;
 
@@ -1248,6 +1274,7 @@ fn validate_server_proxy_config(
                         rule_config_selection.unwrap_config_mut(),
                         client_groups,
                         named_pems,
+                        rule_sets,
                     )?;
                 }
             }
@@ -1278,6 +1305,7 @@ fn validate_server_proxy_config(
                     client_groups,
                     rule_groups,
                     named_pems,
+                    rule_sets,
                     true,
                 )?;
 
@@ -1288,6 +1316,7 @@ fn validate_server_proxy_config(
                         rule_config_selection.unwrap_config_mut(),
                         client_groups,
                         named_pems,
+                        rule_sets,
                     )?;
                 }
             }
@@ -1318,6 +1347,7 @@ fn validate_server_proxy_config(
                     client_groups,
                     rule_groups,
                     named_pems,
+                    rule_sets,
                     true,
                 )?;
 
@@ -1331,6 +1361,7 @@ fn validate_server_proxy_config(
                         rule_config_selection.unwrap_config_mut(),
                         client_groups,
                         named_pems,
+                        rule_sets,
                     )?;
                 }
             }
@@ -1356,6 +1387,7 @@ fn validate_server_proxy_config(
                     client_groups,
                     rule_groups,
                     named_pems,
+                    rule_sets,
                     false,
                 )?;
 
@@ -1366,6 +1398,7 @@ fn validate_server_proxy_config(
                         rule_config_selection.unwrap_config_mut(),
                         client_groups,
                         named_pems,
+                        rule_sets,
                     )?;
                 }
             }
@@ -1397,6 +1430,7 @@ fn validate_tun_config(
     config: &mut TunConfig,
     client_groups: &HashMap<String, Vec<ClientConfig>>,
     rule_groups: &HashMap<String, Vec<RuleConfig>>,
+    rule_sets: &HashMap<String, Arc<RuleSet>>,
 ) -> std::io::Result<()> {
     // Validate ICMP requires TCP
     if !config.tcp_enabled && config.icmp_enabled {
@@ -1458,7 +1492,7 @@ fn validate_tun_config(
     // Validate rules
     for rule in config.rules.iter_mut() {
         let rule = rule.unwrap_config_mut();
-        validate_rule_config(rule, client_groups, &HashMap::new())?;
+        validate_rule_config(rule, client_groups, &HashMap::new(), rule_sets)?;
     }
 
     Ok(())
@@ -1468,7 +1502,23 @@ fn validate_rule_config(
     rule_config: &mut RuleConfig,
     client_groups: &HashMap<String, Vec<ClientConfig>>,
     named_pems: &HashMap<String, String>,
+    rule_sets: &HashMap<String, Arc<RuleSet>>,
 ) -> std::io::Result<()> {
+    let names = rule_config.rule_sets.clone().into_vec();
+    rule_config.loaded_rule_sets = Vec::with_capacity(names.len());
+    for name in names {
+        let loaded = rule_sets.get(&name).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "rule references an unknown rule_set: {name}. \
+                     Declare it with a top-level `- rule_set: {name}` entry."
+                ),
+            )
+        })?;
+        rule_config.loaded_rule_sets.push(loaded.clone());
+    }
+
     if let RuleActionConfig::Allow {
         ref mut client_chains,
         ..
@@ -2969,5 +3019,99 @@ mod tests {
             "error should mention group name: {}",
             err
         );
+    }
+}
+
+#[cfg(test)]
+mod rule_set_validation_tests {
+    use super::*;
+
+    fn parse(yaml: &str) -> Vec<Config> {
+        serde_yaml::from_str(yaml).expect("yaml should parse")
+    }
+
+    /// ValidatedConfigs is not Debug, and deriving it just for tests would put
+    /// a config dump one `{:?}` away in production code.
+    fn expect_error(configs: Vec<Config>) -> String {
+        match create_server_configs(configs) {
+            Ok(_) => panic!("expected validation to fail"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    #[test]
+    fn an_unknown_rule_set_name_is_rejected() {
+        let configs = parse(
+            "
+- address: 0.0.0.0:1080
+  protocol:
+    type: socks
+  rules:
+    - masks: \"0.0.0.0/0\"
+      rule_sets: [does-not-exist]
+      action: allow
+",
+        );
+        let err = expect_error(configs);
+        assert!(err.contains("does-not-exist"), "{err}");
+    }
+
+    #[test]
+    fn a_duplicate_rule_set_name_is_rejected() {
+        let configs = parse(
+            "
+- rule_set: dup
+  path: tests/data/rule_sets/geosite-telegram.srs
+- rule_set: dup
+  path: tests/data/rule_sets/geosite-cloudflare.srs
+",
+        );
+        let err = expect_error(configs);
+        assert!(err.contains("dup"), "{err}");
+    }
+
+    #[test]
+    fn a_missing_rule_set_file_is_a_startup_error() {
+        let configs = parse(
+            "
+- rule_set: missing
+  path: tests/data/rule_sets/does-not-exist.srs
+",
+        );
+        let err = expect_error(configs);
+        assert!(err.contains("missing"), "{err}");
+    }
+
+    #[test]
+    fn a_declared_rule_set_is_loaded_and_attached_to_the_rule() {
+        let configs = parse(
+            "
+- rule_set: telegram
+  path: tests/data/rule_sets/geosite-telegram.srs
+- address: 0.0.0.0:1080
+  protocol:
+    type: socks
+  rules:
+    - rule_sets: [telegram]
+      action: allow
+",
+        );
+        let validated = create_server_configs(configs).unwrap();
+
+        // ValidatedConfigs carries `configs: Vec<Config>`, so pick the server
+        // entry out of it rather than expecting a separate collection.
+        let server = validated
+            .configs
+            .iter()
+            .find_map(|config| match config {
+                Config::Server(server) => Some(server),
+                _ => None,
+            })
+            .expect("expected a server config");
+
+        let rules = server.rules.clone().into_vec();
+        let rule = rules[0].clone().unwrap_config();
+        assert_eq!(rule.loaded_rule_sets.len(), 1);
+        assert_eq!(rule.loaded_rule_sets[0].name(), "telegram");
     }
 }
