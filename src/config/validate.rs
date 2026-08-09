@@ -124,6 +124,9 @@ pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Valida
                     ));
                 }
             }
+            Config::RuleSet(_) => {
+                // Loading happens in the next commit; see the rule-set plan.
+            }
         }
     }
 

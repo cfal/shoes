@@ -18,6 +18,7 @@ pub mod common;
 pub mod dns;
 pub mod groups;
 pub mod redacted;
+pub mod rule_set;
 pub mod rules;
 pub mod selection;
 pub mod server;
@@ -35,6 +36,10 @@ pub use common::DEFAULT_REALITY_SHORT_ID;
 pub use dns::{DnsConfig, DnsConfigGroup, DnsServerSpec, ExpandedDnsGroup, ExpandedDnsSpec};
 pub use groups::{ClientConfigGroup, Config, NamedPem, PemSource};
 pub use redacted::Redacted;
+// Part of the public config surface; the binary itself matches on
+// Config::RuleSet rather than naming the type.
+#[allow(unused_imports)]
+pub use rule_set::RuleSetConfig;
 pub use rules::{ClientChain, ClientChainHop, RuleActionConfig, RuleConfig};
 pub use selection::ConfigSelection;
 pub use server::{

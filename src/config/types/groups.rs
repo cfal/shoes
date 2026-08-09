@@ -8,6 +8,7 @@ use crate::option_util::OneOrSome;
 
 use super::client::ClientConfig;
 use super::dns::DnsConfigGroup;
+use super::rule_set::RuleSetConfig;
 use super::rules::RuleConfig;
 use super::selection::ConfigSelection;
 use super::server::ServerConfig;
@@ -174,6 +175,7 @@ pub enum Config {
     RuleConfigGroup(RuleConfigGroup),
     DnsConfigGroup(DnsConfigGroup),
     NamedPem(NamedPem),
+    RuleSet(RuleSetConfig),
 }
 
 impl<'de> serde::de::Deserialize<'de> for Config {
@@ -196,6 +198,7 @@ impl<'de> serde::de::Deserialize<'de> for Config {
         let has_client_group = map.contains_key(Value::String("client_group".to_string()));
         let has_rule_group = map.contains_key(Value::String("rule_group".to_string()));
         let has_dns_group = map.contains_key(Value::String("dns_group".to_string()));
+        let has_rule_set = map.contains_key(Value::String("rule_set".to_string()));
         let has_address = map.contains_key(Value::String("address".to_string()));
         let has_addresses = map.contains_key(Value::String("addresses".to_string()));
         let has_path_field = map.contains_key(Value::String("path".to_string()));
@@ -229,6 +232,12 @@ impl<'de> serde::de::Deserialize<'de> for Config {
             serde_yaml::from_value(value)
                 .map(Config::DnsConfigGroup)
                 .map_err(|e| Error::custom(format!("invalid DNS config group: {e}")))
+        } else if has_rule_set {
+            // Must precede the address/path branch: a rule-set entry also
+            // carries `path`, which alone means a Unix-socket ServerConfig.
+            serde_yaml::from_value(value)
+                .map(Config::RuleSet)
+                .map_err(|e| Error::custom(format!("invalid rule-set config: {e}")))
         } else if is_tun_config {
             // TunConfig - identified by having 'name' or 'raw_fd' without 'protocol' wrapper
             serde_yaml::from_value(value)
@@ -251,7 +260,8 @@ impl<'de> serde::de::Deserialize<'de> for Config {
                 - Server config: must have 'address', 'addresses', or 'path' field\n\
                 - Client config group: must have 'client_group' field\n\
                 - Rule config group: must have 'rule_group' field\n\
-                - DNS config group: must have 'dns_group' field"
+                - DNS config group: must have 'dns_group' field\n\
+                - Rule-set: must have 'rule_set' field"
             )))
         }
     }
@@ -269,6 +279,60 @@ impl serde::ser::Serialize for Config {
             Config::RuleConfigGroup(group) => group.serialize(serializer),
             Config::DnsConfigGroup(group) => group.serialize(serializer),
             Config::NamedPem(pem) => pem.serialize(serializer),
+            Config::RuleSet(rule_set) => rule_set.serialize(serializer),
+        }
+    }
+}
+
+#[cfg(test)]
+mod rule_set_discriminator_tests {
+    use super::*;
+
+    #[test]
+    fn a_rule_set_entry_is_not_mistaken_for_a_unix_socket_server() {
+        // `path` alone means a Unix-socket ServerConfig, so the rule_set check
+        // has to come first or this parses as a server and fails oddly.
+        let yaml = "
+- rule_set: geosite-ru
+  path: /etc/shoes/geosite-ru.srs
+";
+        let configs: Vec<Config> = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(configs.len(), 1);
+        match &configs[0] {
+            Config::RuleSet(rule_set) => {
+                assert_eq!(rule_set.rule_set, "geosite-ru");
+                assert_eq!(rule_set.path, "/etc/shoes/geosite-ru.srs");
+            }
+            other => panic!("expected a rule-set config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_unix_socket_server_still_parses_as_a_server() {
+        let yaml = "
+- path: /run/shoes.sock
+  protocol:
+    type: socks
+";
+        let configs: Vec<Config> = serde_yaml::from_str(yaml).unwrap();
+        assert!(matches!(configs[0], Config::Server(_)));
+    }
+
+    #[test]
+    fn a_rule_set_entry_round_trips_through_serialization() {
+        let yaml = "
+- rule_set: geoip-ru
+  path: lists/geoip-ru.srs
+";
+        let configs: Vec<Config> = serde_yaml::from_str(yaml).unwrap();
+        let dumped = serde_yaml::to_string(&configs).unwrap();
+        let reparsed: Vec<Config> = serde_yaml::from_str(&dumped).unwrap();
+        match &reparsed[0] {
+            Config::RuleSet(rule_set) => {
+                assert_eq!(rule_set.rule_set, "geoip-ru");
+                assert_eq!(rule_set.path, "lists/geoip-ru.srs");
+            }
+            other => panic!("expected a rule-set config, got {other:?}"),
         }
     }
 }
