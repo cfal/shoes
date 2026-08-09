@@ -1,5 +1,6 @@
 use std::fmt::Debug;
 use std::future::Future;
+use std::hash::Hash;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::pin::Pin;
@@ -7,11 +8,10 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use futures::future::{FutureExt, Shared};
+use futures::future::FutureExt;
 use log::debug;
 use lru::LruCache;
 use parking_lot::Mutex;
-use rustc_hash::FxHashMap;
 use tokio::sync::{Mutex as AsyncMutex, RwLock};
 
 use crate::address::{NetLocation, ResolvedLocation};
@@ -20,7 +20,13 @@ type ResolveFuture = Pin<Box<dyn Future<Output = std::io::Result<Vec<SocketAddr>
 
 const CACHING_NATIVE_RESOLVER_CACHE_CAPACITY: usize = 10_000;
 const RESOLVER_CACHE_CAPACITY: usize = 1_024;
-const RESOLVER_PENDING_CAPACITY: usize = 256;
+
+/// Constructs a bounded LRU without eagerly reserving storage for every entry.
+fn bounded_lru<K: Hash + Eq, V>(capacity: usize) -> LruCache<K, V> {
+    let mut cache = LruCache::unbounded();
+    cache.resize(NonZeroUsize::new(capacity).unwrap());
+    cache
+}
 
 pub trait Resolver: Send + Sync + Debug {
     fn resolve_location(&self, location: &NetLocation) -> ResolveFuture;
@@ -360,8 +366,8 @@ impl CachingNativeResolver {
 
     pub fn with_timeout(result_timeout_secs: u64) -> Self {
         Self {
-            cache: Arc::new(parking_lot::Mutex::new(LruCache::new(
-                NonZeroUsize::new(CACHING_NATIVE_RESOLVER_CACHE_CAPACITY).unwrap(),
+            cache: Arc::new(parking_lot::Mutex::new(bounded_lru(
+                CACHING_NATIVE_RESOLVER_CACHE_CAPACITY,
             ))),
             result_timeout_secs,
         }
@@ -421,20 +427,14 @@ impl Resolver for CachingNativeResolver {
     }
 }
 
-/// Shared future type for concurrent resolution deduplication.
-/// Uses Arc<std::io::Error> because Shared requires Clone on the output type.
-type SharedResolveFuture =
-    Shared<Pin<Box<dyn Future<Output = Result<Vec<SocketAddr>, Arc<std::io::Error>>> + Send>>>;
-
 /// Poll-based resolver cache for use in Future/Stream implementations.
 /// Wraps any Resolver and provides poll_resolve_location for manual polling.
-/// Uses Shared futures to correctly handle concurrent requests for the same target.
 pub struct ResolverCache {
     resolver: Arc<dyn Resolver>,
     /// Completed resolution results with timestamps
     cache: LruCache<NetLocation, (Instant, SocketAddr)>,
-    /// In-flight resolutions using Shared futures for proper waker handling
-    pending: FxHashMap<NetLocation, SharedResolveFuture>,
+    /// The latest poll-based lookup. A changed target cancels the abandoned lookup.
+    pending: Option<(NetLocation, ResolveFuture)>,
     result_timeout_secs: u64,
 }
 
@@ -448,14 +448,16 @@ impl ResolverCache {
     pub fn new_with_timeout(resolver: Arc<dyn Resolver>, result_timeout_secs: u64) -> Self {
         Self {
             resolver,
-            cache: LruCache::new(NonZeroUsize::new(RESOLVER_CACHE_CAPACITY).unwrap()),
-            pending: FxHashMap::default(),
+            cache: bounded_lru(RESOLVER_CACHE_CAPACITY),
+            pending: None,
             result_timeout_secs,
         }
     }
 
     /// Async resolve method for convenience.
     pub async fn resolve_location(&mut self, target: &NetLocation) -> std::io::Result<SocketAddr> {
+        self.pending = None;
+
         // Fast path: IP address
         if let Some(socket_addr) = target.to_socket_addr_nonblocking() {
             return Ok(socket_addr);
@@ -482,12 +484,19 @@ impl ResolverCache {
     }
 
     /// Poll-based resolve for use in Future/Stream poll methods.
-    /// Uses Shared futures to correctly wake all tasks waiting on the same target.
     pub fn poll_resolve_location(
         &mut self,
         cx: &mut Context<'_>,
         target: &NetLocation,
     ) -> Poll<std::io::Result<SocketAddr>> {
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|(pending_target, _)| pending_target != target)
+        {
+            self.pending = None;
+        }
+
         // Fast path: IP address
         if let Some(socket_addr) = target.to_socket_addr_nonblocking() {
             return Poll::Ready(Ok(socket_addr));
@@ -501,28 +510,15 @@ impl ResolverCache {
             self.cache.pop(target);
         }
 
-        // Get or create shared future for this target
-        let mut shared_fut = if let Some(shared_fut) = self.pending.get(target).cloned() {
-            shared_fut
-        } else {
-            if self.pending.len() >= RESOLVER_PENDING_CAPACITY {
-                return Poll::Ready(Err(std::io::Error::other("too many pending DNS lookups")));
-            }
+        if self.pending.is_none() {
+            self.pending = Some((target.clone(), self.resolver.resolve_location(target)));
+        }
 
-            let shared_fut = {
-                let fut = self.resolver.resolve_location(target);
-                // Wrap error in Arc for Clone requirement, then make shared
-                fut.map(|r| r.map_err(Arc::new)).boxed().shared()
-            };
-            self.pending.insert(target.clone(), shared_fut.clone());
-            shared_fut
-        };
-
-        // Poll the shared future
-        match shared_fut.poll_unpin(cx) {
+        let result = self.pending.as_mut().unwrap().1.as_mut().poll(cx);
+        match result {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Ok(addrs)) => {
-                self.pending.remove(target);
+                self.pending = None;
                 if addrs.is_empty() {
                     return Poll::Ready(Err(std::io::Error::other(format!(
                         "DNS lookup returned no addresses for {target}"
@@ -533,9 +529,8 @@ impl ResolverCache {
                 Poll::Ready(Ok(addr))
             }
             Poll::Ready(Err(e)) => {
-                self.pending.remove(target);
-                // Convert Arc<Error> back to Error
-                Poll::Ready(Err(std::io::Error::new(e.kind(), e.to_string())))
+                self.pending = None;
+                Poll::Ready(Err(e))
             }
         }
     }
@@ -631,12 +626,37 @@ mod tests {
         }
     }
 
-    #[derive(Debug)]
-    struct PendingResolver;
+    #[derive(Debug, Default)]
+    struct PendingResolver {
+        active: Arc<AtomicUsize>,
+        calls: AtomicUsize,
+    }
+
+    struct PendingFuture {
+        active: Arc<AtomicUsize>,
+    }
+
+    impl Future for PendingFuture {
+        type Output = std::io::Result<Vec<SocketAddr>>;
+
+        fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+            Poll::Pending
+        }
+    }
+
+    impl Drop for PendingFuture {
+        fn drop(&mut self) {
+            self.active.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
 
     impl Resolver for PendingResolver {
         fn resolve_location(&self, _location: &NetLocation) -> ResolveFuture {
-            Box::pin(std::future::pending())
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.active.fetch_add(1, Ordering::Relaxed);
+            Box::pin(PendingFuture {
+                active: self.active.clone(),
+            })
         }
     }
 
@@ -688,22 +708,38 @@ mod tests {
     }
 
     #[test]
-    fn test_resolver_cache_rejects_excess_pending_results() {
-        let resolver: Arc<dyn Resolver> = Arc::new(PendingResolver);
-        let mut cache = ResolverCache::new(resolver);
+    fn test_resolver_cache_cancels_abandoned_pending_result() {
+        let resolver = Arc::new(PendingResolver::default());
+        let mut cache = ResolverCache::new(resolver.clone());
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let first = unique_location(0);
+        let second = unique_location(1);
 
-        for index in 0..RESOLVER_PENDING_CAPACITY {
-            assert!(matches!(
-                cache.poll_resolve_location(&mut cx, &unique_location(index)),
-                Poll::Pending
-            ));
-        }
+        assert!(matches!(
+            cache.poll_resolve_location(&mut cx, &first),
+            Poll::Pending
+        ));
+        assert_eq!(resolver.active.load(Ordering::Relaxed), 1);
 
-        let result =
-            cache.poll_resolve_location(&mut cx, &unique_location(RESOLVER_PENDING_CAPACITY));
-        assert!(matches!(result, Poll::Ready(Err(_))));
-        assert_eq!(cache.pending.len(), RESOLVER_PENDING_CAPACITY);
+        assert!(matches!(
+            cache.poll_resolve_location(&mut cx, &second),
+            Poll::Pending
+        ));
+        assert_eq!(resolver.active.load(Ordering::Relaxed), 1);
+        assert_eq!(resolver.calls.load(Ordering::Relaxed), 2);
+
+        assert!(matches!(
+            cache.poll_resolve_location(&mut cx, &second),
+            Poll::Pending
+        ));
+        assert_eq!(resolver.calls.load(Ordering::Relaxed), 2);
+
+        let literal = NetLocation::new(Address::Ipv4(std::net::Ipv4Addr::LOCALHOST), 443);
+        assert!(matches!(
+            cache.poll_resolve_location(&mut cx, &literal),
+            Poll::Ready(Ok(_))
+        ));
+        assert_eq!(resolver.active.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
