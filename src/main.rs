@@ -102,6 +102,20 @@ fn start_notify_thread(
     (watcher, rx)
 }
 
+/// Add the rule-set files referenced by these configs to the watch set.
+///
+/// A failure is reported rather than fatal: the file was readable moments ago
+/// during validation, and losing the watch is not a reason to refuse to serve.
+fn watch_rule_set_paths(watcher: &mut RecommendedWatcher, configs: &[config::Config]) {
+    for config in configs {
+        if let config::Config::RuleSet(rule_set) = config
+            && let Err(e) = watcher.watch(Path::new(&rule_set.path), RecursiveMode::NonRecursive)
+        {
+            println!("Could not watch rule-set {}: {e}", rule_set.path);
+        }
+    }
+}
+
 fn print_usage_and_exit(arg0: String) {
     eprintln!("{arg0} [OPTIONS] <config.yaml> [config.yaml...]");
     eprintln!();
@@ -351,6 +365,14 @@ fn main() {
                 debug!("{config:#?}");
             }
             debug!("================================================================================");
+
+            // Rule-set files are only known once the configs are parsed, and
+            // which ones exist can change across a reload, so the watch set is
+            // refreshed here rather than built once at startup. A rule-set edit
+            // then takes the same reload path a config edit does.
+            if let Some((watcher, _)) = reload_state.as_mut() {
+                watch_rule_set_paths(watcher, &configs);
+            }
 
             if dry_run {
                 if let Err(e) = config::create_server_configs(configs) {
