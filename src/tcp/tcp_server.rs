@@ -1,4 +1,5 @@
-use std::net::SocketAddr;
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -429,42 +430,46 @@ async fn start_tcp_servers(
         resolver.clone(),
     ));
 
-    // Extract bind_ip from bind_location for handlers that need it (e.g., SOCKS5 UDP ASSOCIATE)
-    let bind_ip = match &bind_location {
-        BindLocation::Address(a) => {
-            // Use to_socket_addrs() and extract IP from first result
-            a.to_socket_addrs()
-                .ok()
-                .and_then(|addrs| addrs.first().map(|addr| addr.ip()))
-        }
-        BindLocation::Path(_) => None, // Unix socket, no IP needed
-    };
-
-    let tcp_handler: Arc<dyn TcpServerHandler> =
-        create_tcp_server_handler(protocol, &client_proxy_selector, &resolver, bind_ip).into();
-    debug!("TCP handler: {tcp_handler:?}");
-
     let mut handles = vec![];
 
     match bind_location {
-        BindLocation::Address(a) => {
-            let socket_addrs = a.to_socket_addrs()?;
-            for socket_addr in socket_addrs {
-                let tcp_config = tcp_config.clone();
-                let tcp_handler = tcp_handler.clone();
-                let resolver = resolver.clone();
-                let handle = tokio::spawn(async move {
-                    run_tcp_server(socket_addr, tcp_config, resolver, tcp_handler)
-                        .await
-                        .unwrap();
-                });
-                handles.push(handle);
+        BindLocation::Address(addresses) => {
+            // Shares protocol state across ports without reusing an interface-specific UDP bind IP.
+            let mut handlers: HashMap<IpAddr, Arc<dyn TcpServerHandler>> = HashMap::new();
+            for address in addresses.into_vec() {
+                for socket_addr in address.to_socket_addrs()? {
+                    let tcp_handler = handlers
+                        .entry(socket_addr.ip())
+                        .or_insert_with(|| {
+                            create_tcp_server_handler(
+                                protocol.clone(),
+                                &client_proxy_selector,
+                                &resolver,
+                                Some(socket_addr.ip()),
+                            )
+                            .into()
+                        })
+                        .clone();
+                    debug!("TCP handler for {}: {tcp_handler:?}", socket_addr.ip());
+
+                    let tcp_config = tcp_config.clone();
+                    let resolver = resolver.clone();
+                    let handle = tokio::spawn(async move {
+                        run_tcp_server(socket_addr, tcp_config, resolver, tcp_handler)
+                            .await
+                            .unwrap();
+                    });
+                    handles.push(handle);
+                }
             }
         }
         BindLocation::Path(path_buf) => {
             #[cfg(target_family = "unix")]
             {
-                let tcp_handler = tcp_handler.clone();
+                let tcp_handler: Arc<dyn TcpServerHandler> =
+                    create_tcp_server_handler(protocol, &client_proxy_selector, &resolver, None)
+                        .into();
+                debug!("TCP handler: {tcp_handler:?}");
                 let handle = tokio::spawn(async move {
                     run_unix_server(path_buf, resolver, tcp_handler)
                         .await

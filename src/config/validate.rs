@@ -2466,13 +2466,13 @@ mod tests {
                 dns_servers: NoneOrSome::One(DnsServerSpec::Simple("udp://8.8.8.8".to_string())),
             }),
             Config::Server(ServerConfig {
-                bind_location: BindLocation::Address(
+                bind_location: BindLocation::Address(OneOrSome::One(
                     NetLocationPortRange::new(
                         crate::address::Address::Ipv4(std::net::Ipv4Addr::LOCALHOST),
                         vec![1234],
                     )
                     .unwrap(),
-                ),
+                )),
                 protocol: ServerProxyConfig::Http {
                     username: None,
                     password: None,
@@ -2514,13 +2514,13 @@ mod tests {
                 dns_servers: NoneOrSome::One(DnsServerSpec::Simple("udp://8.8.8.8".to_string())),
             }),
             Config::Server(ServerConfig {
-                bind_location: BindLocation::Address(
+                bind_location: BindLocation::Address(OneOrSome::One(
                     NetLocationPortRange::new(
                         crate::address::Address::Ipv4(std::net::Ipv4Addr::LOCALHOST),
                         vec![1234],
                     )
                     .unwrap(),
-                ),
+                )),
                 protocol: ServerProxyConfig::Http {
                     username: None,
                     password: None,
@@ -2574,13 +2574,13 @@ mod tests {
                 dns_servers: NoneOrSome::One(DnsServerSpec::Simple("tcp://1.1.1.1".to_string())),
             }),
             Config::Server(ServerConfig {
-                bind_location: BindLocation::Address(
+                bind_location: BindLocation::Address(OneOrSome::One(
                     NetLocationPortRange::new(
                         crate::address::Address::Ipv4(std::net::Ipv4Addr::LOCALHOST),
                         vec![1234],
                     )
                     .unwrap(),
-                ),
+                )),
                 protocol: ServerProxyConfig::Http {
                     username: None,
                     password: None,
@@ -2625,13 +2625,13 @@ mod tests {
 
         // Server config references non-existent dns_group
         let configs = vec![Config::Server(ServerConfig {
-            bind_location: BindLocation::Address(
+            bind_location: BindLocation::Address(OneOrSome::One(
                 NetLocationPortRange::new(
                     crate::address::Address::Ipv4(std::net::Ipv4Addr::LOCALHOST),
                     vec![1234],
                 )
                 .unwrap(),
-            ),
+            )),
             protocol: ServerProxyConfig::Http {
                 username: None,
                 password: None,

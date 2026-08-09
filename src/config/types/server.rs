@@ -193,9 +193,9 @@ impl<'de> serde::de::Deserialize<'de> for ServerConfig {
             .as_mapping()
             .ok_or_else(|| Error::custom("ServerConfig must be a YAML mapping"))?;
 
-        // Valid fields: address/path (bind_location), protocol, transport, tcp_settings, quic_settings, rules/rule, dns
         const VALID_FIELDS: &[&str] = &[
             "address",
+            "addresses",
             "path", // BindLocation (flattened)
             "protocol",
             "transport",
@@ -220,7 +220,7 @@ impl<'de> serde::de::Deserialize<'de> for ServerConfig {
         }
 
         // Parse bind_location (flattened - either address or path)
-        let bind_location = if let Some(v) = map.get("address") {
+        let bind_location = if let Some(v) = map.get("address").or_else(|| map.get("addresses")) {
             serde_yaml::from_value(v.clone())
                 .map(BindLocation::Address)
                 .map_err(|e| Error::custom(format!("invalid address: {e}")))?
@@ -230,7 +230,7 @@ impl<'de> serde::de::Deserialize<'de> for ServerConfig {
                 .map_err(|e| Error::custom(format!("invalid path: {e}")))?
         } else {
             return Err(Error::custom(
-                "server config must have either 'address' or 'path' field",
+                "server config must have 'address', 'addresses', or 'path' field",
             ));
         };
 
@@ -839,9 +839,8 @@ mod tests {
 
     fn create_test_server_config_http() -> ServerConfig {
         ServerConfig {
-            bind_location: BindLocation::Address(
-                NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080).into(),
-            ),
+            bind_location: NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080)
+                .into(),
             protocol: ServerProxyConfig::Http {
                 username: Some("user".to_string()),
                 password: Some("pass".to_string()),
@@ -856,9 +855,8 @@ mod tests {
 
     fn create_test_server_config_socks() -> ServerConfig {
         ServerConfig {
-            bind_location: BindLocation::Address(
-                NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 1080).into(),
-            ),
+            bind_location: NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 1080)
+                .into(),
             protocol: ServerProxyConfig::Socks {
                 username: None,
                 password: None,
@@ -892,10 +890,11 @@ mod tests {
 
     fn create_test_server_config_vless() -> ServerConfig {
         ServerConfig {
-            bind_location: BindLocation::Address(
-                NetLocation::from_ip_addr(IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)), 443)
-                    .into(),
-            ),
+            bind_location: NetLocation::from_ip_addr(
+                IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)),
+                443,
+            )
+            .into(),
             protocol: ServerProxyConfig::Vless {
                 user_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
                 udp_enabled: true,
@@ -918,9 +917,11 @@ mod tests {
 
     fn create_test_server_config_trojan() -> ServerConfig {
         ServerConfig {
-            bind_location: BindLocation::Address(
-                NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 443).into(),
-            ),
+            bind_location: NetLocation::from_ip_addr(
+                IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
+                443,
+            )
+            .into(),
             protocol: ServerProxyConfig::Trojan {
                 password: "trojan_password".to_string(),
                 shadowsocks: Some(ShadowsocksConfig::Legacy {
@@ -956,9 +957,8 @@ mod tests {
         );
 
         ServerConfig {
-            bind_location: BindLocation::Address(
-                NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 8443).into(),
-            ),
+            bind_location: NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 8443)
+                .into(),
             protocol: ServerProxyConfig::Tls {
                 tls_targets,
                 default_tls_target: Some(Box::new(TlsServerConfig {
@@ -988,9 +988,11 @@ mod tests {
 
     fn create_test_server_config_vmess() -> ServerConfig {
         ServerConfig {
-            bind_location: BindLocation::Address(
-                NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1)), 10086).into(),
-            ),
+            bind_location: NetLocation::from_ip_addr(
+                IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1)),
+                10086,
+            )
+            .into(),
             protocol: ServerProxyConfig::Vmess {
                 cipher: "aes-128-gcm".to_string(),
                 user_id: "b831381d-6324-4d53-ad4f-8cda48b30811".to_string(),
@@ -1006,9 +1008,8 @@ mod tests {
 
     fn create_test_server_config_websocket() -> ServerConfig {
         ServerConfig {
-            bind_location: BindLocation::Address(
-                NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080).into(),
-            ),
+            bind_location: NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080)
+                .into(),
             protocol: ServerProxyConfig::Websocket {
                 targets: Box::new(OneOrSome::One(WebsocketServerConfig {
                     matching_path: Some("/ws".to_string()),
@@ -1031,9 +1032,8 @@ mod tests {
 
     fn create_test_server_config_port_forward() -> ServerConfig {
         ServerConfig {
-            bind_location: BindLocation::Address(
-                NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 9090).into(),
-            ),
+            bind_location: NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 9090)
+                .into(),
             protocol: ServerProxyConfig::PortForward {
                 targets: OneOrSome::Some(vec![
                     NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 80),
@@ -1050,9 +1050,8 @@ mod tests {
 
     fn create_test_server_config_hysteria2() -> ServerConfig {
         ServerConfig {
-            bind_location: BindLocation::Address(
-                NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 443).into(),
-            ),
+            bind_location: NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 443)
+                .into(),
             protocol: ServerProxyConfig::Hysteria2 {
                 password: "hysteria_pass".to_string(),
                 udp_enabled: true,
@@ -1074,9 +1073,8 @@ mod tests {
 
     fn create_test_server_config_tuic() -> ServerConfig {
         ServerConfig {
-            bind_location: BindLocation::Address(
-                NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8443).into(),
-            ),
+            bind_location: NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8443)
+                .into(),
             protocol: ServerProxyConfig::TuicV5 {
                 uuid: "550e8400-e29b-41d4-a716-446655440000".to_string(),
                 password: "tuic_password".to_string(),
@@ -1291,6 +1289,88 @@ rules:
             "Should accept valid server config: {:?}",
             result.err()
         );
+    }
+
+    #[test]
+    fn test_scalar_bind_address_remains_scalar() {
+        let yaml = r#"
+address: "127.0.0.1:8080"
+protocol:
+  type: http
+"#;
+
+        let config: ServerConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(matches!(
+            &config.bind_location,
+            BindLocation::Address(OneOrSome::One(_))
+        ));
+
+        let value = serde_yaml::to_value(&config).unwrap();
+        let address = value
+            .as_mapping()
+            .unwrap()
+            .get(&serde_yaml::Value::String("address".to_string()))
+            .unwrap();
+        assert_eq!(address.as_str(), Some("127.0.0.1:8080"));
+    }
+
+    #[test]
+    fn test_accepts_multiple_bind_addresses() {
+        let yaml = r#"
+address:
+  - "127.0.0.1:22223"
+  - "172.17.0.1:22223-22225"
+protocol:
+  type: http
+"#;
+
+        let config: ServerConfig = serde_yaml::from_str(yaml).unwrap();
+        let BindLocation::Address(addresses) = &config.bind_location else {
+            panic!("expected address bind location");
+        };
+        let socket_addrs: Vec<String> = addresses
+            .iter()
+            .flat_map(|address| address.to_socket_addrs().unwrap())
+            .map(|address| address.to_string())
+            .collect();
+        assert_eq!(
+            socket_addrs,
+            vec![
+                "127.0.0.1:22223",
+                "172.17.0.1:22223",
+                "172.17.0.1:22224",
+                "172.17.0.1:22225",
+            ]
+        );
+
+        let serialized = serde_yaml::to_string(&config).unwrap();
+        let round_tripped: ServerConfig = serde_yaml::from_str(&serialized).unwrap();
+        assert_eq!(round_tripped.bind_location, config.bind_location);
+    }
+
+    #[test]
+    fn test_address_precedes_addresses_alias() {
+        let yaml = r#"
+address: "127.0.0.1:8080"
+addresses:
+  - "172.17.0.1:8080"
+protocol:
+  type: http
+"#;
+
+        let config: ServerConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.bind_location.to_string(), "127.0.0.1:8080");
+    }
+
+    #[test]
+    fn test_rejects_empty_bind_address_list() {
+        let yaml = r#"
+address: []
+protocol:
+  type: http
+"#;
+
+        assert!(serde_yaml::from_str::<ServerConfig>(yaml).is_err());
     }
 
     #[test]

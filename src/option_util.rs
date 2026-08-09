@@ -142,7 +142,7 @@ impl<T> NoneOrSome<T> {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(untagged)]
 pub enum OneOrSome<T> {
     One(T),

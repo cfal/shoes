@@ -1,4 +1,5 @@
-use std::net::SocketAddr;
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -285,7 +286,13 @@ pub async fn start_quic_servers(
 
     let bind_addresses = match bind_location {
         // TODO: switch to non-blocking resolve?
-        BindLocation::Address(a) => a.to_socket_addrs()?,
+        BindLocation::Address(addresses) => {
+            let mut bind_addresses = Vec::new();
+            for address in addresses.into_vec() {
+                bind_addresses.extend(address.to_socket_addrs()?);
+            }
+            bind_addresses
+        }
         BindLocation::Path(_) => {
             return Err(std::io::Error::other(
                 "Cannot listen on path, QUIC does not have unix domain socket support",
@@ -383,16 +390,24 @@ pub async fn start_quic_servers(
             }
         }
         tcp_protocol => {
-            let bind_ip = bind_addresses.first().map(|addr| addr.ip());
-
-            let tcp_handler: Arc<dyn TcpServerHandler> =
-                create_tcp_server_handler(tcp_protocol, &client_proxy_selector, &resolver, bind_ip)
-                    .into();
+            // Shares protocol state across ports without reusing an interface-specific UDP bind IP.
+            let mut handlers: HashMap<IpAddr, Arc<dyn TcpServerHandler>> = HashMap::new();
 
             for bind_address in bind_addresses.into_iter() {
+                let tcp_handler: Arc<dyn TcpServerHandler> = handlers
+                    .entry(bind_address.ip())
+                    .or_insert_with(|| {
+                        create_tcp_server_handler(
+                            tcp_protocol.clone(),
+                            &client_proxy_selector,
+                            &resolver,
+                            Some(bind_address.ip()),
+                        )
+                        .into()
+                    })
+                    .clone();
                 let quic_server_config = quic_server_config.clone();
                 let resolver = resolver.clone();
-                let tcp_handler = tcp_handler.clone();
                 let quic_handles = start_quic_server(
                     bind_address,
                     quic_server_config,

@@ -180,6 +180,7 @@ impl<'de> serde::de::Deserialize<'de> for Config {
         let has_rule_group = map.contains_key(Value::String("rule_group".to_string()));
         let has_dns_group = map.contains_key(Value::String("dns_group".to_string()));
         let has_address = map.contains_key(Value::String("address".to_string()));
+        let has_addresses = map.contains_key(Value::String("addresses".to_string()));
         let has_path_field = map.contains_key(Value::String("path".to_string()));
         let has_pem = map.contains_key(Value::String("pem".to_string()));
 
@@ -216,7 +217,7 @@ impl<'de> serde::de::Deserialize<'de> for Config {
             serde_yaml::from_value(value)
                 .map(Config::TunServer)
                 .map_err(|e| Error::custom(format!("invalid TUN config: {e}")))
-        } else if has_address || has_path_field {
+        } else if has_address || has_addresses || has_path_field {
             // ServerConfig - its custom deserializer validates unknown fields
             serde_yaml::from_value(value)
                 .map(Config::Server)
@@ -230,7 +231,7 @@ impl<'de> serde::de::Deserialize<'de> for Config {
 
             Err(Error::custom(format!(
                 "Unable to determine config type. Found fields: {found_fields:?}. Expected one of:\n\
-                - Server config: must have 'address' or 'path' field\n\
+                - Server config: must have 'address', 'addresses', or 'path' field\n\
                 - Client config group: must have 'client_group' field\n\
                 - Rule config group: must have 'rule_group' field\n\
                 - DNS config group: must have 'dns_group' field"
@@ -555,6 +556,31 @@ client_proxies:
             }
             _ => panic!("Expected NamedPem config"),
         }
+    }
+
+    #[test]
+    fn test_server_config_with_addresses_alias() {
+        let yaml = r#"
+- addresses:
+    - "127.0.0.1:22223"
+    - "172.17.0.1:22223-22225"
+  protocol:
+    type: http
+"#;
+
+        let configs: Vec<Config> = serde_yaml::from_str(yaml).unwrap();
+        let Config::Server(server) = &configs[0] else {
+            panic!("expected server config");
+        };
+        assert_eq!(
+            server.bind_location.to_string(),
+            "127.0.0.1:22223, 172.17.0.1:22223-22225"
+        );
+
+        let serialized = serde_yaml::to_value(&configs[0]).unwrap();
+        let mapping = serialized.as_mapping().unwrap();
+        assert!(mapping.contains_key(&serde_yaml::Value::String("address".to_string())));
+        assert!(!mapping.contains_key(&serde_yaml::Value::String("addresses".to_string())));
     }
 
     #[test]

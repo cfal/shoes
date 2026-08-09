@@ -56,6 +56,11 @@ address: "0.0.0.0:8080"        # IPv4
 address: "[::]:8080"           # IPv6
 address: "0.0.0.0:443-445"     # Port range
 
+# OR bind to multiple addresses and port ranges (`address` is also accepted)
+addresses:
+  - "127.0.0.1:22223"
+  - "172.17.0.1:22223-22225"
+
 # OR bind to Unix socket (TCP only)
 path: "/tmp/shoes.sock"
 

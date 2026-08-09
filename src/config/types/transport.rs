@@ -5,21 +5,30 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::address::{NetLocation, NetLocationPortRange};
-use crate::option_util::{NoneOrOne, NoneOrSome};
+use crate::option_util::{NoneOrOne, NoneOrSome, OneOrSome};
 
 use super::common::default_true;
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum BindLocation {
-    Address(NetLocationPortRange),
+    #[serde(alias = "addresses")]
+    Address(OneOrSome<NetLocationPortRange>),
     Path(PathBuf),
 }
 
 impl std::fmt::Display for BindLocation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            BindLocation::Address(n) => write!(f, "{n}"),
+            BindLocation::Address(addresses) => {
+                for (index, address) in addresses.iter().enumerate() {
+                    if index > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{address}")?;
+                }
+                Ok(())
+            }
             BindLocation::Path(p) => write!(f, "{}", p.display()),
         }
     }
@@ -99,6 +108,6 @@ impl Default for ClientQuicConfig {
 
 impl From<NetLocation> for BindLocation {
     fn from(loc: NetLocation) -> Self {
-        BindLocation::Address(loc.into())
+        BindLocation::Address(OneOrSome::One(loc.into()))
     }
 }
