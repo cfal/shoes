@@ -36,6 +36,9 @@ chrono = "*"
 dashmap = "*"
 digest = "*"
 etherparse = "*"
+# rust_backend rather than the default: the C zlib would add a C toolchain
+# requirement to the Android and iOS cross-builds.
+flate2 = { version = "*", default-features = false, features = ["rust_backend"] }
 futures = "*"
 pin-project-lite = "*"
 h2 = "*"
@@ -60,6 +63,9 @@ quinn = { version = "*", default-features = false, features = ["log", "platform-
 rand = "*"
 rand_core = "*"
 rcgen = { version = "*", default-features = false, features = ["aws_lc_rs", "pem"] }
+# regex-lite, not regex: a few hundred rule-set patterns behind an LRU do not
+# justify ~1.5MB of binary on mobile, and its linear-time engine has no ReDoS.
+regex-lite = "*"
 rust-argon2 = "*"
 rustc-hash = "*"
 rustls = "*"

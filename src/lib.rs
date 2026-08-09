@@ -79,6 +79,7 @@ mod reality;
 mod reality_client_handler;
 pub mod resolver;
 mod routing;
+pub mod rule_set;
 mod rustls_config_util;
 mod rustls_connection_util;
 mod shadow_tls;
