@@ -9,7 +9,7 @@ use super::common::{
     ALERT_DESC_CLOSE_NOTIFY, ALERT_LEVEL_WARNING, CIPHERTEXT_READ_BUF_CAPACITY, CONTENT_TYPE_ALERT,
     CONTENT_TYPE_APPLICATION_DATA, CONTENT_TYPE_CHANGE_CIPHER_SPEC, CONTENT_TYPE_HANDSHAKE,
     HANDSHAKE_TYPE_CERTIFICATE, HANDSHAKE_TYPE_CERTIFICATE_VERIFY,
-    HANDSHAKE_TYPE_ENCRYPTED_EXTENSIONS, HANDSHAKE_TYPE_FINISHED, OUTGOING_BUFFER_LIMIT,
+    HANDSHAKE_TYPE_ENCRYPTED_EXTENSIONS, HANDSHAKE_TYPE_FINISHED, MAX_TLS_PLAINTEXT_LEN,
     PLAINTEXT_READ_BUF_CAPACITY, TLS_MAX_RECORD_SIZE, TLS_RECORD_HEADER_SIZE,
 };
 use super::reality_aead::{AeadKey, decrypt_handshake_message};
@@ -32,6 +32,21 @@ use super::reality_tls13_messages::{
 use super::reality_util::{extract_server_cipher_suite, extract_server_public_key};
 use crate::slide_buffer::SlideBuffer;
 use crate::util::allocate_vec;
+
+// Matches the maximum handshake size accepted by Xray's REALITY implementation.
+const MAX_HANDSHAKE_PLAINTEXT: usize = 4 * MAX_TLS_PLAINTEXT_LEN;
+
+fn append_handshake_plaintext(accumulated: &mut Vec<u8>, plaintext: &[u8]) -> io::Result<usize> {
+    let previous_len = accumulated.len();
+    if previous_len.saturating_add(plaintext.len()) > MAX_HANDSHAKE_PLAINTEXT {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "REALITY handshake exceeds maximum size",
+        ));
+    }
+    accumulated.extend_from_slice(plaintext);
+    Ok(previous_len)
+}
 
 /// Configuration for REALITY client connections
 #[derive(Clone)]
@@ -125,9 +140,9 @@ impl RealityClientConnection {
             cipher_suite: None,
             tls_read_buffer: allocate_vec(TLS_MAX_RECORD_SIZE).into_boxed_slice(),
             ciphertext_read_buf: SlideBuffer::new(CIPHERTEXT_READ_BUF_CAPACITY),
-            ciphertext_write_buf: Vec::with_capacity(OUTGOING_BUFFER_LIMIT),
+            ciphertext_write_buf: Vec::new(),
             plaintext_read_buf: SlideBuffer::new(PLAINTEXT_READ_BUF_CAPACITY),
-            plaintext_write_buf: Vec::with_capacity(OUTGOING_BUFFER_LIMIT),
+            plaintext_write_buf: Vec::new(),
             received_close_notify: false,
             fatal_error: None,
         };
@@ -575,8 +590,8 @@ impl RealityClientConnection {
         handshake_seq += 1;
 
         // Track where new plaintext starts in accumulated buffer
-        let prev_accumulated_len = accumulated_plaintext.len();
-        accumulated_plaintext.extend_from_slice(&plaintext);
+        let prev_accumulated_len =
+            append_handshake_plaintext(&mut accumulated_plaintext, &plaintext)?;
 
         // Parse newly added messages from the plaintext we just added
         let mut offset = prev_accumulated_len;
@@ -856,7 +871,10 @@ impl RealityClientConnection {
 
     /// Get a writer for buffering plaintext to be encrypted
     pub fn writer(&mut self) -> RealityWriter<'_> {
-        RealityWriter::new(&mut self.plaintext_write_buf)
+        RealityWriter::new(
+            &mut self.plaintext_write_buf,
+            self.ciphertext_write_buf.len(),
+        )
     }
 
     /// Write buffered TLS messages to the provided writer
@@ -989,6 +1007,16 @@ pub fn feed_reality_client_connection(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn handshake_plaintext_is_bounded() {
+        let mut accumulated = vec![0; MAX_HANDSHAKE_PLAINTEXT];
+
+        let error = append_handshake_plaintext(&mut accumulated, &[0]).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(accumulated.len(), MAX_HANDSHAKE_PLAINTEXT);
+    }
 
     #[test]
     fn client_hello_transcript_bytes_use_encrypted_session_id() {

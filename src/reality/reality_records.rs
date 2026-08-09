@@ -152,6 +152,9 @@ impl<'a> RecordEncryptor<'a> {
         out: &mut Vec<u8>,
         content_type: u8,
     ) -> io::Result<()> {
+        // Prevents a full plaintext record from doubling its retained Vec capacity.
+        buf.reserve_exact(1 + 16);
+
         // Append inner content type
         buf.push(content_type);
 
@@ -454,6 +457,11 @@ mod tests {
         );
         assert!(result.is_ok());
         assert!(plaintext.is_empty());
+        assert!(
+            plaintext.capacity() <= MAX_TLS_CIPHERTEXT_LEN,
+            "plaintext staging buffer retained {} bytes",
+            plaintext.capacity()
+        );
 
         // Should have one record
         let expected_len = TLS_RECORD_HEADER_SIZE + MAX_TLS_PLAINTEXT_LEN + 1 + 16;

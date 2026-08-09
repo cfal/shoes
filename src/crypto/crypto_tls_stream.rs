@@ -311,9 +311,10 @@ where
             // Drain TLS output to TCP stream
             while self.session.wants_write() {
                 match self.write_tls_direct(cx) {
-                    // tokio-rustls pattern: treat Ok(0) same as Pending in poll_write
-                    // Data is safely buffered in session, will be sent on flush
-                    Poll::Ready(Ok(0)) | Poll::Pending => {
+                    Poll::Ready(Ok(0)) => {
+                        return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
+                    }
+                    Poll::Pending => {
                         would_block = true;
                         self.need_flush = true;
                         break;
@@ -435,3 +436,150 @@ where
 
 // Implement AsyncStream blanket trait
 impl<IO> crate::async_stream::AsyncStream for CryptoTlsStream<IO> where IO: AsyncStream {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::address::{Address, NetLocation};
+    use crate::reality::{RealityServerConfig, RealityServerConnection};
+    use futures::task::noop_waker_ref;
+
+    struct PendingWriteIo;
+
+    impl AsyncRead for PendingWriteIo {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for PendingWriteIo {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Pending
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncPing for PendingWriteIo {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+
+        fn poll_write_ping(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+
+    impl AsyncStream for PendingWriteIo {}
+
+    struct ZeroWriteIo;
+
+    impl AsyncRead for ZeroWriteIo {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for ZeroWriteIo {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(0))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncPing for ZeroWriteIo {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+
+        fn poll_write_ping(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+
+    impl AsyncStream for ZeroWriteIo {}
+
+    fn completed_reality_connection() -> RealityServerConnection {
+        let config = RealityServerConfig {
+            private_key: [0; 32],
+            short_ids: vec![[0; 8]],
+            dest: NetLocation::new(Address::UNSPECIFIED, 443),
+            max_time_diff: None,
+            min_client_version: None,
+            max_client_version: None,
+            cipher_suites: Vec::new(),
+        };
+        RealityServerConnection::new(config)
+            .unwrap()
+            .complete_for_test()
+            .unwrap()
+    }
+
+    #[test]
+    fn reality_stream_stops_accepting_plaintext_when_tls_output_is_blocked() {
+        let mut stream = CryptoTlsStream::new(
+            PendingWriteIo,
+            CryptoConnection::new_reality_server(completed_reality_connection()),
+        );
+        let mut cx = Context::from_waker(noop_waker_ref());
+        let data = [0u8; 16 * 1024];
+        let mut accepted = 0;
+
+        for _ in 0..16 {
+            match Pin::new(&mut stream).poll_write(&mut cx, &data) {
+                Poll::Ready(Ok(written)) => accepted += written,
+                Poll::Pending => break,
+                Poll::Ready(Err(error)) => panic!("unexpected write error: {error}"),
+            }
+        }
+
+        assert!(
+            accepted <= 64 * 1024,
+            "blocked REALITY stream accepted {accepted} plaintext bytes"
+        );
+    }
+
+    #[test]
+    fn reality_stream_rejects_write_zero_without_waiting_for_a_wake() {
+        let mut stream = CryptoTlsStream::new(
+            ZeroWriteIo,
+            CryptoConnection::new_reality_server(completed_reality_connection()),
+        );
+        let mut cx = Context::from_waker(noop_waker_ref());
+
+        let result = Pin::new(&mut stream).poll_write(&mut cx, &[0; 1024]);
+        assert!(matches!(
+            result,
+            Poll::Ready(Err(error)) if error.kind() == io::ErrorKind::WriteZero
+        ));
+    }
+}

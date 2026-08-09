@@ -11,8 +11,8 @@ use subtle::ConstantTimeEq;
 use super::common::{
     ALERT_DESC_CLOSE_NOTIFY, ALERT_LEVEL_WARNING, CIPHERTEXT_READ_BUF_CAPACITY, CONTENT_TYPE_ALERT,
     CONTENT_TYPE_APPLICATION_DATA, CONTENT_TYPE_CHANGE_CIPHER_SPEC, CONTENT_TYPE_HANDSHAKE,
-    HANDSHAKE_TYPE_FINISHED, OUTGOING_BUFFER_LIMIT, PLAINTEXT_READ_BUF_CAPACITY,
-    TLS_MAX_RECORD_SIZE, TLS_RECORD_HEADER_SIZE,
+    HANDSHAKE_TYPE_FINISHED, PLAINTEXT_READ_BUF_CAPACITY, TLS_MAX_RECORD_SIZE,
+    TLS_RECORD_HEADER_SIZE,
 };
 use super::reality_aead::{AeadKey, decrypt_handshake_message};
 use super::reality_auth::{decrypt_session_id, derive_auth_key, perform_ecdh};
@@ -136,12 +136,27 @@ impl RealityServerConnection {
             cipher_suite: None,
             tls_read_buffer: allocate_vec(TLS_MAX_RECORD_SIZE).into_boxed_slice(),
             ciphertext_read_buf: SlideBuffer::new(CIPHERTEXT_READ_BUF_CAPACITY),
-            ciphertext_write_buf: Vec::with_capacity(OUTGOING_BUFFER_LIMIT),
+            ciphertext_write_buf: Vec::new(),
             plaintext_read_buf: SlideBuffer::new(PLAINTEXT_READ_BUF_CAPACITY),
-            plaintext_write_buf: Vec::with_capacity(OUTGOING_BUFFER_LIMIT),
+            plaintext_write_buf: Vec::new(),
             received_close_notify: false,
             fatal_error: None,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn complete_for_test(mut self) -> io::Result<Self> {
+        let cipher_suite = CipherSuite::AES_128_GCM_SHA256;
+        let key = vec![0; cipher_suite.key_len()];
+        let iv = vec![0; cipher_suite.nonce_len()];
+
+        self.handshake_state = HandshakeState::Complete;
+        self.app_read_key = Some(AeadKey::new(cipher_suite, &key)?);
+        self.app_read_iv = Some(iv.clone());
+        self.app_write_key = Some(AeadKey::new(cipher_suite, &key)?);
+        self.app_write_iv = Some(iv);
+        self.cipher_suite = Some(cipher_suite);
+        Ok(self)
     }
 
     /// Read TLS messages from the provided reader into internal buffer
@@ -961,7 +976,10 @@ impl RealityServerConnection {
 
     /// Get a writer for buffering plaintext to be encrypted
     pub fn writer(&mut self) -> RealityWriter<'_> {
-        RealityWriter::new(&mut self.plaintext_write_buf)
+        RealityWriter::new(
+            &mut self.plaintext_write_buf,
+            self.ciphertext_write_buf.len(),
+        )
     }
 
     /// Write buffered TLS messages to the provided writer
@@ -1110,6 +1128,8 @@ mod tests {
         let conn = RealityServerConnection::new(config).unwrap();
         assert!(conn.is_handshaking());
         assert!(!conn.wants_write());
+        assert_eq!(conn.ciphertext_write_buf.capacity(), 0);
+        assert_eq!(conn.plaintext_write_buf.capacity(), 0);
     }
 
     #[test]
