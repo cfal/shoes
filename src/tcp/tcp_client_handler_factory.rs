@@ -379,7 +379,7 @@ pub fn create_tcp_client_proxy_selector(
     let rules = rules
         .into_iter()
         .map(|rule_config| {
-            let RuleConfig { masks, action } = rule_config;
+            let RuleConfig { masks, action, .. } = rule_config;
             let connect_action = match action {
                 RuleActionConfig::Allow {
                     override_address,

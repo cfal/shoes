@@ -51,6 +51,8 @@ pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Valida
         String::from("allow-all-direct"),
         vec![RuleConfig {
             masks: OneOrSome::One(NetLocationMask::ANY),
+            rule_sets: NoneOrSome::Unspecified,
+            loaded_rule_sets: Vec::new(),
             action: RuleActionConfig::Allow {
                 override_address: None,
                 client_chains: NoneOrSome::One(ClientChain::default()),
@@ -61,6 +63,8 @@ pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Valida
         String::from("block-all"),
         vec![RuleConfig {
             masks: OneOrSome::One(NetLocationMask::ANY),
+            rule_sets: NoneOrSome::Unspecified,
+            loaded_rule_sets: Vec::new(),
             action: RuleActionConfig::Block,
         }],
     );
@@ -1749,6 +1753,7 @@ mod tests {
                         override_address: None,
                         client_chains: NoneOrSome::One(ClientChain::default()),
                     },
+                    ..Default::default()
                 }),
             }),
             Config::ClientConfigGroup(ClientConfigGroup {

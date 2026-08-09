@@ -379,6 +379,7 @@ mod tests {
                     ))),
                 }),
             },
+            ..Default::default()
         }
     }
 
@@ -462,6 +463,7 @@ client_proxies:
                 RuleConfig {
                     masks: OneOrSome::One(NetLocationMask::ANY),
                     action: RuleActionConfig::Block,
+                    ..Default::default()
                 },
             ]),
         })];

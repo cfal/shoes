@@ -1,9 +1,12 @@
 //! Rule configuration types.
 
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 
 use crate::address::{NetLocation, NetLocationMask};
 use crate::option_util::{NoneOrSome, OneOrSome};
+use crate::rule_set::RuleSet;
 
 use super::client::ClientConfig;
 use super::selection::ConfigSelection;
@@ -11,6 +14,11 @@ use super::selection::ConfigSelection;
 #[derive(Debug, Clone)]
 pub struct RuleConfig {
     pub masks: OneOrSome<NetLocationMask>,
+    /// Rule-set names as written in the config, kept so the config round-trips.
+    pub rule_sets: NoneOrSome<String>,
+    /// Resolved during validation. Not part of the config surface and never
+    /// serialised.
+    pub loaded_rule_sets: Vec<Arc<RuleSet>>,
     pub action: RuleActionConfig,
 }
 
@@ -18,6 +26,8 @@ impl Default for RuleConfig {
     fn default() -> Self {
         Self {
             masks: OneOrSome::One(NetLocationMask::ANY),
+            rule_sets: NoneOrSome::Unspecified,
+            loaded_rule_sets: Vec::new(),
             action: RuleActionConfig::Allow {
                 override_address: None,
                 client_chains: NoneOrSome::One(ClientChain::default()),
@@ -185,6 +195,8 @@ impl<'de> Deserialize<'de> for RuleConfig {
         struct RuleConfigTemp {
             #[serde(alias = "mask")]
             masks: Option<OneOrSome<NetLocationMask>>,
+            #[serde(alias = "rule_set", default)]
+            rule_sets: NoneOrSome<String>,
             // Action fields (from RuleActionConfig)
             #[serde(default)]
             action: Option<String>,
@@ -201,8 +213,12 @@ impl<'de> Deserialize<'de> for RuleConfig {
 
         let temp = RuleConfigTemp::deserialize(deserializer)?;
 
-        // masks is required
-        let masks = temp.masks.ok_or_else(|| D::Error::missing_field("masks"))?;
+        // masks is required unless the rule matches through a rule-set instead.
+        let masks = match temp.masks {
+            Some(masks) => masks,
+            None if !temp.rule_sets.is_empty() => OneOrSome::Some(Vec::new()),
+            None => return Err(D::Error::missing_field("masks")),
+        };
 
         // Determine action type
         let action_str = temp.action.as_deref().unwrap_or("allow");
@@ -270,7 +286,12 @@ impl<'de> Deserialize<'de> for RuleConfig {
             }
         };
 
-        Ok(RuleConfig { masks, action })
+        Ok(RuleConfig {
+            masks,
+            rule_sets: temp.rule_sets,
+            loaded_rule_sets: Vec::new(),
+            action,
+        })
     }
 }
 
@@ -299,10 +320,36 @@ impl Serialize for RuleConfig {
             }
         };
 
-        let mut map = serializer.serialize_map(Some(1 + action_field_count))?;
+        // OneOrSome::len is test-only, and widening it for one call site is not
+        // worth it.
+        let has_masks = match &self.masks {
+            OneOrSome::One(_) => true,
+            OneOrSome::Some(masks) => !masks.is_empty(),
+        };
+        let has_rule_sets = !self.rule_sets.is_empty();
 
-        // Serialize masks
-        map.serialize_entry("masks", &self.masks)?;
+        let mut field_count = action_field_count;
+        if has_masks {
+            field_count += 1;
+        }
+        if has_rule_sets {
+            field_count += 1;
+        }
+
+        let mut map = serializer.serialize_map(Some(field_count))?;
+
+        // Omitted when empty rather than written as `masks: []`. OneOrSome
+        // guarantees at least one element, so an empty sequence is a value it
+        // refuses to read back, and the dump has to stay loadable.
+        if has_masks {
+            map.serialize_entry("masks", &self.masks)?;
+        }
+
+        // Names only. loaded_rule_sets holds Arc<RuleSet>, which has no
+        // Serialize and has no business in a config dump.
+        if has_rule_sets {
+            map.serialize_entry("rule_sets", &self.rule_sets)?;
+        }
 
         // Serialize action fields (flattened)
         match &self.action {
@@ -620,6 +667,7 @@ mod tests {
                     ))),
                 }),
             },
+            ..Default::default()
         }
     }
 
@@ -1222,5 +1270,72 @@ client_chains:
         } else {
             panic!("Expected Allow action");
         }
+    }
+}
+
+#[cfg(test)]
+mod rule_set_field_tests {
+    use super::*;
+
+    #[test]
+    fn rule_sets_accepts_a_list_and_a_single_name() {
+        let rule: RuleConfig = serde_yaml::from_str(
+            "
+masks: \"0.0.0.0/0\"
+rule_sets: [geosite-ru, geoip-ru]
+action: allow
+",
+        )
+        .unwrap();
+        assert_eq!(rule.rule_sets.clone().into_vec().len(), 2);
+
+        let single: RuleConfig = serde_yaml::from_str(
+            "
+masks: \"0.0.0.0/0\"
+rule_set: geosite-ru
+action: allow
+",
+        )
+        .unwrap();
+        assert_eq!(single.rule_sets.into_vec(), vec!["geosite-ru".to_string()]);
+    }
+
+    #[test]
+    fn masks_may_be_omitted_when_rule_sets_are_given() {
+        let rule: RuleConfig = serde_yaml::from_str(
+            "
+rule_sets: [geosite-ru]
+action: allow
+",
+        )
+        .unwrap();
+        assert!(rule.masks.clone().into_vec().is_empty());
+        assert_eq!(rule.rule_sets.into_vec(), vec!["geosite-ru".to_string()]);
+    }
+
+    #[test]
+    fn masks_are_still_required_when_nothing_else_matches() {
+        let err = serde_yaml::from_str::<RuleConfig>("action: allow\n").unwrap_err();
+        assert!(err.to_string().contains("masks"), "{err}");
+    }
+
+    #[test]
+    fn rule_sets_round_trip_but_loaded_sets_never_serialise() {
+        let rule: RuleConfig = serde_yaml::from_str(
+            "
+rule_sets: [geosite-ru]
+action: allow
+",
+        )
+        .unwrap();
+        let dumped = serde_yaml::to_string(&rule).unwrap();
+        assert!(dumped.contains("rule_sets"), "{dumped}");
+        assert!(!dumped.contains("loaded_rule_sets"), "{dumped}");
+
+        let reparsed: RuleConfig = serde_yaml::from_str(&dumped).unwrap();
+        assert_eq!(
+            reparsed.rule_sets.into_vec(),
+            vec!["geosite-ru".to_string()]
+        );
     }
 }
