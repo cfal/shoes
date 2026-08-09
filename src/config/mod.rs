@@ -21,6 +21,29 @@ pub use pem::convert_cert_paths;
 pub use types::*;
 pub use validate::{ValidatedConfigs, create_server_configs};
 
+/// Rewrite relative rule-set paths so they resolve against the config file that
+/// declared them, letting a config directory be relocated intact.
+///
+/// This has to happen here: `load_configs` is the last point that still knows
+/// which file an entry came from, since the configs are flattened into one list
+/// immediately afterwards.
+fn resolve_rule_set_paths(configs: &mut [Config], config_filename: &str) {
+    let Some(base) = std::path::Path::new(config_filename).parent() else {
+        return;
+    };
+    if base.as_os_str().is_empty() {
+        return;
+    }
+    for config in configs.iter_mut() {
+        if let Config::RuleSet(rule_set) = config {
+            let path = std::path::Path::new(&rule_set.path);
+            if path.is_relative() {
+                rule_set.path = base.join(path).to_string_lossy().into_owned();
+            }
+        }
+    }
+}
+
 /// Loads configuration files from the provided paths.
 ///
 /// Reads each file, parses it as YAML, and returns the combined list of configs.
@@ -56,6 +79,7 @@ pub async fn load_configs(args: &Vec<String>) -> std::io::Result<Vec<Config>> {
                 ));
             }
         };
+        resolve_rule_set_paths(&mut configs, config_filename);
         all_configs.append(&mut configs)
     }
 
@@ -181,5 +205,45 @@ mod redaction_tests {
                 "re-serializing lost a secret: {secret}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod rule_set_path_tests {
+    use super::*;
+
+    fn rule_set(path: &str) -> Config {
+        Config::RuleSet(RuleSetConfig {
+            rule_set: "geo".to_string(),
+            path: path.to_string(),
+        })
+    }
+
+    fn path_of(config: &Config) -> &str {
+        match config {
+            Config::RuleSet(c) => &c.path,
+            other => panic!("expected a rule-set config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn relative_rule_set_paths_resolve_against_the_config_file() {
+        let mut configs = vec![rule_set("lists/geo.srs")];
+        resolve_rule_set_paths(&mut configs, "/etc/shoes/main.yaml");
+        assert_eq!(path_of(&configs[0]), "/etc/shoes/lists/geo.srs");
+    }
+
+    #[test]
+    fn absolute_rule_set_paths_are_left_alone() {
+        let mut configs = vec![rule_set("/opt/geo.srs")];
+        resolve_rule_set_paths(&mut configs, "/etc/shoes/main.yaml");
+        assert_eq!(path_of(&configs[0]), "/opt/geo.srs");
+    }
+
+    #[test]
+    fn a_config_in_the_working_directory_leaves_paths_untouched() {
+        let mut configs = vec![rule_set("geo.srs")];
+        resolve_rule_set_paths(&mut configs, "config.yaml");
+        assert_eq!(path_of(&configs[0]), "geo.srs");
     }
 }
