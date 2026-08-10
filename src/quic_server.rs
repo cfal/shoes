@@ -5,7 +5,6 @@ use std::time::Duration;
 
 use log::{debug, error};
 use quinn::EndpointConfig;
-use tokio::io::AsyncWriteExt;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
@@ -14,15 +13,15 @@ use crate::client_proxy_selector::ConnectDecision;
 use crate::config::{
     BindLocation, ConfigSelection, ServerConfig, ServerProxyConfig, ServerQuicConfig,
 };
-use crate::copy_bidirectional::copy_bidirectional;
 use crate::quic_stream::QuicStream;
 use crate::resolver::Resolver;
 use crate::routing::{ServerStream, run_udp_routing};
 use crate::rustls_config_util::create_server_config;
 use crate::socket_util::new_socket2_udp_socket;
 use crate::tcp::tcp_client_handler_factory::create_tcp_client_proxy_selector;
+use crate::tcp::tcp_forward::{ForwardRequest, forward_tcp};
 use crate::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult};
-use crate::tcp::tcp_server::{run_udp_copy, setup_client_tcp_stream};
+use crate::tcp::tcp_server::run_udp_copy;
 use crate::tcp::tcp_server_handler_factory::create_tcp_server_handler;
 use crate::uuid_util::parse_uuid;
 
@@ -136,71 +135,22 @@ async fn process_streams(
     match setup_result {
         TcpServerSetupResult::TcpForward {
             remote_location,
-            stream: mut server_stream,
+            stream: server_stream,
             need_initial_flush: server_need_initial_flush,
             proxy_selector,
             connection_success_response,
             initial_remote_data,
         } => {
-            let setup_client_stream_future = timeout(
-                Duration::from_secs(60),
-                setup_client_tcp_stream(
-                    &mut server_stream,
-                    proxy_selector,
-                    resolver,
-                    remote_location.clone(),
-                ),
-            );
-
-            let mut client_stream = match setup_client_stream_future.await {
-                Ok(Ok(Some(s))) => s,
-                Ok(Ok(None)) => {
-                    // Must have been blocked.
-                    let _ = server_stream.shutdown().await;
-                    return Ok(());
-                }
-                Ok(Err(e)) => {
-                    let _ = server_stream.shutdown().await;
-                    return Err(std::io::Error::new(
-                        e.kind(),
-                        format!("failed to setup client stream to {remote_location}: {e}"),
-                    ));
-                }
-                Err(elapsed) => {
-                    let _ = server_stream.shutdown().await;
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        format!("client setup to {remote_location} timed out: {elapsed}"),
-                    ));
-                }
-            };
-
-            if let Some(data) = connection_success_response {
-                server_stream.write_all(&data).await?;
-                // server_need_initial_flush should be set to true by the handler if
-                // it's needed.
-            }
-
-            let client_need_initial_flush = match initial_remote_data {
-                Some(data) => {
-                    client_stream.write_all(&data).await?;
-                    true
-                }
-                None => false,
-            };
-
-            let copy_result = copy_bidirectional(
-                &mut server_stream,
-                &mut client_stream,
+            forward_tcp(ForwardRequest {
+                remote_location,
+                server_stream,
                 server_need_initial_flush,
-                client_need_initial_flush,
-            )
-            .await;
-
-            let (_, _) = futures::join!(server_stream.shutdown(), client_stream.shutdown());
-
-            copy_result?;
-            Ok(())
+                connection_success_response,
+                initial_remote_data,
+                proxy_selector,
+                resolver,
+            })
+            .await
         }
         TcpServerSetupResult::BidirectionalUdp {
             remote_location,

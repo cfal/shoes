@@ -5,28 +5,25 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use log::{debug, error};
-use tokio::io::AsyncWriteExt;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
 use super::tcp_client_handler_factory::create_tcp_client_proxy_selector;
 use super::tcp_server_handler_factory::create_tcp_server_handler;
 
-use crate::address::NetLocation;
 use crate::async_stream::AsyncMessageStream;
 use crate::async_stream::{AsyncShutdownMessageExt, AsyncStream};
-use crate::client_proxy_selector::{ClientProxySelector, ConnectDecision};
+use crate::client_proxy_selector::ConnectDecision;
 use crate::config::{BindLocation, Config, ConfigSelection, ServerConfig, TcpConfig, Transport};
-use crate::copy_bidirectional::copy_bidirectional;
 use crate::copy_bidirectional_message::copy_bidirectional_message;
 use crate::quic_server::start_quic_servers;
 use crate::resolver::Resolver;
 use crate::routing::{ServerStream, run_udp_routing};
 use crate::socket_util::{new_tcp_listener, set_tcp_keepalive};
-use crate::tcp::tcp_handler::{TcpClientSetupResult, TcpServerHandler, TcpServerSetupResult};
+use crate::tcp::tcp_forward::{ForwardRequest, forward_tcp};
+use crate::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult};
 #[cfg(unix)]
 use crate::tun::start_tun_server;
-use crate::util::write_all;
 
 async fn run_tcp_server(
     bind_address: SocketAddr,
@@ -151,71 +148,22 @@ where
     match setup_result {
         TcpServerSetupResult::TcpForward {
             remote_location,
-            stream: mut server_stream,
+            stream: server_stream,
             need_initial_flush: server_need_initial_flush,
             proxy_selector,
             connection_success_response,
             initial_remote_data,
         } => {
-            let setup_client_stream_future = timeout(
-                Duration::from_secs(60),
-                setup_client_tcp_stream(
-                    &mut server_stream,
-                    proxy_selector,
-                    resolver,
-                    remote_location.clone(),
-                ),
-            );
-
-            let mut client_stream = match setup_client_stream_future.await {
-                Ok(Ok(Some(s))) => s,
-                Ok(Ok(None)) => {
-                    // Must have been blocked.
-                    let _ = server_stream.shutdown().await;
-                    return Ok(());
-                }
-                Ok(Err(e)) => {
-                    let _ = server_stream.shutdown().await;
-                    return Err(std::io::Error::new(
-                        e.kind(),
-                        format!("failed to setup client stream to {remote_location}: {e}"),
-                    ));
-                }
-                Err(elapsed) => {
-                    let _ = server_stream.shutdown().await;
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        format!("client setup to {remote_location} timed out: {elapsed}"),
-                    ));
-                }
-            };
-
-            if let Some(data) = connection_success_response {
-                write_all(&mut server_stream, &data).await?;
-                // server_need_initial_flush should be set to true by the handler if
-                // it's needed.
-            }
-
-            let client_need_initial_flush = match initial_remote_data {
-                Some(data) => {
-                    write_all(&mut client_stream, &data).await?;
-                    true
-                }
-                None => false,
-            };
-
-            let copy_result = copy_bidirectional(
-                &mut server_stream,
-                &mut client_stream,
+            forward_tcp(ForwardRequest {
+                remote_location,
+                server_stream,
                 server_need_initial_flush,
-                client_need_initial_flush,
-            )
-            .await;
-
-            let (_, _) = futures::join!(server_stream.shutdown(), client_stream.shutdown());
-
-            copy_result?;
-            Ok(())
+                connection_success_response,
+                initial_remote_data,
+                proxy_selector,
+                resolver,
+            })
+            .await
         }
         TcpServerSetupResult::BidirectionalUdp {
             remote_location,
@@ -282,37 +230,6 @@ where
             // Nothing more to do here.
             Ok(())
         }
-    }
-}
-
-pub async fn setup_client_tcp_stream(
-    server_stream: &mut Box<dyn AsyncStream>,
-    client_proxy_selector: Arc<ClientProxySelector>,
-    resolver: Arc<dyn Resolver>,
-    remote_location: NetLocation,
-) -> std::io::Result<Option<Box<dyn AsyncStream>>> {
-    let action = client_proxy_selector
-        .judge(remote_location.into(), &resolver)
-        .await?;
-
-    match action {
-        ConnectDecision::Allow {
-            chain_group,
-            remote_location,
-        } => {
-            let TcpClientSetupResult {
-                client_stream,
-                early_data,
-            } = chain_group.connect_tcp(remote_location, &resolver).await?;
-
-            if let Some(data) = early_data {
-                server_stream.write_all(&data).await?;
-                server_stream.flush().await?;
-            }
-
-            Ok(Some(client_stream))
-        }
-        ConnectDecision::Block => Ok(None),
     }
 }
 

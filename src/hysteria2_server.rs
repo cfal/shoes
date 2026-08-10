@@ -36,7 +36,7 @@ use crate::copy_bidirectional::copy_bidirectional_with_sizes;
 use crate::quic_stream::QuicStream;
 use crate::resolver::{Resolver, ResolverCache};
 use crate::stream_reader::StreamReader;
-use crate::tcp::tcp_server::setup_client_tcp_stream;
+use crate::tcp::tcp_forward::setup_client_tcp_stream;
 use crate::util::allocate_vec;
 
 async fn process_connection(
@@ -857,7 +857,7 @@ async fn process_tcp_stream(
             &mut server_stream,
             client_proxy_selector,
             resolver,
-            remote_location.clone(),
+            remote_location.clone().into(),
         ),
     );
 
