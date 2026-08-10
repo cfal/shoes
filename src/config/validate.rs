@@ -699,6 +699,11 @@ fn validate_server_config(
         ));
     }
 
+    validate_sniff_config(
+        &server_config.sniff,
+        &format!("server at {}", server_config.bind_location),
+    )?;
+
     if let super::types::BindLocation::Path(_) = server_config.bind_location
         && server_config.transport != Transport::Tcp
     {
@@ -732,6 +737,30 @@ fn validate_server_config(
         false, // top-level, not inside TLS/Reality
     )?;
 
+    Ok(())
+}
+
+/// A sniff block that is on but can never sniff anything is a typo, not a
+/// preference. Fail at load rather than quietly doing nothing at runtime.
+fn validate_sniff_config(
+    sniff: &Option<super::types::SniffConfig>,
+    context: &str,
+) -> std::io::Result<()> {
+    let Some(sniff) = sniff else {
+        return Ok(());
+    };
+    if !sniff.enabled {
+        return Ok(());
+    }
+    if sniff.protocols.as_ref().is_some_and(|p| p.is_empty()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "{context}: sniff is enabled but its protocol list is empty; \
+                 drop `protocols` to sniff tls and http, or set `enabled: false`"
+            ),
+        ));
+    }
     Ok(())
 }
 
@@ -1440,6 +1469,8 @@ fn validate_tun_config(
             "TUN: TCP must be enabled for ICMP",
         ));
     }
+
+    validate_sniff_config(&config.sniff, "TUN")?;
 
     if let Some(ref fake_ip) = config.fake_ip {
         // Build the pool now and discard it: a bad CIDR or a zero max_entries
@@ -2337,6 +2368,7 @@ mod tests {
             rules: NoneOrSome::Unspecified,
             dns: None,
             fake_ip: None,
+            sniff: None,
         };
 
         let configs = vec![Config::TunServer(tun_config)];
@@ -2363,6 +2395,7 @@ mod tests {
             rules: NoneOrSome::Unspecified,
             dns: None,
             fake_ip: Some(fake_ip),
+            sniff: None,
         }
     }
 
@@ -2851,6 +2884,7 @@ mod tests {
                 dns: Some(DnsConfig {
                     servers: NoneOrSome::One(DnsServerSpec::Simple("my-dns".to_string())),
                 }),
+                sniff: None,
             }),
         ];
 
@@ -2902,6 +2936,7 @@ mod tests {
                         DnsServerSpec::Simple("udp://1.1.1.1".to_string()), // URL
                     ]),
                 }),
+                sniff: None,
             }),
         ];
 
@@ -2962,6 +2997,7 @@ mod tests {
                         DnsServerSpec::Simple("secure-dns".to_string()),
                     ]),
                 }),
+                sniff: None,
             }),
         ];
 
@@ -3010,6 +3046,7 @@ mod tests {
             dns: Some(DnsConfig {
                 servers: NoneOrSome::One(DnsServerSpec::Simple("nonexistent-dns".to_string())),
             }),
+            sniff: None,
         })];
 
         let result = validate_configs_test(configs).await;
@@ -3038,6 +3075,59 @@ mod rule_set_validation_tests {
             Ok(_) => panic!("expected validation to fail"),
             Err(e) => e.to_string(),
         }
+    }
+
+    #[test]
+    fn sniff_enabled_with_an_empty_protocol_list_is_rejected() {
+        let configs: Vec<Config> = serde_yaml::from_str(
+            r#"
+- address: 127.0.0.1:1080
+  protocol:
+    type: socks
+  sniff:
+    enabled: true
+    protocols: []
+"#,
+        )
+        .unwrap();
+
+        let error = expect_error(configs);
+        assert!(
+            error.contains("protocol list is empty"),
+            "message was: {error}"
+        );
+    }
+
+    #[test]
+    fn sniff_disabled_with_an_empty_protocol_list_is_accepted() {
+        let configs: Vec<Config> = serde_yaml::from_str(
+            r#"
+- address: 127.0.0.1:1080
+  protocol:
+    type: socks
+  sniff:
+    enabled: false
+    protocols: []
+"#,
+        )
+        .unwrap();
+
+        create_server_configs(configs).expect("a disabled sniff block is not validated");
+    }
+
+    #[test]
+    fn sniff_shorthand_parses_on_a_server() {
+        let configs: Vec<Config> = serde_yaml::from_str(
+            r#"
+- address: 127.0.0.1:1080
+  protocol:
+    type: socks
+  sniff: true
+"#,
+        )
+        .unwrap();
+
+        create_server_configs(configs).expect("sniff: true should be accepted");
     }
 
     #[test]

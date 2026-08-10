@@ -23,6 +23,7 @@ pub mod rules;
 pub mod selection;
 pub mod server;
 pub mod shadowsocks;
+pub mod sniff;
 pub mod transport;
 pub mod tun;
 
@@ -48,5 +49,6 @@ pub use server::{
     direct_allow_rule,
 };
 pub use shadowsocks::ShadowsocksConfig;
+pub use sniff::{SniffConfig, SniffProtocolConfig};
 pub use transport::{BindLocation, ClientQuicConfig, ServerQuicConfig, TcpConfig, Transport};
 pub use tun::{FakeIpConfig, TunConfig};

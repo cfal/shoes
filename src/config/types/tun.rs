@@ -116,6 +116,11 @@ pub struct TunConfig {
     /// to the domain when the connection arrives (optional, off by default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fake_ip: Option<FakeIpConfig>,
+
+    /// Protocol sniffing for connections arriving over the TUN. Off when
+    /// absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sniff: Option<super::sniff::SniffConfig>,
 }
 
 fn default_fake_ip_network() -> String {
