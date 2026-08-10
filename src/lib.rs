@@ -86,6 +86,7 @@ mod shadow_tls;
 mod shadowsocks;
 mod slide_buffer;
 mod snell;
+pub mod sniff;
 mod socket_util;
 mod socks5_udp_relay;
 mod socks_handler;
