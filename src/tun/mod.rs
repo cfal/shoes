@@ -80,6 +80,7 @@ pub async fn run_tun_server(
     proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
     fake_ip: Option<Arc<FakeIpResponder>>,
+    sniff: Option<crate::sniff::SniffSettings>,
     mut shutdown_rx: oneshot::Receiver<()>,
 ) -> std::io::Result<()> {
     info!(
@@ -124,6 +125,7 @@ pub async fn run_tun_server(
                 let proxy_selector = proxy_selector.clone();
                 let resolver = resolver.clone();
                 let fake_ip_pool = fake_ip_pool.clone();
+                let sniff = sniff.clone();
 
                 tokio::spawn(async move {
                     let remote_addr = new_conn.remote_addr;
@@ -133,9 +135,14 @@ pub async fn run_tun_server(
 
                     debug!("Handling TCP connection to {:?}", target);
 
-                    if let Err(e) =
-                        handle_tcp_connection(new_conn.connection, target, proxy_selector, resolver)
-                            .await
+                    if let Err(e) = handle_tcp_connection(
+                        new_conn.connection,
+                        target,
+                        proxy_selector,
+                        resolver,
+                        sniff.as_ref(),
+                    )
+                    .await
                     {
                         debug!("TCP connection to {} failed: {}", remote_addr, e);
                     }
@@ -215,11 +222,37 @@ async fn handle_tcp_connection<S>(
     target: NetLocation,
     proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
+    sniff: Option<&crate::sniff::SniffSettings>,
 ) -> std::io::Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
 {
-    let decision = proxy_selector.judge(target.into(), &resolver).await?;
+    let mut connection = connection;
+    let mut sniffed_prefix: Vec<u8> = Vec::new();
+    let mut judged: crate::address::ResolvedLocation = target.clone().into();
+
+    // No reordering is needed here, unlike the inbound path: the TCP handshake
+    // completed locally in smoltcp, so the application has already sent its
+    // first bytes and there is nothing to write first.
+    if let Some(settings) = sniff
+        && let Some(addr) = crate::sniff::sniff_target(&target)
+    {
+        let result = crate::sniff::peek::peek_stream(
+            &mut connection,
+            &[],
+            &settings.protocols,
+            settings.timeout,
+            crate::sniff::peek::DEFAULT_MAX_BYTES,
+        )
+        .await;
+        sniffed_prefix = result.buffered;
+        if let Some(name) = result.sniffed.as_ref().and_then(|s| s.domain.as_deref()) {
+            debug!("sniffed {name} for {target}");
+            judged = crate::sniff::judged_location(name, addr);
+        }
+    }
+
+    let decision = proxy_selector.judge(judged, &resolver).await?;
 
     match decision {
         crate::client_proxy_selector::ConnectDecision::Allow {
@@ -257,6 +290,14 @@ where
                     if let Some(data) = early_data {
                         use tokio::io::AsyncWriteExt;
                         counting.write_all(&data).await?;
+                    }
+
+                    // Whatever sniffing read has to reach the remote before
+                    // anything else, in the order the client sent it.
+                    if !sniffed_prefix.is_empty() {
+                        use tokio::io::AsyncWriteExt;
+                        remote.write_all(&sniffed_prefix).await?;
+                        remote.flush().await?;
                     }
 
                     let result = tokio::io::copy_bidirectional(&mut counting, &mut remote).await;
@@ -403,6 +444,9 @@ pub async fn run_tun_from_config(
         .map(build_fake_ip_responder)
         .transpose()?;
 
+    // Resolved once per TUN session rather than per connection.
+    let sniff = config.sniff.as_ref().and_then(|s| s.to_settings());
+
     let rules = config.rules.map(ConfigSelection::unwrap_config).into_vec();
     let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
     let client_proxy_selector = Arc::new(create_tcp_client_proxy_selector(rules, resolver.clone()));
@@ -412,6 +456,7 @@ pub async fn run_tun_from_config(
         client_proxy_selector,
         resolver,
         fake_ip_responder,
+        sniff,
         shutdown_rx,
     )
     .await
@@ -548,7 +593,7 @@ mod tests {
 
         let target = NetLocation::new(Address::Ipv4(Ipv4Addr::new(93, 184, 216, 34)), 443);
 
-        handle_tcp_connection(local, target, selector, resolver)
+        handle_tcp_connection(local, target, selector, resolver, None)
             .await
             .unwrap();
 
@@ -556,6 +601,135 @@ mod tests {
             written.lock().unwrap().as_slice(),
             b"EARLY",
             "early data from the final hop must reach the local connection"
+        );
+    }
+
+    /// A local stream that offers a ClientHello once and then reports EOF,
+    /// which is what an application looks like right after the smoltcp
+    /// handshake.
+    struct HelloThenEof {
+        hello: Option<Vec<u8>>,
+    }
+
+    impl AsyncRead for HelloThenEof {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            if let Some(hello) = self.hello.take() {
+                buf.put_slice(&hello);
+            }
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for HelloThenEof {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A SOCKS5 server that records the target address the client asked for,
+    /// and everything sent after the reply, then closes.
+    async fn spawn_socks_server_recording(
+        target_seen: Arc<Mutex<Vec<u8>>>,
+        payload_seen: Arc<Mutex<Vec<u8>>>,
+    ) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+
+            let mut head = [0u8; 2];
+            stream.read_exact(&mut head).await.unwrap();
+            let mut methods = vec![0u8; head[1] as usize];
+            stream.read_exact(&mut methods).await.unwrap();
+            stream.write_all(&[0x05, 0x00]).await.unwrap();
+
+            // VER CMD RSV ATYP
+            let mut req = [0u8; 4];
+            stream.read_exact(&mut req).await.unwrap();
+            let address = match req[3] {
+                0x01 => {
+                    let mut v4 = [0u8; 4];
+                    stream.read_exact(&mut v4).await.unwrap();
+                    v4.to_vec()
+                }
+                0x03 => {
+                    let mut len = [0u8; 1];
+                    stream.read_exact(&mut len).await.unwrap();
+                    let mut name = vec![0u8; len[0] as usize];
+                    stream.read_exact(&mut name).await.unwrap();
+                    name
+                }
+                other => panic!("unexpected address type {other}"),
+            };
+            let mut port = [0u8; 2];
+            stream.read_exact(&mut port).await.unwrap();
+            *target_seen.lock().unwrap() = address;
+
+            stream
+                .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                .await
+                .unwrap();
+            stream.flush().await.unwrap();
+
+            let mut payload = Vec::new();
+            let _ = stream.read_to_end(&mut payload).await;
+            *payload_seen.lock().unwrap() = payload;
+        });
+
+        addr
+    }
+
+    #[tokio::test]
+    async fn tun_sniffs_the_sni_and_sends_the_name_upstream() {
+        let target_seen = Arc::new(Mutex::new(Vec::new()));
+        let payload_seen = Arc::new(Mutex::new(Vec::new()));
+        let socks_addr =
+            spawn_socks_server_recording(target_seen.clone(), payload_seen.clone()).await;
+
+        let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+        let selector = selector_through_socks(socks_addr, resolver.clone());
+
+        let hello = crate::sniff::test_client_hello("ex.com");
+        let local = HelloThenEof {
+            hello: Some(hello.clone()),
+        };
+
+        let target = NetLocation::new(Address::Ipv4(Ipv4Addr::new(93, 184, 216, 34)), 443);
+        let settings = crate::sniff::SniffSettings {
+            protocols: vec![crate::sniff::SniffedProtocol::Tls],
+            timeout: std::time::Duration::from_millis(300),
+        };
+
+        handle_tcp_connection(local, target, selector, resolver, Some(&settings))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            target_seen.lock().unwrap().as_slice(),
+            b"ex.com",
+            "the sniffed name should be the address sent to the proxy"
+        );
+        assert_eq!(
+            payload_seen.lock().unwrap().as_slice(),
+            hello.as_slice(),
+            "the bytes read while sniffing must reach the remote unchanged"
         );
     }
 }

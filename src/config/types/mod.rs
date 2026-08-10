@@ -49,6 +49,8 @@ pub use server::{
     direct_allow_rule,
 };
 pub use shadowsocks::ShadowsocksConfig;
+// Part of the public config surface; the binary names only SniffConfig.
+#[allow(unused_imports)]
 pub use sniff::{SniffConfig, SniffProtocolConfig};
 pub use transport::{BindLocation, ClientQuicConfig, ServerQuicConfig, TcpConfig, Transport};
 pub use tun::{FakeIpConfig, TunConfig};
