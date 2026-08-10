@@ -119,6 +119,43 @@ pub(crate) fn normalize_host(raw: &[u8]) -> Option<String> {
     String::from_utf8(host.to_ascii_lowercase()).ok()
 }
 
+/// A minimal but well-formed ClientHello record carrying `name` as its SNI.
+///
+/// Shared by every test that needs one so the length fields are computed in a
+/// single place; hand-written fixtures get them wrong.
+#[cfg(test)]
+pub(crate) fn test_client_hello(name: &str) -> Vec<u8> {
+    let name = name.as_bytes();
+
+    let mut entry = vec![0x00]; // host_name
+    entry.extend_from_slice(&(name.len() as u16).to_be_bytes());
+    entry.extend_from_slice(name);
+
+    let mut list = (entry.len() as u16).to_be_bytes().to_vec();
+    list.extend_from_slice(&entry);
+
+    let mut extensions = vec![0x00, 0x00]; // server_name
+    extensions.extend_from_slice(&(list.len() as u16).to_be_bytes());
+    extensions.extend_from_slice(&list);
+
+    let mut body = vec![0x03, 0x03]; // legacy_version
+    body.extend_from_slice(&[0u8; 32]); // random
+    body.push(0); // session_id length
+    body.extend_from_slice(&[0x00, 0x02, 0x13, 0x01]); // cipher suites
+    body.extend_from_slice(&[0x01, 0x00]); // compression methods
+    body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+    body.extend_from_slice(&extensions);
+
+    let len = body.len() as u32;
+    let mut handshake = vec![0x01, (len >> 16) as u8, (len >> 8) as u8, len as u8];
+    handshake.extend_from_slice(&body);
+
+    let mut record = vec![0x16, 0x03, 0x01];
+    record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
+    record.extend_from_slice(&handshake);
+    record
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,6 +218,17 @@ mod tests {
         assert_eq!(
             sniff_target(&v6),
             Some(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 443))
+        );
+    }
+
+    #[test]
+    fn the_shared_client_hello_fixture_is_well_formed() {
+        assert_eq!(
+            SniffedProtocol::Tls.sniff(&test_client_hello("ex.com")),
+            SniffOutcome::Found(Sniffed {
+                protocol: SniffedProtocol::Tls,
+                domain: Some("ex.com".into()),
+            })
         );
     }
 
