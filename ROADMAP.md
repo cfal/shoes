@@ -41,7 +41,7 @@ The gap is not in protocols. It is in everything around them.
 | Capability | shoes | sing-box |
 | --- | --- | --- |
 | Routing rule matchers | CIDR and `*.domain` masks | 43 fields |
-| Domain/IP lists (geosite, geoip) | none | `.srs` rule-sets, remote, auto-updating |
+| Domain/IP lists (geosite, geoip) | `.srs` rule-sets, local files | `.srs` rule-sets, remote, auto-updating |
 | Protocol sniffing (SNI, Host, QUIC, DNS) | none | yes |
 | Per-app routing on Android | none | `package_name` |
 | Outbound selection | round-robin, no health check | `urltest` by latency, `selector` |
@@ -56,21 +56,26 @@ both exist, but neither protocol appears in `ClientProxyConfig`
 ## Tier 1 — closes most of the gap
 
 Ordered by value per unit of work. All three build on code already in the tree.
+Item 1 is done; 2 and 3 are open.
 
-### 1. Rule-sets
+### 1. Rule-sets — done
 
-`masks` is a literal list. A rule as ordinary as "Russian domains direct,
-everything else through the tunnel" needs tens of thousands of YAML lines, so in
-practice nobody writes it. This single gap is what makes the routing engine
-unusable for a real client, and it blocks the value of everything else here.
+Shipped. Spec: [docs/specs/2026-08-09-rule-sets.md](./docs/specs/2026-08-09-rule-sets.md).
+Plan: [docs/plans/2026-08-09-rule-sets.md](./docs/plans/2026-08-09-rule-sets.md).
 
-sing-box's `.srs` container is documented and binary. Reading it directly means
-the existing ecosystem of compiled lists — geosite, geoip, antifilter,
-Loyalsoldier — works on day one, with no list-building pipeline of our own.
+`masks` was a literal list. A rule as ordinary as "Russian domains direct,
+everything else through the tunnel" needed tens of thousands of YAML lines, so
+in practice nobody wrote it.
 
-Lands in `src/client_proxy_selector.rs`: `ConnectRule` (line 114) gains a matcher
-variant beyond `Vec<NetLocationMask>`, and `judge` (line 283) consults it. The
-`RoutingCache` LRU already in that file absorbs the per-connection cost.
+sing-box `.srs` files are now read directly, so the existing ecosystem of
+compiled lists — geosite, geoip, antifilter, Loyalsoldier — works as-is, with no
+list-building pipeline of our own. `src/rule_set/` decodes the container and
+holds the succinct trie in its on-disk shape; `ConnectRule` consults a rule's
+sets when its masks miss.
+
+Local files only. Remote rule-sets with `update_interval` are deliberately
+deferred — see the spec's scope section — as are `source_ip_cidr`, inline rules
+and `type: logical`.
 
 ### 2. Protocol sniffing
 
