@@ -210,12 +210,15 @@ pub async fn run_tun_server(
 
 /// Convert a SocketAddr to a NetLocation.
 /// Handle a TCP connection by forwarding it through the proxy chain.
-async fn handle_tcp_connection(
-    connection: tcp_conn::TcpConnection,
+async fn handle_tcp_connection<S>(
+    connection: S,
     target: NetLocation,
     proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
-) -> std::io::Result<()> {
+) -> std::io::Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+{
     let decision = proxy_selector.judge(target.into(), &resolver).await?;
 
     match decision {
@@ -238,10 +241,24 @@ async fn handle_tcp_connection(
                         remote_location.location()
                     );
 
-                    let mut remote = setup_result.client_stream;
+                    let crate::tcp::tcp_handler::TcpClientSetupResult {
+                        client_stream: mut remote,
+                        early_data,
+                    } = setup_result;
+
                     // Wrap the local connection with traffic counting so bytes
                     // are reported in real time, not only after the stream closes.
                     let mut counting = traffic::TrafficCountingStream::new(connection);
+
+                    // The final hop can hand back payload it read while still
+                    // completing its own handshake. Dropping it loses the first
+                    // bytes the server said, which the inbound path has always
+                    // forwarded (src/tcp/tcp_server.rs).
+                    if let Some(data) = early_data {
+                        use tokio::io::AsyncWriteExt;
+                        counting.write_all(&data).await?;
+                    }
+
                     let result = tokio::io::copy_bidirectional(&mut counting, &mut remote).await;
 
                     match result {
@@ -398,4 +415,147 @@ pub async fn run_tun_from_config(
         shutdown_rx,
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+    use std::net::{Ipv4Addr, SocketAddr};
+    use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll};
+
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+    use tokio::net::TcpListener;
+
+    use crate::address::{Address, NetLocation, NetLocationMask};
+    use crate::client_proxy_selector::{ClientProxySelector, ConnectAction, ConnectRule};
+    use crate::config::{
+        ClientChain, ClientChainHop, ClientConfig, ClientProxyConfig, ConfigSelection,
+    };
+    use crate::option_util::{NoneOrSome, OneOrSome};
+    use crate::resolver::{NativeResolver, Resolver};
+    use crate::tcp::chain_builder::build_client_chain_group;
+
+    use super::*;
+
+    /// A local stream that reports EOF on read and records everything written.
+    /// Stands in for the smoltcp-backed TUN connection.
+    struct RecordingStream {
+        written: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl AsyncRead for RecordingStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(())) // EOF
+        }
+    }
+
+    impl AsyncWrite for RecordingStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.written.lock().unwrap().extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A SOCKS5 server that answers the handshake and then sends the success
+    /// reply and some payload in a single write, which is what makes the
+    /// client handler report early data.
+    async fn spawn_socks_server_with_early_data(payload: &'static [u8]) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+
+            // Greeting: version, method count, methods.
+            let mut head = [0u8; 2];
+            stream.read_exact(&mut head).await.unwrap();
+            let mut methods = vec![0u8; head[1] as usize];
+            stream.read_exact(&mut methods).await.unwrap();
+            stream.write_all(&[0x05, 0x00]).await.unwrap();
+
+            // Request: VER CMD RSV ATYP, then an IPv4 address and port.
+            let mut req = [0u8; 4];
+            stream.read_exact(&mut req).await.unwrap();
+            let mut rest = [0u8; 6];
+            stream.read_exact(&mut rest).await.unwrap();
+
+            let mut reply = vec![0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
+            reply.extend_from_slice(payload);
+            stream.write_all(&reply).await.unwrap();
+            stream.flush().await.unwrap();
+
+            // Hold the connection open long enough for the copy to drain.
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        });
+
+        addr
+    }
+
+    fn selector_through_socks(
+        socks_addr: SocketAddr,
+        resolver: Arc<dyn Resolver>,
+    ) -> Arc<ClientProxySelector> {
+        let client_config = ClientConfig {
+            address: NetLocation::from_ip_addr(socks_addr.ip(), socks_addr.port()),
+            protocol: ClientProxyConfig::Socks {
+                username: None,
+                password: None,
+            },
+            ..Default::default()
+        };
+        let chain = ClientChain {
+            hops: OneOrSome::One(ClientChainHop::Single(ConfigSelection::Config(
+                client_config,
+            ))),
+        };
+        let group = build_client_chain_group(NoneOrSome::One(chain), resolver);
+        let rule = ConnectRule::new(
+            vec![NetLocationMask::ANY],
+            vec![],
+            ConnectAction::new_allow(None, group),
+        );
+        Arc::new(ClientProxySelector::new(vec![rule]))
+    }
+
+    #[tokio::test]
+    async fn tun_forwards_early_data_to_the_local_connection() {
+        let socks_addr = spawn_socks_server_with_early_data(b"EARLY").await;
+        let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+        let selector = selector_through_socks(socks_addr, resolver.clone());
+
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let local = RecordingStream {
+            written: written.clone(),
+        };
+
+        let target = NetLocation::new(Address::Ipv4(Ipv4Addr::new(93, 184, 216, 34)), 443);
+
+        handle_tcp_connection(local, target, selector, resolver)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            written.lock().unwrap().as_slice(),
+            b"EARLY",
+            "early data from the final hop must reach the local connection"
+        );
+    }
 }
