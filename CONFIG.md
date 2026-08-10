@@ -11,6 +11,7 @@ shoes uses YAML configuration files. Multiple configuration types can be combine
 - [Client Protocols](#client-protocols)
 - [Rules System](#rules-system)
   - [Rule-sets](#rule-sets)
+  - [Protocol sniffing](#protocol-sniffing)
 - [Named Groups](#named-groups)
 - [Named PEMs](#named-pems)
 - [Advanced Features](#advanced-features)
@@ -708,6 +709,74 @@ edit does.
 Domain matching lowercases the destination and ignores a trailing dot. `ip_cidr`
 is compared against a resolved address only when the server resolves rule
 hostnames; otherwise a hostname destination is matched on its name alone.
+
+### Protocol sniffing
+
+A domain rule needs a domain. When a client hands over a bare address -- an app
+with its own DoH resolver, one that dials a literal IP, or a client configured
+for `socks5` rather than `socks5h` -- every domain rule and every rule-set
+silently stops matching.
+
+Sniffing recovers the name from the first bytes of the connection: the
+`server_name` extension of a TLS ClientHello, or the request line and `Host`
+header of an HTTP/1.x request. It is off by default and enabled per listener,
+on a server or on the TUN.
+
+```yaml
+- address: 0.0.0.0:1080
+  protocol:
+    type: socks
+  sniff: true
+```
+
+The long form spells out the defaults:
+
+```yaml
+  sniff:
+    enabled: true
+    protocols: [tls, http]
+    timeout_ms: 300
+```
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | `true` inside a `sniff:` block | Whether to sniff at all |
+| `protocols` | `[tls, http]` | Which sniffers to run. A single name may be written without a list. An empty list with `enabled: true` is a config error |
+| `timeout_ms` | `300` | How long to wait for the client's first bytes |
+
+`timeout_ms: 0` is valid and means "sniff whatever has already been buffered and
+wait for nothing". Use it when no added latency is acceptable.
+
+The recovered name is used **for routing only**. A direct connection still
+dials the original address and performs no DNS lookup; a connection routed
+through a proxy sends the name upstream, so the exit node resolves it -- which
+is what a client using `socks5h` is asking for. CIDR masks keep matching the
+real address either way.
+
+Some connections are never sniffed:
+
+- a destination that is already a hostname, because there is nothing to
+  recover;
+- ports 25, 465, 587, 143, 993, 110 and 995 -- SMTP, IMAP and POP3, where the
+  server speaks first, so waiting would stall the connection for the whole
+  timeout and learn nothing.
+
+Sniffing can never itself fail a connection. If nothing is recognised, if the
+protocol carries no name, or if the client says nothing before the deadline,
+the connection is routed by address exactly as it would have been. Successful
+sniffs are logged at `debug`.
+
+One consequence worth stating plainly: with `sniff` enabled the proxy reads the
+first bytes of application payload before deciding where to route it. Those
+bytes are not stored, are not logged above `debug`, live only in a
+per-connection buffer capped at 16 KiB, and reach the remote unchanged. This is
+why the feature is off unless you turn it on.
+
+Note also that with sniffing enabled, protocols that send a success response --
+SOCKS5 and HTTP `CONNECT` -- send it **before** the upstream connection is
+attempted, because the client will not send anything to sniff until it has one.
+A client therefore sees the connection open and then close, rather than an
+error code, when the upstream is unreachable.
 
 ### Example Rules
 ```yaml

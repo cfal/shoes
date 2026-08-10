@@ -1,0 +1,47 @@
+# Route by domain even when the client only gives us an address.
+#
+# An application with its own DoH resolver never asks our DNS, so Fake IP never
+# sees the name. Sniffing recovers it from the first bytes of the connection:
+# the TLS ClientHello, or the HTTP request line and Host header.
+#
+# The name is used for routing only. A direct connection still dials the
+# original address; a proxied one sends the name upstream for the exit to
+# resolve.
+
+- address: 0.0.0.0:1080
+  protocol:
+    type: socks
+
+  sniff: true
+  # The long form, with the defaults spelled out:
+  #   sniff:
+  #     enabled: true
+  #     protocols: [tls, http]
+  #     timeout_ms: 300
+  #
+  # timeout_ms: 0 means "sniff whatever is already buffered and wait for
+  # nothing" -- useful when no added latency is acceptable.
+
+  rules:
+    # Local networks never leave the machine.
+    - masks: ["192.168.0.0/16", "10.0.0.0/8", "127.0.0.0/8"]
+      action: allow
+      client_chain:
+        protocol:
+          type: direct
+
+    # This now matches a connection opened straight to an IP address, because
+    # the ClientHello named the host.
+    - masks: ["example.com"]
+      action: allow
+      client_chain:
+        protocol:
+          type: direct
+
+    # Everything else goes upstream.
+    - masks: "0.0.0.0/0"
+      action: allow
+      client_chain:
+        address: "proxy.example.com:1080"
+        protocol:
+          type: socks

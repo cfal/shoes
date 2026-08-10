@@ -42,7 +42,7 @@ The gap is not in protocols. It is in everything around them.
 | --- | --- | --- |
 | Routing rule matchers | CIDR and `*.domain` masks | 43 fields |
 | Domain/IP lists (geosite, geoip) | `.srs` rule-sets, local files | `.srs` rule-sets, remote, auto-updating |
-| Protocol sniffing (SNI, Host, QUIC, DNS) | none | yes |
+| Protocol sniffing (SNI, Host, QUIC, DNS) | SNI and Host, TCP only | yes |
 | Per-app routing on Android | none | `package_name` |
 | Outbound selection | round-robin, no health check | `urltest` by latency, `selector` |
 | Per-connection statistics | global counters only | Clash API |
@@ -56,7 +56,7 @@ both exist, but neither protocol appears in `ClientProxyConfig`
 ## Tier 1 — closes most of the gap
 
 Ordered by value per unit of work. All three build on code already in the tree.
-Item 1 is done; 2 and 3 are open.
+Items 1 and 2 are done; 3 is open.
 
 ### 1. Rule-sets — done
 
@@ -77,17 +77,28 @@ Local files only. Remote rule-sets with `update_interval` are deliberately
 deferred — see the spec's scope section — as are `source_ip_cidr`, inline rules
 and `type: logical`.
 
-### 2. Protocol sniffing
+### 2. Protocol sniffing — done
 
-Today a destination domain is known only when Fake IP assigned it. An app with a
-hardcoded DoH resolver, or one that dials a literal IP, defeats that — and every
-domain rule silently degrades to IP matching. Sniffing the TLS ClientHello and
-the HTTP request line recovers the name on the connection itself.
+Shipped. Spec: [docs/specs/2026-08-10-protocol-sniffing.md](./docs/specs/2026-08-10-protocol-sniffing.md).
+Plan: [docs/plans/2026-08-10-protocol-sniffing.md](./docs/plans/2026-08-10-protocol-sniffing.md).
 
-Most of this is written. `read_client_hello`
-(`src/shadow_tls/shadow_tls_server_handler.rs:360`) already returns
-`requested_server_name` and already backs SNI routing for inbound TLS. The work
-is wiring it into the TUN and outbound paths, not writing a parser.
+A destination domain used to be known only when Fake IP assigned it. An app with
+a hardcoded DoH resolver, or one that dials a literal IP, defeats that — and
+every domain rule silently degraded to IP matching, which hit the rule-sets from
+item 1 hardest, since geosite lists are domains only.
+
+`src/sniff/` now reads the TLS ClientHello and the HTTP/1.x request line from
+the first bytes of a connection. The recovered name goes into
+`ResolvedLocation.location` with the original address in `resolved_addr`, so
+domain rules and rule-sets match the name while CIDR masks still match the real
+address and a direct connection dials it without a DNS lookup. Opt-in per
+listener with `sniff: true`, on both TCP inbounds and the TUN.
+
+A QUIC sniffer, DNS sniffing, protocol-only sniffers (`bittorrent`, `ssh`,
+`stun` and friends) and the `protocol` rule matcher they would serve are
+deliberately deferred — see the spec's scope section. Overriding the destination
+for direct connections is not planned: Xray had to bolt an exclusion list onto
+it and sing-box has deprecated it.
 
 ### 3. Hysteria2 and TUIC client outbounds
 
