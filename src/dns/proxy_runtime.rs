@@ -206,9 +206,70 @@ impl QuicSocketBinder for ProxyQuicBinder {
 
 #[cfg(test)]
 mod tests {
+    use async_trait::async_trait;
+
     use super::*;
+    use crate::address::ResolvedLocation;
+    use crate::async_stream::AsyncMessageStream;
+    use crate::client_proxy_chain::{ClientProxyChain, InitialHopEntry};
     use crate::resolver::NativeResolver;
     use crate::tcp::chain_builder::build_direct_chain_group;
+    use crate::tcp::socket_connector::SocketConnector;
+
+    /// A socket connector whose connect never completes, so the only thing
+    /// that can end the attempt is the timeout under test.
+    ///
+    /// The timeout tests used to dial 10.255.255.1:53 and assume the SYN would
+    /// be dropped. That assumption does not hold: most consumer and ISP
+    /// networks transparently redirect TCP port 53 to their own resolver, so
+    /// the connect succeeds in milliseconds and the timeout never fires. The
+    /// arithmetic being tested is ours; the kernel's is not, so no socket is
+    /// involved here at all.
+    #[derive(Debug)]
+    struct StallingConnector;
+
+    #[async_trait]
+    impl SocketConnector for StallingConnector {
+        async fn connect(
+            &self,
+            _resolver: &Arc<dyn Resolver>,
+            _address: &ResolvedLocation,
+        ) -> std::io::Result<Box<dyn AsyncStream>> {
+            std::future::pending::<()>().await;
+            unreachable!("pending never completes")
+        }
+
+        async fn connect_udp_bidirectional(
+            &self,
+            _resolver: &Arc<dyn Resolver>,
+            _target: ResolvedLocation,
+        ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
+            std::future::pending::<()>().await;
+            unreachable!("pending never completes")
+        }
+
+        fn bind_interface(&self) -> Option<&str> {
+            None
+        }
+    }
+
+    /// A provider whose chain can never connect, so `connect_tcp` can only
+    /// ever end in a timeout.
+    fn stalling_provider(connect_timeout: Duration) -> ProxyRuntimeProvider {
+        let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+        let chain = ClientProxyChain::new(
+            vec![InitialHopEntry::Direct(Box::new(StallingConnector))],
+            vec![],
+        );
+        let chain_group = Arc::new(ClientChainGroup::new(vec![chain]));
+        ProxyRuntimeProvider::with_bootstrap(chain_group, resolver, connect_timeout)
+    }
+
+    /// Never actually dialled: the stalling connector ignores it. Present only
+    /// so the address plumbing is exercised and the logs read sensibly.
+    fn unreachable_addr() -> SocketAddr {
+        "192.0.2.1:53".parse().unwrap()
+    }
 
     #[test]
     fn test_provider_is_clone() {
@@ -282,24 +343,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_connect_tcp_respects_timeout() {
-        let resolver = Arc::new(NativeResolver::new());
-        let chain_group = Arc::new(build_direct_chain_group(resolver.clone()));
-        let provider =
-            ProxyRuntimeProvider::with_bootstrap(chain_group, resolver, DEFAULT_CONNECT_TIMEOUT);
-
-        // Use an address that will hang (black hole) rather than refuse immediately.
-        // 10.255.255.1 is a non-routable address that should cause the connection to hang.
-        let server_addr: SocketAddr = "10.255.255.1:53".parse().unwrap();
+        // The requested timeout is shorter than the configured one, so it wins.
+        let provider = stalling_provider(Duration::from_secs(5));
 
         let start = std::time::Instant::now();
         let result = provider
-            .connect_tcp(server_addr, None, Some(Duration::from_millis(100)))
+            .connect_tcp(unreachable_addr(), None, Some(Duration::from_millis(100)))
             .await;
         let elapsed = start.elapsed();
 
         let err = match result {
             Err(e) => e,
-            Ok(_) => panic!("connection should fail"),
+            Ok(_) => panic!("a stalling connector can only end in a timeout"),
         };
         assert_eq!(
             err.kind(),
@@ -307,34 +362,39 @@ mod tests {
             "should be timeout error"
         );
 
-        // Verify timeout was respected (should complete in ~100ms, not 5+ seconds)
+        assert!(
+            elapsed >= Duration::from_millis(50),
+            "returned before the 100ms timeout could have fired, in {:?}",
+            elapsed
+        );
         assert!(
             elapsed < Duration::from_secs(1),
-            "timeout should fire quickly, but took {:?}",
+            "the 100ms request should beat the 5s configured timeout, but took {:?}",
             elapsed
         );
     }
 
     #[tokio::test]
     async fn test_connect_tcp_caps_passed_timeout_by_configured_connect_timeout() {
-        let resolver = Arc::new(NativeResolver::new());
-        let chain_group = Arc::new(build_direct_chain_group(resolver.clone()));
-        let provider =
-            ProxyRuntimeProvider::with_bootstrap(chain_group, resolver, Duration::from_millis(100));
-
-        let server_addr: SocketAddr = "10.255.255.1:53".parse().unwrap();
+        // The configured timeout is shorter, so it caps the longer request.
+        let provider = stalling_provider(Duration::from_millis(100));
 
         let start = std::time::Instant::now();
         let result = provider
-            .connect_tcp(server_addr, None, Some(Duration::from_secs(5)))
+            .connect_tcp(unreachable_addr(), None, Some(Duration::from_secs(5)))
             .await;
         let elapsed = start.elapsed();
 
         let err = match result {
             Err(e) => e,
-            Ok(_) => panic!("connection should fail"),
+            Ok(_) => panic!("a stalling connector can only end in a timeout"),
         };
         assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            elapsed >= Duration::from_millis(50),
+            "returned before the 100ms timeout could have fired, in {:?}",
+            elapsed
+        );
         assert!(
             elapsed < Duration::from_secs(1),
             "configured connect timeout should cap a longer request timeout, but took {:?}",
@@ -343,22 +403,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_connect_tcp_uses_default_timeout_when_none() {
-        let resolver = Arc::new(NativeResolver::new());
-        let chain_group = Arc::new(build_direct_chain_group(resolver.clone()));
-        let provider =
-            ProxyRuntimeProvider::with_bootstrap(chain_group, resolver, DEFAULT_CONNECT_TIMEOUT);
-
-        // Use a black hole address
-        let server_addr: SocketAddr = "10.255.255.1:53".parse().unwrap();
+    async fn test_connect_tcp_uses_configured_timeout_when_none_requested() {
+        // No timeout requested, so the provider's own is used.
+        let provider = stalling_provider(Duration::from_millis(200));
 
         let start = std::time::Instant::now();
-        let result = provider.connect_tcp(server_addr, None, None).await;
+        let result = provider.connect_tcp(unreachable_addr(), None, None).await;
         let elapsed = start.elapsed();
 
         let err = match result {
             Err(e) => e,
-            Ok(_) => panic!("connection should fail"),
+            Ok(_) => panic!("a stalling connector can only end in a timeout"),
         };
         assert_eq!(
             err.kind(),
@@ -366,16 +421,14 @@ mod tests {
             "should be timeout error"
         );
 
-        // Default timeout is 5 seconds; verify it's bounded (less than 10 seconds)
         assert!(
-            elapsed < Duration::from_secs(10),
-            "default timeout should apply, but took {:?}",
+            elapsed >= Duration::from_millis(150),
+            "should have waited for the configured 200ms, but only waited {:?}",
             elapsed
         );
-        // Also verify it waited at least close to 5 seconds (with some tolerance)
         assert!(
-            elapsed >= Duration::from_secs(4),
-            "should wait for default timeout (~5s), but only waited {:?}",
+            elapsed < Duration::from_secs(1),
+            "configured timeout should bound the attempt, but took {:?}",
             elapsed
         );
     }
