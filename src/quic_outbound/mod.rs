@@ -1,5 +1,6 @@
 //! Shared machinery for outbounds that dial over QUIC and own their transport.
 
+pub mod connection;
 pub mod obfs;
 
 use std::sync::Arc;
