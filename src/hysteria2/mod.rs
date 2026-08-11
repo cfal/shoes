@@ -9,6 +9,7 @@ pub mod auth;
 pub mod client;
 pub mod frame;
 pub mod server;
+pub mod udp;
 
 pub use client::Hysteria2Connector;
 pub use server::start_hysteria2_server;

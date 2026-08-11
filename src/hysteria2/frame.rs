@@ -189,6 +189,137 @@ pub fn parse_tcp_response(data: &[u8]) -> std::io::Result<Option<(Result<(), Str
     Ok(Some((verdict, padding_end)))
 }
 
+/// A parsed Hysteria2 UDP datagram.
+pub struct Datagram<'a> {
+    pub session_id: u32,
+    pub packet_id: u16,
+    pub fragment_id: u8,
+    pub fragment_count: u8,
+    /// On a reply this is the source the packet came from. A session is bound
+    /// to one target and AsyncMessageStream has nowhere to carry a source, so
+    /// the client does not use it — but parsing it is not optional, because
+    /// its length is what locates the payload.
+    #[allow(dead_code)]
+    pub address: &'a str,
+    pub payload: &'a [u8],
+}
+
+/// `[u32 session][u16 packet][u8 frag id][u8 frag count][varint addr len][addr]`
+fn encode_datagram_header(
+    session_id: u32,
+    packet_id: u16,
+    fragment_id: u8,
+    fragment_count: u8,
+    address: &str,
+) -> std::io::Result<Vec<u8>> {
+    if address.is_empty() || address.len() as u64 > MAX_ADDRESS_LEN {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("address length {} is not encodable", address.len()),
+        ));
+    }
+    let mut out = Vec::with_capacity(8 + 2 + address.len());
+    out.extend_from_slice(&session_id.to_be_bytes());
+    out.extend_from_slice(&packet_id.to_be_bytes());
+    out.push(fragment_id);
+    out.push(fragment_count);
+    out.extend_from_slice(&encode_varint(address.len() as u64)?);
+    out.extend_from_slice(address.as_bytes());
+    Ok(out)
+}
+
+/// Parse a datagram.
+///
+/// Returns None for anything malformed. A stray packet is dropped rather than
+/// raised as an error, which is how the server treats them too: a datagram
+/// channel carries whatever the network delivers.
+pub fn parse_datagram(data: &[u8]) -> Option<Datagram<'_>> {
+    if data.len() < 9 {
+        return None;
+    }
+    let session_id = u32::from_be_bytes(data[0..4].try_into().ok()?);
+    let packet_id = u16::from_be_bytes(data[4..6].try_into().ok()?);
+    let fragment_id = data[6];
+    let fragment_count = data[7];
+
+    let (address_len, consumed) = decode_varint_slice(&data[8..])?;
+    if address_len == 0 || address_len > MAX_ADDRESS_LEN {
+        return None;
+    }
+    let address_start = 8 + consumed;
+    let address_end = address_start.checked_add(address_len as usize)?;
+    if data.len() < address_end {
+        return None;
+    }
+    let address = std::str::from_utf8(&data[address_start..address_end]).ok()?;
+
+    Some(Datagram {
+        session_id,
+        packet_id,
+        fragment_id,
+        fragment_count,
+        address,
+        payload: &data[address_end..],
+    })
+}
+
+/// Split one UDP payload into datagrams no larger than `max_datagram`.
+///
+/// Every fragment repeats the address, because the protocol puts it in each
+/// datagram header rather than only in the first.
+pub fn build_datagrams(
+    session_id: u32,
+    packet_id: u16,
+    address: &str,
+    payload: &[u8],
+    max_datagram: usize,
+) -> std::io::Result<Vec<Vec<u8>>> {
+    let header_len = encode_datagram_header(session_id, packet_id, 0, 1, address)?.len();
+    let capacity = max_datagram
+        .checked_sub(header_len)
+        .filter(|c| *c > 0)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "datagram limit of {max_datagram} is smaller than a {header_len} byte header"
+                ),
+            )
+        })?;
+
+    let fragment_count = payload.len().div_ceil(capacity).max(1);
+    if fragment_count > u8::MAX as usize {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "payload of {} bytes needs {fragment_count} fragments, over the 255 the protocol allows",
+                payload.len()
+            ),
+        ));
+    }
+
+    let mut datagrams = Vec::with_capacity(fragment_count);
+    for (index, chunk) in payload.chunks(capacity).enumerate() {
+        let mut datagram = encode_datagram_header(
+            session_id,
+            packet_id,
+            index as u8,
+            fragment_count as u8,
+            address,
+        )?;
+        datagram.extend_from_slice(chunk);
+        datagrams.push(datagram);
+    }
+    // An empty payload still has to travel: a zero-length UDP packet is a
+    // packet, and chunks() yields nothing for it.
+    if datagrams.is_empty() {
+        datagrams.push(encode_datagram_header(
+            session_id, packet_id, 0, 1, address,
+        )?);
+    }
+    Ok(datagrams)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -311,5 +442,85 @@ mod tests {
         for _ in 0..64 {
             assert!(random_padding().len() <= MAX_GENERATED_PADDING);
         }
+    }
+
+    #[test]
+    fn test_datagram_header_layout() {
+        let header = encode_datagram_header(0xdeadbeef, 0x1234, 1, 3, "example.com:53").unwrap();
+        assert_eq!(&header[0..4], &0xdeadbeefu32.to_be_bytes());
+        assert_eq!(&header[4..6], &0x1234u16.to_be_bytes());
+        assert_eq!(header[6], 1, "fragment id");
+        assert_eq!(header[7], 3, "fragment count");
+        assert_eq!(header[8], 14, "address length varint");
+        assert_eq!(&header[9..], b"example.com:53");
+    }
+
+    #[test]
+    fn test_parse_datagram_round_trip() {
+        let datagrams = build_datagrams(7, 9, "1.2.3.4:53", b"payload", 1200).unwrap();
+        assert_eq!(datagrams.len(), 1);
+        let parsed = parse_datagram(&datagrams[0]).unwrap();
+        assert_eq!(parsed.session_id, 7);
+        assert_eq!(parsed.packet_id, 9);
+        assert_eq!(parsed.fragment_id, 0);
+        assert_eq!(parsed.fragment_count, 1);
+        assert_eq!(parsed.address, "1.2.3.4:53");
+        assert_eq!(parsed.payload, b"payload");
+    }
+
+    #[test]
+    fn test_parse_datagram_rejects_truncated_input() {
+        assert!(parse_datagram(&[0u8; 8]).is_none());
+        // Announces a 200-byte address that is not there.
+        let mut packet = vec![0u8; 8];
+        packet.push(0x40);
+        packet.push(200);
+        assert!(parse_datagram(&packet).is_none());
+    }
+
+    #[test]
+    fn test_parse_datagram_rejects_empty_address() {
+        let mut packet = vec![0u8; 8];
+        packet.push(0x00); // address length 0
+        assert!(parse_datagram(&packet).is_none());
+    }
+
+    #[test]
+    fn test_fragmentation_splits_and_reassembles() {
+        let payload: Vec<u8> = (0..5000u32).map(|i| i as u8).collect();
+        let datagrams = build_datagrams(1, 2, "a:1", &payload, 1200).unwrap();
+        assert!(datagrams.len() > 1);
+        assert!(datagrams.iter().all(|d| d.len() <= 1200));
+
+        for (index, datagram) in datagrams.iter().enumerate() {
+            let parsed = parse_datagram(datagram).unwrap();
+            assert_eq!(parsed.fragment_id as usize, index);
+            assert_eq!(parsed.fragment_count as usize, datagrams.len());
+            assert_eq!(parsed.address, "a:1", "every fragment repeats the address");
+        }
+
+        let rebuilt: Vec<u8> = datagrams
+            .iter()
+            .flat_map(|d| parse_datagram(d).unwrap().payload.to_vec())
+            .collect();
+        assert_eq!(rebuilt, payload);
+    }
+
+    #[test]
+    fn test_an_empty_payload_still_produces_a_datagram() {
+        let datagrams = build_datagrams(1, 2, "a:1", &[], 1200).unwrap();
+        assert_eq!(datagrams.len(), 1);
+        assert!(parse_datagram(&datagrams[0]).unwrap().payload.is_empty());
+    }
+
+    #[test]
+    fn test_fragmentation_refuses_more_than_255_fragments() {
+        let payload = vec![0u8; 100_000];
+        assert!(build_datagrams(1, 2, "a:1", &payload, 200).is_err());
+    }
+
+    #[test]
+    fn test_fragmentation_refuses_a_limit_below_the_header() {
+        assert!(build_datagrams(1, 2, "a:1", b"x", 4).is_err());
     }
 }

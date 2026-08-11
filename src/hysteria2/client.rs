@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use log::debug;
+use rand::RngExt;
 
 use crate::address::{NetLocation, ResolvedLocation};
 use crate::async_stream::{AsyncMessageStream, AsyncStream};
@@ -185,8 +186,8 @@ impl TerminalConnector for Hysteria2Connector {
 
     async fn connect_udp_bidirectional(
         &self,
-        _resolver: &Arc<dyn Resolver>,
-        _target: ResolvedLocation,
+        resolver: &Arc<dyn Resolver>,
+        target: ResolvedLocation,
     ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
         if !self.udp_enabled {
             return Err(std::io::Error::new(
@@ -194,16 +195,25 @@ impl TerminalConnector for Hysteria2Connector {
                 "UDP is disabled for this Hysteria2 outbound (udp_enabled: false)",
             ));
         }
+
+        let connection = self.connection.get(resolver).await?;
+
+        // Checked after connecting, because the answer arrives with the
+        // authentication rather than being known up front.
         if !self.authenticator.server_udp_enabled() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
                 "the Hysteria2 server refused UDP (Hysteria-UDP: false)",
             ));
         }
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "Hysteria2 UDP relaying is not implemented yet",
-        ))
+
+        let address = target.into_location().to_string();
+        let session_id = rand::rng().random::<u32>();
+        debug!("Hysteria2: UDP session {session_id} to {address}");
+
+        Ok(Box::new(super::udp::Hysteria2UdpSession::new(
+            connection, session_id, address,
+        )))
     }
 
     fn supports_udp(&self) -> bool {
@@ -426,6 +436,101 @@ mod tests {
             Ok(Err(_)) => {}
             Ok(Ok(_)) => panic!("mismatched obfuscation passwords must never connect"),
         }
+    }
+
+    /// Send one datagram through a session and read the reply back.
+    async fn udp_exchange(
+        stream: &mut Box<dyn AsyncMessageStream>,
+        payload: &[u8],
+    ) -> std::io::Result<Vec<u8>> {
+        use crate::async_stream::{AsyncReadMessage, AsyncWriteMessage};
+
+        std::future::poll_fn(|cx| std::pin::Pin::new(&mut *stream).poll_write_message(cx, payload))
+            .await?;
+
+        let mut buf = vec![0u8; 65535];
+        let mut read_buf = tokio::io::ReadBuf::new(&mut buf);
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            std::future::poll_fn(|cx| {
+                std::pin::Pin::new(&mut *stream).poll_read_message(cx, &mut read_buf)
+            }),
+        )
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "no reply arrived"))??;
+
+        Ok(read_buf.filled().to_vec())
+    }
+
+    #[tokio::test]
+    async fn test_udp_round_trip() {
+        let (server, _cert) = spawn_server(None).await;
+        let echo = spawn_udp_echo().await;
+        let resolver = test_resolver();
+        let connector = connector(server, SERVER_PASSWORD, None);
+
+        let mut stream = connector
+            .connect_udp_bidirectional(&resolver, target(echo))
+            .await
+            .unwrap();
+
+        let reply = udp_exchange(&mut stream, b"udp hello").await.unwrap();
+        assert_eq!(reply, b"udp hello");
+    }
+
+    #[tokio::test]
+    async fn test_udp_carries_several_packets_over_one_session() {
+        let (server, _cert) = spawn_server(None).await;
+        let echo = spawn_udp_echo().await;
+        let resolver = test_resolver();
+        let connector = connector(server, SERVER_PASSWORD, None);
+
+        let mut stream = connector
+            .connect_udp_bidirectional(&resolver, target(echo))
+            .await
+            .unwrap();
+
+        for i in 0..4u8 {
+            let payload = vec![i; 32];
+            let reply = udp_exchange(&mut stream, &payload).await.unwrap();
+            assert_eq!(reply, payload, "packet {i}");
+        }
+    }
+
+    /// Larger than a QUIC datagram, so the client has to fragment it and the
+    /// server has to put it back together before forwarding.
+    #[tokio::test]
+    async fn test_large_udp_payload_is_fragmented_and_reassembled() {
+        let (server, _cert) = spawn_server(None).await;
+        let echo = spawn_udp_echo().await;
+        let resolver = test_resolver();
+        let connector = connector(server, SERVER_PASSWORD, None);
+
+        let mut stream = connector
+            .connect_udp_bidirectional(&resolver, target(echo))
+            .await
+            .unwrap();
+
+        let payload: Vec<u8> = (0..4000u32).map(|i| i as u8).collect();
+        let reply = udp_exchange(&mut stream, &payload).await.unwrap();
+        assert_eq!(reply, payload);
+    }
+
+    #[tokio::test]
+    async fn test_udp_round_trip_with_obfuscation() {
+        let password = b"obfuscation password";
+        let (server, _cert) = spawn_server(Some(salamander(password))).await;
+        let echo = spawn_udp_echo().await;
+        let resolver = test_resolver();
+        let connector = connector(server, SERVER_PASSWORD, Some(salamander(password)));
+
+        let mut stream = connector
+            .connect_udp_bidirectional(&resolver, target(echo))
+            .await
+            .unwrap();
+
+        let reply = udp_exchange(&mut stream, b"obfuscated udp").await.unwrap();
+        assert_eq!(reply, b"obfuscated udp");
     }
 
     #[tokio::test]
