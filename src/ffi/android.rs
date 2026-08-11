@@ -245,12 +245,18 @@ pub extern "system" fn Java_com_shoesproxy_ShoesNative_start<'local>(
     let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let running_clone = running.clone();
 
+    common::clear_last_error();
+
     runtime.spawn(async move {
         info!("Shoes service task started");
 
         match common::start_from_config(&config_str, shutdown_rx).await {
             Ok(()) => info!("Shoes service stopped normally"),
-            Err(e) => error!("Shoes service error: {}", e),
+            Err(e) => {
+                let msg = e.to_string();
+                error!("Shoes service error: {}", msg);
+                common::set_last_error(msg);
+            }
         }
 
         running_clone.store(false, Ordering::SeqCst);
@@ -298,5 +304,23 @@ pub extern "system" fn Java_com_shoesproxy_ShoesNative_isRunning(
         JNI_TRUE
     } else {
         JNI_FALSE
+    }
+}
+
+/// Get the last error message from the shoes service.
+///
+/// # Returns
+/// * Error message string, or null if no error has occurred.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_shoesproxy_ShoesNative_getLastError<'local>(
+    mut unowned: EnvUnowned<'local>,
+    _class: JClass<'local>,
+) -> JString<'local> {
+    match common::get_last_error() {
+        Some(msg) => match unowned.with_env(|env| env.new_string(&msg)).into_outcome() {
+            Outcome::Ok(s) => s,
+            _ => JString::null(),
+        },
+        None => JString::null(),
     }
 }

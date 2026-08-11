@@ -90,4 +90,23 @@ const char *shoes_get_version(void);
  */
 int shoes_set_log_file(const char *path);
 
+/**
+ * Get the last error message from the shoes service.
+ *
+ * Returns a heap-allocated null-terminated string containing the error,
+ * or NULL if no error has occurred. The caller must free the returned
+ * string using `shoes_free_string()`.
+ *
+ * Thread-safe. The returned string is a copy.
+ */
+char *shoes_get_last_error(void);
+
+/**
+ * Free a string returned by `shoes_get_last_error()`.
+ *
+ * # Safety
+ * `ptr` must be a pointer returned by `shoes_get_last_error()`, or NULL.
+ */
+void shoes_free_string(char *ptr);
+
 #endif  /* SHOES_H */
