@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use log::debug;
+use rand::RngExt;
 
 use crate::address::{NetLocation, ResolvedLocation};
 use crate::async_stream::{AsyncMessageStream, AsyncStream};
@@ -60,8 +61,6 @@ pub struct TuicConnector {
     connection: LiveConnection,
     udp_enabled: bool,
     udp_relay_mode: TuicUdpRelayMode,
-    /// Read by UDP sessions, which do not exist yet.
-    #[allow(dead_code)]
     heartbeat_interval: Duration,
 }
 
@@ -202,8 +201,8 @@ impl TerminalConnector for TuicConnector {
 
     async fn connect_udp_bidirectional(
         &self,
-        _resolver: &Arc<dyn Resolver>,
-        _target: ResolvedLocation,
+        resolver: &Arc<dyn Resolver>,
+        target: ResolvedLocation,
     ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
         if !self.udp_enabled {
             return Err(std::io::Error::new(
@@ -211,10 +210,26 @@ impl TerminalConnector for TuicConnector {
                 "UDP is disabled for this TUIC outbound (udp_enabled: false)",
             ));
         }
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "TUIC UDP relaying is not implemented yet",
-        ))
+        if self.udp_relay_mode != TuicUdpRelayMode::Native {
+            // Config validation rejects this, so reaching it means the two
+            // disagree rather than that a user asked for something unsupported.
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "only udp_relay_mode: native is implemented",
+            ));
+        }
+
+        let connection = self.connection.get(resolver).await?;
+        let location = target.into_location();
+        let assoc_id: u16 = rand::rng().random();
+        debug!("TUIC: UDP association {assoc_id} to {location}");
+
+        Ok(Box::new(super::udp::TuicUdpSession::new(
+            connection,
+            assoc_id,
+            location,
+            self.heartbeat_interval,
+        )))
     }
 
     fn supports_udp(&self) -> bool {
@@ -389,6 +404,106 @@ mod tests {
             Ok(Ok(_)) => panic!("a wrong password must not relay traffic"),
             Err(_) => panic!("must fail rather than hang"),
         }
+    }
+
+    async fn udp_exchange(
+        stream: &mut Box<dyn AsyncMessageStream>,
+        payload: &[u8],
+    ) -> std::io::Result<Vec<u8>> {
+        use crate::async_stream::{AsyncReadMessage, AsyncWriteMessage};
+
+        std::future::poll_fn(|cx| std::pin::Pin::new(&mut *stream).poll_write_message(cx, payload))
+            .await?;
+
+        let mut buf = vec![0u8; 65535];
+        let mut read_buf = tokio::io::ReadBuf::new(&mut buf);
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            std::future::poll_fn(|cx| {
+                std::pin::Pin::new(&mut *stream).poll_read_message(cx, &mut read_buf)
+            }),
+        )
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "no reply arrived"))??;
+
+        Ok(read_buf.filled().to_vec())
+    }
+
+    #[tokio::test]
+    async fn test_udp_round_trip_in_native_mode() {
+        let server = spawn_server().await;
+        let echo = spawn_udp_echo().await;
+        let resolver = test_resolver();
+        let connector = connector(server, TEST_UUID, SERVER_PASSWORD);
+
+        let mut stream = connector
+            .connect_udp_bidirectional(&resolver, target(echo))
+            .await
+            .unwrap();
+
+        let reply = udp_exchange(&mut stream, b"tuic udp").await.unwrap();
+        assert_eq!(reply, b"tuic udp");
+    }
+
+    #[tokio::test]
+    async fn test_udp_carries_several_packets_over_one_association() {
+        let server = spawn_server().await;
+        let echo = spawn_udp_echo().await;
+        let resolver = test_resolver();
+        let connector = connector(server, TEST_UUID, SERVER_PASSWORD);
+
+        let mut stream = connector
+            .connect_udp_bidirectional(&resolver, target(echo))
+            .await
+            .unwrap();
+
+        for i in 0..4u8 {
+            let payload = vec![i; 48];
+            let reply = udp_exchange(&mut stream, &payload).await.unwrap();
+            assert_eq!(reply, payload, "packet {i}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_large_udp_payload_is_fragmented_and_reassembled() {
+        let server = spawn_server().await;
+        let echo = spawn_udp_echo().await;
+        let resolver = test_resolver();
+        let connector = connector(server, TEST_UUID, SERVER_PASSWORD);
+
+        let mut stream = connector
+            .connect_udp_bidirectional(&resolver, target(echo))
+            .await
+            .unwrap();
+
+        let payload: Vec<u8> = (0..4000u32).map(|i| i as u8).collect();
+        let reply = udp_exchange(&mut stream, &payload).await.unwrap();
+        assert_eq!(reply, payload);
+    }
+
+    #[tokio::test]
+    async fn test_quic_relay_mode_is_refused_rather_than_silently_downgraded() {
+        let server = spawn_server().await;
+        let resolver = test_resolver();
+        let connector = TuicConnector::new(
+            NetLocation::from_str(&server.to_string(), None).unwrap(),
+            TEST_UUID,
+            SERVER_PASSWORD.to_string(),
+            true,
+            TuicUdpRelayMode::Quic,
+            Duration::from_millis(10_000),
+            client_quic_config(),
+            None,
+        )
+        .unwrap();
+
+        let err = connector
+            .connect_udp_bidirectional(&resolver, target(server))
+            .await
+            .err()
+            .expect("the quic relay mode is not implemented")
+            .to_string();
+        assert!(err.contains("native"), "{err}");
     }
 
     #[tokio::test]
