@@ -38,15 +38,19 @@ rustup target add \
     aarch64-apple-ios \
     aarch64-apple-ios-sim
 
+# release-mobile rather than release: opt-level="s" and panic="abort". See the
+# profile comment in Cargo.toml.
+PROFILE_DIR="release-mobile"
+
 echo "==> Building for aarch64-apple-ios (physical device)"
-cargo build --release --target aarch64-apple-ios
+cargo build --profile release-mobile --target aarch64-apple-ios
 
 echo "==> Building for aarch64-apple-ios-sim (Apple Silicon simulator)"
-cargo build --release --target aarch64-apple-ios-sim
+cargo build --profile release-mobile --target aarch64-apple-ios-sim
 
 echo "==> Copying libraries"
-cp "target/aarch64-apple-ios/release/$LIB_NAME"     "$OUTPUT_DIR/device/$LIB_NAME"
-cp "target/aarch64-apple-ios-sim/release/$LIB_NAME" "$OUTPUT_DIR/sim/$LIB_NAME"
+cp "target/aarch64-apple-ios/$PROFILE_DIR/$LIB_NAME"     "$OUTPUT_DIR/device/$LIB_NAME"
+cp "target/aarch64-apple-ios-sim/$PROFILE_DIR/$LIB_NAME" "$OUTPUT_DIR/sim/$LIB_NAME"
 
 echo "==> Packaging as XCFramework"
 xcodebuild -create-xcframework \

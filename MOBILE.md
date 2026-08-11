@@ -67,10 +67,11 @@ bash scripts/build-ios.sh
 
 # Native libs only, skipping Gradle
 cargo ndk -t arm64-v8a -t armeabi-v7a -P 21 \
-    -o android/src/main/jniLibs -- build --release --lib
+    -o android/src/main/jniLibs -- build --profile release-mobile --lib
 
 # iOS device slice by hand — the deployment target is not optional
-IPHONEOS_DEPLOYMENT_TARGET=16.0 cargo build --release --target aarch64-apple-ios
+IPHONEOS_DEPLOYMENT_TARGET=16.0 \
+    cargo build --profile release-mobile --target aarch64-apple-ios
 
 # Tests (849 of them) run on the host. `src/ffi/common.rs` compiles under
 # cfg(test) already, so plain `cargo test` covers it. The `ffi` feature is what
@@ -335,15 +336,34 @@ JNI call once the thread is attached. No change needed there.
 - **Stale ABI comment in CI.** The header comment on the `android` job in
   `.github/workflows/mobile.yml` claims x86_64 and x86 slices; the job builds
   arm64-v8a and armeabi-v7a, same as the script.
-- **No `android:extractNativeLibs` guidance.** For a 14.5 MB `libshoes.so`,
+- **No `android:extractNativeLibs` guidance.** For a 9.4 MB `libshoes.so`,
   leaving it uncompressed in the APK (`useLegacyPackaging = false`, the default
   on AGP 9) is right, but it doubles the on-disk footprint. Worth measuring.
-- **Release binary size is unmeasured.** 14.5 MB is the arm64 *debug* figure;
-  nobody has recorded the release one. The release profile already uses
-  `lto = "fat"`, `opt-level = 3`, `strip = true`. If size matters, `opt-level = "z"`
-  and `panic = "abort"` are the next levers — and note that `panic = "abort"`
-  interacts with the FFI boundary, where an unwind would be UB anyway, so it is
-  arguably more correct as well as smaller. Measure first.
+- **~~Release binary size is unmeasured.~~ Done — see the `release-mobile`
+  profile.** Measured on `aarch64-linux-android`, `--lib`, stripped:
+
+  | profile | raw | zipped |
+  |---|---|---|
+  | `release` (`opt-level = 3`, unwind) | 14,575,384 | 6,038,573 |
+  | `+ panic = "abort"` | 11,854,920 | 5,029,063 |
+  | `opt-level = 2` + abort | 11,393,592 | 4,890,541 |
+  | **`release-mobile`** (`opt-level = "s"` + abort) | **9,415,728** | **3,734,628** |
+
+  `panic = "abort"` is worth 2.7 MB by itself: it deletes `.eh_frame` and
+  `.gcc_except_table`, which are 2 MiB of the baseline. `opt-level = "s"` beats
+  `"z"` on zipped size despite being larger raw, and beats `2` by 1.16 MB
+  zipped. Cost, measured over 11 × 50 MiB transfers through a real AmneziaWG
+  3.0 peer: throughput unchanged (6.55 vs 6.36 MB/s mean, link-bound either
+  way), CPU up ~15% (0.72 s vs 0.62 s per 50 MiB) — about 2 ms per MB.
+- **Feature-gating the protocols would be worth ~17%, for a much larger tax.**
+  Dropping every protocol an awg+vless client cannot reach frees ~1.0 MiB of
+  dependency `.text` (h2, hyper, the quinn/h3 stack, argon2, notify) and
+  ~0.5 MiB of shoes' own — against 15 + 15 serde-derived config variants
+  needing `#[cfg]`, 28 match arms in `validate.rs` alone, and a permanent
+  feature-combination CI matrix. The profile change above got more for two
+  lines. Note also that `.text` is file-backed and demand-paged, so unused
+  protocol code costs essentially no RSS — this is a download-size lever, not
+  a finding-1 lever.
 - **No jemalloc on mobile.** Deliberate (`Cargo.toml:95` excludes iOS and
   Android) and correct — but it means the system allocator's fragmentation
   behaviour is what you get, which makes finding 1 worse than the arithmetic

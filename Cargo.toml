@@ -109,3 +109,24 @@ ndk-sys = "*"
 opt-level = 3
 lto = "fat"
 strip = true
+
+# The profile the Android and iOS artifacts are built with. Mobile pays for
+# code size in download bytes on every install, where a server pays for it
+# once, so the two want different trade-offs and get different profiles.
+#
+# opt-level = "s" rather than 3: measured 38% off the stripped arm64 .so with
+# no measurable throughput cost, because the hot paths here are either
+# hand-written assembly (aws-lc-sys, blake3) or I/O-bound rather than
+# vectorisable loops.
+#
+# panic = "abort" rather than unwind: this deletes .eh_frame and
+# .gcc_except_table, which are ~2 MiB of the baseline on their own. It is also
+# the honest setting for this crate. A panic that reaches the JNI or extern "C"
+# boundary is undefined behaviour, not a caught error, so the unwind tables buy
+# containment we are not entitled to rely on. See install_panic_hook() in
+# src/logging.rs — with abort, a panic is the last thing the process does, so it
+# has to be logged before it happens or it is lost.
+[profile.release-mobile]
+inherits = "release"
+opt-level = "s"
+panic = "abort"

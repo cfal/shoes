@@ -54,13 +54,16 @@ rm -rf "$JNI_LIBS_DIR"
 # --locked: this produces a distributable artifact, so a Cargo.lock that does
 # not already satisfy Cargo.toml should be a hard error rather than something
 # cargo quietly resolves differently on each machine.
+#
+# release-mobile rather than release: opt-level="s" and panic="abort", which
+# together take ~38% off the stripped .so. See the profile comment in Cargo.toml.
 echo "==> Building native .so files for all ABIs"
 cargo ndk \
     -t arm64-v8a \
     -t armeabi-v7a \
     -P 21 \
     -o "$JNI_LIBS_DIR" \
-    -- build --release --lib --locked
+    -- build --profile release-mobile --lib --locked
 
 # cargo-ndk copies every cdylib in the graph, including boringtun's. Nothing
 # loads it — its hashed filename is not even a valid System.loadLibrary name —
