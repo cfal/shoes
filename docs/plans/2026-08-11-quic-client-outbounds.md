@@ -3779,10 +3779,12 @@ fn build_obfuscator(
 Add `pub mod client;` and `pub use client::Hysteria2Connector;` to
 `src/hysteria2/mod.rs`.
 
-This is the step that gives the binary a consumer for the endpoint and
-connection halves of `quic_outbound`. Remove the `#[allow(dead_code)]` from the
-`mod quic_outbound;` declaration in `src/main.rs` and confirm
-`cargo clippy --locked --bins -- -D warnings` still passes.
+This is the step that gives the binary a consumer for code that until now had
+none. Remove both temporary lint allowances and confirm
+`cargo clippy --locked --bins -- -D warnings` still passes:
+
+- `#[allow(dead_code)]` on `mod quic_outbound;` in `src/main.rs`;
+- `#[allow(dead_code)]` on `pub mod frame;` in `src/hysteria2/mod.rs`.
 
 - [ ] **Step 5: Run the tests**
 
