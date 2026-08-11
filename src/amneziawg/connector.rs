@@ -12,7 +12,7 @@ use crate::async_stream::AsyncMessageStream;
 use crate::config::{AmneziaWgClientConfig, ClientProxyConfig, WireGuardClientConfig};
 use crate::resolver::{self, Resolver};
 use crate::tcp::tcp_handler::TcpClientSetupResult;
-use crate::tcp::virtual_network_connector::VirtualNetworkConnector;
+use crate::tcp::terminal_connector::TerminalConnector;
 
 use super::config::AwgRuntimeConfig;
 use super::netstack::{NetStackRequest, VirtualNetStack};
@@ -177,7 +177,7 @@ impl AmneziaWgConnector {
 }
 
 #[async_trait]
-impl VirtualNetworkConnector for AmneziaWgConnector {
+impl TerminalConnector for AmneziaWgConnector {
     async fn connect_tcp(
         &self,
         resolver: &Arc<dyn Resolver>,

@@ -56,7 +56,7 @@ pub fn build_client_proxy_chain(
     // Protocols that own their transport (WireGuard/AmneziaWG) cannot be
     // wrapped by another proxy, so they must be the only hop. Validation
     // enforces that, and that a pool at that hop is homogeneous.
-    if hops.len() == 1 && hops[0].iter().all(|c| c.protocol.is_virtual_network()) {
+    if hops.len() == 1 && hops[0].iter().all(|c| c.protocol.owns_transport()) {
         let connectors = hops
             .into_iter()
             .next()
@@ -68,8 +68,7 @@ pub fn build_client_proxy_chain(
                     config.address,
                 )
                 .expect("config validation should have ensured Wireguard or AmneziaWg variant");
-                Arc::new(connector)
-                    as Arc<dyn crate::tcp::virtual_network_connector::VirtualNetworkConnector>
+                Arc::new(connector) as Arc<dyn crate::tcp::terminal_connector::TerminalConnector>
             })
             .collect();
         return ClientProxyChain::new_terminal(connectors);

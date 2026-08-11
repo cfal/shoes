@@ -580,8 +580,10 @@ impl ClientProxyConfig {
         matches!(self, ClientProxyConfig::Direct)
     }
 
-    /// Returns true for protocols that use a virtual network tunnel (WireGuard/AmneziaWG).
-    pub fn is_virtual_network(&self) -> bool {
+    /// Returns true for protocols that own their own transport and therefore
+    /// cannot be wrapped by another proxy: WireGuard and AmneziaWG today,
+    /// Hysteria2 and TUIC once they land.
+    pub fn owns_transport(&self) -> bool {
         matches!(
             self,
             ClientProxyConfig::Wireguard(_) | ClientProxyConfig::AmneziaWg(_)

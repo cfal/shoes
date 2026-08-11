@@ -8,4 +8,4 @@ pub mod tcp_forward;
 pub mod tcp_handler;
 pub mod tcp_server;
 pub mod tcp_server_handler_factory;
-pub mod virtual_network_connector;
+pub mod terminal_connector;

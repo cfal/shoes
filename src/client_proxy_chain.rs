@@ -22,7 +22,8 @@
 //! - `subsequent_hops`: Protocol connectors for hops 1+ (no socket creation)
 //!
 //! For virtual network chains:
-//! - A single `VirtualNetworkConnector` that handles all connections internally
+//! - A pool of `TerminalConnector`s, each of which handles all connections
+//!   internally
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -35,7 +36,7 @@ use crate::resolver::Resolver;
 use crate::tcp::proxy_connector::ProxyConnector;
 use crate::tcp::socket_connector::SocketConnector;
 use crate::tcp::tcp_handler::TcpClientSetupResult;
-use crate::tcp::virtual_network_connector::VirtualNetworkConnector;
+use crate::tcp::terminal_connector::TerminalConnector;
 
 /// Entry in the initial hop (hop 0) pool.
 ///
@@ -93,7 +94,7 @@ enum ClientProxyChainKind {
     /// TUIC once they land). A pool is selected round-robin, exactly like a
     /// pool of proxy hops.
     Terminal {
-        connectors: Vec<Arc<dyn VirtualNetworkConnector>>,
+        connectors: Vec<Arc<dyn TerminalConnector>>,
         next_index: AtomicU32,
     },
 }
@@ -189,7 +190,7 @@ impl ClientProxyChain {
     ///
     /// # Panics
     /// Panics if `connectors` is empty.
-    pub fn new_terminal(connectors: Vec<Arc<dyn VirtualNetworkConnector>>) -> Self {
+    pub fn new_terminal(connectors: Vec<Arc<dyn TerminalConnector>>) -> Self {
         assert!(
             !connectors.is_empty(),
             "ClientProxyChain must have at least one terminal connector"
@@ -553,9 +554,9 @@ fn select_from_pool<'a>(pool: &'a [InitialHopEntry], index: &AtomicU32) -> &'a I
 }
 
 fn select_terminal<'a>(
-    pool: &'a [Arc<dyn VirtualNetworkConnector>],
+    pool: &'a [Arc<dyn TerminalConnector>],
     index: &AtomicU32,
-) -> &'a Arc<dyn VirtualNetworkConnector> {
+) -> &'a Arc<dyn TerminalConnector> {
     if pool.len() == 1 {
         &pool[0]
     } else {

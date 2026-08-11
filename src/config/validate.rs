@@ -972,7 +972,7 @@ fn validate_client_config(
     }
 
     // WireGuard/AmneziaWG use their own UDP transport; reject incompatible settings
-    if client_config.protocol.is_virtual_network() {
+    if client_config.protocol.owns_transport() {
         let proto = client_config.protocol.protocol_name();
         if client_config.transport != Transport::Tcp {
             return Err(std::io::Error::new(
@@ -1657,7 +1657,7 @@ fn validate_amneziawg_chain_position(
                 .collect(),
             _ => vec![],
         };
-        configs.iter().any(|c| c.protocol.is_virtual_network())
+        configs.iter().any(|c| c.protocol.owns_transport())
     });
 
     if !has_tunnel {
@@ -1678,7 +1678,7 @@ fn validate_amneziawg_chain_position(
     let hop = hops.iter().next().unwrap();
     if let ClientChainHop::Pool(selections) = hop {
         let all_tunnel = selections.iter().all(|s| match s {
-            ConfigSelection::Config(config) => config.protocol.is_virtual_network(),
+            ConfigSelection::Config(config) => config.protocol.owns_transport(),
             _ => false,
         });
         if !all_tunnel {
