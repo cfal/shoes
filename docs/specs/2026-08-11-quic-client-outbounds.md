@@ -78,10 +78,11 @@ Findings from the changelog and the current option reference:
   Salamander is therefore a prerequisite for it rather than an alternative to
   it, and the obfuscation layer here is specified as a trait with one
   implementation rather than as a single concrete type.
-- **Chrome QUIC fingerprint parroting is on by default** in the sing-box
-  Hysteria2 client since 1.14.0-beta.7, disabled with `disable_chrome_parrot`.
-  It is a client-side property: a server accepts a parroting and a
-  non-parroting client alike. Its consequence for us is covered under
+- **Chrome QUIC fingerprint parroting is on by default.** It originated
+  upstream in `apernet/hysteria` 2.11.0, where `quic.disableChromeParrot` turns
+  it off; sing-box followed in 1.14.0-beta.7 with `disable_chrome_parrot`. It is
+  a client-side property: a server accepts a parroting and a non-parroting
+  client alike. Its consequence for us is covered under
   [QUIC transport parameters and fingerprinting](#quic-transport-parameters-and-fingerprinting).
 - **Bandwidth is optional and its absence is meaningful.** With `up_mbps` and
   `down_mbps` unset, the server instructs the client to use BBR rather than
@@ -354,9 +355,9 @@ makes the end-to-end tests possible at all.
 This is not a feature; it is a property of the stack, recorded so the choice is
 made deliberately.
 
-sing-box's Hysteria2 client parrots Chrome's QUIC handshake by default as of
-1.14.0-beta.7. We cannot match that — it is the QUIC equivalent of uTLS, a
-project rather than a backport, and the same conclusion applies as in the
+Hysteria has parroted Chrome's QUIC handshake by default since upstream 2.11.0,
+and sing-box followed. We cannot match that — it is the QUIC equivalent of uTLS,
+a project rather than a backport, and the same conclusion applies as in the
 ROADMAP's TLS fingerprinting section. The population of clients moving toward a
 Chrome-like shape makes a default quinn client *more* distinctive than it was,
 not less.

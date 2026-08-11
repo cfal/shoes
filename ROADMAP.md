@@ -1,7 +1,8 @@
 # Roadmap
 
 Where this fork stands against sing-box and Xray-core, and what is worth building
-next. Written 2026-08-09 against `mobile` at `7ed9f0b`.
+next. Written 2026-08-09 against `mobile` at `7ed9f0b`; the Hysteria section was
+added 2026-08-11 against `apernet/hysteria` at `app/v2.12.1`.
 
 The audience is anyone deciding what to work on. Every gap below is stated with
 the file it lands in, so the estimate is checkable rather than a guess.
@@ -13,6 +14,7 @@ the file it lands in, so the estimate is checkable rather than a guess.
 - [Tier 1 — closes most of the gap](#tier-1--closes-most-of-the-gap)
 - [Tier 2 — worth doing after Tier 1](#tier-2--worth-doing-after-tier-1)
 - [Tier 3 — real, but not urgent](#tier-3--not-urgent)
+- [Hysteria: the rest of the surface](#hysteria-the-rest-of-the-surface)
 - [Explicitly not planned](#explicitly-not-planned)
 - [Open risk: TLS fingerprinting](#open-risk-tls-fingerprinting)
 
@@ -100,12 +102,24 @@ deliberately deferred — see the spec's scope section. Overriding the destinati
 for direct connections is not planned: Xray had to bolt an exclusion list onto
 it and sing-box has deprecated it.
 
-### 3. Hysteria2 and TUIC client outbounds
+### 3. Hysteria2 and TUIC client outbounds — in progress
+
+Spec: [docs/specs/2026-08-11-quic-client-outbounds.md](./docs/specs/2026-08-11-quic-client-outbounds.md).
+Plan: [docs/plans/2026-08-11-quic-client-outbounds.md](./docs/plans/2026-08-11-quic-client-outbounds.md).
 
 The framing and crypto exist in the server modules. Adding the two variants to
 `ClientProxyConfig` and their client handlers is the largest gain in
 real-world-server coverage per line written, and Hysteria2 in particular is now
 one of the most widely deployed protocols in the commercial market.
+
+Neither protocol fits the chain model, which builds an outbound from a socket
+connector that yields a stream and proxy connectors that wrap one: both
+authenticate once per QUIC connection and key their UDP sessions to it. They
+become `TerminalConnector`s instead — the escape hatch AmneziaWG already uses —
+and are therefore always the only hop in a chain.
+
+What that work covers is authentication, TCP, UDP and Salamander obfuscation on
+both ends. What it does not cover is in the next section.
 
 ## Tier 2 — worth doing after Tier 1
 
@@ -160,6 +174,70 @@ group per rule, so split DNS cannot be expressed. Half the mechanism is built.
 - **Multiplex interop** with sing-box's smux/yamux. H2MUX covers our own
   deployments; this is purely about talking to other implementations.
 
+## Hysteria: the rest of the surface
+
+Written against [apernet/hysteria](https://github.com/apernet/hysteria) at
+`app/v2.12.1` (2026-08-09), read from `PROTOCOL.md` and the `serverConfig` and
+`clientConfig` structs in `app/cmd/`.
+
+Speaking the protocol is not the same as matching the implementation. This
+section is the difference, so that "we support Hysteria2" is never claimed
+wider than it is true.
+
+### Interoperability — a server we cannot talk to
+
+| Gap | Effect |
+| --- | --- |
+| **Gecko obfuscation** (`obfs.type: gecko`, upstream 2.9.2) | A server with it configured is unreachable. Experimental upstream, and it builds on Salamander's scrambling rather than replacing it, so it is an added framing layer rather than a second cipher. |
+| **Port hopping** (`transport.udp.hopInterval`, `minHopInterval`, `maxHopInterval`) | Servers published as a port range expect the client to migrate between ports on a timer. Without it, only the single configured port works — and some deployments firewall all but the range. |
+| **`Hysteria-CC-RX: "auto"`** | The protocol allows the literal string as well as an integer. A parser that assumes a number must not choke on it. Our client ignores the header entirely, which is compliant, but the ignoring has to be deliberate. |
+| **Multiple users on our server** (`auth.type: userpass`, `http`, `command`) | `ServerProxyConfig::Hysteria2` takes one password. Upstream supports a user map, an HTTP callback and an external command. A client authenticating as `user:pass` works against us today only because we compare the whole string. |
+
+### Performance — the reason people pick Hysteria
+
+| Gap | Effect |
+| --- | --- |
+| **Brutal congestion control** and the bandwidth negotiation behind it (`bandwidth.up`/`down`, `Hysteria-CC-RX` in both directions) | This is the headline feature. Brutal sends at a declared rate instead of backing off on loss, which is why Hysteria is fast on lossy intercontinental paths. We send `Hysteria-CC-RX: 0` in both directions, which is the protocol's "use ordinary congestion control" signal, so throughput on a lossy path will be visibly below the official client's. Needs a `quinn` congestion controller. |
+| **BBR profile** (`congestion.bbrProfile`: conservative/standard/aggressive) | Tuning knob on top of the fallback controller. |
+| **`bandwidth.disableLossCompensation`** (upstream 2.10.0) | Only meaningful once Brutal exists. |
+| **QUIC stateless resets** (upstream 2.12.1) | Server side. Without them a client holding a connection that died while the device slept waits out its idle timeout before reconnecting. Upstream called this out as most noticeable on mobile, which is this branch's entire audience. |
+| **QUIC window and timeout tuning** (`quic.*`) | We hard-code the values the reference implementation uses. Exposing them is easy; whether it is worth the configuration surface is a separate question. |
+
+### Detectability
+
+| Gap | Effect |
+| --- | --- |
+| **Chrome QUIC fingerprint parroting** | Upstream since 2.11.0 and **on by default** there, with `quic.disableChromeParrot` to turn it off; sing-box followed. So the population a censor sees is moving to a Chrome-shaped handshake, and a default `quinn` client stands out more each release. This is the QUIC twin of the uTLS gap below, and closing it properly is a project rather than a backport. |
+| **Masquerade** (`masquerade.type`: file/proxy/string) | Server side. The protocol requires a Hysteria server to behave like an ordinary HTTP/3 web server for anything that is not an auth request. Ours answers a bare 404 to everything, which is a constant response pattern — exactly what the specification warns active probers look for. |
+| **ECH** (upstream 2.10.0) | Encrypts the ClientHello's SNI. Already listed under "explicitly not planned" for the TLS stack generally. |
+| **mimic** (upstream 2.12.0) | Disguises the connection as TCP for networks that block UDP outright. Linux only, needs an XDP program and a separately installed binary. |
+
+### Operational, server side
+
+Not protocol, but part of what a Hysteria server is expected to do: **ACME**
+certificate issuance, **SNI guard** (`tls.sniGuard`), **`speedTest`**, and
+**Hysteria Realms** — the STUN and hole-punching rendezvous (upstream 2.9.0,
+with UPnP/NAT-PMP in 2.9.3) that lets a server run behind NAT with no public
+address.
+
+### Deliberately not our problem
+
+Upstream bundles a whole proxy application. Several of its configuration
+sections have shoes equivalents that are broader, and copying them would be a
+regression rather than a gain:
+
+| Upstream | Ours |
+| --- | --- |
+| `acl` and `outbounds` | `rules`, `client_chains` and rule-sets |
+| `sniff` | the `sniff` block, on every inbound and the TUN |
+| `resolver` | the `dns` configuration |
+| `socks5`, `http`, `tcpForwarding`, `udpForwarding`, `tcpTProxy`, `tcpRedirect`, `tun` on the client | server types in their own right, usable in front of any outbound |
+| `trafficStats` | global counters today; per-connection statistics is Tier 2 item 6 |
+
+One genuinely missing convenience: shoes cannot import a `hysteria2://` sharing
+link. Every client in the ecosystem can, and it is how servers are distributed
+in practice.
+
 ## Explicitly not planned
 
 - **gRPC transport** — considerable work, and less used in practice than
@@ -178,3 +256,13 @@ not.
 
 There is no mature uTLS equivalent in Rust. Closing this would mean writing one,
 which is a project rather than a backport, and it should be decided as such.
+
+The same exposure now exists over QUIC, and it is getting worse rather than
+staying still. Hysteria has parroted Chrome's QUIC handshake by default since
+its 2.11.0, sing-box followed, and both pin transport parameters — idle timeout
+and receive windows — as part of the imitation. Every release moves more of the
+observable population toward one shape, which makes a default `quinn` client
+easier to pick out by standing still. Our QUIC outbounds at least take their
+transport parameters from the reference implementations rather than inventing
+plausible-looking numbers, so we do not pay for a unique signature we never
+chose; the handshake itself remains ours.
