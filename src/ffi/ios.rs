@@ -113,6 +113,7 @@ pub unsafe extern "C" fn shoes_init(log_level: *const c_char) -> c_int {
             level: filter,
         }];
         crate::logging::init_multi_logger(writers, directives);
+        crate::logging::install_panic_hook();
     }
 
     TUN_SERVICE.get_or_init(|| Mutex::new(None));

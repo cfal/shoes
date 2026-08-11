@@ -195,6 +195,49 @@ pub fn init_multi_logger(writers: Vec<Box<dyn LogWriter>>, mut directives: Vec<D
     log::set_max_level(max_level);
 }
 
+/// Routes panics through the logger instead of stderr, then flushes.
+///
+/// The default hook writes to stderr, which on Android goes nowhere and on iOS
+/// goes somewhere nobody reads. Under the `release-mobile` profile the process
+/// aborts the instant this returns, so anything still sitting in the log file's
+/// buffer is lost — hence the explicit flush.
+///
+/// Call this after `init_multi_logger`; a panic before the logger exists still
+/// reaches stderr through the default hook.
+pub fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        match info.location() {
+            Some(location) => log::error!(
+                "panic at {}:{}:{}: {}",
+                location.file(),
+                location.line(),
+                location.column(),
+                panic_message(info.payload())
+            ),
+            None => log::error!(
+                "panic at an unknown location: {}",
+                panic_message(info.payload())
+            ),
+        }
+
+        log::logger().flush();
+    }));
+}
+
+/// Recovers the text of a panic payload.
+///
+/// `PanicHookInfo::message()` is unstable, so the payload has to be downcast by
+/// hand. `&str` covers `panic!("literal")` and the messages `unwrap` and
+/// `expect` produce; `String` covers `panic!("{}", x)`. A payload from
+/// `panic_any` can be any type at all, and there is nothing to print for it.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("<non-string panic payload>")
+}
+
 /// Parses a level string (case-insensitive). Returns `None` for unrecognized values.
 pub fn parse_log_level(s: &str) -> Option<LevelFilter> {
     match s.to_lowercase().as_str() {
@@ -427,5 +470,44 @@ mod tests {
     fn matches_no_directives() {
         let logger = logger_from(vec![]);
         assert!(!logger.matches(Level::Error, "shoes"));
+    }
+
+    /// The payloads the hook has to render. Under `panic = "abort"` this text
+    /// is the only account of why the process died, so an unwrap that reports
+    /// nothing but "<non-string panic payload>" would be a silent loss.
+    #[test]
+    // The literal `None.unwrap()` and `None.expect()` below are the point of
+    // the test — they are how the panics this hook has to render actually get
+    // produced — so clippy's advice to replace them with `panic!` is backwards
+    // here.
+    #[allow(clippy::unnecessary_literal_unwrap)]
+    fn panic_message_recovers_the_payload_text() {
+        let from_literal = std::panic::catch_unwind(|| panic!("a string literal")).unwrap_err();
+        assert_eq!(panic_message(from_literal.as_ref()), "a string literal");
+
+        let value = 7;
+        let formatted = std::panic::catch_unwind(move || panic!("formatted {value}")).unwrap_err();
+        assert_eq!(panic_message(formatted.as_ref()), "formatted 7");
+
+        let from_expect = std::panic::catch_unwind(|| {
+            Option::<u8>::None.expect("the expect message");
+        })
+        .unwrap_err();
+        assert_eq!(panic_message(from_expect.as_ref()), "the expect message");
+
+        let from_unwrap = std::panic::catch_unwind(|| Option::<u8>::None.unwrap()).unwrap_err();
+        assert!(
+            panic_message(from_unwrap.as_ref()).contains("unwrap"),
+            "an unwrap should still describe itself"
+        );
+    }
+
+    #[test]
+    fn panic_message_falls_back_for_a_foreign_payload() {
+        let payload = std::panic::catch_unwind(|| std::panic::panic_any(42u32)).unwrap_err();
+        assert_eq!(
+            panic_message(payload.as_ref()),
+            "<non-string panic payload>"
+        );
     }
 }

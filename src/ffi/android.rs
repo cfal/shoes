@@ -105,6 +105,7 @@ pub extern "system" fn Java_com_shoesproxy_ShoesNative_init<'local>(
         ];
         let directives = vec![crate::logging::Directive { name: None, level }];
         crate::logging::init_multi_logger(writers, directives);
+        crate::logging::install_panic_hook();
     }
 
     info!("shoes initialized with log level: {}", level_str);

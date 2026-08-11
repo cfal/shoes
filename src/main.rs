@@ -208,6 +208,7 @@ fn main() {
     }
 
     logging::init_multi_logger(writers, directives);
+    logging::install_panic_hook();
 
     if args.iter().any(|s| s == "generate-reality-keypair") {
         let (private_key, public_key) = generate_keypair().unwrap();
