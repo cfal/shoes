@@ -1,8 +1,10 @@
 //! QUIC packet obfuscation.
 
 mod salamander;
+mod socket;
 
 pub use salamander::Salamander;
+pub use socket::ObfuscatedUdpSocket;
 
 use std::fmt::Debug;
 
