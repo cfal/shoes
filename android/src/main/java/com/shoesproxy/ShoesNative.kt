@@ -25,7 +25,9 @@ package com.shoesproxy
  *               device_fd: $tunFd
  *         """.trimIndent()
  *
- *         shoesHandle = ShoesNative.start(config) { fd -> protect(fd) }
+ *         shoesHandle = ShoesNative.start(config, { fd -> protect(fd) }) { up, down ->
+ *             Log.d("VPN", "Traffic: up=$up down=$down")
+ *         }
  *         return START_STICKY
  *     }
  *
@@ -57,6 +59,22 @@ object ShoesNative {
          * @return true if protection succeeded.
          */
         fun protect(fd: Int): Boolean
+    }
+
+    /**
+     * Functional interface for receiving traffic statistics.
+     *
+     * Called periodically (~1 second) from the native engine with cumulative
+     * byte counts since the last [start] call.
+     */
+    fun interface TrafficListener {
+        /**
+         * Called with updated traffic statistics.
+         *
+         * @param uploadBytes   Total bytes sent from device to proxy since start.
+         * @param downloadBytes Total bytes received from proxy to device since start.
+         */
+        fun onTrafficUpdate(uploadBytes: Long, downloadBytes: Long)
     }
 
     /**
@@ -95,9 +113,14 @@ object ShoesNative {
      * @param configYaml YAML configuration string.
      * @param protectCallback Called by the engine to exempt outbound sockets
      *                        from VPN routing (pass `this::protect` from your VpnService).
+     * @param trafficCallback Called periodically with cumulative traffic byte counts.
      * @return A positive handle on success, -1 on error.
      */
-    external fun start(configYaml: String, protectCallback: SocketProtector): Long
+    external fun start(
+        configYaml: String,
+        protectCallback: SocketProtector,
+        trafficCallback: TrafficListener,
+    ): Long
 
     /**
      * Stop the VPN service.
