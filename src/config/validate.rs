@@ -1487,6 +1487,9 @@ fn validate_server_proxy_config(
         ServerProxyConfig::TuicV5 { uuid, .. } => {
             parse_uuid(uuid)?;
         }
+        ServerProxyConfig::Hysteria2 { obfs, .. } => {
+            validate_obfs_config(obfs.as_ref())?;
+        }
         ServerProxyConfig::Trojan { shadowsocks, .. } => {
             if matches!(shadowsocks, Some(ShadowsocksConfig::Aead2022 { .. })) {
                 return Err(std::io::Error::new(

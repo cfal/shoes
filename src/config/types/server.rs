@@ -11,6 +11,7 @@ use crate::option_util::{NoneOrSome, OneOrSome};
 
 use super::common::{default_reality_server_short_ids, default_reality_time_diff, default_true};
 use super::dns::DnsConfig;
+use super::obfs::ObfsConfig;
 use super::rules::{ClientChainHop, RuleConfig};
 use super::selection::ConfigSelection;
 use super::shadowsocks::ShadowsocksConfig;
@@ -758,6 +759,10 @@ pub enum ServerProxyConfig {
         password: Redacted<String>,
         #[serde(default = "default_true")]
         udp_enabled: bool,
+        /// QUIC packet obfuscation. Both ends must agree, or neither can read
+        /// the other's packets at all.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        obfs: Option<ObfsConfig>,
     },
     #[serde(alias = "tuic")]
     TuicV5 {
@@ -1083,6 +1088,7 @@ mod tests {
             protocol: ServerProxyConfig::Hysteria2 {
                 password: "hysteria_pass".into(),
                 udp_enabled: true,
+                obfs: None,
             },
             transport: Transport::Quic,
             tcp_settings: None,
@@ -1246,6 +1252,33 @@ mod tests {
             deserialized.protocol,
             ServerProxyConfig::Hysteria2 { .. }
         ));
+    }
+
+    /// The obfuscation block lives inside `protocol`, which has its own schema,
+    /// so the outer ServerConfig field whitelist does not gate it. Asserted
+    /// rather than assumed, because a field silently rejected at parse time
+    /// looks exactly like a server that ignores the setting.
+    #[test]
+    fn test_server_config_hysteria2_accepts_obfs() {
+        let yaml = r#"
+address: "127.0.0.1:443"
+protocol:
+  type: hysteria2
+  password: hysteria_pass
+  obfs:
+    type: salamander
+    password: obfspass
+"#;
+        let config: ServerConfig = serde_yaml::from_str(yaml).expect("should parse");
+        match config.protocol {
+            ServerProxyConfig::Hysteria2 { obfs, .. } => {
+                let Some(super::ObfsConfig::Salamander { password }) = obfs else {
+                    panic!("expected a salamander obfuscator");
+                };
+                assert_eq!(password.expose(), "obfspass");
+            }
+            other => panic!("expected Hysteria2, got {other:?}"),
+        }
     }
 
     #[test]

@@ -304,14 +304,35 @@ pub async fn start_quic_servers(
 
     let mut handles = vec![];
 
+    /// Build the obfuscator a Hysteria2 listener was configured with, if any.
+    ///
+    /// The password length was already checked during config validation; this
+    /// re-checks it only because the constructor is the one place that owns
+    /// the rule.
+    fn build_obfuscator(
+        obfs: Option<&crate::config::ObfsConfig>,
+    ) -> std::io::Result<Option<Arc<dyn crate::quic_outbound::obfs::Obfuscator>>> {
+        match obfs {
+            Some(crate::config::ObfsConfig::Salamander { password }) => {
+                let salamander =
+                    crate::quic_outbound::obfs::Salamander::new(password.expose().as_bytes())?;
+                Ok(Some(Arc::new(salamander)))
+            }
+            None => Ok(None),
+        }
+    }
+
     match protocol {
         ServerProxyConfig::Hysteria2 {
             password,
             udp_enabled,
+            obfs,
         } => {
             // TODO: hash password instead of passing directly
             let hysteria2_password: &'static str =
                 Box::leak(password.into_inner().into_boxed_str());
+
+            let obfs = build_obfuscator(obfs.as_ref())?;
 
             for bind_address in bind_addresses.into_iter() {
                 let quic_server_config = quic_server_config.clone();
@@ -325,6 +346,7 @@ pub async fn start_quic_servers(
                     resolver,
                     num_endpoints,
                     udp_enabled,
+                    obfs.clone(),
                 )
                 .await?;
                 handles.extend(hysteria2_handles);
