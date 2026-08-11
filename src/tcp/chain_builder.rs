@@ -4,12 +4,13 @@ use std::sync::Arc;
 
 use crate::client_proxy_chain::{ClientChainGroup, ClientProxyChain, InitialHopEntry};
 use crate::config::ConfigSelection;
-use crate::config::{ClientChainHop, ClientConfig};
+use crate::config::{ClientChainHop, ClientConfig, ClientProxyConfig};
 use crate::resolver::Resolver;
 use crate::tcp::proxy_connector::ProxyConnector;
 use crate::tcp::proxy_connector_impl::ProxyConnectorImpl;
 use crate::tcp::socket_connector::SocketConnector;
 use crate::tcp::socket_connector_impl::SocketConnectorImpl;
+use crate::tcp::terminal_connector::TerminalConnector;
 
 /// Build a ClientProxyChain from a client_chain configuration.
 ///
@@ -62,14 +63,7 @@ pub fn build_client_proxy_chain(
             .next()
             .unwrap()
             .into_iter()
-            .map(|config| {
-                let connector = crate::amneziawg::AmneziaWgConnector::from_client_config(
-                    config.protocol,
-                    config.address,
-                )
-                .expect("config validation should have ensured Wireguard or AmneziaWg variant");
-                Arc::new(connector) as Arc<dyn crate::tcp::terminal_connector::TerminalConnector>
-            })
+            .map(build_terminal_connector)
             .collect();
         return ClientProxyChain::new_terminal(connectors);
     }
@@ -127,6 +121,46 @@ pub fn build_client_proxy_chain(
         .collect();
 
     ClientProxyChain::new(initial_hop, subsequent_hops)
+}
+
+/// Build a connector for a protocol that owns its transport.
+///
+/// Every variant here is one `owns_transport` reports, and config validation
+/// has already rejected the settings that do not apply to it.
+fn build_terminal_connector(config: ClientConfig) -> Arc<dyn TerminalConnector> {
+    match config.protocol {
+        ClientProxyConfig::Hysteria2(hysteria2) => {
+            let obfs = build_obfuscator(hysteria2.obfs.as_ref())
+                .expect("obfuscation settings were validated during config load");
+            Arc::new(crate::hysteria2::Hysteria2Connector::new(
+                config.address,
+                hysteria2.password.into_inner(),
+                hysteria2.udp_enabled,
+                config.quic_settings.unwrap_or_default(),
+                config.bind_interface.into_option(),
+                obfs,
+            ))
+        }
+        protocol => {
+            let connector =
+                crate::amneziawg::AmneziaWgConnector::from_client_config(protocol, config.address)
+                    .expect("config validation should have ensured a tunnel variant");
+            Arc::new(connector)
+        }
+    }
+}
+
+fn build_obfuscator(
+    obfs: Option<&crate::config::ObfsConfig>,
+) -> std::io::Result<Option<Arc<dyn crate::quic_outbound::obfs::Obfuscator>>> {
+    match obfs {
+        Some(crate::config::ObfsConfig::Salamander { password }) => {
+            let salamander =
+                crate::quic_outbound::obfs::Salamander::new(password.expose().as_bytes())?;
+            Ok(Some(Arc::new(salamander)))
+        }
+        None => Ok(None),
+    }
 }
 
 /// Find the first proxy address in the chain (for socket connector target).

@@ -110,10 +110,17 @@ impl QuicOutboundSettings {
         let mtu = self.effective_mtu();
         let mut transport = quinn::TransportConfig::default();
         transport
-            // Neither protocol has the server open streams toward us. Incoming
-            // datagrams are unaffected by these limits.
+            // These bound what the *server* may open toward us. Neither
+            // protocol has it open bidirectional streams, so that stays zero.
+            //
+            // Unidirectional streams must be allowed, and a zero here is a
+            // silent deadlock rather than an error: HTTP/3 requires the server
+            // to open its control and QPACK streams before Hysteria2's
+            // authentication can complete, and TUIC carries UDP packets over
+            // server-opened uni streams in its `quic` relay mode. The value
+            // matches what our own Hysteria2 server allows.
             .max_concurrent_bidi_streams(0_u32.into())
-            .max_concurrent_uni_streams(0_u32.into())
+            .max_concurrent_uni_streams(1024_u32.into())
             .keep_alive_interval(Some(Duration::from_secs(10)))
             .max_idle_timeout(Some(Duration::from_secs(30).try_into().unwrap()))
             .send_window(16 * 1024 * 1024)

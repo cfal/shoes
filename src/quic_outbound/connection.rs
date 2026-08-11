@@ -74,6 +74,9 @@ impl LiveConnection {
     }
 
     /// How many connections have been raised over this outbound's lifetime.
+    ///
+    /// Exists so a reconnect can be asserted rather than inferred from timing.
+    #[cfg(test)]
     pub fn connections_raised(&self) -> usize {
         self.connections_raised.load(Ordering::Relaxed)
     }

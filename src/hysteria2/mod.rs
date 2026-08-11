@@ -5,10 +5,10 @@
 // this module privately, so its lint would fire on code that is merely early.
 // Scoped to the codec so the server next door stays under the lint. Remove when
 // the connector lands.
-#[allow(dead_code)]
 pub mod auth;
-#[allow(dead_code)]
+pub mod client;
 pub mod frame;
 pub mod server;
 
+pub use client::Hysteria2Connector;
 pub use server::start_hysteria2_server;

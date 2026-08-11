@@ -18,10 +18,6 @@ mod mixed_handler;
 mod naiveproxy;
 mod option_util;
 mod port_forward_handler;
-// The binary uses the obfuscation half of this module today; the endpoint and
-// connection halves get their consumer when the chain builder starts
-// constructing Hysteria2 and TUIC connectors. Remove this allow then.
-#[allow(dead_code)]
 mod quic_outbound;
 mod quic_server;
 mod quic_stream;
