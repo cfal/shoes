@@ -29,6 +29,7 @@ ffi = []  # Enable FFI module for non-Android builds
 async-trait = "*"
 aws-lc-rs = { version = "*", default-features = false }
 base64 = "*"
+blake2 = "*"
 boringtun = { git = "https://github.com/AYastrebov/boringtun", branch = "master", default-features = false }
 blake3 = "*"
 bytes = "*"
