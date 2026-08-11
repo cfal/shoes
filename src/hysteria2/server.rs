@@ -39,6 +39,11 @@ use crate::stream_reader::StreamReader;
 use crate::tcp::tcp_forward::setup_client_tcp_stream;
 use crate::util::allocate_vec;
 
+use super::frame::{
+    FRAME_TYPE_TCP_REQUEST, MAX_ADDRESS_LEN, MAX_PADDING_LEN, decode_varint_slice, encode_varint,
+    read_varint,
+};
+
 async fn process_connection(
     client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
@@ -473,30 +478,12 @@ async fn run_udp_local_to_remote_loop(
         let fragment_id = data[6];
         let fragment_count = data[7];
 
-        let (address_len, next_index) = {
-            let first_byte = data[8];
-            let length_indicator = first_byte >> 6;
-            let mut value: u64 = (first_byte & 0b00111111) as u64;
-            let num_bytes = match length_indicator {
-                0 => 1,
-                1 => 2,
-                2 => 4,
-                3 => 8,
-                _ => {
-                    // impossible since we only have 2 bits
-                    unreachable!();
-                }
-            };
-            let mut next_index = 9;
-            if num_bytes > 1 {
-                let remaining = &data[9..9 + (num_bytes - 1)];
-                for byte in remaining {
-                    value <<= 8;
-                    value |= *byte as u64;
-                }
-                next_index += num_bytes - 1;
+        let (address_len, next_index) = match decode_varint_slice(&data[8..]) {
+            Some((value, consumed)) => (value as usize, 8 + consumed),
+            None => {
+                debug!("Ignoring datagram with a truncated address length");
+                continue;
             }
-            (value as usize, next_index)
         };
 
         if address_len == 0 {
@@ -504,7 +491,7 @@ async fn run_udp_local_to_remote_loop(
             continue;
         }
 
-        if address_len > 2048 {
+        if address_len > MAX_ADDRESS_LEN as usize {
             debug!("Ignoring packet with address length {address_len}");
             continue;
         }
@@ -764,10 +751,6 @@ async fn run_tcp_loop(
     Ok(())
 }
 
-/// TCP request frame type constant from Hysteria2 protocol.
-/// See: https://github.com/apernet/hysteria/blob/master/core/internal/protocol/proxy.go#L15
-const FRAME_TYPE_TCP_REQUEST: u64 = 0x401;
-
 async fn handle_tcp_header(
     send: &mut quinn::SendStream,
     recv: &mut quinn::RecvStream,
@@ -784,9 +767,8 @@ async fn handle_tcp_header(
         )));
     }
 
-    // max lengths from https://github.com/apernet/hysteria/blob/5520bcc405ee11a47c164c75bae5c40fc2b1d99d/core/internal/protocol/proxy.go#L19
     let address_len = read_varint(recv, &mut stream_reader).await?;
-    if address_len > 2048 {
+    if address_len > MAX_ADDRESS_LEN {
         return Err(std::io::Error::other("invalid address length"));
     }
     let address_bytes = stream_reader.read_slice(recv, address_len as usize).await?;
@@ -795,7 +777,7 @@ async fn handle_tcp_header(
     let remote_location = NetLocation::from_str(address, None)?;
 
     let padding_len = read_varint(recv, &mut stream_reader).await?;
-    if padding_len > 4096 {
+    if padding_len > MAX_PADDING_LEN {
         return Err(std::io::Error::other("invalid padding length"));
     }
     stream_reader.read_slice(recv, padding_len as usize).await?;
@@ -917,58 +899,6 @@ async fn process_tcp_stream(
 
     copy_result?;
     Ok(())
-}
-
-#[inline]
-fn encode_varint(value: u64) -> std::io::Result<Box<[u8]>> {
-    if value <= 0b00111111 {
-        Ok(Box::new([value as u8]))
-    } else if value < (1 << 14) {
-        let mut bytes = (value as u16).to_be_bytes();
-        bytes[0] |= 0b01000000;
-        Ok(Box::new(bytes))
-    } else if value < (1 << 30) {
-        let mut bytes = (value as u32).to_be_bytes();
-        bytes[0] |= 0b10000000;
-        Ok(Box::new(bytes))
-    } else if value < (1 << 62) {
-        let mut bytes = value.to_be_bytes();
-        bytes[0] |= 0b11000000;
-        Ok(Box::new(bytes))
-    } else {
-        Err(std::io::Error::other("value too large to encode as varint"))
-    }
-}
-
-async fn read_varint(
-    recv: &mut quinn::RecvStream,
-    stream_reader: &mut StreamReader,
-) -> std::io::Result<u64> {
-    let first_byte = stream_reader.read_u8(recv).await?;
-
-    let length = first_byte >> 6;
-    let mut value: u64 = (first_byte & 0b00111111) as u64;
-
-    let num_bytes = match length {
-        0 => 1,
-        1 => 2,
-        2 => 4,
-        3 => 8,
-        _ => {
-            // impossible since we only have 2 bits
-            panic!("invalid num bytes value");
-        }
-    };
-
-    if num_bytes > 1 {
-        let remaining_bytes = stream_reader.read_slice(recv, num_bytes - 1).await?;
-        for byte in remaining_bytes {
-            value <<= 8; // Shift left by 8 bits for each subsequent byte
-            value |= *byte as u64; // Add the next byte
-        }
-    }
-
-    Ok(value)
 }
 
 pub async fn start_hysteria2_server(

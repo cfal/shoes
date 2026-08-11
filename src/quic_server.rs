@@ -317,7 +317,7 @@ pub async fn start_quic_servers(
                 let quic_server_config = quic_server_config.clone();
                 let client_proxy_selector = client_proxy_selector.clone();
                 let resolver = resolver.clone();
-                let hysteria2_handles = crate::hysteria2_server::start_hysteria2_server(
+                let hysteria2_handles = crate::hysteria2::start_hysteria2_server(
                     bind_address,
                     quic_server_config,
                     hysteria2_password,
@@ -341,7 +341,7 @@ pub async fn start_quic_servers(
                 let quic_server_config = quic_server_config.clone();
                 let client_proxy_selector = client_proxy_selector.clone();
                 let resolver = resolver.clone();
-                let tuic_handles = crate::tuic_server::start_tuic_server(
+                let tuic_handles = crate::tuic::start_tuic_server(
                     bind_address,
                     quic_server_config,
                     uuid,

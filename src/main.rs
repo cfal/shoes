@@ -12,7 +12,7 @@ mod crypto;
 mod dns;
 mod h2mux;
 mod http_handler;
-mod hysteria2_server;
+mod hysteria2;
 mod logging;
 mod mixed_handler;
 mod naiveproxy;
@@ -42,7 +42,7 @@ mod thread_util;
 mod tls_client_handler;
 mod tls_server_handler;
 mod trojan_handler;
-mod tuic_server;
+mod tuic;
 #[cfg(unix)]
 mod tun;
 mod udp_message_stream;
