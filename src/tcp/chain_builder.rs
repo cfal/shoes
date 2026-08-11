@@ -53,16 +53,26 @@ pub fn build_client_proxy_chain(
         panic!("Client chain must have at least one hop");
     }
 
-    // Check if this is a virtual network tunnel chain (WireGuard/AmneziaWG).
-    // Must be a single hop (validated during config validation).
-    if hops.len() == 1 && hops[0].len() == 1 && hops[0][0].protocol.is_virtual_network() {
-        let config = hops.into_iter().next().unwrap().into_iter().next().unwrap();
-        let connector = crate::amneziawg::AmneziaWgConnector::from_client_config(
-            config.protocol,
-            config.address,
-        )
-        .expect("config validation should have ensured Wireguard or AmneziaWg variant");
-        return ClientProxyChain::new_virtual(std::sync::Arc::new(connector));
+    // Protocols that own their transport (WireGuard/AmneziaWG) cannot be
+    // wrapped by another proxy, so they must be the only hop. Validation
+    // enforces that, and that a pool at that hop is homogeneous.
+    if hops.len() == 1 && hops[0].iter().all(|c| c.protocol.is_virtual_network()) {
+        let connectors = hops
+            .into_iter()
+            .next()
+            .unwrap()
+            .into_iter()
+            .map(|config| {
+                let connector = crate::amneziawg::AmneziaWgConnector::from_client_config(
+                    config.protocol,
+                    config.address,
+                )
+                .expect("config validation should have ensured Wireguard or AmneziaWg variant");
+                Arc::new(connector)
+                    as Arc<dyn crate::tcp::virtual_network_connector::VirtualNetworkConnector>
+            })
+            .collect();
+        return ClientProxyChain::new_terminal(connectors);
     }
 
     // Build initial hop entries from hop 0.
@@ -357,5 +367,35 @@ mod tests {
         let addr = find_first_proxy_address(&hops, &direct);
         assert!(addr.is_some());
         assert_eq!(addr.unwrap().port(), 1080);
+    }
+
+    fn wireguard_config(port: u16) -> ClientConfig {
+        use crate::config::WireGuardClientConfig;
+        ClientConfig {
+            address: NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port),
+            protocol: ClientProxyConfig::Wireguard(Box::new(WireGuardClientConfig {
+                private_key: "cHJpdmF0ZWtleXByaXZhdGVrZXlwcml2YXRla2V5MTI=".into(),
+                peer_public_key: "cHVibGlja2V5cHVibGlja2V5cHVibGlja2V5MTIzNDU=".to_string(),
+                preshared_key: None,
+                local_addresses: OneOrSome::One("10.0.0.2/32".to_string()),
+                allowed_ips: OneOrSome::One("0.0.0.0/0".to_string()),
+                persistent_keepalive: None,
+                mtu: 1280,
+            })),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_build_pool_of_tunnels_does_not_panic() {
+        let chain = build_client_proxy_chain(
+            OneOrSome::One(ClientChainHop::Pool(OneOrSome::Some(vec![
+                ConfigSelection::Config(wireguard_config(51820)),
+                ConfigSelection::Config(wireguard_config(51821)),
+            ]))),
+            mock_resolver(),
+        );
+        assert_eq!(chain.num_hops(), 1);
+        assert!(chain.supports_udp());
     }
 }

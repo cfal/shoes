@@ -89,9 +89,12 @@ enum ClientProxyChainKind {
         udp_final_hop_next_index: AtomicU32,
         udp_uses_initial_hop: bool,
     },
-    /// Virtual network tunnel (e.g., AmneziaWG) that owns its own transport.
-    VirtualNetwork {
-        connector: Arc<dyn VirtualNetworkConnector>,
+    /// Connectors that own their own transport (AmneziaWG today, Hysteria2 and
+    /// TUIC once they land). A pool is selected round-robin, exactly like a
+    /// pool of proxy hops.
+    Terminal {
+        connectors: Vec<Arc<dyn VirtualNetworkConnector>>,
+        next_index: AtomicU32,
     },
 }
 
@@ -120,9 +123,9 @@ impl std::fmt::Debug for ClientProxyChain {
                 .field("udp_final_hop_indices", udp_final_hop_indices)
                 .field("udp_uses_initial_hop", udp_uses_initial_hop)
                 .finish(),
-            ClientProxyChainKind::VirtualNetwork { connector } => f
-                .debug_struct("ClientProxyChain::VirtualNetwork")
-                .field("connector", connector)
+            ClientProxyChainKind::Terminal { connectors, .. } => f
+                .debug_struct("ClientProxyChain::Terminal")
+                .field("connector_count", &connectors.len())
                 .finish(),
         }
     }
@@ -181,10 +184,21 @@ impl ClientProxyChain {
         }
     }
 
-    /// Create a new virtual network chain from a connector.
-    pub fn new_virtual(connector: Arc<dyn VirtualNetworkConnector>) -> Self {
+    /// Create a new terminal chain from one or more connectors that own their
+    /// transport.
+    ///
+    /// # Panics
+    /// Panics if `connectors` is empty.
+    pub fn new_terminal(connectors: Vec<Arc<dyn VirtualNetworkConnector>>) -> Self {
+        assert!(
+            !connectors.is_empty(),
+            "ClientProxyChain must have at least one terminal connector"
+        );
         Self {
-            kind: ClientProxyChainKind::VirtualNetwork { connector },
+            kind: ClientProxyChainKind::Terminal {
+                connectors,
+                next_index: AtomicU32::new(0),
+            },
         }
     }
 
@@ -195,7 +209,7 @@ impl ClientProxyChain {
             ClientProxyChainKind::StreamChain {
                 subsequent_hops, ..
             } => 1 + subsequent_hops.len(),
-            ClientProxyChainKind::VirtualNetwork { .. } => 1,
+            ClientProxyChainKind::Terminal { .. } => 1,
         }
     }
 
@@ -206,7 +220,9 @@ impl ClientProxyChain {
                 udp_final_hop_indices,
                 ..
             } => !udp_final_hop_indices.is_empty(),
-            ClientProxyChainKind::VirtualNetwork { connector } => connector.supports_udp(),
+            ClientProxyChainKind::Terminal { connectors, .. } => {
+                connectors.iter().any(|c| c.supports_udp())
+            }
         }
     }
 
@@ -226,7 +242,7 @@ impl ClientProxyChain {
                     .iter()
                     .all(|entry| matches!(entry, InitialHopEntry::Direct(_)))
             }
-            ClientProxyChainKind::VirtualNetwork { .. } => false,
+            ClientProxyChainKind::Terminal { .. } => false,
         }
     }
 
@@ -242,7 +258,7 @@ impl ClientProxyChain {
                     InitialHopEntry::Proxy { .. } => None,
                 })
             }
-            ClientProxyChainKind::VirtualNetwork { .. } => None,
+            ClientProxyChainKind::Terminal { .. } => None,
         }
     }
 
@@ -341,11 +357,12 @@ impl ClientProxyChain {
 
                 Ok(result)
             }
-            ClientProxyChainKind::VirtualNetwork { connector } => {
-                debug!(
-                    "VirtualNetwork TCP connect -> {}",
-                    remote_location.location()
-                );
+            ClientProxyChainKind::Terminal {
+                connectors,
+                next_index,
+            } => {
+                let connector = select_terminal(connectors, next_index);
+                debug!("Terminal TCP connect -> {}", remote_location.location());
                 connector.connect_tcp(resolver, remote_location).await
             }
         }
@@ -481,8 +498,12 @@ impl ClientProxyChain {
                     final_proxy.setup_udp_bidirectional(stream, target).await
                 }
             }
-            ClientProxyChainKind::VirtualNetwork { connector } => {
-                debug!("VirtualNetwork UDP connect -> {}", target.location());
+            ClientProxyChainKind::Terminal {
+                connectors,
+                next_index,
+            } => {
+                let connector = select_terminal(connectors, next_index);
+                debug!("Terminal UDP connect -> {}", target.location());
                 connector.connect_udp_bidirectional(resolver, target).await
             }
         }
@@ -523,6 +544,18 @@ impl ClientProxyChain {
 }
 
 fn select_from_pool<'a>(pool: &'a [InitialHopEntry], index: &AtomicU32) -> &'a InitialHopEntry {
+    if pool.len() == 1 {
+        &pool[0]
+    } else {
+        let idx = index.fetch_add(1, Ordering::Relaxed) as usize;
+        &pool[idx % pool.len()]
+    }
+}
+
+fn select_terminal<'a>(
+    pool: &'a [Arc<dyn VirtualNetworkConnector>],
+    index: &AtomicU32,
+) -> &'a Arc<dyn VirtualNetworkConnector> {
     if pool.len() == 1 {
         &pool[0]
     } else {
