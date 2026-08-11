@@ -1021,6 +1021,15 @@ fn validate_client_config(
                     "TUIC heartbeat_ms must be greater than zero.",
                 ));
             }
+            // Accepting this silently would be worse than refusing it: the user
+            // would believe they had 0-RTT and get an ordinary handshake.
+            if tuic.zero_rtt_handshake {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "The TUIC client outbound does not implement zero_rtt_handshake. \
+                     Remove the option; the server side still supports it.",
+                ));
+            }
         }
         _ => {}
     }
@@ -1985,6 +1994,17 @@ mod tests {
         fn test_tuic_accepts_a_valid_uuid() {
             let mut config = tuic_client("b0e80a62-8a51-47f0-91f1-f0f7faf8d9d4", 10_000);
             assert!(validate(&mut config).is_ok());
+        }
+
+        #[test]
+        fn test_tuic_rejects_zero_rtt_until_the_client_implements_it() {
+            let mut config = tuic_client("b0e80a62-8a51-47f0-91f1-f0f7faf8d9d4", 10_000);
+            let ClientProxyConfig::Tuic(ref mut tuic) = config.protocol else {
+                unreachable!()
+            };
+            tuic.zero_rtt_handshake = true;
+            let err = validate(&mut config).unwrap_err().to_string();
+            assert!(err.contains("zero_rtt_handshake"), "{err}");
         }
 
         #[test]

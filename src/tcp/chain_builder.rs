@@ -141,6 +141,19 @@ fn build_terminal_connector(config: ClientConfig) -> Arc<dyn TerminalConnector> 
                 obfs,
             ))
         }
+        ClientProxyConfig::Tuic(tuic) => Arc::new(
+            crate::tuic::TuicConnector::new(
+                config.address,
+                &tuic.uuid,
+                tuic.password.into_inner(),
+                tuic.udp_enabled,
+                tuic.udp_relay_mode,
+                std::time::Duration::from_millis(tuic.heartbeat_ms),
+                config.quic_settings.unwrap_or_default(),
+                config.bind_interface.into_option(),
+            )
+            .expect("the uuid was validated during config load"),
+        ),
         protocol => {
             let connector =
                 crate::amneziawg::AmneziaWgConnector::from_client_config(protocol, config.address)
