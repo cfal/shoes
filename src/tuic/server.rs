@@ -24,15 +24,11 @@ use crate::stream_reader::StreamReader;
 use crate::tcp::tcp_forward::setup_client_tcp_stream;
 use crate::util::{allocate_vec, write_all};
 
-const COMMAND_TYPE_AUTHENTICATE: u8 = 0x00;
-const COMMAND_TYPE_CONNECT: u8 = 0x01;
-const COMMAND_TYPE_PACKET: u8 = 0x02;
-const COMMAND_TYPE_DISSOCIATE: u8 = 0x03;
-const COMMAND_TYPE_HEARTBEAT: u8 = 0x04;
-
-// hostname case: type (1) + hostname length (1) + hostname bytes (255) + port (2)
-const MAX_ADDRESS_BYTES_LEN: usize = 1 + 1 + 255 + 2;
-const MAX_HEADER_LEN: usize = 2 + 2 + 1 + 1 + 2 + MAX_ADDRESS_BYTES_LEN;
+use super::frame::{
+    COMMAND_TYPE_AUTHENTICATE, COMMAND_TYPE_CONNECT, COMMAND_TYPE_DISSOCIATE,
+    COMMAND_TYPE_HEARTBEAT, COMMAND_TYPE_PACKET, MAX_HEADER_LEN, TUIC_VERSION, read_address,
+    serialize_address, serialize_socket_addr,
+};
 
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(10);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -211,7 +207,7 @@ async fn auth_connection(
         let mut recv_stream = connection.accept_uni().await?;
         let mut stream_reader = StreamReader::new_with_buffer_size(80);
         let tuic_version = stream_reader.read_u8(&mut recv_stream).await?;
-        if tuic_version != 5 {
+        if tuic_version != TUIC_VERSION {
             return Err(std::io::Error::other(format!(
                 "invalid tuic version: {tuic_version}"
             )));
@@ -288,104 +284,6 @@ async fn run_bidirectional_loop(
     Ok(())
 }
 
-async fn read_address(
-    recv: &mut quinn::RecvStream,
-    stream_reader: &mut StreamReader,
-) -> std::io::Result<Option<NetLocation>> {
-    let address_type = stream_reader.read_u8(recv).await?;
-    let address = match address_type {
-        0xff => {
-            return Ok(None);
-        }
-        0x00 => {
-            let address_len = stream_reader.read_u8(recv).await? as usize;
-            let address_bytes = stream_reader.read_slice(recv, address_len).await?;
-            let address_str = str::from_utf8(address_bytes).map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("invalid address: {e}"),
-                )
-            })?;
-            // Although this is supposed to be a hostname, some clients will pass
-            // ipv4 and ipv6 addresses as well, so parse it rather than directly
-            // using Address:Hostname enum.
-            Address::from(address_str)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?
-        }
-        0x01 => {
-            let ipv4_bytes = stream_reader.read_slice(recv, 4).await?;
-            let ipv4_addr =
-                Ipv4Addr::new(ipv4_bytes[0], ipv4_bytes[1], ipv4_bytes[2], ipv4_bytes[3]);
-            Address::Ipv4(ipv4_addr)
-        }
-        0x02 => {
-            let ipv6_bytes = stream_reader.read_slice(recv, 16).await?;
-            let ipv6_bytes: [u8; 16] = ipv6_bytes.try_into().unwrap();
-            let ipv6_addr = Ipv6Addr::from(ipv6_bytes);
-            Address::Ipv6(ipv6_addr)
-        }
-        _ => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("invalid address type: {address_type}"),
-            ));
-        }
-    };
-
-    let port = stream_reader.read_u16_be(recv).await?;
-
-    Ok(Some(NetLocation::new(address, port)))
-}
-
-fn serialize_address(location: &NetLocation) -> Vec<u8> {
-    let mut address_bytes = match location.address() {
-        Address::Hostname(hostname) => {
-            let mut res = Vec::with_capacity(1 + 1 + hostname.len() + 2);
-            res.push(0x00); // address type
-            let hostname_bytes = hostname.as_bytes();
-            res.push(hostname_bytes.len() as u8);
-            res.extend_from_slice(hostname_bytes);
-            res
-        }
-        Address::Ipv4(ipv4) => {
-            let mut res = Vec::with_capacity(1 + 4 + 2);
-            res.push(0x01); // address type
-            res.extend_from_slice(&ipv4.octets());
-            res
-        }
-        Address::Ipv6(ipv6) => {
-            let mut res = Vec::with_capacity(1 + 16 + 2);
-            res.push(0x02); // address type
-            res.extend_from_slice(&ipv6.octets());
-            res
-        }
-    };
-
-    address_bytes.extend_from_slice(&location.port().to_be_bytes());
-
-    address_bytes
-}
-
-fn serialize_socket_addr(addr: &SocketAddr) -> Vec<u8> {
-    let mut res = match addr {
-        SocketAddr::V4(addr_v4) => {
-            let mut res = Vec::with_capacity(1 + 4 + 2);
-            res.push(0x01); // address type for IPv4
-            res.extend_from_slice(&addr_v4.ip().octets());
-            res
-        }
-        SocketAddr::V6(addr_v6) => {
-            let mut res = Vec::with_capacity(1 + 16 + 2);
-            res.push(0x02); // address type for IPv6
-            res.extend_from_slice(&addr_v6.ip().octets());
-            res
-        }
-    };
-
-    res.extend_from_slice(&addr.port().to_be_bytes());
-    res
-}
-
 async fn process_tcp_stream(
     client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
@@ -394,7 +292,7 @@ async fn process_tcp_stream(
 ) -> std::io::Result<()> {
     let mut stream_reader = StreamReader::new_with_buffer_size(1024);
     let tuic_version = stream_reader.read_u8(&mut recv).await?;
-    if tuic_version != 5 {
+    if tuic_version != TUIC_VERSION {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("invalid tuic version: {tuic_version}"),
@@ -918,7 +816,7 @@ async fn process_uni_stream(
     let mut stream_reader = StreamReader::new_with_buffer_size(MAX_HEADER_LEN + 65535);
 
     let tuic_version = stream_reader.read_u8(&mut recv_stream).await?;
-    if tuic_version != 5 {
+    if tuic_version != TUIC_VERSION {
         return Err(std::io::Error::other(format!(
             "invalid tuic version: {tuic_version}"
         )));
@@ -1287,7 +1185,7 @@ async fn run_datagram_loop(
         }
 
         let tuic_version = data[0];
-        if tuic_version != 5 {
+        if tuic_version != TUIC_VERSION {
             return Err(std::io::Error::other(format!(
                 "unknown version: {tuic_version}"
             )));
