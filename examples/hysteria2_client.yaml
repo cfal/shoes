@@ -1,0 +1,26 @@
+# Route everything through a Hysteria2 server.
+#
+# The password is one opaque string. A server that authenticates by username
+# and password expects them joined: "<username>:<password>".
+#
+# Hysteria2 owns its transport, so it must be the only hop in a chain, and its
+# TLS options live in quic_settings rather than needing 'transport: quic'.
+- address: "127.0.0.1:1080"
+  protocol:
+    type: socks
+  rules:
+    - masks: "0.0.0.0/0"
+      action: allow
+      client_chain:
+        - address: "example.com:443"
+          protocol:
+            type: hysteria2
+            password: "a strong password"
+            # Optional. Both ends must agree on the type and the password, and
+            # a mismatch looks exactly like an unreachable server rather than
+            # producing an error.
+            obfs:
+              type: salamander
+              password: "an obfuscation password"
+          quic_settings:
+            sni_hostname: "example.com"

@@ -133,7 +133,8 @@ jobs:
           set -euo pipefail
           bin="./target/${{ matrix.target }}/release/${{ matrix.binary_name }}"
           "$bin" --version
-          for cfg in socks_basic multi_hop_chain tun_vpn tun_fake_ip amneziawg_client sniff; do
+          for cfg in socks_basic multi_hop_chain tun_vpn tun_fake_ip amneziawg_client sniff \
+                     hysteria2_client tuic_client; do
             echo "==> dry run: examples/$cfg.yaml"
             "$bin" --dry-run "examples/$cfg.yaml"
           done

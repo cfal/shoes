@@ -23,6 +23,11 @@ shoes is a high-performance multi-protocol proxy server written in Rust.
 - **WireGuard** (outbound L3 tunnel over UDP)
 - **AmneziaWG 2.0 / 3.0** (WireGuard with traffic obfuscation; 3.0 adds header protection, content padding and randomized timings)
 
+### QUIC-native Outbounds
+Own their transport, so they are always the only hop in a chain:
+- **Hysteria2** (TCP and UDP, with optional Salamander obfuscation)
+- **TUIC v5** (TCP, and UDP over QUIC datagrams)
+
 ### Transport Protocols
 All server protocols plus:
 - **SagerNet UDP over TCP** (for Shadowsocks, SOCKS5, AnyTLS, NaiveProxy)
@@ -310,6 +315,53 @@ Details worth knowing:
 - `network` must be a range you do not route for real. `198.18.0.0/15` is reserved for benchmarking (RFC 2544), which is why it is the default.
 - Past `max_entries` the pool recycles the least recently used mapping. Answers carry a 1-second TTL so an active domain keeps being refreshed and is not recycled while in use.
 - `bypass_domains` exists because a fake address is useless to anything that must reach the host outside the tunnel: captive-portal probes, NTP, STUN, and `.local`/`.lan` names.
+
+### Hysteria2 Client
+```yaml
+- address: 127.0.0.1:1080
+  protocol:
+    type: socks
+  rules:
+    - masks: "0.0.0.0/0"
+      action: allow
+      client_chain:
+        - address: "example.com:443"
+          protocol:
+            type: hysteria2
+            password: "a strong password"
+            # Optional. Both ends must agree.
+            obfs:
+              type: salamander
+              password: "an obfuscation password"
+          quic_settings:
+            sni_hostname: "example.com"
+```
+
+The password is one opaque string; a server using username and password
+authentication expects them joined as `"<username>:<password>"`. A mismatched
+`obfs` password produces no error — neither end can decode the other, so it
+looks exactly like an unreachable server.
+
+### TUIC Client
+```yaml
+- address: 127.0.0.1:1080
+  protocol:
+    type: socks
+  rules:
+    - masks: "0.0.0.0/0"
+      action: allow
+      client_chain:
+        - address: "example.com:443"
+          protocol:
+            type: tuic
+            uuid: "b0e80a62-8a51-47f0-91f1-f0f7faf8d9d4"
+            password: "a strong password"
+          quic_settings:
+            sni_hostname: "example.com"
+```
+
+Both protocols own their transport, so they are always the only hop in a chain,
+and their TLS options live in `quic_settings` without a `transport: quic` line.
 
 ### WireGuard Client
 ```yaml

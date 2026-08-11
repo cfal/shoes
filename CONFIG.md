@@ -260,7 +260,15 @@ protocol:
   type: hysteria2
   password: string
   udp_enabled: true            # Default: true
+  obfs:                        # Optional. Both ends must agree.
+    type: salamander
+    password: string           # At least 4 bytes
 ```
+
+Obfuscation scrambles every QUIC packet, including the handshake, so a client
+that does not use the same type and password cannot reach this server at all.
+There is no error for a mismatch — neither side can decode the other, so it
+looks exactly like an unreachable server.
 
 ### TUIC v5
 ```yaml
@@ -582,6 +590,74 @@ protocol:
   password: string             # Basic Auth password
   padding: true                # Default: true (enables padding protocol)
 ```
+
+### Hysteria2 Client
+```yaml
+protocol:
+  type: hysteria2              # Aliases: hy2
+  password: string
+  udp_enabled: true            # Default: true
+  obfs:                        # Optional. Both ends must agree.
+    type: salamander
+    password: string           # At least 4 bytes
+```
+
+The password is one opaque string. A server that authenticates by username and
+password expects them joined: `"<username>:<password>"`.
+
+A mismatched `obfs` password produces no error. Neither side can decode the
+other's packets, so the connection simply never establishes and looks exactly
+like an unreachable server. Check it first when a Hysteria2 outbound times out.
+
+### TUIC Client
+```yaml
+protocol:
+  type: tuic                   # Aliases: tuic_v5, tuicv5
+  uuid: string                 # UUID
+  password: string
+  udp_enabled: true            # Default: true
+  udp_relay_mode: native       # Default: native. Only 'native' is implemented.
+  heartbeat_ms: 10000          # Default: 10000
+```
+
+`udp_relay_mode: native` carries UDP over QUIC datagrams. The `quic` mode,
+which carries them over unidirectional streams, is rejected at config load
+rather than silently downgraded — see the note under
+[QUIC-native outbounds](#quic-native-outbounds).
+
+`zero_rtt_handshake` is a server-side option only. The client rejects it rather
+than accepting it and performing an ordinary handshake.
+
+### QUIC-native outbounds
+
+Hysteria2 and TUIC own their transport rather than running over one, which
+changes three things about how they are configured:
+
+- **They must be the only hop in a chain.** QUIC needs a UDP socket, and there
+  is no way to raise one over another proxy's TCP stream.
+- **`transport` and `tcp_settings` are rejected.** The transport is QUIC and is
+  not chosen.
+- **`quic_settings` is where the TLS options go** — `verify`,
+  `server_fingerprints`, `sni_hostname`, `alpn_protocols`, `key` and `cert` all
+  mean the same thing here as they do for a QUIC transport. Unlike WireGuard
+  and AmneziaWG, these protocols accept the block without a `transport: quic`
+  line, because their transport is implied by the protocol.
+
+```yaml
+client_chain:
+  - address: "example.com:443"
+    protocol:
+      type: hysteria2
+      password: "a strong password"
+    quic_settings:
+      sni_hostname: "example.com"
+      verify: true
+```
+
+Not implemented on the client side, and rejected rather than ignored where a
+configuration can ask for them: Brutal congestion control and bandwidth
+negotiation, `gecko` obfuscation, port hopping, and TUIC's `quic` UDP relay
+mode. See [ROADMAP.md](./ROADMAP.md) for what each costs.
 
 ## Rules System
 

@@ -49,16 +49,12 @@ The gap is not in protocols. It is in everything around them.
 | Outbound selection | round-robin, no health check | `urltest` by latency, `selector` |
 | Per-connection statistics | global counters only | Clash API |
 | Extra transports | WebSocket, H2MUX | + gRPC, HTTPUpgrade, HTTP/2 |
-| Hysteria2 / TUIC as a *client* | **absent** | yes |
-
-That last row is the odd one. `src/hysteria2_server.rs` and `src/tuic_server.rs`
-both exist, but neither protocol appears in `ClientProxyConfig`
-(`src/config/types/client.rs:441`). shoes can serve Hysteria2 and cannot dial it.
+| Hysteria2 / TUIC as a *client* | yes | yes |
 
 ## Tier 1 — closes most of the gap
 
-Ordered by value per unit of work. All three build on code already in the tree.
-Items 1 and 2 are done; 3 is open.
+Ordered by value per unit of work. All three built on code already in the tree,
+and all three are now done.
 
 ### 1. Rule-sets — done
 
@@ -102,24 +98,41 @@ deliberately deferred — see the spec's scope section. Overriding the destinati
 for direct connections is not planned: Xray had to bolt an exclusion list onto
 it and sing-box has deprecated it.
 
-### 3. Hysteria2 and TUIC client outbounds — in progress
+### 3. Hysteria2 and TUIC client outbounds — done
 
-Spec: [docs/specs/2026-08-11-quic-client-outbounds.md](./docs/specs/2026-08-11-quic-client-outbounds.md).
+Shipped. Spec: [docs/specs/2026-08-11-quic-client-outbounds.md](./docs/specs/2026-08-11-quic-client-outbounds.md).
 Plan: [docs/plans/2026-08-11-quic-client-outbounds.md](./docs/plans/2026-08-11-quic-client-outbounds.md).
 
-The framing and crypto exist in the server modules. Adding the two variants to
-`ClientProxyConfig` and their client handlers is the largest gain in
-real-world-server coverage per line written, and Hysteria2 in particular is now
-one of the most widely deployed protocols in the commercial market.
+shoes could serve Hysteria2 and could not dial it. The framing and crypto were
+already in the server modules, so the gap was the client-side plumbing, and
+Hysteria2 in particular is now one of the most widely deployed protocols in the
+commercial market.
 
 Neither protocol fits the chain model, which builds an outbound from a socket
 connector that yields a stream and proxy connectors that wrap one: both
 authenticate once per QUIC connection and key their UDP sessions to it. They
-become `TerminalConnector`s instead — the escape hatch AmneziaWG already uses —
-and are therefore always the only hop in a chain.
+are `TerminalConnector`s instead — the escape hatch AmneziaWG already used —
+and are therefore always the only hop in a chain. `src/quic_outbound/` holds
+what they share: endpoint construction from `quic_settings`, one connection per
+outbound re-established lazily, and the obfuscation layer.
 
-What that work covers is authentication, TCP, UDP and Salamander obfuscation on
-both ends. What it does not cover is in the next section.
+Both speak TCP and UDP. Salamander obfuscation works on the client and the
+server. Every protocol path is tested against this repository's own server
+running in-process, and the Hysteria2 client has been checked by hand against a
+third-party sing-box server for TCP and UDP alike.
+
+Two options are refused at config load rather than silently ignored, because a
+user who asks for them and does not get them should be told: TUIC's
+`zero_rtt_handshake`, and its `udp_relay_mode: quic`. The latter is blocked by
+a defect on our own server side — see below. What else is missing is in
+[Hysteria: the rest of the surface](#hysteria-the-rest-of-the-surface).
+
+**Known defect, server side.** In TUIC's `quic` UDP relay mode our server
+writes reply packets onto one unidirectional stream without the version and
+command bytes that make a `Packet` a command, so what it sends is something its
+own receiving side would reject. Fixing it means one stream per reply packet
+with a full command header, which changes `UdpSession::start_with_send_stream`
+and its caller. Until then the client refuses the mode by name.
 
 ## Tier 2 — worth doing after Tier 1
 
