@@ -5695,18 +5695,19 @@ Also document the new server-side `obfs` block on the Hysteria2 inbound.
 
 In README.md, move Hysteria2 and TUIC into the client protocol list.
 
-In ROADMAP.md:
+In ROADMAP.md, most of this landed early, in commit `383d5fd`: Tier 1 §3 is
+already marked in progress and links the spec and this plan, the section
+"Hysteria: the rest of the surface" already enumerates everything deferred, and
+"Open risk: TLS fingerprinting" already covers the QUIC side. Do not write any
+of that a second time. What is left:
 
 - change the `Hysteria2 / TUIC as a *client*` row of the comparison table from
   **absent** to yes;
-- delete the paragraph beginning "That last row is the odd one";
-- rewrite section 3 of Tier 1 as done, in the shape sections 1 and 2 already
-  use, linking the spec and this plan, and naming what was deferred: Brutal
-  congestion control, `gecko`, port hopping, Realm, and Chrome QUIC handshake
-  parroting;
-- add a sentence to the "Open risk: TLS fingerprinting" section recording that
-  sing-box now parrots Chrome's QUIC handshake by default for Hysteria2, so the
-  same exposure exists on the QUIC side.
+- delete the paragraph beginning "That last row is the odd one", which says
+  shoes cannot dial Hysteria2;
+- change the Tier 1 §3 heading from "in progress" to "done", and reword its body
+  from what the work will do to what it does, in the shape sections 1 and 2
+  already use. Leave its closing pointer to the Hysteria gap section intact.
 
 - [ ] **Step 5: Verify and commit**
 
