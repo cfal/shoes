@@ -6,6 +6,8 @@
 // Scoped to the codec so the server next door stays under the lint. Remove when
 // the connector lands.
 #[allow(dead_code)]
+pub mod auth;
+#[allow(dead_code)]
 pub mod frame;
 pub mod server;
 
