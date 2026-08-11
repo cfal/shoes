@@ -121,6 +121,68 @@ pub fn serialize_socket_addr(addr: &SocketAddr) -> Vec<u8> {
     res
 }
 
+/// Address type byte meaning "no address", used on fragments after the first.
+pub const ADDRESS_TYPE_NONE: u8 = 0xff;
+
+fn command(command_type: u8, capacity: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(2 + capacity);
+    out.push(TUIC_VERSION);
+    out.push(command_type);
+    out
+}
+
+/// `Authenticate`: `[16-byte UUID][32-byte token]`.
+pub fn encode_authenticate(uuid: &[u8; 16], token: &[u8; 32]) -> Vec<u8> {
+    let mut out = command(COMMAND_TYPE_AUTHENTICATE, 48);
+    out.extend_from_slice(uuid);
+    out.extend_from_slice(token);
+    out
+}
+
+/// `Connect`: `[address]`. The server never answers it.
+pub fn encode_connect(target: &NetLocation) -> Vec<u8> {
+    let mut out = command(COMMAND_TYPE_CONNECT, MAX_ADDRESS_BYTES_LEN);
+    out.extend_from_slice(&serialize_address(target));
+    out
+}
+
+/// `Packet`: `[u16 assoc][u16 pkt][u8 frag total][u8 frag id][u16 size][address]`.
+///
+/// `target` is None for every fragment after the first, which the specification
+/// encodes as address type 0xff.
+pub fn encode_packet_header(
+    assoc_id: u16,
+    packet_id: u16,
+    fragment_total: u8,
+    fragment_id: u8,
+    size: u16,
+    target: Option<&NetLocation>,
+) -> Vec<u8> {
+    let mut out = command(COMMAND_TYPE_PACKET, MAX_HEADER_LEN);
+    out.extend_from_slice(&assoc_id.to_be_bytes());
+    out.extend_from_slice(&packet_id.to_be_bytes());
+    out.push(fragment_total);
+    out.push(fragment_id);
+    out.extend_from_slice(&size.to_be_bytes());
+    match target {
+        Some(target) => out.extend_from_slice(&serialize_address(target)),
+        None => out.push(ADDRESS_TYPE_NONE),
+    }
+    out
+}
+
+/// `Dissociate`: `[u16 assoc]`.
+pub fn encode_dissociate(assoc_id: u16) -> Vec<u8> {
+    let mut out = command(COMMAND_TYPE_DISSOCIATE, 2);
+    out.extend_from_slice(&assoc_id.to_be_bytes());
+    out
+}
+
+/// `Heartbeat`: no payload.
+pub fn encode_heartbeat() -> Vec<u8> {
+    command(COMMAND_TYPE_HEARTBEAT, 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -167,5 +229,63 @@ mod tests {
         assert_eq!(COMMAND_TYPE_DISSOCIATE, 0x03);
         assert_eq!(COMMAND_TYPE_HEARTBEAT, 0x04);
         assert_eq!(TUIC_VERSION, 0x05);
+    }
+
+    #[test]
+    fn test_authenticate_layout() {
+        let uuid = [0xabu8; 16];
+        let token = [0xcdu8; 32];
+        let command = encode_authenticate(&uuid, &token);
+        assert_eq!(command[0], TUIC_VERSION);
+        assert_eq!(command[1], COMMAND_TYPE_AUTHENTICATE);
+        assert_eq!(&command[2..18], &uuid);
+        assert_eq!(&command[18..50], &token);
+        assert_eq!(command.len(), 50);
+    }
+
+    #[test]
+    fn test_connect_layout() {
+        let loc = NetLocation::new(Address::Hostname("example.com".to_string()), 443);
+        let command = encode_connect(&loc);
+        assert_eq!(command[0], TUIC_VERSION);
+        assert_eq!(command[1], COMMAND_TYPE_CONNECT);
+        assert_eq!(&command[2..], &serialize_address(&loc)[..]);
+    }
+
+    #[test]
+    fn test_packet_header_layout() {
+        let loc = NetLocation::new(Address::Ipv4(Ipv4Addr::new(1, 2, 3, 4)), 53);
+        let header = encode_packet_header(7, 9, 3, 1, 1200, Some(&loc));
+        assert_eq!(header[0], TUIC_VERSION);
+        assert_eq!(header[1], COMMAND_TYPE_PACKET);
+        assert_eq!(&header[2..4], &7u16.to_be_bytes());
+        assert_eq!(&header[4..6], &9u16.to_be_bytes());
+        assert_eq!(header[6], 3, "fragment total");
+        assert_eq!(header[7], 1, "fragment id");
+        assert_eq!(&header[8..10], &1200u16.to_be_bytes());
+        assert_eq!(&header[10..], &serialize_address(&loc)[..]);
+    }
+
+    #[test]
+    fn test_packet_header_uses_the_none_address_for_later_fragments() {
+        let header = encode_packet_header(7, 9, 3, 2, 100, None);
+        assert_eq!(header[10], ADDRESS_TYPE_NONE);
+        assert_eq!(header.len(), 11);
+    }
+
+    #[test]
+    fn test_dissociate_layout() {
+        assert_eq!(
+            encode_dissociate(7),
+            vec![TUIC_VERSION, COMMAND_TYPE_DISSOCIATE, 0x00, 0x07]
+        );
+    }
+
+    #[test]
+    fn test_heartbeat_layout() {
+        assert_eq!(
+            encode_heartbeat(),
+            vec![TUIC_VERSION, COMMAND_TYPE_HEARTBEAT]
+        );
     }
 }
