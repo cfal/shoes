@@ -1286,10 +1286,16 @@ impl AsyncUdpSocket for ObfuscatedUdpSocket {
                 let mut decoded = vec![0u8; len];
                 match self.obfs.deobfuscate(&bufs[i][..len], &mut decoded) {
                     Some(decoded_len) => {
-                        bufs[i][..decoded_len].copy_from_slice(&decoded[..decoded_len]);
+                        // quinn pairs meta[n] with bufs[n], so a survivor that
+                        // moves forward in the metadata must have its bytes
+                        // move with it. Writing the decoded copy straight to
+                        // its final buffer does both at once. Writing it to
+                        // bufs[i] instead would feed quinn the dropped
+                        // packet's buffer.
                         if kept != i {
                             meta[kept] = meta[i];
                         }
+                        bufs[kept][..decoded_len].copy_from_slice(&decoded[..decoded_len]);
                         meta[kept].len = decoded_len;
                         meta[kept].stride = decoded_len;
                         kept += 1;
