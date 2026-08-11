@@ -16,9 +16,10 @@ use super::pem::{embed_optional_pem_from_map, embed_pem_from_map};
 use super::types::{
     ClientChain, ClientChainHop, ClientConfig, ClientProxyConfig, Config, ConfigSelection,
     DEFAULT_REALITY_SHORT_ID, DnsConfig, DnsConfigGroup, DnsServerSpec, ExpandedDnsGroup,
-    ExpandedDnsSpec, PemSource, RuleActionConfig, RuleConfig, ServerConfig, ServerProxyConfig,
-    ServerQuicConfig, ShadowTlsServerConfig, ShadowTlsServerHandshakeConfig, ShadowsocksConfig,
-    TlsServerConfig, Transport, TunConfig, WebsocketServerConfig, direct_allow_rule,
+    ExpandedDnsSpec, ObfsConfig, PemSource, RuleActionConfig, RuleConfig, ServerConfig,
+    ServerProxyConfig, ServerQuicConfig, ShadowTlsServerConfig, ShadowTlsServerHandshakeConfig,
+    ShadowsocksConfig, TlsServerConfig, Transport, TunConfig, WebsocketServerConfig,
+    direct_allow_rule,
 };
 
 const MIN_TLS_BUFFER_SIZE: usize = 16 * 1024;
@@ -937,8 +938,18 @@ fn validate_client_config(
         ));
     }
 
+    // Hysteria2 and TUIC are QUIC-native: their transport is implied by the
+    // protocol rather than selected, so they carry quic_settings without a
+    // 'transport: quic' line. Everything else in the block below - embedding
+    // named PEMs, pairing cert with key, checking fingerprints - applies to
+    // them exactly as it does to a QUIC transport.
+    let quic_native = matches!(
+        client_config.protocol,
+        ClientProxyConfig::Hysteria2(_) | ClientProxyConfig::Tuic(_)
+    );
+
     if let Some(ref mut quic_config) = client_config.quic_settings {
-        if client_config.transport != Transport::Quic {
+        if client_config.transport != Transport::Quic && !quic_native {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "QUIC transport is not selected but QUIC settings specified",
@@ -971,13 +982,16 @@ fn validate_client_config(
         ));
     }
 
-    // WireGuard/AmneziaWG use their own UDP transport; reject incompatible settings
+    // Protocols that own their transport reject the socket-level knobs that do
+    // not apply to them. The QUIC-based ones keep quic_settings, which carries
+    // verify, SNI, fingerprints, ALPN and the client certificate - all of which
+    // mean the same thing for them as for a QUIC transport.
     if client_config.protocol.owns_transport() {
         let proto = client_config.protocol.protocol_name();
         if client_config.transport != Transport::Tcp {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                format!("{proto} uses its own UDP transport. Do not set 'transport'."),
+                format!("{proto} uses its own transport. Do not set 'transport'."),
             ));
         }
         if client_config.tcp_settings.is_some() {
@@ -986,16 +1000,53 @@ fn validate_client_config(
                 format!("tcp_settings is not valid for {proto} protocol."),
             ));
         }
-        if client_config.quic_settings.is_some() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("quic_settings is not valid for {proto} protocol."),
-            ));
+        // quic_settings needs no check here: a tunnel protocol never selects
+        // 'transport: quic', so the QUIC block above has already rejected it.
+    }
+
+    match &client_config.protocol {
+        ClientProxyConfig::Hysteria2(hysteria2) => {
+            validate_obfs_config(hysteria2.obfs.as_ref())?;
         }
+        ClientProxyConfig::Tuic(tuic) => {
+            parse_uuid(&tuic.uuid).map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("TUIC uuid is not a valid UUID: {e}"),
+                )
+            })?;
+            if tuic.heartbeat_ms == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "TUIC heartbeat_ms must be greater than zero.",
+                ));
+            }
+        }
+        _ => {}
     }
 
     validate_client_proxy_config(&mut client_config.protocol, named_pems)?;
 
+    Ok(())
+}
+
+/// Minimum obfuscation password length, matching smPSKMinLen in
+/// apernet/hysteria extras/obfs/salamander.go.
+const MIN_OBFS_PASSWORD_LEN: usize = 4;
+
+fn validate_obfs_config(obfs: Option<&ObfsConfig>) -> std::io::Result<()> {
+    let Some(ObfsConfig::Salamander { password }) = obfs else {
+        return Ok(());
+    };
+    if password.expose().len() < MIN_OBFS_PASSWORD_LEN {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "Obfuscation password must be at least {MIN_OBFS_PASSWORD_LEN} bytes; \
+                 the reference implementation rejects anything shorter."
+            ),
+        ));
+    }
     Ok(())
 }
 
@@ -1814,6 +1865,132 @@ mod tests {
     use super::*;
     use crate::config::pem::convert_cert_paths;
     use crate::dns::IpStrategy;
+
+    mod quic_outbounds {
+        use super::*;
+        use crate::address::NetLocation;
+        use crate::config::types::client::{
+            Hysteria2ClientConfig, TuicClientConfig, TuicUdpRelayMode,
+        };
+        use crate::config::types::transport::{ClientQuicConfig, TcpConfig};
+
+        fn server() -> NetLocation {
+            NetLocation::from_str("example.com:443", None).unwrap()
+        }
+
+        fn hysteria2_client(obfs: Option<ObfsConfig>) -> ClientConfig {
+            ClientConfig {
+                address: server(),
+                protocol: ClientProxyConfig::Hysteria2(Box::new(Hysteria2ClientConfig {
+                    password: "secret".into(),
+                    udp_enabled: true,
+                    obfs,
+                })),
+                ..Default::default()
+            }
+        }
+
+        fn tuic_client(uuid: &str, heartbeat_ms: u64) -> ClientConfig {
+            ClientConfig {
+                address: server(),
+                protocol: ClientProxyConfig::Tuic(Box::new(TuicClientConfig {
+                    uuid: uuid.to_string(),
+                    password: "secret".into(),
+                    udp_enabled: true,
+                    udp_relay_mode: TuicUdpRelayMode::Native,
+                    zero_rtt_handshake: false,
+                    heartbeat_ms,
+                })),
+                ..Default::default()
+            }
+        }
+
+        fn validate(config: &mut ClientConfig) -> std::io::Result<()> {
+            validate_client_config(config, &HashMap::new())
+        }
+
+        #[test]
+        fn test_hysteria2_allows_quic_settings() {
+            let mut config = hysteria2_client(None);
+            config.quic_settings = Some(ClientQuicConfig::default());
+            assert!(validate(&mut config).is_ok());
+        }
+
+        #[test]
+        fn test_wireguard_still_rejects_quic_settings() {
+            let mut config = ClientConfig {
+                address: server(),
+                protocol: ClientProxyConfig::Wireguard(Box::new(
+                    crate::config::WireGuardClientConfig {
+                        private_key: "cHJpdmF0ZWtleXByaXZhdGVrZXlwcml2YXRla2V5MTI=".into(),
+                        peer_public_key: "cHVibGlja2V5cHVibGlja2V5cHVibGlja2V5MTIzNDU=".to_string(),
+                        preshared_key: None,
+                        local_addresses: OneOrSome::One("10.0.0.2/32".to_string()),
+                        allowed_ips: OneOrSome::One("0.0.0.0/0".to_string()),
+                        persistent_keepalive: None,
+                        mtu: 1280,
+                    },
+                )),
+                quic_settings: Some(ClientQuicConfig::default()),
+                ..Default::default()
+            };
+            let err = validate(&mut config).unwrap_err().to_string();
+            assert!(err.contains("QUIC"), "{err}");
+        }
+
+        #[test]
+        fn test_hysteria2_rejects_transport() {
+            let mut config = hysteria2_client(None);
+            config.transport = Transport::Quic;
+            let err = validate(&mut config).unwrap_err().to_string();
+            assert!(err.contains("transport"), "{err}");
+        }
+
+        #[test]
+        fn test_hysteria2_rejects_tcp_settings() {
+            let mut config = hysteria2_client(None);
+            config.tcp_settings = Some(TcpConfig::default());
+            let err = validate(&mut config).unwrap_err().to_string();
+            assert!(err.contains("tcp_settings"), "{err}");
+        }
+
+        #[test]
+        fn test_rejects_short_obfs_password() {
+            let mut config = hysteria2_client(Some(ObfsConfig::Salamander {
+                password: "abc".into(),
+            }));
+            let err = validate(&mut config).unwrap_err().to_string();
+            assert!(err.contains('4'), "error should state the minimum: {err}");
+        }
+
+        #[test]
+        fn test_accepts_four_byte_obfs_password() {
+            let mut config = hysteria2_client(Some(ObfsConfig::Salamander {
+                password: "abcd".into(),
+            }));
+            assert!(validate(&mut config).is_ok());
+        }
+
+        #[test]
+        fn test_tuic_rejects_bad_uuid() {
+            let mut config = tuic_client("not-a-uuid", 10_000);
+            let err = validate(&mut config).unwrap_err().to_string();
+            assert!(err.to_lowercase().contains("uuid"), "{err}");
+        }
+
+        #[test]
+        fn test_tuic_accepts_a_valid_uuid() {
+            let mut config = tuic_client("b0e80a62-8a51-47f0-91f1-f0f7faf8d9d4", 10_000);
+            assert!(validate(&mut config).is_ok());
+        }
+
+        #[test]
+        fn test_tuic_rejects_zero_heartbeat() {
+            let mut config = tuic_client("b0e80a62-8a51-47f0-91f1-f0f7faf8d9d4", 0);
+            let err = validate(&mut config).unwrap_err().to_string();
+            assert!(err.contains("heartbeat_ms"), "{err}");
+        }
+    }
 
     async fn validate_configs_test(configs: Vec<Config>) -> std::io::Result<Vec<Config>> {
         let (converted_configs, _) = convert_cert_paths(configs).await?;
