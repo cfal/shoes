@@ -17,6 +17,7 @@ pub mod client;
 pub mod common;
 pub mod dns;
 pub mod groups;
+pub mod obfs;
 pub mod redacted;
 pub mod rule_set;
 pub mod rules;
@@ -36,6 +37,10 @@ pub use client::{
 pub use common::DEFAULT_REALITY_SHORT_ID;
 pub use dns::{DnsConfig, DnsConfigGroup, DnsServerSpec, ExpandedDnsGroup, ExpandedDnsSpec};
 pub use groups::{ClientConfigGroup, Config, NamedPem, PemSource};
+// Part of the public config surface; the protocol configs that carry it name
+// the module type directly, so the binary does not yet reach for this alias.
+#[allow(unused_imports)]
+pub use obfs::ObfsConfig;
 pub use redacted::Redacted;
 // Part of the public config surface; the binary itself matches on
 // Config::RuleSet rather than naming the type.

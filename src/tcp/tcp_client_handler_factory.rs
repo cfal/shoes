@@ -363,10 +363,14 @@ pub fn create_tcp_client_handler(
         } => Box::new(NaiveProxyTcpClientHandler::new(
             &username, &password, padding,
         )),
-        ClientProxyConfig::Wireguard(..) | ClientProxyConfig::AmneziaWg(..) => {
+        other @ (ClientProxyConfig::Wireguard(..)
+        | ClientProxyConfig::AmneziaWg(..)
+        | ClientProxyConfig::Hysteria2(..)
+        | ClientProxyConfig::Tuic(..)) => {
             panic!(
-                "WireGuard/AmneziaWG owns its transport and should not use TcpClientHandler. \
-                    It must be handled as a TerminalConnector in the chain builder."
+                "{} owns its transport and should not use TcpClientHandler. \
+                    It must be handled as a TerminalConnector in the chain builder.",
+                other.protocol_name()
             )
         }
     }

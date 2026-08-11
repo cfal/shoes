@@ -13,6 +13,7 @@ use crate::option_util::{NoneOrOne, NoneOrSome, OneOrSome};
 use super::common::{
     default_reality_client_short_id, default_true, is_false, is_true, unspecified_address,
 };
+use super::obfs::ObfsConfig;
 use super::server::WebsocketPingType;
 use super::shadowsocks::ShadowsocksConfig;
 use super::transport::{ClientQuicConfig, TcpConfig, Transport};
@@ -180,6 +181,64 @@ impl AmneziaWgParams {
             || self.max_handshake_attempts.is_some()
             || self.persistent_keepalive_interval.is_some()
     }
+}
+
+/// Hysteria2 client outbound.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Hysteria2ClientConfig {
+    /// Server password. A server that authenticates by username and password
+    /// expects `<username>:<password>` here, as a single opaque string.
+    pub password: Redacted<String>,
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub udp_enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub obfs: Option<ObfsConfig>,
+}
+
+/// How TUIC carries UDP packets.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TuicUdpRelayMode {
+    /// QUIC datagrams.
+    #[default]
+    Native,
+    /// QUIC unidirectional streams.
+    Quic,
+}
+
+impl TuicUdpRelayMode {
+    fn is_default(&self) -> bool {
+        *self == Self::Native
+    }
+}
+
+fn default_heartbeat_ms() -> u64 {
+    10_000
+}
+
+fn is_default_heartbeat(value: &u64) -> bool {
+    *value == default_heartbeat_ms()
+}
+
+/// TUIC v5 client outbound.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TuicClientConfig {
+    pub uuid: String,
+    pub password: Redacted<String>,
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub udp_enabled: bool,
+    #[serde(default, skip_serializing_if = "TuicUdpRelayMode::is_default")]
+    pub udp_relay_mode: TuicUdpRelayMode,
+    /// 0-RTT is off by default: 0-RTT data is replayable.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub zero_rtt_handshake: bool,
+    #[serde(
+        default = "default_heartbeat_ms",
+        skip_serializing_if = "is_default_heartbeat"
+    )]
+    pub heartbeat_ms: u64,
 }
 
 /// Custom deserializer for ClientProxyConfig::Shadowsocks
@@ -573,6 +632,13 @@ pub enum ClientProxyConfig {
     /// AmneziaWG 2.0/3.0 client outbound (UDP-backed L3 tunnel with obfuscation)
     #[serde(alias = "awg")]
     AmneziaWg(Box<AmneziaWgClientConfig>),
+    /// Hysteria2 client outbound (QUIC-native, owns its transport).
+    /// Boxed to keep the enum small.
+    #[serde(alias = "hy2")]
+    Hysteria2(Box<Hysteria2ClientConfig>),
+    /// TUIC v5 client outbound (QUIC-native, owns its transport).
+    #[serde(alias = "tuic_v5", alias = "tuicv5")]
+    Tuic(Box<TuicClientConfig>),
 }
 
 impl ClientProxyConfig {
@@ -586,7 +652,10 @@ impl ClientProxyConfig {
     pub fn owns_transport(&self) -> bool {
         matches!(
             self,
-            ClientProxyConfig::Wireguard(_) | ClientProxyConfig::AmneziaWg(_)
+            ClientProxyConfig::Wireguard(_)
+                | ClientProxyConfig::AmneziaWg(_)
+                | ClientProxyConfig::Hysteria2(_)
+                | ClientProxyConfig::Tuic(_)
         )
     }
 
@@ -610,6 +679,8 @@ impl ClientProxyConfig {
             ClientProxyConfig::Naiveproxy { .. } => "NaiveProxy",
             ClientProxyConfig::Wireguard(..) => "WireGuard",
             ClientProxyConfig::AmneziaWg(..) => "AmneziaWG",
+            ClientProxyConfig::Hysteria2(..) => "Hysteria2",
+            ClientProxyConfig::Tuic(..) => "TUIC",
         }
     }
 }
@@ -776,6 +847,63 @@ type: http
         let result: Result<ClientProxyConfig, _> = serde_yaml::from_str(yaml);
         assert!(result.is_ok());
         assert!(matches!(result.unwrap(), ClientProxyConfig::Http { .. }));
+    }
+
+    #[test]
+    fn test_client_proxy_config_hysteria2() {
+        let yaml = r#"
+type: hysteria2
+password: secret
+obfs:
+  type: salamander
+  password: obfspass
+"#;
+        let config: ClientProxyConfig = serde_yaml::from_str(yaml).unwrap();
+        match config {
+            ClientProxyConfig::Hysteria2(ref h) => {
+                assert_eq!(h.password.expose(), "secret");
+                assert!(h.udp_enabled, "udp is on unless turned off");
+                assert!(h.obfs.is_some());
+            }
+            ref other => panic!("expected Hysteria2, got {other:?}"),
+        }
+        assert!(config.owns_transport());
+        assert_eq!(config.protocol_name(), "Hysteria2");
+    }
+
+    #[test]
+    fn test_client_proxy_config_tuic_defaults() {
+        let yaml = r#"
+type: tuic
+uuid: "00000000-0000-0000-0000-000000000000"
+password: secret
+"#;
+        let config: ClientProxyConfig = serde_yaml::from_str(yaml).unwrap();
+        match config {
+            ClientProxyConfig::Tuic(ref t) => {
+                assert!(t.udp_enabled);
+                assert_eq!(t.udp_relay_mode, TuicUdpRelayMode::Native);
+                assert!(!t.zero_rtt_handshake);
+                assert_eq!(t.heartbeat_ms, 10_000);
+            }
+            ref other => panic!("expected Tuic, got {other:?}"),
+        }
+        assert!(config.owns_transport());
+        assert_eq!(config.protocol_name(), "TUIC");
+    }
+
+    #[test]
+    fn test_tuic_rejects_unknown_relay_mode() {
+        let yaml = r#"
+type: tuic
+uuid: "00000000-0000-0000-0000-000000000000"
+password: secret
+udp_relay_mode: sideways
+"#;
+        let err = serde_yaml::from_str::<ClientProxyConfig>(yaml)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("native"), "{err}");
     }
 
     #[test]
