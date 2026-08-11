@@ -2,6 +2,8 @@
 
 pub mod connection;
 pub mod obfs;
+#[cfg(test)]
+pub mod testing;
 
 use std::sync::Arc;
 use std::time::Duration;
