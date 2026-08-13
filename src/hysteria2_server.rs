@@ -986,6 +986,18 @@ pub async fn start_hysteria2_server(
         let resolver = resolver.clone();
         let client_proxy_selector = client_proxy_selector.clone();
 
+        // Bind the UDP socket before spawning so a bind failure (e.g.
+        // EADDRINUSE on restart) is propagated to the caller via ? instead
+        // of panicking the spawned worker task. One bind per endpoint
+        // preserves the SO_REUSEPORT multi-endpoint behavior.
+        let socket2_socket = crate::socket_util::new_socket2_udp_socket_with_buffer_size(
+            bind_address.is_ipv6(),
+            None,
+            Some(bind_address),
+            true,
+            Some(8_625_000),
+        )?;
+
         let join_handle = tokio::spawn(async move {
             let mut server_config = quinn::ServerConfig::with_crypto(quic_server_config);
 
@@ -1012,22 +1024,18 @@ pub async fn start_hysteria2_server(
 
             // Use 7.5MB socket buffers for high-throughput QUIC (8.625MB on BSD for 15% kernel overhead)
             // https://github.com/quic-go/quic-go/wiki/UDP-Buffer-Sizes
-            let socket2_socket = crate::socket_util::new_socket2_udp_socket_with_buffer_size(
-                bind_address.is_ipv6(),
-                None,
-                Some(bind_address),
-                true,
-                Some(8_625_000),
-            )
-            .unwrap();
-
-            let endpoint = quinn::Endpoint::new(
+            let endpoint = match quinn::Endpoint::new(
                 quinn::EndpointConfig::default(),
                 Some(server_config),
                 socket2_socket.into(),
                 Arc::new(quinn::TokioRuntime),
-            )
-            .unwrap();
+            ) {
+                Ok(endpoint) => endpoint,
+                Err(e) => {
+                    error!("Failed to create hysteria2 quinn endpoint: {e}");
+                    return;
+                }
+            };
 
             while let Some(conn) = endpoint.accept().await {
                 let cloned_selector = client_proxy_selector.clone();
