@@ -3,6 +3,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use log::debug;
+use subtle::ConstantTimeEq;
 use tokio::io::AsyncWriteExt;
 
 use crate::address::{Address, NetLocation, ResolvedLocation};
@@ -14,7 +15,57 @@ use crate::tcp::tcp_handler::{
     TcpClientHandler, TcpClientSetupResult, TcpServerHandler, TcpServerSetupResult,
 };
 
+#[cfg(test)]
+mod auth_tests {
+    use super::auth_token_matches;
+
+    #[test]
+    fn test_matches_the_configured_token() {
+        assert!(auth_token_matches("dXNlcjpwYXNz", Some("dXNlcjpwYXNz")));
+    }
+
+    #[test]
+    fn test_rejects_a_different_token() {
+        assert!(!auth_token_matches(
+            "dXNlcjp3cm9uZw==",
+            Some("dXNlcjpwYXNz")
+        ));
+    }
+
+    #[test]
+    fn test_rejects_a_prefix_or_an_extension() {
+        assert!(!auth_token_matches("dXNlcjpwYXN", Some("dXNlcjpwYXNz")));
+        assert!(!auth_token_matches(
+            "dXNlcjpwYXNzeA==",
+            Some("dXNlcjpwYXNz")
+        ));
+    }
+
+    /// Reached when authentication is required but nothing is configured to
+    /// check against. Rejecting keeps that from being an unwrap on None.
+    #[test]
+    fn test_rejects_when_nothing_is_configured() {
+        assert!(!auth_token_matches("anything", None));
+    }
+}
+
 const PROXY_AUTH_HEADER_PREFIX: &str = "proxy-authorization: basic ";
+
+/// Compare a presented credential against the configured one in constant time.
+///
+/// `None` means no credential is configured, which the callers only reach when
+/// they have already decided authentication is required; treating it as a
+/// mismatch keeps that a rejection rather than an unwrap on None.
+fn auth_token_matches(presented: &str, configured: Option<&str>) -> bool {
+    let Some(configured) = configured else {
+        return false;
+    };
+    presented
+        .as_bytes()
+        .ct_eq(configured.as_bytes())
+        .unwrap_u8()
+        == 1
+}
 const CONNECTION_HEADER_PREFIX: &str = "connection: ";
 const PROXY_CONNECTION_HEADER_PREFIX: &str = "proxy-connection: ";
 
@@ -130,11 +181,8 @@ pub async fn setup_http_server_stream_inner(
                     && line[0..PROXY_AUTH_HEADER_PREFIX.len()].to_ascii_lowercase()
                         == PROXY_AUTH_HEADER_PREFIX
                 {
-                    if &line[PROXY_AUTH_HEADER_PREFIX.len()..] != auth_token.unwrap() {
-                        debug!(
-                            "Received incorrect HTTP CONNECT authentication: {}",
-                            &line[PROXY_AUTH_HEADER_PREFIX.len()..]
-                        );
+                    if !auth_token_matches(&line[PROXY_AUTH_HEADER_PREFIX.len()..], auth_token) {
+                        debug!("Received incorrect HTTP CONNECT authentication");
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidInput,
                             "Incorrect HTTP CONNECT authentication",
@@ -232,11 +280,9 @@ pub async fn setup_http_server_stream_inner(
                     && lowercase_line.starts_with(PROXY_AUTH_HEADER_PREFIX)
                 {
                     if need_auth {
-                        if &line[PROXY_AUTH_HEADER_PREFIX.len()..] != auth_token.unwrap() {
-                            debug!(
-                                "Received incorrect HTTP GET authentication: {}",
-                                &line[PROXY_AUTH_HEADER_PREFIX.len()..]
-                            );
+                        if !auth_token_matches(&line[PROXY_AUTH_HEADER_PREFIX.len()..], auth_token)
+                        {
+                            debug!("Received incorrect HTTP GET authentication");
                             return Err(std::io::Error::new(
                                 std::io::ErrorKind::InvalidInput,
                                 "Incorrect HTTP GET authentication",

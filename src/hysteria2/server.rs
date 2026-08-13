@@ -5,6 +5,7 @@ use std::num::NonZeroUsize;
 use std::str;
 use std::sync::Arc;
 use std::time::Duration;
+use subtle::ConstantTimeEq;
 
 use bytes::{Bytes, BytesMut};
 use log::{debug, error, warn};
@@ -190,10 +191,15 @@ fn validate_auth_request<T>(req: http::Request<T>, password: &str) -> std::io::R
     let auth_str = auth_value
         .to_str()
         .map_err(|e| std::io::Error::other(format!("invalid auth header value: {e}")))?;
-    if auth_str != password {
-        return Err(std::io::Error::other(format!(
-            "incorrect auth password: {auth_str}"
-        )));
+
+    // Constant time, and the rejection says nothing about what was sent: an
+    // error carrying the attempted password puts a credential — quite possibly
+    // a correct one for some other server — into the logs.
+    if auth_str.as_bytes().ct_eq(password.as_bytes()).unwrap_u8() == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "incorrect auth password",
+        ));
     }
 
     Ok(())
@@ -1030,5 +1036,68 @@ mod tests {
     fn test_transport_mtu_accounts_for_obfuscation_overhead() {
         assert_eq!(effective_mtu(None), BASE_MTU);
         assert_eq!(effective_mtu(Some(8)), BASE_MTU - 8);
+    }
+
+    fn auth_request(password: &str) -> http::Request<()> {
+        http::Request::post("https://hysteria/auth")
+            .header("Hysteria-Auth", password)
+            .body(())
+            .unwrap()
+    }
+
+    #[test]
+    fn test_auth_accepts_the_configured_password() {
+        assert!(validate_auth_request(auth_request("hunter2"), "hunter2").is_ok());
+    }
+
+    #[test]
+    fn test_auth_rejects_a_wrong_password() {
+        assert!(validate_auth_request(auth_request("wrong"), "hunter2").is_err());
+    }
+
+    #[test]
+    fn test_auth_rejects_a_prefix_of_the_password() {
+        // A comparison that stopped at the first difference would take longer
+        // for this than for a password differing in byte one; the rejection
+        // itself is what this pins.
+        assert!(validate_auth_request(auth_request("hunter"), "hunter2").is_err());
+        assert!(validate_auth_request(auth_request("hunter23"), "hunter2").is_err());
+    }
+
+    /// A rejection must not repeat what was sent. The attempt may well be a
+    /// valid credential for somewhere else, and it ends up in the log either
+    /// way.
+    #[test]
+    fn test_auth_rejection_does_not_echo_the_credential() {
+        let err = validate_auth_request(auth_request("s3cret-elsewhere"), "hunter2")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            !err.contains("s3cret-elsewhere"),
+            "the error repeated the presented credential: {err}"
+        );
+    }
+
+    #[test]
+    fn test_auth_rejects_a_missing_header() {
+        let request = http::Request::post("https://hysteria/auth")
+            .body(())
+            .unwrap();
+        assert!(validate_auth_request(request, "hunter2").is_err());
+    }
+
+    #[test]
+    fn test_auth_rejects_the_wrong_uri_and_method() {
+        let wrong_uri = http::Request::post("https://hysteria/other")
+            .header("Hysteria-Auth", "hunter2")
+            .body(())
+            .unwrap();
+        assert!(validate_auth_request(wrong_uri, "hunter2").is_err());
+
+        let wrong_method = http::Request::get("https://hysteria/auth")
+            .header("Hysteria-Auth", "hunter2")
+            .body(())
+            .unwrap();
+        assert!(validate_auth_request(wrong_method, "hunter2").is_err());
     }
 }

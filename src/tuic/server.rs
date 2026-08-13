@@ -8,6 +8,7 @@ use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use log::{debug, error};
 use lru::LruCache;
+use subtle::ConstantTimeEq;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UdpSocket;
 use tokio::task::JoinHandle;
@@ -221,17 +222,19 @@ async fn auth_connection(
         }
 
         let specified_uuid = stream_reader.read_slice(&mut recv_stream, 16).await?;
-        if specified_uuid != uuid {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                format!("incorrect uuid: {specified_uuid:?}"),
-            ));
-        }
+        let uuid_match = specified_uuid.ct_eq(uuid);
+
         let token_bytes = stream_reader.read_slice(&mut recv_stream, 32).await?;
-        if token_bytes != expected_token_bytes {
+        let token_match = token_bytes.ct_eq(&expected_token_bytes);
+
+        // Constant time, and both are read and compared before either is
+        // judged, so the reply says nothing about which half was wrong. The
+        // token is derived from the password, so a byte-by-byte timing signal
+        // on it is a signal on the password.
+        if (uuid_match & token_match).unwrap_u8() == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
-                "incorrect token",
+                "TUIC authentication failed",
             ));
         }
 
