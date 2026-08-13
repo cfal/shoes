@@ -65,16 +65,18 @@ impl Obfuscator for Salamander {
         Some(out_len)
     }
 
-    fn deobfuscate(&self, input: &[u8], out: &mut [u8]) -> Option<usize> {
-        let out_len = input.len().checked_sub(SALT_LEN)?;
-        if out_len == 0 || out.len() < out_len {
+    fn deobfuscate_in_place(&self, buf: &mut [u8]) -> Option<usize> {
+        let out_len = buf.len().checked_sub(SALT_LEN)?;
+        if out_len == 0 {
             return None;
         }
-        let salt: [u8; SALT_LEN] = input[..SALT_LEN].try_into().ok()?;
+        let salt: [u8; SALT_LEN] = buf[..SALT_LEN].try_into().ok()?;
         let key = self.derive_key(&salt);
 
-        for (i, byte) in input[SALT_LEN..].iter().enumerate() {
-            out[i] = byte ^ key[i % KEY_LEN];
+        // Byte i of the payload is read from i + SALT_LEN and written to i, so
+        // every write lands behind the read that produced it.
+        for i in 0..out_len {
+            buf[i] = buf[i + SALT_LEN] ^ key[i % KEY_LEN];
         }
         Some(out_len)
     }
@@ -96,10 +98,10 @@ mod tests {
         let written = obfs.obfuscate(payload, &mut wire).unwrap();
         assert_eq!(written, payload.len() + 8);
 
-        let mut back = vec![0u8; payload.len()];
-        let read = obfs.deobfuscate(&wire[..written], &mut back).unwrap();
+        wire.truncate(written);
+        let read = obfs.deobfuscate_in_place(&mut wire).unwrap();
         assert_eq!(read, payload.len());
-        assert_eq!(&back[..read], payload);
+        assert_eq!(&wire[..read], payload);
     }
 
     #[test]
@@ -127,10 +129,9 @@ mod tests {
     #[test]
     fn test_deobfuscate_rejects_short_packets() {
         let obfs = Salamander::new(b"a password").unwrap();
-        let mut out = [0u8; 32];
-        assert!(obfs.deobfuscate(&[], &mut out).is_none());
-        assert!(obfs.deobfuscate(&[0u8; 8], &mut out).is_none());
-        assert!(obfs.deobfuscate(&[0u8; 9], &mut out).is_some());
+        assert!(obfs.deobfuscate_in_place(&mut []).is_none());
+        assert!(obfs.deobfuscate_in_place(&mut [0u8; 8]).is_none());
+        assert!(obfs.deobfuscate_in_place(&mut [0u8; 9]).is_some());
     }
 
     #[test]
@@ -163,8 +164,7 @@ mod tests {
             wire.push(byte ^ key[i % 32]);
         }
 
-        let mut out = [0u8; 5];
-        let read = obfs.deobfuscate(&wire, &mut out).unwrap();
-        assert_eq!(&out[..read], payload);
+        let read = obfs.deobfuscate_in_place(&mut wire).unwrap();
+        assert_eq!(&wire[..read], payload);
     }
 }

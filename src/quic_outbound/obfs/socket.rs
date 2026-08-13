@@ -54,17 +54,15 @@ fn deobfuscate_batch(
             continue;
         }
 
-        let mut decoded = vec![0u8; len];
-        match obfs.deobfuscate(&bufs[i][..len], &mut decoded) {
+        match obfs.deobfuscate_in_place(&mut bufs[i][..len]) {
             Some(decoded_len) => {
                 // quinn pairs meta[n] with bufs[n], so a survivor that moves
                 // forward in the metadata must have its bytes move with it.
-                // Writing the decoded copy straight to its final buffer does
-                // both at once.
                 if kept != i {
                     meta[kept] = meta[i];
+                    let (left, right) = bufs.split_at_mut(i);
+                    left[kept][..decoded_len].copy_from_slice(&right[0][..decoded_len]);
                 }
-                bufs[kept][..decoded_len].copy_from_slice(&decoded[..decoded_len]);
                 meta[kept].len = decoded_len;
                 meta[kept].stride = decoded_len;
                 kept += 1;

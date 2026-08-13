@@ -20,9 +20,15 @@ pub trait Obfuscator: Send + Sync + Debug {
     /// dropped packet rather than an error.
     fn obfuscate(&self, input: &[u8], out: &mut [u8]) -> Option<usize>;
 
-    /// Reverse `obfuscate`. Returns None for a packet that cannot be a valid
-    /// obfuscated datagram.
-    fn deobfuscate(&self, input: &[u8], out: &mut [u8]) -> Option<usize>;
+    /// Reverse `obfuscate`, in place, returning the length of the recovered
+    /// payload. Returns None for a packet that cannot be a valid obfuscated
+    /// datagram.
+    ///
+    /// In place rather than into a second buffer because this runs on every
+    /// received packet: the recovered bytes only ever move toward the front of
+    /// the buffer, so nothing is lost by overwriting as we go, and the receive
+    /// path stays free of a per-packet allocation.
+    fn deobfuscate_in_place(&self, buf: &mut [u8]) -> Option<usize>;
 
     /// Bytes added to every packet. Subtracted from the QUIC MTU.
     fn overhead(&self) -> usize;

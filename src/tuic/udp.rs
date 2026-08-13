@@ -31,6 +31,11 @@ const INCOMING_CAPACITY: usize = 64;
 /// UDP payload.
 const MAX_COMMAND_BYTES: usize = 2 + MAX_HEADER_LEN + u16::MAX as usize;
 
+/// How many outgoing packets may wait for the quic-mode writer. Past this the
+/// sender is outrunning the link and the queue would only add latency to
+/// packets that are already stale.
+const OUTGOING_CAPACITY: usize = 64;
+
 /// Build the datagrams for one outgoing UDP packet.
 ///
 /// Only the first fragment carries the address; the rest use address type 0xff,
@@ -184,6 +189,8 @@ pub struct TuicUdpSession {
     mode: TuicUdpRelayMode,
     next_packet_id: AtomicU16,
     incoming: mpsc::Receiver<Vec<u8>>,
+    /// Set only in the quic relay mode, where sending needs to await.
+    outgoing: Option<mpsc::Sender<Vec<Vec<u8>>>>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
@@ -206,6 +213,7 @@ impl TuicUdpSession {
     ) -> Self {
         let (tx, rx) = mpsc::channel(INCOMING_CAPACITY);
         let mut tasks = Vec::with_capacity(3);
+        let mut outgoing = None;
 
         // The server replies in whichever mode the association's first packet
         // used, so only that reader is started. Heartbeats travel as datagrams
@@ -239,6 +247,33 @@ impl TuicUdpSession {
                 }));
             }
             TuicUdpRelayMode::Quic => {
+                // One writer for the association, fed by a bounded queue, so
+                // packets keep their order and a fast sender cannot spawn work
+                // faster than the link retires it.
+                let (outgoing_tx, mut outgoing_rx) =
+                    mpsc::channel::<Vec<Vec<u8>>>(OUTGOING_CAPACITY);
+                outgoing = Some(outgoing_tx);
+
+                let writer_connection = connection.clone();
+                tasks.push(tokio::spawn(async move {
+                    while let Some(packets) = outgoing_rx.recv().await {
+                        for packet in packets {
+                            match writer_connection.open_uni().await {
+                                Ok(mut stream) => {
+                                    if stream.write_all(&packet).await.is_err() {
+                                        return;
+                                    }
+                                    let _ = stream.finish();
+                                }
+                                Err(e) => {
+                                    debug!("TUIC uni send failed: {e}");
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }));
+
                 let stream_connection = connection.clone();
                 let tx = tx.clone();
                 tasks.push(tokio::spawn(async move {
@@ -300,6 +335,7 @@ impl TuicUdpSession {
             mode,
             next_packet_id: AtomicU16::new(0),
             incoming: rx,
+            outgoing,
             tasks,
         }
     }
@@ -362,26 +398,25 @@ impl AsyncWriteMessage for TuicUdpSession {
                     buf,
                     u16::MAX as usize,
                 )?;
-                let connection = this.connection.clone();
-                // Opening a stream is async and this is a poll, so the send is
-                // handed to a task. Ordering within a packet is preserved
-                // because one task writes all of its fragments in turn.
-                tokio::spawn(async move {
-                    for packet in packets {
-                        match connection.open_uni().await {
-                            Ok(mut stream) => {
-                                if stream.write_all(&packet).await.is_err() {
-                                    return;
-                                }
-                                let _ = stream.finish();
-                            }
-                            Err(e) => {
-                                debug!("TUIC uni send failed: {e}");
-                                return;
-                            }
-                        }
-                    }
-                });
+
+                let Some(outgoing) = this.outgoing.as_ref() else {
+                    return Poll::Ready(Err(std::io::Error::other(
+                        "the quic relay mode session has no writer",
+                    )));
+                };
+
+                // Handed to the session's single writer rather than to a task
+                // of its own. Opening a stream is async and this is a poll, so
+                // the work has to move somewhere; a task per packet would grow
+                // without bound under a fast sender and would let packets
+                // overtake each other.
+                //
+                // The queue is bounded, and a full queue drops the packet. That
+                // is what a full socket buffer does to UDP anyway, and it is
+                // the honest answer here: this call cannot wait.
+                if outgoing.try_send(packets).is_err() {
+                    debug!("TUIC uni send queue is full; dropping a packet");
+                }
             }
         }
         Poll::Ready(Ok(()))
