@@ -346,12 +346,15 @@ costs to leave.
   counter, the accumulated length, and the address to reply to) that the shared
   table deliberately does not.
 - One deliberate item not recorded elsewhere:
-  - `src/routing/udp_router.rs` (over 1300 lines), `src/vless/vision_stream.rs`
-    and `src/shadow_tls/shadow_tls_server_handler.rs` have no tests at all.
-    These are data paths, so covering them means designing the tests, not
-    adding a few. `vmess_handler.rs` and `shadowsocks_stream.rs` were on this
-    list until a handshake test was written for each; both found real defects,
-    which is the argument for doing the rest.
+  - `src/vless/vision_stream.rs` and
+    `src/shadow_tls/shadow_tls_server_handler.rs` have no tests at all. These
+    are data paths, so covering them means designing the tests, not adding a
+    few. `vmess_handler.rs`, `shadowsocks_stream.rs` and
+    `routing/udp_router.rs` were on this list until each got tests; the first
+    two surfaced real defects, which is the argument for doing the rest. The
+    router's tests drive `run_udp_routing` end to end through a scripted
+    server-side stream against real loopback echo sockets - reuse that double
+    rather than inventing another.
 - `src/quic_server.rs::start_quic_server`, the generic QUIC listener behind
   VLESS and the other TCP protocols, still builds its own endpoint and sets no
   transport parameters at all — there is a TODO in it proposing some. It was
