@@ -35,6 +35,34 @@ use crate::xudp::XudpMessageStream;
 
 const TAG_LEN: usize = 16;
 
+/// The window either side of the current time that a VMess AEAD auth id is
+/// accepted in. See authid.go in v2ray-core.
+const AUTH_ID_TIME_WINDOW_SECS: u64 = 120;
+
+/// Seconds since the Unix epoch.
+///
+/// A clock set before 1970 is a broken clock rather than something to panic
+/// over: this runs on every connection, and the mobile profile is built with
+/// `panic = "abort"`, where a panic ends the process rather than the
+/// connection.
+fn unix_time_secs() -> std::io::Result<u64> {
+    SystemTime::UNIX_EPOCH
+        .elapsed()
+        .map(|since_epoch| since_epoch.as_secs())
+        .map_err(|e| std::io::Error::other(format!("system clock is before the Unix epoch: {e}")))
+}
+
+/// A timestamp drawn at random from the window the server will accept, which
+/// is what the reference client sends rather than the exact current time.
+///
+/// Saturating because a clock still sitting near the epoch - a device with no
+/// RTC that has not synchronised yet - would otherwise wrap the subtraction
+/// into a timestamp far in the future.
+fn random_auth_id_timestamp() -> std::io::Result<u64> {
+    let delta: u64 = rand::rng().random_range(0..=(AUTH_ID_TIME_WINDOW_SECS * 2));
+    Ok(unix_time_secs()?.saturating_sub(AUTH_ID_TIME_WINDOW_SECS) + delta)
+}
+
 // VMess protocol command types
 const COMMAND_TCP: u8 = 1;
 const COMMAND_UDP: u8 = 2;
@@ -144,9 +172,9 @@ impl TcpServerHandler for VmessTcpServerHandler {
         }
 
         let time_secs = u64::from_be_bytes(aead_bytes[0..8].try_into().unwrap());
-        let current_time_secs = SystemTime::UNIX_EPOCH.elapsed().unwrap().as_secs();
+        let current_time_secs = unix_time_secs()?;
         let time_delta = time_secs.abs_diff(current_time_secs);
-        if time_delta > 120 {
+        if time_delta > AUTH_ID_TIME_WINDOW_SECS {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("Hash timestamp is too old ({time_secs} is {time_delta} seconds old)"),
@@ -222,11 +250,7 @@ impl TcpServerHandler for VmessTcpServerHandler {
             return Err(std::io::Error::other("failed to open encrypted header"));
         }
 
-        let mut header_reader = AeadHeaderReader {
-            server_stream,
-            decrypted_header: encrypted_header,
-            cursor: 0,
-        };
+        let mut header_reader = HeaderCursor::new(encrypted_header);
 
         let mut fnv_hasher = Fnv1aHasher::new();
 
@@ -244,15 +268,11 @@ impl TcpServerHandler for VmessTcpServerHandler {
 
         let command = fixed_header[37];
 
-        log::info!("VMess command: {}", command);
-
         // For MUX/XUDP command (0x03), there is NO destination in the VMess header
         // Destinations come in XUDP frames themselves
         let remote_location = if command == COMMAND_MUX {
             // Use a placeholder address for XUDP - actual destinations come from XUDP frames
-            log::info!(
-                "VMess MUX/XUDP: No destination in VMess header (destinations come in XUDP frames)"
-            );
+            log::debug!("VMess MUX/XUDP: destinations arrive in the XUDP frames");
             NetLocation::new(Address::Ipv4(Ipv4Addr::new(0, 0, 0, 0)), 0)
         } else {
             // For TCP/UDP commands, read port (2 bytes) and address
@@ -331,25 +351,17 @@ impl TcpServerHandler for VmessTcpServerHandler {
         };
 
         let margin_len: u8 = fixed_header[35] >> 4;
-        log::info!("VMess margin_len: {}, command: {}", margin_len, command);
         if margin_len > 0 {
             let mut margin_bytes = allocate_vec(margin_len as usize).into_boxed_slice();
             header_reader.read_slice_into(&mut margin_bytes)?;
-            log::info!("VMess margin_bytes: {:?}", &margin_bytes[..]);
             fnv_hasher.write(&margin_bytes);
         }
 
         let mut check_bytes = [0u8; 4];
         header_reader.read_slice_into(&mut check_bytes)?;
-        log::info!("VMess check_bytes: {:?}", check_bytes);
 
         let expected_check_value = u32::from_be_bytes(check_bytes[0..4].try_into().unwrap());
         let actual_check_value = fnv_hasher.finish();
-        log::info!(
-            "VMess FNV1a: expected={}, actual={}",
-            expected_check_value,
-            actual_check_value
-        );
         if expected_check_value != actual_check_value {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -358,8 +370,6 @@ impl TcpServerHandler for VmessTcpServerHandler {
                 ),
             ));
         }
-
-        let server_stream = header_reader.into_stream();
 
         let data_encryption_iv: &[u8] = &fixed_header[1..17];
         let data_encryption_key: &[u8] = &fixed_header[17..33];
@@ -684,22 +694,46 @@ impl TcpServerHandler for VmessTcpServerHandler {
     }
 }
 
-struct AeadHeaderReader {
-    server_stream: Box<dyn AsyncStream>,
+/// The decrypted AEAD header, read field by field.
+///
+/// Its length is `payload_length` from the request, which the client chose, so
+/// every read is bounds-checked. Reading past the end means the client declared
+/// a header shorter than the fields it claims to contain: a protocol error, and
+/// the reason this is a checked read rather than a slice index.
+struct HeaderCursor {
     decrypted_header: Box<[u8]>,
     cursor: usize,
 }
 
-impl AeadHeaderReader {
-    fn read_slice_into(&mut self, data: &mut [u8]) -> std::io::Result<()> {
-        let len = data.len();
-        data.copy_from_slice(&self.decrypted_header[self.cursor..self.cursor + len]);
-        self.cursor += len;
-        Ok(())
+impl HeaderCursor {
+    fn new(decrypted_header: Box<[u8]>) -> Self {
+        Self {
+            decrypted_header,
+            cursor: 0,
+        }
     }
 
-    fn into_stream(self) -> Box<dyn AsyncStream> {
-        self.server_stream
+    fn read_slice_into(&mut self, data: &mut [u8]) -> std::io::Result<()> {
+        let end = self
+            .cursor
+            .checked_add(data.len())
+            .ok_or_else(|| std::io::Error::other("VMess header read overflowed"))?;
+
+        let Some(chunk) = self.decrypted_header.get(self.cursor..end) else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!(
+                    "VMess header ended early: wanted {} more bytes at offset {}, header is {} bytes",
+                    data.len(),
+                    self.cursor,
+                    self.decrypted_header.len()
+                ),
+            ));
+        };
+
+        data.copy_from_slice(chunk);
+        self.cursor = end;
+        Ok(())
     }
 }
 
@@ -745,11 +779,7 @@ impl TcpClientHandler for VmessTcpClientHandler {
         mut client_stream: Box<dyn AsyncStream>,
         remote_location: ResolvedLocation,
     ) -> std::io::Result<TcpClientSetupResult> {
-        // AEAD allows 120 second delta from the current time.
-        // See authid.go in v2ray-core.
-        let random_delta: u64 = rand::rng().random_range(0..241);
-        let time_secs: u64 =
-            SystemTime::UNIX_EPOCH.elapsed().unwrap().as_secs() - 120u64 + random_delta;
+        let time_secs = random_auth_id_timestamp()?;
 
         let mut aead_bytes = [0u8; 16];
         let time_bytes = time_secs.to_be_bytes();
@@ -1029,10 +1059,7 @@ impl VmessTcpClientHandler {
         // VMess single-target UDP mode: Send VMess header with COMMAND_UDP (2).
         // Same as TCP setup but with command=2 and is_udp=true for VmessStream.
 
-        // AEAD allows 120 second delta from the current time.
-        let random_delta: u64 = rand::rng().random_range(0..241);
-        let time_secs: u64 =
-            SystemTime::UNIX_EPOCH.elapsed().unwrap().as_secs() - 120u64 + random_delta;
+        let time_secs = random_auth_id_timestamp()?;
 
         let mut aead_bytes = [0u8; 16];
         let time_bytes = time_secs.to_be_bytes();
@@ -1262,5 +1289,163 @@ impl VmessTcpClientHandler {
         );
 
         Ok(Box::new(vmess_stream))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::quic_outbound::testing::{direct_selector, test_resolver};
+
+    const TEST_UUID: &str = "b0e80a62-8a51-47f0-91f1-f0f7faf8d9d4";
+
+    /// Run this repository's own VMess client against its own server over a
+    /// loopback socket, and return the destination the server parsed out.
+    ///
+    /// The handshake is the only part of VMess that had no test at all, which
+    /// is why the header parsing could slice out of bounds unnoticed.
+    async fn handshake(target: &str) -> std::io::Result<NetLocation> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let requested = NetLocation::from_str(target, None).unwrap();
+        let client_target = requested.clone();
+        let client = tokio::spawn(async move {
+            let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let handler = VmessTcpClientHandler::new("aes-128-gcm", TEST_UUID, false);
+            handler
+                .setup_client_tcp_stream(Box::new(stream), client_target.into())
+                .await
+                .map(|_| ())
+        });
+
+        let (server_stream, _) = listener.accept().await.unwrap();
+        let resolver = test_resolver();
+        let server = VmessTcpServerHandler::new(
+            "aes-128-gcm",
+            TEST_UUID,
+            false,
+            direct_selector(resolver.clone()),
+            resolver,
+        );
+        let result = server.setup_server_stream(Box::new(server_stream)).await?;
+
+        client.await.unwrap()?;
+
+        match result {
+            TcpServerSetupResult::TcpForward {
+                remote_location, ..
+            } => Ok(remote_location),
+            _ => Err(std::io::Error::other("expected a TCP forward")),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handshake_carries_a_hostname_target() {
+        assert_eq!(
+            handshake("example.com:443").await.unwrap(),
+            NetLocation::from_str("example.com:443", None).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handshake_carries_an_ipv4_target() {
+        assert_eq!(
+            handshake("1.2.3.4:80").await.unwrap(),
+            NetLocation::from_str("1.2.3.4:80", None).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handshake_carries_an_ipv6_target() {
+        assert_eq!(
+            handshake("[2001:db8::1]:8080").await.unwrap(),
+            NetLocation::from_str("[2001:db8::1]:8080", None).unwrap()
+        );
+    }
+
+    /// The header length is whatever the client encrypted into the request, so
+    /// a client that knows a valid UUID can declare one shorter than the fields
+    /// the parser goes on to read. Before this was a checked read, that sliced
+    /// past the end and panicked - which on the mobile profile, built with
+    /// panic = "abort", takes the process down rather than the connection.
+    #[test]
+    fn test_a_short_header_is_an_error_rather_than_a_panic() {
+        // What a client declaring payload_length = 0 produces: nothing but the
+        // AEAD tag, and the parser's first read wants 38 bytes.
+        let mut cursor = HeaderCursor::new(vec![0u8; TAG_LEN].into_boxed_slice());
+
+        let mut fixed_header = [0u8; 38];
+        let err = cursor.read_slice_into(&mut fixed_header).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn test_an_empty_header_refuses_the_first_read() {
+        let mut cursor = HeaderCursor::new(Vec::new().into_boxed_slice());
+        let mut one = [0u8; 1];
+        assert_eq!(
+            cursor.read_slice_into(&mut one).unwrap_err().kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
+    }
+
+    #[test]
+    fn test_reads_advance_through_the_header() {
+        let mut cursor = HeaderCursor::new(vec![1, 2, 3, 4, 5].into_boxed_slice());
+
+        let mut first = [0u8; 2];
+        cursor.read_slice_into(&mut first).unwrap();
+        assert_eq!(first, [1, 2]);
+
+        let mut second = [0u8; 3];
+        cursor.read_slice_into(&mut second).unwrap();
+        assert_eq!(second, [3, 4, 5]);
+    }
+
+    /// Reading exactly to the end must succeed; one byte more must not.
+    #[test]
+    fn test_the_last_byte_is_readable_and_the_next_is_not() {
+        let mut cursor = HeaderCursor::new(vec![7u8; 4].into_boxed_slice());
+
+        let mut all = [0u8; 4];
+        cursor.read_slice_into(&mut all).unwrap();
+        assert_eq!(all, [7, 7, 7, 7]);
+
+        let mut one_too_many = [0u8; 1];
+        assert_eq!(
+            cursor
+                .read_slice_into(&mut one_too_many)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
+    }
+
+    /// A refused read must not consume anything, so the error names the offset
+    /// the caller was actually at.
+    #[test]
+    fn test_a_refused_read_leaves_the_cursor_where_it_was() {
+        let mut cursor = HeaderCursor::new(vec![1, 2, 3].into_boxed_slice());
+
+        let mut two = [0u8; 2];
+        cursor.read_slice_into(&mut two).unwrap();
+
+        let mut too_big = [0u8; 8];
+        let err = cursor.read_slice_into(&mut too_big).unwrap_err();
+        assert!(err.to_string().contains("at offset 2"), "{err}");
+
+        // The one remaining byte is still there.
+        let mut one = [0u8; 1];
+        cursor.read_slice_into(&mut one).unwrap();
+        assert_eq!(one, [3]);
+    }
+
+    /// A zero-length read is the degenerate case of every other one: it must
+    /// succeed at the end rather than being reported as a short header.
+    #[test]
+    fn test_a_zero_length_read_always_succeeds() {
+        let mut cursor = HeaderCursor::new(Vec::new().into_boxed_slice());
+        cursor.read_slice_into(&mut []).unwrap();
     }
 }
