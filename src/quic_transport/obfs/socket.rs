@@ -175,7 +175,7 @@ impl AsyncUdpSocket for ObfuscatedUdpSocket {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::quic_outbound::obfs::Salamander;
+    use crate::quic_transport::obfs::Salamander;
 
     fn wrap(std_socket: std::net::UdpSocket) -> Arc<ObfuscatedUdpSocket> {
         let obfs: Arc<dyn Obfuscator> = Arc::new(Salamander::new(b"a password").unwrap());

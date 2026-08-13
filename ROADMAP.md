@@ -209,6 +209,7 @@ wider than it is true.
 | **`bandwidth.disableLossCompensation`** (upstream 2.10.0) | Only meaningful once Brutal exists. |
 | **QUIC stateless resets** (upstream 2.12.1) | Server side. Without them a client holding a connection that died while the device slept waits out its idle timeout before reconnecting. Upstream called this out as most noticeable on mobile, which is this branch's entire audience. |
 | **QUIC window and timeout tuning** (`quic.*`) | We hard-code the values the reference implementation uses. Exposing them is easy; whether it is worth the configuration surface is a separate question. |
+| **Salamander's overhead is not deducted from the MTU** | `quic_transport::effective_mtu` subtracts the obfuscator's 8 bytes, but `quinn` clamps both `initial_mtu` and `min_mtu` with `.max(1200)` — 1200 being QUIC's own floor — so the subtraction has no effect. An obfuscated packet is therefore 1208 bytes on the wire, and a path that honours exactly 1200 will drop or fragment it. `quinn` exposes no way to send QUIC packets under the floor, so closing this means shrinking the payload some other way or carrying a patched transport. The code says this where the subtraction happens. |
 
 ### Detectability
 

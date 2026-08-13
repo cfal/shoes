@@ -21,6 +21,7 @@ mod port_forward_handler;
 mod quic_outbound;
 mod quic_server;
 mod quic_stream;
+mod quic_transport;
 mod reality;
 mod reality_client_handler;
 mod resolver;

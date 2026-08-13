@@ -20,6 +20,9 @@ use crate::async_stream::AsyncStream;
 use crate::client_proxy_selector::{ClientProxySelector, ConnectDecision};
 use crate::copy_bidirectional::copy_bidirectional_with_sizes;
 use crate::quic_stream::QuicStream;
+use crate::quic_transport::{
+    QuicListenerSettings, QuicTransportParams, effective_mtu, start_quic_listeners,
+};
 use crate::resolver::{Resolver, resolve_single_address};
 use crate::stream_reader::StreamReader;
 use crate::tcp::tcp_forward::setup_client_tcp_stream;
@@ -1291,85 +1294,40 @@ async fn run_datagram_loop(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub async fn start_tuic_server(
-    bind_address: SocketAddr,
-    quic_server_config: Arc<quinn::crypto::rustls::QuicServerConfig>,
+    listener: QuicListenerSettings,
     uuid: &'static [u8],
     password: &'static str,
     client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
-    num_endpoints: usize,
     zero_rtt_handshake: bool,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
-    let mut join_handles = vec![];
-    for _ in 0..num_endpoints {
-        let quic_server_config = quic_server_config.clone();
-        let resolver = resolver.clone();
+    let params = QuicTransportParams {
+        max_concurrent_bidi_streams: 4096,
+        // The `quic` UDP relay mode carries every packet fragment on its own
+        // client-opened uni stream, so this has to be generous.
+        max_concurrent_uni_streams: 4096,
+        max_idle_timeout: Duration::from_secs(60),
+        keep_alive_interval: Duration::from_secs(15),
+        // MTU per the official TUIC reference, less whatever an obfuscator
+        // takes out of every datagram.
+        mtu: effective_mtu(listener.obfs.as_ref().map(|o| o.overhead())),
+        enable_segmentation_offload: listener.obfs.is_none(),
+    };
+
+    start_quic_listeners(listener, params, move |conn| {
         let client_proxy_selector = client_proxy_selector.clone();
-
-        let join_handle = tokio::spawn(async move {
-            let mut server_config = quinn::ServerConfig::with_crypto(quic_server_config);
-
-            Arc::get_mut(&mut server_config.transport)
-                .unwrap()
-                .max_concurrent_bidi_streams(4096_u32.into())
-                .max_concurrent_uni_streams(4096_u32.into())
-                .max_idle_timeout(Some(Duration::from_secs(60).try_into().unwrap()))
-                .keep_alive_interval(Some(Duration::from_secs(15)))
-                .send_window(16 * 1024 * 1024)
-                .receive_window((20u32 * 1024 * 1024).into())
-                .stream_receive_window((8u32 * 1024 * 1024).into())
-                // MTU settings per official TUIC reference
-                .initial_mtu(1200)
-                .min_mtu(1200)
-                // Enable MTU discovery for larger packets on capable networks
-                .mtu_discovery_config(Some(quinn::MtuDiscoveryConfig::default()))
-                // Enable GSO (Generic Segmentation Offload) for better throughput
-                .enable_segmentation_offload(true)
-                // Lower initial RTT estimate for faster initial window growth
-                .initial_rtt(Duration::from_millis(100));
-
-            // Use 7.5MB socket buffers for high-throughput QUIC (8.625MB on BSD for 15% kernel overhead)
-            // https://github.com/quic-go/quic-go/wiki/UDP-Buffer-Sizes
-            let socket2_socket = crate::socket_util::new_socket2_udp_socket_with_buffer_size(
-                bind_address.is_ipv6(),
-                None,
-                Some(bind_address),
-                true,
-                Some(8_625_000),
+        let resolver = resolver.clone();
+        async move {
+            process_connection(
+                client_proxy_selector,
+                resolver,
+                uuid,
+                password,
+                conn,
+                zero_rtt_handshake,
             )
-            .unwrap();
-
-            let endpoint = quinn::Endpoint::new(
-                quinn::EndpointConfig::default(),
-                Some(server_config),
-                socket2_socket.into(),
-                Arc::new(quinn::TokioRuntime),
-            )
-            .unwrap();
-
-            while let Some(conn) = endpoint.accept().await {
-                let cloned_selector = client_proxy_selector.clone();
-                let cloned_resolver = resolver.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = process_connection(
-                        cloned_selector,
-                        cloned_resolver,
-                        uuid,
-                        password,
-                        conn,
-                        zero_rtt_handshake,
-                    )
-                    .await
-                    {
-                        error!("Connection ended with error: {e}");
-                    }
-                });
-            }
-        });
-        join_handles.push(join_handle);
-    }
-
-    Ok(join_handles)
+            .await
+        }
+    })
 }

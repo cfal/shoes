@@ -14,6 +14,7 @@ use crate::config::{
     BindLocation, ConfigSelection, ServerConfig, ServerProxyConfig, ServerQuicConfig,
 };
 use crate::quic_stream::QuicStream;
+use crate::quic_transport::{QuicListenerSettings, build_obfuscator};
 use crate::resolver::Resolver;
 use crate::routing::{ServerStream, run_udp_routing};
 use crate::rustls_config_util::create_server_config;
@@ -304,24 +305,6 @@ pub async fn start_quic_servers(
 
     let mut handles = vec![];
 
-    /// Build the obfuscator a Hysteria2 listener was configured with, if any.
-    ///
-    /// The password length was already checked during config validation; this
-    /// re-checks it only because the constructor is the one place that owns
-    /// the rule.
-    fn build_obfuscator(
-        obfs: Option<&crate::config::ObfsConfig>,
-    ) -> std::io::Result<Option<Arc<dyn crate::quic_outbound::obfs::Obfuscator>>> {
-        match obfs {
-            Some(crate::config::ObfsConfig::Salamander { password }) => {
-                let salamander =
-                    crate::quic_outbound::obfs::Salamander::new(password.expose().as_bytes())?;
-                Ok(Some(Arc::new(salamander)))
-            }
-            None => Ok(None),
-        }
-    }
-
     match protocol {
         ServerProxyConfig::Hysteria2 {
             password,
@@ -335,18 +318,17 @@ pub async fn start_quic_servers(
             let obfs = build_obfuscator(obfs.as_ref())?;
 
             for bind_address in bind_addresses.into_iter() {
-                let quic_server_config = quic_server_config.clone();
-                let client_proxy_selector = client_proxy_selector.clone();
-                let resolver = resolver.clone();
                 let hysteria2_handles = crate::hysteria2::start_hysteria2_server(
-                    bind_address,
-                    quic_server_config,
+                    QuicListenerSettings {
+                        bind_address,
+                        quic_server_config: quic_server_config.clone(),
+                        num_endpoints,
+                        obfs: obfs.clone(),
+                    },
                     hysteria2_password,
-                    client_proxy_selector,
-                    resolver,
-                    num_endpoints,
+                    client_proxy_selector.clone(),
+                    resolver.clone(),
                     udp_enabled,
-                    obfs.clone(),
                 )
                 .await?;
                 handles.extend(hysteria2_handles);
@@ -360,17 +342,18 @@ pub async fn start_quic_servers(
             let uuid: &'static [u8] = Box::leak(parse_uuid(&uuid)?.into_boxed_slice());
             let password: &'static str = Box::leak(password.into_inner().into_boxed_str());
             for bind_address in bind_addresses.into_iter() {
-                let quic_server_config = quic_server_config.clone();
-                let client_proxy_selector = client_proxy_selector.clone();
-                let resolver = resolver.clone();
                 let tuic_handles = crate::tuic::start_tuic_server(
-                    bind_address,
-                    quic_server_config,
+                    QuicListenerSettings {
+                        bind_address,
+                        quic_server_config: quic_server_config.clone(),
+                        num_endpoints,
+                        // TUIC has no obfuscation option in its config.
+                        obfs: None,
+                    },
                     uuid,
                     password,
-                    client_proxy_selector,
-                    resolver,
-                    num_endpoints,
+                    client_proxy_selector.clone(),
+                    resolver.clone(),
                     zero_rtt_handshake,
                 )
                 .await?;

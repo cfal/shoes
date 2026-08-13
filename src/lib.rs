@@ -76,6 +76,7 @@ mod port_forward_handler;
 pub mod quic_outbound;
 mod quic_server;
 mod quic_stream;
+pub mod quic_transport;
 mod reality;
 mod reality_client_handler;
 pub mod resolver;

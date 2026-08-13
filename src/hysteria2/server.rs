@@ -26,19 +26,6 @@ const MAX_FRAGMENT_CACHE_SIZE: usize = 256;
 /// Default is 3 seconds per sing-box reference implementation.
 const AUTH_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// QUIC MTU floor used by the reference implementations.
-pub(crate) const BASE_MTU: u16 = 1200;
-
-/// The MTU available to QUIC once an obfuscator has taken its share of every
-/// datagram. Without this subtraction, packets sized exactly at the floor start
-/// disappearing on paths that honour it.
-pub(crate) fn effective_mtu(obfs_overhead: Option<usize>) -> u16 {
-    match obfs_overhead {
-        Some(overhead) => BASE_MTU - overhead as u16,
-        None => BASE_MTU,
-    }
-}
-
 /// HTTP/3 error code for normal closure.
 /// Per official hysteria reference: https://github.com/apernet/hysteria/blob/master/core/server/server.go#L20
 const CLOSE_ERR_CODE_OK: u32 = 0x100; // HTTP3 ErrCodeNoError
@@ -48,6 +35,9 @@ use crate::async_stream::AsyncStream;
 use crate::client_proxy_selector::{ClientProxySelector, ConnectDecision};
 use crate::copy_bidirectional::copy_bidirectional_with_sizes;
 use crate::quic_stream::QuicStream;
+use crate::quic_transport::{
+    QuicListenerSettings, QuicTransportParams, effective_mtu, start_quic_listeners,
+};
 use crate::resolver::{Resolver, ResolverCache};
 use crate::stream_reader::StreamReader;
 use crate::tcp::tcp_forward::setup_client_tcp_stream;
@@ -920,123 +910,42 @@ async fn process_tcp_stream(
     Ok(())
 }
 
-// A startup entry point taking eight settings positionally is a smell, and the
-// TUIC server next door has the same shape. Worth a shared settings struct, but
-// that belongs to both servers at once rather than to whichever one crossed the
-// threshold first.
-#[allow(clippy::too_many_arguments)]
 pub async fn start_hysteria2_server(
-    bind_address: SocketAddr,
-    quic_server_config: Arc<quinn::crypto::rustls::QuicServerConfig>,
+    listener: QuicListenerSettings,
     hysteria2_password: &'static str,
     client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
-    num_endpoints: usize,
     udp_enabled: bool,
-    obfs: Option<Arc<dyn crate::quic_outbound::obfs::Obfuscator>>,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
-    let mut join_handles = vec![];
-    for _ in 0..num_endpoints {
-        let quic_server_config = quic_server_config.clone();
-        let resolver = resolver.clone();
+    let params = QuicTransportParams {
+        max_concurrent_bidi_streams: 4096,
+        // HTTP/3 QPACK updates arrive on client-opened uni streams.
+        max_concurrent_uni_streams: 1024,
+        max_idle_timeout: Duration::from_secs(30),
+        keep_alive_interval: Duration::from_secs(10),
+        mtu: effective_mtu(listener.obfs.as_ref().map(|o| o.overhead())),
+        enable_segmentation_offload: listener.obfs.is_none(),
+    };
+
+    start_quic_listeners(listener, params, move |conn| {
         let client_proxy_selector = client_proxy_selector.clone();
-        let obfs = obfs.clone();
-
-        let join_handle = tokio::spawn(async move {
-            let mut server_config = quinn::ServerConfig::with_crypto(quic_server_config);
-            let mtu = effective_mtu(obfs.as_ref().map(|o| o.overhead()));
-
-            // values estimated from https://github.com/apernet/hysteria/blob/5520bcc405ee11a47c164c75bae5c40fc2b1d99d/core/server/config.go#L16
-            Arc::get_mut(&mut server_config.transport)
-                .unwrap()
-                .max_concurrent_bidi_streams(4096_u32.into())
-                // required for HTTP/3 QPACK updates
-                .max_concurrent_uni_streams(1024_u32.into())
-                .max_idle_timeout(Some(Duration::from_secs(30).try_into().unwrap()))
-                .keep_alive_interval(Some(Duration::from_secs(10)))
-                .send_window(16 * 1024 * 1024)
-                .receive_window((20u32 * 1024 * 1024).into())
-                .stream_receive_window((8u32 * 1024 * 1024).into())
-                // MTU settings per official TUIC reference, less whatever an
-                // obfuscator takes out of every datagram
-                .initial_mtu(mtu)
-                .min_mtu(mtu)
-                // Enable MTU discovery for larger packets on capable networks
-                .mtu_discovery_config(Some(quinn::MtuDiscoveryConfig::default()))
-                // GSO batches several QUIC packets into one sendmsg, which an
-                // obfuscator cannot scramble as a unit
-                .enable_segmentation_offload(obfs.is_none())
-                // Lower initial RTT estimate for faster initial window growth
-                .initial_rtt(Duration::from_millis(100));
-
-            // Use 7.5MB socket buffers for high-throughput QUIC (8.625MB on BSD for 15% kernel overhead)
-            // https://github.com/quic-go/quic-go/wiki/UDP-Buffer-Sizes
-            let socket2_socket = crate::socket_util::new_socket2_udp_socket_with_buffer_size(
-                bind_address.is_ipv6(),
-                None,
-                Some(bind_address),
-                true,
-                Some(8_625_000),
+        let resolver = resolver.clone();
+        async move {
+            process_connection(
+                client_proxy_selector,
+                resolver,
+                hysteria2_password,
+                conn,
+                udp_enabled,
             )
-            .unwrap();
-
-            let endpoint = match obfs {
-                Some(obfs) => {
-                    let socket = crate::quic_outbound::obfs::ObfuscatedUdpSocket::new(
-                        socket2_socket.into(),
-                        obfs,
-                    )
-                    .unwrap();
-                    quinn::Endpoint::new_with_abstract_socket(
-                        quinn::EndpointConfig::default(),
-                        Some(server_config),
-                        Arc::new(socket),
-                        Arc::new(quinn::TokioRuntime),
-                    )
-                    .unwrap()
-                }
-                None => quinn::Endpoint::new(
-                    quinn::EndpointConfig::default(),
-                    Some(server_config),
-                    socket2_socket.into(),
-                    Arc::new(quinn::TokioRuntime),
-                )
-                .unwrap(),
-            };
-
-            while let Some(conn) = endpoint.accept().await {
-                let cloned_selector = client_proxy_selector.clone();
-                let cloned_resolver = resolver.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = process_connection(
-                        cloned_selector,
-                        cloned_resolver,
-                        hysteria2_password,
-                        conn,
-                        udp_enabled,
-                    )
-                    .await
-                    {
-                        error!("Connection ended with error: {e}");
-                    }
-                });
-            }
-        });
-        join_handles.push(join_handle);
-    }
-
-    Ok(join_handles)
+            .await
+        }
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_transport_mtu_accounts_for_obfuscation_overhead() {
-        assert_eq!(effective_mtu(None), BASE_MTU);
-        assert_eq!(effective_mtu(Some(8)), BASE_MTU - 8);
-    }
 
     fn auth_request(password: &str) -> http::Request<()> {
         http::Request::post("https://hysteria/auth")

@@ -11,8 +11,8 @@ use crate::async_stream::{AsyncMessageStream, AsyncStream};
 use crate::config::ClientQuicConfig;
 use crate::quic_outbound::QuicOutboundSettings;
 use crate::quic_outbound::connection::LiveConnection;
-use crate::quic_outbound::obfs::Obfuscator;
 use crate::quic_stream::QuicStream;
+use crate::quic_transport::obfs::Obfuscator;
 use crate::resolver::Resolver;
 use crate::tcp::tcp_handler::TcpClientSetupResult;
 use crate::tcp::terminal_connector::TerminalConnector;
@@ -224,8 +224,8 @@ impl TerminalConnector for Hysteria2Connector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::quic_outbound::obfs::Salamander;
     use crate::quic_outbound::testing::*;
+    use crate::quic_transport::obfs::Salamander;
     use std::net::SocketAddr;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -242,14 +242,16 @@ mod tests {
         let bind_address = reserve_udp_port();
 
         crate::hysteria2::start_hysteria2_server(
-            bind_address,
-            quic_server_config(&cert, &["h3".to_string()]),
+            crate::quic_transport::QuicListenerSettings {
+                bind_address,
+                quic_server_config: quic_server_config(&cert, &["h3".to_string()]),
+                num_endpoints: 1,
+                obfs,
+            },
             Box::leak(SERVER_PASSWORD.to_string().into_boxed_str()),
             direct_selector(resolver.clone()),
             resolver,
-            1,
             true,
-            obfs,
         )
         .await
         .unwrap();

@@ -5,6 +5,7 @@ use std::sync::Arc;
 use crate::client_proxy_chain::{ClientChainGroup, ClientProxyChain, InitialHopEntry};
 use crate::config::ConfigSelection;
 use crate::config::{ClientChainHop, ClientConfig, ClientProxyConfig};
+use crate::quic_transport::build_obfuscator;
 use crate::resolver::Resolver;
 use crate::tcp::proxy_connector::ProxyConnector;
 use crate::tcp::proxy_connector_impl::ProxyConnectorImpl;
@@ -160,19 +161,6 @@ fn build_terminal_connector(config: ClientConfig) -> Arc<dyn TerminalConnector> 
                     .expect("config validation should have ensured a tunnel variant");
             Arc::new(connector)
         }
-    }
-}
-
-fn build_obfuscator(
-    obfs: Option<&crate::config::ObfsConfig>,
-) -> std::io::Result<Option<Arc<dyn crate::quic_outbound::obfs::Obfuscator>>> {
-    match obfs {
-        Some(crate::config::ObfsConfig::Salamander { password }) => {
-            let salamander =
-                crate::quic_outbound::obfs::Salamander::new(password.expose().as_bytes())?;
-            Ok(Some(Arc::new(salamander)))
-        }
-        None => Ok(None),
     }
 }
 

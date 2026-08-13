@@ -330,12 +330,13 @@ costs to leave.
 - `ROADMAP.md`, "Hysteria: the rest of the surface" — every unimplemented part
   of Hysteria2, grouped by whether it costs reachability, speed or visibility.
 - `MOBILE.md` — mobile defects, numbered, with a suggested order at the end.
-- Two deliberate items not yet recorded elsewhere, both worth doing:
-  - `src/hysteria2/server.rs` and `src/tuic/server.rs` duplicate about forty
-    lines of transport configuration and endpoint construction, and both carry
-    `#[allow(clippy::too_many_arguments)]` on their startup function. A shared
-    settings struct should cover both at once rather than whichever one crossed
-    the threshold first.
+- One deliberate item not recorded elsewhere:
   - `src/routing/udp_router.rs` (over 1300 lines), `src/vless/vision_stream.rs`
     and `src/vmess/vmess_handler.rs` have no tests at all. These are data paths,
     so covering them means designing the tests, not adding a few.
+- `src/quic_server.rs::start_quic_server`, the generic QUIC listener behind
+  VLESS and the other TCP protocols, still builds its own endpoint and sets no
+  transport parameters at all — there is a TODO in it proposing some. It was
+  deliberately left out of the `quic_transport` consolidation: it binds with a
+  different socket buffer size, and giving it the shared parameters would change
+  behaviour for every QUIC inbound rather than remove a duplicate.

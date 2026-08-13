@@ -251,13 +251,16 @@ mod tests {
         );
 
         crate::tuic::start_tuic_server(
-            bind_address,
-            quic_server_config(&cert, &["h3".to_string()]),
+            crate::quic_transport::QuicListenerSettings {
+                bind_address,
+                quic_server_config: quic_server_config(&cert, &["h3".to_string()]),
+                num_endpoints: 1,
+                obfs: None,
+            },
             uuid,
             Box::leak(SERVER_PASSWORD.to_string().into_boxed_str()),
             direct_selector(resolver.clone()),
             resolver,
-            1,
             false,
         )
         .await

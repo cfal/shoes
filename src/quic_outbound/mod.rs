@@ -1,7 +1,6 @@
 //! Shared machinery for outbounds that dial over QUIC and own their transport.
 
 pub mod connection;
-pub mod obfs;
 #[cfg(test)]
 pub mod testing;
 
@@ -10,13 +9,10 @@ use std::time::Duration;
 
 use crate::address::NetLocation;
 use crate::config::ClientQuicConfig;
+use crate::quic_transport::obfs::{ObfuscatedUdpSocket, Obfuscator};
+use crate::quic_transport::{QuicTransportParams, effective_mtu};
 use crate::rustls_config_util::create_client_config;
 use crate::socket_util::new_udp_socket;
-
-use obfs::{ObfuscatedUdpSocket, Obfuscator};
-
-/// QUIC MTU floor used by the reference implementations.
-const BASE_MTU: u16 = 1200;
 
 /// Everything a QUIC outbound needs to raise an endpoint.
 ///
@@ -65,8 +61,7 @@ impl QuicOutboundSettings {
     /// The MTU available to QUIC once an obfuscator has taken its share of
     /// every datagram.
     fn effective_mtu(&self) -> u16 {
-        let overhead = self.obfs.as_ref().map(|o| o.overhead()).unwrap_or(0);
-        BASE_MTU - overhead as u16
+        effective_mtu(self.obfs.as_ref().map(|o| o.overhead()))
     }
 
     /// Raise an endpoint bound for the given address family.
@@ -107,33 +102,19 @@ impl QuicOutboundSettings {
 
         let mut client_config = quinn::ClientConfig::new(Arc::new(quic_client_config));
 
-        let mtu = self.effective_mtu();
-        let mut transport = quinn::TransportConfig::default();
-        transport
+        let transport = QuicTransportParams {
             // These bound what the *server* may open toward us. Neither
             // protocol has it open bidirectional streams, so that stays zero.
-            //
-            // Unidirectional streams must be allowed, and a zero here is a
-            // silent deadlock rather than an error: HTTP/3 requires the server
-            // to open its control and QPACK streams before Hysteria2's
-            // authentication can complete, and TUIC carries UDP packets over
-            // server-opened uni streams in its `quic` relay mode. The value
-            // matches what our own Hysteria2 server allows.
-            .max_concurrent_bidi_streams(0_u32.into())
-            .max_concurrent_uni_streams(1024_u32.into())
-            .keep_alive_interval(Some(Duration::from_secs(10)))
-            .max_idle_timeout(Some(Duration::from_secs(30).try_into().unwrap()))
-            .send_window(16 * 1024 * 1024)
-            .receive_window((20u32 * 1024 * 1024).into())
-            .stream_receive_window((8u32 * 1024 * 1024).into())
-            .initial_mtu(mtu)
-            .min_mtu(mtu)
-            .mtu_discovery_config(Some(quinn::MtuDiscoveryConfig::default()))
-            // GSO batches several QUIC packets into one sendmsg, which an
-            // obfuscator cannot scramble as a unit.
-            .enable_segmentation_offload(self.obfs.is_none())
-            .initial_rtt(Duration::from_millis(100));
-        client_config.transport_config(Arc::new(transport));
+            // The uni stream allowance matches what our own Hysteria2 server
+            // grants; see the field's documentation for why it cannot be zero.
+            max_concurrent_bidi_streams: 0,
+            max_concurrent_uni_streams: 1024,
+            max_idle_timeout: Duration::from_secs(30),
+            keep_alive_interval: Duration::from_secs(10),
+            mtu: self.effective_mtu(),
+            enable_segmentation_offload: self.obfs.is_none(),
+        };
+        client_config.transport_config(Arc::new(transport.build()));
 
         let udp_socket = new_udp_socket(server_is_ipv6, self.bind_interface.clone())?;
         let udp_socket = udp_socket.into_std()?;
@@ -161,7 +142,8 @@ impl QuicOutboundSettings {
 mod tests {
     use super::*;
     use crate::option_util::{NoneOrOne, NoneOrSome};
-    use crate::quic_outbound::obfs::Salamander;
+    use crate::quic_transport::BASE_MTU;
+    use crate::quic_transport::obfs::Salamander;
 
     fn settings() -> QuicOutboundSettings {
         QuicOutboundSettings {
