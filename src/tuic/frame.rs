@@ -158,16 +158,40 @@ pub fn encode_packet_header(
     size: u16,
     target: Option<&NetLocation>,
 ) -> Vec<u8> {
+    let address_bytes = match target {
+        Some(target) => serialize_address(target),
+        None => vec![ADDRESS_TYPE_NONE],
+    };
+    encode_packet_header_with_address(
+        assoc_id,
+        packet_id,
+        fragment_total,
+        fragment_id,
+        size,
+        &address_bytes,
+    )
+}
+
+/// The same header, for a caller that already has the address encoded.
+///
+/// The server replies with the source it heard from, which reaches it as a
+/// `SocketAddr` rather than a `NetLocation`; going through this avoids a
+/// conversion whose only purpose would be to be serialized straight back.
+pub fn encode_packet_header_with_address(
+    assoc_id: u16,
+    packet_id: u16,
+    fragment_total: u8,
+    fragment_id: u8,
+    size: u16,
+    address_bytes: &[u8],
+) -> Vec<u8> {
     let mut out = command(COMMAND_TYPE_PACKET, MAX_HEADER_LEN);
     out.extend_from_slice(&assoc_id.to_be_bytes());
     out.extend_from_slice(&packet_id.to_be_bytes());
     out.push(fragment_total);
     out.push(fragment_id);
     out.extend_from_slice(&size.to_be_bytes());
-    match target {
-        Some(target) => out.extend_from_slice(&serialize_address(target)),
-        None => out.push(ADDRESS_TYPE_NONE),
-    }
+    out.extend_from_slice(address_bytes);
     out
 }
 

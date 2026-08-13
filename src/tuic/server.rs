@@ -26,8 +26,8 @@ use crate::util::{allocate_vec, write_all};
 
 use super::frame::{
     COMMAND_TYPE_AUTHENTICATE, COMMAND_TYPE_CONNECT, COMMAND_TYPE_DISSOCIATE,
-    COMMAND_TYPE_HEARTBEAT, COMMAND_TYPE_PACKET, MAX_HEADER_LEN, TUIC_VERSION, read_address,
-    serialize_address, serialize_socket_addr,
+    COMMAND_TYPE_HEARTBEAT, COMMAND_TYPE_PACKET, MAX_HEADER_LEN, TUIC_VERSION,
+    encode_packet_header_with_address, read_address, serialize_address, serialize_socket_addr,
 };
 
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(10);
@@ -392,9 +392,9 @@ struct FragmentedPacket {
 
 impl UdpSession {
     #[allow(clippy::too_many_arguments)]
-    fn start_with_send_stream(
+    fn start_with_uni_streams(
         assoc_id: u16,
-        send_stream: quinn::SendStream,
+        connection: quinn::Connection,
         client_socket: Arc<UdpSocket>,
         initial_location: NetLocation,
         initial_socket_addr: SocketAddr,
@@ -417,7 +417,7 @@ impl UdpSession {
         tokio::spawn(async move {
             if let Err(e) = run_udp_remote_to_local_stream_loop(
                 assoc_id,
-                send_stream,
+                connection,
                 client_socket,
                 override_local_write_location,
                 session_cancel_token,
@@ -522,9 +522,17 @@ impl UdpSession {
     }
 }
 
+/// Send replies to the client over unidirectional streams.
+///
+/// One stream per packet, each carrying a complete `Packet` command including
+/// the version and type bytes. This used to hold a single stream open for the
+/// association and write bare packet bodies onto it, which is not a command at
+/// all — our own receiving side would have rejected it, and so would every
+/// other implementation. The reference does it this way too: see `packet_quic`
+/// in EAimTY/tuic, `tuic-quinn/src/lib.rs`.
 async fn run_udp_remote_to_local_stream_loop(
     assoc_id: u16,
-    mut send_stream: quinn::SendStream,
+    connection: quinn::Connection,
     socket: Arc<UdpSocket>,
     override_local_write_address: Option<NetLocation>,
     cancel_token: CancellationToken,
@@ -533,11 +541,11 @@ async fn run_udp_remote_to_local_stream_loop(
         override_local_write_address.map(|a| serialize_address(&a).into());
 
     let mut next_packet_id: u16 = 0;
-    let mut buf = allocate_vec(MAX_HEADER_LEN + 65535).into_boxed_slice();
+    let mut buf = allocate_vec(65535).into_boxed_slice();
     let mut loop_count: u8 = 0;
 
     loop {
-        let (payload_len, src_addr) = match socket.try_recv_from(&mut buf[MAX_HEADER_LEN..]) {
+        let (payload_len, src_addr) = match socket.try_recv_from(&mut buf) {
             Ok(res) => res,
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 // Use select! to allow cancellation while waiting for socket to be readable
@@ -572,32 +580,27 @@ async fn run_udp_remote_to_local_stream_loop(
             None => serialize_socket_addr(&src_addr).into(),
         };
 
-        let address_bytes_len = address_bytes.len();
+        let mut packet = encode_packet_header_with_address(
+            assoc_id,
+            packet_id,
+            1,
+            0,
+            payload_len as u16,
+            &address_bytes,
+        );
+        packet.extend_from_slice(&buf[..payload_len]);
 
-        // assoc_id(2) + packet_id(2) + fragment total(1) + fragment id(1) + payload size (2) + address bytes
-        let header_len = 2 + 2 + 1 + 1 + 2 + address_bytes_len;
-
-        let start_offset = MAX_HEADER_LEN - header_len;
-        let end_offset = MAX_HEADER_LEN + payload_len;
-
-        buf[start_offset] = (assoc_id >> 8) as u8;
-        buf[start_offset + 1] = assoc_id as u8;
-        buf[start_offset + 2] = (packet_id >> 8) as u8;
-        buf[start_offset + 3] = packet_id as u8;
-        buf[start_offset + 4] = 1;
-        buf[start_offset + 5] = 0;
-        buf[start_offset + 6] = (payload_len >> 8) as u8;
-        buf[start_offset + 7] = payload_len as u8;
-        buf[start_offset + 8..start_offset + 8 + address_bytes_len].copy_from_slice(&address_bytes);
-
-        let mut i = start_offset;
-        while i < end_offset {
-            let count = send_stream
-                .write(&buf[i..end_offset])
-                .await
-                .map_err(|e| std::io::Error::other(format!("TUIC stream write failed: {e}")))?;
-            i += count;
-        }
+        let mut send_stream = connection
+            .open_uni()
+            .await
+            .map_err(|e| std::io::Error::other(format!("failed to open a TUIC uni stream: {e}")))?;
+        send_stream
+            .write_all(&packet)
+            .await
+            .map_err(|e| std::io::Error::other(format!("TUIC stream write failed: {e}")))?;
+        send_stream
+            .finish()
+            .map_err(|e| std::io::Error::other(format!("TUIC stream finish failed: {e}")))?;
     }
 }
 
@@ -969,12 +972,9 @@ async fn process_udp_packet(
                 let client_socket = crate::socket_util::new_udp_socket(true, None)?;
 
                 let session = if is_uni_stream {
-                    // TODO: should we only have a single send stream?
-                    let send_stream = connection.open_uni().await?;
-
-                    UdpSession::start_with_send_stream(
+                    UdpSession::start_with_uni_streams(
                         assoc_id,
-                        send_stream,
+                        connection.clone(),
                         Arc::new(client_socket),
                         remote_location,
                         resolved_address,

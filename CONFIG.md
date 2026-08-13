@@ -616,14 +616,15 @@ protocol:
   uuid: string                 # UUID
   password: string
   udp_enabled: true            # Default: true
-  udp_relay_mode: native       # Default: native. Only 'native' is implemented.
+  udp_relay_mode: native       # Default: native. Either 'native' or 'quic'.
   heartbeat_ms: 10000          # Default: 10000
 ```
 
-`udp_relay_mode: native` carries UDP over QUIC datagrams. The `quic` mode,
-which carries them over unidirectional streams, is rejected at config load
-rather than silently downgraded — see the note under
-[QUIC-native outbounds](#quic-native-outbounds).
+`udp_relay_mode: native` carries UDP over QUIC datagrams, and `quic` carries
+them over unidirectional streams. Datagrams are cheaper; streams are the way
+through a path that drops or mangles QUIC datagrams, and they carry a packet
+larger than the datagram limit without fragmenting it. The server replies in
+whichever mode the association's first packet used.
 
 `zero_rtt_handshake` is a server-side option only. The client rejects it rather
 than accepting it and performing an ordinary handshake.
@@ -656,8 +657,8 @@ client_chain:
 
 Not implemented on the client side, and rejected rather than ignored where a
 configuration can ask for them: Brutal congestion control and bandwidth
-negotiation, `gecko` obfuscation, port hopping, and TUIC's `quic` UDP relay
-mode. See [ROADMAP.md](./ROADMAP.md) for what each costs.
+negotiation, `gecko` obfuscation, port hopping, and TUIC's `zero_rtt_handshake`.
+See [ROADMAP.md](./ROADMAP.md) for what each costs.
 
 ## Rules System
 

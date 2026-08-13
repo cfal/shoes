@@ -121,18 +121,17 @@ server. Every protocol path is tested against this repository's own server
 running in-process, and the Hysteria2 client has been checked by hand against a
 third-party sing-box server for TCP and UDP alike.
 
-Two options are refused at config load rather than silently ignored, because a
-user who asks for them and does not get them should be told: TUIC's
-`zero_rtt_handshake`, and its `udp_relay_mode: quic`. The latter is blocked by
-a defect on our own server side — see below. What else is missing is in
-[Hysteria: the rest of the surface](#hysteria-the-rest-of-the-surface).
+TUIC carries UDP in both relay modes. `native` uses QUIC datagrams; `quic` uses
+one unidirectional stream per packet, which is what the reference implementation
+does and what our server now does — it used to hold a single stream open for the
+association and write bare packet bodies onto it, without the version and
+command bytes that make a `Packet` a command, so what it sent was something its
+own receiving side would have rejected.
 
-**Known defect, server side.** In TUIC's `quic` UDP relay mode our server
-writes reply packets onto one unidirectional stream without the version and
-command bytes that make a `Packet` a command, so what it sends is something its
-own receiving side would reject. Fixing it means one stream per reply packet
-with a full command header, which changes `UdpSession::start_with_send_stream`
-and its caller. Until then the client refuses the mode by name.
+One option is refused at config load rather than silently ignored, because a
+user who asks for it and does not get it should be told: TUIC's
+`zero_rtt_handshake`. What else is missing is in
+[Hysteria: the rest of the surface](#hysteria-the-rest-of-the-surface).
 
 ## Tier 2 — worth doing after Tier 1
 

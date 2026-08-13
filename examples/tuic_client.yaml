@@ -14,8 +14,9 @@
             type: tuic
             uuid: "b0e80a62-8a51-47f0-91f1-f0f7faf8d9d4"
             password: "a strong password"
-            # native carries UDP over QUIC datagrams. The 'quic' mode is
-            # rejected at config load rather than silently downgraded.
+            # native carries UDP over QUIC datagrams; 'quic' carries them over
+            # unidirectional streams, which survives a path that mangles
+            # datagrams and does not fragment a large packet.
             udp_relay_mode: native
           quic_settings:
             sni_hostname: "example.com"

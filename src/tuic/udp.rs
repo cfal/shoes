@@ -16,14 +16,20 @@ use crate::async_stream::{
     AsyncFlushMessage, AsyncMessageStream, AsyncPing, AsyncReadMessage, AsyncShutdownMessage,
     AsyncWriteMessage,
 };
+use crate::config::TuicUdpRelayMode;
 
 use super::frame::{
-    ADDRESS_TYPE_NONE, COMMAND_TYPE_PACKET, TUIC_VERSION, encode_dissociate, encode_heartbeat,
-    encode_packet_header,
+    ADDRESS_TYPE_NONE, COMMAND_TYPE_PACKET, MAX_HEADER_LEN, TUIC_VERSION, encode_dissociate,
+    encode_heartbeat, encode_packet_header,
 };
 
 /// How many reassembled payloads may queue up before the reader blocks.
 const INCOMING_CAPACITY: usize = 64;
+
+/// Ceiling on a single Packet command read from a unidirectional stream: the
+/// two command bytes, the largest header the protocol allows, and a maximal
+/// UDP payload.
+const MAX_COMMAND_BYTES: usize = 2 + MAX_HEADER_LEN + u16::MAX as usize;
 
 /// Build the datagrams for one outgoing UDP packet.
 ///
@@ -175,6 +181,7 @@ pub struct TuicUdpSession {
     connection: quinn::Connection,
     assoc_id: u16,
     target: NetLocation,
+    mode: TuicUdpRelayMode,
     next_packet_id: AtomicU16,
     incoming: mpsc::Receiver<Vec<u8>>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
@@ -194,32 +201,79 @@ impl TuicUdpSession {
         connection: quinn::Connection,
         assoc_id: u16,
         target: NetLocation,
+        mode: TuicUdpRelayMode,
         heartbeat_interval: Duration,
     ) -> Self {
         let (tx, rx) = mpsc::channel(INCOMING_CAPACITY);
-        let mut tasks = Vec::with_capacity(2);
+        let mut tasks = Vec::with_capacity(3);
 
-        let datagram_connection = connection.clone();
-        tasks.push(tokio::spawn(async move {
-            let mut reassembly = Reassembly::new();
-            loop {
-                let datagram: Bytes = match datagram_connection.read_datagram().await {
-                    Ok(datagram) => datagram,
-                    Err(e) => {
-                        debug!("TUIC datagram reader for association {assoc_id} stopping: {e}");
-                        return;
+        // The server replies in whichever mode the association's first packet
+        // used, so only that reader is started. Heartbeats travel as datagrams
+        // in both modes, but they carry no payload and the reader ignores
+        // anything that is not a Packet for us.
+        match mode {
+            TuicUdpRelayMode::Native => {
+                let datagram_connection = connection.clone();
+                let tx = tx.clone();
+                tasks.push(tokio::spawn(async move {
+                    let mut reassembly = Reassembly::new();
+                    loop {
+                        let datagram: Bytes = match datagram_connection.read_datagram().await {
+                            Ok(datagram) => datagram,
+                            Err(e) => {
+                                debug!(
+                                    "TUIC datagram reader for association {assoc_id} stopping: {e}"
+                                );
+                                return;
+                            }
+                        };
+                        if Reassembly::assoc_id_of(&datagram) != Some(assoc_id) {
+                            continue;
+                        }
+                        if let Some(payload) = reassembly.push(&datagram)
+                            && tx.send(payload).await.is_err()
+                        {
+                            return;
+                        }
                     }
-                };
-                if Reassembly::assoc_id_of(&datagram) != Some(assoc_id) {
-                    continue;
-                }
-                if let Some(payload) = reassembly.push(&datagram)
-                    && tx.send(payload).await.is_err()
-                {
-                    return;
-                }
+                }));
             }
-        }));
+            TuicUdpRelayMode::Quic => {
+                let stream_connection = connection.clone();
+                let tx = tx.clone();
+                tasks.push(tokio::spawn(async move {
+                    let mut reassembly = Reassembly::new();
+                    loop {
+                        let mut recv = match stream_connection.accept_uni().await {
+                            Ok(recv) => recv,
+                            Err(e) => {
+                                debug!(
+                                    "TUIC uni stream reader for association {assoc_id} stopping: {e}"
+                                );
+                                return;
+                            }
+                        };
+                        // One command per stream, which is what the reference
+                        // sends and what our server now sends.
+                        let command = match recv.read_to_end(MAX_COMMAND_BYTES).await {
+                            Ok(command) => command,
+                            Err(e) => {
+                                debug!("TUIC uni stream dropped: {e}");
+                                continue;
+                            }
+                        };
+                        if Reassembly::assoc_id_of(&command) != Some(assoc_id) {
+                            continue;
+                        }
+                        if let Some(payload) = reassembly.push(&command)
+                            && tx.send(payload).await.is_err()
+                        {
+                            return;
+                        }
+                    }
+                }));
+            }
+        }
 
         // The specification asks for heartbeats only while a relaying task is
         // in flight, which is exactly the lifetime of this session. An idle
@@ -243,6 +297,7 @@ impl TuicUdpSession {
             connection,
             assoc_id,
             target,
+            mode,
             next_packet_id: AtomicU16::new(0),
             incoming: rx,
             tasks,
@@ -277,18 +332,57 @@ impl AsyncWriteMessage for TuicUdpSession {
         buf: &[u8],
     ) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
-        let max_packet = this
-            .connection
-            .max_datagram_size()
-            .ok_or_else(|| std::io::Error::other("peer does not accept QUIC datagrams"))?;
-
         let packet_id = this.next_packet_id.fetch_add(1, Ordering::Relaxed);
-        let packets = build_packets(this.assoc_id, packet_id, &this.target, buf, max_packet)?;
 
-        for packet in packets {
-            this.connection
-                .send_datagram(Bytes::from(packet))
-                .map_err(|e| std::io::Error::other(format!("failed to send a datagram: {e}")))?;
+        match this.mode {
+            TuicUdpRelayMode::Native => {
+                let max_packet = this
+                    .connection
+                    .max_datagram_size()
+                    .ok_or_else(|| std::io::Error::other("peer does not accept QUIC datagrams"))?;
+                let packets =
+                    build_packets(this.assoc_id, packet_id, &this.target, buf, max_packet)?;
+                for packet in packets {
+                    this.connection
+                        .send_datagram(Bytes::from(packet))
+                        .map_err(|e| {
+                            std::io::Error::other(format!("failed to send a datagram: {e}"))
+                        })?;
+                }
+            }
+            TuicUdpRelayMode::Quic => {
+                // A stream has no size limit of its own, so the only bound is
+                // the packet's own 16-bit length field. The reference passes
+                // the same ceiling, which means a real UDP payload never
+                // fragments in this mode.
+                let packets = build_packets(
+                    this.assoc_id,
+                    packet_id,
+                    &this.target,
+                    buf,
+                    u16::MAX as usize,
+                )?;
+                let connection = this.connection.clone();
+                // Opening a stream is async and this is a poll, so the send is
+                // handed to a task. Ordering within a packet is preserved
+                // because one task writes all of its fragments in turn.
+                tokio::spawn(async move {
+                    for packet in packets {
+                        match connection.open_uni().await {
+                            Ok(mut stream) => {
+                                if stream.write_all(&packet).await.is_err() {
+                                    return;
+                                }
+                                let _ = stream.finish();
+                            }
+                            Err(e) => {
+                                debug!("TUIC uni send failed: {e}");
+                                return;
+                            }
+                        }
+                    }
+                });
+            }
         }
         Poll::Ready(Ok(()))
     }

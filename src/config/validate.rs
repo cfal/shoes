@@ -18,8 +18,8 @@ use super::types::{
     DEFAULT_REALITY_SHORT_ID, DnsConfig, DnsConfigGroup, DnsServerSpec, ExpandedDnsGroup,
     ExpandedDnsSpec, ObfsConfig, PemSource, RuleActionConfig, RuleConfig, ServerConfig,
     ServerProxyConfig, ServerQuicConfig, ShadowTlsServerConfig, ShadowTlsServerHandshakeConfig,
-    ShadowsocksConfig, TlsServerConfig, Transport, TuicUdpRelayMode, TunConfig,
-    WebsocketServerConfig, direct_allow_rule,
+    ShadowsocksConfig, TlsServerConfig, Transport, TunConfig, WebsocketServerConfig,
+    direct_allow_rule,
 };
 
 const MIN_TLS_BUFFER_SIZE: usize = 16 * 1024;
@@ -1021,16 +1021,6 @@ fn validate_client_config(
                     "TUIC heartbeat_ms must be greater than zero.",
                 ));
             }
-            // Our own server's reply path for this mode omits the version and
-            // command bytes that make a Packet a command, so it does not
-            // round-trip even against us. Refusing beats relaying into silence.
-            if tuic.udp_relay_mode != TuicUdpRelayMode::Native {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "The TUIC client outbound only implements udp_relay_mode: native. \
-                     The 'quic' mode also needs a fix on the server side of this repository.",
-                ));
-            }
             // Accepting this silently would be worse than refusing it: the user
             // would believe they had 0-RTT and get an ordinary handshake.
             if tuic.zero_rtt_handshake {
@@ -2003,6 +1993,16 @@ mod tests {
         #[test]
         fn test_tuic_accepts_a_valid_uuid() {
             let mut config = tuic_client("b0e80a62-8a51-47f0-91f1-f0f7faf8d9d4", 10_000);
+            assert!(validate(&mut config).is_ok());
+        }
+
+        #[test]
+        fn test_tuic_accepts_the_quic_relay_mode() {
+            let mut config = tuic_client("b0e80a62-8a51-47f0-91f1-f0f7faf8d9d4", 10_000);
+            let ClientProxyConfig::Tuic(ref mut tuic) = config.protocol else {
+                unreachable!()
+            };
+            tuic.udp_relay_mode = crate::config::TuicUdpRelayMode::Quic;
             assert!(validate(&mut config).is_ok());
         }
 

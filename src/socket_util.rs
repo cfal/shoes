@@ -186,12 +186,31 @@ mod protection_tests {
         lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    #[derive(Default)]
+    /// Both protectors below act only for the thread that installed them.
+    ///
+    /// The protector is process-wide, but the rest of the suite runs in
+    /// parallel and creates sockets of its own. A recorder that logged those
+    /// would make its own assertions ambiguous, and a refuser that failed them
+    /// would break unrelated tests — which it did, intermittently, before this
+    /// guard existed. A test body runs on its own thread, so this scopes the
+    /// effect to exactly the sockets the test created.
+    fn is_our_thread(owner: std::thread::ThreadId) -> bool {
+        std::thread::current().id() == owner
+    }
+
     struct Recorder {
+        owner: std::thread::ThreadId,
         seen: Mutex<Vec<i32>>,
     }
 
     impl Recorder {
+        fn new() -> Self {
+            Self {
+                owner: std::thread::current().id(),
+                seen: Mutex::new(Vec::new()),
+            }
+        }
+
         fn saw(&self, fd: i32) -> bool {
             self.seen.lock().unwrap().contains(&fd)
         }
@@ -199,16 +218,32 @@ mod protection_tests {
 
     impl SocketProtector for Recorder {
         fn protect(&self, fd: i32) -> std::io::Result<()> {
-            self.seen.lock().unwrap().push(fd);
+            if is_our_thread(self.owner) {
+                self.seen.lock().unwrap().push(fd);
+            }
             Ok(())
         }
     }
 
-    struct Refuser;
+    struct Refuser {
+        owner: std::thread::ThreadId,
+    }
+
+    impl Refuser {
+        fn new() -> Self {
+            Self {
+                owner: std::thread::current().id(),
+            }
+        }
+    }
 
     impl SocketProtector for Refuser {
         fn protect(&self, _fd: i32) -> std::io::Result<()> {
-            Err(std::io::Error::other("the platform refused to protect it"))
+            if is_our_thread(self.owner) {
+                Err(std::io::Error::other("the platform refused to protect it"))
+            } else {
+                Ok(())
+            }
         }
     }
 
@@ -226,7 +261,7 @@ mod protection_tests {
     #[test]
     fn test_outbound_tcp_socket_is_protected() {
         let _guard = serialise();
-        let recorder = install(Recorder::default());
+        let recorder = install(Recorder::new());
 
         let socket = new_tcp_socket(None, false).unwrap();
         let fd = socket.as_raw_fd();
@@ -242,7 +277,7 @@ mod protection_tests {
     #[tokio::test]
     async fn test_outbound_udp_socket_is_protected() {
         let _guard = serialise();
-        let recorder = install(Recorder::default());
+        let recorder = install(Recorder::new());
 
         let socket = new_udp_socket(false, None).unwrap();
         let fd = socket.as_raw_fd();
@@ -259,7 +294,7 @@ mod protection_tests {
     #[tokio::test]
     async fn test_a_refused_protection_fails_socket_creation() {
         let _guard = serialise();
-        install(Refuser);
+        install(Refuser::new());
 
         assert!(new_tcp_socket(None, false).is_err());
         assert!(new_udp_socket(false, None).is_err());
