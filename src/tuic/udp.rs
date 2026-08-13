@@ -1,6 +1,5 @@
 //! One TUIC UDP association as an AsyncMessageStream.
 
-use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::task::{Context, Poll};
@@ -12,6 +11,8 @@ use tokio::io::ReadBuf;
 use tokio::sync::mpsc;
 
 use crate::address::NetLocation;
+use crate::quic_transport::fragments::FragmentTable;
+
 use crate::async_stream::{
     AsyncFlushMessage, AsyncMessageStream, AsyncPing, AsyncReadMessage, AsyncShutdownMessage,
     AsyncWriteMessage,
@@ -106,80 +107,69 @@ pub(crate) fn build_packets(
     Ok(packets)
 }
 
-/// Fragments waiting for their siblings, keyed by packet id.
-struct Reassembly {
-    packets: HashMap<u16, Vec<Option<Vec<u8>>>>,
+/// The fragment header of a Packet command, and where its payload sits.
+struct ParsedPacket<'a> {
+    packet_id: u16,
+    fragment_id: u8,
+    fragment_total: u8,
+    payload: &'a [u8],
 }
 
-impl Reassembly {
-    fn new() -> Self {
-        Self {
-            packets: HashMap::new(),
-        }
+/// Parse a whole Packet command, starting at the version byte.
+fn parse_packet_command(command: &[u8]) -> Option<ParsedPacket<'_>> {
+    if command.len() < 2 || command[0] != TUIC_VERSION || command[1] != COMMAND_TYPE_PACKET {
+        return None;
+    }
+    let body = &command[2..];
+    if body.len() < 8 {
+        return None;
+    }
+    let packet_id = u16::from_be_bytes([body[2], body[3]]);
+    let fragment_total = body[4];
+    let fragment_id = body[5];
+    let size = u16::from_be_bytes([body[6], body[7]]) as usize;
+
+    // Skip the address to reach the payload; its encoding is what tells us
+    // where the payload starts.
+    let address_len = match body.get(8)? {
+        &ADDRESS_TYPE_NONE => 1,
+        0x00 => 1 + 1 + *body.get(9)? as usize + 2,
+        0x01 => 1 + 4 + 2,
+        0x02 => 1 + 16 + 2,
+        _ => return None,
+    };
+    let payload_start = 8 + address_len;
+    let payload_end = payload_start.checked_add(size)?;
+    if body.len() < payload_end {
+        return None;
     }
 
-    /// Feed a whole Packet command, starting at the version byte.
-    fn push(&mut self, command: &[u8]) -> Option<Vec<u8>> {
-        if command.len() < 2 || command[0] != TUIC_VERSION || command[1] != COMMAND_TYPE_PACKET {
-            return None;
-        }
-        let body = &command[2..];
-        if body.len() < 8 {
-            return None;
-        }
-        let packet_id = u16::from_be_bytes([body[2], body[3]]);
-        let fragment_total = body[4];
-        let fragment_id = body[5];
-        let size = u16::from_be_bytes([body[6], body[7]]) as usize;
+    Some(ParsedPacket {
+        packet_id,
+        fragment_id,
+        fragment_total,
+        payload: &body[payload_start..payload_end],
+    })
+}
 
-        if fragment_total == 0 || fragment_id >= fragment_total {
-            return None;
-        }
+/// Parse a Packet command and feed its fragment in; returns the whole payload
+/// when the last piece lands.
+fn push_command(table: &mut FragmentTable, command: &[u8]) -> Option<Vec<u8>> {
+    let parsed = parse_packet_command(command)?;
+    table.push(
+        parsed.packet_id,
+        parsed.fragment_id,
+        parsed.fragment_total,
+        parsed.payload,
+    )
+}
 
-        // Skip the address to reach the payload; its encoding is what tells us
-        // where the payload starts.
-        let address_len = match body.get(8)? {
-            &ADDRESS_TYPE_NONE => 1,
-            0x00 => 1 + 1 + *body.get(9)? as usize + 2,
-            0x01 => 1 + 4 + 2,
-            0x02 => 1 + 16 + 2,
-            _ => return None,
-        };
-        let payload_start = 8 + address_len;
-        let payload_end = payload_start.checked_add(size)?;
-        if body.len() < payload_end {
-            return None;
-        }
-        let payload = body[payload_start..payload_end].to_vec();
-
-        if fragment_total == 1 {
-            return Some(payload);
-        }
-
-        let slots = self
-            .packets
-            .entry(packet_id)
-            .or_insert_with(|| vec![None; fragment_total as usize]);
-        if slots.len() != fragment_total as usize {
-            *slots = vec![None; fragment_total as usize];
-        }
-        slots[fragment_id as usize] = Some(payload);
-
-        if slots.iter().all(|slot| slot.is_some()) {
-            let slots = self.packets.remove(&packet_id)?;
-            Some(slots.into_iter().flatten().flatten().collect())
-        } else {
-            None
-        }
+/// The association id a Packet command carries, without parsing the rest.
+fn assoc_id_of(command: &[u8]) -> Option<u16> {
+    if command.len() < 4 {
+        return None;
     }
-
-    /// The association id a Packet command carries, without parsing the rest.
-    fn assoc_id_of(command: &[u8]) -> Option<u16> {
-        if command.len() < 4 {
-            return None;
-        }
-        Some(u16::from_be_bytes([command[2], command[3]]))
-    }
+    Some(u16::from_be_bytes([command[2], command[3]]))
 }
 
 pub struct TuicUdpSession {
@@ -224,7 +214,7 @@ impl TuicUdpSession {
                 let datagram_connection = connection.clone();
                 let tx = tx.clone();
                 tasks.push(tokio::spawn(async move {
-                    let mut reassembly = Reassembly::new();
+                    let mut fragments = FragmentTable::new();
                     loop {
                         let datagram: Bytes = match datagram_connection.read_datagram().await {
                             Ok(datagram) => datagram,
@@ -235,10 +225,10 @@ impl TuicUdpSession {
                                 return;
                             }
                         };
-                        if Reassembly::assoc_id_of(&datagram) != Some(assoc_id) {
+                        if assoc_id_of(&datagram) != Some(assoc_id) {
                             continue;
                         }
-                        if let Some(payload) = reassembly.push(&datagram)
+                        if let Some(payload) = push_command(&mut fragments, &datagram)
                             && tx.send(payload).await.is_err()
                         {
                             return;
@@ -277,7 +267,7 @@ impl TuicUdpSession {
                 let stream_connection = connection.clone();
                 let tx = tx.clone();
                 tasks.push(tokio::spawn(async move {
-                    let mut reassembly = Reassembly::new();
+                    let mut fragments = FragmentTable::new();
                     loop {
                         let mut recv = match stream_connection.accept_uni().await {
                             Ok(recv) => recv,
@@ -297,10 +287,10 @@ impl TuicUdpSession {
                                 continue;
                             }
                         };
-                        if Reassembly::assoc_id_of(&command) != Some(assoc_id) {
+                        if assoc_id_of(&command) != Some(assoc_id) {
                             continue;
                         }
-                        if let Some(payload) = reassembly.push(&command)
+                        if let Some(payload) = push_command(&mut fragments, &command)
                             && tx.send(payload).await.is_err()
                         {
                             return;
@@ -533,36 +523,39 @@ mod tests {
 
     #[test]
     fn test_reassembly_round_trips_an_unfragmented_packet() {
-        let mut reassembly = Reassembly::new();
+        let mut fragments = FragmentTable::new();
         let packets = build_packets(1, 2, &target(), b"hello", 1200).unwrap();
-        assert_eq!(reassembly.push(&packets[0]).unwrap(), b"hello");
+        assert_eq!(push_command(&mut fragments, &packets[0]).unwrap(), b"hello");
     }
 
     #[test]
     fn test_reassembly_waits_for_every_fragment() {
-        let mut reassembly = Reassembly::new();
+        let mut fragments = FragmentTable::new();
         let payload: Vec<u8> = (0..3000u32).map(|i| i as u8).collect();
         let packets = build_packets(1, 2, &target(), &payload, 1200).unwrap();
         assert!(packets.len() >= 3);
 
         for packet in &packets[..packets.len() - 1] {
-            assert!(reassembly.push(packet).is_none());
+            assert!(push_command(&mut fragments, packet).is_none());
         }
-        assert_eq!(reassembly.push(packets.last().unwrap()).unwrap(), payload);
+        assert_eq!(
+            push_command(&mut fragments, packets.last().unwrap()).unwrap(),
+            payload
+        );
     }
 
     #[test]
     fn test_reassembly_rejects_a_foreign_command() {
-        let mut reassembly = Reassembly::new();
+        let mut fragments = FragmentTable::new();
         let mut packets = build_packets(1, 2, &target(), b"hello", 1200).unwrap();
         packets[0][1] = 0x04; // Heartbeat, not Packet
-        assert!(reassembly.push(&packets[0]).is_none());
+        assert!(push_command(&mut fragments, &packets[0]).is_none());
     }
 
     #[test]
     fn test_assoc_id_is_read_without_parsing_the_rest() {
         let packets = build_packets(0xbeef, 2, &target(), b"hello", 1200).unwrap();
-        assert_eq!(Reassembly::assoc_id_of(&packets[0]), Some(0xbeef));
-        assert_eq!(Reassembly::assoc_id_of(&[0u8; 3]), None);
+        assert_eq!(assoc_id_of(&packets[0]), Some(0xbeef));
+        assert_eq!(assoc_id_of(&[0u8; 3]), None);
     }
 }

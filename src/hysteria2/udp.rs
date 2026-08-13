@@ -1,6 +1,5 @@
 //! One Hysteria2 UDP session as an AsyncMessageStream.
 
-use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::task::{Context, Poll};
@@ -9,6 +8,8 @@ use bytes::Bytes;
 use log::debug;
 use tokio::io::ReadBuf;
 use tokio::sync::mpsc;
+
+use crate::quic_transport::fragments::FragmentTable;
 
 use crate::async_stream::{
     AsyncFlushMessage, AsyncMessageStream, AsyncPing, AsyncReadMessage, AsyncShutdownMessage,
@@ -19,52 +20,6 @@ use super::frame::{build_datagrams, parse_datagram};
 
 /// How many reassembled payloads may queue up before the reader blocks.
 const INCOMING_CAPACITY: usize = 64;
-
-/// Fragments waiting for their siblings, keyed by packet id.
-///
-/// A packet whose fragments never all arrive is dropped when its id is reused,
-/// which is the protocol's own rule: a lost fragment loses the whole packet,
-/// and UDP was never going to guarantee otherwise.
-struct Reassembly {
-    packets: HashMap<u16, Vec<Option<Vec<u8>>>>,
-}
-
-impl Reassembly {
-    fn new() -> Self {
-        Self {
-            packets: HashMap::new(),
-        }
-    }
-
-    /// Feed one datagram; returns a complete payload when the last piece lands.
-    fn push(&mut self, data: &[u8]) -> Option<Vec<u8>> {
-        let parsed = parse_datagram(data)?;
-        if parsed.fragment_count == 0 || parsed.fragment_id >= parsed.fragment_count {
-            return None;
-        }
-        if parsed.fragment_count == 1 {
-            return Some(parsed.payload.to_vec());
-        }
-
-        let slots = self
-            .packets
-            .entry(parsed.packet_id)
-            .or_insert_with(|| vec![None; parsed.fragment_count as usize]);
-        if slots.len() != parsed.fragment_count as usize {
-            // The id was reused with a different fragment count, so the older
-            // packet can never complete. Start over rather than mixing them.
-            *slots = vec![None; parsed.fragment_count as usize];
-        }
-        slots[parsed.fragment_id as usize] = Some(parsed.payload.to_vec());
-
-        if slots.iter().all(|slot| slot.is_some()) {
-            let slots = self.packets.remove(&parsed.packet_id)?;
-            Some(slots.into_iter().flatten().flatten().collect())
-        } else {
-            None
-        }
-    }
-}
 
 pub struct Hysteria2UdpSession {
     connection: quinn::Connection,
@@ -94,7 +49,7 @@ impl Hysteria2UdpSession {
         // at most one UDP session per connection: a second session would need
         // this to demultiplex instead, or its packets would vanish here.
         let reader_task = tokio::spawn(async move {
-            let mut reassembly = Reassembly::new();
+            let mut fragments = FragmentTable::new();
             loop {
                 let datagram: Bytes = match reader_connection.read_datagram().await {
                     Ok(datagram) => datagram,
@@ -103,14 +58,20 @@ impl Hysteria2UdpSession {
                         return;
                     }
                 };
+                // Parsed once and reused: this runs on every datagram, and the
+                // session filter needs the same header the reassembly does.
                 let Some(parsed) = parse_datagram(&datagram) else {
                     continue;
                 };
                 if parsed.session_id != session_id {
                     continue;
                 }
-                if let Some(payload) = reassembly.push(&datagram)
-                    && tx.send(payload).await.is_err()
+                if let Some(payload) = fragments.push(
+                    parsed.packet_id,
+                    parsed.fragment_id,
+                    parsed.fragment_count,
+                    parsed.payload,
+                ) && tx.send(payload).await.is_err()
                 {
                     return;
                 }
@@ -229,28 +190,41 @@ mod tests {
     use super::*;
     use crate::hysteria2::frame::build_datagrams;
 
+    /// Parse a wire datagram and feed its fragment in, exactly as the reader
+    /// task does. Keeps these tests on the encoder's real output rather than on
+    /// hand-written fragment numbers.
+    fn push_wire(table: &mut FragmentTable, datagram: &[u8]) -> Option<Vec<u8>> {
+        let parsed = parse_datagram(datagram)?;
+        table.push(
+            parsed.packet_id,
+            parsed.fragment_id,
+            parsed.fragment_count,
+            parsed.payload,
+        )
+    }
+
     #[test]
     fn test_reassembly_passes_an_unfragmented_packet_straight_through() {
-        let mut reassembly = Reassembly::new();
+        let mut table = FragmentTable::new();
         let datagrams = build_datagrams(1, 1, "a:1", b"hello", 1200).unwrap();
-        assert_eq!(reassembly.push(&datagrams[0]).unwrap(), b"hello");
+        assert_eq!(push_wire(&mut table, &datagrams[0]).unwrap(), b"hello");
     }
 
     #[test]
     fn test_reassembly_waits_for_every_fragment() {
-        let mut reassembly = Reassembly::new();
+        let mut table = FragmentTable::new();
         let payload: Vec<u8> = (0..3000u32).map(|i| i as u8).collect();
         let datagrams = build_datagrams(1, 1, "a:1", &payload, 1200).unwrap();
         assert!(datagrams.len() >= 3);
 
         for datagram in &datagrams[..datagrams.len() - 1] {
             assert!(
-                reassembly.push(datagram).is_none(),
+                push_wire(&mut table, datagram).is_none(),
                 "an incomplete packet must not be delivered"
             );
         }
         assert_eq!(
-            reassembly.push(datagrams.last().unwrap()).unwrap(),
+            push_wire(&mut table, datagrams.last().unwrap()).unwrap(),
             payload,
             "the last fragment completes the packet"
         );
@@ -258,14 +232,14 @@ mod tests {
 
     #[test]
     fn test_reassembly_accepts_fragments_out_of_order() {
-        let mut reassembly = Reassembly::new();
+        let mut table = FragmentTable::new();
         let payload: Vec<u8> = (0..3000u32).map(|i| i as u8).collect();
         let mut datagrams = build_datagrams(1, 1, "a:1", &payload, 1200).unwrap();
         datagrams.reverse();
 
         let mut completed = None;
         for datagram in &datagrams {
-            if let Some(done) = reassembly.push(datagram) {
+            if let Some(done) = push_wire(&mut table, datagram) {
                 completed = Some(done);
             }
         }
@@ -274,16 +248,16 @@ mod tests {
 
     #[test]
     fn test_reassembly_drops_a_malformed_datagram() {
-        let mut reassembly = Reassembly::new();
-        assert!(reassembly.push(&[0u8; 4]).is_none());
+        let mut table = FragmentTable::new();
+        assert!(push_wire(&mut table, &[0u8; 4]).is_none());
     }
 
     #[test]
     fn test_reassembly_drops_a_fragment_id_past_its_count() {
-        let mut reassembly = Reassembly::new();
+        let mut table = FragmentTable::new();
         let mut datagrams = build_datagrams(1, 1, "a:1", b"hello", 1200).unwrap();
         // fragment_count stays 1 while fragment_id claims to be the second.
         datagrams[0][6] = 1;
-        assert!(reassembly.push(&datagrams[0]).is_none());
+        assert!(push_wire(&mut table, &datagrams[0]).is_none());
     }
 }

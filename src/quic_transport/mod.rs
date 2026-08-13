@@ -12,6 +12,7 @@
 //! between two protocols is then a visible choice rather than a copy that
 //! drifted.
 
+pub mod fragments;
 pub mod obfs;
 
 use std::future::Future;

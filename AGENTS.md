@@ -330,6 +330,12 @@ costs to leave.
 - `ROADMAP.md`, "Hysteria: the rest of the surface" — every unimplemented part
   of Hysteria2, grouped by whether it costs reachability, speed or visibility.
 - `MOBILE.md` — mobile defects, numbered, with a suggested order at the end.
+- `src/hysteria2/server.rs` and `src/tuic/server.rs` still reassemble fragments
+  with their own `FragmentedPacket` and `LruCache` pair rather than
+  `quic_transport::fragments::FragmentTable`. Both are already bounded, so
+  there is no defect to fix — they carry extra per-packet state (a received
+  counter, the accumulated length, and the address to reply to) that the shared
+  table deliberately does not.
 - One deliberate item not recorded elsewhere:
   - `src/routing/udp_router.rs` (over 1300 lines), `src/vless/vision_stream.rs`
     and `src/vmess/vmess_handler.rs` have no tests at all. These are data paths,
