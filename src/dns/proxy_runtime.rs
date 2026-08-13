@@ -146,11 +146,15 @@ impl RuntimeProvider for ProxyRuntimeProvider {
 
         Box::pin(async move {
             if bind_interface.is_some() {
-                // Use our socket_util which supports bind_interface.
+                // Use our socket_util which supports bind_interface, and which
+                // excludes the socket from the VPN route for us.
                 new_udp_socket(local_addr.is_ipv6(), bind_interface)
             } else {
-                // Default: bind directly.
-                tokio::net::UdpSocket::bind(local_addr).await
+                // Bind directly, then protect it: a query that goes out through
+                // the tunnel it is meant to resolve for never comes back.
+                let socket = tokio::net::UdpSocket::bind(local_addr).await?;
+                crate::socket_util::protect_outbound(&socket)?;
+                Ok(socket)
             }
         })
     }
@@ -199,6 +203,12 @@ impl QuicSocketBinder for ProxyQuicBinder {
             // Default: bind directly.
             std::net::UdpSocket::bind(local_addr)?
         };
+
+        // Both branches build the socket themselves, so neither has been
+        // through the constructors that would have excluded it from the VPN
+        // route. DNS-over-QUIC leaving through the tunnel it resolves for is
+        // the same loop as any other outbound.
+        crate::socket_util::protect_outbound(&socket)?;
 
         quinn::TokioRuntime.wrap_udp_socket(socket)
     }

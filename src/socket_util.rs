@@ -10,6 +10,13 @@ use std::path::Path;
 
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
+/// Create an outbound UDP socket.
+///
+/// Excluded from the VPN route where a protector is installed — see
+/// [`crate::socket_protector`]. Every caller of this function dials outward,
+/// which is why the protection lives here rather than at each of them. The
+/// socket2 constructors below are the listener-side primitives and are left
+/// alone; an outbound built on one of those has to protect itself.
 pub fn new_udp_socket(
     is_ipv6: bool,
     bind_interface: Option<String>,
@@ -21,7 +28,43 @@ pub fn new_udp_socket(
         false,
     )?;
 
+    protect_outbound(&socket)?;
+
     into_tokio_udp_socket(socket)
+}
+
+/// Exclude a socket from the VPN route before it carries anything.
+///
+/// Binding is harmless; sending is not, so this runs after construction and
+/// before the socket is handed back. Exposed for the few outbound paths that
+/// build their socket themselves rather than through the constructors here.
+pub(crate) fn protect_outbound<S>(socket: &S) -> std::io::Result<()>
+where
+    S: AsRawFdCompat,
+{
+    crate::socket_protector::protect_socket(socket.raw_fd())
+}
+
+/// The one thing `protect_outbound` needs from a socket, across platforms.
+pub(crate) trait AsRawFdCompat {
+    #[cfg(unix)]
+    fn raw_fd(&self) -> std::os::fd::RawFd;
+    #[cfg(not(unix))]
+    fn raw_fd(&self) -> i32;
+}
+
+#[cfg(unix)]
+impl<S: AsRawFd> AsRawFdCompat for S {
+    fn raw_fd(&self) -> std::os::fd::RawFd {
+        self.as_raw_fd()
+    }
+}
+
+#[cfg(windows)]
+impl<S: std::os::windows::io::AsRawSocket> AsRawFdCompat for S {
+    fn raw_fd(&self) -> i32 {
+        self.as_raw_socket() as i32
+    }
 }
 
 fn get_unspecified_socket_addr(is_ipv6: bool) -> SocketAddr {
@@ -99,6 +142,10 @@ fn into_tokio_udp_socket(socket: socket2::Socket) -> std::io::Result<tokio::net:
     }
 }
 
+/// Create an outbound TCP socket.
+///
+/// Excluded from the VPN route where a protector is installed, for the reason
+/// given on [`new_udp_socket`].
 pub fn new_tcp_socket(
     bind_interface: Option<String>,
     is_ipv6: bool,
@@ -118,7 +165,115 @@ pub fn new_tcp_socket(
         panic!("Could not bind to device, unsupported platform.")
     }
 
+    protect_outbound(&tcp_socket)?;
+
     Ok(tcp_socket)
+}
+
+#[cfg(test)]
+mod protection_tests {
+    use super::*;
+    use crate::socket_protector::{SocketProtector, protect_socket, set_global_socket_protector};
+    use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+
+    /// The protector is process-wide, so these tests take turns. Without this
+    /// one test's recorder replaces another's between its install and its
+    /// socket, and the assertion fails for a reason that has nothing to do
+    /// with the code under test.
+    fn serialise() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let lock = LOCK.get_or_init(|| Mutex::new(()));
+        lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    #[derive(Default)]
+    struct Recorder {
+        seen: Mutex<Vec<i32>>,
+    }
+
+    impl Recorder {
+        fn saw(&self, fd: i32) -> bool {
+            self.seen.lock().unwrap().contains(&fd)
+        }
+    }
+
+    impl SocketProtector for Recorder {
+        fn protect(&self, fd: i32) -> std::io::Result<()> {
+            self.seen.lock().unwrap().push(fd);
+            Ok(())
+        }
+    }
+
+    struct Refuser;
+
+    impl SocketProtector for Refuser {
+        fn protect(&self, _fd: i32) -> std::io::Result<()> {
+            Err(std::io::Error::other("the platform refused to protect it"))
+        }
+    }
+
+    fn install<P: SocketProtector + 'static>(protector: P) -> Arc<P> {
+        let protector = Arc::new(protector);
+        set_global_socket_protector(protector.clone());
+        protector
+    }
+
+    /// Restore the unprotected state other tests expect to find.
+    fn uninstall() {
+        set_global_socket_protector(Arc::new(crate::socket_protector::NoOpSocketProtector));
+    }
+
+    #[test]
+    fn test_outbound_tcp_socket_is_protected() {
+        let _guard = serialise();
+        let recorder = install(Recorder::default());
+
+        let socket = new_tcp_socket(None, false).unwrap();
+        let fd = socket.as_raw_fd();
+
+        assert!(
+            recorder.saw(fd),
+            "an outbound TCP socket must be excluded from the VPN route"
+        );
+        uninstall();
+    }
+
+    // new_udp_socket hands the socket to tokio, which needs a reactor.
+    #[tokio::test]
+    async fn test_outbound_udp_socket_is_protected() {
+        let _guard = serialise();
+        let recorder = install(Recorder::default());
+
+        let socket = new_udp_socket(false, None).unwrap();
+        let fd = socket.as_raw_fd();
+
+        assert!(
+            recorder.saw(fd),
+            "an outbound UDP socket must be excluded from the VPN route"
+        );
+        uninstall();
+    }
+
+    /// A socket the platform would not protect is one whose traffic re-enters
+    /// the tunnel. Handing it back would be worse than failing.
+    #[tokio::test]
+    async fn test_a_refused_protection_fails_socket_creation() {
+        let _guard = serialise();
+        install(Refuser);
+
+        assert!(new_tcp_socket(None, false).is_err());
+        assert!(new_udp_socket(false, None).is_err());
+
+        uninstall();
+    }
+
+    #[test]
+    fn test_protection_is_a_no_op_without_a_protector() {
+        let _guard = serialise();
+        // Whatever ran before, prove the unset path is harmless.
+        assert!(protect_socket(-1).is_ok());
+        assert!(new_tcp_socket(None, false).is_ok());
+    }
 }
 
 pub fn set_tcp_keepalive(

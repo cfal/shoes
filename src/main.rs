@@ -33,6 +33,12 @@ mod shadowsocks;
 mod slide_buffer;
 mod snell;
 mod sniff;
+// Consulting a protector happens on every outbound socket; installing one is
+// the FFI's job, and the FFI is compiled out of this binary. So the installer
+// half of this module has no caller here and never will, which is a property of
+// the build rather than something a later change will fix.
+#[allow(dead_code)]
+mod socket_protector;
 mod socket_util;
 mod socks5_udp_relay;
 mod socks_handler;

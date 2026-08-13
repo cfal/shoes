@@ -44,7 +44,8 @@ the findings below assume.
 | `src/tun/tcp_stack_direct.rs` | smoltcp stack on the raw fd; buffer sizes and connection cap live here |
 | `src/tun/tcp_conn.rs` | Per-connection ring buffers (`TcpConnectionControl`) |
 | `src/tun/udp_manager.rs` | UDP session table (`MAX_SESSIONS`) |
-| `src/tun/platform.rs` | `SocketProtector` trait, global protector, `protect_socket` |
+| `src/socket_protector.rs` | `SocketProtector` trait, global protector, `protect_socket` |
+| `src/tun/platform.rs` | `PlatformCallbacks`, `PlatformInterface`; re-exports the protector for the FFI |
 | `src/tun/traffic.rs` | Byte counters, `report_traffic`, `TrafficCountingStream` |
 | `src/amneziawg/` | AmneziaWG 2.0/3.0 client: `config.rs`, `tunnel.rs`, `netstack.rs`, `connector.rs` |
 | `src/dns/fake_ip/` | Fake IP: `pool.rs`, `responder.rs`, `bypass.rs` |
@@ -203,32 +204,33 @@ not part of the problem: the AnyTLS outgoing channel is bounded at
 with the iOS limit named in the comment above it), and the UDP session table is
 an LRU capped at 256.
 
-## 2. Only the AmneziaWG socket is excluded from the tunnel
+## 2. Only the AmneziaWG socket is excluded from the tunnel — fixed
 
-`protect_socket` has exactly one caller in the whole tree:
+`protect_socket` used to have exactly one caller in the whole tree:
 `src/amneziawg/tunnel.rs:82`, guarding the AmneziaWG endpoint's UDP socket. The
-comment there states the hazard correctly — an unprotected socket is captured by
-the TUN it feeds, and every packet loops back into itself.
+comment there stated the hazard correctly — an unprotected socket is captured by
+the TUN it feeds, and every packet loops back into itself — but every other
+outbound socket was created without it. A `client_chain` that was not AmneziaWG
+opened its upstream connection inside its own tunnel, and a working Android
+setup was working because of `Builder.addDisallowedApplication`, an app-side
+workaround nothing here required or documented.
 
-Every other outbound socket is created without it. `src/tcp/socket_connector_impl.rs`
-builds the proxy chain's TCP socket at `:228` and its UDP sockets at `:162` and
-`:328` through `socket_util::new_tcp_socket` / `new_udp_socket`, and neither
-helper touches the protector. So a config whose `client_chain` is an ordinary
-proxy — TLS/VLESS, Shadowsocks, Hysteria2, SOCKS, anything that is not
-AmneziaWG — opens its upstream connection inside its own tunnel.
+The protector now lives in `src/socket_protector.rs`, which compiles on every
+target rather than only on mobile, and `socket_util::new_tcp_socket` and
+`new_udp_socket` consult it. Protection follows from where a socket is created
+rather than from whoever created it having remembered, which is what let five
+call sites drift in the first place. The socket2 constructors are the
+listener-side primitives and are deliberately left alone; the three outbounds
+that build their own socket — the AmneziaWG endpoint and the two DNS paths —
+call `socket_util::protect_outbound` themselves.
 
-On iOS the extension's own traffic is not routed through the tunnel it provides,
-so this is masked. On Android it is not: `VpnService` captures the app's own
-sockets unless they are protected or the app is excluded via
-`Builder.addDisallowedApplication(packageName)`. If a non-AmneziaWG chain works
-on Android today, it is working because of that exclusion — an app-side
-workaround that nothing in this repo requires, documents, or checks.
+Both DNS paths also used to bypass our constructors entirely when no
+`bind_interface` was set, binding through tokio directly, so upstream queries
+leaked even after the outbound sockets were fixed. They protect explicitly now.
 
-What to do: call `protect_socket` in `new_tcp_socket` and `new_udp_socket`, or
-at the connector level in `socket_connector_impl.rs`, so the guarantee does not
-depend on which protocol the user picked. It is a no-op where no protector is
-installed, so it stays correct on desktop. Until then, state the
-`addDisallowedApplication` requirement in the Android integration docs.
+Covered by tests in `src/socket_util.rs` that install a recording protector and
+assert the file descriptor reached it, including that a refused protection fails
+socket creation rather than handing back a socket that would loop.
 
 ## 3. Nothing handles a network change
 

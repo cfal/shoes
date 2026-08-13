@@ -148,15 +148,10 @@ side effect.
 `src/tun/traffic.rs` aside, there is no notion of which app a flow belongs to.
 sing-box resolves uid to package name and matches on it.
 
-This is entangled with a defect already recorded in
-[MOBILE.md](./MOBILE.md): `protect_socket` has exactly one caller,
-`src/amneziawg/tunnel.rs:82`. The general outbound path —
-`socket_util::new_tcp_socket` and `new_udp_socket` — never consults the
-protector, so any non-AmneziaWG `client_chain` opens its upstream socket inside
-the tunnel it is meant to feed. A working Android setup today depends on
-`Builder.addDisallowedApplication`, an app-side workaround this repository
-neither requires nor documents. The leak needs fixing regardless; per-app routing
-is its natural continuation.
+The leak this used to be entangled with is fixed: every outbound socket is now
+excluded from the VPN route, because `socket_util`'s constructors consult the
+protector rather than each caller remembering to. See
+[MOBILE.md](./MOBILE.md) §2. Per-app routing is the remaining half.
 
 ### 6. Per-connection statistics
 
