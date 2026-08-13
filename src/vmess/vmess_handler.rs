@@ -1,6 +1,5 @@
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
-use std::time::SystemTime;
 
 use async_trait::async_trait;
 use aws_lc_rs::aead::{
@@ -29,7 +28,7 @@ use crate::stream_reader::StreamReader;
 use crate::tcp::tcp_handler::{
     TcpClientHandler, TcpClientSetupResult, TcpServerHandler, TcpServerSetupResult,
 };
-use crate::util::{allocate_vec, write_all};
+use crate::util::{allocate_vec, unix_time_secs, write_all};
 use crate::uuid_util::parse_uuid;
 use crate::xudp::XudpMessageStream;
 
@@ -38,19 +37,6 @@ const TAG_LEN: usize = 16;
 /// The window either side of the current time that a VMess AEAD auth id is
 /// accepted in. See authid.go in v2ray-core.
 const AUTH_ID_TIME_WINDOW_SECS: u64 = 120;
-
-/// Seconds since the Unix epoch.
-///
-/// A clock set before 1970 is a broken clock rather than something to panic
-/// over: this runs on every connection, and the mobile profile is built with
-/// `panic = "abort"`, where a panic ends the process rather than the
-/// connection.
-fn unix_time_secs() -> std::io::Result<u64> {
-    SystemTime::UNIX_EPOCH
-        .elapsed()
-        .map(|since_epoch| since_epoch.as_secs())
-        .map_err(|e| std::io::Error::other(format!("system clock is before the Unix epoch: {e}")))
-}
 
 /// A timestamp drawn at random from the window the server will accept, which
 /// is what the reference client sends rather than the exact current time.

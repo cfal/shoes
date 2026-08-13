@@ -338,8 +338,11 @@ costs to leave.
   table deliberately does not.
 - One deliberate item not recorded elsewhere:
   - `src/routing/udp_router.rs` (over 1300 lines), `src/vless/vision_stream.rs`
-    and `src/vmess/vmess_handler.rs` have no tests at all. These are data paths,
-    so covering them means designing the tests, not adding a few.
+    and `src/shadow_tls/shadow_tls_server_handler.rs` have no tests at all.
+    These are data paths, so covering them means designing the tests, not
+    adding a few. `vmess_handler.rs` and `shadowsocks_stream.rs` were on this
+    list until a handshake test was written for each; both found real defects,
+    which is the argument for doing the rest.
 - `src/quic_server.rs::start_quic_server`, the generic QUIC listener behind
   VLESS and the other TCP protocols, still builds its own endpoint and sets no
   transport parameters at all — there is a TODO in it proposing some. It was

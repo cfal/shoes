@@ -392,10 +392,7 @@ impl RealityServerConnection {
 
         // Validate timestamp if max_time_diff is configured
         if let Some(max_diff_ms) = self.config.max_time_diff {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_err(|_| io::Error::other("System time error"))?
-                .as_secs();
+            let now = crate::util::unix_time_secs()?;
 
             let time_diff_secs = now.abs_diff(client_timestamp);
             let max_diff_secs = max_diff_ms / 1000;

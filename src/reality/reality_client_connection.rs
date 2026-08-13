@@ -178,10 +178,7 @@ impl RealityClientConnection {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
         // Create session ID with REALITY metadata
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|_| io::Error::other("System time error"))?
-            .as_secs();
+        let timestamp = crate::util::unix_time_secs()?;
 
         let mut session_id_plaintext = [0u8; 16];
         session_id_plaintext[0] = 1; // Protocol version major

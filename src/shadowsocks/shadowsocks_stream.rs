@@ -1,7 +1,6 @@
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::SystemTime;
 
 use aws_lc_rs::aead::{
     Aad, Algorithm, BoundKey, NONCE_LEN, Nonce, NonceSequence, OpeningKey, SealingKey, UnboundKey,
@@ -21,7 +20,7 @@ use crate::async_stream::{
     AsyncFlushMessage, AsyncMessageStream, AsyncPing, AsyncReadMessage, AsyncShutdownMessage,
     AsyncStream, AsyncWriteMessage,
 };
-use crate::util::allocate_vec;
+use crate::util::{allocate_vec, unix_time_secs};
 
 fn generate_iv(buf: &mut [u8]) {
     let mut rng = rand::rng();
@@ -441,7 +440,7 @@ impl ShadowsocksStream {
 
                 let timestamp_bytes = &self.unprocessed_buf[self.salt_len + 1..self.salt_len + 9];
                 let timestamp_secs = u64::from_be_bytes(timestamp_bytes.try_into().unwrap());
-                let current_time_secs = current_time_secs();
+                let current_time_secs = unix_time_secs()?;
                 // SIP022 (Shadowsocks 2022 Edition) requires rejecting any header
                 // whose timestamp is more than 30 seconds away from the current
                 // time, in either direction. Enforce the same symmetric window so
@@ -504,7 +503,7 @@ impl ShadowsocksStream {
 
                 let timestamp_bytes = &self.unprocessed_buf[self.salt_len + 1..self.salt_len + 9];
                 let timestamp_secs = u64::from_be_bytes(timestamp_bytes.try_into().unwrap());
-                let current_time_secs = current_time_secs();
+                let current_time_secs = unix_time_secs()?;
                 // SIP022 (Shadowsocks 2022 Edition) requires rejecting any header
                 // whose timestamp is more than 30 seconds away from the current
                 // time, in either direction. Enforce the same symmetric window so
@@ -582,7 +581,7 @@ impl ShadowsocksStream {
 
                 // HeaderTypeServerStream = 1
                 response_header[0] = 1;
-                response_header[1..9].copy_from_slice(&current_time_secs().to_be_bytes());
+                response_header[1..9].copy_from_slice(&unix_time_secs()?.to_be_bytes());
                 response_header[9..9 + self.salt_len].copy_from_slice(&decrypt_iv);
 
                 let handled_len = std::cmp::min(
@@ -615,7 +614,7 @@ impl ShadowsocksStream {
 
                 // HeaderTypeClientStream = 0
                 request_header[0] = 0;
-                request_header[1..9].copy_from_slice(&current_time_secs().to_be_bytes());
+                request_header[1..9].copy_from_slice(&unix_time_secs()?.to_be_bytes());
 
                 // This is a bit hacky. We expect/know that the first packet will be the "variable-length header"
                 // with the address and padding, and we need to send it all off in a single packet.
@@ -900,7 +899,76 @@ impl AsyncShutdownMessage for ShadowsocksStream {
 impl AsyncStream for ShadowsocksStream {}
 impl AsyncMessageStream for ShadowsocksStream {}
 
-#[inline]
-fn current_time_secs() -> u64 {
-    SystemTime::UNIX_EPOCH.elapsed().unwrap().as_secs()
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::shadowsocks::blake3_key::Blake3Key;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// AES-128-GCM: salt, session key and PSK are all 16 bytes.
+    const KEY_LEN: usize = 16;
+
+    fn key() -> Arc<Box<dyn ShadowsocksKey>> {
+        Arc::new(Box::new(Blake3Key::new(
+            vec![7u8; KEY_LEN].into_boxed_slice(),
+            KEY_LEN,
+        )) as Box<dyn ShadowsocksKey>)
+    }
+
+    fn stream(tcp: tokio::net::TcpStream, stream_type: ShadowsocksStreamType) -> ShadowsocksStream {
+        ShadowsocksStream::new(
+            Box::new(tcp),
+            stream_type,
+            &aws_lc_rs::aead::AES_128_GCM,
+            KEY_LEN,
+            key(),
+            None,
+        )
+    }
+
+    /// A 2022-edition header carries a timestamp that the peer checks against
+    /// its own clock, which is the path the clock helper runs on. Nothing in
+    /// this file was covered before, so this is also the first end-to-end
+    /// check that a client stream and a server stream agree at all.
+    async fn round_trip(payload: &[u8]) -> std::io::Result<Vec<u8>> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+
+        let payload = payload.to_vec();
+        let sent = payload.clone();
+        let client = tokio::spawn(async move {
+            let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let mut client = stream(tcp, ShadowsocksStreamType::AEAD2022Client);
+            client.write_all(&sent).await?;
+            client.flush().await?;
+            // Held open: a shutdown here would race the read below.
+            std::future::pending::<()>().await;
+            Ok::<_, std::io::Error>(())
+        });
+
+        let (tcp, _) = listener.accept().await?;
+        let mut server = stream(tcp, ShadowsocksStreamType::AEAD2022Server);
+
+        let mut received = vec![0u8; payload.len()];
+        server.read_exact(&mut received).await?;
+
+        client.abort();
+        Ok(received)
+    }
+
+    #[tokio::test]
+    async fn test_a_client_stream_is_readable_by_a_server_stream() {
+        assert_eq!(
+            round_trip(b"hello over shadowsocks").await.unwrap(),
+            b"hello over shadowsocks"
+        );
+    }
+
+    /// Larger than one packet, so the header is parsed once and the payload
+    /// spans several encrypted chunks.
+    #[tokio::test]
+    async fn test_a_payload_spanning_several_packets_round_trips() {
+        let payload: Vec<u8> = (0..40_000u32).map(|i| i as u8).collect();
+        assert_eq!(round_trip(&payload).await.unwrap(), payload);
+    }
 }
