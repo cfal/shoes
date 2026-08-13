@@ -2257,4 +2257,56 @@ mod tests {
             "172.17.0.0/24 should have netmask != 0"
         );
     }
+
+    /// A hostname destination meeting an IP rule is resolved so it can be
+    /// matched against it. This happens whatever `resolve_rule_hostnames` is
+    /// set to - that option governs hostnames in the *rules*, not in the
+    /// destination.
+    ///
+    /// Every other test in this module uses a resolver with no mappings and is
+    /// written to avoid needing one, so resolution actually feeding a decision
+    /// was uncovered, as was the mock's own mapping support.
+    #[tokio::test]
+    async fn test_a_hostname_matches_an_ip_rule_once_resolved() {
+        let rules = vec![
+            block_rule(vec!["10.0.0.0/8"]),
+            allow_rule(vec!["0.0.0.0/0"], "default"),
+        ];
+        let selector = ClientProxySelector::new(rules);
+
+        let resolver: Arc<dyn Resolver> = Arc::new(MockResolver::new().with_mapping(
+            "blocked.example",
+            80,
+            vec!["10.1.2.3".parse().unwrap()],
+        ));
+
+        let location = NetLocation::new(Address::Hostname("blocked.example".to_string()), 80);
+        let decision = selector.judge(location.into(), &resolver).await.unwrap();
+        assert!(
+            matches!(decision, ConnectDecision::Block),
+            "a hostname resolving into a blocked subnet must be blocked"
+        );
+    }
+
+    /// The other half: the same rules and the same lookup, with an address
+    /// outside the blocked range, so the test above cannot be passing merely
+    /// because everything is blocked.
+    #[tokio::test]
+    async fn test_a_hostname_resolving_outside_the_rule_is_allowed() {
+        let rules = vec![
+            block_rule(vec!["10.0.0.0/8"]),
+            allow_rule(vec!["0.0.0.0/0"], "default"),
+        ];
+        let selector = ClientProxySelector::new(rules);
+
+        let resolver: Arc<dyn Resolver> = Arc::new(MockResolver::new().with_mapping(
+            "allowed.example",
+            80,
+            vec!["93.184.216.34".parse().unwrap()],
+        ));
+
+        let location = NetLocation::new(Address::Hostname("allowed.example".to_string()), 80);
+        let decision = selector.judge(location.into(), &resolver).await.unwrap();
+        assert!(matches!(decision, ConnectDecision::Allow { .. }));
+    }
 }

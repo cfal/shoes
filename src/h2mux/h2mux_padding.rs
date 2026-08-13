@@ -557,8 +557,8 @@ mod tests {
 
     #[test]
     fn test_padding_constants() {
-        // Verify padding range
-        assert!(MIN_PADDING <= MAX_PADDING);
+        // The range itself is pinned by the two values below; asserting
+        // MIN <= MAX on top of them is a constant, not a test.
         assert_eq!(MIN_PADDING, 256);
         assert_eq!(MAX_PADDING, 767);
         assert_eq!(FIRST_PADDINGS, 16);

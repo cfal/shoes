@@ -480,7 +480,7 @@ mod tests {
         assert!(!matches!(state.state, UnpadState::Done));
 
         // Second chunk: rest of command + content + padding
-        let chunk2 = vec![
+        let chunk2 = [
             0, 2, // rest of content length (=3), padding length = 2
             10, 11, 12, // content
             0, 0, // padding
@@ -566,7 +566,7 @@ mod tests {
         assert!(matches!(state.state, UnpadState::ReadingPadding { .. }));
 
         // Second chunk: remaining padding
-        let chunk2 = vec![
+        let chunk2 = [
             0, 0, 0, // remaining 3 bytes of padding
         ];
 

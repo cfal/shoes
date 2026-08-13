@@ -310,8 +310,7 @@ mod tests {
             client_quic_config(),
             None,
         )
-        .err()
-        .expect("a malformed uuid must be refused at construction")
+        .expect_err("a malformed uuid must be refused at construction")
         .to_string();
         assert!(err.to_lowercase().contains("uuid"), "{err}");
     }

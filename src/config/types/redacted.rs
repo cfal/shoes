@@ -97,7 +97,10 @@ mod tests {
     /// through it — that is the exact shape of the config dump.
     #[test]
     fn debug_hides_the_value_inside_a_containing_struct() {
+        // The derived Debug is the only reader, and dead-code analysis does
+        // not count derives - which is the whole point of the test.
         #[derive(Debug)]
+        #[allow(dead_code)]
         struct Config {
             name: String,
             password: Redacted<String>,

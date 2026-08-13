@@ -110,13 +110,8 @@ pub async fn spawn_udp_echo() -> SocketAddr {
     let addr = socket.local_addr().unwrap();
     tokio::spawn(async move {
         let mut buf = vec![0u8; 65535];
-        loop {
-            match socket.recv_from(&mut buf).await {
-                Ok((len, from)) => {
-                    let _ = socket.send_to(&buf[..len], from).await;
-                }
-                Err(_) => break,
-            }
+        while let Ok((len, from)) = socket.recv_from(&mut buf).await {
+            let _ = socket.send_to(&buf[..len], from).await;
         }
     });
     addr

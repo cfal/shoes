@@ -313,7 +313,7 @@ mod tests {
 
         // Verify full hash lookup returns correct name
         let hash1_slice: &[u8] = &hash1[..];
-        assert!(user_map.get(hash1_slice).is_some());
+        assert!(user_map.contains_key(hash1_slice));
         assert_eq!(user_map.get(hash1_slice).unwrap(), "alice");
 
         let hash2_slice: &[u8] = &hash2[..];

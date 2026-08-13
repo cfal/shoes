@@ -54,7 +54,7 @@ static PROTECT_CALLBACK: OnceLock<Mutex<Option<ProtectSocketCallback>>> = OnceLo
 /// Socket protector implementation for iOS.
 struct IosSocketProtector;
 
-impl crate::tun::SocketProtector for IosSocketProtector {
+impl crate::socket_protector::SocketProtector for IosSocketProtector {
     fn protect(&self, fd: std::os::unix::io::RawFd) -> std::io::Result<()> {
         let callback_guard = PROTECT_CALLBACK.get_or_init(|| Mutex::new(None)).lock();
 
@@ -179,7 +179,7 @@ pub unsafe extern "C" fn shoes_start(
         traffic_callback(upload, download);
     }));
 
-    crate::tun::set_global_socket_protector(Arc::new(IosSocketProtector));
+    crate::socket_protector::set_global_socket_protector(Arc::new(IosSocketProtector));
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()

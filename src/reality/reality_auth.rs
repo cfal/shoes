@@ -295,9 +295,7 @@ mod tests {
         assert_eq!(&session_id[8..16], &short_id[..]);
 
         // Verify remaining bytes are zero
-        for i in 16..32 {
-            assert_eq!(session_id[i], 0);
-        }
+        assert!(session_id[16..32].iter().all(|b| *b == 0));
     }
 
     #[test]
@@ -471,9 +469,7 @@ mod tests {
         assert_eq!(&session_id[8..16], &short_id[..]);
 
         // Verify remaining bytes are zeros
-        for i in 16..32 {
-            assert_eq!(session_id[i], 0);
-        }
+        assert!(session_id[16..32].iter().all(|b| *b == 0));
     }
 
     #[test]

@@ -87,7 +87,13 @@ pub async fn load_configs(args: &Vec<String>) -> std::io::Result<Vec<Config>> {
 }
 
 /// Load config from a string (used by FFI targets)
+///
+/// The only caller is `crate::ffi`, which is declared in lib.rs and not in
+/// main.rs, so a `--features ffi` build of the binary compiles this with
+/// nothing to use it. That is a property of the build rather than something a
+/// later change will fix.
 #[cfg(any(target_os = "android", target_os = "ios", feature = "ffi"))]
+#[allow(dead_code)]
 pub fn load_config_str(config_str: &str) -> std::io::Result<Vec<Config>> {
     serde_yaml::from_str::<Vec<Config>>(config_str).map_err(|e| {
         std::io::Error::new(

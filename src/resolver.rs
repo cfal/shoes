@@ -576,10 +576,6 @@ mod tests {
                 error_kind: Some(kind),
             }
         }
-
-        fn count(&self) -> usize {
-            self.call_count.load(Ordering::Relaxed)
-        }
     }
 
     impl Resolver for MockResolver {
@@ -594,44 +590,6 @@ mod tests {
                     Ok(addrs)
                 }
             })
-        }
-    }
-
-    /// A mock resolver that fails the first N calls then succeeds.
-    #[derive(Debug)]
-    struct FlakyResolver {
-        fail_count: AtomicUsize,
-        fails_remaining: AtomicUsize,
-        error_kind: std::io::ErrorKind,
-        success_addrs: Vec<SocketAddr>,
-    }
-
-    impl FlakyResolver {
-        fn new(
-            fail_first_n: usize,
-            error_kind: std::io::ErrorKind,
-            success_addrs: Vec<SocketAddr>,
-        ) -> Self {
-            Self {
-                fail_count: AtomicUsize::new(0),
-                fails_remaining: AtomicUsize::new(fail_first_n),
-                error_kind,
-                success_addrs,
-            }
-        }
-    }
-
-    impl Resolver for FlakyResolver {
-        fn resolve_location(&self, _location: &NetLocation) -> ResolveFuture {
-            let remaining = self.fails_remaining.fetch_sub(1, Ordering::Relaxed);
-            if remaining > 0 {
-                self.fail_count.fetch_add(1, Ordering::Relaxed);
-                let kind = self.error_kind;
-                Box::pin(async move { Err(std::io::Error::new(kind, "flaky error")) })
-            } else {
-                let addrs = self.success_addrs.clone();
-                Box::pin(async move { Ok(addrs) })
-            }
         }
     }
 

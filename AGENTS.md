@@ -43,29 +43,38 @@ Run all of this before claiming anything works:
 ```bash
 cargo fmt --all
 cargo fmt --all -- --check
-cargo clippy --locked --lib --bins -- -D warnings
+cargo clippy --locked --lib --bins --tests -- -D warnings
 cargo test --lib
 cargo test --bins
 cargo test --test '*'
 ```
 
-Two exclusions, both deliberate:
+There are no exclusions. Every clippy configuration is clean and is expected to
+stay that way:
 
-- **Do not add `--tests` to clippy.** It fails on pre-existing style lints in
-  test code across the tree. Cleaning those up is its own task; failing every
-  unrelated change on them is not.
-- **`--features ffi --bins` fails and always has.** `mod ffi` is declared only
-  in `src/lib.rs`, so with that feature the binary compiles `src/tun/platform.rs`
-  with nothing to use it. Check the FFI build with `--features ffi --lib`
-  instead, and run `cargo test --features ffi --lib` when you touch anything
-  the FFI reaches.
+```bash
+cargo clippy --locked --features ffi --lib --tests -- -D warnings
+cargo clippy --locked --features ffi --bins -- -D warnings
+```
 
-**Check the FFI build whenever you touch `src/tun/`, `src/socket_protector.rs`
-or `src/ffi/`.** Those files are partly gated behind
-`cfg(any(target_os = "android", target_os = "ios", feature = "ffi"))`, so the
-default build does not compile them at all. Moving the socket protector out of
-`tun::platform` left duplicate definitions and a stale test import behind, and
-the ordinary gate stayed green throughout.
+`--tests` is in the gate on purpose. It catches a class the other passes cannot
+see — `err().expect()` instead of `expect_err`, a lock held across an await, an
+assertion whose value is a constant, a test double nothing constructs. It was
+excluded until the backlog behind it was cleared; putting anything back on that
+list means fixing it instead.
+
+**Run the FFI configurations whenever you touch `src/tun/`,
+`src/socket_protector.rs`, `src/config/mod.rs` or `src/ffi/`.** Those are partly
+gated behind `cfg(any(target_os = "android", target_os = "ios", feature =
+"ffi"))`, so the default build does not compile them at all. Moving the socket
+protector out of `tun::platform` left duplicate definitions and a stale test
+import behind, and the ordinary gate stayed green throughout.
+
+Note what those two FFI lines do *not* include: `--features ffi --bins` compiles
+FFI-gated code into the binary, which does not declare `mod ffi`, so anything
+whose only caller is the FFI looks dead there. `config::load_config_str` carries
+an allow saying exactly that. Prefer that shape — a narrow allow with the reason
+— over dropping the configuration from the gate.
 
 ## Traps in this codebase
 

@@ -170,6 +170,88 @@ pub fn new_tcp_socket(
     Ok(tcp_socket)
 }
 
+pub fn set_tcp_keepalive(
+    tcp_stream: &tokio::net::TcpStream,
+    idle_time: std::time::Duration,
+    send_interval: std::time::Duration,
+) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let raw_fd = tcp_stream.as_raw_fd();
+        let socket2_socket = ManuallyDrop::new(unsafe { Socket::from_raw_fd(raw_fd) });
+        if idle_time.is_zero() && send_interval.is_zero() {
+            socket2_socket.set_keepalive(false)?;
+        } else {
+            let keepalive = socket2::TcpKeepalive::new()
+                .with_time(idle_time)
+                .with_interval(send_interval);
+            socket2_socket.set_keepalive(true)?;
+            socket2_socket.set_tcp_keepalive(&keepalive)?;
+        }
+        Ok(())
+    }
+    #[cfg(windows)]
+    {
+        let _ = (tcp_stream, idle_time, send_interval);
+        Ok(())
+    }
+}
+
+// TODO: change backlog to Option<u32> and make configuration, backlog -1 uses somaxconn on linux
+// https://github.com/rust-lang/rust/blob/3534594029ed1495290e013647a1f53da561f7f1/library/std/src/os/unix/net/listener.rs#L93
+pub fn new_tcp_listener(
+    bind_address: SocketAddr,
+    backlog: u32,
+    bind_interface: Option<String>,
+) -> std::io::Result<tokio::net::TcpListener> {
+    let domain = if bind_address.is_ipv6() {
+        Domain::IPV6
+    } else {
+        Domain::IPV4
+    };
+    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+
+    socket.set_nonblocking(true)?;
+    socket.set_reuse_address(true)?;
+
+    if let Some(ref interface) = bind_interface {
+        #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+        socket.bind_device(Some(interface.as_bytes()))?;
+
+        // This should be handled during config validation.
+        #[cfg(not(any(target_os = "android", target_os = "fuchsia", target_os = "linux")))]
+        panic!("Could not bind to device, unsupported platform.")
+    }
+
+    socket.bind(&SockAddr::from(bind_address))?;
+
+    let backlog = backlog.try_into().unwrap_or(4096);
+    socket.listen(backlog)?;
+
+    let std_listener: std::net::TcpListener = socket.into();
+    tokio::net::TcpListener::from_std(std_listener)
+}
+
+#[cfg(target_family = "unix")]
+pub fn new_unix_listener<P: AsRef<Path>>(
+    path: P,
+    backlog: u32,
+) -> std::io::Result<tokio::net::UnixListener> {
+    let path = path.as_ref();
+
+    let socket = Socket::new(Domain::UNIX, Type::STREAM, None)?;
+    socket.set_nonblocking(true)?;
+
+    let addr = SockAddr::unix(path)?;
+    socket.bind(&addr)?;
+
+    let backlog = backlog.try_into().unwrap_or(4096);
+    socket.listen(backlog)?;
+
+    let std_listener: std::os::unix::net::UnixListener = socket.into();
+    tokio::net::UnixListener::from_std(std_listener)
+}
+
 #[cfg(test)]
 mod protection_tests {
     use super::*;
@@ -309,86 +391,4 @@ mod protection_tests {
         assert!(protect_socket(-1).is_ok());
         assert!(new_tcp_socket(None, false).is_ok());
     }
-}
-
-pub fn set_tcp_keepalive(
-    tcp_stream: &tokio::net::TcpStream,
-    idle_time: std::time::Duration,
-    send_interval: std::time::Duration,
-) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        let raw_fd = tcp_stream.as_raw_fd();
-        let socket2_socket = ManuallyDrop::new(unsafe { Socket::from_raw_fd(raw_fd) });
-        if idle_time.is_zero() && send_interval.is_zero() {
-            socket2_socket.set_keepalive(false)?;
-        } else {
-            let keepalive = socket2::TcpKeepalive::new()
-                .with_time(idle_time)
-                .with_interval(send_interval);
-            socket2_socket.set_keepalive(true)?;
-            socket2_socket.set_tcp_keepalive(&keepalive)?;
-        }
-        Ok(())
-    }
-    #[cfg(windows)]
-    {
-        let _ = (tcp_stream, idle_time, send_interval);
-        Ok(())
-    }
-}
-
-// TODO: change backlog to Option<u32> and make configuration, backlog -1 uses somaxconn on linux
-// https://github.com/rust-lang/rust/blob/3534594029ed1495290e013647a1f53da561f7f1/library/std/src/os/unix/net/listener.rs#L93
-pub fn new_tcp_listener(
-    bind_address: SocketAddr,
-    backlog: u32,
-    bind_interface: Option<String>,
-) -> std::io::Result<tokio::net::TcpListener> {
-    let domain = if bind_address.is_ipv6() {
-        Domain::IPV6
-    } else {
-        Domain::IPV4
-    };
-    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
-
-    socket.set_nonblocking(true)?;
-    socket.set_reuse_address(true)?;
-
-    if let Some(ref interface) = bind_interface {
-        #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
-        socket.bind_device(Some(interface.as_bytes()))?;
-
-        // This should be handled during config validation.
-        #[cfg(not(any(target_os = "android", target_os = "fuchsia", target_os = "linux")))]
-        panic!("Could not bind to device, unsupported platform.")
-    }
-
-    socket.bind(&SockAddr::from(bind_address))?;
-
-    let backlog = backlog.try_into().unwrap_or(4096);
-    socket.listen(backlog)?;
-
-    let std_listener: std::net::TcpListener = socket.into();
-    tokio::net::TcpListener::from_std(std_listener)
-}
-
-#[cfg(target_family = "unix")]
-pub fn new_unix_listener<P: AsRef<Path>>(
-    path: P,
-    backlog: u32,
-) -> std::io::Result<tokio::net::UnixListener> {
-    let path = path.as_ref();
-
-    let socket = Socket::new(Domain::UNIX, Type::STREAM, None)?;
-    socket.set_nonblocking(true)?;
-
-    let addr = SockAddr::unix(path)?;
-    socket.bind(&addr)?;
-
-    let backlog = backlog.try_into().unwrap_or(4096);
-    socket.listen(backlog)?;
-
-    let std_listener: std::os::unix::net::UnixListener = socket.into();
-    tokio::net::UnixListener::from_std(std_listener)
 }

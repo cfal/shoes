@@ -489,14 +489,10 @@ mod tests {
         }
 
         // Drain whatever the completion queued, per decapsulate's contract.
-        loop {
-            match client.decapsulate(None, &[], &mut client_buf) {
-                TunnResult::WriteToNetwork(data) => {
-                    let keepalive = data.to_vec();
-                    let _ = server.decapsulate(None, &keepalive, &mut server_buf);
-                }
-                _ => break,
-            }
+        while let TunnResult::WriteToNetwork(data) = client.decapsulate(None, &[], &mut client_buf)
+        {
+            let keepalive = data.to_vec();
+            let _ = server.decapsulate(None, &keepalive, &mut server_buf);
         }
 
         // A session now exists: real data crosses and comes out intact.

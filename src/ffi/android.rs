@@ -30,7 +30,7 @@ use tokio::runtime::Runtime;
 use tokio::sync::oneshot;
 
 use crate::logging::{DynamicFileLogWriter, LogWriter};
-use crate::tun::{FnSocketProtector, set_global_socket_protector};
+use crate::socket_protector::{FnSocketProtector, set_global_socket_protector};
 
 use super::common::{
     self, LOG_FILE, LOGGER_INITIALIZED, TUN_SERVICE, TunServiceHandle, setup_log_file,

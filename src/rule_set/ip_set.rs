@@ -40,11 +40,6 @@ impl IpSet {
     pub fn len(&self) -> usize {
         self.ranges.len()
     }
-
-    #[cfg(test)]
-    pub fn is_empty(&self) -> bool {
-        self.ranges.is_empty()
-    }
 }
 
 #[cfg(test)]

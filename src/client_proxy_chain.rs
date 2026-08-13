@@ -132,6 +132,18 @@ impl std::fmt::Debug for ClientProxyChain {
     }
 }
 
+/// Everything `as_stream_chain` hands a test, in the order the variant
+/// declares its fields.
+#[cfg(test)]
+type StreamChainParts<'a> = (
+    &'a Vec<InitialHopEntry>,
+    &'a AtomicU32,
+    &'a Vec<Vec<Box<dyn ProxyConnector>>>,
+    &'a Vec<usize>,
+    &'a AtomicU32,
+    bool,
+);
+
 impl ClientProxyChain {
     /// Create a new stream-based chain from initial hop entries and subsequent hop pools.
     ///
@@ -512,16 +524,7 @@ impl ClientProxyChain {
 
     // Test helpers to access internal state for stream chains
     #[cfg(test)]
-    fn as_stream_chain(
-        &self,
-    ) -> (
-        &Vec<InitialHopEntry>,
-        &AtomicU32,
-        &Vec<Vec<Box<dyn ProxyConnector>>>,
-        &Vec<usize>,
-        &AtomicU32,
-        bool,
-    ) {
+    fn as_stream_chain(&self) -> StreamChainParts<'_> {
         match &self.kind {
             ClientProxyChainKind::StreamChain {
                 initial_hop,
@@ -683,8 +686,12 @@ mod tests {
     use crate::tcp::socket_connector::SocketConnector;
 
     /// Mock SocketConnector that fails on connect (for unit testing structure).
+    ///
+    /// The id is carried only so a chain's connectors are distinguishable in a
+    /// Debug dump when a test fails.
     #[derive(Debug)]
     struct MockSocketConnector {
+        #[allow(dead_code)]
         id: usize,
     }
 

@@ -345,23 +345,24 @@ mod tests {
         // Build message body: context_len (1) + list_len (3) + entry
         let body_len = 1 + 3 + entry_len;
 
-        let mut message = Vec::new();
-        // Handshake type (Certificate = 0x0b)
-        message.push(0x0b);
-        // Handshake length (3 bytes, big-endian)
-        message.push(((body_len >> 16) & 0xff) as u8);
-        message.push(((body_len >> 8) & 0xff) as u8);
-        message.push((body_len & 0xff) as u8);
-        // certificate_request_context length = 0
-        message.push(0x00);
-        // certificate_list length (3 bytes)
-        message.push(((list_len >> 16) & 0xff) as u8);
-        message.push(((list_len >> 8) & 0xff) as u8);
-        message.push((list_len & 0xff) as u8);
-        // First certificate: cert_data length (3 bytes)
-        message.push(((cert_len >> 16) & 0xff) as u8);
-        message.push(((cert_len >> 8) & 0xff) as u8);
-        message.push((cert_len & 0xff) as u8);
+        let mut message = vec![
+            // Handshake type (Certificate = 0x0b)
+            0x0b,
+            // Handshake length (3 bytes, big-endian)
+            ((body_len >> 16) & 0xff) as u8,
+            ((body_len >> 8) & 0xff) as u8,
+            (body_len & 0xff) as u8,
+            // certificate_request_context length = 0
+            0x00,
+            // certificate_list length (3 bytes)
+            ((list_len >> 16) & 0xff) as u8,
+            ((list_len >> 8) & 0xff) as u8,
+            (list_len & 0xff) as u8,
+            // First certificate: cert_data length (3 bytes)
+            ((cert_len >> 16) & 0xff) as u8,
+            ((cert_len >> 8) & 0xff) as u8,
+            (cert_len & 0xff) as u8,
+        ];
         // cert_data
         message.extend_from_slice(cert_data);
         // extensions length = 0
@@ -508,15 +509,16 @@ mod tests {
         let signature = [0xABu8; 64];
         let payload_len = 2 + 2 + 64; // sig_alg + sig_len + sig
 
-        let mut message = Vec::new();
-        message.push(0x0f); // CertificateVerify type
-        message.push(0x00);
-        message.push(0x00);
-        message.push(payload_len as u8);
-        message.push(0x08); // Ed25519 algorithm
-        message.push(0x07);
-        message.push(0x00); // Signature length
-        message.push(0x40); // 64
+        let mut message = vec![
+            0x0f, // CertificateVerify type
+            0x00,
+            0x00,
+            payload_len as u8,
+            0x08, // Ed25519 algorithm
+            0x07,
+            0x00, // Signature length
+            0x40, // 64
+        ];
         message.extend_from_slice(&signature);
 
         let result = extract_certificate_verify_signature(&message);
@@ -703,15 +705,16 @@ mod tests {
 
         // Build CertificateVerify message
         let payload_len = 2 + 2 + 64;
-        let mut cv_message = Vec::new();
-        cv_message.push(0x0f); // type
-        cv_message.push(0x00);
-        cv_message.push(0x00);
-        cv_message.push(payload_len as u8);
-        cv_message.push(0x08); // Ed25519
-        cv_message.push(0x07);
-        cv_message.push(0x00); // sig len
-        cv_message.push(0x40);
+        let mut cv_message = vec![
+            0x0f, // type
+            0x00,
+            0x00,
+            payload_len as u8,
+            0x08, // Ed25519
+            0x07,
+            0x00, // sig len
+            0x40,
+        ];
         cv_message.extend_from_slice(signature.as_ref());
 
         // Client side: extract and verify

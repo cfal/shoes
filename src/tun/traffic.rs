@@ -147,15 +147,19 @@ pub fn get_traffic_counters() -> (u64, u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
     use std::sync::atomic::AtomicU64;
+    use tokio::sync::Mutex;
 
-    // Serialize tests that mutate shared global state.
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
+    /// These tests all mutate the same process-wide counters, so they take
+    /// turns. The lock is tokio's rather than std's for two reasons: it can be
+    /// held across the awaits in the stream tests, and it does not poison, so
+    /// one failing test reports its own failure instead of turning the other
+    /// five into "poisoned".
+    static TEST_LOCK: Mutex<()> = Mutex::const_new(());
 
-    #[test]
-    fn test_add_and_reset_counters() {
-        let _guard = TEST_LOCK.lock().unwrap();
+    #[tokio::test]
+    async fn test_add_and_reset_counters() {
+        let _guard = TEST_LOCK.lock().await;
         reset_traffic_counters();
 
         add_upload_bytes(100);
@@ -172,9 +176,9 @@ mod tests {
         assert_eq!(down, 0);
     }
 
-    #[test]
-    fn test_callback_invoked_with_current_counters() {
-        let _guard = TEST_LOCK.lock().unwrap();
+    #[tokio::test]
+    async fn test_callback_invoked_with_current_counters() {
+        let _guard = TEST_LOCK.lock().await;
         reset_traffic_counters();
 
         let captured_up = Arc::new(AtomicU64::new(0));
@@ -197,9 +201,9 @@ mod tests {
         clear_traffic_callback();
     }
 
-    #[test]
-    fn test_clear_callback_stops_reporting() {
-        let _guard = TEST_LOCK.lock().unwrap();
+    #[tokio::test]
+    async fn test_clear_callback_stops_reporting() {
+        let _guard = TEST_LOCK.lock().await;
         reset_traffic_counters();
 
         let call_count = Arc::new(AtomicU64::new(0));
@@ -223,7 +227,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_counting_stream_reports_bytes() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock().await;
         reset_traffic_counters();
 
         let data = b"hello world";
@@ -244,7 +248,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_counting_stream_reports_write_bytes() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock().await;
         reset_traffic_counters();
 
         let buf = Vec::new();
@@ -261,9 +265,9 @@ mod tests {
         assert_eq!(down, 13, "bytes written should be counted as download");
     }
 
-    #[test]
-    fn test_report_without_callback_does_not_panic() {
-        let _guard = TEST_LOCK.lock().unwrap();
+    #[tokio::test]
+    async fn test_report_without_callback_does_not_panic() {
+        let _guard = TEST_LOCK.lock().await;
         clear_traffic_callback();
         report_traffic(); // should be a no-op
     }

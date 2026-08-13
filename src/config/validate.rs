@@ -2695,10 +2695,12 @@ mod tests {
         use crate::config::types::{ClientConfigGroup, ClientProxyConfig};
 
         // Create a non-direct (socks5) chain - should be rejected for UDP.
-        let mut socks_config = ClientConfig::default();
-        socks_config.protocol = ClientProxyConfig::Socks {
-            username: None,
-            password: None,
+        let socks_config = ClientConfig {
+            protocol: ClientProxyConfig::Socks {
+                username: None,
+                password: None,
+            },
+            ..Default::default()
         };
 
         let configs = vec![
@@ -2767,10 +2769,12 @@ mod tests {
         use crate::config::types::{ClientConfigGroup, ClientProxyConfig};
 
         // Create a non-direct (socks5) chain - should be rejected for H3.
-        let mut socks_config = ClientConfig::default();
-        socks_config.protocol = ClientProxyConfig::Socks {
-            username: None,
-            password: None,
+        let socks_config = ClientConfig {
+            protocol: ClientProxyConfig::Socks {
+                username: None,
+                password: None,
+            },
+            ..Default::default()
         };
 
         let configs = vec![

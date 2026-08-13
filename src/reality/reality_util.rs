@@ -526,9 +526,8 @@ mod tests {
         }
 
         let random = extract_client_random(&client_hello).unwrap();
-        for i in 0..32 {
-            assert_eq!(random[i], (i + 1) as u8);
-        }
+        let expected: Vec<u8> = (1..=32).collect();
+        assert_eq!(random, expected.as_slice());
     }
 
     #[test]

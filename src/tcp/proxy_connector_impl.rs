@@ -50,15 +50,6 @@ impl ProxyConnectorImpl {
             ),
         })
     }
-
-    /// Create a ProxyConnector directly from components.
-    #[cfg(test)]
-    pub fn new(location: NetLocation, handler: Box<dyn TcpClientHandler>) -> Self {
-        Self {
-            location,
-            client_handler: handler,
-        }
-    }
 }
 
 #[async_trait]
