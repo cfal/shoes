@@ -300,7 +300,9 @@ mod tests {
     async fn test_an_unbindable_address_is_a_startup_error() {
         let settings = listener(UNBINDABLE.parse().unwrap());
         let result = start_quic_listeners(settings, params(), |_| async { Ok(()) });
-        let err = result.err().expect("binding TEST-NET-1 must fail");
+        let err = result
+            .map(|handles| handles.len())
+            .expect_err("binding TEST-NET-1 must fail");
         assert!(
             matches!(
                 err.kind(),
