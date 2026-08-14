@@ -178,8 +178,8 @@ pub async fn setup_http_server_stream_inner(
                 }
                 if need_auth
                     && line.len() > PROXY_AUTH_HEADER_PREFIX.len() + 1
-                    && line[0..PROXY_AUTH_HEADER_PREFIX.len()].to_ascii_lowercase()
-                        == PROXY_AUTH_HEADER_PREFIX
+                    && line.as_bytes()[0..PROXY_AUTH_HEADER_PREFIX.len()]
+                        .eq_ignore_ascii_case(PROXY_AUTH_HEADER_PREFIX.as_bytes())
                 {
                     if !auth_token_matches(&line[PROXY_AUTH_HEADER_PREFIX.len()..], auth_token) {
                         debug!("Received incorrect HTTP CONNECT authentication");

@@ -761,6 +761,15 @@ impl RealityServerConnection {
 
         // Check if we have the complete record
         let total_record_len = TLS_RECORD_HEADER_SIZE + record_len;
+        // record_len is an unbounded peer-supplied u16; a value larger than the fixed
+        // ciphertext buffer can hold could never "complete" and would overflow the buffer
+        // on the next read. Reject it (RFC 8446 record_overflow) before waiting for data.
+        if total_record_len > TLS_MAX_RECORD_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "TLS record length exceeds maximum",
+            ));
+        }
         if self.ciphertext_read_buf.len() < total_record_len {
             return Ok(false); // Need more data
         }
@@ -902,6 +911,12 @@ impl RealityServerConnection {
 
             // Check if we have the complete record
             let total_record_len = TLS_RECORD_HEADER_SIZE + record_len;
+            if total_record_len > TLS_MAX_RECORD_SIZE {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "TLS record length exceeds maximum",
+                ));
+            }
             if self.ciphertext_read_buf.len() < total_record_len {
                 break; // Need more data
             }

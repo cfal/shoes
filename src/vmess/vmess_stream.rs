@@ -423,6 +423,17 @@ impl VmessStream {
                     ));
                 }
 
+                // The masked length is peer-supplied and the padding length comes from the
+                // shake stream, so a corrupt or malicious frame can claim padding longer than
+                // the data. Guard the subtractions below (release builds wrap on underflow,
+                // which then desyncs the stream and trips the BufferFull assertion downstream).
+                if data_len < padding_len {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "padding length is larger than data length",
+                    ));
+                }
+
                 if self.tag_len > 0 && (data_len - padding_len) < self.tag_len {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
@@ -450,7 +461,7 @@ impl VmessStream {
                 }
 
                 let processed_data_len = data_len - padding_len - self.tag_len;
-                if self.processed_end_offset + processed_data_len >= self.processed_buf.len() {
+                if self.processed_end_offset + processed_data_len > self.processed_buf.len() {
                     self.unprocessed_pending_len = Some((padding_len, data_len));
                     if self.unprocessed_start_offset == self.unprocessed_end_offset {
                         self.unprocessed_start_offset = 0;
@@ -468,7 +479,7 @@ impl VmessStream {
                 }
 
                 let processed_data_len = data_len - padding_len - self.tag_len;
-                if self.processed_end_offset + processed_data_len >= self.processed_buf.len() {
+                if self.processed_end_offset + processed_data_len > self.processed_buf.len() {
                     return Ok(DecryptState::BufferFull);
                 }
 

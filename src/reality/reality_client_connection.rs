@@ -355,7 +355,16 @@ impl RealityClientConnection {
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Buffer too short"))?
             as usize;
 
+        // record_len is an unbounded peer-supplied u16; reject anything larger than the
+        // fixed ciphertext buffer can hold (it could never complete and would overflow
+        // the buffer on the next read) rather than crashing pre-authentication.
         let total_record_len = TLS_RECORD_HEADER_SIZE + record_len;
+        if total_record_len > TLS_MAX_RECORD_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "TLS record length exceeds maximum",
+            ));
+        }
         if self.ciphertext_read_buf.len() < total_record_len {
             return Ok(false);
         }
@@ -519,6 +528,12 @@ impl RealityClientConnection {
         );
 
         let total_record_len = TLS_RECORD_HEADER_SIZE + record_len;
+        if total_record_len > TLS_MAX_RECORD_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "TLS record length exceeds maximum",
+            ));
+        }
         if self.ciphertext_read_buf.len() < total_record_len {
             return Ok(false);
         }
@@ -794,6 +809,12 @@ impl RealityClientConnection {
                 as usize;
 
             let total_record_len = TLS_RECORD_HEADER_SIZE + record_len;
+            if total_record_len > TLS_MAX_RECORD_SIZE {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "TLS record length exceeds maximum",
+                ));
+            }
             if self.ciphertext_read_buf.len() < total_record_len {
                 break;
             }

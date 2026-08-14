@@ -221,6 +221,11 @@ impl ShadowsocksStream {
                 }
 
                 if self.processed_end_offset + data_len_no_tag > self.processed_buf.len() {
+                    // The length header has already been decrypted and unprocessed_start_offset
+                    // advanced past it, so the pending length must be recorded here (as the
+                    // NeedData path above does). Without it, the next call would try to open the
+                    // payload ciphertext as a fresh length header with the wrong nonce and fail.
+                    self.unprocessed_pending_len = Some(data_len_no_tag);
                     return Ok(DecryptState::BufferFull);
                 }
 

@@ -167,22 +167,28 @@ pub fn vision_flow_addon_data() -> &'static [u8] {
     &INSTANCE
 }
 
+/// Decode a protobuf base-128 varint (LEB128): little-endian groups of 7 bits,
+/// high bit set means "more bytes follow". Returns the value and the number of
+/// bytes consumed.
+///
+/// `data` is peer-supplied, so every access is bounds-checked: a truncated
+/// varint (continuation bit set on the last available byte) returns an error
+/// rather than indexing past the slice and panicking.
 fn read_varint(data: &[u8]) -> std::io::Result<(u64, usize)> {
-    let mut cursor = 0usize;
     let mut length = 0u64;
-    loop {
-        let byte = data[cursor];
-        if (byte & 0b10000000) != 0 {
-            length = (length << 8) | ((byte ^ 0b10000000) as u64);
-        } else {
-            length = (length << 8) | (byte as u64);
-            return Ok((length, cursor + 1));
-        }
-        if cursor == 7 || cursor == data.len() {
+    let mut shift = 0u32;
+    for (cursor, &byte) in data.iter().enumerate() {
+        // 10 groups of 7 bits is the most a u64 can hold.
+        if cursor == 10 {
             return Err(std::io::Error::other("Varint is too long"));
         }
-        cursor += 1;
+        length |= ((byte & 0b0111_1111) as u64) << shift;
+        if byte & 0b1000_0000 == 0 {
+            return Ok((length, cursor + 1));
+        }
+        shift += 7;
     }
+    Err(std::io::Error::other("Varint is truncated"))
 }
 
 /// Encode a flow string as protobuf addon data
@@ -211,4 +217,39 @@ fn encode_flow_addon(flow: &str) -> std::io::Result<Vec<u8>> {
     result.extend_from_slice(flow_bytes);
 
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_varint;
+
+    #[test]
+    fn read_varint_decodes_single_byte() {
+        assert_eq!(read_varint(&[0x00]).unwrap(), (0, 1));
+        assert_eq!(read_varint(&[0x7f]).unwrap(), (127, 1));
+    }
+
+    #[test]
+    fn read_varint_decodes_multi_byte_little_endian() {
+        // protobuf value 128 = 0x80 0x01, 300 = 0xac 0x02, 200 = 0xc8 0x01.
+        assert_eq!(read_varint(&[0x80, 0x01]).unwrap(), (128, 2));
+        assert_eq!(read_varint(&[0xac, 0x02]).unwrap(), (300, 2));
+        assert_eq!(read_varint(&[0xc8, 0x01]).unwrap(), (200, 2));
+    }
+
+    #[test]
+    fn read_varint_stops_at_terminator_and_ignores_trailing() {
+        // The value ends at the first byte without the continuation bit.
+        assert_eq!(read_varint(&[0x01, 0xff, 0xff]).unwrap(), (1, 1));
+    }
+
+    #[test]
+    fn read_varint_rejects_truncated_input_without_panicking() {
+        // Continuation bit set on the last (or only) available byte: must error,
+        // not index past the slice. `[0x80]` is exactly the input that panicked the
+        // old off-by-one implementation.
+        assert!(read_varint(&[0x80]).is_err());
+        assert!(read_varint(&[]).is_err());
+        assert!(read_varint(&[0xff, 0xff, 0x80]).is_err());
+    }
 }

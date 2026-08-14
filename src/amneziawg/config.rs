@@ -223,6 +223,16 @@ fn parse_ip_prefix(s: &str) -> std::io::Result<(IpAddr, u8)> {
         let prefix: u8 = prefix_str
             .parse()
             .map_err(|e| ioerr(&format!("invalid prefix '{}': {}", prefix_str, e)))?;
+        // smoltcp's IpCidr::new panics on an out-of-range prefix, so validate here
+        // (this comes from user config) rather than letting it abort the netstack task.
+        let max_prefix = if addr.is_ipv4() { 32 } else { 128 };
+        if prefix > max_prefix {
+            return Err(ioerr(&format!(
+                "prefix /{} out of range for {} address",
+                prefix,
+                if addr.is_ipv4() { "IPv4" } else { "IPv6" }
+            )));
+        }
         Ok((addr, prefix))
     } else {
         let addr: IpAddr = s

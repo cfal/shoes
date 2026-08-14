@@ -869,7 +869,11 @@ async fn setup_remote_handshake(
                         format!("failed to read TLS payload from client during handshake (size {client_payload_size}): {e}")
                     ))?;
 
-                if client_content_type == CONTENT_TYPE_APPLICATION_DATA {
+                // A genuine authenticated record carries a 4-byte HMAC prefix. A shorter
+                // application_data record cannot be one, so relay it like any other frame
+                // rather than slicing [..4]/[4..] and panicking — this path runs before
+                // authentication, so a probe must not be able to crash us here.
+                if client_content_type == CONTENT_TYPE_APPLICATION_DATA && client_payload_size >= 4 {
                     let mut tmp_hmac = hmac_client_data.clone();
                     tmp_hmac.update(&client_payload_bytes[4..]);
 
@@ -1115,7 +1119,9 @@ async fn setup_local_handshake(
             .read_slice(&mut server_stream, client_payload_size as usize)
             .await?;
 
-        if client_content_type == CONTENT_TYPE_APPLICATION_DATA {
+        // See the remote-handshake path: a record shorter than the 4-byte HMAC prefix
+        // cannot be authenticated data, so relay it instead of slicing and panicking.
+        if client_content_type == CONTENT_TYPE_APPLICATION_DATA && client_payload_size >= 4 {
             let mut tmp_hmac = hmac_client_data.clone();
             tmp_hmac.update(&client_payload_bytes[4..]);
 
