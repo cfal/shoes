@@ -569,6 +569,10 @@ async fn run_udp_remote_to_local_stream_loop(
     let mut next_packet_id: u16 = 0;
     let mut buf = allocate_vec(65535).into_boxed_slice();
     let mut loop_count: u8 = 0;
+    // Cache the serialized reply source address; it is constant for the common
+    // single-peer flow, so the steady state is a refcount bump rather than a
+    // serialize_socket_addr allocation per packet. Unused when there is an override.
+    let mut cached_src: Option<(SocketAddr, Bytes)> = None;
 
     loop {
         let (payload_len, src_addr) = match socket.try_recv_from(&mut buf) {
@@ -603,7 +607,12 @@ async fn run_udp_remote_to_local_stream_loop(
 
         let address_bytes = match original_address_bytes {
             Some(ref a) => a.clone(),
-            None => serialize_socket_addr(&src_addr).into(),
+            None => {
+                if cached_src.as_ref().is_none_or(|(a, _)| *a != src_addr) {
+                    cached_src = Some((src_addr, serialize_socket_addr(&src_addr).into()));
+                }
+                cached_src.as_ref().unwrap().1.clone()
+            }
         };
 
         let mut packet = encode_packet_header_with_address(
@@ -649,6 +658,10 @@ async fn run_udp_remote_to_local_datagram_loop(
     let mut next_packet_id: u16 = 0;
     let mut buf = allocate_vec(65535).into_boxed_slice();
     let mut loop_count: u8 = 0;
+    // Cache the serialized reply source address; it is constant for the common
+    // single-peer flow, so the steady state is a refcount bump rather than a
+    // serialize_socket_addr allocation per packet. Unused when there is an override.
+    let mut cached_src: Option<(SocketAddr, Bytes)> = None;
 
     loop {
         let (payload_len, src_addr) = match client_socket.try_recv_from(&mut buf) {

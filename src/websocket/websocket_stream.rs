@@ -353,15 +353,11 @@ impl WebsocketStream {
         let content_bytes = &mut self.unprocessed_buf
             [self.unprocessed_start_offset..self.unprocessed_start_offset + read_amount];
         if self.read_frame_masked {
-            let iter = content_bytes.iter_mut().zip(
-                self.read_frame_mask
-                    .iter()
-                    .cycle()
-                    .skip(self.read_frame_mask_offset),
+            mask_in_place(
+                content_bytes,
+                self.read_frame_mask,
+                self.read_frame_mask_offset,
             );
-            for (byte, &key) in iter {
-                *byte ^= key
-            }
             self.read_frame_mask_offset = (self.read_frame_mask_offset + read_amount) % 4;
         }
 
@@ -409,15 +405,11 @@ impl WebsocketStream {
         let content_bytes = &mut self.unprocessed_buf
             [self.unprocessed_start_offset..self.unprocessed_start_offset + read_amount];
         if self.read_frame_masked {
-            let iter = content_bytes.iter_mut().zip(
-                self.read_frame_mask
-                    .iter()
-                    .cycle()
-                    .skip(self.read_frame_mask_offset),
+            mask_in_place(
+                content_bytes,
+                self.read_frame_mask,
+                self.read_frame_mask_offset,
             );
-            for (byte, &key) in iter {
-                *byte ^= key
-            }
             self.read_frame_mask_offset = (self.read_frame_mask_offset + read_amount) % 4;
         }
 
@@ -814,14 +806,94 @@ fn pack_frame(opcode: u8, use_mask: bool, input: &[u8], output: &mut [u8]) -> us
     if input_len > 0 {
         output[offset..offset + input_len].copy_from_slice(input);
         if let Some(mask_bytes) = mask {
-            let iter = output[offset..offset + input_len]
-                .iter_mut()
-                .zip(mask_bytes.iter().cycle());
-            for (byte, &key) in iter {
-                *byte ^= key
-            }
+            mask_in_place(&mut output[offset..offset + input_len], mask_bytes, 0);
         }
     }
 
     offset + input_len
+}
+
+/// XOR `buf` in place with the 4-byte WebSocket masking key, where `buf[0]`
+/// corresponds to key byte `offset % 4`. A frame's payload can arrive across
+/// several reads, so masking resumes at the frame's current byte position.
+///
+/// Processes 8 bytes per iteration; `chunks_exact_mut` lets the compiler
+/// vectorise the bulk, which is roughly an order of magnitude faster than the
+/// byte-at-a-time loop on the sizeable payloads that dominate a proxied stream.
+#[inline]
+fn mask_in_place(buf: &mut [u8], mask: [u8; 4], offset: usize) {
+    let off = offset & 3;
+    // The key rotated so that buf[0] xors against mask[off].
+    let rot = [
+        mask[off],
+        mask[(off + 1) & 3],
+        mask[(off + 2) & 3],
+        mask[(off + 3) & 3],
+    ];
+    // Two periods of the rotated key; an 8-byte word is exactly two 4-byte periods.
+    let word = u64::from_ne_bytes([
+        rot[0], rot[1], rot[2], rot[3], rot[0], rot[1], rot[2], rot[3],
+    ]);
+    let mut chunks = buf.chunks_exact_mut(8);
+    for chunk in &mut chunks {
+        let masked = u64::from_ne_bytes(chunk.try_into().unwrap()) ^ word;
+        chunk.copy_from_slice(&masked.to_ne_bytes());
+    }
+    // The remainder starts at a multiple of 8 (hence of 4), so it realigns to rot[0].
+    for (i, byte) in chunks.into_remainder().iter_mut().enumerate() {
+        *byte ^= rot[i & 3];
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mask_in_place;
+
+    /// The definition of WebSocket masking (RFC 6455 §5.3), byte by byte.
+    fn naive_mask(buf: &mut [u8], mask: [u8; 4], offset: usize) {
+        for (i, byte) in buf.iter_mut().enumerate() {
+            *byte ^= mask[(offset + i) % 4];
+        }
+    }
+
+    #[test]
+    fn mask_in_place_matches_naive_over_offsets_and_lengths() {
+        let mask = [0x37, 0xfa, 0x21, 0x3d];
+        // Cover every starting alignment and every remainder length past the
+        // 8-byte word, plus lengths that cross several words.
+        for offset in 0..8 {
+            for len in 0..40 {
+                let original: Vec<u8> = (0..len).map(|i| (i as u8).wrapping_mul(7)).collect();
+
+                let mut fast = original.clone();
+                mask_in_place(&mut fast, mask, offset);
+
+                let mut slow = original.clone();
+                naive_mask(&mut slow, mask, offset);
+
+                assert_eq!(fast, slow, "offset={offset} len={len}");
+
+                // Masking is its own inverse, so a second pass restores the input.
+                mask_in_place(&mut fast, mask, offset);
+                assert_eq!(fast, original, "involution offset={offset} len={len}");
+            }
+        }
+    }
+
+    #[test]
+    fn mask_in_place_resumes_across_split_reads() {
+        // A frame delivered in two reads must mask identically to one read.
+        let mask = [1, 2, 3, 4];
+        let whole: Vec<u8> = (0..30u8).collect();
+
+        let mut one_shot = whole.clone();
+        mask_in_place(&mut one_shot, mask, 0);
+
+        let mut split = whole.clone();
+        let (a, b) = split.split_at_mut(7);
+        mask_in_place(a, mask, 0);
+        mask_in_place(b, mask, 7 % 4);
+
+        assert_eq!(one_shot, split);
+    }
 }

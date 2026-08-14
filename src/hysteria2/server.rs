@@ -371,6 +371,11 @@ async fn run_udp_remote_to_local_loop(
     let mut next_packet_id: u16 = 0;
     let mut buf = allocate_vec(65535);
     let mut loop_count: u8 = 0;
+    // The reply source address is serialized into every datagram header, but for
+    // the common single-peer flow it never changes. Cache the encoded address and
+    // its length varint so the steady state is a refcount bump, not a to_string()
+    // plus a varint allocation per packet. Only used when there is no override.
+    let mut cached_src: Option<(SocketAddr, Bytes, Bytes)> = None;
 
     loop {
         let (payload_len, src_addr) = match socket.try_recv_from(&mut buf) {
@@ -410,11 +415,15 @@ async fn run_udp_remote_to_local_loop(
         let (address_bytes, address_len_bytes) = match original_address_bytes {
             Some((ref a, ref b)) => (a.clone(), b.clone()),
             None => {
-                let address_bytes: Bytes = src_addr.to_string().into_bytes().into();
-                // no need to do a length check since this is a socket address and an IP.
-                let address_len = address_bytes.len();
-                let address_len_bytes = encode_varint(address_len as u64)?.into();
-                (address_bytes, address_len_bytes)
+                if cached_src.as_ref().is_none_or(|(a, _, _)| *a != src_addr) {
+                    let address_bytes: Bytes = src_addr.to_string().into_bytes().into();
+                    // no need to do a length check since this is a socket address and an IP.
+                    let address_len_bytes: Bytes =
+                        encode_varint(address_bytes.len() as u64)?.into();
+                    cached_src = Some((src_addr, address_bytes, address_len_bytes));
+                }
+                let (_, a, b) = cached_src.as_ref().unwrap();
+                (a.clone(), b.clone())
             }
         };
 

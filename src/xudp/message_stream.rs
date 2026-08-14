@@ -518,10 +518,13 @@ impl AsyncReadSessionMessage for XudpMessageStream {
                 }
             }
 
-            // Read more data from inner stream
+            // Read more data from the inner stream into reserved but still
+            // uninitialized capacity. Using ReadBuf::uninit avoids zero-filling
+            // 8 KiB on every poll (the old resize(.., 0)), which is pure waste
+            // since poll_read overwrites it and any unwritten tail is dropped.
             let original_filled = this.read_buffer.len();
-            this.read_buffer.resize(original_filled + 8192, 0);
-            let mut temp_buf = ReadBuf::new(&mut this.read_buffer[original_filled..]);
+            this.read_buffer.reserve(8192);
+            let mut temp_buf = ReadBuf::uninit(&mut this.read_buffer.spare_capacity_mut()[..8192]);
 
             log::debug!(
                 "[XUDP SESSION READ] Reading from inner stream, current buffer has {} bytes",
@@ -530,7 +533,12 @@ impl AsyncReadSessionMessage for XudpMessageStream {
             let poll_result = Pin::new(&mut this.inner_stream).poll_read(cx, &mut temp_buf);
 
             let n = temp_buf.filled().len();
-            this.read_buffer.truncate(original_filled + n);
+            // SAFETY: poll_read reported `n` bytes written through `temp_buf` into
+            // the reserved spare capacity, so bytes [0, original_filled + n) are
+            // now initialized. `reserve(8192)` guaranteed the capacity exists.
+            unsafe {
+                this.read_buffer.set_len(original_filled + n);
+            }
 
             match ready!(poll_result) {
                 Ok(()) => {
