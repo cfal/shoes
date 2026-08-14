@@ -4,8 +4,20 @@ use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::str;
 use std::sync::Arc;
+use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use subtle::ConstantTimeEq;
+
+/// Monotonic epoch for UDP-session idle tracking. A session's `last_activity`
+/// stores whole seconds elapsed since this point, which is enough resolution for
+/// a 60s idle timeout and lets both the receive loop and the spawned
+/// remote-to-local task update it through a single atomic.
+static ACTIVITY_EPOCH: LazyLock<std::time::Instant> = LazyLock::new(std::time::Instant::now);
+
+fn activity_secs() -> u64 {
+    ACTIVITY_EPOCH.elapsed().as_secs()
+}
 
 use bytes::{Bytes, BytesMut};
 use log::{debug, error, warn};
@@ -273,7 +285,9 @@ struct UdpSession {
     last_location: NetLocation,
     last_socket_addr: SocketAddr,
     override_remote_write_address: Option<SocketAddr>,
-    last_activity: std::time::Instant,
+    // Shared with the spawned remote-to-local task so that reply traffic counts as
+    // activity too; otherwise a download-only session would be reaped mid-transfer.
+    last_activity: Arc<AtomicU64>,
     cancel_token: CancellationToken,
 }
 
@@ -301,13 +315,15 @@ impl UdpSession {
         // Create a child token so this session is cancelled when the parent (connection) is cancelled
         let session_cancel_token = parent_cancel_token.child_token();
 
+        let last_activity = Arc::new(AtomicU64::new(activity_secs()));
+
         let session = UdpSession {
             fragments: LruCache::new(NonZeroUsize::new(MAX_FRAGMENT_CACHE_SIZE).unwrap()),
             send_socket: client_socket.clone(),
             last_location: initial_location,
             last_socket_addr: initial_socket_addr,
             override_remote_write_address,
-            last_activity: std::time::Instant::now(),
+            last_activity: last_activity.clone(),
             cancel_token: session_cancel_token.clone(),
         };
 
@@ -317,6 +333,7 @@ impl UdpSession {
                 connection,
                 client_socket,
                 override_local_write_location,
+                last_activity,
                 session_cancel_token,
             )
             .await
@@ -334,6 +351,7 @@ async fn run_udp_remote_to_local_loop(
     connection: quinn::Connection,
     socket: Arc<UdpSocket>,
     override_local_write_address: Option<NetLocation>,
+    last_activity: Arc<AtomicU64>,
     cancel_token: CancellationToken,
 ) -> std::io::Result<()> {
     let max_datagram_size = connection
@@ -374,6 +392,10 @@ async fn run_udp_remote_to_local_loop(
                 )));
             }
         };
+
+        // A reply from the remote target keeps the session alive, so a download-only
+        // flow (client silent, server streaming) is not reaped by the idle sweep.
+        last_activity.store(activity_secs(), Ordering::Relaxed);
 
         // Yield periodically to allow quinn's internal tasks to run (keepalives, ACKs, etc.)
         // This prevents starvation during heavy UDP traffic.
@@ -458,8 +480,11 @@ async fn run_udp_local_to_remote_loop(
     loop {
         let now = std::time::Instant::now();
         if (now - last_cleanup) > CLEANUP_INTERVAL {
+            let now_secs = activity_secs();
+            let idle_timeout_secs = IDLE_TIMEOUT.as_secs();
             sessions.retain(|session_id, session| {
-                if session.last_activity.elapsed() > IDLE_TIMEOUT {
+                let idle = now_secs.saturating_sub(session.last_activity.load(Ordering::Relaxed));
+                if idle > idle_timeout_secs {
                     // Cancel the session's background task before removing
                     session.cancel_token.cancel();
                     debug!("Removing inactive UDP session {session_id}");
@@ -606,8 +631,18 @@ async fn run_udp_local_to_remote_loop(
             Entry::Occupied(ref mut entry) => entry.get_mut(),
         };
 
+        // An inbound datagram from the client is activity for this session.
+        session
+            .last_activity
+            .store(activity_secs(), Ordering::Relaxed);
+
         let (complete_payload, remote_location) = if fragment_count == 0 {
             error!("Ignoring empty UDP fragment for session {session_id}");
+            continue;
+        } else if fragment_id >= fragment_count {
+            // fragment_id indexes a `received` vec of length fragment_count below;
+            // both fields are peer-supplied, so an out-of-range id would panic.
+            error!("Ignoring out-of-range UDP fragment for session {session_id}");
             continue;
         } else if fragment_count == 1 {
             (payload_fragment, remote_location)
@@ -715,6 +750,9 @@ async fn run_udp_local_to_remote_loop(
             }
         };
 
+        // send_socket is dual-stack IPv6, so an IPv4 target must be sent as an
+        // IPv4-mapped address (a bare v4 destination fails with EINVAL on macOS/BSD).
+        let socket_addr = crate::socket_util::dual_stack_dest(socket_addr);
         if let Err(e) = session
             .send_socket
             .send_to(&complete_payload, socket_addr)

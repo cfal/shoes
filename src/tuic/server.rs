@@ -8,6 +8,7 @@ use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use log::{debug, error};
 use lru::LruCache;
+use parking_lot::Mutex;
 use subtle::ConstantTimeEq;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UdpSocket;
@@ -50,6 +51,16 @@ const AUTH_TIMEOUT: Duration = Duration::from_secs(3);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 
 type UdpSessionMap = Arc<DashMap<u16, UdpSession>>;
+
+/// Connection-level UDP fragment reassembly cache, keyed by (assoc_id, packet_id).
+///
+/// TUIC carries one fragment per uni stream, and uni streams are handled by
+/// concurrent tasks, so the cache must be shared and synchronized rather than
+/// living on the stack of a single stream handler (a fresh per-stream cache could
+/// never reassemble a multi-fragment packet). Keying on both ids also prevents two
+/// associations that happen to pick the same 16-bit packet id from colliding. The
+/// mutex is only ever held across synchronous LRU operations, never an `.await`.
+type FragmentCache = Arc<Mutex<LruCache<(u16, u16), FragmentedPacket>>>;
 
 async fn process_connection(
     client_proxy_selector: Arc<ClientProxySelector>,
@@ -113,11 +124,18 @@ async fn process_connection(
     let bi_client_proxy_selector = client_proxy_selector.clone();
     let bi_resolver = resolver.clone();
 
+    // One fragment cache shared by the uni-stream tasks and the datagram loop, so a
+    // multi-fragment packet reassembles regardless of which relay mode carries it.
+    let fragments: FragmentCache = Arc::new(Mutex::new(LruCache::new(
+        NonZeroUsize::new(MAX_FRAGMENT_CACHE_SIZE).unwrap(),
+    )));
+
     let uni_connection = connection.clone();
     let uni_client_proxy_selector = client_proxy_selector.clone();
     let uni_resolver = resolver.clone();
     let uni_udp_session_map = udp_session_map.clone();
     let uni_cancel_token = cancel_token.clone();
+    let uni_fragments = fragments.clone();
 
     let datagram_connection = connection.clone();
     let datagram_cancel_token = cancel_token.clone();
@@ -133,6 +151,7 @@ async fn process_connection(
         uni_client_proxy_selector,
         uni_resolver,
         uni_udp_session_map,
+        uni_fragments,
         uni_cancel_token,
     );
 
@@ -141,6 +160,7 @@ async fn process_connection(
         client_proxy_selector,
         resolver,
         udp_session_map,
+        fragments,
         datagram_cancel_token,
     );
 
@@ -737,6 +757,7 @@ async fn run_unidirectional_loop(
     client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
     udp_session_map: UdpSessionMap,
+    fragments: FragmentCache,
     cancel_token: CancellationToken,
 ) -> std::io::Result<()> {
     // Spawn a cleanup task for UDP sessions that terminates when connection closes
@@ -785,6 +806,7 @@ async fn run_unidirectional_loop(
         let client_proxy_selector = client_proxy_selector.clone();
         let resolver = resolver.clone();
         let udp_session_map = udp_session_map.clone();
+        let fragments = fragments.clone();
         let cancel_token = cancel_token.clone();
         tokio::spawn(async move {
             // Per TUIC protocol, each uni stream carries exactly ONE command.
@@ -795,6 +817,7 @@ async fn run_unidirectional_loop(
                 resolver,
                 recv_stream,
                 udp_session_map,
+                fragments,
                 cancel_token,
             )
             .await
@@ -820,6 +843,7 @@ async fn process_uni_stream(
     resolver: Arc<dyn Resolver>,
     mut recv_stream: quinn::RecvStream,
     udp_session_map: UdpSessionMap,
+    fragments: FragmentCache,
     cancel_token: CancellationToken,
 ) -> std::io::Result<()> {
     let mut stream_reader = StreamReader::new_with_buffer_size(MAX_HEADER_LEN + 65535);
@@ -861,21 +885,14 @@ async fn process_uni_stream(
         .read_slice(&mut recv_stream, payload_size as usize)
         .await?;
 
-    // For uni stream packets, we need per-connection fragment reassembly.
-    // Since each stream is one packet, fragments come on separate streams.
-    // We use the connection-level udp_session_map for this.
-    // Note: Fragment reassembly for uni streams is handled at the session level.
-    // For simplicity, we only support non-fragmented packets on uni streams for now,
-    // or let process_udp_packet handle it with a temporary fragment cache.
-    let mut fragments: LruCache<u16, FragmentedPacket> =
-        LruCache::new(NonZeroUsize::new(MAX_FRAGMENT_CACHE_SIZE).unwrap());
-
+    // Fragments arrive on separate uni streams, so reassembly uses the shared
+    // connection-level cache rather than a per-stream one that could never complete.
     process_udp_packet(
         connection,
         &client_proxy_selector,
         &resolver,
         &udp_session_map,
-        &mut fragments,
+        &fragments,
         assoc_id,
         packet_id,
         frag_total,
@@ -896,7 +913,7 @@ async fn process_udp_packet(
     client_proxy_selector: &Arc<ClientProxySelector>,
     resolver: &Arc<dyn Resolver>,
     udp_session_map: &UdpSessionMap,
-    fragments: &mut LruCache<u16, FragmentedPacket>,
+    fragments: &FragmentCache,
     assoc_id: u16,
     packet_id: u16,
     frag_total: u8,
@@ -1031,6 +1048,9 @@ async fn process_udp_packet(
                 ))
             })?;
 
+        // send_socket is dual-stack IPv6, so an IPv4 target must be sent as an
+        // IPv4-mapped address (a bare v4 destination fails with EINVAL on macOS/BSD).
+        let socket_addr = crate::socket_util::dual_stack_dest(socket_addr);
         if let Err(e) = session
             .send_socket
             .send_to(payload_fragment, socket_addr)
@@ -1050,70 +1070,94 @@ async fn process_udp_packet(
             }
         }
     } else {
-        let is_new = !fragments.contains(&packet_id);
+        // Reassembly touches only the shared cache and is fully synchronous, so the
+        // lock is taken here and released before any `.await` below. The block yields
+        // the completed packet, or `None` while fragments are still outstanding.
+        let key = (assoc_id, packet_id);
+        let assembled: Option<(NetLocation, Vec<u8>)> = {
+            let mut cache = fragments.lock();
 
-        if is_new {
-            // Insert new fragmented packet entry
-            fragments.put(
-                packet_id,
-                FragmentedPacket {
-                    fragment_count: frag_total,
-                    fragment_received: 0,
-                    packet_len: 0,
-                    received: vec![None; frag_total as usize],
-                    remote_location: remote_location.clone(),
-                },
-            );
-        }
+            if !cache.contains(&key) {
+                // Insert new fragmented packet entry
+                cache.put(
+                    key,
+                    FragmentedPacket {
+                        fragment_count: frag_total,
+                        fragment_received: 0,
+                        packet_len: 0,
+                        received: vec![None; frag_total as usize],
+                        remote_location: remote_location.clone(),
+                    },
+                );
+            }
 
-        let packet = match fragments.get_mut(&packet_id) {
-            Some(p) => p,
-            None => {
-                // This shouldn't happen since we just inserted it
-                return Err(std::io::Error::other("Fragment cache error"));
+            let packet = match cache.get_mut(&key) {
+                Some(p) => p,
+                None => {
+                    // This shouldn't happen since we just inserted it
+                    return Err(std::io::Error::other("Fragment cache error"));
+                }
+            };
+
+            // The address rides only on the first fragment; adopt it whenever fragment 0
+            // arrives (which may be after a later fragment created the entry).
+            if frag_id == 0 && packet.remote_location.is_none() {
+                if remote_location.is_none() {
+                    cache.pop(&key);
+                    return Err(std::io::Error::other(format!(
+                        "Ignoring packet with empty first fragment address for session {assoc_id}"
+                    )));
+                }
+                packet.remote_location = remote_location.clone();
+            }
+
+            if packet.fragment_count != frag_total {
+                cache.pop(&key);
+                return Err(std::io::Error::other(format!(
+                    "Mismatched fragment count for session {assoc_id} packet {packet_id}"
+                )));
+            }
+            if packet.received[frag_id as usize].is_some() {
+                cache.pop(&key);
+                return Err(std::io::Error::other(format!(
+                    "Duplicate fragment for session {assoc_id} packet {packet_id}"
+                )));
+            }
+
+            packet.fragment_received += 1;
+            packet.packet_len += payload_fragment.len();
+            packet.received[frag_id as usize] = Some(payload_fragment.to_vec().into());
+
+            if packet.fragment_received != packet.fragment_count {
+                None
+            } else {
+                // All fragments received - remove from cache and assemble.
+                let FragmentedPacket {
+                    remote_location,
+                    received,
+                    packet_len,
+                    ..
+                } = cache.pop(&key).unwrap();
+                let remote_location = match remote_location {
+                    Some(loc) => loc,
+                    None => {
+                        return Err(std::io::Error::other(format!(
+                            "Reassembled packet for session {assoc_id} has no address"
+                        )));
+                    }
+                };
+                let mut complete_payload = Vec::with_capacity(packet_len);
+                for frag in received.iter() {
+                    complete_payload.extend_from_slice(frag.as_ref().unwrap());
+                }
+                Some((remote_location, complete_payload))
             }
         };
 
-        if is_new && frag_id == 0 && packet.remote_location.is_none() {
-            if remote_location.is_none() {
-                fragments.pop(&packet_id);
-                return Err(std::io::Error::other(format!(
-                    "Ignoring packet with empty first fragment address for session {assoc_id}"
-                )));
-            }
-            packet.remote_location = remote_location.clone();
-        }
-
-        if packet.fragment_count != frag_total {
-            fragments.pop(&packet_id);
-            return Err(std::io::Error::other(format!(
-                "Mismatched fragment count for session {assoc_id} packet {packet_id}"
-            )));
-        }
-        if packet.received[frag_id as usize].is_some() {
-            fragments.pop(&packet_id);
-            return Err(std::io::Error::other(format!(
-                "Duplicate fragment for session {assoc_id} packet {packet_id}"
-            )));
-        }
-
-        packet.fragment_received += 1;
-        packet.packet_len += payload_fragment.len();
-        packet.received[frag_id as usize] = Some(payload_fragment.to_vec().into());
-
-        if packet.fragment_received != packet.fragment_count {
-            return Ok(());
-        }
-
-        // All fragments received - remove from cache and process
-        let FragmentedPacket {
-            remote_location,
-            received,
-            packet_len,
-            ..
-        } = fragments.pop(&packet_id).unwrap();
-
-        let remote_location = remote_location.unwrap();
+        let (remote_location, complete_payload) = match assembled {
+            Some(assembled) => assembled,
+            None => return Ok(()),
+        };
 
         let (socket_addr, is_updated) = session
             .resolve_address(&remote_location, client_proxy_selector, resolver)
@@ -1124,11 +1168,9 @@ async fn process_udp_packet(
                 ))
             })?;
 
-        let mut complete_payload = Vec::with_capacity(packet_len);
-        for frag in received.iter() {
-            complete_payload.extend_from_slice(frag.as_ref().unwrap());
-        }
-
+        // send_socket is dual-stack IPv6, so an IPv4 target must be sent as an
+        // IPv4-mapped address (a bare v4 destination fails with EINVAL on macOS/BSD).
+        let socket_addr = crate::socket_util::dual_stack_dest(socket_addr);
         if let Err(e) = session
             .send_socket
             .send_to(&complete_payload, socket_addr)
@@ -1157,11 +1199,9 @@ async fn run_datagram_loop(
     client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
     udp_session_map: UdpSessionMap,
+    fragments: FragmentCache,
     cancel_token: CancellationToken,
 ) -> std::io::Result<()> {
-    // Use LRU cache for fragment reassembly to prevent unbounded memory growth.
-    let mut fragments: LruCache<u16, FragmentedPacket> =
-        LruCache::new(NonZeroUsize::new(MAX_FRAGMENT_CACHE_SIZE).unwrap());
     let mut last_cleanup = std::time::Instant::now();
 
     loop {
@@ -1270,6 +1310,14 @@ async fn run_datagram_loop(
             }
         };
 
+        // offset + payload_size is validated per address-type above for 0x00/0x01/0x02,
+        // but the 0xff (no-address) arm sets offset without a length check. Validate
+        // uniformly here so a peer cannot claim a payload_size past the datagram end.
+        if data_len < offset + payload_size {
+            return Err(std::io::Error::other(
+                "decode UDP message: payload larger than datagram",
+            ));
+        }
         let payload_fragment = &data[offset..offset + payload_size];
 
         if let Err(e) = process_udp_packet(
@@ -1277,7 +1325,7 @@ async fn run_datagram_loop(
             &client_proxy_selector,
             &resolver,
             &udp_session_map,
-            &mut fragments,
+            &fragments,
             assoc_id,
             packet_id,
             frag_total,

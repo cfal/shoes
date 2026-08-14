@@ -75,6 +75,23 @@ fn get_unspecified_socket_addr(is_ipv6: bool) -> SocketAddr {
     }
 }
 
+/// Rewrite an IPv4 destination as an IPv4-mapped IPv6 address so it can be sent
+/// from a dual-stack (`AF_INET6`) socket.
+///
+/// [`new_udp_socket`] with `is_ipv6 = true` returns a dual-stack socket so that
+/// one socket can reach both address families. On Linux `send_to` a bare IPv4
+/// address on such a socket is accepted, but on macOS/BSD it fails with
+/// `EINVAL` — the kernel requires the destination to be given as an IPv4-mapped
+/// IPv6 address (`::ffff:a.b.c.d`). Apply this at every UDP send that targets a
+/// socket built as dual-stack; IPv6 destinations pass through unchanged.
+#[inline]
+pub fn dual_stack_dest(addr: SocketAddr) -> SocketAddr {
+    match addr {
+        SocketAddr::V4(v4) => SocketAddr::new(IpAddr::V6(v4.ip().to_ipv6_mapped()), v4.port()),
+        SocketAddr::V6(_) => addr,
+    }
+}
+
 pub fn new_socket2_udp_socket(
     is_ipv6: bool,
     bind_interface: Option<String>,
