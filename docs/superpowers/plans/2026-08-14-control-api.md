@@ -13,6 +13,7 @@
 - **Feature is non-default:** `control-api` MUST NOT be in `default`. Mobile/FFI builds never pass it.
 - **No heavy new deps:** only `serde_json` may be added (feature-gated). Reuse `hyper`, `hyper-util`, `tokio`, `serde`, `dashmap`, `subtle`, `parking_lot`, `rustls`.
 - **Feature-off must compile to nothing on the hot path:** every registry/counting call site outside `src/api/` goes through a shim whose methods are `#[inline]` no-ops when the feature is off. No `#[cfg]` blocks scattered through `tcp_server.rs`.
+- **Hot path touches only per-connection atomics:** the per-poll path bumps only a connection's own (uncontended) `up`/`down` atomics. Global metrics counters are updated once per connection (in `register`/`Drop`), never per poll, so there is no shared cache-line contention across connections. Event and log broadcast sends are guarded by `receiver_count() > 0` so an idle (no panel watching) server pays only an atomic load.
 - **Auth on every endpoint:** constant-time bearer-token compare via `subtle`. Default bind `127.0.0.1`.
 - **shoes stays stateless:** no persistence, no history, no users. Live state + event stream only.
 - **Lint gate:** `cargo clippy --locked --features control-api -- -D warnings` and `cargo fmt --all -- --check` must pass. Run clippy, not just `cargo test`.
@@ -161,6 +162,24 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for CountingStream<S> {
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.inner).poll_shutdown(cx)
     }
+
+    // Forward vectored writes so wrapping the stream never silently disables a
+    // vectored fast path the inner stream supports.
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        let r = Pin::new(&mut self.inner).poll_write_vectored(cx, bufs);
+        if let Poll::Ready(Ok(n)) = &r {
+            self.down.fetch_add(*n as u64, Ordering::Relaxed);
+        }
+        r
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
 }
 
 impl<S: AsyncPing + Unpin> AsyncPing for CountingStream<S> {
@@ -205,8 +224,16 @@ git commit -m "feat(api): CountingStream wrapper for per-connection byte account
   - `ConnectionHandle::set_target(&self, target: String)` — no-op in shim.
   - `pub fn snapshot() -> Vec<ConnectionSnapshot>` — empty in shim.
   - `pub fn subscribe_events() -> tokio::sync::broadcast::Receiver<ConnectionEvent>` (feature on only; used by `src/api`).
+  - `pub fn metrics_counters() -> MetricsCounters` (feature on only) — O(1) read of the global counters, used by `/api/metrics`.
+  - `MetricsCounters { active_connections: u64, total_connections: u64, total_up_bytes: u64, total_down_bytes: u64 }`.
   - `ConnectionSnapshot { id: u64, inbound: &'static str, protocol: String, client_addr: SocketAddr, target: Option<String>, started_unix: u64, up_bytes: u64, down_bytes: u64 }` — serde `Serialize`.
   - `ConnectionEvent { Open(ConnectionSnapshot), Close { id: u64, up_bytes: u64, down_bytes: u64, ended_unix: u64 } }`.
+
+**Test note:** the registry and its counters are process-global, so registry
+tests must not assert absolute counts under the default parallel test runner.
+Serialize them behind a shared `Mutex` guard (as `socket_util`'s
+`protection_tests::serialise()` does) and assert on a specific entry's fields /
+relative deltas, not `snapshot().len()`.
 
 - [ ] **Step 1: Write the failing test (feature-on behavior)**
 
@@ -214,23 +241,27 @@ Add to the `tests` module:
 ```rust
 #[test]
 fn register_deregister_and_snapshot() {
+    // Registry state is process-global; use a unique client_addr so this test
+    // matches only its own entry regardless of other tests running in parallel,
+    // and assert on that entry rather than on absolute counts.
     let addr: SocketAddr = "127.0.0.1:5555".parse().unwrap();
-    assert_eq!(snapshot().len(), 0);
     let handle = register(addr, "socks");
     handle.set_target("example.com:443".to_string());
     let (up, down) = handle.counters();
     up.fetch_add(10, Ordering::Relaxed);
     down.fetch_add(20, Ordering::Relaxed);
 
-    let snap = snapshot();
-    assert_eq!(snap.len(), 1);
-    assert_eq!(snap[0].inbound, "socks");
-    assert_eq!(snap[0].target.as_deref(), Some("example.com:443"));
-    assert_eq!(snap[0].up_bytes, 10);
-    assert_eq!(snap[0].down_bytes, 20);
+    let mine = snapshot()
+        .into_iter()
+        .find(|c| c.client_addr == addr)
+        .expect("our connection should be in the snapshot");
+    assert_eq!(mine.inbound, "socks");
+    assert_eq!(mine.target.as_deref(), Some("example.com:443"));
+    assert_eq!(mine.up_bytes, 10);
+    assert_eq!(mine.down_bytes, 20);
 
     drop(handle);
-    assert_eq!(snapshot().len(), 0);
+    assert!(snapshot().into_iter().all(|c| c.client_addr != addr));
 }
 ```
 
@@ -255,6 +286,32 @@ mod imp {
 
     static EPOCH: LazyLock<std::time::Instant> = LazyLock::new(std::time::Instant::now);
     static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+    // Global counters for O(1) /metrics. These are updated per connection (in
+    // register / Drop), NEVER per poll — the per-poll hot path touches only a
+    // connection's own uncontended atomics, so there is no shared-cache-line
+    // contention across connections. Byte totals are monotonic counters folded
+    // in when a connection closes (standard Prometheus counter semantics).
+    static ACTIVE_CONNECTIONS: AtomicU64 = AtomicU64::new(0);
+    static TOTAL_CONNECTIONS: AtomicU64 = AtomicU64::new(0);
+    static TOTAL_UP_BYTES: AtomicU64 = AtomicU64::new(0);
+    static TOTAL_DOWN_BYTES: AtomicU64 = AtomicU64::new(0);
+
+    pub struct MetricsCounters {
+        pub active_connections: u64,
+        pub total_connections: u64,
+        pub total_up_bytes: u64,
+        pub total_down_bytes: u64,
+    }
+
+    pub fn metrics_counters() -> MetricsCounters {
+        MetricsCounters {
+            active_connections: ACTIVE_CONNECTIONS.load(Ordering::Relaxed),
+            total_connections: TOTAL_CONNECTIONS.load(Ordering::Relaxed),
+            total_up_bytes: TOTAL_UP_BYTES.load(Ordering::Relaxed),
+            total_down_bytes: TOTAL_DOWN_BYTES.load(Ordering::Relaxed),
+        }
+    }
 
     fn unix_now() -> u64 {
         std::time::SystemTime::UNIX_EPOCH
@@ -320,7 +377,13 @@ mod imp {
             target: parking_lot::Mutex::new(None),
         });
         REGISTRY.entries.insert(id, entry.clone());
-        let _ = REGISTRY.events.send(ConnectionEvent::Open(entry_snapshot(id, &entry)));
+        ACTIVE_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
+        TOTAL_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
+        // Only build + send the event if a panel is actually streaming; otherwise
+        // a connection open costs just the receiver_count() atomic load.
+        if REGISTRY.events.receiver_count() > 0 {
+            let _ = REGISTRY.events.send(ConnectionEvent::Open(entry_snapshot(id, &entry)));
+        }
         ConnectionHandle { id, entry }
     }
 
@@ -352,12 +415,20 @@ mod imp {
     impl Drop for ConnectionHandle {
         fn drop(&mut self) {
             REGISTRY.entries.remove(&self.id);
-            let _ = REGISTRY.events.send(ConnectionEvent::Close {
-                id: self.id,
-                up_bytes: self.entry.up.load(Ordering::Relaxed),
-                down_bytes: self.entry.down.load(Ordering::Relaxed),
-                ended_unix: unix_now(),
-            });
+            let up = self.entry.up.load(Ordering::Relaxed);
+            let down = self.entry.down.load(Ordering::Relaxed);
+            // Fold this connection's totals into the global counters once, here.
+            ACTIVE_CONNECTIONS.fetch_sub(1, Ordering::Relaxed);
+            TOTAL_UP_BYTES.fetch_add(up, Ordering::Relaxed);
+            TOTAL_DOWN_BYTES.fetch_add(down, Ordering::Relaxed);
+            if REGISTRY.events.receiver_count() > 0 {
+                let _ = REGISTRY.events.send(ConnectionEvent::Close {
+                    id: self.id,
+                    up_bytes: up,
+                    down_bytes: down,
+                    ended_unix: unix_now(),
+                });
+            }
         }
     }
 
@@ -376,7 +447,8 @@ mod imp {
 
 #[cfg(feature = "control-api")]
 pub use imp::{
-    ConnectionEvent, ConnectionHandle, ConnectionSnapshot, register, snapshot, subscribe_events,
+    ConnectionEvent, ConnectionHandle, ConnectionSnapshot, MetricsCounters, metrics_counters,
+    register, snapshot, subscribe_events,
 };
 ```
 
@@ -841,14 +913,16 @@ pub fn connections(_state: &ApiState) -> Response<Full<Bytes>> {
 }
 
 pub fn metrics(_state: &ApiState) -> Response<Full<Bytes>> {
-    let snap = crate::connection_registry::snapshot();
-    let active = snap.len();
-    let up: u64 = snap.iter().map(|c| c.up_bytes).sum();
-    let down: u64 = snap.iter().map(|c| c.down_bytes).sum();
+    // O(1): read the global counters, do NOT scan the connection map. Byte
+    // totals are cumulative over closed connections (a still-open connection's
+    // bytes are attributed when it closes), which is correct counter semantics.
+    let m = crate::connection_registry::metrics_counters();
     let body = format!(
-        "# TYPE shoes_connections_active gauge\nshoes_connections_active {active}\n\
-         # TYPE shoes_active_up_bytes gauge\nshoes_active_up_bytes {up}\n\
-         # TYPE shoes_active_down_bytes gauge\nshoes_active_down_bytes {down}\n"
+        "# TYPE shoes_connections_active gauge\nshoes_connections_active {}\n\
+         # TYPE shoes_connections_total counter\nshoes_connections_total {}\n\
+         # TYPE shoes_up_bytes_total counter\nshoes_up_bytes_total {}\n\
+         # TYPE shoes_down_bytes_total counter\nshoes_down_bytes_total {}\n",
+        m.active_connections, m.total_connections, m.total_up_bytes, m.total_down_bytes,
     );
     Response::builder()
         .status(StatusCode::OK)
@@ -1002,7 +1076,11 @@ impl BroadcastLogWriter {
             }
             ring.push_back(line.to_string());
         }
-        let _ = SHARED.tx.send(line.to_string());
+        // Only pay for the broadcast (and its second allocation) when a panel is
+        // actually streaming logs; otherwise this is just the ring push above.
+        if SHARED.tx.receiver_count() > 0 {
+            let _ = SHARED.tx.send(line.to_string());
+        }
     }
 }
 

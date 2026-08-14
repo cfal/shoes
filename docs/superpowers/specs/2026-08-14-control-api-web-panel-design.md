@@ -123,13 +123,30 @@ once the handler resolves them (the registry entry is updated in place via the
 shared `Arc`).
 
 **Counting.** `CountingStream<S: AsyncStream>` wraps the client stream and bumps
-`up`/`down` `AtomicU64`s on each `poll_read`/`poll_write`. Applied once at the
-edge, it is protocol-agnostic and covers every downstream copy path
-(`copy_bidirectional`, the UDP message copy, splice) without touching them.
+per-connection `up`/`down` `AtomicU64`s on each `poll_read`/`poll_write` — once
+per poll (not per byte), and the atomics are owned by that connection alone, so
+they are uncontended. Applied once at the edge, it is protocol-agnostic and
+covers every downstream copy path (`copy_bidirectional`, the UDP message copy)
+without touching them. It also forwards `poll_write_vectored`/`is_write_vectored`
+so it never silently disables a vectored-write fast path.
 
-**Metrics/events.** `/connections` snapshots the map. `/metrics` sums active
-connections and bytes plus process-lifetime cumulative counters. `open`/`close`
-push onto the events broadcast channel; a timer pushes metric ticks.
+**Metrics/events.** `/connections` snapshots the map (O(active connections);
+scraped rarely). `/metrics` is served from a handful of **global `AtomicU64`
+counters** so a Prometheus scrape is O(1), not a full map scan:
+- `active_connections` (gauge): +1 in `register`, -1 in `Drop`.
+- `total_connections` (counter): +1 in `register`.
+- `total_up_bytes` / `total_down_bytes` (counters): a connection's final byte
+  totals are folded into these **once, in `Drop`** — never per poll, so the hot
+  path never touches a shared counter and there is no cross-connection
+  contention. Standard monotonic-counter semantics: in-flight bytes of a still-open
+  connection are attributed when it closes.
+
+The per-poll hot path touches only the connection's own (uncontended) atomics.
+`open`/`close` push onto the events broadcast channel; a timer pushes metric
+ticks. Both the event send and the log send (below) are **guarded by
+`receiver_count() > 0`**, so when no panel is watching — the common case — a
+connection open/close or a log line costs only an atomic load and a skip, not a
+channel write.
 
 **Known limits (documented, not fixed in v1):**
 - Byte counts are **client-edge, client-perspective**: `up` = bytes read from the
@@ -140,13 +157,30 @@ push onto the events broadcast channel; a timer pushes metric ticks.
   counting wrapper in v1 (they may register with approximate/no byte counts). This
   is a follow-up.
 
+## Performance cost
+
+- **Data path:** one relaxed, uncontended `fetch_add` per `poll_read`/`poll_write`
+  — i.e. per ~16 KB copy-buffer fill, not per byte — plus the wrapper's own
+  branch. Well under 1% of throughput; the atomic is a rounding error next to the
+  memcpy beside it. No new dynamic dispatch (the accepted stream is already
+  `Box<dyn AsyncStream>`), and the wrapper sits below TLS/protocol layers.
+- **Per connection:** one `Arc` alloc + a `DashMap` insert/remove + count-atomic
+  updates + (only if watched) two event sends. Microseconds against a
+  handshake-dominated connection lifecycle. Memory ~100 B/connection.
+- **Per scrape:** `/metrics` is O(1) (global atomics). `/connections` is O(active
+  connections) but scraped rarely.
+- **Feature off:** compiles to nothing (ZST handle, identity `counted`, inlined
+  no-ops); mobile artifacts byte-for-byte unchanged.
+
 ## Logs
 
 Add `BroadcastLogWriter` (in `api/logsink.rs`, feature-gated) implementing the
-existing `logging::LogWriter` trait: each record is formatted, pushed into a
-bounded ring buffer (recent-N), and sent on a `tokio::sync::broadcast` channel.
-`logging.rs` stays untouched — because `init_multi_logger` already takes
-`Vec<Box<dyn LogWriter>>`, `main.rs` (itself feature-gated at this point)
+existing `logging::LogWriter` trait: each record is formatted, always pushed into
+a bounded ring buffer (recent-N) for replay, and — **only when
+`receiver_count() > 0`** — sent on a `tokio::sync::broadcast` channel, so with no
+panel streaming logs a record costs the ring push plus an atomic load, not a
+channel write. `logging.rs` stays untouched — because `init_multi_logger` already
+takes `Vec<Box<dyn LogWriter>>`, `main.rs` (itself feature-gated at this point)
 constructs the `BroadcastLogWriter` and includes it in the writers vec alongside
 the existing stderr/file writers when the feature and a `control_api` section are
 both present. `/api/logs` replays the ring buffer to
