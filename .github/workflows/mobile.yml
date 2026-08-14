@@ -175,5 +175,10 @@ jobs:
           files: |
             artifacts/Shoes.xcframework.zip
             artifacts/shoes-android/shoes-release.aar
-          draft: true
+          # Published, not a draft, matching build.yml. This job and build.yml's
+          # release both target the same tag; softprops/action-gh-release is
+          # idempotent per tag, so whichever runs first creates the release and
+          # the other appends its artifacts. Release notes are generated once, by
+          # build.yml, so this leaves generate_release_notes off.
+          draft: false
           generate_release_notes: false

@@ -193,5 +193,7 @@ jobs:
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: release-artifacts/*
-          draft: true
+          # Published, not a draft: a tag push should produce a visible release
+          # with the artifacts attached, not one that waits for a manual click.
+          draft: false
           generate_release_notes: true
