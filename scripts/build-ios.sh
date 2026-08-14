@@ -52,6 +52,20 @@ echo "==> Copying libraries"
 cp "target/aarch64-apple-ios/$PROFILE_DIR/$LIB_NAME"     "$OUTPUT_DIR/device/$LIB_NAME"
 cp "target/aarch64-apple-ios-sim/$PROFILE_DIR/$LIB_NAME" "$OUTPUT_DIR/sim/$LIB_NAME"
 
+# cargo's `strip = true` (release profile) applies to linked binaries, not to a
+# staticlib, so the .a keeps every object file's debug and local symbols and
+# ends up very large (~180MB). -S drops debug symbols and -x drops local
+# (non-global) symbols; the global symbols the linker needs to resolve the FFI
+# surface are preserved, so the framework still links. ranlib rebuilds the
+# archive's symbol table afterwards.
+echo "==> Stripping symbols from the static libraries"
+for lib in "$OUTPUT_DIR/device/$LIB_NAME" "$OUTPUT_DIR/sim/$LIB_NAME"; do
+    before=$(du -h "$lib" | cut -f1)
+    strip -S -x "$lib"
+    ranlib "$lib" >/dev/null 2>&1 || true
+    echo "  $(basename "$(dirname "$lib")")/$LIB_NAME: $before -> $(du -h "$lib" | cut -f1)"
+done
+
 echo "==> Packaging as XCFramework"
 xcodebuild -create-xcframework \
     -library "$OUTPUT_DIR/device/$LIB_NAME" \

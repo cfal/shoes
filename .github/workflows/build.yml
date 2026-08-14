@@ -27,33 +27,41 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Linux builds (using cross for cross-compilation)
+          # Linux builds (using cross for cross-compilation).
+          # asset_name is the friendly name used for the release download; the
+          # target triple (with its "unknown" vendor) is still what we build.
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             use_cross: false
             binary_name: shoes
+            asset_name: linux-x86_64
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
             use_cross: true
             binary_name: shoes
+            asset_name: linux-x86_64-musl
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
             use_cross: true
             binary_name: shoes
+            asset_name: linux-arm64
           - target: aarch64-unknown-linux-musl
             os: ubuntu-latest
             use_cross: true
             binary_name: shoes
+            asset_name: linux-arm64-musl
 
           # macOS builds (native compilation)
           - target: x86_64-apple-darwin
             os: macos-latest
             use_cross: false
             binary_name: shoes
+            asset_name: macos-x86_64
           - target: aarch64-apple-darwin
             os: macos-latest
             use_cross: false
             binary_name: shoes
+            asset_name: macos-arm64
 
           # Windows builds
           # TODO: enable when working
@@ -61,10 +69,12 @@ jobs:
           #   os: windows-latest
           #   use_cross: false
           #   binary_name: shoes.exe
+          #   asset_name: windows-x86_64
           # - target: aarch64-pc-windows-msvc
           #   os: windows-latest
           #   use_cross: false
           #   binary_name: shoes.exe
+          #   asset_name: windows-arm64
 
     steps:
       - uses: actions/checkout@v4
@@ -155,7 +165,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p artifacts
-          tarball="${{ github.event.repository.name }}-${{ matrix.target }}.tar.gz"
+          tarball="${{ github.event.repository.name }}-${{ matrix.asset_name }}.tar.gz"
           tar -czf "artifacts/$tarball" \
             -C "target/${{ matrix.target }}/release" "${{ matrix.binary_name }}"
           ls -la "artifacts/$tarball"
@@ -163,7 +173,7 @@ jobs:
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ github.event.repository.name }}-${{ matrix.target }}
+          name: ${{ github.event.repository.name }}-${{ matrix.asset_name }}
           path: artifacts/*.tar.gz
           if-no-files-found: error
 
