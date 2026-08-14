@@ -29,9 +29,11 @@ use tokio::task::JoinHandle;
 /// Timeout for control frame writes (matches reference implementation)
 const CONTROL_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Maximum lifetime for a single stream handler (5 minutes)
-/// Prevents memory leaks from hung streams (slow DNS, stuck connections, etc.)
-const STREAM_HANDLER_TIMEOUT: Duration = Duration::from_secs(300);
+/// Time budget for a stream's setup phase: reading the destination the client
+/// wants and connecting to it. This bounds a stream that is opened but never
+/// driven (e.g. the client never sends a destination) without capping the
+/// lifetime of the bidirectional copy that follows a successful setup.
+const STREAM_SETUP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// AnyTLS Session manages multiplexed streams over a connection
 pub struct AnyTlsSession {
@@ -401,27 +403,16 @@ impl AnyTlsSession {
                     let session_for_cleanup = Arc::clone(self);
 
                     let handle = tokio::spawn(async move {
-                        // Apply timeout to entire stream handler lifetime
-                        // This prevents memory leaks from hung streams
-                        let result = tokio::time::timeout(
-                            STREAM_HANDLER_TIMEOUT,
-                            session.handle_new_stream(stream),
-                        )
-                        .await;
-
-                        match result {
-                            Ok(Ok(())) => {
+                        // The setup phase is bounded inside handle_new_stream (see
+                        // STREAM_SETUP_TIMEOUT); the copy that follows must NOT be
+                        // time-limited, or every long-lived connection (a download, SSH,
+                        // a stream) would be severed once it hit the limit.
+                        match session.handle_new_stream(stream).await {
+                            Ok(()) => {
                                 log::trace!("AnyTLS stream {} completed", stream_id_for_cleanup);
                             }
-                            Ok(Err(e)) => {
+                            Err(e) => {
                                 log::debug!("AnyTLS stream {} error: {}", stream_id_for_cleanup, e);
-                            }
-                            Err(_) => {
-                                log::warn!(
-                                    "AnyTLS stream {} timed out after {:?}",
-                                    stream_id_for_cleanup,
-                                    STREAM_HANDLER_TIMEOUT
-                                );
                             }
                         }
 
@@ -728,8 +719,18 @@ impl AnyTlsSession {
     async fn handle_new_stream(&self, mut stream: AnyTlsStream) -> io::Result<()> {
         let stream_id = stream.id();
 
-        // Read destination address (SOCKS5 address format)
-        let destination = read_location_direct(&mut stream).await?;
+        // Read destination address (SOCKS5 address format). Bounded: a stream that
+        // is opened but never tells us where to connect must not pin a task and a
+        // stream slot forever. The copy that follows is deliberately not bounded.
+        let destination =
+            tokio::time::timeout(STREAM_SETUP_TIMEOUT, read_location_direct(&mut stream))
+                .await
+                .map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "timed out reading AnyTLS stream destination",
+                    )
+                })??;
 
         log::debug!(
             "AnyTLS stream {} (user: {}) -> {}",

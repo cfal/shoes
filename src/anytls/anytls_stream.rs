@@ -157,13 +157,11 @@ impl AsyncRead for AnyTlsStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        // Check if stream/session is closed
-        if self.stream_closed {
-            return Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "stream closed",
-            )));
-        }
+        // Note: `stream_closed` marks that we have shut down our *write* half (sent
+        // FIN). It must not fail reads, or a half-close - which copy_bidirectional
+        // performs when one direction reaches EOF - would sever the still-live read
+        // direction and truncate in-flight data. The read half ends on its own EOF
+        // (peer FIN or the session dropping our data channel), handled below.
 
         // Check EOF with empty buffer
         let remaining_in_buffer = self.read_buffer.len() - self.read_offset;

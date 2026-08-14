@@ -506,11 +506,20 @@ impl AnyTlsClientSession {
 
                 if session.is_closed.load(Ordering::Relaxed) {
                     log::debug!("AnyTLS client reader loop: session closed, exiting");
+                    session.close().await;
                     return Ok(());
                 }
 
                 // Decode any frames already in buffer
-                while let Some(frame) = FrameCodec::decode(&mut buffer)? {
+                loop {
+                    let frame = match FrameCodec::decode(&mut buffer) {
+                        Ok(Some(frame)) => frame,
+                        Ok(None) => break,
+                        Err(e) => {
+                            session.close().await;
+                            return Err(e);
+                        }
+                    };
                     log::debug!(
                         "AnyTLS client received frame: {:?} stream={} len={}",
                         frame.cmd,
@@ -519,6 +528,7 @@ impl AnyTlsClientSession {
                     );
                     if let Err(e) = session.handle_frame(frame).await {
                         log::warn!("AnyTLS client error handling frame: {}", e);
+                        session.close().await;
                         return Err(e);
                     }
                 }
@@ -541,19 +551,44 @@ impl AnyTlsClientSession {
                 }
             };
 
-            let n = read_result?;
+            let n = match read_result {
+                Ok(n) => n,
+                Err(e) => {
+                    if let Some(session) = session_weak.upgrade() {
+                        session.close().await;
+                    }
+                    return Err(e);
+                }
+            };
             if n == 0 {
                 log::debug!("AnyTLS client reader loop: connection closed (EOF)");
-                // Once reader gets EOF from upstream, TLS connection is dead.
-                // Re-upgrade to signal writer loop
+                // Once reader gets EOF from upstream, the TLS connection is dead.
+                // Release every stream and pending open so blocked readers see EOF
+                // rather than parking on the keepalive cycle forever.
                 if let Some(session) = session_weak.upgrade() {
-                    session.is_closed.store(true, Ordering::Relaxed);
-                    session.close_notify.notify_waiters();
+                    session.close().await;
                 }
                 return Ok(()); // Connection closed
             }
             log::debug!("AnyTLS client reader: read {} bytes", n);
         }
+    }
+
+    /// Tear the session down and release everything that could keep a stream or
+    /// a pending open blocked.
+    ///
+    /// A stream holds a strong reference to the session (keepalive) while the
+    /// session's `streams` map holds that stream's data sender, so the map is
+    /// never dropped on its own while any stream is alive. When the transport
+    /// dies we must therefore clear it explicitly: dropping each `data_tx` makes
+    /// the corresponding reader observe EOF instead of parking forever, and
+    /// dropping the pending-open oneshots makes `open_stream` fail fast rather
+    /// than wait out its timeout.
+    async fn close(&self) {
+        self.is_closed.store(true, Ordering::Relaxed);
+        self.close_notify.notify_waiters();
+        self.streams.write().await.clear();
+        self.pending_opens.lock().await.clear();
     }
 
     /// Handle a received frame
