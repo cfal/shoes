@@ -183,7 +183,13 @@ async fn process_connection(
 
 /// Sends periodic heartbeat datagrams to the client to maintain connection liveness.
 /// Per sing-box reference implementation (service.go:366-380).
-/// Returns an error if heartbeat fails, which will cause the connection to close.
+///
+/// A failed send just stops the heartbeat; it must not close the connection.
+/// The TUIC spec defines heartbeats as client-only, so a peer that negotiated
+/// `max_datagram_frame_size = 0` (datagrams disabled) rejects every send here.
+/// Propagating that into the connection's `try_join!` would tear down an
+/// otherwise healthy connection roughly one interval in. QUIC's own keep-alive
+/// and the real stream/datagram loops carry liveness regardless.
 async fn run_heartbeat_loop(
     connection: quinn::Connection,
     cancel_token: CancellationToken,
@@ -201,8 +207,8 @@ async fn run_heartbeat_loop(
                 // Send heartbeat datagram: [version, command_heartbeat]
                 let heartbeat = bytes::Bytes::from_static(&[5, COMMAND_TYPE_HEARTBEAT]);
                 if let Err(e) = connection.send_datagram(heartbeat) {
-                    // Per sing-box reference, heartbeat failure should close the connection
-                    return Err(std::io::Error::other(format!("heartbeat failed: {e}")));
+                    debug!("TUIC heartbeat send failed, stopping heartbeat: {e}");
+                    return Ok(());
                 }
             }
         }

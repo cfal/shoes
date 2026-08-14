@@ -143,7 +143,18 @@ async fn decapsulate_loop(
         let n = match udp.recv(&mut buf).await {
             Ok(n) => n,
             Err(e) => {
-                error!("AmneziaWG UDP recv error: {}", e);
+                // A connected UDP socket reports ICMP port-unreachable (e.g. the
+                // peer restarting) as ECONNREFUSED, and a stale mapping as
+                // ECONNRESET. The socket is still usable, so keep listening rather
+                // than killing inbound for the rest of the process's life.
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::ConnectionReset
+                ) {
+                    debug!("AmneziaWG UDP recv transient error, continuing: {}", e);
+                    continue;
+                }
+                error!("AmneziaWG UDP recv error, stopping decapsulate loop: {}", e);
                 break;
             }
         };

@@ -97,6 +97,13 @@ impl SnellServerHandler {
 const TCP_TUNNEL_RESPONSE: &[u8] = &[0x0];
 const UDP_READY_RESPONSE: &[u8] = TCP_TUNNEL_RESPONSE;
 
+/// Snell uses a 16-byte AEAD salt for every cipher, unlike Shadowsocks where the
+/// salt matches the key length. Reusing the Shadowsocks cipher's `salt_len()`
+/// would read a 32-byte salt for chacha20-ietf-poly1305 - Snell's v1 default
+/// cipher - so the handshake never decrypts against a real Snell peer. Both
+/// open-snell and mihomo hardcode `SaltSize() == 16` regardless of cipher.
+const SNELL_SALT_LEN: usize = 16;
+
 #[async_trait]
 impl TcpServerHandler for SnellServerHandler {
     async fn setup_server_stream(
@@ -107,7 +114,7 @@ impl TcpServerHandler for SnellServerHandler {
             server_stream,
             ShadowsocksStreamType::Aead,
             self.cipher.algorithm(),
-            self.cipher.salt_len(),
+            SNELL_SALT_LEN,
             self.key.clone(),
             None,
         );
@@ -269,7 +276,7 @@ impl TcpClientHandler for SnellClientHandler {
             client_stream,
             ShadowsocksStreamType::Aead,
             self.cipher.algorithm(),
-            self.cipher.salt_len(),
+            SNELL_SALT_LEN,
             self.key.clone(),
             None,
         ));
@@ -338,7 +345,7 @@ impl TcpClientHandler for SnellClientHandler {
             client_stream,
             ShadowsocksStreamType::Aead,
             self.cipher.algorithm(),
-            self.cipher.salt_len(),
+            SNELL_SALT_LEN,
             self.key.clone(),
             None,
         );
@@ -378,5 +385,105 @@ impl TcpClientHandler for SnellClientHandler {
             SnellFixedTargetStream::new(snell_udp_client_stream, target.into_location());
 
         Ok(Box::new(fixed_target_stream))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::quic_outbound::testing::{direct_selector, test_resolver};
+
+    /// Drive shoes' own Snell client against its own server over loopback for the
+    /// given cipher, and return the payload the server read back. This is the only
+    /// end-to-end coverage of the Snell handshake; in particular it exercises the
+    /// 16-byte salt against chacha20-ietf-poly1305 (whose key is 32 bytes), the
+    /// combination the salt-length fix is about.
+    async fn round_trip(cipher_name: &str, payload: &[u8]) -> std::io::Result<Vec<u8>> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+
+        let target = NetLocation::from_str("1.2.3.4:80", None).unwrap();
+        let sent = payload.to_vec();
+        let cipher_name = cipher_name.to_string();
+        let client_cipher_name = cipher_name.clone();
+        let client = tokio::spawn(async move {
+            let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let cipher = ShadowsocksCipher::try_from(client_cipher_name.as_str()).unwrap();
+            let handler = SnellClientHandler::new(cipher, "test-password", false);
+            let mut stream = handler
+                .setup_client_tcp_stream(Box::new(tcp), target.into())
+                .await?
+                .client_stream;
+            stream.write_all(&sent).await?;
+            stream.flush().await?;
+            // Held open: a shutdown would race the server's read below.
+            std::future::pending::<()>().await;
+            Ok::<_, std::io::Error>(())
+        });
+
+        let (server_tcp, _) = listener.accept().await?;
+        let resolver = test_resolver();
+        let cipher = ShadowsocksCipher::try_from(cipher_name.as_str()).unwrap();
+        let server = SnellServerHandler::new(
+            cipher,
+            "test-password",
+            false,
+            direct_selector(resolver.clone()),
+            resolver,
+        );
+
+        let (mut server_stream, success_response, initial) =
+            match server.setup_server_stream(Box::new(server_tcp)).await? {
+                TcpServerSetupResult::TcpForward {
+                    stream,
+                    connection_success_response,
+                    initial_remote_data,
+                    ..
+                } => (stream, connection_success_response, initial_remote_data),
+                _ => return Err(std::io::Error::other("expected a TCP forward")),
+            };
+
+        // The caller is responsible for writing the tunnel-ready response; the
+        // client's setup blocks reading it before it will send any payload.
+        if let Some(response) = success_response {
+            server_stream.write_all(&response).await?;
+            server_stream.flush().await?;
+        }
+
+        let mut received = Vec::with_capacity(payload.len());
+        if let Some(data) = initial {
+            received.extend_from_slice(&data);
+        }
+        let mut buf = vec![0u8; 4096];
+        while received.len() < payload.len() {
+            let n = server_stream.read(&mut buf).await?;
+            assert!(
+                n > 0,
+                "unexpected EOF at {} of {} bytes",
+                received.len(),
+                payload.len()
+            );
+            received.extend_from_slice(&buf[..n]);
+        }
+
+        client.abort();
+        Ok(received)
+    }
+
+    #[tokio::test]
+    async fn test_chacha20_round_trips_with_a_16_byte_salt() {
+        let payload = b"snell over chacha20-ietf-poly1305 ".repeat(200);
+        assert_eq!(
+            round_trip("chacha20-ietf-poly1305", &payload)
+                .await
+                .unwrap(),
+            payload
+        );
+    }
+
+    #[tokio::test]
+    async fn test_aes_128_gcm_round_trips() {
+        let payload = b"snell over aes-128-gcm ".repeat(200);
+        assert_eq!(round_trip("aes-128-gcm", &payload).await.unwrap(), payload);
     }
 }
