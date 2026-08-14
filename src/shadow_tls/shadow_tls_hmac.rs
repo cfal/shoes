@@ -28,3 +28,14 @@ impl ShadowTlsHmac {
         out
     }
 }
+
+/// Constant-time comparison of two Shadow-TLS HMAC tags.
+///
+/// The tags authenticate the peer, so a data-dependent (short-circuiting)
+/// comparison would leak, through timing, how many leading bytes matched -
+/// enough to forge a tag byte by byte and defeat the anti-probing check.
+#[inline]
+pub fn tags_equal(a: &[u8], b: &[u8]) -> bool {
+    use subtle::ConstantTimeEq;
+    a.ct_eq(b).into()
+}

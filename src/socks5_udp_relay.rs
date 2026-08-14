@@ -188,8 +188,12 @@ pub fn encode_socks5_udp_packet(source: &NetLocation, payload: &[u8]) -> Vec<u8>
 ///   and sends it to the client.
 pub struct Socks5UdpRelayStream {
     socket: Arc<UdpSocket>,
-    /// The client's UDP address, learned from the first received packet.
+    /// The client's UDP address, learned from the first valid received packet.
     client_addr: Option<SocketAddr>,
+    /// The IP the client is expected to send from, taken from the ASSOCIATE hint
+    /// when it carried a concrete address. `None` means "learn from the first
+    /// valid packet" (the hint was absent or unspecified, as most clients send).
+    expected_client_ip: Option<IpAddr>,
     /// Receiver for incoming packets from the socket reader task.
     receiver: mpsc::Receiver<(Box<[u8]>, SocketAddr)>,
     /// Handle to the socket reader task.
@@ -201,7 +205,9 @@ impl Socks5UdpRelayStream {
     ///
     /// # Arguments
     /// * `socket` - The bound UDP socket for the relay
-    pub fn new(socket: UdpSocket) -> Self {
+    /// * `expected_client_ip` - The IP the client is expected to send from (from
+    ///   the ASSOCIATE hint), or `None` to learn it from the first valid packet.
+    pub fn new(socket: UdpSocket, expected_client_ip: Option<IpAddr>) -> Self {
         let socket = Arc::new(socket);
         let local_addr = socket.local_addr().ok();
         log::debug!(
@@ -234,6 +240,7 @@ impl Socks5UdpRelayStream {
         Self {
             socket,
             client_addr: None,
+            expected_client_ip,
             receiver: rx,
             reader_task: Some(reader_task),
         }
@@ -250,25 +257,54 @@ impl AsyncReadTargetedMessage for Socks5UdpRelayStream {
 
         match Pin::new(&mut this.receiver).poll_recv(cx) {
             Poll::Ready(Some((packet, from_addr))) => {
-                // Learn/verify client address
-                if let Some(expected) = this.client_addr {
-                    if from_addr != expected {
-                        // Packet from unexpected source, ignore
-                        log::debug!(
-                            "SOCKS5 UDP relay: ignoring packet from {} (expected {})",
-                            from_addr,
-                            expected
-                        );
-                        cx.waker().wake_by_ref();
-                        return Poll::Pending;
+                let parsed = parse_socks5_udp_packet(&packet);
+
+                // Verify or learn the client address. Once learned, only that exact
+                // source is accepted. Before it is learned, an off-path attacker who
+                // reaches the relay port could otherwise capture the association by
+                // racing the client's first packet, so require both that the source
+                // IP matches the ASSOCIATE hint (when the client gave a concrete one)
+                // and that the packet actually parses as a SOCKS5-UDP frame before
+                // committing to it.
+                match this.client_addr {
+                    Some(expected) => {
+                        if from_addr != expected {
+                            log::debug!(
+                                "SOCKS5 UDP relay: ignoring packet from {} (expected {})",
+                                from_addr,
+                                expected
+                            );
+                            cx.waker().wake_by_ref();
+                            return Poll::Pending;
+                        }
                     }
-                } else {
-                    // Learn client address from first packet
-                    log::debug!("SOCKS5 UDP relay: learned client address: {}", from_addr);
-                    this.client_addr = Some(from_addr);
+                    None => {
+                        if this
+                            .expected_client_ip
+                            .is_some_and(|ip| from_addr.ip() != ip)
+                        {
+                            log::debug!(
+                                "SOCKS5 UDP relay: ignoring first packet from {} (hint IP {:?})",
+                                from_addr,
+                                this.expected_client_ip
+                            );
+                            cx.waker().wake_by_ref();
+                            return Poll::Pending;
+                        }
+                        if parsed.is_err() {
+                            log::debug!(
+                                "SOCKS5 UDP relay: not learning from unparseable packet from {}",
+                                from_addr
+                            );
+                            cx.waker().wake_by_ref();
+                            return Poll::Pending;
+                        }
+                        log::debug!("SOCKS5 UDP relay: learned client address: {}", from_addr);
+                        this.client_addr = Some(from_addr);
+                    }
                 }
 
-                match parse_socks5_udp_packet(&packet) {
+                match parsed {
                     Ok((target, payload)) => {
                         log::debug!(
                             "SOCKS5 UDP relay: parsed packet, target={}, payload_len={}",

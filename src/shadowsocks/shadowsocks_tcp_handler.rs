@@ -59,7 +59,12 @@ impl ShadowsocksTcpHandler {
             cipher,
             key,
             aead2022: false,
-            salt_checker: None,
+            // Reject a replayed connection salt. Classic AEAD has no timestamp, so
+            // this is a bounded-window filter rather than a complete one, but it
+            // defeats the active-probe replay it exists to stop; without it a
+            // captured first packet can be replayed to confirm or redirect the
+            // server. Matches the window used on the AEAD-2022 path.
+            salt_checker: Some(Arc::new(Mutex::new(TimedSaltChecker::new(60)))),
             udp_enabled,
             proxy_selector: Some(proxy_selector),
             resolver: Some(resolver),
@@ -76,7 +81,8 @@ impl ShadowsocksTcpHandler {
             cipher,
             key,
             aead2022: false,
-            salt_checker: None,
+            // Reject a replayed server response salt, as on the AEAD-2022 client.
+            salt_checker: Some(Arc::new(Mutex::new(TimedSaltChecker::new(60)))),
             udp_enabled,
             proxy_selector: None,
             resolver: None,

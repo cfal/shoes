@@ -10,7 +10,7 @@ use crate::async_stream::AsyncMessageStream;
 use crate::async_stream::AsyncStream;
 use crate::buf_reader::BufReader;
 use crate::rustls_connection_util::feed_rustls_client_connection;
-use crate::shadow_tls::shadow_tls_hmac::ShadowTlsHmac;
+use crate::shadow_tls::shadow_tls_hmac::{ShadowTlsHmac, tags_equal};
 use crate::shadow_tls::shadow_tls_stream::ShadowTlsStream;
 use crate::stream_reader::StreamReader;
 use crate::tcp::tcp_handler::{TcpClientHandler, TcpClientSetupResult};
@@ -148,7 +148,7 @@ impl ShadowTlsClientHandler {
                     &server_frame[TLS_HEADER_LEN + 4..TLS_HEADER_LEN + payload_len];
 
                 hmac_server_random.update(data_after_hmac);
-                if hmac_server_random.digest() != received_hmac {
+                if !tags_equal(&hmac_server_random.digest(), received_hmac) {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         "invalid HMAC for handshake data",

@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use tokio::io::AsyncWriteExt;
 
-use super::shadow_tls_hmac::ShadowTlsHmac;
+use super::shadow_tls_hmac::{ShadowTlsHmac, tags_equal};
 use super::shadow_tls_stream::ShadowTlsStream;
 use crate::address::NetLocation;
 use crate::async_stream::AsyncStream;
@@ -167,7 +167,7 @@ fn validate_shadowtls_client_hello(
     hmac.update(&[0; 4]);
     hmac.update(&client_hello_frame[digest.client_hello_digest_end_index..]);
 
-    if digest.client_hello_digest != hmac.finalized_digest() {
+    if !tags_equal(&digest.client_hello_digest, &hmac.finalized_digest()) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "HMAC tag mismatch",
@@ -877,7 +877,7 @@ async fn setup_remote_handshake(
                     let mut tmp_hmac = hmac_client_data.clone();
                     tmp_hmac.update(&client_payload_bytes[4..]);
 
-                    if tmp_hmac.finalized_digest() == client_payload_bytes[..4] {
+                    if tags_equal(&tmp_hmac.finalized_digest(), &client_payload_bytes[..4]) {
                         let initial_client_data = &client_payload_bytes[4..];
 
                         hmac_client_data.update(initial_client_data);
@@ -1125,7 +1125,7 @@ async fn setup_local_handshake(
             let mut tmp_hmac = hmac_client_data.clone();
             tmp_hmac.update(&client_payload_bytes[4..]);
 
-            if tmp_hmac.finalized_digest() == client_payload_bytes[..4] {
+            if tags_equal(&tmp_hmac.finalized_digest(), &client_payload_bytes[..4]) {
                 let initial_client_data = &client_payload_bytes[4..];
 
                 hmac_client_data.update(initial_client_data);

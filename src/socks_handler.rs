@@ -373,9 +373,16 @@ async fn handle_udp_associate(
     mut server_stream: Box<dyn AsyncStream>,
     stream_reader: &mut StreamReader,
 ) -> std::io::Result<TcpServerSetupResult> {
-    // Read client's hint address (DST.ADDR:DST.PORT) - we ignore this per RFC
-    let _client_hint = read_location(&mut server_stream, stream_reader).await?;
-    log::debug!("SOCKS5 UDP ASSOCIATE: client hint = {:?}", _client_hint);
+    // Read the client's hint address (DST.ADDR:DST.PORT). RFC 1928 lets the client
+    // advertise the source it will send from; most send 0.0.0.0:0 ("I don't know
+    // my source yet"), but when it carries a concrete IP we use it to bind the
+    // relay to that client's IP instead of learning from whatever arrives first.
+    let client_hint = read_location(&mut server_stream, stream_reader).await?;
+    log::debug!("SOCKS5 UDP ASSOCIATE: client hint = {:?}", client_hint);
+    let expected_client_ip = client_hint
+        .to_socket_addr_nonblocking()
+        .map(|addr| addr.ip())
+        .filter(|ip| !ip.is_unspecified());
 
     // Uses 2MB buffer to prevent packet drops during bursts.
     const UDP_BUFFER_SIZE: usize = 2 * 1024 * 1024;
@@ -405,7 +412,7 @@ async fn handle_udp_associate(
     write_all(&mut server_stream, &response).await?;
     server_stream.flush().await?;
 
-    let relay_stream = Socks5UdpRelayStream::new(udp_socket);
+    let relay_stream = Socks5UdpRelayStream::new(udp_socket, expected_client_ip);
     let proxy_selector = proxy_selector.clone();
     let resolver = resolver.clone();
 

@@ -1,5 +1,7 @@
+use std::collections::{HashSet, VecDeque};
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use aws_lc_rs::aead::{
@@ -37,6 +39,48 @@ const TAG_LEN: usize = 16;
 /// The window either side of the current time that a VMess AEAD auth id is
 /// accepted in. See authid.go in v2ray-core.
 const AUTH_ID_TIME_WINDOW_SECS: u64 = 120;
+
+/// Remembers recently accepted auth ids so a captured handshake cannot be
+/// replayed. Because the server accepts any timestamp within
+/// ±`AUTH_ID_TIME_WINDOW_SECS`, a single auth id stays replayable for up to
+/// twice that span, so ids are retained for `2 * AUTH_ID_TIME_WINDOW_SECS` and
+/// evicted by age (memory is bounded by the connection rate over that window).
+/// This mirrors v2ray-core's `AuthIDDecoderHolder`/`sessionHistory`; without it
+/// an on-path observer can replay a whole recorded session against the target.
+struct AuthIdReplayFilter {
+    known: HashSet<[u8; 16]>,
+    order: VecDeque<(Instant, [u8; 16])>,
+    retain: Duration,
+}
+
+impl AuthIdReplayFilter {
+    fn new() -> Self {
+        Self {
+            known: HashSet::new(),
+            order: VecDeque::new(),
+            retain: Duration::from_secs(2 * AUTH_ID_TIME_WINDOW_SECS),
+        }
+    }
+
+    /// Records `auth_id` and returns `true` if it is fresh, `false` if it was
+    /// already seen within the retention window (i.e. a replay).
+    fn check_and_insert(&mut self, auth_id: [u8; 16]) -> bool {
+        let now = Instant::now();
+        while let Some((seen_at, id)) = self.order.front() {
+            if now.duration_since(*seen_at) < self.retain {
+                break;
+            }
+            self.known.remove(id);
+            self.order.pop_front();
+        }
+
+        if !self.known.insert(auth_id) {
+            return false;
+        }
+        self.order.push_back((now, auth_id));
+        true
+    }
+}
 
 /// A timestamp drawn at random from the window the server will accept, which
 /// is what the reference client sends rather than the exact current time.
@@ -83,6 +127,7 @@ pub struct VmessTcpServerHandler {
     udp_enabled: bool,
     proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
+    replay_filter: parking_lot::Mutex<AuthIdReplayFilter>,
 }
 
 impl std::fmt::Debug for VmessTcpServerHandler {
@@ -117,6 +162,7 @@ impl VmessTcpServerHandler {
             udp_enabled,
             proxy_selector,
             resolver,
+            replay_filter: parking_lot::Mutex::new(AuthIdReplayFilter::new()),
         }
     }
 }
@@ -164,6 +210,16 @@ impl TcpServerHandler for VmessTcpServerHandler {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("Hash timestamp is too old ({time_secs} is {time_delta} seconds old)"),
+            ));
+        }
+
+        // Reject a replayed auth id. The timestamp window alone lets an observer
+        // resend a captured handshake within ±120s; the server would re-derive the
+        // same keys and replay the whole session against the target.
+        if !self.replay_filter.lock().check_and_insert(cert_hash) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "replayed VMess auth id",
             ));
         }
 
@@ -1284,6 +1340,19 @@ mod tests {
     use crate::quic_outbound::testing::{direct_selector, test_resolver};
 
     const TEST_UUID: &str = "b0e80a62-8a51-47f0-91f1-f0f7faf8d9d4";
+
+    #[test]
+    fn replay_filter_accepts_once_and_rejects_repeats() {
+        let mut filter = AuthIdReplayFilter::new();
+        let id_a = [1u8; 16];
+        let id_b = [2u8; 16];
+
+        assert!(filter.check_and_insert(id_a), "first sighting is fresh");
+        assert!(!filter.check_and_insert(id_a), "a repeat is a replay");
+        assert!(!filter.check_and_insert(id_a), "still rejected on retry");
+        assert!(filter.check_and_insert(id_b), "a distinct id is unaffected");
+        assert!(!filter.check_and_insert(id_b), "and is then remembered too");
+    }
 
     /// Run this repository's own VMess client against its own server over a
     /// loopback socket, and return the destination the server parsed out.

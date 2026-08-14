@@ -3,7 +3,7 @@ use std::task::{Context, Poll};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use super::shadow_tls_hmac::ShadowTlsHmac;
+use super::shadow_tls_hmac::{ShadowTlsHmac, tags_equal};
 use crate::async_stream::{AsyncPing, AsyncStream};
 use crate::util::allocate_vec;
 
@@ -195,7 +195,7 @@ impl ShadowTlsStream {
         if let Some(ref mut handshake_hmac) = self.handshake_hmac {
             handshake_hmac.update(payload);
             let expected_digest = handshake_hmac.digest();
-            if received_digest == expected_digest {
+            if tags_equal(received_digest, &expected_digest) {
                 if total_len < self.unprocessed_end_offset {
                     self.unprocessed_buf
                         .copy_within(total_len..self.unprocessed_end_offset, 0);
@@ -213,7 +213,7 @@ impl ShadowTlsStream {
 
         self.read_hmac.update(payload);
         let expected_digest = self.read_hmac.digest();
-        if received_digest != expected_digest {
+        if !tags_equal(received_digest, &expected_digest) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "HMAC verification failed",
