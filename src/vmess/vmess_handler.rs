@@ -1419,6 +1419,97 @@ mod tests {
         );
     }
 
+    /// Push a bulk, position-dependent payload through the real client and server
+    /// handlers and read it back with a fixed buffer size. This exercises the
+    /// zero-copy read path with buffers smaller than, equal to, and larger than a
+    /// VMess chunk, including the staged fallback when a chunk does not fit.
+    async fn data_round_trip(payload: Vec<u8>, read_size: usize) -> std::io::Result<Vec<u8>> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+
+        let target = NetLocation::from_str("1.2.3.4:80", None).unwrap();
+        let sent = payload.clone();
+        let client = tokio::spawn(async move {
+            let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let handler = VmessTcpClientHandler::new("aes-128-gcm", TEST_UUID, false);
+            let mut client_stream = handler
+                .setup_client_tcp_stream(Box::new(tcp), target.into())
+                .await?
+                .client_stream;
+            client_stream.write_all(&sent).await?;
+            client_stream.flush().await?;
+            // Held open: the client never reads the response, and a shutdown here
+            // would race the server's read below.
+            std::future::pending::<()>().await;
+            Ok::<_, std::io::Error>(())
+        });
+
+        let (server_tcp, _) = listener.accept().await?;
+        let resolver = test_resolver();
+        let server = VmessTcpServerHandler::new(
+            "aes-128-gcm",
+            TEST_UUID,
+            false,
+            direct_selector(resolver.clone()),
+            resolver,
+        );
+
+        let (mut server_stream, initial) =
+            match server.setup_server_stream(Box::new(server_tcp)).await? {
+                TcpServerSetupResult::TcpForward {
+                    stream,
+                    initial_remote_data,
+                    ..
+                } => (stream, initial_remote_data),
+                _ => return Err(std::io::Error::other("expected a TCP forward")),
+            };
+
+        // Bytes the server may have parsed out alongside the request header.
+        let mut received = Vec::with_capacity(payload.len());
+        if let Some(data) = initial {
+            received.extend_from_slice(&data);
+        }
+
+        let mut buf = vec![0u8; read_size];
+        while received.len() < payload.len() {
+            let n = server_stream.read(&mut buf).await?;
+            assert!(
+                n > 0,
+                "unexpected EOF at {} of {} bytes",
+                received.len(),
+                payload.len()
+            );
+            received.extend_from_slice(&buf[..n]);
+        }
+
+        client.abort();
+        Ok(received)
+    }
+
+    #[tokio::test]
+    async fn test_data_reassembles_across_buffer_sizes() {
+        // ~3 write chunks, enough to cross chunk boundaries without making the
+        // one-byte-at-a-time reads below take an unreasonable number of polls.
+        let payload: Vec<u8> = (0..24_000u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 11) as u8)
+            .collect();
+        // Includes read sizes equal to the write chunk (8192): reading exactly one
+        // chunk's worth used to strand the rest of an underlying read and deadlock.
+        // The timeout turns any such regression into a fast failure, not a hang.
+        for read_size in [1usize, 3, 137, 8_191, 8_192, 8_193, 40_000] {
+            let got = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                data_round_trip(payload.clone(), read_size),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("timed out reading {read_size} bytes at a time"))
+            .unwrap();
+            assert_eq!(got, payload, "mismatch reading {read_size} bytes at a time");
+        }
+    }
+
     /// The header length is whatever the client encrypted into the request, so
     /// a client that knows a valid UUID can declare one shorter than the fields
     /// the parser goes on to read. Before this was a checked read, that sliced

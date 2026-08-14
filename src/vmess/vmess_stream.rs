@@ -254,8 +254,13 @@ impl VmessStream {
             }
         }
 
+        // No caller buffer here — this only stages data into processed_buf. A
+        // zero-capacity sink disables try_decrypt's direct-to-caller fast path,
+        // so everything is staged as before.
+        let mut empty: [u8; 0] = [];
+        let mut sink = ReadBuf::new(&mut empty);
         loop {
-            match self.try_decrypt()? {
+            match self.try_decrypt(&mut sink)? {
                 DecryptState::NeedData => {
                     break;
                 }
@@ -390,7 +395,7 @@ impl VmessStream {
         check_header_response(encrypted_response_header, response_authentication_v)
     }
 
-    fn try_decrypt(&mut self) -> std::io::Result<DecryptState> {
+    fn try_decrypt(&mut self, out: &mut ReadBuf<'_>) -> std::io::Result<DecryptState> {
         // returns true if a full packet was decrypted, false if not (ie. more data required)
         let available_len = self.unprocessed_end_offset - self.unprocessed_start_offset;
 
@@ -504,14 +509,20 @@ impl VmessStream {
         }
 
         let processed_data_len = data_len - padding_len - self.tag_len;
-        self.processed_buf
-            [self.processed_end_offset..self.processed_end_offset + processed_data_len]
-            .copy_from_slice(
-                &self.unprocessed_buf[self.unprocessed_start_offset
-                    ..self.unprocessed_start_offset + processed_data_len],
-            );
+        // Fast path: with nothing staged in processed_buf and room in the caller's
+        // buffer, hand the just-decrypted plaintext straight over, skipping the
+        // processed_buf hop and its copy. Otherwise stage it as before.
+        let plaintext = &self.unprocessed_buf
+            [self.unprocessed_start_offset..self.unprocessed_start_offset + processed_data_len];
+        if self.processed_end_offset == 0 && out.remaining() >= processed_data_len {
+            out.put_slice(plaintext);
+        } else {
+            self.processed_buf
+                [self.processed_end_offset..self.processed_end_offset + processed_data_len]
+                .copy_from_slice(plaintext);
+            self.processed_end_offset += processed_data_len;
+        }
 
-        self.processed_end_offset += processed_data_len;
         self.unprocessed_start_offset += data_len;
 
         if self.unprocessed_start_offset == self.unprocessed_end_offset {
@@ -550,6 +561,17 @@ impl VmessStream {
         } else {
             self.processed_start_offset = new_processed_start_offset;
         }
+    }
+
+    /// Common read exit: drain any staged plaintext into whatever room the caller
+    /// has left, then return. try_decrypt may already have written straight into
+    /// `buf`, in which case processed_buf is empty and this just returns. Guards
+    /// the read_processed assertions (no staged data, or a full caller buffer).
+    fn finish_read(&mut self, buf: &mut ReadBuf<'_>) -> std::task::Poll<std::io::Result<()>> {
+        if self.processed_end_offset > 0 && buf.remaining() > 0 {
+            self.read_processed(buf);
+        }
+        Poll::Ready(Ok(()))
     }
 
     fn create_write_packet(&mut self) -> bool {
@@ -696,6 +718,10 @@ impl AsyncRead for VmessStream {
     ) -> std::task::Poll<std::io::Result<()>> {
         let this = self.get_mut();
 
+        // Bytes already in the caller's buffer; anything past this that try_decrypt
+        // writes directly (its fast path) means we have data to return.
+        let filled_before = buf.filled().len();
+
         if this.read_header_state != ReadHeaderState::Done && !this.is_eof {
             loop {
                 let mut read_buf =
@@ -712,43 +738,44 @@ impl AsyncRead for VmessStream {
                     break;
                 }
             }
-
-            // We probably already have some user data ready to be processed, so we need
-            // to do so immediately since we go straight to a poll_read below.
-            loop {
-                match this.try_decrypt()? {
-                    DecryptState::NeedData => {
-                        break;
-                    }
-                    DecryptState::ReceivedEof => {
-                        this.is_eof = true;
-                        break;
-                    }
-                    DecryptState::BufferFull => {
-                        assert!(this.processed_end_offset > 0);
-                        this.read_processed(buf);
-                        return Poll::Ready(Ok(()));
-                    }
-                    DecryptState::Success => {
-                        continue;
-                    }
-                }
-            }
-        }
-
-        if this.processed_end_offset > 0 {
-            this.read_processed(buf);
-            return Poll::Ready(Ok(()));
-        } else if this.is_eof {
-            return Poll::Ready(Ok(()));
         }
 
         loop {
+            // Decrypt whatever is already buffered before reading more. Data can
+            // arrive in a single large underlying read while the caller takes it a
+            // little at a time; decrypting at the top of the loop keeps it from
+            // being stranded in unprocessed_buf. try_decrypt hands plaintext
+            // straight to `buf` when it can, staging in processed_buf otherwise.
+            if this.unprocessed_end_offset > 0 {
+                loop {
+                    match this.try_decrypt(buf)? {
+                        DecryptState::NeedData => break,
+                        DecryptState::ReceivedEof => {
+                            this.is_eof = true;
+                            break;
+                        }
+                        DecryptState::BufferFull => return this.finish_read(buf),
+                        DecryptState::Success => {
+                            if buf.remaining() == 0 {
+                                break;
+                            }
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            if this.processed_end_offset > 0 || buf.filled().len() > filled_before {
+                return this.finish_read(buf);
+            }
+
+            if this.is_eof {
+                return Poll::Ready(Ok(()));
+            }
+
             if this.unprocessed_end_offset == this.unprocessed_buf.len() {
-                // if we got here, there's no data in processed buf, and we don't have
-                // space in unprocessed buf to read more to decrypt.
-                // since we know we have enough space for 1 full-sized packet,
-                // this must be because start offset has moved forward too much.
+                // No data in processed buf and no space to read more: the start
+                // offset has moved forward, so compact to reclaim the front.
                 this.reset_unprocessed_buf_offset();
                 assert!(this.unprocessed_end_offset < this.unprocessed_buf.len());
             }
@@ -758,54 +785,13 @@ impl AsyncRead for VmessStream {
             ready!(Pin::new(&mut this.stream).poll_read(cx, &mut read_buf))?;
 
             let len = read_buf.filled().len();
-
-            // Make sure we have enough space to store the processed data.
             if len == 0 {
-                // We've reached EOF. Return any available data first.
+                // EOF: return any available data.
                 this.is_eof = true;
-                if this.processed_end_offset > 0 {
-                    // TODO: I don't think we ever hit this clause.
-                    // The only time we read is when processed_end_offset is 0.
-                    this.read_processed(buf);
-                }
-                return Poll::Ready(Ok(()));
+                return this.finish_read(buf);
             }
 
             this.unprocessed_end_offset += len;
-
-            // Process some data to free up unprocessed_buf space.
-            loop {
-                match this.try_decrypt()? {
-                    DecryptState::NeedData => {
-                        break;
-                    }
-                    DecryptState::ReceivedEof => {
-                        this.is_eof = true;
-                        break;
-                    }
-                    DecryptState::BufferFull => {
-                        assert!(this.processed_end_offset > 0);
-                        this.read_processed(buf);
-                        return Poll::Ready(Ok(()));
-                    }
-                    DecryptState::Success => {
-                        continue;
-                    }
-                }
-            }
-
-            if this.processed_end_offset > 0 {
-                // Return the data we just got.
-                this.read_processed(buf);
-                return Poll::Ready(Ok(()));
-            }
-
-            if this.is_eof {
-                return Poll::Ready(Ok(()));
-            }
-
-            // We don't want to return zero bytes, and we haven't yet hit a Poll::Pending,
-            // so try to read again.
         }
     }
 }
@@ -938,6 +924,8 @@ impl AsyncReadMessage for VmessStream {
     ) -> std::task::Poll<std::io::Result<()>> {
         let this = self.get_mut();
 
+        let filled_before = buf.filled().len();
+
         if this.read_header_state != ReadHeaderState::Done && !this.is_eof {
             loop {
                 let mut read_buf =
@@ -958,45 +946,34 @@ impl AsyncReadMessage for VmessStream {
             // We probably already have some user data ready to be processed, so we need
             // to do so immediately since we go straight to a poll_read below.
             loop {
-                match this.try_decrypt()? {
-                    DecryptState::NeedData => {
-                        break;
-                    }
+                match this.try_decrypt(buf)? {
+                    DecryptState::NeedData => break,
                     DecryptState::ReceivedEof => {
                         this.is_eof = true;
                         break;
                     }
-                    DecryptState::BufferFull => {
-                        assert!(this.processed_end_offset > 0);
-                        this.read_processed(buf);
-                        return Poll::Ready(Ok(()));
-                    }
+                    DecryptState::BufferFull => return this.finish_read(buf),
                     DecryptState::Success => {
+                        if buf.remaining() == 0 {
+                            break;
+                        }
                         continue;
                     }
                 }
             }
         }
 
-        if this.processed_end_offset > 0 {
-            this.read_processed(buf);
-            return Poll::Ready(Ok(()));
+        if this.processed_end_offset > 0 || buf.filled().len() > filled_before {
+            return this.finish_read(buf);
         }
 
-        match this.try_decrypt()? {
+        match this.try_decrypt(buf)? {
             DecryptState::NeedData => {}
             DecryptState::ReceivedEof => {
                 this.is_eof = true;
             }
-            DecryptState::BufferFull => {
-                assert!(this.processed_end_offset > 0);
-                this.read_processed(buf);
-                return Poll::Ready(Ok(()));
-            }
-            DecryptState::Success => {
-                this.read_processed(buf);
-                return Poll::Ready(Ok(()));
-            }
+            DecryptState::BufferFull => return this.finish_read(buf),
+            DecryptState::Success => return this.finish_read(buf),
         }
 
         if this.is_eof {
@@ -1023,32 +1000,20 @@ impl AsyncReadMessage for VmessStream {
             if len == 0 {
                 // We've reached EOF. Return any available data first.
                 this.is_eof = true;
-                if this.processed_end_offset > 0 {
-                    // TODO: I don't think we ever hit this clause.
-                    // The only time we read is when processed_end_offset is 0.
-                    this.read_processed(buf);
-                }
-                return Poll::Ready(Ok(()));
+                return this.finish_read(buf);
             }
 
             this.unprocessed_end_offset += len;
 
             // Process some data to free up unprocessed_buf space.
-            match this.try_decrypt()? {
+            match this.try_decrypt(buf)? {
                 DecryptState::NeedData => {}
                 DecryptState::ReceivedEof => {
                     this.is_eof = true;
-                    return Poll::Ready(Ok(()));
+                    return this.finish_read(buf);
                 }
-                DecryptState::BufferFull => {
-                    assert!(this.processed_end_offset > 0);
-                    this.read_processed(buf);
-                    return Poll::Ready(Ok(()));
-                }
-                DecryptState::Success => {
-                    this.read_processed(buf);
-                    return Poll::Ready(Ok(()));
-                }
+                DecryptState::BufferFull => return this.finish_read(buf),
+                DecryptState::Success => return this.finish_read(buf),
             }
 
             // We don't want to return zero bytes, and we haven't yet hit a Poll::Pending,

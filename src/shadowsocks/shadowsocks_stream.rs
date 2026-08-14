@@ -155,7 +155,7 @@ impl ShadowsocksStream {
         Ok(())
     }
 
-    fn try_decrypt(&mut self) -> std::io::Result<DecryptState> {
+    fn try_decrypt(&mut self, out: &mut ReadBuf<'_>) -> std::io::Result<DecryptState> {
         // returns true if a full packet was decrypted, false if not (ie. more data required)
 
         let available_len = self.unprocessed_end_offset - self.unprocessed_start_offset;
@@ -251,13 +251,20 @@ impl ShadowsocksStream {
             ));
         }
 
-        self.processed_buf[self.processed_end_offset..self.processed_end_offset + pending_len]
-            .copy_from_slice(
-                &self.unprocessed_buf
-                    [self.unprocessed_start_offset..self.unprocessed_start_offset + pending_len],
-            );
+        // Fast path: with nothing staged in processed_buf and room in the caller's
+        // buffer, hand the just-decrypted plaintext straight over, skipping the
+        // processed_buf hop and its copy. Otherwise stage it in processed_buf as
+        // before (partial-fit chunks, or a caller buffer smaller than the chunk).
+        let plaintext = &self.unprocessed_buf
+            [self.unprocessed_start_offset..self.unprocessed_start_offset + pending_len];
+        if self.processed_end_offset == 0 && out.remaining() >= pending_len {
+            out.put_slice(plaintext);
+        } else {
+            self.processed_buf[self.processed_end_offset..self.processed_end_offset + pending_len]
+                .copy_from_slice(plaintext);
+            self.processed_end_offset += pending_len;
+        }
 
-        self.processed_end_offset += pending_len;
         self.unprocessed_start_offset += pending_len_with_tag;
 
         if self.unprocessed_start_offset == self.unprocessed_end_offset {
@@ -655,6 +662,10 @@ impl ShadowsocksStream {
     ) -> std::task::Poll<std::io::Result<()>> {
         let this = self.get_mut();
 
+        // Bytes already in the caller's buffer at entry; anything past this that the
+        // fast path in try_decrypt writes directly means we have data to return.
+        let filled_before = buf.filled().len();
+
         if this.is_initial_read && !this.is_eof {
             loop {
                 let mut read_buf =
@@ -677,9 +688,11 @@ impl ShadowsocksStream {
 
         loop {
             if this.unprocessed_end_offset > 0 {
-                // Process some data to free up unprocessed_buf space.
+                // Process some data to free up unprocessed_buf space. try_decrypt hands
+                // plaintext straight to `buf` when it can, and only falls back to
+                // processed_buf when `buf` is full or a chunk does not fit.
                 loop {
-                    match this.try_decrypt()? {
+                    match this.try_decrypt(buf)? {
                         DecryptState::NeedData => {
                             break;
                         }
@@ -688,7 +701,16 @@ impl ShadowsocksStream {
                             break;
                         }
                         DecryptState::Success => {
-                            if !fill_buffer && this.processed_end_offset > 0 {
+                            // Nothing more fits in the caller's buffer.
+                            if buf.remaining() == 0 {
+                                break;
+                            }
+                            // In message mode, return as soon as one message is ready,
+                            // whether it went to the caller directly or via processed_buf.
+                            if !fill_buffer
+                                && (buf.filled().len() > filled_before
+                                    || this.processed_end_offset > 0)
+                            {
                                 break;
                             }
                             continue;
@@ -706,9 +728,15 @@ impl ShadowsocksStream {
                 assert!(this.unprocessed_end_offset < this.unprocessed_buf.len());
             }
 
-            if this.processed_end_offset > 0 {
-                // Return the data we just got.
+            // Drain any staged data into whatever room the caller has left.
+            if this.processed_end_offset > 0 && buf.remaining() > 0 {
                 this.read_processed(buf);
+                return Poll::Ready(Ok(()));
+            }
+
+            // We have data for the caller: handed over directly, or the buffer filled
+            // (with staged data possibly waiting for the next call), or it was empty.
+            if buf.filled().len() > filled_before || buf.remaining() == 0 {
                 return Poll::Ready(Ok(()));
             }
 
@@ -975,5 +1003,63 @@ mod tests {
     async fn test_a_payload_spanning_several_packets_round_trips() {
         let payload: Vec<u8> = (0..40_000u32).map(|i| i as u8).collect();
         assert_eq!(round_trip(&payload).await.unwrap(), payload);
+    }
+
+    /// Read the same multi-chunk payload back with a fixed buffer size, so the
+    /// caller reassembles it in `read_size` pieces.
+    async fn round_trip_reading_in_chunks(
+        payload: &[u8],
+        read_size: usize,
+    ) -> std::io::Result<Vec<u8>> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+
+        let sent = payload.to_vec();
+        let client = tokio::spawn(async move {
+            let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let mut client = stream(tcp, ShadowsocksStreamType::AEAD2022Client);
+            // The first write becomes the single request-header packet, which must
+            // fit one chunk; the rest is packetized into further chunks by the
+            // normal write path, so the reader sees several encrypted chunks.
+            let first = sent.len().min(1024);
+            client.write_all(&sent[..first]).await?;
+            client.write_all(&sent[first..]).await?;
+            client.flush().await?;
+            std::future::pending::<()>().await;
+            Ok::<_, std::io::Error>(())
+        });
+
+        let (tcp, _) = listener.accept().await?;
+        let mut server = stream(tcp, ShadowsocksStreamType::AEAD2022Server);
+
+        let mut received = Vec::with_capacity(payload.len());
+        let mut buf = vec![0u8; read_size];
+        while received.len() < payload.len() {
+            let n = server.read(&mut buf).await?;
+            assert!(n > 0, "unexpected EOF at {} bytes", received.len());
+            received.extend_from_slice(&buf[..n]);
+        }
+
+        client.abort();
+        Ok(received)
+    }
+
+    /// The zero-copy read path hands a whole chunk to the caller when it fits and
+    /// falls back to staging in processed_buf otherwise, so reassembly must be
+    /// identical across buffer sizes smaller than, equal to, and larger than a
+    /// chunk (0xFFFF for AEAD-2022), including sizes that straddle chunk edges.
+    #[tokio::test]
+    async fn test_reads_reassemble_across_buffer_sizes() {
+        // A non-trivial, position-dependent payload so any misordering shows up.
+        let payload: Vec<u8> = (0..200_000u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 11) as u8)
+            .collect();
+
+        for read_size in [1usize, 3, 137, 65_534, 65_535, 65_536, 100_000] {
+            let got = round_trip_reading_in_chunks(&payload, read_size)
+                .await
+                .unwrap();
+            assert_eq!(got, payload, "mismatch reading {read_size} bytes at a time");
+        }
     }
 }
