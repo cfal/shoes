@@ -702,7 +702,12 @@ async fn run_udp_remote_to_local_datagram_loop(
 
         let address_bytes: Bytes = match &original_address_bytes {
             Some(a) => a.clone(),
-            None => serialize_socket_addr(&src_addr).into(),
+            None => {
+                if cached_src.as_ref().is_none_or(|(a, _)| *a != src_addr) {
+                    cached_src = Some((src_addr, serialize_socket_addr(&src_addr).into()));
+                }
+                cached_src.as_ref().unwrap().1.clone()
+            }
         };
         let address_bytes_len = address_bytes.len();
 

@@ -2,9 +2,11 @@
 //!
 //! Verified against apernet/hysteria, extras/obfs/salamander.go:
 //!
-//!     smPSKMinLen = 4
-//!     smSaltLen   = 8
-//!     smKeyLen    = blake2b.Size256
+//! ```text
+//! smPSKMinLen = 4
+//! smSaltLen   = 8
+//! smKeyLen    = blake2b.Size256
+//! ```
 //!
 //! On the wire a packet is `[8-byte random salt][payload XOR key]`, where
 //! `key = BLAKE2b-256(PSK || salt)` and byte `i` of the payload is XOR'd with

@@ -1033,6 +1033,14 @@ mod tests {
             }
             thread::sleep(Duration::from_millis(50));
         }
+
+        // This test already closed client_fd above; letting the stack's Drop close
+        // it again would be a double close. That is harmless in isolation, but the
+        // freed fd number can be reused by a concurrent test's OwnedFd in between,
+        // and closing it out from under that owner aborts the whole test binary
+        // ("IO Safety violation: owned file descriptor already closed"). The thread
+        // has already exited, so skip the redundant Drop.
+        std::mem::forget(stack);
     }
 
     #[test]
