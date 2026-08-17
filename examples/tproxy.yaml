@@ -1,0 +1,65 @@
+# TPROXY Inbound Example (Linux-only)
+#
+# TPROXY is a transparent proxy mode: traffic is redirected to shoes by the
+# kernel (via iptables/nftables + ip rule), shoes recovers the original
+# destination and forwards it through the outbound chain.
+#
+# ---------------------------------------------------------------------------
+# Privileges
+# ---------------------------------------------------------------------------
+# Setting IP_TRANSPARENT on a socket is a kernel-side privileged operation.
+# The kernel accepts EITHER CAP_NET_RAW or CAP_NET_ADMIN — prefer CAP_NET_RAW
+# (narrower scope: no right to reconfigure interfaces, routes, netfilter, etc.).
+#
+# Quick start (development):
+#   sudo shoes examples/tproxy.yaml
+#
+# Single-binary capability (no sudo at runtime):
+#   sudo setcap cap_net_raw=+ep /usr/local/bin/shoes
+#   shoes examples/tproxy.yaml
+#
+# systemd (recommended for production — runs as unprivileged user):
+#   # /etc/systemd/system/shoes.service
+#   [Unit]
+#   Description=shoes proxy
+#   After=network.target
+#
+#   [Service]
+#   ExecStart=/usr/local/bin/shoes /etc/shoes/tproxy.yaml
+#   User=shoes
+#   Group=shoes
+#   AmbientCapabilities=CAP_NET_RAW
+#   CapabilityBoundingSet=CAP_NET_RAW
+#   NoNewPrivileges=true
+#   Restart=on-failure
+#
+#   [Install]
+#   WantedBy=multi-user.target
+#
+# ---------------------------------------------------------------------------
+# Kernel-side setup (run once, as root):
+# ---------------------------------------------------------------------------
+# # Mark and route packets destined for proxied IPs into a local table.
+# ip rule add fwmark 1 lookup 100
+# ip route add local 0.0.0.0/0 dev lo table 100
+#
+# # iptables rules: redirect TCP+UDP via TPROXY to port 7895.
+# iptables -t mangle -N SHOES
+# iptables -t mangle -A SHOES -d 127.0.0.0/8 -j RETURN
+# iptables -t mangle -A SHOES -d 10.0.0.0/8 -j RETURN
+# iptables -t mangle -A SHOES -d 192.168.0.0/16 -j RETURN
+# iptables -t mangle -A SHOES -d 172.16.0.0/12 -j RETURN
+# iptables -t mangle -A SHOES -p tcp -j TPROXY --on-port 7895 --tproxy-mark 1
+# iptables -t mangle -A SHOES -p udp -j TPROXY --on-port 7895 --tproxy-mark 1
+# iptables -t mangle -A PREROUTING -j SHOES
+# ---------------------------------------------------------------------------
+
+- address: "0.0.0.0:7895"
+  protocol:
+    type: tproxy
+    tcp_enabled: true
+    udp_enabled: true
+  rules:
+    - masks: "0.0.0.0/0"
+      action: allow
+      client_chain: direct

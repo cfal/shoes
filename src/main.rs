@@ -42,6 +42,8 @@ mod trojan_handler;
 mod tuic_server;
 #[cfg(unix)]
 mod tun;
+#[cfg(target_os = "linux")]
+mod tproxy;
 mod udp_message_stream;
 mod uot;
 mod util;

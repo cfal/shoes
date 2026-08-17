@@ -129,6 +129,14 @@ impl NetLocation {
         Self { address, port }
     }
 
+    pub fn from_socket_addr(sa: std::net::SocketAddr) -> Self {
+        let address = match sa.ip() {
+            std::net::IpAddr::V4(a) => Address::Ipv4(a),
+            std::net::IpAddr::V6(a) => Address::Ipv6(a),
+        };
+        Self { address, port: sa.port() }
+    }
+
     pub fn components(&self) -> (&Address, u16) {
         (&self.address, self.port)
     }
@@ -684,5 +692,21 @@ mod tests {
             serde_yaml::from_str(&yaml_str).expect("Failed to deserialize NetLocationMask");
 
         assert_eq!(net_location_mask.to_string(), deserialized.to_string());
+    }
+
+    #[test]
+    fn from_socket_addr_ipv4() {
+        let sa: std::net::SocketAddr = "203.0.113.5:443".parse().unwrap();
+        let nl = NetLocation::from_socket_addr(sa);
+        assert_eq!(nl.port(), 443);
+        assert_eq!(nl.address(), &Address::Ipv4("203.0.113.5".parse().unwrap()));
+    }
+
+    #[test]
+    fn from_socket_addr_ipv6() {
+        let sa: std::net::SocketAddr = "[2001:db8::1]:8080".parse().unwrap();
+        let nl = NetLocation::from_socket_addr(sa);
+        assert_eq!(nl.port(), 8080);
+        assert_eq!(nl.address(), &Address::Ipv6("2001:db8::1".parse().unwrap()));
     }
 }

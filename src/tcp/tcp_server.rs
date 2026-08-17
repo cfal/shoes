@@ -119,35 +119,10 @@ where
     server_handler.setup_server_stream(server_stream).await
 }
 
-pub async fn process_stream<AS>(
-    stream: AS,
-    server_handler: Arc<dyn TcpServerHandler>,
+pub async fn process_setup_result(
+    setup_result: TcpServerSetupResult,
     resolver: Arc<dyn Resolver>,
-) -> std::io::Result<()>
-where
-    AS: AsyncStream + 'static,
-{
-    let setup_server_stream_future = timeout(
-        Duration::from_secs(60),
-        setup_server_stream(stream, server_handler),
-    );
-
-    let setup_result = match setup_server_stream_future.await {
-        Ok(Ok(r)) => r,
-        Ok(Err(e)) => {
-            return Err(std::io::Error::new(
-                e.kind(),
-                format!("failed to setup server stream: {e}"),
-            ));
-        }
-        Err(elapsed) => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                format!("server setup timed out: {elapsed}"),
-            ));
-        }
-    };
-
+) -> std::io::Result<()> {
     match setup_result {
         TcpServerSetupResult::TcpForward {
             remote_location,
@@ -285,6 +260,38 @@ where
     }
 }
 
+pub async fn process_stream<AS>(
+    stream: AS,
+    server_handler: Arc<dyn TcpServerHandler>,
+    resolver: Arc<dyn Resolver>,
+) -> std::io::Result<()>
+where
+    AS: AsyncStream + 'static,
+{
+    let setup_server_stream_future = timeout(
+        Duration::from_secs(60),
+        setup_server_stream(stream, server_handler),
+    );
+
+    let setup_result = match setup_server_stream_future.await {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => {
+            return Err(std::io::Error::new(
+                e.kind(),
+                format!("failed to setup server stream: {e}"),
+            ));
+        }
+        Err(elapsed) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("server setup timed out: {elapsed}"),
+            ));
+        }
+    };
+
+    process_setup_result(setup_result, resolver).await
+}
+
 pub async fn setup_client_tcp_stream(
     server_stream: &mut Box<dyn AsyncStream>,
     client_proxy_selector: Arc<ClientProxySelector>,
@@ -358,7 +365,18 @@ pub async fn start_servers(
             std::io::ErrorKind::Unsupported,
             "TUN server is not supported on this platform",
         )),
-        Config::Server(server_config) => start_tcp_or_quic_servers(server_config, resolver).await,
+        Config::Server(server_config) => {
+            if matches!(server_config.protocol, crate::config::ServerProxyConfig::Tproxy { .. }) {
+                #[cfg(target_os = "linux")]
+                return crate::tproxy::start_tproxy_servers(server_config, resolver).await;
+                #[cfg(not(target_os = "linux"))]
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "tproxy protocol is only supported on Linux",
+                ));
+            }
+            start_tcp_or_quic_servers(server_config, resolver).await
+        }
         _ => unreachable!("create_server_configs only returns Server and TunServer"),
     }
 }

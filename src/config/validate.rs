@@ -629,6 +629,45 @@ fn validate_server_config(
     rule_groups: &HashMap<String, Vec<RuleConfig>>,
     named_pems: &HashMap<String, String>,
 ) -> std::io::Result<()> {
+    // Tproxy-specific validation (fail fast before other checks)
+    if let ServerProxyConfig::Tproxy { tcp_enabled, udp_enabled } = &server_config.protocol {
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (tcp_enabled, udp_enabled); // silence unused warning on non-linux
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "tproxy protocol is only supported on Linux",
+            ));
+        }
+        #[cfg(target_os = "linux")]
+        {
+            if server_config.transport != Transport::Tcp {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "tproxy protocol does not support quic transport",
+                ));
+            }
+            if matches!(server_config.bind_location, super::types::BindLocation::Path(_)) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "tproxy protocol cannot bind to a unix socket path",
+                ));
+            }
+            if server_config.quic_settings.is_some() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "tproxy protocol does not accept quic_settings",
+                ));
+            }
+            if !*tcp_enabled && !*udp_enabled {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "tproxy requires at least one of tcp_enabled or udp_enabled",
+                ));
+            }
+        }
+    }
+
     // First handle QUIC settings certificates
     if let Some(ref mut quic_settings) = server_config.quic_settings {
         embed_pem_from_map(&mut quic_settings.cert, named_pems);
@@ -2653,5 +2692,108 @@ mod tests {
             "error should mention group name: {}",
             err
         );
+    }
+
+    fn tproxy_err(configs: Vec<Config>) -> String {
+        match create_server_configs(configs) {
+            Ok(_) => panic!("expected validation error but got Ok"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tproxy_rejects_quic_transport() {
+        let yaml = r#"
+- address: "0.0.0.0:7895"
+  transport: quic
+  protocol:
+    type: tproxy
+"#;
+        let configs: Vec<Config> = serde_yaml::from_str(yaml).unwrap();
+        let err = tproxy_err(configs);
+        assert!(err.to_lowercase().contains("tproxy"), "got: {err}");
+        assert!(
+            err.to_lowercase().contains("quic") || err.to_lowercase().contains("transport"),
+            "got: {err}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tproxy_rejects_unix_socket_bind() {
+        let yaml = r#"
+- path: "/tmp/foo.sock"
+  protocol:
+    type: tproxy
+"#;
+        let configs: Vec<Config> = serde_yaml::from_str(yaml).unwrap();
+        let err = tproxy_err(configs);
+        assert!(err.to_lowercase().contains("tproxy"), "got: {err}");
+        assert!(
+            err.to_lowercase().contains("unix") || err.to_lowercase().contains("path"),
+            "got: {err}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tproxy_rejects_both_disabled() {
+        let yaml = r#"
+- address: "0.0.0.0:7895"
+  protocol:
+    type: tproxy
+    tcp_enabled: false
+    udp_enabled: false
+"#;
+        let configs: Vec<Config> = serde_yaml::from_str(yaml).unwrap();
+        let err = tproxy_err(configs);
+        assert!(
+            err.to_lowercase().contains("tcp_enabled") || err.to_lowercase().contains("udp_enabled"),
+            "got: {err}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tproxy_rejects_quic_settings() {
+        let yaml = r#"
+- address: "0.0.0.0:7895"
+  quic_settings:
+    cert: "/tmp/does-not-exist.crt"
+    key: "/tmp/does-not-exist.key"
+  protocol:
+    type: tproxy
+"#;
+        let configs: Vec<Config> = serde_yaml::from_str(yaml).unwrap();
+        let err = tproxy_err(configs);
+        assert!(err.to_lowercase().contains("tproxy"), "got: {err}");
+        assert!(err.to_lowercase().contains("quic_settings"), "got: {err}");
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn tproxy_rejects_on_non_linux() {
+        let yaml = r#"
+- address: "0.0.0.0:7895"
+  protocol:
+    type: tproxy
+"#;
+        let configs: Vec<Config> = serde_yaml::from_str(yaml).unwrap();
+        let err = tproxy_err(configs);
+        assert!(err.to_lowercase().contains("linux"), "got: {err}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tproxy_minimal_config_accepted() {
+        crate::thread_util::set_num_threads(1);
+        let yaml = r#"
+- address: "0.0.0.0:7895"
+  protocol:
+    type: tproxy
+"#;
+        let configs: Vec<Config> = serde_yaml::from_str(yaml).unwrap();
+        let _validated = create_server_configs(configs).expect("should validate");
     }
 }

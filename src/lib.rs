@@ -113,6 +113,10 @@ pub mod logging;
 #[cfg(unix)]
 pub mod tun;
 
+/// Linux transparent proxy (TPROXY) inbound.
+#[cfg(target_os = "linux")]
+pub mod tproxy;
+
 /// FFI bindings for mobile platforms.
 #[cfg(any(target_os = "android", target_os = "ios", feature = "ffi"))]
 pub mod ffi;
