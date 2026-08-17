@@ -20,6 +20,7 @@ use crate::shadow_tls::ShadowTlsClientHandler;
 use crate::shadowsocks::ShadowsocksTcpHandler;
 use crate::snell::snell_handler::SnellClientHandler;
 use crate::socks_handler::SocksTcpClientHandler;
+use crate::socks4_handler::Socks4TcpClientHandler;
 use crate::tcp::chain_builder::build_client_chain_group;
 use crate::tcp::tcp_handler::TcpClientHandler;
 use crate::tls_client_handler::TlsClientHandler;
@@ -66,6 +67,14 @@ pub fn create_tcp_client_handler(
         ClientProxyConfig::Socks { username, password } => Box::new(SocksTcpClientHandler::new(
             create_auth_credentials(username, password),
         )),
+        ClientProxyConfig::Socks4 { dns_enabled } => {
+            let socks4_resolver = if dns_enabled {
+                None
+            } else {
+                Some(resolver.clone())
+            };
+            Box::new(Socks4TcpClientHandler::new(socks4_resolver))
+        }
         ClientProxyConfig::Shadowsocks {
             config,
             udp_enabled,
