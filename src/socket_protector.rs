@@ -125,6 +125,16 @@ pub fn set_global_socket_protector(protector: Arc<dyn SocketProtector>) {
     *GLOBAL_SOCKET_PROTECTOR.write().unwrap() = Some(protector);
 }
 
+/// Remove the global socket protector.
+///
+/// Called when a tunnel stops. On Android the protector holds a JNI global
+/// reference to the `VpnService`, so leaving it installed keeps a destroyed
+/// service — and its `Context` — alive, and any socket opened afterwards would
+/// call `protect()` on it.
+pub fn clear_global_socket_protector() {
+    *GLOBAL_SOCKET_PROTECTOR.write().unwrap() = None;
+}
+
 /// Get the global socket protector, if one was installed.
 pub fn get_global_socket_protector() -> Option<Arc<dyn SocketProtector>> {
     GLOBAL_SOCKET_PROTECTOR.read().unwrap().clone()

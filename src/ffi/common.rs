@@ -7,7 +7,7 @@ use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use log::info;
+use log::{error, info, warn};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
@@ -79,10 +79,27 @@ pub fn flush_log_file() {
     }
 }
 
+/// How long `stop_service` waits for the service task to finish.
+const STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How often it looks while waiting.
+const STOP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(5);
+
 /// Stop the TUN service and wait for shutdown.
 ///
 /// This is the common shutdown logic used by both iOS and Android.
-pub fn stop_service() {
+///
+/// Returns `true` if the service confirmed it stopped, `false` if the wait
+/// timed out. The wait is the part that cannot be skipped: it is what
+/// guarantees the stack thread has released the TUN descriptor, so the app can
+/// close its own copy without racing a thread that is still reading from it.
+/// In practice it costs a few milliseconds — the old version polled in 100 ms
+/// steps and so paid at least that much every time.
+///
+/// Dropping the runtime, on the other hand, waits on tasks that no longer hold
+/// anything the app needs back, so it happens on a thread of its own and the
+/// caller does not pay for it.
+pub fn stop_service() -> bool {
     info!("Stopping TUN service");
 
     let handle = if let Some(service) = TUN_SERVICE.get() {
@@ -91,26 +108,65 @@ pub fn stop_service() {
         None
     };
 
-    if let Some(mut handle) = handle {
-        if let Some(tx) = handle.shutdown_tx.take() {
-            let _ = tx.send(());
-        }
+    let Some(mut handle) = handle else {
+        info!("TUN service was not running");
+        crate::socket_protector::clear_global_socket_protector();
+        return true;
+    };
 
-        // Wait up to 5 seconds for service to stop
-        let running = handle.running.clone();
-        for i in 0..50 {
-            if !running.load(Ordering::SeqCst) {
-                info!("TUN service stopped after {}ms", i * 100);
-                break;
+    if let Some(tx) = handle.shutdown_tx.take() {
+        let _ = tx.send(());
+    }
+
+    let started = std::time::Instant::now();
+    let mut stopped = false;
+    while started.elapsed() < STOP_TIMEOUT {
+        if !handle.running.load(Ordering::SeqCst) {
+            stopped = true;
+            break;
+        }
+        std::thread::sleep(STOP_POLL_INTERVAL);
+    }
+
+    if stopped {
+        info!(
+            "TUN service stopped after {}ms",
+            started.elapsed().as_millis()
+        );
+    } else {
+        error!(
+            "TUN service did not stop within {}s; the TUN descriptor may still be in use",
+            STOP_TIMEOUT.as_secs()
+        );
+    }
+
+    // The protector holds a reference to the platform's VPN service object.
+    // Released here rather than in the platform modules so that neither one can
+    // forget.
+    crate::socket_protector::clear_global_socket_protector();
+
+    // shutdown_timeout, not drop: a task wedged in a blocking call would
+    // otherwise keep this thread — the app's main thread, in the sample code
+    // both platforms ship — parked indefinitely.
+    let runtime = Arc::new(parking_lot::Mutex::new(Some(handle.runtime)));
+    let shutdown_runtime = runtime.clone();
+    if let Err(e) = std::thread::Builder::new()
+        .name("shoes-runtime-shutdown".to_owned())
+        .spawn(move || {
+            if let Some(runtime) = shutdown_runtime.lock().take() {
+                runtime.shutdown_timeout(std::time::Duration::from_secs(5));
+                info!("TUN runtime dropped");
             }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-
-        drop(handle.runtime);
-        info!("TUN runtime dropped");
+        })
+    {
+        warn!("Could not spawn the runtime shutdown thread ({e}); dropping inline");
+        // Falling back to an inline drop is worse than a background one, but it
+        // is much better than leaking the runtime and its threads.
+        drop(runtime.lock().take());
     }
 
     info!("TUN service stop completed");
+    stopped
 }
 
 /// Store an error message.
@@ -142,6 +198,20 @@ pub fn is_service_running() -> bool {
     false
 }
 
+/// A config that has been parsed, validated, and had its DNS resolvers built.
+///
+/// Preparing is separate from running so that the FFI can do it on the calling
+/// thread and answer `start` with a real verdict. Everything that a bad config
+/// can fail at — YAML syntax, missing `device_fd`, an unusable key, a resolver
+/// that will not build — fails here, in front of the caller, instead of inside
+/// a spawned task whose error the app only learns about by polling
+/// `isRunning()` and finding it already false.
+pub struct PreparedService {
+    tun_config: crate::config::TunConfig,
+    server_configs: Vec<crate::config::ServerConfig>,
+    dns_registry: crate::dns::DnsRegistry,
+}
+
 /// Start the service from a config YAML string.
 ///
 /// This parses the config YAML and starts both TUN and any Server configs
@@ -151,6 +221,12 @@ pub async fn start_from_config(
     config_yaml: &str,
     shutdown_rx: oneshot::Receiver<()>,
 ) -> std::io::Result<()> {
+    let prepared = prepare_from_config(config_yaml).await?;
+    run_prepared(prepared, shutdown_rx).await
+}
+
+/// Parse and validate a config, and build its resolvers. See [`PreparedService`].
+pub async fn prepare_from_config(config_yaml: &str) -> std::io::Result<PreparedService> {
     info!("Parsing config for TUN server");
 
     let configs: Vec<Config> = load_config_str(config_yaml)?;
@@ -166,7 +242,7 @@ pub async fn start_from_config(
     } = create_server_configs(configs)?;
 
     // Build DNS registry from expanded groups
-    let mut dns_registry = build_dns_registry(dns_groups).await?;
+    let dns_registry = build_dns_registry(dns_groups).await?;
 
     // Separate TUN config from server configs, validate exactly one TUN with device_fd
     let mut tun_config = None;
@@ -207,6 +283,27 @@ pub async fn start_from_config(
     let tun_config = tun_config.ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidData, "No TUN config found")
     })?;
+
+    Ok(PreparedService {
+        tun_config,
+        server_configs,
+        dns_registry,
+    })
+}
+
+/// Run a service that [`prepare_from_config`] has already validated.
+///
+/// Returns when the TUN stops, either because `shutdown_rx` fired or because
+/// the stack died.
+pub async fn run_prepared(
+    prepared: PreparedService,
+    shutdown_rx: oneshot::Receiver<()>,
+) -> std::io::Result<()> {
+    let PreparedService {
+        tun_config,
+        server_configs,
+        mut dns_registry,
+    } = prepared;
 
     // Start TCP servers (like mixed)
     let mut join_handles: Vec<JoinHandle<()>> = Vec::new();

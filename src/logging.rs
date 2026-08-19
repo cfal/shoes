@@ -7,6 +7,7 @@
 use std::cell::Cell;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use log::{Level, LevelFilter, Log, Metadata, Record};
 
@@ -117,6 +118,33 @@ pub struct Directive {
     pub level: LevelFilter,
 }
 
+/// A level that replaces the configured directives while it is set.
+///
+/// Stored as `level as usize + 1` so that zero can mean "not set". Only the
+/// mobile FFI writes it: an app that has to reproduce a bug with debug logging
+/// on would otherwise have to be killed and relaunched, because `init` reads
+/// the level exactly once.
+static LEVEL_OVERRIDE: AtomicUsize = AtomicUsize::new(0);
+
+/// Override the configured levels for every target.
+///
+/// Note that `log` is built with `release_max_level_info`, so `Debug` and
+/// `Trace` are compiled out of release binaries; raising the level past `Info`
+/// only does anything in a build that keeps them.
+// Called from the mobile FFI, which the desktop binary does not compile.
+#[allow(dead_code)]
+pub fn set_log_level(level: LevelFilter) {
+    LEVEL_OVERRIDE.store(level as usize + 1, Ordering::Relaxed);
+    log::set_max_level(level);
+}
+
+fn level_override() -> Option<LevelFilter> {
+    match LEVEL_OVERRIDE.load(Ordering::Relaxed) {
+        0 => None,
+        raw => LevelFilter::iter().nth(raw - 1),
+    }
+}
+
 /// Dispatches formatted log lines to multiple `LogWriter` destinations.
 /// Filters records using env_logger-compatible directive matching.
 pub struct MultiLogger {
@@ -127,6 +155,10 @@ pub struct MultiLogger {
 
 impl MultiLogger {
     fn matches(&self, level: Level, target: &str) -> bool {
+        if let Some(override_level) = level_override() {
+            return level <= override_level;
+        }
+
         for directive in self.directives.iter().rev() {
             match &directive.name {
                 Some(name) if !target.starts_with(name.as_str()) => continue,

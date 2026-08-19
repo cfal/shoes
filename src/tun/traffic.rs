@@ -14,6 +14,15 @@ static UPLOAD_BYTES: AtomicU64 = AtomicU64::new(0);
 /// Cumulative download bytes (proxy → device).
 static DOWNLOAD_BYTES: AtomicU64 = AtomicU64::new(0);
 
+/// The values the last report carried, so an idle tunnel can stay quiet.
+///
+/// `NEVER_REPORTED` rather than zero for the initial state: a tunnel that has
+/// just started and carried nothing yet should still report once, so the app
+/// can zero its counters from the same source it reads them from.
+const NEVER_REPORTED: u64 = u64::MAX;
+static LAST_REPORTED_UPLOAD: AtomicU64 = AtomicU64::new(NEVER_REPORTED);
+static LAST_REPORTED_DOWNLOAD: AtomicU64 = AtomicU64::new(NEVER_REPORTED);
+
 /// Optional callback invoked with (upload_bytes, download_bytes).
 type TrafficCallback = Arc<dyn Fn(u64, u64) + Send + Sync>;
 static TRAFFIC_CALLBACK: OnceLock<RwLock<Option<TrafficCallback>>> = OnceLock::new();
@@ -34,6 +43,8 @@ pub fn add_download_bytes(bytes: u64) {
 pub fn reset_traffic_counters() {
     UPLOAD_BYTES.store(0, Ordering::Relaxed);
     DOWNLOAD_BYTES.store(0, Ordering::Relaxed);
+    LAST_REPORTED_UPLOAD.store(NEVER_REPORTED, Ordering::Relaxed);
+    LAST_REPORTED_DOWNLOAD.store(NEVER_REPORTED, Ordering::Relaxed);
 }
 
 /// Set the traffic callback function.
@@ -54,14 +65,27 @@ pub fn clear_traffic_callback() {
 }
 
 /// Invoke the traffic callback with current counter values.
+///
+/// A tick where neither counter moved reports nothing. The counters are
+/// cumulative, so repeating them tells the app what it already knows — and the
+/// call is a crossing into the JVM or into Swift, once a second, on a device
+/// that is otherwise trying to sleep.
 pub fn report_traffic() {
     let Some(lock) = TRAFFIC_CALLBACK.get() else {
         return;
     };
+
+    let upload = UPLOAD_BYTES.load(Ordering::Relaxed);
+    let download = DOWNLOAD_BYTES.load(Ordering::Relaxed);
+
+    let last_upload = LAST_REPORTED_UPLOAD.swap(upload, Ordering::Relaxed);
+    let last_download = LAST_REPORTED_DOWNLOAD.swap(download, Ordering::Relaxed);
+    if upload == last_upload && download == last_download {
+        return;
+    }
+
     let guard = lock.read();
     if let Some(ref cb) = *guard {
-        let upload = UPLOAD_BYTES.load(Ordering::Relaxed);
-        let download = DOWNLOAD_BYTES.load(Ordering::Relaxed);
         cb(upload, download);
     }
 }
@@ -223,6 +247,41 @@ mod tests {
             1,
             "callback should not fire after clear"
         );
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_tick_reports_nothing() {
+        let _guard = TEST_LOCK.lock().await;
+        reset_traffic_counters();
+
+        let call_count = Arc::new(AtomicU64::new(0));
+        let count_clone = call_count.clone();
+        set_traffic_callback(Arc::new(move |_, _| {
+            count_clone.fetch_add(1, Ordering::Relaxed);
+        }));
+
+        // The first tick always reports, so the app can zero its counters.
+        report_traffic();
+        assert_eq!(call_count.load(Ordering::Relaxed), 1);
+
+        // An idle second: nothing moved, so nothing crosses the FFI boundary.
+        report_traffic();
+        report_traffic();
+        assert_eq!(
+            call_count.load(Ordering::Relaxed),
+            1,
+            "an idle tunnel should not wake the app once a second"
+        );
+
+        add_download_bytes(1);
+        report_traffic();
+        assert_eq!(
+            call_count.load(Ordering::Relaxed),
+            2,
+            "a byte in either direction should report again"
+        );
+
+        clear_traffic_callback();
     }
 
     #[tokio::test]

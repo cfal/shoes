@@ -18,4 +18,7 @@ mod parsed;
 mod proxy_runtime;
 
 pub use builder::build_dns_registry;
+// Named in the mobile FFI's PreparedService, which is not compiled on desktop.
+#[allow(unused_imports)]
+pub use builder::DnsRegistry;
 pub use parsed::{IpStrategy, ParsedDnsUrl};

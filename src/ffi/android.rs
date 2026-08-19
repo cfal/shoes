@@ -271,16 +271,32 @@ pub extern "system" fn Java_com_shoesproxy_ShoesNative_start<'local>(
         }
     };
 
+    common::clear_last_error();
+
+    // Prepared here, on the caller's thread, so that a config this process
+    // cannot run is reported as a failed start. Doing it inside the spawned
+    // task meant start() returned success and the app had to discover the
+    // failure by noticing isRunning() had gone false on its own.
+    let prepared = match runtime.block_on(common::prepare_from_config(&config_str)) {
+        Ok(prepared) => prepared,
+        Err(e) => {
+            let msg = e.to_string();
+            error!("start: invalid config: {}", msg);
+            common::set_last_error(msg);
+            crate::tun::traffic::clear_traffic_callback();
+            crate::socket_protector::clear_global_socket_protector();
+            return -1;
+        }
+    };
+
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let running_clone = running.clone();
 
-    common::clear_last_error();
-
     runtime.spawn(async move {
         info!("Shoes service task started");
 
-        match common::start_from_config(&config_str, shutdown_rx).await {
+        match common::run_prepared(prepared, shutdown_rx).await {
             Ok(()) => info!("Shoes service stopped normally"),
             Err(e) => {
                 let msg = e.to_string();
@@ -336,6 +352,70 @@ pub extern "system" fn Java_com_shoesproxy_ShoesNative_isRunning(
     } else {
         JNI_FALSE
     }
+}
+
+/// Change the log level of a running library.
+///
+/// `init` reads the level once and ignores it on every later call, so without
+/// this a support workflow of "turn on debug logging and reproduce" means
+/// killing the app first.
+///
+/// Note that release builds are compiled with `release_max_level_info`, so
+/// "debug" and "trace" only differ from "info" in a build that keeps them.
+///
+/// # Returns
+/// * 0 on success
+/// * -1 if the level was not recognised
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_shoesproxy_ShoesNative_setLogLevel<'local>(
+    mut unowned: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    log_level: JString<'local>,
+) -> jint {
+    let level_str: String = match unowned
+        .with_env(|env| log_level.try_to_string(env))
+        .into_outcome()
+    {
+        Outcome::Ok(s) => s,
+        Outcome::Err(e) => {
+            error!("Failed to get log level string: {}", e);
+            return -1;
+        }
+        Outcome::Panic(_) => return -1,
+    };
+
+    match crate::logging::parse_log_level(&level_str) {
+        Some(level) => {
+            crate::logging::set_log_level(level);
+            info!("log level set to {}", level_str);
+            0
+        }
+        None => {
+            error!("setLogLevel: unrecognised level {:?}", level_str);
+            -1
+        }
+    }
+}
+
+/// Tell the library the device's network changed.
+///
+/// Call this from `ConnectivityManager.NetworkCallback`. A UDP tunnel bound to
+/// an address that no longer exists does not fail — it goes silent — so without
+/// this the only recovery is a full stop and start, which tears down the TUN
+/// interface and every connection through it. This rebinds the tunnel's socket
+/// in place instead.
+///
+/// Safe to call at any time, including when no tunnel is running, and from any
+/// thread: it does no I/O itself.
+///
+/// # Returns
+/// The number of tunnel endpoints that were told to rebind.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_shoesproxy_ShoesNative_networkChanged(
+    _env: EnvUnowned,
+    _class: JClass,
+) -> jint {
+    crate::amneziawg::notify_network_change() as jint
 }
 
 /// Get the last error message from the shoes service.

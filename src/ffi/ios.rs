@@ -62,10 +62,7 @@ impl crate::socket_protector::SocketProtector for IosSocketProtector {
             if callback(fd as c_int) {
                 Ok(())
             } else {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "Socket protection failed",
-                ))
+                Err(std::io::Error::other("Socket protection failed"))
             }
         } else {
             Ok(())
@@ -95,10 +92,9 @@ pub unsafe extern "C" fn shoes_init(log_level: *const c_char) -> c_int {
     } else {
         // SAFETY: the caller guarantees a valid null-terminated C string,
         // and we checked for null above.
-        match unsafe { CStr::from_ptr(log_level) }.to_str() {
-            Ok(s) => s,
-            Err(_) => "info",
-        }
+        unsafe { CStr::from_ptr(log_level) }
+            .to_str()
+            .unwrap_or("info")
     };
 
     let filter = crate::logging::parse_log_level(level_str).unwrap_or(log::LevelFilter::Info);
@@ -193,14 +189,31 @@ pub unsafe extern "C" fn shoes_start(
         }
     };
 
+    common::clear_last_error();
+
+    // Prepared here, on the caller's thread, so that a config this process
+    // cannot run is reported as a failed start. Doing it inside the spawned
+    // task meant shoes_start() returned success and the app had to discover
+    // the failure by noticing shoes_is_running() had gone false on its own.
+    let prepared = match runtime.block_on(common::prepare_from_config(&config_str)) {
+        Ok(prepared) => prepared,
+        Err(e) => {
+            let msg = e.to_string();
+            error!("shoes_start: invalid config: {}", msg);
+            common::set_last_error(msg);
+            crate::tun::traffic::clear_traffic_callback();
+            crate::socket_protector::clear_global_socket_protector();
+            *PROTECT_CALLBACK.get_or_init(|| Mutex::new(None)).lock() = None;
+            return -1;
+        }
+    };
+
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let running_clone = running.clone();
 
-    common::clear_last_error();
-
     runtime.spawn(async move {
-        match common::start_from_config(&config_str, shutdown_rx).await {
+        match common::run_prepared(prepared, shutdown_rx).await {
             Ok(()) => info!("shoes service stopped normally"),
             Err(e) => {
                 let msg = e.to_string();
@@ -284,6 +297,68 @@ pub unsafe extern "C" fn shoes_set_log_file(path: *const c_char) -> c_int {
     };
 
     setup_log_file(path_str)
+}
+
+/// Change the log level of a running library.
+///
+/// `shoes_init` reads the level once and ignores it on every later call, so
+/// without this a support workflow of "turn on debug logging and reproduce"
+/// means killing the app first. Takes effect immediately, for every subsequent
+/// record.
+///
+/// Note that release builds are compiled with `release_max_level_info`, so
+/// "debug" and "trace" only differ from "info" in a build that keeps them.
+///
+/// # Arguments
+/// * `log_level` - "error", "warn", "info", "debug", "trace", or "off"
+///
+/// # Returns
+/// * 0 on success
+/// * -1 if the level was not recognised
+///
+/// # Safety
+/// `log_level` must be a valid null-terminated C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn shoes_set_log_level(log_level: *const c_char) -> c_int {
+    if log_level.is_null() {
+        return -1;
+    }
+
+    // SAFETY: the caller guarantees a valid null-terminated C string, and we
+    // checked for null above.
+    let Ok(level_str) = (unsafe { CStr::from_ptr(log_level) }).to_str() else {
+        return -1;
+    };
+
+    match crate::logging::parse_log_level(level_str) {
+        Some(level) => {
+            crate::logging::set_log_level(level);
+            info!("log level set to {}", level_str);
+            0
+        }
+        None => {
+            error!("shoes_set_log_level: unrecognised level {:?}", level_str);
+            -1
+        }
+    }
+}
+
+/// Tell the library the device's network changed.
+///
+/// Call this from `NWPathMonitor`'s update handler. A UDP tunnel bound to an
+/// address that no longer exists does not fail — it goes silent — so without
+/// this the only recovery is a full stop and start, which tears down the TUN
+/// interface and every connection through it. This rebinds the tunnel's socket
+/// in place instead.
+///
+/// Safe to call at any time, including when no tunnel is running. It does no
+/// I/O on the calling thread.
+///
+/// # Returns
+/// The number of tunnel endpoints that were told to rebind.
+#[unsafe(no_mangle)]
+pub extern "C" fn shoes_network_changed() -> c_int {
+    crate::amneziawg::notify_network_change() as c_int
 }
 
 /// Get the last error message from the shoes service.
