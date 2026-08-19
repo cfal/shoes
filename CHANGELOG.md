@@ -1,5 +1,65 @@
 # Changelog
 
+## v0.2.9
+
+Mobile integration work. Everything below is on the client side; a server
+deployment is unaffected except for the dependency update.
+
+### Fixes
+
+#### The TUN stack and the app's file descriptor
+- The stack closed the TUN descriptor even when told not to. `close_fd_on_drop`
+  was only honoured on the path that creates the device, so every Android and
+  iOS start had the library closing a descriptor the app owns — a double close
+  once the app closed its own, which in a process opening sockets constantly
+  means closing whichever socket has taken the number since.
+- Shutting down a quiet tunnel could block indefinitely. The stack thread sleeps
+  in a syscall that `unpark` does not interrupt, so `stop` waited for a packet
+  that might never arrive. There is a wake pipe now, and the sleep is bounded.
+- The wait uses `poll()` rather than `select()`, whose `fd_set` cannot hold a
+  descriptor numbered above `FD_SETSIZE`.
+
+#### AmneziaWG across a network change
+- The endpoint socket is rebindable. A UDP socket bound to an address that no
+  longer exists does not report an error — it goes silent — so leaving Wi-Fi
+  used to mean stopping and starting the whole tunnel.
+- `networkChanged()` / `shoes_network_changed()` let the app report the change
+  from `ConnectivityManager.NetworkCallback` or `NWPathMonitor`. A send that
+  fails with a route error also triggers a rebind on its own, so an app that
+  never wires the callback still recovers.
+
+#### FFI
+- `start` validates the config on the calling thread, so a `-1` is a real
+  verdict with `getLastError()` behind it rather than a failure the app has to
+  discover by polling `isRunning()`.
+- `stop` no longer blocks on dropping the runtime, and polls at 5 ms rather than
+  100 ms. It still waits for the stack thread to release the TUN descriptor,
+  which is what makes it safe for the app to close its own copy afterwards.
+- `stop` clears the socket protector, which on Android held a JNI global
+  reference keeping a destroyed `VpnService` and its `Context` alive.
+- `setLogLevel()` / `shoes_set_log_level()` change the level of a running
+  library, so debug logs no longer need an app restart.
+- The traffic callback reports once per session start and then only when a
+  counter moved, instead of crossing into the JVM or Swift once a second on an
+  idle tunnel.
+
+### Memory
+
+- Per-connection buffering is configurable (`tcp_buffer_size`,
+  `max_connections`) and sized by platform. A connection through the TUN and
+  AmneziaWG stacks costs 704 KiB rather than 2.3 MB.
+- Buffers that face the network keep their size. Cutting the AmneziaWG socket
+  buffers to the size of a local buffer measured as a 6x throughput loss, since
+  those are a receive window rather than local buffering; `src/buffer_sizing.rs`
+  documents the distinction and the measurement.
+- The AmneziaWG data path and the TUN write path no longer allocate per packet.
+- Stopping a tunnel drops the read path's buffer pool and asks the allocator to
+  release what it is holding.
+
+### Security
+
+- `h2` updated to 0.4.16 for RUSTSEC-2026-0258 (unbounded empty DATA frames).
+
 ## v0.2.7
 
 ### Improvements
