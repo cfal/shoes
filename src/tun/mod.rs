@@ -229,6 +229,17 @@ pub async fn run_tun_server(
     }
 
     // tcp_stack is dropped here, which stops the stack thread
+    drop(tcp_stack);
+
+    // The read path's buffer pool is process-global, and on mobile the process
+    // outlives the tunnel by hours. Nothing reads from it once the stack thread
+    // is gone, so hand the memory back.
+    tcp_stack_direct::clear_buffer_pool();
+
+    // Freeing the connection buffers does not shrink the process; the allocator
+    // keeps the pages. On a phone that leaves an idle tunnel sitting at the
+    // high-water mark of the busiest thing the user did with it.
+    crate::memory::release_to_os();
 
     info!("TUN server stopped");
 

@@ -206,14 +206,25 @@ carried, against a `MAX_CONCURRENT_CONNECTIONS` of 1024: a ceiling of ~1.34 GB,
 or about 35 connections inside an iOS extension's ~50 MB jetsam limit. A single
 page load in Safari opens more than that.
 
+It was also only half the bill. The AmneziaWG virtual stack
+(`src/amneziawg/netstack.rs`) allocates its own four buffers per connection, at
+256 KiB each, and on a mobile VPN the two stacks are in series: a browser
+connection is accepted by the TUN stack and initiated through the netstack, so
+it paid 1.31 MB *plus* 1 MiB. Its UDP sockets took another 128 KiB of payload
+buffer per session. Both stacks now take their defaults from
+`src/buffer_sizing.rs`, so the total is something one can work out in one place.
+
 Both are configuration now — `tcp_buffer_size` and `max_connections` on the TUN
 config, carried through `TunServerConfig` and `TcpStackOptions` — and both
 default by platform, the way `mtu` already did:
 
-| | buffer/direction | max connections | worst case |
+| | buffer/direction | max connections | worst case, both stacks |
 |---|---|---|---|
-| iOS, Android | 32 KiB | 256 | 32 MiB |
-| everywhere else | 64 KiB | 1024 | 256 MiB |
+| iOS, Android | 32 KiB | 256 | 128 MiB |
+| everywhere else | 64 KiB | 1024 | 1 GiB |
+
+Those ceilings are what a connection *allocates*. What it costs resident is
+lower — see finding 10.
 
 Neither buffer spans a network round trip: both sit between the device and a
 proxy connection inside this process, so their size buys burst tolerance rather
@@ -432,14 +443,79 @@ the app configuring anything. Two things still make it behave better:
   connection to be restored. A default route covers it; a split tunnel needs
   `198.18.0.0/16` (or whatever `network` is set to) added explicitly.
 
+## 10. Memory: what the audit measured
+
+Three questions, since none of the arithmetic above is worth much unmeasured.
+
+**Does anything leak?** No. The whole suite under `leaks --atExit` reports 30
+unreachable allocations of 16 bytes each, all of them `Box::leak` in test
+scaffolding for the TUIC and Hysteria2 servers. Nothing in the TUN stack, the
+tunnel, or the FFI leaks by construction: every socket table has a removal path,
+the endpoint registry holds weak references and sweeps them, and the globals the
+FFI keeps are single values rather than collections.
+
+```bash
+cargo test --lib --no-run
+MallocStackLogging=1 leaks --atExit -- ./target/debug/deps/shoes-<hash>
+```
+
+**What does a connection actually cost?** Less than it allocates, because
+`vec![0u8; n]` gets zero pages the kernel only faults in when they are written.
+Measured with `measure_memory_per_connection` (ignored by default; run it with
+`--ignored --nocapture`), 200 connections at 32 KiB buffers:
+
+| | |
+|---|---|
+| allocated per connection | 128 KiB |
+| resident per connection | ~40 KiB, about a third |
+
+So the 128 MiB ceiling above is a ceiling on address space, and the resident
+figure for 256 saturated mobile connections is nearer 40 MiB — still the
+dominant term inside an iOS extension, which is why the ceiling matters, but not
+the number to quote.
+
+**Does it come back?** Not on its own. After dropping every connection and the
+stack, resident size stayed within 150 KiB of its peak: freeing does not shrink
+a process, because no general-purpose allocator returns spans eagerly. On a
+phone that leaves an idle tunnel parked at the high-water mark of the busiest
+thing the user did with it. `src/memory.rs` now asks the allocator to purge when
+a tunnel stops — `mallopt(M_PURGE_ALL)` on bionic, `malloc_zone_pressure_relief`
+on Apple's libmalloc — alongside dropping the read path's buffer pool.
+
+Be careful what you expect from that: on macOS the purge did not move RSS in
+this measurement, which is consistent with libmalloc marking pages reclaimable
+rather than unmapping them. Whether it helps an iOS extension's `phys_footprint`
+— the number jetsam actually reads — is unverified here and worth checking under
+Instruments before relying on it. On bionic, scudo documents `M_PURGE_ALL` as
+releasing to the OS.
+
+**Allocation churn.** The AmneziaWG data path allocated per packet: a `to_vec()`
+of every datagram leaving `decapsulate`, `encapsulate` and the timer, plus a
+`Vec<Vec<u8>>` per send to hold decoys that are only present during a handshake.
+At the ~4,600 packets/s a 6.5 MB/s tunnel carries, that was tens of thousands of
+allocations a second, which on mobile is battery and fragmentation rather than
+throughput. Those are reusable scratch buffers now, and the decoy list does not
+allocate when there are no decoys. The same went for the TUN write path, where
+every segment and every ACK allocated a fresh buffer; it now uses a thread-local
+one.
+
+What still allocates per packet, deliberately: the two channels that carry IP
+packets between the stacks own their `Vec<u8>`, so a packet crossing them is one
+allocation. Removing that means changing the channel element type to something
+poolable, which is a larger change than it looks and was not worth folding into
+this pass.
+
 ## Suggested order
 
 What is left, in the order it is worth doing:
 
 1. Lazy buffer growth (1). The ceiling is survivable now, but a connection that
-   carries one HTTP request still pays what a video connection pays.
-2. Handle semantics (5). The API implies a multi-instance model it does not
+   carries one HTTP request still pays what a video connection pays, and the
+   resident figure above says a third of that is real.
+2. Confirm the allocator purge does something for `phys_footprint` on a real
+   iOS extension (10). If it does not, the lever is (1) instead.
+3. Handle semantics (5). The API implies a multi-instance model it does not
    have.
-3. Configurable traffic-report interval (7), so an app can back off when its UI
+4. Configurable traffic-report interval (7), so an app can back off when its UI
    is not in the foreground.
-4. The packaging items in 8, and the Fake IP platform wiring in 9.
+5. The packaging items in 8, and the Fake IP platform wiring in 9.

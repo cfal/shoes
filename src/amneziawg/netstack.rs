@@ -132,8 +132,22 @@ impl TxToken for VirtualTxToken<'_> {
 // TCP: shared control buffer (ring-buffer + waker pattern)
 // ---------------------------------------------------------------------------
 
-const TCP_SEND_BUF: usize = 256 * 1024;
-const TCP_RECV_BUF: usize = 256 * 1024;
+// 1 MiB per connection until this was shared with the TUN stack: four buffers
+// of 256 KiB, allocated when the connection is opened rather than when it
+// carries anything, and paid *in addition* to the TUN stack's own four for
+// every connection a device makes through the tunnel. See src/buffer_sizing.rs.
+const TCP_SEND_BUF: usize = crate::buffer_sizing::default_tcp_buffer_size();
+const TCP_RECV_BUF: usize = crate::buffer_sizing::default_tcp_buffer_size();
+
+/// Payload bytes each virtual UDP socket buffers per direction.
+///
+/// Datagrams through the tunnel are MTU-bounded in practice, so the 64 KiB
+/// this replaced — 128 KiB per session, before metadata — was sized for a
+/// datagram nothing sends.
+const UDP_PAYLOAD_BUF: usize = crate::buffer_sizing::default_tcp_buffer_size();
+
+/// Datagrams each virtual UDP socket queues per direction.
+const UDP_PACKET_SLOTS: usize = 32;
 
 /// Shared state between the smoltcp poll loop and the async VirtualTcpStream.
 struct TcpControl {
@@ -478,8 +492,14 @@ impl VirtualNetStack {
         target: SocketAddr,
         reply: tokio::sync::oneshot::Sender<std::io::Result<VirtualUdpStream>>,
     ) {
-        let rx_buf = UdpPacketBuffer::new(vec![UdpPacketMetadata::EMPTY; 64], vec![0u8; 65536]);
-        let tx_buf = UdpPacketBuffer::new(vec![UdpPacketMetadata::EMPTY; 64], vec![0u8; 65536]);
+        let rx_buf = UdpPacketBuffer::new(
+            vec![UdpPacketMetadata::EMPTY; UDP_PACKET_SLOTS],
+            vec![0u8; UDP_PAYLOAD_BUF],
+        );
+        let tx_buf = UdpPacketBuffer::new(
+            vec![UdpPacketMetadata::EMPTY; UDP_PACKET_SLOTS],
+            vec![0u8; UDP_PAYLOAD_BUF],
+        );
         let mut socket = SmolUdpSocket::new(rx_buf, tx_buf);
 
         let local_port = allocate_ephemeral_port();

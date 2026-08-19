@@ -129,6 +129,9 @@ async fn decapsulate_loop(
 ) {
     let mut buf = vec![0u8; MAX_UDP_SIZE];
     let mut out = vec![0u8; MAX_UDP_SIZE];
+    // Reused for every packet this loop sends. See the comment in
+    // drain_queued_packets for why the copy is needed at all.
+    let mut packet = Vec::new();
 
     loop {
         let n = match udp.recv(&mut buf).await {
@@ -162,9 +165,10 @@ async fn decapsulate_loop(
                 debug!("AmneziaWG decapsulate error: {:?}", e);
             }
             TunnResult::WriteToNetwork(data) => {
-                let packet = data.to_vec();
-                send_to_network(&tunn, &udp, packet, "handshake").await;
-                drain_queued_packets(&tunn, &udp, &mut out).await;
+                packet.clear();
+                packet.extend_from_slice(data);
+                send_to_network(&tunn, &udp, &packet, "handshake").await;
+                drain_queued_packets(&tunn, &udp, &mut out, &mut packet).await;
             }
             TunnResult::WriteToTunnelV4(data, _) | TunnResult::WriteToTunnelV6(data, _) => {
                 if tx.try_send(data.to_vec()).is_err() {
@@ -173,29 +177,41 @@ async fn decapsulate_loop(
                     // it is worth seeing when throughput is being lost.
                     debug!("AmneziaWG: virtual stack queue full, dropping inbound packet");
                 }
-                drain_queued_packets(&tunn, &udp, &mut out).await;
+                drain_queued_packets(&tunn, &udp, &mut out, &mut packet).await;
             }
         }
     }
 }
 
-/// Order the datagrams produced by a `WriteToNetwork` result.
+/// Take the datagrams boringtun has queued ahead of the packet that queued
+/// them.
 ///
 /// Any call that can start a handshake queues the AmneziaWG decoys — the I1-I5
 /// chains followed by `Jc` junk packets — and returns the handshake initiation
 /// separately. boringtun requires the queued datagrams to reach the network
-/// *before* the packet that queued them: that ordering is the whole point of
-/// the decoys, since a censor is meant to see junk lead the exchange rather
-/// than a recognisable WireGuard handshake.
+/// *before* it: that ordering is the whole point of the decoys, since a censor
+/// is meant to see junk lead the exchange rather than a recognisable WireGuard
+/// handshake.
 ///
-/// Returns the queued datagrams followed by `packet`. Takes `&mut Tunn` rather
-/// than the mutex so the lock is released before any of this is sent, and so
-/// the ordering can be asserted in a test without a socket.
-fn ordered_outgoing(tunn: &mut Tunn, packet: Vec<u8>) -> Vec<Vec<u8>> {
+/// Empty in the steady state, and an empty `Vec` does not allocate — which
+/// matters because this sits on the path every packet takes. Takes `&mut Tunn`
+/// rather than the mutex so the lock is released before any of it is sent.
+fn take_queued_decoys(tunn: &mut Tunn) -> Vec<Vec<u8>> {
     let mut datagrams = Vec::new();
     while let Some(queued) = tunn.poll_outgoing_packet() {
         datagrams.push(queued);
     }
+    datagrams
+}
+
+/// The queued decoys followed by `packet`, in the order they must be sent.
+///
+/// Only the test uses this; the send path streams the same sequence to the
+/// socket without collecting it. Kept so the ordering can be asserted without a
+/// socket.
+#[cfg(test)]
+fn ordered_outgoing(tunn: &mut Tunn, packet: Vec<u8>) -> Vec<Vec<u8>> {
+    let mut datagrams = take_queued_decoys(tunn);
     datagrams.push(packet);
     datagrams
 }
@@ -204,14 +220,18 @@ fn ordered_outgoing(tunn: &mut Tunn, packet: Vec<u8>) -> Vec<Vec<u8>> {
 async fn send_to_network(
     tunn: &Arc<ParkingMutex<Tunn>>,
     udp: &Arc<EndpointSocket>,
-    packet: Vec<u8>,
+    packet: &[u8],
     context: &str,
 ) {
-    let datagrams = ordered_outgoing(&mut tunn.lock(), packet);
-    for datagram in datagrams {
-        if let Err(e) = udp.send(&datagram).await {
+    let decoys = take_queued_decoys(&mut tunn.lock());
+    for datagram in &decoys {
+        if let Err(e) = udp.send(datagram).await {
             warn!("AmneziaWG UDP send ({}) error: {}", context, e);
         }
+    }
+
+    if let Err(e) = udp.send(packet).await {
+        warn!("AmneziaWG UDP send ({}) error: {}", context, e);
     }
 }
 
@@ -221,15 +241,23 @@ async fn drain_queued_packets(
     tunn: &Arc<ParkingMutex<Tunn>>,
     udp: &Arc<EndpointSocket>,
     out: &mut [u8],
+    packet: &mut Vec<u8>,
 ) {
     loop {
-        let packet = {
+        {
             let mut tunn = tunn.lock();
             match tunn.decapsulate(None, &[], out) {
-                TunnResult::WriteToNetwork(data) => data.to_vec(),
+                // Copied into `packet` rather than sent from `out`: the result
+                // borrows `out` for as long as it lives, and `out` is needed
+                // again on the next turn of this loop. `packet` keeps its
+                // capacity across calls, so the copy costs no allocation.
+                TunnResult::WriteToNetwork(data) => {
+                    packet.clear();
+                    packet.extend_from_slice(data);
+                }
                 _ => break,
             }
-        };
+        }
         send_to_network(tunn, udp, packet, "drain").await;
     }
 }
@@ -240,32 +268,38 @@ async fn encapsulate_loop(
     mut rx: mpsc::Receiver<Vec<u8>>,
 ) {
     let mut out = vec![0u8; MAX_UDP_SIZE];
+    let mut packet = Vec::new();
 
     while let Some(ip_packet) = rx.recv().await {
-        let result = {
+        let has_packet = {
             let mut tunn = tunn.lock();
             match tunn.encapsulate(&ip_packet, &mut out) {
-                TunnResult::WriteToNetwork(data) => Some(data.to_vec()),
-                TunnResult::Done => None,
+                TunnResult::WriteToNetwork(data) => {
+                    packet.clear();
+                    packet.extend_from_slice(data);
+                    true
+                }
+                TunnResult::Done => false,
                 TunnResult::Err(e) => {
                     debug!("AmneziaWG encapsulate error: {:?}", e);
-                    None
+                    false
                 }
                 _ => {
                     debug!("AmneziaWG encapsulate: unexpected tunnel write result");
-                    None
+                    false
                 }
             }
         };
 
-        if let Some(packet) = result {
-            send_to_network(&tunn, &udp, packet, "encap").await;
+        if has_packet {
+            send_to_network(&tunn, &udp, &packet, "encap").await;
         }
     }
 }
 
 async fn timer_loop(tunn: Arc<ParkingMutex<Tunn>>, udp: Arc<EndpointSocket>) {
     let mut out = vec![0u8; MAX_UDP_SIZE];
+    let mut packet = Vec::new();
 
     loop {
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
@@ -281,8 +315,9 @@ async fn timer_loop(tunn: Arc<ParkingMutex<Tunn>>, udp: Arc<EndpointSocket>) {
                 debug!("AmneziaWG timer error: {:?}", e);
             }
             TunnResult::WriteToNetwork(data) => {
-                let packet = data.to_vec();
-                send_to_network(&tunn, &udp, packet, "timer").await;
+                packet.clear();
+                packet.extend_from_slice(data);
+                send_to_network(&tunn, &udp, &packet, "timer").await;
             }
             _ => {}
         }

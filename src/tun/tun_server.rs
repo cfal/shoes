@@ -120,17 +120,11 @@ impl Default for TunServerConfig {
         #[cfg(not(any(target_os = "ios", target_os = "android")))]
         let default_mtu = 1500;
 
-        // The stack allocates four buffers of `tcp_buffer_size` per connection
-        // at SYN, so these two numbers multiply into the worst-case footprint:
-        // 32 MiB on mobile, 256 MiB elsewhere. The mobile figure is what keeps
-        // an iOS packet-tunnel extension inside its ~50 MB limit. Neither
-        // buffer spans a network round trip — both sit between the device and
-        // a proxy connection in the same process — so the size only buys burst
-        // tolerance, and 32 KiB is far more than a mobile radio can outrun.
-        #[cfg(any(target_os = "ios", target_os = "android"))]
-        let (default_buffer_size, default_max_connections) = (32 * 1024, 256);
-        #[cfg(not(any(target_os = "ios", target_os = "android")))]
-        let (default_buffer_size, default_max_connections) = (64 * 1024, 1024);
+        // Shared with the AmneziaWG virtual stack, which allocates the same
+        // four buffers per connection on the far side of the tunnel. See
+        // src/buffer_sizing.rs for what the two of them add up to.
+        let default_buffer_size = crate::buffer_sizing::default_tcp_buffer_size();
+        let default_max_connections = crate::buffer_sizing::default_max_connections();
 
         Self {
             mtu: default_mtu,

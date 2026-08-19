@@ -4,6 +4,7 @@
 //! using `select()` on the TUN fd for event-driven I/O instead of polling.
 
 use std::{
+    cell::RefCell,
     collections::HashMap,
     io, mem,
     net::SocketAddr,
@@ -39,8 +40,12 @@ use super::tcp_conn::{TcpConnection, TcpConnectionControl, TcpSocketState};
 
 pub type PacketBuffer = Vec<u8>;
 
-/// Maximum number of buffers cached globally.
-/// Each buffer has capacity ~65536, so 64 * 65536 = 4MB max.
+/// Maximum number of read buffers cached globally.
+///
+/// Each holds one MTU plus the four-byte packet-information header, so the pool
+/// retains 64 * (mtu + 4): about 576 KiB at Android's 9000-byte default and
+/// 260 KiB at iOS's 4064. It is cleared when a tunnel stops, since a mobile app
+/// outlives its tunnel and has no use for the memory in between.
 const BUFFER_POOL_MAX_SIZE: usize = 64;
 
 static BUFFER_POOL: LazyLock<Mutex<Vec<BytesMut>>> = LazyLock::new(|| Mutex::new(Vec::new()));
@@ -60,6 +65,18 @@ impl Drop for PooledBuffer {
             buffer.clear();
             pool.push(buffer);
         }
+    }
+}
+
+/// Drop every buffer the pool is holding.
+///
+/// Called when a tunnel stops. The pool exists to keep the read path from
+/// allocating per packet, which is worth a few hundred kilobytes while a tunnel
+/// runs and nothing at all once it has stopped.
+pub fn clear_buffer_pool() {
+    if let Ok(mut pool) = BUFFER_POOL.lock() {
+        pool.clear();
+        pool.shrink_to_fit();
     }
 }
 
@@ -405,19 +422,42 @@ struct DirectTxToken {
     fd: RawFd,
 }
 
+thread_local! {
+    /// Scratch for the packet currently being written to the TUN.
+    ///
+    /// Every segment and every ACK the stack sends passes through here, so a
+    /// fresh `vec![0u8; len]` per packet was an allocation per packet on the
+    /// busiest path in the process. The token is consumed synchronously on the
+    /// stack thread and the buffer does not outlive the call, so one buffer per
+    /// thread is enough.
+    static TX_SCRATCH: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
+
 impl TxToken for DirectTxToken {
     fn consume<R, F>(self, len: usize, f: F) -> R
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        let mut buffer = vec![0u8; len];
-        let result = f(&mut buffer);
+        let fd = self.fd;
+        let write = |buffer: &mut Vec<u8>| {
+            buffer.clear();
+            buffer.resize(len, 0);
+            let result = f(buffer);
 
-        if let Err(e) = write_all(self.fd, &buffer) {
-            warn!("Failed to write to TUN: {}", e);
-        }
+            if let Err(e) = write_all(fd, buffer) {
+                warn!("Failed to write to TUN: {}", e);
+            }
 
-        result
+            result
+        };
+
+        TX_SCRATCH.with(|scratch| match scratch.try_borrow_mut() {
+            Ok(mut buffer) => write(&mut buffer),
+            // Unreachable as smoltcp uses it — a token is consumed before the
+            // next one is handed out — but borrowing rather than assuming keeps
+            // a future caller from turning a nested consume into a panic.
+            Err(_) => write(&mut Vec::new()),
+        })
     }
 }
 
@@ -1196,6 +1236,135 @@ mod tests {
         // the whole test binary ("IO Safety violation: owned file descriptor
         // already closed").
         drop(stack);
+    }
+
+    /// Resident bytes this process is using, from `ps`.
+    fn resident_bytes() -> u64 {
+        let pid = std::process::id();
+        let out = std::process::Command::new("ps")
+            .args(["-o", "rss=", "-p", &pid.to_string()])
+            .output()
+            .expect("ps");
+        String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse::<u64>()
+            .expect("rss")
+            * 1024
+    }
+
+    /// One IPv4 SYN, checksummed, from `src_port` to 93.184.216.34:443.
+    fn syn_packet(src_port: u16) -> Vec<u8> {
+        use smoltcp::phy::ChecksumCapabilities;
+        use smoltcp::wire::{Ipv4Repr, TcpControl, TcpRepr, TcpSeqNumber};
+
+        let tcp = TcpRepr {
+            src_port,
+            dst_port: 443,
+            control: TcpControl::Syn,
+            seq_number: TcpSeqNumber(0),
+            ack_number: None,
+            window_len: 64240,
+            window_scale: None,
+            max_seg_size: Some(1400),
+            sack_permitted: false,
+            sack_ranges: [None; 3],
+            timestamp: None,
+            payload: &[],
+        };
+        let src_addr = Ipv4Address::new(10, 0, 0, 2);
+        let dst_addr = Ipv4Address::new(93, 184, 216, 34);
+        let ip = Ipv4Repr {
+            src_addr,
+            dst_addr,
+            next_header: IpProtocol::Tcp,
+            payload_len: tcp.buffer_len(),
+            hop_limit: 64,
+        };
+
+        let checksums = ChecksumCapabilities::default();
+        let mut buffer = vec![0u8; ip.buffer_len() + tcp.buffer_len()];
+        ip.emit(&mut Ipv4Packet::new_unchecked(&mut buffer), &checksums);
+        tcp.emit(
+            &mut TcpPacket::new_unchecked(&mut buffer[ip.buffer_len()..]),
+            &src_addr.into(),
+            &dst_addr.into(),
+            &checksums,
+        );
+        buffer
+    }
+
+    /// What a connection actually costs in resident memory, and whether the
+    /// stack gives it back.
+    ///
+    /// Ignored by default: resident size is a measurement, not something to
+    /// assert on across machines and allocators. Run it with
+    /// `cargo test measure_memory_per_connection -- --ignored --nocapture`
+    /// when changing buffer sizing.
+    #[test]
+    #[ignore = "measurement; run with --ignored --nocapture"]
+    fn measure_memory_per_connection() {
+        use std::io::Write;
+
+        const CONNECTIONS: usize = 200;
+        let buffer_size = 32 * 1024;
+
+        let (mut server, client) = UnixStream::pair().expect("socket pair");
+        let client_fd = client.into_raw_fd();
+
+        let before = resident_bytes();
+        let stack = TcpStackDirect::new(
+            client_fd,
+            TcpStackOptions {
+                mtu: 1500,
+                tcp_buffer_size: buffer_size,
+                max_connections: CONNECTIONS * 2,
+                close_fd_on_drop: true,
+            },
+        );
+        thread::sleep(Duration::from_millis(100));
+
+        for i in 0..CONNECTIONS {
+            server
+                .write_all(&syn_packet(20000 + i as u16))
+                .expect("write SYN");
+            // The stack reads in batches of 64; give it room to keep up rather
+            // than filling the socket buffer and blocking this side.
+            if i % 32 == 0 {
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
+        thread::sleep(Duration::from_millis(500));
+        let occupied = resident_bytes();
+
+        drop(stack);
+        drop(server);
+        clear_buffer_pool();
+        thread::sleep(Duration::from_millis(200));
+        let after_free = resident_bytes();
+
+        crate::memory::release_to_os();
+        thread::sleep(Duration::from_millis(200));
+        let after = resident_bytes();
+
+        let per_connection = (occupied.saturating_sub(before)) as f64 / CONNECTIONS as f64;
+        println!(
+            "buffers {} KiB/direction, {} connections\n  \
+             before          {:>7} KiB\n  \
+             occupied        {:>7} KiB  ({:.0} KiB per connection, \
+             {:.0}% of the four buffers it allocated)\n  \
+             after free      {:>7} KiB  ({:+} KiB vs before)\n  \
+             after purge     {:>7} KiB  ({:+} KiB vs before)",
+            buffer_size / 1024,
+            CONNECTIONS,
+            before / 1024,
+            occupied / 1024,
+            per_connection / 1024.0,
+            100.0 * per_connection / (4.0 * buffer_size as f64),
+            after_free / 1024,
+            (after_free as i64 - before as i64) / 1024,
+            after / 1024,
+            (after as i64 - before as i64) / 1024,
+        );
     }
 
     #[test]

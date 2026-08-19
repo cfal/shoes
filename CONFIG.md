@@ -352,6 +352,13 @@ connection — two smoltcp socket buffers and two ring buffers — so the ceilin
 elsewhere. The logged line `TCP stack: buffer=... max_connections=...` reports it
 at startup.
 
+A connection through an AmneziaWG outbound pays that twice, since the tunnel's
+own virtual stack allocates the same four buffers on the far side. Both take
+their defaults from `src/buffer_sizing.rs`; `tcp_buffer_size` here overrides only
+the device side. Note also that these are allocation ceilings: buffers are
+zero-filled pages, so a connection's resident cost is roughly a third of what it
+allocates until it fills them.
+
 The mobile defaults are chosen for an iOS `NEPacketTunnelProvider`, which is
 killed rather than warned when it crosses roughly 50 MB. Neither buffer spans a
 network round trip — both sit between the device and a proxy connection in the
