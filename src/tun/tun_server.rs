@@ -90,6 +90,20 @@ pub struct TunServerConfig {
     /// - **Linux/Android**: Not used
     #[allow(dead_code)] // Used on iOS
     pub packet_information: bool,
+    /// Bytes of buffering per direction, per TCP connection.
+    ///
+    /// Four buffers of this size are allocated when a connection is accepted,
+    /// so the cost per connection is four times this number. Together with
+    /// `max_connections` it sets the stack's memory ceiling, which is what
+    /// decides whether an iOS packet-tunnel extension stays under its ~50 MB
+    /// jetsam limit.
+    ///
+    /// Default: 32 KiB on iOS and Android, 64 KiB elsewhere.
+    pub tcp_buffer_size: usize,
+    /// TCP connections the stack accepts before it starts dropping SYNs.
+    ///
+    /// Default: 256 on iOS and Android, 1024 elsewhere.
+    pub max_connections: usize,
 }
 
 impl Default for TunServerConfig {
@@ -106,6 +120,18 @@ impl Default for TunServerConfig {
         #[cfg(not(any(target_os = "ios", target_os = "android")))]
         let default_mtu = 1500;
 
+        // The stack allocates four buffers of `tcp_buffer_size` per connection
+        // at SYN, so these two numbers multiply into the worst-case footprint:
+        // 32 MiB on mobile, 256 MiB elsewhere. The mobile figure is what keeps
+        // an iOS packet-tunnel extension inside its ~50 MB limit. Neither
+        // buffer spans a network round trip — both sit between the device and
+        // a proxy connection in the same process — so the size only buys burst
+        // tolerance, and 32 KiB is far more than a mobile radio can outrun.
+        #[cfg(any(target_os = "ios", target_os = "android"))]
+        let (default_buffer_size, default_max_connections) = (32 * 1024, 256);
+        #[cfg(not(any(target_os = "ios", target_os = "android")))]
+        let (default_buffer_size, default_max_connections) = (64 * 1024, 1024);
+
         Self {
             mtu: default_mtu,
             tcp_enabled: true,
@@ -118,6 +144,8 @@ impl Default for TunServerConfig {
             raw_fd: None,
             close_fd_on_drop: true,
             packet_information: false,
+            tcp_buffer_size: default_buffer_size,
+            max_connections: default_max_connections,
         }
     }
 }
@@ -175,6 +203,18 @@ impl TunServerConfig {
     #[allow(dead_code)] // Used on non-Linux platforms
     pub fn close_fd_on_drop(mut self, close: bool) -> Self {
         self.close_fd_on_drop = close;
+        self
+    }
+
+    /// Set the per-direction, per-connection TCP buffer size in bytes.
+    pub fn tcp_buffer_size(mut self, size: usize) -> Self {
+        self.tcp_buffer_size = size;
+        self
+    }
+
+    /// Set the maximum number of concurrent TCP connections.
+    pub fn max_connections(mut self, max: usize) -> Self {
+        self.max_connections = max;
         self
     }
 

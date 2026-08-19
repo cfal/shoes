@@ -52,7 +52,7 @@ use crate::dns::fake_ip::{self, BypassList, FakeIpNetwork, FakeIpPool, FakeIpRes
 use crate::resolver::{NativeResolver, Resolver};
 use crate::tcp::tcp_client_handler_factory::create_tcp_client_proxy_selector;
 
-use tcp_stack_direct::{NewTcpConnection, TcpStackDirect};
+use tcp_stack_direct::{NewTcpConnection, TcpStackDirect, TcpStackOptions};
 use udp_manager::TunUdpManager;
 
 type PacketBuffer = Vec<u8>;
@@ -90,8 +90,35 @@ pub async fn run_tun_server(
 
     let mtu = config.mtu as usize;
 
+    // A buffer smaller than two MTUs cannot hold a single segment plus what
+    // arrives behind it, which stalls the connection rather than slowing it.
+    let tcp_buffer_size = config.tcp_buffer_size.max(mtu * 2);
+    if tcp_buffer_size != config.tcp_buffer_size {
+        warn!(
+            "tcp_buffer_size {} is below two MTUs, raising it to {}",
+            config.tcp_buffer_size, tcp_buffer_size
+        );
+    }
+
+    info!(
+        "TCP stack: buffer={} B/direction, max_connections={} (worst case {} MiB)",
+        tcp_buffer_size,
+        config.max_connections,
+        (tcp_buffer_size * 4 * config.max_connections) / (1024 * 1024)
+    );
+
     // Create the direct TCP stack (runs smoltcp in dedicated thread with select())
-    let mut tcp_stack = TcpStackDirect::new(fd, mtu);
+    let mut tcp_stack = TcpStackDirect::new(
+        fd,
+        TcpStackOptions {
+            mtu,
+            tcp_buffer_size,
+            max_connections: config.max_connections,
+            // Only meaningful on the raw-fd path: when the device was created
+            // here, the `tun` crate owns the descriptor instead.
+            close_fd_on_drop: config.close_fd_on_drop,
+        },
+    );
 
     // Get UDP receiver (stack thread filters UDP and sends here)
     let udp_from_stack_rx = tcp_stack.take_udp_rx().expect("udp_rx already taken");
@@ -176,9 +203,10 @@ pub async fn run_tun_server(
     });
 
     // Wait for shutdown signal or stack thread exit
-    tokio::select! {
+    let stack_died = tokio::select! {
         _ = &mut shutdown_rx => {
             info!("TUN server shutdown requested");
+            false
         }
         _ = async {
             // Poll until stack stops running
@@ -187,8 +215,9 @@ pub async fn run_tun_server(
             }
         } => {
             warn!("Stack thread ended unexpectedly");
+            true
         }
-    }
+    };
 
     traffic_task.abort();
 
@@ -202,6 +231,18 @@ pub async fn run_tun_server(
     // tcp_stack is dropped here, which stops the stack thread
 
     info!("TUN server stopped");
+
+    // An error, not a clean stop: the stack thread only exits on its own when
+    // the descriptor died under it. Reporting Ok here left the mobile FFI
+    // logging "service stopped normally" and leaving getLastError() empty for
+    // what is, from the app's side, the tunnel silently going away.
+    if stack_died {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "TUN stack thread stopped; the device descriptor is no longer usable",
+        ));
+    }
+
     Ok(())
 }
 
@@ -402,9 +443,16 @@ pub async fn run_tun_from_config(
         .icmp_enabled(config.icmp_enabled)
         .close_fd_on_drop(close_fd_on_drop);
 
+    if let Some(size) = config.tcp_buffer_size {
+        tun_server_config = tun_server_config.tcp_buffer_size(size);
+    }
+    if let Some(max) = config.max_connections {
+        tun_server_config = tun_server_config.max_connections(max);
+    }
+
     if let Some(ref name) = config.device_name {
         tun_server_config = tun_server_config.tun_name(name.clone());
-        println!("Starting TUN server on device {}", name);
+        info!("Starting TUN server on device {}", name);
     }
     if let Some(fd) = config.device_fd {
         tun_server_config = tun_server_config.raw_fd(fd);
@@ -412,7 +460,7 @@ pub async fn run_tun_from_config(
         {
             tun_server_config = tun_server_config.packet_information(true);
         }
-        println!("Starting TUN server from device FD {}", fd);
+        info!("Starting TUN server from device FD {}", fd);
     }
     if let Some(addr) = config.address {
         tun_server_config = tun_server_config.address(addr);

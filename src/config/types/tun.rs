@@ -121,6 +121,25 @@ pub struct TunConfig {
     /// absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sniff: Option<super::sniff::SniffConfig>,
+
+    /// Bytes of buffering per direction, per TCP connection.
+    ///
+    /// The stack allocates four buffers of this size when it accepts a
+    /// connection, so the memory a connection costs is four times this number.
+    /// Together with `max_connections` this sets the stack's ceiling, which on
+    /// iOS has to stay well inside the packet-tunnel extension's ~50 MB jetsam
+    /// limit.
+    ///
+    /// Default: 32 KiB on iOS and Android, 64 KiB elsewhere. Raised to two
+    /// MTUs if set below that.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tcp_buffer_size: Option<usize>,
+
+    /// TCP connections the stack accepts before it starts dropping SYNs.
+    ///
+    /// Default: 256 on iOS and Android, 1024 elsewhere.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_connections: Option<usize>,
 }
 
 fn default_fake_ip_network() -> String {

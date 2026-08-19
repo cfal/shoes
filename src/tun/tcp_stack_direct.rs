@@ -23,7 +23,7 @@ use bytes::BytesMut;
 use log::{debug, error, info, trace, warn};
 use smoltcp::{
     iface::{Config as InterfaceConfig, Interface, SocketHandle, SocketSet},
-    phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken, wait as phy_wait},
+    phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken},
     socket::tcp::{
         CongestionControl, Socket as TcpSocket, SocketBuffer as TcpSocketBuffer, State as TcpState,
     },
@@ -127,8 +127,17 @@ pub struct TcpStackDirect {
     udp_rx: Option<UnboundedReceiver<PacketBuffer>>,
     /// Shared state with the stack thread
     shared_state: Arc<Mutex<SharedState>>,
-    /// TUN file descriptor (owned, will be closed on drop)
+    /// TUN file descriptor.
     tun_fd: RawFd,
+    /// Whether `tun_fd` belongs to us. False when the platform owns it — on
+    /// mobile the app opens the device and closing its descriptor here would
+    /// be a double close once the app closes it too, which on a busy process
+    /// means closing whatever unrelated socket has since taken the number.
+    close_fd_on_drop: bool,
+    /// Write end of the pipe that wakes the stack thread out of `poll()`.
+    wake_tx: RawFd,
+    /// Read end, closed here once the thread that reads it has exited.
+    wake_rx: RawFd,
 }
 
 impl Drop for TcpStackDirect {
@@ -137,14 +146,31 @@ impl Drop for TcpStackDirect {
         self.running.store(false, Ordering::Relaxed);
         self.stack_thread.unpark();
 
+        // The thread spends its idle time blocked in poll(), which unpark does
+        // not interrupt. Without this byte it would not look at `running` again
+        // until the next packet arrived, so shutting down a quiet tunnel — a
+        // phone with the screen off, most of the time — would block here until
+        // something happened to arrive. The join below is what guarantees the
+        // TUN descriptor has been let go, so it cannot simply be skipped.
+        let wake = [0u8; 1];
+        unsafe {
+            libc::write(self.wake_tx, wake.as_ptr() as *const libc::c_void, 1);
+        }
+
         // Wait for thread to finish
         if let Some(handle) = self.thread_handle.take() {
             let _ = handle.join();
         }
 
-        // Close the TUN fd
         unsafe {
-            libc::close(self.tun_fd);
+            libc::close(self.wake_tx);
+            libc::close(self.wake_rx);
+        }
+
+        if self.close_fd_on_drop {
+            unsafe {
+                libc::close(self.tun_fd);
+            }
         }
     }
 }
@@ -154,12 +180,27 @@ impl TcpStackDirect {
     ///
     /// # Arguments
     /// * `fd` - Raw file descriptor for the TUN device
-    /// * `mtu` - Maximum transmission unit
+    /// * `options` - MTU, per-connection buffer size, connection cap, and
+    ///   whether the descriptor is ours to close
     ///
     /// This spawns a dedicated OS thread for running the smoltcp interface.
     /// The thread uses `select()` on the fd for efficient event-driven I/O.
-    pub fn new(fd: RawFd, mtu: usize) -> Self {
+    pub fn new(fd: RawFd, options: TcpStackOptions) -> Self {
         let (udp_tx, udp_rx) = mpsc::unbounded_channel();
+
+        // A shutdown that the stack thread can see while it is asleep. Both
+        // ends stay open for the life of the stack; the thread only ever reads,
+        // and Drop only ever writes.
+        let (wake_rx, wake_tx) = match new_wake_pipe() {
+            Ok(pipe) => pipe,
+            Err(e) => {
+                // -1 reads as "no wake fd" in the poll below, which costs a
+                // shutdown that waits for the next packet rather than one that
+                // returns immediately. Not worth refusing to start over.
+                error!("Failed to create the stack wake pipe: {e}");
+                (-1, -1)
+            }
+        };
 
         let running = Arc::new(AtomicBool::new(true));
         let shared_state = Arc::new(Mutex::new(SharedState {
@@ -175,7 +216,14 @@ impl TcpStackDirect {
                 .name("shoes-smoltcp-direct".to_owned())
                 .spawn(move || {
                     let result = panic::catch_unwind(AssertUnwindSafe(|| {
-                        run_direct_stack_thread(fd, mtu, udp_tx, running.clone(), shared_state);
+                        run_direct_stack_thread(
+                            fd,
+                            wake_rx,
+                            options,
+                            udp_tx,
+                            running.clone(),
+                            shared_state,
+                        );
                     }));
 
                     match result {
@@ -208,6 +256,9 @@ impl TcpStackDirect {
             udp_rx: Some(udp_rx),
             shared_state,
             tun_fd: fd,
+            close_fd_on_drop: options.close_fd_on_drop,
+            wake_tx,
+            wake_rx,
         }
     }
 
@@ -370,21 +421,114 @@ impl TxToken for DirectTxToken {
     }
 }
 
-// Buffer sizes matched to netstack-smoltcp: 0x3FFF * 20 = 327,660 bytes (~320KB)
-const TCP_SEND_BUFFER_SIZE: usize = 0x3FFF * 20; // ~320KB for high throughput
-const TCP_RECV_BUFFER_SIZE: usize = 0x3FFF * 20; // ~320KB
 const MAX_PACKET_BATCH: usize = 64; // Process more packets per poll iteration
-const MAX_CONCURRENT_CONNECTIONS: usize = 1024; // Limit concurrent connections like gvisor
+
+/// How the stack thread is sized and who owns its descriptor.
+#[derive(Clone, Copy, Debug)]
+pub struct TcpStackOptions {
+    /// Maximum transmission unit of the TUN device.
+    pub mtu: usize,
+    /// Bytes per direction, per connection. Four buffers of this size are
+    /// allocated when a connection is accepted: two smoltcp socket buffers and
+    /// the two ring buffers in `TcpConnectionControl`.
+    pub tcp_buffer_size: usize,
+    /// Connections the stack will hold before it starts dropping SYNs.
+    pub max_connections: usize,
+    /// Whether the TUN descriptor is ours to close.
+    pub close_fd_on_drop: bool,
+}
+
+/// Create the shutdown wake pipe, returning (read end, write end).
+fn new_wake_pipe() -> io::Result<(RawFd, RawFd)> {
+    let mut fds = [0 as libc::c_int; 2];
+    // SAFETY: `fds` is a two-element array, which is what pipe() writes.
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    for fd in fds {
+        // Nonblocking so that neither end can stall: a wake write must not
+        // block Drop, and the read that drains it must not block the loop.
+        // SAFETY: both descriptors were just returned by pipe().
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFL, 0);
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+            libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+        }
+    }
+
+    Ok((fds[0], fds[1]))
+}
+
+/// Longest this thread sleeps with nothing to do.
+///
+/// A descriptor closed underneath a blocked `poll()` does not wake it — the
+/// platform is under no obligation to, and macOS does not — so an idle stack
+/// on a device whose TUN was torn down would sit there until a packet that is
+/// never coming arrives. One wakeup a second bounds that, and is nothing
+/// against what a tunnel does when it is carrying anything at all.
+const MAX_POLL_WAIT_MILLIS: u64 = 1000;
+
+/// Sleep until the TUN device is readable, the wake pipe fires, or `duration`
+/// elapses. `None` waits [`MAX_POLL_WAIT_MILLIS`]; a negative `wake_fd` is
+/// ignored.
+///
+/// poll() rather than select(): select's `fd_set` cannot hold a descriptor
+/// numbered above `FD_SETSIZE`, and a VPN process with a thousand connections
+/// open reaches those numbers.
+fn wait_readable(fd: RawFd, wake_fd: RawFd, duration: Option<SmolDuration>) -> io::Result<()> {
+    let mut fds = [
+        libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: wake_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+
+    let count = if wake_fd >= 0 { 2 } else { 1 };
+    let timeout = duration
+        .map(|d| d.total_millis())
+        .unwrap_or(MAX_POLL_WAIT_MILLIS)
+        .min(MAX_POLL_WAIT_MILLIS) as libc::c_int;
+
+    // SAFETY: `fds` holds `count` initialised pollfds for the call's duration.
+    let result = unsafe { libc::poll(fds.as_mut_ptr(), count, timeout) };
+    if result < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    // POLLNVAL means the descriptor is closed, which poll reports without
+    // setting errno. Turned into an error so the backstop counter sees it
+    // rather than spinning on an instant return.
+    if fds[0].revents & libc::POLLNVAL != 0 {
+        return Err(io::Error::from_raw_os_error(libc::EBADF));
+    }
+
+    Ok(())
+}
 
 /// Run the direct smoltcp stack thread.
 fn run_direct_stack_thread(
     fd: RawFd,
-    mtu: usize,
+    wake_fd: RawFd,
+    options: TcpStackOptions,
     udp_tx: UnboundedSender<PacketBuffer>,
     running: Arc<AtomicBool>,
     shared_state: Arc<Mutex<SharedState>>,
 ) {
     info!("smoltcp direct stack thread initializing...");
+
+    let TcpStackOptions {
+        mtu,
+        tcp_buffer_size,
+        max_connections,
+        ..
+    } = options;
 
     // Sets fd to non-blocking mode once at startup for performance.
     if let Err(e) = set_nonblocking(fd) {
@@ -485,19 +629,23 @@ fn run_direct_stack_thread(
                                 trace!("TCP packet: {} -> {}, SYN={}", src_addr, dst_addr, is_syn);
                                 if is_syn && !active_connections.contains(&(src_addr, dst_addr)) {
                                     // Check connection limit
-                                    if sockets.len() >= MAX_CONCURRENT_CONNECTIONS {
+                                    if sockets.len() >= max_connections {
                                         warn!(
                                             "Connection limit reached ({}), dropping SYN from {}",
-                                            MAX_CONCURRENT_CONNECTIONS, src_addr
+                                            max_connections, src_addr
                                         );
                                         continue;
                                     }
 
-                                    info!("New TCP SYN: {} -> {}", src_addr, dst_addr);
+                                    // debug, not info: one line per connection
+                                    // at info level fills a mobile log file
+                                    // with a page load's worth of noise.
+                                    debug!("New TCP SYN: {} -> {}", src_addr, dst_addr);
 
                                     if let Some((new_conn, control)) = create_tcp_connection(
                                         src_addr,
                                         dst_addr,
+                                        tcp_buffer_size,
                                         &mut socket_set,
                                         &stack_thread,
                                     ) {
@@ -712,25 +860,25 @@ fn run_direct_stack_thread(
                 SmolDuration::from_millis(millis)
             });
 
-            // phy_wait calls select() on the TUN fd to sleep until data
-            // arrives. If the fd becomes invalid (e.g. device removed),
-            // select() returns EBADF immediately with no sleep, creating a
-            // hot spin loop. The try_recv path usually catches this first,
-            // but this counter acts as a backstop: after 10 consecutive
-            // non-EINTR errors with no successful reads in between, treat
-            // the fd as dead.
-            if let Err(e) = phy_wait(fd, wait_duration)
+            // Sleeps until the TUN has something to read, the wake pipe says
+            // to stop, or the delay smoltcp asked for elapses. If the fd
+            // becomes invalid (e.g. device removed), poll() returns POLLNVAL
+            // immediately with no sleep, creating a hot spin loop. The try_recv
+            // path usually catches this first, but this counter acts as a
+            // backstop: after 10 consecutive non-EINTR errors with no
+            // successful reads in between, treat the fd as dead.
+            if let Err(e) = wait_readable(fd, wake_fd, wait_duration)
                 && e.kind() != io::ErrorKind::Interrupted
             {
                 phy_wait_error_count += 1;
                 if phy_wait_error_count >= MAX_PHY_WAIT_ERRORS {
                     error!(
-                        "select() failed {} consecutive times (last: {}). Stack thread stopping.",
+                        "poll() failed {} consecutive times (last: {}). Stack thread stopping.",
                         phy_wait_error_count, e
                     );
                     running.store(false, Ordering::Relaxed);
                 } else {
-                    warn!("select() error ({}): {}", phy_wait_error_count, e);
+                    warn!("poll() error ({}): {}", phy_wait_error_count, e);
                 }
             }
         }
@@ -749,12 +897,13 @@ struct CreateConnectionResult {
 fn create_tcp_connection(
     src_addr: SocketAddr,
     dst_addr: SocketAddr,
+    buffer_size: usize,
     socket_set: &mut SocketSet<'static>,
     stack_thread: &Thread,
 ) -> Option<(CreateConnectionResult, Arc<TcpConnectionControl>)> {
     let mut socket = TcpSocket::new(
-        TcpSocketBuffer::new(vec![0u8; TCP_RECV_BUFFER_SIZE]),
-        TcpSocketBuffer::new(vec![0u8; TCP_SEND_BUFFER_SIZE]),
+        TcpSocketBuffer::new(vec![0u8; buffer_size]),
+        TcpSocketBuffer::new(vec![0u8; buffer_size]),
     );
 
     // Matched to netstack-smoltcp settings for optimal performance
@@ -772,10 +921,7 @@ fn create_tcp_connection(
 
     debug!("Creating TCP connection: {} -> {}", src_addr, dst_addr);
 
-    let control = Arc::new(TcpConnectionControl::new(
-        TCP_SEND_BUFFER_SIZE,
-        TCP_RECV_BUFFER_SIZE,
-    ));
+    let control = Arc::new(TcpConnectionControl::new(buffer_size, buffer_size));
 
     let handle = socket_set.add(socket);
     let connection = TcpConnection::new(control.clone(), stack_thread.clone());
@@ -985,12 +1131,22 @@ mod tests {
     use std::os::unix::io::IntoRawFd;
     use std::os::unix::net::UnixStream;
 
+    /// Stack options for a test that hands its descriptor over to the stack.
+    fn owning_options() -> TcpStackOptions {
+        TcpStackOptions {
+            mtu: 1500,
+            tcp_buffer_size: 32 * 1024,
+            max_connections: 16,
+            close_fd_on_drop: true,
+        }
+    }
+
     #[test]
     fn test_stack_shutdown_on_eof() {
         let (server, client) = UnixStream::pair().expect("Failed to create socket pair");
         let client_fd = client.into_raw_fd();
 
-        let stack = TcpStackDirect::new(client_fd, 1500);
+        let stack = TcpStackDirect::new(client_fd, owning_options());
 
         thread::sleep(Duration::from_millis(100));
         assert!(stack.is_running(), "Stack thread should be running");
@@ -1014,7 +1170,7 @@ mod tests {
         let (server, client) = UnixStream::pair().expect("Failed to create socket pair");
         let client_fd = client.into_raw_fd();
 
-        let stack = TcpStackDirect::new(client_fd, 1500);
+        let stack = TcpStackDirect::new(client_fd, owning_options());
 
         thread::sleep(Duration::from_millis(100));
         assert!(stack.is_running(), "Stack thread should be running");
@@ -1034,13 +1190,39 @@ mod tests {
             thread::sleep(Duration::from_millis(50));
         }
 
-        // This test already closed client_fd above; letting the stack's Drop close
-        // it again would be a double close. That is harmless in isolation, but the
-        // freed fd number can be reused by a concurrent test's OwnedFd in between,
-        // and closing it out from under that owner aborts the whole test binary
-        // ("IO Safety violation: owned file descriptor already closed"). The thread
-        // has already exited, so skip the redundant Drop.
-        std::mem::forget(stack);
+        // This test already closed client_fd above, so the stack must not close
+        // it again: the freed fd number can be reused by a concurrent test's
+        // OwnedFd in between, and closing it out from under that owner aborts
+        // the whole test binary ("IO Safety violation: owned file descriptor
+        // already closed").
+        drop(stack);
+    }
+
+    #[test]
+    fn stack_leaves_a_borrowed_fd_open() {
+        // The mobile case: the app owns the descriptor and closes it itself.
+        // Closing it here as well would be a double close in a process that is
+        // opening sockets constantly, which means closing whichever socket has
+        // taken the number in the meantime.
+        let (server, client) = UnixStream::pair().expect("Failed to create socket pair");
+        let client_fd = client.into_raw_fd();
+
+        let stack = TcpStackDirect::new(
+            client_fd,
+            TcpStackOptions {
+                close_fd_on_drop: false,
+                ..owning_options()
+            },
+        );
+        thread::sleep(Duration::from_millis(100));
+        drop(stack);
+
+        let still_open = unsafe { libc::fcntl(client_fd, libc::F_GETFD) } != -1;
+        // Closed here, not by the stack, which is the whole point.
+        unsafe { libc::close(client_fd) };
+        drop(server);
+
+        assert!(still_open, "the stack closed a descriptor it does not own");
     }
 
     #[test]
@@ -1050,7 +1232,7 @@ mod tests {
         let (server, client) = UnixStream::pair().expect("Failed to create socket pair");
         let client_fd = client.into_raw_fd();
 
-        let stack = TcpStackDirect::new(client_fd, 1500);
+        let stack = TcpStackDirect::new(client_fd, owning_options());
 
         thread::sleep(Duration::from_millis(100));
         assert!(stack.is_running());

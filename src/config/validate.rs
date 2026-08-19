@@ -2579,6 +2579,8 @@ mod tests {
             dns: None,
             fake_ip: None,
             sniff: None,
+            tcp_buffer_size: None,
+            max_connections: None,
         };
 
         let configs = vec![Config::TunServer(tun_config)];
@@ -2606,6 +2608,8 @@ mod tests {
             dns: None,
             fake_ip: Some(fake_ip),
             sniff: None,
+            tcp_buffer_size: None,
+            max_connections: None,
         }
     }
 

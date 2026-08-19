@@ -328,6 +328,12 @@ tcp_enabled: true              # Default: true
 udp_enabled: true              # Default: true
 icmp_enabled: true             # Default: true
 
+# TCP stack sizing (see "Memory" below)
+tcp_buffer_size: int?          # Bytes per direction per connection.
+                               # Default: 32768 (mobile), 65536 (elsewhere)
+max_connections: int?          # Concurrent TCP connections before SYNs are dropped.
+                               # Default: 256 (mobile), 1024 (elsewhere)
+
 # Fake IP (optional, off by default)
 fake_ip:
   network: string              # IPv4 CIDR, prefix 8-30. Default: "198.18.0.0/16"
@@ -337,6 +343,21 @@ fake_ip:
 # Routing rules
 rules: [RuleConfig]
 ```
+
+### Memory
+
+The stack allocates four buffers of `tcp_buffer_size` when it accepts a
+connection — two smoltcp socket buffers and two ring buffers — so the ceiling is
+`tcp_buffer_size * 4 * max_connections`: 32 MiB on the mobile defaults, 256 MiB
+elsewhere. The logged line `TCP stack: buffer=... max_connections=...` reports it
+at startup.
+
+The mobile defaults are chosen for an iOS `NEPacketTunnelProvider`, which is
+killed rather than warned when it crosses roughly 50 MB. Neither buffer spans a
+network round trip — both sit between the device and a proxy connection in the
+same process — so raising them buys burst tolerance rather than throughput. A
+value below two MTUs is raised to two MTUs, since a buffer that cannot hold a
+segment plus what arrives behind it stalls rather than slows.
 
 ### Fake IP
 
