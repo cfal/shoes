@@ -132,19 +132,24 @@ impl TxToken for VirtualTxToken<'_> {
 // TCP: shared control buffer (ring-buffer + waker pattern)
 // ---------------------------------------------------------------------------
 
-// 1 MiB per connection until this was shared with the TUN stack: four buffers
-// of 256 KiB, allocated when the connection is opened rather than when it
-// carries anything, and paid *in addition* to the TUN stack's own four for
-// every connection a device makes through the tunnel. See src/buffer_sizing.rs.
-const TCP_SEND_BUF: usize = crate::buffer_sizing::default_tcp_buffer_size();
-const TCP_RECV_BUF: usize = crate::buffer_sizing::default_tcp_buffer_size();
+/// The socket's receive window and its in-flight send data.
+///
+/// This socket's peer is a server on the internet, so these are
+/// bandwidth-delay products rather than local buffering: cutting them to the
+/// size of a local buffer measured as a straight 6x throughput loss. See
+/// src/buffer_sizing.rs.
+const TCP_WINDOW: usize = crate::buffer_sizing::default_remote_window_size();
+
+/// The ring buffers between this socket and the async side, which are local and
+/// so need only cover scheduling jitter.
+const TCP_PIPE_BUF: usize = crate::buffer_sizing::default_local_buffer_size();
 
 /// Payload bytes each virtual UDP socket buffers per direction.
 ///
-/// Datagrams through the tunnel are MTU-bounded in practice, so the 64 KiB
-/// this replaced — 128 KiB per session, before metadata — was sized for a
-/// datagram nothing sends.
-const UDP_PAYLOAD_BUF: usize = crate::buffer_sizing::default_tcp_buffer_size();
+/// UDP has no window to keep open, and datagrams through the tunnel are
+/// MTU-bounded in practice, so the 64 KiB this replaced — 128 KiB per session,
+/// before metadata — was sized for a datagram nothing sends.
+const UDP_PAYLOAD_BUF: usize = crate::buffer_sizing::default_local_buffer_size();
 
 /// Datagrams each virtual UDP socket queues per direction.
 const UDP_PACKET_SLOTS: usize = 32;
@@ -340,8 +345,8 @@ impl VirtualNetStack {
         target: SocketAddr,
         reply: tokio::sync::oneshot::Sender<std::io::Result<VirtualTcpStream>>,
     ) {
-        let rx_buf = TcpSocketBuffer::new(vec![0u8; TCP_SEND_BUF]);
-        let tx_buf = TcpSocketBuffer::new(vec![0u8; TCP_RECV_BUF]);
+        let rx_buf = TcpSocketBuffer::new(vec![0u8; TCP_WINDOW]);
+        let tx_buf = TcpSocketBuffer::new(vec![0u8; TCP_WINDOW]);
         let mut socket = SmolTcpSocket::new(rx_buf, tx_buf);
         socket.set_nagle_enabled(false);
         socket.set_congestion_control(CongestionControl::Cubic);
@@ -358,10 +363,10 @@ impl VirtualNetStack {
         }
 
         let control = Arc::new(Mutex::new(TcpControl {
-            send_buf: smoltcp::storage::RingBuffer::new(vec![0u8; TCP_SEND_BUF]),
+            send_buf: smoltcp::storage::RingBuffer::new(vec![0u8; TCP_PIPE_BUF]),
             send_waker: None,
             send_closed: false,
-            recv_buf: smoltcp::storage::RingBuffer::new(vec![0u8; TCP_RECV_BUF]),
+            recv_buf: smoltcp::storage::RingBuffer::new(vec![0u8; TCP_PIPE_BUF]),
             recv_waker: None,
             recv_closed: false,
         }));

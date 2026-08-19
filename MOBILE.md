@@ -211,20 +211,31 @@ It was also only half the bill. The AmneziaWG virtual stack
 256 KiB each, and on a mobile VPN the two stacks are in series: a browser
 connection is accepted by the TUN stack and initiated through the netstack, so
 it paid 1.31 MB *plus* 1 MiB. Its UDP sockets took another 128 KiB of payload
-buffer per session. Both stacks now take their defaults from
-`src/buffer_sizing.rs`, so the total is something one can work out in one place.
+buffer per session.
+
+But the two stacks must not be sized alike, and finding out why cost a
+benchmark. The TUN stack's buffers face an application on the same device, and
+both stacks keep ring buffers between their smoltcp half and their async half —
+nothing there spans a round trip, so those only need to cover scheduling jitter.
+The AmneziaWG stack's *socket* buffers are the receive window and in-flight send
+data of a connection whose far end is a server on the internet. Cutting those to
+32 KiB cost 6x the throughput; see finding 10 for the measurement. They keep
+their size, and `src/buffer_sizing.rs` names the two roles separately so the
+distinction survives the next person who sees two constants that look alike.
 
 Both are configuration now — `tcp_buffer_size` and `max_connections` on the TUN
 config, carried through `TunServerConfig` and `TcpStackOptions` — and both
 default by platform, the way `mtu` already did:
 
-| | buffer/direction | max connections | worst case, both stacks |
-|---|---|---|---|
-| iOS, Android | 32 KiB | 256 | 128 MiB |
-| everywhere else | 64 KiB | 1024 | 1 GiB |
+| | local buffer | remote window | max connections | worst case, both stacks |
+|---|---|---|---|---|
+| iOS, Android | 32 KiB | 256 KiB | 256 | 176 MiB |
+| everywhere else | 64 KiB | 256 KiB | 1024 | 1 GiB |
 
-Those ceilings are what a connection *allocates*. What it costs resident is
-lower — see finding 10.
+A connection through both stacks costs four local buffers in the TUN stack and
+two window buffers plus two local ones in the AmneziaWG stack: 704 KiB on
+mobile, against 2.3 MB before. Those are ceilings on what a connection
+*allocates*; what it costs resident is about a third — see finding 10.
 
 Neither buffer spans a network round trip: both sit between the device and a
 proxy connection inside this process, so their size buys burst tolerance rather
@@ -474,6 +485,22 @@ figure for 256 saturated mobile connections is nearer 40 MiB — still the
 dominant term inside an iOS extension, which is why the ceiling matters, but not
 the number to quote.
 
+**Does the smaller sizing cost throughput?** For the local buffers, no. For the
+window, catastrophically — which is how the distinction above got found. 50 MiB
+per transfer through the real AmneziaWG peer at ~40 ms RTT, arms rotated:
+
+| AmneziaWG socket buffer | throughput | CPU per transfer |
+|---|---|---|
+| 256 KiB | 6.2 MB/s | 0.6-1.6 s |
+| 64 KiB | 2.1 MB/s | 1.1-2.5 s |
+| 32 KiB | 1.05 MB/s | 1.7-3.6 s |
+
+Throughput linear in the buffer is what a receive-window limit looks like, and
+note that the smaller windows burn *more* CPU, because the same bytes take five
+times as long to move. With the window back at 256 KiB and only the ring buffers
+cut, all three configurations — including the 32 KiB mobile one — measure ~6.2
+MB/s, matching the baseline this branch had before any of this work.
+
 **Does it come back?** Not on its own. After dropping every connection and the
 stack, resident size stayed within 150 KiB of its peak: freeing does not shrink
 a process, because no general-purpose allocator returns spans eagerly. On a
@@ -510,8 +537,10 @@ this pass.
 What is left, in the order it is worth doing:
 
 1. Lazy buffer growth (1). The ceiling is survivable now, but a connection that
-   carries one HTTP request still pays what a video connection pays, and the
-   resident figure above says a third of that is real.
+   carries one HTTP request still pays the full window a video connection needs,
+   and the resident figure above says a third of that is real. Growing the
+   window from small toward 256 KiB as a connection proves it can use it is the
+   change that gets both numbers.
 2. Confirm the allocator purge does something for `phys_footprint` on a real
    iOS extension (10). If it does not, the lever is (1) instead.
 3. Handle semantics (5). The API implies a multi-instance model it does not

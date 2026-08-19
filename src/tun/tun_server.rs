@@ -123,7 +123,7 @@ impl Default for TunServerConfig {
         // Shared with the AmneziaWG virtual stack, which allocates the same
         // four buffers per connection on the far side of the tunnel. See
         // src/buffer_sizing.rs for what the two of them add up to.
-        let default_buffer_size = crate::buffer_sizing::default_tcp_buffer_size();
+        let default_buffer_size = crate::buffer_sizing::default_local_buffer_size();
         let default_max_connections = crate::buffer_sizing::default_max_connections();
 
         Self {

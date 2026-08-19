@@ -42,6 +42,8 @@ static ENDPOINTS: Mutex<Vec<Weak<EndpointSocket>>> = Mutex::new(Vec::new());
 /// Safe to call from any thread, including a platform callback thread — it
 /// takes an uncontended lock and wakes a task per tunnel, doing no I/O itself.
 /// Returns the number of tunnels notified.
+// Called from the mobile FFI, which the desktop binary does not compile.
+#[allow(dead_code)]
 pub fn notify_network_change() -> usize {
     let mut endpoints = ENDPOINTS.lock().unwrap_or_else(|e| e.into_inner());
     endpoints.retain(|weak| weak.strong_count() > 0);
