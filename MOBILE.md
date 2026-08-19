@@ -4,9 +4,9 @@ State of the `mobile` branch as a core library for an Android/iOS VPN app, and
 what still stands between it and a shipping product.
 
 Everything in "What works" is verified on this branch. Every finding cites the
-line that produced it — none of it is speculative, but the fixes are not written
-yet. Line references were last checked against `037018e`; if one has drifted,
-trust the symbol name over the number.
+line that produced it. Findings marked *fixed* have landed; the rest are still
+open and are ordered at the end. Line references were last checked against
+`037018e`; if one has drifted, trust the symbol name over the number.
 
 ## What works
 
@@ -14,10 +14,12 @@ trust the symbol name over the number.
 |---|---|---|
 | Builds | `cargo ndk -t arm64-v8a -t armeabi-v7a` clean | `cargo build --target aarch64-apple-ios` clean |
 | Packaging | AAR via `scripts/build-android.sh` | XCFramework via `scripts/build-ios.sh` |
-| Entry points | 7 `Java_com_shoesproxy_ShoesNative_*` JNI symbols | 8 `shoes_*` C symbols |
+| Entry points | 9 `Java_com_shoesproxy_ShoesNative_*` JNI symbols | 10 `shoes_*` C symbols |
 | Socket protection | `VpnService.protect` via `SocketProtector` | `IosSocketProtector` |
 | Traffic stats | `TrafficListener.onTrafficUpdate` | `ShoesTrafficCallback` |
-| Error reporting | `getLastError()` | `shoes_get_last_error()` |
+| Error reporting | `getLastError()`, and `start` returns -1 on a bad config | same, via `shoes_get_last_error()` |
+| Network change | `networkChanged()` | `shoes_network_changed()` |
+| Live log level | `setLogLevel()` | `shoes_set_log_level()` |
 | AmneziaWG 2.0/3.0 | yes | yes |
 | Fake IP / DNS leak | yes, via TUN interception | yes, via TUN interception |
 
@@ -48,6 +50,7 @@ the findings below assume.
 | `src/tun/platform.rs` | `PlatformCallbacks`, `PlatformInterface`; re-exports the protector for the FFI |
 | `src/tun/traffic.rs` | Byte counters, `report_traffic`, `TrafficCountingStream` |
 | `src/amneziawg/` | AmneziaWG 2.0/3.0 client: `config.rs`, `tunnel.rs`, `netstack.rs`, `connector.rs` |
+| `src/amneziawg/endpoint.rs` | The rebindable endpoint socket and the network-change registry |
 | `src/dns/fake_ip/` | Fake IP: `pool.rs`, `responder.rs`, `bypass.rs` |
 | `src/tcp/socket_connector_impl.rs` | Where outbound proxy TCP/UDP sockets are actually created |
 | `src/config/validate.rs` | `create_server_configs` — config validation and group expansion |
@@ -74,7 +77,7 @@ cargo ndk -t arm64-v8a -t armeabi-v7a -P 21 \
 IPHONEOS_DEPLOYMENT_TARGET=16.0 \
     cargo build --profile release-mobile --target aarch64-apple-ios
 
-# Tests (849 of them) run on the host. `src/ffi/common.rs` compiles under
+# Tests run on the host. `src/ffi/common.rs` compiles under
 # cfg(test) already, so plain `cargo test` covers it. The `ffi` feature is what
 # pulls in the socket-protector plumbing (`src/tun/platform.rs`, and the
 # protect call in `src/amneziawg/tunnel.rs:79`) on a desktop target — build with
@@ -92,7 +95,7 @@ on a green tick that was never produced.
 
 ## FFI surface
 
-Android — 7 symbols, all `Java_com_shoesproxy_ShoesNative_*`, mirrored by
+Android — 9 symbols, all `Java_com_shoesproxy_ShoesNative_*`, mirrored by
 `ShoesNative.kt`:
 
 | Kotlin | Rust | Returns |
@@ -100,12 +103,14 @@ Android — 7 symbols, all `Java_com_shoesproxy_ShoesNative_*`, mirrored by
 | `init(logLevel: String)` | `android.rs:79` | 0 ok, -1 error |
 | `getVersion()` | `android.rs:119` | version string |
 | `setLogFile(logPath: String)` | `android.rs:145` | 0 ok, -1 error |
+| `setLogLevel(logLevel: String)` | `android.rs` | 0 ok, -1 unrecognised |
+| `networkChanged()` | `android.rs` | tunnels notified |
 | `start(configYaml, protectCallback, trafficCallback)` | `android.rs:177` | `1` on success, -1 on error |
 | `stop(handle: Long)` | `android.rs:317` | — |
 | `isRunning()` | `android.rs:332` | boolean |
 | `getLastError()` | `android.rs:348` | string or null |
 
-iOS — 8 symbols, declared in `include/shoes.h`:
+iOS — 10 symbols, declared in `include/shoes.h`:
 
 ```c
 int   shoes_init(const char *log_level);
@@ -114,6 +119,8 @@ void  shoes_stop(long _handle);
 bool  shoes_is_running(void);
 const char *shoes_get_version(void);
 int   shoes_set_log_file(const char *path);
+int   shoes_set_log_level(const char *log_level);
+int   shoes_network_changed(void);
 char *shoes_get_last_error(void);   // caller frees
 void  shoes_free_string(char *ptr);
 ```
@@ -123,19 +130,33 @@ void  shoes_free_string(char *ptr);
 
 ## Lifecycle contract
 
-1. `init` once. Idempotent, and see finding 6 for what that costs you.
-2. Open the TUN yourself — `VpnService.Builder.establish().detachFd()` on
-   Android, `NEPacketTunnelProvider` on iOS — and put the fd into the config
-   YAML as `device_fd`. The library never opens the device.
+1. `init` once. Idempotent; use `setLogLevel` / `shoes_set_log_level` to
+   change verbosity afterwards, since `init` reads the level only the first
+   time.
+2. Open the TUN yourself — `VpnService.Builder.establish()` on Android,
+   `NEPacketTunnelProvider` on iOS — and put the fd into the config YAML as
+   `device_fd`. The library never opens the device. Hold the descriptor open:
+   do not `detachFd()` and forget it, and do not close it while the tunnel runs.
 3. `start(configYaml, ...)`. The config must contain **exactly one** TUN entry
-   and it must carry `device_fd`; both are enforced in `common.rs:178-189`.
-   Server entries (a `mixed` listener, say) may sit alongside it and are started
-   too, then aborted when the TUN stops.
-4. `stop(...)`. Signals shutdown, then blocks — see finding 4.
+   and it must carry `device_fd`; both are enforced in `common.rs`. Server
+   entries (a `mixed` listener, say) may sit alongside it and are started too,
+   then aborted when the TUN stops. A -1 means the config was rejected and
+   `getLastError()` says why — parsing, validation and resolver construction all
+   happen before `start` returns, so it is a real verdict rather than a deferred
+   failure.
+4. `stop(...)`. Signals shutdown, then blocks until the engine has released the
+   TUN descriptor — milliseconds in practice, bounded at 5 s. Not from the main
+   thread. Close your descriptor after it returns.
+5. Forward network changes while the tunnel runs: `networkChanged()` /
+   `shoes_network_changed()`. See finding 3.
 
-The fd stays yours. `start_from_config` passes `close_fd_on_drop = false`
-(`common.rs:221`) precisely so the library does not close a descriptor the
-platform owns. Close it yourself after `stop` returns.
+The fd stays yours, and now actually is: the flag that says so
+(`close_fd_on_drop = false`) was only honoured on the path that *creates* the
+device, so on the raw-fd path — every mobile start — the stack closed the app's
+descriptor on shutdown regardless. An app that also closed its own, as this
+document told it to, was double-closing, which in a process that is opening
+sockets constantly means closing whichever socket has since taken the number.
+Close it yourself after `stop` returns.
 
 There is one tunnel per process. All state lives in the `TUN_SERVICE` global in
 `common.rs`, and starting over a running service is refused rather than
@@ -143,20 +164,27 @@ permitted.
 
 ## Threading contract
 
-- `init`, `stop`, `isRunning`, `getLastError` are safe from any thread. `stop`
-  is the one that blocks, and it must not be on the main thread.
-- `start` spawns its own multi-threaded Tokio runtime and returns immediately;
-  the service runs on that runtime, not on the caller's thread.
+- `init`, `stop`, `isRunning`, `getLastError`, `setLogLevel` and
+  `networkChanged` are safe from any thread. `stop` is the one that blocks, and
+  it must not be on the main thread.
+- `start` spawns its own multi-threaded Tokio runtime and returns once the
+  config has been accepted; the service then runs on that runtime, not on the
+  caller's thread. It does parse and validate on the caller's thread, so a
+  config with a large certificate to load costs the caller that much.
 - `SocketProtector.protect(fd)` is invoked from whichever runtime thread is
   creating the socket. It must be safe to call off the main thread and should
   not block. On Android it is delivered through `FnSocketProtector`
   (`android.rs:226`), which attaches to the JVM as needed.
 - `TrafficListener.onTrafficUpdate` fires from a dedicated Tokio task on a 1 s
-  interval (`tun/mod.rs:171-179`) — never the main thread. Marshal to the UI
-  thread yourself.
-- Both callbacks are stored in globals and cleared inside `stop`
-  (`clear_traffic_callback`, and the protect callback on iOS). Do not retain
-  objects across a stop/start cycle and assume they are still wired.
+  interval — never the main thread. Marshal to the UI thread yourself. It fires
+  once at the start of a session and then only on a tick where a counter moved,
+  so an idle tunnel is silent rather than reporting the same numbers 3,600 times
+  an hour.
+- Both callbacks are stored in globals and cleared inside `stop`, along with the
+  socket protector — which on Android holds a JNI global reference to the
+  `VpnService`, so leaving it installed kept a destroyed service and its
+  `Context` alive. Do not retain objects across a stop/start cycle and assume
+  they are still wired.
 
 ## Example configs
 
@@ -168,41 +196,39 @@ valid argument to `start`. `CONFIG.md` is the full reference.
 
 # Findings
 
-## 1. Per-connection memory will get the iOS extension killed
+## 1. Per-connection memory will get the iOS extension killed — fixed
 
-This is the one blocking issue.
+`tcp_stack_direct.rs` set both TCP buffers to `0x3FFF * 20` (~320 KB) as
+constants, and each connection allocated **four** of them eagerly — two smoltcp
+socket buffers and two ring buffers in `TcpConnectionControl::new`. That was
+~1.31 MB per TCP connection, taken at SYN, regardless of what the connection
+carried, against a `MAX_CONCURRENT_CONNECTIONS` of 1024: a ceiling of ~1.34 GB,
+or about 35 connections inside an iOS extension's ~50 MB jetsam limit. A single
+page load in Safari opens more than that.
 
-`src/tun/tcp_stack_direct.rs:374-375` sets both TCP buffers to `0x3FFF * 20`
-(~320 KB), and each connection allocates **four** of them eagerly — two smoltcp
-socket buffers at `tcp_stack_direct.rs:756-757` and two ring buffers in
-`TcpConnectionControl::new` at `tcp_conn.rs:60`. That is **~1.31 MB per TCP
-connection**, allocated at SYN, regardless of how much the connection carries.
+Both are configuration now — `tcp_buffer_size` and `max_connections` on the TUN
+config, carried through `TunServerConfig` and `TcpStackOptions` — and both
+default by platform, the way `mtu` already did:
 
-`MAX_CONCURRENT_CONNECTIONS` is 1024 (`tcp_stack_direct.rs:377`), so the stack's
-own ceiling is about **1.34 GB**.
+| | buffer/direction | max connections | worst case |
+|---|---|---|---|
+| iOS, Android | 32 KiB | 256 | 32 MiB |
+| everywhere else | 64 KiB | 1024 | 256 MiB |
 
-An iOS `NEPacketTunnelProvider` runs under a hard ~50 MB memory limit. The
-extension is jetsam'd, not warned, when it crosses it. That works out to **~35
-concurrent connections** — a single page load in Safari opens more than that.
-Android is more forgiving but a 1024-connection burst still means an OOM kill.
+Neither buffer spans a network round trip: both sit between the device and a
+proxy connection inside this process, so their size buys burst tolerance rather
+than throughput, and the old value was sized for a desktop 10 GbE path. The
+ceiling is logged at startup (`TCP stack: buffer=... max_connections=...`), and
+a value below two MTUs is raised to two MTUs.
 
-What to do:
+What is still worth doing: allocate lazily and grow, rather than taking the full
+four buffers at SYN. The ceiling is now survivable, but a connection that
+carries one HTTP request still pays for a connection that carries a video.
 
-- Make the buffer sizes configurable in `TunServerConfig` rather than constants,
-  and default them far lower on mobile. 32-64 KB per direction is enough to keep
-  a mobile radio busy; the current value is sized for a desktop 10 GbE path.
-- Allocate lazily and grow, instead of taking 1.31 MB at SYN.
-- Set `MAX_CONCURRENT_CONNECTIONS` from config too, and pick a mobile default
-  (256 matches the UDP `MAX_SESSIONS` already in `udp_manager.rs:36`).
-
-Until this is addressed, measure before shipping: run the extension under
-Instruments' Allocations with 50 concurrent connections and watch the footprint.
-
-Two neighbouring allocations have already been sized for this budget and are
-not part of the problem: the AnyTLS outgoing channel is bounded at
-`OUTGOING_CHANNEL_CAPACITY = 256` (`src/anytls/anytls_client_session.rs:30`,
-with the iOS limit named in the comment above it), and the UDP session table is
-an LRU capped at 256.
+Two neighbouring allocations were already sized for this budget: the AnyTLS
+outgoing channel is bounded at `OUTGOING_CHANNEL_CAPACITY = 256`
+(`src/anytls/anytls_client_session.rs:30`), and the UDP session table is an LRU
+capped at 256 (`udp_manager.rs:36`).
 
 ## 2. Only the AmneziaWG socket is excluded from the tunnel — fixed
 
@@ -232,48 +258,58 @@ Covered by tests in `src/socket_util.rs` that install a recording protector and
 assert the file descriptor reached it, including that a refused protection fails
 socket creation rather than handing back a socket that would loop.
 
-## 3. Nothing handles a network change
+## 3. Nothing handles a network change — fixed
 
-There is no API to tell the library the network moved — no `on_network_change`,
-no rebind, no reconnect. `rg -n 'network_change|rebind|path_monitor' src/`
-returns nothing at all.
+There was no API to tell the library the network moved, and nothing that
+noticed on its own. On mobile the default route changes constantly, and when it
+does the AmneziaWG endpoint's UDP socket is still bound to an address that no
+longer exists. It does not error. It goes quiet, and stays quiet, and the only
+recovery was stop-and-start — which tears down the TUN interface and every
+connection through it.
 
-On mobile the default route changes constantly: Wi-Fi to cellular, cellular to
-Wi-Fi, IP change on the same interface, doze wake-up. When it does:
+The endpoint socket is replaceable now (`src/amneziawg/endpoint.rs`). The three
+tunnel tasks hold an `EndpointSocket` instead of a `UdpSocket`, read the live
+socket through a `watch` channel, and are woken when it is swapped underneath
+them. A rebind binds a fresh socket, protects it, and connects it to the same
+peer; no new handshake is needed, because WireGuard peers roam — the server
+updates the endpoint it holds for us as soon as an authenticated packet arrives
+from the new address.
 
-- Every UDP socket, including the AmneziaWG endpoint socket in
-  `src/amneziawg/tunnel.rs`, is still bound to the old local address. It stops
-  receiving, silently. The tunnel does not error; it goes quiet.
-- Resolver state and any pooled TCP connections point at an interface that no
-  longer carries traffic.
+Two things trigger it:
 
-Both platforms already deliver the signal — `ConnectivityManager.NetworkCallback`
-on Android, `NWPathMonitor` on iOS. What is missing is somewhere to deliver it
-to. The minimum useful surface is one FFI call that rebinds the AmneziaWG
-endpoint socket and forces a fresh handshake; a fuller version also drains the
-proxy connection pools and re-resolves.
+- **The app tells us.** `shoes_network_changed()` on iOS, `networkChanged()` on
+  Android — call them from `NWPathMonitor` and from
+  `ConnectivityManager.NetworkCallback`. Safe from any thread and when nothing
+  is running; they do no I/O on the calling thread.
+- **We notice.** A send that fails with `ENETUNREACH`, `EHOSTUNREACH`,
+  `ENETDOWN`, `EADDRNOTAVAIL` or `EINVAL` schedules a rebind by itself, so an
+  app that never wires up the callback still recovers, one failed send later.
+  `ECONNREFUSED` and `ECONNRESET` deliberately do not: on a connected UDP socket
+  those are the peer's ICMP replies and say nothing about our own address.
 
-Today the only recovery is stop-and-start, which tears down the TUN interface
-and every connection through it.
+Still not handled: pooled TCP connections through a non-AmneziaWG chain, and
+resolver state. Both fail and re-establish on their own, where the UDP tunnel
+could not.
 
-## 4. `stop` blocks the calling thread for up to five seconds
+## 4. `stop` blocks the calling thread for up to five seconds — mostly fixed
 
-`stop_service` in `src/ffi/common.rs:85` polls a flag in 100 ms sleeps up to 50
-times, then drops the Runtime — which itself blocks until every task finishes.
+`stop_service` polled a flag in 100 ms sleeps up to 50 times and then dropped
+the Runtime, which itself blocks until every task finishes. Called from
+`onDestroy` on the main thread — which is what the KDoc sample did — that is an
+ANR waiting to happen, and it paid at least 100 ms even when the service had
+already stopped.
 
-On Android, calling `ShoesNative.stop()` from `onDestroy` on the main thread is
-an ANR waiting to happen: the system allows about 5 seconds before it kills the
-app for not responding, and this can consume all of it. The KDoc on
-`ShoesNative.stop` says it "blocks until the service has fully stopped" but does
-not say for how long, and the sample in the KDoc calls it from `onDestroy`.
+Two changes. The poll is 5 ms now, so a stop costs what it actually takes rather
+than rounding up to a tenth of a second. And the Runtime is shut down on a
+thread of its own, with a timeout, because waiting for tasks to drop gets the
+caller nothing.
 
-On iOS, `stopTunnel(with:completionHandler:)` has a similar budget before the
-extension is killed.
-
-What to do: make the shutdown wait asynchronous, or at minimum document a hard
-requirement to call it off the main thread and fix the KDoc sample. A callback
-or a `shoes_stop_async` that signals and returns immediately, with completion
-delivered through the existing error/status channel, fits both platforms better.
+The wait that remains cannot be skipped: it is what guarantees the stack thread
+has released the TUN descriptor, so the app can close its own copy without
+racing a thread still reading from it. `stop` returns `true` when it confirmed
+the stop and `false` on timeout. It must still be called off the main thread,
+and the KDoc sample now does that, closes the descriptor afterwards, and checks
+`start`'s return value.
 
 ## 5. The handle returned by `start` is not a handle
 
@@ -291,34 +327,35 @@ The double-start hazard this created is now fixed — both platforms refuse to
 start over a running service rather than dropping a live Runtime on the caller's
 thread.
 
-## 6. The log level is fixed at first init
+## 6. The log level is fixed at first init — fixed
 
-`shoes_init` returns 0 immediately if `INITIALIZED` was already set
-(`ios.rs:89-91`), before it reads `log_level`. A second call with `"debug"` does
-nothing, and returns success while doing so.
+`shoes_init` returns 0 immediately if `INITIALIZED` was already set, before it
+reads `log_level`, so a second call with `"debug"` did nothing and reported
+success while doing it. For a support workflow — "turn on debug logging and
+reproduce" — the user had to kill the app.
 
-For a support workflow — "turn on debug logging and reproduce" — that means the
-user has to kill the app. A `shoes_set_log_level` that updates the filter on a
-live logger is a small addition and removes the restart.
+`shoes_set_log_level` / `ShoesNative.setLogLevel` change the level of a running
+library. They set an override that `MultiLogger` consults ahead of its
+directives, so the change applies to every target immediately.
 
-Note that `log` is built with `release_max_level_info` (`Cargo.toml:51`), so
-`debug` and `trace` are compiled out of release builds entirely. A live log
-level switch is only useful together with a build that keeps those levels.
+The caveat from before still stands: `log` is built with
+`release_max_level_info` (`Cargo.toml:55`), so `debug` and `trace` are compiled
+out of release builds. Raising the level past `info` only does something in a
+build that keeps them.
 
-## 7. Traffic stats wake the device once a second regardless of traffic
+## 7. Traffic stats wake the device once a second regardless of traffic — fixed
 
-`report_traffic` (`src/tun/traffic.rs:57`) loads both counters and invokes the
-callback unconditionally; the timer task in `tun/mod.rs:171-179` calls it on a
-1-second interval. An idle tunnel therefore crosses into the JVM, or into Swift,
-3,600 times an hour to report numbers that have not changed.
+`report_traffic` loaded both counters and invoked the callback unconditionally,
+so an idle tunnel crossed into the JVM, or into Swift, 3,600 times an hour to
+repeat numbers that had not changed. It now compares against what the last tick
+reported and returns without calling when neither counter moved.
 
-Skipping the call when neither counter moved since the last tick is a few lines
-and lets an idle device stay idle. Consider also making the interval
-configurable, so the app can back off when its UI is not in the foreground.
+The interval is still a fixed 1 s. Making it configurable, so an app can back
+off when its UI is not in the foreground, is still worth doing.
 
 The JNI side itself is fine: `attach_current_thread` in jni 0.22 is the
-permanent-attach variant, which is documented as a thread-local check with no
-JNI call once the thread is attached. No change needed there.
+permanent-attach variant, documented as a thread-local check with no JNI call
+once the thread is attached.
 
 ## 8. Smaller items
 
@@ -335,9 +372,12 @@ JNI call once the thread is attached. No change needed there.
   Store now requires targeting API 35+ for new submissions; `compileSdk` is fine
   but confirm the consuming app's `targetSdk`. `minSdk 21` is very generous —
   raising it to 24 or 26 would let the NDK drop some compatibility shims.
-- **Stale ABI comment in CI.** The header comment on the `android` job in
-  `.github/workflows/mobile.yml` claims x86_64 and x86 slices; the job builds
-  arm64-v8a and armeabi-v7a, same as the script.
+- **~~Stale ABI comment in CI.~~ Fixed.** The `android` job's header comment
+  now names the ABIs it actually builds.
+- **A line per connection at `info`.** The stack logged every accepted SYN at
+  `info`, which in a release build — where `info` is the maximum level — meant a
+  page load's worth of source and destination addresses in logcat and in the log
+  file the user hands to support. It is `debug` now.
 - **No `android:extractNativeLibs` guidance.** For a 9.4 MB `libshoes.so`,
   leaving it uncompressed in the APK (`useLegacyPackaging = false`, the default
   on AGP 9) is right, but it doubles the on-disk footprint. Worth measuring.
@@ -366,10 +406,17 @@ JNI call once the thread is attached. No change needed there.
   lines. Note also that `.text` is file-backed and demand-paged, so unused
   protocol code costs essentially no RSS — this is a download-size lever, not
   a finding-1 lever.
+- **The stack thread's panic guard does nothing on mobile.**
+  `TcpStackDirect::new` wraps the thread body in `catch_unwind` and logs what it
+  catches, but the `release-mobile` profile sets `panic = "abort"`, so a panic
+  there ends the process before the handler runs. The panic hook in
+  `src/logging.rs` still records it, which is the part that matters; the
+  `catch_unwind` is simply inert in shipping builds and should not be read as
+  containment.
 - **No jemalloc on mobile.** Deliberate (`Cargo.toml:95` excludes iOS and
   Android) and correct — but it means the system allocator's fragmentation
-  behaviour is what you get, which makes finding 1 worse than the arithmetic
-  suggests.
+  behaviour is what you get, so the real footprint sits above the ceiling
+  finding 1 computes.
 
 ## 9. Platform wiring Fake IP still expects
 
@@ -387,12 +434,12 @@ the app configuring anything. Two things still make it behave better:
 
 ## Suggested order
 
-1. Buffer sizing and connection limits (1). Nothing else matters if the
-   extension is being killed.
-2. Socket protection coverage (2). Cheap to fix, and it removes a silent
-   dependency on an app-side workaround nobody wrote down.
-3. Network-change handling (3). This is the difference between a VPN that
-   survives walking out of the house and one that does not.
-4. Async stop (4) and live log level (6). Both small, both remove a rough
-   edge users will hit.
-5. Idle traffic ticks (7), handle semantics (5), packaging (8).
+What is left, in the order it is worth doing:
+
+1. Lazy buffer growth (1). The ceiling is survivable now, but a connection that
+   carries one HTTP request still pays what a video connection pays.
+2. Handle semantics (5). The API implies a multi-instance model it does not
+   have.
+3. Configurable traffic-report interval (7), so an app can back off when its UI
+   is not in the foreground.
+4. The packaging items in 8, and the Fake IP platform wiring in 9.

@@ -6,37 +6,58 @@ package com.shoesproxy
  * Call [init] once before using any other method. The native library is
  * loaded automatically when this object is first accessed.
  *
+ * The TUN descriptor belongs to your app. Keep the [android.os.ParcelFileDescriptor]
+ * alive for as long as the tunnel runs and close it after [stop] returns — the
+ * native side never closes a descriptor it did not open.
+ *
  * Example — starting the VPN inside a [android.net.VpnService]:
  * ```kotlin
  * class MyVpnService : VpnService() {
  *
  *     private var shoesHandle: Long = -1
+ *     private var tunInterface: ParcelFileDescriptor? = null
  *
  *     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
  *         ShoesNative.init("info")
  *
- *         val tunFd = Builder()
+ *         val tun = Builder()
  *             .addAddress("10.0.0.1", 24)
- *             .establish()!!
- *             .detachFd()
+ *             .establish() ?: return START_NOT_STICKY
+ *         tunInterface = tun
  *
  *         val config = """
  *             tun:
- *               device_fd: $tunFd
+ *               device_fd: ${tun.fd}
  *         """.trimIndent()
  *
  *         shoesHandle = ShoesNative.start(config, { fd -> protect(fd) }) { up, down ->
  *             Log.d("VPN", "Traffic: up=$up down=$down")
  *         }
+ *         if (shoesHandle < 0) {
+ *             Log.e("VPN", "start failed: ${ShoesNative.getLastError()}")
+ *             tun.close()
+ *             tunInterface = null
+ *             return START_NOT_STICKY
+ *         }
  *         return START_STICKY
  *     }
  *
  *     override fun onDestroy() {
- *         ShoesNative.stop(shoesHandle)
+ *         // Off the main thread: stop() waits for the engine to let go of the
+ *         // TUN descriptor, and the system allows onDestroy about 5 seconds
+ *         // before it kills the app for not responding.
+ *         thread {
+ *             ShoesNative.stop(shoesHandle)
+ *             tunInterface?.close()
+ *             tunInterface = null
+ *         }
  *         super.onDestroy()
  *     }
  * }
  * ```
+ *
+ * Register a [android.net.ConnectivityManager.NetworkCallback] too and call
+ * [networkChanged] from it; see that method for why.
  */
 object ShoesNative {
 
@@ -104,16 +125,53 @@ object ShoesNative {
     external fun setLogFile(logPath: String): Int
 
     /**
+     * Change the log level of a running library.
+     *
+     * Unlike [init], this takes effect on a library that is already running,
+     * so support can ask for debug logs without the app being restarted.
+     *
+     * Release builds are compiled with `release_max_level_info`: "debug" and
+     * "trace" behave like "info" unless the native library was built with
+     * those levels kept.
+     *
+     * @param logLevel "error", "warn", "info", "debug", "trace", or "off".
+     * @return 0 on success, -1 if the level was not recognised.
+     */
+    external fun setLogLevel(logLevel: String): Int
+
+    /**
+     * Tell the engine that the device's network changed.
+     *
+     * Call this from [android.net.ConnectivityManager.NetworkCallback] —
+     * `onAvailable`, `onLost`, and `onLinkPropertiesChanged` are all worth
+     * forwarding. A UDP tunnel bound to an address that no longer exists does
+     * not report an error, it just stops carrying traffic, so without this the
+     * only recovery is stopping and starting the whole tunnel.
+     *
+     * Safe from any thread, and safe when nothing is running.
+     *
+     * @return the number of tunnel endpoints told to rebind.
+     */
+    external fun networkChanged(): Int
+
+    /**
      * Start the shoes VPN service.
      *
-     * Spawns a background async runtime. The [configYaml] must include a
-     * `tun` section with `device_fd` set to the TUN file descriptor obtained
-     * from [android.net.VpnService.Builder.establish].
+     * Spawns a background async runtime and returns once the configuration has
+     * been accepted, so a -1 here means the config was rejected — call
+     * [getLastError] for the reason.
+     *
+     * The [configYaml] must include a `tun` section with `device_fd` set to
+     * the TUN file descriptor obtained from
+     * [android.net.VpnService.Builder.establish]. That descriptor stays yours:
+     * keep the `ParcelFileDescriptor` alive until after [stop] and close it
+     * yourself.
      *
      * @param configYaml YAML configuration string.
      * @param protectCallback Called by the engine to exempt outbound sockets
      *                        from VPN routing (pass `this::protect` from your VpnService).
-     * @param trafficCallback Called periodically with cumulative traffic byte counts.
+     * @param trafficCallback Called with cumulative traffic byte counts about once a
+     *                        second, and not at all while the counts are unchanged.
      * @return A positive handle on success, -1 on error.
      */
     external fun start(
@@ -125,7 +183,11 @@ object ShoesNative {
     /**
      * Stop the VPN service.
      *
-     * Signals shutdown and blocks until the service has fully stopped.
+     * Signals shutdown and blocks until the engine has released the TUN
+     * descriptor — usually a few milliseconds, but bounded at 5 seconds if a
+     * task will not wind down. **Do not call this on the main thread**: the
+     * system's ANR budget is about the same 5 seconds. Close your
+     * `ParcelFileDescriptor` after it returns, not before.
      *
      * @param handle The handle returned by [start].
      */

@@ -106,6 +106,46 @@ const char *shoes_get_version(void);
 int shoes_set_log_file(const char *path);
 
 /**
+ * Change the log level of a running library.
+ *
+ * `shoes_init` reads the level once and ignores it on every later call, so
+ * without this a support workflow of "turn on debug logging and reproduce"
+ * means killing the app first. Takes effect immediately, for every subsequent
+ * record.
+ *
+ * Note that release builds are compiled with `release_max_level_info`, so
+ * "debug" and "trace" only differ from "info" in a build that keeps them.
+ *
+ * # Arguments
+ * * `log_level` - "error", "warn", "info", "debug", "trace", or "off"
+ *
+ * # Returns
+ * * 0 on success
+ * * -1 if the level was not recognised
+ *
+ * # Safety
+ * `log_level` must be a valid null-terminated C string.
+ */
+int shoes_set_log_level(const char *log_level);
+
+/**
+ * Tell the library the device's network changed.
+ *
+ * Call this from `NWPathMonitor`'s update handler. A UDP tunnel bound to an
+ * address that no longer exists does not fail — it goes silent — so without
+ * this the only recovery is a full stop and start, which tears down the TUN
+ * interface and every connection through it. This rebinds the tunnel's socket
+ * in place instead.
+ *
+ * Safe to call at any time, including when no tunnel is running. It does no
+ * I/O on the calling thread.
+ *
+ * # Returns
+ * The number of tunnel endpoints that were told to rebind.
+ */
+int shoes_network_changed(void);
+
+/**
  * Get the last error message from the shoes service.
  *
  * Returns a null-terminated C string containing the error message,
