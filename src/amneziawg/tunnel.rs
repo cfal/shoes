@@ -11,8 +11,9 @@ use boringtun::noise::{Tunn, TunnResult};
 use boringtun::x25519;
 use log::{debug, error, info, warn};
 use parking_lot::Mutex as ParkingMutex;
-use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
+
+use super::endpoint::EndpointSocket;
 
 /// Maximum UDP datagram size (outer AmneziaWG packets).
 const MAX_UDP_SIZE: usize = 65536;
@@ -64,24 +65,10 @@ impl TunnelRuntime {
         })?;
         let tunn = Arc::new(ParkingMutex::new(tunn));
 
-        // Create endpoint UDP socket
-        let bind_addr = if endpoint_addr.is_ipv6() {
-            SocketAddr::from(([0u8; 16], 0u16))
-        } else {
-            SocketAddr::from(([0u8; 4], 0u16))
-        };
-        let udp_socket = UdpSocket::bind(bind_addr).await?;
-
-        // Exclude the endpoint socket from the VPN route before connecting.
-        // Without this the tunnel's own UDP is captured by the TUN interface it
-        // feeds, and every packet loops back into itself. This socket is bound
-        // directly rather than through socket_util, so it protects itself.
-        crate::socket_util::protect_outbound(&udp_socket).map_err(|e| {
-            std::io::Error::other(format!("failed to protect AmneziaWG endpoint socket: {e}"))
-        })?;
-
-        udp_socket.connect(endpoint_addr).await?;
-        let udp_socket = Arc::new(udp_socket);
+        // Rebindable rather than a plain UdpSocket: on mobile the address this
+        // is bound to stops existing every time the device changes network.
+        // See src/amneziawg/endpoint.rs.
+        let udp_socket = EndpointSocket::connect(endpoint_addr).await?;
 
         info!("AmneziaWG tunnel started, endpoint={}", endpoint_addr);
 
@@ -117,10 +104,14 @@ impl TunnelRuntime {
             })
         };
 
+        // Task 4: Rebind the endpoint socket when the network moves.
+        let rebind_task = tokio::spawn(udp_socket.clone().run_rebind_task());
+
         let abort_handles = vec![
             recv_task.abort_handle(),
             send_task.abort_handle(),
             timer_task.abort_handle(),
+            rebind_task.abort_handle(),
         ];
 
         Ok(Arc::new(Self {
@@ -133,7 +124,7 @@ impl TunnelRuntime {
 
 async fn decapsulate_loop(
     tunn: Arc<ParkingMutex<Tunn>>,
-    udp: Arc<UdpSocket>,
+    udp: Arc<EndpointSocket>,
     tx: mpsc::Sender<Vec<u8>>,
 ) {
     let mut buf = vec![0u8; MAX_UDP_SIZE];
@@ -212,7 +203,7 @@ fn ordered_outgoing(tunn: &mut Tunn, packet: Vec<u8>) -> Vec<Vec<u8>> {
 /// Send the datagrams for a `WriteToNetwork` result, decoys first.
 async fn send_to_network(
     tunn: &Arc<ParkingMutex<Tunn>>,
-    udp: &Arc<UdpSocket>,
+    udp: &Arc<EndpointSocket>,
     packet: Vec<u8>,
     context: &str,
 ) {
@@ -228,7 +219,7 @@ async fn send_to_network(
 /// as its contract requires, sending anything it yields.
 async fn drain_queued_packets(
     tunn: &Arc<ParkingMutex<Tunn>>,
-    udp: &Arc<UdpSocket>,
+    udp: &Arc<EndpointSocket>,
     out: &mut [u8],
 ) {
     loop {
@@ -245,7 +236,7 @@ async fn drain_queued_packets(
 
 async fn encapsulate_loop(
     tunn: Arc<ParkingMutex<Tunn>>,
-    udp: Arc<UdpSocket>,
+    udp: Arc<EndpointSocket>,
     mut rx: mpsc::Receiver<Vec<u8>>,
 ) {
     let mut out = vec![0u8; MAX_UDP_SIZE];
@@ -273,7 +264,7 @@ async fn encapsulate_loop(
     }
 }
 
-async fn timer_loop(tunn: Arc<ParkingMutex<Tunn>>, udp: Arc<UdpSocket>) {
+async fn timer_loop(tunn: Arc<ParkingMutex<Tunn>>, udp: Arc<EndpointSocket>) {
     let mut out = vec![0u8; MAX_UDP_SIZE];
 
     loop {
