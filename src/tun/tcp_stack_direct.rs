@@ -1210,7 +1210,15 @@ mod tests {
         let (server, client) = UnixStream::pair().expect("Failed to create socket pair");
         let client_fd = client.into_raw_fd();
 
-        let stack = TcpStackDirect::new(client_fd, owning_options());
+        // Borrowed, not owned: this test closes the descriptor itself below,
+        // and a stack that closed it again would be a double close.
+        let stack = TcpStackDirect::new(
+            client_fd,
+            TcpStackOptions {
+                close_fd_on_drop: false,
+                ..owning_options()
+            },
+        );
 
         thread::sleep(Duration::from_millis(100));
         assert!(stack.is_running(), "Stack thread should be running");
@@ -1230,11 +1238,11 @@ mod tests {
             thread::sleep(Duration::from_millis(50));
         }
 
-        // This test already closed client_fd above, so the stack must not close
-        // it again: the freed fd number can be reused by a concurrent test's
-        // OwnedFd in between, and closing it out from under that owner aborts
-        // the whole test binary ("IO Safety violation: owned file descriptor
-        // already closed").
+        // Safe to drop only because the stack was told the descriptor is not
+        // its own. Closing it twice would let a concurrent test's OwnedFd take
+        // the freed number in between and then lose it, which aborts the whole
+        // test binary ("IO Safety violation: owned file descriptor already
+        // closed") rather than failing one test.
         drop(stack);
     }
 
