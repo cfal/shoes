@@ -1,5 +1,56 @@
 # Changelog
 
+## v0.2.10
+
+Security and packaging. No protocol changes; a server deployment is affected
+only by the REALITY logging fix.
+
+### Security
+
+- REALITY logged key material at debug level: the TLS traffic secret and the
+  key and IV derived from it on every derivation, the authentication key on
+  every client handshake, and the peer's short_id on the server — which also
+  appeared in the rejection error text. Debug logging is switchable at runtime
+  and MOBILE.md tells users a log file is safe to hand to support; with these
+  lines it was a transcript-decryption kit. All of it is gone. What remains
+  logged is lengths, cipher-suite parameters and outcomes, and a rejected
+  short_id is no longer echoed anywhere — it may be a valid credential for a
+  different deployment.
+- The crate's only `unsafe` block is gone. `allocate_vec` handed out
+  uninitialized memory as initialized bytes — formally undefined behaviour.
+  Buffers are zeroed now, which costs nothing that matters: large allocations
+  arrive as lazy zero pages, the same mechanism the resident-memory numbers
+  already relied on.
+
+### The tunnel library is now awgtun
+
+- The boringtun fork became its own project. shoes follows it through v0.8.0
+  — AmneziaWG 3.1 in the library (random trailers, cookie suppression), not
+  yet exposed in shoes configuration — to v0.9.0, which split the C/JNI
+  exports into a separate crate at shoes' request: Rust consumers no longer
+  build artifacts they discard, and nothing foreign lands in the Android AAR
+  to begin with. The delete step and the CI check on the AAR remain as guards.
+- The dependency is pinned to a release tag now rather than a moving branch.
+
+### Packaging
+
+- The Android AAR carries an `x86_64` slice, so the stock emulator can load
+  the library at all; previously `System.loadLibrary` failed at startup on any
+  non-ARM image. Verified in CI by the AAR content check.
+- Intel macOS binaries are no longer published; nothing deploys there.
+
+### Dependencies
+
+- Everything on the latest released versions as of this release, and
+  `cargo audit` is clean: 333 crates against 1225 advisories, nothing flagged.
+- `digest` is pinned to its major (`"0.11"`). The wildcard requirement let a
+  routine re-resolution flip it to 0.10, whose `XofReader` trait does not match
+  the one `shake` implements — caught when it broke this release's build.
+
+Note for the app side: `shoes_get_version()` and `ShoesNative.getVersion()`
+now report 0.2.10.
+
+
 ## v0.2.9
 
 Mobile integration work. Everything below is on the client side; a server
