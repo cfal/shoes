@@ -368,9 +368,11 @@ impl RealityServerConnection {
         ]) as u64;
         let client_short_id = &decrypted_session_id[8..16];
 
+        // The short_id itself stays out of the log: for an invalid client it
+        // may be a valid id for another deployment, and for a valid one it is
+        // this deployment's credential.
         log::debug!("REALITY: Client version: {:?}", client_version);
         log::debug!("REALITY: Client timestamp: {}", client_timestamp);
-        log::debug!("REALITY: Client short_id: {:02x?}", client_short_id);
 
         // Validate short ID using constant-time comparison
         let mut client_short_id_arr = [0u8; 8];
@@ -380,13 +382,12 @@ impl RealityServerConnection {
         });
 
         if !short_id_ok {
-            log::warn!(
-                "REALITY: Client short_id {:02x?} not in configured list",
-                client_short_id
-            );
+            // Do not echo the presented id: it may be a valid credential for a
+            // different deployment, and it lands in the log either way.
+            log::warn!("REALITY: Client short_id not in configured list");
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                format!("Invalid short_id: {:02x?}", client_short_id),
+                "Client short_id is not in the configured list",
             ));
         }
 

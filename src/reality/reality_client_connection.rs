@@ -219,15 +219,13 @@ impl RealityClientConnection {
         // SessionId is at offset 39 in ClientHello handshake
         client_hello[39..71].fill(0);
 
-        log::debug!("REALITY CLIENT: Encrypting SessionId");
-        log::debug!("  auth_key={:02x?}", auth_key);
-        log::debug!("  nonce={:02x?}", nonce);
-        log::debug!("  plaintext={:02x?}", session_id_plaintext);
+        // The auth key and the plaintext (which carries the short_id) stay out
+        // of the log: debug logging is runtime-switchable, and the short_id
+        // identifies the deployment the way a password identifies an account.
         log::debug!(
-            "  aad_len={} (ClientHello with zero SessionId)",
+            "REALITY CLIENT: Encrypting SessionId, aad_len={} (ClientHello with zero SessionId)",
             client_hello.len()
         );
-        log::debug!("  aad[0..4]={:02x?}", &client_hello[0..4]);
 
         let encrypted_session_id =
             encrypt_session_id(&session_id_plaintext, &auth_key, nonce, &client_hello)

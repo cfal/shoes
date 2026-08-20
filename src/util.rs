@@ -18,14 +18,17 @@ pub fn unix_time_secs() -> std::io::Result<u64> {
         .map_err(|e| std::io::Error::other(format!("system clock is before the Unix epoch: {e}")))
 }
 
+/// A zeroed buffer of `len` bytes.
+///
+/// This used to be `with_capacity` + `set_len`, handing out uninitialized
+/// memory as `&mut [u8]` — formally undefined behaviour, and the only `unsafe`
+/// in this crate. Zeroing costs nothing that matters here: large allocations
+/// come from the allocator as untouched zero pages the kernel materialises on
+/// first write, which is exactly the laziness the resident-memory numbers in
+/// MOBILE.md rely on, and no per-packet path allocates at all.
 #[inline]
-#[allow(clippy::uninit_vec)]
-pub fn allocate_vec<T>(len: usize) -> Vec<T> {
-    let mut ret = Vec::with_capacity(len);
-    unsafe {
-        ret.set_len(len);
-    }
-    ret
+pub fn allocate_vec(len: usize) -> Vec<u8> {
+    vec![0u8; len]
 }
 
 // a cancellable alternative to AsyncWriteExt::write_all

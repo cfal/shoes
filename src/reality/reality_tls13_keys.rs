@@ -148,6 +148,9 @@ pub fn derive_traffic_keys(
     let hash_len = cipher_suite.hash_len();
     let hmac_algorithm = cipher_suite.hmac_algorithm();
 
+    // The parameters are loggable; the secret, the key and the IV are not.
+    // Debug logging is runtime-switchable and log files get handed to support,
+    // so a session key printed here is a session handed over with the file.
     log::debug!(
         "TRAFFIC_KEY_DERIVE: cipher_suite={:?}, key_len={}, iv_len={}, hash_len={}",
         cipher_suite,
@@ -155,7 +158,6 @@ pub fn derive_traffic_keys(
         iv_length,
         hash_len
     );
-    log::debug!("TRAFFIC_KEY_DERIVE: traffic_secret={:02x?}", traffic_secret);
 
     // key = HKDF-Expand-Label(Secret, "key", "", key_length)
     let key =
@@ -164,9 +166,6 @@ pub fn derive_traffic_keys(
     // iv = HKDF-Expand-Label(Secret, "iv", "", iv_length)
     let iv =
         hkdf_expand_label_with_algorithm(hmac_algorithm, traffic_secret, b"iv", b"", iv_length)?;
-
-    log::debug!("TRAFFIC_KEY_DERIVE: key={:02x?}", key);
-    log::debug!("TRAFFIC_KEY_DERIVE: iv={:02x?}", iv);
 
     Ok((key, iv))
 }
