@@ -382,12 +382,14 @@ once the thread is attached.
 
 ## 8. Smaller items
 
-- **`libboringtun-*.so` shipped in the AAR.** `cargo-ndk` copies every cdylib in
-  the dependency graph. Nothing loads it — the hashed filename is not a valid
-  `System.loadLibrary` name — so it was 315 KB of dead weight per ABI.
-  `scripts/build-android.sh:66` now deletes it. The dependency has since been
-  renamed to awgtun, so the file is `libawgtun-*.so` today; the script deletes
-  everything except `libshoes.so`, so the rename does not resurrect it.
+- **~~`libboringtun-*.so` shipped in the AAR.~~ Fixed at the source.**
+  `cargo-ndk` copies every cdylib in the dependency graph, and the tunnel
+  library's arrived under a hashed filename nothing could load — 315 KB of dead
+  weight per ABI. First mitigated by a delete step in `build-android.sh`; then
+  awgtun v0.9.0 moved its C/JNI exports into a separate `awgtun-ffi` crate, so
+  the library is a plain rlib and emits no cdylib at all. The delete step and
+  the CI check on the AAR remain as guards against any future dependency doing
+  the same.
 - **Secrets in logs are handled, mostly.** `Redacted<T>`
   (`src/config/types/redacted.rs`) gives keys and passwords a `Debug` that
   prints a placeholder, so a config dump into the log file is safe to hand to

@@ -27,7 +27,7 @@ ffi = []  # Enable FFI module for non-Android builds
 
 [dependencies]
 async-trait = "*"
-awgtun = { git = "https://github.com/AYastrebov/awgtun", tag = "v0.8.0", default-features = false }
+awgtun = { git = "https://github.com/AYastrebov/awgtun", tag = "v0.9.0", default-features = false }
 aws-lc-rs = { version = "*", default-features = false }
 base64 = "*"
 blake2 = "*"

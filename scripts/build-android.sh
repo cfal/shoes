@@ -66,9 +66,11 @@ cargo ndk \
     -o "$JNI_LIBS_DIR" \
     -- build --profile release-mobile --lib --locked
 
-# cargo-ndk copies every cdylib in the graph, including awgtun's. Nothing
-# loads it — its hashed filename is not even a valid System.loadLibrary name —
-# so it is pure weight in the AAR.
+# cargo-ndk copies every cdylib in the dependency graph into the AAR, under
+# hashed filenames System.loadLibrary cannot load. awgtun stopped emitting one
+# in v0.9.0 (it is a plain rlib now), so today this deletes nothing — it stays
+# as a guard so a future dependency's cdylib cannot ship silently. CI verifies
+# the same invariant on the finished AAR.
 echo "==> Dropping cdylibs other than libshoes.so"
 find "$JNI_LIBS_DIR" -name "*.so" ! -name "libshoes.so" -delete
 
