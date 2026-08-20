@@ -336,6 +336,27 @@ costs to leave.
 
 ## Where the known debt is written down
 
+Open findings from the 2026-08-20 audit, none of them fixed yet:
+
+- **No `catch_unwind` at the FFI boundary.** The 9 JNI and 10 C entry points
+  are plain `extern` functions. On the mobile profile `panic = "abort"` makes
+  a panic a defined abort, but a desktop `--features ffi` build unwinds, and a
+  panic crossing an `extern "C"` frame is undefined behaviour. Either wrap the
+  entry points in `catch_unwind` or build desktop FFI artifacts with
+  `panic = "abort"` too.
+- **Every crates.io dependency is `"*"`** (58 of them). `--locked` in CI and
+  the committed lockfile mean builds are reproducible, but any plain
+  `cargo update` may jump majors untested, and nothing pins what a fresh
+  clone without the lockfile would get. Pinning majors (`"1"`, `"0.12"`) keeps
+  the flexibility and removes the cliff.
+- **No advisory coverage.** Dependabot alerts are disabled on the repository
+  and `cargo audit` is not in CI. The h2 RUSTSEC fix in this branch's history
+  was found by hand; the next one will not announce itself. Enable one of the
+  two — a weekly `cargo audit` job is one workflow step.
+- `MOBILE.md` says its line references were last checked against `037018e`;
+  the branch has moved far since, so trust symbol names over line numbers
+  until someone re-verifies them.
+
 - `ROADMAP.md`, "Hysteria: the rest of the surface" — every unimplemented part
   of Hysteria2, grouped by whether it costs reachability, speed or visibility.
 - `MOBILE.md` — mobile defects, numbered, with a suggested order at the end.
