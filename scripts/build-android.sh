@@ -65,7 +65,7 @@ cargo ndk \
     -o "$JNI_LIBS_DIR" \
     -- build --profile release-mobile --lib --locked
 
-# cargo-ndk copies every cdylib in the graph, including boringtun's. Nothing
+# cargo-ndk copies every cdylib in the graph, including awgtun's. Nothing
 # loads it — its hashed filename is not even a valid System.loadLibrary name —
 # so it is pure weight in the AAR.
 echo "==> Dropping cdylibs other than libshoes.so"

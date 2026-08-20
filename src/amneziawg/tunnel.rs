@@ -1,14 +1,14 @@
 //! AmneziaWG tunnel runtime.
 //!
-//! Owns the boringtun Tunn, endpoint UDP socket, and drives the
+//! Owns the awgtun Tunn, endpoint UDP socket, and drives the
 //! encapsulate/decapsulate loop between the virtual IP stack and the network.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use boringtun::amnezia::Amnezia3Config;
-use boringtun::noise::{Tunn, TunnResult};
-use boringtun::x25519;
+use awgtun::amnezia::Amnezia3Config;
+use awgtun::noise::{Tunn, TunnResult};
+use awgtun::x25519;
 use log::{debug, error, info, warn};
 use parking_lot::Mutex as ParkingMutex;
 use tokio::sync::mpsc;
@@ -47,7 +47,7 @@ impl TunnelRuntime {
         amnezia: Amnezia3Config,
         endpoint_addr: SocketAddr,
     ) -> std::io::Result<Arc<Self>> {
-        // Create the boringtun tunnel
+        // Create the awgtun tunnel
         let tunn = Tunn::new_with_amnezia3(
             private_key,
             peer_public_key,
@@ -183,12 +183,12 @@ async fn decapsulate_loop(
     }
 }
 
-/// Take the datagrams boringtun has queued ahead of the packet that queued
+/// Take the datagrams awgtun has queued ahead of the packet that queued
 /// them.
 ///
 /// Any call that can start a handshake queues the AmneziaWG decoys — the I1-I5
 /// chains followed by `Jc` junk packets — and returns the handshake initiation
-/// separately. boringtun requires the queued datagrams to reach the network
+/// separately. awgtun requires the queued datagrams to reach the network
 /// *before* it: that ordering is the whole point of the decoys, since a censor
 /// is meant to see junk lead the exchange rather than a recognisable WireGuard
 /// handshake.
@@ -329,8 +329,8 @@ mod tests {
     use super::*;
     use crate::amneziawg::convert_amnezia_config;
     use crate::config::AmneziaWgParams;
+    use awgtun::noise::PacketClassifier;
     use base64::Engine as _;
-    use boringtun::noise::PacketClassifier;
 
     /// The obfuscation parameters from a real AmneziaWG 3.0 server profile.
     ///
@@ -412,7 +412,7 @@ mod tests {
         (client, server)
     }
 
-    /// Everything the real profile sets must survive the YAML -> boringtun
+    /// Everything the real profile sets must survive the YAML -> awgtun
     /// conversion. A parameter silently dropped here is invisible until the
     /// handshake fails against a real server.
     #[test]
@@ -443,14 +443,14 @@ mod tests {
         assert_eq!(config.timing_ranges.keepalive_timeout.lo, 14);
         assert_eq!(config.timing_ranges.max_handshake_attempts.lo, 18);
 
-        // The clamp for content padding is the tunnel MTU, not boringtun's
+        // The clamp for content padding is the tunnel MTU, not awgtun's
         // default, so the two cannot drift apart.
         assert_eq!(config.mtu, 1420);
     }
 
     /// The decoys must reach the network before the handshake they precede.
     ///
-    /// This is the ordering boringtun documents on `poll_outgoing_packet` and
+    /// This is the ordering awgtun documents on `poll_outgoing_packet` and
     /// `format_handshake_initiation`. Getting it backwards still completes a
     /// handshake — the peer ignores junk whenever it arrives — so nothing but
     /// an explicit order assertion catches it.
@@ -501,7 +501,7 @@ mod tests {
         let mut client_buf = vec![0u8; MAX_UDP_SIZE];
         let mut server_buf = vec![0u8; MAX_UDP_SIZE];
 
-        // Client starts a handshake. An IP-shaped payload, since boringtun
+        // Client starts a handshake. An IP-shaped payload, since awgtun
         // validates the inner packet.
         let mut ip_packet = vec![0u8; 40];
         ip_packet[0] = 0x45; // IPv4, IHL 5

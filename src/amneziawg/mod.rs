@@ -1,7 +1,7 @@
 //! AmneziaWG client outbound module.
 //!
 //! Implements a virtual network tunnel using the AmneziaWG protocol, backed by
-//! the boringtun fork with AmneziaWG 2.0 and 3.0 support. Plain WireGuard is
+//! awgtun, the boringtun fork with AmneziaWG support. Plain WireGuard is
 //! the same code path with every obfuscation parameter left at its default.
 
 mod config;

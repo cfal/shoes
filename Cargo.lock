@@ -152,6 +152,32 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
+name = "awgtun"
+version = "0.8.0"
+source = "git+https://github.com/AYastrebov/awgtun?tag=v0.8.0#7e6832a0d98304e6401066ae060d15320871527b"
+dependencies = [
+ "aead",
+ "base64 0.22.1",
+ "blake2",
+ "chacha20 0.9.1",
+ "chacha20poly1305",
+ "hex",
+ "hmac",
+ "ip_network",
+ "ip_network_table",
+ "libc",
+ "nix",
+ "parking_lot",
+ "portable-atomic",
+ "rand_core 0.6.4",
+ "ring",
+ "subtle",
+ "tracing",
+ "untrusted 0.9.0",
+ "x25519-dalek",
+]
+
+[[package]]
 name = "aws-lc-rs"
 version = "1.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -271,32 +297,6 @@ dependencies = [
  "futures-io",
  "futures-lite",
  "piper",
-]
-
-[[package]]
-name = "boringtun"
-version = "0.7.1"
-source = "git+https://github.com/AYastrebov/boringtun?branch=master#70e4f653ea45fc57c1a0d2813355612ee2b27a2a"
-dependencies = [
- "aead",
- "base64 0.22.1",
- "blake2",
- "chacha20 0.9.1",
- "chacha20poly1305",
- "hex",
- "hmac",
- "ip_network",
- "ip_network_table",
- "libc",
- "nix",
- "parking_lot",
- "portable-atomic",
- "rand_core 0.6.4",
- "ring",
- "subtle",
- "tracing",
- "untrusted 0.9.0",
- "x25519-dalek",
 ]
 
 [[package]]
@@ -2354,11 +2354,11 @@ version = "0.2.9"
 dependencies = [
  "android_logger",
  "async-trait",
+ "awgtun",
  "aws-lc-rs",
  "base64 0.23.1",
  "blake2",
  "blake3",
- "boringtun",
  "bytes",
  "chrono",
  "dashmap",

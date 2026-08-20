@@ -1,13 +1,13 @@
-//! Convert shoes AmneziaWG config types into boringtun types.
+//! Convert shoes AmneziaWG config types into awgtun types.
 
 use std::net::IpAddr;
 
-use base64::Engine;
-use boringtun::amnezia::{
+use awgtun::amnezia::{
     Amnezia3Config, CpsChain, HeaderConfig, HeaderRange, InitPacketConfig, JunkConfig,
     PaddingConfig, U32Range,
 };
-use boringtun::x25519;
+use awgtun::x25519;
+use base64::Engine;
 
 use crate::config::{AmneziaWgClientConfig, AmneziaWgParams};
 
@@ -324,7 +324,7 @@ mod tests {
         let config = convert_amnezia_config(&empty_params(), 1280).unwrap();
 
         // Identical to plain WireGuard apart from the MTU, which shoes always
-        // supplies from its own tunnel config rather than boringtun's default.
+        // supplies from its own tunnel config rather than awgtun's default.
         let mut expected = Amnezia3Config::from_amnezia2(Default::default());
         expected.mtu = 1280;
         assert_eq!(config, expected);
