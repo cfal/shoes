@@ -90,9 +90,9 @@ so the stock x86_64 emulator can load the library at all; without it,
 `System.loadLibrary` fails at startup on any non-ARM image. There is no 32-bit
 x86 slice. iOS ships the device and Apple Silicon simulator slices only.
 
-CI (`.github/workflows/mobile.yml`) triggers on `master` and on PRs into
-`master` only. Pushes to `mobile` build nothing — verify locally before relying
-on a green tick that was never produced.
+CI (`.github/workflows/mobile.yml`) triggers on pushes and PRs to both
+`master` and `mobile`, on `v*` tags, and manually — so a push to this branch
+does produce a real green tick, including the AAR content check.
 
 ## FFI surface
 
