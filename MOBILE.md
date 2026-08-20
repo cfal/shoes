@@ -12,7 +12,7 @@ open and are ordered at the end. Line references were last checked against
 
 | | Android | iOS |
 |---|---|---|
-| Builds | `cargo ndk -t arm64-v8a -t armeabi-v7a` clean | `cargo build --target aarch64-apple-ios` clean |
+| Builds | `cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64` clean | `cargo build --target aarch64-apple-ios` clean |
 | Packaging | AAR via `scripts/build-android.sh` | XCFramework via `scripts/build-ios.sh` |
 | Entry points | 9 `Java_com_shoesproxy_ShoesNative_*` JNI symbols | 10 `shoes_*` C symbols |
 | Socket protection | `VpnService.protect` via `SocketProtector` | `IosSocketProtector` |
@@ -47,7 +47,6 @@ the findings below assume.
 | `src/tun/tcp_conn.rs` | Per-connection ring buffers (`TcpConnectionControl`) |
 | `src/tun/udp_manager.rs` | UDP session table (`MAX_SESSIONS`) |
 | `src/socket_protector.rs` | `SocketProtector` trait, global protector, `protect_socket` |
-| `src/tun/platform.rs` | `PlatformCallbacks`, `PlatformInterface`; re-exports the protector for the FFI |
 | `src/tun/traffic.rs` | Byte counters, `report_traffic`, `TrafficCountingStream` |
 | `src/amneziawg/` | AmneziaWG 2.0/3.0 client: `config.rs`, `tunnel.rs`, `netstack.rs`, `connector.rs` |
 | `src/amneziawg/endpoint.rs` | The rebindable endpoint socket and the network-change registry |
@@ -70,7 +69,7 @@ bash scripts/build-android.sh
 bash scripts/build-ios.sh
 
 # Native libs only, skipping Gradle
-cargo ndk -t arm64-v8a -t armeabi-v7a -P 21 \
+cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 -P 21 \
     -o android/src/main/jniLibs -- build --profile release-mobile --lib
 
 # iOS device slice by hand — the deployment target is not optional
@@ -79,15 +78,17 @@ IPHONEOS_DEPLOYMENT_TARGET=16.0 \
 
 # Tests run on the host. `src/ffi/common.rs` compiles under
 # cfg(test) already, so plain `cargo test` covers it. The `ffi` feature is what
-# pulls in the socket-protector plumbing (`src/tun/platform.rs`, and the
+# pulls in the socket-protector plumbing (`src/socket_protector.rs`, and the
 # protect call in `src/amneziawg/tunnel.rs:79`) on a desktop target — build with
 # it when you are changing that path.
 cargo test
 cargo test --features ffi
 ```
 
-Both build scripts ship only `arm64-v8a` and `armeabi-v7a`. There is no x86 or
-x86_64 slice, so the Android emulator needs an arm64 image.
+The Android build ships `arm64-v8a`, `armeabi-v7a` and `x86_64` — the last one
+so the stock x86_64 emulator can load the library at all; without it,
+`System.loadLibrary` fails at startup on any non-ARM image. There is no 32-bit
+x86 slice. iOS ships the device and Apple Silicon simulator slices only.
 
 CI (`.github/workflows/mobile.yml`) triggers on `master` and on PRs into
 `master` only. Pushes to `mobile` build nothing — verify locally before relying

@@ -61,6 +61,7 @@ echo "==> Building native .so files for all ABIs"
 cargo ndk \
     -t arm64-v8a \
     -t armeabi-v7a \
+    -t x86_64 \
     -P 21 \
     -o "$JNI_LIBS_DIR" \
     -- build --profile release-mobile --lib --locked

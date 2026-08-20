@@ -51,12 +51,8 @@ jobs:
             binary_name: shoes
             asset_name: linux-arm64-musl
 
-          # macOS builds (native compilation)
-          - target: x86_64-apple-darwin
-            os: macos-latest
-            use_cross: false
-            binary_name: shoes
-            asset_name: macos-x86_64
+          # macOS build (native compilation). Intel macOS was dropped
+          # deliberately: nothing deploys there.
           - target: aarch64-apple-darwin
             os: macos-latest
             use_cross: false
