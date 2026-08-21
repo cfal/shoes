@@ -5,6 +5,7 @@
 //! citation table.
 
 pub mod crypto;
+pub mod metadata;
 
 /// Nonce size of XChaCha20-Poly1305. `pkg/cipher/api.go:31`.
 pub const NONCE_LEN: usize = 24;
