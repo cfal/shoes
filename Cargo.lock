@@ -2344,6 +2344,7 @@ dependencies = [
  "blake2",
  "blake3",
  "bytes",
+ "chacha20poly1305",
  "chrono",
  "dashmap",
  "digest 0.11.3",
