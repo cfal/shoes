@@ -51,6 +51,24 @@ impl PaddingStrategy {
     }
 }
 
+/// Padding for a data or ack segment: random bytes, uniform length.
+///
+/// Upstream builds these with a zero-valued `asciiPaddingOpts`
+/// (`pkg/protocol/underlay_stream.go:672`), which makes
+/// `minConsecutiveASCIILen` zero — so the length is uniform over the whole
+/// range and the printable-run transform covers an empty span and does
+/// nothing. The per-user strategy applies to session segments only. Using it
+/// here would give every packet the same shape, which is a signature.
+pub fn build_data_padding(max_len: usize) -> Vec<u8> {
+    if max_len == 0 {
+        return Vec::new();
+    }
+    let len = rand::rng().random_range(0..=max_len);
+    let mut padding = vec![0u8; len];
+    rand::rng().fill_bytes(&mut padding);
+    padding
+}
+
 /// Random bytes with one run forced into printable ASCII, so a segment carries
 /// a plausible run of text. `pkg/protocol/padding.go:138-155`.
 pub fn build_ascii_padding(max_len: usize) -> Vec<u8> {
@@ -198,6 +216,51 @@ mod tests {
     fn test_zero_budget_yields_no_padding() {
         assert!(build_ascii_padding(0).is_empty());
         assert!(build_entropy_padding(0, &[0u8; 10]).is_empty());
+    }
+
+    /// Data segments are padded differently from session segments: upstream
+    /// passes a zero-valued asciiPaddingOpts for them
+    /// (`pkg/protocol/underlay_stream.go:672`), which makes the length uniform
+    /// over the whole range and the printable-run transform a no-op. Applying
+    /// the per-user strategy here instead would put a constant shape on every
+    /// packet — a signature, on a protocol whose purpose is not having one.
+    #[test]
+    fn test_data_padding_is_uniform_over_the_whole_range() {
+        let mut shortest = usize::MAX;
+        let mut longest = 0;
+        for _ in 0..500 {
+            let len = build_data_padding(MAX_PADDING_LEN).len();
+            assert!(len <= MAX_PADDING_LEN);
+            shortest = shortest.min(len);
+            longest = longest.max(len);
+        }
+        // The ASCII strategy can never go below 24, and the entropy strategy
+        // saturates at the maximum for a payload of any size. Neither shape
+        // spans the range the way a uniform draw does.
+        assert!(
+            shortest < ASCII_RUN_BASE,
+            "shortest padding was {shortest}; a uniform draw reaches below {ASCII_RUN_BASE}"
+        );
+        assert!(
+            longest > MAX_PADDING_LEN / 2,
+            "longest padding was {longest}; a uniform draw reaches most of the range"
+        );
+    }
+
+    /// And it carries no forced printable run, unlike session padding.
+    #[test]
+    fn test_data_padding_has_no_forced_printable_run() {
+        // Over many samples a 24-byte printable run should not appear by
+        // chance: each byte has a 95/256 chance of landing in the range.
+        let mut longest = 0;
+        for _ in 0..200 {
+            longest = longest.max(longest_printable_run(&build_data_padding(MAX_PADDING_LEN)));
+        }
+        assert!(
+            longest < ASCII_RUN_BASE,
+            "found a {longest}-byte printable run, which suggests the ASCII \
+             transform is being applied to data padding"
+        );
     }
 
     fn longest_printable_run(data: &[u8]) -> usize {

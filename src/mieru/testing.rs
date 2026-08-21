@@ -49,13 +49,7 @@ impl ScriptedPeer {
 
     /// A data segment carrying `payload` toward the client.
     pub fn data(&mut self, session_id: u32, seq: u32, payload: &[u8]) -> Vec<u8> {
-        encode_data_segment(
-            &mut self.send,
-            session_id,
-            seq,
-            payload,
-            PaddingStrategy::Ascii,
-        )
-        .expect("encoding a data segment")
+        encode_data_segment(&mut self.send, session_id, seq, payload)
+            .expect("encoding a data segment")
     }
 }

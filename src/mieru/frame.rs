@@ -8,7 +8,7 @@
 
 use crate::mieru::crypto::DirectionCipher;
 use crate::mieru::metadata::{self, DataMetadata, Metadata, SessionMetadata};
-use crate::mieru::padding::PaddingStrategy;
+use crate::mieru::padding::{PaddingStrategy, build_data_padding};
 use crate::mieru::{MAX_PADDING_LEN, METADATA_LEN, TAG_LEN};
 
 /// Assemble a session segment: encrypted metadata, then trailing padding.
@@ -35,15 +35,20 @@ pub fn encode_session_segment(
 
 /// Assemble a data segment: encrypted metadata, prefix padding, encrypted
 /// payload, trailing padding.
+///
+/// The padding here is not the per-user strategy: upstream pads data and ack
+/// segments with plain random bytes of uniform length, and reserves the
+/// strategy for session segments (`pkg/protocol/underlay_stream.go:672`).
+/// Applying the strategy to every packet would give the traffic a constant
+/// shape, which is the opposite of what padding is for.
 pub fn encode_data_segment(
     cipher: &mut DirectionCipher,
     session_id: u32,
     seq: u32,
     payload: &[u8],
-    strategy: PaddingStrategy,
 ) -> std::io::Result<Vec<u8>> {
-    let prefix = strategy.build(MAX_PADDING_LEN, payload);
-    let suffix = strategy.build(MAX_PADDING_LEN, payload);
+    let prefix = build_data_padding(MAX_PADDING_LEN);
+    let suffix = build_data_padding(MAX_PADDING_LEN);
 
     let meta = DataMetadata {
         protocol: metadata::DATA_CLIENT_TO_SERVER,
@@ -193,7 +198,7 @@ mod tests {
         let (mut sender, mut receiver) = cipher_pair();
         let body = b"the quick brown fox";
 
-        let wire = encode_data_segment(&mut sender, 99, 1, body, PaddingStrategy::Ascii).unwrap();
+        let wire = encode_data_segment(&mut sender, 99, 1, body).unwrap();
         let (parsed, payload, consumed) = decode_segment(&mut receiver, &wire).unwrap().unwrap();
         assert_eq!(consumed, wire.len());
         assert_eq!(payload, body);
@@ -210,7 +215,7 @@ mod tests {
     fn test_both_padding_strategies_produce_decodable_segments() {
         for strategy in [PaddingStrategy::Ascii, PaddingStrategy::Entropy] {
             let (mut sender, mut receiver) = cipher_pair();
-            let wire = encode_data_segment(&mut sender, 1, 0, b"payload", strategy).unwrap();
+            let wire = encode_data_segment(&mut sender, 1, 0, b"payload").unwrap();
             let (_, payload, _) = decode_segment(&mut receiver, &wire).unwrap().unwrap();
             assert_eq!(
                 payload, b"payload",
@@ -225,8 +230,7 @@ mod tests {
     #[test]
     fn test_an_incomplete_segment_returns_none_without_advancing() {
         let (mut sender, mut receiver) = cipher_pair();
-        let wire =
-            encode_data_segment(&mut sender, 1, 0, b"payload", PaddingStrategy::Ascii).unwrap();
+        let wire = encode_data_segment(&mut sender, 1, 0, b"payload").unwrap();
 
         // Feed every prefix to the same receiver. None may consume anything.
         for cut in 1..wire.len() {
@@ -246,11 +250,8 @@ mod tests {
     #[test]
     fn test_two_segments_decode_in_sequence() {
         let (mut sender, mut receiver) = cipher_pair();
-        let mut wire =
-            encode_data_segment(&mut sender, 1, 0, b"first", PaddingStrategy::Ascii).unwrap();
-        wire.extend_from_slice(
-            &encode_data_segment(&mut sender, 1, 1, b"second", PaddingStrategy::Ascii).unwrap(),
-        );
+        let mut wire = encode_data_segment(&mut sender, 1, 0, b"first").unwrap();
+        wire.extend_from_slice(&encode_data_segment(&mut sender, 1, 1, b"second").unwrap());
 
         let (_, first, consumed) = decode_segment(&mut receiver, &wire).unwrap().unwrap();
         assert_eq!(first, b"first");
@@ -263,8 +264,7 @@ mod tests {
     #[test]
     fn test_a_corrupted_metadata_byte_is_rejected() {
         let (mut sender, mut receiver) = cipher_pair();
-        let mut wire =
-            encode_data_segment(&mut sender, 1, 0, b"payload", PaddingStrategy::Ascii).unwrap();
+        let mut wire = encode_data_segment(&mut sender, 1, 0, b"payload").unwrap();
         // Flip a byte inside the encrypted metadata, past the nonce.
         wire[crate::mieru::NONCE_LEN + 1] ^= 0xff;
         assert!(decode_segment(&mut receiver, &wire).is_err());
@@ -313,7 +313,7 @@ mod tests {
         let (mut sender, mut receiver) = cipher_pair();
         let now_minutes = (crate::util::unix_time_secs().unwrap() / 60) as u32;
 
-        let wire = encode_data_segment(&mut sender, 1, 0, b"x", PaddingStrategy::Ascii).unwrap();
+        let wire = encode_data_segment(&mut sender, 1, 0, b"x").unwrap();
         let (parsed, _, _) = decode_segment(&mut receiver, &wire).unwrap().unwrap();
         let Metadata::Data(data) = parsed else {
             panic!("expected data metadata")
@@ -324,7 +324,7 @@ mod tests {
     #[test]
     fn test_an_empty_payload_segment_carries_no_payload_tag() {
         let (mut sender, mut receiver) = cipher_pair();
-        let wire = encode_data_segment(&mut sender, 1, 0, b"", PaddingStrategy::Ascii).unwrap();
+        let wire = encode_data_segment(&mut sender, 1, 0, b"").unwrap();
         let (_, payload, consumed) = decode_segment(&mut receiver, &wire).unwrap().unwrap();
         assert!(payload.is_empty());
         assert_eq!(consumed, wire.len());

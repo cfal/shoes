@@ -49,7 +49,6 @@ pub struct MieruStream {
     inner: Box<dyn AsyncStream>,
     send: DirectionCipher,
     recv: DirectionCipher,
-    strategy: PaddingStrategy,
     session_id: u32,
     next_seq: u32,
 
@@ -91,6 +90,8 @@ impl MieruStream {
         let key = derive_key(password, username, round_to_interval(unix_secs));
         let mut send = DirectionCipher::new(&key, username);
         let mut recv = DirectionCipher::new(&key, username);
+        // The strategy shapes the session segments only; data segments use
+        // plain random padding, so it is not kept past the handshake.
         let strategy = PaddingStrategy::for_user(username);
 
         // Session ids are the peer's bookkeeping; any value works as long as
@@ -162,7 +163,6 @@ impl MieruStream {
             inner,
             send,
             recv,
-            strategy,
             session_id,
             next_seq: 1,
             pending,
@@ -287,13 +287,8 @@ impl AsyncWrite for MieruStream {
         // The payload length field is 16 bits and the protocol caps a fragment
         // at 32768 bytes, so a larger write becomes several segments.
         let take = buf.len().min(MAX_FRAGMENT_LEN);
-        let segment = encode_data_segment(
-            &mut this.send,
-            this.session_id,
-            this.next_seq,
-            &buf[..take],
-            this.strategy,
-        )?;
+        let segment =
+            encode_data_segment(&mut this.send, this.session_id, this.next_seq, &buf[..take])?;
         this.next_seq = this.next_seq.wrapping_add(1);
         this.outgoing = segment;
         this.outgoing_at = 0;
