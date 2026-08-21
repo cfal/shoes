@@ -71,6 +71,7 @@ mod h2mux;
 mod http_handler;
 pub mod hysteria2;
 mod memory;
+pub mod mieru;
 mod mixed_handler;
 mod naiveproxy;
 mod option_util;
