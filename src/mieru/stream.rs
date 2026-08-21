@@ -12,16 +12,35 @@ use rand::RngExt;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 use crate::async_stream::{AsyncPing, AsyncStream};
-use crate::mieru::MAX_FRAGMENT_LEN;
 use crate::mieru::crypto::{DirectionCipher, derive_key, round_to_interval};
 use crate::mieru::frame::{decode_segment, encode_data_segment, encode_session_segment};
 use crate::mieru::metadata::{Metadata, OPEN_SESSION_REQUEST, SessionMetadata};
 use crate::mieru::padding::PaddingStrategy;
+use crate::mieru::{MAX_FRAGMENT_LEN, MAX_PADDING_LEN, METADATA_LEN, NONCE_LEN, TAG_LEN};
 use crate::util::write_all;
 
-/// How many bytes to buffer while looking for a segment boundary. A segment is
-/// at most metadata, two paddings and a full fragment.
-const READ_BUFFER_LEN: usize = MAX_FRAGMENT_LEN + 1024;
+/// Bytes read from the socket in one go.
+const READ_CHUNK_LEN: usize = 8192;
+
+/// The largest segment a peer may legally send: nonce, sealed metadata, both
+/// paddings at their maximum, and a full fragment with its tag. Upstream caps
+/// the fragment at `maxPDU = 32 * 1024` (`pkg/protocol/segment.go:36`).
+const MAX_SEGMENT_LEN: usize = NONCE_LEN
+    + METADATA_LEN
+    + TAG_LEN
+    + MAX_PADDING_LEN
+    + MAX_FRAGMENT_LEN
+    + TAG_LEN
+    + MAX_PADDING_LEN;
+
+/// How many bytes to buffer while looking for a segment boundary.
+///
+/// A whole segment must fit *and* leave room for the read that completes it,
+/// or a stream of maximum-size segments trips the guard and the connection
+/// dies mid-download. The guard is a defence against a peer claiming a length
+/// it never sends, not a tuning knob, so it is sized from the protocol's own
+/// limits rather than a round number.
+const READ_BUFFER_LEN: usize = MAX_SEGMENT_LEN + READ_CHUNK_LEN;
 
 pub struct MieruStream {
     inner: Box<dyn AsyncStream>,
@@ -170,7 +189,7 @@ impl AsyncRead for MieruStream {
                 return Poll::Ready(Ok(()));
             }
 
-            let mut chunk = [0u8; 8192];
+            let mut chunk = [0u8; READ_CHUNK_LEN];
             let mut chunk_buf = ReadBuf::new(&mut chunk);
             match Pin::new(&mut this.inner).poll_read(cx, &mut chunk_buf) {
                 Poll::Ready(Ok(())) => {
@@ -396,6 +415,29 @@ mod tests {
             "a payload of {} bytes must span more than one segment, got {segments}",
             payload.len()
         );
+    }
+
+    /// A server sending back-to-back maximum-size segments must not trip the
+    /// read guard. The guard has to hold a whole segment *and* the read that
+    /// completes it, or a bulk download dies partway through.
+    #[tokio::test]
+    async fn test_back_to_back_full_size_segments_are_readable() {
+        let (mut stream, mut server, mut peer) = connect().await;
+
+        let chunk: Vec<u8> = (0..MAX_FRAGMENT_LEN).map(|i| i as u8).collect();
+        let mut wire = Vec::new();
+        for seq in 1..=3u32 {
+            wire.extend_from_slice(&peer.data(1, seq, &chunk));
+        }
+        tokio::spawn(async move {
+            let _ = server.write_all(&wire).await;
+            let _ = server.flush().await;
+        });
+
+        let mut received = vec![0u8; MAX_FRAGMENT_LEN * 3];
+        stream.read_exact(&mut received).await.unwrap();
+        assert_eq!(&received[..MAX_FRAGMENT_LEN], chunk.as_slice());
+        assert_eq!(&received[MAX_FRAGMENT_LEN * 2..], chunk.as_slice());
     }
 
     /// A segment split across two reads must reassemble, which it cannot if a

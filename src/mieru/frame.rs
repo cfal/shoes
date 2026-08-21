@@ -20,6 +20,11 @@ pub fn encode_session_segment(
     let mut meta = meta.clone();
     let suffix = strategy.build(MAX_PADDING_LEN, &[]);
     meta.suffix_len = suffix.len() as u8;
+    // Upstream stamps this in sessionStruct.Marshal and its Unmarshal rejects
+    // anything more than one minute from its own clock
+    // (`pkg/protocol/metadata.go:150,170`). A caller-supplied value would be
+    // stale by the time it reached the wire, so the encoder owns the field.
+    meta.timestamp_minutes = current_timestamp_minutes();
 
     let sealed = cipher.seal(&metadata::encode_session(&meta))?;
     let mut out = Vec::with_capacity(sealed.len() + suffix.len());
@@ -263,6 +268,57 @@ mod tests {
         // Flip a byte inside the encrypted metadata, past the nonce.
         wire[crate::mieru::NONCE_LEN + 1] ^= 0xff;
         assert!(decode_segment(&mut receiver, &wire).is_err());
+    }
+
+    /// Upstream rejects a session segment whose timestamp is more than a
+    /// minute from its own clock, so a zero here means the handshake dies
+    /// before the server answers. The encoder owns the field; a caller cannot
+    /// leave it unset.
+    #[test]
+    fn test_a_session_segment_carries_the_current_timestamp() {
+        let (mut sender, mut receiver) = cipher_pair();
+        let now_minutes = (crate::util::unix_time_secs().unwrap() / 60) as u32;
+
+        let wire = encode_session_segment(
+            &mut sender,
+            &SessionMetadata {
+                protocol: OPEN_SESSION_REQUEST,
+                // Deliberately zero: the encoder must overwrite it.
+                timestamp_minutes: 0,
+                session_id: 1,
+                seq: 0,
+                status: 0,
+                payload_len: 0,
+                suffix_len: 0,
+            },
+            PaddingStrategy::Ascii,
+        )
+        .unwrap();
+
+        let (parsed, _, _) = decode_segment(&mut receiver, &wire).unwrap().unwrap();
+        let Metadata::Session(session) = parsed else {
+            panic!("expected session metadata")
+        };
+        assert!(
+            session.timestamp_minutes.abs_diff(now_minutes) <= 1,
+            "timestamp {} is not within a minute of {now_minutes}",
+            session.timestamp_minutes
+        );
+    }
+
+    /// Data segments stamp it too, and did so before this was fixed for the
+    /// session path - so pin both rather than assuming they share a code path.
+    #[test]
+    fn test_a_data_segment_carries_the_current_timestamp() {
+        let (mut sender, mut receiver) = cipher_pair();
+        let now_minutes = (crate::util::unix_time_secs().unwrap() / 60) as u32;
+
+        let wire = encode_data_segment(&mut sender, 1, 0, b"x", PaddingStrategy::Ascii).unwrap();
+        let (parsed, _, _) = decode_segment(&mut receiver, &wire).unwrap().unwrap();
+        let Metadata::Data(data) = parsed else {
+            panic!("expected data metadata")
+        };
+        assert!(data.timestamp_minutes.abs_diff(now_minutes) <= 1);
     }
 
     #[test]
