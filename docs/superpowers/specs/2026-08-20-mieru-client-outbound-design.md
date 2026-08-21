@@ -21,6 +21,14 @@ recalled. Each claim cites where it came from:
 | Strategy seeding | `pkg/rng/rng.go:110-132` |
 | No ARQ over TCP | `pkg/protocol/session.go:1042-1051, 1144-1148` |
 | socks5 inside the session | `apis/client/client.go:120-154` |
+| UDP encapsulation, byte for byte | `apis/common/packet_over_stream.go:39-84` |
+
+A second reference exists and is worth reading before changing this code:
+[enfein/mbox](https://github.com/enfein/mbox) is the author's own integration
+of mieru into sing-box — the same task this document describes, solved for a
+different host. `protocol/mieru/outbound.go` there dials TCP through the
+client API and wraps UDP in `PacketOverStreamTunnel`, which is the same
+division of labour used here.
 
 ## Problem
 
@@ -96,6 +104,13 @@ Read from `pkg/appctl/proto/clientcfg.proto`, `pkg/appctl/proto/base.proto` and
 | `handshakeMode` 0-RTT (send payload with the request) | yes | **no** — standard 1-RTT only |
 | Configurable MTU | yes | not applicable to the TCP transport |
 | Dialer proxy (`ClientDialer`) | yes | shoes' chain model covers this, and more generally |
+
+For a second opinion on which of these a host integration actually needs,
+`option/mieru.go` in mbox is the minimum the author himself exposed when
+putting mieru into sing-box: `server`, `server_ports`, `transport`,
+`username`, `password`, `multiplexing`, `traffic_pattern`. Ours matches on
+username, password and server, and refuses the rest — the same three fields
+carry a working connection in both.
 
 ### Deliberately not our problem
 
@@ -335,6 +350,15 @@ A scripted peer built from our own codec cannot detect a shared
 misunderstanding of the specification: if we encode a field wrongly, we decode
 it wrongly to match, and every test passes. Only a real mieru server can
 settle that.
+
+One piece is no longer in that category. The UDP encapsulation was compared
+line by line against `apis/common/packet_over_stream.go` — the `0x00` prefix,
+the big-endian 16-bit length, the 65535 ceiling, the `0xff` suffix and the
+rejection of a wrong marker at either end all match. That is independent
+confirmation for one component rather than self-agreement. The same reading
+should be done for the segment codec and the key derivation before anyone
+calls this interoperable; the reference implementations are cheap to read and
+cost far less than debugging a live handshake.
 
 So before this outbound is advertised as working, it must complete a manual
 round trip against upstream's `mita` server or a real deployment. Until that
