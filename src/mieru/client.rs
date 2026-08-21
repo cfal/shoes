@@ -110,8 +110,12 @@ async fn read_socks5_reply(session: &mut MieruStream) -> std::io::Result<()> {
 
     // Consume the bound address the reply carries; its value is unused, but
     // its bytes have to leave the stream before payload starts.
-    let mut stream_reader = crate::stream_reader::StreamReader::new_with_buffer_size(64);
-    crate::socks_handler::read_location(session, &mut stream_reader).await?;
+    //
+    // read_location_direct, not read_location: the buffered reader reads
+    // greedily, so when the reply and the target's first response bytes arrive
+    // in one decoded segment it would swallow the payload into a buffer that
+    // is then dropped. This one reads exactly the address.
+    crate::socks_handler::read_location_direct(session).await?;
     Ok(())
 }
 
@@ -182,31 +186,39 @@ impl TcpClientHandler for MieruTcpHandler {
         use tokio::io::AsyncWriteExt;
 
         let mut session = self.open_session(client_stream).await?;
-        let request = encode_socks5_request(SOCKS5_UDP_ASSOCIATE, &target.into_location());
+        let target_location = target.into_location();
+        let request = encode_socks5_request(SOCKS5_UDP_ASSOCIATE, &target_location);
         session.write_all(&request).await?;
         session.flush().await?;
         read_socks5_reply(&mut session).await?;
 
-        Ok(Box::new(MieruUdpStream::new(session)))
+        Ok(Box::new(MieruUdpStream::new(session, target_location)))
     }
 }
 
 /// A mieru session carrying socks5 UDP-associate traffic.
 pub struct MieruUdpStream {
     session: MieruStream,
+    /// The associated destination. Every datagram we send carries it in the
+    /// socks5 UDP header, because that header is how the server learns where
+    /// to forward the payload.
+    target: crate::address::NetLocation,
     pending: Vec<u8>,
 }
 
 impl std::fmt::Debug for MieruUdpStream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MieruUdpStream").finish_non_exhaustive()
+        f.debug_struct("MieruUdpStream")
+            .field("target", &self.target)
+            .finish_non_exhaustive()
     }
 }
 
 impl MieruUdpStream {
-    pub fn new(session: MieruStream) -> Self {
+    pub fn new(session: MieruStream, target: crate::address::NetLocation) -> Self {
         Self {
             session,
+            target,
             pending: Vec::new(),
         }
     }
@@ -220,15 +232,19 @@ impl AsyncReadMessage for MieruUdpStream {
     ) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
         loop {
-            if let Some((payload, consumed)) = decapsulate_udp(&this.pending)? {
+            if let Some((framed, consumed)) = decapsulate_udp(&this.pending)? {
                 this.pending.drain(..consumed);
+                // The server prepends the socks5 UDP header naming where the
+                // datagram came from. shoes' AsyncMessageStream carries bare
+                // payloads, so the header comes off here.
+                let (_source, payload) = crate::socks5_udp_relay::parse_socks5_udp_packet(&framed)?;
                 if payload.len() > buf.remaining() {
                     return Poll::Ready(Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         "mieru UDP datagram is larger than the read buffer",
                     )));
                 }
-                buf.put_slice(&payload);
+                buf.put_slice(payload);
                 return Poll::Ready(Ok(()));
             }
 
@@ -256,9 +272,23 @@ impl AsyncWriteMessage for MieruUdpStream {
         buf: &[u8],
     ) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
-        let framed = try_encapsulate_udp(buf)?;
+        // The server reads each frame with parseSocks5UDPDatagram and expects
+        // RSV RSV FRAG ATYP ADDR PORT before the payload; that header is how
+        // it learns the destination. pkg/socks5/udp.go:335.
+        let with_header = crate::socks5_udp_relay::encode_socks5_udp_packet(&this.target, buf);
+        let framed = try_encapsulate_udp(&with_header)?;
         match Pin::new(&mut this.session).poll_write(cx, &framed) {
-            Poll::Ready(Ok(_)) => Poll::Ready(Ok(())),
+            Poll::Ready(Ok(written)) if written == framed.len() => Poll::Ready(Ok(())),
+            Poll::Ready(Ok(_)) => {
+                // A partial write would put a truncated frame on the wire and
+                // the peer would tear the session down on the missing 0xff.
+                // The session writes at most one fragment per call, so this
+                // means the framed datagram is larger than a fragment.
+                Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "mieru UDP datagram does not fit one segment",
+                )))
+            }
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
             Poll::Pending => Poll::Pending,
         }
@@ -353,6 +383,29 @@ mod tests {
         assert_eq!(first, b"first");
         let (second, _) = decapsulate_udp(&wire[consumed..]).unwrap().unwrap();
         assert_eq!(second, b"second");
+    }
+
+    /// The frame the server reads is not the bare payload: it is a socks5 UDP
+    /// datagram, `RSV RSV FRAG ATYP ADDR PORT payload`, which is how the
+    /// server learns where to forward it. `pkg/socks5/udp.go:335`.
+    #[test]
+    fn test_a_udp_frame_carries_the_socks5_header() {
+        let target = crate::address::NetLocation::from_str("1.2.3.4:53", None).unwrap();
+        let with_header = crate::socks5_udp_relay::encode_socks5_udp_packet(&target, b"query");
+        let framed = encapsulate_udp(&with_header);
+
+        let (inner, _) = decapsulate_udp(&framed).unwrap().unwrap();
+        assert_eq!(&inner[..3], &[0x00, 0x00, 0x00], "RSV RSV FRAG");
+        assert_eq!(inner[3], 0x01, "address type is ipv4");
+        assert_eq!(&inner[4..8], &[1, 2, 3, 4], "the destination address");
+        assert_eq!(&inner[8..10], &53u16.to_be_bytes(), "the destination port");
+        assert_eq!(&inner[10..], b"query", "then the payload");
+
+        // And it parses back to what we put in.
+        let (parsed_target, payload) =
+            crate::socks5_udp_relay::parse_socks5_udp_packet(&inner).unwrap();
+        assert_eq!(parsed_target, target);
+        assert_eq!(payload, b"query");
     }
 
     #[test]

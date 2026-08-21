@@ -11,6 +11,13 @@ pub const DATA_CLIENT_TO_SERVER: u8 = 6;
 pub const DATA_SERVER_TO_CLIENT: u8 = 7;
 pub const ACK_CLIENT_TO_SERVER: u8 = 8;
 pub const ACK_SERVER_TO_CLIENT: u8 = 9;
+/// Session status codes. `pkg/protocol/metadata.go:82`.
+pub const SESSION_STATUS_OK: u8 = 0;
+/// Only the tests construct this today; it names what a non-zero status in a
+/// refusal actually means, which the error path reports numerically.
+#[cfg(test)]
+pub const SESSION_STATUS_QUOTA_EXHAUSTED: u8 = 1;
+
 /// The low-entropy extension. Recognised so it can be refused; never produced.
 pub const DATA_CLIENT_TO_SERVER_LOW_ENTROPY: u8 = 10;
 pub const DATA_SERVER_TO_CLIENT_LOW_ENTROPY: u8 = 11;

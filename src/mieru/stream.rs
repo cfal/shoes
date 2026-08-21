@@ -14,7 +14,10 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use crate::async_stream::{AsyncPing, AsyncStream};
 use crate::mieru::crypto::{DirectionCipher, derive_key, round_to_interval};
 use crate::mieru::frame::{decode_segment, encode_data_segment, encode_session_segment};
-use crate::mieru::metadata::{Metadata, OPEN_SESSION_REQUEST, SessionMetadata};
+use crate::mieru::metadata::{
+    CLOSE_SESSION_REQUEST, CLOSE_SESSION_RESPONSE, Metadata, OPEN_SESSION_REQUEST,
+    OPEN_SESSION_RESPONSE, SESSION_STATUS_OK, SessionMetadata,
+};
 use crate::mieru::padding::PaddingStrategy;
 use crate::mieru::{MAX_FRAGMENT_LEN, MAX_PADDING_LEN, METADATA_LEN, NONCE_LEN, TAG_LEN};
 use crate::util::write_all;
@@ -59,6 +62,10 @@ pub struct MieruStream {
     /// Bytes staged for the socket by `poll_write`.
     outgoing: Vec<u8>,
     outgoing_at: usize,
+
+    /// Set when the peer closed the session. The underlay may stay open, so
+    /// this is what turns a close into EOF for the caller.
+    session_closed: bool,
 }
 
 impl std::fmt::Debug for MieruStream {
@@ -88,7 +95,9 @@ impl MieruStream {
 
         // Session ids are the peer's bookkeeping; any value works as long as
         // it is consistent for the connection.
-        let session_id: u32 = rand::rng().random();
+        // Upstream reserves 0: onOpenSessionRequest fails with "reserved
+        // session ID 0 is used" (pkg/protocol/underlay_stream.go).
+        let session_id: u32 = rand::rng().random_range(1..=u32::MAX);
 
         let request = encode_session_segment(
             &mut send,
@@ -119,9 +128,25 @@ impl MieruStream {
             pending.extend_from_slice(&buf[..n]);
             if let Some((meta, _, consumed)) = decode_segment(&mut recv, &pending)? {
                 match meta {
-                    Metadata::Session(_) => {
+                    Metadata::Session(session)
+                        if session.protocol == OPEN_SESSION_RESPONSE
+                            && session.status == SESSION_STATUS_OK =>
+                    {
                         pending.drain(..consumed);
                         break;
+                    }
+                    // A close, or an open response carrying a status, is the
+                    // server refusing us - upstream sends statusQuotaExhausted
+                    // this way. Treating any session segment as success gives
+                    // the caller a stream that then stalls.
+                    Metadata::Session(session) => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            format!(
+                                "the mieru server refused the session: protocol type {}, status {}",
+                                session.protocol, session.status
+                            ),
+                        ));
                     }
                     Metadata::Data(_) => {
                         return Err(std::io::Error::new(
@@ -145,6 +170,7 @@ impl MieruStream {
             ready_at: 0,
             outgoing: Vec::new(),
             outgoing_at: 0,
+            session_closed: false,
         })
     }
 
@@ -158,8 +184,17 @@ impl MieruStream {
                         self.ready.extend_from_slice(&payload);
                     }
                 }
-                // A close request ends the stream; the caller sees EOF once
-                // ready is drained.
+                // The server closes a session while keeping the TCP underlay
+                // open, so a close has to become EOF here. Without the flag
+                // the reader goes back to the socket and the connection hangs
+                // until an outer timeout.
+                Metadata::Session(session)
+                    if session.protocol == CLOSE_SESSION_REQUEST
+                        || session.protocol == CLOSE_SESSION_RESPONSE =>
+                {
+                    self.session_closed = true;
+                    break;
+                }
                 Metadata::Session(_) => {}
             }
         }
@@ -186,6 +221,11 @@ impl AsyncRead for MieruStream {
                     this.ready.clear();
                     this.ready_at = 0;
                 }
+                return Poll::Ready(Ok(()));
+            }
+
+            if this.session_closed {
+                // Closed and drained: EOF.
                 return Poll::Ready(Ok(()));
             }
 
@@ -455,6 +495,103 @@ mod tests {
         let mut buf = [0u8; 8];
         stream.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, b"split me");
+    }
+
+    /// The server refuses a session by answering with a close, or with a
+    /// non-zero status. Accepting any session segment as success hands the
+    /// caller a stream that then stalls instead of an error naming the cause.
+    #[tokio::test]
+    async fn test_a_refused_session_is_an_error_not_a_stream() {
+        use crate::mieru::frame::encode_session_segment;
+        use crate::mieru::metadata::{
+            CLOSE_SESSION_RESPONSE, OPEN_SESSION_RESPONSE, SESSION_STATUS_QUOTA_EXHAUSTED,
+            SessionMetadata,
+        };
+        use crate::mieru::padding::PaddingStrategy;
+
+        // Two refusals: a close, and an open response carrying a status.
+        for (protocol, status) in [
+            (CLOSE_SESSION_RESPONSE, 0),
+            (OPEN_SESSION_RESPONSE, SESSION_STATUS_QUOTA_EXHAUSTED),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+
+            let client = tokio::spawn(async move {
+                let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+                MieruStream::open(Box::new(tcp), TEST_PASSWORD, TEST_USERNAME, 1000).await
+            });
+
+            let (mut server_tcp, _) = listener.accept().await.unwrap();
+            let mut peer = ScriptedPeer::new(1000);
+            let mut buf = vec![0u8; 4096];
+            let _ = server_tcp.read(&mut buf).await.unwrap();
+
+            let refusal = encode_session_segment(
+                &mut peer.send,
+                &SessionMetadata {
+                    protocol,
+                    timestamp_minutes: 0,
+                    session_id: 1,
+                    seq: 0,
+                    status,
+                    payload_len: 0,
+                    suffix_len: 0,
+                },
+                PaddingStrategy::Ascii,
+            )
+            .unwrap();
+            server_tcp.write_all(&refusal).await.unwrap();
+
+            let err = client.await.unwrap().unwrap_err();
+            assert!(
+                err.to_string().contains("refused"),
+                "protocol {protocol} status {status} should be refused: {err}"
+            );
+        }
+    }
+
+    /// The server can close a session while keeping the TCP underlay open, so
+    /// a close segment has to become EOF. Without that the reader goes back to
+    /// the socket and the proxied connection hangs.
+    #[tokio::test]
+    async fn test_a_close_segment_ends_the_stream() {
+        use crate::mieru::frame::encode_session_segment;
+        use crate::mieru::metadata::{CLOSE_SESSION_REQUEST, SessionMetadata};
+        use crate::mieru::padding::PaddingStrategy;
+
+        let (mut stream, mut server, mut peer) = connect().await;
+
+        // Some data, then a close, and the underlay stays open.
+        let data = peer.data(1, 1, b"last words");
+        server.write_all(&data).await.unwrap();
+        let close = encode_session_segment(
+            &mut peer.send,
+            &SessionMetadata {
+                protocol: CLOSE_SESSION_REQUEST,
+                timestamp_minutes: 0,
+                session_id: 1,
+                seq: 2,
+                status: 0,
+                payload_len: 0,
+                suffix_len: 0,
+            },
+            PaddingStrategy::Ascii,
+        )
+        .unwrap();
+        server.write_all(&close).await.unwrap();
+        server.flush().await.unwrap();
+
+        // The buffered data arrives, then EOF - not a hang.
+        let mut all = Vec::new();
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            stream.read_to_end(&mut all),
+        )
+        .await;
+        assert!(read.is_ok(), "reading after a close must not hang");
+        read.unwrap().unwrap();
+        assert_eq!(all, b"last words");
     }
 
     /// A wrong password must fail at open, not at the first read: the caller
