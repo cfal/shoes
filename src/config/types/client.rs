@@ -247,6 +247,21 @@ fn is_default_heartbeat(value: &u64) -> bool {
     *value == default_heartbeat_ms()
 }
 
+/// mieru client outbound, over mieru's TCP transport.
+///
+/// The wire format is verified against enfein/mieru; see
+/// docs/superpowers/specs/2026-08-20-mieru-client-outbound-design.md.
+/// deny_unknown_fields is what makes mieru's own options - multiplexing,
+/// low entropy, port ranges, the 0-RTT handshake mode - a named error rather
+/// than a setting that is silently ignored.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MieruClientConfig {
+    /// Part of the key derivation, so it must match the server.
+    pub username: String,
+    pub password: Redacted<String>,
+}
+
 /// TUIC v5 client outbound.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -576,10 +591,7 @@ pub enum ClientProxyConfig {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         h2mux: Option<H2MuxConfig>,
     },
-    Mieru {
-        username: String,
-        password: Redacted<String>,
-    },
+    Mieru(MieruClientConfig),
     Reality {
         public_key: String,
         #[serde(default = "default_reality_client_short_id")]
@@ -801,9 +813,9 @@ username: alice
 password: hunter2
 "#;
         match serde_yaml::from_str::<ClientProxyConfig>(yaml).unwrap() {
-            ClientProxyConfig::Mieru { username, password } => {
-                assert_eq!(username, "alice");
-                assert_eq!(password.expose(), "hunter2");
+            ClientProxyConfig::Mieru(mieru) => {
+                assert_eq!(mieru.username, "alice");
+                assert_eq!(mieru.password.expose(), "hunter2");
             }
             other => panic!("expected mieru, got {other:?}"),
         }

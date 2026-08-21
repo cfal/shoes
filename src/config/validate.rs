@@ -1008,6 +1008,20 @@ fn validate_client_config(
         ClientProxyConfig::Hysteria2(hysteria2) => {
             validate_obfs_config(hysteria2.obfs.as_ref())?;
         }
+        ClientProxyConfig::Mieru(_) => {
+            // mieru defines exactly two transports, TCP and UDP, and this
+            // client implements the first. Its TCP segment framing carried
+            // over QUIC or over datagrams is neither of them, so it would
+            // produce bytes no mieru server understands. Refusing beats
+            // dialling something that cannot work.
+            if client_config.transport != Transport::Tcp {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "The mieru client outbound only supports its TCP transport. \
+                     Remove 'transport', or set it to tcp.",
+                ));
+            }
+        }
         ClientProxyConfig::Tuic(tuic) => {
             parse_uuid(&tuic.uuid).map_err(|e| {
                 std::io::Error::new(
@@ -1882,7 +1896,7 @@ mod tests {
         use super::*;
         use crate::address::NetLocation;
         use crate::config::types::client::{
-            Hysteria2ClientConfig, TuicClientConfig, TuicUdpRelayMode,
+            Hysteria2ClientConfig, MieruClientConfig, TuicClientConfig, TuicUdpRelayMode,
         };
         use crate::config::types::transport::{ClientQuicConfig, TcpConfig};
 
@@ -2015,6 +2029,69 @@ mod tests {
             tuic.zero_rtt_handshake = true;
             let err = validate(&mut config).unwrap_err().to_string();
             assert!(err.contains("zero_rtt_handshake"), "{err}");
+        }
+
+        fn mieru_client() -> ClientConfig {
+            ClientConfig {
+                address: server(),
+                protocol: ClientProxyConfig::Mieru(MieruClientConfig {
+                    username: "alice".to_string(),
+                    password: "hunter2".into(),
+                }),
+                ..Default::default()
+            }
+        }
+
+        #[test]
+        fn test_mieru_accepts_the_tcp_transport() {
+            let mut config = mieru_client();
+            assert!(validate(&mut config).is_ok());
+        }
+
+        /// mieru defines exactly two transports, TCP and UDP, and this client
+        /// implements the first. Carrying its TCP framing over QUIC or over a
+        /// datagram transport produces bytes no mieru server understands, so
+        /// the combination is refused rather than dialled.
+        #[test]
+        fn test_mieru_rejects_a_non_tcp_transport() {
+            for transport in [Transport::Quic, Transport::Udp] {
+                let mut config = mieru_client();
+                config.transport = transport;
+                let err = validate(&mut config).unwrap_err().to_string();
+                assert!(
+                    err.contains("mieru"),
+                    "the error should name the protocol: {err}"
+                );
+                assert!(
+                    err.to_lowercase().contains("transport"),
+                    "the error should name the setting: {err}"
+                );
+            }
+        }
+
+        /// The options mieru has and this client does not are not shoes config
+        /// fields, so serde refuses them by name before validation runs. Pinned
+        /// so that adding one of them as a real field cannot silently become a
+        /// no-op.
+        #[test]
+        fn test_mieru_refuses_unimplemented_mieru_options_by_name() {
+            for field in [
+                "multiplexing",
+                "low_entropy",
+                "port_range",
+                "handshake_mode",
+            ] {
+                let yaml = format!(
+                    "type: mieru\nusername: alice\npassword: hunter2\n{field}: something\n"
+                );
+                let err = serde_yaml::from_str::<ClientProxyConfig>(&yaml)
+                    .unwrap_err()
+                    .to_string();
+                assert!(
+                    err.contains(field),
+                    "refusing {field} should name it: {err}"
+                );
+            }
         }
 
         #[test]

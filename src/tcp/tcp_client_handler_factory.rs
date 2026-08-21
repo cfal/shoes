@@ -106,9 +106,10 @@ pub fn create_tcp_client_handler(
                 handler
             }
         }
-        ClientProxyConfig::Mieru { username, password } => Box::new(
-            crate::mieru::client::MieruTcpHandler::new(&username, password.expose()),
-        ),
+        ClientProxyConfig::Mieru(mieru) => Box::new(crate::mieru::client::MieruTcpHandler::new(
+            &mieru.username,
+            mieru.password.expose(),
+        )),
         ClientProxyConfig::Trojan {
             password,
             shadowsocks,

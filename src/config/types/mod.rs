@@ -32,7 +32,7 @@ pub mod tun;
 #[allow(unused_imports)]
 pub use client::{
     AmneziaWgClientConfig, AmneziaWgParams, ClientConfig, ClientProxyConfig, H2MuxConfig,
-    Hysteria2ClientConfig, TlsClientConfig, TuicClientConfig, TuicUdpRelayMode,
+    Hysteria2ClientConfig, MieruClientConfig, TlsClientConfig, TuicClientConfig, TuicUdpRelayMode,
     WebsocketClientConfig, WireGuardClientConfig,
 };
 pub use common::DEFAULT_REALITY_SHORT_ID;
