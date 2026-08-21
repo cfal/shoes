@@ -576,6 +576,10 @@ pub enum ClientProxyConfig {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         h2mux: Option<H2MuxConfig>,
     },
+    Mieru {
+        username: String,
+        password: Redacted<String>,
+    },
     Reality {
         public_key: String,
         #[serde(default = "default_reality_client_short_id")]
@@ -695,6 +699,7 @@ impl ClientProxyConfig {
             ClientProxyConfig::Snell { .. } => "Snell",
             ClientProxyConfig::Vless { .. } => "VLESS",
             ClientProxyConfig::Trojan { .. } => "Trojan",
+            ClientProxyConfig::Mieru { .. } => "mieru",
             ClientProxyConfig::Reality { .. } => "Reality",
             ClientProxyConfig::Tls(..) => "TLS",
             ClientProxyConfig::ShadowTls { .. } => "ShadowTLS",
@@ -786,6 +791,39 @@ mod tests {
             deserialized.protocol,
             ClientProxyConfig::Socks { .. }
         ));
+    }
+
+    #[test]
+    fn test_mieru_client_config_parses() {
+        let yaml = r#"
+type: mieru
+username: alice
+password: hunter2
+"#;
+        match serde_yaml::from_str::<ClientProxyConfig>(yaml).unwrap() {
+            ClientProxyConfig::Mieru { username, password } => {
+                assert_eq!(username, "alice");
+                assert_eq!(password.expose(), "hunter2");
+            }
+            other => panic!("expected mieru, got {other:?}"),
+        }
+    }
+
+    /// The password must not reach a log line or a config dump. Redacted<T>
+    /// is what guarantees that, so pin it rather than trusting the field type.
+    #[test]
+    fn test_mieru_password_is_redacted_in_debug_output() {
+        let yaml = r#"
+type: mieru
+username: alice
+password: hunter2
+"#;
+        let config: ClientProxyConfig = serde_yaml::from_str(yaml).unwrap();
+        let debug = format!("{config:?}");
+        assert!(
+            !debug.contains("hunter2"),
+            "the password leaked into Debug: {debug}"
+        );
     }
 
     #[test]

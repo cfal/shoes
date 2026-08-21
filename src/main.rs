@@ -16,6 +16,7 @@ mod http_handler;
 mod hysteria2;
 mod logging;
 mod memory;
+mod mieru;
 mod mixed_handler;
 mod naiveproxy;
 mod option_util;

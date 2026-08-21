@@ -4,6 +4,7 @@
 //! docs/superpowers/specs/2026-08-20-mieru-client-outbound-design.md for the
 //! citation table.
 
+pub mod client;
 pub mod crypto;
 pub mod frame;
 pub mod metadata;
