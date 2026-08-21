@@ -4,6 +4,8 @@
 //! docs/superpowers/specs/2026-08-20-mieru-client-outbound-design.md for the
 //! citation table.
 
+pub mod crypto;
+
 /// Nonce size of XChaCha20-Poly1305. `pkg/cipher/api.go:31`.
 pub const NONCE_LEN: usize = 24;
 
