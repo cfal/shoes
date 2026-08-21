@@ -1,5 +1,37 @@
 # Changelog
 
+## v0.2.11
+
+### AmneziaWG 3.1
+
+The two parameters awgtun gained in v0.9.0 are configurable now. Both default
+to off, so a 2.0 or 3.0 tunnel is byte-identical on the wire to what it was
+before this change, and each generation stays opt-in on top of the last — a
+2.0 config may adopt a 3.1 parameter without adopting anything from 3.0.
+
+- `random_trailers` appends a random number of bytes to each datagram, so a
+  message with a fixed size stops having one. **Both peers must enable it.** A
+  receiver only tolerates bytes past the end of a handshake message when it is
+  on, so one-sided it breaks the handshake in the direction that grew — and
+  breaks it the same silent way every other wire-shaping mismatch does. Pinned
+  by a test that feeds a trailered initiation to a 3.0 peer.
+- **A one-sided `random_trailers` recovers by itself.** The setting is not on
+  the wire and a disagreeing peer does not answer, so there is nothing to ask:
+  a tunnel that was given packets to send and has still not handshaked after
+  15 seconds rebuilds with the setting flipped, and alternates until one works.
+  Whichever setting handshakes is the one it keeps — a `Tunn` that has
+  handshaked is never flipped, so an established tunnel that later goes idle is
+  never disturbed. Each flip is logged at warning level and names the setting
+  to correct. A misconfiguration costs a delay instead of an outage.
+- `disable_cookies` withholds the cookie reply. The rate limiter still decides
+  a cookie is warranted, so a peer under load gets silence rather than a retry
+  hint. This changes only what we send, so the two ends need not agree.
+- A trailer's length is drawn from a high-water mark of datagram sizes seen on
+  the path, which stops describing anything once the path changes. The endpoint
+  rebind — the mobile network-change recovery — now resets it, the way
+  upstream's `Device` does on a peer roam. awgtun leaves this to the caller
+  because `Tunn` has no endpoint of its own.
+
 ## v0.2.10
 
 Security and packaging. No protocol changes; a server deployment is affected
