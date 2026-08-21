@@ -1,8 +1,14 @@
 name: Build Binaries
 
+# Tags only, plus pull requests and manual runs. A branch push runs Test and
+# Lint; it does not spend five macOS-runner minutes producing artifacts that
+# nothing downloads. The cost of that is real and worth knowing: the Android
+# and iOS cross-builds are not compiled on a branch push, so a break in them is
+# caught when a tag is pushed rather than when the code lands. Run this
+# workflow by hand (Actions -> Run workflow) before tagging if a change touched
+# the FFI, the JNI layer or the build scripts.
 on:
   push:
-    branches: [ master, mobile ]
     tags: [ 'v*' ]
   pull_request:
     branches: [ master, mobile ]

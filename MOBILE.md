@@ -90,9 +90,12 @@ so the stock x86_64 emulator can load the library at all; without it,
 `System.loadLibrary` fails at startup on any non-ARM image. There is no 32-bit
 x86 slice. iOS ships the device and Apple Silicon simulator slices only.
 
-CI (`.github/workflows/mobile.yml`) triggers on pushes and PRs to both
-`master` and `mobile`, on `v*` tags, and manually — so a push to this branch
-does produce a real green tick, including the AAR content check.
+CI (`.github/workflows/mobile.yml`) triggers on `v*` tags, on pull requests to
+`master` and `mobile`, and manually — not on a branch push, which runs Test and
+Lint only. The AAR content check therefore runs when a tag is pushed, or when
+you run the workflow by hand from the Actions tab. Do that before tagging if a
+change touched the FFI, the JNI layer or the build scripts: nothing else
+compiles the Android or iOS targets.
 
 ## FFI surface
 
