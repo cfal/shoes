@@ -5,6 +5,7 @@
 //! citation table.
 
 pub mod crypto;
+pub mod frame;
 pub mod metadata;
 pub mod padding;
 
