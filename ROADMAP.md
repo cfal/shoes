@@ -27,7 +27,7 @@ VLESS, Trojan, Snell v3, Hysteria2, TUIC v5, AnyTLS, NaiveProxy, port-forward,
 TLS, WebSocket.
 
 Client: Direct, HTTP, SOCKS5, Shadowsocks, Snell, VMess, VLESS, Trojan, AnyTLS,
-NaiveProxy, WireGuard, AmneziaWG 2.0/3.0, plus TLS, Reality, ShadowTLS and
+NaiveProxy, WireGuard, AmneziaWG 2.0/3.0/3.1, plus TLS, Reality, ShadowTLS and
 WebSocket as wrapping layers.
 
 Transports and obfuscation: TCP and QUIC for every protocol, XTLS Reality (a

@@ -154,7 +154,11 @@ impl EndpointSocket {
     }
 
     /// Rebind whenever one is asked for. Runs for the life of the tunnel.
-    pub async fn run_rebind_task(self: Arc<Self>) {
+    ///
+    /// `on_rebound` is called after each successful swap, for the state that
+    /// belongs to the path rather than to the peer — see the AmneziaWG 3.1
+    /// trailer window in `tunnel.rs`.
+    pub async fn run_rebind_task(self: Arc<Self>, on_rebound: impl Fn() + Send + 'static) {
         loop {
             self.rebind_requested.notified().await;
 
@@ -169,6 +173,7 @@ impl EndpointSocket {
                     // which is most of the time — the tunnel tasks subscribe
                     // only for the duration of a recv.
                     self.socket.send_replace(Arc::new(socket));
+                    on_rebound();
                     info!(
                         "AmneziaWG endpoint rebound to {} -> {}",
                         local, self.endpoint
@@ -228,7 +233,7 @@ mod tests {
         let endpoint = EndpointSocket::connect(peer_addr).await.unwrap();
         let before = endpoint.local_addr().unwrap();
 
-        tokio::spawn(endpoint.clone().run_rebind_task());
+        tokio::spawn(endpoint.clone().run_rebind_task(|| {}));
         endpoint.request_rebind();
 
         // The rebind is asynchronous; wait for the address to actually move.
@@ -267,7 +272,7 @@ mod tests {
     async fn recv_follows_the_socket_across_a_rebind() {
         let (peer_socket, peer_addr) = peer().await;
         let endpoint = EndpointSocket::connect(peer_addr).await.unwrap();
-        tokio::spawn(endpoint.clone().run_rebind_task());
+        tokio::spawn(endpoint.clone().run_rebind_task(|| {}));
 
         // Park a receive on the pre-rebind socket, then move it. Without the
         // watch channel this future would wait on the old address forever.
@@ -309,6 +314,35 @@ mod tests {
         assert_eq!(received, b"reply");
     }
 
+    /// The rebind callback is what resets AmneziaWG 3.1's trailer window, and
+    /// a silently-never-called callback would look exactly like a working
+    /// tunnel until the trailer sizes were inspected on the wire.
+    #[tokio::test]
+    async fn a_successful_rebind_calls_back() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (_peer_socket, peer_addr) = peer().await;
+        let endpoint = EndpointSocket::connect(peer_addr).await.unwrap();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        tokio::spawn(endpoint.clone().run_rebind_task(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }));
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "nothing rebound yet");
+        endpoint.request_rebind();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while calls.load(Ordering::SeqCst) == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the rebind callback never ran"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
     #[tokio::test]
     async fn a_network_change_reaches_a_live_endpoint_and_not_a_dropped_one() {
         let (_peer_socket, peer_addr) = peer().await;
@@ -316,7 +350,7 @@ mod tests {
         drop(dropped);
 
         let live = EndpointSocket::connect(peer_addr).await.unwrap();
-        tokio::spawn(live.clone().run_rebind_task());
+        tokio::spawn(live.clone().run_rebind_task(|| {}));
         let before = live.local_addr().unwrap();
 
         // Other tests in this binary may have live endpoints of their own, so

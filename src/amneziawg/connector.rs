@@ -109,6 +109,8 @@ impl AmneziaWgConnector {
                 keepalive_timeout: None,
                 max_handshake_attempts: None,
                 persistent_keepalive_interval: None,
+                random_trailers: false,
+                disable_cookies: false,
             },
         };
         Self {
@@ -130,6 +132,7 @@ impl AmneziaWgConnector {
 
         let variant = match self.protocol {
             TunnelProtocol::WireGuard => "WireGuard",
+            TunnelProtocol::AmneziaWg if self.config.awg.uses_awg31() => "AmneziaWG 3.1",
             TunnelProtocol::AmneziaWg if self.config.awg.uses_awg3() => "AmneziaWG 3.0",
             TunnelProtocol::AmneziaWg => "AmneziaWG 2.0",
         };

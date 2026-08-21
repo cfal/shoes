@@ -21,7 +21,7 @@ shoes is a high-performance multi-protocol proxy server written in Rust.
 
 ### Outbound Tunnel Protocols
 - **WireGuard** (outbound L3 tunnel over UDP)
-- **AmneziaWG 2.0 / 3.0** (WireGuard with traffic obfuscation; 3.0 adds header protection, content padding and randomized timings)
+- **AmneziaWG 2.0 / 3.0 / 3.1** (WireGuard with traffic obfuscation; 3.0 adds header protection, content padding and randomized timings, 3.1 adds random trailers and cookie suppression)
 
 ### QUIC-native Outbounds
 Own their transport, so they are always the only hop in a chain:
@@ -486,6 +486,31 @@ AmneziaWG 3.0 adds three things on top of the 2.0 parameters above, all in the s
 Every value that shapes the wire format has to match the server exactly — `h1`-`h4`, `s1`-`s4`, the junk parameters, the header protection key and the content padding. A mismatch is not reported by either end; the peer simply cannot recognise the packets as WireGuard, and the handshake never completes. The timing ranges are local: they only shape when this peer acts, so the two ends may differ.
 
 `h1`-`h4` may be omitted entirely, in which case the standard WireGuard message types (1, 2, 3, 4) are used — useful for a tunnel that wants only the 3.0 features.
+
+### AmneziaWG 3.1 Client
+
+3.1 adds two booleans, both off unless you set them. They are independent of the 3.0 parameters: a 2.0 tunnel may turn them on without adopting anything else, and a tunnel that sets neither behaves exactly as it did before 3.1 existed.
+
+```yaml
+          awg:
+            # 2.0 and/or 3.0 parameters as usual.
+            jc: 4
+            jmin: 64
+            jmax: 256
+
+            # 3.1: append a random number of bytes to each datagram, so a
+            # message with a fixed size stops having one. MUST match the
+            # server — see below.
+            random_trailers: true
+            # 3.1: never answer with a cookie reply. Local to this peer.
+            disable_cookies: true
+```
+
+`random_trailers` has to be enabled on **both** peers or on neither. A receiver only tolerates bytes past the end of a handshake message when it is on, so with it on at one end only the handshake fails in the direction that grew. Handshake messages carry the extra bytes after the message, outside the MAC; transport packets get no trailer at all and widen their content padding instead, and only when `content_padding_addition` is unset — an explicit value wins.
+
+Unlike every other wire-shaping mismatch, this one does not leave you with a dead tunnel. A peer's setting is not on the wire and a peer that disagrees does not answer, so there is nothing to negotiate — instead, a tunnel that has been given packets to send and has still not completed a handshake after 15 seconds rebuilds itself with the setting flipped, and keeps alternating until one of them works. Whichever setting completes the handshake is the one it stays on. The flip is logged at warning level and names the setting to fix, so a config that disagrees with the server costs a delay rather than an outage.
+
+`disable_cookies` withholds the cookie reply. The rate limiter still decides a cookie is warranted, so a peer under load gets silence instead of a retry hint. It changes only what this peer sends, so the two ends need not agree.
 
 > **Note:** WireGuard and AmneziaWG work as client/outbound only — each creates a UDP-backed L3 tunnel to the server. Neither supports multi-hop chains yet; they must be the sole hop. All three modes share one code path: plain WireGuard is AmneziaWG with every obfuscation parameter left at its default.
 

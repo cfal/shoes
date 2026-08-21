@@ -20,7 +20,7 @@ open and are ordered at the end. Line references were last checked against
 | Error reporting | `getLastError()`, and `start` returns -1 on a bad config | same, via `shoes_get_last_error()` |
 | Network change | `networkChanged()` | `shoes_network_changed()` |
 | Live log level | `setLogLevel()` | `shoes_set_log_level()` |
-| AmneziaWG 2.0/3.0 | yes | yes |
+| AmneziaWG 2.0/3.0/3.1 | yes | yes |
 | Fake IP / DNS leak | yes, via TUN interception | yes, via TUN interception |
 
 The iOS build needs `IPHONEOS_DEPLOYMENT_TARGET=16.0`; `aws-lc-sys` references
@@ -48,7 +48,7 @@ the findings below assume.
 | `src/tun/udp_manager.rs` | UDP session table (`MAX_SESSIONS`) |
 | `src/socket_protector.rs` | `SocketProtector` trait, global protector, `protect_socket` |
 | `src/tun/traffic.rs` | Byte counters, `report_traffic`, `TrafficCountingStream` |
-| `src/amneziawg/` | AmneziaWG 2.0/3.0 client: `config.rs`, `tunnel.rs`, `netstack.rs`, `connector.rs` |
+| `src/amneziawg/` | AmneziaWG 2.0/3.0/3.1 client: `config.rs`, `tunnel.rs`, `netstack.rs`, `connector.rs` |
 | `src/amneziawg/endpoint.rs` | The rebindable endpoint socket and the network-change registry |
 | `src/dns/fake_ip/` | Fake IP: `pool.rs`, `responder.rs`, `bypass.rs` |
 | `src/tcp/socket_connector_impl.rs` | Where outbound proxy TCP/UDP sockets are actually created |

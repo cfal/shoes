@@ -94,11 +94,13 @@ pub struct AmneziaWgClientConfig {
 
 /// AmneziaWG obfuscation parameters.
 ///
-/// The 2.0 set (`jc`/`jmin`/`jmax`, `s1`-`s4`, `h1`-`h4`, `i1`-`i5`) and the
-/// 3.0 additions (`header_protection_key`, `content_padding_addition` and the
-/// randomized timing ranges) share one block, matching the single `[Interface]`
-/// section an AmneziaWG `.conf` uses. Leave the 3.0 fields unset for a 2.0
-/// tunnel; leave everything unset for plain WireGuard framing.
+/// The 2.0 set (`jc`/`jmin`/`jmax`, `s1`-`s4`, `h1`-`h4`, `i1`-`i5`), the 3.0
+/// additions (`header_protection_key`, `content_padding_addition` and the
+/// randomized timing ranges) and the 3.1 additions (`random_trailers`,
+/// `disable_cookies`) share one block, matching the single `[Interface]`
+/// section an AmneziaWG `.conf` uses. Each generation is opt-in on top of the
+/// last: leave the 3.1 fields unset for a 3.0 tunnel, the 3.0 fields unset for
+/// a 2.0 tunnel, and everything unset for plain WireGuard framing.
 ///
 /// Range fields accept either a single number (`"7"`) or an inclusive range
 /// (`"5-15"`). Both peers must agree on every value that shapes the wire
@@ -167,10 +169,28 @@ pub struct AmneziaWgParams {
     /// Randomized replacement for the scalar `persistent_keepalive` above.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub persistent_keepalive_interval: Option<String>,
+
+    // --- AmneziaWG 3.1 ---
+    /// Append a random number of bytes to each datagram, so a message with a
+    /// fixed size stops having one. Handshake messages carry the bytes after
+    /// the message; transport packets widen their content padding instead,
+    /// and only when `content_padding_addition` is unset.
+    ///
+    /// Both peers must enable this. A receiver only tolerates a trailing byte
+    /// when it is on, so turning it on for one side alone breaks the handshake
+    /// in the direction that grew.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub random_trailers: bool,
+    /// Never send a cookie reply. The rate limiter still decides a cookie is
+    /// warranted; this withholds the answer, so a peer under load gets silence
+    /// rather than a retry hint. One-sided is fine — it changes what we send,
+    /// not what we accept.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub disable_cookies: bool,
 }
 
 impl AmneziaWgParams {
-    /// True when any 3.0-only parameter is set.
+    /// True when any 3.0-or-later parameter is set.
     pub fn uses_awg3(&self) -> bool {
         self.header_protection_key.is_some()
             || self.content_padding_addition.is_some()
@@ -180,6 +200,12 @@ impl AmneziaWgParams {
             || self.keepalive_timeout.is_some()
             || self.max_handshake_attempts.is_some()
             || self.persistent_keepalive_interval.is_some()
+            || self.uses_awg31()
+    }
+
+    /// True when any 3.1-only parameter is set.
+    pub fn uses_awg31(&self) -> bool {
+        self.random_trailers || self.disable_cookies
     }
 }
 

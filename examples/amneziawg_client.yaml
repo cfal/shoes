@@ -1,6 +1,7 @@
 # AmneziaWG client outbound.
 #
-# Two SOCKS5 inbounds: one over an AmneziaWG 2.0 tunnel, one over 3.0.
+# Three SOCKS5 inbounds: one over an AmneziaWG 2.0 tunnel, one over 3.0, one
+# over 3.1.
 #
 # Every parameter that shapes the wire format (h1-h4, s1-s4, the junk
 # parameters, the header protection key, the content padding) must match the
@@ -88,3 +89,38 @@
             keepalive_timeout: "8-12"
             max_handshake_attempts: "18-20"
             persistent_keepalive_interval: "20-30"
+
+# --- AmneziaWG 3.1 ---
+#
+# The two 3.1 parameters sit on top of any generation; this one keeps the 2.0
+# block above and adds nothing from 3.0, which is a legitimate configuration.
+- address: 127.0.0.1:1082
+  protocol:
+    type: socks
+  rules:
+    - masks: "0.0.0.0/0"
+      action: allow
+      client_chain:
+        address: "awg31.example.com:51820"
+        protocol:
+          type: amneziawg
+          private_key: "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA="  # replace with your key
+          peer_public_key: "ISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0A="  # replace with your key
+          local_addresses: "10.8.0.2/32"
+          allowed_ips: "0.0.0.0/0"
+          mtu: 1280
+          awg:
+            jc: 4
+            jmin: 64
+            jmax: 256
+            s1: 32
+            s2: 32
+            s3: 16
+            s4: 16
+
+            # Random bytes on the end of each datagram. The server must have
+            # RandomTrailers on too: a peer without it rejects a handshake
+            # message that carries a trailer, so one-sided is a dead tunnel.
+            random_trailers: true
+            # Never answer with a cookie reply. Local to this peer.
+            disable_cookies: true

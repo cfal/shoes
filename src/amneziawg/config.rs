@@ -132,6 +132,11 @@ pub fn convert_amnezia_config(awg: &AmneziaWgParams, mtu: u16) -> std::io::Resul
         parse_optional_u32_range(&awg.content_padding_addition, "content_padding_addition")?
             .filter(|range| !range.is_zero());
 
+    // AmneziaWG 3.1. Both default to false, which is what keeps a 2.0 or 3.0
+    // config byte-identical on the wire to what it was before 3.1 existed.
+    config.random_trailers = awg.random_trailers;
+    config.disable_cookies = awg.disable_cookies;
+
     let timings = &mut config.timing_ranges;
     if let Some(range) = parse_optional_u32_range(&awg.rekey_after_time, "rekey_after_time")? {
         timings.rekey_after_time = range;
@@ -316,6 +321,8 @@ mod tests {
             keepalive_timeout: None,
             max_handshake_attempts: None,
             persistent_keepalive_interval: None,
+            random_trailers: false,
+            disable_cookies: false,
         }
     }
 
@@ -425,6 +432,62 @@ mod tests {
         params.rekey_timeout = Some("30-5".to_string());
 
         assert!(convert_amnezia_config(&params, 1280).is_err());
+    }
+
+    #[test]
+    fn awg31_flags_are_off_unless_asked_for() {
+        let config = convert_amnezia_config(&empty_params(), 1280).unwrap();
+        assert!(!config.random_trailers);
+        assert!(!config.disable_cookies);
+
+        let mut params = empty_params();
+        params.random_trailers = true;
+        params.disable_cookies = true;
+        let config = convert_amnezia_config(&params, 1280).unwrap();
+        assert!(config.random_trailers);
+        assert!(config.disable_cookies);
+    }
+
+    /// The 3.1 flags are independent of everything else: a 2.0 configuration
+    /// that turns them on stays 2.0 in every other respect, which is what lets
+    /// them be adopted without also adopting 3.0.
+    #[test]
+    fn awg31_flags_do_not_disturb_a_20_configuration() {
+        let mut params = empty_params();
+        params.jc = 4;
+        params.jmin = 40;
+        params.jmax = 70;
+        params.s1 = 20;
+        params.random_trailers = true;
+
+        let config = convert_amnezia_config(&params, 1280).unwrap();
+        assert_eq!(config.junk.count, 4);
+        assert_eq!(config.paddings.s1, 20);
+        assert_eq!(config.header_protection_key, None);
+        assert_eq!(config.content_padding_addition, None);
+        assert!(config.timing_ranges.rekey_after_time.is_zero());
+        assert!(config.random_trailers);
+        assert!(!config.disable_cookies);
+    }
+
+    #[test]
+    fn uses_awg31_reports_only_the_31_fields() {
+        let mut params = empty_params();
+        params.header_protection_key = Some(
+            base64::engine::general_purpose::STANDARD
+                .encode([0x11u8; 32])
+                .into(),
+        );
+        params.s1 = 12;
+        params.s2 = 12;
+        params.s3 = 12;
+        params.s4 = 12;
+        assert!(params.uses_awg3());
+        assert!(!params.uses_awg31());
+
+        params.disable_cookies = true;
+        assert!(params.uses_awg31());
+        assert!(params.uses_awg3(), "3.1 implies at least 3.0");
     }
 
     #[test]
