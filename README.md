@@ -17,6 +17,7 @@ shoes is a high-performance multi-protocol proxy server written in Rust.
 - **TUIC v5**
 - **AnyTLS**
 - **NaiveProxy**
+- **mieru** (client only, over mieru's TCP transport; not yet verified against a real server)
 - **H2MUX** (supported with VMess, VLESS, Trojan, Shadowsocks, Snell)
 
 ### Outbound Tunnel Protocols

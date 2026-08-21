@@ -662,6 +662,33 @@ whichever mode the association's first packet used.
 `zero_rtt_handshake` is a server-side option only. The client rejects it rather
 than accepting it and performing an ordinary handshake.
 
+### mieru Client
+```yaml
+protocol:
+  type: mieru
+  username: string             # Part of the key derivation, not just a label
+  password: string
+```
+
+A client for the [mieru](https://github.com/enfein/mieru) protocol, over
+mieru's TCP transport. Both fields must match the server exactly: the
+encryption key is derived from the password, the username, and the current
+time rounded to two minutes.
+
+That last part is worth knowing before debugging a failure. A client and
+server whose clocks differ by more than about four minutes cannot agree on a
+key, and a device that has not synchronised its clock cannot connect at all.
+The error says so rather than reporting a generic authentication failure.
+
+UDP destinations work: mieru carries socks5 UDP-associate inside the same TCP
+session, so no separate transport is involved.
+
+Not implemented, and refused rather than ignored if configured: mieru's UDP
+transport, session multiplexing, the low entropy encoding, port ranges and the
+0-RTT handshake mode. `transport` must be `tcp` — mieru defines exactly two
+transports and carrying its TCP framing over QUIC produces bytes no mieru
+server understands.
+
 ### QUIC-native outbounds
 
 Hysteria2 and TUIC own their transport rather than running over one, which

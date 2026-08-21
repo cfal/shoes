@@ -15,6 +15,7 @@ the file it lands in, so the estimate is checkable rather than a guess.
 - [Tier 2 — worth doing after Tier 1](#tier-2--worth-doing-after-tier-1)
 - [Tier 3 — real, but not urgent](#tier-3--not-urgent)
 - [Hysteria: the rest of the surface](#hysteria-the-rest-of-the-surface)
+- [mieru: not yet verified against a real server](#mieru-not-yet-verified-against-a-real-server)
 - [Explicitly not planned](#explicitly-not-planned)
 - [Open risk: TLS fingerprinting](#open-risk-tls-fingerprinting)
 
@@ -245,6 +246,40 @@ regression rather than a gain:
 One genuinely missing convenience: shoes cannot import a `hysteria2://` sharing
 link. Every client in the ecosystem can, and it is how servers are distributed
 in practice.
+
+## mieru: not yet verified against a real server
+
+The mieru client outbound speaks the protocol as documented, and its tests
+run it end to end — but against a scripted peer built from this repository's
+own codec, not against mieru. That construction cannot detect a shared
+misreading of the specification: encode a field wrongly, decode it wrongly to
+match, and every test passes.
+
+One component is out of that category. The UDP encapsulation was compared line
+by line against `apis/common/packet_over_stream.go` in enfein/mieru and
+matches. The segment codec, the metadata offsets and the key derivation have
+not had that treatment, and should get it — reading the reference costs far
+less than debugging a live handshake.
+
+**Until someone completes a round trip against upstream's `mita` server or a
+real deployment, this must not be described as working.** README says so, and
+the entry stays here until the run happens.
+
+Two things would close it permanently rather than once:
+
+- **Implementing a mieru server here.** It turns the scripted peer into a real
+  interoperability test, the way the Hysteria2 and TUIC servers do for their
+  clients. It also costs roughly a third more work than the client did.
+- **A test against `mita` in CI.** Cheaper, but it needs a Go toolchain in the
+  workflow and a server process to manage.
+
+Also unimplemented, and refused in configuration rather than ignored: mieru's
+UDP transport, session multiplexing, the low entropy encoding, port ranges,
+the 0-RTT handshake mode, and configurable traffic patterns. Only the first
+two can make a server unreachable, and both are deployment choices. The
+traffic-pattern options are the ones that matter for the protocol's purpose:
+this client reproduces the default Go client's padding behaviour, so a
+deployment using a customised pattern would look different on the wire.
 
 ## Explicitly not planned
 
