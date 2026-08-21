@@ -8,6 +8,9 @@ pub mod crypto;
 pub mod frame;
 pub mod metadata;
 pub mod padding;
+pub mod stream;
+#[cfg(test)]
+pub mod testing;
 
 /// Nonce size of XChaCha20-Poly1305. `pkg/cipher/api.go:31`.
 pub const NONCE_LEN: usize = 24;
