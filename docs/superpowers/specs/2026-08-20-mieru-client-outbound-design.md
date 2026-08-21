@@ -51,6 +51,81 @@ mieru deployment stays unverified until someone runs it.
 UDP application traffic is **in scope** and works without mieru's UDP
 transport: mieru carries socks5 UDP-associate inside the TCP session.
 
+## Feature parity with the Go client
+
+Read from `pkg/appctl/proto/clientcfg.proto`, `pkg/appctl/proto/base.proto` and
+`pkg/protocol/mux.go` at `b9bbc41`. "Planned" means this design covers it.
+
+### Core protocol
+
+| Capability | Go client | This design |
+| --- | --- | --- |
+| TCP transport | yes | planned |
+| UDP transport | yes | **no** — needs the ARQ stack; rejected in validation |
+| XChaCha20-Poly1305 with time-derived key | yes | planned |
+| Three-salt window on the receiving side | yes | planned — the client keeps one key per attempt and re-derives on rotation |
+| Implicit nonce per direction | yes | planned |
+| User hint in the nonce | yes | planned |
+| Session open/close handshake | yes | planned |
+| Fragmentation to 32768 bytes | yes | planned |
+| socks5 CONNECT inside the session | yes | planned |
+| socks5 UDP-associate inside the session | yes | planned |
+| ACK / window / sequence fields over TCP | carried, not acted on | same — carried, not acted on |
+
+### Obfuscation
+
+| Capability | Go client | This design |
+| --- | --- | --- |
+| ASCII padding strategy | yes | planned |
+| Entropy padding strategy | yes | planned |
+| Per-user stable strategy choice | seeded from username + app version | planned, seeded from username only — see Traffic-pattern parity |
+| Low entropy encoding (4 modes, mask rotation) | yes | **no** — rejected in validation |
+| `trafficPattern.padding` limits | yes | **no** — internal defaults only |
+| `trafficPattern.nonce` (4 nonce types, custom prefixes) | yes | **no** |
+| `trafficPattern.tcpFragment` (extra fragmentation with sleeps) | yes | **no** |
+| `trafficPattern.seed` / `unlockAll` | yes | **no** |
+
+### Connection management
+
+| Capability | Go client | This design |
+| --- | --- | --- |
+| Multiple server endpoints | yes, picked at random per dial | shoes' own chain and pool selection covers this |
+| Port ranges per endpoint (`portRange`) | yes | **no** — a single port per endpoint |
+| Session multiplexing (4 levels) | yes | **no** — one session per connection, `MULTIPLEXING_OFF` equivalent |
+| Underlay reuse | yes | not applicable without multiplexing |
+| `handshakeMode` 0-RTT (send payload with the request) | yes | **no** — standard 1-RTT only |
+| Configurable MTU | yes | not applicable to the TCP transport |
+| Dialer proxy (`ClientDialer`) | yes | shoes' chain model covers this, and more generally |
+
+### Deliberately not our problem
+
+mieru bundles a client application; several of its settings have broader shoes
+equivalents, and copying them would be a regression rather than a gain:
+
+| mieru | shoes |
+| --- | --- |
+| `socks5Port`, `httpProxyPort`, `socks5ListenLAN` | server types in their own right, usable in front of any outbound |
+| `socks5Authentication` | the `socks5` server's own auth |
+| `rpcPort`, `activeProfile`, profile management | configuration is a file |
+| `loggingLevel`, `metricsLoggingInterval` | shoes' logging and counters |
+| `noCheckUpdate` | shoes does not phone home |
+
+### What parity means here
+
+The unimplemented rows fall into two groups, and they carry different risk.
+
+**Reachability:** only the UDP transport and `portRange` can make a server
+unreachable, and both are server-side deployment choices a user controls.
+Everything else in the "no" column is a client-side option — a server accepts a
+client that does not use it.
+
+**Detectability:** the `trafficPattern` rows are the ones that matter for the
+protocol's actual purpose. A Go client with a configured traffic pattern and a
+shoes client without one produce different traffic. This design targets the
+*default* Go client's behaviour, which is what the population of deployments
+mostly runs; matching a customised pattern would need the whole
+`trafficPattern` surface and is the natural second iteration.
+
 ## Protocol summary
 
 ### Key derivation
@@ -221,9 +296,14 @@ Nothing on the data path panics; anything derived from a peer's bytes returns
 - **No secrets leak.** The password, the derived key and the username never
   reach a log line or an error message — only that authentication failed. The
   config password is wrapped in `Redacted<T>`.
-- **Config rejections are loud.** `transport: udp`, a multiplexing setting
-  other than off, and a non-zero low-entropy mode are rejected in
-  `config/validate.rs` naming what is unimplemented.
+- **Config rejections are loud.** Every row marked "no" in the parity table
+  that a user could plausibly write into a shoes config is rejected in
+  `config/validate.rs`, naming what is unimplemented rather than silently
+  ignoring it: `transport: udp`, a multiplexing level other than off, a
+  non-zero low-entropy mode, a port range, 0-RTT handshake mode, and any
+  traffic-pattern field. A user who asks for a traffic pattern and silently
+  gets shoes' defaults believes something false about how their traffic looks,
+  which for this protocol is the whole point.
 
 ## Testing
 
