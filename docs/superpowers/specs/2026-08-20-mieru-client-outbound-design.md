@@ -1,7 +1,7 @@
 # mieru client outbound
 
 Design for speaking the mieru proxy protocol from shoes, as a client outbound
-over TCP, with a server implementation kept for testing.
+over TCP. Client only: shoes dials mieru servers and does not become one.
 
 ## Sources
 
@@ -29,8 +29,15 @@ but not this one, so a user with a mieru deployment cannot route through it.
 
 ## Scope
 
-**In scope:** a client outbound over mieru's TCP transport, and a server
-implementation sufficient to test the client against in process.
+**In scope:** a client outbound over mieru's TCP transport.
+
+**A mieru server is out of scope.** shoes implements servers for most of the
+protocols it speaks, and for Hysteria2 and TUIC that server is what the client
+is tested against in process. Here the client is the whole deliverable; a
+server would be roughly a third more work for a listener nobody has asked for.
+The cost lands on testing, and is paid as described under Testing: a scripted
+peer supplies the bytes a server would send, and interoperability with a real
+mieru deployment stays unverified until someone runs it.
 
 **Out of scope, and rejected loudly in config validation rather than ignored:**
 
@@ -139,7 +146,12 @@ already describe exactly what mieru does with socks5 UDP-associate.
 | `padding.rs` | Both padding strategies and their length bounds | — |
 | `frame.rs` | Segment codec: assemble and parse the byte layout | the three above |
 | `stream.rs` | `MieruStream: AsyncStream` — session state machine, fragmentation, `poll_read`/`poll_write` | `frame.rs` |
-| `client.rs`, `server.rs` | The handlers, socks5 inside the session, UDP encapsulation | `stream.rs` |
+| `client.rs` | `TcpClientHandler`, socks5 inside the session, UDP encapsulation | `stream.rs` |
+
+The codec modules encode **and** decode. The client only needs to decode what a
+server sends, but the reverse direction is what makes the codec testable
+without a server, and it is the same code path a server would use if one is
+ever written.
 
 `frame.rs` does no I/O, so it is testable on vectors. `stream.rs` knows nothing
 about socks5. `client.rs` knows nothing about padding.
@@ -215,22 +227,41 @@ Nothing on the data path panics; anything derived from a peer's bytes returns
 
 ## Testing
 
-Three tiers, matching how the QUIC outbounds are tested:
+Without a server to dial, the usual second tier — run the real thing in
+process — is replaced by a scripted peer. Three tiers:
 
 1. **Codec vectors** in `frame.rs`, `metadata.rs`, `crypto.rs`: field offsets,
    the nonce increment including the carry across a `0xff` byte, key derivation
    against a value computed from the documented steps, and the low-entropy
    example from `docs/protocol.md` used as a rejection test.
-2. **In-process interoperability**: the client against this repository's own
-   mieru server over a loopback socket, for TCP round trips, a UDP round trip
-   through the socks5 encapsulation, a payload larger than one fragment, and a
-   wrong password.
+2. **Scripted peer** over a loopback socket: a test double that encodes, with
+   this crate's own codec, the exact bytes a mieru server would send — the
+   `openSessionResponse`, the socks5 reply, then data segments — and records
+   what the client sends back. It is a byte generator, not a server: no user
+   table, no salt window, no quota. This is the same shape as the scripted
+   server-side stream used by `routing/udp_router.rs`, and it covers the
+   session state machine, fragment reassembly, the UDP encapsulation, and
+   nonce desynchronisation.
 3. **Padding distribution**: lengths stay inside their bounds, ASCII padding
    really contains its printable run, entropy padding moves the bit
    distribution toward the target, and both strategies are reachable.
 
 Every new test is mutation-checked: the defect it describes is reintroduced and
 exactly that test must go red.
+
+### What stays unverified
+
+A scripted peer built from our own codec cannot detect a shared
+misunderstanding of the specification: if we encode a field wrongly, we decode
+it wrongly to match, and every test passes. Only a real mieru server can
+settle that.
+
+So before this outbound is advertised as working, it must complete a manual
+round trip against upstream's `mita` server or a real deployment. Until that
+happens, the feature ships — if it ships at all — described as untested against
+a real peer, and `ROADMAP.md` records the gap. Adding a server implementation
+later would close it permanently by turning tier 2 into a real interoperability
+test.
 
 ## Deliberately not decided here
 
