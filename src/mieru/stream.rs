@@ -131,10 +131,28 @@ impl MieruStream {
                 match meta {
                     Metadata::Session(session)
                         if session.protocol == OPEN_SESSION_RESPONSE
-                            && session.status == SESSION_STATUS_OK =>
+                            && session.status == SESSION_STATUS_OK
+                            && session.session_id == session_id =>
                     {
                         pending.drain(..consumed);
                         break;
+                    }
+                    // The server answers with the id it was given
+                    // (`pkg/protocol/session.go:1123`). A different one means
+                    // we are not looking at our own session, and carrying on
+                    // would send data segments the peer cannot place. Checked
+                    // after the status, so a refusal is still reported as one.
+                    Metadata::Session(session)
+                        if session.protocol == OPEN_SESSION_RESPONSE
+                            && session.status == SESSION_STATUS_OK =>
+                    {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!(
+                                "the mieru server opened session {} while we asked for {session_id}",
+                                session.session_id
+                            ),
+                        ));
                     }
                     // A close, or an open response carrying a status, is the
                     // server refusing us - upstream sends statusQuotaExhausted
@@ -328,6 +346,24 @@ impl AsyncWrite for MieruStream {
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
+        // Shutting down on top of a half-written segment would put a truncated
+        // one on the wire; the peer cannot decrypt it and the last of the
+        // caller's data is lost.
+        while this.outgoing_at < this.outgoing.len() {
+            match Pin::new(&mut this.inner).poll_write(cx, &this.outgoing[this.outgoing_at..]) {
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "mieru transport accepted no bytes",
+                    )));
+                }
+                Poll::Ready(Ok(n)) => this.outgoing_at += n,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        this.outgoing.clear();
+        this.outgoing_at = 0;
         Pin::new(&mut this.inner).poll_shutdown(cx)
     }
 }
@@ -349,36 +385,7 @@ impl AsyncStream for MieruStream {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mieru::testing::{ScriptedPeer, TEST_PASSWORD, TEST_USERNAME};
-
-    /// Connect a MieruStream to a scripted peer over a loopback socket and
-    /// return both ends of the conversation.
-    async fn connect() -> (MieruStream, tokio::net::TcpStream, ScriptedPeer) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        let client = tokio::spawn(async move {
-            let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
-            MieruStream::open(Box::new(tcp), TEST_PASSWORD, TEST_USERNAME, 1000).await
-        });
-
-        let (mut server_tcp, _) = listener.accept().await.unwrap();
-        let mut peer = ScriptedPeer::new(1000);
-
-        // Read the client's openSessionRequest, then answer it.
-        let mut buf = vec![0u8; 4096];
-        let n = server_tcp.read(&mut buf).await.unwrap();
-        let (meta, _, _) = decode_segment(&mut peer.recv, &buf[..n]).unwrap().unwrap();
-        assert!(
-            matches!(meta, Metadata::Session(_)),
-            "the first segment opens the session"
-        );
-
-        let response = peer.open_session_response(1);
-        server_tcp.write_all(&response).await.unwrap();
-
-        (client.await.unwrap().unwrap(), server_tcp, peer)
-    }
+    use crate::mieru::testing::{ScriptedPeer, TEST_PASSWORD, TEST_USERNAME, connect};
 
     #[tokio::test]
     async fn test_open_completes_the_session_handshake() {
@@ -587,6 +594,42 @@ mod tests {
         assert!(read.is_ok(), "reading after a close must not hang");
         read.unwrap().unwrap();
         assert_eq!(all, b"last words");
+    }
+
+    /// The server echoes back the id it was given. A different one means the
+    /// response belongs to some other session, and data segments we send would
+    /// land nowhere - so the handshake must fail rather than hand back a
+    /// stream that silently carries nothing.
+    #[tokio::test]
+    async fn test_a_response_for_another_session_fails_the_handshake() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client = tokio::spawn(async move {
+            let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+            MieruStream::open(Box::new(tcp), TEST_PASSWORD, TEST_USERNAME, 1000).await
+        });
+
+        let (mut server_tcp, _) = listener.accept().await.unwrap();
+        let mut peer = ScriptedPeer::new(1000);
+        let mut buf = vec![0u8; 4096];
+        let n = server_tcp.read(&mut buf).await.unwrap();
+        let (meta, _, _) = decode_segment(&mut peer.recv, &buf[..n]).unwrap().unwrap();
+        let asked_for = match meta {
+            Metadata::Session(session) => session.session_id,
+            Metadata::Data(_) => panic!("the first segment opens the session"),
+        };
+
+        // Answer with a well-formed OK response for a different session.
+        let response = peer.open_session_response(asked_for.wrapping_add(1).max(1));
+        server_tcp.write_all(&response).await.unwrap();
+
+        let err = client.await.unwrap().unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("while we asked for"),
+            "unexpected error: {err}"
+        );
     }
 
     /// A wrong password must fail at open, not at the first read: the caller

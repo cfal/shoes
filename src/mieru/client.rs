@@ -204,6 +204,11 @@ pub struct MieruUdpStream {
     /// to forward the payload.
     target: crate::address::NetLocation,
     pending: Vec<u8>,
+    /// A framed datagram being written out. The session writes at most one
+    /// fragment per call, so a large datagram takes several, and the frame has
+    /// to survive across them.
+    outgoing: Vec<u8>,
+    outgoing_at: usize,
 }
 
 impl std::fmt::Debug for MieruUdpStream {
@@ -220,6 +225,8 @@ impl MieruUdpStream {
             session,
             target,
             pending: Vec::new(),
+            outgoing: Vec::new(),
+            outgoing_at: 0,
         }
     }
 }
@@ -272,26 +279,42 @@ impl AsyncWriteMessage for MieruUdpStream {
         buf: &[u8],
     ) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
-        // The server reads each frame with parseSocks5UDPDatagram and expects
-        // RSV RSV FRAG ATYP ADDR PORT before the payload; that header is how
-        // it learns the destination. pkg/socks5/udp.go:335.
-        let with_header = crate::socks5_udp_relay::encode_socks5_udp_packet(&this.target, buf);
-        let framed = try_encapsulate_udp(&with_header)?;
-        match Pin::new(&mut this.session).poll_write(cx, &framed) {
-            Poll::Ready(Ok(written)) if written == framed.len() => Poll::Ready(Ok(())),
-            Poll::Ready(Ok(_)) => {
-                // A partial write would put a truncated frame on the wire and
-                // the peer would tear the session down on the missing 0xff.
-                // The session writes at most one fragment per call, so this
-                // means the framed datagram is larger than a fragment.
-                Poll::Ready(Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "mieru UDP datagram does not fit one segment",
-                )))
-            }
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-            Poll::Pending => Poll::Pending,
+
+        // A frame left over from a call that returned Pending is resumed as-is.
+        // Re-encoding it would duplicate the part already on the wire, and the
+        // caller is required to re-poll with the same datagram anyway.
+        if this.outgoing_at >= this.outgoing.len() {
+            // The server reads each frame with parseSocks5UDPDatagram and
+            // expects RSV RSV FRAG ATYP ADDR PORT before the payload; that
+            // header is how it learns the destination. pkg/socks5/udp.go:335.
+            let with_header = crate::socks5_udp_relay::encode_socks5_udp_packet(&this.target, buf);
+            this.outgoing = try_encapsulate_udp(&with_header)?;
+            this.outgoing_at = 0;
         }
+
+        // Frames legitimately span segments: upstream's Session.Write splits at
+        // maxPDU and PacketOverStreamTunnel.Read reassembles with io.ReadFull
+        // (pkg/protocol/packet.go). So a short write is normal and the frame
+        // must be finished, not rejected - stopping half way would leave a
+        // truncated frame on the wire and the peer would tear the session down
+        // on the missing 0xff.
+        while this.outgoing_at < this.outgoing.len() {
+            match Pin::new(&mut this.session).poll_write(cx, &this.outgoing[this.outgoing_at..]) {
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "mieru session accepted no bytes of the UDP frame",
+                    )));
+                }
+                Poll::Ready(Ok(n)) => this.outgoing_at += n,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+
+        this.outgoing.clear();
+        this.outgoing_at = 0;
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -406,6 +429,63 @@ mod tests {
             crate::socks5_udp_relay::parse_socks5_udp_packet(&inner).unwrap();
         assert_eq!(parsed_target, target);
         assert_eq!(payload, b"query");
+    }
+
+    /// A datagram larger than one fragment still has to reach the peer whole.
+    /// Upstream splits at maxPDU on write and reassembles with io.ReadFull on
+    /// read (`pkg/protocol/packet.go`), so a frame spanning segments is normal
+    /// traffic - refusing it, or stopping at the first short write, drops the
+    /// datagram and leaves a truncated frame the peer cannot parse.
+    #[tokio::test]
+    async fn test_a_datagram_larger_than_a_fragment_is_written_whole() {
+        use crate::mieru::frame::decode_segment;
+        use crate::mieru::testing::connect;
+        use tokio::io::AsyncReadExt;
+
+        let (session, mut server, mut peer) = connect().await;
+        let target = crate::address::NetLocation::from_str("1.2.3.4:53", None).unwrap();
+        let mut udp = MieruUdpStream::new(session, target.clone());
+
+        let payload: Vec<u8> = (0..crate::mieru::MAX_FRAGMENT_LEN + 5000)
+            .map(|i| i as u8)
+            .collect();
+        let sent = payload.clone();
+        let writer = tokio::spawn(async move {
+            std::future::poll_fn(|cx| Pin::new(&mut udp).poll_write_message(cx, &sent)).await?;
+            std::future::poll_fn(|cx| Pin::new(&mut udp).poll_flush_message(cx)).await
+        });
+
+        // Collect segments until the whole frame is on the wire.
+        let expected = try_encapsulate_udp(&crate::socks5_udp_relay::encode_socks5_udp_packet(
+            &target, &payload,
+        ))
+        .unwrap();
+        let mut wire = Vec::new();
+        let mut pending = Vec::new();
+        let mut buf = vec![0u8; 65536];
+        while wire.len() < expected.len() {
+            let n = tokio::time::timeout(std::time::Duration::from_secs(5), server.read(&mut buf))
+                .await
+                .expect("the writer stalled on a short write")
+                .unwrap();
+            assert!(n > 0, "the session closed before the frame was complete");
+            pending.extend_from_slice(&buf[..n]);
+            while let Some((_, body, consumed)) = decode_segment(&mut peer.recv, &pending).unwrap()
+            {
+                wire.extend_from_slice(&body);
+                pending.drain(..consumed);
+            }
+        }
+
+        writer.await.unwrap().unwrap();
+        assert_eq!(wire, expected, "the frame must arrive byte for byte");
+
+        // And it parses back to the datagram we asked to send.
+        let (inner, _) = decapsulate_udp(&wire).unwrap().unwrap();
+        let (parsed_target, parsed_payload) =
+            crate::socks5_udp_relay::parse_socks5_udp_packet(&inner).unwrap();
+        assert_eq!(parsed_target, target);
+        assert_eq!(parsed_payload, payload);
     }
 
     #[test]
