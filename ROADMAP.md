@@ -2,7 +2,10 @@
 
 Where this fork stands against sing-box and Xray-core, and what is worth building
 next. Written 2026-08-09 against `mobile` at `7ed9f0b`; the Hysteria section was
-added 2026-08-11 against `apernet/hysteria` at `app/v2.12.1`.
+added 2026-08-11 against `apernet/hysteria` at `app/v2.12.1`. Refreshed
+2026-08-23 against `mobile` at `c83ce5f`, 128 commits later: the protocol lists
+and the mieru section were re-checked against the tree, and every Tier 2 and
+Tier 3 item was confirmed still open.
 
 The audience is anyone deciding what to work on. Every gap below is stated with
 the file it lands in, so the estimate is checkable rather than a guess.
@@ -28,8 +31,8 @@ VLESS, Trojan, Snell v3, Hysteria2, TUIC v5, AnyTLS, NaiveProxy, port-forward,
 TLS, WebSocket.
 
 Client: Direct, HTTP, SOCKS5, Shadowsocks, Snell, VMess, VLESS, Trojan, AnyTLS,
-NaiveProxy, WireGuard, AmneziaWG 2.0/3.0/3.1, plus TLS, Reality, ShadowTLS and
-WebSocket as wrapping layers.
+NaiveProxy, Hysteria2, TUIC v5, mieru, WireGuard, AmneziaWG 2.0/3.0/3.1,
+port-forward, plus TLS, Reality, ShadowTLS and WebSocket as wrapping layers.
 
 Transports and obfuscation: TCP and QUIC for every protocol, XTLS Reality (a
 hand-written TLS 1.3 stack, `src/reality/`), XTLS Vision, ShadowTLS v3, H2MUX,
@@ -172,15 +175,26 @@ group per rule, so split DNS cannot be expressed. Half the mechanism is built.
 
 ## Tier 3 — not urgent
 
-- **Network-change handling.** A Wi-Fi to cellular switch leaves the AmneziaWG
-  endpoint socket bound to a dead local address with no error path. Recorded in
-  MOBILE.md. Closer to a bug than a feature, but it needs an interface-watch
-  design to fix properly.
-- **Cache file.** Fake IP mappings, rule-set downloads and the selected outbound
-  do not survive a restart. On mobile, where the process is killed routinely,
-  this is felt more than the effort suggests.
-- **Multiplex interop** with sing-box's smux/yamux. H2MUX covers our own
-  deployments; this is purely about talking to other implementations.
+- **Network-change handling — done.** A Wi-Fi to cellular switch used to leave
+  the AmneziaWG endpoint socket bound to a dead local address with no error
+  path: it went quiet rather than failing, and the only recovery was a
+  stop-and-start that tore down the TUN interface. The endpoint socket is
+  replaceable now (`src/amneziawg/endpoint.rs`), swapped under the tunnel tasks
+  through a `watch` channel. Two things trigger a rebind: the app, through the
+  `notify_network_change()` FFI call meant for `ConnectivityManager` and
+  `NWPathMonitor`, and a send that fails with a route-is-gone error, so an app
+  that never wires up the callback still recovers one failed send later. No new
+  handshake is needed — WireGuard peers roam. See [MOBILE.md](./MOBILE.md) §3.
+- **Cache file.** The Fake IP pool is a `Mutex<PoolState>` and nothing else
+  (`src/dns/fake_ip/pool.rs`), so every mapping is lost on restart. On mobile,
+  where the process is killed routinely, this is felt more than the effort
+  suggests. Rule-set downloads and a remembered outbound selection would belong
+  in the same file, but neither exists yet — see Tier 1 item 1 and Tier 2
+  item 4.
+- **Multiplex interop** with sing-box's smux/yamux. `MuxProtocol` names both
+  (`src/h2mux/mod.rs:60`), but they are identifiers only: no framing behind
+  them. H2MUX covers our own deployments; this is purely about talking to other
+  implementations.
 
 ## Hysteria: the rest of the surface
 
@@ -250,19 +264,38 @@ in practice.
 ## mieru: what is left
 
 The client outbound is verified against a real mieru server — a routebox
-deployment on a VPS, TCP transport, one user, traffic pattern off. A round
-trip carried HTTPS, three sequential connections, a megabyte download over
-the multi-segment path, and DNS through the socks5 UDP associate, in both
-directions. A wrong password is refused with the server closing the
-connection, which the client reports as such.
+deployment on a VPS, TCP transport, one user, traffic pattern off. Two runs,
+the second after the review fixes below:
 
-That run is what the tests could not give. They exercise the client against a
-scripted peer built from this repository's own codec, and that construction
+- **Bulk, both directions.** 10 MB down and 20 MB up, at 6–10 MB/s. The
+  10 MB download hashes byte for byte against the same file fetched
+  directly, so the multi-segment path neither drops nor reorders.
+- **Concurrency.** Eight simultaneous sessions, 4 MB in total, in 0.35 s.
+- **A long session.** A server-sent-events stream held for 185 s: 8.7 MB,
+  5656 events, no break, the last event intact.
+- **Idle.** A keep-alive connection reused after 45 s and after 90 s of
+  silence. mieru has no keepalive of its own over TCP, so this is the case
+  that would fail first.
+- **UDP.** DNS through the socks5 UDP associate, ten queries down one
+  association, each reply matching its transaction id; and TCP on a fresh
+  connection immediately after.
+- **Address families.** An IPv6 destination through the tunnel, and the
+  server reached over both its IPv4 and its IPv6 address.
+
+A wrong password is reported as `the mieru server closed the connection
+before answering the session request` — but only after about 44 seconds.
+That is the server, not us: probed with random bytes it holds the
+connection open, silent, for roughly 42 s before closing, which is mieru's
+defence against active probing. A client-side timeout shorter than that
+turns a clear refusal into what looks like a hang.
+
+Those runs are what the tests could not give. They exercise the client against
+a scripted peer built from this repository's own codec, and that construction
 cannot detect a shared misreading of the specification — encode a field
 wrongly, decode it wrongly to match, and every test passes. A code review
 that read the Go implementation found nine defects while all of them were
 green, four of which broke the protocol outright. A second review, after the
-live run, found eight more: the entropy padding was filling with the wrong
+first live run, found eight more: the entropy padding was filling with the wrong
 bit and so emitted a near-constant byte run, the segment encoders fell back
 to a zero timestamp that a peer rejects, the handshake accepted a response
 for someone else's session, and a UDP datagram spanning segments was refused
