@@ -12,6 +12,30 @@ impl Address {
     pub const UNSPECIFIED: Self = Address::Ipv4(Ipv4Addr::UNSPECIFIED);
 
     pub fn from(s: &str) -> std::io::Result<Self> {
+        // RFC 3986 wraps an IPv6 literal in brackets so that its colons cannot
+        // be mistaken for the port separator, and that is the form clients and
+        // configs actually use: `[::1]:443`. Without this the leading '[' falls
+        // through to the hostname branch below, and the address is handed to
+        // the resolver as a name no DNS server will ever know.
+        //
+        // Brackets mean an IP literal and nothing else - a hostname cannot
+        // contain them - so a bracketed string that is not an IPv6 address is
+        // an error rather than something to look up.
+        if let Some(inner) = s.strip_prefix('[') {
+            let inner = inner.strip_suffix(']').ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("Address starts with '[' but has no closing ']': {s}"),
+                )
+            })?;
+            return inner.parse::<Ipv6Addr>().map(Address::Ipv6).map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("Failed to parse bracketed address as IPv6: {s}: {e}"),
+                )
+            });
+        }
+
         let mut dots = 0;
         let mut possible_ipv4 = true;
         let mut possible_ipv6 = true;
@@ -646,6 +670,97 @@ impl serde::ser::Serialize for NetLocationMask {
 mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
+
+    /// The bracketed form is how RFC 3986 writes an IPv6 literal, and it is
+    /// what both configs and HTTP clients use. Parsing it as a hostname sends
+    /// it to the resolver, which fails with "Name or service not known" and
+    /// makes an IPv6 server unreachable for a reason the message does not
+    /// explain.
+    #[test]
+    fn test_bracketed_ipv6_is_an_address_not_a_hostname() {
+        for (input, expected) in [
+            ("[::1]", Ipv6Addr::LOCALHOST),
+            ("[2001:db8::1]", "2001:db8::1".parse().unwrap()),
+            // A full eight-group address, with no "::" to shorten it.
+            (
+                "[2001:db8:1:2:3:4:5:6]",
+                "2001:db8:1:2:3:4:5:6".parse().unwrap(),
+            ),
+            ("[::ffff:1.2.3.4]", "::ffff:1.2.3.4".parse().unwrap()),
+        ] {
+            assert_eq!(
+                Address::from(input).unwrap(),
+                Address::Ipv6(expected),
+                "{input} must parse as an address"
+            );
+        }
+    }
+
+    /// Brackets denote an IP literal and nothing else, so a bracketed string
+    /// that is not one must not quietly become a hostname to look up.
+    #[test]
+    fn test_a_bracketed_non_address_is_refused() {
+        for input in [
+            "[]",
+            "[example.com]",
+            "[1.2.3.4]",
+            "[::1",
+            "[not an address]",
+        ] {
+            assert!(
+                Address::from(input).is_err(),
+                "{input} must not parse as an address"
+            );
+        }
+    }
+
+    /// The unbracketed forms have to keep working exactly as before.
+    #[test]
+    fn test_unbracketed_addresses_are_unchanged() {
+        assert_eq!(
+            Address::from("::1").unwrap(),
+            Address::Ipv6(Ipv6Addr::LOCALHOST)
+        );
+        assert_eq!(
+            Address::from("1.2.3.4").unwrap(),
+            Address::Ipv4(Ipv4Addr::new(1, 2, 3, 4))
+        );
+        assert_eq!(
+            Address::from("example.com").unwrap(),
+            Address::Hostname("example.com".to_string())
+        );
+    }
+
+    /// The whole point of the brackets: the colons inside them are part of the
+    /// address, and the one after them separates the port.
+    #[test]
+    fn test_a_bracketed_location_separates_the_port() {
+        let location = NetLocation::from_str("[2001:db8::1]:2096", None).unwrap();
+        assert_eq!(
+            location.address(),
+            &Address::Ipv6("2001:db8::1".parse().unwrap())
+        );
+        assert_eq!(location.port(), 2096);
+
+        // And without a port, the default applies.
+        let location = NetLocation::from_str("[2001:db8::1]", Some(443)).unwrap();
+        assert_eq!(
+            location.address(),
+            &Address::Ipv6("2001:db8::1".parse().unwrap())
+        );
+        assert_eq!(location.port(), 443);
+
+        // A bracketed address with no port and no default is still an error.
+        assert!(NetLocation::from_str("[2001:db8::1]", None).is_err());
+    }
+
+    /// Port ranges take the same notation.
+    #[test]
+    fn test_a_bracketed_port_range_parses() {
+        let range = NetLocationPortRange::from_str("[2001:db8::1]:80,443").unwrap();
+        assert_eq!(range.address, Address::Ipv6("2001:db8::1".parse().unwrap()));
+        assert_eq!(range.ports, vec![80, 443]);
+    }
 
     #[test]
     fn test_netlocation_serialization() {
