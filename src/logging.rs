@@ -136,6 +136,16 @@ static LEVEL_OVERRIDE: AtomicUsize = AtomicUsize::new(0);
 pub fn set_log_level(level: LevelFilter) {
     LEVEL_OVERRIDE.store(level as usize + 1, Ordering::Relaxed);
     log::set_max_level(level);
+    // The host app cannot see stderr, so this goes through the log pipeline it
+    // is already reading. Warn is at or below the compiled ceiling in every
+    // build, so the message itself always survives - otherwise the one line
+    // explaining the silence would be compiled out along with the debug logs.
+    if level > log::STATIC_MAX_LEVEL {
+        log::warn!(
+            "Log level {level} was requested, but this build compiles out anything above {}.              The level is set, and no additional lines will appear.",
+            log::STATIC_MAX_LEVEL
+        );
+    }
 }
 
 fn level_override() -> Option<LevelFilter> {

@@ -24,6 +24,11 @@ use super::types::{
 
 const MIN_TLS_BUFFER_SIZE: usize = 16 * 1024;
 
+/// The longest username or password mieru accepts. `apis/constant/user.go:19`
+/// caps the name at 64 bytes and the Go client applies the same figure to the
+/// password (`pkg/appctl/appctlcommon/client.go:67`).
+const MIERU_MAX_CREDENTIAL_LEN: usize = 64;
+
 /// Result of config validation containing server configs and expanded DNS groups.
 /// DNS resolvers are built at runtime from the expanded groups.
 pub struct ValidatedConfigs {
@@ -1008,7 +1013,37 @@ fn validate_client_config(
         ClientProxyConfig::Hysteria2(hysteria2) => {
             validate_obfs_config(hysteria2.obfs.as_ref())?;
         }
-        ClientProxyConfig::Mieru(_) => {
+        ClientProxyConfig::Mieru(mieru) => {
+            // The same limits the Go client enforces before it will dial
+            // (`pkg/appctl/appctlcommon/client.go:57-68`, MaxUserNameLen = 64).
+            // A server built from the same config would reject these
+            // credentials, so catching them here beats a connection that
+            // authenticates against nothing.
+            if mieru.username.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "mieru requires a username: the key is derived from it.",
+                ));
+            }
+            if mieru.username.len() > MIERU_MAX_CREDENTIAL_LEN {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("mieru usernames are limited to {MIERU_MAX_CREDENTIAL_LEN} bytes."),
+                ));
+            }
+            if mieru.password.expose().is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "mieru requires a password: the key is derived from it.",
+                ));
+            }
+            if mieru.password.expose().len() > MIERU_MAX_CREDENTIAL_LEN {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("mieru passwords are limited to {MIERU_MAX_CREDENTIAL_LEN} bytes."),
+                ));
+            }
+
             // mieru defines exactly two transports, TCP and UDP, and this
             // client implements the first. Its TCP segment framing carried
             // over QUIC or over datagrams is neither of them, so it would
@@ -2045,6 +2080,53 @@ mod tests {
         #[test]
         fn test_mieru_accepts_the_tcp_transport() {
             let mut config = mieru_client();
+            assert!(validate(&mut config).is_ok());
+        }
+
+        /// The key is derived from both credentials, so an empty one is not a
+        /// weak password - it is a config that cannot authenticate against
+        /// anything. Upstream refuses to dial in the same situation
+        /// (`pkg/appctl/appctlcommon/client.go:57-63`).
+        #[test]
+        fn test_mieru_rejects_empty_credentials() {
+            let mut config = mieru_client();
+            if let ClientProxyConfig::Mieru(mieru) = &mut config.protocol {
+                mieru.username = String::new();
+            }
+            let err = validate(&mut config).unwrap_err();
+            assert!(err.to_string().contains("username"), "{err}");
+
+            let mut config = mieru_client();
+            if let ClientProxyConfig::Mieru(mieru) = &mut config.protocol {
+                mieru.password = "".into();
+            }
+            let err = validate(&mut config).unwrap_err();
+            assert!(err.to_string().contains("password"), "{err}");
+        }
+
+        /// 64 bytes is the ceiling upstream enforces on both fields, so a
+        /// longer one is a config a matching server would refuse. Failing at
+        /// load names the field; failing at connect time does not.
+        #[test]
+        fn test_mieru_rejects_over_long_credentials() {
+            let mut config = mieru_client();
+            if let ClientProxyConfig::Mieru(mieru) = &mut config.protocol {
+                mieru.username = "x".repeat(MIERU_MAX_CREDENTIAL_LEN + 1);
+            }
+            assert!(validate(&mut config).is_err());
+
+            let mut config = mieru_client();
+            if let ClientProxyConfig::Mieru(mieru) = &mut config.protocol {
+                mieru.password = "x".repeat(MIERU_MAX_CREDENTIAL_LEN + 1).into();
+            }
+            assert!(validate(&mut config).is_err());
+
+            // And exactly at the limit is fine.
+            let mut config = mieru_client();
+            if let ClientProxyConfig::Mieru(mieru) = &mut config.protocol {
+                mieru.username = "x".repeat(MIERU_MAX_CREDENTIAL_LEN);
+                mieru.password = "x".repeat(MIERU_MAX_CREDENTIAL_LEN).into();
+            }
             assert!(validate(&mut config).is_ok());
         }
 
