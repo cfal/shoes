@@ -261,8 +261,13 @@ scripted peer built from this repository's own codec, and that construction
 cannot detect a shared misreading of the specification — encode a field
 wrongly, decode it wrongly to match, and every test passes. A code review
 that read the Go implementation found nine defects while all of them were
-green, four of which broke the protocol outright. The live run is the check
-that neither tests nor review can substitute for.
+green, four of which broke the protocol outright. A second review, after the
+live run, found eight more: the entropy padding was filling with the wrong
+bit and so emitted a near-constant byte run, the segment encoders fell back
+to a zero timestamp that a peer rejects, the handshake accepted a response
+for someone else's session, and a UDP datagram spanning segments was refused
+outright. Reading the reference is what found each of those; the live run is
+the check that neither tests nor review can substitute for.
 
 What is still worth doing, in order:
 
