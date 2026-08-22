@@ -9,7 +9,13 @@
 use crate::mieru::crypto::DirectionCipher;
 use crate::mieru::metadata::{self, DataMetadata, Metadata, SessionMetadata};
 use crate::mieru::padding::{PaddingStrategy, build_data_padding};
+use rand::Rng;
+
 use crate::mieru::{MAX_PADDING_LEN, METADATA_LEN, TAG_LEN};
+
+/// What a segment costs before payload and padding: the metadata, its tag and
+/// the payload's tag. `pkg/protocol/underlay_stream.go:41`.
+const STREAM_OVERHEAD: usize = METADATA_LEN + TAG_LEN * 2;
 
 /// Assemble a session segment: encrypted metadata, then trailing padding.
 pub fn encode_session_segment(
@@ -17,14 +23,31 @@ pub fn encode_session_segment(
     meta: &SessionMetadata,
     strategy: PaddingStrategy,
 ) -> std::io::Result<Vec<u8>> {
+    // This encoder writes metadata and padding only. A non-zero payload_len
+    // would describe a payload that never reaches the wire, and the peer would
+    // sit waiting for bytes that are not coming.
+    if meta.payload_len != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "a mieru session segment carries no payload, so payload_len must be zero",
+        ));
+    }
     let mut meta = meta.clone();
-    let suffix = strategy.build(MAX_PADDING_LEN, &[]);
+    // The entropy strategy balances against the bytes that will precede the
+    // padding. Those are ciphertext, so upstream models them with random data
+    // of the right length rather than the real thing
+    // (`buildRecommendedPaddingOpts`, `pkg/protocol/padding.go:108-134`).
+    // Passing an empty slice instead makes every bit count zero, and the
+    // calculation degenerates into a near-constant run of 0xFF.
+    let mut preceding = vec![0u8; STREAM_OVERHEAD + meta.payload_len as usize];
+    rand::rng().fill_bytes(&mut preceding);
+    let suffix = strategy.build(MAX_PADDING_LEN, &preceding);
     meta.suffix_len = suffix.len() as u8;
     // Upstream stamps this in sessionStruct.Marshal and its Unmarshal rejects
     // anything more than one minute from its own clock
     // (`pkg/protocol/metadata.go:150,170`). A caller-supplied value would be
     // stale by the time it reached the wire, so the encoder owns the field.
-    meta.timestamp_minutes = current_timestamp_minutes();
+    meta.timestamp_minutes = current_timestamp_minutes()?;
 
     let sealed = cipher.seal(&metadata::encode_session(&meta))?;
     let mut out = Vec::with_capacity(sealed.len() + suffix.len());
@@ -52,9 +75,10 @@ pub fn encode_data_segment(
 
     let meta = DataMetadata {
         protocol: metadata::DATA_CLIENT_TO_SERVER,
-        // Minutes since the epoch, as the format requires. A wrong value here
-        // does not break decoding; the peer uses it for its own bookkeeping.
-        timestamp_minutes: current_timestamp_minutes(),
+        // Minutes since the epoch. The peer checks this against its own clock
+        // and drops the segment if it is off by more than a minute
+        // (`dataAckStruct.Unmarshal`, `pkg/protocol/metadata.go:261`).
+        timestamp_minutes: current_timestamp_minutes()?,
         session_id,
         seq,
         // Carried because the format has the fields; over TCP neither end
@@ -85,12 +109,24 @@ pub fn encode_data_segment(
     Ok(out)
 }
 
-/// Minutes since the Unix epoch, falling back to zero on a broken clock: this
-/// field is the peer's bookkeeping, not authentication, so it must not fail a
-/// segment that would otherwise be valid.
-fn current_timestamp_minutes() -> u32 {
-    let secs = crate::util::unix_time_secs().unwrap_or(0);
-    (secs / 60) as u32
+/// Minutes since the Unix epoch.
+///
+/// Both `sessionStruct.Unmarshal` and `dataAckStruct.Unmarshal` reject a
+/// timestamp more than a minute from the peer's own clock
+/// (`pkg/protocol/metadata.go:171,261`), so this is not bookkeeping the peer
+/// shrugs off. Falling back to zero would put every segment outside that
+/// window and the server would drop the lot with no hint as to why; failing
+/// here names the clock instead.
+fn current_timestamp_minutes() -> std::io::Result<u32> {
+    let secs = crate::util::unix_time_secs().map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "mieru stamps every segment with the current time, and this clock is unusable: {e}"
+            ),
+        )
+    })?;
+    Ok((secs / 60) as u32)
 }
 
 /// Try to decode one segment from the front of `input`.
@@ -245,6 +281,29 @@ mod tests {
         // could not if a partial attempt had advanced the nonce.
         let (_, payload, _) = decode_segment(&mut receiver, &wire).unwrap().unwrap();
         assert_eq!(payload, b"payload");
+    }
+
+    /// A session segment is metadata plus padding; nothing writes a payload.
+    /// Announcing one would leave the peer waiting on bytes that never come,
+    /// so the encoder refuses rather than emitting a segment that lies.
+    #[test]
+    fn test_a_session_segment_refuses_to_announce_a_payload() {
+        let (mut cipher, _) = cipher_pair();
+        let err = encode_session_segment(
+            &mut cipher,
+            &SessionMetadata {
+                protocol: OPEN_SESSION_REQUEST,
+                timestamp_minutes: 0,
+                session_id: 7,
+                seq: 0,
+                status: 0,
+                payload_len: 16,
+                suffix_len: 0,
+            },
+            PaddingStrategy::Ascii,
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     }
 
     #[test]

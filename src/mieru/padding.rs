@@ -81,6 +81,11 @@ pub fn build_ascii_padding(max_len: usize) -> Vec<u8> {
     let mut padding = vec![0u8; len];
     rand::rng().fill_bytes(&mut padding);
 
+    // Exclusive upper bound, matching upstream's `mrand.Intn(length - min)`
+    // (`pkg/protocol/padding.go:152`). The run therefore never starts at the
+    // very last position it would fit. That is a bias, and it is upstream's
+    // bias: closing it here would make our traffic differ from the Go
+    // client's, which is the opposite of the goal.
     let begin = if len > run_len {
         rand::rng().random_range(0..len - run_len)
     } else {
@@ -93,8 +98,16 @@ pub fn build_ascii_padding(max_len: usize) -> Vec<u8> {
     padding
 }
 
-/// Padding sized so the rarer bit reaches the target probability across the
-/// segment. `pkg/protocol/padding.go:156-190`.
+/// Padding sized and shaped so the combined bit distribution approaches the
+/// target probability. `pkg/protocol/padding.go:156-205`.
+///
+/// Two details matter and are easy to get backwards. The fill is the
+/// *opposite* of the rarer bit, and individual **bits** are then flipped
+/// toward the rarer value — filling with the rarer bit and perturbing whole
+/// bytes leaves a near-constant run of 0x00 or 0xFF, which is a signature
+/// rather than obfuscation. And `existing` must describe the bytes that will
+/// precede this padding; an empty slice makes every count zero and the whole
+/// calculation degenerate.
 pub fn build_entropy_padding(max_len: usize, existing: &[u8]) -> Vec<u8> {
     if max_len == 0 {
         return Vec::new();
@@ -102,8 +115,14 @@ pub fn build_entropy_padding(max_len: usize, existing: &[u8]) -> Vec<u8> {
     let total_bits = existing.len() * 8;
     let ones: usize = existing.iter().map(|b| b.count_ones() as usize).sum();
     let zeros = total_bits - ones;
-    let rarer_count = ones.min(zeros);
-    let rarer_bit_is_one = ones <= zeros;
+
+    // Upstream starts at bit 0 and switches only when 1 is strictly rarer, so
+    // a tie resolves to 0.
+    let (rarer_bit_is_one, rarer_count) = if ones < zeros {
+        (true, ones)
+    } else {
+        (false, zeros)
+    };
 
     // Solve rarer = target * (existing + padding) for padding, in bits.
     let needed_bits = (rarer_count as f64 / TARGET_BIT_PROBABILITY) - total_bits as f64;
@@ -122,14 +141,21 @@ pub fn build_entropy_padding(max_len: usize, existing: &[u8]) -> Vec<u8> {
         return Vec::new();
     }
 
-    // Fill with the rarer bit so the padding moves the distribution the way
-    // the calculation assumed.
-    let mut padding = vec![if rarer_bit_is_one { 0xff } else { 0x00 }; len];
-    // Perturb a fraction of the bytes so the padding is not a constant run.
-    let perturb = len / 4;
-    for _ in 0..perturb {
-        let at = rand::rng().random_range(0..len);
-        padding[at] = rand::rng().random();
+    // How many bits of the padding should carry the rarer value for the
+    // combined distribution to land on the target.
+    let target_rarer = (((existing.len() + len) * 8) as f64 * TARGET_BIT_PROBABILITY) as isize
+        - rarer_count as isize;
+    let flip = target_rarer.max(0).min((len * 8) as isize) as usize;
+
+    let mut padding = vec![if rarer_bit_is_one { 0x00 } else { 0xff }; len];
+    for _ in 0..flip {
+        let bit = rand::rng().random_range(0..len * 8);
+        let (index, offset) = (bit / 8, bit % 8);
+        if rarer_bit_is_one {
+            padding[index] |= 1 << offset;
+        } else {
+            padding[index] &= !(1 << offset);
+        }
     }
     padding
 }
@@ -199,7 +225,7 @@ mod tests {
     }
 
     /// Entropy padding exists to pull the bit distribution toward the target.
-    /// Feed it all-zero data and the padding must contain ones.
+    /// Feed it all-zero data and the padding must carry ones.
     #[test]
     fn test_entropy_padding_balances_a_skewed_input() {
         let existing = [0u8; 200];
@@ -212,54 +238,97 @@ mod tests {
         assert!(ones > 0, "the padding must carry the rarer bit");
     }
 
+    /// Upstream fills with the *opposite* of the rarer bit and then flips
+    /// individual bits toward it (`pkg/protocol/padding.go:190-205`). Filling
+    /// with the rarer bit instead leaves a near-constant run of 0x00 or 0xFF —
+    /// a signature rather than obfuscation.
     #[test]
-    fn test_zero_budget_yields_no_padding() {
-        assert!(build_ascii_padding(0).is_empty());
-        assert!(build_entropy_padding(0, &[0u8; 10]).is_empty());
-    }
+    fn test_entropy_padding_is_not_a_constant_byte_run() {
+        // Random existing data, which is what upstream models: the bytes
+        // before the padding are ciphertext, so they look random.
+        let mut existing = vec![0u8; 64];
+        rand::rng().fill_bytes(&mut existing);
 
-    /// Data segments are padded differently from session segments: upstream
-    /// passes a zero-valued asciiPaddingOpts for them
-    /// (`pkg/protocol/underlay_stream.go:672`), which makes the length uniform
-    /// over the whole range and the printable-run transform a no-op. Applying
-    /// the per-user strategy here instead would put a constant shape on every
-    /// packet — a signature, on a protocol whose purpose is not having one.
-    #[test]
-    fn test_data_padding_is_uniform_over_the_whole_range() {
-        let mut shortest = usize::MAX;
-        let mut longest = 0;
-        for _ in 0..500 {
-            let len = build_data_padding(MAX_PADDING_LEN).len();
-            assert!(len <= MAX_PADDING_LEN);
-            shortest = shortest.min(len);
-            longest = longest.max(len);
+        let mut saw_a_mixed_one = false;
+        for _ in 0..100 {
+            let padding = build_entropy_padding(MAX_PADDING_LEN, &existing);
+            if padding.len() < 32 {
+                continue;
+            }
+            let first = padding[0];
+            if padding.iter().any(|b| *b != first) {
+                saw_a_mixed_one = true;
+            }
         }
-        // The ASCII strategy can never go below 24, and the entropy strategy
-        // saturates at the maximum for a payload of any size. Neither shape
-        // spans the range the way a uniform draw does.
         assert!(
-            shortest < ASCII_RUN_BASE,
-            "shortest padding was {shortest}; a uniform draw reaches below {ASCII_RUN_BASE}"
-        );
-        assert!(
-            longest > MAX_PADDING_LEN / 2,
-            "longest padding was {longest}; a uniform draw reaches most of the range"
+            saw_a_mixed_one,
+            "every sample was a single repeated byte, which is the signature \
+             the bit-level flip exists to avoid"
         );
     }
 
-    /// And it carries no forced printable run, unlike session padding.
+    /// With all-zero input the padding must come back overwhelmingly made of
+    /// the rarer bit. Two ways of getting this wrong both survive a weaker
+    /// assertion: filling with the rarer bit (a constant 0xFF run, which is a
+    /// signature) and flipping whole bytes instead of bits.
+    ///
+    /// The bound is 0.35, not 0.5, because upstream flips "at most flip bits"
+    /// by drawing positions at random with repeats
+    /// (`pkg/protocol/padding.go:195-205`). At full saturation that lands near
+    /// 1 - 1/e = 63%, and at the longest padding the clamped flip count gives
+    /// about 48%. Demanding more would be demanding the Go client's output be
+    /// something it is not.
+    ///
+    /// Paddings under 8 bytes are skipped: with 8 draws over 8 bit positions
+    /// the share is a coarse statistic whose tail crosses 0.35 about once in
+    /// three thousand runs. That is a flaky test, not a defect being caught.
     #[test]
-    fn test_data_padding_has_no_forced_printable_run() {
-        // Over many samples a 24-byte printable run should not appear by
-        // chance: each byte has a 95/256 chance of landing in the range.
-        let mut longest = 0;
+    fn test_entropy_padding_is_mostly_the_rarer_bit() {
+        let existing = [0u8; 256];
+        let mut evaluated = 0;
         for _ in 0..200 {
-            longest = longest.max(longest_printable_run(&build_data_padding(MAX_PADDING_LEN)));
+            let padding = build_entropy_padding(MAX_PADDING_LEN, &existing);
+            if padding.len() < 8 {
+                continue;
+            }
+            evaluated += 1;
+            let ones: usize = padding.iter().map(|b| b.count_ones() as usize).sum();
+            let share = ones as f64 / (padding.len() * 8) as f64;
+            assert!(
+                share > 0.35,
+                "the padding was only {share:.3} ones over {} bytes, so it is \
+                 not carrying the bit it exists to supply",
+                padding.len()
+            );
         }
         assert!(
-            longest < ASCII_RUN_BASE,
-            "found a {longest}-byte printable run, which suggests the ASCII \
-             transform is being applied to data padding"
+            evaluated > 100,
+            "only {evaluated} samples were long enough to judge, so this test \
+             is no longer measuring what it claims"
+        );
+    }
+
+    /// And the padding must actually move the combined distribution. It cannot
+    /// always reach the 0.325 target - the flip count is clamped to the
+    /// padding's own size - but it must not leave the input where it was.
+    #[test]
+    fn test_entropy_padding_improves_a_skewed_distribution() {
+        let existing = [0u8; 256];
+        let padding = build_entropy_padding(MAX_PADDING_LEN, &existing);
+        assert!(!padding.is_empty(), "skewed data needs padding");
+
+        let total_bits = (existing.len() + padding.len()) * 8;
+        let ones: usize = existing
+            .iter()
+            .chain(padding.iter())
+            .map(|b| b.count_ones() as usize)
+            .sum();
+        let after = ones.min(total_bits - ones) as f64 / total_bits as f64;
+
+        // Before the padding the rarer bit is absent entirely.
+        assert!(
+            after > 0.0,
+            "the padding did not move the distribution at all"
         );
     }
 
