@@ -344,28 +344,46 @@ process — is replaced by a scripted peer. Three tiers:
 Every new test is mutation-checked: the defect it describes is reintroduced and
 exactly that test must go red.
 
-### What stays unverified
+### Verified against a real server
 
 A scripted peer built from our own codec cannot detect a shared
 misunderstanding of the specification: if we encode a field wrongly, we decode
-it wrongly to match, and every test passes. Only a real mieru server can
-settle that.
+it wrongly to match, and every test passes. Only a real mieru server settles
+that, and one has now been run against.
 
-One piece is no longer in that category. The UDP encapsulation was compared
-line by line against `apis/common/packet_over_stream.go` — the `0x00` prefix,
-the big-endian 16-bit length, the 65535 ceiling, the `0xff` suffix and the
-rejection of a wrong marker at either end all match. That is independent
-confirmation for one component rather than self-agreement. The same reading
-should be done for the segment codec and the key derivation before anyone
-calls this interoperable; the reference implementations are cheap to read and
-cost far less than debugging a live handshake.
+The deployment was routebox on a VPS: TCP transport, one user, traffic pattern
+off, no user hint required. What passed, on 2026-08-22:
 
-So before this outbound is advertised as working, it must complete a manual
-round trip against upstream's `mita` server or a real deployment. Until that
-happens, the feature ships — if it ships at all — described as untested against
-a real peer, and `ROADMAP.md` records the gap. Adding a server implementation
-later would close it permanently by turning tier 2 into a real interoperability
-test.
+| | |
+| --- | --- |
+| TCP connect and egress | the reply carried the server's own address |
+| HTTPS through the proxy | 200, 75 ms |
+| Three sequential connections | 200 each, about 150 ms |
+| 1 MB download | 1048576 bytes over the multi-segment path |
+| DNS over socks5 UDP associate | answered, three times running |
+| TCP after UDP on the same config | works |
+| Wrong password | server closes the connection, client says so |
+
+The megabyte download and the UDP round trip matter most: those are the paths
+where the code review found the read-buffer bound and the missing socks5 UDP
+header. They are now confirmed on a live peer rather than only in tests.
+
+One component has independent confirmation of a different kind. The UDP
+encapsulation was compared line by line against
+`apis/common/packet_over_stream.go` — the `0x00` prefix, the big-endian 16-bit
+length, the 65535 ceiling, the `0xff` suffix and the rejection of a wrong
+marker at either end all match.
+
+### What is still not guaranteed
+
+A single manual run is not a regression test. The next change to the codec is
+unguarded, so `ROADMAP.md` keeps a `mita`-in-CI entry as the next step, with a
+mieru server here as the more thorough alternative.
+
+The run also covered one server configuration. A deployment using mieru's UDP
+transport, a configured traffic pattern, session multiplexing, port ranges or
+the low entropy encoding is refused by our validation rather than mishandled —
+but it is refused, not supported.
 
 ## Deliberately not decided here
 

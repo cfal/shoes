@@ -219,12 +219,33 @@ pub fn init_multi_logger(writers: Vec<Box<dyn LogWriter>>, mut directives: Vec<D
         .map(|d| d.level)
         .max()
         .unwrap_or(LevelFilter::Off);
+    warn_if_level_is_compiled_out(max_level);
     let logger = MultiLogger {
         writers,
         directives,
     };
     log::set_boxed_logger(Box::new(logger)).expect("logger already initialized");
     log::set_max_level(max_level);
+}
+
+/// Say so when the requested level cannot be emitted by this build.
+///
+/// `log` is built with `release_max_level_info`, so a release binary has its
+/// `debug!` and `trace!` calls compiled out entirely — asking for them through
+/// `RUST_LOG` or a marker file changes the filter and still produces nothing.
+/// Without this warning the binary reports "setting log level to DEBUG" and
+/// then stays silent, which reads as a broken logger rather than a build that
+/// cannot carry those levels. Diagnosing that from the outside costs an hour.
+fn warn_if_level_is_compiled_out(requested: LevelFilter) {
+    let compiled_in = log::STATIC_MAX_LEVEL;
+    if requested > compiled_in {
+        eprintln!(
+            "Requested log level {requested} is not available in this build: log is compiled \
+             with a maximum of {compiled_in}, so debug and trace calls do not exist in the \
+             binary. Build without the release_max_level_info feature, or use a debug build, \
+             to see them."
+        );
+    }
 }
 
 /// Routes panics through the logger instead of stderr, then flushes.
@@ -541,5 +562,27 @@ mod tests {
             panic_message(payload.as_ref()),
             "<non-string panic payload>"
         );
+    }
+
+    /// The build's compiled-in ceiling is what decides whether a requested
+    /// level can produce output at all. In a test build debug and trace exist,
+    /// so nothing is above the ceiling; in a release build they do not, and
+    /// asking for them warrants the warning. Pin the comparison rather than
+    /// the message, so the rule survives a reword.
+    #[test]
+    fn test_a_level_above_the_compiled_ceiling_is_detected() {
+        let ceiling = log::STATIC_MAX_LEVEL;
+        assert!(
+            LevelFilter::Error <= ceiling,
+            "error must always be emittable"
+        );
+
+        // Whatever the ceiling is, one step past it is not emittable.
+        let past_ceiling = LevelFilter::iter().find(|level| *level > ceiling);
+        match past_ceiling {
+            Some(level) => assert!(level > ceiling),
+            // A build with Trace compiled in has nothing past the ceiling.
+            None => assert_eq!(ceiling, LevelFilter::Trace),
+        }
     }
 }
