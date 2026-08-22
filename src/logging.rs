@@ -142,7 +142,7 @@ pub fn set_log_level(level: LevelFilter) {
     // explaining the silence would be compiled out along with the debug logs.
     if level > log::STATIC_MAX_LEVEL {
         log::warn!(
-            "Log level {level} was requested, but this build compiles out anything above {}.              The level is set, and no additional lines will appear.",
+            "Log level {level} is set, but this build compiles out anything above {}, so no additional lines will appear.",
             log::STATIC_MAX_LEVEL
         );
     }
