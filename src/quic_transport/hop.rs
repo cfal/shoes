@@ -30,13 +30,26 @@ use crate::address::parse_port_union;
 /// would be a pattern, and hiding the pattern is the entire point.
 #[derive(Debug, Clone)]
 pub struct PortSet {
-    ports: Vec<u16>,
+    /// Shared rather than owned: `ports: "20000-50000"` materialises 30,001
+    /// entries, and `HopSettings` is cloned on every endpoint build.
+    ports: Arc<[u16]>,
 }
 
 impl PortSet {
     pub fn parse(s: &str) -> std::io::Result<Self> {
+        let ports = parse_port_union(s)?;
+        // Port 0 is a legal value in the notation - a listener uses it to mean
+        // "any free port" - but it is not a legal destination. sendto to port
+        // zero is rejected by the kernel, and quinn treats a send error as
+        // fatal, so one unlucky pick would tear down a working connection.
+        if ports.first() == Some(&0) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "port hopping cannot use port 0: it is not a destination",
+            ));
+        }
         Ok(Self {
-            ports: parse_port_union(s)?,
+            ports: ports.into(),
         })
     }
 
@@ -90,13 +103,34 @@ impl HopSettings {
         min_interval_ms: Option<u64>,
         max_interval_ms: Option<u64>,
     ) -> std::io::Result<Self> {
+        let invalid = |detail: &str| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, detail.to_string())
+        };
+
+        // Spelled out rather than left to match precedence. The contradictory
+        // shapes are refused here too, not only in config validation: this
+        // constructor is reachable from tests and from any future programmatic
+        // config, and a silent guess in either would be worse than an error.
         let schedule = match (interval_ms, min_interval_ms, max_interval_ms) {
-            (_, Some(min), Some(max)) => HopSchedule::Range {
+            (Some(_), Some(_), _) | (Some(_), _, Some(_)) => {
+                return Err(invalid(
+                    "port hopping takes either a fixed interval or a min/max range, not both",
+                ));
+            }
+            (None, Some(min), Some(max)) if min > max => {
+                return Err(invalid("port hopping's min interval is above its max"));
+            }
+            (None, Some(min), Some(max)) => HopSchedule::Range {
                 min: Duration::from_millis(min),
                 max: Duration::from_millis(max),
             },
-            (Some(interval), _, _) => HopSchedule::Fixed(Duration::from_millis(interval)),
-            _ => HopSchedule::Fixed(DEFAULT_HOP_INTERVAL),
+            (None, Some(_), None) | (None, None, Some(_)) => {
+                return Err(invalid(
+                    "port hopping needs both a min and a max interval, or neither",
+                ));
+            }
+            (Some(interval), None, None) => HopSchedule::Fixed(Duration::from_millis(interval)),
+            (None, None, None) => HopSchedule::Fixed(DEFAULT_HOP_INTERVAL),
         };
         Ok(Self {
             ports: PortSet::parse(ports)?,
@@ -269,15 +303,14 @@ impl AsyncUdpSocket for HoppingUdpSocket {
         self.waker.register(cx.waker());
 
         let state = self.state.read();
-        match state.current.poll_recv(cx, bufs, meta) {
-            Poll::Ready(Ok(count)) => {
-                canonicalise(meta, count, self.canonical);
-                return Poll::Ready(Ok(count));
-            }
-            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-            Poll::Pending => {}
-        }
 
+        // The previous socket goes first, and not out of politeness. What sits
+        // in it was sent before the hop, so it is older than anything on the
+        // current socket - draining it first keeps the order the server sent
+        // in. Taking the current socket first would also starve it outright
+        // while a download saturates the new path, and then drop whatever was
+        // still unread at the next hop: exactly the loss the overlap exists to
+        // prevent. It empties within a hop and then costs one syscall.
         if let Some(previous) = state.previous.as_ref() {
             match previous.poll_recv(cx, bufs, meta) {
                 Poll::Ready(Ok(count)) => {
@@ -290,7 +323,14 @@ impl AsyncUdpSocket for HoppingUdpSocket {
             }
         }
 
-        Poll::Pending
+        match state.current.poll_recv(cx, bufs, meta) {
+            Poll::Ready(Ok(count)) => {
+                canonicalise(meta, count, self.canonical);
+                Poll::Ready(Ok(count))
+            }
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => Poll::Pending,
+        }
     }
 
     fn local_addr(&self) -> std::io::Result<SocketAddr> {
@@ -329,11 +369,12 @@ impl std::fmt::Debug for HoppingPoller {
 impl UdpPoller for HoppingPoller {
     fn poll_writable(self: Pin<&mut Self>, cx: &mut Context) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
-        let (generation, current) = {
-            let state = this.socket.state.read();
-            (state.generation, state.current.clone())
-        };
+        // quinn asks before every datagram, so the common path must not touch
+        // the refcount: read the generation, and only clone the socket on the
+        // rare call where it has actually changed.
+        let generation = this.socket.state.read().generation;
         if generation != this.generation {
+            let current = this.socket.state.read().current.clone();
             this.inner = current.create_io_poller();
             this.generation = generation;
         }
@@ -634,6 +675,45 @@ mod tests {
             seen.insert(set.pick());
         }
         assert_eq!(seen.len(), 4, "only saw {seen:?}");
+    }
+
+    /// Port 0 parses as a port but is not a destination: sendto rejects it and
+    /// quinn treats a send error as fatal, so one unlucky pick would tear down
+    /// a working connection.
+    #[test]
+    fn test_port_zero_is_refused() {
+        assert!(PortSet::parse("0").is_err());
+        assert!(PortSet::parse("0-1000").is_err());
+        assert!(PortSet::parse("0,20000-20005").is_err());
+        assert!(PortSet::parse("1-1000").is_ok(), "1 is fine, only 0 is not");
+    }
+
+    /// The constructor refuses the contradictory shapes itself rather than
+    /// trusting validation in another file. A silent guess here would disagree
+    /// with the documentation and nothing would catch it.
+    #[test]
+    fn test_contradictory_schedules_are_refused() {
+        // Fixed interval beside a range.
+        assert!(HopSettings::new("20000-20005", Some(30_000), Some(10_000), Some(20_000)).is_err());
+        // Half a range.
+        assert!(HopSettings::new("20000-20005", None, Some(10_000), None).is_err());
+        assert!(HopSettings::new("20000-20005", None, None, Some(10_000)).is_err());
+        // Inverted range.
+        assert!(HopSettings::new("20000-20005", None, Some(30_000), Some(10_000)).is_err());
+    }
+
+    #[test]
+    fn test_the_valid_schedule_shapes_are_accepted() {
+        let fixed = HopSettings::new("20000-20005", Some(7_000), None, None).unwrap();
+        assert!(
+            matches!(fixed.schedule, HopSchedule::Fixed(d) if d == Duration::from_millis(7_000))
+        );
+
+        let ranged = HopSettings::new("20000-20005", None, Some(5_000), Some(9_000)).unwrap();
+        assert!(matches!(ranged.schedule, HopSchedule::Range { .. }));
+
+        let defaulted = HopSettings::new("20000-20005", None, None, None).unwrap();
+        assert!(matches!(defaulted.schedule, HopSchedule::Fixed(d) if d == DEFAULT_HOP_INTERVAL));
     }
 
     #[test]

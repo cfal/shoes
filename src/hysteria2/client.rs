@@ -342,6 +342,12 @@ mod tests {
                                 let _ = front.send_to(&from_server[..n], peer).await;
                             }
                         }
+                        // A connected UDP socket surfaces an ICMP port
+                        // unreachable as a recv error, which disables that
+                        // branch. Without this, a second disabled branch
+                        // panics the test instead of failing it, and the
+                        // relay tasks would otherwise outlive the test.
+                        else => break,
                     }
                 }
             });

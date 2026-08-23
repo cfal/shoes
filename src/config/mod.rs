@@ -116,17 +116,62 @@ mod example_tests {
     #[test]
     fn test_every_example_config_parses() {
         let mut checked = 0;
+        let mut validated = 0;
         for entry in std::fs::read_dir("examples").expect("examples/ must exist") {
             let path = entry.unwrap().path();
             if path.extension().and_then(|e| e.to_str()) != Some("yaml") {
                 continue;
             }
             let text = std::fs::read_to_string(&path).unwrap();
-            serde_yaml::from_str::<Vec<Config>>(&text)
+            let configs = serde_yaml::from_str::<Vec<Config>>(&text)
                 .unwrap_or_else(|e| panic!("{} does not parse: {e}", path.display()));
+
+            // Parsing is not enough on its own. Several examples exist to
+            // demonstrate rules only validation enforces - a literal IP where
+            // one is required, an interval above its floor - and an example
+            // the binary refuses at startup would keep a parse-only test
+            // green.
+            //
+            // Examples naming a PEM file are parsed but not validated:
+            // validation expects `convert_cert_paths` to have loaded them
+            // first, which needs the files to exist, and inventing them here
+            // would test the fixture rather than the example.
+            // An example that points at a file on disk cannot be validated
+            // without that file, and inventing one here would test the fixture
+            // rather than the example. Two shapes of that:
+            //
+            // A certificate or key path is asserted on inside the PEM layer,
+            // so it has to be skipped by inspection rather than caught.
+            //
+            // Everything else - a rule-set, say - surfaces as NotFound, which
+            // is tolerated below. Any *other* validation error is the example
+            // being wrong and fails the test.
+            //
+            // A `YOUR_..._HERE` placeholder is skipped too, and deliberately:
+            // an example shipping a real REALITY private key would be worse
+            // than one that fails loudly at startup, because a copied key is a
+            // key everybody has.
+            let needs_a_fixture =
+                text.contains(".pem") || text.contains(".key") || text.contains(".crt");
+            if !needs_a_fixture && !text.contains("YOUR_") {
+                match create_server_configs(configs) {
+                    Ok(_) => validated += 1,
+                    // The kind is lost where the error is wrapped in a
+                    // message, so the text is what there is to go on.
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::NotFound
+                            || e.to_string().contains("No such file or directory") => {}
+                    Err(e) => panic!("{} parses but does not validate: {e}", path.display()),
+                }
+            }
             checked += 1;
         }
         assert!(checked > 10, "only {checked} examples were checked");
+        assert!(
+            validated > 10,
+            "only {validated} of {checked} examples reached validation, so this \
+             test is mostly measuring the parser"
+        );
     }
 }
 

@@ -127,7 +127,22 @@ impl LiveConnection {
                 .is_some_and(|local| local.is_ipv6() == server_addr.is_ipv6());
             let current = match endpoint.take() {
                 Some(e) if reusable => e,
-                _ => self.settings.build_endpoint(server_addr.is_ipv6())?,
+                // A socket that cannot be created for this family is this
+                // address failing, not the walk failing. Propagating here
+                // would skip every remaining address - on a host with no
+                // usable IPv6 that is exactly the dead outbound this loop
+                // exists to prevent.
+                _ => match self.settings.build_endpoint(server_addr.is_ipv6()) {
+                    Ok(built) => built,
+                    Err(e) => {
+                        debug!(
+                            "could not raise an endpoint for {server_addr}: {e}; \
+                             trying the next address"
+                        );
+                        last_err = Some(e);
+                        continue;
+                    }
+                },
             };
 
             let is_last = index + 1 == server_addrs.len();
@@ -153,8 +168,13 @@ impl LiveConnection {
             }
         }
 
+        // resolve_addresses refuses an empty result, so the loop always ran at
+        // least once and always recorded an error before reaching here.
         Err(last_err.unwrap_or_else(|| {
-            std::io::Error::other(format!("could not resolve {}", self.settings.server))
+            std::io::Error::other(format!(
+                "no resolved address for {} could be connected",
+                self.settings.server
+            ))
         }))
     }
 
@@ -178,33 +198,42 @@ impl LiveConnection {
             .sni_hostname()
             .unwrap_or_else(|| server_addr.ip().to_string());
 
-        let connecting = endpoint.connect(server_addr, &server_name).map_err(|e| {
-            std::io::Error::other(format!("QUIC connect to {server_addr} failed: {e}"))
-        })?;
+        // The bound covers the authentication as well as the handshake. A
+        // server that answers the handshake and then never answers the
+        // protocol's auth exchange stalls just as completely, and it does it
+        // while this task still holds the connection mutex.
+        let work = async {
+            let connecting = endpoint.connect(server_addr, &server_name).map_err(|e| {
+                std::io::Error::other(format!("QUIC connect to {server_addr} failed: {e}"))
+            })?;
+
+            let connection = connecting.await.map_err(|e| {
+                std::io::Error::other(format!("QUIC handshake with {server_addr} failed: {e}"))
+            })?;
+
+            self.authenticator.authenticate(&connection).await?;
+            Ok::<_, std::io::Error>(connection)
+        };
 
         let connection = if is_last {
-            connecting.await
+            work.await?
         } else {
-            match tokio::time::timeout(ATTEMPT_TIMEOUT, connecting).await {
-                Ok(result) => result,
+            match tokio::time::timeout(ATTEMPT_TIMEOUT, work).await {
+                Ok(result) => result?,
                 Err(_) => {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::TimedOut,
                         format!(
-                            "QUIC handshake with {server_addr} did not complete within {}s",
+                            "{server_addr} did not complete a handshake and authentication \
+                             within {}s",
                             ATTEMPT_TIMEOUT.as_secs()
                         ),
                     ));
                 }
             }
-        }
-        .map_err(|e| {
-            std::io::Error::other(format!("QUIC handshake with {server_addr} failed: {e}"))
-        })?;
+        };
 
-        self.authenticator.authenticate(&connection).await?;
         self.connections_raised.fetch_add(1, Ordering::Relaxed);
-
         debug!("QUIC connection to {server_addr} established and authenticated");
         Ok(connection)
     }
