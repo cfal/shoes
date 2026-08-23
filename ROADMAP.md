@@ -225,10 +225,19 @@ while leaving the flow linkable. Spec:
 
 It is covered by an in-process bank of UDP relays standing in for an iptables
 REDIRECT, which asserts that more than one port was used at each end rather
-than only that the transfer succeeded. It has not yet been run against a real
-server published on a range; upstream's server supports `listen: :20000-50000`
-natively on Linux and programs the firewall rules itself, and ours still
-listens on a single port.
+than only that the transfer succeeded.
+
+It has also been run by hand against a real third-party Hysteria2 server on a
+VPS, over the internet, with Salamander obfuscation. A local relay bank
+supplied the port range, so what this proves is the client half: across a
+90-second stream the client used all six destination ports and forty-two
+distinct local ports, twenty consecutive requests returned 200, a 20 MB
+download hashed identically to the same file fetched directly, DNS went
+through the socks5 UDP associate, and no hop failed. What it does not prove is
+a server natively published on a range: upstream supports
+`listen: :20000-50000` on Linux and programs the firewall rules itself, ours
+still listens on a single port, and the server in that run saw one port and
+several source addresses rather than a range.
 
 ### Performance — the reason people pick Hysteria
 
