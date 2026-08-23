@@ -220,6 +220,39 @@ pub struct Hysteria2ClientConfig {
     pub udp_enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub obfs: Option<ObfsConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port_hopping: Option<PortHoppingConfig>,
+}
+
+/// Rotate the client's UDP port on a timer, for a server published as a port
+/// range.
+///
+/// <https://v2.hysteria.network/docs/advanced/Port-Hopping/>
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PortHoppingConfig {
+    /// Ports to hop between: `20000-50000`, `1234,5000-6000,7044`.
+    ///
+    /// This *replaces* the port in the outbound's `address`, which is then
+    /// never dialled. That is upstream's behaviour, and what a
+    /// `hysteria2://` sharing link means by its multi-port parameter.
+    ///
+    /// `address` must carry a literal IP when this is set: the peer address
+    /// is fixed for the connection's life, so a hostname has nowhere to
+    /// re-resolve to.
+    pub ports: String,
+
+    /// A fixed interval between hops, in milliseconds. Defaults to 30000, and
+    /// may not go below 5000. Mutually exclusive with the min/max pair.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interval_ms: Option<u64>,
+
+    /// A random interval drawn from `[min, max]` on every hop. Both bounds
+    /// must be given together.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_interval_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_interval_ms: Option<u64>,
 }
 
 /// How TUIC carries UDP packets.
