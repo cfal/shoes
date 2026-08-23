@@ -1022,9 +1022,19 @@ fn validate_client_config(
                 let invalid =
                     |detail: String| std::io::Error::new(std::io::ErrorKind::InvalidInput, detail);
 
-                crate::address::parse_port_union(&hopping.ports).map_err(|e| {
-                    invalid(format!("Hysteria2 port_hopping.ports is unusable: {e}"))
-                })?;
+                // Build the real settings rather than re-checking a subset of
+                // what they require. `chain_builder` expects this to have
+                // happened and `expect`s the result, so anything the
+                // constructor refuses has to be refused here or it becomes a
+                // panic at connect time - port 0 parses as a port but is not a
+                // destination, and that gap was exactly this shape.
+                crate::quic_transport::hop::HopSettings::new(
+                    &hopping.ports,
+                    hopping.interval_ms,
+                    hopping.min_interval_ms,
+                    hopping.max_interval_ms,
+                )
+                .map_err(|e| invalid(format!("Hysteria2 port_hopping is unusable: {e}")))?;
 
                 // The canonical peer address is fixed for the connection's
                 // life - that is what keeps QUIC from seeing a path change on
@@ -2117,6 +2127,19 @@ mod tests {
             let mut c = hopping("20000-20010");
             c.min_interval_ms = Some(10_000);
             let mut config = hysteria2_client_with_hopping(Some(c));
+            assert!(validate(&mut config).is_err());
+        }
+
+        /// Validation has to refuse everything `HopSettings::new` refuses:
+        /// `chain_builder` expects the config to have been validated and
+        /// `expect`s the result, so a gap between the two is a panic at
+        /// connect time rather than an error at load.
+        #[test]
+        fn test_port_hopping_rejects_port_zero() {
+            let mut config = hysteria2_client_with_hopping(Some(hopping("0-1000")));
+            assert!(validate(&mut config).is_err());
+
+            let mut config = hysteria2_client_with_hopping(Some(hopping("0,20000-20005")));
             assert!(validate(&mut config).is_err());
         }
 

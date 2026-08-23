@@ -762,9 +762,47 @@ client_proxies:
                 }
             };
 
-            // Just test parsing, not full validation with file reads
-            // since certificate files don't exist in test environment
-            println!("  ✓ Parsed successfully ({} configs)", configs.len());
+            // Parsing is not enough on its own. Several examples exist to
+            // demonstrate rules only validation enforces - a literal IP where
+            // one is required, an interval above its floor - and an example
+            // the binary refuses at startup would keep a parse-only check
+            // green.
+            //
+            // An example that points at a file on disk cannot be validated
+            // without it, and inventing one here would test the fixture. A
+            // certificate or key path is asserted on inside the PEM layer, so
+            // it has to be skipped by inspection; anything else surfaces as a
+            // missing file and is tolerated below.
+            //
+            // A `YOUR_..._HERE` placeholder is skipped deliberately: an
+            // example shipping a real REALITY private key would be worse than
+            // one that fails loudly at startup, because a copied key is a key
+            // everybody has.
+            let needs_a_fixture = content.contains(".pem")
+                || content.contains(".key")
+                || content.contains(".crt")
+                || content.contains("YOUR_");
+            if needs_a_fixture {
+                println!("  ✓ Parsed successfully ({} configs)", configs.len());
+                continue;
+            }
+
+            match crate::config::create_server_configs(configs) {
+                Ok(validated) => {
+                    println!("  ✓ Validated ({} configs)", validated.configs.len());
+                }
+                // The error kind is lost where it is wrapped in a message, so
+                // the text is what there is to go on.
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::NotFound
+                        || e.to_string().contains("No such file or directory") =>
+                {
+                    println!("  ✓ Parsed; validation needs a file that is not here");
+                }
+                Err(e) => {
+                    failures.push(format!("- {file_name}: parses but does not validate: {e}"));
+                }
+            }
         }
 
         if !failures.is_empty() {
