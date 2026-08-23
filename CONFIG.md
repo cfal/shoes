@@ -633,6 +633,9 @@ protocol:
   obfs:                        # Optional. Both ends must agree.
     type: salamander
     password: string           # At least 4 bytes
+  port_hopping:                # Optional. See below.
+    ports: "20000-50000"
+    interval_ms: 30000
 ```
 
 The password is one opaque string. A server that authenticates by username and
@@ -641,6 +644,38 @@ password expects them joined: `"<username>:<password>"`.
 A mismatched `obfs` password produces no error. Neither side can decode the
 other's packets, so the connection simply never establishes and looks exactly
 like an unreachable server. Check it first when a Hysteria2 outbound times out.
+
+#### Port hopping
+
+A Hysteria2 server is often published as a port range. `port_hopping` rotates
+the client's UDP port across that range on a timer, which is also what keeps
+the connection from holding one 4-tuple for its whole life.
+
+```yaml
+- address: 203.0.113.10:443
+  protocol:
+    type: hysteria2
+    password: ...
+    port_hopping:
+      ports: "20000-50000"       # or "1234,5000-6000,7044"
+      interval_ms: 30000         # default 30000, minimum 5000
+      # or, instead of interval_ms:
+      # min_interval_ms: 15000
+      # max_interval_ms: 45000
+```
+
+**`ports` replaces the port in `address`.** In the example above, 443 is never
+dialled. This matches the reference client, and it is what a `hysteria2://`
+link's multi-port parameter means.
+
+`address` must be a literal IP when port hopping is on. The peer address is
+fixed for the connection's life - that is what stops QUIC from seeing a path
+change on every hop - so a hostname has nowhere to re-resolve to, and the
+combination is refused at config load.
+
+Both the local and the destination port move on each hop. Rotating only the
+destination would leave the flow linkable by its unchanged source port, which
+is the thing port hopping exists to prevent.
 
 ### TUIC Client
 ```yaml

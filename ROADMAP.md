@@ -211,9 +211,24 @@ wider than it is true.
 | Gap | Effect |
 | --- | --- |
 | **Gecko obfuscation** (`obfs.type: gecko`, upstream 2.9.2) | A server with it configured is unreachable. Experimental upstream, and it builds on Salamander's scrambling rather than replacing it, so it is an added framing layer rather than a second cipher. |
-| **Port hopping** (`transport.udp.hopInterval`, `minHopInterval`, `maxHopInterval`) | Servers published as a port range expect the client to migrate between ports on a timer. Without it, only the single configured port works — and some deployments firewall all but the range. |
 | **`Hysteria-CC-RX: "auto"`** | The protocol allows the literal string as well as an integer. A parser that assumes a number must not choke on it. Our client ignores the header entirely, which is compliant, but the ignoring has to be deliberate. |
 | **Multiple users on our server** (`auth.type: userpass`, `http`, `command`) | `ServerProxyConfig::Hysteria2` takes one password. Upstream supports a user map, an HTTP callback and an external command. A client authenticating as `user:pass` works against us today only because we compare the whole string. |
+
+**Port hopping — done, client side.** A server published as a port range is
+reachable now. `src/quic_transport/hop.rs` binds a fresh UDP socket on a timer
+and rotates the destination across the configured union, reporting one constant
+address to QUIC so the connection never sees a path change. The local port
+moves with it, which is the half that stops the 4-tuple being a handle for a
+middlebox — rotating only the destination would have looked like the feature
+while leaving the flow linkable. Spec:
+[docs/superpowers/specs/2026-08-23-hysteria2-port-hopping-design.md](./docs/superpowers/specs/2026-08-23-hysteria2-port-hopping-design.md).
+
+It is covered by an in-process bank of UDP relays standing in for an iptables
+REDIRECT, which asserts that more than one port was used at each end rather
+than only that the transfer succeeded. It has not yet been run against a real
+server published on a range; upstream's server supports `listen: :20000-50000`
+natively on Linux and programs the firewall rules itself, and ours still
+listens on a single port.
 
 ### Performance — the reason people pick Hysteria
 

@@ -209,8 +209,14 @@ bounds.
 
 **Integration — the iptables mimicry.** A bank of UDP relays on a range of
 ports forwards to the single port of our own Hysteria2 server, all in process.
-This is what an iptables REDIRECT does, in userspace and without root, and it
-runs in CI on every commit. A transfer longer than three hop intervals must
+This is close to what an iptables REDIRECT does, in userspace and without root,
+and it runs in CI on every commit. It is not identical: real DNAT rewrites only
+the destination, so the server keeps seeing one client address, whereas the
+relay forwards through its own socket and the server sees a new source on every
+hop. It therefore handles the test's traffic as QUIC connection migration,
+which a real deployment would not have to. That makes the test stricter than
+the deployment rather than weaker, and it is the closest thing reachable
+without root. A transfer longer than three hop intervals must
 satisfy three assertions:
 
 1. the payload arrives intact

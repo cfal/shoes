@@ -1,0 +1,24 @@
+# A Hysteria2 server published as a port range, dialled with port hopping.
+#
+# The server side is not shoes. Point this at a Hysteria2 deployment whose
+# range is actually reachable, whether through the reference server's native
+# range support on Linux or through a DNAT rule that folds the range onto one
+# port.
+#
+# Note that `ports` replaces the port in `address`: 443 below is never dialled.
+# The address must be a literal IP, because the peer address is fixed for the
+# connection's life.
+- address: 127.0.0.1:1080
+  protocol:
+    type: socks
+  rules:
+    - mask: 0.0.0.0/0
+      action: allow
+      client_proxies:
+        - address: 203.0.113.10:443
+          protocol:
+            type: hysteria2
+            password: replace-me
+            port_hopping:
+              ports: "20000-50000"
+              interval_ms: 30000

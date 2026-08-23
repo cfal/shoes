@@ -104,6 +104,33 @@ pub fn load_config_str(config_str: &str) -> std::io::Result<Vec<Config>> {
 }
 
 #[cfg(test)]
+mod example_tests {
+    use super::*;
+
+    /// Every shipped example must parse.
+    ///
+    /// The struct-level tests cover each field in isolation; this covers the
+    /// shape of the YAML around them, which is what a reader copies. A wrong
+    /// nesting level in the documentation is invisible to a test that builds
+    /// the struct directly.
+    #[test]
+    fn test_every_example_config_parses() {
+        let mut checked = 0;
+        for entry in std::fs::read_dir("examples").expect("examples/ must exist") {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) != Some("yaml") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            serde_yaml::from_str::<Vec<Config>>(&text)
+                .unwrap_or_else(|e| panic!("{} does not parse: {e}", path.display()));
+            checked += 1;
+        }
+        assert!(checked > 10, "only {checked} examples were checked");
+    }
+}
+
+#[cfg(test)]
 mod redaction_tests {
     use super::*;
 
