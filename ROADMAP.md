@@ -185,6 +185,29 @@ group per rule, so split DNS cannot be expressed. Half the mechanism is built.
   `NWPathMonitor`, and a send that fails with a route-is-gone error, so an app
   that never wires up the callback still recovers one failed send later. No new
   handshake is needed — WireGuard peers roam. See [MOBILE.md](./MOBILE.md) §3.
+- **Address-family fallback, everywhere else.** A dual-stack host can publish
+  an IPv6 address whose UDP replies never come back while its IPv4 works. The
+  QUIC outbound used to take the first resolved address and stay there, which
+  made the outbound look permanently dead with no error; it now walks the whole
+  list (`src/quic_outbound/connection.rs`). Two things are left.
+
+  The AmneziaWG endpoint has the same shape and the same silence:
+  `src/amneziawg/connector.rs:142` resolves the tunnel's UDP peer to one
+  address and never reconsiders.
+
+  And pre-resolution quietly defeats the fallback that does exist.
+  `SocketConnectorImpl` walks every address only when handed an *unresolved*
+  location (`src/tcp/socket_connector_impl.rs:218`), so each caller that
+  resolves to a literal first — `src/http_handler.rs:417`,
+  `src/routing/udp_router.rs:1043`, `src/tuic/server.rs:535` and `:1000`,
+  `src/anytls/anytls_server_handler.rs:202`,
+  `src/vless/vless_server_handler.rs:84` — collapses the list to one behind its
+  back. That is the more interesting half: the mechanism is there and is being
+  switched off by accident.
+
+  None of this is happy eyeballs. RFC 8305 racing would also remove the three
+  seconds the QUIC fallback now spends discovering that the first address is a
+  black hole, and that is a larger change than walking a list.
 - **Cache file.** The Fake IP pool is a `Mutex<PoolState>` and nothing else
   (`src/dns/fake_ip/pool.rs`), so every mapping is lost on restart. On mobile,
   where the process is killed routinely, this is felt more than the effort
@@ -238,6 +261,12 @@ a server natively published on a range: upstream supports
 `listen: :20000-50000` on Linux and programs the firewall rules itself, ours
 still listens on a single port, and the server in that run saw one port and
 several source addresses rather than a range.
+
+That run also turned up something unrelated to hopping: the same server
+reached by hostname hung, because the name resolved to an IPv6 address whose
+UDP replies never came back and the outbound never tried the working IPv4 one.
+That is fixed, and what is left of it is the Tier 3 entry on address-family
+fallback.
 
 ### Performance — the reason people pick Hysteria
 
