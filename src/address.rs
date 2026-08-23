@@ -276,6 +276,60 @@ impl From<&NetLocation> for ResolvedLocation {
     }
 }
 
+/// Parse a comma-separated union of ports and inclusive ranges: `443`,
+/// `80,443`, `20000-50000`, or `1234,5000-6000,7044`.
+///
+/// The result is sorted and deduplicated, so a port listed twice is one
+/// candidate rather than two.
+///
+/// This is the notation used both for a listener's port range and for
+/// Hysteria2's port hopping
+/// (<https://v2.hysteria.network/docs/advanced/Port-Hopping/>). They are the
+/// same syntax and must stay the same syntax, which is why there is one
+/// parser.
+pub fn parse_port_union(s: &str) -> std::io::Result<Vec<u16>> {
+    let invalid = |detail: String| std::io::Error::new(std::io::ErrorKind::InvalidInput, detail);
+
+    let mut ports = Vec::new();
+    for part in s.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            return Err(invalid(format!("Empty port in port union: {s:?}")));
+        }
+        match part.split_once('-') {
+            Some((start, end)) => {
+                let start: u16 = start
+                    .trim()
+                    .parse()
+                    .map_err(|e| invalid(format!("Invalid port number in {part:?}: {e}")))?;
+                let end: u16 = end
+                    .trim()
+                    .parse()
+                    .map_err(|e| invalid(format!("Invalid port number in {part:?}: {e}")))?;
+                if start > end {
+                    return Err(invalid(format!(
+                        "Port range {part:?} ends before it starts"
+                    )));
+                }
+                ports.extend(start..=end);
+            }
+            None => {
+                ports.push(
+                    part.parse::<u16>()
+                        .map_err(|e| invalid(format!("Invalid port number in {part:?}: {e}")))?,
+                );
+            }
+        }
+    }
+
+    if ports.is_empty() {
+        return Err(invalid(format!("No ports in port union: {s:?}")));
+    }
+    ports.sort_unstable();
+    ports.dedup();
+    Ok(ports)
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct NetLocationPortRange {
     address: Address,
@@ -319,55 +373,7 @@ impl NetLocationPortRange {
         // Parse the address
         let address = Address::from(address_str)?;
 
-        // Parse the port ranges
-        let mut ports = Vec::new();
-        for part in port_str.split(',') {
-            if part.contains('-') {
-                // Handle range like "1-5"
-                let range_parts: Vec<&str> = part.split('-').collect();
-                if range_parts.len() != 2 {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!("Invalid port range format: {part}"),
-                    ));
-                }
-
-                let start = range_parts[0].parse::<u16>().map_err(|e| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!("Invalid port number: {e}"),
-                    )
-                })?;
-
-                let end = range_parts[1].parse::<u16>().map_err(|e| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!("Invalid port number: {e}"),
-                    )
-                })?;
-
-                if start > end {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!("Invalid port range (start > end): {start}-{end}"),
-                    ));
-                }
-
-                for port in start..=end {
-                    ports.push(port);
-                }
-            } else {
-                // Handle single port like "8"
-                let port = part.parse::<u16>().map_err(|e| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!("Invalid port number: {e}"),
-                    )
-                })?;
-
-                ports.push(port);
-            }
-        }
+        let ports = parse_port_union(port_str)?;
 
         Self::new(address, ports)
     }
@@ -760,6 +766,40 @@ mod tests {
         let range = NetLocationPortRange::from_str("[2001:db8::1]:80,443").unwrap();
         assert_eq!(range.address, Address::Ipv6("2001:db8::1".parse().unwrap()));
         assert_eq!(range.ports, vec![80, 443]);
+    }
+
+    /// One notation, two callers: the listen-address parser and Hysteria2
+    /// port hopping. Extracted so they cannot drift apart.
+    #[test]
+    fn test_port_union_accepts_the_documented_forms() {
+        assert_eq!(parse_port_union("443").unwrap(), vec![443]);
+        assert_eq!(parse_port_union("80,443").unwrap(), vec![80, 443]);
+        assert_eq!(
+            parse_port_union("1000-1003").unwrap(),
+            vec![1000, 1001, 1002, 1003]
+        );
+        assert_eq!(
+            parse_port_union("7044,5000-5002,80").unwrap(),
+            vec![80, 5000, 5001, 5002, 7044],
+            "the result is sorted and deduplicated"
+        );
+        assert_eq!(
+            parse_port_union("80,80,80").unwrap(),
+            vec![80],
+            "a repeated port is one port, not three chances of picking it"
+        );
+    }
+
+    #[test]
+    fn test_port_union_rejects_nonsense() {
+        for input in [
+            "", "  ", "0-", "-100", "80-70", "70000", "80,", "a-b", "1-2-3",
+        ] {
+            assert!(
+                parse_port_union(input).is_err(),
+                "{input:?} must not parse as a port union"
+            );
+        }
     }
 
     #[test]
