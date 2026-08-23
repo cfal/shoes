@@ -1,5 +1,69 @@
 # Changelog
 
+## Unreleased
+
+### mieru client outbound
+
+A new protocol, client side only. XChaCha20-Poly1305 with a 24-byte nonce; the
+key derived from the password, the username and the current time rounded to two
+minutes; an implicit nonce sent once per direction and then incremented; three
+metadata formats; both of upstream's padding strategies. socks5 rides inside
+the session, and UDP is framed inside that.
+
+No ARQ: over the TCP transport upstream makes ACK handling a no-op, because TCP
+already orders and retransmits.
+
+Verified against a real mieru server over the internet — bulk transfer in both
+directions with a byte-exact hash against a direct fetch, eight concurrent
+sessions, a three-minute stream, idle keep-alive reuse, DNS through the socks5
+UDP associate, and both address families. That run mattered: the tests exercise
+the client against a scripted peer built from this repository's own codec, and
+two reviews reading the Go implementation found seventeen defects while every
+one of those tests was green.
+
+Refused at config load rather than silently ignored: mieru's UDP transport,
+session multiplexing, the low-entropy encoding, port ranges, the 0-RTT
+handshake mode, and configurable traffic patterns.
+
+### Fixes
+
+- **Bracketed IPv6 addresses are parsed.** `[2001:db8::1]:443` — the form RFC
+  3986 defines and the form HTTP clients send — was classified as a hostname
+  and handed to the resolver, which answered "Name or service not known". An
+  IPv6 outbound was unreachable and the message said nothing about why. The
+  same defect made the HTTP inbound refuse `CONNECT [2001:db8::1]:443`, since
+  it split the authority on the first colon.
+- **`set_log_level` says when a level is compiled out.** Release builds compile
+  out `debug!` and `trace!`, so raising the level through the mobile FFI did
+  nothing and said nothing. The host cannot see stderr, so the warning now goes
+  through the log pipeline it is already reading.
+
+## Earlier work that was never written up
+
+This file starts at v0.2.5 and describes v0.2.9 onward in detail, but a body of
+work that landed before v0.2.9 never got an entry. Listed here so the omission
+is visible rather than silent. [ROADMAP.md](./ROADMAP.md) carries the detail
+and the scope decisions for each.
+
+- **Rule-sets.** sing-box `.srs` files are read directly — the succinct trie in
+  its on-disk shape, IP range sets, headless matching — so the existing
+  ecosystem of compiled lists works as-is. Before this, a rule as ordinary as
+  "Russian domains direct, everything else tunnelled" needed tens of thousands
+  of YAML lines. Local files only.
+- **Protocol sniffing.** The TLS ClientHello and the HTTP/1.x request line are
+  read from the first bytes of a connection, so domain rules keep working for
+  an app with a hardcoded DoH resolver or one that dials a literal IP. Opt-in
+  per listener.
+- **Hysteria2 and TUIC v5 client outbounds.** The servers existed; dialling
+  somebody else's did not. Both own their transport and are therefore terminal
+  in a chain. Both carry TCP and UDP, TUIC in both relay modes.
+- **Salamander obfuscation**, on the client and on our Hysteria2 server.
+- **Vanilla WireGuard and AmneziaWG 2.0 and 3.0**, with the tunnel runtime and
+  its virtual network stack. 3.1 arrived later and is described under v0.2.11.
+- **Fake IP** in TUN mode.
+- **The iOS and Android FFI**: start, stop, traffic statistics and last-error
+  reporting, made to behave on a phone rather than only in tests.
+
 ## v0.2.11
 
 ### AmneziaWG 3.1
