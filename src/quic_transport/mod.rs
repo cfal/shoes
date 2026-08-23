@@ -13,6 +13,7 @@
 //! drifted.
 
 pub mod fragments;
+pub mod hop;
 pub mod obfs;
 
 use std::future::Future;
