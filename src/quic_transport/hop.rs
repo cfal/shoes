@@ -9,13 +9,6 @@
 //! socket is bound on every hop rather than the destination being rewritten on
 //! one, and two sockets stay live at a time.
 
-// Nothing reaches this module from the binary until the QUIC outbound is
-// taught to use it. `lib.rs` allows dead code crate-wide but `main.rs` does
-// not, so without this the tree does not build between the commit that adds
-// the socket and the commit that wires it in. Removed by the wiring commit,
-// which is what proves every item here is actually reachable.
-#![allow(dead_code)]
-
 use std::io::IoSliceMut;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -72,6 +65,43 @@ impl HopSchedule {
                 min + Duration::from_millis(rand::rng().random_range(0..=span))
             }
         }
+    }
+}
+
+/// Upstream's default interval (`extras/transport/udphop/conn.go`).
+pub const DEFAULT_HOP_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Everything the outbound needs in order to hop, resolved from config.
+#[derive(Debug, Clone)]
+pub struct HopSettings {
+    pub ports: PortSet,
+    pub schedule: HopSchedule,
+}
+
+impl HopSettings {
+    /// Build from the config's raw fields.
+    ///
+    /// Validation has already refused the impossible combinations, so this is
+    /// the translation rather than a second check: a fixed interval and a
+    /// range cannot both be present here.
+    pub fn new(
+        ports: &str,
+        interval_ms: Option<u64>,
+        min_interval_ms: Option<u64>,
+        max_interval_ms: Option<u64>,
+    ) -> std::io::Result<Self> {
+        let schedule = match (interval_ms, min_interval_ms, max_interval_ms) {
+            (_, Some(min), Some(max)) => HopSchedule::Range {
+                min: Duration::from_millis(min),
+                max: Duration::from_millis(max),
+            },
+            (Some(interval), _, _) => HopSchedule::Fixed(Duration::from_millis(interval)),
+            _ => HopSchedule::Fixed(DEFAULT_HOP_INTERVAL),
+        };
+        Ok(Self {
+            ports: PortSet::parse(ports)?,
+            schedule,
+        })
     }
 }
 

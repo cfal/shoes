@@ -168,6 +168,7 @@ mod tests {
                 quic: crate::config::ClientQuicConfig::default(),
                 bind_interface: None,
                 obfs: None,
+                port_hopping: None,
                 default_alpn: "h3",
             },
             Arc::new(CountingAuthenticator::default()),

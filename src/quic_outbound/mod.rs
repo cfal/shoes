@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use crate::address::NetLocation;
 use crate::config::ClientQuicConfig;
+use crate::quic_transport::hop::{HopSettings, HoppingUdpSocket, SocketFactory, spawn_hop_task};
 use crate::quic_transport::obfs::{ObfuscatedUdpSocket, Obfuscator};
 use crate::quic_transport::{QuicTransportParams, effective_mtu};
 use crate::rustls_config_util::create_client_config;
@@ -27,6 +28,10 @@ pub struct QuicOutboundSettings {
     pub quic: ClientQuicConfig,
     pub bind_interface: Option<String>,
     pub obfs: Option<Arc<dyn Obfuscator>>,
+    /// When set, the outbound rotates its UDP port on a timer instead of
+    /// dialling `server`'s port. Hysteria2 only; no other protocol here has a
+    /// server that would understand it.
+    pub port_hopping: Option<HopSettings>,
     /// ALPN used when the configuration does not name one.
     pub default_alpn: &'static str,
 }
@@ -112,27 +117,68 @@ impl QuicOutboundSettings {
             max_idle_timeout: Duration::from_secs(30),
             keep_alive_interval: Duration::from_secs(10),
             mtu: self.effective_mtu(),
-            enable_segmentation_offload: self.obfs.is_none(),
+            // The hopping socket reports one segment per transmit, so asking
+            // quinn to coalesce would only produce transmits it has to refuse.
+            enable_segmentation_offload: self.obfs.is_none() && self.port_hopping.is_none(),
         };
         client_config.transport_config(Arc::new(transport.build()));
 
-        let udp_socket = new_udp_socket(server_is_ipv6, self.bind_interface.clone())?;
-        let udp_socket = udp_socket.into_std()?;
+        let Some(hop) = self.port_hopping.clone() else {
+            // Unchanged path: without hopping, nothing about how the socket is
+            // built or handed to quinn changes.
+            let udp_socket = new_udp_socket(server_is_ipv6, self.bind_interface.clone())?;
+            let udp_socket = udp_socket.into_std()?;
 
-        let mut endpoint = match self.obfs.clone() {
-            Some(obfs) => quinn::Endpoint::new_with_abstract_socket(
-                quinn::EndpointConfig::default(),
-                None,
-                Arc::new(ObfuscatedUdpSocket::new(udp_socket, obfs)?),
-                Arc::new(quinn::TokioRuntime),
-            )?,
-            None => quinn::Endpoint::new(
-                quinn::EndpointConfig::default(),
-                None,
-                udp_socket,
-                Arc::new(quinn::TokioRuntime),
-            )?,
+            let mut endpoint = match self.obfs.clone() {
+                Some(obfs) => quinn::Endpoint::new_with_abstract_socket(
+                    quinn::EndpointConfig::default(),
+                    None,
+                    Arc::new(ObfuscatedUdpSocket::new(udp_socket, obfs)?),
+                    Arc::new(quinn::TokioRuntime),
+                )?,
+                None => quinn::Endpoint::new(
+                    quinn::EndpointConfig::default(),
+                    None,
+                    udp_socket,
+                    Arc::new(quinn::TokioRuntime),
+                )?,
+            };
+            endpoint.set_default_client_config(client_config);
+            return Ok(endpoint);
         };
+
+        // Hopping binds sockets for the life of the connection, so the factory
+        // is the only way one is made here: new_udp_socket consults the VPN
+        // protector, and a socket that skipped it would be routed back into
+        // the tunnel it carries.
+        let bind_interface = self.bind_interface.clone();
+        let obfs = self.obfs.clone();
+        let factory: SocketFactory = Arc::new(move || {
+            let socket = new_udp_socket(server_is_ipv6, bind_interface.clone())?.into_std()?;
+            match obfs.clone() {
+                Some(obfs) => Ok(Arc::new(ObfuscatedUdpSocket::new(socket, obfs)?)),
+                None => quinn::Runtime::wrap_udp_socket(&quinn::TokioRuntime, socket),
+            }
+        });
+
+        // Config validation refuses port hopping with a hostname address, so
+        // this is a resolved literal by construction.
+        let canonical = self.server.to_socket_addr_nonblocking().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "port hopping needs a literal server address",
+            )
+        })?;
+
+        let socket = HoppingUdpSocket::new(factory, canonical, hop.ports)?;
+        spawn_hop_task(&socket, hop.schedule);
+
+        let mut endpoint = quinn::Endpoint::new_with_abstract_socket(
+            quinn::EndpointConfig::default(),
+            None,
+            socket,
+            Arc::new(quinn::TokioRuntime),
+        )?;
         endpoint.set_default_client_config(client_config);
         Ok(endpoint)
     }
@@ -151,6 +197,7 @@ mod tests {
             quic: ClientQuicConfig::default(),
             bind_interface: None,
             obfs: None,
+            port_hopping: None,
             default_alpn: "h3",
         }
     }

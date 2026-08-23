@@ -114,6 +114,9 @@ impl TuicConnector {
             bind_interface,
             // TUIC has no obfuscation layer of its own.
             obfs: None,
+            // TUIC has no port hopping in its protocol; offering the
+            // setting would offer something no real server understands.
+            port_hopping: None,
             default_alpn: "h3",
         };
 

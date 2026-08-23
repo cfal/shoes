@@ -133,6 +133,15 @@ fn build_terminal_connector(config: ClientConfig) -> Arc<dyn TerminalConnector> 
         ClientProxyConfig::Hysteria2(hysteria2) => {
             let obfs = build_obfuscator(hysteria2.obfs.as_ref())
                 .expect("obfuscation settings were validated during config load");
+            let port_hopping = hysteria2.port_hopping.as_ref().map(|hopping| {
+                crate::quic_transport::hop::HopSettings::new(
+                    &hopping.ports,
+                    hopping.interval_ms,
+                    hopping.min_interval_ms,
+                    hopping.max_interval_ms,
+                )
+                .expect("port hopping settings were validated during config load")
+            });
             Arc::new(crate::hysteria2::Hysteria2Connector::new(
                 config.address,
                 hysteria2.password.into_inner(),
@@ -140,6 +149,7 @@ fn build_terminal_connector(config: ClientConfig) -> Arc<dyn TerminalConnector> 
                 config.quic_settings.unwrap_or_default(),
                 config.bind_interface.into_option(),
                 obfs,
+                port_hopping,
             ))
         }
         ClientProxyConfig::Tuic(tuic) => Arc::new(

@@ -12,6 +12,7 @@ use crate::config::ClientQuicConfig;
 use crate::quic_outbound::QuicOutboundSettings;
 use crate::quic_outbound::connection::LiveConnection;
 use crate::quic_stream::QuicStream;
+use crate::quic_transport::hop::HopSettings;
 use crate::quic_transport::obfs::Obfuscator;
 use crate::resolver::Resolver;
 use crate::tcp::tcp_handler::TcpClientSetupResult;
@@ -40,6 +41,7 @@ impl std::fmt::Debug for Hysteria2Connector {
 }
 
 impl Hysteria2Connector {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         server: NetLocation,
         password: String,
@@ -47,6 +49,7 @@ impl Hysteria2Connector {
         quic: ClientQuicConfig,
         bind_interface: Option<String>,
         obfs: Option<Arc<dyn Obfuscator>>,
+        port_hopping: Option<HopSettings>,
     ) -> Self {
         let authenticator = Arc::new(Hysteria2Authenticator::new(password));
         let settings = QuicOutboundSettings {
@@ -54,6 +57,7 @@ impl Hysteria2Connector {
             quic,
             bind_interface,
             obfs,
+            port_hopping,
             default_alpn: "h3",
         };
         Self {
@@ -271,6 +275,7 @@ mod tests {
             client_quic_config(),
             None,
             obfs,
+            None,
         )
     }
 
@@ -544,6 +549,7 @@ mod tests {
             SERVER_PASSWORD.to_string(),
             false,
             client_quic_config(),
+            None,
             None,
             None,
         );
