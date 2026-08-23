@@ -136,6 +136,51 @@ impl HoppingUdpSocket {
             waker: AtomicWaker::new(),
         }))
     }
+
+    /// Bind a fresh socket, pick a fresh destination, and retire the oldest.
+    ///
+    /// The ordering mirrors upstream: the socket that was previous is dropped
+    /// — which closes it — the current becomes previous, and the new one
+    /// becomes current. Two sockets are therefore live between hops, and that
+    /// is what covers the datagrams already in flight to the old port.
+    ///
+    /// A failure leaves everything as it was. Losing a working connection
+    /// because a hop could not bind would turn an anti-blocking feature into
+    /// an outage.
+    pub fn hop(&self) -> std::io::Result<()> {
+        let socket = (self.factory)()?;
+        let destination = SocketAddr::new(self.canonical.ip(), self.ports.pick());
+
+        {
+            let mut state = self.state.write();
+            state.previous = Some(std::mem::replace(&mut state.current, socket));
+            state.destination = destination;
+            state.generation += 1;
+        }
+
+        self.waker.wake();
+        Ok(())
+    }
+}
+
+/// Drive `socket` on `schedule` until it is dropped.
+///
+/// The task holds a `Weak`, so it ends when the endpoint does rather than
+/// keeping a connection's sockets alive forever.
+pub fn spawn_hop_task(socket: &Arc<HoppingUdpSocket>, schedule: HopSchedule) {
+    let weak = Arc::downgrade(socket);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(schedule.next()).await;
+            let Some(socket) = weak.upgrade() else {
+                return;
+            };
+            if let Err(e) = socket.hop() {
+                // Staying put beats dropping a working connection.
+                log::warn!("port hop failed, keeping the current socket: {e}");
+            }
+        }
+    });
 }
 
 /// Report every datagram in the batch as having come from `canonical`.
@@ -381,6 +426,153 @@ mod tests {
             })
             .unwrap_err();
         assert!(err.to_string().contains("segmented"), "{err}");
+    }
+
+    /// A factory that counts its calls and fails once it has made `budget`
+    /// sockets.
+    fn counting_factory(budget: usize) -> SocketFactory {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        Arc::new(move || {
+            if calls.fetch_add(1, Ordering::SeqCst) >= budget {
+                return Err(std::io::Error::other("factory exhausted"));
+            }
+            let socket = UdpSocket::bind("127.0.0.1:0")?;
+            TokioRuntime.wrap_udp_socket(socket)
+        })
+    }
+
+    /// The point of the feature: the local port moves too. Rotating only the
+    /// destination leaves the flow linkable by its unchanged source.
+    #[tokio::test]
+    async fn test_a_hop_binds_a_new_local_port() {
+        let peer: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let socket = fixed_socket(peer);
+
+        let before = socket.local_addr().unwrap();
+        socket.hop().unwrap();
+        let after = socket.local_addr().unwrap();
+
+        assert_ne!(before, after, "the local port did not move");
+    }
+
+    /// The server may already have sent to the old port. Without the overlap
+    /// those datagrams are lost, and on a busy connection that is a stall.
+    #[tokio::test]
+    async fn test_the_previous_socket_still_receives_after_a_hop() {
+        let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        let socket = fixed_socket(peer_addr);
+
+        // Let the peer learn the pre-hop local address.
+        send(&socket, b"before").await;
+        let mut buf = [0u8; 64];
+        let (_, old_local) = peer.recv_from(&mut buf).unwrap();
+
+        socket.hop().unwrap();
+
+        // The server answers the address it knew about.
+        peer.send_to(b"late reply", old_local).unwrap();
+
+        let mut recv_buf = [0u8; 64];
+        let (len, _) =
+            tokio::time::timeout(Duration::from_secs(5), recv_one(&socket, &mut recv_buf))
+                .await
+                .expect("a datagram sent to the previous socket must still arrive");
+        assert_eq!(&recv_buf[..len], b"late reply");
+    }
+
+    /// Two hops later the oldest socket is gone. Keeping every socket would
+    /// leak a descriptor per hop for the life of the connection.
+    #[tokio::test]
+    async fn test_the_socket_from_two_hops_ago_is_closed() {
+        let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        let socket = fixed_socket(peer_addr);
+
+        send(&socket, b"first").await;
+        let mut buf = [0u8; 64];
+        let (_, oldest_local) = peer.recv_from(&mut buf).unwrap();
+
+        socket.hop().unwrap();
+        socket.hop().unwrap();
+
+        peer.send_to(b"too late", oldest_local).unwrap();
+
+        let mut recv_buf = [0u8; 64];
+        let outcome =
+            tokio::time::timeout(Duration::from_millis(300), recv_one(&socket, &mut recv_buf))
+                .await;
+        assert!(
+            outcome.is_err(),
+            "a datagram to the socket from two hops ago must not arrive"
+        );
+    }
+
+    /// A hop that cannot bind must not take the connection down. Turning an
+    /// anti-blocking feature into an outage is worse than not having it.
+    #[tokio::test]
+    async fn test_a_failed_hop_leaves_the_current_socket_working() {
+        let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+
+        // One socket for construction, nothing left for a hop.
+        let socket = HoppingUdpSocket::new(
+            counting_factory(1),
+            peer_addr,
+            PortSet::parse(&peer_addr.port().to_string()).unwrap(),
+        )
+        .unwrap();
+
+        let before = socket.local_addr().unwrap();
+        assert!(socket.hop().is_err(), "the factory was set to fail");
+        assert_eq!(
+            socket.local_addr().unwrap(),
+            before,
+            "a failed hop must leave the working socket in place"
+        );
+
+        send(&socket, b"still alive").await;
+        let mut buf = [0u8; 64];
+        let (n, _) = peer.recv_from(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"still alive");
+    }
+
+    /// Without this wake, a task parked on the old socket waits for a datagram
+    /// that may never come.
+    #[tokio::test]
+    async fn test_a_hop_wakes_a_parked_receiver() {
+        let peer: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let socket = fixed_socket(peer);
+        let parked = socket.clone();
+
+        let receiver = tokio::spawn(async move {
+            let mut recv_buf = [0u8; 64];
+            let mut bufs = [IoSliceMut::new(&mut recv_buf)];
+            let mut meta = [RecvMeta::default()];
+            let mut polls = 0u32;
+            std::future::poll_fn(|cx| {
+                polls += 1;
+                if polls > 1 {
+                    // Woken again, which is all this test is asking about.
+                    return Poll::Ready(());
+                }
+                let _ = parked.poll_recv(cx, &mut bufs, &mut meta);
+                Poll::Pending
+            })
+            .await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        socket.hop().unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), receiver)
+            .await
+            .expect("the hop must wake a parked receiver")
+            .unwrap();
     }
 
     #[test]
