@@ -285,6 +285,142 @@ mod tests {
             .into()
     }
 
+    /// What the relay bank observed, which is the only window the test has
+    /// into whether hopping actually happened.
+    #[derive(Default)]
+    struct RelayObservations {
+        /// Bank-side ports that carried at least one datagram.
+        server_ports: std::collections::HashSet<u16>,
+        /// Client source ports seen. This is what proves the local rebind,
+        /// which is the half of the feature that makes the flow unlinkable.
+        client_ports: std::collections::HashSet<u16>,
+    }
+
+    /// Stand in for an `iptables REDIRECT`: bind `count` UDP ports and forward
+    /// everything that arrives to `server`, relaying the replies back.
+    ///
+    /// Not a perfect stand-in. Real DNAT rewrites only the destination, so the
+    /// server keeps seeing one client address; this relays through its own
+    /// socket, so the server sees a new source on every hop and treats it as
+    /// QUIC connection migration. That makes the test stricter than the real
+    /// deployment rather than weaker, and it is the closest thing reachable
+    /// without root.
+    async fn spawn_relay_bank(
+        server: SocketAddr,
+        count: usize,
+    ) -> (Vec<u16>, Arc<std::sync::Mutex<RelayObservations>>) {
+        let seen = Arc::new(std::sync::Mutex::new(RelayObservations::default()));
+        let mut ports = Vec::with_capacity(count);
+
+        for _ in 0..count {
+            let front = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let port = front.local_addr().unwrap().port();
+            ports.push(port);
+
+            let seen = seen.clone();
+            tokio::spawn(async move {
+                let back = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                back.connect(server).await.unwrap();
+
+                let mut from_client = [0u8; 2048];
+                let mut from_server = [0u8; 2048];
+                let mut client: Option<SocketAddr> = None;
+
+                loop {
+                    tokio::select! {
+                        Ok((n, peer)) = front.recv_from(&mut from_client) => {
+                            client = Some(peer);
+                            {
+                                let mut seen = seen.lock().unwrap();
+                                seen.server_ports.insert(port);
+                                seen.client_ports.insert(peer.port());
+                            }
+                            let _ = back.send(&from_client[..n]).await;
+                        }
+                        Ok(n) = back.recv(&mut from_server) => {
+                            if let Some(peer) = client {
+                                let _ = front.send_to(&from_server[..n], peer).await;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        (ports, seen)
+    }
+
+    /// The whole feature, end to end: a server published as a port range, a
+    /// client that rotates across it, and a transfer that outlives several
+    /// hops.
+    ///
+    /// The last two assertions are the test. Without them it passes with
+    /// hopping switched off entirely, which is exactly the kind of green test
+    /// that lets a feature ship doing nothing.
+    #[tokio::test]
+    async fn test_a_transfer_survives_several_hops() {
+        let (server, _cert) = spawn_server(None).await;
+        let echo = spawn_tcp_echo().await;
+        let resolver = test_resolver();
+
+        let (ports, seen) = spawn_relay_bank(server, 6).await;
+        let range = ports
+            .iter()
+            .map(|p| p.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+
+        // 200ms, far below the 5000ms config floor. That floor is a
+        // validation rule, not a property of the mechanism, and raising it
+        // here would turn the test into a minute of waiting.
+        let hop =
+            crate::quic_transport::hop::HopSettings::new(&range, Some(200), None, None).unwrap();
+
+        let connector = Hysteria2Connector::new(
+            NetLocation::from_str(&format!("127.0.0.1:{}", ports[0]), None).unwrap(),
+            SERVER_PASSWORD.to_string(),
+            true,
+            client_quic_config(),
+            None,
+            None,
+            Some(hop),
+        );
+
+        let result = connector
+            .connect_tcp(&resolver, target(echo))
+            .await
+            .unwrap();
+        let mut stream = result.client_stream;
+
+        // Nine exchanges a quarter-second apart outlive several hops.
+        for i in 0..9u8 {
+            let payload = [i; 32];
+            stream.write_all(&payload).await.unwrap();
+            stream.flush().await.unwrap();
+
+            let mut buf = [0u8; 32];
+            tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut buf))
+                .await
+                .expect("the transfer stalled across a hop")
+                .unwrap();
+            assert_eq!(buf, payload, "exchange {i} came back corrupted");
+
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+
+        let seen = seen.lock().unwrap();
+        assert!(
+            seen.server_ports.len() >= 2,
+            "every datagram went to one server port, so nothing hopped: {:?}",
+            seen.server_ports
+        );
+        assert!(
+            seen.client_ports.len() >= 2,
+            "the client kept one local port, so the 4-tuple never changed: {:?}",
+            seen.client_ports
+        );
+    }
+
     #[tokio::test]
     async fn test_tcp_round_trip() {
         let (server, _cert) = spawn_server(None).await;
