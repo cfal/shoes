@@ -10,6 +10,7 @@
 # History:
 #   9757392  mobile @ 367cff0, before the control API
 #   9761568  + 4176  extracting the lifecycle into shoes::control
+#   9760224  - 1344  control::start(), which iOS and Android had a copy of each
 #
 # On that +4176: it is real code, not section padding -- .text grew 2056,
 # .rodata 512, .data.rel.ro 576, .rela.dyn 768, .eh_frame 236. It is not the
@@ -19,7 +20,7 @@
 # its own compilation unit with a stop_service/stop_handle split rather than
 # one function inlined into its single caller.
 #
-# Judged worth paying: 4176 bytes is 0.04% of the library, against a MOBILE.md
-# precedent that declined a 1.0 MiB saving because the build complexity cost
-# more than the megabyte was worth.
-9761568
+# Judged worth paying: the net 2832 bytes is 0.03% of the library, against a
+# MOBILE.md precedent that declined a 1.0 MiB saving because the build
+# complexity cost more than the megabyte was worth.
+9760224

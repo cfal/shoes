@@ -26,12 +26,11 @@ use std::sync::atomic::Ordering;
 use log::{error, info};
 use parking_lot::Mutex;
 use std::sync::OnceLock;
-use tokio::sync::oneshot;
 
 use crate::logging::{DynamicFileLogWriter, LogWriter};
 
 use super::common::{
-    self, INITIALIZED, LOG_FILE, LOGGER_INITIALIZED, TUN_SERVICE, TunServiceHandle, setup_log_file,
+    self, INITIALIZED, LOG_FILE, LOGGER_INITIALIZED, TUN_SERVICE, setup_log_file,
 };
 
 /// Socket protector callback type.
@@ -208,27 +207,10 @@ pub unsafe extern "C" fn shoes_start(
         }
     };
 
-    let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
-    let running_clone = running.clone();
-
-    runtime.spawn(async move {
-        match common::run_prepared(prepared, shutdown_rx).await {
-            Ok(()) => info!("shoes service stopped normally"),
-            Err(e) => {
-                let msg = e.to_string();
-                error!("shoes service error: {}", msg);
-                common::set_last_error(msg);
-            }
-        }
-        running_clone.store(false, Ordering::SeqCst);
-    });
-
-    let handle = TunServiceHandle {
-        shutdown_tx: Some(shutdown_tx),
-        running,
-        runtime,
-    };
+    // The runtime is built here, with two worker threads, rather than inside
+    // control::start: a Network Extension's memory limit is what sets that
+    // number, and Android wants all the cores instead.
+    let handle = crate::control::start(runtime, prepared, common::set_last_error);
 
     // get_or_init, not get().unwrap(): a caller that reaches shoes_start
     // without shoes_init would otherwise panic across the FFI boundary.

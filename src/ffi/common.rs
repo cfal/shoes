@@ -17,9 +17,7 @@ use log::info;
 // Only what ios.rs and android.rs actually name. `mod common` is private, so
 // re-exporting more than that is an unused import rather than a public API --
 // and the Android clippy job builds with -D warnings.
-pub use crate::control::{
-    ServiceHandle as TunServiceHandle, prepare_from_config, run_prepared,
-};
+pub use crate::control::{ServiceHandle as TunServiceHandle, prepare_from_config};
 
 /// Global log file handle for file-based logging.
 pub static LOG_FILE: OnceLock<parking_lot::Mutex<Option<File>>> = OnceLock::new();

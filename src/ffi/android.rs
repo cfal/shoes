@@ -27,13 +27,12 @@ use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jint, jlong};
 use jni::{EnvUnowned, Outcome};
 use log::{Record, error, info};
 use tokio::runtime::Runtime;
-use tokio::sync::oneshot;
 
 use crate::logging::{DynamicFileLogWriter, LogWriter};
 use crate::socket_protector::{FnSocketProtector, set_global_socket_protector};
 
 use super::common::{
-    self, LOG_FILE, LOGGER_INITIALIZED, TUN_SERVICE, TunServiceHandle, setup_log_file,
+    self, LOG_FILE, LOGGER_INITIALIZED, TUN_SERVICE, setup_log_file,
 };
 
 /// Writes to Android logcat. Uses the `record` arg for level mapping;
@@ -289,30 +288,10 @@ pub extern "system" fn Java_com_shoesproxy_ShoesNative_start<'local>(
         }
     };
 
-    let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
-    let running_clone = running.clone();
-
-    runtime.spawn(async move {
-        info!("Shoes service task started");
-
-        match common::run_prepared(prepared, shutdown_rx).await {
-            Ok(()) => info!("Shoes service stopped normally"),
-            Err(e) => {
-                let msg = e.to_string();
-                error!("Shoes service error: {}", msg);
-                common::set_last_error(msg);
-            }
-        }
-
-        running_clone.store(false, Ordering::SeqCst);
-    });
-
-    let handle = TunServiceHandle {
-        runtime,
-        shutdown_tx: Some(shutdown_tx),
-        running,
-    };
+    // Runtime::new() above, not a pinned worker count: Android has no Network
+    // Extension memory limit to stay under, so it takes the cores it can get.
+    // That is why control::start receives a runtime rather than building one.
+    let handle = crate::control::start(runtime, prepared, common::set_last_error);
 
     let service = TUN_SERVICE.get_or_init(|| parking_lot::Mutex::new(None));
     *service.lock() = Some(handle);

@@ -97,6 +97,63 @@ pub fn stop_handle(mut handle: ServiceHandle) -> bool {
     stopped
 }
 
+impl ServiceHandle {
+    /// Whether the service task is still running.
+    pub fn is_running(&self) -> bool {
+        self.running.load(Ordering::SeqCst)
+    }
+}
+
+/// Start a prepared service on `runtime`, and hand back a handle to it.
+///
+/// The runtime is the caller's rather than ours: iOS pins it to two worker
+/// threads to stay inside a Network Extension's memory limit, while Android
+/// takes `Runtime::new()` and all the cores it can get. That is a policy this
+/// module has no business deciding, and folding the two into one default would
+/// quietly change one of them.
+///
+/// `on_error` is called from the service task if the stack stops with an error.
+/// The FFI uses it to fill `LAST_ERROR`, which is how a C caller — which cannot
+/// receive a Rust enum carrying a String — learns what happened.
+///
+/// # One service per process
+///
+/// The traffic counters in `crate::tun::traffic` are process-global statics, so
+/// a second concurrent `ServiceHandle` in one process would report the sum of
+/// both services. Each privileged host runs exactly one tunnel, so this costs
+/// nothing in practice — but it is an invariant this API depends on rather than
+/// an accident.
+pub fn start(
+    runtime: tokio::runtime::Runtime,
+    prepared: PreparedService,
+    on_error: impl Fn(String) + Send + 'static,
+) -> ServiceHandle {
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let running = Arc::new(AtomicBool::new(true));
+    let running_clone = running.clone();
+
+    runtime.spawn(async move {
+        info!("shoes service task started");
+
+        match run_prepared(prepared, shutdown_rx).await {
+            Ok(()) => info!("shoes service stopped normally"),
+            Err(e) => {
+                let msg = e.to_string();
+                error!("shoes service error: {}", msg);
+                on_error(msg);
+            }
+        }
+
+        running_clone.store(false, Ordering::SeqCst);
+    });
+
+    ServiceHandle {
+        runtime,
+        shutdown_tx: Some(shutdown_tx),
+        running,
+    }
+}
+
 /// A config that has been parsed, validated, and had its DNS resolvers built.
 ///
 /// Preparing is separate from running so that the host can do it on the calling
@@ -227,4 +284,57 @@ pub async fn run_prepared(
     }
 
     result
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn current_thread_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    fn prepare(yaml: &str) -> std::io::Result<PreparedService> {
+        current_thread_runtime().block_on(prepare_from_config(yaml))
+    }
+
+    /// A config with no TUN section must fail before anything is spawned, so
+    /// the caller gets a verdict instead of a handle that dies moments later.
+    #[test]
+    fn test_prepare_rejects_a_config_with_no_tun() {
+        let err = prepare("---\n[]\n").map(|_| ()).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("No TUN config found"));
+    }
+
+    /// A TUN section is recognised by device_name or device_fd, so this one is
+    /// a TUN config that names no descriptor. The descriptor is the caller's,
+    /// so that cannot be run and must be said here rather than inside a task.
+    #[test]
+    fn test_prepare_rejects_a_tun_without_a_descriptor() {
+        let err = prepare("---\n- device_name: tun0\n  address: 10.0.0.2\n")
+            .map(|_| ())
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("device_fd"),
+            "expected a device_fd complaint, got: {err}"
+        );
+    }
+
+    /// Two TUN sections have no defined meaning, and silently taking the first
+    /// would route a user's traffic somewhere they did not ask for.
+    #[test]
+    fn test_prepare_rejects_two_tun_configs() {
+        let err = prepare("---\n- device_fd: 3\n- device_fd: 4\n")
+            .map(|_| ())
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("Multiple TUN configs"),
+            "expected a multiple-TUN complaint, got: {err}"
+        );
+    }
 }
