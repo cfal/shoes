@@ -268,8 +268,9 @@ pub fn start(
 ///
 /// Preparing is separate from running so that the host can do it on the calling
 /// thread and answer `start` with a real verdict. Everything that a bad config
-/// can fail at — YAML syntax, missing `device_fd`, an unusable key, a resolver
-/// that will not build — fails here, in front of the caller, instead of inside
+/// can fail at — YAML syntax, a device the host cannot provide, an unusable
+/// key, a resolver that will not build — fails here, in front of the caller,
+/// instead of inside
 /// a spawned task whose error the app only learns about by polling
 /// `isRunning()` and finding it already false.
 pub struct PreparedService {
@@ -283,7 +284,11 @@ pub struct PreparedService {
 ///
 /// This parses the config YAML and starts both TUN and any Server configs
 /// (like mixed HTTP+SOCKS5 servers) that are defined in the config.
-/// The config YAML must already have device_fd set in the TUN config.
+///
+/// What the TUN section must contain depends on `policy`: under
+/// [`DevicePolicy::BorrowedFd`] it needs a `device_fd` the host already owns,
+/// and under [`DevicePolicy::Owned`] it must not have one, because the service
+/// creates the device itself.
 pub async fn start_from_config(
     config_yaml: &str,
     policy: DevicePolicy,
@@ -315,7 +320,8 @@ pub async fn prepare_from_config(
     // Build DNS registry from expanded groups
     let dns_registry = build_dns_registry(dns_groups).await?;
 
-    // Separate TUN config from server configs, validate exactly one TUN with device_fd
+    // Separate TUN config from server configs, and check the one TUN against
+    // what this host can provide -- see DevicePolicy.
     let mut tun_config = None;
     let mut server_configs = Vec::new();
 
@@ -325,7 +331,7 @@ pub async fn prepare_from_config(
                 if tun_config.is_some() {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
-                        "Multiple TUN configs found - only one is allowed for mobile",
+                        "Multiple TUN configs found - only one is allowed",
                     ));
                 }
                 device::validate(&tc, policy)?;

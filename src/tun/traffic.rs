@@ -55,6 +55,15 @@ pub fn active_connections() -> usize {
     ACTIVE_CONNECTIONS.load(Ordering::Relaxed)
 }
 
+/// Serialises tests that move [`ACTIVE_CONNECTIONS`].
+///
+/// The counter is process-global and cargo runs tests in parallel, so a test
+/// in `control::stats` and one in `tun::tcp_stack_direct` can otherwise
+/// interleave and read each other's increments. The lock lives here, next to
+/// the state it guards, rather than in either caller.
+#[cfg(all(test, feature = "control-stats"))]
+pub static COUNTER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Zero the live-connection count.
 ///
 /// Called when the stack thread exits: whatever it was still holding is gone

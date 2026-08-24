@@ -44,17 +44,15 @@ pub fn snapshot() -> StatsSnapshot {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use crate::tun::traffic::{connection_closed, connection_opened, reset_active_connections};
-    use std::sync::Mutex;
-
-    // The counter is process-global, so tests that move it must not interleave.
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
+    use crate::tun::traffic::{
+        COUNTER_TEST_LOCK, connection_closed, connection_opened, reset_active_connections,
+    };
 
     /// The count has to come back down, or a host shows a number that only
     /// ever grows and means nothing after an hour.
     #[test]
     fn test_the_count_rises_and_falls() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = COUNTER_TEST_LOCK.lock().unwrap();
         reset_active_connections();
         assert_eq!(snapshot().active_connections, 0);
 
@@ -73,7 +71,7 @@ mod tests {
     /// socket, so an unmatched close must floor at zero rather than wrap.
     #[test]
     fn test_an_unmatched_close_floors_at_zero() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = COUNTER_TEST_LOCK.lock().unwrap();
         reset_active_connections();
 
         connection_closed();

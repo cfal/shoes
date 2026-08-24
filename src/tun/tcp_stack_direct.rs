@@ -1449,6 +1449,12 @@ mod tests {
     #[cfg(feature = "control-stats")]
     #[test]
     fn test_the_connection_count_does_not_survive_the_stack() {
+        // Shared with control::stats' tests: the counter is process-global and
+        // cargo runs these in parallel, so without this they read each other's
+        // increments.
+        let _guard = super::super::traffic::COUNTER_TEST_LOCK.lock().unwrap();
+        super::super::traffic::reset_active_connections();
+
         let (server, client) = UnixStream::pair().expect("Failed to create socket pair");
         let client_fd = client.into_raw_fd();
 
