@@ -52,7 +52,7 @@ use crate::quic_transport::{
 };
 use crate::resolver::{Resolver, ResolverCache};
 use crate::stream_reader::StreamReader;
-use crate::tcp::tcp_forward::setup_client_tcp_stream;
+use crate::tcp::tcp_forward::connect_client_tcp_stream;
 use crate::util::allocate_vec;
 
 use super::frame::{
@@ -884,6 +884,27 @@ async fn handle_tcp_header(
     Ok((remote_location, stream_reader))
 }
 
+/// What the client is told about a dial that failed.
+///
+/// Upstream returns the dial error's own text (`core/server/server.go:313`),
+/// and for a server that only ever dials directly that is the same thing as
+/// this. Ours can dial through a chain, and those errors name the upstream hop:
+/// `LiveConnection`'s "no resolved address for {server} could be connected"
+/// carries the address of the next proxy. A client asking for a target has no
+/// business learning our topology from a failure, so it gets the kind, and the
+/// operator's log keeps the rest.
+fn refusal_reason(e: &std::io::Error) -> &'static str {
+    use std::io::ErrorKind::*;
+    match e.kind() {
+        ConnectionRefused => "connection refused",
+        TimedOut => "timed out",
+        HostUnreachable | NetworkUnreachable | AddrNotAvailable => "unreachable",
+        NotFound => "no such host",
+        PermissionDenied => "not permitted",
+        _ => "connection failed",
+    }
+}
+
 /// Answer the client's TCP request, once the outcome is actually known.
 async fn write_tcp_response(
     stream: &mut Box<dyn AsyncStream>,
@@ -910,10 +931,15 @@ async fn process_tcp_stream(
 
     let mut server_stream: Box<dyn AsyncStream> = Box::new(QuicStream::from(send, recv));
 
+    // `connect_client_tcp_stream`, not `setup_client_tcp_stream`: the latter
+    // writes the chain's early data into the requester's stream as soon as it
+    // has it, which here would put the target's first bytes *in front of* our
+    // response. The client would then parse the target's greeting as a status
+    // byte and a message length. The early data is written below, after the
+    // response it belongs behind.
     let setup_client_stream_future = timeout(
         Duration::from_secs(60),
-        setup_client_tcp_stream(
-            &mut server_stream,
+        connect_client_tcp_stream(
             client_proxy_selector,
             resolver,
             remote_location.clone().into(),
@@ -923,8 +949,8 @@ async fn process_tcp_stream(
     // Every arm below answers before it gives up. A client that is told
     // nothing sees a stream that opened and closed, and cannot tell a refused
     // target from a server that fell over.
-    let mut client_stream = match setup_client_stream_future.await {
-        Ok(Ok(Some(s))) => s,
+    let (mut client_stream, early_data) = match setup_client_stream_future.await {
+        Ok(Ok(Some(pair))) => pair,
         Ok(Ok(None)) => {
             // Must have been blocked. The rule that blocked it is ours and
             // stays ours; the client is told the request was refused.
@@ -933,7 +959,7 @@ async fn process_tcp_stream(
             return Ok(());
         }
         Ok(Err(e)) => {
-            let _ = write_tcp_response(&mut server_stream, Err(&e.to_string())).await;
+            let _ = write_tcp_response(&mut server_stream, Err(refusal_reason(&e))).await;
             let _ = server_stream.shutdown().await;
             return Err(std::io::Error::new(
                 e.kind(),
@@ -951,6 +977,13 @@ async fn process_tcp_stream(
     };
 
     write_tcp_response(&mut server_stream, Ok(())).await?;
+
+    // Now, and not before: these are the target's bytes and they belong behind
+    // the response.
+    if let Some(data) = early_data {
+        server_stream.write_all(&data).await?;
+        server_stream.flush().await?;
+    }
 
     let unparsed_data = stream_reader.unparsed_data();
     let client_requires_flush = if unparsed_data.is_empty() {

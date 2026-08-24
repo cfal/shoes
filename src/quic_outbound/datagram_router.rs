@@ -30,17 +30,26 @@ pub type SessionKeyFn = fn(&[u8]) -> Option<u32>;
 /// The router belongs to a single connection rather than to the outbound, so
 /// that ending it can fail every session on it without touching sessions that
 /// have since been registered against a replacement connection.
+#[derive(Debug, Default)]
+struct Sessions {
+    queues: HashMap<u32, mpsc::Sender<Bytes>>,
+    /// Set when the reader has stopped, which it only does when the connection
+    /// is gone. Lives under the same lock as the map so that registering and
+    /// terminating cannot interleave.
+    terminated: bool,
+}
+
 #[derive(Debug)]
 pub struct DatagramRouter {
     key_of: SessionKeyFn,
-    sessions: Mutex<HashMap<u32, mpsc::Sender<Bytes>>>,
+    sessions: Mutex<Sessions>,
 }
 
 impl DatagramRouter {
     pub fn new(key_of: SessionKeyFn) -> Self {
         Self {
             key_of,
-            sessions: Mutex::new(HashMap::new()),
+            sessions: Mutex::new(Sessions::default()),
         }
     }
 
@@ -57,16 +66,25 @@ impl DatagramRouter {
         let mut rng = rand::rng();
         let session_id = loop {
             let candidate = rng.random::<u32>();
-            if !sessions.contains_key(&candidate) {
+            if !sessions.queues.contains_key(&candidate) {
                 break candidate;
             }
         };
-        sessions.insert(session_id, sender);
+
+        // A caller can be handed a connection that dies before it registers:
+        // `get` checks the connection under its own lock and the reader stops
+        // afterwards. Keeping the sender out of the map is what makes that
+        // session report end-of-stream on its first read instead of waiting on
+        // a queue nothing will ever fill. The id is still allocated, so nothing
+        // odd goes on the wire if the session tries to write.
+        if !sessions.terminated {
+            sessions.queues.insert(session_id, sender);
+        }
         (session_id, receiver)
     }
 
     pub fn deregister(&self, session_id: u32) {
-        self.sessions.lock().remove(&session_id);
+        self.sessions.lock().queues.remove(&session_id);
     }
 
     /// Hand one datagram to its session.
@@ -81,7 +99,7 @@ impl DatagramRouter {
         };
 
         let mut sessions = self.sessions.lock();
-        let Some(sender) = sessions.get(&session_id) else {
+        let Some(sender) = sessions.queues.get(&session_id) else {
             // Nothing is listening. Dropped here once, rather than by every
             // session's reader in turn.
             return;
@@ -93,7 +111,7 @@ impl DatagramRouter {
                 debug!("QUIC session {session_id} is not draining its datagrams; dropping one");
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
-                sessions.remove(&session_id);
+                sessions.queues.remove(&session_id);
             }
         }
     }
@@ -108,8 +126,11 @@ impl DatagramRouter {
                     // The connection is gone, so every session on it is over.
                     // Dropping the senders is what turns that into an error in
                     // each session's next read: without it they would wait on a
-                    // queue nothing can ever fill again.
-                    self.sessions.lock().clear();
+                    // queue nothing can ever fill again. The flag closes the
+                    // same door for a session that has not registered yet.
+                    let mut sessions = self.sessions.lock();
+                    sessions.terminated = true;
+                    sessions.queues.clear();
                     return;
                 }
             }
@@ -188,7 +209,28 @@ mod tests {
         let (id, session) = router.register();
         drop(session);
         router.dispatch(datagram(id, 1));
-        assert!(!router.sessions.lock().contains_key(&id));
+        assert!(!router.sessions.lock().queues.contains_key(&id));
+    }
+
+    /// A caller can be handed a connection that dies before it registers:
+    /// `get` checks the connection under its own lock, and the reader stops
+    /// afterwards. Such a session must be told the connection is gone rather
+    /// than waiting on a queue nothing will fill - which is what it did while
+    /// `run` only cleared the map and left no mark.
+    #[tokio::test]
+    async fn test_registering_after_the_connection_died_reports_end_of_stream() {
+        let router = DatagramRouter::new(first_four);
+        router.sessions.lock().terminated = true;
+
+        let (_id, mut session) = router.register();
+
+        // Bounded on purpose. The failure this guards against is a wait that
+        // never ends, and a bare `recv().await` would express that by hanging
+        // the whole suite instead of failing this test.
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(2), session.recv())
+            .await
+            .expect("a session on a dead connection must end, not wait");
+        assert!(ended.is_none(), "it must end, not deliver");
     }
 
     /// A malformed datagram is not routable and must not be charged to

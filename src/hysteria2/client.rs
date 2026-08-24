@@ -449,6 +449,131 @@ mod tests {
         assert_eq!(&buf, b"hello through hysteria");
     }
 
+    /// An HTTP CONNECT proxy that answers and greets in a single write, so the
+    /// connector reading its response necessarily reads the greeting with it
+    /// and reports it as early data. That is routine against a real proxy in
+    /// front of anything that speaks first - SMTP, SSH, MySQL, FTP.
+    async fn spawn_coalescing_http_proxy(greeting: &'static [u8]) -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    // Read the CONNECT request up to its blank line.
+                    let mut request = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while !request.ends_with(b"\r\n\r\n") {
+                        match stream.read(&mut byte).await {
+                            Ok(1) => request.push(byte[0]),
+                            _ => return,
+                        }
+                    }
+                    let mut answer = b"HTTP/1.1 200 Connection established\r\n\r\n".to_vec();
+                    answer.extend_from_slice(greeting);
+                    let _ = stream.write_all(&answer).await;
+                    let _ = stream.flush().await;
+                    // Stay open so the stream is not torn down under the test.
+                    let mut sink = [0u8; 1024];
+                    while stream.read(&mut sink).await.unwrap_or(0) > 0 {}
+                });
+            }
+        });
+        addr
+    }
+
+    /// A Hysteria2 server whose outbound is an HTTP proxy, so its dial comes
+    /// back with early data attached.
+    fn http_chain_selector(
+        proxy: SocketAddr,
+        resolver: Arc<dyn Resolver>,
+    ) -> Arc<crate::client_proxy_selector::ClientProxySelector> {
+        use crate::config::{ClientConfig, ClientProxyConfig, RuleConfig};
+
+        let hop = ClientConfig {
+            address: NetLocation::from_str(&proxy.to_string(), None).unwrap(),
+            protocol: ClientProxyConfig::Http {
+                username: None,
+                password: None,
+                resolve_hostname: false,
+            },
+            ..Default::default()
+        };
+
+        Arc::new(
+            crate::tcp::tcp_client_handler_factory::create_tcp_client_proxy_selector(
+                vec![RuleConfig {
+                    action: crate::config::RuleActionConfig::Allow {
+                        override_address: None,
+                        client_chains: crate::option_util::NoneOrSome::One(
+                            crate::config::ClientChain {
+                                hops: crate::option_util::OneOrSome::One(
+                                    crate::config::ClientChainHop::Single(
+                                        crate::config::ConfigSelection::Config(hop),
+                                    ),
+                                ),
+                            },
+                        ),
+                    },
+                    ..Default::default()
+                }],
+                resolver,
+            ),
+        )
+    }
+
+    /// The response has to reach the client in front of the target's first
+    /// bytes.
+    ///
+    /// Moving the response after the dial - which is what makes a failed dial
+    /// reportable at all - put it *behind* the early data the outbound had
+    /// already written, because `setup_client_tcp_stream` writes that as soon
+    /// as it has it. The client then read the greeting's first byte as the
+    /// status and the next as a message length: a bogus refusal, or a stall
+    /// until the response buffer filled.
+    ///
+    /// Invisible to every other test here, because a direct dial has no early
+    /// data at all.
+    #[tokio::test]
+    async fn test_the_response_comes_before_the_targets_first_bytes() {
+        const GREETING: &[u8] = b"220 speaks-first.example ESMTP\r\n";
+
+        let proxy = spawn_coalescing_http_proxy(GREETING).await;
+        let echo = spawn_tcp_echo().await;
+        let resolver = test_resolver();
+
+        let cert = generate_certificate();
+        let bind_address = reserve_udp_port();
+        crate::hysteria2::start_hysteria2_server(
+            crate::quic_transport::QuicListenerSettings {
+                bind_address,
+                quic_server_config: quic_server_config(&cert, &["h3".to_string()]),
+                num_endpoints: 1,
+                obfs: None,
+            },
+            Box::leak(SERVER_PASSWORD.to_string().into_boxed_str()),
+            http_chain_selector(proxy, resolver.clone()),
+            resolver.clone(),
+            true,
+        )
+        .await
+        .unwrap();
+
+        let connector = connector(bind_address, SERVER_PASSWORD, None);
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            connector.connect_tcp(&resolver, target(echo)),
+        )
+        .await
+        .expect("the response must not be lost behind the greeting")
+        .expect("the dial succeeded, so the client must see a success response");
+
+        assert_eq!(
+            result.early_data.as_deref(),
+            Some(GREETING),
+            "the greeting must arrive intact, after the response rather than inside it"
+        );
+    }
+
     /// The protocol has a status byte and a message for exactly this case.
     ///
     /// Answering OK before dialling made a failed dial reach the client as a

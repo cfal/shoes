@@ -77,6 +77,12 @@ pub struct LiveConnection {
     connections_raised: AtomicUsize,
 }
 
+impl Drop for LiveConnection {
+    fn drop(&mut self) {
+        self.close_held_connection();
+    }
+}
+
 impl LiveConnection {
     pub fn new(
         settings: QuicOutboundSettings,
@@ -289,6 +295,26 @@ impl LiveConnection {
         Ok(connection)
     }
 
+    /// Close the connection when the outbound goes away.
+    ///
+    /// The datagram reader owns its own clone of the `quinn::Connection`, so
+    /// dropping this struct does not end it: it stays parked in
+    /// `read_datagram` with the keep-alive running, holding the connection, the
+    /// endpoint and its UDP socket for the life of the process. A config reload
+    /// that replaces an outbound would leak one of each, every time. Closing is
+    /// what turns that parked read into an error.
+    ///
+    /// Correct for the no-router case too. An outbound that has been dropped
+    /// has no business keeping a connection open, and any session still using
+    /// one belongs to a configuration that no longer exists.
+    fn close_held_connection(&mut self) {
+        if let Some(state) = self.state.get_mut().take() {
+            state
+                .connection
+                .close(0u32.into(), b"outbound no longer configured");
+        }
+    }
+
     /// Close the held connection, so the next `get` raises a new one.
     #[cfg(test)]
     pub fn close_for_test(&self) {
@@ -407,6 +433,76 @@ mod tests {
             "took {:?}, which means the black hole was not bounded",
             started.elapsed()
         );
+    }
+
+    /// An outbound that goes away - a config reload replacing it, say - must
+    /// take its connection with it.
+    ///
+    /// The datagram reader owns its own clone of the `quinn::Connection`, so
+    /// dropping the struct is not by itself enough to end it: without the
+    /// explicit close it stays parked in `read_datagram` with the keep-alive
+    /// running, holding the connection, the endpoint and its UDP socket.
+    ///
+    /// Authentication has to be the real thing here. With a no-op
+    /// authenticator the *server* closes the connection on its own 3s auth
+    /// timeout, and the test passes whatever the client does - which is
+    /// exactly how the first version of it fooled us.
+    #[tokio::test]
+    async fn test_dropping_the_outbound_closes_its_connection() {
+        use crate::quic_outbound::testing::*;
+
+        const PASSWORD: &str = "drop test password";
+
+        let cert = generate_certificate();
+        let bind_address = reserve_udp_port();
+        crate::hysteria2::start_hysteria2_server(
+            crate::quic_transport::QuicListenerSettings {
+                bind_address,
+                quic_server_config: quic_server_config(&cert, &["h3".to_string()]),
+                num_endpoints: 1,
+                obfs: None,
+            },
+            Box::leak(PASSWORD.to_string().into_boxed_str()),
+            direct_selector(test_resolver()),
+            test_resolver(),
+            true,
+        )
+        .await
+        .unwrap();
+
+        let live = LiveConnection::new(
+            QuicOutboundSettings {
+                server: crate::address::NetLocation::from_str(&bind_address.to_string(), None)
+                    .unwrap(),
+                quic: client_quic_config(),
+                bind_interface: None,
+                obfs: None,
+                port_hopping: None,
+                default_alpn: "h3",
+            },
+            Arc::new(crate::hysteria2::auth::Hysteria2Authenticator::new(
+                PASSWORD.to_string(),
+            )),
+            Some(|d: &[u8]| Some(u32::from_be_bytes(d.get(0..4)?.try_into().ok()?))),
+        );
+
+        let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
+        let connection = live.get(&resolver).await.unwrap();
+
+        // Long enough that the server's auth timeout would have fired if the
+        // authentication had not really happened.
+        tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+        assert!(
+            connection.close_reason().is_none(),
+            "the connection died on its own, so this test would prove nothing: {:?}",
+            connection.close_reason()
+        );
+
+        drop(live);
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), connection.closed())
+            .await
+            .expect("dropping the outbound must close the connection, not leave it running");
     }
 
     fn live_connection() -> LiveConnection {

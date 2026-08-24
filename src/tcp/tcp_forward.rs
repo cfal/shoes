@@ -146,6 +146,33 @@ pub async fn setup_client_tcp_stream(
     resolver: Arc<dyn Resolver>,
     remote_location: ResolvedLocation,
 ) -> std::io::Result<Option<Box<dyn AsyncStream>>> {
+    let Some((client_stream, early_data)) =
+        connect_client_tcp_stream(client_proxy_selector, resolver, remote_location).await?
+    else {
+        return Ok(None);
+    };
+
+    if let Some(data) = early_data {
+        write_all(server_stream, &data).await?;
+        server_stream.flush().await?;
+    }
+
+    Ok(Some(client_stream))
+}
+
+/// Dial the target, handing back anything the chain read past its own
+/// handshake instead of writing it.
+///
+/// The early data belongs to the requester and has to reach it, but *when* it
+/// may be written is the protocol's business: one that answers its own request
+/// only after the dial has to put that answer in front of these bytes, or the
+/// requester parses the target's greeting as the response. `Ok(None)` is the
+/// rules blocking the request.
+pub async fn connect_client_tcp_stream(
+    client_proxy_selector: Arc<ClientProxySelector>,
+    resolver: Arc<dyn Resolver>,
+    remote_location: ResolvedLocation,
+) -> std::io::Result<Option<(Box<dyn AsyncStream>, Option<Vec<u8>>)>> {
     let action = client_proxy_selector
         .judge(remote_location, &resolver)
         .await?;
@@ -160,12 +187,7 @@ pub async fn setup_client_tcp_stream(
                 early_data,
             } = chain_group.connect_tcp(remote_location, &resolver).await?;
 
-            if let Some(data) = early_data {
-                write_all(server_stream, &data).await?;
-                server_stream.flush().await?;
-            }
-
-            Ok(Some(client_stream))
+            Ok(Some((client_stream, early_data)))
         }
         ConnectDecision::Block => Ok(None),
     }

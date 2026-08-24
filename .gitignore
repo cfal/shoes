@@ -3,3 +3,4 @@
 /*.yaml
 *.pem
 .claude/
+*.log
