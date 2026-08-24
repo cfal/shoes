@@ -449,6 +449,40 @@ mod tests {
         assert_eq!(&buf, b"hello through hysteria");
     }
 
+    /// The protocol has a status byte and a message for exactly this case.
+    ///
+    /// Answering OK before dialling made a failed dial reach the client as a
+    /// connection that succeeded and then closed with no diagnosis - and it
+    /// made our own client's error path unreachable against our own server, so
+    /// the test covering that path in `frame.rs` was proving nothing about the
+    /// pair.
+    #[tokio::test]
+    async fn test_a_failed_dial_is_reported_as_an_error() {
+        let (server, _cert) = spawn_server(None).await;
+        let resolver = test_resolver();
+        let connector = connector(server, SERVER_PASSWORD, None);
+
+        // Nothing listens on port 1, so the server's dial is refused.
+        let dead = NetLocation::from_str("127.0.0.1:1", None).unwrap();
+        let err = tokio::time::timeout(
+            Duration::from_secs(10),
+            connector.connect_tcp(&resolver, dead.into()),
+        )
+        .await
+        .expect("the server must answer rather than leave the client waiting")
+        .err()
+        .expect("a failed dial must be an error, not a stream that closes silently")
+        .to_string();
+
+        // The client only appends ": {message}" when the server sent one, so
+        // the separator is what proves the diagnosis travelled rather than
+        // being invented locally.
+        assert!(
+            err.contains("refused to connect to 127.0.0.1:1: "),
+            "the error must carry the server's own message: {err}"
+        );
+    }
+
     #[tokio::test]
     async fn test_streams_share_one_authenticated_connection() {
         let (server, _cert) = spawn_server(None).await;

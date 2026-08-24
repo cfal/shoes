@@ -21,8 +21,8 @@ fn activity_secs() -> u64 {
 
 use bytes::{Bytes, BytesMut};
 use log::{debug, error, warn};
+use rand::RngExt;
 use rand::distr::Alphanumeric;
-use rand::{Rng, RngExt};
 use rustc_hash::FxHashMap;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UdpSocket;
@@ -56,8 +56,8 @@ use crate::tcp::tcp_forward::setup_client_tcp_stream;
 use crate::util::allocate_vec;
 
 use super::frame::{
-    FRAME_TYPE_TCP_REQUEST, MAX_ADDRESS_LEN, MAX_PADDING_LEN, decode_varint_slice, encode_varint,
-    read_varint,
+    FRAME_TYPE_TCP_REQUEST, MAX_ADDRESS_LEN, MAX_PADDING_LEN, decode_varint_slice,
+    encode_tcp_response, encode_varint, random_padding, read_varint,
 };
 
 async fn process_connection(
@@ -809,8 +809,13 @@ async fn run_tcp_loop(
     Ok(())
 }
 
+/// Read the client's TCP request.
+///
+/// Deliberately writes nothing back. The response carries a status and a
+/// message and there is nothing truthful to put in either until the dial has
+/// resolved, which is what upstream does too
+/// (`core/server/server.go:310-324`).
 async fn handle_tcp_header(
-    send: &mut quinn::SendStream,
     recv: &mut quinn::RecvStream,
 ) -> std::io::Result<(NetLocation, StreamReader)> {
     let mut stream_reader = StreamReader::new_with_buffer_size(8192);
@@ -840,39 +845,17 @@ async fn handle_tcp_header(
     }
     stream_reader.read_slice(recv, padding_len as usize).await?;
 
-    let response_bytes = {
-        // [uint8] Status (0x00 = OK, 0x01 = Error)
-        // [varint] Message length
-        // [bytes] Message string
-        // [varint] Padding length
-        // [bytes] Random padding
-
-        let mut rng = rand::rng();
-
-        // only use the lower 6 bits so that the varint always fits in a single u8
-        let padding_len = rng.random_range(0..=63);
-
-        // first 3 bytes of status = 0x0, message length = 0, padding length
-        let mut response_bytes = allocate_vec(3 + (padding_len as usize));
-        response_bytes[0] = 0;
-        response_bytes[1] = 0;
-        response_bytes[2] = padding_len;
-        rng.fill_bytes(&mut response_bytes[3..]);
-
-        response_bytes
-    };
-
-    let len = response_bytes.len();
-    let mut i = 0;
-    while i < len {
-        let count = send
-            .write(&response_bytes[i..len])
-            .await
-            .map_err(|e| std::io::Error::other(format!("H3 stream write failed: {e}")))?;
-        i += count;
-    }
-
     Ok((remote_location, stream_reader))
+}
+
+/// Answer the client's TCP request, once the outcome is actually known.
+async fn write_tcp_response(
+    stream: &mut Box<dyn AsyncStream>,
+    outcome: Result<(), &str>,
+) -> std::io::Result<()> {
+    let response = encode_tcp_response(outcome, &random_padding())?;
+    stream.write_all(&response).await?;
+    stream.flush().await
 }
 
 async fn process_tcp_stream(
@@ -881,7 +864,7 @@ async fn process_tcp_stream(
     mut send: quinn::SendStream,
     mut recv: quinn::RecvStream,
 ) -> std::io::Result<()> {
-    let (remote_location, stream_reader) = match handle_tcp_header(&mut send, &mut recv).await {
+    let (remote_location, stream_reader) = match handle_tcp_header(&mut recv).await {
         Ok(res) => res,
         Err(e) => {
             let _ = send.shutdown().await;
@@ -901,14 +884,20 @@ async fn process_tcp_stream(
         ),
     );
 
+    // Every arm below answers before it gives up. A client that is told
+    // nothing sees a stream that opened and closed, and cannot tell a refused
+    // target from a server that fell over.
     let mut client_stream = match setup_client_stream_future.await {
         Ok(Ok(Some(s))) => s,
         Ok(Ok(None)) => {
-            // Must have been blocked.
+            // Must have been blocked. The rule that blocked it is ours and
+            // stays ours; the client is told the request was refused.
+            let _ = write_tcp_response(&mut server_stream, Err("connection not permitted")).await;
             let _ = server_stream.shutdown().await;
             return Ok(());
         }
         Ok(Err(e)) => {
+            let _ = write_tcp_response(&mut server_stream, Err(&e.to_string())).await;
             let _ = server_stream.shutdown().await;
             return Err(std::io::Error::new(
                 e.kind(),
@@ -916,6 +905,7 @@ async fn process_tcp_stream(
             ));
         }
         Err(elapsed) => {
+            let _ = write_tcp_response(&mut server_stream, Err("timed out")).await;
             let _ = server_stream.shutdown().await;
             return Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
@@ -923,6 +913,8 @@ async fn process_tcp_stream(
             ));
         }
     };
+
+    write_tcp_response(&mut server_stream, Ok(())).await?;
 
     let unparsed_data = stream_reader.unparsed_data();
     let client_requires_flush = if unparsed_data.is_empty() {

@@ -136,6 +136,47 @@ pub fn random_padding() -> Vec<u8> {
     padding
 }
 
+/// The message a successful response carries, as the reference sends it
+/// (`core/server/server.go:322`). We sent an empty one, which parses and says
+/// nothing.
+pub const CONNECTED_MESSAGE: &str = "Connected";
+
+/// Encode a TCP response.
+///
+/// `[u8 status][varint msg len][msg][varint pad len][pad]`
+///
+/// `Err(message)` is the server declining, and the message is the reason. It is
+/// truncated rather than refused if it is somehow over the limit: a response
+/// that says too little is recoverable for the client, and one that never
+/// arrives is not.
+pub fn encode_tcp_response(outcome: Result<(), &str>, padding: &[u8]) -> std::io::Result<Vec<u8>> {
+    let (status, message) = match outcome {
+        Ok(()) => (0u8, CONNECTED_MESSAGE),
+        Err(message) => (1u8, message),
+    };
+
+    let mut end = message.len().min(MAX_RESPONSE_MESSAGE as usize);
+    while end > 0 && !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    let message = &message[..end];
+
+    if padding.len() as u64 > MAX_PADDING_LEN {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "padding is over the protocol limit",
+        ));
+    }
+
+    let mut out = Vec::with_capacity(1 + 2 + message.len() + 2 + padding.len());
+    out.push(status);
+    out.extend_from_slice(&encode_varint(message.len() as u64)?);
+    out.extend_from_slice(message.as_bytes());
+    out.extend_from_slice(&encode_varint(padding.len() as u64)?);
+    out.extend_from_slice(padding);
+    Ok(out)
+}
+
 /// Parse a TCP response.
 ///
 /// `[u8 status][varint msg len][msg][varint pad len][pad]`
@@ -384,6 +425,59 @@ mod tests {
     fn test_tcp_request_rejects_oversized_address() {
         let address = format!("{}:1", "a".repeat(2048));
         assert!(encode_tcp_request(&address, &[]).is_err());
+    }
+
+    /// Exact bytes, not a round trip through our own parser. An encoder and a
+    /// parser that share a misreading agree with each other and with nothing
+    /// else, which is how most of the Hysteria2 conformance list came to exist.
+    #[test]
+    fn test_a_successful_response_is_the_bytes_upstream_sends() {
+        assert_eq!(
+            encode_tcp_response(Ok(()), &[]).unwrap(),
+            b"\x00\x09Connected\x00",
+            "status 0, a 9-byte message, no padding"
+        );
+    }
+
+    #[test]
+    fn test_a_refusal_carries_status_one_and_its_reason() {
+        assert_eq!(
+            encode_tcp_response(Err("no such host"), &[0xaa]).unwrap(),
+            b"\x01\x0cno such host\x01\xaa"
+        );
+    }
+
+    /// A message over the limit must not cost the client its response: without
+    /// a status byte it has nothing to act on at all.
+    #[test]
+    fn test_an_overlong_message_is_truncated_rather_than_refused() {
+        let long = "e".repeat(MAX_RESPONSE_MESSAGE as usize + 10);
+        let encoded = encode_tcp_response(Err(&long), &[]).unwrap();
+        let (verdict, consumed) = parse_tcp_response(&encoded).unwrap().unwrap();
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(
+            verdict.unwrap_err().len(),
+            MAX_RESPONSE_MESSAGE as usize,
+            "the message must be cut to the limit, not dropped"
+        );
+    }
+
+    /// The limit is a byte count and messages are UTF-8, so the cut has to land
+    /// on a character boundary. A split character would reach the client as a
+    /// replacement character in place of the last letter of the reason.
+    #[test]
+    fn test_truncation_does_not_split_a_character() {
+        // Three bytes each, so the limit falls inside the 1366th one.
+        let long = "☃".repeat(2000);
+        let encoded = encode_tcp_response(Err(&long), &[]).unwrap();
+        let (verdict, _) = parse_tcp_response(&encoded).unwrap().unwrap();
+        let message = verdict.unwrap_err();
+
+        assert_eq!(message.len(), MAX_RESPONSE_MESSAGE as usize / 3 * 3);
+        assert!(
+            message.chars().all(|c| c == '☃'),
+            "a split character would have arrived as U+FFFD"
+        );
     }
 
     #[test]
