@@ -360,7 +360,9 @@ async fn run_udp_remote_to_local_loop(
 
     let original_address_bytes: Option<(Bytes, Bytes)> = match override_local_write_address {
         Some(a) => {
-            let address_bytes: Bytes = a.to_string().into_bytes().into();
+            // The wire form, not Display: an IPv6 literal needs its brackets
+            // or the peer's SplitHostPort refuses the whole datagram.
+            let address_bytes: Bytes = a.to_wire_string().into_bytes().into();
             let address_len = address_bytes.len();
             let address_len_bytes = encode_varint(address_len as u64)?;
             Some((address_bytes, address_len_bytes.into()))

@@ -169,6 +169,23 @@ impl NetLocation {
         self.port
     }
 
+    /// The address as a peer expects to receive it, per RFC 3986: an IPv6
+    /// literal in brackets, so its colons cannot be read as the port
+    /// separator.
+    ///
+    /// `Display` does not do this and must not start: it is what logs and
+    /// error messages use throughout the tree. This is the form for anything
+    /// that leaves the process. Go's `net.SplitHostPort`, which is what the
+    /// Hysteria2 reference feeds a received address to, rejects the
+    /// unbracketed form outright — and our own parser accepts it, because it
+    /// splits at the last colon, so the two agreed and no test failed.
+    pub fn to_wire_string(&self) -> String {
+        match self.address {
+            Address::Ipv6(ref addr) => format!("[{addr}]:{}", self.port),
+            _ => format!("{}:{}", self.address, self.port),
+        }
+    }
+
     pub fn to_socket_addr_nonblocking(&self) -> Option<SocketAddr> {
         match self.address {
             Address::Ipv6(ref addr) => Some(SocketAddr::new(IpAddr::V6(*addr), self.port)),
@@ -800,6 +817,36 @@ mod tests {
                 "{input:?} must not parse as a port union"
             );
         }
+    }
+
+    /// The form that goes on a wire is not the form that goes in a log. Go's
+    /// net.SplitHostPort - which is what a Hysteria2 server feeds a received
+    /// address to - rejects an unbracketed IPv6 literal with "too many
+    /// colons".
+    ///
+    /// Our own parser accepts the unbracketed form because it splits at the
+    /// last colon, so a round-trip through our own code cannot catch this. The
+    /// expected values below are what Go accepts, not what we parse.
+    #[test]
+    fn test_the_wire_form_brackets_an_ipv6_literal() {
+        let v6 = NetLocation::from_str("[2001:db8::1]:443", None).unwrap();
+        assert_eq!(v6.to_wire_string(), "[2001:db8::1]:443");
+
+        let v4 = NetLocation::from_str("1.2.3.4:443", None).unwrap();
+        assert_eq!(v4.to_wire_string(), "1.2.3.4:443");
+
+        let host = NetLocation::from_str("example.com:443", None).unwrap();
+        assert_eq!(host.to_wire_string(), "example.com:443");
+    }
+
+    /// Display is deliberately left alone: it is what logs and error messages
+    /// use all over the tree. This pins the difference so nobody "unifies"
+    /// them and quietly changes every log line in the process.
+    #[test]
+    fn test_display_is_not_the_wire_form() {
+        let v6 = NetLocation::from_str("[2001:db8::1]:443", None).unwrap();
+        assert_eq!(v6.to_string(), "2001:db8::1:443");
+        assert_ne!(v6.to_string(), v6.to_wire_string());
     }
 
     #[test]

@@ -177,7 +177,7 @@ impl TerminalConnector for Hysteria2Connector {
         resolver: &Arc<dyn Resolver>,
         target: ResolvedLocation,
     ) -> std::io::Result<TcpClientSetupResult> {
-        let address = target.location().to_string();
+        let address = target.location().to_wire_string();
         debug!("Hysteria2: TCP connect to {address}");
 
         let (stream, early_data) = self.open_tcp_stream(resolver, &address).await?;
@@ -211,7 +211,7 @@ impl TerminalConnector for Hysteria2Connector {
             ));
         }
 
-        let address = target.into_location().to_string();
+        let address = target.into_location().to_wire_string();
         let session_id = rand::rng().random::<u32>();
         debug!("Hysteria2: UDP session {session_id} to {address}");
 

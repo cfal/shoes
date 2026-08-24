@@ -1372,7 +1372,7 @@ protocol:
         let address = value
             .as_mapping()
             .unwrap()
-            .get(&serde_yaml::Value::String("address".to_string()))
+            .get(serde_yaml::Value::String("address".to_string()))
             .unwrap();
         assert_eq!(address.as_str(), Some("127.0.0.1:8080"));
     }
