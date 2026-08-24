@@ -14,6 +14,7 @@
 #   9760568  +  344  structured status; the types themselves are cfg'd off
 #                     mobile, which is 1824 bytes of the 2168 they cost
 #   9760536  -   32  StopOutcome replacing stop_handle's bool
+#   9761528  +  992  DevicePolicy, replacing two hard-coded mobile assumptions
 #
 # On that +4176: it is real code, not section padding -- .text grew 2056,
 # .rodata 512, .data.rel.ro 576, .rela.dyn 768, .eh_frame 236. It is not the
@@ -23,7 +24,7 @@
 # its own compilation unit with a stop_service/stop_handle split rather than
 # one function inlined into its single caller.
 #
-# Judged worth paying: the net 3144 bytes is 0.03% of the library, against a
+# Judged worth paying: the net 4136 bytes is 0.03% of the library, against a
 # MOBILE.md precedent that declined a 1.0 MiB saving because the build
 # complexity cost more than the megabyte was worth.
-9760536
+9761528

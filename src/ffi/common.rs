@@ -17,7 +17,19 @@ use log::info;
 // Only what ios.rs and android.rs actually name. `mod common` is private, so
 // re-exporting more than that is an unused import rather than a public API --
 // and the Android clippy job builds with -D warnings.
-pub use crate::control::{ServiceHandle as TunServiceHandle, prepare_from_config};
+pub use crate::control::ServiceHandle as TunServiceHandle;
+
+/// Parse and validate a config for a mobile host.
+///
+/// Always `BorrowedFd`: Android takes its descriptor from
+/// `VpnService.Builder.establish()` and iOS from
+/// `NEPacketTunnelProvider.packetFlow`, so neither ever creates a device or
+/// closes one it did not open.
+pub async fn prepare_from_config(
+    config_yaml: &str,
+) -> std::io::Result<crate::control::PreparedService> {
+    crate::control::prepare_from_config(config_yaml, crate::control::DevicePolicy::BorrowedFd).await
+}
 
 /// Global log file handle for file-based logging.
 pub static LOG_FILE: OnceLock<parking_lot::Mutex<Option<File>>> = OnceLock::new();

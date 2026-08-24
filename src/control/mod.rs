@@ -13,8 +13,10 @@ use log::{error, info, warn};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
+mod device;
 mod stop;
 
+pub use device::DevicePolicy;
 pub use stop::StopOutcome;
 
 // Not on Android or iOS. This is not a feature a mobile host might want and
@@ -241,6 +243,7 @@ pub struct PreparedService {
     tun_config: crate::config::TunConfig,
     server_configs: Vec<crate::config::ServerConfig>,
     dns_registry: crate::dns::DnsRegistry,
+    policy: DevicePolicy,
 }
 
 /// Start the service from a config YAML string.
@@ -250,14 +253,18 @@ pub struct PreparedService {
 /// The config YAML must already have device_fd set in the TUN config.
 pub async fn start_from_config(
     config_yaml: &str,
+    policy: DevicePolicy,
     shutdown_rx: oneshot::Receiver<()>,
 ) -> std::io::Result<()> {
-    let prepared = prepare_from_config(config_yaml).await?;
+    let prepared = prepare_from_config(config_yaml, policy).await?;
     run_prepared(prepared, shutdown_rx).await
 }
 
 /// Parse and validate a config, and build its resolvers. See [`PreparedService`].
-pub async fn prepare_from_config(config_yaml: &str) -> std::io::Result<PreparedService> {
+pub async fn prepare_from_config(
+    config_yaml: &str,
+    policy: DevicePolicy,
+) -> std::io::Result<PreparedService> {
     info!("Parsing config for TUN server");
 
     let configs: Vec<Config> = load_config_str(config_yaml)?;
@@ -288,15 +295,13 @@ pub async fn prepare_from_config(config_yaml: &str) -> std::io::Result<PreparedS
                         "Multiple TUN configs found - only one is allowed for mobile",
                     ));
                 }
-                if tc.device_fd.is_none() {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "TUN config missing device_fd - must be injected by caller",
-                    ));
-                }
+                device::validate(&tc, policy)?;
+                // unwrap_or(-1) rather than {:?} on the Option: an Owned host
+                // has no descriptor to report, and -1 says so without pulling
+                // Option<i32>'s Debug impl into a mobile build.
                 info!(
                     "TUN config: fd={}, mtu={}, tcp={}, udp={}, icmp={}",
-                    tc.device_fd.unwrap(),
+                    tc.device_fd.unwrap_or(-1),
                     tc.mtu,
                     tc.tcp_enabled,
                     tc.udp_enabled,
@@ -319,6 +324,7 @@ pub async fn prepare_from_config(config_yaml: &str) -> std::io::Result<PreparedS
         tun_config,
         server_configs,
         dns_registry,
+        policy,
     })
 }
 
@@ -334,6 +340,7 @@ pub async fn run_prepared(
         tun_config,
         server_configs,
         mut dns_registry,
+        policy,
     } = prepared;
 
     // Start TCP servers (like mixed)
@@ -344,14 +351,19 @@ pub async fn run_prepared(
         join_handles.extend(start_servers(Config::Server(server_config), resolver).await?);
     }
 
-    // Run TUN server (blocks until shutdown). close_fd_on_drop = false because mobile owns the FD
+    // Runs until shutdown. Who closes the descriptor follows from the policy:
+    // whoever created the device closes it, and nobody else.
     #[cfg(unix)]
-    let result = run_tun_from_config(tun_config, shutdown_rx, false).await;
+    let result = run_tun_from_config(tun_config, shutdown_rx, policy.close_fd_on_drop()).await;
     #[cfg(not(unix))]
-    let result = Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "TUN is not supported on this platform",
-    ));
+    let result = {
+        // Consumed only by the TUN branch, which this platform does not have.
+        let _ = policy;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "TUN is not supported on this platform",
+        ))
+    };
 
     // Cleanup any servers when TUN stops
     for handle in join_handles {
@@ -374,7 +386,7 @@ mod tests {
     }
 
     fn prepare(yaml: &str) -> std::io::Result<PreparedService> {
-        current_thread_runtime().block_on(prepare_from_config(yaml))
+        current_thread_runtime().block_on(prepare_from_config(yaml, DevicePolicy::BorrowedFd))
     }
 
     /// A config with no TUN section must fail before anything is spawned, so
