@@ -5,7 +5,9 @@ next. Written 2026-08-09 against `mobile` at `7ed9f0b`; the Hysteria section was
 added 2026-08-11 against `apernet/hysteria` at `app/v2.12.1`. Refreshed
 2026-08-23 against `mobile` at `c83ce5f`, 128 commits later: the protocol lists
 and the mieru section were re-checked against the tree, and every Tier 2 and
-Tier 3 item was confirmed still open.
+Tier 3 item was confirmed still open. Refreshed again 2026-08-24 against
+`mobile` at `a27b666`, when the desktop control API landed and earned a section
+of its own.
 
 The audience is anyone deciding what to work on. Every gap below is stated with
 the file it lands in, so the estimate is checkable rather than a guess.
@@ -17,6 +19,7 @@ the file it lands in, so the estimate is checkable rather than a guess.
 - [Tier 1 — closes most of the gap](#tier-1--closes-most-of-the-gap)
 - [Tier 2 — worth doing after Tier 1](#tier-2--worth-doing-after-tier-1)
 - [Tier 3 — real, but not urgent](#tier-3--not-urgent)
+- [Desktop clients](#desktop-clients)
 - [Hysteria: the rest of the surface](#hysteria-the-rest-of-the-surface)
 - [mieru: what is left](#mieru-what-is-left)
 - [Explicitly not planned](#explicitly-not-planned)
@@ -51,9 +54,10 @@ The gap is not in protocols. It is in everything around them.
 | Protocol sniffing (SNI, Host, QUIC, DNS) | SNI and Host, TCP only | yes |
 | Per-app routing on Android | none | `package_name` |
 | Outbound selection | round-robin, no health check | `urltest` by latency, `selector` |
-| Per-connection statistics | global counters only | Clash API |
+| Per-connection statistics | global counters, plus a live connection count | Clash API |
 | Extra transports | WebSocket, H2MUX | + gRPC, HTTPUpgrade, HTTP/2 |
 | Hysteria2 / TUIC as a *client* | yes | yes |
+| Desktop client | control API only, no GUI | full GUI on three platforms |
 
 ## Tier 1 — closes most of the gap
 
@@ -156,12 +160,22 @@ excluded from the VPN route, because `socket_util`'s constructors consult the
 protector rather than each caller remembering to. See
 [MOBILE.md](./MOBILE.md) §2. Per-app routing is the remaining half.
 
-### 6. Per-connection statistics
+### 6. Per-connection statistics — partly done
 
-`src/tun/traffic.rs` keeps two global atomics and a callback. A client UI needs a
-connection list: destination, protocol, the rule that matched, and bytes each
-way. Either expose it over FFI, or implement a subset of the Clash API and
-inherit the existing dashboards (yacd, metacubexd) for free.
+`src/tun/traffic.rs` keeps two global atomics and a callback, and now a live
+connection count beside them, readable through
+`shoes::control::stats::snapshot()` behind the `control-stats` feature.
+
+The rest is blocked on something small and unglamorous: **outbounds have no
+names**. A client UI wants bytes per configured server, and the only key
+available today is an address, which is neither stable across config edits nor
+meaningful to show a user — client configs in `src/config/types/client.rs`
+carry no label field. Adding one is a config schema change that reaches mobile,
+so it wants its own spec, and everything else here waits behind it.
+
+Beyond that: a connection list with destination, protocol, the rule that
+matched, and bytes each way. Either over FFI, or as a subset of the Clash API,
+which inherits the existing dashboards (yacd, metacubexd) for free.
 
 ### 7. HTTPUpgrade transport
 
@@ -218,6 +232,105 @@ group per rule, so split DNS cannot be expressed. Half the mechanism is built.
   (`src/h2mux/mod.rs:60`), but they are identifiers only: no framing behind
   them. H2MUX covers our own deployments; this is purely about talking to other
   implementations.
+
+## Desktop clients
+
+Linux, macOS and Windows, with one Tauri GUI across all three and native
+platform integration underneath. Design in
+`docs/specs/2026-08-24-desktop-control-api.md`, task breakdown in
+`docs/plans/2026-08-24-desktop-control-api.md`.
+
+Seven sub-projects. The first is merged; the other six are open, and the order
+below is roughly the order they unblock each other.
+
+### 1. Control API — done
+
+`shoes::control` is the lifecycle that used to be locked inside
+`src/ffi/common.rs`, compiled out on every non-mobile target. A privileged host
+now gets `prepare_from_config` with a `DevicePolicy`, `start`, `status`,
+`stats::snapshot`, a subscribable log sink, and a `stop` that reports whether
+the device was released. Verified by building an external crate against it, not
+by inspection.
+
+Two facts worth carrying forward. `Status` has no `Starting` variant, because
+nothing can produce one: `start` returns as soon as the task is spawned and the
+stack offers no readiness signal, so a GUI that shows "connected" at that moment
+is lying. Adding one is a change to `run_tun_from_config`, and it should land
+before a tray icon does. And `ServiceHandle` must not be stopped or dropped from
+async code — it owns a `Runtime`, and dropping a runtime inside another panics.
+
+### 2. Windows TUN backend
+
+The largest piece left, and the only one that makes a platform unusable by its
+absence. `src/lib.rs` gates the TUN module on `cfg(unix)`, so on Windows
+`run_prepared` returns `ErrorKind::Unsupported`: a Windows GUI would build,
+start, show a tray icon and fail the moment someone clicks Connect. The library
+itself does build on Windows — CI checks it now — so this is a backend, not a
+port of the whole crate.
+
+`src/tun/tcp_stack_direct.rs` runs smoltcp on a dedicated thread and waits on
+the descriptor. Wintun has no descriptor; it is a ring-buffer session API, so
+the work is a second backend behind the same interface, attaching at
+`DevicePolicy::Owned`.
+
+Upstream PR cfal/shoes#102 implements Windows TUN and is **not** worth adopting.
+It converts the stack to `AsyncDevice` and `.await`, which deletes the
+dedicated-thread design that `MOBILE.md`'s buffer and connection tuning rests
+on, and it removes the `phy_wait_error_count` / `MAX_PHY_WAIT_ERRORS` guard at
+`src/tun/tcp_stack_direct.rs:620` that stops a dead descriptor busy-looping a
+core. It has been conflicting against upstream master since January, and our
+`tun/` has diverged further than master has. Worth reading for which wintun
+knobs matter; not worth cherry-picking.
+
+### 3. macOS Network Extension provider
+
+No new Rust. An NE provider on macOS is handed its descriptor by `packetFlow`
+exactly as on iOS, and `TunServerConfig::raw_fd` plus the `macos` arm in
+`src/tun/mod.rs:470` already consume it. All ten `shoes_*` symbols export on
+`aarch64-apple-darwin`, and CI compares that list against `include/shoes.h`.
+
+What remains is Swift and packaging: a provider target, the
+`com.apple.developer.networking.networkextension` entitlement, and
+post-processing the `.app` to embed the extension, which Tauri's bundler does
+not do.
+
+### 4. Privileged helper and IPC contract
+
+One protocol, three genuinely different mechanisms — `SMAppService` on macOS, a
+service running as SYSTEM on Windows, systemd with polkit on Linux. The GUI must
+have no platform branches, which means it asks the helper what it can do rather
+than inferring it from the OS.
+
+This is where **host network configuration** lives, and shoes deliberately does
+not do it: nothing in `src/` touches routes, `resolv.conf`, systemd-resolved or
+`netsh`. shoes moves packets; the host owns the network. On Linux that is the
+awkward part — systemd-resolved, resolvconf, NetworkManager and a bare
+`/etc/resolv.conf` are four different mechanisms, and without one of them a TUN
+device exists that no traffic is routed into.
+
+### 5. The Tauri GUI
+
+Tray, popover, dashboard, config editor. Can be built against a mocked helper in
+parallel with #2 and #4. Config validation needs none of that plumbing:
+`shoes::config::load_config_str` and `create_server_configs` are public and give
+the editor real parse and semantic errors from the same code that will run the
+connection.
+
+Known rough edge on Linux: the tray goes through StatusNotifierItem, which works
+on KDE and needs a user-installed extension on stock GNOME.
+
+### 6. Packaging, signing, notarization, updater
+
+Signed DMG, MSI and NSIS, deb and AppImage, plus a signed updater feed.
+
+### 7. Share-link import
+
+`vless://`, `ss://`, `hysteria2://` and friends. Nothing in `src/` parses one
+today — the only mention in the tree is a doc comment at
+`src/config/types/client.rs:238`. A parser per protocol, mapping query
+parameters onto the config types. Belongs in the GUI repository rather than
+here: no mobile caller wants it, and it would cost mobile bytes for no mobile
+benefit.
 
 ## Hysteria: the rest of the surface
 
