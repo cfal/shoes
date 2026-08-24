@@ -53,6 +53,12 @@ jobs:
       - name: Run tests with the FFI surface enabled
         run: cargo test --locked --features ffi
 
+      # The desktop host builds with these; nothing else should. Running both
+      # ends of the matrix is what keeps `default = []` honest -- these two
+      # features hold runtime state, and mobile must not inherit it.
+      - name: Run tests with the desktop control surface enabled
+        run: cargo test --locked --features desktop
+
   # The first Windows CI this repository has had. build.yml carries two
   # commented-out Windows targets marked "TODO: enable when working", and
   # nobody can tell whether that is still true without a Windows runner --

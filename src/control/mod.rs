@@ -14,6 +14,8 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 mod device;
+#[cfg(feature = "control-logs")]
+pub mod logs;
 mod stop;
 
 pub use device::DevicePolicy;

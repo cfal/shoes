@@ -24,6 +24,18 @@ path = "src/main.rs"
 [features]
 default = []
 ffi = []  # Enable FFI module for non-Android builds
+# Both of these hold runtime state, which is the budget a phone cannot spare --
+# see MOBILE.md, where the per-connection figures are measured and where the
+# distinction that matters is drawn: code costs download size and almost no
+# RSS, while a log ring and a counter table cost RSS.
+#
+# Two flags rather than one `desktop` so each cost stays attributable: an iOS
+# extension could take the counters without inheriting a log buffer. The
+# supported combinations stay few -- mobile builds the default, a desktop host
+# builds `desktop` -- rather than the combinatorial matrix MOBILE.md warned off.
+control-logs = []   # subscribable log stream; bounded in-memory ring
+control-stats = []  # counters beyond the two byte totals
+desktop = ["control-logs", "control-stats"]
 
 [dependencies]
 async-trait = "*"
