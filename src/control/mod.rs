@@ -13,6 +13,20 @@ use log::{error, info, warn};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
+// Not on Android or iOS. This is not a feature a mobile host might want and
+// currently declines -- it is API a mobile host structurally cannot use, since
+// a C or JNI caller has no way to receive a StatusSnapshot and reads the same
+// facts through shoes_is_running() and shoes_get_last_error() instead. Worth
+// 1824 bytes of the arm64 .so, measured.
+//
+// macOS is deliberately on the near side of this: the desktop Network
+// Extension provider is a target_os = "macos" build and does want it.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+mod status;
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub use status::{Status, StatusSnapshot, StopReason};
+
 use crate::config::{Config, convert_cert_paths, create_server_configs, load_config_str};
 use crate::dns::build_dns_registry;
 use crate::tcp::tcp_server::start_servers;
@@ -22,11 +36,18 @@ use crate::tun::run_tun_from_config;
 /// Handle to a running service.
 pub struct ServiceHandle {
     /// Tokio runtime running the service.
-    pub runtime: tokio::runtime::Runtime,
+    runtime: tokio::runtime::Runtime,
     /// Channel to signal shutdown.
-    pub shutdown_tx: Option<oneshot::Sender<()>>,
+    shutdown_tx: Option<oneshot::Sender<()>>,
     /// Flag indicating if service is running.
-    pub running: Arc<AtomicBool>,
+    running: Arc<AtomicBool>,
+    /// When `start` spawned the service, for `uptime`.
+    started_at: std::time::Instant,
+    /// Set if the stack stopped with an error, so `status` can tell a failure
+    /// from a stop the host asked for. The FFI gets the same string through
+    /// its `on_error` callback, because a C caller cannot receive an enum
+    /// carrying a String.
+    failure: Arc<parking_lot::Mutex<Option<String>>>,
 }
 
 /// How long `stop_handle` waits for the service task to finish.
@@ -102,6 +123,40 @@ impl ServiceHandle {
     pub fn is_running(&self) -> bool {
         self.running.load(Ordering::SeqCst)
     }
+
+    /// A point-in-time reading of this service.
+    ///
+    /// Note that the byte counters are process-global — see the note on
+    /// [`start`] about one service per process.
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    pub fn status(&self) -> StatusSnapshot {
+        let running = self.is_running();
+
+        let status = if running {
+            Status::Running
+        } else {
+            Status::Stopped {
+                reason: match self.failure.lock().clone() {
+                    Some(msg) => StopReason::Failed(msg),
+                    None => StopReason::Requested,
+                },
+            }
+        };
+
+        // The counters live behind cfg(unix) with the TUN module. On Windows
+        // there is no tunnel to count yet, and a host still wants a snapshot.
+        #[cfg(unix)]
+        let (upload_bytes, download_bytes) = crate::tun::traffic::get_traffic_counters();
+        #[cfg(not(unix))]
+        let (upload_bytes, download_bytes) = (0, 0);
+
+        StatusSnapshot {
+            status,
+            uptime: running.then(|| self.started_at.elapsed()),
+            upload_bytes,
+            download_bytes,
+        }
+    }
 }
 
 /// Start a prepared service on `runtime`, and hand back a handle to it.
@@ -131,6 +186,8 @@ pub fn start(
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let running = Arc::new(AtomicBool::new(true));
     let running_clone = running.clone();
+    let failure = Arc::new(parking_lot::Mutex::new(None));
+    let failure_clone = failure.clone();
 
     runtime.spawn(async move {
         info!("shoes service task started");
@@ -140,6 +197,11 @@ pub fn start(
             Err(e) => {
                 let msg = e.to_string();
                 error!("shoes service error: {}", msg);
+                // Recorded for status() as well as handed to the caller: a
+                // Rust host wants StopReason::Failed, the FFI wants a string
+                // for LAST_ERROR, and neither should have to read the other's
+                // channel to get it.
+                *failure_clone.lock() = Some(msg.clone());
                 on_error(msg);
             }
         }
@@ -151,6 +213,8 @@ pub fn start(
         runtime,
         shutdown_tx: Some(shutdown_tx),
         running,
+        started_at: std::time::Instant::now(),
+        failure,
     }
 }
 

@@ -160,7 +160,9 @@ impl<S: tokio::io::AsyncWrite> tokio::io::AsyncWrite for TrafficCountingStream<S
 }
 
 /// Get current traffic counters.
-#[cfg(test)]
+///
+/// Process-global rather than per-service, which is an invariant
+/// `crate::control::start` documents: one service per process.
 pub fn get_traffic_counters() -> (u64, u64) {
     (
         UPLOAD_BYTES.load(Ordering::Relaxed),

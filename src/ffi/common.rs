@@ -9,7 +9,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::OnceLock;
 
 use log::info;
@@ -127,7 +127,7 @@ pub fn is_service_running() -> bool {
     if let Some(service) = TUN_SERVICE.get() {
         let guard = service.lock();
         if let Some(ref handle) = *guard {
-            return handle.running.load(Ordering::SeqCst);
+            return handle.is_running();
         }
     }
     false
