@@ -169,6 +169,21 @@ async fn process_connection(
     }
 }
 
+/// The response to a client whose password was accepted.
+fn auth_response(udp_enabled: bool) -> http::Response<()> {
+    http::Response::builder()
+        .status(http::status::StatusCode::from_u16(233).unwrap())
+        .header("Hysteria-UDP", if udp_enabled { "true" } else { "false" })
+        // "auto" is the server telling the client to run its own congestion
+        // control. "0" means "no limit", which an official client reads as
+        // permission to use Brutal at its configured rate against a server that
+        // has installed no rate control at all.
+        .header("Hysteria-CC-RX", "auto")
+        .header("Hysteria-Padding", generate_ascii_string())
+        .body(())
+        .expect("every part of this response is a constant or a generated string")
+}
+
 fn validate_auth_request<T>(req: http::Request<T>, password: &str) -> std::io::Result<()> {
     if req.uri() != "https://hysteria/auth" {
         return Err(std::io::Error::other(format!(
@@ -233,13 +248,7 @@ async fn auth_connection(
                 })?;
                 match validate_auth_request(req, password) {
                     Ok(()) => {
-                        let resp = http::Response::builder()
-                            .status(http::status::StatusCode::from_u16(233).unwrap())
-                            .header("Hysteria-UDP", if udp_enabled { "true" } else { "false" })
-                            .header("Hysteria-CC-RX", "0")
-                            .header("Hysteria-Padding", generate_ascii_string())
-                            .body(())
-                            .unwrap();
+                        let resp = auth_response(udp_enabled);
 
                         stream.send_response(resp).await.map_err(|e| {
                             std::io::Error::other(format!("failed to send auth response: {e}"))
@@ -993,6 +1002,38 @@ mod tests {
             .header("Hysteria-Auth", password)
             .body(())
             .unwrap()
+    }
+
+    /// `0` does not mean "we are not rate limiting you". PROTOCOL.md defines it
+    /// as "no bandwidth limit; the client MAY transmit at any rate", and an
+    /// official client reading it falls through to fixed-rate Brutal
+    /// congestion control at whatever `up:` it was configured with
+    /// (`core/client/client.go:156-162`) - against a server running ordinary
+    /// congestion control, because we never read the client's declared
+    /// bandwidth and never install Brutal ourselves.
+    ///
+    /// `auto` is the value for exactly that case, and it is what upstream sends
+    /// when the server ignores the client's rate
+    /// (`core/server/server.go:172,206`).
+    #[test]
+    fn test_the_server_asks_the_client_to_run_its_own_congestion_control() {
+        let response = auth_response(true);
+        assert_eq!(response.headers()["Hysteria-CC-RX"], "auto");
+    }
+
+    #[test]
+    fn test_the_auth_response_reports_whether_udp_is_available() {
+        assert_eq!(auth_response(true).headers()["Hysteria-UDP"], "true");
+        assert_eq!(auth_response(false).headers()["Hysteria-UDP"], "false");
+    }
+
+    /// 233 is the protocol's success status, chosen precisely because it is not
+    /// a status any ordinary web server would answer with.
+    #[test]
+    fn test_the_auth_response_carries_the_protocol_status_and_padding() {
+        let response = auth_response(true);
+        assert_eq!(response.status().as_u16(), 233);
+        assert!(!response.headers()["Hysteria-Padding"].is_empty());
     }
 
     #[test]
