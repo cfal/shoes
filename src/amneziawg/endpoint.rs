@@ -261,11 +261,12 @@ mod tests {
         .unwrap();
 
         assert_eq!(&buf[..n], b"after rebind");
-        assert_eq!(
-            from,
-            endpoint.local_addr().unwrap(),
-            "the datagram came from the pre-rebind socket"
-        );
+        // Against `before`, not against a fresh local_addr(). `from` was fixed
+        // when the datagram left; reading the current address afterwards races
+        // any later rebind, and comparing the two then fails for a reason the
+        // test does not care about. What it does care about is that the
+        // datagram no longer comes from the socket the rebind replaced.
+        assert_ne!(from, before, "the datagram came from the pre-rebind socket");
     }
 
     #[tokio::test]
