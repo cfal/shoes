@@ -98,24 +98,16 @@ pub async fn setup_http_server_stream_inner(
         if line.starts_with("CONNECT ") {
             let address = &line[8..line.len() - 9];
 
-            let separator_index = address.find(':').ok_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid address format")
-            })?;
-
-            if address.len() <= separator_index + 1 {
-                return Err(std::io::Error::new(
+            // Splitting on the first ':' breaks the bracketed IPv6 authority
+            // an HTTP client sends for an IPv6 destination, `[::1]:443`: the
+            // first colon is inside the address. NetLocation handles the
+            // brackets, and CONNECT has no default port, so None.
+            let remote_location = NetLocation::from_str(address, None).map_err(|e| {
+                std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
-                    "Invalid address format",
-                ));
-            }
-
-            let domain_name = &address[0..separator_index];
-
-            let port = address[separator_index + 1..]
-                .parse::<u16>()
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-
-            let remote_location = NetLocation::new(Address::from(domain_name)?, port);
+                    format!("Invalid CONNECT address '{address}': {e}"),
+                )
+            })?;
 
             // wait for an empty \r\n before connecting, and check for auth header line if needed.
             let mut need_auth = auth_token.is_some();
@@ -204,15 +196,14 @@ pub async fn setup_http_server_stream_inner(
                 None => (url, "/"),
             };
 
-            let remote_location = match address.find(':') {
-                Some(i) => {
-                    let port = address[i + 1..]
-                        .parse::<u16>()
-                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-                    NetLocation::new(Address::from(&address[0..i])?, port)
-                }
-                None => NetLocation::new(Address::from(address)?, 80),
-            };
+            // Same as CONNECT above, except that an absolute http:// URL may
+            // leave the port out, in which case it is 80.
+            let remote_location = NetLocation::from_str(address, Some(80)).map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("Invalid forward url authority '{address}': {e}"),
+                )
+            })?;
 
             let mut request = format!("{directive} {location} {http_version}\r\n");
 
@@ -447,5 +438,124 @@ impl TcpClientHandler for HttpTcpClientHandler {
             client_stream,
             early_data,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::{TcpListener, TcpStream};
+
+    use crate::client_proxy_selector::{ConnectAction, ConnectRule};
+    use crate::resolver::NativeResolver;
+
+    /// A selector that allows everything, so the test observes the parsed
+    /// destination rather than a routing decision.
+    fn allow_all() -> Arc<ClientProxySelector> {
+        let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+        let chain_group = crate::tcp::chain_builder::build_client_chain_group(
+            crate::option_util::NoneOrSome::None,
+            resolver,
+        );
+        Arc::new(ClientProxySelector::new(vec![ConnectRule::new(
+            vec![crate::address::NetLocationMask::ANY],
+            ConnectAction::new_allow(None, chain_group),
+        )]))
+    }
+
+    /// Feed one request to the handler and return where it decided to connect.
+    ///
+    /// The handler returns before dialling, so nothing here touches the
+    /// network beyond the loopback pair carrying the request.
+    async fn destination_of(request: &str) -> std::io::Result<NetLocation> {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let request = request.to_string();
+        let client = tokio::spawn(async move {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            stream.write_all(request.as_bytes()).await.unwrap();
+            stream.flush().await.unwrap();
+            // Hold the connection open until the handler is done with it.
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        });
+
+        let (server, _) = listener.accept().await.unwrap();
+        let result = setup_http_server_stream_inner(
+            None,
+            Box::new(server),
+            StreamReader::new(),
+            allow_all(),
+        )
+        .await;
+        client.abort();
+
+        match result? {
+            TcpServerSetupResult::TcpForward {
+                remote_location, ..
+            } => Ok(remote_location),
+            _ => panic!("expected a TCP forward"),
+        }
+    }
+
+    /// An HTTP client asking for an IPv6 destination sends the address in
+    /// brackets, exactly so the colons cannot be read as the port separator.
+    /// Splitting on the first ':' takes one from inside the address and the
+    /// request is refused, which makes every IPv6 literal unreachable through
+    /// the HTTP inbound.
+    #[tokio::test]
+    async fn test_connect_accepts_a_bracketed_ipv6_authority() {
+        let destination = destination_of("CONNECT [2001:db8::1]:443 HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
+        assert_eq!(
+            destination,
+            NetLocation::new(Address::Ipv6("2001:db8::1".parse().unwrap()), 443)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_connect_still_takes_a_hostname_and_port() {
+        let destination = destination_of("CONNECT example.com:8443 HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
+        assert_eq!(
+            destination,
+            NetLocation::new(Address::Hostname("example.com".to_string()), 8443)
+        );
+    }
+
+    /// CONNECT has no default port, so an authority without one is a bad
+    /// request rather than a guess.
+    #[tokio::test]
+    async fn test_connect_without_a_port_is_refused() {
+        assert!(
+            destination_of("CONNECT example.com HTTP/1.1\r\n\r\n")
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_forward_url_accepts_a_bracketed_ipv6_authority() {
+        let destination = destination_of("GET http://[2001:db8::1]:8080/path HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
+        assert_eq!(
+            destination,
+            NetLocation::new(Address::Ipv6("2001:db8::1".parse().unwrap()), 8080)
+        );
+    }
+
+    /// An absolute URL may leave the port out, and then it is 80.
+    #[tokio::test]
+    async fn test_a_forward_url_without_a_port_defaults_to_80() {
+        let destination = destination_of("GET http://example.com/path HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
+        assert_eq!(
+            destination,
+            NetLocation::new(Address::Hostname("example.com".to_string()), 80)
+        );
     }
 }
