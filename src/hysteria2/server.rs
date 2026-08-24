@@ -355,6 +355,26 @@ impl UdpSession {
     }
 }
 
+/// Why a session can take UDP from a client but never answer it.
+///
+/// Not a failure of the peer and not one we can work around here. quinn will
+/// not send a datagram to a peer that omitted `max_datagram_frame_size`
+/// (`quinn-proto-0.11.17/src/connection/datagrams.rs:32-34`) and has no
+/// equivalent of upstream's `AssumePeerMaxDatagramFrameSize`, so a client that
+/// omits the parameter - which every official Hysteria2 client does - gets
+/// one-way UDP from us.
+///
+/// The message exists so that shows up in the operator's log as a named cause
+/// rather than as a session that simply never replies.
+fn no_datagram_support(session_id: u32) -> std::io::Error {
+    std::io::Error::other(format!(
+        "UDP session {session_id} can receive but never reply: the client did not \
+         advertise max_datagram_frame_size, and quinn will not send datagrams to a \
+         peer that omitted it. Every official Hysteria2 client omits it. See \
+         docs/superpowers/specs/2026-08-24-hysteria2-conformance-design.md"
+    ))
+}
+
 async fn run_udp_remote_to_local_loop(
     session_id: u32,
     connection: quinn::Connection,
@@ -365,7 +385,7 @@ async fn run_udp_remote_to_local_loop(
 ) -> std::io::Result<()> {
     let max_datagram_size = connection
         .max_datagram_size()
-        .ok_or_else(|| std::io::Error::other("datagram not supported by remote endpoint"))?;
+        .ok_or_else(|| no_datagram_support(session_id))?;
 
     let original_address_bytes: Option<(Bytes, Bytes)> = match override_local_write_address {
         Some(a) => {
@@ -1002,6 +1022,23 @@ mod tests {
             .header("Hysteria-Auth", password)
             .body(())
             .unwrap()
+    }
+
+    /// The one divergence in this round that has no fix available: quinn
+    /// refuses to send datagrams to a peer that omitted
+    /// `max_datagram_frame_size` and offers no way to assume one. What is
+    /// within reach is that the operator can tell this apart from a session
+    /// that is merely idle, so the diagnosis is pinned here against being
+    /// quietly shortened back to "datagram not supported by remote endpoint".
+    #[test]
+    fn test_a_peer_that_cannot_take_datagrams_is_named_as_the_cause() {
+        let message = no_datagram_support(7).to_string();
+        assert!(message.contains("session 7"), "{message}");
+        assert!(message.contains("max_datagram_frame_size"), "{message}");
+        assert!(
+            message.contains("never reply"),
+            "the consequence has to be in the message, not just the cause: {message}"
+        );
     }
 
     /// `0` does not mean "we are not rate limiting you". PROTOCOL.md defines it
