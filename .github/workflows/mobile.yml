@@ -101,12 +101,21 @@ jobs:
           set -euo pipefail
           lib=target/aarch64-apple-darwin/release/libshoes.a
           [ -f "$lib" ] || { echo "$lib not found"; exit 1; }
-          exported=$(nm -gU "$lib" 2>/dev/null | grep -c '_shoes_' || true)
+          # ' T _shoes_' rather than `nm -gU`: -U means --defined-only in
+          # llvm-nm but something else in cctools nm, and which one is on PATH
+          # depends on the runner's Xcode. Matching the type column works in
+          # both, and the first version of this check reported 0 symbols on CI
+          # while reporting 10 on a developer's machine for exactly that reason.
+          exported=$(nm -g "$lib" 2>/dev/null | grep -c ' T _shoes_' || true)
           declared=$(grep -cE '^[a-z].*shoes_[a-z_]+\(' include/shoes.h)
           echo "$exported symbols exported, $declared declared in include/shoes.h"
           if [ "$exported" -ne "$declared" ]; then
             echo "The macOS build and the header disagree. Regenerate the header"
             echo "with cbindgen, or check what stopped being exported."
+            echo "--- exported ---"
+            nm -g "$lib" 2>/dev/null | grep ' T _shoes_' | sed 's/.* //' | sort
+            echo "--- declared ---"
+            grep -oE 'shoes_[a-z_]+\(' include/shoes.h | tr -d '(' | sort -u
             exit 1
           fi
 
