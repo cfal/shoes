@@ -31,9 +31,7 @@ use tokio::runtime::Runtime;
 use crate::logging::{DynamicFileLogWriter, LogWriter};
 use crate::socket_protector::{FnSocketProtector, set_global_socket_protector};
 
-use super::common::{
-    self, LOG_FILE, LOGGER_INITIALIZED, TUN_SERVICE, setup_log_file,
-};
+use super::common::{self, LOG_FILE, LOGGER_INITIALIZED, TUN_SERVICE, setup_log_file};
 
 /// Writes to Android logcat. Uses the `record` arg for level mapping;
 /// logcat has its own formatting so the pre-formatted string is ignored.

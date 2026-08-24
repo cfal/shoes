@@ -29,9 +29,7 @@ use std::sync::OnceLock;
 
 use crate::logging::{DynamicFileLogWriter, LogWriter};
 
-use super::common::{
-    self, INITIALIZED, LOG_FILE, LOGGER_INITIALIZED, TUN_SERVICE, setup_log_file,
-};
+use super::common::{self, INITIALIZED, LOG_FILE, LOGGER_INITIALIZED, TUN_SERVICE, setup_log_file};
 
 /// Socket protector callback type.
 /// Called from Rust to protect sockets from VPN routing.

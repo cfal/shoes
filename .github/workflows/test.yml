@@ -94,8 +94,12 @@ jobs:
       - name: Add NASM to PATH
         run: echo "C:\Program Files\NASM" >> $env:GITHUB_PATH
 
+      # --features desktop, not the default: control::stats is behind
+      # control-stats, so a default check never compiles it and its
+      # cfg(not(unix)) arms -- the very lines this job exists to cover -- go
+      # unchecked.
+      #
       # cargo check, not test: TUN is unsupported on Windows until a wintun
-      # backend lands, so there is nothing yet to run. What matters now is that
-      # the library and its cfg(not(unix)) arms compile at all.
+      # backend lands, so there is nothing yet to run.
       - name: Check the library
-        run: cargo check --locked --lib
+        run: cargo check --locked --lib --features desktop

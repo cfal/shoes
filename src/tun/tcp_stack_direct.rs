@@ -931,6 +931,14 @@ fn run_direct_stack_thread(
         }
     }
 
+    // Sockets still live when the loop breaks -- on a shutdown request, on TUN
+    // EOF, or after MAX_PHY_WAIT_ERRORS -- never reach the cleanup sweep that
+    // decrements, so without this the count keeps whatever was open at the
+    // moment the tunnel stopped. Being process-global, that error then
+    // compounds across every start/stop for the life of the process.
+    #[cfg(feature = "control-stats")]
+    super::traffic::reset_active_connections();
+
     info!("smoltcp direct stack thread stopped");
 }
 
@@ -1432,6 +1440,44 @@ mod tests {
             }
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    /// A tunnel that stops with connections still open must not leave them
+    /// counted. The count is process-global, so a leak here compounds across
+    /// every start and stop for the life of the process: reconnect after
+    /// browsing with thirty sockets open and the GUI starts from thirty.
+    #[cfg(feature = "control-stats")]
+    #[test]
+    fn test_the_connection_count_does_not_survive_the_stack() {
+        let (server, client) = UnixStream::pair().expect("Failed to create socket pair");
+        let client_fd = client.into_raw_fd();
+
+        let stack = TcpStackDirect::new(client_fd, owning_options());
+        thread::sleep(Duration::from_millis(100));
+        assert!(stack.is_running());
+
+        // Stand in for connections the stack is holding when it is told to
+        // stop -- the sweep that decrements only runs inside its loop.
+        super::super::traffic::connection_opened();
+        super::super::traffic::connection_opened();
+        assert_eq!(super::super::traffic::active_connections(), 2);
+
+        drop(server);
+
+        let start = std::time::Instant::now();
+        while stack.is_running() {
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "stack thread never exited"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        assert_eq!(
+            super::super::traffic::active_connections(),
+            0,
+            "connections stayed counted after the stack thread exited"
+        );
     }
 
     #[test]

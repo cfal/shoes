@@ -44,6 +44,22 @@ use crate::tcp::tcp_server::start_servers;
 use crate::tun::run_tun_from_config;
 
 /// Handle to a running service.
+///
+/// # Do not drop this from async code
+///
+/// Prefer [`ServiceHandle::stop`], and call it from a blocking context —
+/// `tokio::task::spawn_blocking` from a Tauri command or an async handler.
+///
+/// Two reasons, and they apply to a plain `drop` as much as to `stop`. The
+/// handle owns a [`tokio::runtime::Runtime`], and dropping a runtime inside
+/// another runtime's context panics with "Cannot drop a runtime in a context
+/// where blocking is not allowed". And `stop` waits, by design, up to
+/// [`STOP_TIMEOUT`] on the calling thread — on an async worker that stalls
+/// every other task sharing it.
+///
+/// Dropping also skips the wait entirely, which is the wait that tells a host
+/// whether it may close a descriptor it lent. That answer only comes back from
+/// `stop`, as a [`StopOutcome`].
 pub struct ServiceHandle {
     /// Tokio runtime running the service.
     runtime: tokio::runtime::Runtime,
@@ -61,12 +77,17 @@ pub struct ServiceHandle {
 }
 
 /// How long `stop_handle` waits for the service task to finish.
-const STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+pub const STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// How often it looks while waiting.
 const STOP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(5);
 
 /// Stop a running service and wait for it to release the TUN descriptor.
+///
+/// Call this from a blocking context — see the warning on [`ServiceHandle`].
+/// It sleeps the calling thread in a poll loop for up to [`STOP_TIMEOUT`], and
+/// if the shutdown thread cannot be spawned it drops the runtime inline, which
+/// panics inside an async context.
 ///
 /// The wait is the part that cannot be skipped: it is what
 /// guarantees the stack thread has released the TUN descriptor, so the app can
@@ -137,6 +158,8 @@ impl ServiceHandle {
     ///
     /// Consumes the handle, because a stopped service has nothing left to
     /// answer and a second stop has no meaning.
+    ///
+    /// Call this from a blocking context — see the warning on this type.
     pub fn stop(self) -> StopOutcome {
         stop_handle(self)
     }
@@ -200,6 +223,12 @@ pub fn start(
     prepared: PreparedService,
     on_error: impl Fn(String) + Send + 'static,
 ) -> ServiceHandle {
+    // From zero, so a second session does not report the first one's bytes
+    // against a fresh uptime. Both FFI platforms already do this in their own
+    // start path; a Rust host had no equivalent.
+    #[cfg(unix)]
+    crate::tun::traffic::reset_traffic_counters();
+
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let running = Arc::new(AtomicBool::new(true));
     let running_clone = running.clone();
@@ -376,7 +405,6 @@ pub async fn run_prepared(
 
     result
 }
-
 
 #[cfg(test)]
 mod tests {

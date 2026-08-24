@@ -3,9 +3,9 @@
 //! Provides global atomic byte counters and a callback mechanism for reporting
 //! traffic statistics to the host application (iOS/Android) via FFI.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(feature = "control-stats")]
 use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use parking_lot::RwLock;
@@ -55,7 +55,13 @@ pub fn active_connections() -> usize {
     ACTIVE_CONNECTIONS.load(Ordering::Relaxed)
 }
 
-#[cfg(all(test, feature = "control-stats"))]
+/// Zero the live-connection count.
+///
+/// Called when the stack thread exits: whatever it was still holding is gone
+/// with it, so the count is zero by definition. Decrementing per surviving
+/// socket would reach the same number by a longer route and drift if any path
+/// missed one.
+#[cfg(feature = "control-stats")]
 pub fn reset_active_connections() {
     ACTIVE_CONNECTIONS.store(0, Ordering::Relaxed);
 }

@@ -37,7 +37,11 @@ pub fn snapshot() -> StatsSnapshot {
     }
 }
 
-#[cfg(test)]
+// cfg(unix) as well as cfg(test): these drive the counter through
+// tun::traffic, and the tun module does not exist on Windows. The
+// cfg(not(unix)) arms of `snapshot` are covered by the Windows CI job
+// compiling this module, not by these.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::tun::traffic::{connection_closed, connection_opened, reset_active_connections};

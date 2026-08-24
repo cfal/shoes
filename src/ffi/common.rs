@@ -9,8 +9,8 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
-use std::sync::atomic::AtomicBool;
 use std::sync::OnceLock;
+use std::sync::atomic::AtomicBool;
 
 use log::info;
 

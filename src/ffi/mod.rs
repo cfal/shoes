@@ -39,12 +39,7 @@
 //! - `shoes_stop` signals shutdown and waits for cleanup
 
 // Common utilities shared between the Apple and Android surfaces
-#[cfg(any(
-    target_os = "android",
-    target_os = "ios",
-    target_os = "macos",
-    test
-))]
+#[cfg(any(target_os = "android", target_os = "ios", target_os = "macos", test))]
 mod common;
 
 #[cfg(target_os = "android")]

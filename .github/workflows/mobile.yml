@@ -178,12 +178,22 @@ jobs:
           [ -f "$so" ] || { echo "$so not found"; exit 1; }
           actual=$(stat -c %s "$so")
           baseline=$(grep -v '^#' mobile-size-baseline.txt | tr -d '[:space:]')
-          echo "arm64 libshoes.so: $actual bytes (baseline $baseline)"
-          if [ "$actual" -gt "$baseline" ]; then
+          # A band, not an exact ceiling. The baseline is recorded from a
+          # developer's build, while this job compiles with an unpinned stable
+          # rustc and the runner's own NDK -- a compiler bump moves the size by
+          # kilobytes on its own, and a hard ceiling would fail PRs that
+          # touched nothing relevant. 2% of ~9.7MB is ~195KB: wide enough to
+          # absorb that drift, narrow enough that anything worth calling a
+          # regression trips it.
+          ceiling=$((baseline + baseline * 2 / 100))
+          echo "arm64 libshoes.so: $actual bytes (baseline $baseline, ceiling $ceiling)"
+          if [ "$actual" -gt "$ceiling" ]; then
             over=$((actual - baseline))
-            echo "Over the baseline by $over bytes."
+            echo "Over the baseline by $over bytes, past the 2% band."
             echo "If the growth is intended, raise mobile-size-baseline.txt in a"
-            echo "commit that says what bought the bytes."
+            echo "commit that says what bought the bytes. If it is not, note that"
+            echo "this number came from a local build -- check a toolchain bump"
+            echo "before assuming the code did it."
             exit 1
           fi
 

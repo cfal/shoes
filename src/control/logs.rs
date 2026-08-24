@@ -53,9 +53,12 @@ impl BroadcastLogWriter {
     /// A GUI that attaches after the tunnel started still needs to see why it
     /// failed, which is why the backlog comes back rather than only the stream.
     pub fn subscribe(&self) -> (Vec<LogLine>, broadcast::Receiver<LogLine>) {
-        // Subscribe while holding the ring lock, so a line written between the
-        // two steps lands on the receiver instead of falling in the gap
-        // between the snapshot and the subscription.
+        // Snapshot and subscribe under the same lock that `push` holds across
+        // both of its steps, so the two cannot interleave and every line is
+        // delivered exactly once. Either this runs first -- empty of the line,
+        // and the receiver exists before the send, so the stream carries it --
+        // or `push` completes first, and the line is in the backlog while the
+        // receiver is created after the send that would have repeated it.
         let ring = self.ring.lock();
         let rx = self.tx.subscribe();
         let backlog = ring.iter().cloned().collect();
@@ -63,13 +66,16 @@ impl BroadcastLogWriter {
     }
 
     fn push(&self, line: LogLine) {
-        {
-            let mut ring = self.ring.lock();
-            if ring.len() == self.capacity {
-                ring.pop_front();
-            }
-            ring.push_back(line.clone());
+        // The send stays inside the lock. Releasing it first opens a window
+        // where `subscribe` snapshots a ring that already holds this line and
+        // then creates a receiver that the send is about to reach as well, so
+        // a host rendering backlog-then-stream shows it twice. Holding it is
+        // safe: a broadcast send never blocks.
+        let mut ring = self.ring.lock();
+        if ring.len() == self.capacity {
+            ring.pop_front();
         }
+        ring.push_back(line.clone());
         // Ignored deliberately: no subscribers, or one that has fallen behind,
         // must not stall a thread that is moving packets.
         let _ = self.tx.send(line);
@@ -144,6 +150,22 @@ mod tests {
         let (_backlog, mut rx) = writer.subscribe();
         writer.push(line("after"));
         assert_eq!(rx.try_recv().unwrap().message, "after");
+    }
+
+    /// A line already in the backlog must not also arrive on the stream, or a
+    /// host rendering backlog-then-stream shows it twice.
+    #[test]
+    fn test_a_retained_line_is_not_also_streamed() {
+        let writer = BroadcastLogWriter::new(4);
+        writer.push(line("once"));
+
+        let (backlog, mut rx) = writer.subscribe();
+        assert_eq!(backlog.len(), 1);
+        assert_eq!(backlog[0].message, "once");
+        assert!(
+            rx.try_recv().is_err(),
+            "a line in the backlog was streamed as well"
+        );
     }
 
     /// A zero capacity would panic inside broadcast::channel, and a host
