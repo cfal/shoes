@@ -221,6 +221,24 @@ interoperating with it, and that decision belongs with the user.
 - Empty UDP payloads, which upstream rejects (`proxy.go:216-219`) and we send.
   It needs a decision — refuse, or document the divergence — and it belongs
   with the phase 3 fingerprint questions.
+- **A burst of UDP datagrams on a freshly raised connection is mostly lost.**
+  Found live, not by any test, and **unexplained**. Six DNS queries sent
+  back to back over a connection that has just been authenticated get roughly
+  one answer; the same six a few hundred milliseconds apart get six. Two
+  independent sessions lose the *same* rounds, so it is the shared connection
+  and not the sessions.
+
+  Not a regression from this phase: a binary built before any of it loses at
+  least as much. Not the demultiplexer, and not the resolver — six *distinct*
+  names do not reproduce it at the same rate, which is how the first
+  measurement of this fooled us. A public resolver collapsing six identical
+  concurrent questions into one answer looks exactly like datagram loss, and
+  any future measurement here has to use distinct names or it is measuring the
+  resolver.
+
+  Worth its own investigation: candidates are quinn's datagram queue against a
+  cold congestion window, and the peer's session setup. Neither has been
+  checked.
 
 ## Testing
 
@@ -235,6 +253,22 @@ agreeing:
 - **1.3** cannot be tested against our own client, which advertises the
   parameter. A test can still pin the *diagnosis*: a client that omits it must
   make the server log a named error rather than a silent task death.
+
+### What the live run actually caught
+
+All of it was run, and it earned its place: it disproved 1.3 as written, which
+no test of ours could have, because the claim was about a peer we do not
+control. Building the official client from source and pointing it at our server
+is the cheapest way to check anything on this list and should be the first move
+next time, not the last.
+
+| Item | How it was confirmed |
+| --- | --- |
+| 1.1 | Official client shows our dial error verbatim; a working target still connects |
+| 1.2 | Warm connection, two sessions: pre-fix loses 1-5 of 6 every run, after is 6/6 twice over |
+| 1.3 | **Disproved as written.** Stock client's UDP works; only `disableChromeParrot: true` reproduces it |
+| 1.4 | Pre-fix binary made a real Go server dial `[2001:db8::1:443]:0`; after, the same request returns 200 |
+| 1.5 | Official client with `up: 200 mbps` reports `tx: 0` — it took `auto` and ignored its own configured rate |
 
 A live run against a real Hysteria2 server, as the port-hopping work had, is
 what would catch the next one of these. That is worth doing once phase 1 lands.

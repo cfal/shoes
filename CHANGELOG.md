@@ -9,6 +9,12 @@ Hysteria2 server behind an `iptables REDIRECT` range expects. Configured as
 `port_hopping: { ports, interval_ms }`; the local port moves with the remote
 one, so the whole 4-tuple changes rather than half of it.
 
+Verified against a real deployment behind an `iptables REDIRECT` rule: over
+seven hops the server saw eight distinct client source ports and traffic to
+every published port, with no request lost. A UDP association survives a hop
+too, though a datagram sent as one happens can be lost — QUIC datagrams are not
+retransmitted, and the new path has to be validated before the peer will use it.
+
 A QUIC outbound also walks every resolved address instead of only the first. A
 dual-stack host whose IPv6 is published but whose return UDP never arrives used
 to look permanently dead; each address now gets a bounded attempt before the

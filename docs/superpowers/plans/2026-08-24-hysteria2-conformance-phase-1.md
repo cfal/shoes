@@ -1,6 +1,6 @@
 # Hysteria2 Conformance, Phase 1 — Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Fix the four Hysteria2 divergences that make a real peer fail against us, and stop the fifth from failing silently.
 
@@ -37,7 +37,7 @@ own parser accepts it, which is why no test has ever failed.
 - Modify: `src/hysteria2/client.rs:181`, `src/hysteria2/client.rs:214`
 - Modify: `src/hysteria2/server.rs:363`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Add to `mod tests` in `src/address.rs`:
 
@@ -71,12 +71,12 @@ Add to `mod tests` in `src/address.rs`:
     }
 ```
 
-- [ ] **Step 2: Run it and watch it fail**
+- [x] **Step 2: Run it and watch it fail**
 
 Run: `cargo test --lib address::tests::test_the_wire_form`
 Expected: FAIL to compile — `no method named 'to_wire_string'`.
 
-- [ ] **Step 3: Add the method**
+- [x] **Step 3: Add the method**
 
 In `src/address.rs`, inside `impl NetLocation`, after `pub fn port`:
 
@@ -97,12 +97,12 @@ In `src/address.rs`, inside `impl NetLocation`, after `pub fn port`:
     }
 ```
 
-- [ ] **Step 4: Run the tests**
+- [x] **Step 4: Run the tests**
 
 Run: `cargo test --lib address::`
 Expected: PASS.
 
-- [ ] **Step 5: Use it at the three sites**
+- [x] **Step 5: Use it at the three sites**
 
 `src/hysteria2/client.rs:181`, replace:
 
@@ -124,12 +124,12 @@ string for a datagram header, and both must use the wire form.
 Run `grep -n "to_string()" src/hysteria2/` afterwards and check that no
 remaining hit is an address destined for the wire.
 
-- [ ] **Step 6: Run the whole suite**
+- [x] **Step 6: Run the whole suite**
 
 Run: `cargo test --lib hysteria2 && cargo test --lib address`
 Expected: PASS.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add src/address.rs src/hysteria2/client.rs src/hysteria2/server.rs
@@ -153,14 +153,14 @@ its own, so N concurrent sessions each lose about (N-1)/N of their traffic.
 - Modify: `src/hysteria2/udp.rs:40-70`
 - Modify: `src/hysteria2/client.rs:218` (where the session is built)
 
-- [ ] **Step 1: Read what exists**
+- [x] **Step 1: Read what exists**
 
 Read `src/hysteria2/udp.rs` in full and `src/quic_outbound/connection.rs`
 lines 50-100. You need to know how `Hysteria2UdpSession` currently receives and
 what `LiveConnection` holds. Note that `LiveConnection::get` returns a *clone*
 of one `quinn::Connection`, which is the root of the defect.
 
-- [ ] **Step 2: Write the failing test**
+- [x] **Step 2: Write the failing test**
 
 Add to `mod tests` in `src/hysteria2/client.rs`:
 
@@ -217,13 +217,13 @@ Add to `mod tests` in `src/hysteria2/client.rs`:
     }
 ```
 
-- [ ] **Step 3: Run it and watch it fail**
+- [x] **Step 3: Run it and watch it fail**
 
 Run: `cargo test --lib hysteria2::client::tests::test_two_udp_sessions -- --nocapture`
 Expected: FAIL — a timeout naming a lost datagram. If it passes, the race did
 not trigger; raise the round count to 32 and re-run before concluding anything.
 
-- [ ] **Step 4: Add the demultiplexer to `LiveConnection`**
+- [x] **Step 4: Add the demultiplexer to `LiveConnection`**
 
 In `src/quic_outbound/connection.rs`, add above `impl LiveConnection`:
 
@@ -265,7 +265,7 @@ impl DatagramRouter {
 }
 ```
 
-- [ ] **Step 5: Drive it from one task per connection**
+- [x] **Step 5: Drive it from one task per connection**
 
 Still in `connection.rs`, add to `LiveConnection` a field
 `router: Arc<DatagramRouter>` initialised in `new`, a getter
@@ -292,7 +292,7 @@ connection is established — in `attempt`, immediately after
         });
 ```
 
-- [ ] **Step 6: Take the channel in the session**
+- [x] **Step 6: Take the channel in the session**
 
 In `src/hysteria2/udp.rs`, replace the field that holds the receive side and the
 task that reads the connection with an
@@ -304,18 +304,18 @@ task that reads the connection with an
 In `src/hysteria2/client.rs`, where the session is constructed, pass
 `self.connection.router()` and the session id.
 
-- [ ] **Step 7: Run the test**
+- [x] **Step 7: Run the test**
 
 Run: `cargo test --lib hysteria2 -- --nocapture`
 Expected: PASS, including the new test and every existing UDP test.
 
-- [ ] **Step 8: Mutation-check**
+- [x] **Step 8: Mutation-check**
 
 Temporarily make `dispatch` drop everything (`let _ = session_id; return;`).
 Expected: the new test fails. Restore and confirm it passes. If it passed with
 dispatch disabled, the test is not exercising the router.
 
-- [ ] **Step 9: Commit**
+- [x] **Step 9: Commit**
 
 ```bash
 git add src/quic_outbound/connection.rs src/hysteria2/udp.rs src/hysteria2/client.rs
@@ -334,13 +334,13 @@ their replies."
 **Files:**
 - Modify: `src/hysteria2/server.rs:841-861` and the dial site around `:902-923`
 
-- [ ] **Step 1: Read both halves**
+- [x] **Step 1: Read both halves**
 
 Read `src/hysteria2/server.rs:830-930`. `handle_tcp_header` builds the response
 bytes; `process_tcp_stream` dials afterwards. The response must move to after
 the dial, and must carry the outcome.
 
-- [ ] **Step 2: Write the failing test**
+- [x] **Step 2: Write the failing test**
 
 Add to the server's test module (or the client's, whichever already spawns both
 ends — reuse `spawn_server`):
@@ -369,12 +369,12 @@ ends — reuse `spawn_server`):
     }
 ```
 
-- [ ] **Step 3: Run it and watch it fail**
+- [x] **Step 3: Run it and watch it fail**
 
 Run: `cargo test --lib test_a_failed_dial_is_reported`
 Expected: FAIL — `connect_tcp` returns `Ok`, because the server said OK.
 
-- [ ] **Step 4: Move the response after the dial**
+- [x] **Step 4: Move the response after the dial**
 
 Change `handle_tcp_header` to return the parsed request without writing a
 response, and have `process_tcp_stream` write the response once the dial has
@@ -385,14 +385,14 @@ success message (`core/server/server.go:322`) where we send an empty one.
 On failure, write status 1 with the dial error's text, then shut down. On
 success, write status 0 with `Connected`.
 
-- [ ] **Step 5: Run the tests**
+- [x] **Step 5: Run the tests**
 
 Run: `cargo test --lib hysteria2`
 Expected: PASS, including `frame.rs`'s
 `test_parse_tcp_response_error_carries_the_message`, which is currently dead
 against our own server.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add src/hysteria2/server.rs
@@ -412,7 +412,7 @@ does."
 **Files:**
 - Modify: `src/hysteria2/server.rs:239`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```rust
     /// 0 means "no limit, send as fast as you like", which makes an official
@@ -438,12 +438,12 @@ that opens a connection and sends the auth POST directly, returning the
 response — the client's own auth code in `src/hysteria2/auth.rs` shows the
 shape.
 
-- [ ] **Step 2: Run it and watch it fail**
+- [x] **Step 2: Run it and watch it fail**
 
 Run: `cargo test --lib test_the_server_reports_auto`
 Expected: FAIL — the header is `0`.
 
-- [ ] **Step 3: Change the value**
+- [x] **Step 3: Change the value**
 
 At `src/hysteria2/server.rs:239`, replace the `"0"` with `"auto"`, and add:
 
@@ -454,7 +454,7 @@ At `src/hysteria2/server.rs:239`, replace the `"0"` with `"auto"`, and add:
         // that has installed no rate control at all.
 ```
 
-- [ ] **Step 4: Run the tests, then commit**
+- [x] **Step 4: Run the tests, then commit**
 
 Run: `cargo test --lib hysteria2`
 
@@ -476,7 +476,7 @@ stop failing silently.
 **Files:**
 - Modify: `src/hysteria2/server.rs:341`, `:357-359`
 
-- [ ] **Step 1: Raise the diagnosis**
+- [x] **Step 1: Raise the diagnosis**
 
 At `server.rs:357`, where `max_datagram_size()` returns `None`, log at `warn`
 with a message that names the cause and the consequence:
@@ -494,7 +494,7 @@ with a message that names the cause and the consequence:
 At `server.rs:341`, where the spawned task ends, make sure the task's exit is
 logged rather than silent.
 
-- [ ] **Step 2: Run the suite and commit**
+- [x] **Step 2: Run the suite and commit**
 
 Run: `cargo fmt --all && cargo test --lib && cargo clippy --locked --lib --bins --tests -- -D warnings`
 
@@ -512,7 +512,7 @@ warning instead of a task that dies at debug level."
 
 ### Task 6: The gate, and the record
 
-- [ ] **Step 1: Full gate**
+- [x] **Step 1: Full gate**
 
 ```bash
 cargo fmt --all -- --check
@@ -524,7 +524,7 @@ cargo test --bins
 cargo test --test '*'
 ```
 
-- [ ] **Step 2: Record it**
+- [x] **Step 2: Record it**
 
 Add an `Unreleased` entry to `CHANGELOG.md` describing the four fixes in terms
 of what a user sees — an IPv6 target that now works, UDP sessions that no
@@ -532,7 +532,7 @@ longer lose traffic, a failed dial that now says why, and a congestion-control
 signal that no longer makes an official client misbehave. Mention the datagram
 limitation and that it is unresolved.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add CHANGELOG.md
@@ -541,12 +541,24 @@ git commit -m "docs: record the Hysteria2 conformance fixes"
 
 ---
 
-## Live verification
+## Live verification — done
 
 Phase 1 is where a live run pays for itself: four of these are invisible to any
-test where both ends are ours. Against a real Hysteria2 server, check an IPv6
-target, two simultaneous UDP associations, and a connection to a dead port.
+test where both ends are ours.
 
-Test configs carrying real credentials go in a temp directory outside the
-working tree and are deleted afterwards; `git status` and the outgoing diff get
-scanned before any push.
+Run against a real Hysteria2 server and, for the server-side items, against the
+official client built from upstream `619a6f8`. Every item confirmed, and finding
+1.3 was **disproved as written** — see the results table in the spec.
+
+The one thing a test could never have told us: the official client's Chrome
+parroting overrides its own `OmitMaxDatagramFrameSize`, so the stock client's
+UDP works against us.
+
+Port hopping, which this plan does not cover, was verified in the same session
+against a real deployment with an `iptables REDIRECT` rule: eight distinct
+client source ports and both destination ports over seven hops, with every
+request succeeding.
+
+Test configs carrying real credentials went in a temp directory outside the
+working tree and were deleted afterwards; `git status` and the outgoing diff
+were scanned before the push.
