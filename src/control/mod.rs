@@ -13,6 +13,10 @@ use log::{error, info, warn};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
+mod stop;
+
+pub use stop::StopOutcome;
+
 // Not on Android or iOS. This is not a feature a mobile host might want and
 // currently declines -- it is API a mobile host structurally cannot use, since
 // a C or JNI caller has no way to receive a StatusSnapshot and reads the same
@@ -58,8 +62,7 @@ const STOP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis
 
 /// Stop a running service and wait for it to release the TUN descriptor.
 ///
-/// Returns `true` if the service confirmed it stopped, `false` if the wait
-/// timed out. The wait is the part that cannot be skipped: it is what
+/// The wait is the part that cannot be skipped: it is what
 /// guarantees the stack thread has released the TUN descriptor, so the app can
 /// close its own copy without racing a thread that is still reading from it.
 /// In practice it costs a few milliseconds — the old version polled in 100 ms
@@ -68,7 +71,7 @@ const STOP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis
 /// Dropping the runtime, on the other hand, waits on tasks that no longer hold
 /// anything the app needs back, so it happens on a thread of its own and the
 /// caller does not pay for it.
-pub fn stop_handle(mut handle: ServiceHandle) -> bool {
+pub fn stop_handle(mut handle: ServiceHandle) -> StopOutcome {
     if let Some(tx) = handle.shutdown_tx.take() {
         let _ = tx.send(());
     }
@@ -83,17 +86,17 @@ pub fn stop_handle(mut handle: ServiceHandle) -> bool {
         std::thread::sleep(STOP_POLL_INTERVAL);
     }
 
-    if stopped {
-        info!(
-            "TUN service stopped after {}ms",
-            started.elapsed().as_millis()
-        );
+    let waited = started.elapsed();
+    let outcome = if stopped {
+        info!("TUN service stopped after {}ms", waited.as_millis());
+        StopOutcome::Released
     } else {
         error!(
             "TUN service did not stop within {}s; the TUN descriptor may still be in use",
             STOP_TIMEOUT.as_secs()
         );
-    }
+        StopOutcome::TimedOut { waited }
+    };
 
     // shutdown_timeout, not drop: a task wedged in a blocking call would
     // otherwise keep this thread — the app's main thread, in the sample code
@@ -115,13 +118,21 @@ pub fn stop_handle(mut handle: ServiceHandle) -> bool {
         drop(runtime.lock().take());
     }
 
-    stopped
+    outcome
 }
 
 impl ServiceHandle {
     /// Whether the service task is still running.
     pub fn is_running(&self) -> bool {
         self.running.load(Ordering::SeqCst)
+    }
+
+    /// Stop this service and wait for it to release the device.
+    ///
+    /// Consumes the handle, because a stopped service has nothing left to
+    /// answer and a second stop has no meaning.
+    pub fn stop(self) -> StopOutcome {
+        stop_handle(self)
     }
 
     /// A point-in-time reading of this service.

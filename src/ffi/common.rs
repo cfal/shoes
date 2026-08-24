@@ -93,7 +93,9 @@ pub fn stop_service() -> bool {
         return true;
     };
 
-    let stopped = crate::control::stop_handle(handle);
+    // The C and JNI surfaces answer with an int, so the obligation the type
+    // carries is flattened here rather than at the call sites.
+    let stopped = crate::control::stop_handle(handle).device_released();
 
     // The protector holds a reference to the platform's VPN service object.
     // Released here rather than in the platform modules so that neither one can
