@@ -1,6 +1,7 @@
 //! Shared machinery for outbounds that dial over QUIC and own their transport.
 
 pub mod connection;
+pub mod datagram_router;
 #[cfg(test)]
 pub mod testing;
 

@@ -4,7 +4,6 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use log::debug;
-use rand::RngExt;
 
 use crate::address::{NetLocation, ResolvedLocation};
 use crate::async_stream::{AsyncMessageStream, AsyncStream};
@@ -61,7 +60,11 @@ impl Hysteria2Connector {
             default_alpn: "h3",
         };
         Self {
-            connection: LiveConnection::new(settings, authenticator.clone()),
+            connection: LiveConnection::new(
+                settings,
+                authenticator.clone(),
+                Some(super::udp::session_id_of),
+            ),
             authenticator,
             udp_enabled,
         }
@@ -200,7 +203,7 @@ impl TerminalConnector for Hysteria2Connector {
             ));
         }
 
-        let connection = self.connection.get(resolver).await?;
+        let (connection, router) = self.connection.get_with_datagrams(resolver).await?;
 
         // Checked after connecting, because the answer arrives with the
         // authentication rather than being known up front.
@@ -212,11 +215,9 @@ impl TerminalConnector for Hysteria2Connector {
         }
 
         let address = target.into_location().to_wire_string();
-        let session_id = rand::rng().random::<u32>();
-        debug!("Hysteria2: UDP session {session_id} to {address}");
 
         Ok(Box::new(super::udp::Hysteria2UdpSession::new(
-            connection, session_id, address,
+            connection, router, address,
         )))
     }
 
@@ -625,6 +626,82 @@ mod tests {
 
         let reply = udp_exchange(&mut stream, b"udp hello").await.unwrap();
         assert_eq!(reply, b"udp hello");
+    }
+
+    /// Two UDP sessions over one outbound must not eat each other's datagrams.
+    ///
+    /// Before the demultiplexer each session ran its own `read_datagram` loop
+    /// on the shared connection and dropped whatever session id was not its
+    /// own. quinn pops from a single queue, so with two sessions each won about
+    /// half the datagrams and the other half were discarded by the reader that
+    /// happened to get them.
+    ///
+    /// Nothing is asserted about order: the protocol does not promise it for
+    /// datagrams, and a test that demanded it would be pinning a property of
+    /// loopback rather than of the code.
+    #[tokio::test]
+    async fn test_two_udp_sessions_do_not_steal_from_each_other() {
+        use crate::async_stream::{AsyncReadMessage, AsyncWriteMessage};
+
+        let (server, _cert) = spawn_server(None).await;
+        let echo = spawn_udp_echo().await;
+        let resolver = test_resolver();
+        let connector = connector(server, SERVER_PASSWORD, None);
+
+        let mut first = connector
+            .connect_udp_bidirectional(&resolver, target(echo))
+            .await
+            .unwrap();
+        let mut second = connector
+            .connect_udp_bidirectional(&resolver, target(echo))
+            .await
+            .unwrap();
+
+        // Interleaved, so a stealing reader has every chance to win the race.
+        for round in 0..8u8 {
+            for (label, session) in [(1u8, &mut first), (2u8, &mut second)] {
+                std::future::poll_fn(|cx| {
+                    std::pin::Pin::new(&mut *session).poll_write_message(cx, &[label, round])
+                })
+                .await
+                .unwrap();
+            }
+        }
+
+        for (label, session) in [(1u8, &mut first), (2u8, &mut second)] {
+            let mut received = Vec::new();
+            for _ in 0..8u8 {
+                let mut buf = [0u8; 64];
+                let mut read = tokio::io::ReadBuf::new(&mut buf);
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    std::future::poll_fn(|cx| {
+                        std::pin::Pin::new(&mut *session).poll_read_message(cx, &mut read)
+                    }),
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "session {label} received only {} of its 8 datagrams",
+                        received.len()
+                    )
+                })
+                .unwrap();
+
+                assert_eq!(
+                    read.filled()[0],
+                    label,
+                    "session {label} was handed another session's datagram"
+                );
+                received.push(read.filled()[1]);
+            }
+            received.sort_unstable();
+            assert_eq!(
+                received,
+                (0..8u8).collect::<Vec<_>>(),
+                "session {label} did not get its own eight back"
+            );
+        }
     }
 
     #[tokio::test]

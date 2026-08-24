@@ -1,6 +1,7 @@
 //! One Hysteria2 UDP session as an AsyncMessageStream.
 
 use std::pin::Pin;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::task::{Context, Poll};
 
@@ -9,6 +10,7 @@ use log::debug;
 use tokio::io::ReadBuf;
 use tokio::sync::mpsc;
 
+use crate::quic_outbound::datagram_router::DatagramRouter;
 use crate::quic_transport::fragments::FragmentTable;
 
 use crate::async_stream::{
@@ -18,16 +20,25 @@ use crate::async_stream::{
 
 use super::frame::{build_datagrams, parse_datagram};
 
-/// How many reassembled payloads may queue up before the reader blocks.
-const INCOMING_CAPACITY: usize = 64;
+/// Where the session id sits in a Hysteria2 datagram: the first four bytes,
+/// before the packet id and the fragment numbers
+/// (`core/internal/protocol/proxy.go:151-223`).
+///
+/// This is all the connection's demultiplexer needs to read. The rest of the
+/// header is parsed by the session itself, which is where that session's
+/// reassembly table lives.
+pub fn session_id_of(datagram: &[u8]) -> Option<u32> {
+    Some(u32::from_be_bytes(datagram.get(0..4)?.try_into().ok()?))
+}
 
 pub struct Hysteria2UdpSession {
     connection: quinn::Connection,
+    router: Arc<DatagramRouter>,
     session_id: u32,
     address: String,
     next_packet_id: AtomicU16,
-    incoming: mpsc::Receiver<Vec<u8>>,
-    reader_task: tokio::task::JoinHandle<()>,
+    incoming: mpsc::Receiver<Bytes>,
+    fragments: FragmentTable,
 }
 
 impl std::fmt::Debug for Hysteria2UdpSession {
@@ -40,51 +51,27 @@ impl std::fmt::Debug for Hysteria2UdpSession {
 }
 
 impl Hysteria2UdpSession {
-    pub fn new(connection: quinn::Connection, session_id: u32, address: String) -> Self {
-        let (tx, rx) = mpsc::channel(INCOMING_CAPACITY);
-        let reader_connection = connection.clone();
-
-        // One task reads this connection's datagrams. It filters by session id
-        // and drops the rest, which is only correct because an outbound holds
-        // at most one UDP session per connection: a second session would need
-        // this to demultiplex instead, or its packets would vanish here.
-        let reader_task = tokio::spawn(async move {
-            let mut fragments = FragmentTable::new();
-            loop {
-                let datagram: Bytes = match reader_connection.read_datagram().await {
-                    Ok(datagram) => datagram,
-                    Err(e) => {
-                        debug!("Hysteria2 UDP reader for session {session_id} stopping: {e}");
-                        return;
-                    }
-                };
-                // Parsed once and reused: this runs on every datagram, and the
-                // session filter needs the same header the reassembly does.
-                let Some(parsed) = parse_datagram(&datagram) else {
-                    continue;
-                };
-                if parsed.session_id != session_id {
-                    continue;
-                }
-                if let Some(payload) = fragments.push(
-                    parsed.packet_id,
-                    parsed.fragment_id,
-                    parsed.fragment_count,
-                    parsed.payload,
-                ) && tx.send(payload).await.is_err()
-                {
-                    return;
-                }
-            }
-        });
+    /// Open a session on a connection, taking its id from the connection's
+    /// demultiplexer.
+    ///
+    /// Registering here rather than in the caller keeps the registration and
+    /// the deregistration in `Drop` as one pair that cannot come apart.
+    pub fn new(
+        connection: quinn::Connection,
+        router: Arc<DatagramRouter>,
+        address: String,
+    ) -> Self {
+        let (session_id, incoming) = router.register();
+        debug!("Hysteria2: UDP session {session_id} to {address}");
 
         Self {
             connection,
+            router,
             session_id,
             address,
             next_packet_id: AtomicU16::new(0),
-            incoming: rx,
-            reader_task,
+            incoming,
+            fragments: FragmentTable::new(),
         }
     }
 }
@@ -92,8 +79,9 @@ impl Hysteria2UdpSession {
 impl Drop for Hysteria2UdpSession {
     fn drop(&mut self) {
         // The protocol has no way to close a session; the server releases the
-        // port on its own idle timer. All we owe is our own reader.
-        self.reader_task.abort();
+        // port on its own idle timer. All we owe is our seat in the router, so
+        // that its datagrams stop being queued for nobody.
+        self.router.deregister(self.session_id);
     }
 }
 
@@ -131,26 +119,48 @@ impl AsyncReadMessage for Hysteria2UdpSession {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
-        match this.incoming.poll_recv(cx) {
-            Poll::Ready(Some(payload)) => {
-                if payload.len() > buf.remaining() {
+
+        // The router has already established that these datagrams are ours.
+        // What is left - the header past the session id, and the reassembly -
+        // is per-session work and belongs here rather than on the reader shared
+        // by every session on the connection.
+        loop {
+            let datagram = match this.incoming.poll_recv(cx) {
+                Poll::Ready(Some(datagram)) => datagram,
+                Poll::Ready(None) => {
                     return Poll::Ready(Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!(
-                            "UDP payload of {} bytes does not fit a {} byte buffer",
-                            payload.len(),
-                            buf.remaining()
-                        ),
+                        std::io::ErrorKind::BrokenPipe,
+                        "the Hysteria2 UDP session ended",
                     )));
                 }
-                buf.put_slice(&payload);
-                Poll::Ready(Ok(()))
+                Poll::Pending => return Poll::Pending,
+            };
+
+            let Some(parsed) = parse_datagram(&datagram) else {
+                continue;
+            };
+            let Some(payload) = this.fragments.push(
+                parsed.packet_id,
+                parsed.fragment_id,
+                parsed.fragment_count,
+                parsed.payload,
+            ) else {
+                // A fragment that completes nothing. Not a read.
+                continue;
+            };
+
+            if payload.len() > buf.remaining() {
+                return Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "UDP payload of {} bytes does not fit a {} byte buffer",
+                        payload.len(),
+                        buf.remaining()
+                    ),
+                )));
             }
-            Poll::Ready(None) => Poll::Ready(Err(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "the Hysteria2 UDP session ended",
-            ))),
-            Poll::Pending => Poll::Pending,
+            buf.put_slice(&payload);
+            return Poll::Ready(Ok(()));
         }
     }
 }

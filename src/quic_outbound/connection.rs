@@ -10,6 +10,7 @@ use tokio::sync::Mutex;
 use crate::resolver::{Resolver, resolve_addresses};
 
 use super::QuicOutboundSettings;
+use super::datagram_router::{DatagramRouter, SessionKeyFn};
 
 /// How long one address gets before the next is tried.
 ///
@@ -29,6 +30,10 @@ pub trait ConnectionAuthenticator: Send + Sync + std::fmt::Debug {
 struct State {
     endpoint: quinn::Endpoint,
     connection: quinn::Connection,
+    /// Present only for outbounds that route datagrams by session, and rebuilt
+    /// with every connection: a router outliving its connection would fail
+    /// sessions belonging to the one that replaced it.
+    router: Option<Arc<DatagramRouter>>,
 }
 
 impl std::fmt::Debug for State {
@@ -61,6 +66,13 @@ fn needs_reconnect(state: Option<&State>) -> bool {
 pub struct LiveConnection {
     settings: QuicOutboundSettings,
     authenticator: Arc<dyn ConnectionAuthenticator>,
+    /// How to key an incoming datagram, for protocols that want one reader per
+    /// connection instead of one per session.
+    ///
+    /// `None` leaves datagrams entirely alone, and must: a protocol that reads
+    /// them itself - TUIC does, in its native relay mode - would find them
+    /// already consumed by a reader it never asked for.
+    datagram_key: Option<SessionKeyFn>,
     state: Mutex<Option<State>>,
     connections_raised: AtomicUsize,
 }
@@ -69,10 +81,12 @@ impl LiveConnection {
     pub fn new(
         settings: QuicOutboundSettings,
         authenticator: Arc<dyn ConnectionAuthenticator>,
+        datagram_key: Option<SessionKeyFn>,
     ) -> Self {
         Self {
             settings,
             authenticator,
+            datagram_key,
             state: Mutex::new(None),
             connections_raised: AtomicUsize::new(0),
         }
@@ -92,10 +106,37 @@ impl LiveConnection {
 
     /// Return an open, authenticated connection, raising one if needed.
     pub async fn get(&self, resolver: &Arc<dyn Resolver>) -> std::io::Result<quinn::Connection> {
+        Ok(self.get_inner(resolver).await?.0)
+    }
+
+    /// The connection together with the demultiplexer routing its datagrams.
+    ///
+    /// The two are handed out as a pair because they are only valid together: a
+    /// session registered with one connection's router receives nothing once
+    /// that connection has been replaced.
+    pub async fn get_with_datagrams(
+        &self,
+        resolver: &Arc<dyn Resolver>,
+    ) -> std::io::Result<(quinn::Connection, Arc<DatagramRouter>)> {
+        let (connection, router) = self.get_inner(resolver).await?;
+        let router = router.ok_or_else(|| {
+            std::io::Error::other(
+                "this QUIC outbound was built without a datagram demultiplexer, \
+                 so it cannot carry a session",
+            )
+        })?;
+        Ok((connection, router))
+    }
+
+    async fn get_inner(
+        &self,
+        resolver: &Arc<dyn Resolver>,
+    ) -> std::io::Result<(quinn::Connection, Option<Arc<DatagramRouter>>)> {
         let mut state = self.state.lock().await;
 
         if !needs_reconnect(state.as_ref()) {
-            return Ok(state.as_ref().unwrap().connection.clone());
+            let held = state.as_ref().unwrap();
+            return Ok((held.connection.clone(), held.router.clone()));
         }
 
         if let Some(previous) = state.as_ref() {
@@ -154,11 +195,21 @@ impl LiveConnection {
                              address(es) failed"
                         );
                     }
+                    // One reader for the whole connection, started before the
+                    // connection is handed out so that no datagram can arrive
+                    // before something is there to route it. It ends when the
+                    // connection does.
+                    let router = self.datagram_key.map(|key_of| {
+                        let router = Arc::new(DatagramRouter::new(key_of));
+                        tokio::spawn(router.clone().run(connection.clone()));
+                        router
+                    });
                     *state = Some(State {
                         endpoint: current,
                         connection: connection.clone(),
+                        router: router.clone(),
                     });
-                    return Ok(connection);
+                    return Ok((connection, router));
                 }
                 Err(e) => {
                     debug!("QUIC connect to {server_addr} failed: {e}; trying the next address");
@@ -336,6 +387,7 @@ mod tests {
                 default_alpn: "h3",
             },
             Arc::new(CountingAuthenticator::default()),
+            None,
         );
 
         let resolver: Arc<dyn crate::resolver::Resolver> = Arc::new(ScriptedResolver {
@@ -368,6 +420,7 @@ mod tests {
                 default_alpn: "h3",
             },
             Arc::new(CountingAuthenticator::default()),
+            None,
         )
     }
 

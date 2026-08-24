@@ -121,7 +121,12 @@ impl TuicConnector {
         };
 
         Ok(Self {
-            connection: LiveConnection::new(settings, authenticator),
+            // No per-connection demultiplexer: TUIC's native relay mode reads
+            // the connection's datagrams itself, and a reader it did not ask
+            // for would consume them first. It has the same defect Hysteria2
+            // had - one reader per association on a shared connection - and
+            // fixing it is its own change, not a side effect of this one.
+            connection: LiveConnection::new(settings, authenticator, None),
             udp_enabled,
             udp_relay_mode,
             heartbeat_interval,

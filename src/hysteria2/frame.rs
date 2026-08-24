@@ -191,6 +191,11 @@ pub fn parse_tcp_response(data: &[u8]) -> std::io::Result<Option<(Result<(), Str
 
 /// A parsed Hysteria2 UDP datagram.
 pub struct Datagram<'a> {
+    /// Read by the connection's demultiplexer before the rest of the header is
+    /// touched, so a session that has already been routed one has no use for
+    /// it. Parsed anyway: it is the first field of the wire format, and a
+    /// parser that skipped it would be documenting the format wrongly.
+    #[allow(dead_code)]
     pub session_id: u32,
     pub packet_id: u16,
     pub fragment_id: u8,
