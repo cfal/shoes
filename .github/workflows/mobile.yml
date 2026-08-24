@@ -99,27 +99,30 @@ jobs:
       - name: Verify the C surface matches include/shoes.h
         run: |
           set -uo pipefail
-          lib=target/aarch64-apple-darwin/release/libshoes.a
-          [ -f "$lib" ] || { echo "$lib not found"; exit 1; }
+          # The dylib, not the staticlib. `strip = true` in [profile.release]
+          # reaches the archive's symbol table on newer toolchains -- this check
+          # read 10 symbols on a developer's rustc 1.94 and zero on CI's 1.98,
+          # from an archive that was otherwise 28MB larger. A dynamic library
+          # has to keep its exported symbols to be linkable at all, and that
+          # export list is the ABI a Swift provider actually binds to.
+          lib=target/aarch64-apple-darwin/release/libshoes.dylib
+          if [ ! -f "$lib" ]; then
+            echo "$lib not found"
+            ls -la target/aarch64-apple-darwin/release/ | head -20
+            exit 1
+          fi
 
-          # Unconditional, because the first two attempts at this check failed
-          # on the runner while passing on a developer's machine and printed
-          # nothing that explained the difference. A few lines of `nm` output
-          # cost nothing and settle it.
-          echo "--- archive ---"
-          ls -la "$lib"
-          echo "--- nm ---"
-          command -v nm
-          nm --version 2>&1 | head -2
-          echo "--- anything matching shoes, any symbol type ---"
-          nm -g "$lib" 2>/dev/null | grep -i 'shoes_' | head -20 || true
+          echo "--- exported ---"
+          nm -gj "$lib" 2>/dev/null | grep '^_shoes_' | sed 's/^_//' | sort || true
 
-          exported=$(nm -g "$lib" 2>/dev/null | grep -c ' T _shoes_' || true)
+          exported=$(nm -gj "$lib" 2>/dev/null | grep -c '^_shoes_' || true)
           declared=$(grep -cE '^[a-z].*shoes_[a-z_]+\(' include/shoes.h)
           echo "$exported symbols exported, $declared declared in include/shoes.h"
           if [ "$exported" -ne "$declared" ]; then
             echo "The macOS build and the header disagree. Regenerate the header"
             echo "with cbindgen, or check what stopped being exported."
+            echo "--- declared ---"
+            grep -oE 'shoes_[a-z_]+\(' include/shoes.h | tr -d '(' | sort -u
             exit 1
           fi
 
