@@ -698,6 +698,11 @@ fn run_direct_stack_thread(
                                             },
                                         );
                                         active_connections.insert((src_addr, dst_addr));
+                                        // On a SYN, not per packet, so a
+                                        // relaxed atomic here is not
+                                        // measurable.
+                                        #[cfg(feature = "control-stats")]
+                                        super::traffic::connection_opened();
 
                                         if let Ok(state) = shared_state.try_lock()
                                             && let Some(ref tx) = state.new_conn_tx
@@ -869,6 +874,8 @@ fn run_direct_stack_thread(
         for handle in sockets_to_remove {
             if let Some(socket_info) = sockets.remove(&handle) {
                 active_connections.remove(&(socket_info.src_addr, socket_info.dst_addr));
+                #[cfg(feature = "control-stats")]
+                super::traffic::connection_closed();
                 trace!(
                     "Cleaned up connection: {} -> {}",
                     socket_info.src_addr, socket_info.dst_addr

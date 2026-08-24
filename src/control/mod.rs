@@ -16,6 +16,8 @@ use tokio::task::JoinHandle;
 mod device;
 #[cfg(feature = "control-logs")]
 pub mod logs;
+#[cfg(feature = "control-stats")]
+pub mod stats;
 mod stop;
 
 pub use device::DevicePolicy;

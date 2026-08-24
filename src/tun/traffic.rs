@@ -4,6 +4,8 @@
 //! traffic statistics to the host application (iOS/Android) via FFI.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(feature = "control-stats")]
+use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, OnceLock};
 
 use parking_lot::RwLock;
@@ -13,6 +15,45 @@ static UPLOAD_BYTES: AtomicU64 = AtomicU64::new(0);
 
 /// Cumulative download bytes (proxy → device).
 static DOWNLOAD_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Live TCP connections through the stack.
+///
+/// Here rather than in `crate::control::stats` because `tcp_stack_direct` is
+/// compiled into the binary too, and main.rs has no `control` module. Same
+/// reason the byte counters are here.
+///
+/// Behind the feature, like its call sites: these are `pub` in a `pub mod`, so
+/// unconditionally they are exported API that nothing can drop, and a mobile
+/// build with the feature off would still carry them. Measured at 720 bytes.
+#[cfg(feature = "control-stats")]
+static ACTIVE_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
+
+/// Called when the stack accepts a connection.
+#[cfg(feature = "control-stats")]
+pub fn connection_opened() {
+    ACTIVE_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Called when the stack cleans one up.
+#[cfg(feature = "control-stats")]
+pub fn connection_closed() {
+    // Saturating rather than wrapping: a close without a matching open would
+    // otherwise show a host 18 quintillion live connections.
+    let _ = ACTIVE_CONNECTIONS.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+        Some(n.saturating_sub(1))
+    });
+}
+
+/// Live TCP connections right now.
+#[cfg(feature = "control-stats")]
+pub fn active_connections() -> usize {
+    ACTIVE_CONNECTIONS.load(Ordering::Relaxed)
+}
+
+#[cfg(all(test, feature = "control-stats"))]
+pub fn reset_active_connections() {
+    ACTIVE_CONNECTIONS.store(0, Ordering::Relaxed);
+}
 
 /// The values the last report carried, so an idle tunnel can stay quiet.
 ///
