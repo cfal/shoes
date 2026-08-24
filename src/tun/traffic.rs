@@ -163,6 +163,11 @@ impl<S: tokio::io::AsyncWrite> tokio::io::AsyncWrite for TrafficCountingStream<S
 ///
 /// Process-global rather than per-service, which is an invariant
 /// `crate::control::start` documents: one service per process.
+///
+/// `allow(dead_code)` for the same reason as its neighbours here: the binary
+/// declares its modules in main.rs, which has no `control`, so a binary build
+/// compiles this with nothing to call it.
+#[allow(dead_code)]
 pub fn get_traffic_counters() -> (u64, u64) {
     (
         UPLOAD_BYTES.load(Ordering::Relaxed),
