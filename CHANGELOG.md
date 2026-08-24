@@ -37,14 +37,20 @@ our decoder shared the misreading, so both ends agreed and nothing failed.
   you like", which made an official client switch to fixed-rate Brutal
   congestion control against a server running ordinary congestion control.
 
-One divergence has no fix available and is **unresolved**: our server cannot
-send UDP to a peer that omits `max_datagram_frame_size`, which every official
-Hysteria2 client does. quinn refuses to send datagrams to such a peer and offers
-no equivalent of upstream's `AssumePeerMaxDatagramFrameSize`, so the choice is
-between carrying a patched quinn, upstreaming the knob, or documenting the
-limitation. Until it is made, the operator gets a log line naming the cause and
-the consequence instead of a session that silently never answers. See
-`docs/superpowers/specs/2026-08-24-hysteria2-conformance-design.md`.
+One known limitation remains: our server cannot send UDP to a peer that omits
+`max_datagram_frame_size`, because quinn refuses to send datagrams to such a
+peer and has no equivalent of upstream's `AssumePeerMaxDatagramFrameSize`. An
+official Hysteria2 client does this only with `disableChromeParrot: true` — its
+Chrome parroting otherwise forces the parameter to be advertised — so a stock
+client's UDP works. Such a peer now produces a log line naming the cause instead
+of a session that silently never answers.
+
+All four fixes were verified against a real Hysteria2 server, and the two
+server-side ones against the official client built from upstream: an IPv6 target
+that the reference implementation used to dial as port 0, two simultaneous UDP
+associations that previously lost most of their answers, a failed dial whose
+reason now reaches the official client, and a client that honours `auto` by
+ignoring its own configured bandwidth.
 
 TUIC shares the same connection machinery and has the same one-reader-per-
 session defect. It is untouched here and remains to be fixed.

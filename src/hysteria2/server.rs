@@ -360,9 +360,15 @@ impl UdpSession {
 /// Not a failure of the peer and not one we can work around here. quinn will
 /// not send a datagram to a peer that omitted `max_datagram_frame_size`
 /// (`quinn-proto-0.11.17/src/connection/datagrams.rs:32-34`) and has no
-/// equivalent of upstream's `AssumePeerMaxDatagramFrameSize`, so a client that
-/// omits the parameter - which every official Hysteria2 client does - gets
-/// one-way UDP from us.
+/// equivalent of upstream's `AssumePeerMaxDatagramFrameSize`, so such a client
+/// gets one-way UDP from us.
+///
+/// Narrower than it looks. The official client asks its QUIC library to omit
+/// the parameter, but its Chrome parroting - on by default - overrides that,
+/// because Chrome always advertises it and one parameter short of Chrome's set
+/// is a fingerprint (`apernet/quic-go config.go:107-114`). Verified live: the
+/// stock client's UDP works against us, and the same client with
+/// `disableChromeParrot: true` receives but never gets a reply.
 ///
 /// The message exists so that shows up in the operator's log as a named cause
 /// rather than as a session that simply never replies.
@@ -370,7 +376,8 @@ fn no_datagram_support(session_id: u32) -> std::io::Error {
     std::io::Error::other(format!(
         "UDP session {session_id} can receive but never reply: the client did not \
          advertise max_datagram_frame_size, and quinn will not send datagrams to a \
-         peer that omitted it. Every official Hysteria2 client omits it. See \
+         peer that omitted it. An official Hysteria2 client does this only with \
+         Chrome parroting disabled. See \
          docs/superpowers/specs/2026-08-24-hysteria2-conformance-design.md"
     ))
 }
@@ -1030,6 +1037,10 @@ mod tests {
     /// within reach is that the operator can tell this apart from a session
     /// that is merely idle, so the diagnosis is pinned here against being
     /// quietly shortened back to "datagram not supported by remote endpoint".
+    ///
+    /// The last assertion is there because the first version of this message
+    /// said "every official Hysteria2 client omits it", which a live run
+    /// disproved: Chrome parroting makes the stock client advertise it.
     #[test]
     fn test_a_peer_that_cannot_take_datagrams_is_named_as_the_cause() {
         let message = no_datagram_support(7).to_string();
@@ -1038,6 +1049,10 @@ mod tests {
         assert!(
             message.contains("never reply"),
             "the consequence has to be in the message, not just the cause: {message}"
+        );
+        assert!(
+            message.contains("Chrome parroting disabled"),
+            "the message must name the narrow case, not blame every client: {message}"
         );
     }
 

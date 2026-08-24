@@ -68,19 +68,33 @@ per-session channels (`core/client/udp.go:126-142`).
 `read_datagram` loop, dispatching into per-session channels. Sessions register
 and deregister; a datagram for an unknown session is dropped there, once.
 
-### 1.3 Our server cannot send UDP to an official client
+### 1.3 Our server cannot send UDP to a client that omits the datagram size
+
+**Corrected 2026-08-24 after a live run. The original claim — "every official
+client omits `max_datagram_frame_size`" — is wrong, and this finding is far
+narrower than it was written.**
+
+`core/client/client.go:92-93` does set `OmitMaxDatagramFrameSize: true`, but
+`ChromeParrot` — on unless `disableChromeParrot` is set — overrides it back to
+false, because Chrome always advertises the parameter and omitting it would
+leave the client one parameter short of Chrome's set
+(`apernet/quic-go config.go:107-114`, and its own test at `config_test.go:239`).
+So the **stock official client advertises the parameter and its UDP works
+against us**; only a client with parroting deliberately disabled does not.
+
+Verified both ways against our server with the official client built from
+`619a6f8`: default config carries UDP, and `disableChromeParrot: true` gives
+exactly one-way UDP with our named warning in the log.
 
 `run_udp_remote_to_local_loop` requires `connection.max_datagram_size()`
-(`server.rs:357`). Every official client omits `max_datagram_frame_size` —
-`core/client/client.go:92-93` sets it *and* `OmitMaxDatagramFrameSize: true` —
-and upstream's server compensates with `AssumePeerMaxDatagramFrameSize`
-(`core/server/server.go:64`).
+(`server.rs:357`), and upstream's server compensates for such a peer with
+`AssumePeerMaxDatagramFrameSize` (`core/server/server.go:64`).
 
 **quinn has no equivalent.** `Datagrams::max_size` returns `None` through `?` on
 `peer_params.max_datagram_frame_size`
 (`quinn-proto-0.11.17/src/connection/datagrams.rs:79`), and there is no config
-knob to assume a value. So an official client against our server gets one-way
-UDP: queries leave, answers never come back, and nothing surfaces client-side.
+knob to assume a value. So such a client gets one-way UDP: queries leave,
+answers never come back, and nothing surfaces client-side.
 
 **There is no fix inside quinn.** `Datagrams::send` calls `max_size()` itself
 and returns `SendDatagramError::UnsupportedByPeer` when the peer omitted the
@@ -88,21 +102,26 @@ parameter (`quinn-proto-0.11.17/src/connection/datagrams.rs:32-34`), so
 bypassing our own check and letting quinn size the datagram does not help: the
 send call is where it refuses.
 
-That leaves three options, and choosing between them is the user's call rather
-than the implementer's:
+That leaves three options. With the finding corrected, the third is no longer a
+headline feature broken for the peer that matters most — it is a documented
+limitation for a peer that has deliberately turned off its own camouflage:
 
 1. **Carry a patched quinn**, adding the equivalent of upstream's
    `AssumePeerMaxDatagramFrameSize`. A small patch — the value would be used at
    `datagrams.rs:79` in place of the `?` — but it means a fork to maintain, and
    this tree deliberately pins released dependencies.
 2. **Upstream the knob to quinn** and wait. Correct, and slow.
-3. **Document the limitation**: our Hysteria2 server does not carry UDP to
-   peers that omit `max_datagram_frame_size`, which is every official client.
-   Honest, and leaves a headline feature broken for the peer that matters most.
+3. **Document the limitation**: our Hysteria2 server does not carry UDP to a
+   peer that omits `max_datagram_frame_size`, which an official client does only
+   with `disableChromeParrot: true`.
 
-Until that is decided, the implementable part is to stop failing silently: the
-task that dies today logs at debug and vanishes (`server.rs:341,357-359`), so a
-client sees one-way UDP with nothing in the operator's log naming the cause.
+**Recommended: 3.** A fork or an upstream wait is a large cost for a
+configuration a user has to opt into, and which costs them their Chrome
+fingerprint anyway.
+
+Either way the implementable part is the same: name the cause, so a client
+seeing one-way UDP leaves something in the operator's log
+(`server.rs:341,357-359`).
 
 ### 1.4 IPv6 addresses go on the wire unbracketed
 
