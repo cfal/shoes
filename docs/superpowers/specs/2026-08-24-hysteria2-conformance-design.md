@@ -82,18 +82,27 @@ and upstream's server compensates with `AssumePeerMaxDatagramFrameSize`
 knob to assume a value. So an official client against our server gets one-way
 UDP: queries leave, answers never come back, and nothing surfaces client-side.
 
-**Decision, in order of preference:**
+**There is no fix inside quinn.** `Datagrams::send` calls `max_size()` itself
+and returns `SendDatagramError::UnsupportedByPeer` when the peer omitted the
+parameter (`quinn-proto-0.11.17/src/connection/datagrams.rs:32-34`), so
+bypassing our own check and letting quinn size the datagram does not help: the
+send call is where it refuses.
 
-1. Try `send_datagram` without consulting `max_size()`, bounding the payload
-   ourselves from the path MTU. If quinn only refuses on the size check inside
-   `max_size`, this works and costs nothing.
-2. If `send_datagram` itself refuses when the parameter is absent, the
-   remaining honest options are to carry a patched quinn or to document that
-   our server does not serve UDP to peers that omit the parameter. Both are
-   decisions for the user, not for the implementer — stop and ask.
+That leaves three options, and choosing between them is the user's call rather
+than the implementer's:
 
-The implementation step is to determine which, by reading
-`quinn-proto`'s `send_datagram`, before writing code.
+1. **Carry a patched quinn**, adding the equivalent of upstream's
+   `AssumePeerMaxDatagramFrameSize`. A small patch — the value would be used at
+   `datagrams.rs:79` in place of the `?` — but it means a fork to maintain, and
+   this tree deliberately pins released dependencies.
+2. **Upstream the knob to quinn** and wait. Correct, and slow.
+3. **Document the limitation**: our Hysteria2 server does not carry UDP to
+   peers that omit `max_datagram_frame_size`, which is every official client.
+   Honest, and leaves a headline feature broken for the peer that matters most.
+
+Until that is decided, the implementable part is to stop failing silently: the
+task that dies today logs at debug and vanishes (`server.rs:341,357-359`), so a
+client sees one-way UDP with nothing in the operator's log naming the cause.
 
 ### 1.4 IPv6 addresses go on the wire unbracketed
 
@@ -205,8 +214,8 @@ agreeing:
 - **1.1, 1.2, 1.5** are testable in process against our own server, because the
   defect is a behaviour, not a shared misreading.
 - **1.3** cannot be tested against our own client, which advertises the
-  parameter. It needs a client that omits it — constructible in a test by
-  building a quinn client config without `datagram_receive_buffer_size`.
+  parameter. A test can still pin the *diagnosis*: a client that omits it must
+  make the server log a named error rather than a silent task death.
 
 A live run against a real Hysteria2 server, as the port-hopping work had, is
 what would catch the next one of these. That is worth doing once phase 1 lands.
