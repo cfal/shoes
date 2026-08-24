@@ -1,6 +1,29 @@
 # Changelog
 
-## Unreleased
+## v0.2.12
+
+### Synced with upstream
+
+`cfal/shoes` moved seven commits ahead; this branch is rebased onto them. Most
+land on the server side and change nothing a mobile client does, but two touch
+code this branch had also rewritten, and those needed a decision rather than a
+merge:
+
+- **The resolver cache holds a list, not an address.** Upstream bounded both
+  resolver caches and reduced `ResolverCache` to a single pending lookup; this
+  branch had separately made `CachingNativeResolver` cache every resolved
+  address, so a cache hit still feeds the per-address connect fallback. Both
+  changes are kept: the cache is bounded *and* holds the full list.
+- **Sniffing survives multiple bind addresses.** Upstream let a server config
+  bind several addresses, sharing one protocol handler per IP; this branch had
+  threaded the sniff settings into `run_tcp_server`. The sniff settings are now
+  cloned per spawned listener inside the new per-address loop.
+
+Also arriving from upstream: a bound on the REALITY client handshake plaintext,
+pending ciphertext counted against the REALITY outgoing limit, and a `WriteZero`
+error instead of a silent success on a zero-byte TLS direct write. The AGP 9.0
+Android migration that landed upstream as #136 is this fork's own change coming
+back the other way.
 
 ### mieru client outbound
 
