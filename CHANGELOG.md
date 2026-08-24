@@ -1,5 +1,54 @@
 # Changelog
 
+## Unreleased
+
+### Hysteria2 port hopping
+
+The client can rotate its UDP port across a published range, which is what a
+Hysteria2 server behind an `iptables REDIRECT` range expects. Configured as
+`port_hopping: { ports, interval_ms }`; the local port moves with the remote
+one, so the whole 4-tuple changes rather than half of it.
+
+A QUIC outbound also walks every resolved address instead of only the first. A
+dual-stack host whose IPv6 is published but whose return UDP never arrives used
+to look permanently dead; each address now gets a bounded attempt before the
+next is tried, with the last one left unbounded so a single-address outbound
+behaves exactly as it did.
+
+### Hysteria2 conformance with the reference implementation
+
+Four divergences that made a real Hysteria2 peer fail against us, found by
+reading the Go source rather than by any test — in every case our encoder and
+our decoder shared the misreading, so both ends agreed and nothing failed.
+
+- **An IPv6 target now works.** We put `2001:db8::1:443` on the wire, which Go's
+  `net.SplitHostPort` rejects outright. Addresses leaving the process are now
+  bracketed per RFC 3986. `Display` is unchanged: it is what logs and errors use
+  throughout the tree.
+- **Concurrent UDP sessions no longer lose each other's traffic.** Every session
+  ran its own datagram reader on the shared connection and discarded what was
+  not its own; with two sessions the second could receive nothing at all. One
+  demultiplexer per connection now routes by session id, as upstream does.
+- **A failed dial now says why.** The server answered "OK" before it had dialled
+  anything, so a refused target reached the client as a connection that
+  succeeded and immediately closed with no diagnosis. The response now waits for
+  the dial and carries the outcome, with `Connected` on success.
+- **`Hysteria-CC-RX: auto` instead of `0`.** `0` means "no limit, send as fast as
+  you like", which made an official client switch to fixed-rate Brutal
+  congestion control against a server running ordinary congestion control.
+
+One divergence has no fix available and is **unresolved**: our server cannot
+send UDP to a peer that omits `max_datagram_frame_size`, which every official
+Hysteria2 client does. quinn refuses to send datagrams to such a peer and offers
+no equivalent of upstream's `AssumePeerMaxDatagramFrameSize`, so the choice is
+between carrying a patched quinn, upstreaming the knob, or documenting the
+limitation. Until it is made, the operator gets a log line naming the cause and
+the consequence instead of a session that silently never answers. See
+`docs/superpowers/specs/2026-08-24-hysteria2-conformance-design.md`.
+
+TUIC shares the same connection machinery and has the same one-reader-per-
+session defect. It is untouched here and remains to be fixed.
+
 ## v0.2.12
 
 ### Synced with upstream
