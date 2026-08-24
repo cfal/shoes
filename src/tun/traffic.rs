@@ -45,7 +45,12 @@ pub fn connection_closed() {
 }
 
 /// Live TCP connections right now.
+///
+/// Unlike its two writers, which the stack calls from both targets, the only
+/// reader is `crate::control::stats` -- and main.rs has no `control`, so a
+/// binary build compiles this with nothing to call it.
 #[cfg(feature = "control-stats")]
+#[allow(dead_code)]
 pub fn active_connections() -> usize {
     ACTIVE_CONNECTIONS.load(Ordering::Relaxed)
 }

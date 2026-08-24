@@ -412,6 +412,25 @@ mod tests {
         }
     }
 
+    /// How long a single loopback exchange may take before the test calls it a
+    /// hang.
+    ///
+    /// This guards against a hang; it does not assert latency, so it is sized
+    /// for the worst scheduling the suite can produce rather than for the
+    /// common case, where these exchanges complete in milliseconds.
+    ///
+    /// It was 10s, and that was not enough. `#[tokio::test]` runs a
+    /// current-thread runtime, so the TUIC server, the UDP echo and the client
+    /// all share one thread; the suite runs many such tests at once. When the
+    /// machine is saturated -- a compile finishing alongside the run was how
+    /// this showed up -- that thread stops being polled promptly, datagrams are
+    /// dropped, and QUIC's probe timeout backs off exponentially. Ten seconds
+    /// is reachable that way, and
+    /// `test_udp_carries_several_packets_over_one_association` gets four
+    /// chances at it because it is the only one of these tests that exchanges
+    /// more than once.
+    const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(60);
+
     async fn udp_exchange(
         stream: &mut Box<dyn AsyncMessageStream>,
         payload: &[u8],
@@ -424,7 +443,7 @@ mod tests {
         let mut buf = vec![0u8; 65535];
         let mut read_buf = tokio::io::ReadBuf::new(&mut buf);
         tokio::time::timeout(
-            Duration::from_secs(10),
+            EXCHANGE_TIMEOUT,
             std::future::poll_fn(|cx| {
                 std::pin::Pin::new(&mut *stream).poll_read_message(cx, &mut read_buf)
             }),
