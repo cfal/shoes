@@ -118,6 +118,9 @@ pub mod config;
 /// Multi-output logging infrastructure.
 pub mod logging;
 
+/// Service lifecycle for embedding hosts.
+pub mod control;
+
 /// TUN device support for VPN mode.
 #[cfg(unix)]
 pub mod tun;

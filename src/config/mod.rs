@@ -86,13 +86,17 @@ pub async fn load_configs(args: &Vec<String>) -> std::io::Result<Vec<Config>> {
     Ok(all_configs)
 }
 
-/// Load config from a string (used by FFI targets)
+/// Load config from a string, rather than from a path.
 ///
-/// The only caller is `crate::ffi`, which is declared in lib.rs and not in
-/// main.rs, so a `--features ffi` build of the binary compiles this with
-/// nothing to use it. That is a property of the build rather than something a
-/// later change will fix.
-#[cfg(any(target_os = "android", target_os = "ios", feature = "ffi"))]
+/// Ungated, because `crate::control` calls it on every platform: an embedding
+/// host — a Network Extension, a Windows service, a desktop GUI validating
+/// what the user typed — has the config as a string and no file to point at.
+/// It was previously gated to the FFI targets, which made the library unable
+/// to parse a config on a desktop build at all.
+///
+/// Still `allow(dead_code)`: the binary declares its modules in main.rs, which
+/// has no `control`, so a binary build compiles this with nothing to use it.
+/// That is a property of the build rather than something a later change fixes.
 #[allow(dead_code)]
 pub fn load_config_str(config_str: &str) -> std::io::Result<Vec<Config>> {
     serde_yaml::from_str::<Vec<Config>>(config_str).map_err(|e| {

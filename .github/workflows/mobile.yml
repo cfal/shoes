@@ -122,6 +122,29 @@ jobs:
       - name: Build AAR
         run: bash scripts/build-android.sh
 
+      # The desktop control API is meant to cost mobile as close to nothing as
+      # it can. This is what turns that intention into something CI can reject:
+      # a checked-in number, raised deliberately, in the same spirit as the
+      # LINT_TOOLCHAIN pin in lint.yml.
+      - name: Check the arm64 library against the size baseline
+        run: |
+          set -euo pipefail
+          # The exact path, not a find: target/.../deps/ holds a second
+          # libshoes.so and picking between them by directory order would make
+          # this check nondeterministic.
+          so=target/aarch64-linux-android/release-mobile/libshoes.so
+          [ -f "$so" ] || { echo "$so not found"; exit 1; }
+          actual=$(stat -c %s "$so")
+          baseline=$(grep -v '^#' mobile-size-baseline.txt | tr -d '[:space:]')
+          echo "arm64 libshoes.so: $actual bytes (baseline $baseline)"
+          if [ "$actual" -gt "$baseline" ]; then
+            over=$((actual - baseline))
+            echo "Over the baseline by $over bytes."
+            echo "If the growth is intended, raise mobile-size-baseline.txt in a"
+            echo "commit that says what bought the bytes."
+            exit 1
+          fi
+
       # And verify it, so the divergence cannot come back silently.
       - name: Verify AAR ships only libshoes.so
         run: |

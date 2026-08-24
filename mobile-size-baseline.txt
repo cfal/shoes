@@ -1,0 +1,25 @@
+# Bytes in target/aarch64-linux-android/release-mobile/libshoes.so, built with
+#   cargo ndk -t arm64-v8a build --profile release-mobile --lib
+#
+# CI fails if the built library exceeds this. Raise it deliberately, in a commit
+# that says what bought the bytes. MOBILE.md explains why this budget is
+# defended and, just as importantly, what it is not: download size and RSS are
+# separate budgets, and this is the download one. Code costs bytes here and
+# almost nothing in RSS.
+#
+# History:
+#   9757392  mobile @ 367cff0, before the control API
+#   9761568  + 4176  extracting the lifecycle into shoes::control
+#
+# On that +4176: it is real code, not section padding -- .text grew 2056,
+# .rodata 512, .data.rel.ro 576, .rela.dyn 768, .eh_frame 236. It is not the
+# module's visibility either; making `control` pub(crate) on mobile changed
+# nothing, because ffi::common re-exports the same items and .dynsym is
+# identical across both builds. It is the cost of the lifecycle existing as
+# its own compilation unit with a stop_service/stop_handle split rather than
+# one function inlined into its single caller.
+#
+# Judged worth paying: 4176 bytes is 0.04% of the library, against a MOBILE.md
+# precedent that declined a 1.0 MiB saving because the build complexity cost
+# more than the megabyte was worth.
+9761568
