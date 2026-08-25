@@ -1,7 +1,5 @@
-use lru::LruCache;
 use std::collections::hash_map::Entry;
 use std::net::SocketAddr;
-use std::num::NonZeroUsize;
 use std::str;
 use std::sync::Arc;
 use std::sync::LazyLock;
@@ -30,10 +28,6 @@ use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
-/// Maximum number of fragmented packets to track per session.
-/// Old entries are automatically evicted when this limit is reached.
-const MAX_FRAGMENT_CACHE_SIZE: usize = 256;
-
 /// Authentication timeout - close connection if client doesn't authenticate within this time.
 /// Default is 3 seconds per sing-box reference implementation.
 const AUTH_TIMEOUT: Duration = Duration::from_secs(3);
@@ -47,6 +41,7 @@ use crate::async_stream::AsyncStream;
 use crate::client_proxy_selector::{ClientProxySelector, ConnectDecision};
 use crate::copy_bidirectional::copy_bidirectional_with_sizes;
 use crate::quic_stream::QuicStream;
+use crate::quic_transport::fragments::Defragmenter;
 use crate::quic_transport::{
     QuicListenerSettings, QuicTransportParams, effective_mtu, start_quic_listeners,
 };
@@ -287,7 +282,15 @@ async fn auth_connection(
 }
 
 struct UdpSession {
-    fragments: LruCache<u16, FragmentedPacket>,
+    fragments: Defragmenter,
+    /// The address the fragment that started the in-flight packet carried.
+    ///
+    /// The protocol repeats the address in every fragment, but only the first
+    /// one decides where the reassembled packet goes - upstream reads it off
+    /// the message that opened the packet (`core/server/udp.go:137`). Kept
+    /// beside the reassembler rather than inside it because the client end has
+    /// one fixed address per session and would carry this for nothing.
+    pending_location: Option<NetLocation>,
     send_socket: Arc<UdpSocket>,
     // we cache the last location in case of mid-session address changes, and
     // don't want to have to call ClientProxySelector::judge on every packet.
@@ -298,14 +301,6 @@ struct UdpSession {
     // activity too; otherwise a download-only session would be reaped mid-transfer.
     last_activity: Arc<AtomicU64>,
     cancel_token: CancellationToken,
-}
-
-struct FragmentedPacket {
-    fragment_count: u8,
-    fragment_received: u8,
-    packet_len: usize,
-    received: Vec<Option<Bytes>>,
-    remote_location: NetLocation,
 }
 
 impl UdpSession {
@@ -327,7 +322,8 @@ impl UdpSession {
         let last_activity = Arc::new(AtomicU64::new(activity_secs()));
 
         let session = UdpSession {
-            fragments: LruCache::new(NonZeroUsize::new(MAX_FRAGMENT_CACHE_SIZE).unwrap()),
+            fragments: Defragmenter::new(),
+            pending_location: None,
             send_socket: client_socket.clone(),
             last_location: initial_location,
             last_socket_addr: initial_socket_addr,
@@ -687,67 +683,33 @@ async fn run_udp_local_to_remote_loop(
             error!("Ignoring empty UDP fragment for session {session_id}");
             continue;
         } else if fragment_id >= fragment_count {
-            // fragment_id indexes a `received` vec of length fragment_count below;
+            // fragment_id indexes a slot vec of length fragment_count below;
             // both fields are peer-supplied, so an out-of-range id would panic.
             error!("Ignoring out-of-range UDP fragment for session {session_id}");
             continue;
         } else if fragment_count == 1 {
+            // Returns before the reassembler is touched, so an unfragmented
+            // packet cannot clear the pending location out from under a
+            // fragmented one that is still arriving.
             (payload_fragment, remote_location)
         } else {
-            let is_new = !session.fragments.contains(&packet_id);
-
-            if is_new {
-                session.fragments.put(
-                    packet_id,
-                    FragmentedPacket {
-                        fragment_count,
-                        fragment_received: 0,
-                        packet_len: 0,
-                        received: vec![None; fragment_count as usize],
-                        remote_location: remote_location.clone(),
-                    },
-                );
+            // A packet id we are not already assembling starts a new packet,
+            // and the address it carries is the one the whole packet goes to.
+            if session.fragments.in_flight_packet_id() != Some(packet_id) {
+                session.pending_location = Some(remote_location.clone());
             }
-
-            let entry = match session.fragments.get_mut(&packet_id) {
-                Some(e) => e,
-                None => {
-                    // This shouldn't happen since we just inserted it
-                    error!("Fragment cache error for session {session_id}");
-                    continue;
+            match session
+                .fragments
+                .push(packet_id, fragment_id, fragment_count, &payload_fragment)
+            {
+                Some(packet) => {
+                    // Emptied on completion, so the next fragment of a new
+                    // packet is always seen as starting one.
+                    let location = session.pending_location.take().unwrap_or(remote_location);
+                    (Bytes::from(packet), location)
                 }
-            };
-
-            if entry.fragment_count != fragment_count {
-                session.fragments.pop(&packet_id);
-                error!("Mismatched fragment count for session {session_id} packet {packet_id}");
-                continue;
+                None => continue,
             }
-            if entry.received[fragment_id as usize].is_some() {
-                session.fragments.pop(&packet_id);
-                error!("Duplicate fragment for session {session_id} packet {packet_id}");
-                continue;
-            }
-            entry.fragment_received += 1;
-            entry.packet_len += payload_fragment.len();
-            entry.received[fragment_id as usize] = Some(payload_fragment);
-
-            if entry.fragment_received != entry.fragment_count {
-                continue;
-            }
-
-            // All fragments received - remove from cache and process
-            let FragmentedPacket {
-                remote_location: initial_location,
-                received,
-                packet_len,
-                ..
-            } = session.fragments.pop(&packet_id).unwrap();
-            let mut complete_payload = BytesMut::with_capacity(packet_len);
-            for frag in received.iter() {
-                complete_payload.extend_from_slice(frag.as_ref().unwrap());
-            }
-            (complete_payload.freeze(), initial_location)
         };
 
         let socket_addr = match session.override_remote_write_address {
