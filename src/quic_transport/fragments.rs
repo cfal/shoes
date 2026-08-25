@@ -143,7 +143,12 @@ impl Defragmenter {
     }
 
     /// The packet id being assembled, or None between packets.
-    pub fn in_flight_packet_id(&self) -> Option<u16> {
+    ///
+    /// An observation point for the tests, like [`FragmentTable::pending`].
+    /// Callers keeping state per packet want [`Self::starts_new_packet`], which
+    /// answers the question they actually have and cannot drift from `push`.
+    #[cfg(test)]
+    fn in_flight_packet_id(&self) -> Option<u16> {
         self.in_flight.as_ref().map(|p| p.packet_id)
     }
 
