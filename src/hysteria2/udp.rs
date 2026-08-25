@@ -11,7 +11,7 @@ use tokio::io::ReadBuf;
 use tokio::sync::mpsc;
 
 use crate::quic_outbound::datagram_router::DatagramRouter;
-use crate::quic_transport::fragments::FragmentTable;
+use crate::quic_transport::fragments::Defragmenter;
 
 use crate::async_stream::{
     AsyncFlushMessage, AsyncMessageStream, AsyncPing, AsyncReadMessage, AsyncShutdownMessage,
@@ -38,7 +38,7 @@ pub struct Hysteria2UdpSession {
     address: String,
     next_packet_id: AtomicU16,
     incoming: mpsc::Receiver<Bytes>,
-    fragments: FragmentTable,
+    fragments: Defragmenter,
 }
 
 impl std::fmt::Debug for Hysteria2UdpSession {
@@ -71,7 +71,7 @@ impl Hysteria2UdpSession {
             address,
             next_packet_id: AtomicU16::new(0),
             incoming,
-            fragments: FragmentTable::new(),
+            fragments: Defragmenter::new(),
         }
     }
 }
@@ -203,7 +203,7 @@ mod tests {
     /// Parse a wire datagram and feed its fragment in, exactly as the reader
     /// task does. Keeps these tests on the encoder's real output rather than on
     /// hand-written fragment numbers.
-    fn push_wire(table: &mut FragmentTable, datagram: &[u8]) -> Option<Vec<u8>> {
+    fn push_wire(table: &mut Defragmenter, datagram: &[u8]) -> Option<Vec<u8>> {
         let parsed = parse_datagram(datagram)?;
         table.push(
             parsed.packet_id,
@@ -215,14 +215,14 @@ mod tests {
 
     #[test]
     fn test_reassembly_passes_an_unfragmented_packet_straight_through() {
-        let mut table = FragmentTable::new();
+        let mut table = Defragmenter::new();
         let datagrams = build_datagrams(1, 1, "a:1", b"hello", 1200).unwrap();
         assert_eq!(push_wire(&mut table, &datagrams[0]).unwrap(), b"hello");
     }
 
     #[test]
     fn test_reassembly_waits_for_every_fragment() {
-        let mut table = FragmentTable::new();
+        let mut table = Defragmenter::new();
         let payload: Vec<u8> = (0..3000u32).map(|i| i as u8).collect();
         let datagrams = build_datagrams(1, 1, "a:1", &payload, 1200).unwrap();
         assert!(datagrams.len() >= 3);
@@ -242,7 +242,7 @@ mod tests {
 
     #[test]
     fn test_reassembly_accepts_fragments_out_of_order() {
-        let mut table = FragmentTable::new();
+        let mut table = Defragmenter::new();
         let payload: Vec<u8> = (0..3000u32).map(|i| i as u8).collect();
         let mut datagrams = build_datagrams(1, 1, "a:1", &payload, 1200).unwrap();
         datagrams.reverse();
@@ -258,13 +258,13 @@ mod tests {
 
     #[test]
     fn test_reassembly_drops_a_malformed_datagram() {
-        let mut table = FragmentTable::new();
+        let mut table = Defragmenter::new();
         assert!(push_wire(&mut table, &[0u8; 4]).is_none());
     }
 
     #[test]
     fn test_reassembly_drops_a_fragment_id_past_its_count() {
-        let mut table = FragmentTable::new();
+        let mut table = Defragmenter::new();
         let mut datagrams = build_datagrams(1, 1, "a:1", b"hello", 1200).unwrap();
         // fragment_count stays 1 while fragment_id claims to be the second.
         datagrams[0][6] = 1;
