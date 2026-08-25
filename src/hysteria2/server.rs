@@ -517,6 +517,40 @@ async fn run_udp_remote_to_local_loop(
     }
 }
 
+/// How often idle sessions are looked for, whether or not traffic is arriving.
+///
+/// Upstream runs a 1s ticker independent of the receive path
+/// (`core/server/udp.go:277-288`). Ours used to sweep only at the top of the
+/// receive loop, so a client that fell silent kept every session it had opened,
+/// each with a socket and a parked task, until the connection ended.
+const CLEANUP_INTERVAL: Duration = Duration::from_secs(1);
+
+/// How long a session may go without traffic in either direction.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Drop every session that has been silent longer than `idle_timeout_secs`.
+///
+/// `now_secs` and the sessions' stored activity are both counts of whole
+/// seconds since `ACTIVITY_EPOCH`, and the subtraction saturates: a stored
+/// value ahead of `now_secs` reads as zero idle time rather than as an
+/// enormous one.
+fn sweep_idle_sessions(
+    sessions: &mut FxHashMap<u32, UdpSession>,
+    now_secs: u64,
+    idle_timeout_secs: u64,
+) {
+    sessions.retain(|session_id, session| {
+        let idle = now_secs.saturating_sub(session.last_activity.load(Ordering::Relaxed));
+        if idle > idle_timeout_secs {
+            // Dropping the session cancels its reply loop; see `Drop`.
+            debug!("Removing inactive UDP session {session_id}");
+            false
+        } else {
+            true
+        }
+    });
+}
+
 async fn run_udp_local_to_remote_loop(
     connection: quinn::Connection,
     client_proxy_selector: Arc<ClientProxySelector>,
@@ -525,34 +559,29 @@ async fn run_udp_local_to_remote_loop(
 ) -> std::io::Result<()> {
     let mut resolver_cache = ResolverCache::new(resolver.clone());
     let mut sessions: FxHashMap<u32, UdpSession> = FxHashMap::default();
-    let mut last_cleanup = std::time::Instant::now();
 
-    // Match reference implementation defaults for UDP session management
-    const CLEANUP_INTERVAL: Duration = Duration::from_secs(10);
-    const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+    let mut cleanup = tokio::time::interval(CLEANUP_INTERVAL);
+    // The first tick of an interval completes immediately, and a sweep of an
+    // empty map is not worth a branch to skip.
+    cleanup.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
-        let now = std::time::Instant::now();
-        if (now - last_cleanup) > CLEANUP_INTERVAL {
-            let now_secs = activity_secs();
-            let idle_timeout_secs = IDLE_TIMEOUT.as_secs();
-            sessions.retain(|session_id, session| {
-                let idle = now_secs.saturating_sub(session.last_activity.load(Ordering::Relaxed));
-                if idle > idle_timeout_secs {
-                    // Dropping the session cancels its reply loop; see `Drop`.
-                    debug!("Removing inactive UDP session {session_id}");
-                    false
-                } else {
-                    true
-                }
-            });
-            last_cleanup = now;
-        }
-
-        let data = connection
-            .read_datagram()
-            .await
-            .map_err(|err| std::io::Error::other(format!("failed to read datagram: {err}")))?;
+        let data = tokio::select! {
+            _ = cleanup.tick() => {
+                sweep_idle_sessions(&mut sessions, activity_secs(), IDLE_TIMEOUT.as_secs());
+                continue;
+            }
+            // Cancel-safe: `ReadDatagram::poll` takes a datagram out of quinn's
+            // queue only on the poll that returns Ready, and it checks that
+            // queue before it registers for a notification
+            // (`quinn-0.11.11/src/connection.rs:803-828`). Dropping the future
+            // to serve a tick therefore cannot lose a datagram or a wakeup.
+            data = connection.read_datagram() => {
+                data.map_err(|err| {
+                    std::io::Error::other(format!("failed to read datagram: {err}"))
+                })?
+            }
+        };
 
         // Per official hysteria reference (server.go:332-353), parse errors are ignored
         // and we continue waiting for the next message. Only connection errors are fatal.
@@ -1200,5 +1229,42 @@ mod tests {
             token.is_cancelled(),
             "removal is how the send-failure path drops a session"
         );
+    }
+
+    /// Extracted from the receive loop so it can be tested at all: while it
+    /// lived inside `run_udp_local_to_remote_loop` the only way to reach it was
+    /// a live quinn connection, which is why it went without one.
+    #[tokio::test]
+    async fn test_the_sweep_removes_only_the_idle_session() {
+        let parent = CancellationToken::new();
+        let mut sessions: FxHashMap<u32, UdpSession> = FxHashMap::default();
+        // now = 1000, timeout = 60: session 1 last spoke at 900, session 2 at 990.
+        sessions.insert(1, detached_session(&parent, 900).await);
+        sessions.insert(2, detached_session(&parent, 990).await);
+        let idle_token = sessions.get(&1).unwrap().cancel_token.clone();
+        let live_token = sessions.get(&2).unwrap().cancel_token.clone();
+
+        sweep_idle_sessions(&mut sessions, 1000, 60);
+
+        assert!(!sessions.contains_key(&1), "100s idle is past the timeout");
+        assert!(sessions.contains_key(&2), "10s idle is well inside it");
+        assert!(
+            idle_token.is_cancelled(),
+            "the reaped session must be ended"
+        );
+        assert!(!live_token.is_cancelled(), "the live one must be untouched");
+    }
+
+    /// A clock that has not yet passed the timeout must not reap anything - the
+    /// subtraction runs on a monotonic epoch and saturates rather than wrapping.
+    #[tokio::test]
+    async fn test_the_sweep_keeps_a_session_whose_activity_is_in_the_future() {
+        let parent = CancellationToken::new();
+        let mut sessions: FxHashMap<u32, UdpSession> = FxHashMap::default();
+        sessions.insert(1, detached_session(&parent, 5000).await);
+
+        sweep_idle_sessions(&mut sessions, 1000, 60);
+
+        assert!(sessions.contains_key(&1));
     }
 }
