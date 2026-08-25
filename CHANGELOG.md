@@ -114,9 +114,23 @@ Not implemented: Xray's `ed` early data, which hands back a stream before its
 response has been read and so does not fit `setup_client_tcp_stream`'s
 contract, and Xray's browser-shaped default headers.
 
-**Not yet verified against a real sing-box.** Every test here is written
-against our own reading of the Go source, and that construction is exactly what
-let a shared misreading pass the whole suite in mieru and in Hysteria2.
+Verified against a real sing-box, release 1.13.19, in both directions with
+VMess inside the tunnel. Our client through their server and their client
+through our server each fetched a page and then 10 MB in each direction — a
+download and a `POST` body — with every transfer hashing byte for byte against
+the same content fetched directly, so nothing was dropped, duplicated or
+reordered across segment boundaries.
+
+The two refusal cases were checked against that client rather than against our
+own: sing-box asking for a path we do not serve got `unexpected status: 404 Not
+Found` while our log named the path that missed, and sing-box configured with
+`type: ws` — a genuine WebSocket handshake — was refused with the same `404`,
+our log reading `real websocket request received`. That is the rule the whole
+design turns on, and it now holds against a peer we do not control.
+
+Not covered by that run: TLS in front of the transport, a CDN between the ends,
+and a `Host` mismatch, since sing-box only enforces `host` when its own
+configuration names one.
 
 ### AmneziaWG 3.1 carries traffic
 

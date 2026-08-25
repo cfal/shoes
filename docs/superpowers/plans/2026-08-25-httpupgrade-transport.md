@@ -56,7 +56,7 @@ pinned by a test below.
 - Delete: `src/h2mux/prepend_stream.rs`
 - Modify: `src/h2mux/mod.rs:35`, `src/h2mux/h2mux_server_session.rs:32`, `src/lib.rs`, `src/main.rs`
 
-- [ ] **Step 1: Move the file unchanged**
+- [x] **Step 1: Move the file unchanged**
 
 ```bash
 git mv src/h2mux/prepend_stream.rs src/prepend_stream.rs
@@ -70,7 +70,7 @@ import in `src/h2mux/h2mux_server_session.rs` from
 Add `mod prepend_stream;` to `src/lib.rs` (alphabetically, after
 `mod port_forward_handler;`) and to `src/main.rs` (after `mod port_forward_handler;`).
 
-- [ ] **Step 2: Write the failing test**
+- [x] **Step 2: Write the failing test**
 
 Append to `src/prepend_stream.rs`:
 
@@ -148,12 +148,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 3: Run the tests and watch them fail**
+- [x] **Step 3: Run the tests and watch them fail**
 
 Run: `cargo test --lib prepend_stream:: 2>&1 | tail -20`
 Expected: compile error — `the trait bound PrependStream<TestStream>: AsyncStream is not satisfied`, and `AsyncPing` is not implemented.
 
-- [ ] **Step 4: Add the two impls**
+- [x] **Step 4: Add the two impls**
 
 Append to `src/prepend_stream.rs`, before the test module:
 
@@ -173,7 +173,7 @@ impl<S: crate::async_stream::AsyncPing + Unpin> crate::async_stream::AsyncPing
 impl<S: crate::async_stream::AsyncStream> crate::async_stream::AsyncStream for PrependStream<S> {}
 ```
 
-- [ ] **Step 5: Run the tests and the rest of the suite**
+- [x] **Step 5: Run the tests and the rest of the suite**
 
 Run: `cargo test --lib prepend_stream:: 2>&1 | tail -5`
 Expected: `test result: ok. 2 passed`
@@ -181,7 +181,7 @@ Expected: `test result: ok. 2 passed`
 Run: `cargo test 2>&1 | rg "^test result"`
 Expected: every line `ok`, h2mux included — the move must not change its behaviour.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add -A src/prepend_stream.rs src/h2mux src/lib.rs src/main.rs
@@ -196,7 +196,7 @@ git commit -m "refactor: PrependStream leaves h2mux and becomes an AsyncStream"
 - Create: `src/http_parse.rs`
 - Modify: `src/websocket/websocket_handler.rs:1-17,263-315`, `src/lib.rs`, `src/main.rs`
 
-- [ ] **Step 1: Create the module with the code moved verbatim**
+- [x] **Step 1: Create the module with the code moved verbatim**
 
 Create `src/http_parse.rs`:
 
@@ -270,7 +270,7 @@ impl ParsedHttpData {
 Add `mod http_parse;` to `src/lib.rs` (after `mod http_handler;`) and to
 `src/main.rs` (after `mod http_handler;`).
 
-- [ ] **Step 2: Delete the original and import the new one**
+- [x] **Step 2: Delete the original and import the new one**
 
 In `src/websocket/websocket_handler.rs`, delete the `struct ParsedHttpData`
 definition and its `impl` block (lines 263-315), and add to the imports:
@@ -279,7 +279,7 @@ definition and its `impl` block (lines 263-315), and add to the imports:
 use crate::http_parse::ParsedHttpData;
 ```
 
-- [ ] **Step 3: Write the failing test**
+- [x] **Step 3: Write the failing test**
 
 Append to `src/http_parse.rs`:
 
@@ -383,7 +383,7 @@ pub mod testing {
 Then replace the local `TestStream` in `src/prepend_stream.rs`'s test module
 with `use crate::async_stream::testing::TestStream;`.
 
-- [ ] **Step 4: Run the tests**
+- [x] **Step 4: Run the tests**
 
 Run: `cargo test --lib http_parse:: 2>&1 | tail -5`
 Expected: `test result: ok. 2 passed`
@@ -391,7 +391,7 @@ Expected: `test result: ok. 2 passed`
 Run: `cargo test 2>&1 | rg "^test result"`
 Expected: all `ok` — the WebSocket handler now uses the moved parser.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add -A src/http_parse.rs src/async_stream.rs src/prepend_stream.rs src/websocket src/lib.rs src/main.rs
@@ -405,7 +405,7 @@ git commit -m "refactor: the HTTP header parser moves out of the WebSocket handl
 **Files:**
 - Modify: `src/config/types/server.rs:623-656,748-752,847`, `src/config/types/client.rs:676-679,752,799-807`
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Append to the `mod tests` in `src/config/types/server.rs`:
 
@@ -470,12 +470,12 @@ protocol:
     }
 ```
 
-- [ ] **Step 2: Run them and watch them fail**
+- [x] **Step 2: Run them and watch them fail**
 
 Run: `cargo test --lib httpupgrade 2>&1 | tail -10`
 Expected: compile error — `no variant named HttpUpgrade`.
 
-- [ ] **Step 3: Add the server config**
+- [x] **Step 3: Add the server config**
 
 In `src/config/types/server.rs`, after `WebsocketPingType`'s `impl` block
 (line 656):
@@ -514,7 +514,7 @@ Add the `Display` arm next to the `Websocket` one (line 847):
             Self::HttpUpgrade { .. } => write!(f, "HttpUpgrade"),
 ```
 
-- [ ] **Step 4: Add the client config**
+- [x] **Step 4: Add the client config**
 
 In `src/config/types/client.rs`, after `WebsocketClientConfig` (line 807):
 
@@ -551,12 +551,12 @@ And the `protocol_name` arm after the `Websocket` one (line 752):
             ClientProxyConfig::HttpUpgrade(..) => "HTTPUpgrade",
 ```
 
-- [ ] **Step 5: Run the tests**
+- [x] **Step 5: Run the tests**
 
 Run: `cargo test --lib httpupgrade 2>&1 | tail -5`
 Expected: `test result: ok. 3 passed`
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add src/config/types/server.rs src/config/types/client.rs
@@ -571,7 +571,7 @@ git commit -m "config: HTTPUpgrade server and client types"
 - Create: `src/httpupgrade/mod.rs`, `src/httpupgrade/server.rs`
 - Modify: `src/lib.rs`, `src/main.rs`
 
-- [ ] **Step 1: Create the module skeleton**
+- [x] **Step 1: Create the module skeleton**
 
 Create `src/httpupgrade/mod.rs`:
 
@@ -598,7 +598,7 @@ pub use server::{HttpUpgradeServerTarget, HttpUpgradeTcpServerHandler};
 Add `mod httpupgrade;` to `src/lib.rs` (after `mod http_parse;`) and to
 `src/main.rs` (after `mod http_parse;`).
 
-- [ ] **Step 2: Write the failing tests**
+- [x] **Step 2: Write the failing tests**
 
 Create `src/httpupgrade/server.rs` containing only this test module for now:
 
@@ -772,12 +772,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 3: Run them and watch them fail**
+- [x] **Step 3: Run them and watch them fail**
 
 Run: `cargo test --lib httpupgrade::server 2>&1 | tail -10`
 Expected: compile error — `HttpUpgradeTcpServerHandler` is not defined.
 
-- [ ] **Step 4: Write the implementation**
+- [x] **Step 4: Write the implementation**
 
 Prepend to `src/httpupgrade/server.rs`, above the test module:
 
@@ -965,12 +965,12 @@ impl TcpServerHandler for HttpUpgradeTcpServerHandler {
 }
 ```
 
-- [ ] **Step 5: Run the tests**
+- [x] **Step 5: Run the tests**
 
 Run: `cargo test --lib httpupgrade::server 2>&1 | tail -5`
 Expected: `test result: ok. 8 passed`
 
-- [ ] **Step 6: Mutation check the two rules that matter**
+- [x] **Step 6: Mutation check the two rules that matter**
 
 Temporarily delete the `sec-websocket-key` block and re-run:
 Expected: `a_real_websocket_handshake_is_refused` FAILS. Restore it.
@@ -980,7 +980,7 @@ Expected: `the_payload_after_the_header_block_reaches_the_inner_handler` FAILS
 (hangs on `read_exact`, then times out — kill it and restore). If it passes,
 the test is not testing what it claims.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add src/httpupgrade src/lib.rs src/main.rs
@@ -994,7 +994,7 @@ git commit -m "httpupgrade: the server side"
 **Files:**
 - Create: `src/httpupgrade/client.rs`
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Create `src/httpupgrade/client.rs` with only this test module:
 
@@ -1218,12 +1218,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run them and watch them fail**
+- [x] **Step 2: Run them and watch them fail**
 
 Run: `cargo test --lib httpupgrade::client 2>&1 | tail -10`
 Expected: compile error — `HttpUpgradeTcpClientHandler` is not defined.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 Prepend to `src/httpupgrade/client.rs`:
 
@@ -1368,12 +1368,12 @@ impl TcpClientHandler for HttpUpgradeTcpClientHandler {
 }
 ```
 
-- [ ] **Step 4: Run the tests**
+- [x] **Step 4: Run the tests**
 
 Run: `cargo test --lib httpupgrade::client 2>&1 | tail -5`
 Expected: `test result: ok. 7 passed`
 
-- [ ] **Step 5: Mutation check**
+- [x] **Step 5: Mutation check**
 
 Temporarily add `("Sec-WebSocket-Key", "x")` to the always-sent headers in
 `build_request` and re-run: `no_websocket_key_is_sent` must FAIL. Restore.
@@ -1382,7 +1382,7 @@ Temporarily replace `stream_reader.unparsed_data_owned()` with `None`:
 `the_payload_after_the_header_block_reaches_the_inner_handler` must FAIL.
 Restore.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add src/httpupgrade/client.rs
@@ -1401,7 +1401,7 @@ paths are never resolved — a config that looks fine and fails at runtime.
 **Files:**
 - Modify: `src/tcp/tcp_server_handler_factory.rs:225,587`, `src/tcp/tcp_client_handler_factory.rs:325`, `src/config/validate.rs:932,1250,1597`, `src/config/pem.rs:295,406`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to the `mod tests` in `src/config/validate.rs`:
 
@@ -1437,7 +1437,7 @@ Append to the `mod tests` in `src/config/validate.rs`:
     }
 ```
 
-- [ ] **Step 2: Run it and watch it fail**
+- [x] **Step 2: Run it and watch it fail**
 
 Run: `cargo test --lib httpupgrade_validates 2>&1 | tail -10`
 Expected: FAIL — the config loads without complaint, because nothing looks
@@ -1445,7 +1445,7 @@ inside the new variant. (If it fails to compile instead, adjust the call to
 match how neighbouring tests in this file load a config, then re-run and
 confirm it fails for the right reason before continuing.)
 
-- [ ] **Step 3: Add the server factory arm**
+- [x] **Step 3: Add the server factory arm**
 
 In `src/tcp/tcp_server_handler_factory.rs`, after the `Websocket` arm (line 233):
 
@@ -1514,7 +1514,7 @@ use crate::httpupgrade::{HttpUpgradeServerTarget, HttpUpgradeTcpServerHandler};
 
 and add `HttpUpgradeServerConfig` to the existing `use crate::config::{...}` list.
 
-- [ ] **Step 4: Add the client factory arm**
+- [x] **Step 4: Add the client factory arm**
 
 In `src/tcp/tcp_client_handler_factory.rs`, after the `Websocket` arm (line 339):
 
@@ -1546,7 +1546,7 @@ use crate::httpupgrade::HttpUpgradeTcpClientHandler;
 
 and add `HttpUpgradeClientConfig` to the existing `use crate::config::{...}` list.
 
-- [ ] **Step 5: Add the validation and PEM arms**
+- [x] **Step 5: Add the validation and PEM arms**
 
 In `src/config/validate.rs`, beside the `ServerProxyConfig::Websocket` arm
 (line 1597):
@@ -1628,7 +1628,7 @@ And beside `ClientProxyConfig::Websocket` at line 406:
         }
 ```
 
-- [ ] **Step 6: Run the test and the suite**
+- [x] **Step 6: Run the test and the suite**
 
 Run: `cargo test --lib httpupgrade 2>&1 | rg "^test result"`
 Expected: `ok`, with the validation test now passing.
@@ -1636,7 +1636,7 @@ Expected: `ok`, with the validation test now passing.
 Run: `cargo test 2>&1 | rg "^test result"`
 Expected: all `ok`.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add src/tcp src/config
@@ -1651,7 +1651,7 @@ git commit -m "httpupgrade: build the handlers from configuration"
 - Create: `src/httpupgrade/tests.rs`
 - Modify: `src/httpupgrade/mod.rs`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Create `src/httpupgrade/tests.rs`:
 
@@ -1769,7 +1769,7 @@ Add to `src/httpupgrade/mod.rs`:
 mod tests;
 ```
 
-- [ ] **Step 2: Run it**
+- [x] **Step 2: Run it**
 
 Run: `cargo test --lib httpupgrade::tests 2>&1 | tail -5`
 Expected: `test result: ok. 1 passed`
@@ -1777,7 +1777,7 @@ Expected: `test result: ok. 1 passed`
 If it hangs, the handshake is deadlocking on a duplex with too small a buffer —
 check that the server writes its `101` before the client reads.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add src/httpupgrade
@@ -1792,7 +1792,7 @@ git commit -m "httpupgrade: an end-to-end test through both handlers"
 - Modify: `CONFIG.md:237-248,590-598`, `CHANGELOG.md:3`
 - Create: `examples/httpupgrade.yaml`
 
-- [ ] **Step 1: Document the server type**
+- [x] **Step 1: Document the server type**
 
 In `CONFIG.md`, after the `### WebSocket` block (line 248):
 
@@ -1816,7 +1816,7 @@ reference does — a real WebSocket client would misread the unframed bytes that
 follow. Anything else that does not match is refused with `404` too.
 ````
 
-- [ ] **Step 2: Document the client type**
+- [x] **Step 2: Document the client type**
 
 After the `### WebSocket Client` block (line 598):
 
@@ -1838,7 +1838,7 @@ a bare sing-box server accepts and a CDN does not. `Host`, `Connection` and
 `Upgrade` in `matching_headers` are ignored — the transport owns all three.
 ````
 
-- [ ] **Step 3: Write the example**
+- [x] **Step 3: Write the example**
 
 Create `examples/httpupgrade.yaml`:
 
@@ -1887,7 +1887,7 @@ Create `examples/httpupgrade.yaml`:
               user_id: b0e80a62-8a51-47f0-91f1-f0f7faf8d9d4
 ```
 
-- [ ] **Step 4: Add the changelog entry**
+- [x] **Step 4: Add the changelog entry**
 
 Under `## Unreleased` in `CHANGELOG.md`, after the existing sections:
 
@@ -1918,7 +1918,7 @@ Not implemented: Xray's `ed` early data, which returns a stream before its
 response has been read, and Xray's browser-shaped default headers.
 ```
 
-- [ ] **Step 5: Check the example parses**
+- [x] **Step 5: Check the example parses**
 
 Run: `cargo run -- --dry-run examples/httpupgrade.yaml 2>&1 | tail -5`
 
@@ -1927,7 +1927,7 @@ Expected: no error about the config's shape. A complaint about the missing
 `cert.pem` is fine and expected; a complaint about an unknown protocol type or
 an unknown field is not.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add CONFIG.md CHANGELOG.md examples/httpupgrade.yaml
@@ -1938,7 +1938,7 @@ git commit -m "docs: HTTPUpgrade configuration, example and changelog"
 
 ### Task 9: The full gate
 
-- [ ] **Step 1: Format, lint, test**
+- [x] **Step 1: Format, lint, test**
 
 ```bash
 cargo fmt --check
@@ -1949,7 +1949,7 @@ cargo test 2>&1 | rg "^test result"
 
 Expected: `fmt` silent, both clippy runs clean, every test line `ok`.
 
-- [ ] **Step 2: Commit anything the gate changed**
+- [x] **Step 2: Commit anything the gate changed**
 
 ```bash
 git add -A
@@ -1976,7 +1976,7 @@ cd /tmp/sing-box && go build -o /tmp/sing-box-bin ./cmd/sing-box && /tmp/sing-bo
 
 Write both configs under `/tmp`, never inside the working tree.
 
-- [ ] **Step 1: Our client against their server**
+- [x] **Step 1: Our client against their server**
 
 Run sing-box as a VMess server behind `httpupgrade` on `127.0.0.1:18443` with
 `path: /download`, no TLS. Point a shoes socks5 inbound at it through
@@ -1988,7 +1988,7 @@ curl -sS --socks5-hostname 127.0.0.1:1080 https://example.com -o /tmp/a.html -w 
 
 Expected: `200`, and sing-box's log shows the connection. Record the byte count.
 
-- [ ] **Step 2: Their client against our server**
+- [x] **Step 2: Their client against our server**
 
 Swap the roles: shoes serves `httpupgrade` wrapping VMess, sing-box dials it as
 a client with its own socks5 inbound. Run the same `curl` through sing-box's
@@ -1996,7 +1996,7 @@ socks5 port.
 
 Expected: `200`.
 
-- [ ] **Step 3: Bulk transfer, both directions**
+- [x] **Step 3: Bulk transfer, both directions**
 
 Through each of the two chains above, fetch a file of at least 10 MB and
 compare its hash against the same file fetched directly:
@@ -2009,7 +2009,7 @@ curl -sS <url> | sha256sum
 Expected: identical hashes. A framing or a leftover-bytes defect shows up here
 and nowhere else.
 
-- [ ] **Step 4: The refusals, against a real client**
+- [x] **Step 4: The refusals, against a real client**
 
 Point sing-box's `httpupgrade` client at our server with the *wrong* path.
 Expected: sing-box logs an unexpected status rather than hanging, and our log
@@ -2020,7 +2020,7 @@ WebSocket client) on the same port.
 Expected: our server answers `404` and sing-box reports the failure. This is the
 rule the whole design turns on, checked against a peer we do not control.
 
-- [ ] **Step 5: Record what the run proved**
+- [x] **Step 5: Record what the run proved**
 
 Add the measured results to the `CHANGELOG.md` entry from Task 8 — what was
 transferred, in which direction, and what the refusal cases did. State what was
@@ -2031,7 +2031,7 @@ git add CHANGELOG.md
 git commit -m "docs: record the sing-box interoperability run"
 ```
 
-- [ ] **Step 6: Clean up**
+- [x] **Step 6: Clean up**
 
 ```bash
 rm -rf /tmp/sing-box /tmp/sing-box-bin /tmp/*.json /tmp/a.html
