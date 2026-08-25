@@ -303,6 +303,17 @@ struct UdpSession {
     cancel_token: CancellationToken,
 }
 
+impl Drop for UdpSession {
+    /// Cancelling here rather than at each removal is what keeps the removal
+    /// paths from diverging. There are three of them - the idle sweep, a failed
+    /// `send_to`, and the map dropping when the connection ends - and one of
+    /// them used to forget, leaving the reply loop parked on its socket for the
+    /// life of the connection.
+    fn drop(&mut self) {
+        self.cancel_token.cancel();
+    }
+}
+
 impl UdpSession {
     // TODO: remove this function completely and inline?
     #[allow(clippy::too_many_arguments)]
@@ -528,8 +539,7 @@ async fn run_udp_local_to_remote_loop(
             sessions.retain(|session_id, session| {
                 let idle = now_secs.saturating_sub(session.last_activity.load(Ordering::Relaxed));
                 if idle > idle_timeout_secs {
-                    // Cancel the session's background task before removing
-                    session.cancel_token.cancel();
+                    // Dropping the session cancels its reply loop; see `Drop`.
                     debug!("Removing inactive UDP session {session_id}");
                     false
                 } else {
@@ -768,6 +778,7 @@ async fn run_udp_local_to_remote_loop(
             .await
         {
             error!("Failed to forward UDP payload for session {session_id}: {e}");
+            // Removing it drops it, and dropping it cancels its reply loop.
             sessions.remove(&session_id);
         }
     }
@@ -1137,5 +1148,57 @@ mod tests {
             .body(())
             .unwrap();
         assert!(validate_auth_request(wrong_method, "hunter2").is_err());
+    }
+
+    /// Build a session with no connection behind it. `UdpSession::start` needs
+    /// a live quinn connection to spawn its reply loop; nothing here does.
+    async fn detached_session(parent: &CancellationToken, idle_since_secs: u64) -> UdpSession {
+        let socket = crate::socket_util::new_udp_socket(true, None).unwrap();
+        let location = NetLocation::from_str("127.0.0.1:9", None).unwrap();
+        UdpSession {
+            fragments: Defragmenter::new(),
+            pending_location: None,
+            send_socket: Arc::new(socket),
+            last_location: location,
+            last_socket_addr: "127.0.0.1:9".parse().unwrap(),
+            override_remote_write_address: None,
+            last_activity: Arc::new(AtomicU64::new(idle_since_secs)),
+            cancel_token: parent.child_token(),
+        }
+    }
+
+    /// The reply loop holds a UDP socket and parks on `recv_from` forever; the
+    /// only thing that ends it is its token. Dropping the session is therefore
+    /// the last moment anything can cancel it, so that is where the cancel
+    /// goes - not in each of the callers that happen to remove a session today.
+    #[tokio::test]
+    async fn test_dropping_a_session_cancels_its_reply_loop() {
+        let parent = CancellationToken::new();
+        let session = detached_session(&parent, 0).await;
+        let token = session.cancel_token.clone();
+
+        assert!(!token.is_cancelled());
+        drop(session);
+        assert!(
+            token.is_cancelled(),
+            "a dropped session must not leave its task parked on a socket"
+        );
+    }
+
+    /// The path that had the bug: a failed `send_to` removes the session from
+    /// the map, and that removal must end the task like every other one.
+    #[tokio::test]
+    async fn test_removing_a_session_from_the_map_cancels_it() {
+        let parent = CancellationToken::new();
+        let mut sessions: FxHashMap<u32, UdpSession> = FxHashMap::default();
+        sessions.insert(1, detached_session(&parent, 0).await);
+        let token = sessions.get(&1).unwrap().cancel_token.clone();
+
+        sessions.remove(&1);
+
+        assert!(
+            token.is_cancelled(),
+            "removal is how the send-failure path drops a session"
+        );
     }
 }
