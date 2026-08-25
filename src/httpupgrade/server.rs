@@ -3,7 +3,7 @@ use rustc_hash::FxHashMap;
 use tokio::io::AsyncWriteExt;
 
 use crate::async_stream::AsyncStream;
-use crate::http_parse::ParsedHttpData;
+use crate::http_parse::{ParsedHttpData, parse_request_line};
 use crate::prepend_stream::PrependStream;
 use crate::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult};
 
@@ -83,32 +83,28 @@ impl TcpServerHandler for HttpUpgradeTcpServerHandler {
         };
 
         let ParsedHttpData {
-            mut first_line,
+            first_line,
             headers: request_headers,
             stream_reader,
         } = parsed;
 
-        if !first_line.ends_with(" HTTP/1.0") && !first_line.ends_with(" HTTP/1.1") {
+        let Some((method, request_path)) = parse_request_line(&first_line) else {
             return Err(refuse(
                 &mut server_stream,
                 BAD_REQUEST,
-                format!("httpupgrade: invalid http version: {first_line}"),
+                format!("httpupgrade: malformed request line: {first_line}"),
             )
             .await);
-        }
+        };
 
-        if !first_line.starts_with("GET ") {
+        if method != "GET" {
             return Err(refuse(
                 &mut server_stream,
                 NOT_FOUND,
-                format!("httpupgrade: bad method: {first_line}"),
+                format!("httpupgrade: bad method: {method}"),
             )
             .await);
         }
-
-        // remove ' HTTP/1.x', then everything after 'GET ' is the path
-        first_line.truncate(first_line.len() - 9);
-        let request_path = first_line.split_off(4);
 
         if !header_is(&request_headers, "connection", "upgrade") {
             return Err(refuse(
@@ -148,7 +144,7 @@ impl TcpServerHandler for HttpUpgradeTcpServerHandler {
             } = server_target;
 
             if let Some(path) = matching_path
-                && path != &request_path
+                && path != request_path
             {
                 continue;
             }
@@ -345,6 +341,24 @@ mod tests {
         let (result, response) = respond_to(
             &handler,
             b"GET / HTTP/0.9\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(response.starts_with(b"HTTP/1.1 400 Bad Request\r\n"));
+    }
+
+    /// `GET HTTP/1.1` satisfies a `GET ` prefix test and a ` HTTP/1.1` suffix
+    /// test at once while carrying no request target, which used to slice past
+    /// the end of the line and panic. On a mobile build, where the release
+    /// profile aborts on panic, that was one unauthenticated packet against the
+    /// whole process.
+    #[tokio::test]
+    async fn a_request_line_with_no_path_is_refused() {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let handler = handler_with(None, received);
+        let (result, response) = respond_to(
+            &handler,
+            b"GET HTTP/1.1\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
         )
         .await;
         assert!(result.is_err());

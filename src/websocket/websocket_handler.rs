@@ -9,7 +9,7 @@ use crate::address::ResolvedLocation;
 use crate::async_stream::AsyncMessageStream;
 use crate::async_stream::AsyncStream;
 use crate::config::WebsocketPingType;
-use crate::http_parse::ParsedHttpData;
+use crate::http_parse::{ParsedHttpData, parse_request_line};
 use crate::tcp::tcp_handler::{
     TcpClientHandler, TcpClientSetupResult, TcpServerHandler, TcpServerSetupResult,
 };
@@ -40,29 +40,20 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
         mut server_stream: Box<dyn AsyncStream>,
     ) -> std::io::Result<TcpServerSetupResult> {
         let ParsedHttpData {
-            mut first_line,
+            first_line,
             headers: mut request_headers,
             stream_reader,
         } = ParsedHttpData::parse(&mut server_stream).await?;
-        let request_path = {
-            if !first_line.ends_with(" HTTP/1.0") && !first_line.ends_with(" HTTP/1.1") {
-                return Err(std::io::Error::other(format!(
-                    "invalid http request version: {first_line}"
-                )));
-            }
 
-            if !first_line.starts_with("GET ") {
-                return Err(std::io::Error::other(format!(
-                    "invalid http request: {first_line}"
-                )));
-            }
+        let (method, request_path) = parse_request_line(&first_line).ok_or_else(|| {
+            std::io::Error::other(format!("invalid http request line: {first_line}"))
+        })?;
 
-            // remove ' HTTP/1.x'
-            first_line.truncate(first_line.len() - 9);
-
-            // return the path after 'GET '
-            first_line.split_off(4)
-        };
+        if method != "GET" {
+            return Err(std::io::Error::other(format!(
+                "invalid http request method: {method}"
+            )));
+        }
 
         let websocket_key = request_headers
             .remove("sec-websocket-key")
@@ -77,7 +68,7 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
             } = server_target;
 
             if let Some(path) = matching_path
-                && path != &request_path
+                && path != request_path
             {
                 continue;
             }
@@ -269,4 +260,29 @@ fn create_websocket_key_response(key: String) -> String {
     input.extend_from_slice(WS_GUID);
     let hash = digest(&SHA1_FOR_LEGACY_USE_ONLY, &input);
     BASE64.encode(hash.as_ref())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::async_stream::testing::TestStream;
+    use tokio::io::{AsyncWriteExt, duplex};
+
+    /// The same shape that panicked in the HTTPUpgrade server: `GET HTTP/1.1`
+    /// passes a prefix test and a suffix test while carrying no request target.
+    /// Both transports now split the line rather than slicing between the two.
+    #[tokio::test]
+    async fn a_request_line_with_no_path_is_an_error_not_a_panic() {
+        let handler = WebsocketTcpServerHandler::new(vec![]);
+        let (near, mut far) = duplex(8192);
+        far.write_all(
+            b"GET HTTP/1.1\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        let result = handler
+            .setup_server_stream(Box::new(TestStream(near)))
+            .await;
+        assert!(result.is_err());
+    }
 }

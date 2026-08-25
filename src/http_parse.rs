@@ -63,11 +63,50 @@ impl ParsedHttpData {
     }
 }
 
+/// Splits an HTTP/1.x request line into its method and its request target.
+///
+/// Returns `None` for anything that is not `<method> <target> HTTP/1.0` or
+/// `HTTP/1.1`. A line with no target at all is one of those: `GET HTTP/1.1`
+/// both starts with `GET ` and ends with ` HTTP/1.1`, so a prefix test and a
+/// suffix test together still admit it, and slicing out what is "between" them
+/// then runs off the end of the string.
+pub fn parse_request_line(first_line: &str) -> Option<(&str, &str)> {
+    let rest = first_line
+        .strip_suffix(" HTTP/1.1")
+        .or_else(|| first_line.strip_suffix(" HTTP/1.0"))?;
+    let (method, target) = rest.split_once(' ')?;
+    if method.is_empty() || target.is_empty() {
+        return None;
+    }
+    Some((method, target))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::async_stream::testing::TestStream;
     use tokio::io::AsyncWriteExt;
+
+    #[test]
+    fn a_request_line_splits_into_method_and_target() {
+        assert_eq!(parse_request_line("GET /p HTTP/1.1"), Some(("GET", "/p")));
+        assert_eq!(parse_request_line("POST / HTTP/1.0"), Some(("POST", "/")));
+    }
+
+    /// The shape that used to panic: both a `GET ` prefix and a ` HTTP/1.1`
+    /// suffix, and nothing in between.
+    #[test]
+    fn a_request_line_with_no_target_is_rejected() {
+        assert_eq!(parse_request_line("GET HTTP/1.1"), None);
+        assert_eq!(parse_request_line("GET HTTP/1.0"), None);
+    }
+
+    #[test]
+    fn a_request_line_with_no_recognised_version_is_rejected() {
+        assert_eq!(parse_request_line("GET /p HTTP/0.9"), None);
+        assert_eq!(parse_request_line("GET /p"), None);
+        assert_eq!(parse_request_line(""), None);
+    }
 
     async fn parse_from(bytes: &[u8]) -> std::io::Result<ParsedHttpData> {
         let (near, mut far) = tokio::io::duplex(4096);
