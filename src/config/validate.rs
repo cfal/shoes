@@ -16,10 +16,10 @@ use super::pem::{embed_optional_pem_from_map, embed_pem_from_map};
 use super::types::{
     ClientChain, ClientChainHop, ClientConfig, ClientProxyConfig, Config, ConfigSelection,
     DEFAULT_REALITY_SHORT_ID, DnsConfig, DnsConfigGroup, DnsServerSpec, ExpandedDnsGroup,
-    ExpandedDnsSpec, ObfsConfig, PemSource, RuleActionConfig, RuleConfig, ServerConfig,
-    ServerProxyConfig, ServerQuicConfig, ShadowTlsServerConfig, ShadowTlsServerHandshakeConfig,
-    ShadowsocksConfig, TlsServerConfig, Transport, TunConfig, WebsocketServerConfig,
-    direct_allow_rule,
+    ExpandedDnsSpec, HttpUpgradeServerConfig, ObfsConfig, PemSource, RuleActionConfig, RuleConfig,
+    ServerConfig, ServerProxyConfig, ServerQuicConfig, ShadowTlsServerConfig,
+    ShadowTlsServerHandshakeConfig, ShadowsocksConfig, TlsServerConfig, Transport, TunConfig,
+    WebsocketServerConfig, direct_allow_rule,
 };
 
 const MIN_TLS_BUFFER_SIZE: usize = 16 * 1024;
@@ -932,6 +932,9 @@ fn validate_client_proxy_structure(config: &ClientProxyConfig) -> std::io::Resul
         ClientProxyConfig::Websocket(ws_config) => {
             validate_client_proxy_structure(&ws_config.protocol)?;
         }
+        ClientProxyConfig::HttpUpgrade(config) => {
+            validate_client_proxy_structure(&config.protocol)?;
+        }
         _ => {}
     }
     Ok(())
@@ -1249,6 +1252,10 @@ fn validate_client_proxy_config(
 
         ClientProxyConfig::Websocket(ws_config) => {
             validate_client_proxy_config(&mut ws_config.protocol, named_pems)?;
+        }
+
+        ClientProxyConfig::HttpUpgrade(config) => {
+            validate_client_proxy_config(&mut config.protocol, named_pems)?;
         }
 
         ClientProxyConfig::Wireguard(wg_config) => {
@@ -1601,6 +1608,34 @@ fn validate_server_proxy_config(
                     override_rules,
                     ..
                 } = websocket_server_config;
+                validate_server_proxy_config(
+                    protocol,
+                    client_groups,
+                    rule_groups,
+                    named_pems,
+                    rule_sets,
+                    false,
+                )?;
+
+                ConfigSelection::replace_none_or_some_groups(override_rules, rule_groups)?;
+
+                for rule_config_selection in override_rules.iter_mut() {
+                    validate_rule_config(
+                        rule_config_selection.unwrap_config_mut(),
+                        client_groups,
+                        named_pems,
+                        rule_sets,
+                    )?;
+                }
+            }
+        }
+        ServerProxyConfig::HttpUpgrade { targets } => {
+            for httpupgrade_server_config in targets.iter_mut() {
+                let HttpUpgradeServerConfig {
+                    protocol,
+                    override_rules,
+                    ..
+                } = httpupgrade_server_config;
                 validate_server_proxy_config(
                     protocol,
                     client_groups,
@@ -2366,6 +2401,39 @@ mod tests {
             let err = validate(&mut config).unwrap_err().to_string();
             assert!(err.contains("heartbeat_ms"), "{err}");
         }
+    }
+
+    /// The matches on the proxy config enums in this file end in `_ => {}`, so
+    /// a transport whose arm is missing is skipped in silence -- the protocol
+    /// it wraps is never validated. The inner rule here names a client group
+    /// that does not exist, which only that recursion can catch.
+    #[tokio::test]
+    async fn httpupgrade_validates_the_protocol_it_wraps() {
+        let yaml = r#"
+- address: 0.0.0.0:8443
+  protocol:
+    type: httpupgrade
+    targets:
+      - matching_path: /download
+        protocol:
+          type: socks
+        override_rules:
+          - mask: 0.0.0.0/0
+            action: allow
+            client_chain: no-such-group
+  rules:
+    - mask: 0.0.0.0/0
+      action: allow
+"#;
+        let configs: Vec<Config> = serde_yaml::from_str(yaml).unwrap();
+        let err = validate_configs_test(configs)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("no-such-group"),
+            "the wrapped protocol's rules were not validated: {err}"
+        );
     }
 
     async fn validate_configs_test(configs: Vec<Config>) -> std::io::Result<Vec<Config>> {

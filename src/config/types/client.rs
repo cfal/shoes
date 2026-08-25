@@ -675,6 +675,9 @@ pub enum ClientProxyConfig {
     },
     #[serde(alias = "ws")]
     Websocket(WebsocketClientConfig),
+    /// WebSocket's handshake without WebSocket's framing. See `src/httpupgrade/`.
+    #[serde(alias = "http-upgrade", alias = "http_upgrade")]
+    HttpUpgrade(HttpUpgradeClientConfig),
     #[serde(alias = "noop")]
     PortForward,
     /// AnyTLS outbound protocol
@@ -750,6 +753,7 @@ impl ClientProxyConfig {
             ClientProxyConfig::ShadowTls { .. } => "ShadowTLS",
             ClientProxyConfig::Vmess { .. } => "VMess",
             ClientProxyConfig::Websocket(..) => "WebSocket",
+            ClientProxyConfig::HttpUpgrade(..) => "HTTPUpgrade",
             ClientProxyConfig::PortForward => "PortForward",
             ClientProxyConfig::Anytls { .. } => "AnyTLS",
             ClientProxyConfig::Naiveproxy { .. } => "NaiveProxy",
@@ -803,6 +807,24 @@ pub struct WebsocketClientConfig {
     pub matching_headers: Option<HashMap<String, String>>,
     #[serde(default, skip_serializing_if = "WebsocketPingType::is_default")]
     pub ping_type: WebsocketPingType,
+    pub protocol: Box<ClientProxyConfig>,
+}
+
+/// HTTPUpgrade client transport.
+///
+/// `host` exists here and not on the server because there is nowhere else to
+/// get the value: `setup_client_tcp_stream` receives the user's destination,
+/// not the proxy's address, and the TLS wrapper's SNI is not visible from this
+/// layer. On the server, `Host` is one header among many and
+/// `matching_headers` already matches it.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct HttpUpgradeClientConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matching_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matching_headers: Option<HashMap<String, String>>,
     pub protocol: Box<ClientProxyConfig>,
 }
 
@@ -1013,6 +1035,25 @@ udp_relay_mode: sideways
             .unwrap_err()
             .to_string();
         assert!(err.contains("native"), "{err}");
+    }
+
+    #[test]
+    fn test_httpupgrade_client_config() {
+        let yaml = r#"
+type: httpupgrade
+host: cdn.example.com
+matching_path: /download
+protocol:
+  type: direct
+"#;
+        let config: ClientProxyConfig = serde_yaml::from_str(yaml).unwrap();
+        match config {
+            ClientProxyConfig::HttpUpgrade(c) => {
+                assert_eq!(c.host.as_deref(), Some("cdn.example.com"));
+                assert_eq!(c.matching_path.as_deref(), Some("/download"));
+            }
+            other => panic!("expected HttpUpgrade, got {other:?}"),
+        }
     }
 
     #[test]

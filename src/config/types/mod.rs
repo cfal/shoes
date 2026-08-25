@@ -32,8 +32,8 @@ pub mod tun;
 #[allow(unused_imports)]
 pub use client::{
     AmneziaWgClientConfig, AmneziaWgParams, ClientConfig, ClientProxyConfig, H2MuxConfig,
-    Hysteria2ClientConfig, MieruClientConfig, TlsClientConfig, TuicClientConfig, TuicUdpRelayMode,
-    WebsocketClientConfig, WireGuardClientConfig,
+    HttpUpgradeClientConfig, Hysteria2ClientConfig, MieruClientConfig, TlsClientConfig,
+    TuicClientConfig, TuicUdpRelayMode, WebsocketClientConfig, WireGuardClientConfig,
 };
 pub use common::DEFAULT_REALITY_SHORT_ID;
 pub use dns::{DnsConfig, DnsConfigGroup, DnsServerSpec, ExpandedDnsGroup, ExpandedDnsSpec};
@@ -50,9 +50,9 @@ pub use rule_set::RuleSetConfig;
 pub use rules::{ClientChain, ClientChainHop, RuleActionConfig, RuleConfig};
 pub use selection::ConfigSelection;
 pub use server::{
-    RealityServerConfig, ServerConfig, ServerProxyConfig, ShadowTlsServerConfig,
-    ShadowTlsServerHandshakeConfig, TlsServerConfig, WebsocketPingType, WebsocketServerConfig,
-    direct_allow_rule,
+    HttpUpgradeServerConfig, RealityServerConfig, ServerConfig, ServerProxyConfig,
+    ShadowTlsServerConfig, ShadowTlsServerHandshakeConfig, TlsServerConfig, WebsocketPingType,
+    WebsocketServerConfig, direct_allow_rule,
 };
 pub use shadowsocks::ShadowsocksConfig;
 // Part of the public config surface; the binary names only SniffConfig.

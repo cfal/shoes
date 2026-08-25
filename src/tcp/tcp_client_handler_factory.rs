@@ -8,11 +8,12 @@ use crate::anytls::{AnyTlsClientHandler, PaddingFactory};
 use crate::client_proxy_selector::{ClientProxySelector, ConnectAction, ConnectRule};
 use crate::config::Redacted;
 use crate::config::{
-    ClientProxyConfig, RuleActionConfig, RuleConfig, ShadowsocksConfig, TlsClientConfig,
-    WebsocketClientConfig,
+    ClientProxyConfig, HttpUpgradeClientConfig, RuleActionConfig, RuleConfig, ShadowsocksConfig,
+    TlsClientConfig, WebsocketClientConfig,
 };
 use crate::h2mux::H2MuxClientHandler;
 use crate::http_handler::HttpTcpClientHandler;
+use crate::httpupgrade::HttpUpgradeTcpClientHandler;
 use crate::naiveproxy::NaiveProxyTcpClientHandler;
 use crate::port_forward_handler::PortForwardClientHandler;
 use crate::resolver::Resolver;
@@ -335,6 +336,23 @@ pub fn create_tcp_client_handler(
                 matching_path,
                 matching_headers.map(|h| h.into_iter().collect()),
                 ping_type,
+                handler,
+            ))
+        }
+        ClientProxyConfig::HttpUpgrade(httpupgrade_client_config) => {
+            let HttpUpgradeClientConfig {
+                host,
+                matching_path,
+                matching_headers,
+                protocol,
+            } = httpupgrade_client_config;
+
+            let handler = create_tcp_client_handler(*protocol, None, resolver.clone());
+
+            Box::new(HttpUpgradeTcpClientHandler::new(
+                host,
+                matching_path,
+                matching_headers.map(|h| h.into_iter().collect()),
                 handler,
             ))
         }

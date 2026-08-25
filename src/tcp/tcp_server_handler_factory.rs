@@ -10,10 +10,12 @@ use crate::client_proxy_selector::ClientProxySelector;
 use crate::config::Redacted;
 use crate::config::{ClientChainHop, ClientConfig};
 use crate::config::{
-    ConfigSelection, RealityServerConfig, ServerProxyConfig, ShadowTlsServerConfig,
-    ShadowTlsServerHandshakeConfig, ShadowsocksConfig, TlsServerConfig, WebsocketServerConfig,
+    ConfigSelection, HttpUpgradeServerConfig, RealityServerConfig, ServerProxyConfig,
+    ShadowTlsServerConfig, ShadowTlsServerHandshakeConfig, ShadowsocksConfig, TlsServerConfig,
+    WebsocketServerConfig,
 };
 use crate::http_handler::HttpTcpServerHandler;
+use crate::httpupgrade::{HttpUpgradeServerTarget, HttpUpgradeTcpServerHandler};
 use crate::mixed_handler::MixedTcpServerHandler;
 use crate::naiveproxy::UserLookup;
 use crate::option_util::OneOrSome;
@@ -231,6 +233,21 @@ pub fn create_tcp_server_handler(
                 })
                 .collect::<Vec<_>>();
             Box::new(WebsocketTcpServerHandler::new(server_targets))
+        }
+        ServerProxyConfig::HttpUpgrade { targets } => {
+            let server_targets: Vec<HttpUpgradeServerTarget> = targets
+                .into_vec()
+                .into_iter()
+                .map(|config| {
+                    create_httpupgrade_server_target(
+                        config,
+                        client_proxy_selector,
+                        resolver,
+                        bind_ip,
+                    )
+                })
+                .collect::<Vec<_>>();
+            Box::new(HttpUpgradeTcpServerHandler::new(server_targets))
         }
         ServerProxyConfig::PortForward { targets } => {
             let targets = targets.into_vec();
@@ -623,6 +640,48 @@ fn create_websocket_server_target(
         matching_path,
         matching_headers,
         ping_type,
+        handler,
+    }
+}
+
+fn create_httpupgrade_server_target(
+    httpupgrade_server_config: HttpUpgradeServerConfig,
+    client_proxy_selector: &Arc<ClientProxySelector>,
+    resolver: &Arc<dyn Resolver>,
+    bind_ip: Option<IpAddr>,
+) -> HttpUpgradeServerTarget {
+    let HttpUpgradeServerConfig {
+        matching_path,
+        matching_headers,
+        protocol,
+        override_rules,
+    } = httpupgrade_server_config;
+
+    let matching_headers = matching_headers.map(|h| {
+        h.into_iter()
+            .map(|(mut key, val)| {
+                key.make_ascii_lowercase();
+                (key, val)
+            })
+            .collect::<FxHashMap<_, _>>()
+    });
+
+    // Same rule as the websocket target above: override_rules earns its own
+    // selector, otherwise the parent's is shared.
+    let effective_selector = if !override_rules.is_empty() {
+        let rules = override_rules
+            .map(ConfigSelection::unwrap_config)
+            .into_vec();
+        Arc::new(create_tcp_client_proxy_selector(rules, resolver.clone()))
+    } else {
+        client_proxy_selector.clone()
+    };
+
+    let handler = create_tcp_server_handler(protocol, &effective_selector, resolver, bind_ip);
+
+    HttpUpgradeServerTarget {
+        matching_path,
+        matching_headers,
         handler,
     }
 }

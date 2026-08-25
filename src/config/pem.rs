@@ -306,6 +306,20 @@ fn gather_pem_file_paths_from_server_proxy(
                 }
             }
         }
+        ServerProxyConfig::HttpUpgrade { targets } => {
+            for httpupgrade_config in targets.iter_mut() {
+                // Recurse into inner protocol
+                gather_pem_file_paths_from_server_proxy(
+                    &mut httpupgrade_config.protocol,
+                    known_pem_paths,
+                    unknown_pem_paths,
+                )?;
+                // Check override rules
+                for rule in httpupgrade_config.override_rules.iter_mut() {
+                    gather_pem_file_paths_from_rule(rule, known_pem_paths, unknown_pem_paths);
+                }
+            }
+        }
         _ => {}
     }
     Ok(())
@@ -406,6 +420,13 @@ fn gather_pem_file_paths_from_client_proxy(
         ClientProxyConfig::Websocket(ws_config) => {
             gather_pem_file_paths_from_client_proxy(
                 &mut ws_config.protocol,
+                known_pem_paths,
+                unknown_pem_paths,
+            );
+        }
+        ClientProxyConfig::HttpUpgrade(config) => {
+            gather_pem_file_paths_from_client_proxy(
+                &mut config.protocol,
                 known_pem_paths,
                 unknown_pem_paths,
             );

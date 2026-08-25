@@ -655,6 +655,22 @@ impl WebsocketPingType {
     }
 }
 
+/// One matchable HTTPUpgrade target.
+///
+/// The same shape as `WebsocketServerConfig` without `ping_type`: HTTPUpgrade
+/// has no frames, so there is nothing to ping with.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct HttpUpgradeServerConfig {
+    #[serde(default)]
+    pub matching_path: Option<String>,
+    #[serde(default)]
+    pub matching_headers: Option<HashMap<String, String>>,
+    pub protocol: ServerProxyConfig,
+
+    #[serde(alias = "override_rule", default)]
+    pub override_rules: NoneOrSome<ConfigSelection<RuleConfig>>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ServerProxyConfig {
@@ -749,6 +765,12 @@ pub enum ServerProxyConfig {
     Websocket {
         #[serde(alias = "target")]
         targets: Box<OneOrSome<WebsocketServerConfig>>,
+    },
+    /// WebSocket's handshake without WebSocket's framing. See `src/httpupgrade/`.
+    #[serde(alias = "http-upgrade", alias = "http_upgrade")]
+    HttpUpgrade {
+        #[serde(alias = "target")]
+        targets: Box<OneOrSome<HttpUpgradeServerConfig>>,
     },
     #[serde(alias = "forward")]
     PortForward {
@@ -845,6 +867,7 @@ impl std::fmt::Display for ServerProxyConfig {
             }
             Self::Vmess { .. } => write!(f, "Vmess"),
             Self::Websocket { .. } => write!(f, "Websocket"),
+            Self::HttpUpgrade { .. } => write!(f, "HttpUpgrade"),
             Self::PortForward { .. } => write!(f, "Portforward"),
             Self::Hysteria2 { .. } => write!(f, "Hysteria2"),
             Self::TuicV5 { .. } => write!(f, "TuicV5"),
@@ -1216,6 +1239,42 @@ mod tests {
             deserialized.protocol,
             ServerProxyConfig::Vmess { .. }
         ));
+    }
+
+    #[test]
+    fn test_httpupgrade_server_config() {
+        let yaml = r#"
+type: httpupgrade
+targets:
+  - matching_path: /download
+    matching_headers:
+      Host: cdn.example.com
+    protocol:
+      type: vmess
+      cipher: aes-128-gcm
+      user_id: b0e80a62-8a51-47f0-91f1-f0f7faf8d9d4
+"#;
+        let config: ServerProxyConfig = serde_yaml::from_str(yaml).unwrap();
+        match config {
+            ServerProxyConfig::HttpUpgrade { targets } => {
+                let targets = targets.into_vec();
+                assert_eq!(targets.len(), 1);
+                assert_eq!(targets[0].matching_path.as_deref(), Some("/download"));
+            }
+            other => panic!("expected HttpUpgrade, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_httpupgrade_server_config_alias() {
+        let yaml = r#"
+type: http-upgrade
+target:
+  protocol:
+    type: socks
+"#;
+        let config: ServerProxyConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(matches!(config, ServerProxyConfig::HttpUpgrade { .. }));
     }
 
     #[test]
