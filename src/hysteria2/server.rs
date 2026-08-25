@@ -389,6 +389,51 @@ fn no_datagram_support(session_id: u32) -> std::io::Error {
     ))
 }
 
+/// How a reply payload is split across datagrams.
+///
+/// Returns the payload bytes each fragment may carry and how many fragments
+/// there will be. Both inputs are the peer's: `max_datagram_size` is what it
+/// advertised, and `header_overhead` includes the reply address it chose, up to
+/// `MAX_ADDRESS_LEN`. Neither may be able to panic us, which is what an
+/// `assert!` here used to allow, and neither may silently produce a fragment
+/// count that does not fit the byte the protocol gives it.
+///
+/// `frame::build_datagrams` does the same arithmetic for the client. Merging
+/// the two encoders is the spec's phase 3 item; this one deliberately holds no
+/// framing so that the merge is a deletion.
+fn fragment_plan(
+    max_datagram_size: usize,
+    header_overhead: usize,
+    payload_len: usize,
+) -> std::io::Result<(usize, u8)> {
+    let available_payload = max_datagram_size
+        .checked_sub(header_overhead)
+        .filter(|available| *available > 0)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "a datagram of {max_datagram_size} bytes has no room for a payload after a \
+                     {header_overhead} byte header"
+                ),
+            )
+        })?;
+
+    // An empty UDP packet is still a packet, and `div_ceil` gives zero for it.
+    let fragment_count = payload_len.div_ceil(available_payload).max(1);
+    if fragment_count > u8::MAX as usize {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "a reply of {payload_len} bytes needs {fragment_count} fragments, over the 255 \
+                 the protocol allows"
+            ),
+        ));
+    }
+
+    Ok((available_payload, fragment_count as u8))
+}
+
 async fn run_udp_remote_to_local_loop(
     session_id: u32,
     connection: quinn::Connection,
@@ -475,44 +520,25 @@ async fn run_udp_remote_to_local_loop(
         // session_id(4) + packet_id(2) + fragment id(1) + fragment count(1) + address length varint + address bytes
         let header_overhead = 4 + 2 + 1 + 1 + address_len_bytes.len() + address_bytes.len();
 
-        assert!(
-            max_datagram_size > header_overhead,
-            "max datagram size ({max_datagram_size}) is smaller than header overhead ({header_overhead})"
-        );
+        let (available_payload, fragment_count) =
+            fragment_plan(max_datagram_size, header_overhead, payload_len)?;
 
-        if header_overhead + payload_len <= max_datagram_size {
-            let mut datagram = BytesMut::with_capacity(header_overhead + payload_len);
+        for fragment_id in 0..fragment_count {
+            let start = (fragment_id as usize) * available_payload;
+            let end = std::cmp::min(start + available_payload, payload_len);
+            let mut datagram = BytesMut::with_capacity(header_overhead + (end - start));
             datagram.extend_from_slice(&session_id.to_be_bytes());
             datagram.extend_from_slice(&packet_id.to_be_bytes());
-            // fragment id = 0, fragment count = 0
-            datagram.extend_from_slice(&[0, 1]);
+            datagram.extend_from_slice(&[fragment_id, fragment_count]);
             datagram.extend_from_slice(&address_len_bytes);
             datagram.extend_from_slice(&address_bytes);
-            datagram.extend_from_slice(&buf[..payload_len]);
+            datagram.extend_from_slice(&buf[start..end]);
 
-            connection
-                .send_datagram(datagram.freeze())
-                .map_err(|e| std::io::Error::other(format!("Failed to send datagram: {e}")))?;
-        } else {
-            let available_payload = max_datagram_size - header_overhead;
-            let fragment_count = payload_len.div_ceil(available_payload) as u8;
-            for fragment_id in 0..fragment_count {
-                let start = (fragment_id as usize) * available_payload;
-                let end = std::cmp::min(start + available_payload, payload_len);
-                let mut datagram = BytesMut::with_capacity(header_overhead + (end - start));
-                datagram.extend_from_slice(&session_id.to_be_bytes());
-                datagram.extend_from_slice(&packet_id.to_be_bytes());
-                datagram.extend_from_slice(&[fragment_id, fragment_count]);
-                datagram.extend_from_slice(&address_len_bytes);
-                datagram.extend_from_slice(&address_bytes);
-                datagram.extend_from_slice(&buf[start..end]);
-
-                connection.send_datagram(datagram.freeze()).map_err(|e| {
-                    std::io::Error::other(format!(
-                        "Failed to send datagram fragment {fragment_id}: {e}"
-                    ))
-                })?;
-            }
+            connection.send_datagram(datagram.freeze()).map_err(|e| {
+                std::io::Error::other(format!(
+                    "Failed to send datagram fragment {fragment_id}: {e}"
+                ))
+            })?;
         }
     }
 }
@@ -1266,5 +1292,57 @@ mod tests {
         sweep_idle_sessions(&mut sessions, 1000, 60);
 
         assert!(sessions.contains_key(&1));
+    }
+
+    /// Both operands come from the peer: the datagram size it advertised, and
+    /// the length of the address it asked us to reply from. A peer must not be
+    /// able to choose a pair of them that aborts the process.
+    #[test]
+    fn test_a_header_that_does_not_fit_the_datagram_is_an_error_not_a_panic() {
+        let err = fragment_plan(64, 64, 100).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("64"), "both sizes belong in it: {message}");
+
+        let err = fragment_plan(64, 200, 100).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{err}");
+    }
+
+    /// The protocol counts fragments in one byte. A payload needing more than
+    /// 255 of them cannot be sent, and must not be sent as a wrapped count -
+    /// which would tell the receiver to expect a few and then hand it fragment
+    /// ids past the number it was given.
+    #[test]
+    fn test_a_payload_needing_more_than_255_fragments_is_refused() {
+        // 10 bytes of payload per fragment, 65535 bytes to send: 6554 fragments.
+        let err = fragment_plan(60, 50, 65535).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("6554"),
+            "say how many it needed: {message}"
+        );
+        assert!(message.contains("255"), "and what the limit is: {message}");
+    }
+
+    #[test]
+    fn test_a_payload_that_fits_one_datagram_is_one_fragment() {
+        assert_eq!(fragment_plan(1200, 200, 500).unwrap(), (1000, 1));
+        // Exactly filling it is still one fragment.
+        assert_eq!(fragment_plan(1200, 200, 1000).unwrap(), (1000, 1));
+        // One byte over is two.
+        assert_eq!(fragment_plan(1200, 200, 1001).unwrap(), (1000, 2));
+    }
+
+    /// A zero-length UDP packet is a packet. `div_ceil` gives zero fragments
+    /// for it, which would drop it silently, so the count floors at one.
+    #[test]
+    fn test_an_empty_payload_still_takes_one_fragment() {
+        assert_eq!(fragment_plan(1200, 200, 0).unwrap(), (1000, 1));
+    }
+
+    #[test]
+    fn test_the_largest_sendable_payload_is_accepted() {
+        // 255 fragments of 1000 bytes is exactly the limit.
+        assert_eq!(fragment_plan(1200, 200, 255_000).unwrap(), (1000, 255));
+        assert!(fragment_plan(1200, 200, 255_001).is_err());
     }
 }
