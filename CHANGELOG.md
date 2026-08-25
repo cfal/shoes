@@ -85,6 +85,39 @@ anything on the wire.
 TUIC shares the same connection machinery and has the same one-reader-per-
 session defect. It is untouched here and remains to be fixed.
 
+### HTTPUpgrade transport
+
+WebSocket's HTTP handshake without WebSocket's framing, on the server and the
+client, compatible with sing-box's `httpupgrade`. A `GET` carrying
+`Connection: Upgrade`, a `101`, and raw bytes after that -- no masking and no
+frame header on every write, which is what a proxy pays WebSocket for and gets
+nothing back for. Configured as `type: httpupgrade` on either side; see
+CONFIG.md.
+
+Read from the reference implementation rather than from its documentation,
+which is where the two rules that decide interoperability live. A real
+WebSocket handshake is *refused* rather than served: our client never sends
+`Sec-WebSocket-Key` and our server answers `404` to a request carrying one,
+because a framed peer would read the unframed bytes that follow as garbage. And
+bytes arriving in the same packet as the header block are the tunnel's first
+payload; there is no stream wrapper here to hold them, so they go in front of
+the connection instead. Both rules are pinned by tests watched failing with the
+fix removed.
+
+One deviation, deliberate: sing-box answers `400` for a Host mismatch and `404`
+for everything else, while `Host` here is an ordinary entry in
+`matching_headers` and indistinguishable at the point of refusal, so every
+mismatch is `404`. No client can tell -- sing-box's own inspects nothing but the
+`101` and the two headers.
+
+Not implemented: Xray's `ed` early data, which hands back a stream before its
+response has been read and so does not fit `setup_client_tcp_stream`'s
+contract, and Xray's browser-shaped default headers.
+
+**Not yet verified against a real sing-box.** Every test here is written
+against our own reading of the Go source, and that construction is exactly what
+let a shared misreading pass the whole suite in mieru and in Hysteria2.
+
 ### AmneziaWG 3.1 carries traffic
 
 The awgtun pin moves to the fixes it made after v0.9.0. Three of them are on a

@@ -247,6 +247,24 @@ protocol:
       override_rules: [RuleConfig]
 ```
 
+### HTTPUpgrade
+```yaml
+protocol:
+  type: httpupgrade            # Aliases: http-upgrade, http_upgrade
+  targets:
+    - matching_path: string?   # Optional path filter (e.g., "/download")
+      matching_headers:        # Optional header filters, including Host
+        X-Custom-Header: "value"
+      protocol: ServerProxyConfig
+      override_rules: [RuleConfig]
+```
+
+WebSocket's handshake without its framing, compatible with sing-box's
+`httpupgrade`. There is no `ping_type`: without frames there is nothing to ping
+with. A request carrying `Sec-WebSocket-Key` is refused with `404`, as the
+reference does -- a real WebSocket client would misread the unframed bytes that
+follow. Anything else that does not match is refused with `404` too.
+
 ### Port Forward
 ```yaml
 protocol:
@@ -597,6 +615,22 @@ protocol:
   ping_type: ping-frame        # disabled | ping-frame | empty-frame
   protocol: ClientProxyConfig
 ```
+
+### HTTPUpgrade Client
+```yaml
+protocol:
+  type: httpupgrade
+  host: string?                # Sent as the Host header
+  matching_path: string?
+  matching_headers:
+    header_name: string
+  protocol: ClientProxyConfig
+```
+
+Set `host` whenever a CDN, or a sing-box server with its own `host` configured,
+sits in front: left unset the request goes out without a `Host` header, which a
+bare sing-box server accepts and a CDN does not. `Host`, `Connection` and
+`Upgrade` in `matching_headers` are ignored -- the transport owns all three.
 
 ### Port Forward (No-op)
 ```yaml

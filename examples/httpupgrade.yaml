@@ -1,0 +1,46 @@
+# HTTPUpgrade behind TLS, the shape a CDN-fronted deployment uses.
+# The same handshake as WebSocket, without the framing on every write.
+- address: 0.0.0.0:443
+  transport: tcp
+  protocol:
+    type: tls
+    default_target:
+      cert: cert.pem
+      key: key.pem
+      protocol:
+        type: httpupgrade
+        targets:
+          # Host is an ordinary matching header here; the client sends it from
+          # its own `host` setting.
+          - matching_path: /download
+            matching_headers:
+              Host: cdn.example.com
+            protocol:
+              type: vmess
+              cipher: aes-128-gcm
+              user_id: b0e80a62-8a51-47f0-91f1-f0f7faf8d9d4
+  rules:
+    - mask: 0.0.0.0/0
+      action: allow
+
+# The matching client.
+- address: 127.0.0.1:1080
+  protocol:
+    type: socks
+  rules:
+    - mask: 0.0.0.0/0
+      action: allow
+      client_chain:
+        address: cdn.example.com:443
+        protocol:
+          type: tls
+          protocol:
+            type: httpupgrade
+            # Without this the request carries no Host header at all, which a
+            # CDN refuses.
+            host: cdn.example.com
+            matching_path: /download
+            protocol:
+              type: vmess
+              cipher: aes-128-gcm
+              user_id: b0e80a62-8a51-47f0-91f1-f0f7faf8d9d4
