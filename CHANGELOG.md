@@ -58,6 +58,30 @@ associations that previously lost most of their answers, a failed dial whose
 reason now reaches the official client, and a client that honours `auto` by
 ignoring its own configured bandwidth.
 
+Three robustness defects in the same UDP path followed, none of which changes
+anything on the wire.
+
+- **A UDP session can no longer be made to hold about 78 MB.** It tracked up to
+  256 incomplete packets of up to 255 fragments each, and a peer that sends
+  every fragment of every packet but one fills that. Upstream keeps one packet
+  id in flight and discards it the moment another arrives, which caps the same
+  attack at roughly 300 KB. Both of our ends changed, and the one that matters
+  most is the phone.
+- **A session whose send fails no longer leaks its socket and its task.**
+  Removing it from the map left its reply loop parked on `recv_from` for the
+  rest of the connection; the idle sweep did it correctly, so there were two
+  removal paths and one of them was wrong. Cancelling when the session is
+  dropped makes them the same by construction.
+- **Idle sessions are reaped on a timer.** The sweep ran only when another
+  datagram happened to arrive, so a client that went quiet kept every session it
+  had opened — each with a socket and a task — until the connection ended.
+- **An unsendable reply is now an error rather than a panic or a corrupt one.**
+  The size check was an `assert!` on two values the peer chooses, so a peer
+  could abort the process; and a payload needing more than the 255 fragments the
+  protocol counts had its count truncated, telling the receiver to expect a
+  handful and then sending it fragment ids past that count. Both now return an
+  error naming the sizes.
+
 TUIC shares the same connection machinery and has the same one-reader-per-
 session defect. It is untouched here and remains to be fixed.
 

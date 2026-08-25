@@ -154,7 +154,28 @@ congestion control.
 
 **Decision:** send `auto`.
 
-## Phase 2 — robustness
+## Phase 2 — robustness — done
+
+Landed 2026-08-25 on `feature/hysteria2-conformance-phase-2`. Plan:
+[docs/superpowers/plans/2026-08-25-hysteria2-conformance-phase-2.md](../plans/2026-08-25-hysteria2-conformance-phase-2.md).
+
+One deviation from what is written below. 2.1 is stated against the server's own
+table, but the shared `FragmentTable` that the *client* uses has the identical
+exposure, and the client is the end that runs on a phone. So the fix landed as a
+new `Defragmenter` in `src/quic_transport/fragments.rs` that both Hysteria2 ends
+use. TUIC's `FragmentTable` was deliberately left alone: Hysteria's reference
+says nothing about what TUIC's does, and changing it on that basis would be the
+kind of unchecked assumption this document exists to remove.
+
+Two things found while doing it, neither of them in this list. The reply path's
+single-datagram branch was the fragment loop with a count of one written out a
+second time, down to the same `[0, 1]` header, so it went with the `assert!`.
+And `reserve_udp_port` in the test harness closed its probe socket before
+returning the address, so two test servers could be handed one port — and
+because they bind with `SO_REUSEPORT` they both succeeded and the kernel split
+the datagrams between them, with no bind error to show for it. That is what one
+observed `test_udp_round_trip` failure had been.
+
 
 ### 2.1 Fragment cache and session map are unbounded in the ways that matter
 
