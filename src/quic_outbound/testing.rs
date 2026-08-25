@@ -4,8 +4,9 @@
 //! change to either side that breaks the pairing fails a test rather than
 //! waiting for a user to notice.
 
+use std::collections::HashSet;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex};
 
 use crate::client_proxy_selector::ClientProxySelector;
 use crate::config::{ClientQuicConfig, RuleConfig};
@@ -78,15 +79,45 @@ pub fn quic_server_config(
     Arc::new(quic)
 }
 
+/// Ports this process has already handed out.
+///
+/// The probe socket is closed before its port is returned, so nothing stops the
+/// operating system handing the same ephemeral port to the next caller. That is
+/// not the harmless collision it looks like: test servers bind with
+/// `SO_REUSEPORT` (`quic_transport::build_server_endpoint` passes `true`), so
+/// two servers on one port both bind successfully and the kernel splits the
+/// datagrams between them. The client then talks to a server that has never
+/// heard of its connection and waits out its timeout, with no bind error
+/// anywhere - `SO_REUSEPORT` is precisely what suppresses it.
+static ISSUED_PORTS: LazyLock<Mutex<HashSet<u16>>> = LazyLock::new(Mutex::default);
+
 /// Reserve a loopback UDP port and release it, so a server can bind it.
 ///
 /// Binding to port 0 inside the server is not an option: the caller needs to
 /// know the address to dial, and the server does not report it back.
+///
+/// A port is never handed out twice in one process, which is what makes
+/// concurrent tests safe from each other - `cargo test` runs them as threads of
+/// a single process. A port taken by something else on the machine is still
+/// possible and is not something this can fix.
 pub fn reserve_udp_port() -> SocketAddr {
-    let probe = std::net::UdpSocket::bind("127.0.0.1:0").expect("binding a probe socket");
-    let addr = probe.local_addr().expect("probe address");
-    drop(probe);
-    addr
+    const ATTEMPTS: usize = 64;
+
+    for _ in 0..ATTEMPTS {
+        let probe = std::net::UdpSocket::bind("127.0.0.1:0").expect("binding a probe socket");
+        let addr = probe.local_addr().expect("probe address");
+        drop(probe);
+
+        if ISSUED_PORTS
+            .lock()
+            .expect("the issued-port set is never held across a panic")
+            .insert(addr.port())
+        {
+            return addr;
+        }
+    }
+
+    panic!("the operating system offered no unused ephemeral port in {ATTEMPTS} attempts");
 }
 
 /// An echo server on a fresh TCP port. Returns its address.
@@ -158,5 +189,14 @@ mod tests {
     #[test]
     fn test_reserved_ports_differ() {
         assert_ne!(reserve_udp_port(), reserve_udp_port());
+    }
+
+    /// One repeat is enough to make a test wait out a ten-second timeout for a
+    /// reply that went to somebody else's server, so "usually different" is not
+    /// the property wanted here.
+    #[test]
+    fn test_no_port_is_ever_reserved_twice() {
+        let ports: HashSet<u16> = (0..200).map(|_| reserve_udp_port().port()).collect();
+        assert_eq!(ports.len(), 200, "every reservation must be distinct");
     }
 }
