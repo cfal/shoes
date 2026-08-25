@@ -1,9 +1,13 @@
 //! Reassembly of fragmented UDP payloads.
 //!
 //! Hysteria2 and TUIC both split a UDP payload that does not fit one QUIC
-//! datagram into numbered fragments under a shared packet id, and both put the
-//! pieces back together the same way. Only the framing differs, so the callers
-//! parse their own headers and hand the results here.
+//! datagram into numbered fragments under a shared packet id. The callers parse
+//! their own framing and hand the results here.
+//!
+//! The two protocols do not agree on how much may be in flight, so there are
+//! two reassemblers. [`Defragmenter`] holds one packet id, which is Hysteria2's
+//! rule and its memory bound. [`FragmentTable`] holds a bounded table of them,
+//! which is what TUIC uses.
 //!
 //! It lives beside the other QUIC-protocol machinery because those two are its
 //! only users; nothing about the table itself is QUIC-specific.
@@ -24,6 +28,8 @@ use std::num::NonZeroUsize;
 /// reordering heavily.
 pub const MAX_PENDING_PACKETS: usize = 256;
 
+/// TUIC's reassembler: a bounded table of packets waiting for their pieces.
+///
 /// Fragments waiting for their siblings, keyed by packet id.
 ///
 /// A packet whose fragments never all arrive is dropped once its id is reused
@@ -92,6 +98,121 @@ impl FragmentTable {
     #[cfg(test)]
     fn pending(&self) -> usize {
         self.packets.len()
+    }
+}
+
+/// Reassembly for a protocol that keeps one packet id in flight at a time.
+///
+/// Hysteria2's rule, on both of its ends: `frag.Defragger` tracks a single
+/// packet id and throws away what it held the moment a different one arrives
+/// (`core/internal/frag/frag.go:40-43`). A lost fragment costs one packet and
+/// nothing else.
+///
+/// That rule is the memory bound. A session can be made to hold one packet -
+/// at most 255 fragments of a QUIC datagram, about 300 KB - where a table
+/// keyed by packet id holds as many as its capacity, which a peer fills by
+/// sending every fragment of every id but one.
+///
+/// [`FragmentTable`] is the other answer to the same question and TUIC keeps
+/// it. Whether TUIC's reference also holds one packet at a time has not been
+/// read, and Hysteria's source is not evidence about TUIC's.
+pub struct Defragmenter {
+    in_flight: Option<InFlight>,
+}
+
+struct InFlight {
+    packet_id: u16,
+    slots: Vec<Option<Vec<u8>>>,
+    /// Slots filled. Counted rather than rescanned, and incremented only when
+    /// an empty slot is filled, so a duplicate cannot complete a packet that
+    /// still has a hole.
+    received: usize,
+    /// Bytes held, so the finished packet is allocated once at its real size.
+    len: usize,
+}
+
+impl Default for Defragmenter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Defragmenter {
+    pub fn new() -> Self {
+        Self { in_flight: None }
+    }
+
+    /// The packet id being assembled, or None between packets.
+    ///
+    /// For a caller that keeps something of its own beside the packet - the
+    /// Hysteria2 server keeps the remote address the first fragment carried -
+    /// this is how it learns that a new packet has started.
+    pub fn in_flight_packet_id(&self) -> Option<u16> {
+        self.in_flight.as_ref().map(|p| p.packet_id)
+    }
+
+    /// Feed one fragment; returns the whole payload when the last piece lands.
+    ///
+    /// Returns None both for a fragment that merely completes nothing and for
+    /// one that cannot be valid. The caller cannot act differently on the two,
+    /// and a malformed fragment is a dropped packet either way.
+    pub fn push(
+        &mut self,
+        packet_id: u16,
+        fragment_id: u8,
+        fragment_count: u8,
+        payload: &[u8],
+    ) -> Option<Vec<u8>> {
+        if fragment_count == 0 || fragment_id >= fragment_count {
+            return None;
+        }
+
+        // The common case, and it must not touch the state: upstream returns
+        // the message for `FragCount <= 1` before it looks at the id
+        // (`frag.go:31-33`), so an unfragmented packet arriving between the
+        // fragments of a larger one cannot discard it.
+        if fragment_count == 1 {
+            return Some(payload.to_vec());
+        }
+
+        let continues_current = self
+            .in_flight
+            .as_ref()
+            .is_some_and(|p| p.packet_id == packet_id && p.slots.len() == fragment_count as usize);
+        if !continues_current {
+            // A different id, or the same id with a different count: whatever
+            // was held can never complete, so it goes rather than accumulating.
+            self.in_flight = Some(InFlight {
+                packet_id,
+                slots: vec![None; fragment_count as usize],
+                received: 0,
+                len: 0,
+            });
+        }
+
+        let in_flight = self
+            .in_flight
+            .as_mut()
+            .expect("in_flight was just set if it was not already the current packet");
+
+        let slot = &mut in_flight.slots[fragment_id as usize];
+        if slot.is_some() {
+            return None;
+        }
+        *slot = Some(payload.to_vec());
+        in_flight.received += 1;
+        in_flight.len += payload.len();
+
+        if in_flight.received < in_flight.slots.len() {
+            return None;
+        }
+
+        let done = self.in_flight.take()?;
+        let mut packet = Vec::with_capacity(done.len);
+        for fragment in done.slots.into_iter().flatten() {
+            packet.extend_from_slice(&fragment);
+        }
+        Some(packet)
     }
 }
 
@@ -203,5 +324,127 @@ mod tests {
         }
 
         assert_eq!(table.push(9999, 2, 3, b"c").unwrap(), b"abc");
+    }
+
+    #[test]
+    fn test_defragmenter_passes_an_unfragmented_packet_straight_through() {
+        let mut frag = Defragmenter::new();
+        assert_eq!(frag.push(1, 0, 1, b"payload").unwrap(), b"payload");
+        assert_eq!(
+            frag.in_flight_packet_id(),
+            None,
+            "nothing should have been stored"
+        );
+    }
+
+    #[test]
+    fn test_defragmenter_reassembles_in_order() {
+        let mut frag = Defragmenter::new();
+        assert!(frag.push(7, 0, 3, b"one ").is_none());
+        assert!(frag.push(7, 1, 3, b"two ").is_none());
+        assert_eq!(frag.push(7, 2, 3, b"three").unwrap(), b"one two three");
+        assert_eq!(
+            frag.in_flight_packet_id(),
+            None,
+            "a completed packet must be released"
+        );
+    }
+
+    #[test]
+    fn test_defragmenter_reassembles_out_of_order() {
+        let mut frag = Defragmenter::new();
+        assert!(frag.push(7, 2, 3, b"three").is_none());
+        assert!(frag.push(7, 0, 3, b"one ").is_none());
+        assert_eq!(frag.push(7, 1, 3, b"two ").unwrap(), b"one two three");
+    }
+
+    /// The rule that bounds the memory: upstream keeps one packet id and drops
+    /// what it held the moment another arrives (`frag.go:40-43`). The older
+    /// packet is not merely deprioritised - it is gone, and its remaining
+    /// fragments complete nothing.
+    #[test]
+    fn test_defragmenter_a_new_packet_id_discards_the_previous_one() {
+        let mut frag = Defragmenter::new();
+        assert!(frag.push(1, 0, 2, b"first half").is_none());
+
+        assert!(frag.push(2, 0, 2, b"other ").is_none());
+        assert_eq!(frag.in_flight_packet_id(), Some(2));
+
+        // Packet 1's second half now completes nothing: its first half is gone.
+        assert!(frag.push(1, 1, 2, b"second half").is_none());
+        // And packet 2 is what is being tracked, uncorrupted by the visit.
+        assert_eq!(
+            frag.in_flight_packet_id(),
+            Some(1),
+            "the stray restarted it"
+        );
+    }
+
+    /// An unfragmented packet arriving mid-reassembly must not disturb it:
+    /// upstream returns early for `FragCount <= 1` before touching any state.
+    #[test]
+    fn test_defragmenter_an_unfragmented_packet_does_not_disturb_reassembly() {
+        let mut frag = Defragmenter::new();
+        assert!(frag.push(7, 0, 2, b"one ").is_none());
+        assert_eq!(frag.push(9, 0, 1, b"unrelated").unwrap(), b"unrelated");
+        assert_eq!(frag.push(7, 1, 2, b"two").unwrap(), b"one two");
+    }
+
+    #[test]
+    fn test_defragmenter_a_reused_id_with_a_new_count_starts_over() {
+        let mut frag = Defragmenter::new();
+        assert!(frag.push(1, 0, 3, b"stale").is_none());
+        // Same id, different count: the earlier fragment cannot belong to it.
+        assert!(frag.push(1, 0, 2, b"a").is_none());
+        assert_eq!(frag.push(1, 1, 2, b"b").unwrap(), b"ab");
+    }
+
+    /// A repeated fragment must not be counted twice, or a packet with a hole
+    /// in it would be released as complete.
+    #[test]
+    fn test_defragmenter_a_duplicate_fragment_completes_nothing() {
+        let mut frag = Defragmenter::new();
+        assert!(frag.push(1, 0, 3, b"a").is_none());
+        assert!(frag.push(1, 0, 3, b"a").is_none());
+        assert!(frag.push(1, 1, 3, b"b").is_none());
+        assert_eq!(
+            frag.in_flight_packet_id(),
+            Some(1),
+            "two of three slots are filled, so nothing may have been released"
+        );
+        assert_eq!(frag.push(1, 2, 3, b"c").unwrap(), b"abc");
+    }
+
+    #[test]
+    fn test_defragmenter_refuses_invalid_fragment_headers() {
+        let mut frag = Defragmenter::new();
+        assert!(frag.push(1, 0, 0, b"count of zero").is_none());
+        assert!(frag.push(1, 3, 3, b"id equal to count").is_none());
+        assert!(frag.push(1, 9, 3, b"id past the count").is_none());
+        assert_eq!(
+            frag.in_flight_packet_id(),
+            None,
+            "nothing invalid should be stored"
+        );
+    }
+
+    /// The reason this type exists beside `FragmentTable`.
+    ///
+    /// A peer sending 254 of every packet's 255 fragments and completing none
+    /// makes a 256-entry table hold about 78 MB. Holding one packet id caps the
+    /// same attack at one packet, and every id after the first costs nothing
+    /// extra because it evicts the one before it.
+    #[test]
+    fn test_defragmenter_holds_one_packet_however_many_ids_arrive() {
+        let mut frag = Defragmenter::new();
+
+        for packet_id in 0..=u16::MAX {
+            assert!(frag.push(packet_id, 0, 255, b"first fragment").is_none());
+            assert_eq!(
+                frag.in_flight_packet_id(),
+                Some(packet_id),
+                "only the newest id may be held"
+            );
+        }
     }
 }
