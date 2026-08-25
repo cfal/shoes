@@ -69,6 +69,7 @@ mod crypto;
 pub mod dns;
 mod h2mux;
 mod http_handler;
+mod http_parse;
 pub mod hysteria2;
 mod memory;
 pub mod mieru;

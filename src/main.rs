@@ -13,6 +13,7 @@ mod crypto;
 mod dns;
 mod h2mux;
 mod http_handler;
+mod http_parse;
 mod hysteria2;
 mod logging;
 mod memory;

@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use async_trait::async_trait;
 use aws_lc_rs::digest::{SHA1_FOR_LEGACY_USE_ONLY, digest};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -11,7 +9,7 @@ use crate::address::ResolvedLocation;
 use crate::async_stream::AsyncMessageStream;
 use crate::async_stream::AsyncStream;
 use crate::config::WebsocketPingType;
-use crate::stream_reader::StreamReader;
+use crate::http_parse::ParsedHttpData;
 use crate::tcp::tcp_handler::{
     TcpClientHandler, TcpClientSetupResult, TcpServerHandler, TcpServerSetupResult,
 };
@@ -257,60 +255,6 @@ impl TcpClientHandler for WebsocketTcpClientHandler {
         self.handler
             .setup_client_udp_bidirectional(Box::new(websocket_stream), target)
             .await
-    }
-}
-
-struct ParsedHttpData {
-    first_line: String,
-    headers: HashMap<String, String>,
-    stream_reader: StreamReader,
-}
-
-impl ParsedHttpData {
-    async fn parse(stream: &mut Box<dyn AsyncStream>) -> std::io::Result<Self> {
-        let mut stream_reader = StreamReader::new();
-        let mut first_line: Option<String> = None;
-        // don't use FxHashMap for unvalidated user data
-        let mut headers: HashMap<String, String> = HashMap::new();
-
-        let mut line_count = 0;
-        loop {
-            let line = stream_reader.read_line(stream).await?;
-            if line.is_empty() {
-                break;
-            }
-
-            if line.len() >= 4096 {
-                return Err(std::io::Error::other("http request line is too long"));
-            }
-
-            if first_line.is_none() {
-                first_line = Some(line.to_string());
-            } else {
-                let tokens: Vec<&str> = line.splitn(2, ':').collect();
-                if tokens.len() != 2 {
-                    return Err(std::io::Error::other(format!(
-                        "invalid http request line: {line}"
-                    )));
-                }
-                let header_key = tokens[0].trim().to_lowercase();
-                let header_value = tokens[1].trim().to_string();
-                headers.insert(header_key, header_value);
-            }
-
-            line_count += 1;
-            if line_count >= 40 {
-                return Err(std::io::Error::other("http request is too long"));
-            }
-        }
-
-        let first_line = first_line.ok_or_else(|| std::io::Error::other("empty http request"))?;
-
-        Ok(Self {
-            first_line,
-            headers,
-            stream_reader,
-        })
     }
 }
 
