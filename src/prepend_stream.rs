@@ -70,3 +70,49 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for PrependStream<S> {
         Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
+
+impl<S: crate::async_stream::AsyncPing + Unpin> crate::async_stream::AsyncPing
+    for PrependStream<S>
+{
+    fn supports_ping(&self) -> bool {
+        self.inner.supports_ping()
+    }
+
+    fn poll_write_ping(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
+        Pin::new(&mut self.inner).poll_write_ping(cx)
+    }
+}
+
+impl<S: crate::async_stream::AsyncStream> crate::async_stream::AsyncStream for PrependStream<S> {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::async_stream::AsyncStream;
+    use crate::async_stream::testing::TestStream;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
+
+    /// The prefix comes first, then whatever the stream itself carries.
+    #[tokio::test]
+    async fn the_prefix_is_read_before_the_stream() {
+        let (near, mut far) = duplex(1024);
+        far.write_all(b"world").await.unwrap();
+
+        let mut stream = PrependStream::new(TestStream(near), Some(b"hello ".to_vec().into()));
+
+        let mut got = vec![0u8; 11];
+        stream.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"hello world");
+    }
+
+    /// The point of the move: a handler can hand this to an inner handler.
+    #[tokio::test]
+    async fn a_prepend_stream_is_an_async_stream() {
+        let (near, _far) = duplex(1024);
+        let boxed: Box<dyn AsyncStream> = Box::new(PrependStream::new(
+            TestStream(near),
+            Some(b"x".to_vec().into()),
+        ));
+        assert!(!boxed.supports_ping());
+    }
+}

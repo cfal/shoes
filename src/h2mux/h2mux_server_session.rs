@@ -29,7 +29,7 @@ use super::h2mux_padding::H2MuxPaddingStream;
 use super::h2mux_protocol::{SessionRequest, StreamRequest};
 use super::h2mux_server_stream::H2MuxServerStream;
 use super::h2mux_stream::H2MuxStream;
-use super::prepend_stream::PrependStream;
+use crate::prepend_stream::PrependStream;
 
 /// HTTP/2 window and frame size configuration
 const STREAM_WINDOW_SIZE: u32 = 256 * 1024; // 256 KB per stream
