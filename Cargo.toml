@@ -39,7 +39,7 @@ desktop = ["control-logs", "control-stats"]
 
 [dependencies]
 async-trait = "*"
-awgtun = { git = "https://github.com/AYastrebov/awgtun", tag = "v0.9.0", default-features = false }
+awgtun = { git = "https://github.com/AYastrebov/awgtun", rev = "65d72ea7d7dfd9740ca8bc1ae59c0d494cd2999e", default-features = false }
 aws-lc-rs = { version = "*", default-features = false }
 base64 = "*"
 blake2 = "*"

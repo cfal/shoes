@@ -85,6 +85,35 @@ anything on the wire.
 TUIC shares the same connection machinery and has the same one-reader-per-
 session defect. It is untouched here and remains to be fixed.
 
+### AmneziaWG 3.1 carries traffic
+
+The awgtun pin moves to the fixes it made after v0.9.0. Three of them are on a
+path shoes uses, and all three were found against a live AmneziaWG 3.1 server:
+
+- **A data packet is no longer misparsed as a handshake.** 3.1 relaxes the three
+  handshake size tests from `==` to `>`, since a random trailer makes the
+  datagram longer than the message, and those tests ran before the transport
+  one. All that separated a full-size data packet from a handshake was a type
+  field read over ciphertext, so uniformly random: with the ranges Amnezia's own
+  generator emits, ~3.5% of received packets were dropped. Classification now
+  tries transport first.
+- **We stop sending packets a 3.1 peer will drop for the same reason.** Its
+  receive path is not ours to fix, but the value it reads is masked by a
+  keystream derived from our S4 prefix, so the prefix is redrawn until all three
+  candidates miss. Upstream measured 0.17 MB/s to 12.55 MB/s on the affected
+  direction.
+- **A real `I1` chain is accepted.** The `<r>` length cap was an invented 1000
+  bytes; production chains pad the initiation to the size of a TLS record and
+  were rejected at config load, so the tunnel never sent a packet. The bound is
+  now the largest UDP datagram, which is the only one amneziawg-go has.
+
+Nothing in shoes changes; the pin move is the whole diff. A 2.0 tunnel is
+untouched, and a 3.0 one keeps its wire format: the relaxed size tests apply
+only with random trailers on, so a 3.0 sender redraws its prefix only for the
+much rarer case of a transport datagram whose length equals a handshake
+message's — a collision the reference classifier would have misparsed too, and
+one the prefix being random already made arbitrary.
+
 ## v0.2.12
 
 ### Synced with upstream
