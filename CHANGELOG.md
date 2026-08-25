@@ -58,7 +58,7 @@ associations that previously lost most of their answers, a failed dial whose
 reason now reaches the official client, and a client that honours `auto` by
 ignoring its own configured bandwidth.
 
-Three robustness defects in the same UDP path followed, none of which changes
+Four robustness fixes in the same UDP path followed, none of which changes
 anything on the wire.
 
 - **A UDP session can no longer be made to hold about 78 MB.** It tracked up to

@@ -389,14 +389,34 @@ fn no_datagram_support(session_id: u32) -> std::io::Error {
     ))
 }
 
+/// What splitting a reply across datagrams came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FragmentPlan {
+    /// Send it: this many payload bytes per fragment, in this many fragments.
+    Send {
+        available_payload: usize,
+        fragment_count: u8,
+    },
+    /// This one reply will not fit the 255 fragments the protocol counts.
+    ///
+    /// A property of the reply, not of the session - the next one may well be
+    /// small enough - so it costs a dropped packet and nothing more. Upstream
+    /// does the same (`core/internal/frag/frag.go:13-15`).
+    TooManyFragments { needed: usize },
+}
+
 /// How a reply payload is split across datagrams.
 ///
-/// Returns the payload bytes each fragment may carry and how many fragments
-/// there will be. Both inputs are the peer's: `max_datagram_size` is what it
-/// advertised, and `header_overhead` includes the reply address it chose, up to
+/// Both inputs are the peer's: `max_datagram_size` is what it advertised, and
+/// `header_overhead` includes the reply address it chose, up to
 /// `MAX_ADDRESS_LEN`. Neither may be able to panic us, which is what an
 /// `assert!` here used to allow, and neither may silently produce a fragment
 /// count that does not fit the byte the protocol gives it.
+///
+/// The `Err` is reserved for the one condition that cannot improve: a datagram
+/// with no room for a payload after the header is a constant of the connection,
+/// so a session that hits it can only fail. A reply needing too many fragments
+/// is the other kind of problem and comes back as a value.
 ///
 /// `frame::build_datagrams` does the same arithmetic for the client. Merging
 /// the two encoders is the spec's phase 3 item; this one deliberately holds no
@@ -405,7 +425,7 @@ fn fragment_plan(
     max_datagram_size: usize,
     header_overhead: usize,
     payload_len: usize,
-) -> std::io::Result<(usize, u8)> {
+) -> std::io::Result<FragmentPlan> {
     let available_payload = max_datagram_size
         .checked_sub(header_overhead)
         .filter(|available| *available > 0)
@@ -422,16 +442,15 @@ fn fragment_plan(
     // An empty UDP packet is still a packet, and `div_ceil` gives zero for it.
     let fragment_count = payload_len.div_ceil(available_payload).max(1);
     if fragment_count > u8::MAX as usize {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!(
-                "a reply of {payload_len} bytes needs {fragment_count} fragments, over the 255 \
-                 the protocol allows"
-            ),
-        ));
+        return Ok(FragmentPlan::TooManyFragments {
+            needed: fragment_count,
+        });
     }
 
-    Ok((available_payload, fragment_count as u8))
+    Ok(FragmentPlan::Send {
+        available_payload,
+        fragment_count: fragment_count as u8,
+    })
 }
 
 async fn run_udp_remote_to_local_loop(
@@ -521,7 +540,25 @@ async fn run_udp_remote_to_local_loop(
         let header_overhead = 4 + 2 + 1 + 1 + address_len_bytes.len() + address_bytes.len();
 
         let (available_payload, fragment_count) =
-            fragment_plan(max_datagram_size, header_overhead, payload_len)?;
+            match fragment_plan(max_datagram_size, header_overhead, payload_len)? {
+                FragmentPlan::Send {
+                    available_payload,
+                    fragment_count,
+                } => (available_payload, fragment_count),
+                FragmentPlan::TooManyFragments { needed } => {
+                    // One reply the session cannot carry, not a session that
+                    // cannot carry replies. Ending the loop here would leave the
+                    // session in the map with its socket and no reply path, and
+                    // the client's own traffic would keep refreshing its
+                    // activity so the idle sweep never reaped it - a permanent
+                    // one-way session, which is the leak this file just closed.
+                    warn!(
+                        "Dropping a {payload_len} byte reply for session {session_id}: it needs \
+                         {needed} fragments, over the 255 the protocol allows"
+                    );
+                    continue;
+                }
+            };
 
         for fragment_id in 0..fragment_count {
             let start = (fragment_id as usize) * available_payload;
@@ -758,9 +795,15 @@ async fn run_udp_local_to_remote_loop(
             // fragmented one that is still arriving.
             (payload_fragment, remote_location)
         } else {
-            // A packet id we are not already assembling starts a new packet,
-            // and the address it carries is the one the whole packet goes to.
-            if session.fragments.in_flight_packet_id() != Some(packet_id) {
+            // A fragment that restarts assembly starts a new packet, and the
+            // address it carries is the one that whole packet goes to. The
+            // reassembler is asked rather than told: the same id with a
+            // different count restarts it too, and comparing only ids here
+            // would forward the packet to the address of an abandoned one.
+            if session
+                .fragments
+                .starts_new_packet(packet_id, fragment_count)
+            {
                 session.pending_location = Some(remote_location.clone());
             }
             match session
@@ -1311,38 +1354,55 @@ mod tests {
     /// 255 of them cannot be sent, and must not be sent as a wrapped count -
     /// which would tell the receiver to expect a few and then hand it fragment
     /// ids past the number it was given.
+    ///
+    /// It comes back as a value rather than an error because it is a property
+    /// of one reply. Making it an `Err` ends the session's reply loop while the
+    /// session stays in the map, and the client's own traffic keeps its
+    /// activity fresh, so the idle sweep never reaps it: a permanent one-way
+    /// session holding a socket. Upstream drops the packet and carries on.
     #[test]
-    fn test_a_payload_needing_more_than_255_fragments_is_refused() {
+    fn test_a_payload_needing_more_than_255_fragments_is_dropped_not_fatal() {
         // 10 bytes of payload per fragment, 65535 bytes to send: 6554 fragments.
-        let err = fragment_plan(60, 50, 65535).unwrap_err();
-        let message = err.to_string();
-        assert!(
-            message.contains("6554"),
-            "say how many it needed: {message}"
+        assert_eq!(
+            fragment_plan(60, 50, 65535).unwrap(),
+            FragmentPlan::TooManyFragments { needed: 6554 }
         );
-        assert!(message.contains("255"), "and what the limit is: {message}");
+    }
+
+    fn sends(max_datagram_size: usize, header_overhead: usize, payload_len: usize) -> (usize, u8) {
+        match fragment_plan(max_datagram_size, header_overhead, payload_len).unwrap() {
+            FragmentPlan::Send {
+                available_payload,
+                fragment_count,
+            } => (available_payload, fragment_count),
+            other => panic!("expected a sendable plan, got {other:?}"),
+        }
     }
 
     #[test]
     fn test_a_payload_that_fits_one_datagram_is_one_fragment() {
-        assert_eq!(fragment_plan(1200, 200, 500).unwrap(), (1000, 1));
+        assert_eq!(sends(1200, 200, 500), (1000, 1));
         // Exactly filling it is still one fragment.
-        assert_eq!(fragment_plan(1200, 200, 1000).unwrap(), (1000, 1));
+        assert_eq!(sends(1200, 200, 1000), (1000, 1));
         // One byte over is two.
-        assert_eq!(fragment_plan(1200, 200, 1001).unwrap(), (1000, 2));
+        assert_eq!(sends(1200, 200, 1001), (1000, 2));
     }
 
     /// A zero-length UDP packet is a packet. `div_ceil` gives zero fragments
     /// for it, which would drop it silently, so the count floors at one.
     #[test]
     fn test_an_empty_payload_still_takes_one_fragment() {
-        assert_eq!(fragment_plan(1200, 200, 0).unwrap(), (1000, 1));
+        assert_eq!(sends(1200, 200, 0), (1000, 1));
     }
 
     #[test]
     fn test_the_largest_sendable_payload_is_accepted() {
         // 255 fragments of 1000 bytes is exactly the limit.
-        assert_eq!(fragment_plan(1200, 200, 255_000).unwrap(), (1000, 255));
-        assert!(fragment_plan(1200, 200, 255_001).is_err());
+        assert_eq!(sends(1200, 200, 255_000), (1000, 255));
+        assert_eq!(
+            fragment_plan(1200, 200, 255_001).unwrap(),
+            FragmentPlan::TooManyFragments { needed: 256 },
+            "one byte past the limit is a dropped reply, not a dead session"
+        );
     }
 }

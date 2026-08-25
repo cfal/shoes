@@ -143,12 +143,31 @@ impl Defragmenter {
     }
 
     /// The packet id being assembled, or None between packets.
-    ///
-    /// For a caller that keeps something of its own beside the packet - the
-    /// Hysteria2 server keeps the remote address the first fragment carried -
-    /// this is how it learns that a new packet has started.
     pub fn in_flight_packet_id(&self) -> Option<u16> {
         self.in_flight.as_ref().map(|p| p.packet_id)
+    }
+
+    /// Whether a fragment with these numbers would restart assembly rather
+    /// than continue the packet in flight.
+    ///
+    /// A caller that keeps something of its own per packet - the Hysteria2
+    /// server keeps the address the packet opened with - refreshes it exactly
+    /// when this says yes. It shares its answer with [`Self::push`] rather than
+    /// restating the rule, because a caller that mirrored the condition would
+    /// go stale the day the rule changed.
+    pub fn starts_new_packet(&self, packet_id: u16, fragment_count: u8) -> bool {
+        !self.continues_in_flight(packet_id, fragment_count)
+    }
+
+    /// True when a fragment belongs to the packet already being assembled.
+    ///
+    /// Both the id and the count have to match: the same id carrying a
+    /// different count cannot be the same packet, and its slots are the wrong
+    /// shape for it.
+    fn continues_in_flight(&self, packet_id: u16, fragment_count: u8) -> bool {
+        self.in_flight
+            .as_ref()
+            .is_some_and(|p| p.packet_id == packet_id && p.slots.len() == fragment_count as usize)
     }
 
     /// Feed one fragment; returns the whole payload when the last piece lands.
@@ -175,11 +194,7 @@ impl Defragmenter {
             return Some(payload.to_vec());
         }
 
-        let continues_current = self
-            .in_flight
-            .as_ref()
-            .is_some_and(|p| p.packet_id == packet_id && p.slots.len() == fragment_count as usize);
-        if !continues_current {
+        if !self.continues_in_flight(packet_id, fragment_count) {
             // A different id, or the same id with a different count: whatever
             // was held can never complete, so it goes rather than accumulating.
             self.in_flight = Some(InFlight {
@@ -372,7 +387,8 @@ mod tests {
 
         // Packet 1's second half now completes nothing: its first half is gone.
         assert!(frag.push(1, 1, 2, b"second half").is_none());
-        // And packet 2 is what is being tracked, uncorrupted by the visit.
+        // And that stray fragment evicted packet 2 in its turn - it is a
+        // fragment of an id we are not assembling, so it starts assembly over.
         assert_eq!(
             frag.in_flight_packet_id(),
             Some(1),
@@ -413,6 +429,24 @@ mod tests {
             "two of three slots are filled, so nothing may have been released"
         );
         assert_eq!(frag.push(1, 2, 3, b"c").unwrap(), b"abc");
+    }
+
+    /// The condition a caller keeping per-packet state has to act on. It is
+    /// not "a different id": the same id with a different count restarts
+    /// assembly too, and a caller comparing only ids would go on using state
+    /// belonging to a packet that no longer exists.
+    #[test]
+    fn test_defragmenter_reports_when_a_fragment_starts_a_new_packet() {
+        let mut frag = Defragmenter::new();
+        assert!(frag.starts_new_packet(7, 3), "nothing is in flight yet");
+
+        frag.push(7, 0, 3, b"a");
+        assert!(!frag.starts_new_packet(7, 3), "same id, same count");
+        assert!(frag.starts_new_packet(8, 3), "a different id");
+        assert!(
+            frag.starts_new_packet(7, 2),
+            "the same id with a different count cannot be the same packet"
+        );
     }
 
     #[test]
