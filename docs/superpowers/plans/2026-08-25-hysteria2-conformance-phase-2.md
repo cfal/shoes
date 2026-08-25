@@ -1,6 +1,6 @@
 # Hysteria2 Conformance, Phase 2 — Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Take the three robustness defects in the Hysteria2 UDP path — a
 reassembly table a peer can grow to about 78 MB per session, a session removal
@@ -104,7 +104,7 @@ packet has started. It is a small window into the state rather than a generic
 metadata slot, because the client (Task 3) has a fixed address per session and
 would carry a type parameter for nothing.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Add to the existing `mod tests` at the bottom of
 `src/quic_transport/fragments.rs`. Note the `Defragmenter::` prefix: these live
@@ -230,7 +230,7 @@ beside `FragmentTable`'s tests, which stay untouched.
     }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 ```bash
 export PATH="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH"
@@ -241,7 +241,7 @@ Expected: FAIL to compile, `cannot find type Defragmenter in this scope` (E0433
 / E0412) at every one of the new tests. A compile failure is the correct red
 here — the type does not exist yet.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 Add above the `#[cfg(test)] mod tests` block in
 `src/quic_transport/fragments.rs`:
@@ -368,7 +368,7 @@ fragment_count` was checked at the top, and `slots.len() == fragment_count` is
 either freshly constructed above or was the condition for reusing the existing
 one.
 
-- [ ] **Step 4: Correct `FragmentTable`'s docs**
+- [x] **Step 4: Correct `FragmentTable`'s docs**
 
 The module doc at the top of the file says Hysteria2 and TUIC both use the
 table. After Task 3 only TUIC does. Replace the module doc's second paragraph
@@ -403,7 +403,7 @@ with:
 ///
 ```
 
-- [ ] **Step 5: Run the tests to verify they pass**
+- [x] **Step 5: Run the tests to verify they pass**
 
 ```bash
 export PATH="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH"
@@ -413,7 +413,7 @@ cargo test --lib quic_transport::fragments
 Expected: PASS, including every pre-existing `FragmentTable` test — this task
 adds a type and must not have changed one.
 
-- [ ] **Step 6: Format, lint and commit**
+- [x] **Step 6: Format, lint and commit**
 
 ```bash
 cargo fmt --all
@@ -441,7 +441,7 @@ another. The server's own header validation stays exactly where it is — the
 with the session id, and that diagnosis is worth keeping even though
 `Defragmenter` would refuse the same fragments silently.
 
-- [ ] **Step 1: Confirm the existing coverage passes first**
+- [x] **Step 1: Confirm the existing coverage passes first**
 
 ```bash
 export PATH="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH"
@@ -453,7 +453,7 @@ Expected: PASS. This is the baseline the refactor has to preserve; a failure
 here is a pre-existing flake, not something this task caused, and it needs
 chasing before continuing.
 
-- [ ] **Step 2: Change the imports and the session struct**
+- [x] **Step 2: Change the imports and the session struct**
 
 At the top of `src/hysteria2/server.rs`, remove:
 
@@ -536,7 +536,7 @@ In `UdpSession::start`, replace the initialiser's first line:
             send_socket: client_socket.clone(),
 ```
 
-- [ ] **Step 3: Replace the reassembly block**
+- [x] **Step 3: Replace the reassembly block**
 
 In `run_udp_local_to_remote_loop`, replace the whole
 `let (complete_payload, remote_location) = if fragment_count == 0 { ... };`
@@ -581,7 +581,7 @@ Two things about this that are easy to get wrong:
 - `pending_location.take()` empties it on completion, so the next fragment of a
   new packet is always seen as starting one.
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 ```bash
 export PATH="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH"
@@ -593,7 +593,7 @@ Expected: PASS, and in particular
 through the client and the server — larger than one QUIC datagram, so the
 client fragments it and this code is what puts it back together.
 
-- [ ] **Step 5: Confirm the old table is gone**
+- [x] **Step 5: Confirm the old table is gone**
 
 ```bash
 grep -n "LruCache\|FragmentedPacket\|MAX_FRAGMENT_CACHE_SIZE" src/hysteria2/server.rs
@@ -602,7 +602,7 @@ grep -n "LruCache\|FragmentedPacket\|MAX_FRAGMENT_CACHE_SIZE" src/hysteria2/serv
 Expected: no output. Non-empty output means a leftover, and `cargo build` would
 have warned about an unused import rather than failed.
 
-- [ ] **Step 6: Format, lint and commit**
+- [x] **Step 6: Format, lint and commit**
 
 ```bash
 cargo fmt --all
@@ -629,7 +629,7 @@ server (`core/client/udp.go`), so one packet in flight is the protocol's rule
 rather than a server-side hardening measure. The client's exposure is the same
 shape and it is the end that runs on a phone, where the 78 MB matters most.
 
-- [ ] **Step 1: Read the existing tests**
+- [x] **Step 1: Read the existing tests**
 
 ```bash
 sed -n '199,273p' src/hysteria2/udp.rs
@@ -640,7 +640,7 @@ feeds the table. They are the coverage for this change; note which of them
 assume more than one packet may be in flight, because such a test is now
 asserting the old rule and must be rewritten rather than deleted.
 
-- [ ] **Step 2: Swap the type**
+- [x] **Step 2: Swap the type**
 
 `src/hysteria2/udp.rs:14`:
 
@@ -669,7 +669,7 @@ And `push_wire`'s signature at `:206`:
 with every `FragmentTable::new()` in that test module becoming
 `Defragmenter::new()`.
 
-- [ ] **Step 3: Run the tests**
+- [x] **Step 3: Run the tests**
 
 ```bash
 export PATH="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH"
@@ -682,7 +682,7 @@ assert the new one — the older id is discarded — and say in the test's doc
 comment that this is upstream's behaviour, citing `frag.go:40-43`. Do not
 delete it.
 
-- [ ] **Step 4: Run the whole Hysteria2 suite**
+- [x] **Step 4: Run the whole Hysteria2 suite**
 
 ```bash
 cargo test --lib hysteria2::
@@ -691,7 +691,7 @@ cargo test --lib hysteria2::
 Expected: PASS. `test_large_udp_payload_is_fragmented_and_reassembled` now
 exercises `Defragmenter` on both ends at once.
 
-- [ ] **Step 5: Format, lint and commit**
+- [x] **Step 5: Format, lint and commit**
 
 ```bash
 cargo fmt --all
@@ -731,7 +731,7 @@ explicit `remove`, a `retain` returning false, the map itself dropping when the
 loop exits — runs the same cancel. A helper function would fix today's bug and
 leave tomorrow's third removal path free to forget again.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Add to `mod tests` in `src/hysteria2/server.rs`. The session is built field by
 field rather than through `UdpSession::start`, because `start` spawns a task
@@ -792,7 +792,7 @@ lifetime behaviour.
     }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 ```bash
 export PATH="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH"
@@ -808,7 +808,7 @@ loop already calls (`NetLocation::from_str(addr_str, None)`), not the `FromStr`
 trait — do not add a `use std::str::FromStr;` to make it compile, that would
 bring the one-argument trait method into scope and change which is called.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 Add directly after `struct UdpSession { ... }` in `src/hysteria2/server.rs`:
 
@@ -857,7 +857,7 @@ not re-add a cancel beside it:
         }
 ```
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 ```bash
 cargo test --lib hysteria2::server
@@ -868,7 +868,7 @@ Expected: PASS. Watch for a new failure in the client↔server UDP tests: if a
 session is now being cancelled somewhere it was not before, it will show up as a
 UDP round trip that stops working, not as a subtle regression.
 
-- [ ] **Step 5: Format, lint and commit**
+- [x] **Step 5: Format, lint and commit**
 
 ```bash
 cargo fmt --all
@@ -906,7 +906,7 @@ client goes quiet keeps every session it ever opened, with its socket and its
 task, until the connection itself ends. Upstream sweeps on a 1s ticker that owes
 nothing to traffic (`core/server/udp.go:277-288`).
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```rust
     /// Extracted from the receive loop so it can be tested at all: while it
@@ -944,7 +944,7 @@ nothing to traffic (`core/server/udp.go:277-288`).
     }
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 ```bash
 export PATH="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH"
@@ -954,7 +954,7 @@ cargo test --lib hysteria2::server::tests::test_the_sweep
 Expected: FAIL to compile, `cannot find function sweep_idle_sessions in this
 scope`.
 
-- [ ] **Step 3: Extract the function**
+- [x] **Step 3: Extract the function**
 
 Add above `run_udp_local_to_remote_loop` in `src/hysteria2/server.rs`:
 
@@ -997,7 +997,7 @@ fn sweep_idle_sessions(
 If Task 4 has not been done yet, put `session.cancel_token.cancel();` back above
 the `debug!` and change the comment to say so; Task 4 removes it.
 
-- [ ] **Step 4: Drive it from a timer**
+- [x] **Step 4: Drive it from a timer**
 
 In `run_udp_local_to_remote_loop`, delete the two `const` declarations that were
 inside it and the `let mut last_cleanup = std::time::Instant::now();` line, and
@@ -1045,7 +1045,7 @@ condition does not change: it still ends when `read_datagram` returns an error,
 and `cancel_token` is still not selected on, because the connection's token is
 cancelled after `try_join!` returns rather than before.
 
-- [ ] **Step 5: Run the tests to verify they pass**
+- [x] **Step 5: Run the tests to verify they pass**
 
 ```bash
 cargo test --lib hysteria2::server
@@ -1060,7 +1060,7 @@ silent and a 60-second wait. What is tested is the reaping decision, which is
 where the arithmetic and the cancellation live. The wiring is three lines and
 gets a reviewer instead.
 
-- [ ] **Step 6: Check the timer against the whole suite**
+- [x] **Step 6: Check the timer against the whole suite**
 
 ```bash
 cargo test --lib
@@ -1074,7 +1074,7 @@ failing intermittently, run it twenty times before concluding it is unrelated:
 for i in $(seq 1 20); do cargo test --lib hysteria2:: || break; done
 ```
 
-- [ ] **Step 7: Format, lint and commit**
+- [x] **Step 7: Format, lint and commit**
 
 ```bash
 cargo fmt --all
@@ -1125,7 +1125,7 @@ client, and unifying the two encoders is the spec's phase 3 structural item —
 keeping this one arithmetic-only, with no framing in it, is what makes that
 merge a deletion later rather than a rewrite.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
     /// Both operands come from the peer: the datagram size it advertised, and
@@ -1178,7 +1178,7 @@ merge a deletion later rather than a rewrite.
     }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 ```bash
 export PATH="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH"
@@ -1190,7 +1190,7 @@ cargo test --lib hysteria2::server::tests::test_the_largest
 
 Expected: FAIL to compile, `cannot find function fragment_plan in this scope`.
 
-- [ ] **Step 3: Write the function**
+- [x] **Step 3: Write the function**
 
 Add above `run_udp_remote_to_local_loop` in `src/hysteria2/server.rs`:
 
@@ -1241,7 +1241,7 @@ fn fragment_plan(
 }
 ```
 
-- [ ] **Step 4: Use it, and delete the duplicated single-datagram branch**
+- [x] **Step 4: Use it, and delete the duplicated single-datagram branch**
 
 In `run_udp_remote_to_local_loop`, replace everything from the `assert!` down to
 the end of the `else` block — that is the `assert!`, the
@@ -1274,7 +1274,7 @@ The single-datagram branch is gone because it was this loop with
 `[0, 1]` fragment id and count, the same header and the same payload slice.
 Two copies of one encoder is how the divergences in this spec came to exist.
 
-- [ ] **Step 5: Run the tests to verify they pass**
+- [x] **Step 5: Run the tests to verify they pass**
 
 ```bash
 cargo test --lib hysteria2::server
@@ -1286,7 +1286,7 @@ Expected: PASS, including `test_udp_round_trip` and
 former single-datagram branch and the second down the fragment loop, so between
 them they cover the branch that was deleted and the one that absorbed it.
 
-- [ ] **Step 6: Confirm nothing can panic there any more**
+- [x] **Step 6: Confirm nothing can panic there any more**
 
 ```bash
 grep -n "assert!\|unwrap()\|expect(\|as u8" src/hysteria2/server.rs | sed -n '1,20p'
@@ -1295,7 +1295,7 @@ grep -n "assert!\|unwrap()\|expect(\|as u8" src/hysteria2/server.rs | sed -n '1,
 Every remaining hit must be either inside `mod tests` or on a value that did not
 come from the network. Read each one; do not assume.
 
-- [ ] **Step 7: Format, lint and commit**
+- [x] **Step 7: Format, lint and commit**
 
 ```bash
 cargo fmt --all
@@ -1312,7 +1312,7 @@ git commit -m "hysteria2: refuse an unsendable reply instead of panicking on it"
 **Files:**
 - Modify: `CHANGELOG.md`, `docs/superpowers/specs/2026-08-24-hysteria2-conformance-design.md`
 
-- [ ] **Step 1: Full gate**
+- [x] **Step 1: Full gate**
 
 ```bash
 export PATH="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH"
@@ -1329,7 +1329,7 @@ cargo test --test '*'
 Every one must pass. `cargo fmt --all -- --check` is first because it is the
 first job in CI and the cheapest to fail.
 
-- [ ] **Step 2: Run the UDP path repeatedly**
+- [x] **Step 2: Run the UDP path repeatedly**
 
 Task 5 puts a timer inside the receive loop's `select!`. That is the change most
 likely to show up as an intermittent failure rather than a deterministic one.
@@ -1342,7 +1342,7 @@ Expected: twenty passes. If one fails, do not re-run until it goes green —
 find it. This repository has twice shipped a test that failed roughly one run in
 fifty.
 
-- [ ] **Step 3: Record it**
+- [x] **Step 3: Record it**
 
 Add to the `Unreleased` section of `CHANGELOG.md`, under the existing
 `### Hysteria2 conformance with the reference implementation` heading, a short
@@ -1363,7 +1363,7 @@ subsection covering what a user or operator sees:
 
 Say plainly that none of this changes the wire format.
 
-- [ ] **Step 4: Mark phase 2 done in the spec**
+- [x] **Step 4: Mark phase 2 done in the spec**
 
 In `docs/superpowers/specs/2026-08-24-hysteria2-conformance-design.md`, change
 the `## Phase 2 — robustness` heading to `## Phase 2 — robustness — done` and
@@ -1373,7 +1373,7 @@ used by both Hysteria2 ends rather than only in the server's own table, and
 TUIC's `FragmentTable` was deliberately left alone because Hysteria's reference
 says nothing about TUIC's.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add CHANGELOG.md docs/superpowers/specs/2026-08-24-hysteria2-conformance-design.md
@@ -1419,3 +1419,48 @@ For the reader who goes looking and finds these still open:
 - **Everything in phase 3,** which is fingerprint decisions and needs the
   user's answer to one question before it can be planned: are we imitating the
   Go client, or merely interoperating with it?
+
+---
+
+## What execution found
+
+Done 2026-08-25. Every task landed as written; three things the plan did not
+anticipate are worth carrying forward.
+
+**The clippy gate cannot pass on macOS, and never could.** `cargo clippy -- -D
+warnings` reports five errors on a pristine tree here: two `unused variable:
+interface` in `src/socket_util.rs` (the interface binding is Linux-only) and
+three `nonminimal_bool` in `src/config/types/dns.rs`'s tests, under this
+machine's clippy 1.94. CI is Linux and is green, so the workable local gate is
+*no new diagnostics in the files being touched*, checked with:
+
+```bash
+cargo clippy --locked --lib --tests 2>&1 -- -D warnings \
+  | grep -E "^ +--> src/(quic_transport|quic_outbound|hysteria2)/"
+```
+
+Anyone writing the next plan for this repository should state the gate that way
+rather than as an unqualified pass.
+
+**A test-harness race had to be fixed before the 20-run gate could mean
+anything.** `hysteria2::client::tests::test_udp_round_trip` failed once, on a run
+that took 10.08s against a usual 2.3s — exactly `udp_exchange`'s ten-second
+timeout. `reserve_udp_port` closes its probe socket before returning the
+address, so two servers can be handed one port; and because they bind with
+`SO_REUSEPORT` (`quic_transport::build_server_endpoint` passes `true`) they both
+bind successfully and the kernel splits datagrams between them. No bind error is
+raised, because `SO_REUSEPORT` is what suppresses it. Ports issued in a process
+are now remembered and never reused (`e88486c`). This was the third latent flake
+in this harness; the previous two were found the same way, by chasing a single
+failure rather than re-running until green.
+
+**The reply path's single-datagram branch was dead weight.** Task 6 predicted
+this and it held: with `fragment_count == 1` the fragment loop writes the same
+`[0, 1]` header, the same address and the same payload slice, so the branch was
+the loop written out a second time. It went with the `assert!`.
+
+Gate as run: fmt clean; 1326 lib + 1315 bin + 8 integration tests passing;
+clippy clean in the touched modules across four feature combinations;
+`hysteria2::` 20/20 clean and the full lib suite 10/10 clean.
+
+Live verification is still outstanding — see the section above.
