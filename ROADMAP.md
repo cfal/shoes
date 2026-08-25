@@ -7,7 +7,9 @@ added 2026-08-11 against `apernet/hysteria` at `app/v2.12.1`. Refreshed
 and the mieru section were re-checked against the tree, and every Tier 2 and
 Tier 3 item was confirmed still open. Refreshed again 2026-08-24 against
 `mobile` at `a27b666`, when the desktop control API landed and earned a section
-of its own.
+of its own. Refreshed again 2026-08-25 against `mobile` at `30346aa`, when the
+first two phases of Hysteria2 conformance landed — which corrected two claims in
+the Hysteria section that had been wrong rather than merely stale.
 
 The audience is anyone deciding what to work on. Every gap below is stated with
 the file it lands in, so the estimate is checkable rather than a guess.
@@ -342,12 +344,65 @@ Speaking the protocol is not the same as matching the implementation. This
 section is the difference, so that "we support Hysteria2" is never claimed
 wider than it is true.
 
+### Conformance with the reference — phases 1 and 2 done
+
+A review that read the Go source of
+[HyNetworks/hysteria](https://github.com/HyNetworks/hysteria) at `619a6f8`
+found fifteen divergences across 5500 lines of our Hysteria2 code. Design:
+[docs/superpowers/specs/2026-08-24-hysteria2-conformance-design.md](./docs/superpowers/specs/2026-08-24-hysteria2-conformance-design.md).
+
+**Phase 1 — the ones that made a real peer fail — done.** An IPv6 target went
+on the wire unbracketed, so `2001:db8::1` port 443 became `2001:db8::1:443` and
+Go's `net.SplitHostPort` refused it outright. Concurrent UDP sessions each ran
+their own reader on the shared connection and dropped what was not theirs, so
+with two sessions each won about half the datagrams; one demultiplexer per
+connection routes by session id now. The server answered success before it
+dialled, so a refused target reached the client as a connection that succeeded
+and immediately closed with no diagnosis. And it sent `Hysteria-CC-RX: 0`,
+which the protocol defines as "no limit, transmit at any rate" — not the
+"run your own congestion control" signal it was taken for — so an official
+client configured with `up: 200 mbps` switched to fixed-rate Brutal against a
+server running ordinary congestion control.
+
+One of the five has no fix available here and is documented rather than closed:
+our server cannot carry UDP to a peer that omits `max_datagram_frame_size`,
+because quinn refuses to send a datagram to such a peer and has no equivalent of
+upstream's `AssumePeerMaxDatagramFrameSize`. An official client does this only
+with `disableChromeParrot: true`, so a stock client is unaffected. It names the
+cause in the operator's log now instead of silently never replying.
+
+**Phase 2 — robustness — done.** A UDP session tracked up to 256 incomplete
+packets of up to 255 fragments each — about 78 MB — and opening sessions cost a
+peer nothing; holding one packet id in flight, as upstream does, caps it at
+roughly 300 KB. A session whose send failed was dropped from the map without its
+reply task being cancelled, leaving a socket and a parked task for the life of
+the connection. Idle sessions were swept only when another datagram happened to
+arrive, so a client that went quiet kept everything it had opened. And an
+`assert!` on two peer-chosen values sat on the reply path beside a fragment
+count that truncated to a byte.
+
+**Phase 3 is a decision, not a repair, and it is open.** Auth and request
+padding sizes, connection ID length, stream limits and the masquerade body are
+all places where we differ from the Go client — some deliberately, some not —
+and choosing means answering one question first: *are we imitating that client,
+or merely interoperating with it?* The tables below are what phase 3 would draw
+from. Structural work waits behind the same decision: the server keeps a second
+datagram encoder beside `frame.rs`, and two encoders for one wire format is
+exactly the arrangement that produced this list.
+
+Which is the part worth carrying away. In almost every case **our encoder and
+our decoder shared a misreading, so every test passed** — the same shape that
+produced nine defects in mieru and then eight more. Reading the reference found
+each one. A live run against the official client then disproved one of the
+findings as written, which no test of ours could have done, because the claim
+was about a peer we do not control.
+
 ### Interoperability — a server we cannot talk to
 
 | Gap | Effect |
 | --- | --- |
 | **Gecko obfuscation** (`obfs.type: gecko`, upstream 2.9.2) | A server with it configured is unreachable. Experimental upstream, and it builds on Salamander's scrambling rather than replacing it, so it is an added framing layer rather than a second cipher. |
-| **`Hysteria-CC-RX: "auto"`** | The protocol allows the literal string as well as an integer. A parser that assumes a number must not choke on it. Our client ignores the header entirely, which is compliant, but the ignoring has to be deliberate. |
+| **`Hysteria-CC-RX: "auto"`, on the client** | The protocol allows the literal string as well as an integer. Our *server* sends `auto` now — see the conformance section above — but our client still ignores the header it receives. That is compliant only for as long as we install no congestion controller of our own, and becomes a real gap the day Brutal lands. |
 | **Multiple users on our server** (`auth.type: userpass`, `http`, `command`) | `ServerProxyConfig::Hysteria2` takes one password. Upstream supports a user map, an HTTP callback and an external command. A client authenticating as `user:pass` works against us today only because we compare the whole string. |
 
 **Port hopping — done, client side.** A server published as a port range is
@@ -385,7 +440,7 @@ fallback.
 
 | Gap | Effect |
 | --- | --- |
-| **Brutal congestion control** and the bandwidth negotiation behind it (`bandwidth.up`/`down`, `Hysteria-CC-RX` in both directions) | This is the headline feature. Brutal sends at a declared rate instead of backing off on loss, which is why Hysteria is fast on lossy intercontinental paths. We send `Hysteria-CC-RX: 0` in both directions, which is the protocol's "use ordinary congestion control" signal, so throughput on a lossy path will be visibly below the official client's. Needs a `quinn` congestion controller. |
+| **Brutal congestion control** and the bandwidth negotiation behind it (`bandwidth.up`/`down`, `Hysteria-CC-RX` in both directions) | This is the headline feature. Brutal sends at a declared rate instead of backing off on loss, which is why Hysteria is fast on lossy intercontinental paths. Our server answers `auto` (`server.rs:176`), the value for a server that declines to set a rate, and our client declares `0` (`auth.rs:35`), meaning it does not know its own receive rate. Neither end installs Brutal either way, so throughput on a lossy path stays visibly below the official client's. Needs a `quinn` congestion controller. This row said we sent `0` in both directions and called `0` the "use ordinary congestion control" signal; both halves were wrong, and the second was the defect phase 1 fixed. |
 | **BBR profile** (`congestion.bbrProfile`: conservative/standard/aggressive) | Tuning knob on top of the fallback controller. |
 | **`bandwidth.disableLossCompensation`** (upstream 2.10.0) | Only meaningful once Brutal exists. |
 | **QUIC stateless resets** (upstream 2.12.1) | Server side. Without them a client holding a connection that died while the device slept waits out its idle timeout before reconnecting. Upstream called this out as most noticeable on mobile, which is this branch's entire audience. |
