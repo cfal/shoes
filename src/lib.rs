@@ -77,6 +77,7 @@ pub mod mieru;
 mod mixed_handler;
 mod naiveproxy;
 mod option_util;
+mod outbound_stats;
 mod port_forward_handler;
 mod prepend_stream;
 pub mod quic_outbound;
