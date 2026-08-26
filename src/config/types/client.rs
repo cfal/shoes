@@ -541,6 +541,11 @@ where
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientConfig {
+    /// A stable, human-meaningful identifier for this outbound. Optional: an
+    /// outbound without one is keyed by its address, which works but is
+    /// neither stable across config edits nor meaningful to show a person.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     #[serde(default, skip_serializing_if = "NoneOrOne::is_unspecified")]
     pub bind_interface: NoneOrOne<String>,
     #[serde(
@@ -560,6 +565,7 @@ pub struct ClientConfig {
 impl Default for ClientConfig {
     fn default() -> Self {
         Self {
+            name: None,
             bind_interface: NoneOrOne::None,
             address: unspecified_address(),
             protocol: ClientProxyConfig::Direct,
@@ -567,6 +573,32 @@ impl Default for ClientConfig {
             tcp_settings: None,
             quic_settings: None,
         }
+    }
+}
+
+impl ClientConfig {
+    /// The key this outbound's traffic is counted against.
+    ///
+    /// A name if one is set; otherwise `direct` for a direct outbound, whose
+    /// address is unspecified and would otherwise collide with every other
+    /// direct outbound on `0.0.0.0:0`; otherwise the address.
+    pub fn stats_key(&self) -> std::io::Result<String> {
+        if let Some(name) = &self.name {
+            let trimmed = name.trim();
+            if trimmed.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "an outbound 'name' is empty; remove the field or give it a value",
+                ));
+            }
+            return Ok(trimmed.to_string());
+        }
+
+        if self.protocol.is_direct() && self.address.is_unspecified() {
+            return Ok("direct".to_string());
+        }
+
+        Ok(self.address.to_string())
     }
 }
 
@@ -835,6 +867,7 @@ mod tests {
 
     fn create_test_client_config() -> ClientConfig {
         ClientConfig {
+            name: None,
             bind_interface: NoneOrOne::One("eth0".to_string()),
             address: NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 1080),
             protocol: ClientProxyConfig::Socks {
@@ -1067,5 +1100,62 @@ protocol:
         let result: Result<ClientProxyConfig, _> = serde_yaml::from_str(yaml);
         assert!(result.is_ok());
         assert!(matches!(result.unwrap(), ClientProxyConfig::Websocket(_)));
+    }
+}
+
+#[cfg(test)]
+mod named_outbound_tests {
+    use super::*;
+
+    fn parse(yaml: &str) -> ClientConfig {
+        serde_yaml::from_str(yaml).unwrap()
+    }
+
+    #[test]
+    fn a_name_round_trips_through_yaml() {
+        let config = parse("name: Frankfurt\naddress: fra1.example:443\nprotocol:\n  type: socks\n");
+        let encoded = serde_yaml::to_string(&config).unwrap();
+        let decoded: ClientConfig = serde_yaml::from_str(&encoded).unwrap();
+        assert_eq!(decoded.name.as_deref(), Some("Frankfurt"));
+    }
+
+    /// A config that does not use the field must serialize exactly as it did
+    /// before the field existed: the desktop config editor re-serializes
+    /// whatever it loads.
+    #[test]
+    fn an_absent_name_is_not_serialized() {
+        let config = parse("address: fra1.example:443\nprotocol:\n  type: socks\n");
+        let encoded = serde_yaml::to_string(&config).unwrap();
+        assert!(!encoded.contains("name"), "unexpected name in: {encoded}");
+    }
+
+    #[test]
+    fn a_name_is_the_key_when_present() {
+        let config = parse("name: Frankfurt\naddress: fra1.example:443\nprotocol:\n  type: socks\n");
+        assert_eq!(config.stats_key().unwrap(), "Frankfurt");
+    }
+
+    #[test]
+    fn an_unnamed_outbound_is_keyed_by_its_address() {
+        let config = parse("address: fra1.example:443\nprotocol:\n  type: socks\n");
+        assert_eq!(config.stats_key().unwrap(), "fra1.example:443");
+    }
+
+    /// Every direct outbound carries NetLocation::UNSPECIFIED, and the default
+    /// rule action is a direct chain, so an address fallback would collide
+    /// them all on "0.0.0.0:0".
+    #[test]
+    fn a_direct_outbound_is_keyed_direct_not_by_its_empty_address() {
+        let config = ClientConfig::default();
+        assert!(config.protocol.is_direct());
+        assert_eq!(config.stats_key().unwrap(), "direct");
+    }
+
+    /// Silently falling through to the address would be undebuggable.
+    #[test]
+    fn a_blank_name_is_rejected() {
+        let config = parse("name: \"   \"\naddress: fra1.example:443\nprotocol:\n  type: socks\n");
+        let err = config.stats_key().unwrap_err();
+        assert!(err.to_string().contains("empty"), "unhelpful message: {err}");
     }
 }

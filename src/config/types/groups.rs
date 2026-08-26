@@ -350,6 +350,7 @@ mod tests {
 
     fn create_test_client_config() -> ClientConfig {
         ClientConfig {
+            name: None,
             bind_interface: crate::option_util::NoneOrOne::One("eth0".to_string()),
             address: NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 1080),
             protocol: ClientProxyConfig::Socks {
@@ -390,6 +391,7 @@ mod tests {
             client_proxies: OneOrSome::Some(vec![
                 ConfigSelection::Config(create_test_client_config()),
                 ConfigSelection::Config(ClientConfig {
+                    name: None,
                     bind_interface: crate::option_util::NoneOrOne::None,
                     address: NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53),
                     protocol: ClientProxyConfig::Http {
