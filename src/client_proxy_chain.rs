@@ -409,6 +409,10 @@ impl ClientProxyChain {
                 initial_hop_next_index,
                 subsequent_hops,
                 subsequent_next_indices,
+                #[cfg(feature = "control-stats")]
+                initial_hop_counters,
+                #[cfg(feature = "control-stats")]
+                subsequent_hop_counters,
                 ..
             } => {
                 let (entry, _initial_idx) = select_from_pool(initial_hop, initial_hop_next_index);
@@ -492,17 +496,57 @@ impl ClientProxyChain {
                     remote_location.location()
                 );
 
+                #[cfg(feature = "control-stats")]
+                let result = {
+                    let counters = Self::exit_counters(
+                        initial_hop_counters,
+                        subsequent_hop_counters,
+                        _initial_idx,
+                        &_subsequent_indices,
+                    );
+                    let counting = crate::outbound_counting_stream::OutboundCountingStream::new(
+                        result.client_stream,
+                        counters,
+                    );
+                    // early_data never travels through the stream and would
+                    // otherwise be lost from the count entirely.
+                    if let Some(data) = &result.early_data {
+                        counting.count_early_data(data.len());
+                    }
+                    TcpClientSetupResult {
+                        client_stream: Box::new(counting),
+                        early_data: result.early_data,
+                    }
+                };
+
                 Ok(result)
             }
             ClientProxyChainKind::Terminal {
                 connectors,
                 next_index,
                 #[cfg(feature = "control-stats")]
-                    connector_counters: _connector_counters,
+                connector_counters,
             } => {
                 let (connector, _idx) = select_terminal(connectors, next_index);
                 debug!("Terminal TCP connect -> {}", remote_location.location());
-                connector.connect_tcp(resolver, remote_location).await
+                let result = connector.connect_tcp(resolver, remote_location).await?;
+
+                #[cfg(feature = "control-stats")]
+                let result = {
+                    let counting = crate::outbound_counting_stream::OutboundCountingStream::new(
+                        result.client_stream,
+                        connector_counters[_idx].clone(),
+                    );
+                    if let Some(data) = &result.early_data {
+                        counting.count_early_data(data.len());
+                    }
+                    TcpClientSetupResult {
+                        client_stream: Box::new(counting),
+                        early_data: result.early_data,
+                    }
+                };
+
+                Ok(result)
             }
         }
     }
@@ -1344,5 +1388,280 @@ mod tests {
 
         let single = ClientProxyChain::exit_counters(&[unattributed(), a.clone()], &[], 1, &[]);
         assert!(Arc::ptr_eq(&single, &a));
+    }
+
+    // --- Connecting mocks -------------------------------------------------
+    //
+    // The mocks above return Err from every connect method: they test
+    // structure, not connections. Counting can only be tested through a
+    // connection that completes, so these carry real bytes.
+
+    /// A socket that actually connects: hands out one half of a duplex pipe
+    /// and lets the test keep the other, so bytes can be driven through.
+    #[cfg(feature = "control-stats")]
+    #[derive(Debug)]
+    struct PipeSocket {
+        half: std::sync::Mutex<Option<tokio::io::DuplexStream>>,
+    }
+
+    #[cfg(feature = "control-stats")]
+    impl PipeSocket {
+        fn new() -> (Box<dyn SocketConnector>, tokio::io::DuplexStream) {
+            let (ours, theirs) = tokio::io::duplex(4096);
+            let socket = Self {
+                half: std::sync::Mutex::new(Some(ours)),
+            };
+            (Box::new(socket), theirs)
+        }
+    }
+
+    #[cfg(feature = "control-stats")]
+    #[async_trait]
+    impl SocketConnector for PipeSocket {
+        async fn connect(
+            &self,
+            _resolver: &Arc<dyn Resolver>,
+            _address: &ResolvedLocation,
+        ) -> std::io::Result<Box<dyn AsyncStream>> {
+            let half = self
+                .half
+                .lock()
+                .unwrap()
+                .take()
+                .expect("PipeSocket connects once");
+            Ok(Box::new(crate::async_stream::testing::TestStream(half)))
+        }
+
+        async fn connect_udp_bidirectional(
+            &self,
+            _resolver: &Arc<dyn Resolver>,
+            _target: ResolvedLocation,
+        ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
+            Err(std::io::Error::other("PipeSocket has no native UDP"))
+        }
+
+        fn bind_interface(&self) -> Option<&str> {
+            None
+        }
+    }
+
+    /// A proxy hop that performs no handshake: the stream goes out as it came
+    /// in. Enough to prove which hop's counter a chain credits.
+    #[cfg(feature = "control-stats")]
+    #[derive(Debug)]
+    struct PassthroughProxy {
+        location: NetLocation,
+    }
+
+    #[cfg(feature = "control-stats")]
+    #[async_trait]
+    impl ProxyConnector for PassthroughProxy {
+        fn proxy_location(&self) -> &NetLocation {
+            &self.location
+        }
+
+        fn supports_udp_over_tcp(&self) -> bool {
+            true
+        }
+
+        async fn setup_tcp_stream(
+            &self,
+            stream: Box<dyn AsyncStream>,
+            _target: &ResolvedLocation,
+        ) -> std::io::Result<TcpClientSetupResult> {
+            Ok(TcpClientSetupResult {
+                client_stream: stream,
+                early_data: None,
+            })
+        }
+
+        async fn setup_udp_bidirectional(
+            &self,
+            _stream: Box<dyn AsyncStream>,
+            _target: ResolvedLocation,
+        ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
+            Ok(Box::new(SinkMessageStream))
+        }
+    }
+
+    #[cfg(feature = "control-stats")]
+    fn passthrough(port: u16) -> Box<dyn ProxyConnector> {
+        Box::new(PassthroughProxy {
+            location: NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port),
+        })
+    }
+
+    /// A message stream that accepts every write and never yields a read.
+    #[cfg(feature = "control-stats")]
+    #[derive(Debug, Default)]
+    struct SinkMessageStream;
+
+    #[cfg(feature = "control-stats")]
+    impl crate::async_stream::AsyncReadMessage for SinkMessageStream {
+        fn poll_read_message(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    #[cfg(feature = "control-stats")]
+    impl crate::async_stream::AsyncWriteMessage for SinkMessageStream {
+        fn poll_write_message(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[cfg(feature = "control-stats")]
+    impl crate::async_stream::AsyncFlushMessage for SinkMessageStream {
+        fn poll_flush_message(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[cfg(feature = "control-stats")]
+    impl crate::async_stream::AsyncShutdownMessage for SinkMessageStream {
+        fn poll_shutdown_message(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[cfg(feature = "control-stats")]
+    impl crate::async_stream::AsyncPing for SinkMessageStream {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+
+        fn poll_write_ping(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<bool>> {
+            std::task::Poll::Ready(Ok(false))
+        }
+    }
+
+    #[cfg(feature = "control-stats")]
+    impl AsyncMessageStream for SinkMessageStream {}
+
+    #[cfg(feature = "control-stats")]
+    fn test_location() -> ResolvedLocation {
+        ResolvedLocation::new(NetLocation::from_ip_addr(
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+            443,
+        ))
+    }
+
+    #[cfg(feature = "control-stats")]
+    fn test_resolver() -> Arc<dyn Resolver> {
+        Arc::new(crate::resolver::NativeResolver::new())
+    }
+
+    /// The relay is where the bytes physically flow; the exit is the server a
+    /// person means. Only the exit may be credited.
+    #[cfg(feature = "control-stats")]
+    #[tokio::test]
+    async fn a_two_hop_chain_credits_the_exit_not_the_relay() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let _guard = crate::outbound_stats::REGISTRY_TEST_LOCK.lock().unwrap();
+        crate::outbound_stats::reset_for_test();
+
+        let direct = crate::outbound_stats::register("direct", "0.0.0.0:0").unwrap();
+        let relay = crate::outbound_stats::register("relay", "relay:1080").unwrap();
+        let exit = crate::outbound_stats::register("exit", "exit:1081").unwrap();
+
+        let (socket, mut peer) = PipeSocket::new();
+        let chain = ClientProxyChain::new(
+            vec![InitialHopEntry::Direct(socket)],
+            vec![vec![passthrough(1080)], vec![passthrough(1081)]],
+        )
+        .with_counters(vec![direct], vec![vec![relay], vec![exit]]);
+
+        let mut result = chain
+            .connect_tcp(test_location(), &test_resolver())
+            .await
+            .unwrap();
+
+        // Deliberately asymmetric, so a transposition cannot pass.
+        result.client_stream.write_all(&[1u8; 5]).await.unwrap();
+        peer.write_all(&[2u8; 13]).await.unwrap();
+        let mut buf = [0u8; 13];
+        result.client_stream.read_exact(&mut buf).await.unwrap();
+
+        let by_name = |n: &str| {
+            crate::outbound_stats::snapshot_all()
+                .into_iter()
+                .find(|o| o.name == n)
+                .unwrap()
+        };
+        assert_eq!(by_name("exit").upload_bytes, 5);
+        assert_eq!(by_name("exit").download_bytes, 13);
+        assert_eq!(by_name("exit").active_connections, 1);
+        assert_eq!(by_name("relay").upload_bytes, 0);
+        assert_eq!(by_name("relay").download_bytes, 0);
+        assert_eq!(by_name("relay").active_connections, 0);
+        assert_eq!(by_name("direct").active_connections, 0);
+
+        drop(result);
+        assert_eq!(by_name("exit").active_connections, 0);
+    }
+
+    /// A single-hop chain has no subsequent hop, so the initial hop IS the
+    /// exit -- and a pool credits the member actually selected.
+    #[cfg(feature = "control-stats")]
+    #[tokio::test]
+    async fn a_pool_credits_the_member_selected() {
+        let _guard = crate::outbound_stats::REGISTRY_TEST_LOCK.lock().unwrap();
+        crate::outbound_stats::reset_for_test();
+
+        let first = crate::outbound_stats::register("first", "first:1").unwrap();
+        let second = crate::outbound_stats::register("second", "second:2").unwrap();
+
+        let (socket_a, _peer_a) = PipeSocket::new();
+        let (socket_b, _peer_b) = PipeSocket::new();
+        let chain = ClientProxyChain::new(
+            vec![
+                InitialHopEntry::Direct(socket_a),
+                InitialHopEntry::Direct(socket_b),
+            ],
+            vec![],
+        )
+        .with_counters(vec![first, second], vec![]);
+
+        // Round-robin: the first connection takes member 0, the second member 1.
+        let a = chain
+            .connect_tcp(test_location(), &test_resolver())
+            .await
+            .unwrap();
+        let b = chain
+            .connect_tcp(test_location(), &test_resolver())
+            .await
+            .unwrap();
+
+        let all = crate::outbound_stats::snapshot_all();
+        assert_eq!(
+            all.iter().find(|o| o.name == "first").unwrap().active_connections,
+            1
+        );
+        assert_eq!(
+            all.iter().find(|o| o.name == "second").unwrap().active_connections,
+            1
+        );
+
+        drop(a);
+        drop(b);
+        let all = crate::outbound_stats::snapshot_all();
+        assert!(all.iter().all(|o| o.active_connections == 0));
     }
 }
