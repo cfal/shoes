@@ -43,6 +43,12 @@ pub struct OutboundSet {
     entries: HashMap<String, String>,
 }
 
+/// `allow(dead_code)` for the reason `tun::traffic` gives about its own
+/// accessors: the binary declares its modules in main.rs, and which of these
+/// have a caller depends on the build. `iter` is used by the registry, which
+/// is behind `control-stats`; the rest serve tests. They are the accessors a
+/// set type owes its callers either way.
+#[allow(dead_code)]
 impl OutboundSet {
     pub fn insert(&mut self, key: &str, address: &str) -> std::io::Result<()> {
         match self.entries.get(key) {
@@ -76,7 +82,11 @@ impl OutboundSet {
 /// test that touches it -- directly, or through a path that installs -- takes
 /// this first. Unconditional so that tests of unfeatured code which still
 /// reach an install (`control::prepare_from_config`) can hold it too.
+///
+/// `allow(dead_code)`: with `control-stats` off there is no registry, so the
+/// tests that take it are compiled out and nothing refers to it.
 #[cfg(test)]
+#[allow(dead_code)]
 pub static REGISTRY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(feature = "control-stats")]

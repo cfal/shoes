@@ -220,6 +220,11 @@ mod tests {
     /// of tun::traffic, whose stream sits on the device side. The two byte
     /// counts are deliberately different, because equal ones would pass with
     /// the directions transposed.
+    // The guard is held across awaits on purpose. `#[tokio::test]` runs a
+    // current-thread runtime, so there is no other task on this thread to
+    // starve, and no test takes this lock twice -- it exists precisely to stop
+    // these tests interleaving on the process-global registry.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn a_read_is_download_and_a_write_is_upload() {
         let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
@@ -240,6 +245,11 @@ mod tests {
         assert_eq!(all[0].upload_bytes, 3, "a write must count as upload");
     }
 
+    // The guard is held across awaits on purpose. `#[tokio::test]` runs a
+    // current-thread runtime, so there is no other task on this thread to
+    // starve, and no test takes this lock twice -- it exists precisely to stop
+    // these tests interleaving on the process-global registry.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn a_connection_is_counted_for_its_lifetime() {
         let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
@@ -254,6 +264,11 @@ mod tests {
         assert_eq!(snapshot_all()[0].active_connections, 0);
     }
 
+    // The guard is held across awaits on purpose. `#[tokio::test]` runs a
+    // current-thread runtime, so there is no other task on this thread to
+    // starve, and no test takes this lock twice -- it exists precisely to stop
+    // these tests interleaving on the process-global registry.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn early_data_is_credited_as_download() {
         let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
@@ -269,6 +284,11 @@ mod tests {
 
     /// A datagram session is not a connection: active_connections counts TCP
     /// today, and folding datagrams in would change what a host is reading.
+    // The guard is held across awaits on purpose. `#[tokio::test]` runs a
+    // current-thread runtime, so there is no other task on this thread to
+    // starve, and no test takes this lock twice -- it exists precisely to stop
+    // these tests interleaving on the process-global registry.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn a_message_stream_does_not_hold_a_connection_slot() {
         let _guard = REGISTRY_TEST_LOCK.lock().unwrap();

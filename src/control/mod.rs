@@ -483,6 +483,11 @@ mod outbound_install_tests {
 
     /// Preparing a service is the commitment to running it, so this is where
     /// the registry is replaced — and where a host's list appears at zero.
+    // The guard is held across awaits on purpose. `#[tokio::test]` runs a
+    // current-thread runtime, so there is no other task on this thread to
+    // starve, and no test takes this lock twice -- it exists precisely to stop
+    // these tests interleaving on the process-global registry.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn preparing_a_service_installs_its_outbounds() {
         let _guard = REGISTRY_TEST_LOCK.lock().unwrap();

@@ -1415,7 +1415,7 @@ mod tests {
         let c = Arc::new(crate::outbound_stats::OutboundCounters::default());
 
         let two_hop = ClientProxyChain::exit_counters(
-            &[a.clone()],
+            std::slice::from_ref(&a),
             &[vec![b.clone()], vec![unattributed(), c.clone()]],
             0,
             &[0, 1],
@@ -1462,7 +1462,9 @@ mod tests {
 
     #[cfg(feature = "control-stats")]
     impl PipeSocket {
-        fn new() -> (Box<dyn SocketConnector>, tokio::io::DuplexStream) {
+        /// Not `new`: this returns the connector paired with the peer half,
+        /// not a bare Self.
+        fn pair() -> (Box<dyn SocketConnector>, tokio::io::DuplexStream) {
             let (ours, theirs) = tokio::io::duplex(4096);
             let socket = Self {
                 half: std::sync::Mutex::new(Some(ours)),
@@ -1626,6 +1628,11 @@ mod tests {
 
     /// The relay is where the bytes physically flow; the exit is the server a
     /// person means. Only the exit may be credited.
+    // The guard is held across awaits on purpose. `#[tokio::test]` runs a
+    // current-thread runtime, so there is no other task on this thread to
+    // starve, and no test takes this lock twice -- it exists precisely to stop
+    // these tests interleaving on the process-global registry.
+    #[allow(clippy::await_holding_lock)]
     #[cfg(feature = "control-stats")]
     #[tokio::test]
     async fn a_two_hop_chain_credits_the_exit_not_the_relay() {
@@ -1640,7 +1647,7 @@ mod tests {
         ]);
         let (direct, relay, exit) = (handles[0].clone(), handles[1].clone(), handles[2].clone());
 
-        let (socket, mut peer) = PipeSocket::new();
+        let (socket, mut peer) = PipeSocket::pair();
         let chain = ClientProxyChain::new(
             vec![InitialHopEntry::Direct(socket)],
             vec![vec![passthrough(1080)], vec![passthrough(1081)]],
@@ -1678,6 +1685,11 @@ mod tests {
 
     /// A single-hop chain has no subsequent hop, so the initial hop IS the
     /// exit -- and a pool credits the member actually selected.
+    // The guard is held across awaits on purpose. `#[tokio::test]` runs a
+    // current-thread runtime, so there is no other task on this thread to
+    // starve, and no test takes this lock twice -- it exists precisely to stop
+    // these tests interleaving on the process-global registry.
+    #[allow(clippy::await_holding_lock)]
     #[cfg(feature = "control-stats")]
     #[tokio::test]
     async fn a_pool_credits_the_member_selected() {
@@ -1687,8 +1699,8 @@ mod tests {
         let handles = installed(&[("first", "first:1"), ("second", "second:2")]);
         let (first, second) = (handles[0].clone(), handles[1].clone());
 
-        let (socket_a, _peer_a) = PipeSocket::new();
-        let (socket_b, _peer_b) = PipeSocket::new();
+        let (socket_a, _peer_a) = PipeSocket::pair();
+        let (socket_b, _peer_b) = PipeSocket::pair();
         let chain = ClientProxyChain::new(
             vec![
                 InitialHopEntry::Direct(socket_a),
@@ -1730,6 +1742,11 @@ mod tests {
         assert!(all.iter().all(|o| o.active_connections == 0));
     }
 
+    // The guard is held across awaits on purpose. `#[tokio::test]` runs a
+    // current-thread runtime, so there is no other task on this thread to
+    // starve, and no test takes this lock twice -- it exists precisely to stop
+    // these tests interleaving on the process-global registry.
+    #[allow(clippy::await_holding_lock)]
     #[cfg(feature = "control-stats")]
     #[tokio::test]
     async fn udp_payload_is_credited_to_the_final_hop_without_a_connection_slot() {
@@ -1737,7 +1754,7 @@ mod tests {
         crate::outbound_stats::reset_for_test();
 
         let only = installed(&[("only", "only:1080")])[0].clone();
-        let (socket, _peer) = PipeSocket::new();
+        let (socket, _peer) = PipeSocket::pair();
         let chain = ClientProxyChain::new(
             vec![InitialHopEntry::Proxy {
                 socket,
@@ -1752,7 +1769,6 @@ mod tests {
             .await
             .unwrap();
 
-        use crate::async_stream::AsyncWriteMessage;
         std::future::poll_fn(|cx| {
             std::pin::Pin::new(&mut *stream).poll_write_message(cx, &[0u8; 11])
         })
