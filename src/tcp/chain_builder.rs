@@ -55,6 +55,25 @@ pub fn build_client_proxy_chain(
         panic!("Client chain must have at least one hop");
     }
 
+    // Same shape as `hops`, so a pool index selects the same member in both.
+    // register() only fails on what validation already rejected -- a blank
+    // name, or one name on two addresses -- so a failure here is a bug.
+    #[cfg(feature = "control-stats")]
+    let hop_counters: Vec<Vec<Arc<crate::outbound_stats::OutboundCounters>>> = hops
+        .iter()
+        .map(|pool| {
+            pool.iter()
+                .map(|config| {
+                    crate::outbound_stats::register(
+                        &config.stats_key().expect("validated config"),
+                        &config.address.to_string(),
+                    )
+                    .expect("validated config")
+                })
+                .collect()
+        })
+        .collect();
+
     // Protocols that own their transport (WireGuard/AmneziaWG) cannot be
     // wrapped by another proxy, so they must be the only hop. Validation
     // enforces that, and that a pool at that hop is homogeneous.
@@ -66,7 +85,11 @@ pub fn build_client_proxy_chain(
             .into_iter()
             .map(build_terminal_connector)
             .collect();
-        return ClientProxyChain::new_terminal(connectors);
+        let chain = ClientProxyChain::new_terminal(connectors);
+        #[cfg(feature = "control-stats")]
+        let chain =
+            chain.with_terminal_counters(hop_counters.into_iter().next().expect("one hop"));
+        return chain;
     }
 
     // Build initial hop entries from hop 0.
@@ -121,7 +144,14 @@ pub fn build_client_proxy_chain(
         })
         .collect();
 
-    ClientProxyChain::new(initial_hop, subsequent_hops)
+    let chain = ClientProxyChain::new(initial_hop, subsequent_hops);
+    #[cfg(feature = "control-stats")]
+    let chain = {
+        let mut counters = hop_counters.into_iter();
+        let initial = counters.next().expect("at least one hop");
+        chain.with_counters(initial, counters.collect())
+    };
+    chain
 }
 
 /// Build a connector for a protocol that owns its transport.
@@ -441,5 +471,32 @@ mod tests {
         );
         assert_eq!(chain.num_hops(), 1);
         assert!(chain.supports_udp());
+    }
+
+    #[cfg(feature = "control-stats")]
+    #[test]
+    fn the_built_chain_registers_the_configured_names() {
+        let _guard = crate::outbound_stats::REGISTRY_TEST_LOCK.lock().unwrap();
+        crate::outbound_stats::reset_for_test();
+
+        let mut relay = socks_config(1080);
+        relay.name = Some("relay".to_string());
+        let mut exit = socks_config(1081);
+        exit.name = Some("exit".to_string());
+
+        let _chain = build_client_proxy_chain(
+            OneOrSome::Some(vec![
+                ClientChainHop::Single(ConfigSelection::Config(relay)),
+                ClientChainHop::Single(ConfigSelection::Config(exit)),
+            ]),
+            mock_resolver(),
+        );
+
+        let names: Vec<String> = crate::outbound_stats::snapshot_all()
+            .into_iter()
+            .map(|o| o.name)
+            .collect();
+        assert!(names.contains(&"relay".to_string()), "got {names:?}");
+        assert!(names.contains(&"exit".to_string()), "got {names:?}");
     }
 }
