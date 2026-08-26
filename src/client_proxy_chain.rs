@@ -301,14 +301,17 @@ impl ClientProxyChain {
     /// is the last subsequent hop when there is one and the initial hop
     /// otherwise.
     #[cfg(feature = "control-stats")]
+    ///
+    /// Takes only the exit hop's index rather than every hop's, so the caller
+    /// has nothing to collect: the selection it already holds answers this.
     fn exit_counters(
         initial_hop_counters: &[Arc<OutboundCounters>],
         subsequent_hop_counters: &[Vec<Arc<OutboundCounters>>],
         initial_idx: usize,
-        subsequent_indices: &[usize],
+        subsequent_exit_idx: Option<usize>,
     ) -> Arc<OutboundCounters> {
-        match (subsequent_hop_counters.last(), subsequent_indices.last()) {
-            (Some(pool), Some(&idx)) => pool[idx].clone(),
+        match (subsequent_hop_counters.last(), subsequent_exit_idx) {
+            (Some(pool), Some(idx)) => pool[idx].clone(),
             _ => initial_hop_counters[initial_idx].clone(),
         }
     }
@@ -414,24 +417,23 @@ impl ClientProxyChain {
                 ..
             } => {
                 let (entry, _initial_idx) = select_from_pool(initial_hop, initial_hop_next_index);
+                // One allocation per connection, the same one this path always
+                // made. The indices ride along in it rather than in a second
+                // vector, so a build without counters carries them without
+                // paying for them.
                 let selected = select_subsequent(subsequent_hops, subsequent_next_indices);
-                // Behind the feature: with counters compiled out the indices
-                // are discarded, and this is a per-connection allocation on
-                // the build that can least afford one.
                 #[cfg(feature = "control-stats")]
-                let _subsequent_indices: Vec<usize> = selected.iter().map(|(_, i)| *i).collect();
-                let subsequent_proxies: Vec<&dyn ProxyConnector> =
-                    selected.into_iter().map(|(p, _)| p).collect();
+                let subsequent_exit_idx = selected.last().map(|(_, i)| *i);
 
                 debug!(
                     "Chain TCP connect: 1 initial + {} subsequent hop(s) -> {}",
-                    subsequent_proxies.len(),
+                    selected.len(),
                     remote_location.location()
                 );
 
-                let first_subsequent_target: ResolvedLocation = subsequent_proxies
+                let first_subsequent_target: ResolvedLocation = selected
                     .first()
-                    .map(|p| p.proxy_location().into())
+                    .map(|(p, _)| p.proxy_location().into())
                     .unwrap_or_else(|| remote_location.clone());
 
                 let mut result = match entry {
@@ -460,16 +462,16 @@ impl ClientProxyChain {
                     }
                 };
 
-                for (i, proxy) in subsequent_proxies.iter().enumerate() {
-                    let target: ResolvedLocation = subsequent_proxies
+                for (i, (proxy, _)) in selected.iter().enumerate() {
+                    let target: ResolvedLocation = selected
                         .get(i + 1)
-                        .map(|p| p.proxy_location().into())
+                        .map(|(p, _)| p.proxy_location().into())
                         .unwrap_or_else(|| remote_location.clone());
 
                     debug!(
                         "Subsequent hop {}/{}: {} -> {}",
                         i + 1,
-                        subsequent_proxies.len(),
+                        selected.len(),
                         proxy.proxy_location(),
                         target.location()
                     );
@@ -479,7 +481,7 @@ impl ClientProxyChain {
                         .await?;
 
                     if let Some(data) = &result.early_data
-                        && i < subsequent_proxies.len() - 1
+                        && i < selected.len() - 1
                     {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
@@ -494,7 +496,7 @@ impl ClientProxyChain {
 
                 debug!(
                     "Chain TCP complete: {} total hop(s) to {}",
-                    1 + subsequent_proxies.len(),
+                    1 + selected.len(),
                     remote_location.location()
                 );
 
@@ -504,7 +506,7 @@ impl ClientProxyChain {
                         initial_hop_counters,
                         subsequent_hop_counters,
                         _initial_idx,
-                        &_subsequent_indices,
+                        subsequent_exit_idx,
                     );
                     let counting = crate::outbound_counting_stream::OutboundCountingStream::new(
                         result.client_stream,
@@ -1418,15 +1420,17 @@ mod tests {
         let b = Arc::new(crate::outbound_stats::OutboundCounters::default());
         let c = Arc::new(crate::outbound_stats::OutboundCounters::default());
 
+        // Two subsequent hops, the exit being index 1 of the second pool.
         let two_hop = ClientProxyChain::exit_counters(
             std::slice::from_ref(&a),
             &[vec![b.clone()], vec![unattributed(), c.clone()]],
             0,
-            &[0, 1],
+            Some(1),
         );
         assert!(Arc::ptr_eq(&two_hop, &c));
 
-        let single = ClientProxyChain::exit_counters(&[unattributed(), a.clone()], &[], 1, &[]);
+        // No subsequent hop at all: the initial hop is the exit.
+        let single = ClientProxyChain::exit_counters(&[unattributed(), a.clone()], &[], 1, None);
         assert!(Arc::ptr_eq(&single, &a));
     }
 
