@@ -32,13 +32,13 @@ use log::debug;
 
 use crate::address::ResolvedLocation;
 use crate::async_stream::AsyncMessageStream;
+#[cfg(feature = "control-stats")]
+use crate::outbound_stats::OutboundCounters;
 use crate::resolver::Resolver;
 use crate::tcp::proxy_connector::ProxyConnector;
 use crate::tcp::socket_connector::SocketConnector;
 use crate::tcp::tcp_handler::TcpClientSetupResult;
 use crate::tcp::terminal_connector::TerminalConnector;
-#[cfg(feature = "control-stats")]
-use crate::outbound_stats::OutboundCounters;
 
 /// Entry in the initial hop (hop 0) pool.
 ///
@@ -199,8 +199,7 @@ impl ClientProxyChain {
         // a chain built with no config behind it counts into a void rather
         // than crediting an arbitrary server.
         #[cfg(feature = "control-stats")]
-        let initial_hop_counters =
-            vec![crate::outbound_stats::unattributed(); initial_hop.len()];
+        let initial_hop_counters = vec![crate::outbound_stats::unattributed(); initial_hop.len()];
         #[cfg(feature = "control-stats")]
         let subsequent_hop_counters: Vec<Vec<Arc<OutboundCounters>>> = subsequent_hops
             .iter()
@@ -235,8 +234,7 @@ impl ClientProxyChain {
             "ClientProxyChain must have at least one terminal connector"
         );
         #[cfg(feature = "control-stats")]
-        let connector_counters =
-            vec![crate::outbound_stats::unattributed(); connectors.len()];
+        let connector_counters = vec![crate::outbound_stats::unattributed(); connectors.len()];
 
         Self {
             kind: ClientProxyChainKind::Terminal {
@@ -720,7 +718,9 @@ impl ClientProxyChain {
             } => {
                 let (connector, _idx) = select_terminal(connectors, next_index);
                 debug!("Terminal UDP connect -> {}", target.location());
-                let stream = connector.connect_udp_bidirectional(resolver, target).await?;
+                let stream = connector
+                    .connect_udp_bidirectional(resolver, target)
+                    .await?;
 
                 #[cfg(feature = "control-stats")]
                 let stream: Box<dyn AsyncMessageStream> = Box::new(
@@ -1397,8 +1397,8 @@ mod tests {
     #[cfg(feature = "control-stats")]
     #[test]
     fn with_counters_replaces_the_unattributed_handles() {
-        let counters =
-            crate::outbound_stats::register("Frankfurt", "fra1.example:443").unwrap();
+        let _guard = crate::outbound_stats::REGISTRY_TEST_LOCK.lock().unwrap();
+        let counters = installed(&[("Frankfurt", "fra1.example:443")])[0].clone();
         let chain = ClientProxyChain::new(vec![direct_entry(0)], vec![])
             .with_counters(vec![counters.clone()], vec![]);
         assert!(Arc::ptr_eq(&chain.initial_counter(0), &counters));
@@ -1424,6 +1424,26 @@ mod tests {
 
         let single = ClientProxyChain::exit_counters(&[unattributed(), a.clone()], &[], 1, &[]);
         assert!(Arc::ptr_eq(&single, &a));
+    }
+
+    /// Install these outbounds and hand back their counters, in order.
+    /// install is the only writer, so a test that wants real counters has to
+    /// declare them the way a running config would.
+    ///
+    /// This WRITES process-global state: the caller must already hold
+    /// `REGISTRY_TEST_LOCK`, or it will race every other test that reads the
+    /// registry.
+    #[cfg(feature = "control-stats")]
+    fn installed(entries: &[(&str, &str)]) -> Vec<Arc<crate::outbound_stats::OutboundCounters>> {
+        let mut set = crate::outbound_stats::OutboundSet::default();
+        for (name, address) in entries {
+            set.insert(name, address).unwrap();
+        }
+        crate::outbound_stats::install(&set);
+        entries
+            .iter()
+            .map(|(name, _)| crate::outbound_stats::lookup(name))
+            .collect()
     }
 
     // --- Connecting mocks -------------------------------------------------
@@ -1613,9 +1633,12 @@ mod tests {
         let _guard = crate::outbound_stats::REGISTRY_TEST_LOCK.lock().unwrap();
         crate::outbound_stats::reset_for_test();
 
-        let direct = crate::outbound_stats::register("direct", "0.0.0.0:0").unwrap();
-        let relay = crate::outbound_stats::register("relay", "relay:1080").unwrap();
-        let exit = crate::outbound_stats::register("exit", "exit:1081").unwrap();
+        let handles = installed(&[
+            ("direct", "0.0.0.0:0"),
+            ("relay", "relay:1080"),
+            ("exit", "exit:1081"),
+        ]);
+        let (direct, relay, exit) = (handles[0].clone(), handles[1].clone(), handles[2].clone());
 
         let (socket, mut peer) = PipeSocket::new();
         let chain = ClientProxyChain::new(
@@ -1661,8 +1684,8 @@ mod tests {
         let _guard = crate::outbound_stats::REGISTRY_TEST_LOCK.lock().unwrap();
         crate::outbound_stats::reset_for_test();
 
-        let first = crate::outbound_stats::register("first", "first:1").unwrap();
-        let second = crate::outbound_stats::register("second", "second:2").unwrap();
+        let handles = installed(&[("first", "first:1"), ("second", "second:2")]);
+        let (first, second) = (handles[0].clone(), handles[1].clone());
 
         let (socket_a, _peer_a) = PipeSocket::new();
         let (socket_b, _peer_b) = PipeSocket::new();
@@ -1687,11 +1710,17 @@ mod tests {
 
         let all = crate::outbound_stats::snapshot_all();
         assert_eq!(
-            all.iter().find(|o| o.name == "first").unwrap().active_connections,
+            all.iter()
+                .find(|o| o.name == "first")
+                .unwrap()
+                .active_connections,
             1
         );
         assert_eq!(
-            all.iter().find(|o| o.name == "second").unwrap().active_connections,
+            all.iter()
+                .find(|o| o.name == "second")
+                .unwrap()
+                .active_connections,
             1
         );
 
@@ -1707,7 +1736,7 @@ mod tests {
         let _guard = crate::outbound_stats::REGISTRY_TEST_LOCK.lock().unwrap();
         crate::outbound_stats::reset_for_test();
 
-        let only = crate::outbound_stats::register("only", "only:1080").unwrap();
+        let only = installed(&[("only", "only:1080")])[0].clone();
         let (socket, _peer) = PipeSocket::new();
         let chain = ClientProxyChain::new(
             vec![InitialHopEntry::Proxy {
@@ -1730,11 +1759,12 @@ mod tests {
         .await
         .unwrap();
 
-        let only = crate::outbound_stats::snapshot_all()
-            .into_iter()
-            .next()
-            .unwrap();
-        assert_eq!(only.upload_bytes, 11);
+        let all = crate::outbound_stats::snapshot_all();
+        let only = all
+            .iter()
+            .find(|o| o.name == "only")
+            .unwrap_or_else(|| panic!("registry held {all:?}"));
+        assert_eq!(only.upload_bytes, 11, "registry held {all:?}");
         // A datagram session is not a connection.
         assert_eq!(only.active_connections, 0);
     }

@@ -94,10 +94,11 @@ mod tests {
         let _registry = crate::outbound_stats::REGISTRY_TEST_LOCK.lock().unwrap();
         crate::outbound_stats::reset_for_test();
 
-        crate::outbound_stats::register("Amsterdam", "ams1.example:443")
-            .unwrap()
-            .add_download(4096);
-        crate::outbound_stats::register("Frankfurt", "fra1.example:443").unwrap();
+        let mut set = crate::outbound_stats::OutboundSet::default();
+        set.insert("Amsterdam", "ams1.example:443").unwrap();
+        set.insert("Frankfurt", "fra1.example:443").unwrap();
+        crate::outbound_stats::install(&set);
+        crate::outbound_stats::lookup("Amsterdam").add_download(4096);
 
         let snap = snapshot();
         let names: Vec<&str> = snap.outbounds.iter().map(|o| o.name.as_str()).collect();

@@ -1113,7 +1113,8 @@ mod named_outbound_tests {
 
     #[test]
     fn a_name_round_trips_through_yaml() {
-        let config = parse("name: Frankfurt\naddress: fra1.example:443\nprotocol:\n  type: socks\n");
+        let config =
+            parse("name: Frankfurt\naddress: fra1.example:443\nprotocol:\n  type: socks\n");
         let encoded = serde_yaml::to_string(&config).unwrap();
         let decoded: ClientConfig = serde_yaml::from_str(&encoded).unwrap();
         assert_eq!(decoded.name.as_deref(), Some("Frankfurt"));
@@ -1131,7 +1132,8 @@ mod named_outbound_tests {
 
     #[test]
     fn a_name_is_the_key_when_present() {
-        let config = parse("name: Frankfurt\naddress: fra1.example:443\nprotocol:\n  type: socks\n");
+        let config =
+            parse("name: Frankfurt\naddress: fra1.example:443\nprotocol:\n  type: socks\n");
         assert_eq!(config.stats_key().unwrap(), "Frankfurt");
     }
 
@@ -1156,6 +1158,9 @@ mod named_outbound_tests {
     fn a_blank_name_is_rejected() {
         let config = parse("name: \"   \"\naddress: fra1.example:443\nprotocol:\n  type: socks\n");
         let err = config.stats_key().unwrap_err();
-        assert!(err.to_string().contains("empty"), "unhelpful message: {err}");
+        assert!(
+            err.to_string().contains("empty"),
+            "unhelpful message: {err}"
+        );
     }
 }

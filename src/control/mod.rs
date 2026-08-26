@@ -325,7 +325,6 @@ pub async fn prepare_from_config(
     #[cfg(not(feature = "control-stats"))]
     let _ = outbounds;
 
-
     // Build DNS registry from expanded groups
     let dns_registry = build_dns_registry(dns_groups).await?;
 
@@ -432,7 +431,12 @@ mod tests {
             .unwrap()
     }
 
+    /// `prepare_from_config` installs the config's outbounds into the
+    /// process-global registry, so these tests write shared state even when
+    /// they fail afterwards. Serialise them against everything else that
+    /// touches it, the way `tun::traffic::COUNTER_TEST_LOCK` is used.
     fn prepare(yaml: &str) -> std::io::Result<PreparedService> {
+        let _registry = crate::outbound_stats::REGISTRY_TEST_LOCK.lock().unwrap();
         current_thread_runtime().block_on(prepare_from_config(yaml, DevicePolicy::BorrowedFd))
     }
 

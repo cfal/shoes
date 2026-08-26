@@ -72,9 +72,16 @@ impl OutboundSet {
     }
 }
 
+/// The registry is process-global and cargo runs tests in parallel, so every
+/// test that touches it -- directly, or through a path that installs -- takes
+/// this first. Unconditional so that tests of unfeatured code which still
+/// reach an install (`control::prepare_from_config`) can hold it too.
+#[cfg(test)]
+pub static REGISTRY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(feature = "control-stats")]
 mod registry {
-    use super::{OutboundSet, conflict};
+    use super::OutboundSet;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::sync::{Arc, OnceLock, RwLock};
@@ -105,11 +112,11 @@ mod registry {
         /// Floors at zero: cleanup paths can run more than once for one
         /// stream, and a wrapped count would read as billions of connections.
         pub fn connection_closed(&self) {
-            let _ = self
-                .active_connections
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                    Some(n.saturating_sub(1))
-                });
+            let _ =
+                self.active_connections
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                        Some(n.saturating_sub(1))
+                    });
         }
     }
 
@@ -124,6 +131,10 @@ mod registry {
 
     struct Entry {
         counters: Arc<OutboundCounters>,
+        /// The address this key was installed with. Carried for a Debug dump
+        /// and for the conflict message an `OutboundSet` produces; nothing
+        /// reads it at runtime, because conflicts are settled at config load.
+        #[allow(dead_code)]
         address: String,
     }
 
@@ -154,38 +165,21 @@ mod registry {
         *registry().write().unwrap() = fresh;
     }
 
-    /// The counters for a key, inserting if absent. Idempotent for the same
-    /// key and address; the same key with a different address is rejected
-    /// with the same message validation uses.
-    pub fn register(key: &str, address: &str) -> std::io::Result<Arc<OutboundCounters>> {
-        {
-            let guard = registry().read().unwrap();
-            if let Some(existing) = guard.get(key) {
-                if existing.address != address {
-                    return Err(conflict(key, &existing.address, address));
-                }
-                return Ok(existing.counters.clone());
-            }
-        }
-
-        let mut guard = registry().write().unwrap();
-        // Another thread may have inserted between the read and the write.
-        if let Some(existing) = guard.get(key) {
-            if existing.address != address {
-                return Err(conflict(key, &existing.address, address));
-            }
-            return Ok(existing.counters.clone());
-        }
-
-        let counters = Arc::new(OutboundCounters::default());
-        guard.insert(
-            key.to_string(),
-            Entry {
-                counters: counters.clone(),
-                address: address.to_string(),
-            },
-        );
-        Ok(counters)
+    /// The counters for a key, or [`unattributed`] if the running config does
+    /// not declare it.
+    ///
+    /// A read, never a write: `install` is the only writer, so the list a host
+    /// sees is exactly the set the running config declared. Building a chain
+    /// must not be able to add a server to that list -- which it could, before
+    /// this was a lookup, from any code path that built a chain without a
+    /// config behind it.
+    pub fn lookup(key: &str) -> Arc<OutboundCounters> {
+        registry()
+            .read()
+            .unwrap()
+            .get(key)
+            .map(|entry| entry.counters.clone())
+            .unwrap_or_else(unattributed)
     }
 
     /// Counters that are never listed, for a chain built without attribution
@@ -220,11 +214,6 @@ mod registry {
         out.sort_by(|a, b| a.name.cmp(&b.name));
         out
     }
-
-    /// The registry is process-global and cargo runs tests in parallel, so
-    /// every test that touches it takes this first.
-    #[cfg(test)]
-    pub static REGISTRY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[cfg(test)]
     pub fn reset_for_test() {
@@ -314,14 +303,16 @@ mod registry_tests {
         assert_eq!(names, vec!["Second"]);
     }
 
+    /// Two lookups of one key are the same counter, which is what makes the
+    /// clones group expansion produces share a total.
     #[test]
-    fn registering_an_installed_key_returns_its_counter() {
+    fn two_lookups_of_a_key_share_one_counter() {
         let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
         reset_for_test();
 
         install(&set_of(&[("Frankfurt", "fra1.example:443")]));
-        let a = register("Frankfurt", "fra1.example:443").unwrap();
-        let b = register("Frankfurt", "fra1.example:443").unwrap();
+        let a = lookup("Frankfurt");
+        let b = lookup("Frankfurt");
         a.add_upload(100);
         b.add_upload(50);
 
@@ -330,14 +321,20 @@ mod registry_tests {
         assert_eq!(all[0].upload_bytes, 150);
     }
 
+    /// A lookup must not be able to add a server to a host's list. Before
+    /// this was a read, any code path that built a chain could.
     #[test]
-    fn registering_a_conflicting_address_is_rejected() {
+    fn looking_up_an_unknown_key_lists_nothing() {
         let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
         reset_for_test();
 
         install(&set_of(&[("Frankfurt", "fra1.example:443")]));
-        let err = register("Frankfurt", "fra2.example:443").unwrap_err();
-        assert!(err.to_string().contains("fra2.example:443"));
+        lookup("Somewhere else").add_upload(500);
+
+        let all = snapshot_all();
+        assert_eq!(all.len(), 1, "{all:?}");
+        assert_eq!(all[0].name, "Frankfurt");
+        assert_eq!(all[0].upload_bytes, 0);
     }
 
     /// Asymmetric values: equal ones would pass with the two transposed.
@@ -346,7 +343,8 @@ mod registry_tests {
         let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
         reset_for_test();
 
-        let c = register("Frankfurt", "fra1.example:443").unwrap();
+        install(&set_of(&[("Frankfurt", "fra1.example:443")]));
+        let c = lookup("Frankfurt");
         c.add_upload(7);
         c.add_download(9999);
 
@@ -360,7 +358,8 @@ mod registry_tests {
         let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
         reset_for_test();
 
-        let c = register("Frankfurt", "fra1.example:443").unwrap();
+        install(&set_of(&[("Frankfurt", "fra1.example:443")]));
+        let c = lookup("Frankfurt");
         c.connection_opened();
         c.connection_opened();
         assert_eq!(snapshot_all()[0].active_connections, 2);
@@ -375,7 +374,8 @@ mod registry_tests {
         let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
         reset_for_test();
 
-        let c = register("Frankfurt", "fra1.example:443").unwrap();
+        install(&set_of(&[("Frankfurt", "fra1.example:443")]));
+        let c = lookup("Frankfurt");
         c.connection_closed();
         assert_eq!(snapshot_all()[0].active_connections, 0);
     }

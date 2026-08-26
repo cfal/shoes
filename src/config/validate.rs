@@ -210,8 +210,13 @@ pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Valida
 
     for name in dns_group_order {
         let specs = expanded_dns_groups.get(&name).unwrap();
-        let expanded_specs =
-            expand_dns_specs(specs, &client_groups, &named_pems, &group_names, &mut outbounds)?;
+        let expanded_specs = expand_dns_specs(
+            specs,
+            &client_groups,
+            &named_pems,
+            &group_names,
+            &mut outbounds,
+        )?;
         final_dns_groups.push(ExpandedDnsGroup {
             name,
             specs: expanded_specs,
@@ -233,7 +238,13 @@ pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Valida
 
     // Validate TUN configs.
     for config in tun_configs.iter_mut() {
-        validate_tun_config(config, &client_groups, &rule_groups, &rule_sets, &mut outbounds)?;
+        validate_tun_config(
+            config,
+            &client_groups,
+            &rule_groups,
+            &rule_sets,
+            &mut outbounds,
+        )?;
         validate_dns_group_ref(&config.dns, &group_names)?;
     }
 
@@ -2069,14 +2080,12 @@ fn expand_selection(
 ) -> std::io::Result<Vec<ClientConfig>> {
     let configs = match selection {
         ConfigSelection::Config(config) => vec![config.clone()],
-        ConfigSelection::GroupName(name) => {
-            client_groups.get(name).cloned().ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!("Unknown client group: {name}"),
-                )
-            })?
-        }
+        ConfigSelection::GroupName(name) => client_groups.get(name).cloned().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("Unknown client group: {name}"),
+            )
+        })?,
     };
 
     // Every chain hop funnels through here, inline ones included, which is

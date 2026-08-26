@@ -200,8 +200,21 @@ impl<S> AsyncMessageStream for OutboundCountingMessageStream<S> where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::outbound_stats::{REGISTRY_TEST_LOCK, register, reset_for_test, snapshot_all};
+    use crate::outbound_stats::{REGISTRY_TEST_LOCK, reset_for_test, snapshot_all};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Install one outbound and hand back its counters. Every test here goes
+    /// through install: it is the only writer, so a test that wants a real
+    /// counter has to declare it the way a running config would.
+    fn installed(
+        name: &str,
+        address: &str,
+    ) -> std::sync::Arc<crate::outbound_stats::OutboundCounters> {
+        let mut set = crate::outbound_stats::OutboundSet::default();
+        set.insert(name, address).unwrap();
+        crate::outbound_stats::install(&set);
+        crate::outbound_stats::lookup(name)
+    }
 
     /// At the outbound a read is DOWNLOAD and a write is UPLOAD — the inverse
     /// of tun::traffic, whose stream sits on the device side. The two byte
@@ -211,7 +224,7 @@ mod tests {
     async fn a_read_is_download_and_a_write_is_upload() {
         let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
         reset_for_test();
-        let counters = register("Frankfurt", "fra1.example:443").unwrap();
+        let counters = installed("Frankfurt", "fra1.example:443");
 
         let (mut peer, local) = tokio::io::duplex(4096);
         peer.write_all(&[0u8; 9]).await.unwrap();
@@ -231,7 +244,7 @@ mod tests {
     async fn a_connection_is_counted_for_its_lifetime() {
         let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
         reset_for_test();
-        let counters = register("Frankfurt", "fra1.example:443").unwrap();
+        let counters = installed("Frankfurt", "fra1.example:443");
 
         let (_peer, local) = tokio::io::duplex(64);
         let counting = OutboundCountingStream::new(local, counters);
@@ -245,7 +258,7 @@ mod tests {
     async fn early_data_is_credited_as_download() {
         let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
         reset_for_test();
-        let counters = register("Frankfurt", "fra1.example:443").unwrap();
+        let counters = installed("Frankfurt", "fra1.example:443");
 
         let (_peer, local) = tokio::io::duplex(64);
         let counting = OutboundCountingStream::new(local, counters);
@@ -260,7 +273,7 @@ mod tests {
     async fn a_message_stream_does_not_hold_a_connection_slot() {
         let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
         reset_for_test();
-        let counters = register("Frankfurt", "fra1.example:443").unwrap();
+        let counters = installed("Frankfurt", "fra1.example:443");
 
         let (_peer, local) = tokio::io::duplex(64);
         let counting = OutboundCountingMessageStream::new(local, counters);

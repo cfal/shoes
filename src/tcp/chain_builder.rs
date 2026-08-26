@@ -56,19 +56,20 @@ pub fn build_client_proxy_chain(
     }
 
     // Same shape as `hops`, so a pool index selects the same member in both.
-    // register() only fails on what validation already rejected -- a blank
-    // name, or one name on two addresses -- so a failure here is a bug.
+    // A lookup, not a registration: the running config's outbounds were
+    // installed before any chain was built, and building one must not be able
+    // to add a server to what a host lists. A key that is somehow absent gets
+    // the unattributed counter rather than appearing from nowhere.
+    //
+    // stats_key fails only on a blank name, which validation already rejected
+    // by the time a chain is built, so a failure here is a bug.
     #[cfg(feature = "control-stats")]
     let hop_counters: Vec<Vec<Arc<crate::outbound_stats::OutboundCounters>>> = hops
         .iter()
         .map(|pool| {
             pool.iter()
                 .map(|config| {
-                    crate::outbound_stats::register(
-                        &config.stats_key().expect("validated config"),
-                        &config.address.to_string(),
-                    )
-                    .expect("validated config")
+                    crate::outbound_stats::lookup(&config.stats_key().expect("validated config"))
                 })
                 .collect()
         })
@@ -87,8 +88,7 @@ pub fn build_client_proxy_chain(
             .collect();
         let chain = ClientProxyChain::new_terminal(connectors);
         #[cfg(feature = "control-stats")]
-        let chain =
-            chain.with_terminal_counters(hop_counters.into_iter().next().expect("one hop"));
+        let chain = chain.with_terminal_counters(hop_counters.into_iter().next().expect("one hop"));
         return chain;
     }
 
@@ -473,11 +473,22 @@ mod tests {
         assert!(chain.supports_udp());
     }
 
+    /// A built chain picks up the counters the running config installed, and
+    /// adds nothing to the list of its own accord.
     #[cfg(feature = "control-stats")]
     #[test]
-    fn the_built_chain_registers_the_configured_names() {
-        let _guard = crate::outbound_stats::REGISTRY_TEST_LOCK.lock().unwrap();
-        crate::outbound_stats::reset_for_test();
+    fn the_built_chain_picks_up_the_installed_counters() {
+        use crate::outbound_stats::{
+            OutboundSet, REGISTRY_TEST_LOCK, install, lookup, reset_for_test, snapshot_all,
+            unattributed,
+        };
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
+        reset_for_test();
+
+        let mut set = OutboundSet::default();
+        set.insert("relay", "127.0.0.1:1080").unwrap();
+        set.insert("exit", "127.0.0.1:1081").unwrap();
+        install(&set);
 
         let mut relay = socks_config(1080);
         relay.name = Some("relay".to_string());
@@ -492,11 +503,9 @@ mod tests {
             mock_resolver(),
         );
 
-        let names: Vec<String> = crate::outbound_stats::snapshot_all()
-            .into_iter()
-            .map(|o| o.name)
-            .collect();
-        assert!(names.contains(&"relay".to_string()), "got {names:?}");
-        assert!(names.contains(&"exit".to_string()), "got {names:?}");
+        // The handles are the installed ones, not the void.
+        assert!(!Arc::ptr_eq(&lookup("exit"), &unattributed()));
+        let names: Vec<String> = snapshot_all().into_iter().map(|o| o.name).collect();
+        assert_eq!(names, vec!["exit", "relay"], "building must add nothing");
     }
 }
