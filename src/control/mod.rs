@@ -315,8 +315,16 @@ pub async fn prepare_from_config(
     let crate::config::ValidatedConfigs {
         configs: validated_configs,
         dns_groups,
-        outbounds: _outbounds,
+        outbounds,
     } = create_server_configs(configs)?;
+
+    // Replace, not add: a reload through this path must not carry the
+    // previous config's servers into the new list.
+    #[cfg(feature = "control-stats")]
+    crate::outbound_stats::install(&outbounds);
+    #[cfg(not(feature = "control-stats"))]
+    let _ = outbounds;
+
 
     // Build DNS registry from expanded groups
     let dns_registry = build_dns_registry(dns_groups).await?;
@@ -462,5 +470,39 @@ mod tests {
             err.to_string().contains("Multiple TUN configs"),
             "expected a multiple-TUN complaint, got: {err}"
         );
+    }
+}
+
+#[cfg(all(test, feature = "control-stats"))]
+mod outbound_install_tests {
+    use crate::outbound_stats::{REGISTRY_TEST_LOCK, reset_for_test, snapshot_all};
+
+    /// Preparing a service is the commitment to running it, so this is where
+    /// the registry is replaced — and where a host's list appears at zero.
+    #[tokio::test]
+    async fn preparing_a_service_installs_its_outbounds() {
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
+        reset_for_test();
+
+        // A TUN section is required, and BorrowedFd is the policy that takes
+        // a descriptor from the config. Nothing opens it here -- the device is
+        // touched in run_prepared, not in prepare_from_config.
+        let yaml = r#"
+- device_fd: 3
+  rules:
+    - masks: "0.0.0.0/0"
+      action: allow
+      client_chain:
+        name: Frankfurt
+        address: "fra1.example:443"
+        protocol: {type: socks}
+"#;
+        let _prepared = super::prepare_from_config(yaml, super::DevicePolicy::BorrowedFd)
+            .await
+            .unwrap();
+
+        let names: Vec<String> = snapshot_all().into_iter().map(|o| o.name).collect();
+        assert!(names.contains(&"Frankfurt".to_string()), "got {names:?}");
+        assert!(names.contains(&"direct".to_string()), "got {names:?}");
     }
 }

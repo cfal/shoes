@@ -416,8 +416,15 @@ fn main() {
             let config::ValidatedConfigs {
                 configs: server_configs,
                 dns_groups,
-                outbounds: _outbounds,
+                outbounds,
             } = server_configs;
+
+            // Replace, not add: a reload must not carry the previous config's
+            // servers into the new list.
+            #[cfg(feature = "control-stats")]
+            crate::outbound_stats::install(&outbounds);
+            #[cfg(not(feature = "control-stats"))]
+            let _ = outbounds;
 
             // Build DNS registry from expanded groups (async - resolves hostnames)
             let mut dns_registry = match dns::build_dns_registry(dns_groups).await {
