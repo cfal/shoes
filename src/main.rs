@@ -22,6 +22,8 @@ mod mieru;
 mod mixed_handler;
 mod naiveproxy;
 mod option_util;
+#[cfg(feature = "control-stats")]
+mod outbound_counting_stream;
 mod outbound_stats;
 mod port_forward_handler;
 mod prepend_stream;
