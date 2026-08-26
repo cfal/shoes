@@ -234,6 +234,43 @@ group per rule, so split DNS cannot be expressed. Half the mechanism is built.
   (`src/h2mux/mod.rs:60`), but they are identifiers only: no framing behind
   them. H2MUX covers our own deployments; this is purely about talking to other
   implementations.
+- **Transparent inbounds on Linux: `redirect` and `tproxy`.** We have neither.
+  The inbound enum (`src/config/types/server.rs:676`) has sixteen variants and
+  every one of them learns its destination from the protocol; `PortForward` is
+  the closest in shape but its target is configured, not recovered from the
+  kernel. TUN covers the same user problem more portably and is what the mobile
+  and desktop clients use, so this is only interesting for a Linux router or
+  gateway proxying *other* devices — where sing-box, mihomo and v2ray all ship
+  it, and where routing every byte through the userspace netstack in
+  `src/tun/tcp_stack_direct.rs` costs more than plain `accept()` on kernel
+  sockets.
+
+  `redirect` is the cheap half and the better first move: `SO_ORIGINAL_DST` by
+  `getsockopt` on the accepted socket, no privileged listener, plain `iptables
+  REDIRECT`, and it works on macOS pf as well. `tproxy` TCP is then incremental
+  — `IP_TRANSPARENT` goes in `new_tcp_listener` (`src/socket_util.rs:219`)
+  beside the existing `set_reuse_address`, and on such a listener the accepted
+  socket's `local_addr()` *is* the original destination. Both need the same
+  plumbing: `AsyncStream` (`src/async_stream.rs:173`) carries no `local_addr`
+  and `setup_server_stream` only receives `Box<dyn AsyncStream>`, so the
+  destination has to be captured in `run_tcp_server`
+  (`src/tcp/tcp_server.rs:41`) while the concrete `TcpStream` is still in hand.
+  A day between them.
+
+  UDP is the part that is actually work, and a separate decision. The generic
+  engine already exists — `run_udp_routing` (`src/routing/udp_router.rs:1322`)
+  takes anything implementing `AsyncTargetedMessageStream`, with
+  `src/socks5_udp_relay.rs` as a working template — but three things sit
+  outside it. Receiving needs `IP_RECVORIGDSTADDR` and a `libc::recvmsg` with
+  hand-walked cmsgs, since tokio's `UdpSocket` has no `recvmsg`. Every other
+  UDP inbound gets one socket per client session, whereas a tproxy socket sees
+  every client on one fd and needs a source-keyed session table with idle
+  sweeping (`src/tun/udp_manager.rs` has the pattern). And replies must appear
+  to come *from* the original destination, which means a second
+  `IP_TRANSPARENT` socket bound to that address, cached per destination — that
+  one has no analog anywhere in the tree. Three to four days, and the
+  interesting paths cannot run in CI: they need `CAP_NET_ADMIN` and nftables
+  rules, so the tests would be `#[ignore]`d by default.
 
 ## Desktop clients
 
