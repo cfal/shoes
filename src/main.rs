@@ -416,6 +416,7 @@ fn main() {
             let config::ValidatedConfigs {
                 configs: server_configs,
                 dns_groups,
+                outbounds: _outbounds,
             } = server_configs;
 
             // Build DNS registry from expanded groups (async - resolves hostnames)

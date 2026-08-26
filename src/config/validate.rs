@@ -40,6 +40,10 @@ pub struct ValidatedConfigs {
     pub configs: Vec<Config>,
     /// Expanded DNS groups in topological order (bootstrap deps first).
     pub dns_groups: Vec<ExpandedDnsGroup>,
+    /// Every outbound the config mentions, keyed and conflict-checked. Built
+    /// here and installed where a service starts — never here, because this
+    /// function also serves `--dry-run` and the config editor.
+    pub outbounds: crate::outbound_stats::OutboundSet,
 }
 
 /// Validates configs and returns startable server configs with expanded DNS groups.
@@ -52,6 +56,11 @@ pub struct ValidatedConfigs {
 /// - Validates all ServerConfigs and TunConfigs against the groups and PEMs
 /// - Returns ValidatedConfigs containing configs and expanded DNS groups
 pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<ValidatedConfigs> {
+    // Built here and returned, never installed here: this function also serves
+    // `--dry-run` and the config editor, and validating a draft must not touch
+    // the live list of a service running in the same process.
+    let mut outbounds = crate::outbound_stats::OutboundSet::default();
+
     // First pass: collect raw groups with unresolved references
     let mut raw_client_groups: HashMap<String, OneOrSome<ConfigSelection<ClientConfig>>> =
         HashMap::new();
@@ -162,6 +171,14 @@ pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Valida
     // Resolve client groups using topological sort
     let mut client_groups = resolve_client_groups_topologically(raw_client_groups)?;
 
+    // A group nothing references is still a configured server, and a person
+    // expects to see it listed at zero rather than missing.
+    for configs in client_groups.values() {
+        for config in configs {
+            outbounds.insert(&config.stats_key()?, &config.address.to_string())?;
+        }
+    }
+
     // Embed PEMs into all client configs in groups before they're used
     for configs in client_groups.values_mut() {
         for config in configs.iter_mut() {
@@ -193,7 +210,8 @@ pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Valida
 
     for name in dns_group_order {
         let specs = expanded_dns_groups.get(&name).unwrap();
-        let expanded_specs = expand_dns_specs(specs, &client_groups, &named_pems, &group_names)?;
+        let expanded_specs =
+            expand_dns_specs(specs, &client_groups, &named_pems, &group_names, &mut outbounds)?;
         final_dns_groups.push(ExpandedDnsGroup {
             name,
             specs: expanded_specs,
@@ -208,13 +226,14 @@ pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Valida
             &rule_groups,
             &named_pems,
             &rule_sets,
+            &mut outbounds,
         )?;
         validate_dns_group_ref(&config.dns, &group_names)?;
     }
 
     // Validate TUN configs.
     for config in tun_configs.iter_mut() {
-        validate_tun_config(config, &client_groups, &rule_groups, &rule_sets)?;
+        validate_tun_config(config, &client_groups, &rule_groups, &rule_sets, &mut outbounds)?;
         validate_dns_group_ref(&config.dns, &group_names)?;
     }
 
@@ -225,6 +244,7 @@ pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Valida
     Ok(ValidatedConfigs {
         configs: result,
         dns_groups: final_dns_groups,
+        outbounds,
     })
 }
 
@@ -543,6 +563,7 @@ fn expand_dns_specs(
     client_groups: &HashMap<String, Vec<ClientConfig>>,
     named_pems: &HashMap<String, String>,
     dns_group_names: &HashSet<&str>,
+    outbounds: &mut crate::outbound_stats::OutboundSet,
 ) -> std::io::Result<Vec<ExpandedDnsSpec>> {
     let mut result = Vec::new();
 
@@ -571,7 +592,7 @@ fn expand_dns_specs(
             for hop in chain.hops.iter_mut() {
                 validate_client_chain_hop(hop, client_groups, named_pems)?;
             }
-            expand_client_chain(&mut chain.hops, client_groups)?;
+            expand_client_chain(&mut chain.hops, client_groups, outbounds)?;
             expanded_chains.push(chain);
         }
 
@@ -667,6 +688,7 @@ fn validate_server_config(
     rule_groups: &HashMap<String, Vec<RuleConfig>>,
     named_pems: &HashMap<String, String>,
     rule_sets: &HashMap<String, Arc<RuleSet>>,
+    outbounds: &mut crate::outbound_stats::OutboundSet,
 ) -> std::io::Result<()> {
     // First handle QUIC settings certificates
     if let Some(ref mut quic_settings) = server_config.quic_settings {
@@ -736,6 +758,7 @@ fn validate_server_config(
             client_groups,
             named_pems,
             rule_sets,
+            outbounds,
         )?;
     }
 
@@ -746,6 +769,7 @@ fn validate_server_config(
         named_pems,
         rule_sets,
         false, // top-level, not inside TLS/Reality
+        outbounds,
     )?;
 
     Ok(())
@@ -1404,6 +1428,7 @@ fn validate_server_proxy_config(
     named_pems: &HashMap<String, String>,
     rule_sets: &HashMap<String, Arc<RuleSet>>,
     inside_tls_or_reality: bool,
+    outbounds: &mut crate::outbound_stats::OutboundSet,
 ) -> std::io::Result<()> {
     match server_proxy_config {
         ServerProxyConfig::Naiveproxy { .. } if !inside_tls_or_reality => {
@@ -1459,6 +1484,7 @@ fn validate_server_proxy_config(
                     named_pems,
                     rule_sets,
                     true,
+                    outbounds,
                 )?;
 
                 ConfigSelection::replace_none_or_some_groups(override_rules, rule_groups)?;
@@ -1469,6 +1495,7 @@ fn validate_server_proxy_config(
                         client_groups,
                         named_pems,
                         rule_sets,
+                        outbounds,
                     )?;
                 }
             }
@@ -1491,6 +1518,7 @@ fn validate_server_proxy_config(
                     named_pems,
                     rule_sets,
                     true,
+                    outbounds,
                 )?;
 
                 ConfigSelection::replace_none_or_some_groups(override_rules, rule_groups)?;
@@ -1501,6 +1529,7 @@ fn validate_server_proxy_config(
                         client_groups,
                         named_pems,
                         rule_sets,
+                        outbounds,
                     )?;
                 }
             }
@@ -1533,6 +1562,7 @@ fn validate_server_proxy_config(
                     named_pems,
                     rule_sets,
                     true,
+                    outbounds,
                 )?;
 
                 ConfigSelection::replace_none_or_some_groups(override_rules, rule_groups)?;
@@ -1543,6 +1573,7 @@ fn validate_server_proxy_config(
                         client_groups,
                         named_pems,
                         rule_sets,
+                        outbounds,
                     )?;
                 }
             }
@@ -1575,6 +1606,7 @@ fn validate_server_proxy_config(
                     named_pems,
                     rule_sets,
                     true,
+                    outbounds,
                 )?;
 
                 ConfigSelection::replace_none_or_some_groups(
@@ -1588,6 +1620,7 @@ fn validate_server_proxy_config(
                         client_groups,
                         named_pems,
                         rule_sets,
+                        outbounds,
                     )?;
                 }
             }
@@ -1615,6 +1648,7 @@ fn validate_server_proxy_config(
                     named_pems,
                     rule_sets,
                     false,
+                    outbounds,
                 )?;
 
                 ConfigSelection::replace_none_or_some_groups(override_rules, rule_groups)?;
@@ -1625,6 +1659,7 @@ fn validate_server_proxy_config(
                         client_groups,
                         named_pems,
                         rule_sets,
+                        outbounds,
                     )?;
                 }
             }
@@ -1643,6 +1678,7 @@ fn validate_server_proxy_config(
                     named_pems,
                     rule_sets,
                     false,
+                    outbounds,
                 )?;
 
                 ConfigSelection::replace_none_or_some_groups(override_rules, rule_groups)?;
@@ -1653,6 +1689,7 @@ fn validate_server_proxy_config(
                         client_groups,
                         named_pems,
                         rule_sets,
+                        outbounds,
                     )?;
                 }
             }
@@ -1688,6 +1725,7 @@ fn validate_tun_config(
     client_groups: &HashMap<String, Vec<ClientConfig>>,
     rule_groups: &HashMap<String, Vec<RuleConfig>>,
     rule_sets: &HashMap<String, Arc<RuleSet>>,
+    outbounds: &mut crate::outbound_stats::OutboundSet,
 ) -> std::io::Result<()> {
     // Validate ICMP requires TCP
     if !config.tcp_enabled && config.icmp_enabled {
@@ -1751,7 +1789,7 @@ fn validate_tun_config(
     // Validate rules
     for rule in config.rules.iter_mut() {
         let rule = rule.unwrap_config_mut();
-        validate_rule_config(rule, client_groups, &HashMap::new(), rule_sets)?;
+        validate_rule_config(rule, client_groups, &HashMap::new(), rule_sets, outbounds)?;
     }
 
     Ok(())
@@ -1762,6 +1800,7 @@ fn validate_rule_config(
     client_groups: &HashMap<String, Vec<ClientConfig>>,
     named_pems: &HashMap<String, String>,
     rule_sets: &HashMap<String, Arc<RuleSet>>,
+    outbounds: &mut crate::outbound_stats::OutboundSet,
 ) -> std::io::Result<()> {
     let names = rule_config.rule_sets.clone().into_vec();
     rule_config.loaded_rule_sets = Vec::with_capacity(names.len());
@@ -1803,7 +1842,7 @@ fn validate_rule_config(
                 validate_client_chain_hop(hop, client_groups, named_pems)?;
             }
             // Then expand group references to inline configs
-            expand_client_chain(&mut chain.hops, client_groups)?;
+            expand_client_chain(&mut chain.hops, client_groups, outbounds)?;
             // Validate that direct connectors only appear at hop 0
             validate_direct_connector_positions(&chain.hops, chain_index)?;
             // Validate AmneziaWG is the only hop in its chain
@@ -1972,10 +2011,11 @@ fn validate_and_expand_selection(
 fn expand_client_chain(
     client_chain: &mut OneOrSome<ClientChainHop>,
     client_groups: &HashMap<String, Vec<ClientConfig>>,
+    outbounds: &mut crate::outbound_stats::OutboundSet,
 ) -> std::io::Result<()> {
     let expanded_hops: Vec<ClientChainHop> = client_chain
         .iter()
-        .map(|hop| expand_chain_hop(hop, client_groups))
+        .map(|hop| expand_chain_hop(hop, client_groups, outbounds))
         .collect::<std::io::Result<Vec<_>>>()?;
 
     *client_chain = if expanded_hops.len() == 1 {
@@ -1990,10 +2030,11 @@ fn expand_client_chain(
 fn expand_chain_hop(
     hop: &ClientChainHop,
     client_groups: &HashMap<String, Vec<ClientConfig>>,
+    outbounds: &mut crate::outbound_stats::OutboundSet,
 ) -> std::io::Result<ClientChainHop> {
     match hop {
         ClientChainHop::Single(selection) => {
-            let configs = expand_selection(selection, client_groups)?;
+            let configs = expand_selection(selection, client_groups, outbounds)?;
             // Single becomes a Pool if the group has multiple configs
             if configs.len() == 1 {
                 Ok(ClientChainHop::Single(ConfigSelection::Config(
@@ -2008,7 +2049,7 @@ fn expand_chain_hop(
         ClientChainHop::Pool(selections) => {
             let mut all_configs = vec![];
             for selection in selections.iter() {
-                all_configs.extend(expand_selection(selection, client_groups)?);
+                all_configs.extend(expand_selection(selection, client_groups, outbounds)?);
             }
             Ok(ClientChainHop::Pool(OneOrSome::Some(
                 all_configs
@@ -2024,16 +2065,28 @@ fn expand_chain_hop(
 fn expand_selection(
     selection: &ConfigSelection<ClientConfig>,
     client_groups: &HashMap<String, Vec<ClientConfig>>,
+    outbounds: &mut crate::outbound_stats::OutboundSet,
 ) -> std::io::Result<Vec<ClientConfig>> {
-    match selection {
-        ConfigSelection::Config(config) => Ok(vec![config.clone()]),
-        ConfigSelection::GroupName(name) => client_groups.get(name).cloned().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("Unknown client group: {name}"),
-            )
-        }),
+    let configs = match selection {
+        ConfigSelection::Config(config) => vec![config.clone()],
+        ConfigSelection::GroupName(name) => {
+            client_groups.get(name).cloned().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("Unknown client group: {name}"),
+                )
+            })?
+        }
+    };
+
+    // Every chain hop funnels through here, inline ones included, which is
+    // the form that would otherwise go unlisted. Insertion is idempotent, so
+    // a hop that came from a group costs nothing.
+    for config in &configs {
+        outbounds.insert(&config.stats_key()?, &config.address.to_string())?;
     }
+
+    Ok(configs)
 }
 
 #[cfg(test)]
@@ -3833,5 +3886,188 @@ mod rule_set_validation_tests {
         let rule = rules[0].clone().unwrap_config();
         assert_eq!(rule.loaded_rule_sets.len(), 1);
         assert_eq!(rule.loaded_rule_sets[0].name(), "telegram");
+    }
+}
+
+#[cfg(test)]
+mod outbound_set_tests {
+    use crate::config::load_config_str;
+    use crate::outbound_stats::OutboundSet;
+
+    fn validate(yaml: &str) -> std::io::Result<OutboundSet> {
+        let configs = load_config_str(yaml)?;
+        super::create_server_configs(configs).map(|v| v.outbounds)
+    }
+
+    #[test]
+    fn every_configured_outbound_is_in_the_set() {
+        let set = validate(
+            r#"
+- client_group: eu
+  client_proxies:
+    - name: Frankfurt
+      address: "fra1.example:443"
+      protocol: {type: socks}
+    - name: Amsterdam
+      address: "ams1.example:443"
+      protocol: {type: socks}
+- address: "127.0.0.1:1080"
+  protocol: {type: socks}
+  rules:
+    - masks: "0.0.0.0/0"
+      action: allow
+      client_chain: eu
+"#,
+        )
+        .unwrap();
+
+        assert!(set.contains("Frankfurt"));
+        assert!(set.contains("Amsterdam"));
+    }
+
+    /// A group nothing references is still a configured server.
+    #[test]
+    fn an_unreferenced_group_is_still_listed() {
+        let set = validate(
+            r#"
+- client_group: spare
+  client_proxies:
+    - name: Spare
+      address: "spare.example:443"
+      protocol: {type: socks}
+- address: "127.0.0.1:1080"
+  protocol: {type: socks}
+"#,
+        )
+        .unwrap();
+
+        assert!(set.contains("Spare"));
+    }
+
+    /// Group expansion clones a config into every referencing group; the
+    /// clones are one server.
+    #[test]
+    fn a_group_referenced_twice_yields_one_entry() {
+        let set = validate(
+            r#"
+- client_group: base
+  client_proxies:
+    - name: Frankfurt
+      address: "fra1.example:443"
+      protocol: {type: socks}
+- client_group: a
+  client_proxies: [base]
+- client_group: b
+  client_proxies: [base]
+- address: "127.0.0.1:1080"
+  protocol: {type: socks}
+  rules:
+    - masks: "0.0.0.0/0"
+      action: allow
+      client_chains: [a, b]
+"#,
+        )
+        .unwrap();
+
+        // "direct" is always present from the built-in group, so the count is
+        // the built-in plus Frankfurt.
+        assert!(set.contains("Frankfurt"));
+        assert_eq!(set.len(), 2, "{:?}", set.iter().collect::<Vec<_>>());
+    }
+
+    /// An inline hop is the more common form and must be listed too.
+    #[test]
+    fn an_inline_hop_is_in_the_set() {
+        let set = validate(
+            r#"
+- address: "127.0.0.1:1080"
+  protocol: {type: socks}
+  rules:
+    - masks: "0.0.0.0/0"
+      action: allow
+      client_chain:
+        name: Inline
+        address: "fra1.example:443"
+        protocol: {type: socks}
+"#,
+        )
+        .unwrap();
+
+        assert!(set.contains("Inline"));
+    }
+
+    #[test]
+    fn one_name_on_two_different_servers_is_rejected() {
+        let err = validate(
+            r#"
+- client_group: eu
+  client_proxies:
+    - name: Frankfurt
+      address: "fra1.example:443"
+      protocol: {type: socks}
+    - name: Frankfurt
+      address: "fra2.example:443"
+      protocol: {type: socks}
+- address: "127.0.0.1:1080"
+  protocol: {type: socks}
+"#,
+        )
+        .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(msg.contains("Frankfurt"), "must name the name: {msg}");
+        assert!(msg.contains("fra1.example:443"), "must name both: {msg}");
+        assert!(msg.contains("fra2.example:443"), "must name both: {msg}");
+    }
+
+    /// Nearly every config has a direct outbound, and two of them must not
+    /// read as a conflict on the unspecified address.
+    #[test]
+    fn two_direct_outbounds_are_one_entry() {
+        let set = validate(
+            r#"
+- address: "127.0.0.1:1080"
+  protocol: {type: socks}
+  rules:
+    - masks: "10.0.0.0/8"
+      action: allow
+      client_chain:
+        protocol: {type: direct}
+    - masks: "0.0.0.0/0"
+      action: allow
+      client_chain:
+        protocol: {type: direct}
+"#,
+        )
+        .unwrap();
+
+        assert!(set.contains("direct"));
+        assert_eq!(set.len(), 1);
+    }
+
+    /// The dry-run and editor property: validating touches no live state.
+    #[cfg(feature = "control-stats")]
+    #[test]
+    fn validating_does_not_change_the_registry() {
+        use crate::outbound_stats::{REGISTRY_TEST_LOCK, reset_for_test, snapshot_all};
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
+        reset_for_test();
+
+        validate(
+            r#"
+- address: "127.0.0.1:1080"
+  protocol: {type: socks}
+  rules:
+    - masks: "0.0.0.0/0"
+      action: allow
+      client_chain:
+        name: Draft
+        address: "draft.example:443"
+        protocol: {type: socks}
+"#,
+        )
+        .unwrap();
+
+        assert!(snapshot_all().is_empty(), "validation must not install");
     }
 }

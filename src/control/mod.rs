@@ -315,6 +315,7 @@ pub async fn prepare_from_config(
     let crate::config::ValidatedConfigs {
         configs: validated_configs,
         dns_groups,
+        outbounds: _outbounds,
     } = create_server_configs(configs)?;
 
     // Build DNS registry from expanded groups
