@@ -1560,10 +1560,24 @@ fn validate_server_proxy_config(
                     ..
                 } = *tls_server_config;
 
-                if let ShadowTlsServerHandshakeConfig::Local(local_handshake) = handshake {
-                    embed_pem_from_map(&mut local_handshake.cert, named_pems);
-                    embed_pem_from_map(&mut local_handshake.key, named_pems);
-                    validate_client_fingerprints(&mut local_handshake.client_fingerprints)?;
+                match handshake {
+                    ShadowTlsServerHandshakeConfig::Local(local_handshake) => {
+                        embed_pem_from_map(&mut local_handshake.cert, named_pems);
+                        embed_pem_from_map(&mut local_handshake.key, named_pems);
+                        validate_client_fingerprints(&mut local_handshake.client_fingerprints)?;
+                    }
+                    ShadowTlsServerHandshakeConfig::Remote(remote_handshake) => {
+                        // This chain reaches build_client_proxy_chain without
+                        // passing through a rule, so it has to be expanded
+                        // here or it is expanded nowhere: its outbounds would
+                        // be missing from the set, and a group reference in it
+                        // would panic in chain_builder.
+                        expand_client_chain(
+                            &mut remote_handshake.client_chain,
+                            client_groups,
+                            outbounds,
+                        )?;
+                    }
                 }
 
                 validate_server_proxy_config(
@@ -1609,6 +1623,15 @@ fn validate_server_proxy_config(
 
                 validate_reality_private_key(&reality_config.private_key, sni_hostname)?;
                 validate_reality_server_short_ids(&reality_config.short_ids, sni_hostname)?;
+
+                // Same as the ShadowTLS remote handshake above: this chain is
+                // built without ever passing through a rule.
+                if !reality_config.dest_client_chain.is_empty() {
+                    let mut hops: OneOrSome<ClientChainHop> =
+                        OneOrSome::Some(reality_config.dest_client_chain.clone().into_vec());
+                    expand_client_chain(&mut hops, client_groups, outbounds)?;
+                    reality_config.dest_client_chain = NoneOrSome::Some(hops.into_vec());
+                }
 
                 validate_server_proxy_config(
                     &mut reality_config.protocol,
@@ -4078,5 +4101,152 @@ mod outbound_set_tests {
         .unwrap();
 
         assert!(snapshot_all().is_empty(), "validation must not install");
+    }
+}
+
+/// The chains that reach `build_client_proxy_chain` without passing through a
+/// rule: a ShadowTLS remote handshake and a REALITY dest fallback.
+///
+/// They are easy to forget precisely because they are not rules, and forgetting
+/// them is not cosmetic: an outbound missing from the set is invisible in
+/// `stats::snapshot()`, is never conflict-checked, and — since `chain_builder`
+/// panics on an unresolved group reference — cannot use a group at all.
+#[cfg(test)]
+mod handshake_chain_tests {
+    use crate::config::load_config_str;
+    use crate::outbound_stats::OutboundSet;
+
+    fn validate(yaml: &str) -> std::io::Result<OutboundSet> {
+        let configs = load_config_str(yaml)?;
+        super::create_server_configs(configs).map(|v| v.outbounds)
+    }
+
+    fn shadowtls(chain: &str) -> String {
+        format!(
+            r#"
+- address: "127.0.0.1:8443"
+  protocol:
+    type: tls
+    shadowtls_targets:
+      example.com:
+        password: pw
+        handshake:
+          address: example.com:443
+          client_chain:
+{chain}
+        protocol:
+          type: socks
+"#
+        )
+    }
+
+    #[test]
+    fn a_shadowtls_handshake_chain_is_in_the_set() {
+        let set = validate(&shadowtls(
+            r#"            - name: HandshakeHop
+              address: "hop.example:1080"
+              protocol: {type: socks}"#,
+        ))
+        .unwrap();
+
+        assert!(
+            set.contains("HandshakeHop"),
+            "got {:?}",
+            set.iter().collect::<Vec<_>>()
+        );
+    }
+
+    /// Without this, the config loads and `chain_builder` aborts the process
+    /// when the server starts.
+    #[test]
+    fn a_blank_name_in_a_shadowtls_handshake_chain_is_rejected() {
+        let err = validate(&shadowtls(
+            r#"            - name: "   "
+              address: "hop.example:1080"
+              protocol: {type: socks}"#,
+        ))
+        .unwrap_err();
+        assert!(err.to_string().contains("empty"), "got: {err}");
+    }
+
+    /// `chain_builder` panics on an unresolved group reference, so a group in
+    /// one of these chains has to be expanded here like any other.
+    ///
+    /// Asserting on the expanded config rather than on the set: a group member
+    /// reaches the set through the group-members loop whether or not the chain
+    /// referencing it was ever expanded, so the set proves nothing here.
+    #[test]
+    fn a_group_reference_in_a_shadowtls_handshake_chain_is_expanded() {
+        use crate::config::{ClientChainHop, Config, ConfigSelection, ServerProxyConfig};
+
+        let yaml = format!(
+            r#"
+- client_group: hs
+  client_proxies:
+    - name: FromGroup
+      address: "hop.example:1080"
+      protocol: {{type: socks}}
+{}"#,
+            shadowtls(r#"            - hs"#)
+        );
+        let configs = load_config_str(&yaml).unwrap();
+        let validated = super::create_server_configs(configs).unwrap();
+
+        let mut checked = false;
+        for config in &validated.configs {
+            let Config::Server(server) = config else {
+                continue;
+            };
+            let ServerProxyConfig::Tls {
+                shadowtls_targets, ..
+            } = &server.protocol
+            else {
+                continue;
+            };
+            for target in shadowtls_targets.values() {
+                let crate::config::ShadowTlsServerHandshakeConfig::Remote(remote) =
+                    &target.handshake
+                else {
+                    continue;
+                };
+                for hop in remote.client_chain.iter() {
+                    let ClientChainHop::Single(selection) = hop else {
+                        panic!("expected a single hop, got {hop:?}")
+                    };
+                    assert!(
+                        matches!(selection, ConfigSelection::Config(_)),
+                        "group reference survived validation: {selection:?}"
+                    );
+                    checked = true;
+                }
+            }
+        }
+        assert!(checked, "test did not reach the handshake chain");
+    }
+
+    #[test]
+    fn a_reality_dest_chain_is_in_the_set() {
+        let yaml = r#"
+- address: "127.0.0.1:8443"
+  protocol:
+    type: tls
+    reality_targets:
+      example.com:
+        private_key: "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"
+        short_ids: ["01ab"]
+        dest: "example.com:443"
+        dest_client_chain:
+          - name: DestHop
+            address: "dest.example:1080"
+            protocol: {type: socks}
+        protocol:
+          type: socks
+"#;
+        let set = validate(yaml).unwrap();
+        assert!(
+            set.contains("DestHop"),
+            "got {:?}",
+            set.iter().collect::<Vec<_>>()
+        );
     }
 }

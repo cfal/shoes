@@ -16,9 +16,29 @@
 
 use std::collections::HashMap;
 
+/// The key a direct outbound always takes, and therefore the one name a
+/// config cannot use for anything else.
+///
+/// `create_server_configs` seeds a built-in `direct` client group, so this key
+/// is present in every config whether or not one was written.
+pub const DIRECT_KEY: &str = "direct";
+
 /// The message for one name on two servers. One function, so validation and
 /// the registry cannot disagree about what a conflict looks like.
 fn conflict(key: &str, first: &str, second: &str) -> std::io::Error {
+    // `direct` is taken before a config is read, so the generic message would
+    // blame someone for a duplicate they never wrote.
+    if key == DIRECT_KEY {
+        return std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "\"{DIRECT_KEY}\" is reserved: it is the key every direct outbound \
+                 is counted against, so it cannot also name {second}. Choose \
+                 another name for that outbound."
+            ),
+        );
+    }
+
     std::io::Error::new(
         std::io::ErrorKind::InvalidInput,
         format!(
@@ -55,8 +75,39 @@ impl OutboundSet {
             Some(first) if first != address => Err(conflict(key, first, address)),
             Some(_) => Ok(()),
             None => {
+                self.warn_if_the_same_server_is_also_unnamed(key, address);
                 self.entries.insert(key.to_string(), address.to_string());
                 Ok(())
+            }
+        }
+    }
+
+    /// One server written with a `name` in one chain and without one in
+    /// another gets two keys, so a host shows it as two rows and its bytes
+    /// divide between them by which chain served the connection.
+    ///
+    /// A warning rather than a merge: choosing which key wins would be
+    /// guessing, and two *named* keys on one address is a legitimate way to
+    /// track one server reached with different credentials. Only the
+    /// named/unnamed mix is reported, because only that one is unintentional
+    /// -- it is what a config looks like part-way through adopting `name`.
+    fn warn_if_the_same_server_is_also_unnamed(&self, key: &str, address: &str) {
+        let incoming_is_unnamed = key == address;
+        for existing in self.entries.iter().filter(|(_, a)| *a == address) {
+            let (existing_key, _) = existing;
+            let existing_is_unnamed = existing_key == address;
+            if incoming_is_unnamed != existing_is_unnamed {
+                let (named, unnamed) = if incoming_is_unnamed {
+                    (existing_key.as_str(), key)
+                } else {
+                    (key, existing_key.as_str())
+                };
+                log::warn!(
+                    "outbound {address} is named \"{named}\" in one chain and unnamed in \
+                     another, so its traffic will be reported under both \"{named}\" and \
+                     \"{unnamed}\". Give it the same name everywhere to see one figure."
+                );
+                return;
             }
         }
     }
@@ -254,6 +305,45 @@ mod set_tests {
         set.insert("Frankfurt", "fra1.example:443").unwrap();
         set.insert("Frankfurt", "fra1.example:443").unwrap();
         assert_eq!(set.len(), 1);
+    }
+
+    /// Naming a server in one chain but not another splits its counters. The
+    /// set still holds both keys -- the point is that the operator is told.
+    #[test]
+    fn a_server_named_in_one_place_and_not_another_keeps_both_keys() {
+        let mut set = OutboundSet::default();
+        set.insert("A", "same.example:443").unwrap();
+        set.insert("same.example:443", "same.example:443").unwrap();
+
+        assert!(set.contains("A"));
+        assert!(set.contains("same.example:443"));
+        assert_eq!(set.len(), 2);
+    }
+
+    /// Two named keys on one address is deliberate -- one server reached with
+    /// different credentials -- and must not be reported as a mistake.
+    #[test]
+    fn two_named_keys_on_one_address_are_allowed() {
+        let mut set = OutboundSet::default();
+        set.insert("A", "same.example:443").unwrap();
+        set.insert("B", "same.example:443").unwrap();
+        assert_eq!(set.len(), 2);
+    }
+
+    /// The reserved key is taken before a config is read, so the message must
+    /// not read as "you wrote this name twice".
+    #[test]
+    fn the_reserved_direct_name_says_it_is_reserved() {
+        let mut set = OutboundSet::default();
+        set.insert(DIRECT_KEY, "0.0.0.0:0").unwrap();
+        let err = set.insert(DIRECT_KEY, "1.2.3.4:1080").unwrap_err();
+
+        let msg = err.to_string();
+        assert!(msg.contains("reserved"), "got: {msg}");
+        assert!(
+            msg.contains("1.2.3.4:1080"),
+            "must name the outbound: {msg}"
+        );
     }
 
     /// Addresses are compared rather than whole configs, so one server

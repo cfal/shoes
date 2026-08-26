@@ -415,6 +415,10 @@ impl ClientProxyChain {
             } => {
                 let (entry, _initial_idx) = select_from_pool(initial_hop, initial_hop_next_index);
                 let selected = select_subsequent(subsequent_hops, subsequent_next_indices);
+                // Behind the feature: with counters compiled out the indices
+                // are discarded, and this is a per-connection allocation on
+                // the build that can least afford one.
+                #[cfg(feature = "control-stats")]
                 let _subsequent_indices: Vec<usize> = selected.iter().map(|(_, i)| *i).collect();
                 let subsequent_proxies: Vec<&dyn ProxyConnector> =
                     selected.into_iter().map(|(p, _)| p).collect();

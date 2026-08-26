@@ -453,6 +453,15 @@ Notes:
 
 Used in rules to specify upstream proxies.
 
+`name` is optional and identifies this outbound in `stats::snapshot()`. An
+outbound without one is keyed by its address instead, which works but is
+neither stable across config edits nor meaningful to show a user. Two
+outbounds sharing a name but not an address are rejected at config load.
+
+`direct` is **reserved**: every direct outbound is counted against it, so it
+cannot name anything else. Naming a server in one chain but not in another
+splits its figures across two rows; shoes warns when it sees that.
+
 ```yaml
 name: string                   # Optional; identifies this outbound in stats
 address: string                # Proxy server address (e.g., "proxy.example.com:1080")

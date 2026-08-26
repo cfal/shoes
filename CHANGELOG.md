@@ -14,7 +14,12 @@ otherwise collide with every other direct outbound.
 Bytes are credited to the **exit** hop of a chain rather than to the relay the
 socket actually opens, because the exit is the server a person means. Two
 outbounds sharing a name but not an address are rejected at config load, on
-every build.
+every build, and `direct` is reserved.
+
+A ShadowTLS remote handshake chain and a REALITY `dest_client_chain` are now
+expanded during validation like every other chain. They were not, which meant
+a group reference in either one panicked when the server started; now it
+resolves, and their outbounds are counted rather than silently dropped.
 
 ### Hysteria2 port hopping
 

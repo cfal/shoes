@@ -595,7 +595,7 @@ impl ClientConfig {
         }
 
         if self.protocol.is_direct() && self.address.is_unspecified() {
-            return Ok("direct".to_string());
+            return Ok(crate::outbound_stats::DIRECT_KEY.to_string());
         }
 
         Ok(self.address.to_string())

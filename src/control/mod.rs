@@ -318,13 +318,6 @@ pub async fn prepare_from_config(
         outbounds,
     } = create_server_configs(configs)?;
 
-    // Replace, not add: a reload through this path must not carry the
-    // previous config's servers into the new list.
-    #[cfg(feature = "control-stats")]
-    crate::outbound_stats::install(&outbounds);
-    #[cfg(not(feature = "control-stats"))]
-    let _ = outbounds;
-
     // Build DNS registry from expanded groups
     let dns_registry = build_dns_registry(dns_groups).await?;
 
@@ -366,6 +359,17 @@ pub async fn prepare_from_config(
     let tun_config = tun_config.ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidData, "No TUN config found")
     })?;
+
+    // Last, once nothing above can still fail. Installing earlier would
+    // publish a rejected config's outbounds -- and, if a service were already
+    // running, drop its live counters out of the registry while its chains
+    // went on holding them, so its traffic would vanish from every later
+    // snapshot. Replace rather than merge: a reload must not carry the
+    // previous config's servers into the new list.
+    #[cfg(feature = "control-stats")]
+    crate::outbound_stats::install(&outbounds);
+    #[cfg(not(feature = "control-stats"))]
+    let _ = outbounds;
 
     Ok(PreparedService {
         tun_config,
@@ -513,5 +517,43 @@ mod outbound_install_tests {
         let names: Vec<String> = snapshot_all().into_iter().map(|o| o.name).collect();
         assert!(names.contains(&"Frankfurt".to_string()), "got {names:?}");
         assert!(names.contains(&"direct".to_string()), "got {names:?}");
+    }
+
+    /// A prepare that fails must leave the registry alone. Otherwise a
+    /// rejected config's servers are published, and a service already running
+    /// loses its counters from the registry while its chains go on holding
+    /// them -- its traffic would disappear from every later snapshot.
+    // Same as its neighbour: a current-thread runtime, and the lock exists to
+    // stop these tests interleaving on the process-global registry.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_failed_prepare_does_not_touch_the_registry() {
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
+        reset_for_test();
+
+        // Valid config, valid outbound, but no TUN section: this fails after
+        // create_server_configs has already produced the set.
+        let yaml = r#"
+- address: "127.0.0.1:0"
+  protocol: {type: socks}
+  rules:
+    - masks: "0.0.0.0/0"
+      action: allow
+      client_chain:
+        name: Rejected
+        address: "rejected.example:443"
+        protocol: {type: socks}
+"#;
+        let err = super::prepare_from_config(yaml, super::DevicePolicy::BorrowedFd)
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        assert!(err.to_string().contains("No TUN config"), "got: {err}");
+
+        assert!(
+            snapshot_all().is_empty(),
+            "a rejected config published {:?}",
+            snapshot_all()
+        );
     }
 }
