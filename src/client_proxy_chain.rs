@@ -567,9 +567,9 @@ impl ClientProxyChain {
                 udp_final_hop_next_index,
                 udp_uses_initial_hop,
                 #[cfg(feature = "control-stats")]
-                    initial_hop_counters: _initial_hop_counters,
+                initial_hop_counters,
                 #[cfg(feature = "control-stats")]
-                    subsequent_hop_counters: _subsequent_hop_counters,
+                subsequent_hop_counters,
             } => {
                 if udp_final_hop_indices.is_empty() {
                     return Err(std::io::Error::new(
@@ -588,10 +588,10 @@ impl ClientProxyChain {
                         target.location()
                     );
 
-                    match entry {
+                    let stream = match entry {
                         InitialHopEntry::Direct(socket) => {
                             debug!("Chain UDP: Direct connection (native UDP)");
-                            socket.connect_udp_bidirectional(resolver, target).await
+                            socket.connect_udp_bidirectional(resolver, target).await?
                         }
                         InitialHopEntry::Proxy { socket, proxy } => {
                             debug!(
@@ -600,9 +600,21 @@ impl ClientProxyChain {
                             );
                             let proxy_loc = proxy.proxy_location().into();
                             let stream = socket.connect(resolver, &proxy_loc).await?;
-                            proxy.setup_udp_bidirectional(stream, target).await
+                            proxy.setup_udp_bidirectional(stream, target).await?
                         }
-                    }
+                    };
+
+                    // pool_idx indexes initial_hop here: this branch is the
+                    // one where the initial hop IS the final hop.
+                    #[cfg(feature = "control-stats")]
+                    let stream: Box<dyn AsyncMessageStream> = Box::new(
+                        crate::outbound_counting_stream::OutboundCountingMessageStream::new(
+                            stream,
+                            initial_hop_counters[pool_idx].clone(),
+                        ),
+                    );
+
+                    Ok(stream)
                 } else {
                     let (entry, _initial_idx) =
                         select_from_pool(initial_hop, initial_hop_next_index);
@@ -683,18 +695,42 @@ impl ClientProxyChain {
                         "Chain UDP final hop: {} (UDP)",
                         final_proxy.proxy_location()
                     );
-                    final_proxy.setup_udp_bidirectional(stream, target).await
+                    let stream = final_proxy.setup_udp_bidirectional(stream, target).await?;
+
+                    // pool_idx indexes the final hop pool in this branch.
+                    #[cfg(feature = "control-stats")]
+                    let stream: Box<dyn AsyncMessageStream> = Box::new(
+                        crate::outbound_counting_stream::OutboundCountingMessageStream::new(
+                            stream,
+                            subsequent_hop_counters
+                                .last()
+                                .expect("multi-hop branch has a final pool")[pool_idx]
+                                .clone(),
+                        ),
+                    );
+
+                    Ok(stream)
                 }
             }
             ClientProxyChainKind::Terminal {
                 connectors,
                 next_index,
                 #[cfg(feature = "control-stats")]
-                    connector_counters: _connector_counters,
+                connector_counters,
             } => {
                 let (connector, _idx) = select_terminal(connectors, next_index);
                 debug!("Terminal UDP connect -> {}", target.location());
-                connector.connect_udp_bidirectional(resolver, target).await
+                let stream = connector.connect_udp_bidirectional(resolver, target).await?;
+
+                #[cfg(feature = "control-stats")]
+                let stream: Box<dyn AsyncMessageStream> = Box::new(
+                    crate::outbound_counting_stream::OutboundCountingMessageStream::new(
+                        stream,
+                        connector_counters[_idx].clone(),
+                    ),
+                );
+
+                Ok(stream)
             }
         }
     }
@@ -1663,5 +1699,43 @@ mod tests {
         drop(b);
         let all = crate::outbound_stats::snapshot_all();
         assert!(all.iter().all(|o| o.active_connections == 0));
+    }
+
+    #[cfg(feature = "control-stats")]
+    #[tokio::test]
+    async fn udp_payload_is_credited_to_the_final_hop_without_a_connection_slot() {
+        let _guard = crate::outbound_stats::REGISTRY_TEST_LOCK.lock().unwrap();
+        crate::outbound_stats::reset_for_test();
+
+        let only = crate::outbound_stats::register("only", "only:1080").unwrap();
+        let (socket, _peer) = PipeSocket::new();
+        let chain = ClientProxyChain::new(
+            vec![InitialHopEntry::Proxy {
+                socket,
+                proxy: passthrough(1080),
+            }],
+            vec![],
+        )
+        .with_counters(vec![only], vec![]);
+
+        let mut stream = chain
+            .connect_udp_bidirectional(&test_resolver(), test_location())
+            .await
+            .unwrap();
+
+        use crate::async_stream::AsyncWriteMessage;
+        std::future::poll_fn(|cx| {
+            std::pin::Pin::new(&mut *stream).poll_write_message(cx, &[0u8; 11])
+        })
+        .await
+        .unwrap();
+
+        let only = crate::outbound_stats::snapshot_all()
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(only.upload_bytes, 11);
+        // A datagram session is not a connection.
+        assert_eq!(only.active_connections, 0);
     }
 }
