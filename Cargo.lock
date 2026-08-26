@@ -151,7 +151,7 @@ version = "0.9.0"
 source = "git+https://github.com/AYastrebov/awgtun?rev=65d72ea7d7dfd9740ca8bc1ae59c0d494cd2999e#65d72ea7d7dfd9740ca8bc1ae59c0d494cd2999e"
 dependencies = [
  "aead",
- "base64 0.22.1",
+ "base64",
  "blake2",
  "chacha20 0.9.1",
  "chacha20poly1305",
@@ -200,12 +200,6 @@ name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
-
-[[package]]
-name = "base64"
-version = "0.23.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
 
 [[package]]
 name = "bit-vec"
@@ -1803,7 +1797,7 @@ version = "3.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d30c53c26bc5b31a98cd02d20f25a7c8567146caf63ed593a9d87b2775291be"
 dependencies = [
- "base64 0.22.1",
+ "base64",
  "serde_core",
 ]
 
@@ -2075,7 +2069,7 @@ version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ae76b7506744d254fd0eb2c0ff5c5d108201ccbb083111ac04a44eeda105680"
 dependencies = [
- "base64 0.22.1",
+ "base64",
  "blake2b_simd",
  "constant_time_eq",
  "crossbeam-utils",
@@ -2334,13 +2328,13 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "shoes"
-version = "0.2.12"
+version = "0.2.13"
 dependencies = [
  "android_logger",
  "async-trait",
  "awgtun",
  "aws-lc-rs",
- "base64 0.23.1",
+ "base64",
  "blake2",
  "blake3",
  "bytes",
@@ -2374,7 +2368,7 @@ dependencies = [
  "pin-project-lite",
  "quinn",
  "rand",
- "rand_core 0.10.1",
+ "rand_core 0.6.4",
  "rcgen",
  "regex-lite",
  "rust-argon2",

@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.2.13
 
 ### Named outbounds
 
@@ -150,6 +150,20 @@ design turns on, and it now holds against a peer we do not control.
 Not covered by that run: TLS in front of the transport, a CDN between the ends,
 and a `Host` mismatch, since sing-box only enforces `host` when its own
 configuration names one.
+
+### A request line with no path no longer panics
+
+`GET HTTP/1.1` satisfies a `GET ` prefix test and a ` HTTP/1.1` suffix test at
+the same time while carrying no request target between them, and both HTTP
+upgrade transports then sliced out the bytes "in between" a three-byte string.
+The parse runs before any header is examined, so nothing authenticates ahead of
+it: one request from any peer that reaches the listener did it. On a desktop
+build that killed the connection task; the `release-mobile` profile sets
+`panic = "abort"`, so on a phone it took the process down.
+
+The defect was in the WebSocket handler before HTTPUpgrade copied it, and both
+are fixed together — they now share one request-line parser that splits the line
+rather than slicing between two tests that can each pass on nothing.
 
 ### AmneziaWG 3.1 carries traffic
 
