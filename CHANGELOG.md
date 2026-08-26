@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### Named outbounds
+
+An outbound can carry a `name`, and with the `control-stats` feature
+`control::stats::snapshot()` reports upload, download and active-connection
+counts against it. An outbound without a name is keyed by its address, so
+existing configs get the same figures under a less friendly label; a `direct`
+outbound is keyed `direct`, since its address is unspecified and would
+otherwise collide with every other direct outbound.
+
+Bytes are credited to the **exit** hop of a chain rather than to the relay the
+socket actually opens, because the exit is the server a person means. Two
+outbounds sharing a name but not an address are rejected at config load, on
+every build.
+
 ### Hysteria2 port hopping
 
 The client can rotate its UDP port across a published range, which is what a

@@ -454,6 +454,7 @@ Notes:
 Used in rules to specify upstream proxies.
 
 ```yaml
+name: string                   # Optional; identifies this outbound in stats
 address: string                # Proxy server address (e.g., "proxy.example.com:1080")
 protocol: ClientProxyConfig
 transport: tcp | quic          # Default: tcp
@@ -1013,10 +1014,12 @@ rules:
 ```yaml
 - client_group: my-upstream
   client_proxies:              # Define proxies in this group
-    - address: "proxy1.example.com:1080"
+    - name: proxy-1            # Optional; the key its traffic is counted against
+      address: "proxy1.example.com:1080"
       protocol:
         type: socks
-    - address: "proxy2.example.com:1080"
+    - name: proxy-2
+      address: "proxy2.example.com:1080"
       protocol:
         type: socks
 
