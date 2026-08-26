@@ -4,35 +4,38 @@
 
 **Goal:** Give every outbound a stable identifier, and report upload, download and active-connection counts per outbound through `shoes::control::stats::snapshot()`.
 
-**Architecture:** An optional `name` on `ClientConfig` resolves during validation to a non-empty key (name, else `direct`, else the address). Each key gets an `Arc<OutboundCounters>` in a process-global registry, populated from the whole config so every configured server is listed at zero. `ClientProxyChain` carries counter handles parallel to its hop pools; at connect time it wraps the returned stream in a counting adapter holding the **exit** hop's handle.
+**Architecture:** An optional `name` on `ClientConfig` resolves to a non-empty key (name, else `direct`, else the address). Validation builds a conflict-checked `OutboundSet` of keys and returns it in `ValidatedConfigs` without touching global state; the two places a service actually starts install that set into a process-global registry. `ClientProxyChain` carries counter handles parallel to its hop pools and, at connect time, wraps the returned stream in a counting adapter holding the **exit** hop's handle. Everything that holds runtime state is behind the `control-stats` feature, as the repo's RSS policy requires.
 
-**Tech Stack:** Rust 2024, tokio, serde/serde_yaml, `pin_project_lite`, `std::sync::atomic`.
+**Tech Stack:** Rust 2024, tokio, serde/serde_yaml, `pin_project_lite` 0.2, `std::sync::atomic`.
 
 **Spec:** `docs/superpowers/specs/2026-08-26-named-outbounds-design.md`
 
 ## Global Constraints
 
-- **Rust toolchain is not on `PATH`.** The rustup shim is dangling — invoking `cargo` directly fails with `could not execute process 'rustc -vV'`. Every command in this plan must be run after:
+- **Rust toolchain is not on `PATH`.** Invoking `cargo` directly fails with `could not execute process 'rustc -vV'`. Every command in this plan must be run after:
   ```bash
   export PATH="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH"
   ```
-- **`name` is optional.** Every config that exists today, including ones shipped inside released mobile apps, must keep loading unchanged.
-- **A config that does not use `name` must round-trip byte-identically.** Use `#[serde(default, skip_serializing_if = "Option::is_none")]`.
-- **Direction convention at the outbound is the inverse of `src/tun/traffic.rs`.** There, a read is upload. Here, a **read is download** and a **write is upload**. Do not reuse `TrafficCountingStream`.
-- **Bytes are credited to the exit hop**, never to the relay, and each connection is credited exactly once.
-- **New modules must be declared in BOTH `src/lib.rs` and `src/main.rs`**, alphabetically. The two module lists are maintained separately.
-- **Do not change the meaning of the three existing `StatsSnapshot` fields.**
-- Commit after every task. Author must be `ayastrebov@gmail.com` (repo default `user.email` is already correct).
+- **Feature gate.** Runtime state (`OutboundCounters`, the registry, both adapters, the chain's counter handles, the wrapping) is behind `#[cfg(feature = "control-stats")]`. Config rules (`name`, `stats_key`, `OutboundSet`, the conflict check) are unconditional. Tests of gated code run with `--features control-stats`.
+- **Validation is pure.** `create_server_configs` must not read or write the global registry — it is also what `--dry-run` and the config editor call.
+- **`name` is optional**, and a config without one must round-trip byte-identically: `#[serde(default, skip_serializing_if = "Option::is_none")]`.
+- **Direction at the outbound is the inverse of `src/tun/traffic.rs`.** There, a read is upload. Here a **read is download**, a **write is upload**. Do not reuse `TrafficCountingStream`.
+- **Bytes are credited to the exit hop**, never the relay; each connection credited exactly once.
+- **New modules go in BOTH `src/lib.rs` and `src/main.rs`**, alphabetically — the two lists are maintained separately.
+- **The three existing `StatsSnapshot` fields keep their meaning.**
+- Commit after every task. Author is `ayastrebov@gmail.com` (the repo's `user.email` is already set).
 
 ## File Structure
 
 | File | Responsibility |
 | --- | --- |
 | `src/config/types/client.rs` (modify) | The `name` field and `ClientConfig::stats_key()` |
-| `src/outbound_stats.rs` (create) | `OutboundCounters`, `OutboundStats`, the process-global registry |
-| `src/outbound_counting_stream.rs` (create) | The two counting adapters, byte-level and message-level |
-| `src/config/validate.rs` (modify) | Walk the config and register every outbound's key |
+| `src/outbound_stats.rs` (create) | Unconditional `OutboundSet` + conflict check; gated `OutboundCounters`, registry, `install` |
+| `src/outbound_counting_stream.rs` (create, gated) | The two counting adapters |
+| `src/config/validate.rs` (modify) | Thread an `OutboundSet` through expansion; return it in `ValidatedConfigs` |
+| `src/control/mod.rs`, `src/main.rs` (modify) | `install` the set where a service starts |
 | `src/client_proxy_chain.rs` (modify) | Carry counter handles; wrap at the two connect points |
+| `src/tcp/chain_builder.rs` (modify) | Attach the handles the config names |
 | `src/control/stats.rs` (modify) | Expose `outbounds` on the snapshot |
 | `CONFIG.md`, `CHANGELOG.md` (modify) | Document the field |
 
@@ -41,11 +44,11 @@
 ### Task 1: The `name` field and its key
 
 **Files:**
-- Modify: `src/config/types/client.rs:543-571` (the `ClientConfig` struct and its `Default` impl)
-- Test: `src/config/types/client.rs` (new `#[cfg(test)] mod named_outbound_tests` at end of file)
+- Modify: `src/config/types/client.rs:543-571` (`ClientConfig` and its `Default`)
+- Test: same file, new `mod named_outbound_tests` at the end
 
 **Interfaces:**
-- Consumes: nothing
+- Consumes: `NetLocation::is_unspecified()` (`src/address.rs:121`), `ClientProxyConfig::is_direct()` (`src/config/types/client.rs:723`), `Display for NetLocation` (`src/address.rs:198`)
 - Produces: `ClientConfig::name: Option<String>`; `ClientConfig::stats_key(&self) -> std::io::Result<String>`
 
 - [ ] **Step 1: Write the failing tests**
@@ -70,8 +73,8 @@ mod named_outbound_tests {
     }
 
     /// A config that does not use the field must serialize exactly as it did
-    /// before the field existed, because the desktop config editor
-    /// re-serializes whatever it loads.
+    /// before the field existed: the desktop config editor re-serializes
+    /// whatever it loads.
     #[test]
     fn an_absent_name_is_not_serialized() {
         let config = parse("address: fra1.example:443\nprotocol:\n  type: socks\n");
@@ -92,8 +95,8 @@ mod named_outbound_tests {
     }
 
     /// Every direct outbound carries NetLocation::UNSPECIFIED, and the default
-    /// rule action is a direct chain, so an address fallback would collide them
-    /// all on "0.0.0.0:0".
+    /// rule action is a direct chain, so an address fallback would collide
+    /// them all on "0.0.0.0:0".
     #[test]
     fn a_direct_outbound_is_keyed_direct_not_by_its_empty_address() {
         let config = ClientConfig::default();
@@ -106,10 +109,7 @@ mod named_outbound_tests {
     fn a_blank_name_is_rejected() {
         let config = parse("name: \"   \"\naddress: fra1.example:443\nprotocol:\n  type: socks\n");
         let err = config.stats_key().unwrap_err();
-        assert!(
-            err.to_string().contains("empty"),
-            "unhelpful message: {err}"
-        );
+        assert!(err.to_string().contains("empty"), "unhelpful message: {err}");
     }
 }
 ```
@@ -121,11 +121,11 @@ export PATH="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH"
 cargo test --lib config::types::client::named_outbound_tests
 ```
 
-Expected: compile error — `no field 'name' on type 'ClientConfig'` and `no method named 'stats_key'`.
+Expected: compile error — `no field 'name' on type 'ClientConfig'`, `no method named 'stats_key'`.
 
 - [ ] **Step 3: Add the field**
 
-In `src/config/types/client.rs`, add as the first field of `ClientConfig` (before `bind_interface`):
+In `src/config/types/client.rs`, add as the **first** field of `pub struct ClientConfig` (before `bind_interface`):
 
 ```rust
     /// A stable, human-meaningful identifier for this outbound. Optional: an
@@ -135,15 +135,11 @@ In `src/config/types/client.rs`, add as the first field of `ClientConfig` (befor
     pub name: Option<String>,
 ```
 
-And in the `Default` impl, add as the first field:
-
-```rust
-            name: None,
-```
+In `impl Default for ClientConfig`, add as the first field: `name: None,`
 
 - [ ] **Step 4: Add `stats_key`**
 
-Immediately after the `Default for ClientConfig` impl block:
+Immediately after the `impl Default for ClientConfig` block:
 
 ```rust
 impl ClientConfig {
@@ -198,44 +194,88 @@ git commit -m "config: an outbound can carry a name"
 
 ---
 
-### Task 2: The counter registry
+### Task 2: The outbound set and the counter registry
 
 **Files:**
 - Create: `src/outbound_stats.rs`
-- Modify: `src/lib.rs:58-107` (module list), `src/main.rs` (module list)
+- Modify: `src/lib.rs` (module list, alphabetical after `option_util`), `src/main.rs` (same)
 - Test: in `src/outbound_stats.rs`
 
 **Interfaces:**
 - Consumes: nothing
-- Produces:
-  - `pub struct OutboundCounters` with `add_upload(&self, u64)`, `add_download(&self, u64)`, `connection_opened(&self)`, `connection_closed(&self)`
+- Produces, unconditional:
+  - `pub struct OutboundSet` — `Default`, `insert(&mut self, key: &str, address: &str) -> std::io::Result<()>`, `len(&self) -> usize`, `is_empty(&self) -> bool`, `contains(&self, key: &str) -> bool`, `iter(&self) -> impl Iterator<Item = (&str, &str)>`
+- Produces, `#[cfg(feature = "control-stats")]`:
+  - `pub struct OutboundCounters` — `add_upload(&self, u64)`, `add_download(&self, u64)`, `connection_opened(&self)`, `connection_closed(&self)`
   - `pub struct OutboundStats { pub name: String, pub upload_bytes: u64, pub download_bytes: u64, pub active_connections: usize }`
-  - `pub fn register(key: &str, address: &str) -> std::io::Result<Arc<OutboundCounters>>`
-  - `pub fn reset()`
+  - `pub fn install(set: &OutboundSet)` — replaces the registry contents
+  - `pub fn register(key: &str, address: &str) -> std::io::Result<Arc<OutboundCounters>>` — idempotent, conflict-checked
   - `pub fn unattributed() -> Arc<OutboundCounters>`
   - `pub fn snapshot_all() -> Vec<OutboundStats>`
-  - `#[cfg(test)] pub fn reset_for_test()` and `pub static REGISTRY_TEST_LOCK: Mutex<()>`
+  - `#[cfg(test)] pub fn reset_for_test()`, `pub static REGISTRY_TEST_LOCK: Mutex<()>`
 
-**Why conflict detection lives here:** the alternative is threading a
-`HashMap<String, String>` of seen keys through `expand_selection` and the group
-resolver, which are separate call paths. Storing the first address alongside
-the counters makes `register` self-checking and callable from anywhere.
+**Why the set is separate from the registry:** validation builds the set and must not touch global state (it also serves `--dry-run` and the editor). The registry is installed from the set only where a service starts. One conflict function serves both.
 
 - [ ] **Step 1: Write the failing tests**
 
-Create `src/outbound_stats.rs` containing ONLY this test module for now:
+Create `src/outbound_stats.rs` containing only:
 
 ```rust
 #[cfg(test)]
-mod tests {
+mod set_tests {
     use super::*;
 
     #[test]
-    fn a_registered_outbound_starts_at_zero() {
+    fn a_key_is_recorded_with_its_address() {
+        let mut set = OutboundSet::default();
+        set.insert("Frankfurt", "fra1.example:443").unwrap();
+        assert!(set.contains("Frankfurt"));
+        assert_eq!(set.len(), 1);
+    }
+
+    /// Group expansion clones a ClientConfig into every referencing group, so
+    /// the same server arrives many times and must not be a conflict.
+    #[test]
+    fn the_same_key_and_address_twice_is_one_entry() {
+        let mut set = OutboundSet::default();
+        set.insert("Frankfurt", "fra1.example:443").unwrap();
+        set.insert("Frankfurt", "fra1.example:443").unwrap();
+        assert_eq!(set.len(), 1);
+    }
+
+    /// Addresses are compared rather than whole configs, so one server
+    /// reachable with two sets of credentials stays legal.
+    #[test]
+    fn one_key_on_two_addresses_is_rejected_naming_both() {
+        let mut set = OutboundSet::default();
+        set.insert("Frankfurt", "fra1.example:443").unwrap();
+        let err = set.insert("Frankfurt", "fra2.example:443").unwrap_err();
+
+        let msg = err.to_string();
+        assert!(msg.contains("Frankfurt"), "must name the name: {msg}");
+        assert!(msg.contains("fra1.example:443"), "must name both: {msg}");
+        assert!(msg.contains("fra2.example:443"), "must name both: {msg}");
+    }
+}
+
+#[cfg(all(test, feature = "control-stats"))]
+mod registry_tests {
+    use super::*;
+
+    fn set_of(entries: &[(&str, &str)]) -> OutboundSet {
+        let mut set = OutboundSet::default();
+        for (k, a) in entries {
+            set.insert(k, a).unwrap();
+        }
+        set
+    }
+
+    #[test]
+    fn an_installed_outbound_starts_at_zero() {
         let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
         reset_for_test();
 
-        register("Frankfurt", "fra1.example:443").unwrap();
+        install(&set_of(&[("Frankfurt", "fra1.example:443")]));
         let all = snapshot_all();
 
         assert_eq!(all.len(), 1);
@@ -245,13 +285,27 @@ mod tests {
         assert_eq!(all[0].active_connections, 0);
     }
 
-    /// Group expansion clones a ClientConfig into every group that references
-    /// it, so the same server arrives many times and must share one counter.
+    /// A reload replaces the list rather than accumulating servers from the
+    /// config it just discarded — stale entries would also read as false
+    /// address conflicts.
     #[test]
-    fn registering_the_same_key_twice_returns_the_same_counter() {
+    fn installing_a_second_set_replaces_the_first() {
         let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
         reset_for_test();
 
+        install(&set_of(&[("First", "fra1.example:443")]));
+        install(&set_of(&[("Second", "ams1.example:443")]));
+
+        let names: Vec<String> = snapshot_all().into_iter().map(|o| o.name).collect();
+        assert_eq!(names, vec!["Second"]);
+    }
+
+    #[test]
+    fn registering_an_installed_key_returns_its_counter() {
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
+        reset_for_test();
+
+        install(&set_of(&[("Frankfurt", "fra1.example:443")]));
         let a = register("Frankfurt", "fra1.example:443").unwrap();
         let b = register("Frankfurt", "fra1.example:443").unwrap();
         a.add_upload(100);
@@ -260,6 +314,16 @@ mod tests {
         let all = snapshot_all();
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].upload_bytes, 150);
+    }
+
+    #[test]
+    fn registering_a_conflicting_address_is_rejected() {
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
+        reset_for_test();
+
+        install(&set_of(&[("Frankfurt", "fra1.example:443")]));
+        let err = register("Frankfurt", "fra2.example:443").unwrap_err();
+        assert!(err.to_string().contains("fra2.example:443"));
     }
 
     /// Asymmetric values: equal ones would pass with the two transposed.
@@ -291,8 +355,7 @@ mod tests {
         assert_eq!(snapshot_all()[0].active_connections, 1);
     }
 
-    /// An unmatched close must floor rather than wrap, as the equivalent
-    /// counter in tun::traffic does.
+    /// An unmatched close floors rather than wraps, as tun::traffic does.
     #[test]
     fn an_unmatched_close_floors_at_zero() {
         let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
@@ -309,48 +372,18 @@ mod tests {
         let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
         reset_for_test();
 
-        register("zurich", "zrh:443").unwrap();
-        register("amsterdam", "ams:443").unwrap();
-        register("frankfurt", "fra:443").unwrap();
+        install(&set_of(&[
+            ("zurich", "zrh:443"),
+            ("amsterdam", "ams:443"),
+            ("frankfurt", "fra:443"),
+        ]));
 
         let names: Vec<String> = snapshot_all().into_iter().map(|o| o.name).collect();
         assert_eq!(names, vec!["amsterdam", "frankfurt", "zurich"]);
     }
 
-    /// A name must identify one server. Addresses are compared rather than
-    /// whole configs, so one server reachable with two sets of credentials
-    /// stays legal.
-    #[test]
-    fn one_key_on_two_addresses_is_rejected() {
-        let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
-        reset_for_test();
-
-        register("Frankfurt", "fra1.example:443").unwrap();
-        let err = register("Frankfurt", "fra2.example:443").unwrap_err();
-
-        let msg = err.to_string();
-        assert!(msg.contains("Frankfurt"), "must name the name: {msg}");
-        assert!(msg.contains("fra1.example:443"), "must name both: {msg}");
-        assert!(msg.contains("fra2.example:443"), "must name both: {msg}");
-    }
-
-    /// A reload must replace the list, not accumulate servers from the config
-    /// that was just discarded — and stale entries would also produce false
-    /// address conflicts.
-    #[test]
-    fn reset_clears_a_previous_load() {
-        let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
-        reset_for_test();
-
-        register("Frankfurt", "fra1.example:443").unwrap();
-        reset();
-        register("Frankfurt", "fra2.example:443").unwrap();
-
-        assert_eq!(snapshot_all().len(), 1);
-    }
-
-    /// Traffic through a chain built without counters must not panic or be
-    /// attributed to a real server.
+    /// Traffic through a chain built without counters must neither panic nor
+    /// be credited to a real server.
     #[test]
     fn unattributed_traffic_is_not_listed() {
         let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
@@ -364,205 +397,276 @@ mod tests {
 
 - [ ] **Step 2: Declare the module and run the tests to verify they fail**
 
-Add `mod outbound_stats;` to `src/lib.rs` after `mod option_util;`, and `mod outbound_stats;` to `src/main.rs` in the same alphabetical position.
+Add `mod outbound_stats;` to `src/lib.rs` after `mod option_util;` (line 79), and to `src/main.rs` in the same alphabetical position.
 
 ```bash
-cargo test --lib outbound_stats
+cargo test --features control-stats --lib outbound_stats
 ```
 
-Expected: compile errors — `cannot find function 'register'`, `cannot find function 'snapshot_all'`, etc.
+Expected: compile errors — `cannot find type 'OutboundSet'`, etc.
 
-- [ ] **Step 3: Write the implementation**
+- [ ] **Step 3: Write the unconditional half**
 
-Prepend to `src/outbound_stats.rs`, above the test module:
+Prepend to `src/outbound_stats.rs`:
 
 ```rust
-//! Per-outbound counters, keyed by the name an outbound carries in the config.
+//! Per-outbound identity and counters, keyed by the name an outbound carries
+//! in the config.
 //!
-//! Process-global rather than per-service, for the same reason
-//! `crate::tun::traffic` is: `crate::control::start` documents one service per
-//! process, and `crate::control::stats::snapshot` is a free function with no
-//! service handle to thread a registry through.
+//! Two halves. [`OutboundSet`] is what validation builds: every key with its
+//! address, conflict-checked, pure — `create_server_configs` also serves
+//! `--dry-run` and the config editor, and must not touch live state. The
+//! registry below it is process-global runtime state, installed from a set
+//! only where a service actually starts, and compiled only with
+//! `control-stats`, per the RSS policy `Cargo.toml` states and
+//! `crate::tun::traffic` applies.
 //!
-//! The registry is populated during config validation rather than on first
-//! use, so a host lists every configured server at zero before any of them has
-//! carried a byte. An empty list on a fresh connection would read as "no
-//! servers", which is wrong.
+//! Process-global rather than per-service for the reason `tun::traffic` gives:
+//! `crate::control::start` documents one service per process, and
+//! `crate::control::stats::snapshot` is a free function with no handle to
+//! thread a registry through.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock, RwLock};
 
-/// The counters for one outbound.
-#[derive(Debug, Default)]
-pub struct OutboundCounters {
-    upload_bytes: AtomicU64,
-    download_bytes: AtomicU64,
-    active_connections: AtomicUsize,
+/// The message for one name on two servers. One function, so validation and
+/// the registry cannot disagree about what a conflict looks like.
+fn conflict(key: &str, first: &str, second: &str) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!(
+            "two outbounds are named \"{key}\" but have different addresses \
+             ({first} and {second}); a name must identify one server"
+        ),
+    )
 }
 
-impl OutboundCounters {
-    /// Bytes sent towards the outbound.
-    pub fn add_upload(&self, bytes: u64) {
-        self.upload_bytes.fetch_add(bytes, Ordering::Relaxed);
-    }
-
-    /// Bytes received from the outbound.
-    pub fn add_download(&self, bytes: u64) {
-        self.download_bytes.fetch_add(bytes, Ordering::Relaxed);
-    }
-
-    pub fn connection_opened(&self) {
-        self.active_connections.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Floors at zero: cleanup paths can run more than once for one stream,
-    /// and a wrapped count would read as billions of live connections.
-    pub fn connection_closed(&self) {
-        let _ = self
-            .active_connections
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                Some(n.saturating_sub(1))
-            });
-    }
-}
-
-/// A point-in-time reading for one outbound.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OutboundStats {
-    pub name: String,
-    pub upload_bytes: u64,
-    pub download_bytes: u64,
-    pub active_connections: usize,
-}
-
-/// The counters for one outbound, plus the address it was first registered
-/// with — kept so a second registration under the same key can be checked
-/// rather than silently merging two different servers.
-struct Entry {
-    counters: Arc<OutboundCounters>,
-    address: String,
-}
-
-type Registry = RwLock<HashMap<String, Entry>>;
-
-fn registry() -> &'static Registry {
-    static REGISTRY: OnceLock<Registry> = OnceLock::new();
-    REGISTRY.get_or_init(|| RwLock::new(HashMap::new()))
-}
-
-/// Register an outbound and get its counters.
+/// Every outbound a config mentions, keyed, with the address each key was
+/// first seen with.
 ///
-/// Idempotent for the same key and address: group expansion clones a
-/// `ClientConfig` into every referencing group, so one server arrives many
-/// times and all the clones must share one counter.
-///
-/// The same key with a *different* address is a config mistake and is
-/// rejected. Addresses are compared rather than whole configs: structural
+/// Group expansion clones a `ClientConfig` into every referencing group, so
+/// one server arrives many times; the same key with the same address is
+/// therefore expected. The same key with a *different* address is a config
+/// mistake. Addresses are compared rather than whole configs: structural
 /// equality would demand `PartialEq` across `ClientProxyConfig`,
 /// `Redacted<String>` and the transport types, and would reject the legitimate
 /// case of one server reachable with two sets of credentials.
-pub fn register(key: &str, address: &str) -> std::io::Result<Arc<OutboundCounters>> {
-    if let Some(existing) = registry().read().unwrap().get(key) {
-        if existing.address != address {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "two outbounds are named \"{key}\" but have different addresses \
-                     ({} and {address}); a name must identify one server",
-                    existing.address
-                ),
-            ));
+#[derive(Debug, Default, Clone)]
+pub struct OutboundSet {
+    entries: HashMap<String, String>,
+}
+
+impl OutboundSet {
+    pub fn insert(&mut self, key: &str, address: &str) -> std::io::Result<()> {
+        match self.entries.get(key) {
+            Some(first) if first != address => Err(conflict(key, first, address)),
+            Some(_) => Ok(()),
+            None => {
+                self.entries.insert(key.to_string(), address.to_string());
+                Ok(())
+            }
         }
-        return Ok(existing.counters.clone());
     }
 
-    let mut guard = registry().write().unwrap();
-    // Re-check: another thread may have inserted between the read and write.
-    if let Some(existing) = guard.get(key) {
-        if existing.address != address {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "two outbounds are named \"{key}\" but have different addresses \
-                     ({} and {address}); a name must identify one server",
-                    existing.address
-                ),
-            ));
-        }
-        return Ok(existing.counters.clone());
+    pub fn len(&self) -> usize {
+        self.entries.len()
     }
 
-    let counters = Arc::new(OutboundCounters::default());
-    guard.insert(
-        key.to_string(),
-        Entry {
-            counters: counters.clone(),
-            address: address.to_string(),
-        },
-    );
-    Ok(counters)
-}
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
 
-/// Drop every registration. Called at the start of a config load, so a reload
-/// replaces the list rather than accumulating servers from the config it just
-/// discarded — stale entries would also produce false address conflicts.
-pub fn reset() {
-    registry().write().unwrap().clear();
-}
+    pub fn contains(&self, key: &str) -> bool {
+        self.entries.contains_key(key)
+    }
 
-/// Counters that are never listed, for a chain built without attribution —
-/// tests, and any future construction path that has no config behind it.
-/// Traffic through such a chain is counted into a void rather than being
-/// credited to some arbitrary server.
-pub fn unattributed() -> Arc<OutboundCounters> {
-    static UNATTRIBUTED: OnceLock<Arc<OutboundCounters>> = OnceLock::new();
-    UNATTRIBUTED
-        .get_or_init(|| Arc::new(OutboundCounters::default()))
-        .clone()
-}
-
-/// Every registered outbound, sorted by name so a host redrawing on a timer
-/// does not reorder its own rows.
-pub fn snapshot_all() -> Vec<OutboundStats> {
-    let guard = registry().read().unwrap();
-    let mut out: Vec<OutboundStats> = guard
-        .iter()
-        .map(|(name, entry)| OutboundStats {
-            name: name.clone(),
-            upload_bytes: entry.counters.upload_bytes.load(Ordering::Relaxed),
-            download_bytes: entry.counters.download_bytes.load(Ordering::Relaxed),
-            active_connections: entry.counters.active_connections.load(Ordering::Relaxed),
-        })
-        .collect();
-    out.sort_by(|a, b| a.name.cmp(&b.name));
-    out
-}
-
-/// The registry is process-global, so tests that touch it must not run
-/// concurrently. Take this lock first in every such test.
-#[cfg(test)]
-pub static REGISTRY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-#[cfg(test)]
-pub fn reset_for_test() {
-    reset();
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.entries.iter().map(|(k, a)| (k.as_str(), a.as_str()))
+    }
 }
 ```
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [ ] **Step 4: Write the gated half**
+
+Append after the unconditional half, before the test modules:
+
+```rust
+#[cfg(feature = "control-stats")]
+mod registry {
+    use super::{OutboundSet, conflict};
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::{Arc, OnceLock, RwLock};
+
+    /// The counters for one outbound.
+    #[derive(Debug, Default)]
+    pub struct OutboundCounters {
+        upload_bytes: AtomicU64,
+        download_bytes: AtomicU64,
+        active_connections: AtomicUsize,
+    }
+
+    impl OutboundCounters {
+        /// Bytes sent towards the outbound.
+        pub fn add_upload(&self, bytes: u64) {
+            self.upload_bytes.fetch_add(bytes, Ordering::Relaxed);
+        }
+
+        /// Bytes received from the outbound.
+        pub fn add_download(&self, bytes: u64) {
+            self.download_bytes.fetch_add(bytes, Ordering::Relaxed);
+        }
+
+        pub fn connection_opened(&self) {
+            self.active_connections.fetch_add(1, Ordering::Relaxed);
+        }
+
+        /// Floors at zero: cleanup paths can run more than once for one
+        /// stream, and a wrapped count would read as billions of connections.
+        pub fn connection_closed(&self) {
+            let _ = self
+                .active_connections
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                    Some(n.saturating_sub(1))
+                });
+        }
+    }
+
+    /// A point-in-time reading for one outbound.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct OutboundStats {
+        pub name: String,
+        pub upload_bytes: u64,
+        pub download_bytes: u64,
+        pub active_connections: usize,
+    }
+
+    struct Entry {
+        counters: Arc<OutboundCounters>,
+        address: String,
+    }
+
+    type Registry = RwLock<HashMap<String, Entry>>;
+
+    fn registry() -> &'static Registry {
+        static REGISTRY: OnceLock<Registry> = OnceLock::new();
+        REGISTRY.get_or_init(|| RwLock::new(HashMap::new()))
+    }
+
+    /// Replace the registry with the outbounds of the config that is about to
+    /// run, each at zero. Called where a service starts, never from
+    /// validation: a reload replaces the list rather than accumulating.
+    pub fn install(set: &OutboundSet) {
+        let fresh: HashMap<String, Entry> = set
+            .iter()
+            .map(|(key, address)| {
+                (
+                    key.to_string(),
+                    Entry {
+                        counters: Arc::new(OutboundCounters::default()),
+                        address: address.to_string(),
+                    },
+                )
+            })
+            .collect();
+        *registry().write().unwrap() = fresh;
+    }
+
+    /// The counters for a key, inserting if absent. Idempotent for the same
+    /// key and address; the same key with a different address is rejected
+    /// with the same message validation uses.
+    pub fn register(key: &str, address: &str) -> std::io::Result<Arc<OutboundCounters>> {
+        {
+            let guard = registry().read().unwrap();
+            if let Some(existing) = guard.get(key) {
+                if existing.address != address {
+                    return Err(conflict(key, &existing.address, address));
+                }
+                return Ok(existing.counters.clone());
+            }
+        }
+
+        let mut guard = registry().write().unwrap();
+        // Another thread may have inserted between the read and the write.
+        if let Some(existing) = guard.get(key) {
+            if existing.address != address {
+                return Err(conflict(key, &existing.address, address));
+            }
+            return Ok(existing.counters.clone());
+        }
+
+        let counters = Arc::new(OutboundCounters::default());
+        guard.insert(
+            key.to_string(),
+            Entry {
+                counters: counters.clone(),
+                address: address.to_string(),
+            },
+        );
+        Ok(counters)
+    }
+
+    /// Counters that are never listed, for a chain built without attribution
+    /// — tests, and any construction path with no config behind it. Traffic
+    /// through such a chain is counted into a void rather than credited to
+    /// some arbitrary server.
+    pub fn unattributed() -> Arc<OutboundCounters> {
+        static UNATTRIBUTED: OnceLock<Arc<OutboundCounters>> = OnceLock::new();
+        UNATTRIBUTED
+            .get_or_init(|| Arc::new(OutboundCounters::default()))
+            .clone()
+    }
+
+    /// Every registered outbound, sorted by name so a host redrawing on a
+    /// timer does not reorder its own rows.
+    ///
+    /// `allow(dead_code)` for the reason `tun::traffic` gives: the only reader
+    /// is `crate::control::stats`, and main.rs has no `control`, so the binary
+    /// compiles this with nothing to call it.
+    #[allow(dead_code)]
+    pub fn snapshot_all() -> Vec<OutboundStats> {
+        let guard = registry().read().unwrap();
+        let mut out: Vec<OutboundStats> = guard
+            .iter()
+            .map(|(name, entry)| OutboundStats {
+                name: name.clone(),
+                upload_bytes: entry.counters.upload_bytes.load(Ordering::Relaxed),
+                download_bytes: entry.counters.download_bytes.load(Ordering::Relaxed),
+                active_connections: entry.counters.active_connections.load(Ordering::Relaxed),
+            })
+            .collect();
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
+    }
+
+    /// The registry is process-global and cargo runs tests in parallel, so
+    /// every test that touches it takes this first.
+    #[cfg(test)]
+    pub static REGISTRY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[cfg(test)]
+    pub fn reset_for_test() {
+        registry().write().unwrap().clear();
+    }
+}
+
+#[cfg(feature = "control-stats")]
+pub use registry::*;
+```
+
+- [ ] **Step 5: Run the tests to verify they pass, with and without the feature**
 
 ```bash
+cargo test --features control-stats --lib outbound_stats
 cargo test --lib outbound_stats
 ```
 
-Expected: 9 passed.
+Expected: 12 passed with the feature; 3 passed without.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
 git add src/outbound_stats.rs src/lib.rs src/main.rs
-git commit -m "stats: a registry of per-outbound counters"
+git commit -m "stats: an outbound set for validation, a registry for runtime"
 ```
 
 ---
@@ -571,18 +675,18 @@ git commit -m "stats: a registry of per-outbound counters"
 
 **Files:**
 - Create: `src/outbound_counting_stream.rs`
-- Modify: `src/lib.rs`, `src/main.rs` (module lists)
-- Test: in `src/outbound_counting_stream.rs`
+- Modify: `src/lib.rs`, `src/main.rs` — declare as `#[cfg(feature = "control-stats")] mod outbound_counting_stream;` immediately before `mod outbound_stats;`
+- Test: in the new file
 
 **Interfaces:**
-- Consumes: `crate::outbound_stats::{OutboundCounters, register, reset_for_test, REGISTRY_TEST_LOCK}`
+- Consumes: `crate::outbound_stats::OutboundCounters` (Task 2); `crate::async_stream::{AsyncPing, AsyncStream, AsyncMessageStream, AsyncReadMessage, AsyncWriteMessage, AsyncFlushMessage, AsyncShutdownMessage}` (`src/async_stream.rs:14-197`)
 - Produces:
-  - `pub struct OutboundCountingStream<S>` with `pub fn new(inner: S, counters: Arc<OutboundCounters>) -> Self`
-  - `pub struct OutboundCountingMessageStream<S>` with the same constructor shape
+  - `pub struct OutboundCountingStream<S>` — `new(inner: S, counters: Arc<OutboundCounters>) -> Self`, `count_early_data(&self, len: usize)`
+  - `pub struct OutboundCountingMessageStream<S>` — `new(inner: S, counters: Arc<OutboundCounters>) -> Self`
 
 - [ ] **Step 1: Write the failing tests**
 
-Create `src/outbound_counting_stream.rs` with ONLY this test module:
+Create `src/outbound_counting_stream.rs` containing only:
 
 ```rust
 #[cfg(test)]
@@ -592,9 +696,9 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// At the outbound a read is DOWNLOAD and a write is UPLOAD — the inverse
-    /// of tun::traffic, whose stream sits on the device side. The byte counts
-    /// here are deliberately different sizes, because equal ones would pass
-    /// with the two transposed.
+    /// of tun::traffic, whose stream sits on the device side. The two byte
+    /// counts are deliberately different, because equal ones would pass with
+    /// the directions transposed.
     #[tokio::test]
     async fn a_read_is_download_and_a_write_is_upload() {
         let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
@@ -629,10 +733,23 @@ mod tests {
         assert_eq!(snapshot_all()[0].active_connections, 0);
     }
 
+    #[tokio::test]
+    async fn early_data_is_credited_as_download() {
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
+        reset_for_test();
+        let counters = register("Frankfurt", "fra1.example:443").unwrap();
+
+        let (_peer, local) = tokio::io::duplex(64);
+        let counting = OutboundCountingStream::new(local, counters);
+        counting.count_early_data(17);
+
+        assert_eq!(snapshot_all()[0].download_bytes, 17);
+    }
+
     /// A datagram session is not a connection: active_connections counts TCP
     /// today, and folding datagrams in would change what a host is reading.
     #[tokio::test]
-    async fn a_message_stream_counts_bytes_but_not_connections() {
+    async fn a_message_stream_does_not_hold_a_connection_slot() {
         let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
         reset_for_test();
         let counters = register("Frankfurt", "fra1.example:443").unwrap();
@@ -645,19 +762,19 @@ mod tests {
 }
 ```
 
+`OutboundCountingMessageStream::new` has no trait bounds, so wrapping a bare `DuplexStream` compiles; the test only reads the connection count.
+
 - [ ] **Step 2: Declare the module and run the tests to verify they fail**
 
-Add `mod outbound_counting_stream;` to `src/lib.rs` and `src/main.rs`, immediately before `mod outbound_stats;`.
-
 ```bash
-cargo test --lib outbound_counting_stream
+cargo test --features control-stats --lib outbound_counting_stream
 ```
 
 Expected: compile error — `cannot find type 'OutboundCountingStream'`.
 
 - [ ] **Step 3: Write the byte-level adapter**
 
-Prepend to `src/outbound_counting_stream.rs`:
+Prepend to the file:
 
 ```rust
 //! Counting adapters that credit an outbound for what passes through it.
@@ -666,8 +783,8 @@ Prepend to `src/outbound_counting_stream.rs`:
 //! `crate::tun::traffic::TrafficCountingStream`. That one sits on the device
 //! side, where a read is bytes travelling device to proxy — upload. These sit
 //! at the outbound, where a read is bytes arriving from the server — download.
-//! Reusing that type here would silently transpose the two figures, and no
-//! test that only checks totals would notice.
+//! Reusing that type would silently transpose the two figures, and no test
+//! that only checks totals would notice.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -676,13 +793,14 @@ use std::task::{Context, Poll};
 use tokio::io::ReadBuf;
 
 use crate::async_stream::{
-    AsyncFlushMessage, AsyncPing, AsyncReadMessage, AsyncShutdownMessage, AsyncWriteMessage,
+    AsyncFlushMessage, AsyncMessageStream, AsyncPing, AsyncReadMessage, AsyncShutdownMessage,
+    AsyncStream, AsyncWriteMessage,
 };
 use crate::outbound_stats::OutboundCounters;
 
 pin_project_lite::pin_project! {
-    /// Counts application payload bytes to and from one outbound, and holds a
-    /// live-connection slot for as long as it exists.
+    /// Counts application payload bytes to and from one outbound, and holds
+    /// a live-connection slot for as long as it exists.
     pub struct OutboundCountingStream<S> {
         #[pin]
         inner: S,
@@ -703,7 +821,7 @@ impl<S> OutboundCountingStream<S> {
     }
 
     /// Credit bytes that never travelled through this stream: `early_data`
-    /// read by the final hop while completing its own handshake. Dropping it
+    /// the final hop read while completing its own handshake. Dropping it
     /// would lose the first bytes of every such connection — a small number,
     /// but a systematically biased one.
     pub fn count_early_data(&self, len: usize) {
@@ -763,7 +881,7 @@ impl<S: AsyncPing + Unpin> AsyncPing for OutboundCountingStream<S> {
     }
 }
 
-impl<S> crate::async_stream::AsyncStream for OutboundCountingStream<S> where
+impl<S> AsyncStream for OutboundCountingStream<S> where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + AsyncPing + Unpin + Send + Sync
 {
 }
@@ -771,7 +889,7 @@ impl<S> crate::async_stream::AsyncStream for OutboundCountingStream<S> where
 
 - [ ] **Step 4: Write the message-level adapter**
 
-Append to the same file, before the test module:
+Append before the test module:
 
 ```rust
 pin_project_lite::pin_project! {
@@ -779,8 +897,8 @@ pin_project_lite::pin_project! {
     /// already sees them.
     ///
     /// Deliberately does NOT touch `active_connections`: that figure counts
-    /// TCP connections today, and folding datagram sessions into it would
-    /// silently change what an existing host is reading.
+    /// TCP connections today, and folding datagram sessions in would silently
+    /// change what an existing host is reading.
     pub struct OutboundCountingMessageStream<S> {
         #[pin]
         inner: S,
@@ -853,7 +971,7 @@ impl<S: AsyncPing + Unpin> AsyncPing for OutboundCountingMessageStream<S> {
     }
 }
 
-impl<S> crate::async_stream::AsyncMessageStream for OutboundCountingMessageStream<S> where
+impl<S> AsyncMessageStream for OutboundCountingMessageStream<S> where
     S: AsyncReadMessage
         + AsyncWriteMessage
         + AsyncFlushMessage
@@ -868,12 +986,10 @@ impl<S> crate::async_stream::AsyncMessageStream for OutboundCountingMessageStrea
 - [ ] **Step 5: Run the tests to verify they pass**
 
 ```bash
-cargo test --lib outbound_counting_stream
+cargo test --features control-stats --lib outbound_counting_stream
 ```
 
-Expected: 3 passed.
-
-If the message-stream test fails to compile because `tokio::io::DuplexStream` does not implement the message traits, replace its body with a hand-written stub that does — the assertion under test is only that `active_connections` stays at zero.
+Expected: 4 passed.
 
 - [ ] **Step 6: Commit**
 
@@ -884,47 +1000,37 @@ git commit -m "stats: counting adapters for the outbound side"
 
 ---
 
-### Task 4: Register every outbound during validation
+### Task 4: Validation builds the set
 
 **Files:**
-- Modify: `src/config/validate.rs:163` (after group resolution), `:2024-2037` (`expand_selection`), `:54` (`create_server_configs` entry)
-- Test: `src/config/validate.rs` (new test module)
+- Modify: `src/config/validate.rs:39-43` (`ValidatedConfigs`), `:54` (`create_server_configs`), `:163` (after group resolution), `:225` (the `Ok(ValidatedConfigs {..})`), `:2024` (`expand_selection`) and the functions between
+- Modify: `src/main.rs:413`, `src/control/mod.rs:315` — the two exact-struct destructures of `ValidatedConfigs`
+- Test: `src/config/validate.rs`, new `mod outbound_set_tests` at the end
 
 **Interfaces:**
-- Consumes: `ClientConfig::stats_key()` (Task 1), `crate::outbound_stats::{register, reset}` (Task 2)
-- Produces: no new public API — registration is a side effect of `create_server_configs`
+- Consumes: `ClientConfig::stats_key()` (Task 1), `OutboundSet` (Task 2)
+- Produces: `ValidatedConfigs::outbounds: OutboundSet`
 
-**Two registration points, both idempotent:**
-1. After `resolve_client_groups_topologically` at line 163, so a group that is
-   defined but never referenced by a rule still appears in the list.
-2. Inside `expand_selection` at line 2024, the single funnel every chain hop
-   passes through — inline hops included, which is the more common form.
+**How the set is threaded.** `expand_selection` (`:2024`) is the single funnel every chain hop passes through — inline hops included — and it is reached from two roots: `validate_rule_config` (`:1806`) and the DNS-spec expansion (`:574`). Give `expand_selection` a `&mut OutboundSet` parameter and let the compiler drive the rest: every function it flags gets `outbounds: &mut OutboundSet` as its **last** parameter and passes it through unchanged, until `create_server_configs` owns the value. Group members are added once more at line 163 so a group nothing references is still listed.
 
 - [ ] **Step 1: Write the failing tests**
 
-Append to the end of `src/config/validate.rs`:
+Append to `src/config/validate.rs`:
 
 ```rust
 #[cfg(test)]
-mod outbound_registration_tests {
+mod outbound_set_tests {
     use crate::config::load_config_str;
-    use crate::outbound_stats::{REGISTRY_TEST_LOCK, reset_for_test, snapshot_all};
+    use crate::outbound_stats::OutboundSet;
 
-    fn validate(yaml: &str) -> std::io::Result<()> {
+    fn validate(yaml: &str) -> std::io::Result<OutboundSet> {
         let configs = load_config_str(yaml)?;
-        super::create_server_configs(configs).map(|_| ())
-    }
-
-    fn names() -> Vec<String> {
-        snapshot_all().into_iter().map(|o| o.name).collect()
+        super::create_server_configs(configs).map(|v| v.outbounds)
     }
 
     #[test]
-    fn every_configured_outbound_is_listed_before_it_carries_traffic() {
-        let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
-        reset_for_test();
-
-        validate(
+    fn every_configured_outbound_is_in_the_set() {
+        let set = validate(
             r#"
 - client_group: eu
   client_proxies:
@@ -939,24 +1045,39 @@ mod outbound_registration_tests {
   rules:
     - masks: "0.0.0.0/0"
       action: allow
-      client_chains: [eu]
+      client_chain: eu
 "#,
         )
         .unwrap();
 
-        let got = names();
-        assert!(got.contains(&"Frankfurt".to_string()), "got {got:?}");
-        assert!(got.contains(&"Amsterdam".to_string()), "got {got:?}");
+        assert!(set.contains("Frankfurt"));
+        assert!(set.contains("Amsterdam"));
     }
 
-    /// Group expansion clones a config into every referencing group; all the
-    /// clones are one server and must produce one entry.
+    /// A group nothing references is still a configured server.
+    #[test]
+    fn an_unreferenced_group_is_still_listed() {
+        let set = validate(
+            r#"
+- client_group: spare
+  client_proxies:
+    - name: Spare
+      address: "spare.example:443"
+      protocol: {type: socks}
+- address: "127.0.0.1:1080"
+  protocol: {type: socks}
+"#,
+        )
+        .unwrap();
+
+        assert!(set.contains("Spare"));
+    }
+
+    /// Group expansion clones a config into every referencing group; the
+    /// clones are one server.
     #[test]
     fn a_group_referenced_twice_yields_one_entry() {
-        let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
-        reset_for_test();
-
-        validate(
+        let set = validate(
             r#"
 - client_group: base
   client_proxies:
@@ -977,39 +1098,35 @@ mod outbound_registration_tests {
         )
         .unwrap();
 
-        let count = names().iter().filter(|n| *n == "Frankfurt").count();
-        assert_eq!(count, 1, "one server must have one counter");
+        // "direct" is always present from the built-in group, so the count is
+        // the built-in plus Frankfurt.
+        assert!(set.contains("Frankfurt"));
+        assert_eq!(set.len(), 2, "{:?}", set.iter().collect::<Vec<_>>());
     }
 
     /// An inline hop is the more common form and must be listed too.
     #[test]
-    fn an_inline_hop_is_registered() {
-        let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
-        reset_for_test();
-
-        validate(
+    fn an_inline_hop_is_in_the_set() {
+        let set = validate(
             r#"
 - address: "127.0.0.1:1080"
   protocol: {type: socks}
   rules:
     - masks: "0.0.0.0/0"
       action: allow
-      client_chains:
-        - name: Inline
-          address: "fra1.example:443"
-          protocol: {type: socks}
+      client_chain:
+        name: Inline
+        address: "fra1.example:443"
+        protocol: {type: socks}
 "#,
         )
         .unwrap();
 
-        assert!(names().contains(&"Inline".to_string()), "got {:?}", names());
+        assert!(set.contains("Inline"));
     }
 
     #[test]
     fn one_name_on_two_different_servers_is_rejected() {
-        let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
-        reset_for_test();
-
         let err = validate(
             r#"
 - client_group: eu
@@ -1022,10 +1139,6 @@ mod outbound_registration_tests {
       protocol: {type: socks}
 - address: "127.0.0.1:1080"
   protocol: {type: socks}
-  rules:
-    - masks: "0.0.0.0/0"
-      action: allow
-      client_chains: [eu]
 "#,
         )
         .unwrap_err();
@@ -1036,10 +1149,36 @@ mod outbound_registration_tests {
         assert!(msg.contains("fra2.example:443"), "must name both: {msg}");
     }
 
-    /// Nearly every config has at least one direct outbound, and two of them
-    /// must not read as a conflict on the unspecified address.
+    /// Nearly every config has a direct outbound, and two of them must not
+    /// read as a conflict on the unspecified address.
     #[test]
-    fn two_direct_outbounds_do_not_conflict() {
+    fn two_direct_outbounds_are_one_entry() {
+        let set = validate(
+            r#"
+- address: "127.0.0.1:1080"
+  protocol: {type: socks}
+  rules:
+    - masks: "10.0.0.0/8"
+      action: allow
+      client_chain:
+        protocol: {type: direct}
+    - masks: "0.0.0.0/0"
+      action: allow
+      client_chain:
+        protocol: {type: direct}
+"#,
+        )
+        .unwrap();
+
+        assert!(set.contains("direct"));
+        assert_eq!(set.len(), 1);
+    }
+
+    /// The dry-run and editor property: validating touches no live state.
+    #[cfg(feature = "control-stats")]
+    #[test]
+    fn validating_does_not_change_the_registry() {
+        use crate::outbound_stats::{REGISTRY_TEST_LOCK, reset_for_test, snapshot_all};
         let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
         reset_for_test();
 
@@ -1048,55 +1187,17 @@ mod outbound_registration_tests {
 - address: "127.0.0.1:1080"
   protocol: {type: socks}
   rules:
-    - masks: "10.0.0.0/8"
-      action: allow
-      client_chains: [{protocol: {type: direct}}]
     - masks: "0.0.0.0/0"
       action: allow
-      client_chains: [{protocol: {type: direct}}]
+      client_chain:
+        name: Draft
+        address: "draft.example:443"
+        protocol: {type: socks}
 "#,
         )
         .unwrap();
 
-        let count = names().iter().filter(|n| *n == "direct").count();
-        assert_eq!(count, 1);
-    }
-
-    /// Loading a second config must not inherit the first one's servers.
-    #[test]
-    fn a_second_load_replaces_the_list() {
-        let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
-        reset_for_test();
-
-        let first = r#"
-- address: "127.0.0.1:1080"
-  protocol: {type: socks}
-  rules:
-    - masks: "0.0.0.0/0"
-      action: allow
-      client_chains:
-        - name: First
-          address: "fra1.example:443"
-          protocol: {type: socks}
-"#;
-        let second = r#"
-- address: "127.0.0.1:1080"
-  protocol: {type: socks}
-  rules:
-    - masks: "0.0.0.0/0"
-      action: allow
-      client_chains:
-        - name: Second
-          address: "ams1.example:443"
-          protocol: {type: socks}
-"#;
-
-        validate(first).unwrap();
-        validate(second).unwrap();
-
-        let got = names();
-        assert!(got.contains(&"Second".to_string()), "got {got:?}");
-        assert!(!got.contains(&"First".to_string()), "stale entry: {got:?}");
+        assert!(snapshot_all().is_empty(), "validation must not install");
     }
 }
 ```
@@ -1104,45 +1205,62 @@ mod outbound_registration_tests {
 - [ ] **Step 2: Run the tests to verify they fail**
 
 ```bash
-export PATH="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH"
-cargo test --lib config::validate::outbound_registration_tests
+cargo test --features control-stats --lib config::validate::outbound_set_tests
 ```
 
-Expected: four fail on an empty or stale snapshot; `one_name_on_two_different_servers_is_rejected` fails because validation succeeds.
+Expected: compile error — `no field 'outbounds' on type 'ValidatedConfigs'`.
 
-- [ ] **Step 3: Clear the registry at the start of a load**
+- [ ] **Step 3: Add the field**
 
-In `create_server_configs` (`src/config/validate.rs:54`), as the very first statement of the function body:
+In `src/config/validate.rs`, extend `ValidatedConfigs` (`:39`):
 
 ```rust
-    // A load replaces the outbound list rather than adding to it: stale
-    // entries from a discarded config would be listed as live servers and
-    // would also produce false address conflicts.
-    crate::outbound_stats::reset();
+pub struct ValidatedConfigs {
+    pub configs: Vec<Config>,
+    /// Expanded DNS groups in topological order (bootstrap deps first).
+    pub dns_groups: Vec<ExpandedDnsGroup>,
+    /// Every outbound the config mentions, keyed and conflict-checked. Built
+    /// here and installed where a service starts — never here, because this
+    /// function also serves `--dry-run` and the config editor.
+    pub outbounds: crate::outbound_stats::OutboundSet,
+}
 ```
 
-- [ ] **Step 4: Register every group member**
+- [ ] **Step 4: Fix the two exact-struct destructures**
 
-Immediately after line 163, `let mut client_groups = resolve_client_groups_topologically(raw_client_groups)?;`, add:
+They will fail to compile until they name the new field.
+
+`src/control/mod.rs:315`:
 
 ```rust
-    // Register group members even when no rule references the group, so a
-    // configured server is listed whether or not traffic can reach it yet.
-    for configs in client_groups.values() {
-        for config in configs {
-            crate::outbound_stats::register(&config.stats_key()?, &config.address.to_string())?;
-        }
-    }
+    let crate::config::ValidatedConfigs {
+        configs: validated_configs,
+        dns_groups,
+        outbounds,
+    } = create_server_configs(configs)?;
 ```
 
-- [ ] **Step 5: Register every expanded hop**
+`src/main.rs:413`:
 
-Replace `expand_selection` (`src/config/validate.rs:2024`) with:
+```rust
+            let config::ValidatedConfigs {
+                configs: server_configs,
+                dns_groups,
+                outbounds,
+            } = server_configs;
+```
+
+Both `outbounds` bindings are consumed in Task 5; until then, prefix them `_outbounds` to keep the build warning-free, and rename in Task 5.
+
+- [ ] **Step 5: Thread the set through expansion**
+
+Replace `expand_selection` (`:2024`):
 
 ```rust
 fn expand_selection(
     selection: &ConfigSelection<ClientConfig>,
     client_groups: &HashMap<String, Vec<ClientConfig>>,
+    outbounds: &mut crate::outbound_stats::OutboundSet,
 ) -> std::io::Result<Vec<ClientConfig>> {
     let configs = match selection {
         ConfigSelection::Config(config) => vec![config.clone()],
@@ -1156,64 +1274,188 @@ fn expand_selection(
         }
     };
 
-    // Every chain hop funnels through here, inline ones included, which is the
-    // form that would otherwise go unlisted. Registration is idempotent, so a
-    // hop that came from an already-registered group costs nothing.
+    // Every chain hop funnels through here, inline ones included, which is
+    // the form that would otherwise go unlisted. Insertion is idempotent, so
+    // a hop that came from a group costs nothing.
     for config in &configs {
-        crate::outbound_stats::register(&config.stats_key()?, &config.address.to_string())?;
+        outbounds.insert(&config.stats_key()?, &config.address.to_string())?;
     }
 
     Ok(configs)
 }
 ```
 
-- [ ] **Step 6: Run the tests to verify they pass**
+Now build:
 
 ```bash
-cargo test --lib config::validate::outbound_registration_tests
+cargo check --features control-stats
 ```
 
-Expected: 6 passed.
+Each error is a caller that must pass the set. Add `outbounds: &mut crate::outbound_stats::OutboundSet` as the last parameter of every flagged function and pass `outbounds` through. The chain is `expand_chain_hop` (`:1990`) → `expand_client_chain` (`:1972`) → its two callers at `:574` and `:1806` → their enclosing functions → up to `create_server_configs`. Repeat `cargo check` until it is clean.
 
-- [ ] **Step 7: Run the whole config suite**
+- [ ] **Step 6: Own the set in `create_server_configs`**
+
+At the top of the function body:
+
+```rust
+    let mut outbounds = crate::outbound_stats::OutboundSet::default();
+```
+
+Immediately after line 163 (`let mut client_groups = resolve_client_groups_topologically(raw_client_groups)?;`):
+
+```rust
+    // A group nothing references is still a configured server, and a person
+    // expects to see it listed at zero rather than missing.
+    for configs in client_groups.values() {
+        for config in configs {
+            outbounds.insert(&config.stats_key()?, &config.address.to_string())?;
+        }
+    }
+```
+
+Pass `&mut outbounds` at every call the compiler flagged in Step 5, and add `outbounds,` to the `Ok(ValidatedConfigs { .. })` at line ~225.
+
+- [ ] **Step 7: Run the tests to verify they pass**
 
 ```bash
+cargo test --features control-stats --lib config::validate::outbound_set_tests
 cargo test --lib config
 ```
 
-Expected: all pass. `groups::tests::test_example_files_load_and_validate` loads every file in `examples/`, so a false conflict there surfaces here. If it fails, an example genuinely has two different servers under one address key — fix the example, not the check.
+Expected: 7 passed, then the whole config suite green. `groups::tests::test_example_files_load_and_validate` loads every file in `examples/`, so a false conflict there surfaces here; if one does, an example genuinely has two servers under one address key — fix the example, not the check.
 
 - [ ] **Step 8: Commit**
 
 ```bash
-git add src/config/validate.rs
-git commit -m "config: register every outbound's counters at load"
+git add src/config/validate.rs src/control/mod.rs src/main.rs
+git commit -m "config: validation returns the set of named outbounds"
 ```
 
 ---
 
-### Task 5: Carry counter handles on the chain
+### Task 5: Install the set where a service starts
+
+**Files:**
+- Modify: `src/control/mod.rs:315-320`, `src/main.rs:413-418`
+
+**Interfaces:**
+- Consumes: `ValidatedConfigs::outbounds` (Task 4), `crate::outbound_stats::install` (Task 2)
+- Produces: a populated registry before any chain is built
+
+- [ ] **Step 1: Write the failing test**
+
+Append to `src/control/mod.rs`:
+
+```rust
+#[cfg(all(test, feature = "control-stats"))]
+mod outbound_install_tests {
+    use crate::outbound_stats::{REGISTRY_TEST_LOCK, reset_for_test, snapshot_all};
+
+    /// Preparing a service is the commitment to running it, so this is where
+    /// the registry is replaced — and where a host's list appears at zero.
+    #[tokio::test]
+    async fn preparing_a_service_installs_its_outbounds() {
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
+        reset_for_test();
+
+        let yaml = r#"
+- address: "127.0.0.1:0"
+  protocol: {type: socks}
+  rules:
+    - masks: "0.0.0.0/0"
+      action: allow
+      client_chain:
+        name: Frankfurt
+        address: "fra1.example:443"
+        protocol: {type: socks}
+"#;
+        // prepare_from_config needs no device for a server-only config.
+        let _prepared = super::prepare_from_config(yaml, super::DevicePolicy::Owned)
+            .await
+            .unwrap();
+
+        let names: Vec<String> = snapshot_all().into_iter().map(|o| o.name).collect();
+        assert!(names.contains(&"Frankfurt".to_string()), "got {names:?}");
+        assert!(names.contains(&"direct".to_string()), "got {names:?}");
+    }
+}
+```
+
+If `DevicePolicy::Owned` is not the variant name, find the right one:
+
+```bash
+grep -n 'pub enum DevicePolicy' -A 8 src/control/device.rs
+```
+
+- [ ] **Step 2: Run to verify it fails**
+
+```bash
+cargo test --features control-stats --lib control::outbound_install_tests
+```
+
+Expected: FAIL — the snapshot is empty.
+
+- [ ] **Step 3: Install in `prepare_from_config`**
+
+In `src/control/mod.rs`, rename `_outbounds` back to `outbounds` in the destructure, and immediately after it:
+
+```rust
+    // Replace, not add: a reload through this path must not carry the
+    // previous config's servers into the new list.
+    #[cfg(feature = "control-stats")]
+    crate::outbound_stats::install(&outbounds);
+    #[cfg(not(feature = "control-stats"))]
+    let _ = outbounds;
+```
+
+- [ ] **Step 4: Install in the binary's start path**
+
+In `src/main.rs`, after the destructure at `:413` (rename `_outbounds` to `outbounds`), add the same four lines.
+
+- [ ] **Step 5: Run to verify it passes, and that both features build**
+
+```bash
+cargo test --features control-stats --lib control::outbound_install_tests
+cargo check
+cargo check --features control-stats
+```
+
+Expected: 1 passed; both checks clean.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add src/control/mod.rs src/main.rs
+git commit -m "stats: install the outbound list where a service starts"
+```
+
+---
+
+### Task 6: Carry counter handles on the chain
 
 **Files:**
 - Modify: `src/client_proxy_chain.rs:82-101` (`ClientProxyChainKind`), `:156-216` (`new`, `new_terminal`), `:550-586` (selection helpers)
-- Test: in `src/client_proxy_chain.rs`
+- Test: the existing `mod tests` in the same file
 
 **Interfaces:**
 - Consumes: `crate::outbound_stats::{OutboundCounters, unattributed}` (Task 2)
-- Produces:
+- Produces (all `#[cfg(feature = "control-stats")]`):
   - `ClientProxyChain::with_counters(self, initial: Vec<Arc<OutboundCounters>>, subsequent: Vec<Vec<Arc<OutboundCounters>>>) -> Self`
   - `ClientProxyChain::with_terminal_counters(self, counters: Vec<Arc<OutboundCounters>>) -> Self`
+  - `fn exit_counters(initial: &[Arc<OutboundCounters>], subsequent: &[Vec<Arc<OutboundCounters>>], initial_idx: usize, subsequent_indices: &[usize]) -> Arc<OutboundCounters>`
+- Produces (unconditional — the selection helpers now also return the index chosen):
   - `fn select_from_pool<'a>(pool: &'a [InitialHopEntry], index: &AtomicU32) -> (&'a InitialHopEntry, usize)`
   - `fn select_terminal<'a>(pool: &'a [Arc<dyn TerminalConnector>], index: &AtomicU32) -> (&'a Arc<dyn TerminalConnector>, usize)`
   - `fn select_subsequent<'a>(hops: &'a [Vec<Box<dyn ProxyConnector>>], indices: &[AtomicU32]) -> Vec<(&'a dyn ProxyConnector, usize)>`
 
-**Why a builder rather than new parameters:** `ClientProxyChain::new` has more than ten call sites, all in this file's tests. Adding parameters would churn every one of them for no benefit. `new` fills the counter vectors with `unattributed()` handles sized to the pools; `with_counters` replaces them.
+**Why a builder rather than new parameters:** `ClientProxyChain::new` has more than ten call sites, all tests in this file. `new` fills the counter vectors with `unattributed()` sized to the pools; `with_counters` replaces them.
 
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 1: Write the failing tests**
 
-Append to the existing test module in `src/client_proxy_chain.rs`:
+Append inside the existing `mod tests`:
 
 ```rust
+    #[cfg(feature = "control-stats")]
     #[test]
     fn a_chain_without_counters_is_unattributed_not_empty() {
         let chain = ClientProxyChain::new(vec![direct_entry(0)], vec![]);
@@ -1222,6 +1464,7 @@ Append to the existing test module in `src/client_proxy_chain.rs`:
         assert_eq!(chain.initial_counter_len(), 1);
     }
 
+    #[cfg(feature = "control-stats")]
     #[test]
     fn with_counters_replaces_the_unattributed_handles() {
         let counters =
@@ -1230,91 +1473,137 @@ Append to the existing test module in `src/client_proxy_chain.rs`:
             .with_counters(vec![counters.clone()], vec![]);
         assert!(Arc::ptr_eq(&chain.initial_counter(0), &counters));
     }
+
+    /// The exit is the last subsequent hop when there is one, else the
+    /// initial hop.
+    #[cfg(feature = "control-stats")]
+    #[test]
+    fn exit_counters_picks_the_last_hop() {
+        use crate::outbound_stats::unattributed;
+        let a = Arc::new(crate::outbound_stats::OutboundCounters::default());
+        let b = Arc::new(crate::outbound_stats::OutboundCounters::default());
+        let c = Arc::new(crate::outbound_stats::OutboundCounters::default());
+
+        let two_hop = ClientProxyChain::exit_counters(
+            &[a.clone()],
+            &[vec![b.clone()], vec![unattributed(), c.clone()]],
+            0,
+            &[0, 1],
+        );
+        assert!(Arc::ptr_eq(&two_hop, &c));
+
+        let single = ClientProxyChain::exit_counters(&[unattributed(), a.clone()], &[], 1, &[]);
+        assert!(Arc::ptr_eq(&single, &a));
+    }
 ```
+
+`OutboundCounters::default()` is reachable: it is `#[derive(Default)]` and `pub` in Task 2.
 
 - [ ] **Step 2: Run to verify it fails**
 
 ```bash
-cargo test --lib client_proxy_chain
+cargo test --features control-stats --lib client_proxy_chain
 ```
 
 Expected: compile error — `no method named 'with_counters'`.
 
 - [ ] **Step 3: Add the fields**
 
-In `ClientProxyChainKind::StreamChain`, add after `subsequent_next_indices`:
+Add `use crate::outbound_stats::OutboundCounters;` under `#[cfg(feature = "control-stats")]` at the top of the file.
+
+In `ClientProxyChainKind::StreamChain`, after `subsequent_next_indices`:
 
 ```rust
         /// One handle per member of `initial_hop`, same order.
+        #[cfg(feature = "control-stats")]
         initial_hop_counters: Vec<Arc<OutboundCounters>>,
         /// One handle per member of each pool in `subsequent_hops`, same order.
+        #[cfg(feature = "control-stats")]
         subsequent_hop_counters: Vec<Vec<Arc<OutboundCounters>>>,
 ```
 
-In `ClientProxyChainKind::Terminal`, add after `next_index`:
+In `ClientProxyChainKind::Terminal`, after `next_index`:
 
 ```rust
+        #[cfg(feature = "control-stats")]
         connector_counters: Vec<Arc<OutboundCounters>>,
 ```
 
-In `new`, build them before constructing `Self`:
+In `new`, before `Self { .. }` is constructed:
 
 ```rust
-        let initial_hop_counters = vec![crate::outbound_stats::unattributed(); initial_hop.len()];
+        #[cfg(feature = "control-stats")]
+        let initial_hop_counters =
+            vec![crate::outbound_stats::unattributed(); initial_hop.len()];
+        #[cfg(feature = "control-stats")]
         let subsequent_hop_counters: Vec<Vec<Arc<OutboundCounters>>> = subsequent_hops
             .iter()
             .map(|hop| vec![crate::outbound_stats::unattributed(); hop.len()])
             .collect();
 ```
 
-In `new_terminal`:
+and add both to the struct literal under `#[cfg(feature = "control-stats")]`. Same in `new_terminal`:
 
 ```rust
-        let connector_counters = vec![crate::outbound_stats::unattributed(); connectors.len()];
+        #[cfg(feature = "control-stats")]
+        let connector_counters =
+            vec![crate::outbound_stats::unattributed(); connectors.len()];
 ```
 
-- [ ] **Step 4: Add the builder methods and test accessors**
+Every existing `match &self.kind { ClientProxyChainKind::StreamChain { .. } }` pattern already ends in `..` (e.g. `as_stream_chain`), so it keeps compiling.
+
+- [ ] **Step 4: Add the builders and `exit_counters`**
 
 In `impl ClientProxyChain`:
 
 ```rust
-    /// Attach the counters for each pool member, in the same order the pools
-    /// were built. Panics on a length mismatch: that is a construction bug in
+    /// Attach the counters for each pool member, in the order the pools were
+    /// built. Panics on a length mismatch: that is a construction bug in
     /// `chain_builder`, and silently mis-attributing traffic would be worse
     /// than a loud failure at startup.
+    #[cfg(feature = "control-stats")]
     pub fn with_counters(
         mut self,
         initial: Vec<Arc<OutboundCounters>>,
         subsequent: Vec<Vec<Arc<OutboundCounters>>>,
     ) -> Self {
-        if let ClientProxyChainKind::StreamChain {
-            initial_hop,
-            subsequent_hops,
-            initial_hop_counters,
-            subsequent_hop_counters,
-            ..
-        } = &mut self.kind
-        {
-            assert_eq!(initial.len(), initial_hop.len(), "initial counter count");
-            assert_eq!(subsequent.len(), subsequent_hops.len(), "hop count");
-            for (given, hop) in subsequent.iter().zip(subsequent_hops.iter()) {
-                assert_eq!(given.len(), hop.len(), "pool counter count");
+        match &mut self.kind {
+            ClientProxyChainKind::StreamChain {
+                initial_hop,
+                subsequent_hops,
+                initial_hop_counters,
+                subsequent_hop_counters,
+                ..
+            } => {
+                assert_eq!(initial.len(), initial_hop.len(), "initial counter count");
+                assert_eq!(subsequent.len(), subsequent_hops.len(), "hop count");
+                for (given, hop) in subsequent.iter().zip(subsequent_hops.iter()) {
+                    assert_eq!(given.len(), hop.len(), "pool counter count");
+                }
+                *initial_hop_counters = initial;
+                *subsequent_hop_counters = subsequent;
             }
-            *initial_hop_counters = initial;
-            *subsequent_hop_counters = subsequent;
+            ClientProxyChainKind::Terminal { .. } => {
+                panic!("with_counters on a terminal chain; use with_terminal_counters")
+            }
         }
         self
     }
 
+    #[cfg(feature = "control-stats")]
     pub fn with_terminal_counters(mut self, counters: Vec<Arc<OutboundCounters>>) -> Self {
-        if let ClientProxyChainKind::Terminal {
-            connectors,
-            connector_counters,
-            ..
-        } = &mut self.kind
-        {
-            assert_eq!(counters.len(), connectors.len(), "terminal counter count");
-            *connector_counters = counters;
+        match &mut self.kind {
+            ClientProxyChainKind::Terminal {
+                connectors,
+                connector_counters,
+                ..
+            } => {
+                assert_eq!(counters.len(), connectors.len(), "terminal counter count");
+                *connector_counters = counters;
+            }
+            ClientProxyChainKind::StreamChain { .. } => {
+                panic!("with_terminal_counters on a stream chain; use with_counters")
+            }
         }
         self
     }
@@ -1322,6 +1611,7 @@ In `impl ClientProxyChain`:
     /// The counters this connection's bytes belong to: the exit hop's, which
     /// is the last subsequent hop when there is one and the initial hop
     /// otherwise.
+    #[cfg(feature = "control-stats")]
     fn exit_counters(
         initial_hop_counters: &[Arc<OutboundCounters>],
         subsequent_hop_counters: &[Vec<Arc<OutboundCounters>>],
@@ -1334,7 +1624,7 @@ In `impl ClientProxyChain`:
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "control-stats"))]
     fn initial_counter_len(&self) -> usize {
         match &self.kind {
             ClientProxyChainKind::StreamChain {
@@ -1345,7 +1635,7 @@ In `impl ClientProxyChain`:
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "control-stats"))]
     fn initial_counter(&self, i: usize) -> Arc<OutboundCounters> {
         match &self.kind {
             ClientProxyChainKind::StreamChain {
@@ -1359,7 +1649,7 @@ In `impl ClientProxyChain`:
 
 - [ ] **Step 5: Make the selection helpers return indices**
 
-Replace the three helpers at the bottom of the file:
+Replace the three helpers at `:550-586`:
 
 ```rust
 fn select_from_pool<'a>(
@@ -1404,7 +1694,7 @@ fn select_subsequent<'a>(
 }
 ```
 
-Then fix the call sites the compiler points at. In `connect_tcp`, the two bindings become:
+Then fix the call sites the compiler points at. In `connect_tcp` (`:292-294`):
 
 ```rust
                 let (entry, initial_idx) = select_from_pool(initial_hop, initial_hop_next_index);
@@ -1414,15 +1704,18 @@ Then fix the call sites the compiler points at. In `connect_tcp`, the two bindin
                     selected.into_iter().map(|(p, _)| p).collect();
 ```
 
-and in the `Terminal` arm, `let (connector, _idx) = select_terminal(connectors, next_index);`.
+In the `Terminal` arm of `connect_tcp` and of `connect_udp_bidirectional`: `let (connector, idx) = select_terminal(connectors, next_index);`. In the `else` branch of `connect_udp_bidirectional` (`:434`): `let (entry, _initial_idx) = select_from_pool(initial_hop, initial_hop_next_index);`.
 
-- [ ] **Step 6: Run the tests to verify they pass**
+Until Tasks 8 and 9 use them, `initial_idx`, `subsequent_indices` and `idx` are unused; prefix them with `_` for now and un-prefix in those tasks.
+
+- [ ] **Step 6: Run the tests, both ways**
 
 ```bash
+cargo test --features control-stats --lib client_proxy_chain
 cargo test --lib client_proxy_chain
 ```
 
-Expected: all pass, including the two new ones.
+Expected: all pass both ways.
 
 - [ ] **Step 7: Commit**
 
@@ -1433,23 +1726,24 @@ git commit -m "chain: carry a counter handle for every pool member"
 
 ---
 
-### Task 6: Build the chain with real counters
+### Task 7: Build the chain with the counters the config names
 
 **Files:**
-- Modify: `src/tcp/chain_builder.rs:20-130` (`build_client_proxy_chain`), `:131` (`build_terminal_connector`)
-- Test: in `src/tcp/chain_builder.rs`
+- Modify: `src/tcp/chain_builder.rs:53-57` (after the empty-hops check), `:61-70` (terminal return), `:127` (stream return)
+- Test: the existing `mod tests` in the same file
 
 **Interfaces:**
-- Consumes: `ClientConfig::stats_key()` (Task 1), `register` (Task 2), `with_counters` / `with_terminal_counters` (Task 5)
+- Consumes: `ClientConfig::stats_key()` (Task 1), `register` (Task 2), `with_counters` / `with_terminal_counters` (Task 6), the module's existing `socks_config(port)` and `mock_resolver()` helpers (`:237-251`)
 - Produces: chains whose counter handles correspond to their pool members
 
 - [ ] **Step 1: Write the failing test**
 
-Append to the test module in `src/tcp/chain_builder.rs`:
+Append inside the existing `mod tests`:
 
 ```rust
+    #[cfg(feature = "control-stats")]
     #[test]
-    fn the_built_chain_carries_the_configured_names() {
+    fn the_built_chain_registers_the_configured_names() {
         let _guard = crate::outbound_stats::REGISTRY_TEST_LOCK.lock().unwrap();
         crate::outbound_stats::reset_for_test();
 
@@ -1463,7 +1757,7 @@ Append to the test module in `src/tcp/chain_builder.rs`:
                 ClientChainHop::Single(ConfigSelection::Config(relay)),
                 ClientChainHop::Single(ConfigSelection::Config(exit)),
             ]),
-            test_resolver(),
+            mock_resolver(),
         );
 
         let names: Vec<String> = crate::outbound_stats::snapshot_all()
@@ -1475,34 +1769,28 @@ Append to the test module in `src/tcp/chain_builder.rs`:
     }
 ```
 
-If the test module has no `test_resolver` helper, find the one the existing tests use:
-
-```bash
-grep -n 'fn test_resolver\|Resolver' src/tcp/chain_builder.rs | head
-```
-
 - [ ] **Step 2: Run to verify it fails**
 
 ```bash
-cargo test --lib chain_builder::tests::the_built_chain_carries_the_configured_names
+cargo test --features control-stats --lib chain_builder::tests::the_built_chain_registers_the_configured_names
 ```
 
-Expected: FAIL — the snapshot is empty, because nothing registers.
+Expected: FAIL — the snapshot is empty.
 
-- [ ] **Step 3: Collect the keys while building**
+- [ ] **Step 3: Collect the handles while building**
 
-In `build_client_proxy_chain`, the `hops: Vec<Vec<ClientConfig>>` value is assembled before any connector is constructed. Immediately after it, and before the configs are consumed, derive the counters in the same shape:
+In `build_client_proxy_chain`, immediately after the `if hops.is_empty() { panic!(..) }` check (`:53-55`) and before the terminal check:
 
 ```rust
     // Same shape as `hops`, so a pool index selects the same member in both.
-    let hop_counters: Vec<Vec<Arc<OutboundCounters>>> = hops
+    // register() only fails on what validation already rejected — a blank
+    // name, or one name on two addresses — so a failure here is a bug.
+    #[cfg(feature = "control-stats")]
+    let hop_counters: Vec<Vec<Arc<crate::outbound_stats::OutboundCounters>>> = hops
         .iter()
         .map(|pool| {
             pool.iter()
                 .map(|config| {
-                    // Both calls only fail on input validation has already
-                    // rejected by the time a chain is built: a blank name, or
-                    // one name on two addresses.
                     crate::outbound_stats::register(
                         &config.stats_key().expect("validated config"),
                         &config.address.to_string(),
@@ -1514,33 +1802,39 @@ In `build_client_proxy_chain`, the `hops: Vec<Vec<ClientConfig>>` value is assem
         .collect();
 ```
 
-- [ ] **Step 4: Attach them at construction**
+- [ ] **Step 4: Attach at both construction points**
 
-Where the function currently returns `ClientProxyChain::new(initial_hop, subsequent_hops)`, split `hop_counters` the same way the hops are split — the first entry is the initial hop, the rest are subsequent — and chain the builder:
-
-```rust
-    let mut counters_iter = hop_counters.into_iter();
-    let initial_counters = counters_iter.next().expect("at least one hop");
-    let subsequent_counters: Vec<Vec<Arc<OutboundCounters>>> = counters_iter.collect();
-
-    ClientProxyChain::new(initial_hop, subsequent_hops)
-        .with_counters(initial_counters, subsequent_counters)
-```
-
-For the terminal path, where the function returns `ClientProxyChain::new_terminal(connectors)`, attach `hop_counters` flattened — a terminal chain is a single hop, so `hop_counters` has exactly one pool:
+Replace `return ClientProxyChain::new_terminal(connectors);` (`:69`):
 
 ```rust
-    ClientProxyChain::new_terminal(connectors)
-        .with_terminal_counters(hop_counters.into_iter().next().expect("one hop"))
+        let chain = ClientProxyChain::new_terminal(connectors);
+        #[cfg(feature = "control-stats")]
+        let chain = chain.with_terminal_counters(
+            hop_counters.into_iter().next().expect("one hop"),
+        );
+        return chain;
 ```
 
-- [ ] **Step 5: Run to verify it passes**
+Replace the tail `ClientProxyChain::new(initial_hop, subsequent_hops)` (`:127`):
+
+```rust
+    let chain = ClientProxyChain::new(initial_hop, subsequent_hops);
+    #[cfg(feature = "control-stats")]
+    let chain = {
+        let mut counters = hop_counters.into_iter();
+        let initial = counters.next().expect("at least one hop");
+        chain.with_counters(initial, counters.collect())
+    };
+    chain
+}
+```
+
+- [ ] **Step 5: Run to verify it passes, both ways**
 
 ```bash
+cargo test --features control-stats --lib chain_builder
 cargo test --lib chain_builder
 ```
-
-Expected: all pass.
 
 - [ ] **Step 6: Commit**
 
@@ -1551,42 +1845,236 @@ git commit -m "chain: build with the counters the config names"
 
 ---
 
-### Task 7: Count TCP traffic against the exit hop
+### Task 8: Count TCP traffic against the exit hop
 
 **Files:**
-- Modify: `src/client_proxy_chain.rs:279-380` (`connect_tcp`)
-- Test: in `src/client_proxy_chain.rs`
+- Modify: `src/client_proxy_chain.rs:279-383` (`connect_tcp`)
+- Test: the existing `mod tests` in the same file
 
 **Interfaces:**
-- Consumes: `OutboundCountingStream` (Task 3), `exit_counters` and the indexed helpers (Task 5)
-- Produces: `connect_tcp` returns a wrapped stream
+- Consumes: `OutboundCountingStream` (Task 3); `exit_counters`, the indexed helpers (Task 6); `crate::async_stream::testing::TestStream` (`src/async_stream.rs:516`, a duplex half that satisfies `AsyncStream`); `NetLocation::from_ip_addr(IpAddr, u16)` (`src/address.rs:148`); `ResolvedLocation::new(NetLocation)` (`src/address.rs:227`); `NativeResolver::new()`
+- Produces: `connect_tcp` returns a wrapped stream; and these test helpers, used again by Task 9:
+  - `struct PipeSocket` — a `SocketConnector` whose `connect` hands out one half of a duplex pipe, once; `PipeSocket::new() -> (Box<dyn SocketConnector>, tokio::io::DuplexStream)` returns the connector and the peer half
+  - `struct PassthroughProxy` — a `ProxyConnector` whose `setup_tcp_stream` returns the stream unchanged; `passthrough(port: u16) -> Box<dyn ProxyConnector>`
+  - `fn test_location() -> ResolvedLocation`, `fn test_resolver() -> Arc<dyn Resolver>`
 
-- [ ] **Step 1: Write the failing tests**
+**Why new mocks:** the module's existing `MockSocketConnector` and `MockProxyConnector` return `Err("not implemented")` from every connect method. They test structure, not connections. Counting can only be tested through a connection that completes.
 
-Append to the test module in `src/client_proxy_chain.rs`. These drive real connections through mock connectors; follow the pattern the existing `connect_tcp` tests in this module use for building a working mock.
+- [ ] **Step 1: Add the connecting mocks**
+
+Append inside the existing `mod tests`:
+
+```rust
+    /// A socket that actually connects: hands out one half of a duplex pipe
+    /// and lets the test keep the other, so bytes can be driven through.
+    #[cfg(feature = "control-stats")]
+    #[derive(Debug)]
+    struct PipeSocket {
+        half: std::sync::Mutex<Option<tokio::io::DuplexStream>>,
+    }
+
+    #[cfg(feature = "control-stats")]
+    impl PipeSocket {
+        fn new() -> (Box<dyn SocketConnector>, tokio::io::DuplexStream) {
+            let (ours, theirs) = tokio::io::duplex(4096);
+            let socket = Self {
+                half: std::sync::Mutex::new(Some(ours)),
+            };
+            (Box::new(socket), theirs)
+        }
+    }
+
+    #[cfg(feature = "control-stats")]
+    #[async_trait]
+    impl SocketConnector for PipeSocket {
+        async fn connect(
+            &self,
+            _resolver: &Arc<dyn Resolver>,
+            _address: &ResolvedLocation,
+        ) -> std::io::Result<Box<dyn AsyncStream>> {
+            let half = self
+                .half
+                .lock()
+                .unwrap()
+                .take()
+                .expect("PipeSocket connects once");
+            Ok(Box::new(crate::async_stream::testing::TestStream(half)))
+        }
+
+        async fn connect_udp_bidirectional(
+            &self,
+            _resolver: &Arc<dyn Resolver>,
+            _target: ResolvedLocation,
+        ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
+            Err(std::io::Error::other("PipeSocket has no native UDP"))
+        }
+
+        fn bind_interface(&self) -> Option<&str> {
+            None
+        }
+    }
+
+    /// A proxy hop that performs no handshake: the stream goes out as it
+    /// came in. Enough to prove which hop's counter a chain credits.
+    #[cfg(feature = "control-stats")]
+    #[derive(Debug)]
+    struct PassthroughProxy {
+        location: NetLocation,
+    }
+
+    #[cfg(feature = "control-stats")]
+    #[async_trait]
+    impl ProxyConnector for PassthroughProxy {
+        fn proxy_location(&self) -> &NetLocation {
+            &self.location
+        }
+
+        fn supports_udp_over_tcp(&self) -> bool {
+            true
+        }
+
+        async fn setup_tcp_stream(
+            &self,
+            stream: Box<dyn AsyncStream>,
+            _target: &ResolvedLocation,
+        ) -> std::io::Result<TcpClientSetupResult> {
+            Ok(TcpClientSetupResult {
+                client_stream: stream,
+                early_data: None,
+            })
+        }
+
+        async fn setup_udp_bidirectional(
+            &self,
+            _stream: Box<dyn AsyncStream>,
+            _target: ResolvedLocation,
+        ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
+            Ok(Box::new(SinkMessageStream::default()))
+        }
+    }
+
+    #[cfg(feature = "control-stats")]
+    fn passthrough(port: u16) -> Box<dyn ProxyConnector> {
+        Box::new(PassthroughProxy {
+            location: NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port),
+        })
+    }
+
+    /// A message stream that accepts every write and never yields a read.
+    #[cfg(feature = "control-stats")]
+    #[derive(Debug, Default)]
+    struct SinkMessageStream;
+
+    #[cfg(feature = "control-stats")]
+    impl crate::async_stream::AsyncReadMessage for SinkMessageStream {
+        fn poll_read_message(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    #[cfg(feature = "control-stats")]
+    impl crate::async_stream::AsyncWriteMessage for SinkMessageStream {
+        fn poll_write_message(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[cfg(feature = "control-stats")]
+    impl crate::async_stream::AsyncFlushMessage for SinkMessageStream {
+        fn poll_flush_message(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[cfg(feature = "control-stats")]
+    impl crate::async_stream::AsyncShutdownMessage for SinkMessageStream {
+        fn poll_shutdown_message(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[cfg(feature = "control-stats")]
+    impl crate::async_stream::AsyncPing for SinkMessageStream {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+
+        fn poll_write_ping(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<bool>> {
+            std::task::Poll::Ready(Ok(false))
+        }
+    }
+
+    #[cfg(feature = "control-stats")]
+    impl AsyncMessageStream for SinkMessageStream {}
+
+    #[cfg(feature = "control-stats")]
+    fn test_location() -> ResolvedLocation {
+        ResolvedLocation::new(NetLocation::from_ip_addr(
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+            443,
+        ))
+    }
+
+    #[cfg(feature = "control-stats")]
+    fn test_resolver() -> Arc<dyn Resolver> {
+        Arc::new(crate::resolver::NativeResolver::new())
+    }
+```
+
+If `IpAddr`/`Ipv4Addr`/`NetLocation`/`ResolvedLocation`/`TcpClientSetupResult`/`AsyncMessageStream`/`async_trait` are not already imported in the test module, add the `use` lines the compiler names — the existing mocks in the same module use all of them.
+
+- [ ] **Step 2: Write the failing tests**
+
+Append inside `mod tests`:
 
 ```rust
     /// The relay is where the bytes physically flow; the exit is the server a
-    /// person means. The exit must be credited and the relay left at zero.
+    /// person means. Only the exit may be credited.
+    #[cfg(feature = "control-stats")]
     #[tokio::test]
     async fn a_two_hop_chain_credits_the_exit_not_the_relay() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let _guard = crate::outbound_stats::REGISTRY_TEST_LOCK.lock().unwrap();
         crate::outbound_stats::reset_for_test();
 
+        let direct = crate::outbound_stats::register("direct", "0.0.0.0:0").unwrap();
         let relay = crate::outbound_stats::register("relay", "relay:1080").unwrap();
         let exit = crate::outbound_stats::register("exit", "exit:1081").unwrap();
 
+        let (socket, mut peer) = PipeSocket::new();
         let chain = ClientProxyChain::new(
-            vec![direct_entry(0)],
-            vec![vec![mock_proxy(1080, true)], vec![mock_proxy(1081, true)]],
+            vec![InitialHopEntry::Direct(socket)],
+            vec![vec![passthrough(1080)], vec![passthrough(1081)]],
         )
-        .with_counters(vec![relay.clone()], vec![vec![relay], vec![exit]]);
+        .with_counters(vec![direct], vec![vec![relay], vec![exit]]);
 
-        let result = chain
+        let mut result = chain
             .connect_tcp(test_location(), &test_resolver())
             .await
             .unwrap();
-        drop(result);
+
+        // Deliberately asymmetric, so a transposition cannot pass.
+        result.client_stream.write_all(&[1u8; 5]).await.unwrap();
+        peer.write_all(&[2u8; 13]).await.unwrap();
+        let mut buf = [0u8; 13];
+        result.client_stream.read_exact(&mut buf).await.unwrap();
 
         let by_name = |n: &str| {
             crate::outbound_stats::snapshot_all()
@@ -1594,109 +2082,136 @@ Append to the test module in `src/client_proxy_chain.rs`. These drive real conne
                 .find(|o| o.name == n)
                 .unwrap()
         };
-        assert_eq!(by_name("relay").active_connections, 0);
-        assert_eq!(by_name("exit").active_connections, 0);
-        // The exit held the slot while the stream was alive; the relay never did.
+        assert_eq!(by_name("exit").upload_bytes, 5);
+        assert_eq!(by_name("exit").download_bytes, 13);
+        assert_eq!(by_name("exit").active_connections, 1);
         assert_eq!(by_name("relay").upload_bytes, 0);
+        assert_eq!(by_name("relay").download_bytes, 0);
+        assert_eq!(by_name("relay").active_connections, 0);
+        assert_eq!(by_name("direct").active_connections, 0);
+
+        drop(result);
+        assert_eq!(by_name("exit").active_connections, 0);
     }
 
-    /// A single-hop chain has no subsequent hop, so the initial hop IS the exit.
+    /// A single-hop chain has no subsequent hop, so the initial hop IS the
+    /// exit — and a pool credits the member actually selected.
+    #[cfg(feature = "control-stats")]
     #[tokio::test]
-    async fn a_single_hop_chain_credits_its_only_hop() {
+    async fn a_pool_credits_the_member_selected() {
         let _guard = crate::outbound_stats::REGISTRY_TEST_LOCK.lock().unwrap();
         crate::outbound_stats::reset_for_test();
 
-        let only = crate::outbound_stats::register("only", "only:1080").unwrap();
-        let chain = ClientProxyChain::new(vec![direct_entry(0)], vec![])
-            .with_counters(vec![only], vec![]);
+        let first = crate::outbound_stats::register("first", "first:1").unwrap();
+        let second = crate::outbound_stats::register("second", "second:2").unwrap();
 
-        let result = chain
-            .connect_tcp(test_location(), &test_resolver())
-            .await
-            .unwrap();
+        let (socket_a, _peer_a) = PipeSocket::new();
+        let (socket_b, _peer_b) = PipeSocket::new();
+        let chain = ClientProxyChain::new(
+            vec![
+                InitialHopEntry::Direct(socket_a),
+                InitialHopEntry::Direct(socket_b),
+            ],
+            vec![],
+        )
+        .with_counters(vec![first, second], vec![]);
 
-        assert_eq!(
-            crate::outbound_stats::snapshot_all()[0].active_connections,
-            1,
-            "the slot must be held while the stream is alive"
-        );
-        drop(result);
-        assert_eq!(
-            crate::outbound_stats::snapshot_all()[0].active_connections,
-            0
-        );
+        // Round-robin: the first connection takes member 0, the second member 1.
+        let a = chain.connect_tcp(test_location(), &test_resolver()).await.unwrap();
+        let b = chain.connect_tcp(test_location(), &test_resolver()).await.unwrap();
+
+        let all = crate::outbound_stats::snapshot_all();
+        assert_eq!(all.iter().find(|o| o.name == "first").unwrap().active_connections, 1);
+        assert_eq!(all.iter().find(|o| o.name == "second").unwrap().active_connections, 1);
+
+        drop(a);
+        drop(b);
+        let all = crate::outbound_stats::snapshot_all();
+        assert!(all.iter().all(|o| o.active_connections == 0));
     }
 ```
 
-- [ ] **Step 2: Run to verify they fail**
+- [ ] **Step 3: Run to verify they fail**
 
 ```bash
-cargo test --lib client_proxy_chain
+cargo test --features control-stats --lib client_proxy_chain
 ```
 
-Expected: FAIL — `active_connections` stays at zero throughout, because nothing wraps.
+Expected: the two new tests FAIL — `active_connections` and the byte counts stay at zero, because nothing wraps.
 
-- [ ] **Step 3: Wrap in the StreamChain arm**
+- [ ] **Step 4: Wrap in the StreamChain arm**
 
-At the end of the `StreamChain` arm of `connect_tcp`, replace `Ok(result)` with:
+Add `initial_hop_counters` and `subsequent_hop_counters` to the `StreamChain` destructuring pattern at the top of `connect_tcp`'s match arm (under `#[cfg(feature = "control-stats")]` on each binding), un-prefix `initial_idx` and `subsequent_indices`, and replace the arm's final `Ok(result)` with:
 
 ```rust
-                let counters = Self::exit_counters(
-                    initial_hop_counters,
-                    subsequent_hop_counters,
-                    initial_idx,
-                    &subsequent_indices,
-                );
+                #[cfg(feature = "control-stats")]
+                let result = {
+                    let counters = Self::exit_counters(
+                        initial_hop_counters,
+                        subsequent_hop_counters,
+                        initial_idx,
+                        &subsequent_indices,
+                    );
+                    let counting = crate::outbound_counting_stream::OutboundCountingStream::new(
+                        result.client_stream,
+                        counters,
+                    );
+                    // early_data never travels through the stream and would
+                    // otherwise be lost from the count.
+                    if let Some(data) = &result.early_data {
+                        counting.count_early_data(data.len());
+                    }
+                    TcpClientSetupResult {
+                        client_stream: Box::new(counting),
+                        early_data: result.early_data,
+                    }
+                };
 
-                let counting = OutboundCountingStream::new(result.client_stream, counters);
-                // early_data never travels through the stream, so it would
-                // otherwise be lost from the count entirely.
-                if let Some(data) = &result.early_data {
-                    counting.count_early_data(data.len());
-                }
-
-                Ok(TcpClientSetupResult {
-                    client_stream: Box::new(counting),
-                    early_data: result.early_data,
-                })
+                Ok(result)
 ```
 
-Destructure `initial_hop_counters` and `subsequent_hop_counters` in the `match &self.kind` pattern at the top of the arm, replacing the trailing `..` with the two new bindings.
-
-- [ ] **Step 4: Wrap in the Terminal arm**
+- [ ] **Step 5: Wrap in the Terminal arm**
 
 ```rust
             ClientProxyChainKind::Terminal {
                 connectors,
                 next_index,
+                #[cfg(feature = "control-stats")]
                 connector_counters,
             } => {
                 let (connector, idx) = select_terminal(connectors, next_index);
                 debug!("Terminal TCP connect -> {}", remote_location.location());
                 let result = connector.connect_tcp(resolver, remote_location).await?;
 
-                let counting =
-                    OutboundCountingStream::new(result.client_stream, connector_counters[idx].clone());
-                if let Some(data) = &result.early_data {
-                    counting.count_early_data(data.len());
-                }
+                #[cfg(feature = "control-stats")]
+                let result = {
+                    let counting = crate::outbound_counting_stream::OutboundCountingStream::new(
+                        result.client_stream,
+                        connector_counters[idx].clone(),
+                    );
+                    if let Some(data) = &result.early_data {
+                        counting.count_early_data(data.len());
+                    }
+                    TcpClientSetupResult {
+                        client_stream: Box::new(counting),
+                        early_data: result.early_data,
+                    }
+                };
+                #[cfg(not(feature = "control-stats"))]
+                let _ = idx;
 
-                Ok(TcpClientSetupResult {
-                    client_stream: Box::new(counting),
-                    early_data: result.early_data,
-                })
+                Ok(result)
             }
 ```
 
-- [ ] **Step 5: Run to verify they pass**
+- [ ] **Step 6: Run to verify they pass, both ways**
 
 ```bash
+cargo test --features control-stats --lib client_proxy_chain
 cargo test --lib client_proxy_chain
 ```
 
-Expected: all pass.
-
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
 git add src/client_proxy_chain.rs
@@ -1705,86 +2220,153 @@ git commit -m "chain: count TCP bytes against the exit hop"
 
 ---
 
-### Task 8: Count UDP traffic against the exit hop
+### Task 9: Count UDP payload against the final hop
 
 **Files:**
-- Modify: `src/client_proxy_chain.rs:385-470` (`connect_udp_bidirectional`)
-- Test: in `src/client_proxy_chain.rs`
+- Modify: `src/client_proxy_chain.rs:385-540` (`connect_udp_bidirectional`)
+- Test: the existing `mod tests`
 
 **Interfaces:**
-- Consumes: `OutboundCountingMessageStream` (Task 3)
+- Consumes: `OutboundCountingMessageStream` (Task 3); `PipeSocket`, `passthrough`, `test_location`, `test_resolver` (Task 8)
 - Produces: `connect_udp_bidirectional` returns a wrapped message stream
 
-**Note:** this function already computes its final-hop index explicitly as `pool_idx`, in both the `udp_uses_initial_hop` branch and the multi-hop branch. Use that index directly rather than deriving one.
+**Note:** this function already computes its final-hop index explicitly as `pool_idx` in both branches. Use that index; do not derive another.
 
 - [ ] **Step 1: Write the failing test**
 
+Append inside `mod tests`:
+
 ```rust
+    #[cfg(feature = "control-stats")]
     #[tokio::test]
-    async fn udp_bytes_are_credited_to_the_final_hop() {
+    async fn udp_payload_is_credited_to_the_final_hop_without_a_connection_slot() {
         let _guard = crate::outbound_stats::REGISTRY_TEST_LOCK.lock().unwrap();
         crate::outbound_stats::reset_for_test();
 
         let only = crate::outbound_stats::register("only", "only:1080").unwrap();
-        let chain = ClientProxyChain::new(vec![proxy_entry(0, 1080, true)], vec![])
-            .with_counters(vec![only], vec![]);
+        let (socket, _peer) = PipeSocket::new();
+        let chain = ClientProxyChain::new(
+            vec![InitialHopEntry::Proxy {
+                socket,
+                proxy: passthrough(1080),
+            }],
+            vec![],
+        )
+        .with_counters(vec![only], vec![]);
 
         let mut stream = chain
             .connect_udp_bidirectional(&test_resolver(), test_location())
             .await
             .unwrap();
 
-        use crate::async_stream::AsyncWriteMessageExt;
-        stream.write_message(&[0u8; 11]).await.unwrap();
+        use crate::async_stream::AsyncWriteMessage;
+        std::future::poll_fn(|cx| std::pin::Pin::new(&mut *stream).poll_write_message(cx, &[0u8; 11]))
+            .await
+            .unwrap();
 
-        assert_eq!(crate::outbound_stats::snapshot_all()[0].upload_bytes, 11);
+        let only = crate::outbound_stats::snapshot_all().into_iter().next().unwrap();
+        assert_eq!(only.upload_bytes, 11);
         // A datagram session is not a connection.
-        assert_eq!(
-            crate::outbound_stats::snapshot_all()[0].active_connections,
-            0
-        );
+        assert_eq!(only.active_connections, 0);
     }
-```
-
-If there is no `AsyncWriteMessageExt`, drive the write through `poll_write_message` with a manual context, following whatever the existing message-stream tests in the repo do:
-
-```bash
-grep -rn 'poll_write_message' src --include=*.rs | grep -i test | head
 ```
 
 - [ ] **Step 2: Run to verify it fails**
 
 ```bash
-cargo test --lib client_proxy_chain::tests::udp_bytes_are_credited_to_the_final_hop
+cargo test --features control-stats --lib client_proxy_chain::tests::udp_payload_is_credited_to_the_final_hop_without_a_connection_slot
 ```
 
 Expected: FAIL — `upload_bytes` is 0.
 
-- [ ] **Step 3: Wrap both branches**
+- [ ] **Step 3: Wrap the `udp_uses_initial_hop` branch**
 
-Add `initial_hop_counters` and `subsequent_hop_counters` to the `StreamChain` destructuring pattern in `connect_udp_bidirectional`.
-
-In the `udp_uses_initial_hop` branch, `pool_idx` already indexes `initial_hop`, so the counters are `initial_hop_counters[pool_idx].clone()`. Wrap whatever the two `match entry` arms return:
+Add `initial_hop_counters` and `subsequent_hop_counters` to the destructuring pattern at the top of `connect_udp_bidirectional` (each under `#[cfg(feature = "control-stats")]`). In the `if *udp_uses_initial_hop` branch, `pool_idx` indexes `initial_hop`. Bind the branch's `match entry { .. }` to a value and wrap it:
 
 ```rust
-                    let counters = initial_hop_counters[pool_idx].clone();
                     let stream = match entry {
-                        // ... unchanged arms, each yielding Box<dyn AsyncMessageStream>
-                    }?;
-                    Ok(Box::new(OutboundCountingMessageStream::new(stream, counters)))
+                        InitialHopEntry::Direct(socket) => {
+                            debug!("Chain UDP: Direct connection (native UDP)");
+                            socket.connect_udp_bidirectional(resolver, target).await?
+                        }
+                        InitialHopEntry::Proxy { socket, proxy } => {
+                            debug!(
+                                "Chain UDP: Proxy {} (UDP, no subsequent)",
+                                proxy.proxy_location()
+                            );
+                            let proxy_loc = proxy.proxy_location().into();
+                            let stream = socket.connect(resolver, &proxy_loc).await?;
+                            proxy.setup_udp_bidirectional(stream, target).await?
+                        }
+                    };
+
+                    #[cfg(feature = "control-stats")]
+                    let stream: Box<dyn AsyncMessageStream> = Box::new(
+                        crate::outbound_counting_stream::OutboundCountingMessageStream::new(
+                            stream,
+                            initial_hop_counters[pool_idx].clone(),
+                        ),
+                    );
+
+                    Ok(stream)
 ```
 
-In the multi-hop branch, `pool_idx` indexes the final hop pool, so the counters are `subsequent_hop_counters.last().expect("non-empty")[pool_idx].clone()`. Wrap the value the branch returns in the same way.
+- [ ] **Step 4: Wrap the multi-hop branch**
 
-- [ ] **Step 4: Run to verify it passes**
+There, `pool_idx` indexes the final hop pool. Replace the branch's tail `final_proxy.setup_udp_bidirectional(stream, target).await`:
+
+```rust
+                    let stream = final_proxy.setup_udp_bidirectional(stream, target).await?;
+
+                    #[cfg(feature = "control-stats")]
+                    let stream: Box<dyn AsyncMessageStream> = Box::new(
+                        crate::outbound_counting_stream::OutboundCountingMessageStream::new(
+                            stream,
+                            subsequent_hop_counters
+                                .last()
+                                .expect("multi-hop branch has a final pool")[pool_idx]
+                                .clone(),
+                        ),
+                    );
+
+                    Ok(stream)
+```
+
+- [ ] **Step 5: Wrap the Terminal arm**
+
+```rust
+            ClientProxyChainKind::Terminal {
+                connectors,
+                next_index,
+                #[cfg(feature = "control-stats")]
+                connector_counters,
+            } => {
+                let (connector, idx) = select_terminal(connectors, next_index);
+                debug!("Terminal UDP connect -> {}", target.location());
+                let stream = connector.connect_udp_bidirectional(resolver, target).await?;
+
+                #[cfg(feature = "control-stats")]
+                let stream: Box<dyn AsyncMessageStream> = Box::new(
+                    crate::outbound_counting_stream::OutboundCountingMessageStream::new(
+                        stream,
+                        connector_counters[idx].clone(),
+                    ),
+                );
+                #[cfg(not(feature = "control-stats"))]
+                let _ = idx;
+
+                Ok(stream)
+            }
+```
+
+- [ ] **Step 6: Run to verify it passes, both ways**
 
 ```bash
+cargo test --features control-stats --lib client_proxy_chain
 cargo test --lib client_proxy_chain
 ```
 
-Expected: all pass.
-
-- [ ] **Step 5: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
 git add src/client_proxy_chain.rs
@@ -1793,23 +2375,25 @@ git commit -m "chain: count UDP payload against the final hop"
 
 ---
 
-### Task 9: Expose the figures, and document the field
+### Task 10: Expose the figures, and document the field
 
 **Files:**
-- Modify: `src/control/stats.rs:1-40`, `CONFIG.md:456-460`, `CONFIG.md:1014`, `CHANGELOG.md:3`
-- Test: in `src/control/stats.rs`
+- Modify: `src/control/stats.rs:1-40`, `CONFIG.md:~456` and `~1014`, `CHANGELOG.md:3`
+- Test: the existing test module in `src/control/stats.rs`
 
 **Interfaces:**
 - Consumes: `crate::outbound_stats::{OutboundStats, snapshot_all}` (Task 2)
 - Produces: `StatsSnapshot::outbounds: Vec<OutboundStats>`
 
+`src/control/stats.rs` is compiled only with `control-stats` (`src/control/mod.rs:19`), so nothing here needs its own `cfg`.
+
 - [ ] **Step 1: Write the failing test**
 
-Append to the test module in `src/control/stats.rs`:
+Append inside the existing `mod tests`:
 
 ```rust
     #[test]
-    fn the_snapshot_carries_every_registered_outbound() {
+    fn the_snapshot_carries_every_installed_outbound() {
         let _registry = crate::outbound_stats::REGISTRY_TEST_LOCK.lock().unwrap();
         crate::outbound_stats::reset_for_test();
 
@@ -1828,26 +2412,27 @@ Append to the test module in `src/control/stats.rs`:
 - [ ] **Step 2: Run to verify it fails**
 
 ```bash
-cargo test --lib control::stats
+cargo test --features control-stats --lib control::stats
 ```
 
 Expected: compile error — `no field 'outbounds' on type 'StatsSnapshot'`.
 
 - [ ] **Step 3: Extend the snapshot**
 
-`StatsSnapshot` currently derives `Copy`, which a `Vec` forbids. Change the derive to `#[derive(Debug, Clone, PartialEq, Eq)]` and add the field:
+`StatsSnapshot` derives `Copy` (`:12`), which a `Vec` forbids. Change the derive to `#[derive(Debug, Clone, PartialEq, Eq)]` and add:
 
 ```rust
-    /// One entry per configured outbound, sorted by name. Populated at config
-    /// load, so a host lists every server at zero before any traffic flows.
-    pub outbounds: Vec<OutboundStats>,
+    /// One entry per configured outbound, sorted by name. Installed when the
+    /// service starts, so a host lists every server at zero before any
+    /// traffic flows.
+    pub outbounds: Vec<crate::outbound_stats::OutboundStats>,
 ```
 
-In `snapshot()`, add `outbounds: crate::outbound_stats::snapshot_all(),` to the constructed value.
+In `snapshot()`, add `outbounds: crate::outbound_stats::snapshot_all(),`.
 
-- [ ] **Step 4: Replace the module header comment**
+- [ ] **Step 4: Replace the module header**
 
-The header of `src/control/stats.rs` currently explains why per-outbound figures are impossible. That is no longer true. Replace it with:
+The current header explains why per-outbound figures are impossible. Replace lines 1-9 with:
 
 ```rust
 //! Counters a host displays.
@@ -1855,7 +2440,7 @@ The header of `src/control/stats.rs` currently explains why per-outbound figures
 //! Two layers. `upload_bytes` and `download_bytes` are process-wide totals
 //! measured at the TUN edge (`crate::tun::traffic`), so in server mode, where
 //! nothing increments them, they stay at zero. `outbounds` is measured at the
-//! outbound instead (`crate::outbound_stats`), and is populated in every mode.
+//! outbound instead (`crate::outbound_stats`) and is populated in every mode.
 //!
 //! The two will not agree to the byte: the TUN-edge counter also sees the
 //! sniffed prefix and anything a connection wrote before it failed. The
@@ -1868,36 +2453,38 @@ The header of `src/control/stats.rs` currently explains why per-outbound figures
 - [ ] **Step 5: Run the test and the whole suite**
 
 ```bash
-cargo test --lib control::stats
-cargo test --lib
+cargo test --features control-stats --lib control::stats
+cargo test --features control-stats --lib
 ```
 
-Expected: all pass. If anything failed to build because it copied a `StatsSnapshot`, add `.clone()` at that site — the type is no longer `Copy`.
+If anything fails to build because it copied a `StatsSnapshot`, add `.clone()` at that site — the type is no longer `Copy`.
 
 - [ ] **Step 6: Document the field**
 
-In `CONFIG.md`, in the `## Client Config` block at line ~456, add as the first line of the YAML sample:
+In `CONFIG.md`, in the `## Client Config` YAML block (~line 456), add as the first line:
 
 ```yaml
 name: string                   # Optional; identifies this outbound in stats
 ```
 
-And under `### Client Proxy Group` at line ~1014, give the two sample proxies names so the shape is visible in context.
+Under `### Client Proxy Group` (~line 1014), give the two sample proxies `name: proxy-1` and `name: proxy-2` so the shape is visible in context.
 
-Add to `CHANGELOG.md` immediately under `## Unreleased`:
+In `CHANGELOG.md`, immediately under `## Unreleased`:
 
 ```markdown
 ### Named outbounds
 
-An outbound can carry a `name`, and `control::stats::snapshot()` reports
-upload, download and active-connection counts against it. An outbound without
-a name is keyed by its address, so existing configs get the same figures under
-a less friendly label; a `direct` outbound is keyed `direct`, since its address
-is unspecified and would otherwise collide with every other direct outbound.
+An outbound can carry a `name`, and with the `control-stats` feature
+`control::stats::snapshot()` reports upload, download and active-connection
+counts against it. An outbound without a name is keyed by its address, so
+existing configs get the same figures under a less friendly label; a `direct`
+outbound is keyed `direct`, since its address is unspecified and would
+otherwise collide with every other direct outbound.
 
 Bytes are credited to the **exit** hop of a chain rather than to the relay the
 socket actually opens, because the exit is the server a person means. Two
-outbounds sharing a name but not an address are rejected at config load.
+outbounds sharing a name but not an address are rejected at config load, on
+every build.
 ```
 
 - [ ] **Step 7: Commit**
@@ -1911,19 +2498,19 @@ git commit -m "stats: report bytes per named outbound"
 
 ## Final verification
 
-- [ ] **Full suite**
+- [ ] **Full suite, both ways**
 
 ```bash
 export PATH="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH"
-cargo test --all-targets 2>&1 | tail -20
+cargo test --all-targets 2>&1 | tail -5
+cargo test --features control-stats --all-targets 2>&1 | tail -5
 ```
 
-Expected: no failures.
-
-- [ ] **Lint gate** — the repo's gate is `-D warnings` with `--tests`
+- [ ] **Lint gate, both ways** — the repo's gate is `-D warnings` with `--tests`
 
 ```bash
 cargo clippy --all-targets -- -D warnings
+cargo clippy --features control-stats --all-targets -- -D warnings
 ```
 
 - [ ] **Formatting**
@@ -1932,16 +2519,16 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
-- [ ] **Every example still loads** — this is the real regression net for a config schema change
+- [ ] **Every example still loads**
 
 ```bash
 cargo test --lib config::types::groups::tests::test_example_files_load_and_validate
 ```
 
-- [ ] **Windows still builds**, since `outbound_stats` must not depend on the `cfg(unix)`-only TUN module
+- [ ] **Windows still builds** — `outbound_stats` must not depend on the `cfg(unix)`-only TUN module
 
 ```bash
-cargo check --target x86_64-pc-windows-msvc 2>&1 | tail -5
+cargo check --target x86_64-pc-windows-msvc --features control-stats 2>&1 | tail -3
 ```
 
-If the target is not installed, skip this and note it in the PR — CI covers it.
+If the target is not installed, skip and note it in the PR — CI covers it.

@@ -38,6 +38,9 @@ and active-connection counts in `control::stats::snapshot()`.** Nothing else.
 | Where counting happens today | `src/tun/mod.rs:326`, `src/tun/udp_manager.rs:497`, `:530` |
 | The stats surface being extended | `src/control/stats.rs` |
 | Unspecified address for `direct` | `src/config/types/common.rs:36`, `src/address.rs:115` |
+| Where a service actually starts | `src/control/mod.rs:318`, `src/main.rs:404` |
+| Validation-only callers of the same function | `src/main.rs:394` (`--dry-run`), the config editor |
+| The RSS policy and its gate | `Cargo.toml:27-37`, `src/tun/traffic.rs:22-28` |
 
 ## What is actually true today
 
@@ -79,6 +82,8 @@ direct chain, so nearly every config contains one.
 | What identifies an unnamed one? | Its address, rendered as a string |
 | Which hop do a chain's bytes count against? | The exit hop |
 | Where is the counting done? | Inside the chain, against a global name-keyed registry |
+| When is the registry populated? | At service start, from a set validation computed |
+| Is any of it feature-gated? | The runtime state, behind `control-stats`; the config rules are not |
 
 The unit is the individual `ClientConfig` because that is what the waiting
 consumers are shaped like: one share link is one endpoint, `urltest` probes one
@@ -166,12 +171,27 @@ struct OutboundCounters {
 }
 ```
 
-Populated during validation from every outbound the config mentions — group
-members and hops written inline in a `client_chains` entry alike, since inline
-is the more common form and a server missing from the list is exactly the bug
-this is meant to fix. A GUI therefore lists every configured server at zero
-before any of them has carried a byte — an empty list on a fresh connection
-would read as "no servers", which is wrong.
+**Computed during validation, installed at start.** Validation builds an
+`OutboundSet` — every key with its address, conflict-checked — from every
+outbound the config mentions: group members and hops written inline in a
+`client_chains` entry alike, since inline is the more common form and a server
+missing from the list is exactly the bug this is meant to fix. The set travels
+out in `ValidatedConfigs`.
+
+Validation must not touch the global registry, because `create_server_configs`
+is not only the start path. `--dry-run` (`src/main.rs:394`) calls it and exits,
+and the config editor will call it on a draft; if it reset the registry, then
+validating a draft would wipe the live list of the service running in the same
+process. So validation is pure, and `outbound_stats::install(&set)` replaces
+the registry contents at the two places a service actually starts:
+`prepare_from_config` (`src/control/mod.rs:318`) and the binary's start path
+(`src/main.rs:404`). A reload goes through the same call, so it replaces the
+list rather than accumulating servers from the config it just discarded —
+stale entries would also produce false address conflicts.
+
+A GUI therefore lists every configured server at zero before any of them has
+carried a byte — an empty list on a fresh connection would read as "no
+servers", which is wrong.
 
 Process-global rather than owned by the service, for the reason `traffic.rs`
 already states: "process-global rather than per-service, which is an invariant
@@ -181,6 +201,27 @@ inventing one here would be a larger change than the feature.
 
 Registration is idempotent — a repeated key returns the existing handle, which
 is what makes cloned group members share a counter.
+
+## Feature gate
+
+`Cargo.toml` states a policy and `src/tun/traffic.rs` applies it: code costs
+download size and almost no RSS, while "a log ring and a counter table cost
+RSS", so runtime state lives behind `control-stats`. `ACTIVE_CONNECTIONS` is
+gated that way, measured at 720 bytes, and `crate::control::stats` itself is
+compiled only with the feature.
+
+This is a counter table. It follows the policy:
+
+- **Unconditional:** the `name` field, `stats_key`, the `OutboundSet` that
+  validation builds, and the conflict check. These are config rules; a config
+  that is wrong is wrong on every build.
+- **Behind `control-stats`:** `OutboundCounters`, the registry, both counting
+  adapters, the counter handles the chain carries, and the wrapping in
+  `connect_tcp` / `connect_udp_bidirectional`. With the feature off, the chain
+  returns the stream untouched and nothing about a connection changes.
+
+`desktop = ["control-logs", "control-stats"]`, so every consumer this is being
+built for gets it. Tests of the gated half run with `--features control-stats`.
 
 ## Counting
 
@@ -238,12 +279,17 @@ replaced by a description of what the module now does.
 
 ## Testing
 
+Tests of the registry, the adapters and the chain run with
+`--features control-stats`; the config-level tests need no feature.
+
 **Config level.** A `name` round-trips through load and serialize. An absent
 name falls back to the address. A direct outbound keys to `direct` rather than
 to `0.0.0.0:0`, and two direct outbounds in one config do not conflict. An
 empty name is rejected. Two different addresses under one name are rejected,
 and the message names both addresses. A config whose group is referenced from
-three places yields one registry entry, not three.
+three places yields one entry in the set, not three. Validating a config does
+not change what the registry reports — the dry-run and editor property — and
+installing a second set replaces the first.
 
 **Counting level.** A two-hop chain credits the exit hop and leaves the relay
 at zero. A pool credits the member actually selected, verified by driving
