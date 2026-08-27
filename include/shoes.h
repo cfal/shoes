@@ -161,11 +161,19 @@ char *shoes_get_last_error(void);
  * Read the runtime counters as a JSON document.
  *
  * Returns a null-terminated UTF-8 string the caller must free with
- * `shoes_free_string()`, or NULL if this library was built without the
- * `control-stats` feature. It is never NULL for any other reason: before
- * `shoes_start` every number is zero and `outbounds` is empty; after
- * `shoes_stop` it holds the final figures of the session that just ended,
- * and the next `shoes_start` resets them.
+ * `shoes_free_string()`, or NULL if no document could be produced.
+ *
+ * NULL is not a statement about the service. A library built without the
+ * `control-stats` feature returns NULL always; otherwise NULL means only
+ * that the string could not be built, which is not expected to be reachable
+ * here but is not worth an abort. **Do not latch the first NULL as "this
+ * build has no stats"** -- the Android side of this API shares the contract
+ * and can fail that way under JVM memory pressure. Poll again.
+ *
+ * A non-NULL document is always well formed. Before `shoes_start` every
+ * number is zero and `outbounds` is empty; after `shoes_stop` it holds the
+ * final figures of the session that just ended, and the next `shoes_start`
+ * resets them.
  *
  * Safe to call from any thread, and safe when nothing is running. It does no
  * I/O -- it takes a short read lock on the outbound registry and allocates

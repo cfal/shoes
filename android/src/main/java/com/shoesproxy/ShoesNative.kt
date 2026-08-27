@@ -211,11 +211,16 @@ object ShoesNative {
     /**
      * Read the runtime counters as a JSON string.
      *
-     * Returns null only if the native library was built without stats
-     * support. Otherwise it is always a document: before [start] every number
-     * is zero and `outbounds` is empty, and after [stop] it holds the final
-     * figures of the session that just ended until the next [start] resets
-     * them. Safe from any thread.
+     * Returns null when no document could be produced. A library built
+     * without stats support returns null always; otherwise null means the
+     * JVM could not allocate the string, which can happen under memory
+     * pressure. The two are not distinguishable, so **do not latch the first
+     * null and stop polling** — a transient failure would disable your stats
+     * UI for the rest of the session.
+     *
+     * A non-null document has every number zero before [start], and after
+     * [stop] it holds the final figures of the session that just ended until
+     * the next [start] resets them. Safe from any thread.
      *
      * The document looks like
      * `{"upload_bytes":0,"download_bytes":0,"active_connections":0,"outbounds":[...]}`.

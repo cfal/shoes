@@ -131,6 +131,15 @@ jobs:
             exit 1
           fi
 
+      # Last, so nothing can disturb the dylib the check above reads. A check
+      # rather than a build: this exists only to compile the
+      # not(control-stats) arms of src/ffi/ios.rs, which return NULL and which
+      # nothing else in CI sees -- test.yml runs on ubuntu, where the module
+      # is cfg'd out entirely. It guards the promise that a build without the
+      # feature still compiles and keeps the same symbols.
+      - name: Check the FFI surface with stats off
+        run: cargo check --locked --release --lib --features ffi --target aarch64-apple-darwin
+
   # ──────────────────────────────────────────────────────────────────────────
   # Android — AAR with JNI .so for arm64-v8a, armeabi-v7a, x86_64 (emulator)
   # ──────────────────────────────────────────────────────────────────────────

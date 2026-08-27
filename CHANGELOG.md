@@ -13,7 +13,9 @@ there is no new ownership rule to learn. The traffic callback and every
 existing symbol are unchanged.
 
 The symbol exists in every build and only its body is behind `control-stats`;
-without the feature it returns NULL. That keeps `include/shoes.h` identical
+without the feature it returns NULL. NULL also covers a string that could not
+be allocated, so a host should poll rather than read the first NULL as a
+permanent verdict on the build. That keeps `include/shoes.h` identical
 whatever features generated it, which is the property a host relies on when it
 diffs the header to decide whether a version bump is a drop-in.
 

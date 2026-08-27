@@ -68,13 +68,18 @@ bash scripts/build-android.sh
 # macOS + Xcode only. Regenerates include/shoes.h via cbindgen if installed.
 bash scripts/build-ios.sh
 
-# Native libs only, skipping Gradle
+# Native libs only, skipping Gradle. --features control-stats because that is
+# what the scripts above build and what the size baseline is recorded against:
+# without it getStats() returns null and the arm64 .so is ~24 KB smaller, so a
+# size regression measured this way reads as under the ceiling.
 cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 -P 21 \
-    -o android/src/main/jniLibs -- build --profile release-mobile --lib
+    -o android/src/main/jniLibs -- build --profile release-mobile --lib \
+    --features control-stats
 
 # iOS device slice by hand — the deployment target is not optional
 IPHONEOS_DEPLOYMENT_TARGET=16.0 \
-    cargo build --profile release-mobile --target aarch64-apple-ios
+    cargo build --profile release-mobile --features control-stats \
+    --target aarch64-apple-ios
 
 # Tests run on the host. `src/ffi/common.rs` compiles under
 # cfg(test) already, so plain `cargo test` covers it. The `ffi` feature is what
@@ -113,7 +118,7 @@ Android — 10 symbols, all `Java_com_shoesproxy_ShoesNative_*`, mirrored by
 | `stop(handle: Long)` | `android.rs:317` | — |
 | `isRunning()` | `android.rs:332` | boolean |
 | `getLastError()` | `android.rs:348` | string or null |
-| `getStats()` | `android.rs` | JSON string, or null without `control-stats` |
+| `getStats()` | `android.rs` | JSON string, or null (see below) |
 
 iOS — 11 symbols, declared in `include/shoes.h`:
 
@@ -127,7 +132,7 @@ int   shoes_set_log_file(const char *path);
 int   shoes_set_log_level(const char *log_level);
 int   shoes_network_changed(void);
 char *shoes_get_last_error(void);   // caller frees
-char *shoes_get_stats(void);        // caller frees; NULL without control-stats
+char *shoes_get_stats(void);        // caller frees; NULL, see below
 void  shoes_free_string(char *ptr);
 ```
 
@@ -136,7 +141,11 @@ them back to `shoes_free_string` or they leak.
 
 `shoes_get_stats` is the one symbol whose behaviour depends on a feature: its
 body is compiled only with `control-stats`, and without it the function still
-exists and returns NULL. That is deliberate -- the header must not vary with
+exists and returns NULL. NULL is not only that, though — it also covers a
+string that could not be allocated, which on Android is reachable under JVM
+memory pressure. The two cases are not distinguishable, so a host must poll
+rather than latch the first NULL as "this build has no stats"; both platforms'
+headers say so. That is deliberate -- the header must not vary with
 the features it was generated with, because a downstream client diffs
 `include/` to decide whether a version bump is a drop-in. Both published
 artifacts are built with the feature on.

@@ -415,8 +415,14 @@ pub extern "system" fn Java_com_shoesproxy_ShoesNative_getLastError<'local>(
 
 /// Read the runtime counters as a JSON string.
 ///
-/// Null only if the library was built without `control-stats`; otherwise
-/// always a document, with every number zero before `start`. The shape and
+/// Null if no document could be produced: always, if the library was built
+/// without `control-stats`; otherwise if the JVM could not allocate the
+/// string, which the OOM arm below can genuinely reach. A caller must not
+/// treat the first null as "this build has no stats" and stop asking -- the
+/// two cases are not distinguishable here, so the transient one has to be
+/// survivable. Poll again.
+///
+/// A non-null document has every number zero before `start`. The shape and
 /// the meaning of each field are documented on `shoes_get_stats` in
 /// `include/shoes.h`, which is the one description both platforms share.
 ///

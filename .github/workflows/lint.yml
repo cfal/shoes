@@ -105,7 +105,15 @@ jobs:
       # On a host build src/ffi/android.rs is cfg'd out, so the re-exports in
       # src/tun/mod.rs read as dead code -- clippy --fix acted on exactly that
       # and would have broken this build. Here the consumers compile.
+      # Both feature configurations. The published artifact builds with
+      # control-stats, but the stub arms in src/ffi/android.rs -- the ones
+      # that return null when the feature is off -- are compiled by nothing
+      # else in CI: test.yml runs on ubuntu, where the JNI module is cfg'd
+      # out entirely. Linting only the featured build is how they would rot.
       - name: Run clippy for Android
+        run: cargo ndk -t arm64-v8a -- clippy --locked --lib -- -D warnings
+
+      - name: Run clippy for Android with the stats surface enabled
         run: cargo ndk -t arm64-v8a -- clippy --locked --lib --features control-stats -- -D warnings
 
   audit:
