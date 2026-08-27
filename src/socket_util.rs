@@ -111,6 +111,15 @@ pub fn new_socket2_udp_socket_with_buffer_size(
     let domain = if is_ipv6 { Domain::IPV6 } else { Domain::IPV4 };
     let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
 
+    // Dual-stack, explicitly. The callers that ask for an IPv6 socket send to
+    // IPv4-mapped addresses (`dual_stack_dest`), which worked only because
+    // Linux defaults IPV6_V6ONLY to off; Windows defaults it to on, and every
+    // mapped send then fails as unreachable — hysteria2's and TUIC's UDP
+    // relays lose all their IPv4 traffic.
+    if is_ipv6 {
+        socket.set_only_v6(false)?;
+    }
+
     socket.set_nonblocking(true)?;
 
     // Set socket buffer sizes if specified.
@@ -129,9 +138,11 @@ pub fn new_socket2_udp_socket_with_buffer_size(
         panic!("Cannot support reuse sockets");
     }
 
-    if let Some(ref interface) = bind_interface {
+    // Underscore-prefixed like `_b` below: consumed only on the platforms
+    // that can bind a socket to a device.
+    if let Some(ref _interface) = bind_interface {
         #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
-        socket.bind_device(Some(interface.as_bytes()))?;
+        socket.bind_device(Some(_interface.as_bytes()))?;
 
         // This should be handled during config validation.
         #[cfg(not(any(target_os = "android", target_os = "fuchsia", target_os = "linux")))]
@@ -231,9 +242,11 @@ pub fn new_tcp_listener(
     socket.set_nonblocking(true)?;
     socket.set_reuse_address(true)?;
 
-    if let Some(ref interface) = bind_interface {
+    // Underscore-prefixed like `_b` below: consumed only on the platforms
+    // that can bind a socket to a device.
+    if let Some(ref _interface) = bind_interface {
         #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
-        socket.bind_device(Some(interface.as_bytes()))?;
+        socket.bind_device(Some(_interface.as_bytes()))?;
 
         // This should be handled during config validation.
         #[cfg(not(any(target_os = "android", target_os = "fuchsia", target_os = "linux")))]
@@ -363,7 +376,9 @@ mod protection_tests {
         let recorder = install(Recorder::new());
 
         let socket = new_tcp_socket(None, false).unwrap();
-        let fd = socket.as_raw_fd();
+        // raw_fd(), not as_raw_fd(): the compat trait is what makes this test
+        // meaningful on Windows, where the value is the raw socket instead.
+        let fd = socket.raw_fd();
 
         assert!(
             recorder.saw(fd),
@@ -379,7 +394,7 @@ mod protection_tests {
         let recorder = install(Recorder::new());
 
         let socket = new_udp_socket(false, None).unwrap();
-        let fd = socket.as_raw_fd();
+        let fd = socket.raw_fd();
 
         assert!(
             recorder.saw(fd),

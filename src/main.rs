@@ -60,7 +60,7 @@ mod tls_client_handler;
 mod tls_server_handler;
 mod trojan_handler;
 mod tuic;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 mod tun;
 mod udp_message_stream;
 mod uot;

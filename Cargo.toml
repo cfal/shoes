@@ -105,7 +105,11 @@ rustls = "*"
 serde = { version = "*", features = ["derive", "std"] }
 serde_yaml = "*"
 shake = "*"
-smoltcp = { version = "*", default-features = false, features = ["std", "log", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-icmp", "socket-udp", "socket-tcp", "socket-tcp-cubic", "phy-tuntap_interface", "assembler-max-segment-count-32"] }
+# auto-icmp-echo-reply: without it smoltcp silently ignores echo requests
+# (src/iface/interface/ipv4.rs gates the reply arm on it), so `icmp_enabled`
+# promised ping support the stack never delivered — found by pinging through
+# the Windows TUN and confirmed to be platform-independent.
+smoltcp = { version = "*", default-features = false, features = ["std", "log", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-icmp", "socket-udp", "socket-tcp", "socket-tcp-cubic", "phy-tuntap_interface", "assembler-max-segment-count-32", "auto-icmp-echo-reply"] }
 socket2 = "*"
 subtle = "*"
 tokio = { version = "*", features = [
@@ -118,7 +122,6 @@ tokio = { version = "*", features = [
     "time",
 ] }
 tokio-util = { version = "*", features = ["time"] }
-tun = { version = "*", features = ["async"] }
 url = "*"
 webpki-roots = { version = "*" }
 x509-parser = { version = "*", default-features = false, features = ["verify-aws"] }
@@ -128,6 +131,25 @@ rcgen = { version = "*", default-features = false, features = ["aws_lc_rs", "pem
 serde_json = "*"
 tempfile = "*"
 tokio-rustls = "*"
+
+# Unix only: on Windows the TUN backend drives wintun directly
+# (src/tun/wintun_device.rs), and the tun crate's Windows half — wintun
+# behind a blocking Read on an internal thread — is exactly the
+# double-buffered shape that backend exists to avoid.
+[target.'cfg(unix)'.dependencies]
+tun = { version = "*", features = ["async"] }
+
+[target.'cfg(windows)'.dependencies]
+# verify_binary_signature: wintun.dll is resolved by the loader's search
+# order and this process runs elevated, so an unsigned DLL on that path
+# would be a privilege escalation. Refuse it rather than load it.
+wintun-bindings = { version = "0.7", features = ["verify_binary_signature"] }
+# Only for WaitForMultipleObjects and its constants in the stack thread's
+# wait; everything else Windows-shaped goes through wintun-bindings.
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+] }
 
 # jemalloc for better memory performance (not supported on Windows MSVC, iOS, or Android)
 [target.'cfg(not(any(target_env = "msvc", target_os = "ios", target_os = "android")))'.dependencies]

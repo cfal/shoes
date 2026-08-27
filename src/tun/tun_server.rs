@@ -36,7 +36,9 @@
 
 use std::net::IpAddr;
 
+#[cfg(unix)]
 use log::info;
+#[cfg(unix)]
 use tun::{Configuration as TunConfiguration, Device};
 
 /// Configuration for the TUN server.
@@ -243,7 +245,10 @@ impl TunServerConfig {
     /// Create a synchronous TUN device from this configuration.
     ///
     /// This is used by the direct mode stack which reads/writes directly
-    /// from the TUN fd using select() for event-driven I/O.
+    /// from the TUN fd using select() for event-driven I/O. Unix only: the
+    /// Windows backend creates a wintun adapter in `wintun_device.rs`
+    /// instead, which has no descriptor to hand back.
+    #[cfg(unix)]
     pub fn create_sync_device(&self) -> std::io::Result<Device> {
         let mut config = TunConfiguration::default();
         config.mtu(self.mtu);
@@ -293,17 +298,8 @@ impl TunServerConfig {
 
         if let Some(fd) = self.raw_fd {
             info!("Creating TUN device from raw FD: {}", fd);
-            #[cfg(unix)]
-            {
-                config.raw_fd(fd);
-                config.close_fd_on_drop(self.close_fd_on_drop);
-            }
-            #[cfg(not(unix))]
-            {
-                return Err(std::io::Error::other(
-                    "raw_fd is only supported on Unix platforms",
-                ));
-            }
+            config.raw_fd(fd);
+            config.close_fd_on_drop(self.close_fd_on_drop);
         }
 
         tun::create(&config)

@@ -28,16 +28,17 @@ pub struct StatsSnapshot {
 
 /// Read the counters.
 pub fn snapshot() -> StatsSnapshot {
-    // The byte counters live behind cfg(unix) with the TUN module. On Windows
-    // there is no tunnel to count yet, and a host still wants a snapshot.
-    #[cfg(unix)]
+    // The byte counters live with the TUN module, which exists on Unix and
+    // Windows. On anything else there is no tunnel to count, and a host
+    // still wants a snapshot.
+    #[cfg(any(unix, windows))]
     let (upload_bytes, download_bytes) = crate::tun::traffic::get_traffic_counters();
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     let (upload_bytes, download_bytes) = (0, 0);
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     let active_connections = crate::tun::traffic::active_connections();
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     let active_connections = 0;
 
     StatsSnapshot {
@@ -114,11 +115,11 @@ fn write_json_string(out: &mut String, s: &str) {
     out.push('"');
 }
 
-// cfg(unix) as well as cfg(test): these drive the counter through
-// tun::traffic, and the tun module does not exist on Windows. The
-// cfg(not(unix)) arms of `snapshot` are covered by the Windows CI job
-// compiling this module, not by these.
-#[cfg(all(test, unix))]
+// any(unix, windows) as well as cfg(test): these drive the counter through
+// tun::traffic, and the tun module exists exactly there. The remaining
+// cfg(not(any(unix, windows))) arms of `snapshot` are covered by nothing
+// that runs, only by review.
+#[cfg(all(test, any(unix, windows)))]
 mod tests {
     use super::*;
     use crate::tun::traffic::{

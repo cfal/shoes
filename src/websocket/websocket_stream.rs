@@ -834,13 +834,13 @@ fn mask_in_place(buf: &mut [u8], mask: [u8; 4], offset: usize) {
     let word = u64::from_ne_bytes([
         rot[0], rot[1], rot[2], rot[3], rot[0], rot[1], rot[2], rot[3],
     ]);
-    let mut chunks = buf.chunks_exact_mut(8);
-    for chunk in &mut chunks {
-        let masked = u64::from_ne_bytes(chunk.try_into().unwrap()) ^ word;
-        chunk.copy_from_slice(&masked.to_ne_bytes());
+    let (words, remainder) = buf.as_chunks_mut::<8>();
+    for chunk in words {
+        let masked = u64::from_ne_bytes(*chunk) ^ word;
+        *chunk = masked.to_ne_bytes();
     }
     // The remainder starts at a multiple of 8 (hence of 4), so it realigns to rot[0].
-    for (i, byte) in chunks.into_remainder().iter_mut().enumerate() {
+    for (i, byte) in remainder.iter_mut().enumerate() {
         *byte ^= rot[i & 3];
     }
 }

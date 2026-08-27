@@ -128,7 +128,7 @@ pub mod logging;
 pub mod control;
 
 /// TUN device support for VPN mode.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub mod tun;
 
 /// FFI bindings for mobile platforms.

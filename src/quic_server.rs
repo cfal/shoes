@@ -43,12 +43,34 @@ async fn start_quic_server(
     //     .keep_alive_interval(Some(Duration::from_secs(15)))
     //     .max_idle_timeout(Some(Duration::from_secs(30).try_into().unwrap()));
 
+    // As in quic_transport::start_quic_listeners: several endpoints on one
+    // address need SO_REUSEPORT, which Windows does not have. Said out loud,
+    // so a user who configured more is not left guessing why their listener
+    // count differs from a Linux deployment.
+    let num_endpoints = if cfg!(windows) {
+        if num_endpoints > 1 {
+            log::info!(
+                "QUIC listener on {}: num_endpoints {} reduced to 1 (no SO_REUSEPORT on Windows)",
+                bind_address,
+                num_endpoints
+            );
+        }
+        1
+    } else {
+        num_endpoints
+    };
+
     let mut join_handles = vec![];
     for _ in 0..num_endpoints {
         let server_config = quinn::ServerConfig::with_crypto(quic_server_config.clone());
 
-        let socket2_socket =
-            new_socket2_udp_socket(bind_address.is_ipv6(), None, Some(bind_address), true).unwrap();
+        let socket2_socket = new_socket2_udp_socket(
+            bind_address.is_ipv6(),
+            None,
+            Some(bind_address),
+            cfg!(not(windows)),
+        )
+        .unwrap();
 
         let endpoint = quinn::Endpoint::new(
             EndpointConfig::default(),

@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+// Only the unix-socket server takes a filesystem path.
+#[cfg(unix)]
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,7 +25,7 @@ use crate::sniff::SniffSettings;
 use crate::socket_util::{new_tcp_listener, set_tcp_keepalive};
 use crate::tcp::tcp_forward::{ForwardRequest, forward_tcp};
 use crate::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use crate::tun::start_tun_server;
 
 async fn run_tcp_server(
@@ -277,11 +279,11 @@ pub async fn start_servers(
     resolver: Arc<dyn Resolver>,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
     match config {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         Config::TunServer(tun_config) => start_tun_server(tun_config, resolver)
             .await
             .map(|t| vec![t]),
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         Config::TunServer(_) => Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "TUN server is not supported on this platform",
@@ -397,7 +399,9 @@ async fn start_tcp_servers(
                 }
             }
         }
-        BindLocation::Path(path_buf) => {
+        // Underscore-prefixed for the same reason as `_b` in socket_util:
+        // consumed only by the unix arm.
+        BindLocation::Path(_path_buf) => {
             #[cfg(target_family = "unix")]
             {
                 let tcp_handler: Arc<dyn TcpServerHandler> =
@@ -405,7 +409,7 @@ async fn start_tcp_servers(
                         .into();
                 debug!("TCP handler: {tcp_handler:?}");
                 let handle = tokio::spawn(async move {
-                    run_unix_server(path_buf, resolver, tcp_handler, sniff)
+                    run_unix_server(_path_buf, resolver, tcp_handler, sniff)
                         .await
                         .unwrap();
                 });
@@ -413,8 +417,7 @@ async fn start_tcp_servers(
             }
             #[cfg(not(target_family = "unix"))]
             {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
+                return Err(std::io::Error::other(
                     "Unix sockets are not supported on this platform",
                 ));
             }

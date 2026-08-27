@@ -59,18 +59,14 @@ jobs:
       - name: Run tests with the desktop control surface enabled
         run: cargo test --locked --features desktop
 
-  # The first Windows CI this repository has had. build.yml carries two
-  # commented-out Windows targets marked "TODO: enable when working", and
-  # nobody can tell whether that is still true without a Windows runner --
-  # cross-checking from macOS or Linux fails in aws-lc-sys and blake3 for
-  # want of an MSVC toolchain, which says nothing about the real thing.
-  #
-  # The immediate reason to have it: src/lib.rs gates the TUN module on
-  # cfg(unix), so shoes::control takes a cfg(not(unix)) branch on Windows
-  # that no other job compiles. The desktop GUI targets Windows before the
-  # tunnel does, so that branch has to build.
-  windows-check:
-    name: Check Windows build
+  # Windows went from cargo check to the full test suite when the wintun TUN
+  # backend landed: the shared smoltcp loop is exercised through a scripted
+  # device double, so the stack logic runs here with no driver and no
+  # elevation. The wintun-specific half (adapter creation, the event wait) is
+  # behind an #[ignore]d test that needs Administrator and wintun.dll, run by
+  # hand -- see docs/specs/2026-08-27-windows-tun-backend.md.
+  windows-test:
+    name: Test Windows build
     runs-on: windows-latest
     timeout-minutes: 45
 
@@ -94,12 +90,13 @@ jobs:
       - name: Add NASM to PATH
         run: echo "C:\Program Files\NASM" >> $env:GITHUB_PATH
 
-      # --features desktop, not the default: control::stats is behind
-      # control-stats, so a default check never compiles it and its
-      # cfg(not(unix)) arms -- the very lines this job exists to cover -- go
-      # unchecked.
-      #
-      # cargo check, not test: TUN is unsupported on Windows until a wintun
-      # backend lands, so there is nothing yet to run.
-      - name: Check the library
-        run: cargo check --locked --lib --features desktop
+      # --bins as well as --lib: src/main.rs declares its module tree
+      # independently (the trap AGENTS.md documents), so a Windows-only
+      # compile error confined to the binary is invisible to a lib-only run.
+      - name: Run tests
+        run: cargo test --locked --lib --bins
+
+      # Both ends of the feature matrix, as on Linux: control::stats and the
+      # scripted-loop counter test only compile with the features on.
+      - name: Run tests with the desktop control surface enabled
+        run: cargo test --locked --lib --bins --features desktop

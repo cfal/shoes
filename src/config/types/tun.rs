@@ -14,6 +14,10 @@
 //!
 //! - **iOS**: Requires a file descriptor from `NEPacketTunnelProvider.packetFlow`.
 //!   Use `packet_information: true` if using the socket FD directly.
+//!
+//! - **Windows 11**: Creates a wintun adapter named `device_name`; requires
+//!   `device_name` and an IPv4 `address`/`netmask`, refuses `device_fd` and
+//!   `destination`. Needs Administrator and `wintun.dll`.
 
 use std::net::IpAddr;
 
@@ -50,30 +54,36 @@ fn default_mtu() -> u16 {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TunConfig {
-    /// TUN device name (Linux only, e.g., "tun0").
-    /// Ignored on iOS/Android where the device is provided via device_fd.
+    /// TUN device name (e.g., "tun0"; the wintun adapter name on Windows).
+    /// Required on Windows; ignored on iOS/Android where the device is
+    /// provided via device_fd.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device_name: Option<String>,
 
     /// Raw file descriptor for the TUN device (iOS/Android).
     /// - **Android**: from `VpnService.Builder.establish()`
     /// - **iOS**: from `NEPacketTunnelProvider.packetFlow`
+    /// - **Windows**: refused; shoes creates the adapter itself
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device_fd: Option<i32>,
 
     /// TUN device IP address (e.g., "10.0.0.1").
     /// - **Linux**: Sets the device's IP address
+    /// - **Windows**: Sets the adapter's address; required, IPv4 only
     /// - **iOS/Android**: Informational only (address is set by VPN service)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub address: Option<IpAddr>,
 
     /// TUN device netmask (e.g., "255.255.255.0").
     /// - **Linux**: Sets the device's netmask
+    /// - **Windows**: Required, IPv4 only
     /// - **iOS/Android**: Informational only
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub netmask: Option<IpAddr>,
 
-    /// TUN device destination/gateway (Linux only).
+    /// TUN device point-to-point destination (Linux only; refused on
+    /// Windows, where the wintun configuration path would turn it into a
+    /// system default route).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub destination: Option<IpAddr>,
 

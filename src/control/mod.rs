@@ -40,7 +40,7 @@ pub use status::{Status, StatusSnapshot, StopReason};
 use crate::config::{Config, convert_cert_paths, create_server_configs, load_config_str};
 use crate::dns::build_dns_registry;
 use crate::tcp::tcp_server::start_servers;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use crate::tun::run_tun_from_config;
 
 /// Handle to a running service.
@@ -183,11 +183,12 @@ impl ServiceHandle {
             }
         };
 
-        // The counters live behind cfg(unix) with the TUN module. On Windows
-        // there is no tunnel to count yet, and a host still wants a snapshot.
-        #[cfg(unix)]
+        // The counters live with the TUN module, which exists on Unix and
+        // Windows. On anything else there is no tunnel to count, and a host
+        // still wants a snapshot.
+        #[cfg(any(unix, windows))]
         let (upload_bytes, download_bytes) = crate::tun::traffic::get_traffic_counters();
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         let (upload_bytes, download_bytes) = (0, 0);
 
         StatusSnapshot {
@@ -226,7 +227,7 @@ pub fn start(
     // From zero, so a second session does not report the first one's bytes
     // against a fresh uptime. Both FFI platforms already do this in their own
     // start path; a Rust host had no equivalent.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     crate::tun::traffic::reset_traffic_counters();
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -404,9 +405,9 @@ pub async fn run_prepared(
 
     // Runs until shutdown. Who closes the descriptor follows from the policy:
     // whoever created the device closes it, and nobody else.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     let result = run_tun_from_config(tun_config, shutdown_rx, policy.close_fd_on_drop()).await;
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     let result = {
         // Consumed only by the TUN branch, which this platform does not have.
         let _ = policy;
@@ -458,9 +459,13 @@ mod tests {
     /// so that cannot be run and must be said here rather than inside a task.
     #[test]
     fn test_prepare_rejects_a_tun_without_a_descriptor() {
-        let err = prepare("---\n- device_name: tun0\n  address: 10.0.0.2\n")
-            .map(|_| ())
-            .unwrap_err();
+        // netmask included so the config passes per-platform validation on
+        // Windows and the failure under test — the missing descriptor — is
+        // the one that fires.
+        let err =
+            prepare("---\n- device_name: tun0\n  address: 10.0.0.2\n  netmask: 255.255.255.0\n")
+                .map(|_| ())
+                .unwrap_err();
         assert!(
             err.to_string().contains("device_fd"),
             "expected a device_fd complaint, got: {err}"
@@ -469,9 +474,26 @@ mod tests {
 
     /// Two TUN sections have no defined meaning, and silently taking the first
     /// would route a user's traffic somewhere they did not ask for.
+    ///
+    /// The shape and policy are per-platform because each platform accepts a
+    /// different TUN shape; the duplicate-TUN complaint is the same on both.
     #[test]
     fn test_prepare_rejects_two_tun_configs() {
-        let err = prepare("---\n- device_fd: 3\n- device_fd: 4\n")
+        #[cfg(not(windows))]
+        let (yaml, policy) = (
+            "---\n- device_fd: 3\n- device_fd: 4\n",
+            DevicePolicy::BorrowedFd,
+        );
+        #[cfg(windows)]
+        let (yaml, policy) = (
+            "---\n- device_name: tun0\n  address: 10.0.0.2\n  netmask: 255.255.255.0\n\
+             - device_name: tun1\n  address: 10.0.1.2\n  netmask: 255.255.255.0\n",
+            DevicePolicy::Owned,
+        );
+
+        let _registry = crate::outbound_stats::REGISTRY_TEST_LOCK.lock().unwrap();
+        let err = current_thread_runtime()
+            .block_on(prepare_from_config(yaml, policy))
             .map(|_| ())
             .unwrap_err();
         assert!(
@@ -497,22 +519,30 @@ mod outbound_install_tests {
         let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
         reset_for_test();
 
-        // A TUN section is required, and BorrowedFd is the policy that takes
-        // a descriptor from the config. Nothing opens it here -- the device is
+        // A TUN section is required. On the fd platforms BorrowedFd takes the
+        // descriptor from the config; Windows has no descriptor and creates
+        // its own device. Nothing opens anything here -- the device is
         // touched in run_prepared, not in prepare_from_config.
-        let yaml = r#"
-- device_fd: 3
+        #[cfg(not(windows))]
+        let (tun_yaml, policy) = ("device_fd: 3", super::DevicePolicy::BorrowedFd);
+        #[cfg(windows)]
+        let (tun_yaml, policy) = (
+            "device_name: tun0\n  address: 10.0.0.2\n  netmask: 255.255.255.0",
+            super::DevicePolicy::Owned,
+        );
+        let yaml = format!(
+            r#"
+- {tun_yaml}
   rules:
     - masks: "0.0.0.0/0"
       action: allow
       client_chain:
         name: Frankfurt
         address: "fra1.example:443"
-        protocol: {type: socks}
-"#;
-        let _prepared = super::prepare_from_config(yaml, super::DevicePolicy::BorrowedFd)
-            .await
-            .unwrap();
+        protocol: {{type: socks}}
+"#
+        );
+        let _prepared = super::prepare_from_config(&yaml, policy).await.unwrap();
 
         let names: Vec<String> = snapshot_all().into_iter().map(|o| o.name).collect();
         assert!(names.contains(&"Frankfurt".to_string()), "got {names:?}");

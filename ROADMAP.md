@@ -14,6 +14,12 @@ again 2026-08-27 against `mobile` at `a84dcc6`, when runtime stats reached the
 mobile FFI: that closed the naming blocker Tier 2 item 6 was waiting on, and
 two claims here — HTTPUpgrade as pending, and per-connection statistics as
 having nowhere to send a per-server figure — were stale rather than wrong.
+Refreshed the same day on `windows-tun`, when the Windows TUN backend landed
+and desktop sub-project #2 closed — which also turned the Windows CI job from
+a check into the full test suite, and fixed two Windows defects the suite
+surfaced the first time it ran there: QUIC inbounds panicking on SO_REUSEPORT,
+and dual-stack UDP relays losing all their IPv4 traffic because Windows
+defaults IPV6_V6ONLY on.
 
 The audience is anyone deciding what to work on. Every gap below is stated with
 the file it lands in, so the estimate is checkable rather than a guess.
@@ -47,7 +53,7 @@ Transports and obfuscation: TCP and QUIC for every protocol, XTLS Reality (a
 hand-written TLS 1.3 stack, `src/reality/`), XTLS Vision, ShadowTLS v3, H2MUX,
 SagerNet UDP-over-TCP, XUDP.
 
-TUN mode with a Fake IP pool, on Linux, Android and iOS.
+TUN mode with a Fake IP pool, on Linux, Android, iOS and Windows 11.
 
 ## Where we do not
 
@@ -292,8 +298,8 @@ platform integration underneath. Design in
 `docs/specs/2026-08-24-desktop-control-api.md`, task breakdown in
 `docs/plans/2026-08-24-desktop-control-api.md`.
 
-Seven sub-projects. The first is merged; the other six are open, and the order
-below is roughly the order they unblock each other.
+Seven sub-projects. The first two are done; the other five are open, and the
+order below is roughly the order they unblock each other.
 
 ### 1. Control API — done
 
@@ -311,28 +317,36 @@ is lying. Adding one is a change to `run_tun_from_config`, and it should land
 before a tray icon does. And `ServiceHandle` must not be stopped or dropped from
 async code — it owns a `Runtime`, and dropping a runtime inside another panics.
 
-### 2. Windows TUN backend
+### 2. Windows TUN backend — done
 
-The largest piece left, and the only one that makes a platform unusable by its
-absence. `src/lib.rs` gates the TUN module on `cfg(unix)`, so on Windows
-`run_prepared` returns `ErrorKind::Unsupported`: a Windows GUI would build,
-start, show a tray icon and fail the moment someone clicks Connect. The library
-itself does build on Windows — CI checks it now — so this is a backend, not a
-port of the whole crate.
+Shipped. Spec: [docs/specs/2026-08-27-windows-tun-backend.md](./docs/specs/2026-08-27-windows-tun-backend.md).
+Plan: [docs/plans/2026-08-27-windows-tun-backend.md](./docs/plans/2026-08-27-windows-tun-backend.md).
 
-`src/tun/tcp_stack_direct.rs` runs smoltcp on a dedicated thread and waits on
-the descriptor. Wintun has no descriptor; it is a ring-buffer session API, so
-the work is a second backend behind the same interface, attaching at
-`DevicePolicy::Owned`.
+The smoltcp loop moved to `src/tun/stack_common.rs` behind a `StackDevice`
+trait and a shared `StackHandle` manager, unchanged in behaviour; the Unix
+backend keeps its descriptor and `poll()`, and `src/tun/tcp_stack_wintun.rs`
+drives a wintun ring-buffer session, waiting on the session's event handles
+and woken at shutdown through `Session::shutdown()` — the design wireguard-go
+uses, dedicated thread and dead-device backstop preserved. Windows 11 only,
+attaching at `DevicePolicy::Owned`: shoes creates and configures the adapter
+(`src/tun/wintun_device.rs`, deterministic GUID per name, ring sized as
+wireguard-go's) and never touches routes or DNS — `destination` is refused on
+Windows because the wintun path would turn it into a system default route,
+and the adapter address must be IPv4 because wintun-bindings' netsh arm
+cannot express IPv6.
 
-Upstream PR cfal/shoes#102 implements Windows TUN and is **not** worth adopting.
-It converts the stack to `AsyncDevice` and `.await`, which deletes the
-dedicated-thread design that `MOBILE.md`'s buffer and connection tuning rests
-on, and it removes the `phy_wait_error_count` / `MAX_PHY_WAIT_ERRORS` guard at
-`src/tun/tcp_stack_direct.rs:620` that stops a dead descriptor busy-looping a
-core. It has been conflicting against upstream master since January, and our
-`tun/` has diverged further than master has. Worth reading for which wintun
-knobs matter; not worth cherry-picking.
+Upstream PR cfal/shoes#102 was read for which knobs matter and deliberately
+not adopted: it deletes the dedicated-thread design and the
+`phy_wait_error_count` backstop, both of which this backend keeps.
+
+The shared loop is tested through a scripted device double on every platform,
+so Windows CI went from `cargo check` to the full suite — which surfaced and
+fixed two unrelated Windows defects on its first run: QUIC inbounds panicked
+on SO_REUSEPORT (now one endpoint there, logged), and every dual-stack UDP
+relay lost its IPv4 traffic because Windows defaults `IPV6_V6ONLY` on.
+Adapter creation itself needs Administrator and `wintun.dll`, so that half
+lives in an `#[ignore]`d test run by hand, plus a live end-to-end run —
+TCP, UDP/DNS, Fake IP and ICMP through a real adapter with routed traffic.
 
 ### 3. macOS Network Extension provider
 

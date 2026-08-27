@@ -2389,6 +2389,8 @@ dependencies = [
  "tun",
  "url",
  "webpki-roots",
+ "windows-sys 0.61.2",
+ "wintun-bindings",
  "x509-parser",
 ]
 

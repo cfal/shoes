@@ -83,7 +83,9 @@ quic_settings:
   alpn_protocols: [string]     # Optional ALPN protocols
   client_ca_certs: [string]    # Optional client CA certificates
   client_fingerprints: [string] # Optional client certificate fingerprints
-  num_endpoints: int           # Optional, 0 = auto (based on thread count)
+  num_endpoints: int           # Optional, 0 = auto (based on thread count).
+                               # Always 1 on Windows (no SO_REUSEPORT); a larger
+                               # value is reduced and logged.
 
 # Routing rules (default: allow-all-direct)
 rules: string | [RuleConfig]
@@ -331,17 +333,19 @@ NaiveProxy implements HTTP/2 CONNECT with padding for censorship resistance. Sho
 TUN (network TUNnel) devices operate at the IP layer (Layer 3), allowing shoes to act as a transparent VPN.
 
 ```yaml
-# Linux: Create TUN device by name
-device_name: string            # Device name (e.g., "tun0")
-address: string                # Device IP address (e.g., "10.0.0.1")
-netmask: string?               # Netmask (e.g., "255.255.255.0")
-destination: string?           # Gateway/destination (Linux only)
+# Linux/Windows: Create TUN device by name
+device_name: string            # Device name (e.g., "tun0"; the wintun adapter name on Windows)
+address: string                # Device IP address (e.g., "10.0.0.1"). IPv4 only on Windows.
+netmask: string?               # Netmask (e.g., "255.255.255.0"). Required (IPv4) on Windows.
+destination: string?           # Point-to-point peer (Linux only; refused on Windows,
+                               # where it would install a default route)
 
 # iOS/Android: Use existing file descriptor
 device_fd: int                 # FD from VpnService (Android) or NEPacketTunnelProvider (iOS)
+                               # Not supported on Windows: shoes creates the adapter itself
 
 # Common settings
-mtu: 1500                      # Default: 1500 (Linux), 9000 (Android), 4064 (iOS)
+mtu: 1500                      # Default: 1500 (Linux/Windows), 9000 (Android), 4064 (iOS)
 tcp_enabled: true              # Default: true
 udp_enabled: true              # Default: true
 icmp_enabled: true             # Default: true
@@ -426,6 +430,18 @@ Notes:
 - **Linux**: Requires root or `CAP_NET_ADMIN`. Creates device with specified name/address.
 - **Android**: Use `device_fd` from `VpnService.Builder.establish()`. Routes configured via VpnService.
 - **iOS**: Use `device_fd` from `NEPacketTunnelProvider.packetFlow`.
+- **Windows 11**: shoes creates a [wintun](https://www.wintun.net) adapter named
+  `device_name`; `address` and `netmask` are required, `device_fd` is refused.
+  Requires Administrator and `wintun.dll` next to `shoes.exe` or in `System32`
+  (the DLL's signature is verified before it is loaded). shoes configures the
+  adapter only — routes and DNS stay yours:
+
+  ```powershell
+  # Route a prefix into the tunnel (index from: Get-NetAdapter)
+  New-NetRoute -DestinationPrefix "0.0.0.0/1" -InterfaceAlias "shoes0" -NextHop 0.0.0.0
+  # Point DNS at it if the tunnel should resolve (pairs well with fake_ip)
+  Set-DnsClientServerAddress -InterfaceAlias "shoes0" -ServerAddresses 10.99.0.1
+  ```
 
 **Example (Linux):**
 ```yaml
@@ -448,6 +464,7 @@ Notes:
 ```
 
 **Example (Fake IP):** see `examples/tun_fake_ip.yaml`.
+**Example (Windows):** see `examples/tun_windows.yaml`.
 
 ## Client Config
 
@@ -1245,7 +1262,7 @@ openssl x509 -in cert.pem -noout -fingerprint -sha256
 
 - Enable `vision: true` for TLS-in-TLS scenarios
 - Use `tcp_settings.no_delay: true` for low latency
-- Set `quic_settings.num_endpoints` to match worker threads
+- Set `quic_settings.num_endpoints` to match worker threads (Linux/macOS; Windows always uses 1)
 - Use QUIC transport for high-latency or lossy networks
 
 ### Common Issues

@@ -794,10 +794,12 @@ client_proxies:
                     println!("  ✓ Validated ({} configs)", validated.configs.len());
                 }
                 // The error kind is lost where it is wrapped in a message, so
-                // the text is what there is to go on.
+                // the text is what there is to go on — in each platform's
+                // wording.
                 Err(e)
                     if e.kind() == std::io::ErrorKind::NotFound
-                        || e.to_string().contains("No such file or directory") =>
+                        || e.to_string().contains("No such file or directory")
+                        || e.to_string().contains("cannot find the file") =>
                 {
                     println!("  ✓ Parsed; validation needs a file that is not here");
                 }

@@ -28,15 +28,22 @@
 //!   Use `TunServerConfig::packet_information(true)` if using the socket FD
 //!   directly, or `false` if using the readPackets/writePackets API.
 
+mod stack_common;
 mod tcp_conn;
+#[cfg(unix)]
 mod tcp_stack_direct;
+#[cfg(windows)]
+mod tcp_stack_wintun;
 pub mod traffic;
 mod tun_server;
 mod udp_handler;
 mod udp_manager;
+#[cfg(windows)]
+mod wintun_device;
 
 pub use tun_server::TunServerConfig;
 
+#[cfg(unix)]
 use std::os::unix::io::IntoRawFd;
 use std::sync::Arc;
 
@@ -52,7 +59,11 @@ use crate::dns::fake_ip::{self, BypassList, FakeIpNetwork, FakeIpPool, FakeIpRes
 use crate::resolver::{NativeResolver, Resolver};
 use crate::tcp::tcp_client_handler_factory::create_tcp_client_proxy_selector;
 
-use tcp_stack_direct::{NewTcpConnection, TcpStackDirect, TcpStackOptions};
+use stack_common::{NewTcpConnection, TcpStackOptions};
+#[cfg(unix)]
+use tcp_stack_direct::TcpStackDirect;
+#[cfg(windows)]
+use tcp_stack_wintun::TcpStackWintun;
 use udp_manager::TunUdpManager;
 
 type PacketBuffer = Vec<u8>;
@@ -78,6 +89,7 @@ pub async fn run_tun_server(
         config.mtu, config.tcp_enabled, config.udp_enabled, config.icmp_enabled
     );
 
+    #[cfg(unix)]
     let fd = if let Some(fd) = config.raw_fd {
         info!("Using provided raw FD: {}", fd);
         fd
@@ -86,6 +98,48 @@ pub async fn run_tun_server(
         let fd = tun_device.into_raw_fd();
         info!("Created TUN device with FD: {}", fd);
         fd
+    };
+
+    // Windows has no descriptor to inject — a wintun handle does not survive
+    // a process boundary the way an fd does — so shoes always creates the
+    // device itself. validate.rs enforces the same shape at config time;
+    // this is the backstop for callers that skip validation, and it must
+    // agree with validate.rs rather than invent looser rules of its own.
+    #[cfg(windows)]
+    let wintun = {
+        if let Some(fd) = config.raw_fd {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                format!("device_fd {fd} is not supported on Windows; shoes creates the device"),
+            ));
+        }
+        // Refused rather than forwarded: wintun-bindings would turn it into
+        // a system default gateway (netsh `gateway=`), and routes are the
+        // host's to manage, not shoes'.
+        if config.destination.is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "TUN 'destination' is not supported on Windows: it would install \
+                 a default route through the adapter, and routes stay the host's",
+            ));
+        }
+        let (Some(name), Some(address), Some(netmask)) =
+            (config.tun_name.as_deref(), config.address, config.netmask)
+        else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "TUN on Windows requires 'device_name', 'address' and 'netmask'",
+            ));
+        };
+        let (std::net::IpAddr::V4(address), std::net::IpAddr::V4(netmask)) = (address, netmask)
+        else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "TUN on Windows requires an IPv4 'address' and 'netmask': \
+                 the wintun configuration path cannot express IPv6",
+            ));
+        };
+        wintun_device::open_wintun(name, address, netmask, config.mtu)?
     };
 
     let mtu = config.mtu as usize;
@@ -107,18 +161,22 @@ pub async fn run_tun_server(
         (tcp_buffer_size * 4 * config.max_connections) / (1024 * 1024)
     );
 
-    // Create the direct TCP stack (runs smoltcp in dedicated thread with select())
-    let mut tcp_stack = TcpStackDirect::new(
-        fd,
-        TcpStackOptions {
-            mtu,
-            tcp_buffer_size,
-            max_connections: config.max_connections,
-            // Only meaningful on the raw-fd path: when the device was created
-            // here, the `tun` crate owns the descriptor instead.
-            close_fd_on_drop: config.close_fd_on_drop,
-        },
-    );
+    let stack_options = TcpStackOptions {
+        mtu,
+        tcp_buffer_size,
+        max_connections: config.max_connections,
+        // Only meaningful on the Unix raw-fd path: when the device was
+        // created here, the `tun` crate owns the descriptor instead, and on
+        // Windows the session is structurally ours.
+        close_fd_on_drop: config.close_fd_on_drop,
+    };
+
+    // Create the TCP stack (runs smoltcp in a dedicated thread, woken by the
+    // platform's readiness primitive).
+    #[cfg(unix)]
+    let mut tcp_stack = TcpStackDirect::new(fd, stack_options);
+    #[cfg(windows)]
+    let mut tcp_stack = TcpStackWintun::new(wintun, stack_options);
 
     // Get UDP receiver (stack thread filters UDP and sends here)
     let udp_from_stack_rx = tcp_stack.take_udp_rx().expect("udp_rx already taken");
@@ -175,11 +233,16 @@ pub async fn run_tun_server(
     let udp_task = if config.udp_enabled {
         let proxy_selector = proxy_selector.clone();
         let resolver = resolver.clone();
+        // Wakes the stack thread out of its idle wait when a response is
+        // queued; without it a reply to a quiet tunnel waits out the poll
+        // timeout — ~500 ms on every cold DNS lookup, measured.
+        let udp_waker = tcp_stack.udp_waker();
 
         Some(tokio::spawn(async move {
             handle_udp_packets(
                 udp_from_stack_rx,
                 udp_to_stack_tx,
+                udp_waker,
                 proxy_selector,
                 resolver,
                 fake_ip,
@@ -234,7 +297,7 @@ pub async fn run_tun_server(
     // The read path's buffer pool is process-global, and on mobile the process
     // outlives the tunnel by hours. Nothing reads from it once the stack thread
     // is gone, so hand the memory back.
-    tcp_stack_direct::clear_buffer_pool();
+    stack_common::clear_buffer_pool();
 
     // Freeing the connection buffers does not shrink the process; the allocator
     // keeps the pages. On a phone that leaves an idle tunnel sitting at the
@@ -386,13 +449,14 @@ where
 async fn handle_udp_packets(
     from_stack_rx: mpsc::UnboundedReceiver<PacketBuffer>,
     to_stack_tx: mpsc::UnboundedSender<PacketBuffer>,
+    waker: stack_common::StackWaker,
     proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
     fake_ip: Option<Arc<FakeIpResponder>>,
 ) {
     info!("Starting UDP handler (session-based)");
 
-    let udp_handler = udp_handler::UdpHandler::new(from_stack_rx, to_stack_tx);
+    let udp_handler = udp_handler::UdpHandler::new(from_stack_rx, to_stack_tx, waker);
     let (reader, writer) = udp_handler.split();
 
     let manager = TunUdpManager::new(reader, writer, proxy_selector, resolver, fake_ip);

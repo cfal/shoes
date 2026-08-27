@@ -146,7 +146,9 @@ fn build_server_endpoint(
         settings.bind_address.is_ipv6(),
         None,
         Some(settings.bind_address),
-        true,
+        // SO_REUSEPORT is what lets several endpoints share one address, and
+        // Windows does not have it; there a single endpoint binds plainly.
+        cfg!(not(windows)),
         Some(SOCKET_BUFFER_SIZE),
     )?;
 
@@ -180,9 +182,26 @@ where
     F: Fn(quinn::Incoming) -> Fut + Clone + Send + 'static,
     Fut: Future<Output = std::io::Result<()>> + Send + 'static,
 {
-    let mut join_handles = Vec::with_capacity(settings.num_endpoints);
+    // Several endpoints on one address need SO_REUSEPORT, which Windows does
+    // not have. One endpoint is correct there rather than merely tolerable:
+    // the kernel-queue spreading the extra sockets buy on Linux has no
+    // equivalent to lose.
+    let num_endpoints = if cfg!(windows) {
+        if settings.num_endpoints > 1 {
+            log::info!(
+                "QUIC listener on {}: num_endpoints {} reduced to 1 (no SO_REUSEPORT on Windows)",
+                settings.bind_address,
+                settings.num_endpoints
+            );
+        }
+        1
+    } else {
+        settings.num_endpoints
+    };
 
-    for _ in 0..settings.num_endpoints {
+    let mut join_handles = Vec::with_capacity(num_endpoints);
+
+    for _ in 0..num_endpoints {
         // Bound before spawning, so that a port already in use fails startup.
         // Nothing ever awaits these join handles - a config reload aborts them
         // - so a panic raised inside the task would be swallowed and the
@@ -321,9 +340,13 @@ mod tests {
         let mut settings = listener(reserve_udp_port());
         settings.num_endpoints = 3;
 
+        // Sharing one address across endpoints is SO_REUSEPORT, so Windows
+        // gets exactly one however many were asked for.
+        let expected = if cfg!(windows) { 1 } else { 3 };
+
         let handles = start_quic_listeners(settings, params(), |_| async { Ok(()) })
             .expect("loopback must bind");
-        assert_eq!(handles.len(), 3);
+        assert_eq!(handles.len(), expected);
 
         for handle in handles {
             assert!(!handle.is_finished(), "an acceptor exited immediately");

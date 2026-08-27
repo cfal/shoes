@@ -1816,6 +1816,59 @@ fn validate_tun_config(
             ));
         }
     }
+    #[cfg(target_os = "windows")]
+    {
+        // No descriptor to inject: a wintun handle does not survive a process
+        // boundary the way an fd does, so shoes always creates the adapter.
+        if config.device_fd.is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "TUN on Windows does not support 'device_fd'; shoes creates the wintun \
+                 adapter itself — configure 'device_name', 'address' and 'netmask'",
+            ));
+        }
+        // Refused rather than forwarded: wintun-bindings turns a gateway into
+        // `netsh ... gateway=`, which installs a system default route through
+        // the adapter. On Linux `destination` is only the point-to-point peer
+        // address; silently promoting it to a default route would hijack the
+        // host's routing the moment a Linux config is ported.
+        if config.destination.is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "TUN 'destination' is not supported on Windows: it would install a \
+                 default route through the adapter, and routes stay the host's — \
+                 add routes yourself (see examples/tun_windows.yaml)",
+            ));
+        }
+        // A wintun adapter without an address is reachable by nothing and
+        // fails silently, so the address is required rather than optional.
+        if config.device_name.is_none() || config.address.is_none() || config.netmask.is_none() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "TUN on Windows requires 'device_name', 'address' and 'netmask'",
+            ));
+        }
+        // IPv4 only, said at config time: wintun-bindings 0.7 configures the
+        // adapter through `netsh interface ipv4`, and its ipv6 arm emits
+        // parameters netsh's ipv6 context does not accept — an IPv6 address
+        // here would pass --dry-run and then fail at tunnel start with an
+        // opaque netsh error.
+        if !config
+            .address
+            .as_ref()
+            .is_some_and(std::net::IpAddr::is_ipv4)
+            || !config
+                .netmask
+                .as_ref()
+                .is_some_and(std::net::IpAddr::is_ipv4)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "TUN on Windows requires an IPv4 'address' and 'netmask': the wintun \
+                 configuration path cannot express IPv6",
+            ));
+        }
+    }
 
     // Resolve rule group references
     ConfigSelection::replace_none_or_some_groups(&mut config.rules, rule_groups)?;
@@ -2711,6 +2764,12 @@ mod tests {
         let cert_dir = test_dir.path().join("certs");
         tokio::fs::create_dir_all(&cert_dir).await.unwrap();
 
+        // Forward slashes even on Windows: the path is interpolated into
+        // double-quoted YAML scalars below, where a backslash starts an
+        // escape sequence ("C:\Users" reads as an \U unicode escape and the
+        // parse fails). Windows file APIs accept either separator.
+        let cert_dir = std::path::PathBuf::from(cert_dir.display().to_string().replace('\\', "/"));
+
         let test_cert = "-----BEGIN CERTIFICATE-----\nTEST CERT CONTENT\n-----END CERTIFICATE-----";
         let test_key = "-----BEGIN PRIVATE KEY-----\nTEST KEY CONTENT\n-----END PRIVATE KEY-----";
 
@@ -3065,7 +3124,8 @@ mod tests {
             device_name: Some("tun0".to_string()),
             device_fd: None,
             address: Some("10.0.0.1".parse().unwrap()),
-            netmask: None,
+            // Windows requires a netmask, and this test is about ICMP.
+            netmask: Some("255.255.255.0".parse().unwrap()),
             destination: None,
             mtu: 1500,
             tcp_enabled: false, // TCP disabled
@@ -3094,7 +3154,8 @@ mod tests {
             device_name: Some("tun0".to_string()),
             device_fd: None,
             address: Some("10.0.0.1".parse().unwrap()),
-            netmask: None,
+            // Windows requires a netmask; these tests are about fake_ip.
+            netmask: Some("255.255.255.0".parse().unwrap()),
             destination: None,
             mtu: 1500,
             tcp_enabled: true,
@@ -3115,6 +3176,38 @@ mod tests {
             max_entries: 1024,
             bypass_domains: NoneOrSome::Unspecified,
         }
+    }
+
+    /// Windows refuses `destination` at config time: wintun-bindings would
+    /// turn it into `netsh ... gateway=`, a system default route through the
+    /// adapter, which contradicts "shoes configures the adapter only".
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn test_tun_windows_rejects_destination() {
+        let mut tun_config = tun_config_with_fake_ip(fake_ip_config("198.18.0.0/16"));
+        tun_config.fake_ip = None;
+        tun_config.destination = Some("10.0.0.1".parse().unwrap());
+        let err = validate_configs_test(vec![Config::TunServer(tun_config)])
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("destination"), "{err}");
+    }
+
+    /// An IPv6 adapter address cannot be expressed through wintun-bindings'
+    /// netsh path, so it must fail at config time, not at tunnel start.
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn test_tun_windows_rejects_an_ipv6_address() {
+        let mut tun_config = tun_config_with_fake_ip(fake_ip_config("198.18.0.0/16"));
+        tun_config.fake_ip = None;
+        tun_config.address = Some("fd00::2".parse().unwrap());
+        tun_config.netmask = Some("ffff:ffff::".parse().unwrap());
+        let err = validate_configs_test(vec![Config::TunServer(tun_config)])
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("IPv4"), "{err}");
     }
 
     #[tokio::test]

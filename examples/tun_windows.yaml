@@ -1,0 +1,57 @@
+# TUN VPN on Windows 11 (wintun)
+#
+# shoes creates a wintun adapter named `device_name`, assigns it `address`
+# and `netmask`, and speaks IP through the driver's ring buffers. Unlike the
+# Unix platforms there is no descriptor to inject: `device_fd` is refused.
+#
+# Requirements:
+# - Windows 11, run as Administrator (creating a wintun adapter needs it)
+# - wintun.dll from https://www.wintun.net next to shoes.exe or in System32
+#   (its signature is verified before it is loaded)
+#
+# shoes configures the adapter only. Routes and DNS stay yours — see the
+# usage notes at the bottom.
+
+- device_name: "shoes0"
+  address: "10.99.0.2"
+  netmask: "255.255.255.0"
+  mtu: 1500
+  tcp_enabled: true
+  udp_enabled: true
+  # Answer DNS locally from a private pool, so hostname rules keep working
+  # and nothing resolves on the device. Optional; delete to forward DNS.
+  fake_ip:
+    network: "198.18.0.0/16"
+    bypass_domains:
+      - "*.local"
+      - "captive.apple.com"
+      - "*.pool.ntp.org"
+  rules:
+    - masks: "0.0.0.0/0"
+      action: allow
+      client_chain:
+        - protocol:
+            type: direct
+
+# =============================================================================
+# Usage Notes
+# =============================================================================
+#
+# 1. Route traffic into the adapter (elevated PowerShell). A single test
+#    prefix first:
+#      New-NetRoute -DestinationPrefix "1.1.1.1/32" -InterfaceAlias "shoes0" -NextHop 0.0.0.0
+#
+# 2. For full-tunnel mode, the two-halves trick avoids touching the real
+#    default route:
+#      New-NetRoute -DestinationPrefix "0.0.0.0/1"   -InterfaceAlias "shoes0" -NextHop 0.0.0.0
+#      New-NetRoute -DestinationPrefix "128.0.0.0/1" -InterfaceAlias "shoes0" -NextHop 0.0.0.0
+#    and, when the exit is a proxy server, pin that server to the physical
+#    gateway first so the tunnel does not swallow its own transport:
+#      New-NetRoute -DestinationPrefix "<proxy-ip>/32" -NextHop <original-gateway> -InterfaceIndex <physical-if>
+#
+# 3. With fake_ip enabled, point DNS at any address the routes above carry
+#    (queries are intercepted by port, the address does not matter):
+#      Set-DnsClientServerAddress -InterfaceAlias "Ethernet" -ServerAddresses 1.1.1.1
+#
+# 4. Everything is undone by deleting the routes and the adapter; the adapter
+#    disappears when shoes exits.

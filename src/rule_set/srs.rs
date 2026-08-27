@@ -136,10 +136,8 @@ impl<'a> Reader<'a> {
             .checked_mul(8)
             .ok_or_else(|| Error::other("length overflow"))?;
         let bytes = self.take(byte_len)?;
-        Ok(bytes
-            .chunks_exact(8)
-            .map(|c| u64::from_be_bytes(c.try_into().unwrap()))
-            .collect())
+        let (words, _) = bytes.as_chunks::<8>();
+        Ok(words.iter().map(|c| u64::from_be_bytes(*c)).collect())
     }
 
     fn str_list(&mut self) -> Result<Vec<String>> {

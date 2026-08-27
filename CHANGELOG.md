@@ -1,5 +1,39 @@
 # Changelog
 
+## Unreleased
+
+### Windows TUN backend
+
+TUN mode works on Windows 11. shoes creates a [wintun](https://www.wintun.net)
+adapter named `device_name`, assigns it the config's IPv4 `address` and
+`netmask`, and runs the same smoltcp stack the other platforms use — the loop
+moved to a shared module behind a small device trait, so the Unix backends are
+unchanged in behaviour and the Windows one drives wintun's ring-buffer session
+with event-based waits. Requires Administrator and `wintun.dll` (whose
+signature is verified before it is loaded). shoes configures the adapter only;
+routes and DNS stay the host's — `destination` is refused on Windows because
+the wintun configuration path would turn it into a system default route, and
+`device_fd` is refused because there is no descriptor to inject.
+`examples/tun_windows.yaml` shows the config and the routing commands.
+
+Windows CI went from `cargo check` to the full test suite, which surfaced two
+Windows defects that predate this work, both fixed: QUIC inbounds panicked at
+startup because SO_REUSEPORT does not exist there (they now bind one endpoint
+and say so when reducing a configured `num_endpoints`), and the Hysteria2 and
+TUIC UDP relays lost all their IPv4 traffic because Windows defaults
+`IPV6_V6ONLY` on where Linux defaults it off — dual-stack sockets now request
+it explicitly everywhere.
+
+The live run then caught two defects that were never Windows-specific, both
+fixed on every platform. A UDP response queued while the TUN stack thread was
+idle waited out the stack's one-second poll timeout, because nothing woke the
+thread on enqueue — measured at ~500 ms added to every cold DNS lookup, which
+Fake IP answers in microseconds. The response path now carries a waker: a
+byte down the wake pipe on Unix, an auto-reset event in the Windows wait. And
+`icmp_enabled` never actually answered pings: smoltcp only builds its echo
+reply arm under the `auto-icmp-echo-reply` feature, which was not enabled.
+It is now, so a TUN answers pings on every platform.
+
 ## v0.2.14
 
 ### Runtime stats through the FFI

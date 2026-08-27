@@ -17,6 +17,8 @@ use futures::{Sink, Stream, ready};
 use smoltcp::wire::{IpProtocol, Ipv4Packet, Ipv6Packet, UdpPacket};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
+use super::stack_common::StackWaker;
+
 pub type PacketBuffer = Vec<u8>;
 
 /// UDP message: (payload, local_addr, remote_addr)
@@ -28,6 +30,9 @@ pub struct UdpHandler {
     from_tun_rx: UnboundedReceiver<PacketBuffer>,
     /// Sender for UDP packets to TUN
     to_tun_tx: UnboundedSender<PacketBuffer>,
+    /// Wakes the stack thread after a send, so the response is written now
+    /// rather than when the stack's idle wait times out.
+    waker: StackWaker,
 }
 
 impl UdpHandler {
@@ -35,10 +40,12 @@ impl UdpHandler {
     pub fn new(
         from_tun_rx: UnboundedReceiver<PacketBuffer>,
         to_tun_tx: UnboundedSender<PacketBuffer>,
+        waker: StackWaker,
     ) -> Self {
         Self {
             from_tun_rx,
             to_tun_tx,
+            waker,
         }
     }
 
@@ -50,6 +57,7 @@ impl UdpHandler {
             },
             UdpWriter {
                 to_tun_tx: self.to_tun_tx,
+                waker: self.waker,
             },
         )
     }
@@ -63,6 +71,7 @@ pub struct UdpReader {
 /// Write half for sending UDP packets.
 pub struct UdpWriter {
     to_tun_tx: UnboundedSender<PacketBuffer>,
+    waker: StackWaker,
 }
 
 impl UdpWriter {
@@ -73,7 +82,9 @@ impl UdpWriter {
         let packet = build_udp_packet(&payload, src_addr, dst_addr)?;
         self.to_tun_tx
             .send(packet)
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "channel closed"))
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "channel closed"))?;
+        (self.waker)();
+        Ok(())
     }
 }
 
@@ -109,7 +120,9 @@ impl Sink<UdpMessage> for UdpWriter {
         let packet = build_udp_packet(&payload, src_addr, dst_addr)?;
         self.to_tun_tx
             .send(packet)
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "channel closed"))
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "channel closed"))?;
+        (self.waker)();
+        Ok(())
     }
 
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {

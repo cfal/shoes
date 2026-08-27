@@ -240,7 +240,10 @@ mod rule_set_path_tests {
     fn relative_rule_set_paths_resolve_against_the_config_file() {
         let mut configs = vec![rule_set("lists/geo.srs")];
         resolve_rule_set_paths(&mut configs, "/etc/shoes/main.yaml");
-        assert_eq!(path_of(&configs[0]), "/etc/shoes/lists/geo.srs");
+        // Built with join rather than written out, because the separator the
+        // resolver inserts is the platform's: "/" on Unix, "\" on Windows.
+        let expected = std::path::Path::new("/etc/shoes").join("lists/geo.srs");
+        assert_eq!(path_of(&configs[0]), expected.to_str().unwrap());
     }
 
     #[test]
