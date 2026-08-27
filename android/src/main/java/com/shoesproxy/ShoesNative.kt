@@ -207,4 +207,25 @@ object ShoesNative {
      * or null if no error has occurred (normal shutdown or still running).
      */
     external fun getLastError(): String?
+
+    /**
+     * Read the runtime counters as a JSON string.
+     *
+     * Returns null only if the native library was built without stats
+     * support. Otherwise it is always a document: before [start] every number
+     * is zero and `outbounds` is empty, and after [stop] it holds the final
+     * figures of the session that just ended until the next [start] resets
+     * them. Safe from any thread.
+     *
+     * The document looks like
+     * `{"upload_bytes":0,"download_bytes":0,"active_connections":0,"outbounds":[...]}`.
+     * The two top-level byte totals are the same figures [TrafficListener]
+     * delivers, and `active_connections` is live TCP connections through the
+     * tunnel. Each `outbounds` entry carries `name`, `upload_bytes`,
+     * `download_bytes` and `active_connections` measured at that server
+     * instead, so it will not agree with the top-level totals to the byte.
+     * Later releases may add keys; ignore ones you do not recognise. The full
+     * description lives on `shoes_get_stats` in `include/shoes.h`.
+     */
+    external fun getStats(): String?
 }

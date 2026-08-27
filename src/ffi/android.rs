@@ -412,3 +412,38 @@ pub extern "system" fn Java_com_shoesproxy_ShoesNative_getLastError<'local>(
         None => JString::null(),
     }
 }
+
+/// Read the runtime counters as a JSON string.
+///
+/// Null only if the library was built without `control-stats`; otherwise
+/// always a document, with every number zero before `start`. The shape and
+/// the meaning of each field are documented on `shoes_get_stats` in
+/// `include/shoes.h`, which is the one description both platforms share.
+///
+/// Safe from any thread and when nothing is running: no I/O, a short read
+/// lock, one allocation.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_shoesproxy_ShoesNative_getStats<'local>(
+    // The stub arm never touches the env; the attribute keeps -D warnings
+    // quiet there without needing a second signature.
+    #[cfg_attr(not(feature = "control-stats"), allow(unused_mut, unused_variables))]
+    mut unowned: EnvUnowned<'local>,
+    _class: JClass<'local>,
+) -> JString<'local> {
+    // Unconditional symbol, gated body -- the same reasoning as
+    // shoes_get_stats in ios.rs: the surface a host binds to should not
+    // depend on which features built it.
+    #[cfg(feature = "control-stats")]
+    {
+        let json = crate::control::stats::snapshot().to_json();
+        match unowned.with_env(|env| env.new_string(&json)).into_outcome() {
+            Outcome::Ok(s) => s,
+            // Can fail under JVM OOM; return null to avoid panicking across FFI.
+            _ => JString::null(),
+        }
+    }
+    #[cfg(not(feature = "control-stats"))]
+    {
+        JString::null()
+    }
+}
