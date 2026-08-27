@@ -338,7 +338,7 @@ costs to leave.
 
 Open findings from the 2026-08-20 audit, none of them fixed yet:
 
-- **No `catch_unwind` at the FFI boundary.** The 9 JNI and 10 C entry points
+- **No `catch_unwind` at the FFI boundary.** The 10 JNI and 11 C entry points
   are plain `extern` functions. On the mobile profile `panic = "abort"` makes
   a panic a defined abort, but a desktop `--features ffi` build unwinds, and a
   panic crossing an `extern "C"` frame is undefined behaviour. Either wrap the

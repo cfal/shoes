@@ -1,5 +1,10 @@
 # Bytes in target/aarch64-linux-android/release-mobile/libshoes.so, built with
-#   cargo ndk -t arm64-v8a build --profile release-mobile --lib
+#   cargo ndk -t arm64-v8a build --profile release-mobile --lib \
+#       --features control-stats
+#
+# Recorded WITH control-stats since 2026-08-27, because that is what
+# scripts/build-android.sh builds and therefore what ships. The same commit
+# measures 9812264 without it.
 #
 # CI fails if the built library exceeds this by more than 2%. A band rather
 # than an exact ceiling because this number is recorded from a developer's
@@ -20,6 +25,19 @@
 #   9761528  +  992  DevicePolicy, replacing two hard-coded mobile assumptions
 #   9761768  +  240  resetting the counters when a service starts and when the
 #                     stack thread exits
+#   9811960  +50192  no code change: rustc 1.94.1 and NDK 28.1 against whatever
+#                     built the line above. Measured before touching the tree,
+#                     which is how the next four lines stay attributable.
+#   9812264  +  304  shoes_get_stats and getStats as stub symbols, feature off.
+#                     This is what a host that does not want stats pays: 304
+#                     bytes, and the same 11 C and 10 JNI symbols as a build
+#                     with the feature, so the header does not vary.
+#   9837168  +24904  --features control-stats: the registry, the counting
+#                     adapters, the connection counter, and the JSON
+#                     serializer behind both entry points. 0.25% of the
+#                     library, against an RSS cost of 2 KiB at the
+#                     256-connection ceiling -- MOBILE.md section 10 has the
+#                     measurement and the method.
 #
 # On that +4176: it is real code, not section padding -- .text grew 2056,
 # .rodata 512, .data.rel.ro 576, .rela.dyn 768, .eh_frame 236. It is not the
@@ -32,4 +50,4 @@
 # Judged worth paying: the net 4376 bytes is 0.03% of the library, against a
 # MOBILE.md precedent that declined a 1.0 MiB saving because the build
 # complexity cost more than the megabyte was worth.
-9761768
+9837168

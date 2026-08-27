@@ -14,9 +14,9 @@ open and are ordered at the end. Line references were last checked against
 |---|---|---|
 | Builds | `cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64` clean | `cargo build --target aarch64-apple-ios` clean |
 | Packaging | AAR via `scripts/build-android.sh` | XCFramework via `scripts/build-ios.sh` |
-| Entry points | 9 `Java_com_shoesproxy_ShoesNative_*` JNI symbols | 10 `shoes_*` C symbols |
+| Entry points | 10 `Java_com_shoesproxy_ShoesNative_*` JNI symbols | 11 `shoes_*` C symbols |
 | Socket protection | `VpnService.protect` via `SocketProtector` | `IosSocketProtector` |
-| Traffic stats | `TrafficListener.onTrafficUpdate` | `ShoesTrafficCallback` |
+| Traffic stats | `TrafficListener.onTrafficUpdate`, `getStats()` | `ShoesTrafficCallback`, `shoes_get_stats()` |
 | Error reporting | `getLastError()`, and `start` returns -1 on a bad config | same, via `shoes_get_last_error()` |
 | Network change | `networkChanged()` | `shoes_network_changed()` |
 | Live log level | `setLogLevel()` | `shoes_set_log_level()` |
@@ -99,7 +99,7 @@ compiles the Android or iOS targets.
 
 ## FFI surface
 
-Android — 9 symbols, all `Java_com_shoesproxy_ShoesNative_*`, mirrored by
+Android — 10 symbols, all `Java_com_shoesproxy_ShoesNative_*`, mirrored by
 `ShoesNative.kt`:
 
 | Kotlin | Rust | Returns |
@@ -113,8 +113,9 @@ Android — 9 symbols, all `Java_com_shoesproxy_ShoesNative_*`, mirrored by
 | `stop(handle: Long)` | `android.rs:317` | — |
 | `isRunning()` | `android.rs:332` | boolean |
 | `getLastError()` | `android.rs:348` | string or null |
+| `getStats()` | `android.rs` | JSON string, or null without `control-stats` |
 
-iOS — 10 symbols, declared in `include/shoes.h`:
+iOS — 11 symbols, declared in `include/shoes.h`:
 
 ```c
 int   shoes_init(const char *log_level);
@@ -126,11 +127,19 @@ int   shoes_set_log_file(const char *path);
 int   shoes_set_log_level(const char *log_level);
 int   shoes_network_changed(void);
 char *shoes_get_last_error(void);   // caller frees
+char *shoes_get_stats(void);        // caller frees; NULL without control-stats
 void  shoes_free_string(char *ptr);
 ```
 
-`shoes_get_last_error` returns an owned string. Pass it back to
-`shoes_free_string` or it leaks.
+`shoes_get_last_error` and `shoes_get_stats` both return owned strings. Pass
+them back to `shoes_free_string` or they leak.
+
+`shoes_get_stats` is the one symbol whose behaviour depends on a feature: its
+body is compiled only with `control-stats`, and without it the function still
+exists and returns NULL. That is deliberate -- the header must not vary with
+the features it was generated with, because a downstream client diffs
+`include/` to decide whether a version bump is a drop-in. Both published
+artifacts are built with the feature on.
 
 ## Lifecycle contract
 
@@ -492,6 +501,39 @@ So the 128 MiB ceiling above is a ceiling on address space, and the resident
 figure for 256 saturated mobile connections is nearer 40 MiB — still the
 dominant term inside an iOS extension, which is why the ceiling matters, but not
 the number to quote.
+
+**What does `control-stats` cost?** Asked by the downstream client, which
+wanted the figure measured rather than estimated before enabling it inside a
+Network Extension. Measured 2026-08-27, arm64, `release-mobile`:
+
+| | |
+|---|---|
+| code, feature off (stub symbols only) | +304 bytes |
+| code, feature on | +24,904 bytes, 0.25% of the library |
+| resident at 256 connections | not resolvable; see below |
+
+The premise of the question was a counter table, and there is no table keyed
+by connection. The feature holds one process-wide `AtomicUsize`
+(`tun/traffic.rs`), roughly 200 bytes per *configured outbound* in the
+registry (`outbound_stats.rs`), 8 bytes per hop on a chain, and one `Arc`
+pointer per live outbound stream — 2 KiB at the 256-connection ceiling, which
+is an eighth of a single 16 KiB page. A test in `outbound_counting_stream.rs`
+pins that last figure so a field added to the adapter fails rather than
+silently moving it.
+
+That is below what RSS can measure, and the attempt says so rather than
+inventing a number. `measure_memory_per_connection` at `CONNECTIONS = 256`,
+release profile, three runs each: 10128/10624/10096 KiB without the feature
+against 10352/10640/10576 KiB with it — overlapping ranges, a 240 KiB
+difference of means inside a 528 KiB within-config spread. The debug profile
+appears to show a real gap (34/36/37 KiB per connection against 40/47/42), but
+`--features ffi`, which adds code and *no* counters at all, lands at 39/44/42 —
+so what that arm measures is compiled code faulting in text pages, not
+per-connection state. Run the control arm before believing a debug figure here.
+
+Both published artifacts therefore build with `control-stats` and without
+`control-logs`. The log ring is the one that holds real memory, and a host
+already reads a log file through `shoes_set_log_file`.
 
 **Does the smaller sizing cost throughput?** For the local buffers, no. For the
 window, catastrophically — which is how the distinction above got found. 50 MiB

@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased
+
+### Runtime stats through the FFI
+
+`shoes_get_stats()` on iOS and `ShoesNative.getStats()` on Android return
+`control::stats::snapshot()` as a JSON string: the two byte totals the traffic
+callback already delivers, a live connection count, and one entry per
+configured outbound with its own bytes and connection count. The C string is
+freed with `shoes_free_string`, the same call that frees the error string, so
+there is no new ownership rule to learn. The traffic callback and every
+existing symbol are unchanged.
+
+The symbol exists in every build and only its body is behind `control-stats`;
+without the feature it returns NULL. That keeps `include/shoes.h` identical
+whatever features generated it, which is the property a host relies on when it
+diffs the header to decide whether a version bump is a drop-in.
+
+Both published mobile artifacts now build with `control-stats`. Measured on
+the arm64 library it costs 24,904 bytes of download, and 304 bytes for a build
+that leaves the feature off. Resident cost at the 256-connection mobile
+ceiling is 2 KiB -- below one page, and below what RSS can resolve; MOBILE.md
+section 10 records the measurement and the control arm that rules out a false
+positive.
+
 ## v0.2.13
 
 ### Named outbounds
