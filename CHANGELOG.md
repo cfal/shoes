@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.2.14
 
 ### Runtime stats through the FFI
 
@@ -25,6 +25,14 @@ that leaves the feature off. Resident cost at the 256-connection mobile
 ceiling is 2 KiB -- below one page, and below what RSS can resolve; MOBILE.md
 section 10 records the measurement and the control arm that rules out a false
 positive.
+
+**This release is additive.** `include/shoes.h` and the Kotlin bridge both
+change, so a consumer that watches those paths to decide whether a bump is a
+drop-in will see a diff — but nothing existing moved. No symbol changed
+signature or behaviour, `ShoesTrafficCallback` and `TrafficListener` are
+untouched, and the only edit to an existing declaration is the comment on
+`shoes_free_string`, which now names the second function whose strings it
+frees. The surface goes from 9 JNI and 10 C symbols to 10 and 11.
 
 ## v0.2.13
 
