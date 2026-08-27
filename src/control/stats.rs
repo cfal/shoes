@@ -48,6 +48,72 @@ pub fn snapshot() -> StatsSnapshot {
     }
 }
 
+impl StatsSnapshot {
+    /// The snapshot as one line of JSON, for the FFI.
+    ///
+    /// Hand-written rather than serde_json: the library has no JSON
+    /// dependency, and a serializer for four integers and a list of
+    /// four-field records would cost more download bytes than the feature it
+    /// serves. The shape is documented on `shoes_get_stats` in
+    /// `include/shoes.h`; adding a key is a compatible change, renaming one
+    /// is not.
+    pub fn to_json(&self) -> String {
+        use std::fmt::Write as _;
+
+        let mut out = String::with_capacity(96 + 96 * self.outbounds.len());
+        // write! into a String cannot fail; the Results are discarded on that
+        // basis rather than unwrapped.
+        let _ = write!(
+            out,
+            "{{\"upload_bytes\":{},\"download_bytes\":{},\"active_connections\":{},\"outbounds\":[",
+            self.upload_bytes, self.download_bytes, self.active_connections
+        );
+        for (i, o) in self.outbounds.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push_str("{\"name\":");
+            write_json_string(&mut out, &o.name);
+            let _ = write!(
+                out,
+                ",\"upload_bytes\":{},\"download_bytes\":{},\"active_connections\":{}}}",
+                o.upload_bytes, o.download_bytes, o.active_connections
+            );
+        }
+        out.push_str("]}");
+        out
+    }
+}
+
+/// Append `s` as a JSON string literal, quotes included.
+///
+/// RFC 8259 section 7: the quote and the backslash are escaped, control
+/// characters below U+0020 are escaped, and everything else -- including
+/// non-ASCII -- is emitted as it stands, which is valid because the output is
+/// UTF-8. U+0000 is a control character and so becomes six ASCII bytes, which
+/// is what lets the C caller put the result through `CString::new`.
+fn write_json_string(out: &mut String, s: &str) {
+    use std::fmt::Write as _;
+
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '\"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{0008}' => out.push_str("\\b"),
+            '\u{000c}' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 => {
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
 // cfg(unix) as well as cfg(test): these drive the counter through
 // tun::traffic, and the tun module does not exist on Windows. The
 // cfg(not(unix)) arms of `snapshot` are covered by the Windows CI job
@@ -104,5 +170,131 @@ mod tests {
         let names: Vec<&str> = snap.outbounds.iter().map(|o| o.name.as_str()).collect();
         assert_eq!(names, vec!["Amsterdam", "Frankfurt"]);
         assert_eq!(snap.outbounds[0].download_bytes, 4096);
+    }
+}
+
+#[cfg(test)]
+mod json_tests {
+    use super::*;
+    use crate::outbound_stats::OutboundStats;
+
+    fn outbound(name: &str, up: u64, down: u64, conns: usize) -> OutboundStats {
+        OutboundStats {
+            name: name.to_string(),
+            upload_bytes: up,
+            download_bytes: down,
+            active_connections: conns,
+        }
+    }
+
+    /// The zero document is what a host sees before `start`. Byte-exact,
+    /// because a host may well compare against a literal to detect "nothing
+    /// yet".
+    #[test]
+    fn a_zero_snapshot_is_the_documented_literal() {
+        let snap = StatsSnapshot {
+            upload_bytes: 0,
+            download_bytes: 0,
+            active_connections: 0,
+            outbounds: Vec::new(),
+        };
+        assert_eq!(
+            snap.to_json(),
+            r#"{"upload_bytes":0,"download_bytes":0,"active_connections":0,"outbounds":[]}"#
+        );
+    }
+
+    /// Asymmetric values so a transposition fails; u64::MAX so a cast to a
+    /// narrower type fails.
+    #[test]
+    fn every_field_round_trips_through_a_real_parser() {
+        let snap = StatsSnapshot {
+            upload_bytes: 7,
+            download_bytes: u64::MAX,
+            active_connections: 3,
+            outbounds: vec![
+                outbound("Frankfurt", 11, 22, 1),
+                outbound("Amsterdam", 33, 44, 2),
+            ],
+        };
+        let v: serde_json::Value = serde_json::from_str(&snap.to_json()).unwrap();
+
+        assert_eq!(v["upload_bytes"], 7);
+        assert_eq!(v["download_bytes"], u64::MAX);
+        assert_eq!(v["active_connections"], 3);
+        let outs = v["outbounds"].as_array().unwrap();
+        assert_eq!(outs.len(), 2);
+        // Input order, not re-sorted: snapshot() already sorts by name and
+        // the serializer must not have an opinion of its own.
+        assert_eq!(outs[0]["name"], "Frankfurt");
+        assert_eq!(outs[0]["upload_bytes"], 11);
+        assert_eq!(outs[0]["download_bytes"], 22);
+        assert_eq!(outs[0]["active_connections"], 1);
+        assert_eq!(outs[1]["name"], "Amsterdam");
+        assert_eq!(outs[1]["active_connections"], 2);
+    }
+
+    /// Every character class JSON cannot carry raw, built by code point so
+    /// that this file contains no control characters of its own: quote,
+    /// backslash, the four with short escapes, two that need the six-byte
+    /// form, and multi-byte UTF-8 which must pass through untouched.
+    fn hostile_name() -> String {
+        let mut name = String::from("quote:\" backslash:");
+        name.push(char::from(0x5c));
+        name.push_str(" lf:");
+        name.push(char::from(0x0a));
+        name.push_str(" tab:");
+        name.push(char::from(0x09));
+        name.push_str(" cr:");
+        name.push(char::from(0x0d));
+        name.push_str(" bs:");
+        name.push(char::from(0x08));
+        name.push_str(" ff:");
+        name.push(char::from(0x0c));
+        name.push_str(" soh:");
+        name.push(char::from(0x01));
+        name.push_str(" us:");
+        name.push(char::from(0x1f));
+        name.push_str(" latin1:");
+        name.push(char::from(0xe9));
+        name.push_str(" astral:");
+        name.push(char::from_u32(0x1f980).unwrap());
+        name
+    }
+
+    /// Names come from user config, so this is the one place a bad escape
+    /// becomes a malformed document on a phone.
+    #[test]
+    fn a_hostile_name_survives_escaping() {
+        let name = hostile_name();
+        let snap = StatsSnapshot {
+            upload_bytes: 0,
+            download_bytes: 0,
+            active_connections: 0,
+            outbounds: vec![outbound(&name, 0, 0, 0)],
+        };
+        let v: serde_json::Value = serde_json::from_str(&snap.to_json()).unwrap();
+        assert_eq!(v["outbounds"][0]["name"], name);
+    }
+
+    /// The C side hands this to CString::new, which rejects an interior NUL.
+    /// The escaper must have already turned it into six ASCII bytes.
+    #[test]
+    fn an_interior_nul_is_escaped_not_emitted() {
+        let name = format!("a{}b", char::from(0x00));
+        let snap = StatsSnapshot {
+            upload_bytes: 0,
+            download_bytes: 0,
+            active_connections: 0,
+            outbounds: vec![outbound(&name, 0, 0, 0)],
+        };
+        let json = snap.to_json();
+        assert!(!json.as_bytes().contains(&0), "raw NUL in {json:?}");
+
+        let expected = format!("a{}u0000b", char::from(0x5c));
+        assert!(json.contains(&expected), "{json}");
+
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["outbounds"][0]["name"], name);
     }
 }
