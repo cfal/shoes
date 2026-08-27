@@ -349,10 +349,12 @@ Open findings from the 2026-08-20 audit, none of them fixed yet:
   `cargo update` may jump majors untested, and nothing pins what a fresh
   clone without the lockfile would get. Pinning majors (`"1"`, `"0.12"`) keeps
   the flexibility and removes the cliff.
-- **No advisory coverage.** Dependabot alerts are disabled on the repository
-  and `cargo audit` is not in CI. The h2 RUSTSEC fix in this branch's history
-  was found by hand; the next one will not announce itself. Enable one of the
-  two — a weekly `cargo audit` job is one workflow step.
+- **Advisory coverage is CI-side only.** `cargo audit --deny warnings` runs as
+  the `Security advisories` job in `lint.yml`, on every push and pull request
+  rather than on a schedule — so an advisory published against an unchanged
+  lockfile is not noticed until something else lands. Dependabot alerts are
+  still off. Adding a `schedule:` trigger to that job is the one-line half of
+  what is missing.
 - `MOBILE.md` says its line references were last checked against `037018e`;
   the branch has moved far since, so trust symbol names over line numbers
   until someone re-verifies them.

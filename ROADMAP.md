@@ -9,7 +9,11 @@ Tier 3 item was confirmed still open. Refreshed again 2026-08-24 against
 `mobile` at `a27b666`, when the desktop control API landed and earned a section
 of its own. Refreshed again 2026-08-25 against `mobile` at `30346aa`, when the
 first two phases of Hysteria2 conformance landed — which corrected two claims in
-the Hysteria section that had been wrong rather than merely stale.
+the Hysteria section that had been wrong rather than merely stale. Refreshed
+again 2026-08-27 against `mobile` at `a84dcc6`, when runtime stats reached the
+mobile FFI: that closed the naming blocker Tier 2 item 6 was waiting on, and
+two claims here — HTTPUpgrade as pending, and per-connection statistics as
+having nowhere to send a per-server figure — were stale rather than wrong.
 
 The audience is anyone deciding what to work on. Every gap below is stated with
 the file it lands in, so the estimate is checkable rather than a guess.
@@ -56,8 +60,8 @@ The gap is not in protocols. It is in everything around them.
 | Protocol sniffing (SNI, Host, QUIC, DNS) | SNI and Host, TCP only | yes |
 | Per-app routing on Android | none | `package_name` |
 | Outbound selection | round-robin, no health check | `urltest` by latency, `selector` |
-| Per-connection statistics | global counters, plus a live connection count | Clash API |
-| Extra transports | WebSocket, H2MUX | + gRPC, HTTPUpgrade, HTTP/2 |
+| Per-connection statistics | global counters, a live connection count, and per-outbound bytes — readable from a mobile host over FFI | Clash API |
+| Extra transports | WebSocket, HTTPUpgrade, H2MUX | + gRPC, HTTP/2 |
 | Hysteria2 / TUIC as a *client* | yes | yes |
 | Desktop client | control API only, no GUI | full GUI on three platforms |
 
@@ -164,25 +168,34 @@ protector rather than each caller remembering to. See
 
 ### 6. Per-connection statistics — partly done
 
-`src/tun/traffic.rs` keeps two global atomics and a callback, and now a live
-connection count beside them, readable through
-`shoes::control::stats::snapshot()` behind the `control-stats` feature.
+`src/tun/traffic.rs` keeps two global atomics and a callback, and a live
+connection count beside them. `shoes::control::stats::snapshot()` reports
+those plus a per-outbound breakdown behind the `control-stats` feature.
 
-The rest is blocked on something small and unglamorous: **outbounds have no
-names**. A client UI wants bytes per configured server, and the only key
-available today is an address, which is neither stable across config edits nor
-meaningful to show a user — client configs in `src/config/types/client.rs`
-carry no label field. Adding one is a config schema change that reaches mobile,
-so it wants its own spec, and everything else here waits behind it.
+The naming blocker is gone. `ClientConfig` carries an optional `name`
+(`src/config/types/client.rs`), outbounds without one are keyed by address and
+a direct outbound by `direct`, and bytes are credited to the exit hop of a
+chain — see `docs/superpowers/specs/2026-08-26-named-outbounds-design.md`.
 
-Beyond that: a connection list with destination, protocol, the rule that
-matched, and bytes each way. Either over FFI, or as a subset of the Clash API,
-which inherits the existing dashboards (yacd, metacubexd) for free.
+A mobile host can read all of it: `shoes_get_stats()` and
+`ShoesNative.getStats()` return the snapshot as JSON, and both published
+artifacts build with `control-stats`. See
+`docs/superpowers/specs/2026-08-27-stats-ffi-design.md`, and MOBILE.md
+section 10 for what the counters cost.
 
-### 7. HTTPUpgrade transport
+What is left is a connection *list* — destination, protocol, the rule that
+matched, and bytes each way, per connection rather than per outbound. That is
+the part that would need a table keyed by connection, which is exactly the RSS
+the mobile budget declined; it wants a design that lets a host ask for it
+rather than one that keeps it always. Either over FFI, or as a subset of the
+Clash API, which inherits the existing dashboards (yacd, metacubexd) for free.
 
-WebSocket without the framing, and `src/websocket/` is already there. Small, and
-required by a good share of CDN-fronted server configs.
+### 7. HTTPUpgrade transport — done
+
+WebSocket's handshake without WebSocket's framing, client and server, wire
+compatible with sing-box's `httpupgrade`. Configured as `type: httpupgrade`;
+see `src/httpupgrade/` and `ClientProxyConfig::HttpUpgrade`. Shipped in
+v0.2.13.
 
 ### 8. DNS rules
 
