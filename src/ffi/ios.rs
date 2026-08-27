@@ -124,6 +124,20 @@ pub unsafe extern "C" fn shoes_init(log_level: *const c_char) -> c_int {
 /// * `traffic_callback` - Callback invoked about once a second with cumulative
 ///   upload and download byte counts
 ///
+/// # The TUN descriptor is borrowed, not transferred
+///
+/// The caller opens the device and owns the descriptor for the whole session.
+/// shoes reads from `device_fd` until `shoes_stop` returns and never closes
+/// it -- not on shutdown, not on error, not at any point in between. There is
+/// no flag that changes this: closing a descriptor the host still holds would
+/// be the worse failure of the two, since the number is immediately recycled
+/// by the next `socket()` or `open()` in the process.
+///
+/// So the descriptor must stay open across the whole session, and closing it
+/// is the caller's job once `shoes_stop` has returned. Not closing it leaks
+/// the descriptor, and where the platform ties the tunnel interface to the
+/// descriptor, the tunnel outlives the stop.
+///
 /// # Returns
 /// * Handle (> 0) on success
 /// * -1 on error
@@ -219,6 +233,31 @@ pub unsafe extern "C" fn shoes_start(
 }
 
 /// Stop the shoes VPN service.
+///
+/// Signals shutdown and blocks until the engine has released the TUN
+/// descriptor -- milliseconds in practice, bounded at 5 seconds if a task
+/// will not wind down. Do not call it from a thread that has a watchdog
+/// budget of its own; on Android the ANR budget is about the same 5 seconds.
+///
+/// # The descriptor is yours to close, after this returns
+///
+/// shoes is still reading `device_fd` until this call returns, so closing it
+/// first closes a descriptor the engine holds, and the number is then handed
+/// to the next socket the process opens. Closing it afterwards is the
+/// caller's job -- shoes never closes it. See `shoes_start`.
+///
+/// What that close does is platform-dependent, and on one platform it is not
+/// optional:
+///
+/// * Android: the app created the descriptor with
+///   `VpnService.Builder.establish()`, and closing it is what takes the TUN
+///   interface down. Skip it and the interface stays up, the system will not
+///   destroy the `VpnService`, and the next start finds one already running.
+///   Note that `ParcelFileDescriptor.detachFd()` moves ownership out of the
+///   wrapper, so `close()` on that wrapper afterwards closes nothing.
+/// * iOS: the descriptor was read off `NEPacketTunnelProvider.packetFlow` and
+///   belongs to a live NetworkExtension object, which tears it down with the
+///   extension. An app that did not create it has nothing to close.
 ///
 /// # Arguments
 /// * `handle` - Handle returned by shoes_start (currently unused, we use global state)

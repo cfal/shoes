@@ -165,7 +165,9 @@ object ShoesNative {
      * the TUN file descriptor obtained from
      * [android.net.VpnService.Builder.establish]. That descriptor stays yours:
      * keep the `ParcelFileDescriptor` alive until after [stop] and close it
-     * yourself.
+     * yourself. Take the fd with [android.os.ParcelFileDescriptor.getFd], not
+     * `detachFd()` — detaching moves ownership out of the wrapper, so a later
+     * `close()` on it closes nothing and the TUN interface stays up.
      *
      * @param configYaml YAML configuration string.
      * @param protectCallback Called by the engine to exempt outbound sockets
