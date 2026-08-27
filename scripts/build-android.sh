@@ -57,6 +57,13 @@ rm -rf "$JNI_LIBS_DIR"
 #
 # release-mobile rather than release: opt-level="s" and panic="abort", which
 # together take ~38% off the stripped .so. See the profile comment in Cargo.toml.
+# --features control-stats: the counters shoes_get_stats / getStats read.
+# On for the published artifact because the resident cost is one atomic, a few
+# hundred bytes per configured outbound and 8 bytes per live connection --
+# 2 KiB at the 256-connection mobile ceiling, below one page. MOBILE.md
+# section 10 carries the measurement. control-logs stays off: the log ring is
+# exactly the memory an iOS extension cannot spare, and a host reads a log
+# file through shoes_set_log_file instead.
 echo "==> Building native .so files for all ABIs"
 cargo ndk \
     -t arm64-v8a \
@@ -64,7 +71,7 @@ cargo ndk \
     -t x86_64 \
     -P 21 \
     -o "$JNI_LIBS_DIR" \
-    -- build --profile release-mobile --lib --locked
+    -- build --profile release-mobile --lib --locked --features control-stats
 
 # cargo-ndk copies every cdylib in the dependency graph into the AAR, under
 # hashed filenames System.loadLibrary cannot load. awgtun stopped emitting one

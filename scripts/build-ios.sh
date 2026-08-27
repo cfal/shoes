@@ -42,11 +42,18 @@ rustup target add \
 # profile comment in Cargo.toml.
 PROFILE_DIR="release-mobile"
 
+# --features control-stats: the counters shoes_get_stats / getStats read.
+# On for the published artifact because the resident cost is one atomic, a few
+# hundred bytes per configured outbound and 8 bytes per live connection --
+# 2 KiB at the 256-connection mobile ceiling, below one page. MOBILE.md
+# section 10 carries the measurement. control-logs stays off: the log ring is
+# exactly the memory an iOS extension cannot spare, and a host reads a log
+# file through shoes_set_log_file instead.
 echo "==> Building for aarch64-apple-ios (physical device)"
-cargo build --profile release-mobile --target aarch64-apple-ios
+cargo build --profile release-mobile --features control-stats --target aarch64-apple-ios
 
 echo "==> Building for aarch64-apple-ios-sim (Apple Silicon simulator)"
-cargo build --profile release-mobile --target aarch64-apple-ios-sim
+cargo build --profile release-mobile --features control-stats --target aarch64-apple-ios-sim
 
 echo "==> Copying libraries"
 cp "target/aarch64-apple-ios/$PROFILE_DIR/$LIB_NAME"     "$OUTPUT_DIR/device/$LIB_NAME"

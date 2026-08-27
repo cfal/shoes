@@ -93,8 +93,13 @@ jobs:
       # provider, which is Swift and so consumes the same C API as iOS -- the
       # provider is handed a descriptor by packetFlow either way. Building it
       # here means a change to the FFI cannot break the macOS host silently.
+      #
+      # control-stats as well, so the body of shoes_get_stats is compiled and
+      # linked here rather than only on a tag build. The symbol itself is
+      # unconditional, which is what keeps the check below counting the same
+      # list whichever features are on.
       - name: Build staticlib
-        run: cargo build --locked --release --features ffi --target aarch64-apple-darwin
+        run: cargo build --locked --release --features ffi,control-stats --target aarch64-apple-darwin
 
       - name: Verify the C surface matches include/shoes.h
         run: |

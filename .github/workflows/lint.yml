@@ -106,7 +106,7 @@ jobs:
       # src/tun/mod.rs read as dead code -- clippy --fix acted on exactly that
       # and would have broken this build. Here the consumers compile.
       - name: Run clippy for Android
-        run: cargo ndk -t arm64-v8a -- clippy --locked --lib -- -D warnings
+        run: cargo ndk -t arm64-v8a -- clippy --locked --lib --features control-stats -- -D warnings
 
   audit:
     name: Security advisories
