@@ -360,15 +360,67 @@ pub extern "C" fn shoes_get_last_error() -> *mut c_char {
     }
 }
 
-/// Free a string returned by `shoes_get_last_error()`.
+/// Read the runtime counters as a JSON document.
+///
+/// Returns a null-terminated UTF-8 string the caller must free with
+/// `shoes_free_string()`, or NULL if this library was built without the
+/// `control-stats` feature. It is never NULL for any other reason: before
+/// `shoes_start` every number is zero and `outbounds` is empty; after
+/// `shoes_stop` it holds the final figures of the session that just ended,
+/// and the next `shoes_start` resets them.
+///
+/// Safe to call from any thread, and safe when nothing is running. It does no
+/// I/O -- it takes a short read lock on the outbound registry and allocates
+/// the string.
+///
+/// The document has this shape, and later releases may add keys to it, so a
+/// host should ignore keys it does not recognise:
+///
+///   {"upload_bytes":0,"download_bytes":0,"active_connections":0,
+///    "outbounds":[{"name":"Frankfurt","upload_bytes":0,"download_bytes":0,
+///                  "active_connections":0}]}
+///
+/// `upload_bytes` and `download_bytes` at the top level are the same two
+/// totals `ShoesTrafficCallback` delivers, measured at the TUN edge.
+/// `active_connections` at the top level is live TCP connections through the
+/// tunnel. Each `outbounds` entry is measured at the proxy instead: its bytes
+/// are application payload to and from that server, and its
+/// `active_connections` counts streams open to it. The two measurements do
+/// not agree to the byte and are not meant to -- see src/control/stats.rs.
+/// `outbounds` is sorted by name and lists every outbound in the running
+/// config, including ones that have carried nothing yet.
+#[unsafe(no_mangle)]
+pub extern "C" fn shoes_get_stats() -> *mut c_char {
+    // The symbol exists in every build, so that include/shoes.h does not
+    // depend on the features it was generated with and the exported-symbol
+    // count the macOS CI job checks is the same list either way. Only the
+    // body is gated.
+    #[cfg(feature = "control-stats")]
+    {
+        match CString::new(crate::control::stats::snapshot().to_json()) {
+            Ok(cstr) => cstr.into_raw(),
+            // Unreachable -- to_json escapes U+0000 -- but a NULL here is a
+            // host seeing "no stats", where an unwrap would be an abort.
+            Err(_) => std::ptr::null_mut(),
+        }
+    }
+    #[cfg(not(feature = "control-stats"))]
+    {
+        std::ptr::null_mut()
+    }
+}
+
+/// Free a string returned by `shoes_get_last_error()` or `shoes_get_stats()`.
 ///
 /// # Safety
-/// `ptr` must be a pointer returned by `shoes_get_last_error()`, or NULL.
+/// `ptr` must be a pointer returned by one of those two functions, or NULL,
+/// and must not have been freed already.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn shoes_free_string(ptr: *mut c_char) {
     if !ptr.is_null() {
         // SAFETY: the caller guarantees `ptr` came from `into_raw` in
-        // `shoes_get_last_error` and has not already been freed.
+        // `shoes_get_last_error` or `shoes_get_stats`, and has not already
+        // been freed.
         drop(unsafe { CString::from_raw(ptr) });
     }
 }

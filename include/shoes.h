@@ -158,10 +158,44 @@ int shoes_network_changed(void);
 char *shoes_get_last_error(void);
 
 /**
- * Free a string returned by `shoes_get_last_error()`.
+ * Read the runtime counters as a JSON document.
+ *
+ * Returns a null-terminated UTF-8 string the caller must free with
+ * `shoes_free_string()`, or NULL if this library was built without the
+ * `control-stats` feature. It is never NULL for any other reason: before
+ * `shoes_start` every number is zero and `outbounds` is empty; after
+ * `shoes_stop` it holds the final figures of the session that just ended,
+ * and the next `shoes_start` resets them.
+ *
+ * Safe to call from any thread, and safe when nothing is running. It does no
+ * I/O -- it takes a short read lock on the outbound registry and allocates
+ * the string.
+ *
+ * The document has this shape, and later releases may add keys to it, so a
+ * host should ignore keys it does not recognise:
+ *
+ *   {"upload_bytes":0,"download_bytes":0,"active_connections":0,
+ *    "outbounds":[{"name":"Frankfurt","upload_bytes":0,"download_bytes":0,
+ *                  "active_connections":0}]}
+ *
+ * `upload_bytes` and `download_bytes` at the top level are the same two
+ * totals `ShoesTrafficCallback` delivers, measured at the TUN edge.
+ * `active_connections` at the top level is live TCP connections through the
+ * tunnel. Each `outbounds` entry is measured at the proxy instead: its bytes
+ * are application payload to and from that server, and its
+ * `active_connections` counts streams open to it. The two measurements do
+ * not agree to the byte and are not meant to -- see src/control/stats.rs.
+ * `outbounds` is sorted by name and lists every outbound in the running
+ * config, including ones that have carried nothing yet.
+ */
+char *shoes_get_stats(void);
+
+/**
+ * Free a string returned by `shoes_get_last_error()` or `shoes_get_stats()`.
  *
  * # Safety
- * `ptr` must be a pointer returned by `shoes_get_last_error()`, or NULL.
+ * `ptr` must be a pointer returned by one of those two functions, or NULL,
+ * and must not have been freed already.
  */
 void shoes_free_string(char *ptr);
 
