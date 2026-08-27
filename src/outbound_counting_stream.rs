@@ -203,6 +203,26 @@ mod tests {
     use crate::outbound_stats::{REGISTRY_TEST_LOCK, reset_for_test, snapshot_all};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    /// The per-connection RSS cost the mobile hosts were promised: one
+    /// pointer, and no per-connection entry in any table. MOBILE.md section
+    /// 10 and the Cargo.toml feature comment both quote a figure derived
+    /// from this -- 2 KiB at the 256-connection ceiling -- so a field added
+    /// here moves a number those two documents state. Adding one is allowed;
+    /// doing it without noticing is not.
+    #[test]
+    fn the_adapter_adds_one_pointer_per_stream() {
+        use std::mem::size_of;
+
+        // Cursor<Vec<u8>>, not TcpStream: the assertion is about the
+        // adapter's own overhead, and a wrapped type whose size is already a
+        // multiple of the pointer size cannot hide the Arc in padding.
+        type Inner = std::io::Cursor<Vec<u8>>;
+        assert_eq!(
+            size_of::<OutboundCountingStream<Inner>>() - size_of::<Inner>(),
+            size_of::<usize>()
+        );
+    }
+
     /// Install one outbound and hand back its counters. Every test here goes
     /// through install: it is the only writer, so a test that wants a real
     /// counter has to declare it the way a running config would.
