@@ -20,6 +20,8 @@ use crate::resolver::{NativeResolver, ResolverCache};
 
 use super::frame::{FrameMetadata, FrameOption, SessionStatus, TargetNetwork};
 
+const MAX_XUDP_ROUTES: usize = 1024;
+
 pub struct XudpMessageStream {
     /// Underlying byte stream (VLESS VisionStream, VMess stream, or any TLS stream) that reads/writes raw XUDP frame bytes
     inner_stream: Box<dyn AsyncStream>,
@@ -134,6 +136,12 @@ impl XudpMessageStream {
         };
         if let Some(route_id) = session.routes.get(original_destination) {
             return Ok(Some(*route_id));
+        }
+        if self.routes.len() >= MAX_XUDP_ROUTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("XUDP route limit of {MAX_XUDP_ROUTES} exceeded"),
+            ));
         }
 
         let route_id = self.allocate_route_id()?;
