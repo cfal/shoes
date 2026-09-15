@@ -497,22 +497,18 @@ where
 
         let mut written = 0;
         while written < data.len() {
-            match self.session.writer().write(&data[written..]) {
-                Ok(n) => {
-                    if n == 0 {
-                        // Session buffer full, save remainder
-                        log::debug!(
-                            "VISION WRITE: Session buffer full, saving {} bytes to pending",
-                            data.len() - written
-                        );
-                        self.pending_plain_writes
-                            .extend_from_slice(&data[written..]);
-                        return Ok(());
-                    }
-                    written += n;
-                }
-                Err(e) => return Err(e),
+            let n = self.session.writer().write(&data[written..])?;
+            if n == 0 {
+                // Session buffer full, save remainder
+                log::debug!(
+                    "VISION WRITE: Session buffer full, saving {} bytes to pending",
+                    data.len() - written
+                );
+                self.pending_plain_writes
+                    .extend_from_slice(&data[written..]);
+                return Ok(());
             }
+            written += n;
         }
 
         Ok(())

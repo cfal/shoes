@@ -79,6 +79,7 @@ pub const OUTGOING_BUFFER_LIMIT: usize = 64 * 1024;
 ///
 /// This is the zero-allocation version for use with in-place decryption.
 /// NOTE: Does NOT strip padding zeros - our implementation doesn't add padding.
+#[cfg(test)]
 #[inline]
 pub fn strip_content_type_slice(plaintext: &[u8]) -> io::Result<(u8, usize)> {
     if plaintext.is_empty() {
@@ -111,7 +112,7 @@ pub fn strip_content_type_slice(plaintext: &[u8]) -> io::Result<(u8, usize)> {
 /// ends with zero bytes. Use `strip_content_type_with_padding` for messages from
 /// external implementations that may use padding.
 ///
-/// Only used by tests - the hot path uses `strip_content_type_slice` for zero-allocation.
+/// Only used by tests.
 #[cfg(test)]
 pub fn strip_content_type(plaintext: &mut Vec<u8>) -> io::Result<u8> {
     let (content_type, valid_len) = strip_content_type_slice(plaintext)?;

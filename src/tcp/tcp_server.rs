@@ -398,7 +398,7 @@ async fn start_tcp_or_quic_servers(
     if join_handles.is_empty() {
         return Err(std::io::Error::other(format!(
             "failed to start servers at {}",
-            &config.bind_location
+            config.bind_location
         )));
     }
 
@@ -417,7 +417,7 @@ async fn start_tcp_servers(
         ..
     } = config;
 
-    println!("Starting {} TCP server at {}", &protocol, &bind_location);
+    println!("Starting {} TCP server at {}", protocol, bind_location);
 
     let rules = rules.map(ConfigSelection::unwrap_config).into_vec();
     // We should always have a direct entry.

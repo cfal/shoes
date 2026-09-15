@@ -278,7 +278,7 @@ pub async fn start_quic_servers(
         ..
     } = config;
 
-    println!("Starting {} QUIC server at {}", &protocol, &bind_location);
+    println!("Starting {} QUIC server at {}", protocol, bind_location);
 
     let rules = rules.map(ConfigSelection::unwrap_config).into_vec();
     // A direct entry must always exist
