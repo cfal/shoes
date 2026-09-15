@@ -97,25 +97,7 @@ pub async fn setup_http_server_stream_inner(
     let (remote_location, connection_success_response, initial_remote_data, need_initial_flush) =
         if line.starts_with("CONNECT ") {
             let address = &line[8..line.len() - 9];
-
-            let separator_index = address.find(':').ok_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid address format")
-            })?;
-
-            if address.len() <= separator_index + 1 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "Invalid address format",
-                ));
-            }
-
-            let domain_name = &address[0..separator_index];
-
-            let port = address[separator_index + 1..]
-                .parse::<u16>()
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-
-            let remote_location = NetLocation::new(Address::from(domain_name)?, port);
+            let remote_location = NetLocation::from_authority(address, None)?;
 
             // wait for an empty \r\n before connecting, and check for auth header line if needed.
             let mut need_auth = auth_token.is_some();
@@ -204,15 +186,7 @@ pub async fn setup_http_server_stream_inner(
                 None => (url, "/"),
             };
 
-            let remote_location = match address.find(':') {
-                Some(i) => {
-                    let port = address[i + 1..]
-                        .parse::<u16>()
-                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-                    NetLocation::new(Address::from(&address[0..i])?, port)
-                }
-                None => NetLocation::new(Address::from(address)?, 80),
-            };
+            let remote_location = NetLocation::from_authority(address, Some(80))?;
 
             let mut request = format!("{directive} {location} {http_version}\r\n");
 

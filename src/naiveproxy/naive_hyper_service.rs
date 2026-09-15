@@ -358,47 +358,7 @@ async fn naive_service(
 
 fn parse_connect_destination(req: &Request<Incoming>) -> Option<NetLocation> {
     let authority = req.uri().authority()?;
-    parse_authority(authority.as_str()).ok()
-}
-
-/// Parse authority string (host:port) into NetLocation
-fn parse_authority(authority: &str) -> io::Result<NetLocation> {
-    // Handle IPv6: [::1]:443
-    if authority.starts_with('[') {
-        let end_bracket = authority
-            .find(']')
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid IPv6 address"))?;
-
-        let host = &authority[1..end_bracket];
-
-        let port =
-            if authority.len() > end_bracket + 1 && authority.as_bytes()[end_bracket + 1] == b':' {
-                authority[end_bracket + 2..].parse::<u16>().map_err(|e| {
-                    io::Error::new(io::ErrorKind::InvalidInput, format!("Invalid port: {}", e))
-                })?
-            } else {
-                return Err(io::Error::new(io::ErrorKind::InvalidInput, "Missing port"));
-            };
-
-        let addr = host.parse().map_err(|e| {
-            io::Error::new(io::ErrorKind::InvalidInput, format!("Invalid IPv6: {}", e))
-        })?;
-
-        return Ok(NetLocation::new(Address::Ipv6(addr), port));
-    }
-
-    // Handle host:port
-    let colon = authority
-        .rfind(':')
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Missing port"))?;
-
-    let host = &authority[..colon];
-    let port = authority[colon + 1..]
-        .parse::<u16>()
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("Invalid port: {}", e)))?;
-
-    let address = Address::from(host)?;
-    Ok(NetLocation::new(address, port))
+    NetLocation::from_authority(authority.as_str(), None).ok()
 }
 
 /// Serve static files or return 401 Unauthorized
