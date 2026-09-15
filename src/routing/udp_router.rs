@@ -522,7 +522,7 @@ impl<'a> UdpRouter<'a> {
             };
 
             match state {
-                Some(KeyState::Active(id)) => self.remove_session(id),
+                Some(KeyState::Active(id)) => self.cancel_session(id),
                 Some(KeyState::Pending) => {
                     if let Some(index) = self.pending_creates.iter().position(|pending| {
                         matches!(
@@ -1113,9 +1113,21 @@ impl<'a> UdpRouter<'a> {
     /// Remove a session (split-borrow friendly version)
     #[inline]
     fn remove_session(&mut self, id: SessionKey) {
-        let Some(mut session) = self.sessions.swap_remove(&id) else {
+        let Some(session) = self.take_session(id) else {
             return;
         };
+
+        self.pending_shutdowns.push_back(session.remote);
+    }
+
+    #[inline]
+    fn cancel_session(&mut self, id: SessionKey) {
+        drop(self.take_session(id));
+    }
+
+    #[inline]
+    fn take_session(&mut self, id: SessionKey) -> Option<RoutingSession> {
+        let mut session = self.sessions.swap_remove(&id)?;
 
         debug!("Session removed: {}", session.destination);
 
@@ -1125,18 +1137,17 @@ impl<'a> UdpRouter<'a> {
         }
 
         // Remove from lookup map
-        match (&mut self.session_lookup, session.lookup_key) {
+        match (&mut self.session_lookup, &session.lookup_key) {
             (SessionLookup::ByDestination(map), LookupKey::Destination(dest)) => {
-                map.remove(&dest);
+                map.remove(dest);
             }
             (SessionLookup::BySessionId(map), LookupKey::SessionId(sid)) => {
-                map.remove(&sid);
+                map.remove(sid);
             }
             _ => unreachable!(),
         }
 
-        // Queue remote stream for graceful shutdown
-        self.pending_shutdowns.push_back(session.remote);
+        Some(session)
     }
 
     /// Process expired sessions

@@ -20,7 +20,7 @@ use crate::resolver::{NativeResolver, ResolverCache};
 
 use super::frame::{FrameMetadata, FrameOption, SessionStatus, TargetNetwork};
 
-const MAX_XUDP_ROUTES: usize = 1024;
+pub(crate) const MAX_XUDP_ROUTES: usize = 1024;
 
 pub struct XudpMessageStream {
     /// Underlying byte stream (VLESS VisionStream, VMess stream, or any TLS stream) that reads/writes raw XUDP frame bytes
@@ -138,10 +138,12 @@ impl XudpMessageStream {
             return Ok(Some(*route_id));
         }
         if self.routes.len() >= MAX_XUDP_ROUTES {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("XUDP route limit of {MAX_XUDP_ROUTES} exceeded"),
-            ));
+            log::warn!(
+                "[XUDP SESSION READ] Dropping packet for new destination {} after reaching the {}-route limit",
+                original_destination,
+                MAX_XUDP_ROUTES
+            );
+            return Ok(None);
         }
 
         let route_id = self.allocate_route_id()?;
@@ -366,28 +368,23 @@ impl AsyncReadSessionMessage for XudpMessageStream {
                 )));
             }
 
-            let Some(session_id) =
+            if let Some(session_id) =
                 this.get_or_create_route(wire_session_id, &original_destination)?
-            else {
-                return Poll::Ready(Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("XUDP session {wire_session_id} is no longer active"),
-                )));
-            };
-
-            let socket_addr = match this
-                .resolver_cache
-                .poll_resolve_location(cx, &original_destination)
             {
-                Poll::Ready(result) => result?,
-                Poll::Pending => {
-                    this.incoming_message = Some((data, original_destination, wire_session_id));
-                    return Poll::Pending;
-                }
-            };
+                let socket_addr = match this
+                    .resolver_cache
+                    .poll_resolve_location(cx, &original_destination)
+                {
+                    Poll::Ready(result) => result?,
+                    Poll::Pending => {
+                        this.incoming_message = Some((data, original_destination, wire_session_id));
+                        return Poll::Pending;
+                    }
+                };
 
-            buf.put_slice(&data);
-            return Poll::Ready(Ok((session_id, socket_addr)));
+                buf.put_slice(&data);
+                return Poll::Ready(Ok((session_id, socket_addr)));
+            }
         }
 
         if this.is_eof {
