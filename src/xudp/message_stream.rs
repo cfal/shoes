@@ -66,8 +66,13 @@ struct RoutedSession {
 
 impl XudpMessageStream {
     pub fn new(inner_stream: Box<dyn AsyncStream>) -> Self {
-        // Create resolver implicitly like UdpMessageStream does
-        let resolver = Arc::new(NativeResolver::new());
+        Self::new_with_resolver(inner_stream, Arc::new(NativeResolver::new()))
+    }
+
+    pub(crate) fn new_with_resolver(
+        inner_stream: Box<dyn AsyncStream>,
+        resolver: Arc<dyn crate::resolver::Resolver>,
+    ) -> Self {
         Self {
             inner_stream,
             read_buffer: BytesMut::with_capacity(65536),
@@ -398,6 +403,16 @@ impl AsyncReadSessionMessage for XudpMessageStream {
             // Try to decode a complete frame from the read buffer
             match this.try_decode_one_frame()? {
                 Some((data, destination, wire_session_id)) => {
+                    let Some(session_id) =
+                        this.get_or_create_route(wire_session_id, &destination)?
+                    else {
+                        log::warn!(
+                            "[XUDP SESSION READ] Dropping data without an admitted route for session {}",
+                            wire_session_id
+                        );
+                        continue;
+                    };
+
                     // Resolve hostname to IP if needed
                     log::debug!("[XUDP SESSION READ] Resolving destination: {}", destination);
                     let socket_addr =
@@ -427,15 +442,6 @@ impl AsyncReadSessionMessage for XudpMessageStream {
                         resolved_destination
                     );
 
-                    let Some(session_id) =
-                        this.get_or_create_route(wire_session_id, &destination)?
-                    else {
-                        log::warn!(
-                            "[XUDP SESSION READ] Ignoring data for closed session {}",
-                            wire_session_id
-                        );
-                        continue;
-                    };
                     log::debug!(
                         "[XUDP SESSION READ] Session {} mapped to {}",
                         session_id,
