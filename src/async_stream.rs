@@ -111,12 +111,18 @@ pub trait AsyncWriteSourcedMessage {
 
 /// Session-based message reading trait. Used by protocols like XUDP that have session IDs.
 /// Returns (session_id, data, source_addr) tuples.
+pub type MessageSessionId = u64;
+
 pub trait AsyncReadSessionMessage {
     fn poll_read_session_message(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<(u16, SocketAddr)>>;
+    ) -> Poll<std::io::Result<(MessageSessionId, SocketAddr)>>;
+
+    fn take_closed_session(&mut self) -> Option<MessageSessionId> {
+        None
+    }
 }
 
 /// Session-based message writing trait. Used by protocols like XUDP that have session IDs.
@@ -125,7 +131,7 @@ pub trait AsyncWriteSessionMessage {
     fn poll_write_session_message(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        session_id: u16,
+        session_id: MessageSessionId,
         buf: &[u8],
         target: &SocketAddr,
     ) -> Poll<std::io::Result<()>>;
@@ -464,8 +470,12 @@ impl<T: ?Sized + AsyncReadSessionMessage + Unpin> AsyncReadSessionMessage for Bo
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<(u16, SocketAddr)>> {
+    ) -> Poll<std::io::Result<(MessageSessionId, SocketAddr)>> {
         Pin::new(&mut **self).poll_read_session_message(cx, buf)
+    }
+
+    fn take_closed_session(&mut self) -> Option<MessageSessionId> {
+        (**self).take_closed_session()
     }
 }
 
@@ -474,8 +484,12 @@ impl<T: ?Sized + AsyncReadSessionMessage + Unpin> AsyncReadSessionMessage for &m
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<(u16, SocketAddr)>> {
+    ) -> Poll<std::io::Result<(MessageSessionId, SocketAddr)>> {
         Pin::new(&mut **self).poll_read_session_message(cx, buf)
+    }
+
+    fn take_closed_session(&mut self) -> Option<MessageSessionId> {
+        (**self).take_closed_session()
     }
 }
 
@@ -483,7 +497,7 @@ impl<T: ?Sized + AsyncWriteSessionMessage + Unpin> AsyncWriteSessionMessage for 
     fn poll_write_session_message(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        session_id: u16,
+        session_id: MessageSessionId,
         buf: &[u8],
         target: &SocketAddr,
     ) -> Poll<std::io::Result<()>> {
@@ -495,7 +509,7 @@ impl<T: ?Sized + AsyncWriteSessionMessage + Unpin> AsyncWriteSessionMessage for 
     fn poll_write_session_message(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        session_id: u16,
+        session_id: MessageSessionId,
         buf: &[u8],
         target: &SocketAddr,
     ) -> Poll<std::io::Result<()>> {

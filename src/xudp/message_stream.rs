@@ -4,7 +4,7 @@
 
 use bytes::{Buf, BufMut, BytesMut};
 use futures::ready;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -14,7 +14,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use crate::address::{Address, NetLocation};
 use crate::async_stream::{
     AsyncFlushMessage, AsyncPing, AsyncReadSessionMessage, AsyncSessionMessageStream,
-    AsyncShutdownMessage, AsyncStream, AsyncWriteSessionMessage,
+    AsyncShutdownMessage, AsyncStream, AsyncWriteSessionMessage, MessageSessionId,
 };
 use crate::resolver::{NativeResolver, ResolverCache};
 
@@ -30,33 +30,36 @@ pub struct XudpMessageStream {
     /// Write buffer for outgoing XUDP frames
     write_buffer: BytesMut,
 
-    /// Session ID counter (starts at 1, wraps at u16::MAX)
-    next_session_id: u16,
+    next_route_id: MessageSessionId,
 
-    /// Active sessions: destination (RESOLVED IP) -> session_id
-    /// Keys are always resolved IP addresses, never hostnames
-    /// This ensures responses from UDP sockets (which give us IPs) can find the correct session
-    destination_to_session: HashMap<NetLocation, u16>,
+    /// Active protocol sessions and their independently routed destinations.
+    wire_sessions: HashMap<u16, WireSession>,
 
-    /// Reverse mapping: session_id -> destination (RESOLVED IP)
-    /// Used to remember which session_id maps to which destination
-    session_to_destination: HashMap<u16, NetLocation>,
+    /// Translates router identities back to protocol session IDs and destinations.
+    routes: HashMap<MessageSessionId, RoutedSession>,
 
-    /// Maps session_id -> ORIGINAL destination (before resolution)
-    /// This preserves hostnames for encoding in response frames
-    session_to_original_destination: HashMap<u16, NetLocation>,
+    /// Route identities whose protocol session has ended.
+    closed_routes: VecDeque<MessageSessionId>,
 
     /// Resolver cache for hostname resolution
     /// Resolves hostnames to IPs before storing in session maps
     resolver_cache: ResolverCache,
 
-    /// Buffered incoming message (if we read a complete frame)
-    /// Stores: (data, original_destination, optional_resolved_destination, wire_session_id)
-    /// If resolved_destination is None, we still need to resolve it
-    incoming_message: Option<(Vec<u8>, NetLocation, Option<NetLocation>, u16)>,
+    /// Buffered incoming message waiting for destination resolution.
+    incoming_message: Option<(Vec<u8>, NetLocation, u16)>,
 
     /// EOF flag
     is_eof: bool,
+}
+
+struct WireSession {
+    default_destination: NetLocation,
+    routes: HashMap<NetLocation, MessageSessionId>,
+}
+
+struct RoutedSession {
+    wire_session_id: u16,
+    original_destination: NetLocation,
 }
 
 impl XudpMessageStream {
@@ -67,10 +70,10 @@ impl XudpMessageStream {
             inner_stream,
             read_buffer: BytesMut::with_capacity(65536),
             write_buffer: BytesMut::with_capacity(65536),
-            next_session_id: 1,
-            destination_to_session: HashMap::new(),
-            session_to_destination: HashMap::new(),
-            session_to_original_destination: HashMap::new(),
+            next_route_id: 1,
+            wire_sessions: HashMap::new(),
+            routes: HashMap::new(),
+            closed_routes: VecDeque::new(),
             resolver_cache: ResolverCache::new(resolver),
             incoming_message: None,
             is_eof: false,
@@ -92,77 +95,61 @@ impl XudpMessageStream {
         Ok(())
     }
 
-    /// Allocate new session ID
-    fn allocate_session_id(&mut self) -> u16 {
-        loop {
-            let id = self.next_session_id;
-            self.next_session_id = self.next_session_id.wrapping_add(1);
-            if self.next_session_id == 0 {
-                self.next_session_id = 1; // Skip 0
-            }
+    fn allocate_route_id(&mut self) -> std::io::Result<MessageSessionId> {
+        let id = self.next_route_id;
+        self.next_route_id = self.next_route_id.checked_add(1).ok_or_else(|| {
+            std::io::Error::other("XUDP internal session identifier space exhausted")
+        })?;
+        Ok(id)
+    }
 
-            // Check if ID is already in use (unlikely with u16 space)
-            if !self.session_to_destination.contains_key(&id) {
-                return id;
-            }
+    fn close_wire_session(&mut self, wire_session_id: u16) {
+        let Some(session) = self.wire_sessions.remove(&wire_session_id) else {
+            return;
+        };
+        for route_id in session.routes.into_values() {
+            self.routes.remove(&route_id);
+            self.closed_routes.push_back(route_id);
         }
     }
 
-    /// Get or create session ID for destination, preserving original address
-    /// resolved_destination: IP address (used for reverse lookup from UDP responses)
-    /// original_destination: Original address from XUDP frame (may be hostname, used in response frames)
-    fn get_or_create_session(
-        &mut self,
-        resolved_destination: &NetLocation,
-        original_destination: &NetLocation,
-    ) -> (u16, bool) {
-        if let Some(&session_id) = self.destination_to_session.get(resolved_destination) {
-            log::debug!(
-                "[XUDP] Found existing session {} for destination {}",
-                session_id,
-                resolved_destination
-            );
-            (session_id, false) // Existing session
-        } else {
-            let session_id = self.allocate_session_id();
-            log::debug!(
-                "[XUDP] Creating NEW session {} for resolved dest {} (original: {})",
-                session_id,
-                resolved_destination,
-                original_destination
-            );
-            self.destination_to_session
-                .insert(resolved_destination.clone(), session_id);
-            self.session_to_destination
-                .insert(session_id, resolved_destination.clone());
-            // Store original destination for use in response frames
-            self.session_to_original_destination
-                .insert(session_id, original_destination.clone());
-            log::debug!(
-                "[XUDP] Session maps updated. Total sessions: {}",
-                self.destination_to_session.len()
-            );
-            (session_id, true) // New session
-        }
+    fn start_wire_session(&mut self, wire_session_id: u16, destination: NetLocation) {
+        self.close_wire_session(wire_session_id);
+        self.wire_sessions.insert(
+            wire_session_id,
+            WireSession {
+                default_destination: destination,
+                routes: HashMap::new(),
+            },
+        );
     }
 
-    fn routed_session_id(
+    fn get_or_create_route(
         &mut self,
         wire_session_id: u16,
-        resolved_destination: &NetLocation,
         original_destination: &NetLocation,
-    ) -> u16 {
-        if wire_session_id == 0 {
-            return self
-                .get_or_create_session(resolved_destination, original_destination)
-                .0;
+    ) -> std::io::Result<Option<MessageSessionId>> {
+        let Some(session) = self.wire_sessions.get(&wire_session_id) else {
+            return Ok(None);
+        };
+        if let Some(route_id) = session.routes.get(original_destination) {
+            return Ok(Some(*route_id));
         }
 
-        self.session_to_destination
-            .insert(wire_session_id, resolved_destination.clone());
-        self.session_to_original_destination
-            .insert(wire_session_id, original_destination.clone());
-        wire_session_id
+        let route_id = self.allocate_route_id()?;
+        self.wire_sessions
+            .get_mut(&wire_session_id)
+            .expect("wire session disappeared during route allocation")
+            .routes
+            .insert(original_destination.clone(), route_id);
+        self.routes.insert(
+            route_id,
+            RoutedSession {
+                wire_session_id,
+                original_destination: original_destination.clone(),
+            },
+        );
+        Ok(Some(route_id))
     }
 
     /// Try to decode one complete XUDP frame from the read buffer.
@@ -252,30 +239,12 @@ impl XudpMessageStream {
             }
             let data = self.read_buffer.split_to(data_len).to_vec();
 
-            if let Some(ref target) = metadata.target {
-                log::debug!(
-                    "[XUDP READ] Updating session {} mapping to target {}",
-                    metadata.session_id,
-                    target
-                );
-                self.session_to_destination
-                    .insert(metadata.session_id, target.clone());
-                self.session_to_original_destination
-                    .insert(metadata.session_id, target.clone());
-            }
-
             if metadata.status == SessionStatus::End {
-                if let Some(destination) = self.session_to_destination.remove(&metadata.session_id)
-                    && self.destination_to_session.get(&destination) == Some(&metadata.session_id)
-                {
-                    self.destination_to_session.remove(&destination);
-                }
-                self.session_to_original_destination
-                    .remove(&metadata.session_id);
+                self.close_wire_session(metadata.session_id);
                 continue;
             }
 
-            if metadata.status == SessionStatus::KeepAlive || !has_data || data.is_empty() {
+            if metadata.status == SessionStatus::KeepAlive {
                 continue;
             }
 
@@ -298,22 +267,35 @@ impl XudpMessageStream {
                 ));
             }
 
-            let destination = if let Some(ref target) = metadata.target {
-                target.clone()
-            } else {
-                let Some(destination) = self
-                    .session_to_destination
-                    .get(&metadata.session_id)
-                    .cloned()
-                else {
-                    log::warn!(
-                        "[XUDP READ] Ignoring data for unknown session {}",
-                        metadata.session_id
-                    );
-                    continue;
-                };
-                destination
+            let destination = match metadata.status {
+                SessionStatus::New => {
+                    let target = metadata.target.ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "XUDP New frame is missing its destination",
+                        )
+                    })?;
+                    self.start_wire_session(metadata.session_id, target.clone());
+                    target
+                }
+                SessionStatus::Keep => {
+                    let Some(session) = self.wire_sessions.get(&metadata.session_id) else {
+                        log::warn!(
+                            "[XUDP READ] Ignoring data for unknown session {}",
+                            metadata.session_id
+                        );
+                        continue;
+                    };
+                    metadata
+                        .target
+                        .unwrap_or_else(|| session.default_destination.clone())
+                }
+                SessionStatus::End | SessionStatus::KeepAlive => unreachable!(),
             };
+
+            if !has_data || data.is_empty() {
+                continue;
+            }
 
             log::debug!(
                 "[XUDP READ] Decoded complete frame with {} bytes for destination {}",
@@ -363,62 +345,38 @@ impl AsyncReadSessionMessage for XudpMessageStream {
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<(u16, SocketAddr)>> {
+    ) -> Poll<std::io::Result<(MessageSessionId, SocketAddr)>> {
         let this = self.get_mut();
 
         // Return buffered message if available
-        if let Some((data, original_destination, resolved_opt, wire_session_id)) =
-            this.incoming_message.take()
-        {
+        if let Some((data, original_destination, wire_session_id)) = this.incoming_message.take() {
             if data.len() > buf.remaining() {
-                // Re-buffer it
-                this.incoming_message =
-                    Some((data, original_destination, resolved_opt, wire_session_id));
+                this.incoming_message = Some((data, original_destination, wire_session_id));
                 return Poll::Ready(Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     "buffer too small for incoming message",
                 )));
             }
 
-            // Resolve if not already resolved
-            let resolved_destination = if let Some(resolved) = resolved_opt {
-                resolved
-            } else {
-                match this
-                    .resolver_cache
-                    .poll_resolve_location(cx, &original_destination)
-                {
-                    Poll::Ready(Ok(socket_addr)) => match socket_addr {
-                        SocketAddr::V4(addr) => {
-                            NetLocation::new(Address::Ipv4(*addr.ip()), addr.port())
-                        }
-                        SocketAddr::V6(addr) => {
-                            NetLocation::new(Address::Ipv6(*addr.ip()), addr.port())
-                        }
-                    },
-                    Poll::Ready(Err(e)) => {
-                        return Poll::Ready(Err(e));
-                    }
-                    Poll::Pending => {
-                        // Re-buffer and wait for DNS
-                        this.incoming_message =
-                            Some((data, original_destination, None, wire_session_id));
-                        return Poll::Pending;
-                    }
-                }
+            let Some(session_id) =
+                this.get_or_create_route(wire_session_id, &original_destination)?
+            else {
+                return Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("XUDP session {wire_session_id} is no longer active"),
+                )));
             };
 
-            let session_id = this.routed_session_id(
-                wire_session_id,
-                &resolved_destination,
-                &original_destination,
-            );
-
-            // Convert to SocketAddr for return
-            let socket_addr = futures::ready!(
-                this.resolver_cache
-                    .poll_resolve_location(cx, &original_destination)
-            )?;
+            let socket_addr = match this
+                .resolver_cache
+                .poll_resolve_location(cx, &original_destination)
+            {
+                Poll::Ready(result) => result?,
+                Poll::Pending => {
+                    this.incoming_message = Some((data, original_destination, wire_session_id));
+                    return Poll::Pending;
+                }
+            };
 
             buf.put_slice(&data);
             return Poll::Ready(Ok((session_id, socket_addr)));
@@ -445,8 +403,7 @@ impl AsyncReadSessionMessage for XudpMessageStream {
                             }
                             Poll::Pending => {
                                 // DNS resolution pending - buffer the frame and wait
-                                this.incoming_message =
-                                    Some((data, destination, None, wire_session_id));
+                                this.incoming_message = Some((data, destination, wire_session_id));
                                 return Poll::Pending;
                             }
                         };
@@ -465,11 +422,15 @@ impl AsyncReadSessionMessage for XudpMessageStream {
                         resolved_destination
                     );
 
-                    let session_id = this.routed_session_id(
-                        wire_session_id,
-                        &resolved_destination,
-                        &destination,
-                    );
+                    let Some(session_id) =
+                        this.get_or_create_route(wire_session_id, &destination)?
+                    else {
+                        log::warn!(
+                            "[XUDP SESSION READ] Ignoring data for closed session {}",
+                            wire_session_id
+                        );
+                        continue;
+                    };
                     log::debug!(
                         "[XUDP SESSION READ] Session {} mapped to {}",
                         session_id,
@@ -479,12 +440,7 @@ impl AsyncReadSessionMessage for XudpMessageStream {
                     // Successfully decoded a frame
                     if data.len() > buf.remaining() {
                         // Buffer it with resolved destination for next read
-                        this.incoming_message = Some((
-                            data,
-                            destination,
-                            Some(resolved_destination),
-                            wire_session_id,
-                        ));
+                        this.incoming_message = Some((data, destination, wire_session_id));
                         return Poll::Ready(Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
                             "buffer too small for incoming message",
@@ -545,13 +501,17 @@ impl AsyncReadSessionMessage for XudpMessageStream {
             }
         }
     }
+
+    fn take_closed_session(&mut self) -> Option<MessageSessionId> {
+        self.closed_routes.pop_front()
+    }
 }
 
 impl AsyncWriteSessionMessage for XudpMessageStream {
     fn poll_write_session_message(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        session_id: u16,
+        session_id: MessageSessionId,
         buf: &[u8],
         target: &SocketAddr,
     ) -> Poll<std::io::Result<()>> {
@@ -570,75 +530,35 @@ impl AsyncWriteSessionMessage for XudpMessageStream {
             ready!(self.as_mut().poll_flush_message(cx))?;
         }
 
-        // Check if this is a new session BEFORE looking up or creating entries.
-        // XUDP protocol requires first frame for a session to be StatusNew.
-        let is_new_session = !self
-            .session_to_original_destination
-            .contains_key(&session_id);
-
-        // Use original destination (hostname) instead of resolved IP
-        // Look up the original destination that the client requested.
-        // If not found (e.g., XUDP-to-XUDP forwarding), use the target from the caller
-        // and create a new session entry.
-        let target_location = if let Some(original) = self
-            .session_to_original_destination
-            .get(&session_id)
-            .cloned()
-        {
-            original
-        } else {
-            // Session doesn't exist yet - this happens when forwarding from another XUDP stream.
-            // Create a new session using the target address.
-            let addr = match target.ip() {
-                std::net::IpAddr::V4(v4) => Address::Ipv4(v4),
-                std::net::IpAddr::V6(v6) => Address::Ipv6(v6),
-            };
-            let target_location = NetLocation::new(addr, target.port());
+        let Some(route) = self.routes.get(&session_id) else {
             log::debug!(
-                "[XUDP SESSION WRITE] Creating new session {} for destination {} (forwarding mode)",
-                session_id,
-                target_location
+                "[XUDP SESSION WRITE] Discarding response for closed route {}",
+                session_id
             );
-            // Store the mapping for potential future writes with same session_id
-            self.session_to_original_destination
-                .insert(session_id, target_location.clone());
-            let resolved = target_location.clone();
-            self.destination_to_session
-                .insert(resolved.clone(), session_id);
-            self.session_to_destination.insert(session_id, resolved);
-            target_location
+            return Poll::Ready(Ok(()));
         };
+        let wire_session_id = route.wire_session_id;
+        let target_location = route.original_destination.clone();
 
         log::debug!(
             "[XUDP SESSION WRITE] Using original destination {} for session {} (response came from {})",
             target_location,
-            session_id,
+            wire_session_id,
             target
         );
 
-        // Build frame with appropriate status (New for first frame, Keep for subsequent)
-        let status = if is_new_session {
-            log::debug!(
-                "[XUDP SESSION WRITE] Sending NEW frame for session {} (first write)",
-                session_id
-            );
-            SessionStatus::New
-        } else {
-            SessionStatus::Keep
-        };
-
         let metadata = FrameMetadata {
-            session_id,
-            status,
+            session_id: wire_session_id,
+            status: SessionStatus::Keep,
             option: FrameOption::new().with_data(),
-            target: Some(target_location.clone()), // Use ORIGINAL (hostname), not resolved IP!
+            target: Some(target_location.clone()),
             network: Some(TargetNetwork::Udp),
         };
 
         log::debug!(
             "[XUDP SESSION WRITE] Encoding {:?} frame: session_id={}, target={}, data_len={}",
-            status,
-            session_id,
+            SessionStatus::Keep,
+            wire_session_id,
             target_location,
             buf.len()
         );
@@ -652,9 +572,7 @@ impl AsyncWriteSessionMessage for XudpMessageStream {
         // Write data
         self.write_buffer.extend_from_slice(buf);
 
-        // Flush immediately
-
-        self.poll_flush_message(cx)
+        Poll::Ready(Ok(()))
     }
 }
 

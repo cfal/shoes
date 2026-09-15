@@ -30,7 +30,7 @@ use crate::async_stream::{
     AsyncFlushMessage, AsyncMessageStream, AsyncPing, AsyncReadMessage, AsyncReadSessionMessage,
     AsyncReadTargetedMessage, AsyncSessionMessageStream, AsyncShutdownMessage,
     AsyncShutdownMessageExt, AsyncTargetedMessageStream, AsyncWriteMessage,
-    AsyncWriteSessionMessage, AsyncWriteSourcedMessage,
+    AsyncWriteSessionMessage, AsyncWriteSourcedMessage, MessageSessionId,
 };
 use crate::client_proxy_selector::{ClientProxySelector, ConnectDecision};
 use crate::resolver::{Resolver, resolve_single_address};
@@ -131,7 +131,7 @@ enum LookupKey {
     /// For Targeted streams: use destination
     Destination(NetLocation),
     /// For SessionBased streams: use protocol session_id
-    SessionId(u16),
+    SessionId(MessageSessionId),
 }
 
 /// Session lookup strategy - determined by server stream type
@@ -139,7 +139,7 @@ enum SessionLookup {
     /// For Targeted: destination -> KeyState
     ByDestination(FxHashMap<NetLocation, KeyState>),
     /// For SessionBased: session_id -> KeyState
-    BySessionId(FxHashMap<u16, KeyState>),
+    BySessionId(FxHashMap<MessageSessionId, KeyState>),
 }
 
 /// A routing session (one per unique flow)
@@ -148,7 +148,7 @@ struct RoutingSession {
     destination: NetLocation,
 
     /// The session's session id if this is a session UDP stream
-    session_id: u16,
+    session_id: MessageSessionId,
 
     /// Resolved address for response source field
     resolved_addr: SocketAddr,
@@ -187,7 +187,7 @@ struct RoutingSession {
 impl RoutingSession {
     fn new(
         destination: NetLocation,
-        session_id: u16,
+        session_id: MessageSessionId,
         resolved_addr: SocketAddr,
         lookup_key: LookupKey,
         remote: Box<dyn AsyncMessageStream>,
@@ -292,7 +292,7 @@ impl ServerStream {
         cx: &mut Context<'_>,
         data: &[u8],
         source: &SocketAddr,
-        session_id: u16,
+        session_id: MessageSessionId,
     ) -> Poll<io::Result<()>> {
         match self {
             ServerStream::Targeted(stream) => {
@@ -331,6 +331,13 @@ impl ServerStream {
             ServerStream::Session(stream) => stream.shutdown_message().await,
         }
     }
+
+    fn take_closed_session(&mut self) -> Option<MessageSessionId> {
+        match self {
+            ServerStream::Targeted(_) => None,
+            ServerStream::Session(stream) => stream.take_closed_session(),
+        }
+    }
 }
 
 impl std::fmt::Debug for ServerStream {
@@ -345,7 +352,7 @@ impl std::fmt::Debug for ServerStream {
 /// Packet info extracted from server stream
 struct InboundPacket {
     destination: NetLocation,
-    session_id: u16,
+    session_id: MessageSessionId,
 }
 
 /// Result of session creation
@@ -361,7 +368,7 @@ type SessionCreateFuture = Pin<Box<dyn Future<Output = io::Result<SessionCreateR
 struct PendingSessionCreate {
     lookup_key: LookupKey,
     destination: NetLocation,
-    session_id: u16,
+    session_id: MessageSessionId,
     initial_data: Vec<u8>,
     future: SessionCreateFuture,
 }
@@ -507,6 +514,30 @@ impl<'a> UdpRouter<'a> {
         }
     }
 
+    fn drain_closed_server_sessions(&mut self) {
+        while let Some(session_id) = self.server.take_closed_session() {
+            let state = match &mut self.session_lookup {
+                SessionLookup::BySessionId(map) => map.remove(&session_id),
+                SessionLookup::ByDestination(_) => unreachable!(),
+            };
+
+            match state {
+                Some(KeyState::Active(id)) => self.remove_session(id),
+                Some(KeyState::Pending) => {
+                    if let Some(index) = self.pending_creates.iter().position(|pending| {
+                        matches!(
+                            pending.lookup_key,
+                            LookupKey::SessionId(id) if id == session_id
+                        )
+                    }) {
+                        self.pending_creates.swap_remove(index);
+                    }
+                }
+                None => {}
+            }
+        }
+    }
+
     /// Read from server, route to sessions
     /// Returns (made_progress, exhausted) - exhausted only if read hit Pending, not pool exhaustion
     #[inline]
@@ -523,7 +554,9 @@ impl<'a> UdpRouter<'a> {
         loop {
             // Read packet from server directly into pool buffer
             let mut read_buf = ReadBuf::new(&mut buf);
-            let packet = match self.server.poll_read_message(cx, &mut read_buf) {
+            let poll_result = self.server.poll_read_message(cx, &mut read_buf);
+            self.drain_closed_server_sessions();
+            let packet = match poll_result {
                 Poll::Ready(Ok(p)) => {
                     server_read_progress = true;
                     debug!(
