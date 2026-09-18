@@ -9,11 +9,16 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  SING_BOX_VERSION: 1.14.1
+  SING_BOX_SHA256: 12cb2816b52febb356f6a885b740cc8758c3f30b8ae0ca8edba80f0d2d35343f
+  MIHOMO_VERSION: 1.19.31
+  MIHOMO_SHA256: 04cf9f09671704f839ddbee2e93069dc831a4123a75281e725d1d96ab9ac1afc
 
 jobs:
-  test:
-    name: Unit Tests
+  unit-tests:
+    name: Unit tests
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
     - uses: actions/checkout@v4
@@ -40,7 +45,110 @@ jobs:
         key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
 
     - name: Build
-      run: cargo build --verbose
+      run: cargo build --workspace --locked --verbose
 
-    - name: Run tests
-      run: cargo test --verbose
+    - name: Run local tests
+      run: cargo test --workspace --locked --lib --bins --verbose
+
+  integration-tests:
+    name: Integration (${{ matrix.name }})
+    needs: unit-tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - name: local protocols
+          features: integration-tests
+          target: integration
+          filters: ""
+          peer: sing-box
+        - name: optional peer interoperability
+          features: optional-peer-tests
+          target: optional_peer
+          filters: ""
+          peer: mihomo
+        - name: external DNS
+          features: external-network-tests
+          target: external_network
+          filters: dns resolver vless_doh vless_dot
+          peer: sing-box
+        - name: external proxies
+          features: external-network-tests
+          target: external_network
+          filters: portforward shadowtls
+          peer: sing-box
+        - name: external REALITY
+          features: external-network-tests
+          target: external_network
+          filters: reality
+          peer: sing-box
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache cargo registry
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/registry
+        key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Cache cargo index
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/git
+        key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Cache cargo build
+      uses: actions/cache@v4
+      with:
+        path: target
+        key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Install sing-box test peer
+      if: matrix.peer == 'sing-box'
+      run: |
+        archive="$RUNNER_TEMP/sing-box.tar.gz"
+        curl --fail --location --retry 3 \
+          --output "$archive" \
+          "https://github.com/SagerNet/sing-box/releases/download/v${SING_BOX_VERSION}/sing-box-${SING_BOX_VERSION}-linux-amd64.tar.gz"
+        echo "${SING_BOX_SHA256}  ${archive}" | sha256sum --check --strict
+        tar --extract --gzip --file "$archive" --directory "$RUNNER_TEMP"
+        binary="$RUNNER_TEMP/sing-box-${SING_BOX_VERSION}-linux-amd64/sing-box"
+        chmod +x "$binary"
+        echo "SHOES_TEST_SING_BOX_BIN=$binary" >> "$GITHUB_ENV"
+
+    - name: Install Mihomo test peer
+      if: matrix.peer == 'mihomo'
+      run: |
+        archive="$RUNNER_TEMP/mihomo.gz"
+        binary="$RUNNER_TEMP/mihomo"
+        curl --fail --location --retry 3 \
+          --output "$archive" \
+          "https://github.com/MetaCubeX/mihomo/releases/download/v${MIHOMO_VERSION}/mihomo-linux-amd64-compatible-v${MIHOMO_VERSION}.gz"
+        echo "${MIHOMO_SHA256}  ${archive}" | sha256sum --check --strict
+        gzip --decompress --stdout "$archive" > "$binary"
+        chmod +x "$binary"
+        echo "SHOES_TEST_MIHOMO_BIN=$binary" >> "$GITHUB_ENV"
+
+    - name: Run integration tests
+      env:
+        TEST_FILTERS: ${{ matrix.filters }}
+      run: |
+        if [ -z "$TEST_FILTERS" ]; then
+          cargo test -p shoes --locked \
+            --features "${{ matrix.features }}" \
+            --test "${{ matrix.target }}" \
+            --verbose -- --test-threads=1
+        else
+          for filter in $TEST_FILTERS; do
+            cargo test -p shoes --locked \
+              --features "${{ matrix.features }}" \
+              --test "${{ matrix.target }}" \
+              --verbose "$filter::" -- --test-threads=1
+          done
+        fi
