@@ -17,9 +17,8 @@ use crate::client_proxy_chain::ClientChainGroup;
 use crate::resolver::Resolver;
 use crate::socket_util::new_udp_socket;
 
-/// Default connection timeout for DNS server connections. Matches hickory-dns CONNECT_TIMEOUT.
 #[cfg(test)]
-const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const TEST_CONNECT_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// RuntimeProvider that routes TCP connections through a proxy chain.
 /// For direct-only chains, UDP and QUIC use the configured bind_interface.
@@ -207,8 +206,45 @@ impl QuicSocketBinder for ProxyQuicBinder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::async_stream::AsyncMessageStream;
+    use crate::client_proxy_chain::{ClientProxyChain, InitialHopEntry};
     use crate::resolver::NativeResolver;
     use crate::tcp::chain_builder::build_direct_chain_group;
+    use crate::tcp::socket_connector::SocketConnector;
+    use async_trait::async_trait;
+
+    #[derive(Debug)]
+    struct PendingSocketConnector;
+
+    #[async_trait]
+    impl SocketConnector for PendingSocketConnector {
+        async fn connect(
+            &self,
+            _resolver: &Arc<dyn Resolver>,
+            _address: &crate::address::ResolvedLocation,
+        ) -> io::Result<Box<dyn AsyncStream>> {
+            std::future::pending().await
+        }
+
+        async fn connect_udp_bidirectional(
+            &self,
+            _resolver: &Arc<dyn Resolver>,
+            _target: crate::address::ResolvedLocation,
+        ) -> io::Result<Box<dyn AsyncMessageStream>> {
+            unreachable!("TCP timeout tests do not open UDP streams")
+        }
+
+        fn bind_interface(&self) -> Option<&str> {
+            None
+        }
+    }
+
+    fn build_pending_chain_group() -> ClientChainGroup {
+        ClientChainGroup::new(vec![ClientProxyChain::new(
+            vec![InitialHopEntry::Direct(Box::new(PendingSocketConnector))],
+            vec![],
+        )])
+    }
 
     #[test]
     fn test_provider_is_clone() {
@@ -216,7 +252,7 @@ mod tests {
         let resolver = Arc::new(NativeResolver::new());
         let chain_group = Arc::new(build_direct_chain_group(resolver.clone()));
         let provider =
-            ProxyRuntimeProvider::with_bootstrap(chain_group, resolver, DEFAULT_CONNECT_TIMEOUT);
+            ProxyRuntimeProvider::with_bootstrap(chain_group, resolver, TEST_CONNECT_TIMEOUT);
         let _cloned = provider.clone();
     }
 
@@ -231,7 +267,7 @@ mod tests {
         let resolver = Arc::new(NativeResolver::new());
         let chain_group = Arc::new(build_direct_chain_group(resolver.clone()));
         let provider =
-            ProxyRuntimeProvider::with_bootstrap(chain_group, resolver, DEFAULT_CONNECT_TIMEOUT);
+            ProxyRuntimeProvider::with_bootstrap(chain_group, resolver, TEST_CONNECT_TIMEOUT);
 
         let local_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let server_addr: SocketAddr = "8.8.8.8:53".parse().unwrap();
@@ -247,19 +283,20 @@ mod tests {
 
     #[tokio::test]
     async fn test_connect_tcp_with_direct_chain_connects_to_target() {
-        // This test verifies the provider correctly routes to the target.
-        // Use localhost with a port that should be refused quickly.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
         let resolver = Arc::new(NativeResolver::new());
         let chain_group = Arc::new(build_direct_chain_group(resolver.clone()));
         let provider =
-            ProxyRuntimeProvider::with_bootstrap(chain_group, resolver, DEFAULT_CONNECT_TIMEOUT);
-
-        // Use localhost port 1 (reserved, should be refused quickly)
-        let server_addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+            ProxyRuntimeProvider::with_bootstrap(chain_group, resolver, TEST_CONNECT_TIMEOUT);
 
         let result = provider.connect_tcp(server_addr, None, None).await;
-        // Connection should fail (connection refused)
-        assert!(result.is_err());
+        assert!(result.is_ok());
+        assert!(
+            tokio::time::timeout(TEST_CONNECT_TIMEOUT, listener.accept())
+                .await
+                .is_ok()
+        );
     }
 
     #[test]
@@ -267,7 +304,7 @@ mod tests {
         let resolver = Arc::new(NativeResolver::new());
         let chain_group = Arc::new(build_direct_chain_group(resolver.clone()));
         let provider =
-            ProxyRuntimeProvider::with_bootstrap(chain_group, resolver, DEFAULT_CONNECT_TIMEOUT);
+            ProxyRuntimeProvider::with_bootstrap(chain_group, resolver, TEST_CONNECT_TIMEOUT);
         let _handle = provider.create_handle();
     }
 
@@ -276,20 +313,18 @@ mod tests {
         let resolver = Arc::new(NativeResolver::new());
         let chain_group = Arc::new(build_direct_chain_group(resolver.clone()));
         let provider =
-            ProxyRuntimeProvider::with_bootstrap(chain_group, resolver, DEFAULT_CONNECT_TIMEOUT);
+            ProxyRuntimeProvider::with_bootstrap(chain_group, resolver, TEST_CONNECT_TIMEOUT);
         assert!(provider.quic_binder().is_some());
     }
 
     #[tokio::test]
     async fn test_connect_tcp_respects_timeout() {
         let resolver = Arc::new(NativeResolver::new());
-        let chain_group = Arc::new(build_direct_chain_group(resolver.clone()));
+        let chain_group = Arc::new(build_pending_chain_group());
         let provider =
-            ProxyRuntimeProvider::with_bootstrap(chain_group, resolver, DEFAULT_CONNECT_TIMEOUT);
+            ProxyRuntimeProvider::with_bootstrap(chain_group, resolver, TEST_CONNECT_TIMEOUT);
 
-        // Use an address that will hang (black hole) rather than refuse immediately.
-        // 10.255.255.1 is a non-routable address that should cause the connection to hang.
-        let server_addr: SocketAddr = "10.255.255.1:53".parse().unwrap();
+        let server_addr: SocketAddr = "192.0.2.1:53".parse().unwrap();
 
         let start = std::time::Instant::now();
         let result = provider
@@ -318,11 +353,11 @@ mod tests {
     #[tokio::test]
     async fn test_connect_tcp_caps_passed_timeout_by_configured_connect_timeout() {
         let resolver = Arc::new(NativeResolver::new());
-        let chain_group = Arc::new(build_direct_chain_group(resolver.clone()));
+        let chain_group = Arc::new(build_pending_chain_group());
         let provider =
             ProxyRuntimeProvider::with_bootstrap(chain_group, resolver, Duration::from_millis(100));
 
-        let server_addr: SocketAddr = "10.255.255.1:53".parse().unwrap();
+        let server_addr: SocketAddr = "192.0.2.1:53".parse().unwrap();
 
         let start = std::time::Instant::now();
         let result = provider
@@ -343,14 +378,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_connect_tcp_uses_default_timeout_when_none() {
+    async fn test_connect_tcp_uses_configured_timeout_when_none() {
         let resolver = Arc::new(NativeResolver::new());
-        let chain_group = Arc::new(build_direct_chain_group(resolver.clone()));
+        let chain_group = Arc::new(build_pending_chain_group());
         let provider =
-            ProxyRuntimeProvider::with_bootstrap(chain_group, resolver, DEFAULT_CONNECT_TIMEOUT);
+            ProxyRuntimeProvider::with_bootstrap(chain_group, resolver, TEST_CONNECT_TIMEOUT);
 
-        // Use a black hole address
-        let server_addr: SocketAddr = "10.255.255.1:53".parse().unwrap();
+        let server_addr: SocketAddr = "192.0.2.1:53".parse().unwrap();
 
         let start = std::time::Instant::now();
         let result = provider.connect_tcp(server_addr, None, None).await;
@@ -366,16 +400,14 @@ mod tests {
             "should be timeout error"
         );
 
-        // Default timeout is 5 seconds; verify it's bounded (less than 10 seconds)
         assert!(
-            elapsed < Duration::from_secs(10),
-            "default timeout should apply, but took {:?}",
+            elapsed < Duration::from_secs(1),
+            "configured timeout should apply, but took {:?}",
             elapsed
         );
-        // Also verify it waited at least close to 5 seconds (with some tolerance)
         assert!(
-            elapsed >= Duration::from_secs(4),
-            "should wait for default timeout (~5s), but only waited {:?}",
+            elapsed >= Duration::from_millis(50),
+            "configured timeout fired too early after {:?}",
             elapsed
         );
     }

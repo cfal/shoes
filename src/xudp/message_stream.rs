@@ -588,3 +588,207 @@ impl AsyncWriteSessionMessage for XudpMessageStream {
 }
 
 impl AsyncSessionMessageStream for XudpMessageStream {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::task::noop_waker;
+    use std::collections::HashSet;
+    use std::io;
+    use std::sync::Mutex;
+
+    struct PendingOnceWriter {
+        output: Arc<Mutex<Vec<u8>>>,
+        pending: bool,
+    }
+
+    impl AsyncRead for PendingOnceWriter {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for PendingOnceWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if self.pending {
+                self.pending = false;
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            self.output.lock().unwrap().extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncPing for PendingOnceWriter {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+
+        fn poll_write_ping(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+
+    impl AsyncStream for PendingOnceWriter {}
+
+    #[test]
+    fn buffered_response_is_accepted_once_when_output_blocks() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let inner = PendingOnceWriter {
+            output: Arc::clone(&output),
+            pending: true,
+        };
+        let mut stream = XudpMessageStream::new(Box::new(inner));
+        let destination = NetLocation::new(Address::Ipv4("127.0.0.1".parse().unwrap()), 53);
+        stream.start_wire_session(10, destination.clone());
+        let route_id = stream
+            .get_or_create_route(10, &destination)
+            .unwrap()
+            .unwrap();
+        let source = "127.0.0.1:53".parse().unwrap();
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        assert!(matches!(
+            Pin::new(&mut stream).poll_write_session_message(&mut cx, route_id, b"x", &source),
+            Poll::Ready(Ok(()))
+        ));
+        assert!(matches!(
+            Pin::new(&mut stream).poll_flush_message(&mut cx),
+            Poll::Pending
+        ));
+        assert!(matches!(
+            Pin::new(&mut stream).poll_flush_message(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
+        assert_eq!(
+            *output.lock().unwrap(),
+            [0, 12, 0, 10, 2, 1, 2, 0, 53, 1, 127, 0, 0, 1, 0, 1, b'x']
+        );
+    }
+
+    #[test]
+    fn closed_routes_cannot_emit_or_reuse_internal_ids() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let inner = PendingOnceWriter {
+            output: Arc::clone(&output),
+            pending: false,
+        };
+        let mut stream = XudpMessageStream::new(Box::new(inner));
+        let destination = NetLocation::new(Address::Ipv4("127.0.0.1".parse().unwrap()), 53);
+        stream.start_wire_session(0, destination.clone());
+        let old_route = stream
+            .get_or_create_route(0, &destination)
+            .unwrap()
+            .unwrap();
+        stream.close_wire_session(0);
+        assert_eq!(stream.take_closed_session(), Some(old_route));
+        assert_eq!(stream.take_closed_session(), None);
+
+        let source = "127.0.0.1:53".parse().unwrap();
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(matches!(
+            Pin::new(&mut stream).poll_write_session_message(&mut cx, old_route, b"late", &source),
+            Poll::Ready(Ok(()))
+        ));
+        assert!(output.lock().unwrap().is_empty());
+
+        stream.start_wire_session(0, destination.clone());
+        let new_route = stream
+            .get_or_create_route(0, &destination)
+            .unwrap()
+            .unwrap();
+        assert_ne!(new_route, old_route);
+    }
+
+    #[test]
+    fn route_limit_preserves_existing_routes_and_releases_closed_routes() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let inner = PendingOnceWriter {
+            output,
+            pending: false,
+        };
+        let mut stream = XudpMessageStream::new(Box::new(inner));
+        let address = Address::Ipv4("127.0.0.1".parse().unwrap());
+        let first_destination = NetLocation::new(address.clone(), 1);
+        stream.start_wire_session(10, first_destination.clone());
+        let preserved_destination = NetLocation::new(address.clone(), u16::MAX);
+        stream.start_wire_session(20, preserved_destination.clone());
+
+        let first_route = stream
+            .get_or_create_route(10, &first_destination)
+            .unwrap()
+            .unwrap();
+        let preserved_route = stream
+            .get_or_create_route(20, &preserved_destination)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stream.get_or_create_route(10, &first_destination).unwrap(),
+            Some(first_route)
+        );
+
+        for port in 2..MAX_XUDP_ROUTES as u16 {
+            let destination = NetLocation::new(address.clone(), port);
+            assert!(
+                stream
+                    .get_or_create_route(10, &destination)
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        assert_eq!(stream.routes.len(), MAX_XUDP_ROUTES);
+        assert_eq!(
+            stream.get_or_create_route(10, &first_destination).unwrap(),
+            Some(first_route)
+        );
+        assert_eq!(
+            stream
+                .get_or_create_route(20, &preserved_destination)
+                .unwrap(),
+            Some(preserved_route)
+        );
+
+        let rejected_destination = NetLocation::new(address.clone(), u16::MAX - 1);
+        let error = stream
+            .get_or_create_route(20, &rejected_destination)
+            .unwrap();
+        assert_eq!(error, None);
+        assert_eq!(stream.routes.len(), MAX_XUDP_ROUTES);
+
+        stream.close_wire_session(10);
+        assert_eq!(stream.routes.len(), 1);
+        assert!(stream.routes.contains_key(&preserved_route));
+        let closed_routes: HashSet<_> =
+            std::iter::from_fn(|| stream.take_closed_session()).collect();
+        assert_eq!(closed_routes.len(), MAX_XUDP_ROUTES - 1);
+        assert!(closed_routes.contains(&first_route));
+        assert!(!closed_routes.contains(&preserved_route));
+        assert_eq!(stream.take_closed_session(), None);
+
+        assert!(
+            stream
+                .get_or_create_route(20, &rejected_destination)
+                .unwrap()
+                .is_some()
+        );
+    }
+}

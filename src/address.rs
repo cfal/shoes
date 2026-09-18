@@ -710,6 +710,46 @@ mod tests {
     }
 
     #[test]
+    fn test_http_authority_parsing() {
+        assert_eq!(
+            NetLocation::from_authority("example.com:8080", None).unwrap(),
+            NetLocation::new(Address::Hostname("example.com".to_string()), 8080)
+        );
+        assert_eq!(
+            NetLocation::from_authority("127.0.0.1", Some(80)).unwrap(),
+            NetLocation::new(Address::Ipv4(Ipv4Addr::LOCALHOST), 80)
+        );
+        assert_eq!(
+            NetLocation::from_authority("[::1]:443", None).unwrap(),
+            NetLocation::new(Address::Ipv6(Ipv6Addr::LOCALHOST), 443)
+        );
+        assert_eq!(
+            NetLocation::from_authority("[::1]", Some(80)).unwrap(),
+            NetLocation::new(Address::Ipv6(Ipv6Addr::LOCALHOST), 80)
+        );
+    }
+
+    #[test]
+    fn test_http_authority_rejects_malformed_inputs() {
+        for authority in [
+            "",
+            "example.com",
+            "example.com:",
+            ":443",
+            "[::1",
+            "::1:443",
+            "[127.0.0.1]:443",
+            "[::1]443",
+            "[::1]:70000",
+        ] {
+            assert!(
+                NetLocation::from_authority(authority, None).is_err(),
+                "accepted malformed authority {authority:?}"
+            );
+        }
+    }
+
+    #[test]
     fn test_address_mask_serialization() {
         let address_mask =
             AddressMask::from("192.168.0.0/16").expect("Failed to create AddressMask");
