@@ -2,6 +2,7 @@
 name = "shoes"
 version = "0.2.8"
 edition = "2024"
+autotests = false
 license = "MIT"
 description = "A multi-protocol proxy server."
 homepage = "https://github.com/cfal/shoes/"
@@ -9,6 +10,10 @@ repository = "https://github.com/cfal/shoes/"
 readme = "README.md"
 keywords = ["proxy", "proxy-server", "shadowsocks", "v2ray", "vmess"]
 categories = ["command-line-utilities", "network-programming"]
+
+[workspace]
+members = ["tests/support"]
+resolver = "3"
 
 [lib]
 name = "shoes"
@@ -24,6 +29,36 @@ path = "src/main.rs"
 [features]
 default = []
 ffi = []  # Enable FFI module for non-Android builds
+integration-tests = []
+optional-peer-tests = ["integration-tests"]
+external-network-tests = ["integration-tests"]
+privileged-tests = ["integration-tests"]
+stress-tests = ["integration-tests"]
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
+required-features = ["integration-tests"]
+
+[[test]]
+name = "external_network"
+path = "tests/external_network.rs"
+required-features = ["external-network-tests"]
+
+[[test]]
+name = "optional_peer"
+path = "tests/optional_peer.rs"
+required-features = ["optional-peer-tests"]
+
+[[test]]
+name = "privileged"
+path = "tests/privileged.rs"
+required-features = ["privileged-tests"]
+
+[[test]]
+name = "stress"
+path = "tests/stress.rs"
+required-features = ["stress-tests"]
 
 [dependencies]
 async-trait = "*"
@@ -86,6 +121,7 @@ x509-parser = { version = "*", default-features = false, features = ["verify-aws
 rcgen = { version = "*", default-features = false, features = ["aws_lc_rs", "pem"] }
 rustls-pemfile = "*"
 serde_json = "*"
+shoes-test-support = { path = "tests/support" }
 tempfile = "*"
 tokio-rustls = "*"
 

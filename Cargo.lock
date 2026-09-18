@@ -2124,6 +2124,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "shake",
+ "shoes-test-support",
  "smoltcp",
  "socket2",
  "subtle",
@@ -2136,6 +2137,27 @@ dependencies = [
  "url",
  "webpki-roots",
  "x509-parser",
+]
+
+[[package]]
+name = "shoes-test-support"
+version = "0.0.0"
+dependencies = [
+ "aws-lc-rs",
+ "base64",
+ "bytes",
+ "futures",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "libc",
+ "rand",
+ "rcgen",
+ "rustls",
+ "rustls-pemfile",
+ "tempfile",
+ "tokio",
+ "tokio-rustls",
 ]
 
 [[package]]

@@ -1,0 +1,32 @@
+[package]
+name = "shoes-test-support"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+aws-lc-rs = { version = "*", default-features = false }
+base64 = "*"
+bytes = "*"
+futures = "*"
+http-body-util = "*"
+hyper = { version = "*", features = ["server", "http1", "http2"] }
+hyper-util = { version = "*", features = ["tokio", "server"] }
+rand = "*"
+rcgen = { version = "*", default-features = false, features = ["aws_lc_rs", "pem"] }
+rustls = "*"
+rustls-pemfile = "*"
+tempfile = "*"
+tokio = { version = "*", features = [
+    "fs",
+    "io-util",
+    "macros",
+    "net",
+    "rt-multi-thread",
+    "sync",
+    "time",
+] }
+tokio-rustls = "*"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "*"
