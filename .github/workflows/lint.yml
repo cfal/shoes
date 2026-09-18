@@ -22,7 +22,7 @@ jobs:
         components: rustfmt
 
     - name: Check formatting
-      run: cargo fmt -- --check
+      run: cargo fmt --all -- --check
 
   clippy:
     name: Clippy
@@ -54,4 +54,4 @@ jobs:
         key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
 
     - name: Run clippy
-      run: cargo clippy -- -D warnings
+      run: cargo clippy --workspace --all-targets --all-features -- -D warnings
