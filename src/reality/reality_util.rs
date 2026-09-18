@@ -526,8 +526,8 @@ mod tests {
         }
 
         let random = extract_client_random(&client_hello).unwrap();
-        for i in 0..32 {
-            assert_eq!(random[i], (i + 1) as u8);
+        for (i, byte) in random.iter().enumerate() {
+            assert_eq!(*byte, (i + 1) as u8);
         }
     }
 
@@ -537,13 +537,13 @@ mod tests {
 
         // Valid 32-byte key
         let key_bytes = [0x42u8; 32];
-        let encoded = URL_SAFE_NO_PAD.encode(&key_bytes);
+        let encoded = URL_SAFE_NO_PAD.encode(key_bytes);
         let decoded = decode_public_key(&encoded).unwrap();
         assert_eq!(decoded, key_bytes);
 
         // Invalid length
         let short_key = [0x42u8; 16];
-        let encoded_short = URL_SAFE_NO_PAD.encode(&short_key);
+        let encoded_short = URL_SAFE_NO_PAD.encode(short_key);
         assert!(decode_public_key(&encoded_short).is_err());
 
         // Invalid base64

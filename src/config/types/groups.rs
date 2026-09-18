@@ -579,8 +579,8 @@ client_proxies:
 
         let serialized = serde_yaml::to_value(&configs[0]).unwrap();
         let mapping = serialized.as_mapping().unwrap();
-        assert!(mapping.contains_key(&serde_yaml::Value::String("address".to_string())));
-        assert!(!mapping.contains_key(&serde_yaml::Value::String("addresses".to_string())));
+        assert!(mapping.contains_key(serde_yaml::Value::String("address".to_string())));
+        assert!(!mapping.contains_key(serde_yaml::Value::String("addresses".to_string())));
     }
 
     #[test]

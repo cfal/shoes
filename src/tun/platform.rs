@@ -117,7 +117,7 @@ pub trait PlatformCallbacks: Send + Sync {
     ///
     /// # Arguments
     /// * `error` - If the service stopped due to an error, the error message.
-    ///             `None` if the service stopped normally.
+    ///   `None` if the service stopped normally.
     fn on_stopped(&self, error: Option<String>);
 
     /// Called periodically with traffic statistics.
@@ -251,9 +251,7 @@ mod tests {
 
     #[test]
     fn test_fn_protector_error() {
-        let protector = FnSocketProtector::new(|_fd| {
-            Err(io::Error::new(io::ErrorKind::Other, "protection failed"))
-        });
+        let protector = FnSocketProtector::new(|_fd| Err(io::Error::other("protection failed")));
         assert!(protector.protect(42).is_err());
     }
 }

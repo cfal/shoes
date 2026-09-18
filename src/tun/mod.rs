@@ -36,8 +36,16 @@ mod udp_manager;
 
 // Platform module only needed for mobile FFI targets
 #[cfg(any(target_os = "android", target_os = "ios", feature = "ffi"))]
+#[cfg_attr(
+    all(feature = "ffi", not(any(target_os = "android", target_os = "ios"))),
+    allow(dead_code)
+)]
 mod platform;
 #[cfg(any(target_os = "android", target_os = "ios", feature = "ffi"))]
+#[cfg_attr(
+    all(feature = "ffi", not(any(target_os = "android", target_os = "ios"))),
+    allow(unused_imports)
+)]
 pub use platform::{
     FnSocketProtector, NoOpPlatformCallbacks, NoOpSocketProtector, PlatformCallbacks,
     PlatformInterface, SocketProtector, get_global_socket_protector, protect_socket,

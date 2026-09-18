@@ -425,7 +425,7 @@ mod tests {
         let mut state = VisionUnpadder::new(user_uuid);
 
         // Data that's less than 16 bytes (too short to check UUID)
-        let short_data = vec![1, 2, 3, 4, 5];
+        let short_data = [1, 2, 3, 4, 5];
         let result = state.unpad(&short_data[..]).unwrap();
         assert!(result.content.is_empty()); // Need more data
         assert!(result.command.is_none());
@@ -480,7 +480,7 @@ mod tests {
         assert!(!matches!(state.state, UnpadState::Done));
 
         // Second chunk: rest of command + content + padding
-        let chunk2 = vec![
+        let chunk2 = [
             0, 2, // rest of content length (=3), padding length = 2
             10, 11, 12, // content
             0, 0, // padding
@@ -566,9 +566,7 @@ mod tests {
         assert!(matches!(state.state, UnpadState::ReadingPadding { .. }));
 
         // Second chunk: remaining padding
-        let chunk2 = vec![
-            0, 0, 0, // remaining 3 bytes of padding
-        ];
+        let chunk2 = [0, 0, 0];
 
         // Now padding is complete, should return End command (no more content since it was already returned)
         let result2 = state.unpad(&chunk2[..]).unwrap();

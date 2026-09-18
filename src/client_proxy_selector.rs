@@ -580,16 +580,6 @@ mod tests {
                 mappings: std::collections::HashMap::new(),
             }
         }
-
-        fn with_mapping(mut self, hostname: &str, port: u16, addrs: Vec<IpAddr>) -> Self {
-            let key = format!("{}:{}", hostname, port);
-            let socket_addrs: Vec<SocketAddr> = addrs
-                .into_iter()
-                .map(|ip| SocketAddr::new(ip, port))
-                .collect();
-            self.mappings.insert(key, socket_addrs);
-            self
-        }
     }
 
     impl Resolver for MockResolver {

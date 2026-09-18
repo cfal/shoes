@@ -247,7 +247,7 @@ mod tests {
         let mut shared_a_bytes = [0u8; 32];
         agreement::agree(
             &priv_a,
-            &agreement::UnparsedPublicKey::new(&agreement::X25519, pub_b.as_ref()),
+            agreement::UnparsedPublicKey::new(&agreement::X25519, pub_b.as_ref()),
             (),
             |key_material| {
                 shared_a_bytes.copy_from_slice(key_material);
@@ -259,7 +259,7 @@ mod tests {
         let mut shared_b_bytes = [0u8; 32];
         agreement::agree(
             &priv_b,
-            &agreement::UnparsedPublicKey::new(&agreement::X25519, pub_a.as_ref()),
+            agreement::UnparsedPublicKey::new(&agreement::X25519, pub_a.as_ref()),
             (),
             |key_material| {
                 shared_b_bytes.copy_from_slice(key_material);
@@ -295,8 +295,8 @@ mod tests {
         assert_eq!(&session_id[8..16], &short_id[..]);
 
         // Verify remaining bytes are zero
-        for i in 16..32 {
-            assert_eq!(session_id[i], 0);
+        for byte in &session_id[16..] {
+            assert_eq!(*byte, 0);
         }
     }
 
@@ -471,8 +471,8 @@ mod tests {
         assert_eq!(&session_id[8..16], &short_id[..]);
 
         // Verify remaining bytes are zeros
-        for i in 16..32 {
-            assert_eq!(session_id[i], 0);
+        for byte in &session_id[16..] {
+            assert_eq!(*byte, 0);
         }
     }
 

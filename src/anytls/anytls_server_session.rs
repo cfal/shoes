@@ -1220,10 +1220,10 @@ mod tests {
         let mut buf = vec![0u8; 256];
         let result = timeout(Duration::from_millis(500), server.read(&mut buf)).await;
 
-        if let Ok(Ok(n)) = result {
-            if n > 0 {
-                assert_eq!(buf[0], Command::Alert as u8);
-            }
+        if let Ok(Ok(n)) = result
+            && n > 0
+        {
+            assert_eq!(buf[0], Command::Alert as u8);
         }
 
         session.close().await;
@@ -1261,10 +1261,10 @@ mod tests {
         let mut response_buf = vec![0u8; 16];
         let result = timeout(Duration::from_millis(500), server.read(&mut response_buf)).await;
 
-        if let Ok(Ok(n)) = result {
-            if n >= 7 {
-                assert_eq!(response_buf[0], Command::HeartResponse as u8);
-            }
+        if let Ok(Ok(n)) = result
+            && n >= 7
+        {
+            assert_eq!(response_buf[0], Command::HeartResponse as u8);
         }
 
         session.close().await;
@@ -1501,16 +1501,15 @@ mod tests {
         let mut buf = vec![0u8; 256];
         let result = timeout(Duration::from_millis(500), server.read(&mut buf)).await;
 
-        if let Ok(Ok(n)) = result {
-            if n >= 7 {
-                // Could be ServerSettings or UpdatePaddingScheme
-                // Either is valid response
-                let cmd = buf[0];
-                assert!(
-                    cmd == Command::UpdatePaddingScheme as u8
-                        || cmd == Command::ServerSettings as u8
-                );
-            }
+        if let Ok(Ok(n)) = result
+            && n >= 7
+        {
+            // Could be ServerSettings or UpdatePaddingScheme
+            // Either is valid response
+            let cmd = buf[0];
+            assert!(
+                cmd == Command::UpdatePaddingScheme as u8 || cmd == Command::ServerSettings as u8
+            );
         }
 
         session.close().await;

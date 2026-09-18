@@ -558,7 +558,6 @@ mod tests {
     #[test]
     fn test_padding_constants() {
         // Verify padding range
-        assert!(MIN_PADDING <= MAX_PADDING);
         assert_eq!(MIN_PADDING, 256);
         assert_eq!(MAX_PADDING, 767);
         assert_eq!(FIRST_PADDINGS, 16);
