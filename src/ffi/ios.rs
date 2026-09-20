@@ -39,6 +39,10 @@ use super::common::{
 /// The callback receives a file descriptor and should return true if protected successfully.
 pub type ProtectSocketCallback = extern "C" fn(fd: c_int) -> bool;
 
+/// Traffic statistics callback type.
+/// Called periodically with cumulative upload and download byte counts.
+pub type ShoesTrafficCallback = extern "C" fn(upload_bytes: u64, download_bytes: u64);
+
 /// Global socket protector callback.
 static PROTECT_CALLBACK: OnceLock<Mutex<Option<ProtectSocketCallback>>> = OnceLock::new();
 
@@ -127,6 +131,7 @@ pub unsafe extern "C" fn shoes_init(log_level: *const c_char) -> c_int {
 pub unsafe extern "C" fn shoes_start(
     config_yaml: *const c_char,
     protect_callback: ProtectSocketCallback,
+    traffic_callback: ShoesTrafficCallback,
 ) -> c_long {
     if config_yaml.is_null() {
         error!("shoes_start: config_yaml is null");
@@ -147,6 +152,12 @@ pub unsafe extern "C" fn shoes_start(
         let mut callback_guard = PROTECT_CALLBACK.get_or_init(|| Mutex::new(None)).lock();
         *callback_guard = Some(protect_callback);
     }
+
+    // Store traffic callback and reset counters
+    crate::tun::traffic::reset_traffic_counters();
+    crate::tun::traffic::set_traffic_callback(Arc::new(move |upload, download| {
+        traffic_callback(upload, download);
+    }));
 
     crate::tun::set_global_socket_protector(Arc::new(IosSocketProtector));
 
@@ -193,6 +204,7 @@ pub unsafe extern "C" fn shoes_start(
 #[unsafe(no_mangle)]
 pub extern "C" fn shoes_stop(_handle: c_long) {
     common::stop_service();
+    crate::tun::traffic::clear_traffic_callback();
 
     if let Some(callback) = PROTECT_CALLBACK.get() {
         let mut guard = callback.lock();

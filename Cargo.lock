@@ -2112,6 +2112,7 @@ dependencies = [
  "notify",
  "parking_lot",
  "percent-encoding",
+ "pin-project-lite",
  "quinn",
  "rand",
  "rand_core",

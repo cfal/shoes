@@ -179,21 +179,28 @@ pub extern "system" fn Java_com_shoesproxy_ShoesNative_start<'local>(
     _class: JClass<'local>,
     config_yaml: JString<'local>,
     protect_callback: JObject<'local>,
+    traffic_callback: JObject<'local>,
 ) -> jlong {
     info!("Starting shoes service");
 
     let result = unowned
         .with_env(
-            |env| -> jni::errors::Result<(String, Global<JObject<'static>>, jni::JavaVM)> {
+            |env| -> jni::errors::Result<(
+                String,
+                Global<JObject<'static>>,
+                Global<JObject<'static>>,
+                jni::JavaVM,
+            )> {
                 let config_str: String = env.get_string(&config_yaml).map(|s| s.to_string())?;
-                let callback_ref = env.new_global_ref(protect_callback)?;
+                let protect_ref = env.new_global_ref(protect_callback)?;
+                let traffic_ref = env.new_global_ref(traffic_callback)?;
                 let jvm = env.get_java_vm()?;
-                Ok((config_str, callback_ref, jvm))
+                Ok((config_str, protect_ref, traffic_ref, jvm))
             },
         )
         .into_outcome();
 
-    let (config_str, callback_ref, jvm) = match result {
+    let (config_str, protect_ref, traffic_ref, jvm) = match result {
         Outcome::Ok(v) => v,
         Outcome::Err(e) => {
             error!("Failed to extract JNI values for start: {}", e);
@@ -204,15 +211,15 @@ pub extern "system" fn Java_com_shoesproxy_ShoesNative_start<'local>(
     let jvm: Arc<jni::JavaVM> = Arc::new(jvm);
 
     // Socket protector calls VpnService.protect() to exempt sockets from VPN routing
-    let callback_ref: Arc<Global<JObject<'static>>> = Arc::new(callback_ref);
+    let protect_ref: Arc<Global<JObject<'static>>> = Arc::new(protect_ref);
     let jvm_clone = jvm.clone();
-    let callback_clone = callback_ref.clone();
+    let protect_clone = protect_ref.clone();
 
     let protector = FnSocketProtector::new(move |fd: i32| {
         let protect_ok = jvm_clone
             .attach_current_thread(|env: &mut jni::Env| -> jni::errors::Result<bool> {
                 let v = env.call_method(
-                    &*callback_clone,
+                    &*protect_clone,
                     jni::jni_str!("protect"),
                     jni::jni_sig!("(I)Z"),
                     &[JValue::Int(fd)],
@@ -232,6 +239,23 @@ pub extern "system" fn Java_com_shoesproxy_ShoesNative_start<'local>(
     });
 
     set_global_socket_protector(Arc::new(protector));
+
+    // Traffic callback calls TrafficListener.onTrafficUpdate(long, long)
+    let traffic_ref: Arc<Global<JObject<'static>>> = Arc::new(traffic_ref);
+    let jvm_traffic = jvm.clone();
+    crate::tun::traffic::reset_traffic_counters();
+    crate::tun::traffic::set_traffic_callback(Arc::new(move |upload: u64, download: u64| {
+        let _ =
+            jvm_traffic.attach_current_thread(|env: &mut jni::Env| -> jni::errors::Result<()> {
+                env.call_method(
+                    &*traffic_ref,
+                    jni::jni_str!("onTrafficUpdate"),
+                    jni::jni_sig!("(JJ)V"),
+                    &[JValue::Long(upload as i64), JValue::Long(download as i64)],
+                )?;
+                Ok(())
+            });
+    }));
 
     let runtime = match Runtime::new() {
         Ok(rt) => rt,
@@ -282,6 +306,7 @@ pub extern "system" fn Java_com_shoesproxy_ShoesNative_stop(
     _handle: jlong,
 ) {
     common::stop_service();
+    crate::tun::traffic::clear_traffic_callback();
 }
 
 /// Check if the TUN service is running.

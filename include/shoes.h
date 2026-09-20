@@ -20,6 +20,15 @@
 typedef bool (*ProtectSocketCallback)(int fd);
 
 /**
+ * Traffic statistics callback type.
+ * Called periodically (every ~1 second) with cumulative byte counts.
+ *
+ * @param upload_bytes   Total bytes sent from device to proxy since start.
+ * @param download_bytes Total bytes received from proxy to device since start.
+ */
+typedef void (*ShoesTrafficCallback)(uint64_t upload_bytes, uint64_t download_bytes);
+
+/**
  * Initialize the shoes library.
  *
  * # Arguments
@@ -40,6 +49,7 @@ int shoes_init(const char *log_level);
  * # Arguments
  * * `config_yaml` - YAML configuration string (must include device_fd in TUN config)
  * * `protect_callback` - Callback function to protect sockets from VPN routing
+ * * `traffic_callback` - Callback function for periodic traffic statistics
  *
  * # Returns
  * * Handle (> 0) on success
@@ -48,7 +58,9 @@ int shoes_init(const char *log_level);
  * # Safety
  * `config_yaml` must be a valid null-terminated C string.
  */
-long shoes_start(const char *config_yaml, ProtectSocketCallback protect_callback);
+long shoes_start(const char *config_yaml,
+                 ProtectSocketCallback protect_callback,
+                 ShoesTrafficCallback traffic_callback);
 
 /**
  * Stop the shoes VPN service.
