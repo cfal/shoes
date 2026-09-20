@@ -774,6 +774,24 @@ impl AnyTlsSession {
                     remote_location
                 );
 
+                // Send the SYNACK *before* connecting to the upstream target.
+                //
+                // sing-box's AnyTLS client pools idle sessions and reuses them for
+                // later streams. Opening a stream on a reused session (sid >= 2) arms
+                // a 3s `synDone` watcher that CLOSES THE WHOLE SESSION if the SYNACK is
+                // late (see sing-anytls session OpenStream). A post-connect SYNACK on a
+                // high-RTT link plus variable connect latency can exceed 3s, so every
+                // reused session is killed and re-dialed -> pool churn -> upload
+                // collapses. Download is immune (first stream sid==1 arms no watcher).
+                //
+                // Acking at stream-open keeps the watcher window at ~1 RTT. If the
+                // connect then fails we report it with a second SYNACK carrying the
+                // error; the sing-box client maps the follow-up to closeWithError.
+                if let Err(e) = self.send_synack(stream_id, None).await {
+                    log::debug!("Failed to send early SYNACK for stream {}: {}", stream_id, e);
+                    // Continue anyway - client may be v1 (send_synack is a no-op there)
+                }
+
                 // Connect through the proxy chain
                 let client_result = match chain_group
                     .connect_tcp(remote_location, &self.resolver)
@@ -781,19 +799,14 @@ impl AnyTlsSession {
                 {
                     Ok(result) => result,
                     Err(e) => {
-                        // Send SYNACK with error message (protocol v2)
+                        // Already acked above; surface the failure so the client tears
+                        // the stream down promptly instead of waiting on a timeout.
                         let error_msg = format!("connect failed: {}", e);
                         let _ = self.send_synack(stream_id, Some(&error_msg)).await;
                         return Err(e);
                     }
                 };
                 let mut client_stream = client_result.client_stream;
-
-                // Send successful SYNACK (protocol v2)
-                if let Err(e) = self.send_synack(stream_id, None).await {
-                    log::debug!("Failed to send SYNACK for stream {}: {}", stream_id, e);
-                    // Continue anyway - client may be v1
-                }
 
                 log::debug!("AnyTLS stream {} connected to destination", stream_id);
 
