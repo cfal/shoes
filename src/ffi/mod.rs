@@ -39,7 +39,7 @@
 //! - `shoes_stop` signals shutdown and waits for cleanup
 
 // Common utilities shared between iOS and Android
-#[cfg(any(target_os = "android", target_os = "ios"))]
+#[cfg(any(target_os = "android", target_os = "ios", test))]
 mod common;
 
 #[cfg(target_os = "android")]

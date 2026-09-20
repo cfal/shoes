@@ -114,4 +114,12 @@ object ShoesNative {
      * @return true if the service is active.
      */
     external fun isRunning(): Boolean
+
+    /**
+     * Get the last error message from the shoes service.
+     *
+     * Returns the error string if the service stopped due to an error,
+     * or null if no error has occurred (normal shutdown or still running).
+     */
+    external fun getLastError(): String?
 }

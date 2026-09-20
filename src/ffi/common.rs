@@ -29,6 +29,10 @@ pub static TUN_SERVICE: OnceLock<parking_lot::Mutex<Option<TunServiceHandle>>> =
 /// Global flag to track initialization.
 pub static INITIALIZED: AtomicBool = AtomicBool::new(false);
 
+/// Last error message from the service. Set when `start_from_config` fails
+/// or the service stops with an error. Read via `shoes_get_last_error()`.
+pub static LAST_ERROR: OnceLock<parking_lot::Mutex<Option<String>>> = OnceLock::new();
+
 /// Handle to a running TUN service.
 pub struct TunServiceHandle {
     /// Tokio runtime running the service.
@@ -107,6 +111,24 @@ pub fn stop_service() {
     }
 
     info!("TUN service stop completed");
+}
+
+/// Store an error message.
+pub fn set_last_error(error: String) {
+    let err = LAST_ERROR.get_or_init(|| parking_lot::Mutex::new(None));
+    *err.lock() = Some(error);
+}
+
+/// Clear the last error message (called on successful start).
+pub fn clear_last_error() {
+    if let Some(err) = LAST_ERROR.get() {
+        *err.lock() = None;
+    }
+}
+
+/// Get the last error message, if any.
+pub fn get_last_error() -> Option<String> {
+    LAST_ERROR.get().and_then(|m| m.lock().clone())
 }
 
 /// Check if the TUN service is running.
@@ -209,4 +231,45 @@ pub async fn start_from_config(
     }
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    // Serialize tests that mutate shared LAST_ERROR state.
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn test_set_and_get_last_error() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        clear_last_error();
+
+        assert!(get_last_error().is_none());
+
+        set_last_error("connection refused".to_string());
+        assert_eq!(get_last_error().as_deref(), Some("connection refused"));
+    }
+
+    #[test]
+    fn test_clear_last_error() {
+        let _guard = TEST_LOCK.lock().unwrap();
+
+        set_last_error("some error".to_string());
+        assert!(get_last_error().is_some());
+
+        clear_last_error();
+        assert!(get_last_error().is_none());
+    }
+
+    #[test]
+    fn test_set_overwrites_previous_error() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        clear_last_error();
+
+        set_last_error("first error".to_string());
+        set_last_error("second error".to_string());
+        assert_eq!(get_last_error().as_deref(), Some("second error"));
+    }
 }
