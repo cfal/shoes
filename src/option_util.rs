@@ -167,6 +167,7 @@ where
 
 impl<T> OneOrSome<T> {
     #[cfg(test)]
+    #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         match self {
             OneOrSome::One(_) => 1,

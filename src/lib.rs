@@ -47,6 +47,39 @@
 //! shoes_stop(handle)
 //! ```
 //!
+//! # Library Embedding
+//!
+//! Applications that run their own userspace packet stack have no TUN file
+//! descriptor to hand to [`tun`] or the FFI. They can drive a client proxy
+//! chain directly, opening one proxied connection per flow:
+//!
+//! ```no_run
+//! use std::sync::Arc;
+//!
+//! use shoes::config::{ClientChainHop, ClientConfig, ConfigSelection};
+//! use shoes::resolver::{NativeResolver, Resolver};
+//! use shoes::tcp::chain_builder::build_client_proxy_chain;
+//! use shoes::{NetLocation, OneOrSome, ResolvedLocation};
+//!
+//! # async fn example(client_yaml: &str) -> std::io::Result<()> {
+//! let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+//! let client: ClientConfig = serde_yaml::from_str(client_yaml).map_err(std::io::Error::other)?;
+//! let chain = build_client_proxy_chain(
+//!     OneOrSome::One(ClientChainHop::Single(ConfigSelection::Config(client))),
+//!     resolver.clone(),
+//! );
+//! let target = NetLocation::from_str("example.com:443", None)?;
+//! let setup = chain.connect_tcp(ResolvedLocation::from(target), &resolver).await?;
+//! // `setup.client_stream` is an `AsyncRead + AsyncWrite` stream to the target.
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! UDP flows use `connect_udp_bidirectional` on the same chain. Servers can be
+//! started inside the caller's tokio runtime with
+//! [`tcp::tcp_server::start_servers`] from configs validated by
+//! [`config::create_server_configs`].
+//!
 //! # Platform Support
 //!
 //! - Linux (x86_64, aarch64)
@@ -57,9 +90,9 @@
 // expose them for FFI/mobile integration.
 mod address;
 mod anytls;
-mod async_stream;
+pub mod async_stream;
 mod buf_reader;
-mod client_proxy_chain;
+pub mod client_proxy_chain;
 mod client_proxy_selector;
 mod copy_bidirectional;
 mod copy_bidirectional_message;
@@ -89,7 +122,7 @@ mod socks5_udp_relay;
 mod socks_handler;
 mod stream_reader;
 mod sync_adapter;
-mod tcp;
+pub mod tcp;
 mod thread_util;
 mod tls_client_handler;
 mod tls_server_handler;
@@ -116,3 +149,8 @@ pub mod tun;
 /// FFI bindings for mobile platforms.
 #[cfg(any(target_os = "android", target_os = "ios", feature = "ffi"))]
 pub mod ffi;
+
+// Types needed to build a client proxy chain and address its targets when
+// embedding the library (see "Library Embedding" above).
+pub use address::{Address, NetLocation, ResolvedLocation};
+pub use option_util::OneOrSome;
