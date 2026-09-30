@@ -1,10 +1,12 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use log::debug;
 use subtle::ConstantTimeEq;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
+use tokio::time::timeout;
 
 use crate::address::{Address, NetLocation};
 use crate::async_stream::AsyncStream;
@@ -24,6 +26,16 @@ use super::vless_util::{
     COMMAND_MUX, COMMAND_TCP, COMMAND_UDP, XTLS_VISION_FLOW, parse_addons_from_reader,
     parse_remote_location_from_reader,
 };
+
+/// Maximum lifetime of a VLESS fallback transparent-proxy task.
+///
+/// When VLESS auth fails (or the client protocol version is wrong), we transparently
+/// proxy the connection to the configured fallback destination. These tasks previously
+/// ran `copy_bidirectional` with no timeout, so a half-open (dropped/errored) client
+/// would keep the task, both sockets, and the copy buffers alive until TCP keepalive
+/// fired — allowing memory to climb without bound under connection churn. This cap
+/// guarantees every fallback task terminates.
+const FALLBACK_COPY_TIMEOUT: Duration = Duration::from_secs(300);
 
 pub struct VlessTcpServerHandler {
     user_id: Box<[u8]>,
@@ -104,13 +116,23 @@ async fn vless_fallback_to_dest<S: AsyncStream + 'static>(
     // data transfer runs indefinitely.
     tokio::spawn(async move {
         let mut client_stream = client_stream;
-        let result = crate::copy_bidirectional::copy_bidirectional(
+        let copy_future = crate::copy_bidirectional::copy_bidirectional(
             &mut client_stream,
             &mut *dest_stream,
             false, // client doesn't need initial flush
             false, // dest doesn't need initial flush
-        )
-        .await;
+        );
+
+        let result = match timeout(FALLBACK_COPY_TIMEOUT, copy_future).await {
+            Ok(r) => r,
+            Err(_) => {
+                debug!(
+                    "VLESS FALLBACK: Connection timed out after {}s, closing",
+                    FALLBACK_COPY_TIMEOUT.as_secs()
+                );
+                Ok(())
+            }
+        };
 
         let _ = client_stream.shutdown().await;
         let _ = dest_stream.shutdown().await;
