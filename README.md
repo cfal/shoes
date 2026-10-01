@@ -54,6 +54,8 @@ For advanced access control (IP allowlist/blocklists), see [tobaru](https://gith
 
 Precompiled binaries for x86_64 and Apple aarch64 are available on [Github Releases](https://github.com/cfal/shoes/releases).
 
+For automated VLESS + REALITY setup on an Alpine x86_64 VPS, see the [Alpine installation guide](docs/alpine-reality.md).
+
 Or install with cargo:
 
 ```bash
