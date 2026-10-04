@@ -6,16 +6,21 @@
 use std::convert::Infallible;
 use std::io;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::pin::Pin;
+use std::sync::{Arc, LazyLock};
+use std::task::{Context, Poll};
 
 use bytes::Bytes;
+use futures::Stream;
 use http::{Method, Request, Response, StatusCode};
-use http_body_util::{BodyExt, Empty, Full, combinators::BoxBody};
-use hyper::body::Incoming;
+use http_body_util::{BodyExt, Empty, combinators::BoxBody};
+use hyper::body::{Body, Frame, Incoming, SizeHint};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use log::debug;
 use rand::RngExt;
 use tokio::io::AsyncWriteExt;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio_util::io::ReaderStream;
 
 use crate::address::{Address, NetLocation};
 use crate::async_stream::{AsyncMessageStream, AsyncStream};
@@ -51,6 +56,56 @@ impl tokio::io::AsyncRead for HyperUpgradedStream {
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<io::Result<()>> {
         std::pin::Pin::new(&mut self.0).poll_read(cx, buf)
+    }
+}
+
+#[cfg(test)]
+mod fallback_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn large_get_is_chunked_and_head_has_no_body() {
+        let dir = tempfile::tempdir_in(std::env::var_os("HOME").unwrap()).unwrap();
+        let file = std::fs::File::create(dir.path().join("large.bin")).unwrap();
+        file.set_len(64 * 1024 * 1024).unwrap();
+        let root = Some(dir.path().to_path_buf());
+        let head = serve_fallback("/large.bin", &root, true).await.unwrap();
+        assert_eq!(head.status(), StatusCode::OK);
+        assert_eq!(head.headers()["content-length"], "67108864");
+        assert!(
+            head.into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .is_empty()
+        );
+        let mut get = serve_fallback("/large.bin", &root, false).await.unwrap();
+        let chunk = get
+            .body_mut()
+            .frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap();
+        assert_eq!(chunk.len(), 16 * 1024);
+        assert_eq!(
+            get.body().size_hint().exact(),
+            Some(64 * 1024 * 1024 - 16 * 1024)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fallback_rejects_symlink_escape() {
+        let dir = tempfile::tempdir_in(std::env::var_os("HOME").unwrap()).unwrap();
+        let root = dir.path().join("public");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(dir.path().join("secret"), b"private").unwrap();
+        std::os::unix::fs::symlink(dir.path().join("secret"), root.join("escape")).unwrap();
+        let response = serve_fallback("/escape", &Some(root), false).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 }
 
@@ -114,8 +169,42 @@ fn empty_body() -> BoxBody<Bytes, io::Error> {
         .boxed()
 }
 
-fn full_body(data: Bytes) -> BoxBody<Bytes, io::Error> {
-    Full::new(data).map_err(|never| match never {}).boxed()
+static FALLBACK_TRANSFERS: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(32)));
+
+struct FileBody {
+    reader: ReaderStream<tokio::io::Take<tokio::fs::File>>,
+    remaining: u64,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl Body for FileBody {
+    type Data = Bytes;
+    type Error = io::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, io::Error>>> {
+        match std::task::ready!(Pin::new(&mut self.reader).poll_next(cx)) {
+            Some(Ok(bytes)) => {
+                self.remaining -= bytes.len() as u64;
+                Poll::Ready(Some(Ok(Frame::data(bytes))))
+            }
+            None if self.remaining != 0 => {
+                self.remaining = 0;
+                Poll::Ready(Some(Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "fallback file truncated",
+                ))))
+            }
+            result => Poll::Ready(result.map(|r| r.map(Frame::data))),
+        }
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        SizeHint::with_exact(self.remaining)
+    }
 }
 
 /// Run the hyper-based NaiveProxy service
@@ -374,6 +463,12 @@ async fn serve_fallback(
             .body(empty_body())
             .unwrap());
     };
+    let Ok(permit) = FALLBACK_TRANSFERS.clone().try_acquire_owned() else {
+        return Ok(Response::builder()
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .body(empty_body())
+            .unwrap());
+    };
 
     // Sanitize path to prevent directory traversal
     let request_path = uri_path.trim_start_matches('/');
@@ -392,12 +487,38 @@ async fn serve_fallback(
         }
     }
 
-    if file_path.is_dir() {
+    if tokio::fs::metadata(&file_path)
+        .await
+        .is_ok_and(|m| m.is_dir())
+    {
         file_path.push("index.html");
     }
 
-    match tokio::fs::read(&file_path).await {
-        Ok(contents) => {
+    let open = async {
+        let root = tokio::fs::canonicalize(base_path).await?;
+        let path = tokio::fs::canonicalize(&file_path).await?;
+        if !path.starts_with(&root) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "fallback path escapes root",
+            ));
+        }
+        let metadata = tokio::fs::metadata(&path).await?;
+        if !metadata.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "not a regular file",
+            ));
+        }
+        let file = if is_head {
+            None
+        } else {
+            Some(tokio::fs::File::open(path).await?)
+        };
+        Ok((file, metadata.len()))
+    };
+    match open.await {
+        Ok((file, length)) => {
             let mime = mime_guess::from_path(&file_path)
                 .first_or_octet_stream()
                 .to_string();
@@ -405,18 +526,27 @@ async fn serve_fallback(
             let body = if is_head {
                 empty_body()
             } else {
-                full_body(Bytes::from(contents.clone()))
+                FileBody {
+                    reader: ReaderStream::with_capacity(file.unwrap().take(length), 16 * 1024),
+                    remaining: length,
+                    _permit: permit,
+                }
+                .boxed()
             };
 
             Ok(Response::builder()
                 .status(StatusCode::OK)
                 .header("content-type", mime)
-                .header("content-length", contents.len())
+                .header("content-length", length)
                 .body(body)
                 .unwrap())
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Response::builder()
             .status(StatusCode::NOT_FOUND)
+            .body(empty_body())
+            .unwrap()),
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => Ok(Response::builder()
+            .status(StatusCode::FORBIDDEN)
             .body(empty_body())
             .unwrap()),
         Err(_) => Ok(Response::builder()
