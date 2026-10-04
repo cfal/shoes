@@ -4,7 +4,6 @@ use async_trait::async_trait;
 use log::debug;
 use subtle::ConstantTimeEq;
 use tokio::io::AsyncWriteExt;
-use tokio::net::TcpStream;
 
 use crate::address::{Address, NetLocation};
 use crate::async_stream::AsyncStream;
@@ -85,7 +84,8 @@ async fn vless_fallback_to_dest<S: AsyncStream + 'static>(
 
     debug!("VLESS FALLBACK: Resolved {} to {}", fallback, dest_addr);
 
-    let mut dest_stream: Box<dyn AsyncStream> = Box::new(TcpStream::connect(dest_addr).await?);
+    let socket = crate::socket_util::new_tcp_socket(None, dest_addr.is_ipv6())?;
+    let mut dest_stream: Box<dyn AsyncStream> = Box::new(socket.connect(dest_addr).await?);
 
     debug!(
         "VLESS FALLBACK: Connected to fallback, forwarding {} bytes",

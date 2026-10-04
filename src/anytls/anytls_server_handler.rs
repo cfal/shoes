@@ -10,7 +10,6 @@ use async_trait::async_trait;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
-use tokio::net::TcpStream;
 
 use crate::address::NetLocation;
 use crate::anytls::anytls_padding::PaddingFactory;
@@ -201,7 +200,8 @@ impl AnyTlsServerHandler {
 
         log::debug!("AnyTLS FALLBACK: Resolved {} to {}", fallback, dest_addr);
 
-        let mut dest_stream: Box<dyn AsyncStream> = Box::new(TcpStream::connect(dest_addr).await?);
+        let socket = crate::socket_util::new_tcp_socket(None, dest_addr.is_ipv6())?;
+        let mut dest_stream: Box<dyn AsyncStream> = Box::new(socket.connect(dest_addr).await?);
 
         log::debug!(
             "AnyTLS FALLBACK: Connected to fallback, forwarding {} bytes",
