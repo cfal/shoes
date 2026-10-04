@@ -45,15 +45,17 @@ async fn start_quic_server(
                     conn.refuse();
                     continue;
                 };
-                let Some(memory) = crate::resources::try_quic_memory() else {
-                    conn.refuse();
-                    continue;
+                let conn = match conn.accept() {
+                    Ok(conn) => conn,
+                    Err(e) => {
+                        debug!("QUIC accept failed: {e}");
+                        continue;
+                    }
                 };
                 let resolver = resolver.clone();
                 let server_handler = server_handler.clone();
                 tasks.spawn(async move {
                     let _permit = permit;
-                    let _memory = memory;
                     if let Err(e) = process_connection(resolver, server_handler, conn).await {
                         error!("Connection ended with error: {e}");
                     }
@@ -70,7 +72,7 @@ async fn start_quic_server(
 async fn process_connection(
     resolver: Arc<dyn Resolver>,
     server_handler: Arc<dyn TcpServerHandler>,
-    conn: quinn::Incoming,
+    conn: quinn::Connecting,
 ) -> std::io::Result<()> {
     let connection = conn.await?;
     let mut tasks = tokio::task::JoinSet::new();

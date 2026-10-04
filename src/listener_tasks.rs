@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use tokio::task::JoinSet;
 
-pub(crate) struct QuicListener(pub quinn::Endpoint);
+pub(crate) struct QuicListener(pub crate::quic_endpoint::QuicEndpoint);
 
 impl QuicListener {
     pub fn bind_all(
@@ -20,20 +20,15 @@ impl QuicListener {
                     true,
                     Some(crate::resources::LIMITS.quic_socket_buffer),
                 )?;
-                quinn::Endpoint::new(
-                    quinn::EndpointConfig::default(),
-                    Some(config.clone()),
-                    socket.into(),
-                    std::sync::Arc::new(quinn::TokioRuntime),
-                )
-                .map(Self)
+                crate::quic_endpoint::QuicEndpoint::new(Some(config.clone()), socket.into())
+                    .map(Self)
             })
             .collect()
     }
 }
 
 impl std::ops::Deref for QuicListener {
-    type Target = quinn::Endpoint;
+    type Target = crate::quic_endpoint::QuicEndpoint;
 
     fn deref(&self) -> &Self::Target {
         &self.0
@@ -203,7 +198,16 @@ mod tests {
         let client = create_client();
         let (client_conn, server_conn) = tokio::join!(
             async { client.connect(target, "localhost").unwrap().await.unwrap() },
-            async { listener.accept().await.unwrap().await.unwrap() },
+            async {
+                listener
+                    .accept()
+                    .await
+                    .unwrap()
+                    .accept()
+                    .unwrap()
+                    .await
+                    .unwrap()
+            },
         );
         client_conn
             .send_datagram(bytes::Bytes::from_static(b"before"))
@@ -233,7 +237,7 @@ mod tests {
             let (connected, accepted) = tokio::time::timeout(Duration::from_secs(2), async {
                 tokio::join!(
                     async { client.connect(target, "localhost").unwrap().await },
-                    async { listener.accept().await.unwrap().await },
+                    async { listener.accept().await.unwrap().accept().unwrap().await },
                 )
             })
             .await

@@ -38,7 +38,7 @@ async fn process_connection(
     client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
     password: Arc<str>,
-    conn: quinn::Incoming,
+    conn: quinn::Connecting,
     udp_enabled: bool,
 ) -> std::io::Result<()> {
     let connection = conn.await?;
@@ -855,16 +855,18 @@ pub async fn start_hysteria2_server(
                     conn.refuse();
                     continue;
                 };
-                let Some(memory) = crate::resources::try_quic_memory() else {
-                    conn.refuse();
-                    continue;
+                let conn = match conn.accept() {
+                    Ok(conn) => conn,
+                    Err(e) => {
+                        debug!("QUIC accept failed: {e}");
+                        continue;
+                    }
                 };
                 let cloned_selector = client_proxy_selector.clone();
                 let cloned_resolver = resolver.clone();
                 let hysteria2_password = hysteria2_password.clone();
                 tasks.spawn(async move {
                     let _permit = permit;
-                    let _memory = memory;
                     if let Err(e) = process_connection(
                         cloned_selector,
                         cloned_resolver,

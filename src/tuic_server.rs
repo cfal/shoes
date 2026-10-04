@@ -67,7 +67,7 @@ async fn process_connection(
     resolver: Arc<dyn Resolver>,
     uuid: Arc<[u8]>,
     password: Arc<str>,
-    conn: quinn::Incoming,
+    conn: quinn::Connecting,
     zero_rtt_handshake: bool,
 ) -> std::io::Result<()> {
     // Accept the incoming connection. When 0-RTT is enabled, use into_0rtt() to
@@ -76,11 +76,8 @@ async fn process_connection(
     // to replay attacks, though for incoming server connections it's 0.5-RTT which
     // is safer but still shouldn't be used for client-authenticated data).
     let connection = if zero_rtt_handshake {
-        let connecting = conn
-            .accept()
-            .map_err(|e| std::io::Error::other(format!("QUIC accept failed: {e}")))?;
         // For incoming connections, into_0rtt() always succeeds per quinn docs
-        let (connection, _zero_rtt_accepted) = connecting
+        let (connection, _zero_rtt_accepted) = conn
             .into_0rtt()
             .map_err(|_| std::io::Error::other("failed to enable 0-RTT"))?;
         connection
@@ -1272,9 +1269,12 @@ pub async fn start_tuic_server(
                     conn.refuse();
                     continue;
                 };
-                let Some(memory) = crate::resources::try_quic_memory() else {
-                    conn.refuse();
-                    continue;
+                let conn = match conn.accept() {
+                    Ok(conn) => conn,
+                    Err(e) => {
+                        debug!("QUIC accept failed: {e}");
+                        continue;
+                    }
                 };
                 let cloned_selector = client_proxy_selector.clone();
                 let cloned_resolver = resolver.clone();
@@ -1282,7 +1282,6 @@ pub async fn start_tuic_server(
                 let password = password.clone();
                 tasks.spawn(async move {
                     let _permit = permit;
-                    let _memory = memory;
                     if let Err(e) = process_connection(
                         cloned_selector,
                         cloned_resolver,

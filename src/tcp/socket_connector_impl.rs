@@ -17,6 +17,7 @@ use tokio::net::UdpSocket;
 use crate::address::{NetLocation, ResolvedLocation};
 use crate::async_stream::AsyncStream;
 use crate::config::{ClientConfig, ClientQuicConfig, Transport};
+use crate::quic_endpoint::QuicEndpoint;
 use crate::quic_stream::QuicStream;
 use crate::resolver::{Resolver, resolve_addresses, resolve_location};
 use crate::rustls_config_util::create_client_config;
@@ -34,7 +35,7 @@ enum TransportConfig {
     },
     Quic {
         sni_hostname: Option<String>,
-        endpoints: Vec<Arc<quinn::Endpoint>>,
+        endpoints: Vec<Arc<QuicEndpoint>>,
         next_endpoint_index: AtomicU8,
     },
 }
@@ -172,13 +173,7 @@ impl SocketConnectorImpl {
                     };
                     let udp_socket = udp_socket.into_std().unwrap();
 
-                    let mut endpoint = quinn::Endpoint::new(
-                        quinn::EndpointConfig::default(),
-                        None,
-                        udp_socket,
-                        Arc::new(quinn::TokioRuntime),
-                    )
-                    .unwrap();
+                    let mut endpoint = QuicEndpoint::new(None, udp_socket).unwrap();
                     endpoint.set_default_client_config(quinn_client_config.clone());
                     endpoints.push(Arc::new(endpoint));
                 }
@@ -261,8 +256,6 @@ impl SocketConnector for SocketConnectorImpl {
                 next_endpoint_index,
                 sni_hostname,
             } => {
-                let permit =
-                    crate::resources::try_quic_memory().ok_or_else(crate::resources::exhausted)?;
                 let domain = match sni_hostname {
                     Some(s) => s.as_str(),
                     None => address.address().hostname().unwrap_or("example.com"),
@@ -287,9 +280,7 @@ impl SocketConnector for SocketConnectorImpl {
                                             i, target_addr, i
                                         );
                                     }
-                                    return Ok(Box::new(
-                                        QuicStream::from(send, recv).with_memory_permit(permit),
-                                    ));
+                                    return Ok(Box::new(QuicStream::from(send, recv)));
                                 }
                                 Err(e) => {
                                     debug!("QUIC open_bi to {} failed: {}", target_addr, e);
