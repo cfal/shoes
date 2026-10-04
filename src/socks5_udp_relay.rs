@@ -397,9 +397,35 @@ impl AsyncPing for Socks5UdpRelayStream {
 
 impl AsyncTargetedMessageStream for Socks5UdpRelayStream {}
 
+impl Drop for Socks5UdpRelayStream {
+    fn drop(&mut self) {
+        if let Some(reader) = self.reader_task.take() {
+            reader.abort();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn dropping_quiet_relay_releases_reader_and_socket() {
+        let socket = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+        let relay = Socks5UdpRelayStream::new(socket);
+        let socket = Arc::downgrade(&relay.socket);
+        let reader = relay.reader_task.as_ref().unwrap().abort_handle();
+        tokio::task::yield_now().await;
+        drop(relay);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !reader.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(socket.upgrade().is_none());
+    }
 
     #[test]
     fn test_parse_ipv4_packet() {
