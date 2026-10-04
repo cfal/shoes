@@ -370,7 +370,6 @@ impl RealityServerConnection {
 
         log::debug!("REALITY: Client version: {:?}", client_version);
         log::debug!("REALITY: Client timestamp: {}", client_timestamp);
-        log::debug!("REALITY: Client short_id: {:02x?}", client_short_id);
 
         // Validate short ID using constant-time comparison
         let mut client_short_id_arr = [0u8; 8];

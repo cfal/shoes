@@ -361,14 +361,8 @@ fn main() {
             };
 
             if load_file_count > 0 {
-                    println!("Loaded {load_file_count} certs/keys from files");
+                println!("Loaded {load_file_count} certs/keys from files");
             }
-
-            for config in configs.iter() {
-                debug!("================================================================================");
-                debug!("{config:#?}");
-            }
-            debug!("================================================================================");
 
             if dry_run {
                 if let Err(e) = config::create_server_configs(configs) {

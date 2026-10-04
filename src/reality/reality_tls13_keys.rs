@@ -54,12 +54,6 @@ pub fn hkdf_expand(
         ctx.update(&[i as u8]);
         let tag = ctx.sign();
 
-        log::debug!(
-            "HKDF iteration {}: output={:02x?}",
-            i,
-            &tag.as_ref()[..tag.as_ref().len().min(16)]
-        );
-
         prev = tag.as_ref().to_vec();
         output.extend_from_slice(tag.as_ref());
     }
@@ -155,7 +149,6 @@ pub fn derive_traffic_keys(
         iv_length,
         hash_len
     );
-    log::debug!("TRAFFIC_KEY_DERIVE: traffic_secret={:02x?}", traffic_secret);
 
     // key = HKDF-Expand-Label(Secret, "key", "", key_length)
     let key =
@@ -164,9 +157,6 @@ pub fn derive_traffic_keys(
     // iv = HKDF-Expand-Label(Secret, "iv", "", iv_length)
     let iv =
         hkdf_expand_label_with_algorithm(hmac_algorithm, traffic_secret, b"iv", b"", iv_length)?;
-
-    log::debug!("TRAFFIC_KEY_DERIVE: key={:02x?}", key);
-    log::debug!("TRAFFIC_KEY_DERIVE: iv={:02x?}", iv);
 
     Ok((key, iv))
 }
@@ -270,8 +260,6 @@ pub fn derive_handshake_keys(
     // 7. Master Secret = HKDF-Extract(salt=derived_secret, IKM=0)
     let master_secret = hkdf_extract_with_algorithm(hmac_algorithm, &derived_secret_2, &zero_salt);
 
-    log::debug!("  master_secret: {:?}", &master_secret[..8]);
-
     Ok(Tls13HandshakeKeys {
         client_handshake_traffic_secret,
         server_handshake_traffic_secret,
@@ -326,15 +314,6 @@ pub fn derive_application_secrets(
         handshake_hash,
     )?;
 
-    log::debug!(
-        "  client_app_traffic: {:?}",
-        &client_application_traffic_secret[..8]
-    );
-    log::debug!(
-        "DERIVE_APP_SECRETS: ClientAppSecret(full)={:02x?}",
-        client_application_traffic_secret
-    );
-
     // Server Application Traffic Secret
     let server_application_traffic_secret = derive_secret_with_algorithm(
         hmac_algorithm,
@@ -342,15 +321,6 @@ pub fn derive_application_secrets(
         b"s ap traffic",
         handshake_hash,
     )?;
-
-    log::debug!(
-        "  server_app_traffic: {:?}",
-        &server_application_traffic_secret[..8]
-    );
-    log::debug!(
-        "DERIVE_APP_SECRETS: ServerAppSecret(full)={:02x?}",
-        server_application_traffic_secret
-    );
 
     Ok((
         client_application_traffic_secret,
