@@ -2,7 +2,6 @@
 //
 // Changes:
 // - Customizable buffer size
-// - Don't bother initializing buffer
 // - Read and write whenever there's a space
 // - Circular buffer
 // - Cooperative yielding via tokio's coop budget to prevent task starvation
@@ -179,7 +178,7 @@ impl CopyBuffer {
 
 enum TransferState {
     Running,
-    ShuttingDown,
+    ShuttingDown(Pin<Box<tokio::time::Sleep>>),
     Done,
 }
 
@@ -211,12 +210,23 @@ where
         match state {
             TransferState::Running => {
                 ready!(buf.poll_copy(cx, r.as_mut(), w.as_mut()))?;
-                *state = TransferState::ShuttingDown;
+                *state = TransferState::ShuttingDown(Box::pin(tokio::time::sleep(
+                    crate::util::SHUTDOWN_TIMEOUT,
+                )));
             }
-            TransferState::ShuttingDown => {
-                ready!(w.as_mut().poll_shutdown(cx))?;
-                *state = TransferState::Done;
-            }
+            TransferState::ShuttingDown(deadline) => match w.as_mut().poll_shutdown(cx) {
+                Poll::Ready(result) => {
+                    result?;
+                    *state = TransferState::Done;
+                }
+                Poll::Pending => {
+                    ready!(deadline.as_mut().poll(cx));
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "stream shutdown timed out",
+                    )));
+                }
+            },
             TransferState::Done => return Poll::Ready(Ok(())),
         }
     }
@@ -276,11 +286,10 @@ where
 ///
 /// The future will complete successfully once both directions of communication has been shut down.
 /// A direction is shut down when the reader reports EOF,
-/// at which point [`shutdown()`] is called on the corresponding writer. When finished,
-/// it will return a tuple of the number of bytes copied from a to b
-/// and the number of bytes copied from b to a, in that order.
+/// at which point [`shutdown()`] is called on the corresponding writer.
+/// Each shutdown has a five-second deadline; an active read direction has no lifetime limit.
 ///
-/// [`shutdown()`]: crate::io::AsyncWriteExt::shutdown
+/// [`shutdown()`]: tokio::io::AsyncWriteExt::shutdown
 ///
 /// # Errors
 ///
@@ -288,9 +297,6 @@ where
 /// or `b` returns an error. Some data read from either stream may be lost (not
 /// written to the other stream) in this case.
 ///
-/// # Return value
-///
-/// Returns a tuple of bytes copied `a` to `b` and bytes copied `b` to `a`.
 pub async fn copy_bidirectional<A, B>(
     a: &mut A,
     b: &mut B,
@@ -349,4 +355,88 @@ where
         sleep_future,
     }
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::async_stream::AsyncPing;
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+    struct StalledShutdown;
+
+    impl AsyncRead for StalledShutdown {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for StalledShutdown {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            data: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(data.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncPing for StalledShutdown {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+
+        fn poll_write_ping(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+
+    impl AsyncStream for StalledShutdown {}
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_shutdown_and_error_cleanup_have_deadlines() {
+        let start = tokio::time::Instant::now();
+        let error = copy_bidirectional(&mut StalledShutdown, &mut StalledShutdown, false, false)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(start.elapsed(), crate::util::SHUTDOWN_TIMEOUT);
+        let start = tokio::time::Instant::now();
+        crate::util::shutdown_stream(&mut StalledShutdown).await;
+        assert_eq!(start.elapsed(), crate::util::SHUTDOWN_TIMEOUT);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn half_close_does_not_limit_response_lifetime() {
+        let (mut client, mut downstream) = tokio::io::duplex(64);
+        let (mut upstream, mut server) = tokio::io::duplex(64);
+        let copy = tokio::spawn(async move {
+            copy_bidirectional(&mut downstream, &mut upstream, false, false).await
+        });
+        client.write_all(b"request").await.unwrap();
+        client.shutdown().await.unwrap();
+        let mut request = Vec::new();
+        server.read_to_end(&mut request).await.unwrap();
+        assert_eq!(request, b"request");
+        tokio::time::advance(std::time::Duration::from_secs(300)).await;
+        assert!(!copy.is_finished());
+        server.write_all(b"response").await.unwrap();
+        server.shutdown().await.unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        assert_eq!(response, b"response");
+        copy.await.unwrap().unwrap();
+    }
 }

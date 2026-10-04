@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use bytes::Bytes;
 use http::Response;
 use log::{debug, info};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
 use tokio::task::{AbortHandle, JoinSet};
 use tokio::time::{Duration, interval, timeout};
@@ -448,8 +448,12 @@ async fn handle_h2mux_stream(
 
     if is_udp {
         if !udp_enabled {
-            let _ = stream.write_error_response("UDP not enabled").await;
-            let _ = stream.shutdown().await;
+            let _ = timeout(
+                crate::util::SHUTDOWN_TIMEOUT,
+                stream.write_error_response("UDP not enabled"),
+            )
+            .await;
+            crate::util::shutdown_stream(&mut stream).await;
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "UDP not enabled",
@@ -477,9 +481,10 @@ async fn handle_h2mux_tcp(
     proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
 ) -> io::Result<()> {
-    let action = proxy_selector
-        .judge(destination.clone().into(), &resolver)
-        .await?;
+    let action = crate::util::timeout_stream_setup(
+        proxy_selector.judge(destination.clone().into(), &resolver),
+    )
+    .await?;
 
     match action {
         ConnectDecision::Allow {
@@ -488,23 +493,30 @@ async fn handle_h2mux_tcp(
         } => {
             debug!("H2MUX TCP: connecting to {} via chain", remote_location);
 
-            let client_result = chain_group.connect_tcp(remote_location, &resolver).await?;
+            let client_result = crate::util::timeout_stream_setup(
+                chain_group.connect_tcp(remote_location, &resolver),
+            )
+            .await?;
             let mut client_stream = client_result.client_stream;
 
             // Bidirectional copy
             let result = copy_bidirectional(&mut stream, &mut *client_stream, false, false).await;
 
-            let _ = stream.shutdown().await;
-            let _ = client_stream.shutdown().await;
+            futures::join!(
+                crate::util::shutdown_stream(&mut stream),
+                crate::util::shutdown_stream(&mut client_stream),
+            );
 
             result
         }
         ConnectDecision::Block => {
             debug!("H2MUX TCP: blocked by rules: {}", destination);
-            let _ = stream
-                .write_error_response("Connection blocked by rules")
-                .await;
-            let _ = stream.shutdown().await;
+            let _ = timeout(
+                crate::util::SHUTDOWN_TIMEOUT,
+                stream.write_error_response("Connection blocked by rules"),
+            )
+            .await;
+            crate::util::shutdown_stream(&mut stream).await;
             Err(io::Error::new(
                 io::ErrorKind::ConnectionRefused,
                 format!("Connection to {} blocked", destination),
@@ -522,7 +534,9 @@ async fn handle_h2mux_udp(
 ) -> io::Result<()> {
     debug!("H2MUX UDP fixed: {}", destination);
 
-    let action = proxy_selector.judge(destination.into(), &resolver).await?;
+    let action =
+        crate::util::timeout_stream_setup(proxy_selector.judge(destination.into(), &resolver))
+            .await?;
 
     match action {
         ConnectDecision::Allow {
@@ -530,9 +544,10 @@ async fn handle_h2mux_udp(
             remote_location,
         } => {
             // Connect to destination
-            let client_stream = chain_group
-                .connect_udp_bidirectional(&resolver, remote_location)
-                .await?;
+            let client_stream = crate::util::timeout_stream_setup(
+                chain_group.connect_udp_bidirectional(&resolver, remote_location),
+            )
+            .await?;
 
             // Wrap in VlessMessageStream for length-prefixed packets
             let server_stream = VlessMessageStream::new(Box::new(stream));
@@ -540,10 +555,12 @@ async fn handle_h2mux_udp(
             run_udp_copy(Box::new(server_stream), client_stream, false, false).await
         }
         ConnectDecision::Block => {
-            let _ = stream
-                .write_error_response("Connection blocked by rules")
-                .await;
-            let _ = stream.shutdown().await;
+            let _ = timeout(
+                crate::util::SHUTDOWN_TIMEOUT,
+                stream.write_error_response("Connection blocked by rules"),
+            )
+            .await;
+            crate::util::shutdown_stream(&mut stream).await;
             Err(io::Error::new(
                 io::ErrorKind::ConnectionRefused,
                 "UDP connection blocked by rules",
@@ -580,6 +597,7 @@ async fn handle_h2mux_udp_packet_addr(
 mod tests {
     use super::*;
     use crate::h2mux::{H2MuxClientSession, H2MuxOptions};
+    use tokio::io::AsyncWriteExt;
 
     #[tokio::test]
     async fn dropping_server_closes_driver_and_waiting_streams() {

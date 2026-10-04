@@ -6,7 +6,6 @@ use std::time::Duration;
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use log::{debug, error};
-use tokio::io::AsyncWriteExt;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
@@ -513,18 +512,18 @@ async fn process_tcp_stream(
         Ok(Ok(Some(s))) => s,
         Ok(Ok(None)) => {
             // Must have been blocked.
-            let _ = server_stream.shutdown().await;
+            crate::util::shutdown_stream(&mut server_stream).await;
             return Ok(());
         }
         Ok(Err(e)) => {
-            let _ = server_stream.shutdown().await;
+            crate::util::shutdown_stream(&mut server_stream).await;
             return Err(std::io::Error::new(
                 e.kind(),
                 format!("failed to setup client stream to {remote_location}: {e}"),
             ));
         }
         Err(elapsed) => {
-            let _ = server_stream.shutdown().await;
+            crate::util::shutdown_stream(&mut server_stream).await;
             return Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 format!("client setup to {remote_location} timed out: {elapsed}"),
@@ -552,7 +551,10 @@ async fn process_tcp_stream(
     )
     .await;
 
-    let (_, _) = futures::join!(server_stream.shutdown(), client_stream.shutdown());
+    futures::join!(
+        crate::util::shutdown_stream(&mut server_stream),
+        crate::util::shutdown_stream(&mut client_stream),
+    );
 
     copy_result?;
     Ok(())

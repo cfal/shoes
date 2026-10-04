@@ -20,7 +20,6 @@ use hyper_util::rt::TokioIo;
 use log::debug;
 use parking_lot::Mutex;
 use rand::RngExt;
-use tokio::io::AsyncWriteExt;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use tokio_util::io::ReaderStream;
@@ -652,8 +651,12 @@ async fn handle_naive_stream<S: AsyncStream + 'static>(
             }
 
             // UoT V2 header: destination uses SOCKS5 address format
-            let is_connect = stream.read_u8().await?;
-            let destination = read_location_direct(&mut stream).await?;
+            let (is_connect, destination) = crate::util::timeout_stream_setup(async {
+                let is_connect = stream.read_u8().await?;
+                let destination = read_location_direct(&mut stream).await?;
+                Ok((is_connect, destination))
+            })
+            .await?;
 
             debug!(
                 "NaiveProxy stream (user: {}): UoT V2 connect={} -> {}",
@@ -663,18 +666,20 @@ async fn handle_naive_stream<S: AsyncStream + 'static>(
             if is_connect == 1 {
                 let uot_v2_stream = UotV2Stream::new(stream);
 
-                let action = proxy_selector
-                    .judge(destination.clone().into(), &resolver)
-                    .await?;
+                let action = crate::util::timeout_stream_setup(
+                    proxy_selector.judge(destination.clone().into(), &resolver),
+                )
+                .await?;
 
                 match action {
                     ConnectDecision::Allow {
                         chain_group,
                         remote_location,
                     } => {
-                        let client_stream = chain_group
-                            .connect_udp_bidirectional(&resolver, remote_location)
-                            .await?;
+                        let client_stream = crate::util::timeout_stream_setup(
+                            chain_group.connect_udp_bidirectional(&resolver, remote_location),
+                        )
+                        .await?;
 
                         return run_udp_copy(
                             Box::new(uot_v2_stream) as Box<dyn AsyncMessageStream>,
@@ -711,16 +716,20 @@ async fn handle_naive_stream<S: AsyncStream + 'static>(
         user_name, remote_location
     );
 
-    let action = proxy_selector
-        .judge(remote_location.clone().into(), &resolver)
-        .await?;
+    let action = crate::util::timeout_stream_setup(
+        proxy_selector.judge(remote_location.clone().into(), &resolver),
+    )
+    .await?;
 
     let mut client_stream: Box<dyn AsyncStream> = match action {
         ConnectDecision::Allow {
             chain_group,
             remote_location,
         } => {
-            let result = chain_group.connect_tcp(remote_location, &resolver).await?;
+            let result = crate::util::timeout_stream_setup(
+                chain_group.connect_tcp(remote_location, &resolver),
+            )
+            .await?;
             result.client_stream
         }
         ConnectDecision::Block => {
@@ -741,8 +750,10 @@ async fn handle_naive_stream<S: AsyncStream + 'static>(
     )
     .await;
 
-    let _ = stream.shutdown().await;
-    let _ = client_stream.shutdown().await;
+    futures::join!(
+        crate::util::shutdown_stream(&mut stream),
+        crate::util::shutdown_stream(&mut client_stream),
+    );
 
     match result {
         Ok(()) => {

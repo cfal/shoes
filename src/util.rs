@@ -1,5 +1,19 @@
 use tokio::io::AsyncWriteExt;
 
+pub(crate) const SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+pub(crate) async fn shutdown_stream<T: AsyncWriteExt + Unpin + ?Sized>(stream: &mut T) {
+    let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, stream.shutdown()).await;
+}
+
+pub(crate) async fn timeout_stream_setup<T>(
+    future: impl std::future::Future<Output = std::io::Result<T>>,
+) -> std::io::Result<T> {
+    tokio::time::timeout(std::time::Duration::from_secs(60), future)
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "stream setup timed out"))?
+}
+
 #[inline]
 pub fn allocate_vec(len: usize) -> Vec<u8> {
     vec![0; len]
@@ -48,5 +62,16 @@ mod tests {
         write_all(&mut writer, b"abcd").await.unwrap();
         write_all(&mut writer, b"").await.unwrap();
         assert_eq!(writer, b"abcd");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_stream_setup_times_out() {
+        let start = tokio::time::Instant::now();
+        let error = timeout_stream_setup(std::future::pending::<std::io::Result<()>>())
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(start.elapsed(), std::time::Duration::from_secs(60));
+        assert_eq!(timeout_stream_setup(async { Ok(42) }).await.unwrap(), 42);
     }
 }
