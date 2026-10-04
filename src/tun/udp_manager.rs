@@ -166,9 +166,7 @@ impl TunUdpManager {
                                 local_addr, remote_addr, payload.len()
                             );
 
-                            if let Err(e) = self.handle_packet(local_addr, remote_addr, payload) {
-                                debug!("[TunUdpManager] Failed to handle packet: {}", e);
-                            }
+                            self.handle_packet(local_addr, remote_addr, payload);
                         }
                         None => {
                             debug!("[TunUdpManager] TUN reader closed");
@@ -192,15 +190,10 @@ impl TunUdpManager {
     ///
     /// Uses try_send to avoid blocking the manager event loop on a single
     /// overloaded session (prevents head-of-line blocking at the manager level).
-    fn handle_packet(
-        &mut self,
-        local_addr: SocketAddr,
-        remote_addr: SocketAddr,
-        payload: Vec<u8>,
-    ) -> io::Result<()> {
+    fn handle_packet(&mut self, local_addr: SocketAddr, remote_addr: SocketAddr, payload: Vec<u8>) {
         let Some(packet) = QueuedPacket::reserve(payload, &self.queued_bytes) else {
             debug!("[TunUdpManager] UDP queued byte budget exhausted, dropping packet");
-            return Ok(());
+            return;
         };
         if let Some(session) = self.sessions.get_mut(&local_addr) {
             session.last_active = Instant::now();
@@ -211,21 +204,20 @@ impl TunUdpManager {
                     local_addr
                 );
                 self.sessions.pop(&local_addr);
-                self.create_session(local_addr)?;
+                self.create_session(local_addr);
             }
         } else {
-            self.create_session(local_addr)?;
+            self.create_session(local_addr);
         }
 
         let session = self.sessions.get_mut(&local_addr).unwrap();
         match session.tx.try_send((remote_addr, packet)) {
-            Ok(()) => Ok(()),
+            Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
                 debug!(
                     "[TunUdpManager] Session queue full for {}, dropping packet",
                     local_addr
                 );
-                Ok(())
             }
             Err(mpsc::error::TrySendError::Closed(pkt)) => {
                 debug!(
@@ -233,18 +225,17 @@ impl TunUdpManager {
                     local_addr
                 );
                 self.sessions.pop(&local_addr);
-                self.create_session(local_addr)?;
+                self.create_session(local_addr);
                 // Retry once on the fresh session
                 if let Some(session) = self.sessions.get_mut(&local_addr) {
                     let _ = session.tx.try_send(pkt);
                 }
-                Ok(())
             }
         }
     }
 
     /// Create a new session for a local address.
-    fn create_session(&mut self, peer_addr: SocketAddr) -> io::Result<()> {
+    fn create_session(&mut self, peer_addr: SocketAddr) {
         debug!("[TunUdpManager] Creating session for {}", peer_addr);
 
         let (tx, rx) = mpsc::channel(CHANNEL_SIZE);
@@ -265,10 +256,7 @@ impl TunUdpManager {
             last_active: Instant::now(),
         };
 
-        // If LRU insertion evicts an old session, abort its task to avoid
-        // detached background loops accumulating over time.
         self.sessions.push(peer_addr, session);
-        Ok(())
     }
 
     /// Write a response packet to the TUN.
@@ -296,9 +284,7 @@ impl TunUdpManager {
 
         for addr in expired {
             debug!("[TunUdpManager] Removing expired session for {}", addr);
-            if let Some(session) = self.sessions.pop(&addr) {
-                session.handle.abort();
-            }
+            self.sessions.pop(&addr);
         }
     }
 }
@@ -342,7 +328,7 @@ async fn session_task(
     loop {
         tokio::select! {
             packet = rx.recv() => {
-                let Some((dest_addr, payload)) = packet else {
+                let Some((dest_addr, packet)) = packet else {
                     debug!("[TunUdpSession {}] Channel closed", peer_addr);
                     break;
                 };
@@ -360,37 +346,23 @@ async fn session_task(
                     destinations.remove(&dest);
                 }
 
-                // Create destination task if absent
                 if !destinations.contains_key(&dest) {
                     if destinations.len() >= destinations_per_session {
                         continue;
                     }
-                    let Ok(permit) = destination_slots.clone().try_acquire_owned() else { continue };
-                    let setup = tokio::time::timeout(WRITE_TIMEOUT, create_connection(&dest, &proxy_selector, &resolver)).await
-                        .unwrap_or_else(|_| Err(io::Error::new(io::ErrorKind::TimedOut, "TUN UDP setup timed out")));
-                    match setup {
-                        Ok(stream) => {
-                            let source_addr = match dest.to_socket_addr_nonblocking() {
-                                Some(addr) => addr,
-                                None => continue,
-                            };
-
-                            let (write_tx, write_rx) = mpsc::channel(CHANNEL_SIZE);
-                            let handle = tokio::spawn(destination_task(
-                                peer_addr,
-                                source_addr,
-                                stream,
-                                write_rx,
-                                response_tx.clone(),
-                                permit,
-                            ));
-
-                            debug!(
-                                "[TunUdpSession {}] Created destination task for {}",
-                                peer_addr, dest
-                            );
-                            destinations.insert(dest.clone(), DestinationEntry { write_tx, handle });
-                        }
+                    let Ok(permit) = destination_slots.clone().try_acquire_owned() else {
+                        continue;
+                    };
+                    let setup = tokio::time::timeout(
+                        WRITE_TIMEOUT,
+                        create_connection(&dest, &proxy_selector, &resolver),
+                    )
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(io::Error::new(io::ErrorKind::TimedOut, "TUN UDP setup timed out"))
+                    });
+                    let stream = match setup {
+                        Ok(stream) => stream,
                         Err(e) => {
                             debug!(
                                 "[TunUdpSession {}] Failed to connect to {}: {}",
@@ -398,13 +370,32 @@ async fn session_task(
                             );
                             continue;
                         }
-                    }
+                    };
+                    let Some(source_addr) = dest.to_socket_addr_nonblocking() else {
+                        continue;
+                    };
+
+                    let (write_tx, write_rx) = mpsc::channel(CHANNEL_SIZE);
+                    let handle = tokio::spawn(destination_task(
+                        peer_addr,
+                        source_addr,
+                        stream,
+                        write_rx,
+                        response_tx.clone(),
+                        permit,
+                    ));
+
+                    debug!(
+                        "[TunUdpSession {}] Created destination task for {}",
+                        peer_addr, dest
+                    );
+                    destinations.insert(dest.clone(), DestinationEntry { write_tx, handle });
                 }
 
                 // Forward payload to destination task. Uses try_send to avoid
                 // blocking the session loop on a single slow destination.
                 let entry = destinations.get(&dest).unwrap();
-                match entry.write_tx.try_send(payload) {
+                match entry.write_tx.try_send(packet) {
                     Ok(()) => {}
                     Err(mpsc::error::TrySendError::Full(_)) => {
                         debug!(
