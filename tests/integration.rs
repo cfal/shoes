@@ -10,6 +10,8 @@ mod hysteria2;
 mod hysteria2_udp;
 #[path = "cases/integration/naiveproxy_integration.rs"]
 mod naiveproxy;
+#[path = "cases/integration/quic_udp_routing_test.rs"]
+mod quic_udp_routing;
 #[path = "cases/integration/shadowsocks_integration.rs"]
 mod shadowsocks;
 #[path = "cases/integration/shadowsocks_client_udp_test.rs"]
