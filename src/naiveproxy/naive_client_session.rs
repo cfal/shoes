@@ -100,9 +100,11 @@ impl NaiveClientSession {
 
     /// Check if this session is still usable for new streams.
     pub fn is_ready(&self) -> bool {
-        // SendRequest::poll_ready would be more accurate, but this is a good heuristic
-        // The actual check happens when we try to send a request
-        true // Optimistic - let send_request fail if not ready
+        !self.driver_handle.0.is_finished()
+    }
+
+    pub fn same_generation(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.driver_handle, &other.driver_handle)
     }
 
     /// Open a new CONNECT stream to the specified target.
@@ -132,7 +134,9 @@ impl NaiveClientSession {
             .body(())
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
 
-        // No ready() call needed - matches h2 benchmarks pattern
+        std::future::poll_fn(|cx| self.send_request.poll_ready(cx))
+            .await
+            .map_err(|e| io::Error::other(format!("H2 session closed: {e}")))?;
         let (response_future, send_stream) = self
             .send_request
             .send_request(request, false)
@@ -175,7 +179,8 @@ impl NaiveClientSession {
         };
 
         let recv_stream = response.into_body();
-        let h2_stream = H2MultiStream::new(send_stream, recv_stream);
+        let mut h2_stream = H2MultiStream::new(send_stream, recv_stream);
+        h2_stream.set_session_owner(self.clone());
 
         let client_stream: Box<dyn AsyncStream> = if padding_type != PaddingType::None {
             Box::new(NaivePaddingStream::new(
@@ -205,6 +210,55 @@ fn format_authority(location: &NetLocation) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn active_stream_keeps_driver_after_session_slot_is_dropped() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (client, peer) = tokio::io::duplex(8192);
+        let server = tokio::spawn(async move {
+            let mut conn = h2::server::handshake(peer).await.unwrap();
+            let (req, mut respond) = conn.accept().await.unwrap().unwrap();
+            let send = respond
+                .send_response(http::Response::new(()), false)
+                .unwrap();
+            let mut stream = H2MultiStream::new(send, req.into_body());
+            let echo = async {
+                let mut data = [0; 4];
+                stream.read_exact(&mut data).await.unwrap();
+                stream.write_all(&data).await.unwrap();
+                stream.shutdown().await.unwrap();
+            };
+            tokio::select! { _ = echo => {}, _ = conn.accept() => {} }
+            let _ =
+                tokio::time::timeout(std::time::Duration::from_millis(100), conn.accept()).await;
+        });
+        let mut session = NaiveClientSession::new(Box::new(client)).await.unwrap();
+        let weak = Arc::downgrade(&session.driver_handle);
+        let mut stream = session
+            .open_stream(
+                &NetLocation::from_str("example.com:443", None).unwrap(),
+                "Basic dTpw",
+                false,
+            )
+            .await
+            .unwrap();
+        drop(session);
+        assert!(weak.upgrade().is_some());
+        stream.write_all(b"test").await.unwrap();
+        let mut data = [0; 4];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            stream.read_exact(&mut data),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(&data, b"test");
+        drop(stream);
+        assert!(weak.upgrade().is_none());
+        server.abort();
+        let _ = server.await;
+    }
 
     #[test]
     fn test_format_authority_ipv4() {

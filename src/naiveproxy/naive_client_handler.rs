@@ -84,13 +84,26 @@ impl TcpClientHandler for NaiveProxyTcpClientHandler {
     ) -> io::Result<TcpClientSetupResult> {
         let mut session = self.get_or_create_session(client_stream).await?;
 
-        let stream = session
+        let result = session
             .open_stream(
                 remote_location.location(),
                 &self.auth_header,
                 self.padding_enabled,
             )
-            .await?;
+            .await;
+        let stream = match result {
+            Ok(stream) => stream,
+            Err(e) => {
+                let mut slot = self.session.lock().await;
+                if slot
+                    .as_ref()
+                    .is_some_and(|current| current.same_generation(&session))
+                {
+                    *slot = None;
+                }
+                return Err(e);
+            }
+        };
 
         Ok(TcpClientSetupResult {
             client_stream: stream,
@@ -129,6 +142,31 @@ impl NaiveProxyTcpClientHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn replaces_closed_session_with_supplied_transport() {
+        let handler = NaiveProxyTcpClientHandler::new("user", "pass", false);
+        let (client, peer) = tokio::io::duplex(8192);
+        let first = handler
+            .get_or_create_session(Box::new(client))
+            .await
+            .unwrap();
+        drop(peer);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while first.is_ready() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let (client, _peer) = tokio::io::duplex(8192);
+        let second = handler
+            .get_or_create_session(Box::new(client))
+            .await
+            .unwrap();
+        assert!(second.is_ready());
+        assert!(!first.same_generation(&second));
+    }
 
     #[test]
     fn test_handler_new_encodes_credentials() {
