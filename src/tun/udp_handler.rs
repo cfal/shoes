@@ -15,7 +15,7 @@ use std::{
 use etherparse::PacketBuilder;
 use futures::{Sink, Stream, ready};
 use smoltcp::wire::{IpProtocol, Ipv4Packet, Ipv6Packet, UdpPacket};
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{Receiver, Sender, error::TrySendError};
 
 pub type PacketBuffer = Vec<u8>;
 
@@ -25,17 +25,14 @@ pub type UdpMessage = (Vec<u8>, SocketAddr, SocketAddr);
 /// UDP handler for reading/writing UDP packets from/to TUN.
 pub struct UdpHandler {
     /// Receiver for UDP packets from TUN
-    from_tun_rx: UnboundedReceiver<PacketBuffer>,
+    from_tun_rx: Receiver<PacketBuffer>,
     /// Sender for UDP packets to TUN
-    to_tun_tx: UnboundedSender<PacketBuffer>,
+    to_tun_tx: Sender<PacketBuffer>,
 }
 
 impl UdpHandler {
     /// Create a new UDP handler.
-    pub fn new(
-        from_tun_rx: UnboundedReceiver<PacketBuffer>,
-        to_tun_tx: UnboundedSender<PacketBuffer>,
-    ) -> Self {
+    pub fn new(from_tun_rx: Receiver<PacketBuffer>, to_tun_tx: Sender<PacketBuffer>) -> Self {
         Self {
             from_tun_rx,
             to_tun_tx,
@@ -57,23 +54,25 @@ impl UdpHandler {
 
 /// Read half for receiving UDP packets.
 pub struct UdpReader {
-    from_tun_rx: UnboundedReceiver<PacketBuffer>,
+    from_tun_rx: Receiver<PacketBuffer>,
 }
 
 /// Write half for sending UDP packets.
 pub struct UdpWriter {
-    to_tun_tx: UnboundedSender<PacketBuffer>,
+    to_tun_tx: Sender<PacketBuffer>,
 }
 
 impl UdpWriter {
-    /// Synchronous send that builds the UDP packet and sends it directly
-    /// on the unbounded channel, avoiding the need for an async runtime.
+    /// UDP is lossy: saturation drops a packet rather than retaining unbounded data.
     pub fn send_sync(&self, message: UdpMessage) -> io::Result<()> {
         let (payload, src_addr, dst_addr) = message;
         let packet = build_udp_packet(&payload, src_addr, dst_addr)?;
-        self.to_tun_tx
-            .send(packet)
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "channel closed"))
+        match self.to_tun_tx.try_send(packet) {
+            Ok(()) | Err(TrySendError::Full(_)) => Ok(()),
+            Err(TrySendError::Closed(_)) => {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "channel closed"))
+            }
+        }
     }
 }
 
@@ -100,16 +99,12 @@ impl Sink<UdpMessage> for UdpWriter {
     type Error = io::Error;
 
     fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        // Unbounded channel is always ready
+        // Saturated UDP output drops packets.
         Poll::Ready(Ok(()))
     }
 
     fn start_send(self: Pin<&mut Self>, item: UdpMessage) -> Result<(), Self::Error> {
-        let (payload, src_addr, dst_addr) = item;
-        let packet = build_udp_packet(&payload, src_addr, dst_addr)?;
-        self.to_tun_tx
-            .send(packet)
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "channel closed"))
+        self.send_sync(item)
     }
 
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {

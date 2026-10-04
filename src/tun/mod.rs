@@ -55,12 +55,12 @@ pub use platform::{
 pub use tun_server::TunServerConfig;
 
 use std::net::SocketAddr;
-use std::os::unix::io::IntoRawFd;
+use std::os::fd::{BorrowedFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::sync::Arc;
 
 use log::{debug, info, warn};
 use tokio::sync::{mpsc, oneshot};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 
 use crate::address::{Address, NetLocation};
 use crate::client_proxy_selector::ClientProxySelector;
@@ -69,10 +69,35 @@ use crate::config::selection::ConfigSelection;
 use crate::resolver::{NativeResolver, Resolver};
 use crate::tcp::tcp_client_handler_factory::create_tcp_client_proxy_selector;
 
-use tcp_stack_direct::{NewTcpConnection, TcpStackDirect};
+use tcp_stack_direct::{NewTcpConnection, PACKET_QUEUE_CAPACITY, TcpStackDirect};
 use udp_manager::TunUdpManager;
 
 type PacketBuffer = Vec<u8>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::fd::AsRawFd;
+
+    #[tokio::test]
+    async fn borrowed_tun_fd_remains_open_after_stop() {
+        let (_peer, client) = std::os::unix::net::UnixStream::pair().unwrap();
+        let config = TunServerConfig::new()
+            .raw_fd(client.as_raw_fd())
+            .close_fd_on_drop(false);
+        let (tx, rx) = oneshot::channel();
+        tx.send(()).unwrap();
+        run_tun_server(
+            config,
+            Arc::new(ClientProxySelector::new(Vec::new())),
+            Arc::new(NativeResolver::new()),
+            rx,
+        )
+        .await
+        .unwrap();
+        assert!(unsafe { libc::fcntl(client.as_raw_fd(), libc::F_GETFD) } >= 0);
+    }
+}
 
 /// Run the TUN server with the given configuration.
 ///
@@ -95,12 +120,16 @@ pub async fn run_tun_server(
 
     let fd = if let Some(fd) = config.raw_fd {
         info!("Using provided raw FD: {}", fd);
-        fd
+        if config.close_fd_on_drop {
+            unsafe { OwnedFd::from_raw_fd(fd) }
+        } else {
+            unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned()?
+        }
     } else {
         let tun_device = config.create_sync_device()?;
         let fd = tun_device.into_raw_fd();
         info!("Created TUN device with FD: {}", fd);
-        fd
+        unsafe { OwnedFd::from_raw_fd(fd) }
     };
 
     let mtu = config.mtu as usize;
@@ -112,24 +141,32 @@ pub async fn run_tun_server(
     let udp_from_stack_rx = tcp_stack.take_udp_rx().expect("udp_rx already taken");
 
     // Channel for sending UDP responses back (stack thread will write to TUN)
-    let (udp_to_stack_tx, udp_to_stack_rx) = mpsc::unbounded_channel::<PacketBuffer>();
+    let (udp_to_stack_tx, udp_to_stack_rx) = mpsc::channel::<PacketBuffer>(PACKET_QUEUE_CAPACITY);
     tcp_stack.set_udp_response_tx(udp_to_stack_rx);
 
-    let (tcp_conn_tx, mut tcp_conn_rx) = mpsc::unbounded_channel::<NewTcpConnection>();
+    let (tcp_conn_tx, mut tcp_conn_rx) = mpsc::channel::<NewTcpConnection>(PACKET_QUEUE_CAPACITY);
     tcp_stack.set_new_conn_tx(tcp_conn_tx);
 
-    let tcp_task: Option<JoinHandle<()>> = if config.tcp_enabled {
+    let mut tasks = JoinSet::new();
+    if config.tcp_enabled {
         let proxy_selector = proxy_selector.clone();
         let resolver = resolver.clone();
 
-        Some(tokio::spawn(async move {
+        tasks.spawn(async move {
             info!("Starting TCP connection handler");
-
-            while let Some(new_conn) = tcp_conn_rx.recv().await {
+            let mut connections = JoinSet::new();
+            loop {
+                let new_conn = tokio::select! {
+                    conn = tcp_conn_rx.recv() => match conn {
+                        Some(conn) => conn,
+                        None => break,
+                    },
+                    _ = connections.join_next(), if !connections.is_empty() => continue,
+                };
                 let proxy_selector = proxy_selector.clone();
                 let resolver = resolver.clone();
 
-                tokio::spawn(async move {
+                connections.spawn(async move {
                     let remote_addr = new_conn.remote_addr;
                     let target = socket_addr_to_net_location(remote_addr);
 
@@ -145,21 +182,17 @@ pub async fn run_tun_server(
             }
 
             debug!("TCP connection handler ended");
-        }))
-    } else {
-        None
-    };
+        });
+    }
 
-    let udp_task = if config.udp_enabled {
+    if config.udp_enabled {
         let proxy_selector = proxy_selector.clone();
         let resolver = resolver.clone();
 
-        Some(tokio::spawn(async move {
+        tasks.spawn(async move {
             handle_udp_packets(udp_from_stack_rx, udp_to_stack_tx, proxy_selector, resolver).await;
-        }))
-    } else {
-        None
-    };
+        });
+    }
 
     info!("TUN server started successfully");
 
@@ -178,12 +211,7 @@ pub async fn run_tun_server(
         }
     }
 
-    if let Some(t) = tcp_task {
-        t.abort();
-    }
-    if let Some(t) = udp_task {
-        t.abort();
-    }
+    tasks.shutdown().await;
 
     // tcp_stack is dropped here, which stops the stack thread
 
@@ -272,8 +300,8 @@ async fn handle_tcp_connection(
 /// - Stores the return address in each session
 /// - Routes responses using the stored address (no NAT table lookup)
 async fn handle_udp_packets(
-    from_stack_rx: mpsc::UnboundedReceiver<PacketBuffer>,
-    to_stack_tx: mpsc::UnboundedSender<PacketBuffer>,
+    from_stack_rx: mpsc::Receiver<PacketBuffer>,
+    to_stack_tx: mpsc::Sender<PacketBuffer>,
     proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
 ) {
