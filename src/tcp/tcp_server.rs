@@ -37,12 +37,18 @@ async fn run_tcp_server(
     let TcpConfig { no_delay } = tcp_config;
 
     let listener = new_tcp_listener(bind_address, 4096, None)?;
+    let mut tasks = crate::listener_tasks::ListenerTasks::new();
 
     loop {
-        let (stream, addr) = match listener.accept().await {
+        let accepted = tokio::select! {
+            result = listener.accept() => result,
+            _ = tasks.join_next(), if !tasks.is_empty() => continue,
+        };
+        let (stream, addr) = match accepted {
             Ok(v) => v,
             Err(e) => {
                 error!("Accept failed: {e}");
+                tokio::time::sleep(Duration::from_millis(100)).await;
                 continue;
             }
         };
@@ -61,7 +67,7 @@ async fn run_tcp_server(
 
         let cloned_resolver = resolver.clone();
         let cloned_handler = server_handler.clone();
-        tokio::spawn(async move {
+        tasks.spawn(async move {
             if let Err(e) = process_stream(stream, cloned_handler, cloned_resolver).await {
                 error!("{}:{} finished with error: {:?}", addr.ip(), addr.port(), e);
             } else {
@@ -86,19 +92,25 @@ async fn run_unix_server(
     }
 
     let listener = crate::socket_util::new_unix_listener(path_buf, 4096)?;
+    let mut tasks = crate::listener_tasks::ListenerTasks::new();
 
     loop {
-        let (stream, addr) = match listener.accept().await {
+        let accepted = tokio::select! {
+            result = listener.accept() => result,
+            _ = tasks.join_next(), if !tasks.is_empty() => continue,
+        };
+        let (stream, addr) = match accepted {
             Ok(v) => v,
             Err(e) => {
                 error!("Accept failed: {e:?}");
+                tokio::time::sleep(Duration::from_millis(100)).await;
                 continue;
             }
         };
 
         let cloned_resolver = resolver.clone();
         let cloned_handler = server_handler.clone();
-        tokio::spawn(async move {
+        tasks.spawn(async move {
             if let Err(e) = process_stream(stream, cloned_handler, cloned_resolver).await {
                 error!("{addr:?} finished with error: {e:?}");
             } else {

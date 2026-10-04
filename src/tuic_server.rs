@@ -1317,12 +1317,19 @@ pub async fn start_tuic_server(
             )
             .unwrap();
 
-            while let Some(conn) = endpoint.accept().await {
+            let endpoint = crate::listener_tasks::QuicListener(endpoint);
+            let mut tasks = crate::listener_tasks::ListenerTasks::new();
+            loop {
+                let conn = tokio::select! {
+                    conn = endpoint.accept() => conn,
+                    _ = tasks.join_next(), if !tasks.is_empty() => continue,
+                };
+                let Some(conn) = conn else { break };
                 let cloned_selector = client_proxy_selector.clone();
                 let cloned_resolver = resolver.clone();
                 let uuid = uuid.clone();
                 let password = password.clone();
-                tokio::spawn(async move {
+                tasks.spawn(async move {
                     if let Err(e) = process_connection(
                         cloned_selector,
                         cloned_resolver,

@@ -881,11 +881,18 @@ pub async fn start_hysteria2_server(
             )
             .unwrap();
 
-            while let Some(conn) = endpoint.accept().await {
+            let endpoint = crate::listener_tasks::QuicListener(endpoint);
+            let mut tasks = crate::listener_tasks::ListenerTasks::new();
+            loop {
+                let conn = tokio::select! {
+                    conn = endpoint.accept() => conn,
+                    _ = tasks.join_next(), if !tasks.is_empty() => continue,
+                };
+                let Some(conn) = conn else { break };
                 let cloned_selector = client_proxy_selector.clone();
                 let cloned_resolver = resolver.clone();
                 let hysteria2_password = hysteria2_password.clone();
-                tokio::spawn(async move {
+                tasks.spawn(async move {
                     if let Err(e) = process_connection(
                         cloned_selector,
                         cloned_resolver,
