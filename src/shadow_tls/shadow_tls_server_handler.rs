@@ -234,8 +234,10 @@ async fn shadowtls_fallback_to_handshake_server(
         )
         .await;
 
-        let _ = client_stream.shutdown().await;
-        let _ = handshake_stream.shutdown().await;
+        futures::join!(
+            crate::util::shutdown_stream(&mut client_stream),
+            crate::util::shutdown_stream(&mut handshake_stream),
+        );
 
         if let Err(e) = result {
             log::debug!("SHADOWTLS FALLBACK: Connection ended: {}", e);

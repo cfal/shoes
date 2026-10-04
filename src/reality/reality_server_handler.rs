@@ -304,12 +304,18 @@ fn start_forward_to_dest(
         for record in &dest_records {
             if let Err(e) = write_all(&mut client_stream, record).await {
                 log::debug!("REALITY FALLBACK: Error forwarding record: {}", e);
-                let _ = futures::join!(client_stream.shutdown(), dest_stream.shutdown());
+                futures::join!(
+                    crate::util::shutdown_stream(&mut client_stream),
+                    crate::util::shutdown_stream(&mut dest_stream),
+                );
                 return;
             }
             if let Err(e) = client_stream.flush().await {
                 log::debug!("REALITY FALLBACK: Error flushing record: {}", e);
-                let _ = futures::join!(client_stream.shutdown(), dest_stream.shutdown());
+                futures::join!(
+                    crate::util::shutdown_stream(&mut client_stream),
+                    crate::util::shutdown_stream(&mut dest_stream),
+                );
                 return;
             }
         }
@@ -318,7 +324,10 @@ fn start_forward_to_dest(
             && let Err(e) = write_all(&mut client_stream, &remaining_data).await
         {
             log::debug!("REALITY FALLBACK: Error forwarding remaining data: {}", e);
-            let _ = futures::join!(client_stream.shutdown(), dest_stream.shutdown());
+            futures::join!(
+                crate::util::shutdown_stream(&mut client_stream),
+                crate::util::shutdown_stream(&mut dest_stream),
+            );
             return;
         }
 
@@ -336,10 +345,108 @@ fn start_forward_to_dest(
         )
         .await;
 
-        let _ = futures::join!(client_stream.shutdown(), dest_stream.shutdown());
+        futures::join!(
+            crate::util::shutdown_stream(&mut client_stream),
+            crate::util::shutdown_stream(&mut dest_stream),
+        );
 
         if let Err(e) = result {
             log::debug!("REALITY FALLBACK: Connection ended with error: {}", e);
         }
     }))
+}
+
+#[cfg(test)]
+mod cleanup_tests {
+    use super::*;
+    use std::io;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+    struct StalledShutdown {
+        fail_write: bool,
+        fail_flush: bool,
+        _marker: Arc<()>,
+    }
+
+    impl AsyncRead for StalledShutdown {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for StalledShutdown {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if self.fail_write {
+                Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()))
+            } else {
+                Poll::Ready(Ok(bytes.len()))
+            }
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            if self.fail_flush {
+                Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()))
+            } else {
+                Poll::Ready(Ok(()))
+            }
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl crate::async_stream::AsyncPing for StalledShutdown {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+        fn poll_write_ping(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+
+    impl AsyncStream for StalledShutdown {}
+
+    #[tokio::test(start_paused = true)]
+    async fn fallback_cleanup_is_bounded_after_copy_and_early_errors() {
+        let bytes = Bytes::from_static(b"handshake");
+        let cases = [
+            (false, false, vec![], Bytes::new(), 10),
+            (true, false, vec![bytes.clone()], Bytes::new(), 5),
+            (false, true, vec![bytes.clone()], Bytes::new(), 5),
+            (true, false, vec![], bytes, 5),
+        ];
+        for (fail_write, fail_flush, records, remaining, seconds) in cases {
+            let marker = Arc::new(());
+            let client = StalledShutdown {
+                fail_write,
+                fail_flush,
+                _marker: marker.clone(),
+            };
+            let dest = StalledShutdown {
+                fail_write: false,
+                fail_flush: false,
+                _marker: marker.clone(),
+            };
+            let TcpServerSetupResult::Session(session) =
+                start_forward_to_dest(Box::new(client), Box::new(dest), records, remaining)
+            else {
+                panic!("fallback must remain owned by its caller")
+            };
+            let started = tokio::time::Instant::now();
+            tokio::time::timeout(std::time::Duration::from_secs(11), session)
+                .await
+                .expect("fallback cleanup retained the streams indefinitely");
+            assert_eq!(started.elapsed(), std::time::Duration::from_secs(seconds));
+            assert_eq!(Arc::strong_count(&marker), 1);
+        }
+    }
 }

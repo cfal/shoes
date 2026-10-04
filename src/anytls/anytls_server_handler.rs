@@ -226,8 +226,10 @@ impl AnyTlsServerHandler {
             )
             .await;
 
-            let _ = client_stream.shutdown().await;
-            let _ = dest_stream.shutdown().await;
+            futures::join!(
+                crate::util::shutdown_stream(&mut client_stream),
+                crate::util::shutdown_stream(&mut dest_stream),
+            );
 
             if let Err(e) = result {
                 log::debug!("AnyTLS FALLBACK: Connection ended: {}", e);
