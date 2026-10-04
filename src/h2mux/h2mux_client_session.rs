@@ -2,7 +2,7 @@
 //!
 //! Manages a single HTTP/2 connection for multiplexing multiple streams.
 //! Matches sing-mux behavior: uses PING keepalive to detect dead connections,
-//! Streams keep their driver alive; dropping the last owner stops background I/O.
+//! Streams keep their driver alive; the last owner starts a bounded drain.
 
 use std::io;
 use std::sync::Arc;
@@ -13,13 +13,16 @@ use h2::{Ping, PingPong};
 use http::{Method, Request, Version};
 use log::debug;
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::oneshot;
 use tokio::time::interval;
 
 use crate::address::NetLocation;
 use crate::async_stream::AsyncStream;
 
 use super::H2MuxOptions;
-use super::activity_tracker::{PING_INTERVAL, PING_TIMEOUT, STREAM_OPEN_TIMEOUT};
+use super::activity_tracker::{
+    PING_INTERVAL, PING_TIMEOUT, SHUTDOWN_DRAIN_TIMEOUT, STREAM_OPEN_TIMEOUT,
+};
 use super::h2mux_client_stream::H2MuxClientStream;
 use super::h2mux_padding::H2MuxPaddingStream;
 use super::h2mux_protocol::SessionRequest;
@@ -37,7 +40,6 @@ const MAX_FRAME_SIZE: u32 = 16 * 1024;
 /// - Driver ownership shared by sessions and active streams
 pub struct H2MuxClientSession {
     send_request: h2::client::SendRequest<Bytes>,
-    /// Handle to abort the connection driver on drop
     driver_handle: Arc<DriverHandle>,
     padding_enabled: bool,
     active_streams: Arc<AtomicU32>,
@@ -58,16 +60,13 @@ impl std::fmt::Debug for H2MuxClientSession {
     }
 }
 
-/// RAII wrapper to abort the driver when all session clones are dropped
 struct DriverHandle {
-    driver: tokio::task::AbortHandle,
+    _drain: oneshot::Sender<()>,
     ping: Option<tokio::task::AbortHandle>,
 }
 
 impl Drop for DriverHandle {
     fn drop(&mut self) {
-        debug!("H2MuxClientSession: aborting connection driver");
-        self.driver.abort();
         if let Some(ping) = &self.ping {
             ping.abort();
         }
@@ -93,7 +92,7 @@ impl H2MuxClientSession {
     /// 1. Send session request header on RAW stream (unpadded)
     /// 2. Apply padding layer if enabled
     /// 3. Perform HTTP/2 handshake over (potentially padded) stream
-    /// 4. Spawn connection driver, idle watchdog, and PING keepalive tasks
+    /// 4. Spawn connection driver and PING keepalive tasks
     pub async fn new<IO>(mut conn: IO, options: &H2MuxOptions) -> io::Result<Self>
     where
         IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -130,10 +129,16 @@ impl H2MuxClientSession {
 
         let is_closed = Arc::new(AtomicBool::new(false));
         let driver_closed = Arc::clone(&is_closed);
+        let (drain_tx, drain_rx) = oneshot::channel();
 
         // Spawn connection driver
         let abort_handle = tokio::spawn(async move {
-            if let Err(e) = connection.await {
+            // Dropping the last owner must still flush queued DATA and END_STREAM.
+            let result = tokio::select! {
+                result = &mut connection => Some(result),
+                _ = drain_rx => tokio::time::timeout(SHUTDOWN_DRAIN_TIMEOUT, connection).await.ok(),
+            };
+            if let Some(Err(e)) = result {
                 debug!("H2MUX client connection ended: {}", e);
             }
             driver_closed.store(true, Ordering::Relaxed);
@@ -150,7 +155,7 @@ impl H2MuxClientSession {
         Ok(Self {
             send_request,
             driver_handle: Arc::new(DriverHandle {
-                driver: abort_handle,
+                _drain: drain_tx,
                 ping,
             }),
             padding_enabled,
@@ -323,7 +328,7 @@ mod tests {
                 .await
                 .unwrap();
             let owner = Arc::downgrade(&session.driver_handle);
-            let driver = session.driver_handle.driver.clone();
+            let closed = Arc::clone(&session.is_closed);
             let destination = NetLocation::from_str("example.com:443", None).unwrap();
             let mut stream = session.open_tcp(&destination).await.unwrap();
             assert_eq!(session.active_streams(), 1);
@@ -340,7 +345,7 @@ mod tests {
             drop(stream);
             assert!(owner.upgrade().is_none());
             tokio::time::timeout(std::time::Duration::from_secs(1), async {
-                while !driver.is_finished() {
+                while !closed.load(Ordering::Relaxed) {
                     tokio::task::yield_now().await;
                 }
             })
@@ -349,6 +354,81 @@ mod tests {
             peer.abort();
             let _ = peer.await;
         }
+    }
+
+    #[tokio::test]
+    async fn last_stream_drop_drains_tail_after_peer_half_close() {
+        let (client, mut peer) = tokio::io::duplex(65536);
+        let peer = tokio::spawn(async move {
+            SessionRequest::decode(&mut peer).await.unwrap();
+            let mut connection = h2::server::handshake(peer).await.unwrap();
+            let (request, mut respond) = connection.accept().await.unwrap().unwrap();
+            let mut send = respond
+                .send_response(http::Response::new(()), false)
+                .unwrap();
+            let mut receive = request.into_body();
+            let read = async {
+                let warmup = receive.data().await.unwrap().unwrap();
+                assert!(warmup.ends_with(b"warmup"));
+                receive
+                    .flow_control()
+                    .release_capacity(warmup.len())
+                    .unwrap();
+                send.send_data(Bytes::from_static(&[0]), true).unwrap();
+
+                let mut tail = Vec::new();
+                while let Some(data) = receive.data().await {
+                    let data = data.unwrap();
+                    receive.flow_control().release_capacity(data.len()).unwrap();
+                    tail.extend_from_slice(&data);
+                }
+                tail
+            };
+            tokio::pin!(read);
+            tokio::select! {
+                tail = &mut read => tail,
+                accepted = connection.accept() => {
+                    assert!(!matches!(accepted, Some(Ok(_))));
+                    read.await
+                }
+            }
+        });
+        let options = H2MuxOptions {
+            padding: false,
+            ..Default::default()
+        };
+        let mut session = H2MuxClientSession::new(client, &options).await.unwrap();
+        let destination = NetLocation::from_str("example.com:443", None).unwrap();
+        let mut stream = session.open_tcp(&destination).await.unwrap();
+        drop(session);
+        stream.write_all(b"warmup").await.unwrap();
+        stream.read_to_end(&mut Vec::new()).await.unwrap();
+        stream.write_all(b"FINAL-TAIL").await.unwrap();
+        stream.flush().await.unwrap();
+        stream.shutdown().await.unwrap();
+        drop(stream);
+        let tail = tokio::time::timeout(std::time::Duration::from_secs(1), peer)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(tail, b"FINAL-TAIL");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn last_owner_drain_is_bounded_when_peer_stalls() {
+        let (client, _peer) = tokio::io::duplex(64);
+        let mut session = H2MuxClientSession::new(client, &H2MuxOptions::default())
+            .await
+            .unwrap();
+        let closed = Arc::clone(&session.is_closed);
+        let destination = NetLocation::from_str("example.com:443", None).unwrap();
+        let stream = session.open_tcp(&destination).await.unwrap();
+        drop(session);
+        drop(stream);
+        tokio::task::yield_now().await;
+        assert!(!closed.load(Ordering::Relaxed));
+        tokio::time::sleep(SHUTDOWN_DRAIN_TIMEOUT + std::time::Duration::from_millis(1)).await;
+        assert!(closed.load(Ordering::Relaxed));
     }
 
     #[test]
