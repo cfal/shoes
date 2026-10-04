@@ -31,6 +31,8 @@ pub struct ResourceLimits {
     pub quic_send_window: usize,
     pub quic_stream_window: usize,
     pub quic_memory_bytes: usize,
+    /// Admission estimate for Hickory's private H3 transport, not a hard buffer limit.
+    pub quic_dns_memory_bytes: usize,
     pub quic_socket_buffer: usize,
 }
 
@@ -46,6 +48,12 @@ pub static LIMITS: LazyLock<ResourceLimits> = LazyLock::new(|| ResourceLimits {
     quic_memory_bytes: setting(
         "SHOES_QUIC_MEMORY_BYTES",
         64 << 20,
+        1 << 20,
+        (1 << 30).min(Semaphore::MAX_PERMITS),
+    ),
+    quic_dns_memory_bytes: setting(
+        "SHOES_QUIC_DNS_MEMORY_BYTES",
+        16 << 20,
         1 << 20,
         (1 << 30).min(Semaphore::MAX_PERMITS),
     ),
@@ -164,6 +172,10 @@ pub(crate) fn try_quic_memory() -> Option<OwnedSemaphorePermit> {
     )
 }
 
+pub(crate) fn try_dns_quic_memory() -> Option<OwnedSemaphorePermit> {
+    QUIC_BYTES.acquire(LIMITS.quic_dns_memory_bytes as u32)
+}
+
 pub(crate) fn configure_quic(config: &mut quinn::ServerConfig, uni_streams: u32) {
     config
         .max_incoming(LIMITS.max_connections.min(128))
@@ -274,6 +286,13 @@ mod tests {
             };
             assert_eq!(LIMITS.quic_memory_bytes, expected);
             assert_eq!(QUIC_BYTES.slots.available_permits(), expected);
+            let expected_dns = if requested <= maximum {
+                requested
+            } else {
+                16 << 20
+            };
+            assert_eq!(LIMITS.quic_dns_memory_bytes, expected_dns);
+            assert!(LIMITS.quic_dns_memory_bytes <= Semaphore::MAX_PERMITS);
         } else {
             for requested in [maximum, maximum + 1] {
                 let status = std::process::Command::new(std::env::current_exe().unwrap())
@@ -284,6 +303,7 @@ mod tests {
                     ])
                     .env("SHOES_QUIC_BUDGET_TEST_CHILD", "1")
                     .env("SHOES_QUIC_MEMORY_BYTES", requested.to_string())
+                    .env("SHOES_QUIC_DNS_MEMORY_BYTES", requested.to_string())
                     .status()
                     .unwrap();
                 assert!(status.success());

@@ -22,7 +22,10 @@ impl QuicEndpoint {
         config: Option<quinn::ServerConfig>,
         socket: std::net::UdpSocket,
     ) -> io::Result<Self> {
-        let socket = MemorySocket(quinn::TokioRuntime.wrap_udp_socket(socket)?);
+        let socket = MemorySocket {
+            inner: quinn::TokioRuntime.wrap_udp_socket(socket)?,
+            endpoint_memory: None,
+        };
         quinn::Endpoint::new_with_abstract_socket(
             quinn::EndpointConfig::default(),
             config,
@@ -97,11 +100,29 @@ impl Incoming {
     }
 }
 
+/// For a dedicated single-connection endpoint, such as Hickory's H3 client.
+/// Pooled endpoints must reserve each connection through QuicEndpoint instead.
+pub(crate) fn socket_with_memory(
+    socket: std::net::UdpSocket,
+    memory: OwnedSemaphorePermit,
+) -> io::Result<Arc<dyn AsyncUdpSocket>> {
+    Ok(Arc::new(MemorySocket {
+        inner: quinn::TokioRuntime.wrap_udp_socket(socket)?,
+        endpoint_memory: Some(memory),
+    }))
+}
+
 #[derive(Debug)]
-struct MemorySocket(Arc<dyn AsyncUdpSocket>);
+struct MemorySocket {
+    inner: Arc<dyn AsyncUdpSocket>,
+    endpoint_memory: Option<OwnedSemaphorePermit>,
+}
 
 impl AsyncUdpSocket for MemorySocket {
     fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
+        if self.endpoint_memory.is_some() {
+            return self.inner.clone().create_io_poller();
+        }
         // Quinn creates one poller synchronously inside connect/accept. Its State
         // drops protocol stream/datagram buffers before dropping this poller,
         // including when application handles survive driver completion.
@@ -112,13 +133,13 @@ impl AsyncUdpSocket for MemorySocket {
                 .expect("QUIC memory reserved once per connection")
         });
         Box::pin(MemoryPoller {
-            inner: self.0.clone().create_io_poller(),
+            inner: self.inner.clone().create_io_poller(),
             _memory: memory,
         })
     }
 
     fn try_send(&self, transmit: &quinn::udp::Transmit<'_>) -> io::Result<()> {
-        self.0.try_send(transmit)
+        self.inner.try_send(transmit)
     }
 
     fn poll_recv(
@@ -127,23 +148,23 @@ impl AsyncUdpSocket for MemorySocket {
         bufs: &mut [IoSliceMut<'_>],
         meta: &mut [quinn::udp::RecvMeta],
     ) -> Poll<io::Result<usize>> {
-        self.0.poll_recv(cx, bufs, meta)
+        self.inner.poll_recv(cx, bufs, meta)
     }
 
     fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.0.local_addr()
+        self.inner.local_addr()
     }
 
     fn max_transmit_segments(&self) -> usize {
-        self.0.max_transmit_segments()
+        self.inner.max_transmit_segments()
     }
 
     fn max_receive_segments(&self) -> usize {
-        self.0.max_receive_segments()
+        self.inner.max_receive_segments()
     }
 
     fn may_fragment(&self) -> bool {
-        self.0.may_fragment()
+        self.inner.may_fragment()
     }
 }
 
@@ -169,7 +190,7 @@ mod tests {
     use tokio::sync::Semaphore;
     use tokio::time::timeout;
 
-    fn endpoints() -> (QuicEndpoint, QuicEndpoint) {
+    fn configs() -> (quinn::ClientConfig, quinn::ServerConfig) {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let mut roots = rustls::RootCertStore::empty();
         roots.add(cert.cert.der().clone()).unwrap();
@@ -178,6 +199,12 @@ mod tests {
             rustls::pki_types::PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()).into(),
         )
         .unwrap();
+        let client_config = quinn::ClientConfig::with_root_certificates(Arc::new(roots)).unwrap();
+        (client_config, server_config)
+    }
+
+    fn endpoints() -> (QuicEndpoint, QuicEndpoint) {
+        let (client_config, server_config) = configs();
         let server = QuicEndpoint::new(
             Some(server_config),
             std::net::UdpSocket::bind("0.0.0.0:0").unwrap(),
@@ -185,9 +212,7 @@ mod tests {
         .unwrap();
         let mut client =
             QuicEndpoint::new(None, std::net::UdpSocket::bind("0.0.0.0:0").unwrap()).unwrap();
-        client.set_default_client_config(
-            quinn::ClientConfig::with_root_certificates(Arc::new(roots)).unwrap(),
-        );
+        client.set_default_client_config(client_config);
         (client, server)
     }
 
@@ -347,6 +372,72 @@ mod tests {
         assert_eq!(live.load(Ordering::SeqCst), 0);
         assert_eq!(client_budget.available_permits(), 1);
         drop(peer);
+        assert_eq!(server_budget.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn socket_reservation_survives_draining_and_retained_streams() {
+        let (client_config, server_config) = configs();
+        let budget = Arc::new(Semaphore::new(1));
+        let socket = socket_with_memory(
+            std::net::UdpSocket::bind("0.0.0.0:0").unwrap(),
+            budget.clone().try_acquire_owned().unwrap(),
+        )
+        .unwrap();
+        let mut client = quinn::Endpoint::new_with_abstract_socket(
+            quinn::EndpointConfig::default(),
+            None,
+            socket,
+            Arc::new(quinn::TokioRuntime),
+        )
+        .unwrap();
+        client.set_default_client_config(client_config);
+        let server = QuicEndpoint::new(
+            Some(server_config),
+            std::net::UdpSocket::bind("0.0.0.0:0").unwrap(),
+        )
+        .unwrap();
+        let server_budget = Arc::new(Semaphore::new(1));
+        let address = SocketAddr::from(([127, 0, 0, 1], server.local_addr().unwrap().port()));
+        let (connection, peer) = timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                async { client.connect(address, "localhost").unwrap().await.unwrap() },
+                async {
+                    server
+                        .accept()
+                        .await
+                        .unwrap()
+                        .accept_with_memory(server_budget.clone().try_acquire_owned().unwrap())
+                        .unwrap()
+                        .await
+                        .unwrap()
+                },
+            )
+        })
+        .await
+        .unwrap();
+        let live = Arc::new(AtomicUsize::new(0));
+        let (mut send, recv) = connection.open_bi().await.unwrap();
+        send.write_chunk(payload(&live, &budget)).await.unwrap();
+        connection.close(0u32.into(), b"closed with handles alive");
+        assert_eq!(budget.available_permits(), 0);
+        assert_eq!(live.load(Ordering::SeqCst), 1);
+        timeout(Duration::from_secs(5), client.wait_idle())
+            .await
+            .unwrap();
+        drop((client, connection, send));
+        assert_eq!(budget.available_permits(), 0);
+        assert_eq!(live.load(Ordering::SeqCst), 1);
+        drop(recv);
+        let _returned = timeout(Duration::from_secs(5), budget.clone().acquire_owned())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(live.load(Ordering::SeqCst), 0);
+        drop(peer);
+        timeout(Duration::from_secs(5), server.wait_idle())
+            .await
+            .unwrap();
         assert_eq!(server_budget.available_permits(), 1);
     }
 
