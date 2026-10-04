@@ -21,6 +21,9 @@ pub trait AsyncPing {
 }
 
 pub trait AsyncReadMessage {
+    fn read_message_eof_on_empty(&self) -> bool {
+        true
+    }
     fn poll_read_message(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -76,6 +79,9 @@ impl<T: AsyncShutdownMessage + Unpin + ?Sized> Future for ShutdownMessageFuture<
 impl<T: AsyncShutdownMessage + ?Sized> AsyncShutdownMessageExt for T {}
 
 pub trait AsyncReadTargetedMessage {
+    fn targeted_eof_on_empty(&self) -> bool {
+        true
+    }
     fn poll_read_targeted_message(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -138,6 +144,9 @@ pub trait AsyncWriteSessionMessage {
 }
 
 impl AsyncReadMessage for UdpSocket {
+    fn read_message_eof_on_empty(&self) -> bool {
+        false
+    }
     fn poll_read_message(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -308,6 +317,9 @@ impl<T: ?Sized + AsyncPing + Unpin> AsyncPing for &mut T {
 }
 
 impl<T: ?Sized + AsyncReadMessage + Unpin> AsyncReadMessage for Box<T> {
+    fn read_message_eof_on_empty(&self) -> bool {
+        (**self).read_message_eof_on_empty()
+    }
     fn poll_read_message(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -318,6 +330,9 @@ impl<T: ?Sized + AsyncReadMessage + Unpin> AsyncReadMessage for Box<T> {
 }
 
 impl<T: ?Sized + AsyncReadMessage + Unpin> AsyncReadMessage for &mut T {
+    fn read_message_eof_on_empty(&self) -> bool {
+        (**self).read_message_eof_on_empty()
+    }
     fn poll_read_message(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -384,6 +399,9 @@ impl<T: ?Sized + AsyncShutdownMessage + Unpin> AsyncShutdownMessage for &mut T {
 }
 
 impl<T: ?Sized + AsyncReadTargetedMessage + Unpin> AsyncReadTargetedMessage for Box<T> {
+    fn targeted_eof_on_empty(&self) -> bool {
+        (**self).targeted_eof_on_empty()
+    }
     fn poll_read_targeted_message(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -394,6 +412,9 @@ impl<T: ?Sized + AsyncReadTargetedMessage + Unpin> AsyncReadTargetedMessage for 
 }
 
 impl<T: ?Sized + AsyncReadTargetedMessage + Unpin> AsyncReadTargetedMessage for &mut T {
+    fn targeted_eof_on_empty(&self) -> bool {
+        (**self).targeted_eof_on_empty()
+    }
     fn poll_read_targeted_message(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,

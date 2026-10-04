@@ -256,6 +256,12 @@ pub enum ServerStream {
 }
 
 impl ServerStream {
+    fn eof_on_empty(&self) -> bool {
+        match self {
+            Self::Targeted(stream) => stream.targeted_eof_on_empty(),
+            Self::Session(_) => true,
+        }
+    }
     fn poll_read_message(
         &mut self,
         cx: &mut Context<'_>,
@@ -578,7 +584,7 @@ impl<'a> UdpRouter<'a> {
             };
 
             let len = read_buf.filled().len();
-            if len == 0 {
+            if len == 0 && self.server.eof_on_empty() {
                 self.set_server_read_eof();
                 break;
             }
@@ -650,7 +656,9 @@ impl<'a> UdpRouter<'a> {
                         continue;
                     }
 
-                    if self.pending_creates.len() >= MAX_PENDING_CREATES {
+                    if self.pending_creates.len() >= MAX_PENDING_CREATES
+                        || self.sessions.len() + self.pending_creates.len() >= 64
+                    {
                         debug!(
                             "Too many pending creates, dropping new session creation for {}",
                             packet.destination
@@ -797,7 +805,7 @@ impl<'a> UdpRouter<'a> {
                             "[UdpRouter] Read {} bytes from session remote (session {})",
                             len, session.destination
                         );
-                        if len == 0 {
+                        if len == 0 && session.remote.read_message_eof_on_empty() {
                             session.remote_read_eof = true;
                             if session.should_remove() {
                                 self.sessions_to_remove.insert(id);
@@ -988,7 +996,7 @@ impl<'a> UdpRouter<'a> {
                 session.expiry_key = Some(expiry_key);
 
                 // Try to write immediately
-                if !initial_data.is_empty() {
+                if !initial_data.is_empty() || !self.server.eof_on_empty() {
                     debug!(
                         "Writing initial_data ({} bytes) to session for {}",
                         initial_data.len(),

@@ -359,6 +359,9 @@ impl UnconnectedUdpSocket {
 }
 
 impl crate::async_stream::AsyncReadMessage for UnconnectedUdpSocket {
+    fn read_message_eof_on_empty(&self) -> bool {
+        false
+    }
     fn poll_read_message(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,

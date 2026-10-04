@@ -10,7 +10,6 @@ use rand::distr::Alphanumeric;
 use rand::{Rng, RngExt};
 use rustc_hash::FxHashMap;
 use tokio::io::AsyncWriteExt;
-use tokio::net::UdpSocket;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
@@ -28,7 +27,8 @@ use crate::async_stream::AsyncStream;
 use crate::client_proxy_selector::{ClientProxySelector, ConnectDecision};
 use crate::copy_bidirectional::copy_bidirectional_with_sizes;
 use crate::quic_stream::QuicStream;
-use crate::resolver::{Resolver, ResolverCache};
+use crate::resolver::Resolver;
+use crate::routing::udp_relay::UdpRelay;
 use crate::stream_reader::StreamReader;
 use crate::tcp::tcp_server::setup_client_tcp_stream;
 use crate::udp_fragments::UdpFragments;
@@ -248,13 +248,8 @@ async fn auth_connection(
 }
 
 struct UdpSession {
-    send_socket: Arc<UdpSocket>,
-    // we cache the last location in case of mid-session address changes, and
-    // don't want to have to call ClientProxySelector::judge on every packet.
-    last_location: NetLocation,
-    last_socket_addr: SocketAddr,
-    override_remote_write_address: Option<SocketAddr>,
-    last_activity: tokio::time::Instant,
+    send_socket: Arc<UdpRelay>,
+    pinned_location: Option<NetLocation>,
     cancel_token: CancellationToken,
     task: Option<tokio::task::AbortHandle>,
 }
@@ -274,11 +269,9 @@ impl UdpSession {
     fn start(
         session_id: u32,
         connection: quinn::Connection,
-        client_socket: Arc<UdpSocket>,
-        initial_location: NetLocation,
-        initial_socket_addr: SocketAddr,
+        client_socket: Arc<UdpRelay>,
         override_local_write_location: Option<NetLocation>,
-        override_remote_write_address: Option<SocketAddr>,
+        pinned_location: Option<NetLocation>,
         parent_cancel_token: &CancellationToken,
     ) -> Self {
         // Create a child token so this session is cancelled when the parent (connection) is cancelled
@@ -286,10 +279,7 @@ impl UdpSession {
 
         let mut session = UdpSession {
             send_socket: client_socket.clone(),
-            last_location: initial_location,
-            last_socket_addr: initial_socket_addr,
-            override_remote_write_address,
-            last_activity: tokio::time::Instant::now(),
+            pinned_location,
             cancel_token: session_cancel_token.clone(),
             task: None,
         };
@@ -318,7 +308,7 @@ impl UdpSession {
 async fn run_udp_remote_to_local_loop(
     session_id: u32,
     connection: quinn::Connection,
-    socket: Arc<UdpSocket>,
+    socket: Arc<UdpRelay>,
     override_local_write_address: Option<NetLocation>,
     cancel_token: CancellationToken,
 ) -> std::io::Result<()> {
@@ -341,24 +331,9 @@ async fn run_udp_remote_to_local_loop(
     let mut loop_count: u8 = 0;
 
     loop {
-        let (payload_len, src_addr) = match socket.try_recv_from(&mut buf) {
-            Ok(res) => res,
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                tokio::select! {
-                    _ = cancel_token.cancelled() => {
-                        return Ok(());
-                    }
-                    result = socket.readable() => {
-                        result?;
-                        continue;
-                    }
-                }
-            }
-            Err(e) => {
-                return Err(std::io::Error::other(format!(
-                    "failed to receive from UDP socket: {e}"
-                )));
-            }
+        let (payload_len, src_addr) = tokio::select! {
+            _ = cancel_token.cancelled() => return Ok(()),
+            result = socket.recv_from(&mut buf) => result?,
         };
 
         // Yield periodically to allow quinn's internal tasks to run (keepalives, ACKs, etc.)
@@ -510,7 +485,6 @@ async fn run_udp_local_to_remote_loop(
     resolver: Arc<dyn Resolver>,
     cancel_token: CancellationToken,
 ) -> std::io::Result<()> {
-    let mut resolver_cache = ResolverCache::new(resolver.clone());
     let mut sessions: FxHashMap<u32, UdpSession> = FxHashMap::default();
     let mut fragments = UdpFragments::new();
     let mut cleanup = tokio::time::interval(Duration::from_secs(1));
@@ -521,7 +495,7 @@ async fn run_udp_local_to_remote_loop(
             _ = cancel_token.cancelled() => return Ok(()),
             _ = cleanup.tick() => {
                 fragments.expire();
-                sessions.retain(|_, session| session.last_activity.elapsed() < IDLE_TIMEOUT);
+                sessions.retain(|_, session| session.send_socket.idle_for() < IDLE_TIMEOUT);
                 continue;
             }
             data = connection.read_datagram() => data.map_err(|err| std::io::Error::other(format!("failed to read datagram: {err}")))?,
@@ -574,55 +548,21 @@ async fn run_udp_local_to_remote_loop(
                     }
                 };
 
-                // the remote location specified at the beginning of a session is assumed
-                // to be the remote location for the entire session iif it does not match
-                // the resolved address, as per the official client - which is only if
-                // it's a hostname. in our case, we also have to handle when the remote
-                // location is replaced by a different location in the rules.
-                //
-                // it's possible that when we receive packets on the client socket,
-                // it could be the resolved hostname versus what was initially provided,
-                // and we need to write datagrams back to the user using their provided
-                // address so that they know where it's from.
-                //
-                // it would be much simpler to always replace, or never, but we stick to
-                // the official client behavior for now.
-                //
-                // ref: https://github.com/apernet/hysteria/blob/5520bcc405ee11a47c164c75bae5c40fc2b1d99d/core/server/udp.go#L137
-
-                let resolved_address = match resolver_cache
-                    .resolve_location(updated_location.location())
-                    .await
+                let pinned_location = if remote_location.address().hostname().is_some()
+                    || updated_location.location() != &remote_location
                 {
-                    Ok(s) => s,
-                    Err(e) => {
-                        error!("Failed to resolve initial remote location {remote_location}: {e}");
-                        continue;
-                    }
+                    Some(remote_location.clone())
+                } else {
+                    None
                 };
-
-                let (override_remote_write_address, override_local_write_location) =
-                    if resolved_address.to_string() != remote_location.to_string() {
-                        (Some(resolved_address), Some(remote_location.clone()))
-                    } else {
-                        (None, None)
-                    };
-
-                // even if the remote location is ipv4, a future location could be ipv6.
-                // TODO: the configured client socket is for the current remote_location, but
-                // the remote_location could be changed later on with a different client_socket
-                // configuration.
-                // Use IPv6 dual-stack socket for direct UDP
-                let client_socket = crate::socket_util::new_udp_socket(true, None)?;
+                let client_socket = UdpRelay::new(client_proxy_selector.clone(), resolver.clone());
 
                 let session = UdpSession::start(
                     session_id,
                     connection.clone(),
                     Arc::new(client_socket),
-                    remote_location.clone(),
-                    resolved_address,
-                    override_local_write_location,
-                    override_remote_write_address,
+                    pinned_location.clone(),
+                    pinned_location,
                     &cancel_token,
                 );
                 entry.insert(session)
@@ -630,59 +570,8 @@ async fn run_udp_local_to_remote_loop(
             Entry::Occupied(ref mut entry) => entry.get_mut(),
         };
 
-        let socket_addr = match session.override_remote_write_address {
-            Some(addr) => addr,
-            None => {
-                if remote_location == session.last_location {
-                    session.last_socket_addr
-                } else {
-                    warn!(
-                        "Location changed during ongoing UDP session: {}",
-                        remote_location.clone()
-                    );
-                    let action = client_proxy_selector
-                        .judge(remote_location.clone().into(), &resolver)
-                        .await;
-                    let updated_location = match action {
-                        Ok(ConnectDecision::Allow {
-                            chain_group: _,
-                            remote_location,
-                        }) => remote_location,
-                        Ok(ConnectDecision::Block) => {
-                            warn!("Blocked UDP forward to {remote_location}");
-                            continue;
-                        }
-                        Err(e) => {
-                            error!("Failed to judge UDP forward to {remote_location}: {e}");
-                            continue;
-                        }
-                    };
-                    let updated_socket_addr = match resolver_cache
-                        .resolve_location(updated_location.location())
-                        .await
-                    {
-                        Ok(s) => s,
-                        Err(e) => {
-                            error!(
-                                "Failed to resolve updated remote location {}: {e}",
-                                updated_location.location()
-                            );
-                            continue;
-                        }
-                    };
-                    session.last_location = updated_location.into_location();
-                    session.last_socket_addr = updated_socket_addr;
-                    updated_socket_addr
-                }
-            }
-        };
-
-        session.last_activity = tokio::time::Instant::now();
-        if let Err(e) = session
-            .send_socket
-            .send_to(&complete_payload, socket_addr)
-            .await
-        {
+        let target = session.pinned_location.clone().unwrap_or(remote_location);
+        if let Err(e) = session.send_socket.send_to(&complete_payload, target) {
             error!("Failed to forward UDP payload for session {session_id}: {e}");
             sessions.remove(&session_id);
         }
