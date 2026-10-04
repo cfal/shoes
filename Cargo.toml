@@ -118,6 +118,7 @@ webpki-roots = { version = "*" }
 x509-parser = { version = "*", default-features = false, features = ["verify-aws"] }
 
 [dev-dependencies]
+tokio = { version = "*", features = ["test-util"] }
 rcgen = { version = "*", default-features = false, features = ["aws_lc_rs", "pem"] }
 rustls-pemfile = "*"
 serde_json = "*"
