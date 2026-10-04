@@ -260,7 +260,7 @@ pub fn create_tcp_server_handler(
                 PaddingFactory::default_factory()
             };
 
-            // AnyTLS spawns its own task and returns AlreadyHandled, so it needs the proxy
+            // AnyTLS handles its logical streams internally, so it needs the proxy
             // provider directly (it won't inherit from outer handler through TcpForward)
             Box::new(AnyTlsServerHandler::new(
                 users,

@@ -224,10 +224,8 @@ async fn shadowtls_fallback_to_handshake_server(
 
     log::debug!("SHADOWTLS FALLBACK: ClientHello forwarded, spawning bidirectional copy");
 
-    // Spawn the long-running bidirectional copy as a background task.
-    // This allows the setup to complete within the timeout while the actual
-    // data transfer runs indefinitely.
-    tokio::spawn(async move {
+    // Return the transfer to the caller so cancellation owns the entire connection.
+    Ok(TcpServerSetupResult::Session(Box::pin(async move {
         let result = crate::copy_bidirectional::copy_bidirectional(
             &mut *client_stream,
             &mut *handshake_stream,
@@ -244,9 +242,7 @@ async fn shadowtls_fallback_to_handshake_server(
         } else {
             log::debug!("SHADOWTLS FALLBACK: Connection completed");
         }
-    });
-
-    Ok(TcpServerSetupResult::AlreadyHandled)
+    })))
 }
 
 #[inline]
@@ -329,7 +325,7 @@ pub async fn setup_shadowtls_server_stream(
         });
 
     if let Ok(ref setup_result) = target_setup_result
-        && matches!(setup_result, TcpServerSetupResult::AlreadyHandled)
+        && matches!(setup_result, TcpServerSetupResult::Session(_))
     {
         return target_setup_result;
     }

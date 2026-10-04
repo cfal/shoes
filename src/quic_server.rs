@@ -259,8 +259,8 @@ async fn process_streams(
             )
             .await
         }
-        TcpServerSetupResult::AlreadyHandled => {
-            // Connection already handled by a spawned task (e.g., Reality fallback)
+        TcpServerSetupResult::Session(session) => {
+            session.await;
             Ok(())
         }
     }

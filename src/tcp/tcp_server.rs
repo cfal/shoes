@@ -277,11 +277,53 @@ where
             )
             .await
         }
-        TcpServerSetupResult::AlreadyHandled => {
-            // Connection is being handled by a spawned task (e.g., Reality fallback).
-            // Nothing more to do here.
+        TcpServerSetupResult::Session(session) => {
+            session.await;
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod lifetime_tests {
+    use super::*;
+    use async_trait::async_trait;
+
+    #[derive(Debug)]
+    struct SessionHandler(Arc<()>);
+
+    #[async_trait]
+    impl TcpServerHandler for SessionHandler {
+        async fn setup_server_stream(
+            &self,
+            stream: Box<dyn AsyncStream>,
+        ) -> std::io::Result<TcpServerSetupResult> {
+            let owned = self.0.clone();
+            Ok(TcpServerSetupResult::Session(Box::pin(async move {
+                let _owned = owned;
+                let _stream = stream;
+                std::future::pending::<()>().await;
+            })))
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn session_outlives_setup_deadline_but_not_its_owner() {
+        let marker = Arc::new(());
+        let handler = Arc::new(SessionHandler(marker.clone()));
+        let (stream, _peer) = tokio::io::duplex(64);
+        let task = tokio::spawn(process_stream(
+            stream,
+            handler,
+            Arc::new(crate::resolver::NativeResolver),
+        ));
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(600)).await;
+        assert!(!task.is_finished());
+        assert_eq!(Arc::strong_count(&marker), 2);
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(Arc::strong_count(&marker), 1);
     }
 }
 

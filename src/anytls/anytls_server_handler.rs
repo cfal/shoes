@@ -171,14 +171,12 @@ impl TcpServerHandler for AnyTlsServerHandler {
             initial_data,
         );
 
-        // Run the session in a background task
-        tokio::spawn(async move {
+        // Keep the session outside the handshake timeout, but owned by the caller.
+        Ok(TcpServerSetupResult::Session(Box::pin(async move {
             if let Err(e) = session.run().await {
                 log::debug!("AnyTLS session ended: {}", e);
             }
-        });
-
-        Ok(TcpServerSetupResult::AlreadyHandled)
+        })))
     }
 }
 
@@ -218,10 +216,8 @@ impl AnyTlsServerHandler {
 
         log::debug!("AnyTLS FALLBACK: Spawning bidirectional copy");
 
-        // Spawn the long-running bidirectional copy as a background task.
-        // This allows the setup to complete within the timeout while the actual
-        // data transfer runs indefinitely.
-        tokio::spawn(async move {
+        // Return the transfer to the caller so cancellation owns the entire connection.
+        Ok(TcpServerSetupResult::Session(Box::pin(async move {
             let result = copy_bidirectional(
                 &mut *client_stream,
                 &mut *dest_stream,
@@ -238,9 +234,7 @@ impl AnyTlsServerHandler {
             } else {
                 log::debug!("AnyTLS FALLBACK: Connection completed");
             }
-        });
-
-        Ok(TcpServerSetupResult::AlreadyHandled)
+        })))
     }
 }
 

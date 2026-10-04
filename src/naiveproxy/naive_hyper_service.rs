@@ -4,10 +4,11 @@
 //! It handles CONNECT requests with padding support and built-in static file fallback.
 
 use std::convert::Infallible;
+use std::future::Future;
 use std::io;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Weak};
 use std::task::{Context, Poll};
 
 use bytes::Bytes;
@@ -15,11 +16,13 @@ use futures::Stream;
 use http::{Method, Request, Response, StatusCode};
 use http_body_util::{BodyExt, Empty, combinators::BoxBody};
 use hyper::body::{Body, Frame, Incoming, SizeHint};
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::TokioIo;
 use log::debug;
+use parking_lot::Mutex;
 use rand::RngExt;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::task::JoinSet;
 use tokio_util::io::ReaderStream;
 
 use crate::address::{Address, NetLocation};
@@ -47,7 +50,7 @@ use super::user_lookup::UserLookup;
 ///
 /// This is needed because `TokioIo<Upgraded>` doesn't implement `AsyncStream`
 /// (which requires `Sync`), but we need `AsyncStream` for UoT stream wrappers.
-struct HyperUpgradedStream(TokioIo<hyper::upgrade::Upgraded>);
+struct HyperUpgradedStream(Mutex<TokioIo<hyper::upgrade::Upgraded>>);
 
 impl tokio::io::AsyncRead for HyperUpgradedStream {
     fn poll_read(
@@ -55,13 +58,30 @@ impl tokio::io::AsyncRead for HyperUpgradedStream {
         cx: &mut std::task::Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<io::Result<()>> {
-        std::pin::Pin::new(&mut self.0).poll_read(cx, buf)
+        std::pin::Pin::new(self.0.get_mut()).poll_read(cx, buf)
     }
 }
 
 #[cfg(test)]
 mod fallback_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn connection_executor_cancels_children_without_a_reference_cycle() {
+        let tasks = Arc::new(Mutex::new(JoinSet::new()));
+        let executor = ConnectionExecutor(Arc::downgrade(&tasks));
+        let marker = Arc::new(());
+        let owned = marker.clone();
+        hyper::rt::Executor::execute(&executor, async move {
+            let _owned = owned;
+            std::future::pending::<()>().await;
+        });
+        tokio::task::yield_now().await;
+        drop(tasks);
+        tokio::task::yield_now().await;
+        assert_eq!(Arc::strong_count(&marker), 1);
+        assert!(executor.0.upgrade().is_none());
+    }
 
     #[tokio::test]
     async fn large_get_is_chunked_and_head_has_no_body() {
@@ -115,21 +135,21 @@ impl tokio::io::AsyncWrite for HyperUpgradedStream {
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<io::Result<usize>> {
-        std::pin::Pin::new(&mut self.0).poll_write(cx, buf)
+        std::pin::Pin::new(self.0.get_mut()).poll_write(cx, buf)
     }
 
     fn poll_flush(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<io::Result<()>> {
-        std::pin::Pin::new(&mut self.0).poll_flush(cx)
+        std::pin::Pin::new(self.0.get_mut()).poll_flush(cx)
     }
 
     fn poll_shutdown(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<io::Result<()>> {
-        std::pin::Pin::new(&mut self.0).poll_shutdown(cx)
+        std::pin::Pin::new(self.0.get_mut()).poll_shutdown(cx)
     }
 }
 
@@ -146,12 +166,26 @@ impl crate::async_stream::AsyncPing for HyperUpgradedStream {
     }
 }
 
-// SAFETY: The underlying hyper Upgraded stream is used only from async contexts
-// in a single-threaded manner per connection. The Sync bound is required by
-// AsyncStream but the stream is never actually shared across threads.
-unsafe impl Sync for HyperUpgradedStream {}
-
 impl AsyncStream for HyperUpgradedStream {}
+
+#[derive(Clone)]
+struct ConnectionExecutor(Weak<Mutex<JoinSet<()>>>);
+
+impl<F> hyper::rt::Executor<F> for ConnectionExecutor
+where
+    F: Future + Send + 'static,
+    F::Output: Send,
+{
+    fn execute(&self, future: F) {
+        if let Some(tasks) = self.0.upgrade() {
+            let mut tasks = tasks.lock();
+            while tasks.try_join_next().is_some() {}
+            tasks.spawn(async move {
+                let _ = future.await;
+            });
+        }
+    }
+}
 
 /// Service configuration for hyper NaiveProxy handler
 struct NaiveServiceConfig {
@@ -161,6 +195,7 @@ struct NaiveServiceConfig {
     proxy_selector: Arc<ClientProxySelector>,
     udp_enabled: bool,
     padding_enabled: bool,
+    executor: ConnectionExecutor,
 }
 
 fn empty_body() -> BoxBody<Bytes, io::Error> {
@@ -219,6 +254,8 @@ pub(super) async fn run_naive_hyper_service<IO: AsyncStream + 'static>(
     use_h2: bool,
 ) -> io::Result<TcpServerSetupResult> {
     let io = TokioIo::new(tls_stream);
+    let tasks = Arc::new(Mutex::new(JoinSet::new()));
+    let executor = ConnectionExecutor(Arc::downgrade(&tasks));
 
     let service_config = Arc::new(NaiveServiceConfig {
         users: naive_cfg.users.clone(),
@@ -227,11 +264,13 @@ pub(super) async fn run_naive_hyper_service<IO: AsyncStream + 'static>(
         proxy_selector: effective_selector,
         udp_enabled: naive_cfg.udp_enabled,
         padding_enabled: naive_cfg.padding_enabled,
+        executor: executor.clone(),
     });
 
     if use_h2 {
         // HTTP/2 for NaiveProxy clients
-        tokio::spawn(async move {
+        Ok(TcpServerSetupResult::Session(Box::pin(async move {
+            let _tasks = tasks;
             let service = hyper::service::service_fn(move |req| {
                 let config = service_config.clone();
                 async move { naive_service(req, config).await }
@@ -242,7 +281,7 @@ pub(super) async fn run_naive_hyper_service<IO: AsyncStream + 'static>(
             const WINDOW_SIZE: u32 = 256 * 1024; // 256 KB (was 16 MB)
             const MAX_FRAME_SIZE: u32 = 16 * 1024;
 
-            let result = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+            let result = hyper::server::conn::http2::Builder::new(executor)
                 .auto_date_header(false)
                 .initial_stream_window_size(WINDOW_SIZE)
                 .initial_connection_window_size(WINDOW_SIZE)
@@ -254,11 +293,11 @@ pub(super) async fn run_naive_hyper_service<IO: AsyncStream + 'static>(
             if let Err(e) = result {
                 debug!("Naive HTTP/2 connection error: {}", e);
             }
-        });
+        })))
     } else {
         // HTTP/1.1 for browsers and censors - serve static files only, no proxy
         let fallback_path = naive_cfg.fallback_path.clone();
-        tokio::spawn(async move {
+        Ok(TcpServerSetupResult::Session(Box::pin(async move {
             let service = hyper::service::service_fn(move |req| {
                 let path = fallback_path.clone();
                 async move { http1_fallback_service(req, path).await }
@@ -272,10 +311,8 @@ pub(super) async fn run_naive_hyper_service<IO: AsyncStream + 'static>(
             if let Err(e) = result {
                 debug!("Naive HTTP/1.1 fallback error: {}", e);
             }
-        });
+        })))
     }
-
-    Ok(TcpServerSetupResult::AlreadyHandled)
 }
 
 /// HTTP/1.1 fallback service - only serves static files, no proxy functionality
@@ -395,10 +432,10 @@ async fn naive_service(
     let proxy_selector = config.proxy_selector.clone();
     let udp_enabled = config.udp_enabled;
 
-    tokio::spawn(async move {
+    hyper::rt::Executor::execute(&config.executor, async move {
         match on_upgrade.await {
             Ok(upgraded) => {
-                let io = HyperUpgradedStream(TokioIo::new(upgraded));
+                let io = HyperUpgradedStream(Mutex::new(TokioIo::new(upgraded)));
 
                 if padding_type != PaddingType::None {
                     let stream =
