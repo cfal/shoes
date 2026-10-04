@@ -848,49 +848,31 @@ pub async fn start_hysteria2_server(
     udp_enabled: bool,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
     let mut join_handles = vec![];
-    for _ in 0..num_endpoints {
-        let quic_server_config = quic_server_config.clone();
+    let mut server_config = quinn::ServerConfig::with_crypto(quic_server_config);
+
+    crate::resources::configure_quic(&mut server_config, 16);
+    Arc::get_mut(&mut server_config.transport)
+        .unwrap()
+        .max_idle_timeout(Some(Duration::from_secs(30).try_into().unwrap()))
+        .keep_alive_interval(Some(Duration::from_secs(10)))
+        // MTU settings per official TUIC reference
+        .initial_mtu(1200)
+        .min_mtu(1200)
+        // Enable MTU discovery for larger packets on capable networks
+        .mtu_discovery_config(Some(quinn::MtuDiscoveryConfig::default()))
+        // Enable GSO (Generic Segmentation Offload) for better throughput
+        .enable_segmentation_offload(true)
+        // Lower initial RTT estimate for faster initial window growth
+        .initial_rtt(Duration::from_millis(100));
+
+    for endpoint in
+        crate::listener_tasks::QuicListener::bind_all(bind_address, server_config, num_endpoints)?
+    {
         let resolver = resolver.clone();
         let client_proxy_selector = client_proxy_selector.clone();
         let hysteria2_password = hysteria2_password.clone();
-
         let join_handle = tokio::spawn(async move {
-            let mut server_config = quinn::ServerConfig::with_crypto(quic_server_config);
-
-            crate::resources::configure_quic(&mut server_config, 16);
-            Arc::get_mut(&mut server_config.transport)
-                .unwrap()
-                .max_idle_timeout(Some(Duration::from_secs(30).try_into().unwrap()))
-                .keep_alive_interval(Some(Duration::from_secs(10)))
-                // MTU settings per official TUIC reference
-                .initial_mtu(1200)
-                .min_mtu(1200)
-                // Enable MTU discovery for larger packets on capable networks
-                .mtu_discovery_config(Some(quinn::MtuDiscoveryConfig::default()))
-                // Enable GSO (Generic Segmentation Offload) for better throughput
-                .enable_segmentation_offload(true)
-                // Lower initial RTT estimate for faster initial window growth
-                .initial_rtt(Duration::from_millis(100));
-
-            let socket2_socket = crate::socket_util::new_socket2_udp_socket_with_buffer_size(
-                bind_address.is_ipv6(),
-                None,
-                Some(bind_address),
-                true,
-                Some(crate::resources::LIMITS.quic_socket_buffer),
-            )
-            .unwrap();
-
-            let endpoint = quinn::Endpoint::new(
-                quinn::EndpointConfig::default(),
-                Some(server_config),
-                socket2_socket.into(),
-                Arc::new(quinn::TokioRuntime),
-            )
-            .unwrap();
-
-            let endpoint = crate::listener_tasks::QuicListener(endpoint);
-            let mut tasks = crate::listener_tasks::ListenerTasks::new();
+            let mut tasks = crate::listener_tasks::ListenerTasks::immediate();
             loop {
                 let conn = tokio::select! {
                     conn = endpoint.accept() => conn,

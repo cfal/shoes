@@ -3,7 +3,6 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use log::{debug, error};
-use quinn::EndpointConfig;
 use tokio::task::JoinHandle;
 
 use crate::config::{
@@ -12,7 +11,6 @@ use crate::config::{
 use crate::quic_stream::QuicStream;
 use crate::resolver::Resolver;
 use crate::rustls_config_util::create_server_config;
-use crate::socket_util::new_socket2_udp_socket;
 use crate::tcp::tcp_client_handler_factory::create_tcp_client_proxy_selector;
 use crate::tcp::tcp_handler::TcpServerHandler;
 use crate::tcp::tcp_server_handler_factory::create_tcp_server_handler;
@@ -26,25 +24,15 @@ async fn start_quic_server(
     num_endpoints: usize,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
     let mut join_handles = vec![];
-    for _ in 0..num_endpoints {
-        let mut server_config = quinn::ServerConfig::with_crypto(quic_server_config.clone());
-        crate::resources::configure_quic(&mut server_config, 0);
-
-        let socket2_socket =
-            new_socket2_udp_socket(bind_address.is_ipv6(), None, Some(bind_address), true).unwrap();
-
-        let endpoint = quinn::Endpoint::new(
-            EndpointConfig::default(),
-            Some(server_config),
-            socket2_socket.into(),
-            Arc::new(quinn::TokioRuntime),
-        )?;
-
+    let mut server_config = quinn::ServerConfig::with_crypto(quic_server_config);
+    crate::resources::configure_quic(&mut server_config, 0);
+    for endpoint in
+        crate::listener_tasks::QuicListener::bind_all(bind_address, server_config, num_endpoints)?
+    {
         let resolver = resolver.clone();
         let server_handler = server_handler.clone();
         let join_handle = tokio::spawn(async move {
-            let endpoint = crate::listener_tasks::QuicListener(endpoint);
-            let mut tasks = crate::listener_tasks::ListenerTasks::new();
+            let mut tasks = crate::listener_tasks::ListenerTasks::immediate();
             loop {
                 let conn = tokio::select! {
                     conn = endpoint.accept() => conn,

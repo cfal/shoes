@@ -112,8 +112,9 @@ fn print_usage_and_exit(arg0: String) {
     eprintln!("    -d, --dry-run        Parse the config and exit");
     eprintln!("    --no-reload          Disable automatic config reloading on file changes");
     eprintln!(
-        "    SHOES_RELOAD_GRACE_SECS sets the reload drain deadline (default: 300, 0: immediate)"
+        "    SHOES_RELOAD_GRACE_SECS sets the TCP reload drain deadline (default: 300, 0: immediate)"
     );
+    eprintln!("    QUIC connections disconnect immediately on reload.");
     eprintln!("    -V, --version        Print version information and exit");
     eprintln!();
     eprintln!("RESOURCE LIMITS (environment, read at startup; byte values are decimal):");
