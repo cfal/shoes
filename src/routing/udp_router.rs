@@ -249,6 +249,14 @@ struct PendingWrite {
     len: usize,
 }
 
+struct PendingResponse {
+    id: SessionKey,
+    buf: Box<[u8]>,
+    len: usize,
+    source: SocketAddr,
+    session_id: MessageSessionId,
+}
+
 /// Server stream variants - unified via enum
 pub enum ServerStream {
     /// SOCKS5 UDP, Shadowsocks UoT, etc.
@@ -409,7 +417,7 @@ pub struct UdpRouter<'a> {
 
     remote_write_queue: VecDeque<PendingWrite>,
     remote_flush_queue: VecDeque<SessionKey>,
-    server_write_queue: VecDeque<PendingWrite>,
+    server_write_queue: VecDeque<PendingResponse>,
 
     needs_server_flush: bool,
 
@@ -601,6 +609,7 @@ impl<'a> UdpRouter<'a> {
 
             match key_state {
                 Some(KeyState::Active(id)) => {
+                    let multiple_sessions = self.sessions.len() > 1;
                     let Some(session) = self.sessions.get_mut(id) else {
                         // session is gone, skip message
                         continue;
@@ -612,12 +621,20 @@ impl<'a> UdpRouter<'a> {
                     }
 
                     // Skip if session has too many pending writes (backpressure)
-                    if session.in_remote_write_queue >= MAX_PENDING_REMOTE_WRITES_PER_SESSION {
+                    // A sole destination can use the entire bounded pool during a readiness delay.
+                    if multiple_sessions
+                        && session.in_remote_write_queue >= MAX_PENDING_REMOTE_WRITES_PER_SESSION
+                    {
                         continue;
                     }
 
-                    // Always try to write immediately
-                    match Pin::new(&mut session.remote).poll_write_message(cx, &buf[..len]) {
+                    // Retrying a framed write must use its original packet until it completes.
+                    let result = if session.in_remote_write_queue != 0 {
+                        Poll::Pending
+                    } else {
+                        Pin::new(&mut session.remote).poll_write_message(cx, &buf[..len])
+                    };
+                    match result {
                         Poll::Ready(Ok(())) => {
                             remote_writes_progress = true;
 
@@ -684,9 +701,15 @@ impl<'a> UdpRouter<'a> {
     #[inline]
     fn drain_remote_writes(&mut self, cx: &mut Context<'_>) -> bool {
         let queue_len = self.remote_write_queue.len();
+        let mut blocked = HashSet::new();
 
         for _ in 0..queue_len {
             let PendingWrite { id, buf, len } = self.remote_write_queue.pop_front().unwrap();
+            if blocked.contains(&id) {
+                self.remote_write_queue
+                    .push_back(PendingWrite { id, buf, len });
+                continue;
+            }
 
             let Some(session) = self.sessions.get_mut(&id) else {
                 // Session gone, release buffer
@@ -718,6 +741,7 @@ impl<'a> UdpRouter<'a> {
                     self.remote_write_pool.release(buf);
                 }
                 Poll::Pending => {
+                    blocked.insert(id);
                     self.remote_write_queue
                         .push_back(PendingWrite { id, buf, len });
                 }
@@ -751,6 +775,10 @@ impl<'a> UdpRouter<'a> {
             if !session.in_remote_flush_queue {
                 continue;
             }
+            if session.in_remote_write_queue != 0 {
+                self.remote_flush_queue.push_back(id);
+                continue;
+            }
 
             match Pin::new(&mut session.remote).poll_flush_message(cx) {
                 Poll::Ready(Ok(())) => {
@@ -776,6 +804,9 @@ impl<'a> UdpRouter<'a> {
     /// Returns (made_progress, write_success, exhausted) - exhausted only if reads hit Pending, not pool exhaustion
     #[inline]
     fn poll_read_remotes(&mut self, cx: &mut Context<'_>) -> (bool, bool) {
+        if !self.server_write_queue.is_empty() {
+            return (false, false);
+        }
         // Acquire one buffer upfront - reused across sessions
         let Some(mut buf) = self.server_write_pool.acquire() else {
             debug!("inbound pool exhausted, applying backpressure");
@@ -789,6 +820,9 @@ impl<'a> UdpRouter<'a> {
         let session_count = self.sessions.len();
 
         for i in 0..session_count {
+            if !self.server_write_queue.is_empty() {
+                break;
+            }
             let idx = (self.session_poll_position + i) % session_count;
             let Some((&id, session)) = self.sessions.get_index_mut(idx) else {
                 continue;
@@ -838,8 +872,13 @@ impl<'a> UdpRouter<'a> {
                             Poll::Pending => {
                                 debug!("[UdpRouter] Write to server pending");
                                 session.in_server_write_queue += 1;
-                                self.server_write_queue
-                                    .push_back(PendingWrite { id, buf, len });
+                                self.server_write_queue.push_back(PendingResponse {
+                                    id,
+                                    buf,
+                                    len,
+                                    source: session.resolved_addr,
+                                    session_id: session.session_id,
+                                });
 
                                 match self.server_write_pool.acquire() {
                                     Some(new_buf) => {
@@ -894,36 +933,43 @@ impl<'a> UdpRouter<'a> {
         let mut server_write_progress = false;
 
         while let Some(pending) = self.server_write_queue.pop_front() {
-            let PendingWrite { id, buf, len } = pending;
+            let PendingResponse {
+                id,
+                buf,
+                len,
+                source,
+                session_id,
+            } = pending;
 
-            let Some(session) = self.sessions.get_mut(&id) else {
-                // Session gone, release buffer
-                self.server_write_pool.release(buf);
-                continue;
-            };
-
-            match self.server.poll_write_message(
-                cx,
-                &buf[..len],
-                &session.resolved_addr,
-                session.session_id,
-            ) {
+            match self
+                .server
+                .poll_write_message(cx, &buf[..len], &source, session_id)
+            {
                 Poll::Ready(Ok(())) => {
-                    session.in_server_write_queue -= 1;
-                    if session.should_remove() {
-                        self.sessions_to_remove.insert(id);
+                    if let Some(session) = self.sessions.get_mut(&id) {
+                        session.in_server_write_queue -= 1;
+                        if session.should_remove() {
+                            self.sessions_to_remove.insert(id);
+                        }
                     }
                     server_write_progress = true;
                     self.server_write_pool.release(buf);
                 }
                 Poll::Pending => {
-                    self.server_write_queue
-                        .push_front(PendingWrite { id, buf, len });
+                    self.server_write_queue.push_front(PendingResponse {
+                        id,
+                        buf,
+                        len,
+                        source,
+                        session_id,
+                    });
                     break;
                 }
                 Poll::Ready(Err(e)) => {
                     warn!("server write error: {}", e);
-                    session.in_server_write_queue -= 1; // last use of session borrow
+                    if let Some(session) = self.sessions.get_mut(&id) {
+                        session.in_server_write_queue -= 1;
+                    }
                     self.server_write_pool.release(buf); // release current buffer
                     self.set_server_write_eof(); // clears remaining queue
                     break;
@@ -1387,7 +1433,7 @@ impl UdpRouter<'_> {
                 self.last_server_write = Instant::now();
             }
 
-            if self.needs_server_flush {
+            if self.needs_server_flush && self.server_write_queue.is_empty() {
                 match self.server.poll_flush_message(cx) {
                     Poll::Ready(Ok(())) => {
                         self.needs_server_flush = false;
@@ -1434,7 +1480,7 @@ mod tests {
     use futures::task::noop_waker;
     use std::future::Future;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio::io::{AsyncRead, AsyncWrite};
 
     use crate::async_stream::AsyncStream;
@@ -1604,6 +1650,8 @@ mod tests {
     #[derive(Default)]
     struct RemoteState {
         writes: Mutex<Vec<Vec<u8>>>,
+        pending_write: Mutex<Option<Vec<u8>>>,
+        blocked: AtomicBool,
         shutdown_polls: AtomicUsize,
         drops: AtomicUsize,
     }
@@ -1634,6 +1682,18 @@ mod tests {
             _cx: &mut Context<'_>,
             buf: &[u8],
         ) -> Poll<io::Result<()>> {
+            let mut pending = self.state.pending_write.lock().unwrap();
+            if let Some(previous) = pending.as_ref() {
+                assert_eq!(
+                    previous, buf,
+                    "a pending packet was replaced before completion"
+                );
+            }
+            if self.state.blocked.load(Ordering::SeqCst) {
+                *pending = Some(buf.to_vec());
+                return Poll::Pending;
+            }
+            pending.take();
             self.state.writes.lock().unwrap().push(buf.to_vec());
             Poll::Ready(Ok(()))
         }
@@ -1666,6 +1726,71 @@ mod tests {
     }
 
     impl AsyncMessageStream for RecordingRemote {}
+
+    #[tokio::test]
+    async fn pending_packets_keep_order_and_a_single_flow_burst_uses_bounded_backpressure() {
+        let destination = NetLocation::from_str("127.0.0.1:53", None).unwrap();
+        let mut input = BytesMut::new();
+        let expected: Vec<Vec<u8>> = (0..20).map(|i| vec![i]).collect();
+        for (index, payload) in expected.iter().enumerate() {
+            append_xudp_frame(
+                &mut input,
+                10,
+                if index == 0 {
+                    SessionStatus::New
+                } else {
+                    SessionStatus::Keep
+                },
+                Some(destination.clone()),
+                Some(payload),
+            );
+        }
+        let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+        let xudp = XudpMessageStream::new_with_resolver(
+            Box::new(PendingByteStream {
+                input: input.to_vec(),
+                offset: 0,
+            }),
+            resolver.clone(),
+        );
+        let mut server = ServerStream::Session(Box::new(xudp));
+        let mut router = UdpRouter::new(
+            &mut server,
+            Arc::new(ClientProxySelector::new(Vec::new())),
+            resolver,
+            false,
+        );
+        let state = Arc::new(RemoteState::default());
+        state.blocked.store(true, Ordering::SeqCst);
+        router.sessions.insert(
+            0,
+            RoutingSession::new(
+                destination.clone(),
+                1,
+                destination.to_socket_addr_nonblocking().unwrap(),
+                LookupKey::SessionId(1),
+                Box::new(RecordingRemote {
+                    state: state.clone(),
+                }),
+            ),
+        );
+        let SessionLookup::BySessionId(lookup) = &mut router.session_lookup else {
+            unreachable!()
+        };
+        lookup.insert(1, KeyState::Active(0));
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        router.poll_outbound(&mut cx, false);
+        assert_eq!(router.remote_write_queue.len(), REMOTE_WRITE_POOL_SIZE);
+        assert_eq!(
+            router.remote_write_pool.created_count,
+            REMOTE_WRITE_POOL_SIZE
+        );
+        state.blocked.store(false, Ordering::SeqCst);
+        router.poll_outbound(&mut cx, false);
+        assert_eq!(*state.writes.lock().unwrap(), expected);
+        assert!(router.remote_write_queue.is_empty());
+    }
 
     fn append_xudp_frame(
         output: &mut BytesMut,
