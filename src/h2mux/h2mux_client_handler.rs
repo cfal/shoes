@@ -1,12 +1,7 @@
 //! H2MUX Client Handler
 //!
 //! Wraps an inner TcpClientHandler to multiplex multiple streams over h2mux.
-//! Maintains a pool of H2MuxClientSession connections with session selection logic.
-//!
-//! TODO: Session pooling is not yet working. Currently each call to setup_client_tcp_stream
-//! creates a new session because the caller provides the transport stream. To enable true
-//! multiplexing, setup_client_tcp_stream and the proxy chain group need significant changes
-//! to allow the handler to manage its own transport connections.
+//! Each supplied transport belongs to its returned stream; idle sessions are not retained.
 
 use std::io;
 use std::pin::Pin;
@@ -16,7 +11,6 @@ use std::task::{Context, Poll};
 use async_trait::async_trait;
 use bytes::BytesMut;
 use log::debug;
-use parking_lot::Mutex;
 use tokio::io::{AsyncRead, ReadBuf};
 
 use crate::address::{Address, NetLocation, ResolvedLocation};
@@ -32,115 +26,19 @@ use super::{H2MuxOptions, MUX_DESTINATION_HOST, MUX_DESTINATION_PORT};
 /// H2MUX client handler that multiplexes streams over HTTP/2.
 ///
 /// This handler wraps an inner protocol handler (e.g., Shadowsocks, VLESS)
-/// and uses h2mux to multiplex multiple logical streams over pooled connections.
+/// and establishes h2mux on the transport supplied by the proxy chain.
 #[derive(Debug)]
 pub struct H2MuxClientHandler {
     /// Inner protocol handler used to establish connections to the proxy server
     inner: Arc<dyn TcpClientHandler>,
     /// H2MUX configuration options
     options: H2MuxOptions,
-    /// Pool of active sessions
-    sessions: Arc<Mutex<Vec<SessionEntry>>>,
-}
-
-/// Entry in the session pool, tracking session state
-#[derive(Debug)]
-struct SessionEntry {
-    session: H2MuxClientSession,
-    /// Estimated number of active streams (may be stale)
-    estimated_streams: u32,
 }
 
 impl H2MuxClientHandler {
     /// Create a new H2MUX client handler wrapping the given inner handler.
     pub fn new(inner: Arc<dyn TcpClientHandler>, options: H2MuxOptions) -> Self {
-        Self {
-            inner,
-            options,
-            sessions: Arc::new(Mutex::new(Vec::new())),
-        }
-    }
-
-    /// Get an existing session or create a new one.
-    /// Reserved for future session pooling.
-    #[allow(dead_code)]
-    async fn get_or_create_session(&self) -> io::Result<H2MuxClientSession> {
-        // First try to find an existing session
-        {
-            let mut sessions = self.sessions.lock();
-
-            // Remove closed sessions
-            sessions.retain(|entry| entry.session.is_ready());
-
-            // Find best session (fewest streams that can take new request)
-            let best_idx = sessions
-                .iter()
-                .enumerate()
-                .filter(|(_, e)| e.session.is_ready())
-                .min_by_key(|(_, e)| e.estimated_streams)
-                .map(|(idx, _)| idx);
-
-            if let Some(idx) = best_idx {
-                let num_sessions = sessions.len();
-                let num_streams = sessions[idx].estimated_streams;
-
-                // Use this session if it has no streams (idle)
-                if num_streams == 0 {
-                    sessions[idx].estimated_streams += 1;
-                    return Ok(sessions[idx].session.clone());
-                }
-
-                // Check if we should use existing vs create new
-                let should_use_existing = if self.options.max_connections > 0 {
-                    // Have connection limit: use existing if at limit or below min_streams
-                    num_sessions >= self.options.max_connections as usize
-                        || num_streams < self.options.min_streams
-                } else if self.options.max_streams > 0 {
-                    // No connection limit but have stream limit: use if below max
-                    num_streams < self.options.max_streams
-                } else {
-                    // No limits: always reuse
-                    true
-                };
-
-                if should_use_existing {
-                    sessions[idx].estimated_streams += 1;
-                    return Ok(sessions[idx].session.clone());
-                }
-            }
-        }
-
-        // Create new session
-        self.create_session().await
-    }
-
-    /// Create a new h2mux session by connecting through the inner handler.
-    /// Reserved for future session pooling.
-    #[allow(dead_code)]
-    async fn create_session(&self) -> io::Result<H2MuxClientSession> {
-        debug!("H2MuxClientHandler: creating new session");
-
-        // Connect to the proxy server using the inner handler with magic destination
-        let _magic_location = NetLocation::new(
-            Address::Hostname(MUX_DESTINATION_HOST.to_string()),
-            MUX_DESTINATION_PORT,
-        );
-
-        // We need a raw connection to the proxy server first.
-        // The inner handler will connect to the server and send the magic destination.
-        // We'll get back the wrapped stream.
-
-        // Note: We need a transport stream first. The caller should provide this
-        // via setup_client_tcp_stream. For connection pooling to work properly,
-        // we need access to the connection factory.
-        //
-        // For now, we implement a simpler model where each call to setup_client_tcp_stream
-        // that needs a new session will create one on-demand. The caller must provide
-        // the transport stream.
-
-        Err(io::Error::other(
-            "H2MuxClientHandler requires transport stream to be provided",
-        ))
+        Self { inner, options }
     }
 
     /// Create a session from an existing transport stream.
@@ -154,18 +52,7 @@ impl H2MuxClientHandler {
 
         // Session handles padding internally: sends request header on raw stream,
         // then applies padding layer before HTTP/2 handshake.
-        let session = H2MuxClientSession::new(stream, &self.options).await?;
-
-        // Add to pool
-        {
-            let mut sessions = self.sessions.lock();
-            sessions.push(SessionEntry {
-                session: session.clone(),
-                estimated_streams: 0,
-            });
-        }
-
-        Ok(session)
+        H2MuxClientSession::new(stream, &self.options).await
     }
 }
 

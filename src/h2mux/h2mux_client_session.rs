@@ -2,7 +2,7 @@
 //!
 //! Manages a single HTTP/2 connection for multiplexing multiple streams.
 //! Matches sing-mux behavior: uses PING keepalive to detect dead connections,
-//! but has no application-level idle timeout (relies on session pool cleanup).
+//! Streams keep their driver alive; dropping the last owner stops background I/O.
 
 use std::io;
 use std::sync::Arc;
@@ -34,15 +34,13 @@ const MAX_FRAME_SIZE: u32 = (1 << 24) - 1; // ~16 MB (max allowed by HTTP/2)
 /// Matches sing-mux behavior:
 /// - PING keepalive (30s) - detects dead connections
 /// - Stream open timeout (5s) - prevents hanging on unresponsive servers
-/// - No application-level idle timeout (session pool handles cleanup)
+/// - Driver ownership shared by sessions and active streams
 pub struct H2MuxClientSession {
     send_request: h2::client::SendRequest<Bytes>,
     /// Handle to abort the connection driver on drop
     driver_handle: Arc<DriverHandle>,
     padding_enabled: bool,
-    /// Approximate count of open streams. Only incremented, never decremented.
-    /// TODO: For proper session pooling, wrap streams in a guard that decrements on drop.
-    active_streams: AtomicU32,
+    active_streams: Arc<AtomicU32>,
     /// Closed flag - set by ping failure or connection error
     is_closed: Arc<AtomicBool>,
 }
@@ -61,12 +59,18 @@ impl std::fmt::Debug for H2MuxClientSession {
 }
 
 /// RAII wrapper to abort the driver when all session clones are dropped
-struct DriverHandle(tokio::task::AbortHandle);
+struct DriverHandle {
+    driver: tokio::task::AbortHandle,
+    ping: Option<tokio::task::AbortHandle>,
+}
 
 impl Drop for DriverHandle {
     fn drop(&mut self) {
         debug!("H2MuxClientSession: aborting connection driver");
-        self.0.abort();
+        self.driver.abort();
+        if let Some(ping) = &self.ping {
+            ping.abort();
+        }
     }
 }
 
@@ -76,7 +80,7 @@ impl Clone for H2MuxClientSession {
             send_request: self.send_request.clone(),
             driver_handle: Arc::clone(&self.driver_handle),
             padding_enabled: self.padding_enabled,
-            active_streams: AtomicU32::new(self.active_streams.load(Ordering::Relaxed)),
+            active_streams: Arc::clone(&self.active_streams),
             is_closed: Arc::clone(&self.is_closed),
         }
     }
@@ -125,28 +129,32 @@ impl H2MuxClientSession {
         let ping_pong = connection.ping_pong();
 
         let is_closed = Arc::new(AtomicBool::new(false));
+        let driver_closed = Arc::clone(&is_closed);
 
         // Spawn connection driver
         let abort_handle = tokio::spawn(async move {
             if let Err(e) = connection.await {
                 debug!("H2MUX client connection ended: {}", e);
             }
+            driver_closed.store(true, Ordering::Relaxed);
         })
         .abort_handle();
 
         // Spawn PING keepalive task to detect dead connections
         // (matches Go's http2.Transport.ReadIdleTimeout behavior)
-        if let Some(pp) = ping_pong {
-            Self::spawn_ping_task(pp, Arc::clone(&is_closed));
-        }
+        let ping = ping_pong
+            .map(|pp| Self::spawn_ping_task(pp, Arc::clone(&is_closed), abort_handle.clone()));
 
         debug!("H2MuxClientSession: ready for multiplexing");
 
         Ok(Self {
             send_request,
-            driver_handle: Arc::new(DriverHandle(abort_handle)),
+            driver_handle: Arc::new(DriverHandle {
+                driver: abort_handle,
+                ping,
+            }),
             padding_enabled,
-            active_streams: AtomicU32::new(0),
+            active_streams: Arc::new(AtomicU32::new(0)),
             is_closed,
         })
     }
@@ -155,7 +163,11 @@ impl H2MuxClientSession {
     ///
     /// Sends periodic PINGs to verify the server is still responsive.
     /// Matches Go's http2.Transport.ReadIdleTimeout behavior.
-    fn spawn_ping_task(mut ping_pong: PingPong, is_closed: Arc<AtomicBool>) {
+    fn spawn_ping_task(
+        mut ping_pong: PingPong,
+        is_closed: Arc<AtomicBool>,
+        driver: tokio::task::AbortHandle,
+    ) -> tokio::task::AbortHandle {
         tokio::spawn(async move {
             let mut timer = interval(PING_INTERVAL);
             timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -186,7 +198,9 @@ impl H2MuxClientSession {
                     }
                 }
             }
-        });
+            driver.abort();
+        })
+        .abort_handle()
     }
 
     /// Check if the session is still usable.
@@ -198,6 +212,10 @@ impl H2MuxClientSession {
     #[allow(dead_code)]
     pub fn active_streams(&self) -> u32 {
         self.active_streams.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn release_stream(&self) {
+        self.active_streams.fetch_sub(1, Ordering::Relaxed);
     }
 
     /// Open a new TCP stream to the specified destination.
@@ -223,7 +241,7 @@ impl H2MuxClientSession {
         destination: &NetLocation,
         is_tcp: bool,
     ) -> io::Result<Box<dyn AsyncStream>> {
-        if self.is_closed.load(Ordering::Relaxed) {
+        if !self.is_ready() {
             return Err(io::Error::new(
                 io::ErrorKind::NotConnected,
                 "H2MUX session is closed",
@@ -267,8 +285,13 @@ impl H2MuxClientSession {
             .map_err(|e| io::Error::other(format!("Failed to send CONNECT: {}", e)))?;
 
         // Create unified client stream with lazy response resolution
-        let client_stream =
-            H2MuxClientStream::new(send_stream, response_future, destination.clone(), is_tcp)?;
+        let client_stream = H2MuxClientStream::new(
+            send_stream,
+            response_future,
+            destination.clone(),
+            is_tcp,
+            self.clone(),
+        )?;
 
         self.active_streams.fetch_add(1, Ordering::Relaxed);
 
@@ -281,6 +304,52 @@ impl H2MuxClientSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn streams_own_driver_until_last_stream_is_dropped() {
+        for _ in 0..16 {
+            let (client, peer) = tokio::io::duplex(65536);
+            let peer = tokio::spawn(async move {
+                let mut session = super::super::H2MuxServerSession::new(peer).await.unwrap();
+                let mut inbound = session.accept().await.unwrap();
+                let mut bytes = [0; 3];
+                inbound.stream.read_exact(&mut bytes).await.unwrap();
+                inbound.stream.write_all(&bytes).await.unwrap();
+                inbound.stream.flush().await.unwrap();
+                while session.accept().await.is_some() {}
+            });
+            let mut session = H2MuxClientSession::new(client, &H2MuxOptions::default())
+                .await
+                .unwrap();
+            let owner = Arc::downgrade(&session.driver_handle);
+            let driver = session.driver_handle.driver.clone();
+            let destination = NetLocation::from_str("example.com:443", None).unwrap();
+            let mut stream = session.open_tcp(&destination).await.unwrap();
+            assert_eq!(session.active_streams(), 1);
+            drop(session);
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                stream.write_all(b"abc").await.unwrap();
+                stream.flush().await.unwrap();
+                let mut bytes = [0; 3];
+                stream.read_exact(&mut bytes).await.unwrap();
+                assert_eq!(&bytes, b"abc");
+            })
+            .await
+            .unwrap();
+            drop(stream);
+            assert!(owner.upgrade().is_none());
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                while !driver.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            peer.abort();
+            let _ = peer.await;
+        }
+    }
 
     #[test]
     fn test_session_clone() {
