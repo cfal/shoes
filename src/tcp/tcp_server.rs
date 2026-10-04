@@ -52,6 +52,9 @@ async fn run_tcp_server(
                 continue;
             }
         };
+        let Some(permit) = crate::resources::try_connection(Some(addr.ip())) else {
+            continue;
+        };
 
         if let Err(e) = set_tcp_keepalive(
             &stream,
@@ -68,6 +71,7 @@ async fn run_tcp_server(
         let cloned_resolver = resolver.clone();
         let cloned_handler = server_handler.clone();
         tasks.spawn(async move {
+            let _permit = permit;
             if let Err(e) = process_stream(stream, cloned_handler, cloned_resolver).await {
                 error!("{}:{} finished with error: {:?}", addr.ip(), addr.port(), e);
             } else {
@@ -107,10 +111,14 @@ async fn run_unix_server(
                 continue;
             }
         };
+        let Some(permit) = crate::resources::try_connection(None) else {
+            continue;
+        };
 
         let cloned_resolver = resolver.clone();
         let cloned_handler = server_handler.clone();
         tasks.spawn(async move {
+            let _permit = permit;
             if let Err(e) = process_stream(stream, cloned_handler, cloned_resolver).await {
                 error!("{addr:?} finished with error: {e:?}");
             } else {
@@ -139,6 +147,7 @@ pub async fn process_stream<AS>(
 where
     AS: AsyncStream + 'static,
 {
+    let _permit = crate::resources::try_stream().ok_or_else(crate::resources::exhausted)?;
     let setup_server_stream_future = timeout(
         Duration::from_secs(60),
         setup_server_stream(stream, server_handler),

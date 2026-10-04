@@ -9,6 +9,7 @@ use crate::async_stream::{AsyncPing, AsyncStream};
 pub struct QuicStream {
     send_stream: SendStream,
     recv_stream: RecvStream,
+    memory_permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 impl QuicStream {
@@ -16,7 +17,13 @@ impl QuicStream {
         Self {
             send_stream,
             recv_stream,
+            memory_permit: None,
         }
+    }
+
+    pub fn with_memory_permit(mut self, permit: tokio::sync::OwnedSemaphorePermit) -> Self {
+        self.memory_permit = Some(permit);
+        self
     }
 }
 

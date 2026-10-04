@@ -196,6 +196,7 @@ struct NaiveServiceConfig {
     udp_enabled: bool,
     padding_enabled: bool,
     executor: ConnectionExecutor,
+    slots: Arc<Semaphore>,
 }
 
 fn empty_body() -> BoxBody<Bytes, io::Error> {
@@ -265,6 +266,9 @@ pub(super) async fn run_naive_hyper_service<IO: AsyncStream + 'static>(
         udp_enabled: naive_cfg.udp_enabled,
         padding_enabled: naive_cfg.padding_enabled,
         executor: executor.clone(),
+        slots: Arc::new(Semaphore::new(
+            crate::resources::LIMITS.max_streams_per_connection,
+        )),
     });
 
     if use_h2 {
@@ -286,7 +290,7 @@ pub(super) async fn run_naive_hyper_service<IO: AsyncStream + 'static>(
                 .initial_stream_window_size(WINDOW_SIZE)
                 .initial_connection_window_size(WINDOW_SIZE)
                 .max_frame_size(MAX_FRAME_SIZE)
-                .max_concurrent_streams(1024)
+                .max_concurrent_streams(crate::resources::LIMITS.max_streams_per_connection as u32)
                 .serve_connection(io, service)
                 .await;
 
@@ -426,6 +430,19 @@ async fn naive_service(
         PaddingType::None
     };
 
+    let Some(permits) = config
+        .slots
+        .clone()
+        .try_acquire_owned()
+        .ok()
+        .and_then(|local| crate::resources::try_stream().map(|global| (local, global)))
+    else {
+        return Ok(Response::builder()
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .body(empty_body())
+            .unwrap());
+    };
+
     // Get upgrade future before moving the request
     let on_upgrade = hyper::upgrade::on(&mut req);
     let resolver = config.resolver.clone();
@@ -433,6 +450,7 @@ async fn naive_service(
     let udp_enabled = config.udp_enabled;
 
     hyper::rt::Executor::execute(&config.executor, async move {
+        let _permits = permits;
         match on_upgrade.await {
             Ok(upgraded) => {
                 let io = HyperUpgradedStream(Mutex::new(TokioIo::new(upgraded)));
@@ -712,7 +730,7 @@ async fn handle_naive_stream<S: AsyncStream + 'static>(
     };
 
     // Use larger buffers for better throughput (default 8KB is too small)
-    const COPY_BUF_SIZE: usize = 256 * 1024;
+    const COPY_BUF_SIZE: usize = 32 * 1024;
     let result = copy_bidirectional_with_sizes(
         &mut stream,
         &mut client_stream,

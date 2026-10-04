@@ -147,6 +147,7 @@ impl SocketConnectorImpl {
                     quinn::ClientConfig::new(Arc::new(quic_client_config));
 
                 let mut transport_config = quinn::TransportConfig::default();
+                crate::resources::configure_quic_transport(&mut transport_config);
                 transport_config
                     .max_concurrent_bidi_streams(0_u32.into())
                     .max_concurrent_uni_streams(0_u8.into())
@@ -260,6 +261,8 @@ impl SocketConnector for SocketConnectorImpl {
                 next_endpoint_index,
                 sni_hostname,
             } => {
+                let permit =
+                    crate::resources::try_quic_memory().ok_or_else(crate::resources::exhausted)?;
                 let domain = match sni_hostname {
                     Some(s) => s.as_str(),
                     None => address.address().hostname().unwrap_or("example.com"),
@@ -284,7 +287,9 @@ impl SocketConnector for SocketConnectorImpl {
                                             i, target_addr, i
                                         );
                                     }
-                                    return Ok(Box::new(QuicStream::from(send, recv)));
+                                    return Ok(Box::new(
+                                        QuicStream::from(send, recv).with_memory_permit(permit),
+                                    ));
                                 }
                                 Err(e) => {
                                     debug!("QUIC open_bi to {} failed: {}", target_addr, e);

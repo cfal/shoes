@@ -172,6 +172,7 @@ pub async fn start_from_config(
     shutdown_rx: oneshot::Receiver<()>,
 ) -> std::io::Result<()> {
     info!("Parsing config for TUN server");
+    let _resource_reporter = crate::resources::ResourceReporter::start();
 
     let configs: Vec<Config> = load_config_str(config_yaml)?;
 

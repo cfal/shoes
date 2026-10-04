@@ -56,7 +56,9 @@ impl UdpState {
         Self {
             sessions: DashMap::new(),
             fragments: parking_lot::Mutex::new(UdpFragments::new()),
-            slots: Arc::new(tokio::sync::Semaphore::new(64)),
+            slots: Arc::new(tokio::sync::Semaphore::new(
+                crate::resources::LIMITS.max_udp_destinations,
+            )),
         }
     }
 }
@@ -85,10 +87,13 @@ mod lifecycle_tests {
 
     #[tokio::test]
     async fn map_removal_releases_reply_task() {
-        let socket = Arc::new(UdpRelay::new(
-            Arc::new(ClientProxySelector::new(Vec::new())),
-            Arc::new(crate::resolver::NativeResolver::new()),
-        ));
+        let socket = Arc::new(
+            UdpRelay::new(
+                Arc::new(ClientProxySelector::new(Vec::new())),
+                Arc::new(crate::resolver::NativeResolver::new()),
+            )
+            .unwrap(),
+        );
         let weak = Arc::downgrade(&socket);
         let token = CancellationToken::new();
         let task_socket = socket.clone();
@@ -339,9 +344,16 @@ async fn run_bidirectional_loop(
         };
 
         let conn = connection.clone();
+        if tasks.len() >= crate::resources::LIMITS.max_streams_per_connection {
+            continue;
+        }
+        let Some(permit) = crate::resources::try_stream() else {
+            continue;
+        };
         let client_proxy_selector = client_proxy_selector.clone();
         let resolver = resolver.clone();
         tasks.spawn(async move {
+            let _permit = permit;
             match process_tcp_stream(client_proxy_selector, resolver, send_stream, recv_stream)
                 .await
             {
@@ -865,12 +877,19 @@ async fn run_unidirectional_loop(
             }
         };
 
+        if tasks.len() > crate::resources::LIMITS.max_streams_per_connection {
+            continue;
+        }
+        let Some(permit) = crate::resources::try_stream() else {
+            continue;
+        };
         let connection = connection.clone();
         let client_proxy_selector = client_proxy_selector.clone();
         let resolver = resolver.clone();
         let udp_session_map = udp_session_map.clone();
         let cancel_token = cancel_token.clone();
         tasks.spawn(async move {
+            let _permit = permit;
             // Per TUIC protocol, each uni stream carries exactly ONE command.
             // The reference implementation (handle_stream.rs) handles one task per stream.
             match timeout(
@@ -997,7 +1016,9 @@ async fn process_udp_packet(
     else {
         return Ok(());
     };
-    if udp_session_map.sessions.len() >= 64 && !udp_session_map.sessions.contains_key(&assoc_id) {
+    if udp_session_map.sessions.len() >= crate::resources::LIMITS.max_udp_destinations
+        && !udp_session_map.sessions.contains_key(&assoc_id)
+    {
         return Ok(());
     }
 
@@ -1047,7 +1068,7 @@ async fn process_udp_packet(
                 } else {
                     None
                 };
-                let client_socket = UdpRelay::new(client_proxy_selector.clone(), resolver.clone());
+                let client_socket = UdpRelay::new(client_proxy_selector.clone(), resolver.clone())?;
 
                 let session = if is_uni_stream {
                     UdpSession::start_with_send_stream(
@@ -1279,15 +1300,14 @@ pub async fn start_tuic_server(
         let join_handle = tokio::spawn(async move {
             let mut server_config = quinn::ServerConfig::with_crypto(quic_server_config);
 
+            crate::resources::configure_quic(
+                &mut server_config,
+                crate::resources::LIMITS.max_streams_per_connection as u32,
+            );
             Arc::get_mut(&mut server_config.transport)
                 .unwrap()
-                .max_concurrent_bidi_streams(4096_u32.into())
-                .max_concurrent_uni_streams(4096_u32.into())
                 .max_idle_timeout(Some(Duration::from_secs(60).try_into().unwrap()))
                 .keep_alive_interval(Some(Duration::from_secs(15)))
-                .send_window(16 * 1024 * 1024)
-                .receive_window((20u32 * 1024 * 1024).into())
-                .stream_receive_window((8u32 * 1024 * 1024).into())
                 // MTU settings per official TUIC reference
                 .initial_mtu(1200)
                 .min_mtu(1200)
@@ -1298,14 +1318,12 @@ pub async fn start_tuic_server(
                 // Lower initial RTT estimate for faster initial window growth
                 .initial_rtt(Duration::from_millis(100));
 
-            // Use 7.5MB socket buffers for high-throughput QUIC (8.625MB on BSD for 15% kernel overhead)
-            // https://github.com/quic-go/quic-go/wiki/UDP-Buffer-Sizes
             let socket2_socket = crate::socket_util::new_socket2_udp_socket_with_buffer_size(
                 bind_address.is_ipv6(),
                 None,
                 Some(bind_address),
                 true,
-                Some(8_625_000),
+                Some(crate::resources::LIMITS.quic_socket_buffer),
             )
             .unwrap();
 
@@ -1325,11 +1343,23 @@ pub async fn start_tuic_server(
                     _ = tasks.join_next(), if !tasks.is_empty() => continue,
                 };
                 let Some(conn) = conn else { break };
+                let Some(permit) =
+                    crate::resources::try_connection(Some(conn.remote_address().ip()))
+                else {
+                    conn.refuse();
+                    continue;
+                };
+                let Some(memory) = crate::resources::try_quic_memory() else {
+                    conn.refuse();
+                    continue;
+                };
                 let cloned_selector = client_proxy_selector.clone();
                 let cloned_resolver = resolver.clone();
                 let uuid = uuid.clone();
                 let password = password.clone();
                 tasks.spawn(async move {
+                    let _permit = permit;
+                    let _memory = memory;
                     if let Err(e) = process_connection(
                         cloned_selector,
                         cloned_resolver,

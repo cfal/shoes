@@ -520,7 +520,9 @@ async fn run_udp_local_to_remote_loop(
                 continue;
             }
         };
-        if sessions.len() >= 64 && !sessions.contains_key(&session_id) {
+        if sessions.len() >= crate::resources::LIMITS.max_udp_destinations
+            && !sessions.contains_key(&session_id)
+        {
             continue;
         }
 
@@ -553,7 +555,11 @@ async fn run_udp_local_to_remote_loop(
                 } else {
                     None
                 };
-                let client_socket = UdpRelay::new(client_proxy_selector.clone(), resolver.clone());
+                let Ok(client_socket) =
+                    UdpRelay::new(client_proxy_selector.clone(), resolver.clone())
+                else {
+                    continue;
+                };
 
                 let session = UdpSession::start(
                     session_id,
@@ -602,9 +608,16 @@ async fn run_tcp_loop(
             }
         };
 
+        if tasks.len() >= crate::resources::LIMITS.max_streams_per_connection {
+            continue;
+        }
+        let Some(permit) = crate::resources::try_stream() else {
+            continue;
+        };
         let client_proxy_selector = client_proxy_selector.clone();
         let resolver = resolver.clone();
         tasks.spawn(async move {
+            let _permit = permit;
             if let Err(e) =
                 process_tcp_stream(client_proxy_selector, resolver, send_stream, recv_stream).await
             {
@@ -841,17 +854,11 @@ pub async fn start_hysteria2_server(
         let join_handle = tokio::spawn(async move {
             let mut server_config = quinn::ServerConfig::with_crypto(quic_server_config);
 
-            // values estimated from https://github.com/apernet/hysteria/blob/5520bcc405ee11a47c164c75bae5c40fc2b1d99d/core/server/config.go#L16
+            crate::resources::configure_quic(&mut server_config, 16);
             Arc::get_mut(&mut server_config.transport)
                 .unwrap()
-                .max_concurrent_bidi_streams(4096_u32.into())
-                // required for HTTP/3 QPACK updates
-                .max_concurrent_uni_streams(1024_u32.into())
                 .max_idle_timeout(Some(Duration::from_secs(30).try_into().unwrap()))
                 .keep_alive_interval(Some(Duration::from_secs(10)))
-                .send_window(16 * 1024 * 1024)
-                .receive_window((20u32 * 1024 * 1024).into())
-                .stream_receive_window((8u32 * 1024 * 1024).into())
                 // MTU settings per official TUIC reference
                 .initial_mtu(1200)
                 .min_mtu(1200)
@@ -862,14 +869,12 @@ pub async fn start_hysteria2_server(
                 // Lower initial RTT estimate for faster initial window growth
                 .initial_rtt(Duration::from_millis(100));
 
-            // Use 7.5MB socket buffers for high-throughput QUIC (8.625MB on BSD for 15% kernel overhead)
-            // https://github.com/quic-go/quic-go/wiki/UDP-Buffer-Sizes
             let socket2_socket = crate::socket_util::new_socket2_udp_socket_with_buffer_size(
                 bind_address.is_ipv6(),
                 None,
                 Some(bind_address),
                 true,
-                Some(8_625_000),
+                Some(crate::resources::LIMITS.quic_socket_buffer),
             )
             .unwrap();
 
@@ -889,10 +894,22 @@ pub async fn start_hysteria2_server(
                     _ = tasks.join_next(), if !tasks.is_empty() => continue,
                 };
                 let Some(conn) = conn else { break };
+                let Some(permit) =
+                    crate::resources::try_connection(Some(conn.remote_address().ip()))
+                else {
+                    conn.refuse();
+                    continue;
+                };
+                let Some(memory) = crate::resources::try_quic_memory() else {
+                    conn.refuse();
+                    continue;
+                };
                 let cloned_selector = client_proxy_selector.clone();
                 let cloned_resolver = resolver.clone();
                 let hysteria2_password = hysteria2_password.clone();
                 tasks.spawn(async move {
+                    let _permit = permit;
+                    let _memory = memory;
                     if let Err(e) = process_connection(
                         cloned_selector,
                         cloned_resolver,

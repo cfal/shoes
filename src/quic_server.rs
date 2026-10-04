@@ -25,17 +25,10 @@ async fn start_quic_server(
     server_handler: Arc<dyn TcpServerHandler>,
     num_endpoints: usize,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
-    // TODO: consider setting transport config
-    //   Arc::get_mut(&mut server_config.transport)
-    //     .unwrap()
-    //     .max_concurrent_bidi_streams(1024_u32.into())
-    //     .max_concurrent_uni_streams(0_u8.into())
-    //     .keep_alive_interval(Some(Duration::from_secs(15)))
-    //     .max_idle_timeout(Some(Duration::from_secs(30).try_into().unwrap()));
-
     let mut join_handles = vec![];
     for _ in 0..num_endpoints {
-        let server_config = quinn::ServerConfig::with_crypto(quic_server_config.clone());
+        let mut server_config = quinn::ServerConfig::with_crypto(quic_server_config.clone());
+        crate::resources::configure_quic(&mut server_config, 0);
 
         let socket2_socket =
             new_socket2_udp_socket(bind_address.is_ipv6(), None, Some(bind_address), true).unwrap();
@@ -58,9 +51,21 @@ async fn start_quic_server(
                     _ = tasks.join_next(), if !tasks.is_empty() => continue,
                 };
                 let Some(conn) = conn else { break };
+                let Some(permit) =
+                    crate::resources::try_connection(Some(conn.remote_address().ip()))
+                else {
+                    conn.refuse();
+                    continue;
+                };
+                let Some(memory) = crate::resources::try_quic_memory() else {
+                    conn.refuse();
+                    continue;
+                };
                 let resolver = resolver.clone();
                 let server_handler = server_handler.clone();
                 tasks.spawn(async move {
+                    let _permit = permit;
+                    let _memory = memory;
                     if let Err(e) = process_connection(resolver, server_handler, conn).await {
                         error!("Connection ended with error: {e}");
                     }
@@ -97,6 +102,9 @@ async fn process_connection(
             }
             Ok(s) => s,
         };
+        if tasks.len() >= crate::resources::LIMITS.max_streams_per_connection {
+            continue;
+        }
         let cloned_resolver = resolver.clone();
         let cloned_handler = server_handler.clone();
         tasks.spawn(async move {

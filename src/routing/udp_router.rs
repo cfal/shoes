@@ -148,6 +148,7 @@ enum SessionLookup {
 
 /// A routing session (one per unique flow)
 struct RoutingSession {
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
     /// The destination this session routes to
     destination: NetLocation,
 
@@ -197,6 +198,7 @@ impl RoutingSession {
         remote: Box<dyn AsyncMessageStream>,
     ) -> Self {
         Self {
+            permit: None,
             destination,
             session_id,
             resolved_addr,
@@ -367,6 +369,7 @@ struct InboundPacket {
 
 /// Result of session creation
 struct SessionCreateResult {
+    permit: tokio::sync::OwnedSemaphorePermit,
     remote: Box<dyn AsyncMessageStream>,
     resolved_addr: SocketAddr,
 }
@@ -384,6 +387,7 @@ struct PendingSessionCreate {
 }
 
 struct PendingShutdown {
+    _permit: Option<tokio::sync::OwnedSemaphorePermit>,
     stream: Box<dyn AsyncMessageStream>,
     deadline: Pin<Box<tokio::time::Sleep>>,
 }
@@ -657,7 +661,8 @@ impl<'a> UdpRouter<'a> {
                     }
 
                     if self.pending_creates.len() >= MAX_PENDING_CREATES
-                        || self.sessions.len() + self.pending_creates.len() >= 64
+                        || self.sessions.len() + self.pending_creates.len()
+                            >= crate::resources::LIMITS.max_udp_destinations
                     {
                         debug!(
                             "Too many pending creates, dropping new session creation for {}",
@@ -963,6 +968,7 @@ impl<'a> UdpRouter<'a> {
 
         match result {
             Ok(SessionCreateResult {
+                permit,
                 remote,
                 resolved_addr,
             }) => {
@@ -988,6 +994,7 @@ impl<'a> UdpRouter<'a> {
 
                 let mut session =
                     RoutingSession::new(destination, session_id, resolved_addr, lookup_key, remote);
+                session.permit = Some(permit);
 
                 // TODO: part of constructor, we now know the id in advance
                 let expiry_key = self
@@ -1058,6 +1065,9 @@ impl<'a> UdpRouter<'a> {
     /// Start session creation
     #[inline]
     fn start_session_creation(&mut self, cx: &mut Context<'_>, packet: InboundPacket, data: &[u8]) {
+        let Some(permit) = crate::resources::try_stream() else {
+            return;
+        };
         let InboundPacket {
             destination,
             session_id,
@@ -1097,6 +1107,7 @@ impl<'a> UdpRouter<'a> {
                         .await?;
 
                     Ok(SessionCreateResult {
+                        permit,
                         remote: client_stream,
                         resolved_addr,
                     })
@@ -1133,14 +1144,19 @@ impl<'a> UdpRouter<'a> {
             return;
         };
 
-        self.queue_shutdown(session.remote);
+        self.queue_shutdown(session.remote, session.permit);
     }
 
-    fn queue_shutdown(&mut self, stream: Box<dyn AsyncMessageStream>) {
+    fn queue_shutdown(
+        &mut self,
+        stream: Box<dyn AsyncMessageStream>,
+        permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    ) {
         if self.pending_shutdowns.len() >= MAX_PENDING_SHUTDOWNS {
             self.pending_shutdowns.pop_front();
         }
         self.pending_shutdowns.push_back(PendingShutdown {
+            _permit: permit,
             stream,
             deadline: Box::pin(tokio::time::sleep(SHUTDOWN_TIMEOUT)),
         });
@@ -1468,6 +1484,7 @@ mod tests {
             initial_data: b"accepted".to_vec(),
             future: Box::pin(async move {
                 Ok(SessionCreateResult {
+                    permit: crate::resources::try_stream().unwrap(),
                     remote: Box::new(remote),
                     resolved_addr: "127.0.0.1:12345".parse().unwrap(),
                 })
@@ -1495,9 +1512,12 @@ mod tests {
         let mut router = UdpRouter::new(&mut server, selector, resolver, false);
         let state = Arc::new(RemoteState::default());
         for _ in 0..MAX_PENDING_SHUTDOWNS + 3 {
-            router.queue_shutdown(Box::new(RecordingRemote {
-                state: Arc::clone(&state),
-            }));
+            router.queue_shutdown(
+                Box::new(RecordingRemote {
+                    state: Arc::clone(&state),
+                }),
+                None,
+            );
         }
         assert_eq!(router.pending_shutdowns.len(), MAX_PENDING_SHUTDOWNS);
         assert_eq!(state.drops.load(Ordering::SeqCst), 3);

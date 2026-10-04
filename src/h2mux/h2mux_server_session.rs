@@ -42,6 +42,8 @@ const INBOUND_BUFFER: usize = 128;
 
 /// An incoming stream with its destination
 pub struct InboundStream {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    _local_permit: tokio::sync::OwnedSemaphorePermit,
     /// The multiplexed stream (wrapped with deferred status response)
     pub stream: H2MuxServerStream,
     /// Stream request with destination info
@@ -129,7 +131,7 @@ impl H2MuxServerSession {
             .initial_window_size(STREAM_WINDOW_SIZE)
             .initial_connection_window_size(CONNECTION_WINDOW_SIZE)
             .max_frame_size(MAX_FRAME_SIZE)
-            .max_concurrent_streams(1024)
+            .max_concurrent_streams(crate::resources::LIMITS.max_streams_per_connection as u32)
             .handshake(conn)
             .await
             .map_err(|e| io::Error::other(format!("H2 server handshake failed: {}", e)))?;
@@ -168,6 +170,9 @@ impl H2MuxServerSession {
         // Skip the first tick which returns immediately
         idle_timer.tick().await;
         let mut tasks = JoinSet::new();
+        let slots = Arc::new(tokio::sync::Semaphore::new(
+            crate::resources::LIMITS.max_streams_per_connection,
+        ));
 
         loop {
             tokio::select! {
@@ -177,8 +182,9 @@ impl H2MuxServerSession {
                     match result {
                         Some(Ok((request, respond))) => {
                             let inbound_tx = inbound_tx.clone();
+                            let slots = slots.clone();
                             tasks.spawn(async move {
-                                if let Err(e) = Self::handle_stream(request, respond, inbound_tx).await {
+                                if let Err(e) = Self::handle_stream(request, respond, inbound_tx, slots).await {
                                     debug!("H2MuxServerSession: stream error: {}", e);
                                 }
                             });
@@ -215,8 +221,9 @@ impl H2MuxServerSession {
                                 match result {
                                     Ok((request, respond)) => {
                                         let inbound_tx = inbound_tx.clone();
+                                        let slots = slots.clone();
                                         tasks.spawn(async move {
-                                            if let Err(e) = Self::handle_stream(request, respond, inbound_tx).await {
+                                            if let Err(e) = Self::handle_stream(request, respond, inbound_tx, slots).await {
                                                 debug!("H2MuxServerSession: stream error during drain: {}", e);
                                             }
                                         });
@@ -247,7 +254,19 @@ impl H2MuxServerSession {
         request: http::Request<h2::RecvStream>,
         mut respond: h2::server::SendResponse<Bytes>,
         inbound_tx: mpsc::Sender<InboundStream>,
+        slots: Arc<tokio::sync::Semaphore>,
     ) -> io::Result<()> {
+        let Ok(local_permit) = slots.try_acquire_owned() else {
+            respond.send_reset(h2::Reason::REFUSED_STREAM);
+            return Ok(());
+        };
+        let permit = match crate::resources::try_stream() {
+            Some(permit) => permit,
+            None => {
+                respond.send_reset(h2::Reason::REFUSED_STREAM);
+                return Ok(());
+            }
+        };
         // Send 200 OK response
         let response = Response::builder()
             .status(http::StatusCode::OK)
@@ -280,6 +299,8 @@ impl H2MuxServerSession {
 
         // Send to inbound channel
         let inbound = InboundStream {
+            _permit: permit,
+            _local_permit: local_permit,
             stream: server_stream,
             request: stream_request,
         };
@@ -408,6 +429,8 @@ async fn handle_h2mux_stream(
     resolver: Arc<dyn Resolver>,
 ) -> io::Result<()> {
     let InboundStream {
+        _permit,
+        _local_permit,
         mut stream,
         request,
     } = inbound;

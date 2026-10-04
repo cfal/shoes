@@ -23,6 +23,7 @@ mod quic_stream;
 mod reality;
 mod reality_client_handler;
 mod resolver;
+mod resources;
 mod routing;
 mod rustls_config_util;
 mod rustls_connection_util;
@@ -114,6 +115,21 @@ fn print_usage_and_exit(arg0: String) {
         "    SHOES_RELOAD_GRACE_SECS sets the reload drain deadline (default: 300, 0: immediate)"
     );
     eprintln!("    -V, --version        Print version information and exit");
+    eprintln!();
+    eprintln!("RESOURCE LIMITS (environment, read at startup; byte values are decimal):");
+    eprintln!("    SHOES_MAX_CONNECTIONS                  256");
+    eprintln!("    SHOES_MAX_CONNECTIONS_PER_IP           64");
+    eprintln!("    SHOES_MAX_STREAMS                      512 (includes pending UDP destinations)");
+    eprintln!("    SHOES_MAX_STREAMS_PER_CONNECTION       64");
+    eprintln!("    SHOES_MAX_UDP_DESTINATIONS              64 per router/QUIC association set");
+    eprintln!("    SHOES_QUIC_RECEIVE_WINDOW              2097152");
+    eprintln!("    SHOES_QUIC_SEND_WINDOW                 2097152");
+    eprintln!("    SHOES_QUIC_STREAM_WINDOW               262144");
+    eprintln!(
+        "    SHOES_QUIC_MEMORY_BYTES                67108864 (shared inbound/outbound allowance)"
+    );
+    eprintln!("    SHOES_QUIC_SOCKET_BUFFER               1048576 per endpoint direction");
+    eprintln!("    QUIC admission reserves receive + send + 524288 bytes per connection.");
     eprintln!();
     eprintln!("COMMANDS:");
     eprintln!(
@@ -317,6 +333,7 @@ fn main() {
         .expect("Could not build tokio runtime");
 
     runtime.block_on(async move {
+        let _resource_reporter = resources::ResourceReporter::start();
         let mut reload_state = if no_reload {
             None
         } else {

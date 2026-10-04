@@ -380,6 +380,21 @@ impl AnyTlsSession {
                 }
 
                 let stream_id = frame.stream_id;
+                if self.streams.read().contains_key(&stream_id) {
+                    return Ok(());
+                }
+                let permit = if self.stream_tasks.lock().len()
+                    < crate::resources::LIMITS.max_streams_per_connection
+                {
+                    crate::resources::try_stream()
+                } else {
+                    None
+                };
+                let Some(permit) = permit else {
+                    self.write_control_frame(&Frame::control(Command::Fin, stream_id))
+                        .await?;
+                    return Ok(());
+                };
                 // Hold task registration until spawn is recorded, so fast completion cannot
                 // remove a missing handle and leave a completed task in the map.
                 let mut tasks = self.stream_tasks.lock();
@@ -415,6 +430,7 @@ impl AnyTlsSession {
                 if let Some(stream) = stream_opt {
                     let session = Arc::clone(self);
                     let handle = tokio::spawn(async move {
+                        let _permit = permit;
                         if let Err(e) = session.handle_new_stream(stream).await {
                             log::debug!("AnyTLS stream {} error: {}", stream_id, e);
                         }

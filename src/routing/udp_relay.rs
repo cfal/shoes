@@ -23,6 +23,7 @@ type Reply = (Vec<u8>, SocketAddr);
 
 /// Channel transport for QUIC associations using the shared routing and proxy-chain machinery.
 pub struct UdpRelay {
+    _permit: tokio::sync::OwnedSemaphorePermit,
     tx: mpsc::Sender<(Vec<u8>, NetLocation)>,
     rx: Mutex<mpsc::Receiver<Reply>>,
     task: tokio::task::AbortHandle,
@@ -30,7 +31,11 @@ pub struct UdpRelay {
 }
 
 impl UdpRelay {
-    pub fn new(selector: Arc<ClientProxySelector>, resolver: Arc<dyn Resolver>) -> Self {
+    pub fn new(
+        selector: Arc<ClientProxySelector>,
+        resolver: Arc<dyn Resolver>,
+    ) -> io::Result<Self> {
+        let permit = crate::resources::try_stream().ok_or_else(crate::resources::exhausted)?;
         let (tx, input) = mpsc::channel(QUEUE_SIZE);
         let (output, rx) = mpsc::channel(QUEUE_SIZE);
         let stream = ChannelStream { input, output };
@@ -44,12 +49,13 @@ impl UdpRelay {
             .await;
         })
         .abort_handle();
-        Self {
+        Ok(Self {
+            _permit: permit,
             tx,
             rx: Mutex::new(rx),
             task,
             last_activity: parking_lot::Mutex::new(Instant::now()),
-        }
+        })
     }
 
     pub fn idle_for(&self) -> std::time::Duration {
@@ -189,7 +195,7 @@ mod tests {
                 crate::tcp::chain_builder::build_direct_chain_group(resolver.clone()),
             ),
         )]));
-        let relay = UdpRelay::new(selector, resolver);
+        let relay = UdpRelay::new(selector, resolver).unwrap();
         let original = NetLocation::from_str("192.0.2.1:53", None).unwrap();
         for payload in [b"".as_slice(), b"query".as_slice()] {
             relay.send_to(payload, original.clone()).unwrap();

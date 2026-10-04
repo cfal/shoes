@@ -246,6 +246,7 @@ async fn handle_tcp_connection(
     proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
 ) -> std::io::Result<()> {
+    let _permit = crate::resources::try_stream().ok_or_else(crate::resources::exhausted)?;
     let decision = tokio::time::timeout(
         std::time::Duration::from_secs(30),
         proxy_selector.judge(target.into(), &resolver),
