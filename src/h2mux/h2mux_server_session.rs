@@ -34,7 +34,7 @@ use super::prepend_stream::PrependStream;
 /// HTTP/2 window and frame size configuration
 const STREAM_WINDOW_SIZE: u32 = 256 * 1024; // 256 KB per stream
 const CONNECTION_WINDOW_SIZE: u32 = 1 << 20; // 1 MB (matches Go's http2 default)
-const MAX_FRAME_SIZE: u32 = (1 << 24) - 1; // ~16 MB (max allowed by HTTP/2)
+const MAX_FRAME_SIZE: u32 = 16 * 1024;
 
 /// Channel buffer size for inbound streams
 const INBOUND_BUFFER: usize = 128;

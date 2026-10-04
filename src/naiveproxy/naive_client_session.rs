@@ -72,7 +72,7 @@ impl NaiveClientSession {
         // H2 settings tuned for reasonable throughput without excessive memory
         // Reference naiveproxy uses ~64KB default, we use 256 KB for better throughput
         const WINDOW_SIZE: u32 = 256 * 1024; // 256 KB (was 16 MB)
-        const MAX_FRAME_SIZE: u32 = (1 << 24) - 1; // ~16 MB (max allowed by HTTP/2)
+        const MAX_FRAME_SIZE: u32 = 16 * 1024;
 
         let (send_request, connection) = h2::client::Builder::new()
             .initial_window_size(WINDOW_SIZE)

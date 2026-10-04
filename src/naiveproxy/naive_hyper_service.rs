@@ -151,7 +151,7 @@ pub(super) async fn run_naive_hyper_service<IO: AsyncStream + 'static>(
             // H2 settings tuned for reasonable throughput without excessive memory
             // Reference naiveproxy uses ~64KB default, we use 256 KB for better throughput
             const WINDOW_SIZE: u32 = 256 * 1024; // 256 KB (was 16 MB)
-            const MAX_FRAME_SIZE: u32 = (1 << 24) - 1; // ~16 MB (max allowed by HTTP/2)
+            const MAX_FRAME_SIZE: u32 = 16 * 1024;
 
             let result = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
                 .auto_date_header(false)
