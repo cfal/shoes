@@ -43,7 +43,12 @@ pub static LIMITS: LazyLock<ResourceLimits> = LazyLock::new(|| ResourceLimits {
     quic_receive_window: setting("SHOES_QUIC_RECEIVE_WINDOW", 2 << 20, 65536, 64 << 20),
     quic_send_window: setting("SHOES_QUIC_SEND_WINDOW", 2 << 20, 65536, 64 << 20),
     quic_stream_window: setting("SHOES_QUIC_STREAM_WINDOW", 256 << 10, 16384, 64 << 20),
-    quic_memory_bytes: setting("SHOES_QUIC_MEMORY_BYTES", 64 << 20, 1 << 20, 1 << 30),
+    quic_memory_bytes: setting(
+        "SHOES_QUIC_MEMORY_BYTES",
+        64 << 20,
+        1 << 20,
+        (1 << 30).min(Semaphore::MAX_PERMITS),
+    ),
     quic_socket_buffer: setting("SHOES_QUIC_SOCKET_BUFFER", 1 << 20, 65536, 16 << 20),
 });
 
@@ -253,6 +258,38 @@ impl Drop for ResourceReporter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quic_memory_budget_respects_semaphore_limit() {
+        let maximum = (1 << 30).min(Semaphore::MAX_PERMITS);
+        if std::env::var_os("SHOES_QUIC_BUDGET_TEST_CHILD").is_some() {
+            let requested: usize = std::env::var("SHOES_QUIC_MEMORY_BYTES")
+                .unwrap()
+                .parse()
+                .unwrap();
+            let expected = if requested <= maximum {
+                requested
+            } else {
+                64 << 20
+            };
+            assert_eq!(LIMITS.quic_memory_bytes, expected);
+            assert_eq!(QUIC_BYTES.slots.available_permits(), expected);
+        } else {
+            for requested in [maximum, maximum + 1] {
+                let status = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "resources::tests::quic_memory_budget_respects_semaphore_limit",
+                        "--quiet",
+                    ])
+                    .env("SHOES_QUIC_BUDGET_TEST_CHILD", "1")
+                    .env("SHOES_QUIC_MEMORY_BYTES", requested.to_string())
+                    .status()
+                    .unwrap();
+                assert!(status.success());
+            }
+        }
+    }
 
     #[test]
     fn permits_bound_work_and_return_on_drop() {
