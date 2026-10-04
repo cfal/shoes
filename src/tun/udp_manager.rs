@@ -32,7 +32,7 @@ use super::udp_handler::{UdpMessage, UdpReader, UdpWriter};
 const SESSION_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Channel buffer size for session and destination packets
-const CHANNEL_SIZE: usize = 4;
+const CHANNEL_SIZE: usize = 64;
 
 /// Response channel buffer size. Bounds memory growth when destination
 /// tasks produce responses faster than the manager can write to TUN.
@@ -71,12 +71,29 @@ pub struct TunUdpManager {
     response_tx: mpsc::Sender<UdpMessage>,
     destination_slots: Arc<Semaphore>,
     destinations_per_session: usize,
+    queued_bytes: Arc<Semaphore>,
+}
+
+struct QueuedPacket {
+    payload: Vec<u8>,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl QueuedPacket {
+    fn reserve(payload: Vec<u8>, budget: &Arc<Semaphore>) -> Option<Self> {
+        let size = u32::try_from(payload.len().max(1)).ok()?;
+        let permit = budget.clone().try_acquire_many_owned(size).ok()?;
+        Some(Self {
+            payload,
+            _permit: permit,
+        })
+    }
 }
 
 /// A UDP session for a single local (app) address.
 struct Session {
     /// Channel to send outgoing packets to the session task
-    tx: mpsc::Sender<(SocketAddr, Vec<u8>)>,
+    tx: mpsc::Sender<(SocketAddr, QueuedPacket)>,
     /// Handle to the session task
     handle: tokio::task::JoinHandle<()>,
     /// Last activity time
@@ -116,6 +133,7 @@ impl TunUdpManager {
             response_tx,
             destination_slots: Arc::new(Semaphore::new(limits.max_udp_destinations)),
             destinations_per_session: limits.max_udp_destinations_per_session,
+            queued_bytes: Arc::new(Semaphore::new(limits.max_udp_queued_bytes)),
         }
     }
 
@@ -180,6 +198,10 @@ impl TunUdpManager {
         remote_addr: SocketAddr,
         payload: Vec<u8>,
     ) -> io::Result<()> {
+        let Some(packet) = QueuedPacket::reserve(payload, &self.queued_bytes) else {
+            debug!("[TunUdpManager] UDP queued byte budget exhausted, dropping packet");
+            return Ok(());
+        };
         if let Some(session) = self.sessions.get_mut(&local_addr) {
             session.last_active = Instant::now();
 
@@ -196,7 +218,7 @@ impl TunUdpManager {
         }
 
         let session = self.sessions.get_mut(&local_addr).unwrap();
-        match session.tx.try_send((remote_addr, payload)) {
+        match session.tx.try_send((remote_addr, packet)) {
             Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Full(_)) => {
                 debug!(
@@ -287,7 +309,7 @@ impl TunUdpManager {
 /// up in all exit paths: graceful shutdown, LRU eviction, abort cancellation.
 struct DestinationEntry {
     /// Sends write requests to the destination task
-    write_tx: mpsc::Sender<Vec<u8>>,
+    write_tx: mpsc::Sender<QueuedPacket>,
     /// Aborted on drop to terminate the destination task immediately
     handle: tokio::task::JoinHandle<()>,
 }
@@ -305,7 +327,7 @@ impl Drop for DestinationEntry {
 /// event-driven with no polling.
 async fn session_task(
     peer_addr: SocketAddr,
-    mut rx: mpsc::Receiver<(SocketAddr, Vec<u8>)>,
+    mut rx: mpsc::Receiver<(SocketAddr, QueuedPacket)>,
     response_tx: mpsc::Sender<UdpMessage>,
     proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
@@ -430,7 +452,7 @@ async fn destination_task(
     peer_addr: SocketAddr,
     source_addr: SocketAddr,
     mut stream: Box<dyn AsyncMessageStream>,
-    mut write_rx: mpsc::Receiver<Vec<u8>>,
+    mut write_rx: mpsc::Receiver<QueuedPacket>,
     response_tx: mpsc::Sender<UdpMessage>,
     _permit: OwnedSemaphorePermit,
 ) {
@@ -445,7 +467,7 @@ async fn destination_task(
         // to after the select block where all future borrows are released.
         enum Action {
             Read(io::Result<()>),
-            Write(Option<Vec<u8>>),
+            Write(Option<QueuedPacket>),
             Timeout,
         }
 
@@ -460,7 +482,7 @@ async fn destination_task(
         match action {
             Action::Read(Ok(())) => {
                 let len = buf.filled().len();
-                if len == 0 {
+                if len == 0 && stream.read_message_eof_on_empty() {
                     break;
                 }
                 sleep.as_mut().reset(Instant::now() + CONNECTION_TIMEOUT);
@@ -488,10 +510,14 @@ async fn destination_task(
                 );
                 break;
             }
-            Action::Write(Some(payload)) => {
+            Action::Write(Some(packet)) => {
                 sleep.as_mut().reset(Instant::now() + CONNECTION_TIMEOUT);
 
-                match tokio::time::timeout(WRITE_TIMEOUT, send_message(&mut stream, &payload)).await
+                match tokio::time::timeout(
+                    WRITE_TIMEOUT,
+                    send_message(&mut stream, &packet.payload),
+                )
+                .await
                 {
                     Ok(Ok(())) => {}
                     Ok(Err(e)) => {
@@ -557,6 +583,74 @@ async fn send_message(stream: &mut Box<dyn AsyncMessageStream>, data: &[u8]) -> 
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn burst_packets_share_a_byte_budget_across_both_queue_stages() {
+        let budget = Arc::new(Semaphore::new(640));
+        let (session_tx, mut session_rx) = mpsc::channel(CHANNEL_SIZE);
+        let (destination_tx, destination_rx) = mpsc::channel(CHANNEL_SIZE);
+        for _ in 0..64 {
+            let packet = QueuedPacket::reserve(vec![0; 10], &budget).unwrap();
+            assert!(session_tx.try_send(packet).is_ok());
+        }
+        assert_eq!(budget.available_permits(), 0);
+        assert!(QueuedPacket::reserve(vec![0], &budget).is_none());
+        for _ in 0..64 {
+            assert!(
+                destination_tx
+                    .try_send(session_rx.recv().await.unwrap())
+                    .is_ok()
+            );
+        }
+        assert_eq!(budget.available_permits(), 0);
+        drop(destination_rx);
+        assert_eq!(budget.available_permits(), 640);
+        assert!(QueuedPacket::reserve(vec![0; 641], &budget).is_none());
+        let empty = QueuedPacket::reserve(Vec::new(), &budget).unwrap();
+        assert_eq!(budget.available_permits(), 639);
+        drop(empty);
+        assert_eq!(budget.available_permits(), 640);
+    }
+
+    #[tokio::test]
+    async fn empty_udp_reply_does_not_close_destination() {
+        let remote = tokio::net::UdpSocket::bind("0.0.0.0:0").await.unwrap();
+        let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await.unwrap();
+        let source = SocketAddr::from(([127, 0, 0, 1], remote.local_addr().unwrap().port()));
+        socket.connect(source).await.unwrap();
+        let budget = Arc::new(Semaphore::new(64));
+        let (write_tx, write_rx) = mpsc::channel(CHANNEL_SIZE);
+        let (response_tx, mut response_rx) = mpsc::channel(RESPONSE_CHANNEL_SIZE);
+        let permit = Arc::new(Semaphore::new(1)).acquire_owned().await.unwrap();
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(destination_task(
+            "127.0.0.1:1234".parse().unwrap(),
+            source,
+            Box::new(socket),
+            write_rx,
+            response_tx,
+            permit,
+        ));
+        for payload in [b"".as_slice(), b"still open".as_slice()] {
+            assert!(
+                write_tx
+                    .try_send(QueuedPacket::reserve(payload.to_vec(), &budget).unwrap())
+                    .is_ok()
+            );
+            let mut bytes = [0; 64];
+            let (length, peer) =
+                tokio::time::timeout(Duration::from_secs(1), remote.recv_from(&mut bytes))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            remote.send_to(&bytes[..length], peer).await.unwrap();
+            let (response, _, _) = tokio::time::timeout(Duration::from_secs(1), response_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(response, payload);
+        }
+    }
 
     #[tokio::test]
     async fn lru_eviction_aborts_stalled_session() {

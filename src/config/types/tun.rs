@@ -35,6 +35,8 @@ pub struct TunResourceLimits {
     pub max_udp_sessions: usize,
     pub max_udp_destinations: usize,
     pub max_udp_destinations_per_session: usize,
+    /// Shared outbound payload allowance across session and destination queues.
+    pub max_udp_queued_bytes: usize,
 }
 
 impl Default for TunResourceLimits {
@@ -46,6 +48,7 @@ impl Default for TunResourceLimits {
             max_udp_sessions: 64,
             max_udp_destinations: 64,
             max_udp_destinations_per_session: 16,
+            max_udp_queued_bytes: 2 * 1024 * 1024,
         }
     }
 }
@@ -59,6 +62,7 @@ impl TunResourceLimits {
             || self.max_udp_destinations == 0
             || self.max_udp_destinations > tokio::sync::Semaphore::MAX_PERMITS
             || self.max_udp_destinations_per_session == 0
+            || !(65535..=tokio::sync::Semaphore::MAX_PERMITS).contains(&self.max_udp_queued_bytes)
         {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -87,6 +91,17 @@ mod tests {
         limits.tcp_memory_bytes = 1;
         assert!(limits.validate().is_err());
         limits.tcp_buffer_size = 0;
+        assert!(limits.validate().is_err());
+    }
+
+    #[test]
+    fn udp_queue_budget_must_fit_a_maximum_datagram() {
+        let mut limits = TunResourceLimits {
+            max_udp_queued_bytes: 65535,
+            ..Default::default()
+        };
+        limits.validate().unwrap();
+        limits.max_udp_queued_bytes = 65534;
         assert!(limits.validate().is_err());
     }
 }
