@@ -21,6 +21,7 @@ use crate::resolver::Resolver;
 use crate::routing::{ServerStream, run_udp_routing};
 use crate::tcp::tcp_server::run_udp_copy;
 use crate::uot::SocksPacketAddrStream;
+use crate::util::{SHUTDOWN_TIMEOUT, shutdown_stream, timeout_stream_setup};
 use crate::vless::VlessMessageStream;
 
 use super::MuxProtocol;
@@ -446,32 +447,28 @@ async fn handle_h2mux_stream(
         packet_addr
     );
 
-    if is_udp {
-        if !udp_enabled {
-            let _ = timeout(
-                crate::util::SHUTDOWN_TIMEOUT,
-                stream.write_error_response("UDP not enabled"),
-            )
-            .await;
-            crate::util::shutdown_stream(&mut stream).await;
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "UDP not enabled",
-            ));
-        }
-
-        // UDP stream - wrap in message stream
-        if packet_addr {
-            // Per-packet addressing (like UoT V1)
-            handle_h2mux_udp_packet_addr(stream, proxy_selector, resolver).await
-        } else {
-            // Fixed destination
-            handle_h2mux_udp(stream, destination, proxy_selector, resolver).await
-        }
-    } else {
-        // TCP stream - regular forwarding
-        handle_h2mux_tcp(stream, destination, proxy_selector, resolver).await
+    if !is_udp {
+        return handle_h2mux_tcp(stream, destination, proxy_selector, resolver).await;
     }
+
+    if !udp_enabled {
+        reject_h2mux_stream(&mut stream, "UDP not enabled").await;
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "UDP not enabled",
+        ));
+    }
+
+    if packet_addr {
+        handle_h2mux_udp_packet_addr(stream, proxy_selector, resolver).await
+    } else {
+        handle_h2mux_udp(stream, destination, proxy_selector, resolver).await
+    }
+}
+
+async fn reject_h2mux_stream(stream: &mut H2MuxServerStream, message: &str) {
+    let _ = timeout(SHUTDOWN_TIMEOUT, stream.write_error_response(message)).await;
+    shutdown_stream(stream).await;
 }
 
 /// Handle TCP stream from h2mux
@@ -481,10 +478,8 @@ async fn handle_h2mux_tcp(
     proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
 ) -> io::Result<()> {
-    let action = crate::util::timeout_stream_setup(
-        proxy_selector.judge(destination.clone().into(), &resolver),
-    )
-    .await?;
+    let action =
+        timeout_stream_setup(proxy_selector.judge(destination.clone().into(), &resolver)).await?;
 
     match action {
         ConnectDecision::Allow {
@@ -493,30 +488,22 @@ async fn handle_h2mux_tcp(
         } => {
             debug!("H2MUX TCP: connecting to {} via chain", remote_location);
 
-            let client_result = crate::util::timeout_stream_setup(
-                chain_group.connect_tcp(remote_location, &resolver),
-            )
-            .await?;
+            let client_result =
+                timeout_stream_setup(chain_group.connect_tcp(remote_location, &resolver)).await?;
             let mut client_stream = client_result.client_stream;
 
-            // Bidirectional copy
             let result = copy_bidirectional(&mut stream, &mut *client_stream, false, false).await;
 
             futures::join!(
-                crate::util::shutdown_stream(&mut stream),
-                crate::util::shutdown_stream(&mut client_stream),
+                shutdown_stream(&mut stream),
+                shutdown_stream(&mut client_stream),
             );
 
             result
         }
         ConnectDecision::Block => {
             debug!("H2MUX TCP: blocked by rules: {}", destination);
-            let _ = timeout(
-                crate::util::SHUTDOWN_TIMEOUT,
-                stream.write_error_response("Connection blocked by rules"),
-            )
-            .await;
-            crate::util::shutdown_stream(&mut stream).await;
+            reject_h2mux_stream(&mut stream, "Connection blocked by rules").await;
             Err(io::Error::new(
                 io::ErrorKind::ConnectionRefused,
                 format!("Connection to {} blocked", destination),
@@ -534,17 +521,14 @@ async fn handle_h2mux_udp(
 ) -> io::Result<()> {
     debug!("H2MUX UDP fixed: {}", destination);
 
-    let action =
-        crate::util::timeout_stream_setup(proxy_selector.judge(destination.into(), &resolver))
-            .await?;
+    let action = timeout_stream_setup(proxy_selector.judge(destination.into(), &resolver)).await?;
 
     match action {
         ConnectDecision::Allow {
             chain_group,
             remote_location,
         } => {
-            // Connect to destination
-            let client_stream = crate::util::timeout_stream_setup(
+            let client_stream = timeout_stream_setup(
                 chain_group.connect_udp_bidirectional(&resolver, remote_location),
             )
             .await?;
@@ -555,12 +539,7 @@ async fn handle_h2mux_udp(
             run_udp_copy(Box::new(server_stream), client_stream, false, false).await
         }
         ConnectDecision::Block => {
-            let _ = timeout(
-                crate::util::SHUTDOWN_TIMEOUT,
-                stream.write_error_response("Connection blocked by rules"),
-            )
-            .await;
-            crate::util::shutdown_stream(&mut stream).await;
+            reject_h2mux_stream(&mut stream, "Connection blocked by rules").await;
             Err(io::Error::new(
                 io::ErrorKind::ConnectionRefused,
                 "UDP connection blocked by rules",

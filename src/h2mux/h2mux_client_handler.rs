@@ -41,18 +41,21 @@ impl H2MuxClientHandler {
         Self { inner, options }
     }
 
-    /// Create a session from an existing transport stream.
-    ///
-    /// The session will handle padding internally if enabled in options.
-    async fn create_session_from_stream(
-        &self,
-        stream: Box<dyn AsyncStream>,
-    ) -> io::Result<H2MuxClientSession> {
+    async fn create_session(&self, stream: Box<dyn AsyncStream>) -> io::Result<H2MuxClientSession> {
+        let magic_location = ResolvedLocation::new(NetLocation::new(
+            Address::Hostname(MUX_DESTINATION_HOST.to_string()),
+            MUX_DESTINATION_PORT,
+        ));
+        let inner_result = self
+            .inner
+            .setup_client_tcp_stream(stream, magic_location)
+            .await?;
+
         debug!("H2MuxClientHandler: creating session from stream");
 
         // Session handles padding internally: sends request header on raw stream,
         // then applies padding layer before HTTP/2 handshake.
-        H2MuxClientSession::new(stream, &self.options).await
+        H2MuxClientSession::new(inner_result.client_stream, &self.options).await
     }
 }
 
@@ -63,25 +66,7 @@ impl TcpClientHandler for H2MuxClientHandler {
         client_stream: Box<dyn AsyncStream>,
         remote_location: ResolvedLocation,
     ) -> io::Result<TcpClientSetupResult> {
-        // First, connect through the inner handler to the magic destination.
-        // This establishes the protocol layer (e.g., Shadowsocks, VLESS).
-        let magic_location = ResolvedLocation::new(NetLocation::new(
-            Address::Hostname(MUX_DESTINATION_HOST.to_string()),
-            MUX_DESTINATION_PORT,
-        ));
-
-        let inner_result = self
-            .inner
-            .setup_client_tcp_stream(client_stream, magic_location)
-            .await?;
-
-        // Now we have a stream connected to the magic destination
-        // Create an h2mux session over it
-        let mut session = self
-            .create_session_from_stream(inner_result.client_stream)
-            .await?;
-
-        // Open a stream to the actual destination
+        let mut session = self.create_session(client_stream).await?;
         let location = remote_location.into_location();
         let stream = session.open_tcp(&location).await?;
 
@@ -92,7 +77,6 @@ impl TcpClientHandler for H2MuxClientHandler {
     }
 
     fn supports_udp_over_tcp(&self) -> bool {
-        // H2MUX supports UDP through its own stream protocol
         true
     }
 
@@ -101,28 +85,10 @@ impl TcpClientHandler for H2MuxClientHandler {
         client_stream: Box<dyn AsyncStream>,
         target: ResolvedLocation,
     ) -> io::Result<Box<dyn AsyncMessageStream>> {
-        // First, connect through the inner handler to the magic destination
-        let magic_location = ResolvedLocation::new(NetLocation::new(
-            Address::Hostname(MUX_DESTINATION_HOST.to_string()),
-            MUX_DESTINATION_PORT,
-        ));
-
-        let inner_result = self
-            .inner
-            .setup_client_tcp_stream(client_stream, magic_location)
-            .await?;
-
-        // Create an h2mux session over it
-        let mut session = self
-            .create_session_from_stream(inner_result.client_stream)
-            .await?;
-
-        // Open a UDP stream to the target
+        let mut session = self.create_session(client_stream).await?;
         let location = target.into_location();
         let stream = session.open_udp(&location, false).await?;
 
-        // Wrap the stream as a message stream
-        // The H2MuxStream already handles length-prefixed UDP packets
         Ok(Box::new(H2MuxUdpMessageStream::new(stream)))
     }
 }
