@@ -66,7 +66,7 @@ use crate::address::{Address, NetLocation};
 use crate::client_proxy_selector::ClientProxySelector;
 use crate::config::TunConfig;
 use crate::config::selection::ConfigSelection;
-use crate::resolver::{NativeResolver, Resolver};
+use crate::resolver::Resolver;
 use crate::tcp::tcp_client_handler_factory::create_tcp_client_proxy_selector;
 
 use tcp_stack_direct::{NewTcpConnection, PACKET_QUEUE_CAPACITY, TcpStackDirect};
@@ -90,7 +90,7 @@ mod tests {
         run_tun_server(
             config,
             Arc::new(ClientProxySelector::new(Vec::new())),
-            Arc::new(NativeResolver::new()),
+            Arc::new(crate::resolver::NativeResolver::new()),
             rx,
         )
         .await
@@ -133,10 +133,12 @@ pub async fn run_tun_server(
         unsafe { OwnedFd::from_raw_fd(fd) }
     };
 
-    let mtu = config.mtu as usize;
-
     // Create the direct TCP stack (runs smoltcp in dedicated thread with select())
-    let mut tcp_stack = TcpStackDirect::with_limits(fd, mtu, config.resource_limits.clone());
+    let mut stack_config = config.clone();
+    if config.raw_fd.is_none() && cfg!(any(target_os = "macos", target_os = "ios")) {
+        stack_config.packet_information = true;
+    }
+    let mut tcp_stack = TcpStackDirect::with_config(fd, stack_config);
 
     // Get UDP receiver (stack thread filters UDP and sends here)
     let udp_from_stack_rx = tcp_stack.take_udp_rx().expect("udp_rx already taken");
@@ -341,13 +343,13 @@ async fn handle_udp_packets(
 /// Start TUN server based on the provided configuration.
 pub async fn start_tun_server(
     config: TunConfig,
-    _resolver: std::sync::Arc<dyn crate::resolver::Resolver>,
+    resolver: std::sync::Arc<dyn crate::resolver::Resolver>,
 ) -> std::io::Result<JoinHandle<()>> {
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
     let handle = tokio::spawn(async move {
         let _keep_alive = shutdown_tx;
-        if let Err(e) = run_tun_from_config(config, shutdown_rx, true).await {
+        if let Err(e) = run_tun_from_config(config, shutdown_rx, true, resolver).await {
             warn!("TUN server error: {}", e);
         }
     });
@@ -360,6 +362,7 @@ pub async fn run_tun_from_config(
     config: TunConfig,
     shutdown_rx: tokio::sync::oneshot::Receiver<()>,
     close_fd_on_drop: bool,
+    resolver: Arc<dyn Resolver>,
 ) -> std::io::Result<()> {
     let mut tun_server_config = TunServerConfig::new()
         .mtu(config.mtu)
@@ -390,9 +393,11 @@ pub async fn run_tun_from_config(
     if let Some(dest) = config.destination {
         tun_server_config = tun_server_config.destination(dest);
     }
+    if let Some(packet_information) = config.packet_information {
+        tun_server_config.packet_information = packet_information;
+    }
 
     let rules = config.rules.map(ConfigSelection::unwrap_config).into_vec();
-    let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
     let client_proxy_selector = Arc::new(create_tcp_client_proxy_selector(rules, resolver.clone()));
 
     run_tun_server(

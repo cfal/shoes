@@ -117,6 +117,8 @@ fn default_mtu() -> u16 {
 pub struct TunConfig {
     #[serde(default)]
     pub resource_limits: TunResourceLimits,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub packet_information: Option<bool>,
     /// TUN device name (Linux only, e.g., "tun0").
     /// Ignored on iOS/Android where the device is provided via device_fd.
     #[serde(default, skip_serializing_if = "Option::is_none")]

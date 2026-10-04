@@ -2034,6 +2034,7 @@ mod tests {
         // ICMP requires TCP to be enabled
         let tun_config = TunConfig {
             resource_limits: Default::default(),
+            packet_information: None,
             device_name: Some("tun0".to_string()),
             device_fd: None,
             address: Some("10.0.0.1".parse().unwrap()),

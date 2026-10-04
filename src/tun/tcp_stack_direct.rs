@@ -35,8 +35,8 @@ use smoltcp::{
 };
 use tokio::sync::mpsc::{self, Receiver, Sender};
 
+use super::TunServerConfig;
 use super::tcp_conn::{TcpConnection, TcpConnectionControl, TcpSocketState};
-use crate::config::tun::TunResourceLimits;
 
 pub type PacketBuffer = Vec<u8>;
 pub const PACKET_QUEUE_CAPACITY: usize = 64;
@@ -163,10 +163,10 @@ impl TcpStackDirect {
     /// The thread uses `select()` on the fd for efficient event-driven I/O.
     #[cfg(test)]
     pub fn new(tun_fd: OwnedFd, mtu: usize) -> Self {
-        Self::with_limits(tun_fd, mtu, TunResourceLimits::default())
+        Self::with_config(tun_fd, TunServerConfig::new().mtu(mtu as u16))
     }
 
-    pub fn with_limits(tun_fd: OwnedFd, mtu: usize, limits: TunResourceLimits) -> Self {
+    pub fn with_config(tun_fd: OwnedFd, config: TunServerConfig) -> Self {
         let fd = tun_fd.as_raw_fd();
         let (udp_tx, udp_rx) = mpsc::channel(PACKET_QUEUE_CAPACITY);
 
@@ -184,14 +184,7 @@ impl TcpStackDirect {
                 .name("shoes-smoltcp-direct".to_owned())
                 .spawn(move || {
                     let result = panic::catch_unwind(AssertUnwindSafe(|| {
-                        run_direct_stack_thread(
-                            fd,
-                            mtu,
-                            udp_tx,
-                            running.clone(),
-                            shared_state,
-                            limits,
-                        );
+                        run_direct_stack_thread(fd, config, udp_tx, running.clone(), shared_state);
                     }));
 
                     match result {
@@ -259,14 +252,16 @@ struct DirectDevice {
     fd: RawFd,
     mtu: usize,
     pending_rx: Option<PooledBuffer>,
+    packet_information: bool,
 }
 
 impl DirectDevice {
-    fn new(fd: RawFd, mtu: usize) -> Self {
+    fn new(fd: RawFd, mtu: usize, packet_information: bool) -> Self {
         Self {
             fd,
             mtu,
             pending_rx: None,
+            packet_information,
         }
     }
 
@@ -287,6 +282,15 @@ impl DirectDevice {
         match read_nonblocking(self.fd, &mut buffer) {
             Ok(n) if n > 0 => {
                 buffer.truncate(n);
+                if self.packet_information {
+                    if n < 5 || buffer[..4] != packet_header(buffer[4])? {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "invalid TUN packet information",
+                        ));
+                    }
+                    let _ = buffer.split_to(4);
+                }
                 Ok(Some(buffer))
             }
             Ok(_) => {
@@ -314,7 +318,7 @@ impl DirectDevice {
 
     /// Write a packet to TUN.
     fn write_packet(&self, data: &[u8]) -> io::Result<()> {
-        write_all(self.fd, data)
+        write_packet(self.fd, data, self.packet_information)
     }
 }
 
@@ -328,7 +332,10 @@ impl Device for DirectDevice {
     ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         if let Some(buffer) = self.pending_rx.take() {
             let rx = DirectRxToken { buffer };
-            let tx = DirectTxToken { fd: self.fd };
+            let tx = DirectTxToken {
+                fd: self.fd,
+                packet_information: self.packet_information,
+            };
             Some((rx, tx))
         } else {
             None
@@ -336,7 +343,10 @@ impl Device for DirectDevice {
     }
 
     fn transmit(&mut self, _timestamp: SmolInstant) -> Option<Self::TxToken<'_>> {
-        Some(DirectTxToken { fd: self.fd })
+        Some(DirectTxToken {
+            fd: self.fd,
+            packet_information: self.packet_information,
+        })
     }
 
     fn capabilities(&self) -> DeviceCapabilities {
@@ -368,6 +378,7 @@ impl RxToken for DirectRxToken {
 
 struct DirectTxToken {
     fd: RawFd,
+    packet_information: bool,
 }
 
 impl TxToken for DirectTxToken {
@@ -378,7 +389,7 @@ impl TxToken for DirectTxToken {
         let mut buffer = vec![0u8; len];
         let result = f(&mut buffer);
 
-        if let Err(e) = write_all(self.fd, &buffer) {
+        if let Err(e) = write_packet(self.fd, &buffer, self.packet_information) {
             warn!("Failed to write to TUN: {}", e);
         }
 
@@ -391,11 +402,10 @@ const MAX_PACKET_BATCH: usize = 64; // Process more packets per poll iteration
 /// Run the direct smoltcp stack thread.
 fn run_direct_stack_thread(
     fd: RawFd,
-    mtu: usize,
+    config: TunServerConfig,
     udp_tx: Sender<PacketBuffer>,
     running: Arc<AtomicBool>,
     shared_state: Arc<Mutex<SharedState>>,
-    limits: TunResourceLimits,
 ) {
     info!("smoltcp direct stack thread initializing...");
 
@@ -405,7 +415,8 @@ fn run_direct_stack_thread(
         return;
     }
 
-    let mut device = DirectDevice::new(fd, mtu);
+    let limits = &config.resource_limits;
+    let mut device = DirectDevice::new(fd, config.mtu as usize, config.packet_information);
 
     let mut iface_config = InterfaceConfig::new(HardwareAddress::Ip);
     iface_config.random_seed = rand::random();
@@ -493,7 +504,7 @@ fn run_direct_stack_thread(
                     pkt.len()
                 );
                 match protocol {
-                    IpProtocol::Tcp => {
+                    IpProtocol::Tcp if config.tcp_enabled => {
                         match extract_tcp_info(&pkt) {
                             Some((src_addr, dst_addr, is_syn)) => {
                                 trace!("TCP packet: {} -> {}, SYN={}", src_addr, dst_addr, is_syn);
@@ -542,11 +553,11 @@ fn run_direct_stack_thread(
 
                         tcp_packets.push(pkt);
                     }
-                    IpProtocol::Icmp | IpProtocol::Icmpv6 => {
+                    IpProtocol::Icmp | IpProtocol::Icmpv6 if config.icmp_enabled => {
                         // ICMP goes to smoltcp immediately
                         tcp_packets.push(pkt);
                     }
-                    IpProtocol::Udp => {
+                    IpProtocol::Udp if config.udp_enabled => {
                         // UDP goes to tokio - convert to Vec since it leaves our pool
                         let _ = udp_tx.try_send(pkt.to_vec());
                     }
@@ -960,6 +971,43 @@ fn set_nonblocking(fd: RawFd) -> io::Result<()> {
     Ok(())
 }
 
+fn packet_header(first_byte: u8) -> io::Result<[u8; 4]> {
+    let version = first_byte >> 4;
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    let protocol = match version {
+        4 => libc::AF_INET as u32,
+        6 => libc::AF_INET6 as u32,
+        _ => 0,
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    let protocol: u32 = match version {
+        4 => 0x0800,
+        6 => 0x86dd,
+        _ => 0,
+    };
+    if protocol == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid IP version",
+        ));
+    }
+    Ok(protocol.to_be_bytes())
+}
+
+fn write_packet(fd: RawFd, data: &[u8], packet_information: bool) -> io::Result<()> {
+    if packet_information {
+        let Some(&first_byte) = data.first() else {
+            return Ok(());
+        };
+        let mut framed = Vec::with_capacity(data.len() + 4);
+        framed.extend_from_slice(&packet_header(first_byte)?);
+        framed.extend_from_slice(data);
+        write_all(fd, &framed)
+    } else {
+        write_all(fd, data)
+    }
+}
+
 /// Non-blocking read from a file descriptor (fd must already be non-blocking).
 /// Returns Err(WouldBlock) when no data is available, so callers can
 /// distinguish it from Ok(0) which indicates EOF.
@@ -1008,6 +1056,42 @@ mod tests {
     use super::*;
     use std::os::unix::io::IntoRawFd;
     use std::os::unix::net::UnixStream;
+
+    #[test]
+    fn packet_information_roundtrips_ipv4_and_ipv6() {
+        use std::os::unix::net::UnixDatagram;
+        let (peer, tun) = UnixDatagram::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        set_nonblocking(tun.as_raw_fd()).unwrap();
+        let mut device = DirectDevice::new(tun.as_raw_fd(), 1500, true);
+        for version in [0x45, 0x60] {
+            let packet = [version, 1, 2, 3, 4, 5];
+            let mut framed = packet_header(version).unwrap().to_vec();
+            framed.extend_from_slice(&packet);
+            peer.send(&framed).unwrap();
+            assert_eq!(&device.try_recv().unwrap().unwrap()[..], &packet);
+            device.write_packet(&packet).unwrap();
+            let mut buf = [0; 64];
+            let n = peer.recv(&mut buf).unwrap();
+            assert_eq!(&buf[..n], &framed);
+        }
+    }
+
+    #[test]
+    fn disabled_udp_does_not_reach_async_handler() {
+        use std::os::unix::net::UnixDatagram;
+        let (peer, tun) = UnixDatagram::pair().unwrap();
+        let mut stack =
+            TcpStackDirect::with_config(tun.into(), TunServerConfig::new().udp_enabled(false));
+        let mut rx = stack.take_udp_rx().unwrap();
+        let builder =
+            etherparse::PacketBuilder::ipv4([10, 0, 0, 2], [1, 1, 1, 1], 64).udp(1000, 53);
+        let mut packet = Vec::new();
+        builder.write(&mut packet, b"dns").unwrap();
+        peer.send(&packet).unwrap();
+        thread::sleep(Duration::from_millis(40));
+        assert!(rx.try_recv().is_err());
+    }
 
     #[test]
     fn socket_owner_drop_wakes_readers_and_writers() {
