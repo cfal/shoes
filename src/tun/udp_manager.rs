@@ -122,11 +122,13 @@ impl TunUdpManager {
         limits: TunResourceLimits,
     ) -> Self {
         let (response_tx, response_rx) = mpsc::channel(RESPONSE_CHANNEL_SIZE);
+        let mut sessions = LruCache::unbounded();
+        sessions.resize(NonZeroUsize::new(limits.max_udp_sessions).unwrap());
 
         Self {
             reader,
             writer,
-            sessions: LruCache::new(NonZeroUsize::new(limits.max_udp_sessions).unwrap()),
+            sessions,
             proxy_selector,
             resolver,
             response_rx,
@@ -574,6 +576,27 @@ async fn send_message(stream: &mut Box<dyn AsyncMessageStream>, data: &[u8]) -> 
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
+
+    #[test]
+    fn session_limit_does_not_preallocate_entries() {
+        let limits = TunResourceLimits {
+            max_udp_sessions: usize::MAX,
+            ..Default::default()
+        };
+        limits.validate().unwrap();
+        let (_, from_tun) = mpsc::channel(1);
+        let (to_tun, _) = mpsc::channel(1);
+        let (reader, writer) = super::super::udp_handler::UdpHandler::new(from_tun, to_tun).split();
+        let manager = TunUdpManager::new(
+            reader,
+            writer,
+            Arc::new(ClientProxySelector::new(Vec::new())),
+            Arc::new(crate::resolver::NativeResolver::new()),
+            limits,
+        );
+        assert!(manager.sessions.is_empty());
+        assert_eq!(manager.sessions.cap().get(), usize::MAX);
+    }
 
     #[tokio::test]
     async fn burst_packets_share_a_byte_budget_across_both_queue_stages() {
