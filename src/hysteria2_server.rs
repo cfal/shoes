@@ -13,7 +13,7 @@ use rand::{Rng, RngExt};
 use rustc_hash::FxHashMap;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UdpSocket;
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
@@ -51,6 +51,7 @@ async fn process_connection(
     // Create a cancellation token for the entire connection lifecycle.
     // When cancelled, all spawned tasks (UDP sessions) will terminate gracefully.
     let cancel_token = CancellationToken::new();
+    let _cancel_on_drop = cancel_token.clone().drop_guard();
 
     // we unfortunately need to keep the h3 connection around because it closes the underlying
     // connection on drop, see
@@ -261,6 +262,16 @@ struct UdpSession {
     override_remote_write_address: Option<SocketAddr>,
     last_activity: std::time::Instant,
     cancel_token: CancellationToken,
+    task: Option<tokio::task::AbortHandle>,
+}
+
+impl Drop for UdpSession {
+    fn drop(&mut self) {
+        self.cancel_token.cancel();
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+    }
 }
 
 struct FragmentedPacket {
@@ -287,7 +298,7 @@ impl UdpSession {
         // Create a child token so this session is cancelled when the parent (connection) is cancelled
         let session_cancel_token = parent_cancel_token.child_token();
 
-        let session = UdpSession {
+        let mut session = UdpSession {
             fragments: LruCache::new(NonZeroUsize::new(MAX_FRAGMENT_CACHE_SIZE).unwrap()),
             send_socket: client_socket.clone(),
             last_location: initial_location,
@@ -295,21 +306,25 @@ impl UdpSession {
             override_remote_write_address,
             last_activity: std::time::Instant::now(),
             cancel_token: session_cancel_token.clone(),
+            task: None,
         };
 
-        tokio::spawn(async move {
-            if let Err(e) = run_udp_remote_to_local_loop(
-                session_id,
-                connection,
-                client_socket,
-                override_local_write_location,
-                session_cancel_token,
-            )
-            .await
-            {
-                error!("UDP remote-to-local write loop ended with error: {e}");
-            }
-        });
+        session.task = Some(
+            tokio::spawn(async move {
+                if let Err(e) = run_udp_remote_to_local_loop(
+                    session_id,
+                    connection,
+                    client_socket,
+                    override_local_write_location,
+                    session_cancel_token,
+                )
+                .await
+                {
+                    error!("UDP remote-to-local write loop ended with error: {e}");
+                }
+            })
+            .abort_handle(),
+        );
 
         session
     }
@@ -735,8 +750,13 @@ async fn run_tcp_loop(
     client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
 ) -> std::io::Result<()> {
+    let mut tasks = JoinSet::new();
     loop {
-        let (send_stream, recv_stream) = match connection.accept_bi().await {
+        let accepted = tokio::select! {
+            result = connection.accept_bi() => result,
+            _ = tasks.join_next(), if !tasks.is_empty() => continue,
+        };
+        let (send_stream, recv_stream) = match accepted {
             Ok(s) => s,
             Err(quinn::ConnectionError::ApplicationClosed(_)) => {
                 break;
@@ -753,7 +773,7 @@ async fn run_tcp_loop(
 
         let client_proxy_selector = client_proxy_selector.clone();
         let resolver = resolver.clone();
-        tokio::spawn(async move {
+        tasks.spawn(async move {
             if let Err(e) =
                 process_tcp_stream(client_proxy_selector, resolver, send_stream, recv_stream).await
             {

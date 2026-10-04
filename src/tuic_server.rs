@@ -10,7 +10,7 @@ use log::{debug, error};
 use lru::LruCache;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UdpSocket;
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
@@ -49,7 +49,44 @@ const AUTH_TIMEOUT: Duration = Duration::from_secs(3);
 /// Default is 10 seconds per sing-box reference implementation.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 
-type UdpSessionMap = Arc<DashMap<u16, UdpSession>>;
+type UdpSessionMap = Arc<DashMap<u16, Arc<UdpSession>>>;
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn map_removal_and_losing_insert_release_reply_task() {
+        let socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await.unwrap());
+        let weak = Arc::downgrade(&socket);
+        let token = CancellationToken::new();
+        let task_socket = socket.clone();
+        let task = tokio::spawn(async move {
+            let _socket = task_socket;
+            std::future::pending::<()>().await;
+        });
+        let session = Arc::new(UdpSession {
+            send_socket: socket,
+            last: parking_lot::Mutex::new((
+                NetLocation::from_str("127.0.0.1:1", None).unwrap(),
+                "127.0.0.1:1".parse().unwrap(),
+                tokio::time::Instant::now(),
+            )),
+            override_remote_write_address: None,
+            cancel_token: token.clone(),
+            task: Some(task.abort_handle()),
+        });
+        let map: UdpSessionMap = Arc::new(DashMap::new());
+        map.insert(1, session);
+        let snapshot = map.get(&1).map(|entry| entry.value().clone()).unwrap();
+        map.remove(&1);
+        assert!(!token.is_cancelled());
+        drop(snapshot);
+        assert!(token.is_cancelled());
+        let _ = task.await;
+        assert!(weak.upgrade().is_none());
+    }
+}
 
 async fn process_connection(
     client_proxy_selector: Arc<ClientProxySelector>,
@@ -98,6 +135,7 @@ async fn process_connection(
     // Create a cancellation token for the entire connection lifecycle.
     // When cancelled, all spawned tasks (UDP sessions, cleanup task, heartbeat) will terminate gracefully.
     let cancel_token = CancellationToken::new();
+    let _cancel_on_drop = cancel_token.clone().drop_guard();
 
     // this allows for:
     // 1. multiple threads can read different sessions concurrently
@@ -248,8 +286,13 @@ async fn run_bidirectional_loop(
     client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
 ) -> std::io::Result<()> {
+    let mut tasks = JoinSet::new();
     loop {
-        let (send_stream, recv_stream) = match connection.accept_bi().await {
+        let accepted = tokio::select! {
+            result = connection.accept_bi() => result,
+            _ = tasks.join_next(), if !tasks.is_empty() => continue,
+        };
+        let (send_stream, recv_stream) = match accepted {
             Ok(s) => s,
             Err(quinn::ConnectionError::ApplicationClosed(_)) => {
                 break;
@@ -267,7 +310,7 @@ async fn run_bidirectional_loop(
         let conn = connection.clone();
         let client_proxy_selector = client_proxy_selector.clone();
         let resolver = resolver.clone();
-        tokio::spawn(async move {
+        tasks.spawn(async move {
             match process_tcp_stream(client_proxy_selector, resolver, send_stream, recv_stream)
                 .await
             {
@@ -476,12 +519,20 @@ struct UdpSession {
     send_socket: Arc<UdpSocket>,
     // we cache the last location in case of mid-session address changes, and
     // don't want to have to call ClientProxySelector::judge on every packet.
-    last_location: NetLocation,
-    last_socket_addr: SocketAddr,
+    last: parking_lot::Mutex<(NetLocation, SocketAddr, tokio::time::Instant)>,
     override_remote_write_address: Option<SocketAddr>,
-    last_activity: std::time::Instant,
     // Cancellation token for this session's background task
     cancel_token: CancellationToken,
+    task: Option<tokio::task::AbortHandle>,
+}
+
+impl Drop for UdpSession {
+    fn drop(&mut self) {
+        self.cancel_token.cancel();
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+    }
 }
 
 struct FragmentedPacket {
@@ -507,28 +558,34 @@ impl UdpSession {
         // Create a child token so this session is cancelled when the parent (connection) is cancelled
         let session_cancel_token = parent_cancel_token.child_token();
 
-        let session = UdpSession {
+        let mut session = UdpSession {
             send_socket: client_socket.clone(),
-            last_location: initial_location,
-            last_socket_addr: initial_socket_addr,
+            last: parking_lot::Mutex::new((
+                initial_location,
+                initial_socket_addr,
+                tokio::time::Instant::now(),
+            )),
             override_remote_write_address,
-            last_activity: std::time::Instant::now(),
             cancel_token: session_cancel_token.clone(),
+            task: None,
         };
 
-        tokio::spawn(async move {
-            if let Err(e) = run_udp_remote_to_local_stream_loop(
-                assoc_id,
-                send_stream,
-                client_socket,
-                override_local_write_location,
-                session_cancel_token,
-            )
-            .await
-            {
-                error!("UDP remote-to-local write loop ended with error: {e}");
-            }
-        });
+        session.task = Some(
+            tokio::spawn(async move {
+                if let Err(e) = run_udp_remote_to_local_stream_loop(
+                    assoc_id,
+                    send_stream,
+                    client_socket,
+                    override_local_write_location,
+                    session_cancel_token,
+                )
+                .await
+                {
+                    error!("UDP remote-to-local write loop ended with error: {e}");
+                }
+            })
+            .abort_handle(),
+        );
 
         session
     }
@@ -547,28 +604,34 @@ impl UdpSession {
         // Create a child token so this session is cancelled when the parent (connection) is cancelled
         let session_cancel_token = parent_cancel_token.child_token();
 
-        let session = UdpSession {
+        let mut session = UdpSession {
             send_socket: client_socket.clone(),
-            last_location: initial_location,
-            last_socket_addr: initial_socket_addr,
+            last: parking_lot::Mutex::new((
+                initial_location,
+                initial_socket_addr,
+                tokio::time::Instant::now(),
+            )),
             override_remote_write_address,
-            last_activity: std::time::Instant::now(),
             cancel_token: session_cancel_token.clone(),
+            task: None,
         };
 
-        tokio::spawn(async move {
-            if let Err(e) = run_udp_remote_to_local_datagram_loop(
-                assoc_id,
-                connection,
-                client_socket,
-                override_local_write_location,
-                session_cancel_token,
-            )
-            .await
-            {
-                error!("UDP remote-to-local write loop ended with error: {e}");
-            }
-        });
+        session.task = Some(
+            tokio::spawn(async move {
+                if let Err(e) = run_udp_remote_to_local_datagram_loop(
+                    assoc_id,
+                    connection,
+                    client_socket,
+                    override_local_write_location,
+                    session_cancel_token,
+                )
+                .await
+                {
+                    error!("UDP remote-to-local write loop ended with error: {e}");
+                }
+            })
+            .abort_handle(),
+        );
 
         session
     }
@@ -580,11 +643,12 @@ impl UdpSession {
         client_proxy_selector: &Arc<ClientProxySelector>,
         resolver: &Arc<dyn Resolver>,
     ) -> std::io::Result<(SocketAddr, bool)> {
+        let (last_location, last_socket_addr, _) = self.last.lock().clone();
         let (addr, is_updated) = match self.override_remote_write_address {
             Some(addr) => (addr, false),
             None => {
-                if location == &self.last_location {
-                    (self.last_socket_addr, false)
+                if location == &last_location {
+                    (last_socket_addr, false)
                 } else {
                     let action = client_proxy_selector
                         .judge(location.clone().into(), resolver)
@@ -618,9 +682,8 @@ impl UdpSession {
         Ok((addr, is_updated))
     }
 
-    fn update_last_location(&mut self, location: NetLocation, socket_addr: SocketAddr) {
-        self.last_location = location;
-        self.last_socket_addr = socket_addr;
+    fn update_last_location(&self, location: NetLocation, socket_addr: SocketAddr) {
+        *self.last.lock() = (location, socket_addr, tokio::time::Instant::now());
     }
 }
 
@@ -832,10 +895,11 @@ async fn run_unidirectional_loop(
     udp_session_map: UdpSessionMap,
     cancel_token: CancellationToken,
 ) -> std::io::Result<()> {
+    let mut tasks = JoinSet::new();
     // Spawn a cleanup task for UDP sessions that terminates when connection closes
     let cleanup_session_map = udp_session_map.clone();
     let cleanup_cancel_token = cancel_token.clone();
-    tokio::spawn(async move {
+    tasks.spawn(async move {
         let mut interval = tokio::time::interval(CLEANUP_INTERVAL);
         loop {
             tokio::select! {
@@ -844,7 +908,7 @@ async fn run_unidirectional_loop(
                 }
                 _ = interval.tick() => {
                     cleanup_session_map.retain(|assoc_id, session| {
-                        if session.last_activity.elapsed() > IDLE_TIMEOUT {
+                        if session.last.lock().2.elapsed() > IDLE_TIMEOUT {
                             // Cancel the session's background task before removing
                             session.cancel_token.cancel();
                             debug!("Removing inactive UDP session {assoc_id}");
@@ -859,7 +923,11 @@ async fn run_unidirectional_loop(
     });
 
     loop {
-        let recv_stream = match connection.accept_uni().await {
+        let accepted = tokio::select! {
+            result = connection.accept_uni() => result,
+            _ = tasks.join_next(), if !tasks.is_empty() => continue,
+        };
+        let recv_stream = match accepted {
             Ok(recv_stream) => recv_stream,
             Err(quinn::ConnectionError::ApplicationClosed(_)) => {
                 break;
@@ -879,19 +947,27 @@ async fn run_unidirectional_loop(
         let resolver = resolver.clone();
         let udp_session_map = udp_session_map.clone();
         let cancel_token = cancel_token.clone();
-        tokio::spawn(async move {
+        tasks.spawn(async move {
             // Per TUIC protocol, each uni stream carries exactly ONE command.
             // The reference implementation (handle_stream.rs) handles one task per stream.
-            match process_uni_stream(
-                &connection,
-                client_proxy_selector,
-                resolver,
-                recv_stream,
-                udp_session_map,
-                cancel_token,
+            match timeout(
+                Duration::from_secs(30),
+                process_uni_stream(
+                    &connection,
+                    client_proxy_selector,
+                    resolver,
+                    recv_stream,
+                    udp_session_map,
+                    cancel_token,
+                ),
             )
             .await
-            {
+            .unwrap_or_else(|_| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "TUIC command timed out",
+                ))
+            }) {
                 Ok(()) => {}
                 Err(e) => {
                     // Per official TUIC reference (handle_stream.rs:70-78),
@@ -1013,8 +1089,11 @@ async fn process_udp_packet(
         )));
     }
 
+    let existing = udp_session_map
+        .get(&assoc_id)
+        .map(|entry| Arc::clone(entry.value()));
     let session = {
-        match udp_session_map.get(&assoc_id) {
+        match existing {
             Some(s) => s,
             None => {
                 // TODO: it's possible that a new session starts with a fragmented packet, and we
@@ -1101,9 +1180,11 @@ async fn process_udp_packet(
                 // TODO: why is there no way to get a Ref<_> from an Entry<_>? see if we can
                 // do better than converting into a RefMut<_> and then downgrading.
                 match udp_session_map.entry(assoc_id) {
-                    dashmap::mapref::entry::Entry::Occupied(entry) => entry.into_ref().downgrade(),
+                    dashmap::mapref::entry::Entry::Occupied(entry) => entry.get().clone(),
                     dashmap::mapref::entry::Entry::Vacant(entry) => {
-                        entry.insert_entry(session).into_ref().downgrade()
+                        let session = Arc::new(session);
+                        entry.insert(session.clone());
+                        session
                     }
                 }
             }
@@ -1133,17 +1214,13 @@ async fn process_udp_packet(
             .await
         {
             error!("Failed to forward UDP payload for session {assoc_id}: {e}");
-            drop(session);
-            udp_session_map.remove(&assoc_id);
+            udp_session_map.remove_if(&assoc_id, |_, current| Arc::ptr_eq(current, &session));
             return Ok(());
         }
 
-        drop(session);
-        if let Some(mut session) = udp_session_map.get_mut(&assoc_id) {
-            session.last_activity = std::time::Instant::now();
-            if is_updated {
-                session.update_last_location(remote_location.clone(), socket_addr);
-            }
+        session.last.lock().2 = tokio::time::Instant::now();
+        if is_updated {
+            session.update_last_location(remote_location.clone(), socket_addr);
         }
     } else {
         let is_new = !fragments.contains(&packet_id);
@@ -1231,17 +1308,13 @@ async fn process_udp_packet(
             .await
         {
             error!("Failed to forward UDP payload for session {assoc_id}: {e}");
-            drop(session);
-            udp_session_map.remove(&assoc_id);
+            udp_session_map.remove_if(&assoc_id, |_, current| Arc::ptr_eq(current, &session));
             return Ok(());
         }
 
-        drop(session);
-        if let Some(mut session) = udp_session_map.get_mut(&assoc_id) {
-            session.last_activity = std::time::Instant::now();
-            if is_updated {
-                session.update_last_location(remote_location.clone(), socket_addr);
-            }
+        session.last.lock().2 = tokio::time::Instant::now();
+        if is_updated {
+            session.update_last_location(remote_location.clone(), socket_addr);
         }
     }
 
@@ -1264,7 +1337,7 @@ async fn run_datagram_loop(
         let now = std::time::Instant::now();
         if (now - last_cleanup) > CLEANUP_INTERVAL {
             udp_session_map.retain(|assoc_id, session| {
-                if session.last_activity.elapsed() > IDLE_TIMEOUT {
+                if session.last.lock().2.elapsed() > IDLE_TIMEOUT {
                     // Cancel the session's background task before removing
                     session.cancel_token.cancel();
                     debug!("Removing inactive UDP session {assoc_id}");
