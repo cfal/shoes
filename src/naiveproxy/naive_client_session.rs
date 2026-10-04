@@ -22,6 +22,7 @@ use bytes::Bytes;
 use http::{Method, Request, Version};
 use log::debug;
 use rand::RngExt;
+use tokio::sync::oneshot;
 
 use crate::address::{Address, NetLocation};
 use crate::async_stream::AsyncStream;
@@ -41,18 +42,12 @@ use super::naive_padding_stream::{
 pub struct NaiveClientSession {
     /// The SendRequest handle - has internal Arc, cheap to clone
     send_request: h2::client::SendRequest<Bytes>,
-    /// Handle to abort the connection driver on drop (shared across clones)
     driver_handle: Arc<DriverHandle>,
 }
 
-/// Wrapper to abort the driver when all session clones are dropped.
-struct DriverHandle(tokio::task::AbortHandle);
-
-impl Drop for DriverHandle {
-    fn drop(&mut self) {
-        debug!("NaiveClientSession: all clones dropped, aborting connection driver");
-        self.0.abort();
-    }
+struct DriverHandle {
+    driver: tokio::task::AbortHandle,
+    _drain: oneshot::Sender<()>,
 }
 
 impl Clone for NaiveClientSession {
@@ -74,7 +69,7 @@ impl NaiveClientSession {
         const WINDOW_SIZE: u32 = 256 * 1024; // 256 KB (was 16 MB)
         const MAX_FRAME_SIZE: u32 = 16 * 1024;
 
-        let (send_request, connection) = h2::client::Builder::new()
+        let (send_request, mut connection) = h2::client::Builder::new()
             .initial_window_size(WINDOW_SIZE)
             .initial_connection_window_size(WINDOW_SIZE)
             .max_frame_size(MAX_FRAME_SIZE)
@@ -83,8 +78,14 @@ impl NaiveClientSession {
             .await
             .map_err(|e| io::Error::other(format!("H2 client handshake failed: {}", e)))?;
 
+        let (drain_tx, drain_rx) = oneshot::channel();
         let abort_handle = tokio::spawn(async move {
-            if let Err(e) = connection.await {
+            // Retired sessions must flush queued DATA and END_STREAM before teardown.
+            let result = tokio::select! {
+                result = &mut connection => Some(result),
+                _ = drain_rx => tokio::time::timeout(crate::util::SHUTDOWN_TIMEOUT, connection).await.ok(),
+            };
+            if let Some(Err(e)) = result {
                 debug!("NaiveProxy client H2 connection ended: {}", e);
             }
         })
@@ -94,13 +95,16 @@ impl NaiveClientSession {
 
         Ok(Self {
             send_request,
-            driver_handle: Arc::new(DriverHandle(abort_handle)),
+            driver_handle: Arc::new(DriverHandle {
+                driver: abort_handle,
+                _drain: drain_tx,
+            }),
         })
     }
 
     /// Check if this session is still usable for new streams.
     pub fn is_ready(&self) -> bool {
-        !self.driver_handle.0.is_finished()
+        !self.driver_handle.driver.is_finished()
     }
 
     pub fn same_generation(&self, other: &Self) -> bool {
@@ -210,6 +214,25 @@ fn format_authority(location: &NetLocation) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn last_owner_drain_is_bounded_when_peer_stalls() {
+        let (client, _peer) = tokio::io::duplex(64);
+        let mut session = NaiveClientSession::new(Box::new(client)).await.unwrap();
+        let request = Request::builder()
+            .method(Method::CONNECT)
+            .uri("example.com:443")
+            .body(())
+            .unwrap();
+        drop(session.send_request.send_request(request, false).unwrap());
+        let driver = session.driver_handle.driver.clone();
+        drop(session);
+        tokio::task::yield_now().await;
+        assert!(!driver.is_finished());
+        tokio::time::sleep(crate::util::SHUTDOWN_TIMEOUT + std::time::Duration::from_millis(1))
+            .await;
+        assert!(driver.is_finished());
+    }
 
     #[tokio::test]
     async fn active_stream_keeps_driver_after_session_slot_is_dropped() {
