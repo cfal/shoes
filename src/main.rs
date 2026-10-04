@@ -42,6 +42,7 @@ mod trojan_handler;
 mod tuic_server;
 #[cfg(unix)]
 mod tun;
+mod udp_fragments;
 mod udp_message_stream;
 mod uot;
 mod util;

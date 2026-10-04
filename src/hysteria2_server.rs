@@ -1,7 +1,5 @@
-use lru::LruCache;
 use std::collections::hash_map::Entry;
 use std::net::SocketAddr;
-use std::num::NonZeroUsize;
 use std::str;
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,10 +14,6 @@ use tokio::net::UdpSocket;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
-
-/// Maximum number of fragmented packets to track per session.
-/// Old entries are automatically evicted when this limit is reached.
-const MAX_FRAGMENT_CACHE_SIZE: usize = 256;
 
 /// Authentication timeout - close connection if client doesn't authenticate within this time.
 /// Default is 3 seconds per sing-box reference implementation.
@@ -37,6 +31,7 @@ use crate::quic_stream::QuicStream;
 use crate::resolver::{Resolver, ResolverCache};
 use crate::stream_reader::StreamReader;
 use crate::tcp::tcp_server::setup_client_tcp_stream;
+use crate::udp_fragments::UdpFragments;
 use crate::util::allocate_vec;
 
 async fn process_connection(
@@ -253,14 +248,13 @@ async fn auth_connection(
 }
 
 struct UdpSession {
-    fragments: LruCache<u16, FragmentedPacket>,
     send_socket: Arc<UdpSocket>,
     // we cache the last location in case of mid-session address changes, and
     // don't want to have to call ClientProxySelector::judge on every packet.
     last_location: NetLocation,
     last_socket_addr: SocketAddr,
     override_remote_write_address: Option<SocketAddr>,
-    last_activity: std::time::Instant,
+    last_activity: tokio::time::Instant,
     cancel_token: CancellationToken,
     task: Option<tokio::task::AbortHandle>,
 }
@@ -272,14 +266,6 @@ impl Drop for UdpSession {
             task.abort();
         }
     }
-}
-
-struct FragmentedPacket {
-    fragment_count: u8,
-    fragment_received: u8,
-    packet_len: usize,
-    received: Vec<Option<Bytes>>,
-    remote_location: NetLocation,
 }
 
 impl UdpSession {
@@ -299,12 +285,11 @@ impl UdpSession {
         let session_cancel_token = parent_cancel_token.child_token();
 
         let mut session = UdpSession {
-            fragments: LruCache::new(NonZeroUsize::new(MAX_FRAGMENT_CACHE_SIZE).unwrap()),
             send_socket: client_socket.clone(),
             last_location: initial_location,
             last_socket_addr: initial_socket_addr,
             override_remote_write_address,
-            last_activity: std::time::Instant::now(),
+            last_activity: tokio::time::Instant::now(),
             cancel_token: session_cancel_token.clone(),
             task: None,
         };
@@ -400,10 +385,12 @@ async fn run_udp_remote_to_local_loop(
         // session_id(4) + packet_id(2) + fragment id(1) + fragment count(1) + address length varint + address bytes
         let header_overhead = 4 + 2 + 1 + 1 + address_len_bytes.len() + address_bytes.len();
 
-        assert!(
-            max_datagram_size > header_overhead,
-            "max datagram size ({max_datagram_size}) is smaller than header overhead ({header_overhead})"
-        );
+        if max_datagram_size <= header_overhead {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "QUIC datagram cannot fit UDP header",
+            ));
+        }
 
         if header_overhead + payload_len <= max_datagram_size {
             let mut datagram = BytesMut::with_capacity(header_overhead + payload_len);
@@ -420,7 +407,10 @@ async fn run_udp_remote_to_local_loop(
                 .map_err(|e| std::io::Error::other(format!("Failed to send datagram: {e}")))?;
         } else {
             let available_payload = max_datagram_size - header_overhead;
-            let fragment_count = payload_len.div_ceil(available_payload) as u8;
+            let fragment_count =
+                u8::try_from(payload_len.div_ceil(available_payload)).map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, "too many UDP fragments")
+                })?;
             for fragment_id in 0..fragment_count {
                 let start = (fragment_id as usize) * available_payload;
                 let end = std::cmp::min(start + available_payload, payload_len);
@@ -442,6 +432,78 @@ async fn run_udp_remote_to_local_loop(
     }
 }
 
+struct UdpPacket<'a> {
+    session_id: u32,
+    packet_id: u16,
+    fragment_id: u8,
+    fragment_count: u8,
+    location: NetLocation,
+    payload: &'a [u8],
+}
+
+fn parse_udp_packet(data: &[u8]) -> std::io::Result<UdpPacket<'_>> {
+    let invalid = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid Hysteria UDP datagram",
+        )
+    };
+    if data.len() < 9 || data[7] == 0 || data[6] >= data[7] {
+        return Err(invalid());
+    }
+    let length = 1usize << (data[8] >> 6);
+    let encoded = data.get(8..8 + length).ok_or_else(invalid)?;
+    let address_len = encoded[1..]
+        .iter()
+        .fold((encoded[0] & 63) as u64, |value, byte| {
+            (value << 8) | *byte as u64
+        });
+    if address_len == 0 || address_len > 2048 {
+        return Err(invalid());
+    }
+    let end = 8 + length + address_len as usize;
+    let address = data.get(8 + length..end).ok_or_else(invalid)?;
+    let location = NetLocation::from_str(str::from_utf8(address).map_err(|_| invalid())?, None)?;
+    Ok(UdpPacket {
+        session_id: u32::from_be_bytes(data[..4].try_into().unwrap()),
+        packet_id: u16::from_be_bytes(data[4..6].try_into().unwrap()),
+        fragment_id: data[6],
+        fragment_count: data[7],
+        location,
+        payload: &data[end..],
+    })
+}
+
+#[cfg(test)]
+mod datagram_tests {
+    use super::*;
+
+    #[test]
+    fn truncated_varints_and_fragment_indices_never_panic() {
+        for first in [0x00, 0x40, 0x80, 0xc0] {
+            let mut packet = vec![0; 9];
+            packet[7] = 1;
+            packet[8] = first;
+            assert!(parse_udp_packet(&packet).is_err());
+        }
+        let address = b"127.0.0.1:53";
+        let mut packet = vec![0, 0, 0, 1, 0, 1, 0, 1, address.len() as u8];
+        packet.extend_from_slice(address);
+        packet.extend_from_slice(b"payload");
+        assert_eq!(parse_udp_packet(&packet).unwrap().payload, b"payload");
+        for len in 0..packet.len() {
+            let _ = parse_udp_packet(&packet[..len]);
+        }
+        for count in [0, 1, 2, 255] {
+            for id in 0..=255 {
+                packet[6] = id;
+                packet[7] = count;
+                assert_eq!(parse_udp_packet(&packet).is_ok(), count != 0 && id < count);
+            }
+        }
+    }
+}
+
 async fn run_udp_local_to_remote_loop(
     connection: quinn::Connection,
     client_proxy_selector: Arc<ClientProxySelector>,
@@ -450,102 +512,45 @@ async fn run_udp_local_to_remote_loop(
 ) -> std::io::Result<()> {
     let mut resolver_cache = ResolverCache::new(resolver.clone());
     let mut sessions: FxHashMap<u32, UdpSession> = FxHashMap::default();
-    let mut last_cleanup = std::time::Instant::now();
-
-    // Match reference implementation defaults for UDP session management
-    const CLEANUP_INTERVAL: Duration = Duration::from_secs(10);
+    let mut fragments = UdpFragments::new();
+    let mut cleanup = tokio::time::interval(Duration::from_secs(1));
     const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
     loop {
-        let now = std::time::Instant::now();
-        if (now - last_cleanup) > CLEANUP_INTERVAL {
-            sessions.retain(|session_id, session| {
-                if session.last_activity.elapsed() > IDLE_TIMEOUT {
-                    // Cancel the session's background task before removing
-                    session.cancel_token.cancel();
-                    debug!("Removing inactive UDP session {session_id}");
-                    false
-                } else {
-                    true
-                }
-            });
-            last_cleanup = now;
-        }
-
-        let data = connection
-            .read_datagram()
-            .await
-            .map_err(|err| std::io::Error::other(format!("failed to read datagram: {err}")))?;
-
-        // Per official hysteria reference (server.go:332-353), parse errors are ignored
-        // and we continue waiting for the next message. Only connection errors are fatal.
-        if data.len() < 9 {
-            debug!("Ignoring short datagram (len={})", data.len());
-            continue;
-        }
-        let session_id = u32::from_be_bytes(data[0..4].try_into().unwrap());
-        let packet_id = u16::from_be_bytes(data[4..6].try_into().unwrap());
-        let fragment_id = data[6];
-        let fragment_count = data[7];
-
-        let (address_len, next_index) = {
-            let first_byte = data[8];
-            let length_indicator = first_byte >> 6;
-            let mut value: u64 = (first_byte & 0b00111111) as u64;
-            let num_bytes = match length_indicator {
-                0 => 1,
-                1 => 2,
-                2 => 4,
-                3 => 8,
-                _ => {
-                    // impossible since we only have 2 bits
-                    unreachable!();
-                }
-            };
-            let mut next_index = 9;
-            if num_bytes > 1 {
-                let remaining = &data[9..9 + (num_bytes - 1)];
-                for byte in remaining {
-                    value <<= 8;
-                    value |= *byte as u64;
-                }
-                next_index += num_bytes - 1;
+        let data = tokio::select! {
+            _ = cancel_token.cancelled() => return Ok(()),
+            _ = cleanup.tick() => {
+                fragments.expire();
+                sessions.retain(|_, session| session.last_activity.elapsed() < IDLE_TIMEOUT);
+                continue;
             }
-            (value as usize, next_index)
+            data = connection.read_datagram() => data.map_err(|err| std::io::Error::other(format!("failed to read datagram: {err}")))?,
         };
-
-        if address_len == 0 {
-            debug!("Ignoring packet with empty address");
-            continue;
-        }
-
-        if address_len > 2048 {
-            debug!("Ignoring packet with address length {address_len}");
-            continue;
-        }
-
-        if data.len() < next_index + address_len {
-            debug!("Ignoring datagram with truncated address");
-            continue;
-        }
-        let address_bytes = &data[next_index..next_index + address_len];
-        let payload_fragment = data.slice(next_index + address_len..);
-
-        let addr_str = match str::from_utf8(address_bytes) {
-            Ok(s) => s,
+        let packet = match parse_udp_packet(&data) {
+            Ok(packet) => packet,
             Err(e) => {
-                debug!("Invalid UTF-8 in address: {e}");
+                debug!("Ignoring invalid Hysteria UDP datagram: {e}");
                 continue;
             }
         };
-
-        let remote_location = match NetLocation::from_str(addr_str, None) {
-            Ok(loc) => loc,
+        let session_id = packet.session_id;
+        let (remote_location, complete_payload) = match fragments.push(
+            (session_id, packet.packet_id),
+            packet.fragment_count,
+            packet.fragment_id,
+            Some(packet.location),
+            packet.payload,
+        ) {
+            Ok(Some(packet)) => packet,
+            Ok(None) => continue,
             Err(e) => {
-                debug!("Failed to parse address '{addr_str}': {e}");
+                debug!("Ignoring invalid Hysteria fragments: {e}");
                 continue;
             }
         };
+        if sessions.len() >= 64 && !sessions.contains_key(&session_id) {
+            continue;
+        }
 
         let mut session_entry = sessions.entry(session_id);
         let session = match session_entry {
@@ -625,68 +630,6 @@ async fn run_udp_local_to_remote_loop(
             Entry::Occupied(ref mut entry) => entry.get_mut(),
         };
 
-        let (complete_payload, remote_location) = if fragment_count == 0 {
-            error!("Ignoring empty UDP fragment for session {session_id}");
-            continue;
-        } else if fragment_count == 1 {
-            (payload_fragment, remote_location)
-        } else {
-            let is_new = !session.fragments.contains(&packet_id);
-
-            if is_new {
-                session.fragments.put(
-                    packet_id,
-                    FragmentedPacket {
-                        fragment_count,
-                        fragment_received: 0,
-                        packet_len: 0,
-                        received: vec![None; fragment_count as usize],
-                        remote_location: remote_location.clone(),
-                    },
-                );
-            }
-
-            let entry = match session.fragments.get_mut(&packet_id) {
-                Some(e) => e,
-                None => {
-                    // This shouldn't happen since we just inserted it
-                    error!("Fragment cache error for session {session_id}");
-                    continue;
-                }
-            };
-
-            if entry.fragment_count != fragment_count {
-                session.fragments.pop(&packet_id);
-                error!("Mismatched fragment count for session {session_id} packet {packet_id}");
-                continue;
-            }
-            if entry.received[fragment_id as usize].is_some() {
-                session.fragments.pop(&packet_id);
-                error!("Duplicate fragment for session {session_id} packet {packet_id}");
-                continue;
-            }
-            entry.fragment_received += 1;
-            entry.packet_len += payload_fragment.len();
-            entry.received[fragment_id as usize] = Some(payload_fragment);
-
-            if entry.fragment_received != entry.fragment_count {
-                continue;
-            }
-
-            // All fragments received - remove from cache and process
-            let FragmentedPacket {
-                remote_location: initial_location,
-                received,
-                packet_len,
-                ..
-            } = session.fragments.pop(&packet_id).unwrap();
-            let mut complete_payload = BytesMut::with_capacity(packet_len);
-            for frag in received.iter() {
-                complete_payload.extend_from_slice(frag.as_ref().unwrap());
-            }
-            (complete_payload.freeze(), initial_location)
-        };
-
         let socket_addr = match session.override_remote_write_address {
             Some(addr) => addr,
             None => {
@@ -734,6 +677,7 @@ async fn run_udp_local_to_remote_loop(
             }
         };
 
+        session.last_activity = tokio::time::Instant::now();
         if let Err(e) = session
             .send_socket
             .send_to(&complete_payload, socket_addr)
