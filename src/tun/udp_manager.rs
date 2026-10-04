@@ -522,34 +522,6 @@ async fn destination_task(
     }
 }
 
-#[cfg(test)]
-mod lifecycle_tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn lru_eviction_aborts_stalled_session() {
-        let marker = Arc::new(());
-        let weak = Arc::downgrade(&marker);
-        let make_session = |marker| {
-            let (tx, _rx) = mpsc::channel(1);
-            Session {
-                tx,
-                handle: tokio::spawn(async move {
-                    let _marker = marker;
-                    std::future::pending::<()>().await;
-                }),
-                last_active: Instant::now(),
-            }
-        };
-        let mut sessions = LruCache::new(NonZeroUsize::new(1).unwrap());
-        sessions.push(1, make_session(marker));
-        tokio::task::yield_now().await;
-        sessions.push(2, make_session(Arc::new(())));
-        tokio::task::yield_now().await;
-        assert_eq!(weak.strong_count(), 0);
-    }
-}
-
 /// Create a connection to a destination through the proxy chain.
 async fn create_connection(
     dest: &NetLocation,
@@ -580,4 +552,32 @@ async fn send_message(stream: &mut Box<dyn AsyncMessageStream>, data: &[u8]) -> 
     std::future::poll_fn(|cx| Pin::new(&mut **stream).poll_write_message(cx, data)).await?;
     std::future::poll_fn(|cx| Pin::new(&mut **stream).poll_flush_message(cx)).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn lru_eviction_aborts_stalled_session() {
+        let marker = Arc::new(());
+        let weak = Arc::downgrade(&marker);
+        let make_session = |marker| {
+            let (tx, _rx) = mpsc::channel(1);
+            Session {
+                tx,
+                handle: tokio::spawn(async move {
+                    let _marker = marker;
+                    std::future::pending::<()>().await;
+                }),
+                last_active: Instant::now(),
+            }
+        };
+        let mut sessions = LruCache::new(NonZeroUsize::new(1).unwrap());
+        sessions.push(1, make_session(marker));
+        tokio::task::yield_now().await;
+        sessions.push(2, make_session(Arc::new(())));
+        tokio::task::yield_now().await;
+        assert_eq!(weak.strong_count(), 0);
+    }
 }

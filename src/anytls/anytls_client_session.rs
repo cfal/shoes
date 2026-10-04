@@ -48,142 +48,6 @@ pub(super) enum OutgoingMessage {
     },
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::time::Duration;
-
-    async fn open() -> (
-        Arc<AnyTlsClientSession>,
-        AnyTlsStream,
-        tokio::io::DuplexStream,
-    ) {
-        let (transport, peer) = tokio::io::duplex(128);
-        let session = AnyTlsClientSession::new(
-            Box::new(transport),
-            "test",
-            PaddingFactory::default_factory(),
-        )
-        .await
-        .unwrap();
-        let stream = session
-            .open_stream(NetLocation::from_str("127.0.0.1:12345", None).unwrap())
-            .await
-            .unwrap();
-        (session, stream, peer)
-    }
-
-    #[tokio::test]
-    async fn stalled_transport_backpressures_all_streams() {
-        let (session, mut stream, peer) = open().await;
-        let bytes = vec![1; 2 * 1024 * 1024];
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), stream.write_all(&bytes))
-                .await
-                .is_err()
-        );
-        assert!(session.state.outgoing_tx.capacity() <= STREAM_CHANNEL_BUFFER);
-        drop(peer);
-    }
-
-    #[tokio::test]
-    async fn transport_eof_wakes_parked_reader() {
-        let (session, mut stream, mut peer) = open().await;
-        peer.shutdown().await.unwrap();
-        let mut byte = [0];
-        let result = tokio::time::timeout(Duration::from_secs(1), stream.read(&mut byte))
-            .await
-            .unwrap();
-        assert_eq!(result.unwrap(), 0);
-        assert!(session.state.streams.lock().is_empty());
-    }
-
-    #[tokio::test]
-    async fn dropping_last_owner_cancels_stalled_io() {
-        let (session, mut stream, _peer) = open().await;
-        stream.write_all(b"payload").await.unwrap();
-        tokio::task::yield_now().await;
-        let state = Arc::downgrade(&session.state);
-        let tasks = session.tasks.clone();
-        drop(session);
-        drop(stream);
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while tasks.iter().any(|task| !task.is_finished()) {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-        assert!(state.upgrade().is_none());
-    }
-
-    #[tokio::test]
-    async fn cancelled_stream_open_releases_registration() {
-        let (session, stream, _peer) = open().await;
-        session.state.peer_version.store(2, Ordering::Relaxed);
-        let destination = NetLocation::from_str("127.0.0.1:12345", None).unwrap();
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), session.open_stream(destination))
-                .await
-                .is_err()
-        );
-        assert_eq!(session.state.streams.lock().len(), 1);
-        assert!(session.state.pending_opens.lock().is_empty());
-        drop(stream);
-        assert!(session.state.streams.lock().is_empty());
-    }
-
-    #[tokio::test]
-    async fn shutdown_drains_data_after_a_cancelled_flush() {
-        let (transport, mut peer) = tokio::io::duplex(64);
-        let padding = Arc::new(PaddingFactory::new(b"stop=1\n0=0-0").unwrap());
-        let session = AnyTlsClientSession::new(Box::new(transport), "test", padding)
-            .await
-            .unwrap();
-        let mut stream = session
-            .open_stream(NetLocation::from_str("127.0.0.1:12345", None).unwrap())
-            .await
-            .unwrap();
-        stream.write_all(b"first").await.unwrap();
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), stream.flush())
-                .await
-                .is_err()
-        );
-        let reader = tokio::spawn(async move {
-            let mut auth = [0; 34];
-            peer.read_exact(&mut auth).await.unwrap();
-            let mut bytes = Vec::new();
-            peer.read_to_end(&mut bytes).await.unwrap();
-            let mut buffer = BytesMut::from(bytes.as_slice());
-            let mut payloads = Vec::new();
-            let mut fin = false;
-            while let Some(frame) = FrameCodec::decode(&mut buffer).unwrap() {
-                if frame.cmd == Command::Psh {
-                    assert!(!fin);
-                    payloads.push(frame.data);
-                }
-                if frame.cmd == Command::Fin {
-                    fin = true;
-                }
-            }
-            assert!(fin);
-            assert_eq!(
-                &payloads[1..],
-                &[Bytes::from_static(b"first"), Bytes::from_static(b"second")]
-            );
-        });
-        stream.write_all(b"second").await.unwrap();
-        stream.shutdown().await.unwrap();
-        drop(stream);
-        drop(session);
-        tokio::time::timeout(Duration::from_secs(1), reader)
-            .await
-            .unwrap()
-            .unwrap();
-    }
-}
-
 /// AnyTLS client session - manages multiplexed streams over a connection
 ///
 /// Each session handles:
@@ -1033,5 +897,141 @@ impl ClientSessionState {
         registration.armed = false;
 
         Ok(stream)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    async fn open() -> (
+        Arc<AnyTlsClientSession>,
+        AnyTlsStream,
+        tokio::io::DuplexStream,
+    ) {
+        let (transport, peer) = tokio::io::duplex(128);
+        let session = AnyTlsClientSession::new(
+            Box::new(transport),
+            "test",
+            PaddingFactory::default_factory(),
+        )
+        .await
+        .unwrap();
+        let stream = session
+            .open_stream(NetLocation::from_str("127.0.0.1:12345", None).unwrap())
+            .await
+            .unwrap();
+        (session, stream, peer)
+    }
+
+    #[tokio::test]
+    async fn stalled_transport_backpressures_all_streams() {
+        let (session, mut stream, peer) = open().await;
+        let bytes = vec![1; 2 * 1024 * 1024];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), stream.write_all(&bytes))
+                .await
+                .is_err()
+        );
+        assert!(session.state.outgoing_tx.capacity() <= STREAM_CHANNEL_BUFFER);
+        drop(peer);
+    }
+
+    #[tokio::test]
+    async fn transport_eof_wakes_parked_reader() {
+        let (session, mut stream, mut peer) = open().await;
+        peer.shutdown().await.unwrap();
+        let mut byte = [0];
+        let result = tokio::time::timeout(Duration::from_secs(1), stream.read(&mut byte))
+            .await
+            .unwrap();
+        assert_eq!(result.unwrap(), 0);
+        assert!(session.state.streams.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn dropping_last_owner_cancels_stalled_io() {
+        let (session, mut stream, _peer) = open().await;
+        stream.write_all(b"payload").await.unwrap();
+        tokio::task::yield_now().await;
+        let state = Arc::downgrade(&session.state);
+        let tasks = session.tasks.clone();
+        drop(session);
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while tasks.iter().any(|task| !task.is_finished()) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(state.upgrade().is_none());
+    }
+
+    #[tokio::test]
+    async fn cancelled_stream_open_releases_registration() {
+        let (session, stream, _peer) = open().await;
+        session.state.peer_version.store(2, Ordering::Relaxed);
+        let destination = NetLocation::from_str("127.0.0.1:12345", None).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), session.open_stream(destination))
+                .await
+                .is_err()
+        );
+        assert_eq!(session.state.streams.lock().len(), 1);
+        assert!(session.state.pending_opens.lock().is_empty());
+        drop(stream);
+        assert!(session.state.streams.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_data_after_a_cancelled_flush() {
+        let (transport, mut peer) = tokio::io::duplex(64);
+        let padding = Arc::new(PaddingFactory::new(b"stop=1\n0=0-0").unwrap());
+        let session = AnyTlsClientSession::new(Box::new(transport), "test", padding)
+            .await
+            .unwrap();
+        let mut stream = session
+            .open_stream(NetLocation::from_str("127.0.0.1:12345", None).unwrap())
+            .await
+            .unwrap();
+        stream.write_all(b"first").await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), stream.flush())
+                .await
+                .is_err()
+        );
+        let reader = tokio::spawn(async move {
+            let mut auth = [0; 34];
+            peer.read_exact(&mut auth).await.unwrap();
+            let mut bytes = Vec::new();
+            peer.read_to_end(&mut bytes).await.unwrap();
+            let mut buffer = BytesMut::from(bytes.as_slice());
+            let mut payloads = Vec::new();
+            let mut fin = false;
+            while let Some(frame) = FrameCodec::decode(&mut buffer).unwrap() {
+                if frame.cmd == Command::Psh {
+                    assert!(!fin);
+                    payloads.push(frame.data);
+                }
+                if frame.cmd == Command::Fin {
+                    fin = true;
+                }
+            }
+            assert!(fin);
+            assert_eq!(
+                &payloads[1..],
+                &[Bytes::from_static(b"first"), Bytes::from_static(b"second")]
+            );
+        });
+        stream.write_all(b"second").await.unwrap();
+        stream.shutdown().await.unwrap();
+        drop(stream);
+        drop(session);
+        tokio::time::timeout(Duration::from_secs(1), reader)
+            .await
+            .unwrap()
+            .unwrap();
     }
 }

@@ -447,36 +447,6 @@ fn parse_udp_packet(data: &[u8]) -> std::io::Result<UdpPacket<'_>> {
     })
 }
 
-#[cfg(test)]
-mod datagram_tests {
-    use super::*;
-
-    #[test]
-    fn truncated_varints_and_fragment_indices_never_panic() {
-        for first in [0x00, 0x40, 0x80, 0xc0] {
-            let mut packet = vec![0; 9];
-            packet[7] = 1;
-            packet[8] = first;
-            assert!(parse_udp_packet(&packet).is_err());
-        }
-        let address = b"127.0.0.1:53";
-        let mut packet = vec![0, 0, 0, 1, 0, 1, 0, 1, address.len() as u8];
-        packet.extend_from_slice(address);
-        packet.extend_from_slice(b"payload");
-        assert_eq!(parse_udp_packet(&packet).unwrap().payload, b"payload");
-        for len in 0..packet.len() {
-            let _ = parse_udp_packet(&packet[..len]);
-        }
-        for count in [0, 1, 2, 255] {
-            for id in 0..=255 {
-                packet[6] = id;
-                packet[7] = count;
-                assert_eq!(parse_udp_packet(&packet).is_ok(), count != 0 && id < count);
-            }
-        }
-    }
-}
-
 async fn run_udp_local_to_remote_loop(
     connection: quinn::Connection,
     client_proxy_selector: Arc<ClientProxySelector>,
@@ -913,4 +883,34 @@ pub async fn start_hysteria2_server(
     }
 
     Ok(join_handles)
+}
+
+#[cfg(test)]
+mod datagram_tests {
+    use super::*;
+
+    #[test]
+    fn truncated_varints_and_fragment_indices_never_panic() {
+        for first in [0x00, 0x40, 0x80, 0xc0] {
+            let mut packet = vec![0; 9];
+            packet[7] = 1;
+            packet[8] = first;
+            assert!(parse_udp_packet(&packet).is_err());
+        }
+        let address = b"127.0.0.1:53";
+        let mut packet = vec![0, 0, 0, 1, 0, 1, 0, 1, address.len() as u8];
+        packet.extend_from_slice(address);
+        packet.extend_from_slice(b"payload");
+        assert_eq!(parse_udp_packet(&packet).unwrap().payload, b"payload");
+        for len in 0..packet.len() {
+            let _ = parse_udp_packet(&packet[..len]);
+        }
+        for count in [0, 1, 2, 255] {
+            for id in 0..=255 {
+                packet[6] = id;
+                packet[7] = count;
+                assert_eq!(parse_udp_packet(&packet).is_ok(), count != 0 && id < count);
+            }
+        }
+    }
 }

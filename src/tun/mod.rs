@@ -74,31 +74,6 @@ use udp_manager::TunUdpManager;
 
 type PacketBuffer = Vec<u8>;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::os::fd::AsRawFd;
-
-    #[tokio::test]
-    async fn borrowed_tun_fd_remains_open_after_stop() {
-        let (_peer, client) = std::os::unix::net::UnixStream::pair().unwrap();
-        let config = TunServerConfig::new()
-            .raw_fd(client.as_raw_fd())
-            .close_fd_on_drop(false);
-        let (tx, rx) = oneshot::channel();
-        tx.send(()).unwrap();
-        run_tun_server(
-            config,
-            Arc::new(ClientProxySelector::new(Vec::new())),
-            Arc::new(crate::resolver::NativeResolver::new()),
-            rx,
-        )
-        .await
-        .unwrap();
-        assert!(unsafe { libc::fcntl(client.as_raw_fd(), libc::F_GETFD) } >= 0);
-    }
-}
-
 /// Run the TUN server with the given configuration.
 ///
 /// This function:
@@ -408,4 +383,29 @@ pub async fn run_tun_from_config(
         shutdown_rx,
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::fd::AsRawFd;
+
+    #[tokio::test]
+    async fn borrowed_tun_fd_remains_open_after_stop() {
+        let (_peer, client) = std::os::unix::net::UnixStream::pair().unwrap();
+        let config = TunServerConfig::new()
+            .raw_fd(client.as_raw_fd())
+            .close_fd_on_drop(false);
+        let (tx, rx) = oneshot::channel();
+        tx.send(()).unwrap();
+        run_tun_server(
+            config,
+            Arc::new(ClientProxySelector::new(Vec::new())),
+            Arc::new(crate::resolver::NativeResolver::new()),
+            rx,
+        )
+        .await
+        .unwrap();
+        assert!(unsafe { libc::fcntl(client.as_raw_fd(), libc::F_GETFD) } >= 0);
+    }
 }

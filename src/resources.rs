@@ -199,14 +199,21 @@ pub struct ResourceSnapshot {
 
 impl std::fmt::Display for BudgetSnapshot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "active={} peak={} refused={}", self.active, self.peak, self.rejected)
+        write!(
+            f,
+            "active={} peak={} refused={}",
+            self.active, self.peak, self.rejected
+        )
     }
 }
 
 impl std::fmt::Display for ResourceSnapshot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "connections[{}] streams[{}] quic_reserved_bytes[{}] per_ip_refused={}",
-            self.connections, self.streams, self.quic_buffer_bytes, self.peer_rejections)
+        write!(
+            f,
+            "connections[{}] streams[{}] quic_reserved_bytes[{}] per_ip_refused={}",
+            self.connections, self.streams, self.quic_buffer_bytes, self.peer_rejections
+        )
     }
 }
 
@@ -300,11 +307,16 @@ mod tests {
             assert!(PEERS.lock().is_empty());
         } else {
             let status = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "resources::tests::environment_limits_apply_in_a_fresh_process", "--quiet"])
+                .args([
+                    "--exact",
+                    "resources::tests::environment_limits_apply_in_a_fresh_process",
+                    "--quiet",
+                ])
                 .env("SHOES_RESOURCE_TEST_CHILD", "1")
                 .env("SHOES_MAX_CONNECTIONS", "2")
                 .env("SHOES_MAX_CONNECTIONS_PER_IP", "1")
-                .status().unwrap();
+                .status()
+                .unwrap();
             assert!(status.success());
         }
     }

@@ -62,67 +62,6 @@ impl UdpState {
     }
 }
 
-#[cfg(test)]
-mod lifecycle_tests {
-    use super::*;
-
-    #[test]
-    fn truncated_payload_with_absent_address_is_rejected() {
-        assert!(parse_udp_packet(&[5, 2, 0, 1, 0, 1, 2, 1, 0, 1, 0xff]).is_err());
-        let mut packet = vec![5, 2, 0, 1, 0, 1, 1, 0, 0, 3, 1, 127, 0, 0, 1, 0, 53];
-        packet.extend_from_slice(b"dns");
-        assert_eq!(parse_udp_packet(&packet).unwrap().payload_fragment, b"dns");
-        for len in 0..packet.len() {
-            assert!(parse_udp_packet(&packet[..len]).is_err());
-        }
-        for count in [0, 1, 2, 255] {
-            for id in 0..=255 {
-                packet[6] = count;
-                packet[7] = id;
-                assert_eq!(parse_udp_packet(&packet).is_ok(), count != 0 && id < count);
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn map_removal_releases_reply_task() {
-        let socket = Arc::new(
-            UdpRelay::new(
-                Arc::new(ClientProxySelector::new(Vec::new())),
-                Arc::new(crate::resolver::NativeResolver::new()),
-            )
-            .unwrap(),
-        );
-        let weak = Arc::downgrade(&socket);
-        let token = CancellationToken::new();
-        let task_socket = socket.clone();
-        let task = tokio::spawn(async move {
-            let _socket = task_socket;
-            std::future::pending::<()>().await;
-        });
-        let session = Arc::new(UdpSession {
-            send_socket: socket,
-            pinned_location: None,
-            cancel_token: token.clone(),
-            task: Some(task.abort_handle()),
-            _permit: None,
-        });
-        let map: UdpSessionMap = Arc::new(UdpState::new());
-        map.sessions.insert(1, session);
-        let snapshot = map
-            .sessions
-            .get(&1)
-            .map(|entry| entry.value().clone())
-            .unwrap();
-        map.sessions.remove(&1);
-        assert!(!token.is_cancelled());
-        drop(snapshot);
-        assert!(token.is_cancelled());
-        let _ = task.await;
-        assert!(weak.upgrade().is_none());
-    }
-}
-
 async fn process_connection(
     client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
@@ -1363,4 +1302,65 @@ pub async fn start_tuic_server(
     }
 
     Ok(join_handles)
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    #[test]
+    fn truncated_payload_with_absent_address_is_rejected() {
+        assert!(parse_udp_packet(&[5, 2, 0, 1, 0, 1, 2, 1, 0, 1, 0xff]).is_err());
+        let mut packet = vec![5, 2, 0, 1, 0, 1, 1, 0, 0, 3, 1, 127, 0, 0, 1, 0, 53];
+        packet.extend_from_slice(b"dns");
+        assert_eq!(parse_udp_packet(&packet).unwrap().payload_fragment, b"dns");
+        for len in 0..packet.len() {
+            assert!(parse_udp_packet(&packet[..len]).is_err());
+        }
+        for count in [0, 1, 2, 255] {
+            for id in 0..=255 {
+                packet[6] = count;
+                packet[7] = id;
+                assert_eq!(parse_udp_packet(&packet).is_ok(), count != 0 && id < count);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn map_removal_releases_reply_task() {
+        let socket = Arc::new(
+            UdpRelay::new(
+                Arc::new(ClientProxySelector::new(Vec::new())),
+                Arc::new(crate::resolver::NativeResolver::new()),
+            )
+            .unwrap(),
+        );
+        let weak = Arc::downgrade(&socket);
+        let token = CancellationToken::new();
+        let task_socket = socket.clone();
+        let task = tokio::spawn(async move {
+            let _socket = task_socket;
+            std::future::pending::<()>().await;
+        });
+        let session = Arc::new(UdpSession {
+            send_socket: socket,
+            pinned_location: None,
+            cancel_token: token.clone(),
+            task: Some(task.abort_handle()),
+            _permit: None,
+        });
+        let map: UdpSessionMap = Arc::new(UdpState::new());
+        map.sessions.insert(1, session);
+        let snapshot = map
+            .sessions
+            .get(&1)
+            .map(|entry| entry.value().clone())
+            .unwrap();
+        map.sessions.remove(&1);
+        assert!(!token.is_cancelled());
+        drop(snapshot);
+        assert!(token.is_cancelled());
+        let _ = task.await;
+        assert!(weak.upgrade().is_none());
+    }
 }

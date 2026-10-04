@@ -88,56 +88,6 @@ enum DecryptState {
 
 const METADATA_SIZE: usize = 2 + (2 * TAG_LEN);
 
-#[cfg(test)]
-mod replay_tests {
-    use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    #[derive(Debug)]
-    struct CountingChecker(Arc<AtomicUsize>);
-    impl SaltChecker for CountingChecker {
-        fn insert_and_check(&mut self, _: &[u8]) -> bool {
-            self.0.fetch_add(1, Ordering::Relaxed);
-            true
-        }
-    }
-
-    #[tokio::test]
-    async fn legacy_salt_is_admitted_only_after_payload_authentication() {
-        let key: Arc<Box<dyn ShadowsocksKey>> = Arc::new(Box::new(
-            super::super::default_key::DefaultKey::new("secret", 32),
-        ));
-        let make_stream = |checker| {
-            let (stream, _peer) = tokio::io::duplex(4096);
-            ShadowsocksStream::new(
-                Box::new(stream),
-                ShadowsocksStreamType::Aead,
-                &aws_lc_rs::aead::AES_256_GCM,
-                32,
-                key.clone(),
-                checker,
-            )
-        };
-        let mut writer = make_stream(None);
-        writer.process_write_header(b"hello").unwrap();
-        let wire = writer.write_cache[..writer.write_cache_end_offset].to_vec();
-        for corrupt in [true, false] {
-            let calls = Arc::new(AtomicUsize::new(0));
-            let mut reader =
-                make_stream(Some(Arc::new(Mutex::new(CountingChecker(calls.clone())))));
-            reader.unprocessed_buf[..wire.len()].copy_from_slice(&wire);
-            reader.unprocessed_end_offset = wire.len();
-            if corrupt {
-                reader.unprocessed_buf[wire.len() - 1] ^= 1;
-            }
-            reader.process_read_header().unwrap();
-            assert_eq!(calls.load(Ordering::Relaxed), 0);
-            assert_eq!(reader.try_decrypt().is_ok(), !corrupt);
-            assert_eq!(calls.load(Ordering::Relaxed), usize::from(!corrupt));
-        }
-    }
-}
-
 impl ShadowsocksStream {
     pub fn new(
         stream: Box<dyn AsyncStream>,
@@ -968,4 +918,54 @@ impl AsyncMessageStream for ShadowsocksStream {}
 #[inline]
 fn current_time_secs() -> u64 {
     SystemTime::UNIX_EPOCH.elapsed().unwrap().as_secs()
+}
+
+#[cfg(test)]
+mod replay_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Debug)]
+    struct CountingChecker(Arc<AtomicUsize>);
+    impl SaltChecker for CountingChecker {
+        fn insert_and_check(&mut self, _: &[u8]) -> bool {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_salt_is_admitted_only_after_payload_authentication() {
+        let key: Arc<Box<dyn ShadowsocksKey>> = Arc::new(Box::new(
+            super::super::default_key::DefaultKey::new("secret", 32),
+        ));
+        let make_stream = |checker| {
+            let (stream, _peer) = tokio::io::duplex(4096);
+            ShadowsocksStream::new(
+                Box::new(stream),
+                ShadowsocksStreamType::Aead,
+                &aws_lc_rs::aead::AES_256_GCM,
+                32,
+                key.clone(),
+                checker,
+            )
+        };
+        let mut writer = make_stream(None);
+        writer.process_write_header(b"hello").unwrap();
+        let wire = writer.write_cache[..writer.write_cache_end_offset].to_vec();
+        for corrupt in [true, false] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut reader =
+                make_stream(Some(Arc::new(Mutex::new(CountingChecker(calls.clone())))));
+            reader.unprocessed_buf[..wire.len()].copy_from_slice(&wire);
+            reader.unprocessed_end_offset = wire.len();
+            if corrupt {
+                reader.unprocessed_buf[wire.len() - 1] ^= 1;
+            }
+            reader.process_read_header().unwrap();
+            assert_eq!(calls.load(Ordering::Relaxed), 0);
+            assert_eq!(reader.try_decrypt().is_ok(), !corrupt);
+            assert_eq!(calls.load(Ordering::Relaxed), usize::from(!corrupt));
+        }
+    }
 }
