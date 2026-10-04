@@ -1234,6 +1234,7 @@ fn validate_tun_config(
     client_groups: &HashMap<String, Vec<ClientConfig>>,
     rule_groups: &HashMap<String, Vec<RuleConfig>>,
 ) -> std::io::Result<()> {
+    config.resource_limits.validate()?;
     // Validate ICMP requires TCP
     if !config.tcp_enabled && config.icmp_enabled {
         return Err(std::io::Error::new(
@@ -2032,6 +2033,7 @@ mod tests {
     async fn test_tun_icmp_requires_tcp() {
         // ICMP requires TCP to be enabled
         let tun_config = TunConfig {
+            resource_limits: Default::default(),
             device_name: Some("tun0".to_string()),
             device_fd: None,
             address: Some("10.0.0.1".parse().unwrap()),

@@ -36,6 +36,7 @@ use smoltcp::{
 use tokio::sync::mpsc::{self, Receiver, Sender};
 
 use super::tcp_conn::{TcpConnection, TcpConnectionControl, TcpSocketState};
+use crate::config::tun::TunResourceLimits;
 
 pub type PacketBuffer = Vec<u8>;
 pub const PACKET_QUEUE_CAPACITY: usize = 64;
@@ -160,7 +161,12 @@ impl TcpStackDirect {
     ///
     /// This spawns a dedicated OS thread for running the smoltcp interface.
     /// The thread uses `select()` on the fd for efficient event-driven I/O.
+    #[cfg(test)]
     pub fn new(tun_fd: OwnedFd, mtu: usize) -> Self {
+        Self::with_limits(tun_fd, mtu, TunResourceLimits::default())
+    }
+
+    pub fn with_limits(tun_fd: OwnedFd, mtu: usize, limits: TunResourceLimits) -> Self {
         let fd = tun_fd.as_raw_fd();
         let (udp_tx, udp_rx) = mpsc::channel(PACKET_QUEUE_CAPACITY);
 
@@ -178,7 +184,14 @@ impl TcpStackDirect {
                 .name("shoes-smoltcp-direct".to_owned())
                 .spawn(move || {
                     let result = panic::catch_unwind(AssertUnwindSafe(|| {
-                        run_direct_stack_thread(fd, mtu, udp_tx, running.clone(), shared_state);
+                        run_direct_stack_thread(
+                            fd,
+                            mtu,
+                            udp_tx,
+                            running.clone(),
+                            shared_state,
+                            limits,
+                        );
                     }));
 
                     match result {
@@ -373,11 +386,7 @@ impl TxToken for DirectTxToken {
     }
 }
 
-// Buffer sizes matched to netstack-smoltcp: 0x3FFF * 20 = 327,660 bytes (~320KB)
-const TCP_SEND_BUFFER_SIZE: usize = 0x3FFF * 20; // ~320KB for high throughput
-const TCP_RECV_BUFFER_SIZE: usize = 0x3FFF * 20; // ~320KB
 const MAX_PACKET_BATCH: usize = 64; // Process more packets per poll iteration
-const MAX_CONCURRENT_CONNECTIONS: usize = 1024; // Limit concurrent connections like gvisor
 
 /// Run the direct smoltcp stack thread.
 fn run_direct_stack_thread(
@@ -386,6 +395,7 @@ fn run_direct_stack_thread(
     udp_tx: Sender<PacketBuffer>,
     running: Arc<AtomicBool>,
     shared_state: Arc<Mutex<SharedState>>,
+    limits: TunResourceLimits,
 ) {
     info!("smoltcp direct stack thread initializing...");
 
@@ -489,10 +499,11 @@ fn run_direct_stack_thread(
                                 trace!("TCP packet: {} -> {}, SYN={}", src_addr, dst_addr, is_syn);
                                 if is_syn && !active_connections.contains(&(src_addr, dst_addr)) {
                                     // Check connection limit
-                                    if sockets.len() >= MAX_CONCURRENT_CONNECTIONS {
+                                    if sockets.len() >= limits.tcp_connection_limit() {
                                         warn!(
                                             "Connection limit reached ({}), dropping SYN from {}",
-                                            MAX_CONCURRENT_CONNECTIONS, src_addr
+                                            limits.tcp_connection_limit(),
+                                            src_addr
                                         );
                                         continue;
                                     }
@@ -504,6 +515,7 @@ fn run_direct_stack_thread(
                                         dst_addr,
                                         &mut socket_set,
                                         &stack_thread,
+                                        limits.tcp_buffer_size,
                                     ) {
                                         sockets.insert(
                                             new_conn.handle,
@@ -759,10 +771,11 @@ fn create_tcp_connection(
     dst_addr: SocketAddr,
     socket_set: &mut SocketSet<'static>,
     stack_thread: &Thread,
+    buffer_size: usize,
 ) -> Option<(CreateConnectionResult, Arc<TcpConnectionControl>)> {
     let mut socket = TcpSocket::new(
-        TcpSocketBuffer::new(vec![0u8; TCP_RECV_BUFFER_SIZE]),
-        TcpSocketBuffer::new(vec![0u8; TCP_SEND_BUFFER_SIZE]),
+        TcpSocketBuffer::new(vec![0u8; buffer_size]),
+        TcpSocketBuffer::new(vec![0u8; buffer_size]),
     );
 
     // Matched to netstack-smoltcp settings for optimal performance
@@ -780,10 +793,7 @@ fn create_tcp_connection(
 
     debug!("Creating TCP connection: {} -> {}", src_addr, dst_addr);
 
-    let control = Arc::new(TcpConnectionControl::new(
-        TCP_SEND_BUFFER_SIZE,
-        TCP_RECV_BUFFER_SIZE,
-    ));
+    let control = Arc::new(TcpConnectionControl::new(buffer_size, buffer_size));
 
     let handle = socket_set.add(socket);
     let connection = TcpConnection::new(control.clone(), stack_thread.clone());

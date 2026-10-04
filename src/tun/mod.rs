@@ -113,6 +113,7 @@ pub async fn run_tun_server(
     resolver: Arc<dyn Resolver>,
     mut shutdown_rx: oneshot::Receiver<()>,
 ) -> std::io::Result<()> {
+    config.resource_limits.validate()?;
     info!(
         "Starting TUN server (direct mode): mtu={}, tcp={}, udp={}, icmp={}",
         config.mtu, config.tcp_enabled, config.udp_enabled, config.icmp_enabled
@@ -135,7 +136,7 @@ pub async fn run_tun_server(
     let mtu = config.mtu as usize;
 
     // Create the direct TCP stack (runs smoltcp in dedicated thread with select())
-    let mut tcp_stack = TcpStackDirect::new(fd, mtu);
+    let mut tcp_stack = TcpStackDirect::with_limits(fd, mtu, config.resource_limits.clone());
 
     // Get UDP receiver (stack thread filters UDP and sends here)
     let udp_from_stack_rx = tcp_stack.take_udp_rx().expect("udp_rx already taken");
@@ -188,9 +189,17 @@ pub async fn run_tun_server(
     if config.udp_enabled {
         let proxy_selector = proxy_selector.clone();
         let resolver = resolver.clone();
+        let limits = config.resource_limits.clone();
 
         tasks.spawn(async move {
-            handle_udp_packets(udp_from_stack_rx, udp_to_stack_tx, proxy_selector, resolver).await;
+            handle_udp_packets(
+                udp_from_stack_rx,
+                udp_to_stack_tx,
+                proxy_selector,
+                resolver,
+                limits,
+            )
+            .await;
         });
     }
 
@@ -235,7 +244,12 @@ async fn handle_tcp_connection(
     proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
 ) -> std::io::Result<()> {
-    let decision = proxy_selector.judge(target.into(), &resolver).await?;
+    let decision = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        proxy_selector.judge(target.into(), &resolver),
+    )
+    .await
+    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "TUN routing timed out"))??;
 
     match decision {
         crate::client_proxy_selector::ConnectDecision::Allow {
@@ -247,10 +261,14 @@ async fn handle_tcp_connection(
                 remote_location.location()
             );
 
-            match chain_group
-                .connect_tcp(remote_location.clone(), &resolver)
-                .await
-            {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                chain_group.connect_tcp(remote_location.clone(), &resolver),
+            )
+            .await
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "TUN TCP setup timed out")
+            })? {
                 Ok(setup_result) => {
                     debug!(
                         "TCP: connected to {}, starting bidirectional copy",
@@ -304,13 +322,14 @@ async fn handle_udp_packets(
     to_stack_tx: mpsc::Sender<PacketBuffer>,
     proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
+    limits: crate::config::tun::TunResourceLimits,
 ) {
     info!("Starting UDP handler (session-based)");
 
     let udp_handler = udp_handler::UdpHandler::new(from_stack_rx, to_stack_tx);
     let (reader, writer) = udp_handler.split();
 
-    let manager = TunUdpManager::new(reader, writer, proxy_selector, resolver);
+    let manager = TunUdpManager::new(reader, writer, proxy_selector, resolver, limits);
 
     if let Err(e) = manager.run().await {
         warn!("UDP handler error: {}", e);
@@ -348,6 +367,7 @@ pub async fn run_tun_from_config(
         .udp_enabled(config.udp_enabled)
         .icmp_enabled(config.icmp_enabled)
         .close_fd_on_drop(close_fd_on_drop);
+    tun_server_config.resource_limits = config.resource_limits;
 
     if let Some(ref name) = config.device_name {
         tun_server_config = tun_server_config.tun_name(name.clone());

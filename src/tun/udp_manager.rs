@@ -17,12 +17,13 @@ use futures::StreamExt;
 use log::debug;
 use lru::LruCache;
 use tokio::io::ReadBuf;
-use tokio::sync::mpsc;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::time::{Instant, interval};
 
 use crate::address::{Address, NetLocation};
 use crate::async_stream::AsyncMessageStream;
 use crate::client_proxy_selector::{ClientProxySelector, ConnectDecision};
+use crate::config::tun::TunResourceLimits;
 use crate::resolver::Resolver;
 
 use super::udp_handler::{UdpMessage, UdpReader, UdpWriter};
@@ -30,15 +31,12 @@ use super::udp_handler::{UdpMessage, UdpReader, UdpWriter};
 /// Session timeout - sessions without activity are expired
 const SESSION_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// Maximum number of sessions (LRU eviction when exceeded)
-const MAX_SESSIONS: usize = 256;
-
 /// Channel buffer size for session and destination packets
-const CHANNEL_SIZE: usize = 64;
+const CHANNEL_SIZE: usize = 4;
 
 /// Response channel buffer size. Bounds memory growth when destination
 /// tasks produce responses faster than the manager can write to TUN.
-const RESPONSE_CHANNEL_SIZE: usize = 512;
+const RESPONSE_CHANNEL_SIZE: usize = 32;
 
 /// Per-destination connection timeout (self-enforced by destination tasks)
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(120);
@@ -71,6 +69,8 @@ pub struct TunUdpManager {
     response_rx: mpsc::Receiver<UdpMessage>,
     /// Cloned into each session, then into each destination task
     response_tx: mpsc::Sender<UdpMessage>,
+    destination_slots: Arc<Semaphore>,
+    destinations_per_session: usize,
 }
 
 /// A UDP session for a single local (app) address.
@@ -89,6 +89,12 @@ impl Session {
     }
 }
 
+impl Drop for Session {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
 impl TunUdpManager {
     /// Create a new TUN UDP manager.
     pub fn new(
@@ -96,17 +102,20 @@ impl TunUdpManager {
         writer: UdpWriter,
         proxy_selector: Arc<ClientProxySelector>,
         resolver: Arc<dyn Resolver>,
+        limits: TunResourceLimits,
     ) -> Self {
         let (response_tx, response_rx) = mpsc::channel(RESPONSE_CHANNEL_SIZE);
 
         Self {
             reader,
             writer,
-            sessions: LruCache::new(NonZeroUsize::new(MAX_SESSIONS).unwrap()),
+            sessions: LruCache::new(NonZeroUsize::new(limits.max_udp_sessions).unwrap()),
             proxy_selector,
             resolver,
             response_rx,
             response_tx,
+            destination_slots: Arc::new(Semaphore::new(limits.max_udp_destinations)),
+            destinations_per_session: limits.max_udp_destinations_per_session,
         }
     }
 
@@ -224,6 +233,8 @@ impl TunUdpManager {
             self.response_tx.clone(),
             self.proxy_selector.clone(),
             self.resolver.clone(),
+            self.destination_slots.clone(),
+            self.destinations_per_session,
         ));
 
         let session = Session {
@@ -234,9 +245,7 @@ impl TunUdpManager {
 
         // If LRU insertion evicts an old session, abort its task to avoid
         // detached background loops accumulating over time.
-        if let Some(evicted_session) = self.sessions.put(peer_addr, session) {
-            evicted_session.handle.abort();
-        }
+        self.sessions.push(peer_addr, session);
         Ok(())
     }
 
@@ -300,6 +309,8 @@ async fn session_task(
     response_tx: mpsc::Sender<UdpMessage>,
     proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
+    destination_slots: Arc<Semaphore>,
+    destinations_per_session: usize,
 ) {
     debug!("[TunUdpSession {}] Starting", peer_addr);
 
@@ -329,7 +340,13 @@ async fn session_task(
 
                 // Create destination task if absent
                 if !destinations.contains_key(&dest) {
-                    match create_connection(&dest, &proxy_selector, &resolver).await {
+                    if destinations.len() >= destinations_per_session {
+                        continue;
+                    }
+                    let Ok(permit) = destination_slots.clone().try_acquire_owned() else { continue };
+                    let setup = tokio::time::timeout(WRITE_TIMEOUT, create_connection(&dest, &proxy_selector, &resolver)).await
+                        .unwrap_or_else(|_| Err(io::Error::new(io::ErrorKind::TimedOut, "TUN UDP setup timed out")));
+                    match setup {
                         Ok(stream) => {
                             let source_addr = match dest.to_socket_addr_nonblocking() {
                                 Some(addr) => addr,
@@ -343,6 +360,7 @@ async fn session_task(
                                 stream,
                                 write_rx,
                                 response_tx.clone(),
+                                permit,
                             ));
 
                             debug!(
@@ -414,6 +432,7 @@ async fn destination_task(
     mut stream: Box<dyn AsyncMessageStream>,
     mut write_rx: mpsc::Receiver<Vec<u8>>,
     response_tx: mpsc::Sender<UdpMessage>,
+    _permit: OwnedSemaphorePermit,
 ) {
     let mut read_buf = vec![0u8; 65535];
     let sleep = tokio::time::sleep(CONNECTION_TIMEOUT);
@@ -500,6 +519,34 @@ async fn destination_task(
                 break;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn lru_eviction_aborts_stalled_session() {
+        let marker = Arc::new(());
+        let weak = Arc::downgrade(&marker);
+        let make_session = |marker| {
+            let (tx, _rx) = mpsc::channel(1);
+            Session {
+                tx,
+                handle: tokio::spawn(async move {
+                    let _marker = marker;
+                    std::future::pending::<()>().await;
+                }),
+                last_active: Instant::now(),
+            }
+        };
+        let mut sessions = LruCache::new(NonZeroUsize::new(1).unwrap());
+        sessions.push(1, make_session(marker));
+        tokio::task::yield_now().await;
+        sessions.push(2, make_session(Arc::new(())));
+        tokio::task::yield_now().await;
+        assert_eq!(weak.strong_count(), 0);
     }
 }
 
