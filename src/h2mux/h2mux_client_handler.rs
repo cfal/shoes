@@ -11,7 +11,7 @@ use std::task::{Context, Poll};
 use async_trait::async_trait;
 use bytes::BytesMut;
 use log::debug;
-use tokio::io::{AsyncRead, ReadBuf};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::address::{Address, NetLocation, ResolvedLocation};
 use crate::async_stream::{
@@ -137,6 +137,7 @@ struct H2MuxUdpMessageStream {
     read_header: [u8; 2],
     read_header_pos: usize,
     read_data_remaining: usize,
+    read_buffer: Vec<u8>,
     // Write buffer for assembling length-prefixed messages
     write_buffer: BytesMut,
     write_pos: usize,
@@ -156,9 +157,25 @@ impl H2MuxUdpMessageStream {
             read_header: [0u8; 2],
             read_header_pos: 0,
             read_data_remaining: 0,
+            read_buffer: Vec::new(),
             write_buffer: BytesMut::with_capacity(65537),
             write_pos: 0,
         }
+    }
+
+    fn poll_drain_write(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        while self.write_pos < self.write_buffer.len() {
+            let n = std::task::ready!(
+                Pin::new(&mut self.stream).poll_write(cx, &self.write_buffer[self.write_pos..])
+            )?;
+            if n == 0 {
+                return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
+            }
+            self.write_pos += n;
+        }
+        self.write_buffer.clear();
+        self.write_pos = 0;
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -209,6 +226,7 @@ impl AsyncReadMessage for H2MuxUdpMessageStream {
                     let len = u16::from_be_bytes(this.read_header) as usize;
                     this.read_header_pos = 0;
                     this.read_data_remaining = len;
+                    this.read_buffer.resize(len, 0);
                     this.read_state = ReadState::Data;
 
                     if len == 0 {
@@ -226,8 +244,8 @@ impl AsyncReadMessage for H2MuxUdpMessageStream {
                 }
                 ReadState::Data => {
                     // Read the message data
-                    let to_read = this.read_data_remaining.min(buf.remaining());
-                    let mut temp_buf = ReadBuf::new(buf.initialize_unfilled_to(to_read));
+                    let offset = this.read_buffer.len() - this.read_data_remaining;
+                    let mut temp_buf = ReadBuf::new(&mut this.read_buffer[offset..]);
                     match Pin::new(&mut this.stream).poll_read(cx, &mut temp_buf) {
                         Poll::Ready(Ok(())) => {
                             let n = temp_buf.filled().len();
@@ -237,12 +255,18 @@ impl AsyncReadMessage for H2MuxUdpMessageStream {
                                     "EOF while reading message data",
                                 )));
                             }
-                            buf.advance(n);
                             this.read_data_remaining -= n;
 
                             if this.read_data_remaining == 0 {
                                 // Message complete
                                 this.read_state = ReadState::Header;
+                                if this.read_buffer.len() > buf.remaining() {
+                                    return Poll::Ready(Err(io::Error::new(
+                                        io::ErrorKind::InvalidInput,
+                                        "UDP receive buffer too small",
+                                    )));
+                                }
+                                buf.put_slice(&this.read_buffer);
                                 return Poll::Ready(Ok(()));
                             }
                             // Continue reading
@@ -263,25 +287,6 @@ impl AsyncWriteMessage for H2MuxUdpMessageStream {
         buf: &[u8],
     ) -> Poll<io::Result<()>> {
         use bytes::BufMut;
-        use tokio::io::AsyncWrite;
-
-        let this = &mut *self;
-
-        // Flush any pending data first
-        while this.write_pos < this.write_buffer.len() {
-            let remaining = &this.write_buffer[this.write_pos..];
-            match Pin::new(&mut this.stream).poll_write(cx, remaining) {
-                Poll::Ready(Ok(n)) => {
-                    this.write_pos += n;
-                }
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
-            }
-        }
-
-        // Clear buffer after fully written
-        this.write_buffer.clear();
-        this.write_pos = 0;
 
         if buf.len() > 65535 {
             return Poll::Ready(Err(io::Error::new(
@@ -289,52 +294,18 @@ impl AsyncWriteMessage for H2MuxUdpMessageStream {
                 "UDP packet too large",
             )));
         }
-
-        // Build message: length prefix + data
-        this.write_buffer.put_u16(buf.len() as u16);
-        this.write_buffer.put_slice(buf);
-
-        // Write the message
-        while this.write_pos < this.write_buffer.len() {
-            let remaining = &this.write_buffer[this.write_pos..];
-            match Pin::new(&mut this.stream).poll_write(cx, remaining) {
-                Poll::Ready(Ok(n)) => {
-                    this.write_pos += n;
-                }
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
-            }
-        }
-
-        this.write_buffer.clear();
-        this.write_pos = 0;
-
+        std::task::ready!(self.poll_drain_write(cx))?;
+        self.write_buffer.put_u16(buf.len() as u16);
+        self.write_buffer.put_slice(buf);
+        // Accept exactly once; subsequent writes and flush drain this bounded buffer.
         Poll::Ready(Ok(()))
     }
 }
 
 impl AsyncFlushMessage for H2MuxUdpMessageStream {
     fn poll_flush_message(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        use tokio::io::AsyncWrite;
-
-        let this = &mut *self;
-
-        // Flush any pending data first
-        while this.write_pos < this.write_buffer.len() {
-            let remaining = &this.write_buffer[this.write_pos..];
-            match Pin::new(&mut this.stream).poll_write(cx, remaining) {
-                Poll::Ready(Ok(n)) => {
-                    this.write_pos += n;
-                }
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
-            }
-        }
-
-        this.write_buffer.clear();
-        this.write_pos = 0;
-
-        Pin::new(&mut this.stream).poll_flush(cx)
+        std::task::ready!(self.poll_drain_write(cx))?;
+        Pin::new(&mut self.stream).poll_flush(cx)
     }
 }
 
@@ -343,7 +314,7 @@ impl AsyncShutdownMessage for H2MuxUdpMessageStream {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<io::Result<()>> {
-        use tokio::io::AsyncWrite;
+        std::task::ready!(self.as_mut().poll_flush_message(cx))?;
         Pin::new(&mut self.stream).poll_shutdown(cx)
     }
 }
@@ -359,3 +330,61 @@ impl AsyncPing for H2MuxUdpMessageStream {
 }
 
 impl AsyncMessageStream for H2MuxUdpMessageStream {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn partial_message_read_preserves_payload_across_polls() {
+        let (stream, mut peer) = tokio::io::duplex(1024);
+        let mut stream = H2MuxUdpMessageStream::new(Box::new(stream));
+        peer.write_all(&[0, 3, b'a']).await.unwrap();
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut storage = [0; 32];
+        let mut first = ReadBuf::new(&mut storage);
+        assert!(
+            Pin::new(&mut stream)
+                .poll_read_message(&mut cx, &mut first)
+                .is_pending()
+        );
+        assert!(first.filled().is_empty());
+        peer.write_all(b"bc").await.unwrap();
+        let mut next = ReadBuf::new(&mut storage);
+        assert!(matches!(
+            Pin::new(&mut stream).poll_read_message(&mut cx, &mut next),
+            Poll::Ready(Ok(()))
+        ));
+        assert_eq!(next.filled(), b"abc");
+    }
+
+    #[tokio::test]
+    async fn pending_write_and_shutdown_preserve_packet_boundaries() {
+        let (stream, mut peer) = tokio::io::duplex(1);
+        let mut stream = H2MuxUdpMessageStream::new(Box::new(stream));
+        let writer = tokio::spawn(async move {
+            for payload in [b"abc".as_slice(), b"defg".as_slice()] {
+                futures::future::poll_fn(|cx| {
+                    Pin::new(&mut stream).poll_write_message(cx, payload)
+                })
+                .await
+                .unwrap();
+            }
+            futures::future::poll_fn(|cx| Pin::new(&mut stream).poll_shutdown_message(cx))
+                .await
+                .unwrap();
+        });
+        let mut bytes = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            peer.read_to_end(&mut bytes),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        writer.await.unwrap();
+        assert_eq!(&bytes, b"\0\x03abc\0\x04defg");
+    }
+}

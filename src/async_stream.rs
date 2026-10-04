@@ -240,6 +240,20 @@ impl AsyncPing for TcpStream {
 
 impl AsyncStream for TcpStream {}
 
+#[cfg(test)]
+impl AsyncPing for tokio::io::DuplexStream {
+    fn supports_ping(&self) -> bool {
+        false
+    }
+
+    fn poll_write_ping(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<bool>> {
+        Poll::Ready(Ok(false))
+    }
+}
+
+#[cfg(test)]
+impl AsyncStream for tokio::io::DuplexStream {}
+
 #[cfg(target_family = "unix")]
 impl AsyncPing for UnixStream {
     fn supports_ping(&self) -> bool {
