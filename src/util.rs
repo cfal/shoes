@@ -1,9 +1,17 @@
 use tokio::io::AsyncWriteExt;
 
+use crate::async_stream::AsyncShutdownMessageExt;
+
 pub(crate) const SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 pub(crate) async fn shutdown_stream<T: AsyncWriteExt + Unpin + ?Sized>(stream: &mut T) {
     let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, stream.shutdown()).await;
+}
+
+pub(crate) async fn shutdown_message_stream<T: AsyncShutdownMessageExt + Unpin + ?Sized>(
+    stream: &mut T,
+) {
+    let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, stream.shutdown_message()).await;
 }
 
 pub(crate) async fn timeout_stream_setup<T>(
