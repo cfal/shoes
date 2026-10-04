@@ -1094,6 +1094,75 @@ mod tests {
     }
 
     #[test]
+    fn icmp_echo_replies_respect_protocol_switch() {
+        use smoltcp::wire::{Icmpv4Message, Icmpv4Packet, Icmpv6Message, Icmpv6Packet};
+        use std::os::unix::net::UnixDatagram;
+
+        let ipv4_src = [10, 0, 0, 2];
+        let ipv4_dst = [1, 1, 1, 1];
+        let ipv6_src = Ipv6Address::new(0xfd00, 0, 0, 0, 0, 0, 0, 2);
+        let ipv6_dst = Ipv6Address::new(0xfd00, 0, 0, 0, 0, 0, 0, 3);
+        let mut ipv4_request = Vec::new();
+        etherparse::PacketBuilder::ipv4(ipv4_src, ipv4_dst, 64)
+            .icmpv4_echo_request(17, 23)
+            .write(&mut ipv4_request, b"ping")
+            .unwrap();
+        let mut ipv6_request = Vec::new();
+        etherparse::PacketBuilder::ipv6(ipv6_src.octets(), ipv6_dst.octets(), 64)
+            .icmpv6_echo_request(17, 23)
+            .write(&mut ipv6_request, b"ping")
+            .unwrap();
+
+        for enabled in [true, false] {
+            let (peer, tun) = UnixDatagram::pair().unwrap();
+            peer.set_read_timeout(Some(Duration::from_millis(if enabled {
+                1000
+            } else {
+                200
+            })))
+            .unwrap();
+            let stack = TcpStackDirect::with_config(
+                tun.into(),
+                TunServerConfig::new().icmp_enabled(enabled),
+            );
+            for request in [&ipv4_request, &ipv6_request] {
+                peer.send(request).unwrap();
+                let mut response = [0; 1500];
+                let result = peer.recv(&mut response);
+                if !enabled {
+                    assert!(matches!(
+                        result.unwrap_err().kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ));
+                    assert!(stack.is_running());
+                    continue;
+                }
+                let response = &response[..result.unwrap()];
+                if request[0] >> 4 == 4 {
+                    let ip = Ipv4Packet::new_checked(response).unwrap();
+                    assert_eq!(ip.src_addr().octets(), ipv4_dst);
+                    assert_eq!(ip.dst_addr().octets(), ipv4_src);
+                    assert!(ip.verify_checksum());
+                    let icmp = Icmpv4Packet::new_checked(ip.payload()).unwrap();
+                    assert_eq!(icmp.msg_type(), Icmpv4Message::EchoReply);
+                    assert_eq!((icmp.echo_ident(), icmp.echo_seq_no()), (17, 23));
+                    assert_eq!(icmp.data(), b"ping");
+                    assert!(icmp.verify_checksum());
+                } else {
+                    let ip = Ipv6Packet::new_checked(response).unwrap();
+                    assert_eq!(ip.src_addr(), ipv6_dst);
+                    assert_eq!(ip.dst_addr(), ipv6_src);
+                    let icmp = Icmpv6Packet::new_checked(ip.payload()).unwrap();
+                    assert_eq!(icmp.msg_type(), Icmpv6Message::EchoReply);
+                    assert_eq!((icmp.echo_ident(), icmp.echo_seq_no()), (17, 23));
+                    assert_eq!(icmp.payload(), b"ping");
+                    assert!(icmp.verify_checksum(&ip.src_addr(), &ip.dst_addr()));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn socket_owner_drop_wakes_readers_and_writers() {
         use futures::task::{ArcWake, waker};
         use std::pin::Pin;
