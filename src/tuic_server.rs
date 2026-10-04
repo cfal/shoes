@@ -122,8 +122,8 @@ mod lifecycle_tests {
 async fn process_connection(
     client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
-    uuid: &'static [u8],
-    password: &'static str,
+    uuid: Arc<[u8]>,
+    password: Arc<str>,
     conn: quinn::Incoming,
     zero_rtt_handshake: bool,
 ) -> std::io::Result<()> {
@@ -147,7 +147,7 @@ async fn process_connection(
 
     // Authentication with timeout - per sing-box reference, default 3 seconds.
     // This prevents malicious clients from holding connections open without authenticating.
-    match timeout(AUTH_TIMEOUT, auth_connection(&connection, uuid, password)).await {
+    match timeout(AUTH_TIMEOUT, auth_connection(&connection, &uuid, &password)).await {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
             connection.close(0u32.into(), b"auth failed");
@@ -260,8 +260,8 @@ async fn run_heartbeat_loop(
 
 async fn auth_connection(
     connection: &quinn::Connection,
-    uuid: &'static [u8],
-    password: &'static str,
+    uuid: &[u8],
+    password: &str,
 ) -> std::io::Result<()> {
     let mut expected_token_bytes = [0u8; 32];
     connection
@@ -297,7 +297,7 @@ async fn auth_connection(
         if specified_uuid != uuid {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
-                format!("incorrect uuid: {specified_uuid:?}"),
+                "incorrect uuid",
             ));
         }
         let token_bytes = stream_reader.read_slice(&mut recv_stream, 32).await?;
@@ -1261,8 +1261,8 @@ async fn run_datagram_loop(
 pub async fn start_tuic_server(
     bind_address: SocketAddr,
     quic_server_config: Arc<quinn::crypto::rustls::QuicServerConfig>,
-    uuid: &'static [u8],
-    password: &'static str,
+    uuid: Arc<[u8]>,
+    password: Arc<str>,
     client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
     num_endpoints: usize,
@@ -1273,6 +1273,8 @@ pub async fn start_tuic_server(
         let quic_server_config = quic_server_config.clone();
         let resolver = resolver.clone();
         let client_proxy_selector = client_proxy_selector.clone();
+        let uuid = uuid.clone();
+        let password = password.clone();
 
         let join_handle = tokio::spawn(async move {
             let mut server_config = quinn::ServerConfig::with_crypto(quic_server_config);
@@ -1318,6 +1320,8 @@ pub async fn start_tuic_server(
             while let Some(conn) = endpoint.accept().await {
                 let cloned_selector = client_proxy_selector.clone();
                 let cloned_resolver = resolver.clone();
+                let uuid = uuid.clone();
+                let password = password.clone();
                 tokio::spawn(async move {
                     if let Err(e) = process_connection(
                         cloned_selector,

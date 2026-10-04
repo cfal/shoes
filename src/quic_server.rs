@@ -345,7 +345,7 @@ pub async fn start_quic_servers(
             udp_enabled,
         } => {
             // TODO: hash password instead of passing directly
-            let hysteria2_password: &'static str = Box::leak(password.into_boxed_str());
+            let hysteria2_password: Arc<str> = password.into();
 
             for bind_address in bind_addresses.into_iter() {
                 let quic_server_config = quic_server_config.clone();
@@ -354,7 +354,7 @@ pub async fn start_quic_servers(
                 let hysteria2_handles = crate::hysteria2_server::start_hysteria2_server(
                     bind_address,
                     quic_server_config,
-                    hysteria2_password,
+                    hysteria2_password.clone(),
                     client_proxy_selector,
                     resolver,
                     num_endpoints,
@@ -369,8 +369,8 @@ pub async fn start_quic_servers(
             password,
             zero_rtt_handshake,
         } => {
-            let uuid: &'static [u8] = Box::leak(parse_uuid(&uuid)?.into_boxed_slice());
-            let password: &'static str = Box::leak(password.into_boxed_str());
+            let uuid: Arc<[u8]> = parse_uuid(&uuid)?.into();
+            let password: Arc<str> = password.into();
             for bind_address in bind_addresses.into_iter() {
                 let quic_server_config = quic_server_config.clone();
                 let client_proxy_selector = client_proxy_selector.clone();
@@ -378,8 +378,8 @@ pub async fn start_quic_servers(
                 let tuic_handles = crate::tuic_server::start_tuic_server(
                     bind_address,
                     quic_server_config,
-                    uuid,
-                    password,
+                    uuid.clone(),
+                    password.clone(),
                     client_proxy_selector,
                     resolver,
                     num_endpoints,

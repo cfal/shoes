@@ -37,7 +37,7 @@ use crate::util::allocate_vec;
 async fn process_connection(
     client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
-    password: &'static str,
+    password: Arc<str>,
     conn: quinn::Incoming,
     udp_enabled: bool,
 ) -> std::io::Result<()> {
@@ -64,7 +64,7 @@ async fn process_connection(
     // Per sing-box reference, authentication timeout is 3 seconds
     match timeout(
         AUTH_TIMEOUT,
-        auth_connection(&mut h3_conn, password, udp_enabled),
+        auth_connection(&mut h3_conn, &password, udp_enabled),
     )
     .await
     {
@@ -169,9 +169,7 @@ fn validate_auth_request<T>(req: http::Request<T>, password: &str) -> std::io::R
         .to_str()
         .map_err(|e| std::io::Error::other(format!("invalid auth header value: {e}")))?;
     if auth_str != password {
-        return Err(std::io::Error::other(format!(
-            "incorrect auth password: {auth_str}"
-        )));
+        return Err(std::io::Error::other("incorrect auth password"));
     }
 
     Ok(())
@@ -827,7 +825,7 @@ async fn read_varint(
 pub async fn start_hysteria2_server(
     bind_address: SocketAddr,
     quic_server_config: Arc<quinn::crypto::rustls::QuicServerConfig>,
-    hysteria2_password: &'static str,
+    hysteria2_password: Arc<str>,
     client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
     num_endpoints: usize,
@@ -838,6 +836,7 @@ pub async fn start_hysteria2_server(
         let quic_server_config = quic_server_config.clone();
         let resolver = resolver.clone();
         let client_proxy_selector = client_proxy_selector.clone();
+        let hysteria2_password = hysteria2_password.clone();
 
         let join_handle = tokio::spawn(async move {
             let mut server_config = quinn::ServerConfig::with_crypto(quic_server_config);
@@ -885,6 +884,7 @@ pub async fn start_hysteria2_server(
             while let Some(conn) = endpoint.accept().await {
                 let cloned_selector = client_proxy_selector.clone();
                 let cloned_resolver = resolver.clone();
+                let hysteria2_password = hysteria2_password.clone();
                 tokio::spawn(async move {
                     if let Err(e) = process_connection(
                         cloned_selector,
