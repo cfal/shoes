@@ -59,7 +59,7 @@ impl ShadowsocksTcpHandler {
             cipher,
             key,
             aead2022: false,
-            salt_checker: None,
+            salt_checker: Some(Arc::new(Mutex::new(TimedSaltChecker::new(60)))),
             udp_enabled,
             proxy_selector: Some(proxy_selector),
             resolver: Some(resolver),
