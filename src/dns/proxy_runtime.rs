@@ -15,7 +15,6 @@ use crate::address::{Address, NetLocation};
 use crate::async_stream::AsyncStream;
 use crate::client_proxy_chain::ClientChainGroup;
 use crate::resolver::Resolver;
-use crate::socket_util::new_udp_socket;
 
 #[cfg(test)]
 const TEST_CONNECT_TIMEOUT: Duration = Duration::from_millis(100);
@@ -144,13 +143,12 @@ impl RuntimeProvider for ProxyRuntimeProvider {
         let bind_interface = self.bind_interface.clone();
 
         Box::pin(async move {
-            if bind_interface.is_some() {
-                // Use our socket_util which supports bind_interface.
-                new_udp_socket(local_addr.is_ipv6(), bind_interface)
-            } else {
-                // Default: bind directly.
-                tokio::net::UdpSocket::bind(local_addr).await
-            }
+            let socket = crate::socket_util::new_outbound_socket2_udp_socket(
+                local_addr.is_ipv6(),
+                bind_interface,
+                Some(local_addr),
+            )?;
+            tokio::net::UdpSocket::from_std(socket.into())
         })
     }
 
@@ -171,35 +169,12 @@ impl QuicSocketBinder for ProxyQuicBinder {
         local_addr: SocketAddr,
         _server_addr: SocketAddr,
     ) -> Result<Arc<dyn quinn::AsyncUdpSocket>, io::Error> {
-        let socket = if self.bind_interface.is_some() {
-            // Use socket2 for bind_interface support.
-            let socket2_socket = crate::socket_util::new_socket2_udp_socket(
-                local_addr.is_ipv6(),
-                self.bind_interface.clone(),
-                Some(local_addr),
-                false,
-            )?;
-            // Convert socket2 -> std::net::UdpSocket.
-            #[cfg(unix)]
-            {
-                use std::os::unix::io::FromRawFd;
-                use std::os::unix::io::IntoRawFd;
-                let raw_fd = socket2_socket.into_raw_fd();
-                unsafe { std::net::UdpSocket::from_raw_fd(raw_fd) }
-            }
-            #[cfg(windows)]
-            {
-                use std::os::windows::io::FromRawSocket;
-                use std::os::windows::io::IntoRawSocket;
-                let raw_socket = socket2_socket.into_raw_socket();
-                unsafe { std::net::UdpSocket::from_raw_socket(raw_socket) }
-            }
-        } else {
-            // Default: bind directly.
-            std::net::UdpSocket::bind(local_addr)?
-        };
-
-        quinn::TokioRuntime.wrap_udp_socket(socket)
+        let socket = crate::socket_util::new_outbound_socket2_udp_socket(
+            local_addr.is_ipv6(),
+            self.bind_interface.clone(),
+            Some(local_addr),
+        )?;
+        quinn::TokioRuntime.wrap_udp_socket(socket.into())
     }
 }
 

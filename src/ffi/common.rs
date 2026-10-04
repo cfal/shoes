@@ -28,6 +28,7 @@ pub static TUN_SERVICE: OnceLock<parking_lot::Mutex<Option<TunServiceHandle>>> =
 
 /// Global flag to track initialization.
 pub static INITIALIZED: AtomicBool = AtomicBool::new(false);
+pub static SERVICE_LIFECYCLE: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
 /// Handle to a running TUN service.
 pub struct TunServiceHandle {
@@ -37,6 +38,44 @@ pub struct TunServiceHandle {
     pub shutdown_tx: Option<oneshot::Sender<()>>,
     /// Flag indicating if service is running.
     pub running: Arc<AtomicBool>,
+    pub task: JoinHandle<std::io::Result<()>>,
+}
+
+struct ServiceRunGuard(Arc<AtomicBool>);
+
+impl Drop for ServiceRunGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+        #[cfg(unix)]
+        crate::tun::clear_global_socket_protector();
+    }
+}
+
+pub fn spawn_service(
+    runtime: &tokio::runtime::Runtime,
+    config: String,
+    shutdown: oneshot::Receiver<()>,
+    running: Arc<AtomicBool>,
+) -> JoinHandle<std::io::Result<()>> {
+    let guard = ServiceRunGuard(running);
+    runtime.spawn(async move {
+        let _guard = guard;
+        let result = start_from_config(&config, shutdown).await;
+        if let Err(e) = &result {
+            log::error!("Shoes service failed: {e}");
+        }
+        result
+    })
+}
+
+struct ServerTasks(Vec<JoinHandle<()>>);
+
+impl Drop for ServerTasks {
+    fn drop(&mut self) {
+        for task in &self.0 {
+            task.abort();
+        }
+    }
 }
 
 /// Set up log file for file-based logging.
@@ -79,6 +118,7 @@ pub fn flush_log_file() {
 ///
 /// This is the common shutdown logic used by both iOS and Android.
 pub fn stop_service() {
+    let _lifecycle = SERVICE_LIFECYCLE.lock();
     info!("Stopping TUN service");
 
     let handle = if let Some(service) = TUN_SERVICE.get() {
@@ -92,17 +132,19 @@ pub fn stop_service() {
             let _ = tx.send(());
         }
 
-        // Wait up to 5 seconds for service to stop
-        let running = handle.running.clone();
-        for i in 0..50 {
-            if !running.load(Ordering::SeqCst) {
-                info!("TUN service stopped after {}ms", i * 100);
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
+        match handle.runtime.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(5), &mut handle.task).await
+        }) {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => log::error!("TUN service task failed: {e}"),
+            Err(_) => handle.task.abort(),
         }
-
-        drop(handle.runtime);
+        handle
+            .runtime
+            .shutdown_timeout(std::time::Duration::from_secs(5));
+        handle.running.store(false, Ordering::SeqCst);
+        #[cfg(unix)]
+        crate::tun::clear_global_socket_protector();
         info!("TUN runtime dropped");
     }
 
@@ -187,11 +229,13 @@ pub async fn start_from_config(
     })?;
 
     // Start TCP servers (like mixed)
-    let mut join_handles: Vec<JoinHandle<()>> = Vec::new();
+    let mut join_handles = ServerTasks(Vec::new());
 
     for server_config in server_configs {
         let resolver = dns_registry.get_for_server(server_config.dns.as_ref());
-        join_handles.extend(start_servers(Config::Server(server_config), resolver).await?);
+        join_handles
+            .0
+            .extend(start_servers(Config::Server(server_config), resolver).await?);
     }
 
     // Run TUN server (blocks until shutdown). close_fd_on_drop = false because mobile owns the FD
@@ -207,9 +251,7 @@ pub async fn start_from_config(
     ));
 
     // Cleanup any servers when TUN stops
-    for handle in join_handles {
-        handle.abort();
-    }
+    drop(join_handles);
 
     result
 }

@@ -26,7 +26,6 @@ use jni::objects::{Global, JClass, JObject, JString, JValue};
 use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jint, jlong};
 use jni::{EnvUnowned, Outcome};
 use log::{Record, error, info};
-use tokio::runtime::Runtime;
 use tokio::sync::oneshot;
 
 use crate::logging::{DynamicFileLogWriter, LogWriter};
@@ -180,6 +179,14 @@ pub extern "system" fn Java_com_shoesproxy_ShoesNative_start<'local>(
     config_yaml: JString<'local>,
     protect_callback: JObject<'local>,
 ) -> jlong {
+    let _lifecycle = common::SERVICE_LIFECYCLE.lock();
+    if TUN_SERVICE
+        .get()
+        .is_some_and(|service| service.lock().is_some())
+    {
+        error!("Stop the previous shoes service before starting another");
+        return -1;
+    }
     info!("Starting shoes service");
 
     let result = unowned
@@ -233,33 +240,29 @@ pub extern "system" fn Java_com_shoesproxy_ShoesNative_start<'local>(
 
     set_global_socket_protector(Arc::new(protector));
 
-    let runtime = match Runtime::new() {
+    crate::thread_util::set_num_threads(2);
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+    {
         Ok(rt) => rt,
         Err(e) => {
             error!("Failed to create tokio runtime: {}", e);
+            crate::tun::clear_global_socket_protector();
             return -1;
         }
     };
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
-    let running_clone = running.clone();
-
-    runtime.spawn(async move {
-        info!("Shoes service task started");
-
-        match common::start_from_config(&config_str, shutdown_rx).await {
-            Ok(()) => info!("Shoes service stopped normally"),
-            Err(e) => error!("Shoes service error: {}", e),
-        }
-
-        running_clone.store(false, Ordering::SeqCst);
-    });
+    let task = common::spawn_service(&runtime, config_str, shutdown_rx, running.clone());
 
     let handle = TunServiceHandle {
         runtime,
         shutdown_tx: Some(shutdown_tx),
         running,
+        task,
     };
 
     let service = TUN_SERVICE.get_or_init(|| parking_lot::Mutex::new(None));
