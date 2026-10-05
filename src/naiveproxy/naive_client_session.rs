@@ -39,6 +39,7 @@ use super::naive_padding_stream::{
 ///
 /// `NaiveClientSession` is cheaply cloneable - cloning shares the underlying
 /// H2 connection (via h2's internal `Arc<Mutex<...>>`).
+#[derive(Clone)]
 pub struct NaiveClientSession {
     /// The SendRequest handle - has internal Arc, cheap to clone
     send_request: h2::client::SendRequest<Bytes>,
@@ -48,15 +49,6 @@ pub struct NaiveClientSession {
 struct DriverHandle {
     driver: tokio::task::AbortHandle,
     _drain: oneshot::Sender<()>,
-}
-
-impl Clone for NaiveClientSession {
-    fn clone(&self) -> Self {
-        Self {
-            send_request: self.send_request.clone(),
-            driver_handle: Arc::clone(&self.driver_handle),
-        }
-    }
 }
 
 impl NaiveClientSession {

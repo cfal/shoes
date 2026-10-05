@@ -38,6 +38,7 @@ const MAX_FRAME_SIZE: u32 = 16 * 1024;
 /// - PING keepalive (30s) - detects dead connections
 /// - Stream open timeout (5s) - prevents hanging on unresponsive servers
 /// - Driver ownership shared by sessions and active streams
+#[derive(Clone)]
 pub struct H2MuxClientSession {
     send_request: h2::client::SendRequest<Bytes>,
     driver_handle: Arc<DriverHandle>,
@@ -69,18 +70,6 @@ impl Drop for DriverHandle {
     fn drop(&mut self) {
         if let Some(ping) = &self.ping {
             ping.abort();
-        }
-    }
-}
-
-impl Clone for H2MuxClientSession {
-    fn clone(&self) -> Self {
-        Self {
-            send_request: self.send_request.clone(),
-            driver_handle: Arc::clone(&self.driver_handle),
-            padding_enabled: self.padding_enabled,
-            active_streams: Arc::clone(&self.active_streams),
-            is_closed: Arc::clone(&self.is_closed),
         }
     }
 }
