@@ -1,6 +1,6 @@
 [package]
 name = "shoes"
-version = "0.2.8"
+version = "0.3.0"
 edition = "2024"
 autotests = false
 license = "MIT"

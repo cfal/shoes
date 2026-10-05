@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.3.0
+
+### New Features
+
+- Added configurable connection, stream, UDP destination, and QUIC buffer budgets through `SHOES_*` environment variables.
+- Added support for multiple bind addresses in server configurations.
+- Added file logging with `--log-file` and version reporting with `--version`.
+- Added Android AAR and iOS XCFramework release artifacts for mobile embedding.
+
+### Improvements
+
+- Bounded protocol queues and setup/shutdown deadlines, with more reliable task, socket, and session cleanup during disconnects and configuration reloads.
+- Improved H2MUX and NaiveProxy draining, AnyTLS session ownership, QUIC listener startup cleanup, and TUN connection teardown.
+- Improved UDP/XUDP session isolation, destination admission, cancellation, and routing overrides.
+- Bounded DNS caches and pending lookups, preserved upstream connection pooling, and improved resolver refresh and destination-address failover.
+- Improved REALITY compatibility and buffering, and fixed Vision handling of already-decrypted data after the END command.
+- Hardened protocol parsing and authentication, and fixed mobile stop/restart socket-protection cleanup.
+
+Resource budgets limit admitted work and modeled buffers, not total process memory. DNS-over-HTTP/3 reservations remain approximate.
+
 ## v0.2.7
 
 ### Improvements
