@@ -201,7 +201,7 @@ pub async fn start_quic_servers(
                 let quic_server_config = quic_server_config.clone();
                 let client_proxy_selector = client_proxy_selector.clone();
                 let resolver = resolver.clone();
-                let hysteria2_handles = crate::hysteria2_server::start_hysteria2_server(
+                let result = crate::hysteria2_server::start_hysteria2_server(
                     bind_address,
                     quic_server_config,
                     hysteria2_password.clone(),
@@ -210,8 +210,8 @@ pub async fn start_quic_servers(
                     num_endpoints,
                     udp_enabled,
                 )
-                .await?;
-                handles.extend(hysteria2_handles);
+                .await;
+                collect_started_listeners(&mut handles, result).await?;
             }
         }
         ServerProxyConfig::TuicV5 {
@@ -225,7 +225,7 @@ pub async fn start_quic_servers(
                 let quic_server_config = quic_server_config.clone();
                 let client_proxy_selector = client_proxy_selector.clone();
                 let resolver = resolver.clone();
-                let tuic_handles = crate::tuic_server::start_tuic_server(
+                let result = crate::tuic_server::start_tuic_server(
                     bind_address,
                     quic_server_config,
                     uuid.clone(),
@@ -235,8 +235,8 @@ pub async fn start_quic_servers(
                     num_endpoints,
                     zero_rtt_handshake,
                 )
-                .await?;
-                handles.extend(tuic_handles);
+                .await;
+                collect_started_listeners(&mut handles, result).await?;
             }
         }
         tcp_protocol => {
@@ -258,19 +258,122 @@ pub async fn start_quic_servers(
                     .clone();
                 let quic_server_config = quic_server_config.clone();
                 let resolver = resolver.clone();
-                let quic_handles = start_quic_server(
+                let result = start_quic_server(
                     bind_address,
                     quic_server_config,
                     resolver,
                     tcp_handler,
                     num_endpoints,
                 )
-                .await?;
+                .await;
 
-                handles.extend(quic_handles);
+                collect_started_listeners(&mut handles, result).await?;
             }
         }
     }
 
     Ok(handles)
+}
+
+async fn collect_started_listeners(
+    handles: &mut Vec<JoinHandle<()>>,
+    result: std::io::Result<Vec<JoinHandle<()>>>,
+) -> std::io::Result<()> {
+    match result {
+        Ok(started) => {
+            handles.extend(started);
+            Ok(())
+        }
+        Err(error) => {
+            for handle in handles.iter() {
+                handle.abort();
+            }
+            for handle in handles.drain(..) {
+                let _ = handle.await;
+            }
+            Err(error)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::address::NetLocation;
+    use crate::config::{RuleConfig, Transport};
+    use crate::option_util::{NoneOrSome, OneOrSome};
+    use crate::resolver::NativeResolver;
+    use std::time::Duration;
+
+    async fn assert_partial_startup_cleanup(protocol: ServerProxyConfig) {
+        let first = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+        let first_addr = first.local_addr().unwrap();
+        let occupied = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+        let occupied_addr = occupied.local_addr().unwrap();
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let config = ServerConfig {
+            bind_location: BindLocation::Address(OneOrSome::Some(
+                [first_addr, occupied_addr]
+                    .into_iter()
+                    .map(|addr| NetLocation::from_ip_addr(addr.ip(), addr.port()).into())
+                    .collect(),
+            )),
+            protocol,
+            transport: Transport::Quic,
+            tcp_settings: None,
+            quic_settings: Some(ServerQuicConfig {
+                cert: cert.cert.pem(),
+                key: cert.signing_key.serialize_pem(),
+                alpn_protocols: NoneOrSome::One("h3".into()),
+                client_ca_certs: NoneOrSome::None,
+                client_fingerprints: NoneOrSome::None,
+                num_endpoints: 2,
+            }),
+            rules: NoneOrSome::One(ConfigSelection::Config(RuleConfig::default())),
+            dns: None,
+        };
+        drop(first);
+        let error = start_quic_servers(config, Arc::new(NativeResolver::new()))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Ok(socket) = std::net::UdpSocket::bind(first_addr) {
+                    break socket;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("partial startup left the first QUIC address bound");
+    }
+
+    #[tokio::test]
+    async fn partial_hysteria2_startup_releases_earlier_listeners() {
+        assert_partial_startup_cleanup(ServerProxyConfig::Hysteria2 {
+            password: "password".into(),
+            udp_enabled: true,
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn partial_tuic_startup_releases_earlier_listeners() {
+        assert_partial_startup_cleanup(ServerProxyConfig::TuicV5 {
+            uuid: "550e8400-e29b-41d4-a716-446655440000".into(),
+            password: "password".into(),
+            zero_rtt_handshake: false,
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn partial_generic_quic_startup_releases_earlier_listeners() {
+        assert_partial_startup_cleanup(ServerProxyConfig::Http {
+            username: None,
+            password: None,
+        })
+        .await;
+    }
 }
