@@ -294,17 +294,7 @@ where
         self.tls.poll_drain_tls(cx)
     }
 
-    /// Read the VLESS response header from the TLS session
-    ///
-    /// The VLESS response consists of:
-    /// - 1 byte: version (must be 0)
-    /// - 1 byte: addon length
-    /// - N bytes: addon data (if addon_length > 0)
-    ///
-    /// This is called lazily on the first read when vless_response_pending is true.
-    /// Uses packetization to feed TLS records one at a time to avoid bad MAC errors.
-    ///
-    /// Returns any unused data that came after the response
+    /// Read the VLESS response header and addons, returning any following plaintext.
     fn poll_read_vless_response(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<BytesMut>> {
         loop {
             if self.partial_vless_response.len() >= 2 {
@@ -335,6 +325,16 @@ where
         }
     }
 
+    fn copy_pending_read(&mut self, buf: &mut ReadBuf<'_>) -> bool {
+        if self.pending_read.is_empty() {
+            return false;
+        }
+        let len = buf.remaining().min(self.pending_read.len());
+        buf.put_slice(&self.pending_read[..len]);
+        self.pending_read.advance(len);
+        true
+    }
+
     fn poll_read_padding_tls(
         &mut self,
         cx: &mut Context<'_>,
@@ -348,10 +348,7 @@ where
                 return Poll::Ready(Ok(()));
             }
             self.handle_padded_bytes(plaintext.filled())?;
-            if !self.pending_read.is_empty() {
-                let len = buf.remaining().min(self.pending_read.len());
-                buf.put_slice(&self.pending_read[..len]);
-                self.pending_read.advance(len);
+            if self.copy_pending_read(buf) {
                 return Poll::Ready(Ok(()));
             }
             if self.read_mode != VisionMode::PaddingTls {
@@ -733,10 +730,7 @@ impl<IO: AsyncStream> AsyncRead for VisionStream<IO> {
         if buf.remaining() == 0 {
             return Poll::Ready(Ok(()));
         }
-        if !this.pending_read.is_empty() {
-            let len = buf.remaining().min(this.pending_read.len());
-            buf.put_slice(&this.pending_read[..len]);
-            this.pending_read.advance(len);
+        if this.copy_pending_read(buf) {
             return Poll::Ready(Ok(()));
         }
 
@@ -744,10 +738,7 @@ impl<IO: AsyncStream> AsyncRead for VisionStream<IO> {
             let decrypted_data = ready!(this.poll_read_vless_response(cx))?;
             this.vless_response_pending = false;
             this.feed_initial_read_data(&decrypted_data)?;
-            if !this.pending_read.is_empty() {
-                let len = buf.remaining().min(this.pending_read.len());
-                buf.put_slice(&this.pending_read[..len]);
-                this.pending_read.advance(len);
+            if this.copy_pending_read(buf) {
                 return Poll::Ready(Ok(()));
             }
         }

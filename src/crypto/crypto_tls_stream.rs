@@ -260,7 +260,7 @@ impl<IO: AsyncStream> CryptoTlsStream<IO> {
             TlsInput::Records { deframer, preserve } => {
                 let mut scratch = [0; 4096];
                 let record =
-                    ready!(deframer.poll_read_record(&mut self.io, cx, &mut scratch, *preserve,))?;
+                    ready!(deframer.poll_read_record(&mut self.io, cx, &mut scratch, *preserve))?;
                 self.release_empty_deframer();
                 match record {
                     Some(record) => {
@@ -282,7 +282,7 @@ impl<IO: AsyncStream> CryptoTlsStream<IO> {
         Poll::Ready(Ok(n))
     }
 
-    fn write_tls_direct(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
+    fn poll_write_tls(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
         let mut adapter = SyncWriteAdapter {
             io: &mut self.io,
             cx,
@@ -310,7 +310,7 @@ impl<IO: AsyncStream> CryptoTlsStream<IO> {
             }
         } else if !self.write_raw {
             while self.session.wants_write() {
-                if ready!(self.write_tls_direct(cx))? == 0 {
+                if ready!(self.poll_write_tls(cx))? == 0 {
                     return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
                 }
             }

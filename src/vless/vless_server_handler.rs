@@ -357,20 +357,12 @@ where
             debug!("Remote location parsed: {}", remote_location);
             let unparsed_data = stream_reader.unparsed_data();
 
-            let flow_stream: Box<dyn AsyncStream> = if flow == XTLS_VISION_FLOW {
-                debug!("Creating VISION stream (Custom TLS) for flow: {}", flow);
-                Box::new(VisionStream::new_server(
-                    tls_stream,
-                    user_uuid,
-                    unparsed_data,
-                )?)
-            } else {
-                Box::new(tls_stream)
-            };
+            debug!("Creating VISION stream (Custom TLS) for flow: {}", flow);
+            let vision_stream = VisionStream::new_server(tls_stream, user_uuid, unparsed_data)?;
 
             Ok(TcpServerSetupResult::TcpForward {
                 remote_location,
-                stream: flow_stream,
+                stream: Box::new(vision_stream),
                 need_initial_flush: false,
                 connection_success_response: None, // VisionStream will send VLESS response with first write
                 initial_remote_data: None,         // Data fed to VisionStream instead
