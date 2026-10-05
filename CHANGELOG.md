@@ -1,10 +1,36 @@
 # Changelog
 
+## v0.3.1
+
+### Fixes
+
+- Restored unlimited connection, stream, UDP destination, and QUIC memory admission by default. Limits are now opt-in, while transport buffers and connection cleanup remain bounded.
+- Made TUN connection, memory, session, destination, and queued-byte admission limits opt-in through the existing `resource_limits` configuration.
+- Preserved outstanding resource reservations when limits change during configuration reloads.
+- Preserved QUIC protocol control streams when small application stream limits are configured.
+
+### Configuration Migration
+
+Resource-related `SHOES_*` environment variables are no longer used. Configure process-wide limits with a single top-level `global_limits` YAML entry across all loaded configuration files:
+
+```yaml
+- global_limits:
+    max_connections: 1024
+    max_streams: 2048
+    reload_grace_secs: 300
+```
+
+Omitted or `null` admission caps are unlimited; transport buffer sizes remain finite. `SHOES_RELOAD_GRACE_SECS` is replaced by `global_limits.reload_grace_secs`. Existing TUN `resource_limits` values remain supported; omitted admission caps are now unlimited.
+
+Resource budgets limit admitted work and modeled buffers, not total process memory. DNS-over-HTTP/3 reservations remain approximate.
+
+Known limitation: Vision TLS handoff can still fail when a TCP read ends partway through a TLS record.
+
 ## v0.3.0
 
 ### New Features
 
-- Added opt-in connection, stream, UDP destination, and QUIC memory budgets through a single top-level `global_limits` YAML entry. Omitted or `null` admission caps are unlimited; transport buffers remain bounded.
+- Added configurable connection, stream, UDP destination, and QUIC buffer budgets through `SHOES_*` environment variables.
 - Added support for multiple bind addresses in server configurations.
 - Added file logging with `--log-file` and version reporting with `--version`.
 - Added Android AAR and iOS XCFramework release artifacts for mobile embedding.
