@@ -71,6 +71,10 @@ impl TcpServerSetupResult {
 }
 
 #[async_trait]
+#[allow(
+    clippy::double_must_use,
+    reason = "async-trait adds must_use to boxed futures"
+)]
 pub trait TcpServerHandler: Send + Sync + Debug {
     async fn setup_server_stream(
         &self,
@@ -87,6 +91,10 @@ pub struct TcpClientSetupResult {
 }
 
 #[async_trait]
+#[allow(
+    clippy::double_must_use,
+    reason = "async-trait adds must_use to boxed futures"
+)]
 pub trait TcpClientHandler: Send + Sync + Debug {
     /// Setup a client connection through this proxy.
     ///

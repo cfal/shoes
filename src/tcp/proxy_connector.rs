@@ -32,6 +32,10 @@ use crate::tcp::tcp_handler::TcpClientSetupResult;
 ///
 /// - `TcpClientConnector`: For all proxy protocols (SOCKS5, HTTP, VMess, VLESS, etc.)
 #[async_trait]
+#[allow(
+    clippy::double_must_use,
+    reason = "async-trait adds must_use to boxed futures"
+)]
 pub trait ProxyConnector: Send + Sync + Debug {
     /// Returns the proxy server address.
     ///
