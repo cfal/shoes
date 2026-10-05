@@ -709,6 +709,10 @@ fn run_direct_stack_thread(
             }
         }
 
+        // Dispatch queued data and abort resets before removing closed sockets.
+        let after_transfer = SmolInstant::now();
+        iface.poll(after_transfer, &mut device, &mut socket_set);
+
         for handle in sockets_to_remove {
             if let Some(socket_info) = sockets.remove(&handle) {
                 active_connections.remove(&(socket_info.src_addr, socket_info.dst_addr));
@@ -729,10 +733,6 @@ fn run_direct_stack_thread(
             );
             last_log_time = std::time::Instant::now();
         }
-
-        // Polls again after data transfer (critical for performance).
-        let after_transfer = SmolInstant::now();
-        iface.poll(after_transfer, &mut device, &mut socket_set);
 
         // Wait for data using select() - this is the key for event-driven I/O
         if !has_tcp_packet && device.pending_rx.is_none() {
@@ -1056,6 +1056,64 @@ mod tests {
     use super::*;
     use std::os::unix::io::IntoRawFd;
     use std::os::unix::net::UnixStream;
+
+    #[tokio::test]
+    async fn abandoned_connection_sends_reset_before_releasing_socket() {
+        use std::os::unix::net::UnixDatagram;
+        use tokio::io::AsyncReadExt;
+
+        let (peer, tun) = UnixDatagram::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let mut stack = TcpStackDirect::new(tun.into(), 1500);
+        let (tx, mut rx) = mpsc::channel(4);
+        stack.set_new_conn_tx(tx);
+        let packet = |sequence, acknowledgment: Option<u32>, payload: &[u8]| {
+            let builder = etherparse::PacketBuilder::ipv4([10, 0, 0, 2], [1, 1, 1, 1], 64)
+                .tcp(10001, 443, sequence, 4096);
+            let builder = match acknowledgment {
+                Some(ack) => builder.ack(ack),
+                None => builder.syn(),
+            };
+            let mut bytes = Vec::new();
+            builder.write(&mut bytes, payload).unwrap();
+            bytes
+        };
+        let mut buf = [0; 1500];
+        peer.send(&packet(101, None, b"")).unwrap();
+        let n = peer.recv(&mut buf).unwrap();
+        let ip = Ipv4Packet::new_checked(&buf[..n]).unwrap();
+        let syn_ack = TcpPacket::new_checked(ip.payload()).unwrap();
+        assert!(syn_ack.syn() && syn_ack.ack());
+        let acknowledgment = (syn_ack.seq_number().0 as u32).wrapping_add(1);
+        let mut incoming = rx.recv().await.unwrap();
+        peer.send(&packet(102, Some(acknowledgment), b"x")).unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            incoming.connection.read_exact(&mut [0]),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        drop(incoming);
+
+        loop {
+            let n = peer
+                .recv(&mut buf)
+                .expect("abandoned connection did not send a reset");
+            let ip = Ipv4Packet::new_checked(&buf[..n]).unwrap();
+            let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+            if tcp.rst() {
+                assert!(!tcp.fin());
+                break;
+            }
+        }
+        peer.send(&packet(1001, None, b"")).unwrap();
+        let n = peer.recv(&mut buf).unwrap();
+        let ip = Ipv4Packet::new_checked(&buf[..n]).unwrap();
+        let syn_ack = TcpPacket::new_checked(ip.payload()).unwrap();
+        assert!(syn_ack.syn() && syn_ack.ack());
+        assert_eq!(syn_ack.ack_number().0 as u32, 1002);
+    }
 
     #[test]
     fn packet_information_roundtrips_ipv4_and_ipv6() {
