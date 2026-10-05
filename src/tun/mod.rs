@@ -123,7 +123,7 @@ pub async fn run_tun_server(
     let (udp_to_stack_tx, udp_to_stack_rx) = mpsc::channel::<PacketBuffer>(PACKET_QUEUE_CAPACITY);
     tcp_stack.set_udp_response_tx(udp_to_stack_rx);
 
-    let (tcp_conn_tx, mut tcp_conn_rx) = mpsc::channel::<NewTcpConnection>(PACKET_QUEUE_CAPACITY);
+    let (tcp_conn_tx, mut tcp_conn_rx) = mpsc::unbounded_channel::<NewTcpConnection>();
     tcp_stack.set_new_conn_tx(tcp_conn_tx);
 
     let mut tasks = JoinSet::new();

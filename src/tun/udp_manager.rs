@@ -17,7 +17,7 @@ use futures::StreamExt;
 use log::debug;
 use lru::LruCache;
 use tokio::io::ReadBuf;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio::sync::mpsc;
 use tokio::time::{Instant, interval};
 
 use crate::address::{Address, NetLocation};
@@ -25,6 +25,7 @@ use crate::async_stream::AsyncMessageStream;
 use crate::client_proxy_selector::{ClientProxySelector, ConnectDecision};
 use crate::config::tun::TunResourceLimits;
 use crate::resolver::Resolver;
+use crate::resources::{Budget, BudgetPermit};
 
 use super::udp_handler::{UdpMessage, UdpReader, UdpWriter};
 
@@ -69,20 +70,19 @@ pub struct TunUdpManager {
     response_rx: mpsc::Receiver<UdpMessage>,
     /// Cloned into each session, then into each destination task
     response_tx: mpsc::Sender<UdpMessage>,
-    destination_slots: Arc<Semaphore>,
-    destinations_per_session: usize,
-    queued_bytes: Arc<Semaphore>,
+    destination_slots: Arc<Budget>,
+    destinations_per_session: Option<usize>,
+    queued_bytes: Arc<Budget>,
 }
 
 struct QueuedPacket {
     payload: Vec<u8>,
-    _permit: OwnedSemaphorePermit,
+    _permit: BudgetPermit,
 }
 
 impl QueuedPacket {
-    fn reserve(payload: Vec<u8>, budget: &Arc<Semaphore>) -> Option<Self> {
-        let size = u32::try_from(payload.len().max(1)).ok()?;
-        let permit = budget.clone().try_acquire_many_owned(size).ok()?;
+    fn reserve(payload: Vec<u8>, budget: &Arc<Budget>) -> Option<Self> {
+        let permit = budget.acquire(payload.len().max(1))?;
         Some(Self {
             payload,
             _permit: permit,
@@ -123,7 +123,9 @@ impl TunUdpManager {
     ) -> Self {
         let (response_tx, response_rx) = mpsc::channel(RESPONSE_CHANNEL_SIZE);
         let mut sessions = LruCache::unbounded();
-        sessions.resize(NonZeroUsize::new(limits.max_udp_sessions).unwrap());
+        if let Some(limit) = limits.max_udp_sessions {
+            sessions.resize(NonZeroUsize::new(limit).unwrap());
+        }
 
         Self {
             reader,
@@ -133,9 +135,9 @@ impl TunUdpManager {
             resolver,
             response_rx,
             response_tx,
-            destination_slots: Arc::new(Semaphore::new(limits.max_udp_destinations)),
+            destination_slots: Arc::new(Budget::new(limits.max_udp_destinations)),
             destinations_per_session: limits.max_udp_destinations_per_session,
-            queued_bytes: Arc::new(Semaphore::new(limits.max_udp_queued_bytes)),
+            queued_bytes: Arc::new(Budget::new(limits.max_udp_queued_bytes)),
         }
     }
 
@@ -319,8 +321,8 @@ async fn session_task(
     response_tx: mpsc::Sender<UdpMessage>,
     proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
-    destination_slots: Arc<Semaphore>,
-    destinations_per_session: usize,
+    destination_slots: Arc<Budget>,
+    destinations_per_session: Option<usize>,
 ) {
     debug!("[TunUdpSession {}] Starting", peer_addr);
 
@@ -349,10 +351,10 @@ async fn session_task(
                 }
 
                 if !destinations.contains_key(&dest) {
-                    if destinations.len() >= destinations_per_session {
+                    if destinations_per_session.is_some_and(|limit| destinations.len() >= limit) {
                         continue;
                     }
-                    let Ok(permit) = destination_slots.clone().try_acquire_owned() else {
+                    let Some(permit) = destination_slots.acquire(1) else {
                         continue;
                     };
                     let setup = tokio::time::timeout(
@@ -447,7 +449,7 @@ async fn destination_task(
     mut stream: Box<dyn AsyncMessageStream>,
     mut write_rx: mpsc::Receiver<QueuedPacket>,
     response_tx: mpsc::Sender<UdpMessage>,
-    _permit: OwnedSemaphorePermit,
+    _permit: BudgetPermit,
 ) {
     let mut read_buf = vec![0u8; 65535];
     let sleep = tokio::time::sleep(CONNECTION_TIMEOUT);
@@ -577,10 +579,33 @@ async fn send_message(stream: &mut Box<dyn AsyncMessageStream>, data: &[u8]) -> 
 mod lifecycle_tests {
     use super::*;
 
+    #[tokio::test]
+    async fn default_session_admission_does_not_evict_at_the_old_limit() {
+        let (_, from_tun) = mpsc::channel(1);
+        let (to_tun, _) = mpsc::channel(1);
+        let (reader, writer) = super::super::udp_handler::UdpHandler::new(from_tun, to_tun).split();
+        let mut manager = TunUdpManager::new(
+            reader,
+            writer,
+            Arc::new(ClientProxySelector::new(Vec::new())),
+            Arc::new(crate::resolver::NativeResolver::new()),
+            TunResourceLimits::default(),
+        );
+        for port in 10000..10300 {
+            manager.create_session(SocketAddr::from(([127, 0, 0, 1], port)));
+        }
+        assert_eq!(manager.sessions.len(), 300);
+        assert!(
+            manager
+                .sessions
+                .contains(&SocketAddr::from(([127, 0, 0, 1], 10000)))
+        );
+    }
+
     #[test]
     fn session_limit_does_not_preallocate_entries() {
         let limits = TunResourceLimits {
-            max_udp_sessions: usize::MAX,
+            max_udp_sessions: Some(usize::MAX),
             ..Default::default()
         };
         limits.validate().unwrap();
@@ -600,7 +625,7 @@ mod lifecycle_tests {
 
     #[tokio::test]
     async fn burst_packets_share_a_byte_budget_across_both_queue_stages() {
-        let budget = Arc::new(Semaphore::new(640));
+        let budget = Arc::new(Budget::new(Some(640)));
         let (session_tx, mut session_rx) = mpsc::channel(CHANNEL_SIZE);
         let (destination_tx, destination_rx) = mpsc::channel(CHANNEL_SIZE);
         for _ in 0..64 {
@@ -632,10 +657,10 @@ mod lifecycle_tests {
         let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await.unwrap();
         let source = SocketAddr::from(([127, 0, 0, 1], remote.local_addr().unwrap().port()));
         socket.connect(source).await.unwrap();
-        let budget = Arc::new(Semaphore::new(64));
+        let budget = Arc::new(Budget::new(Some(64)));
         let (write_tx, write_rx) = mpsc::channel(CHANNEL_SIZE);
         let (response_tx, mut response_rx) = mpsc::channel(RESPONSE_CHANNEL_SIZE);
-        let permit = Arc::new(Semaphore::new(1)).acquire_owned().await.unwrap();
+        let permit = Arc::new(Budget::new(Some(1))).acquire(1).unwrap();
         let mut tasks = tokio::task::JoinSet::new();
         tasks.spawn(destination_task(
             "127.0.0.1:1234".parse().unwrap(),

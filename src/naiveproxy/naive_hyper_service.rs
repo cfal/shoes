@@ -8,7 +8,7 @@ use std::future::Future;
 use std::io;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::{Arc, LazyLock, Weak};
+use std::sync::{Arc, Weak};
 use std::task::{Context, Poll};
 
 use bytes::Bytes;
@@ -20,7 +20,6 @@ use hyper_util::rt::TokioIo;
 use log::debug;
 use parking_lot::Mutex;
 use rand::RngExt;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use tokio_util::io::ReaderStream;
 
@@ -195,7 +194,7 @@ struct NaiveServiceConfig {
     udp_enabled: bool,
     padding_enabled: bool,
     executor: ConnectionExecutor,
-    slots: Arc<Semaphore>,
+    slots: Arc<crate::resources::Budget>,
 }
 
 fn empty_body() -> BoxBody<Bytes, io::Error> {
@@ -204,13 +203,10 @@ fn empty_body() -> BoxBody<Bytes, io::Error> {
         .boxed()
 }
 
-static FALLBACK_TRANSFERS: LazyLock<Arc<Semaphore>> =
-    LazyLock::new(|| Arc::new(Semaphore::new(32)));
-
 struct FileBody {
     reader: ReaderStream<tokio::io::Take<tokio::fs::File>>,
     remaining: u64,
-    _permit: OwnedSemaphorePermit,
+    _permit: crate::resources::BudgetPermit,
 }
 
 impl Body for FileBody {
@@ -265,8 +261,8 @@ pub(super) async fn run_naive_hyper_service<IO: AsyncStream + 'static>(
         udp_enabled: naive_cfg.udp_enabled,
         padding_enabled: naive_cfg.padding_enabled,
         executor: executor.clone(),
-        slots: Arc::new(Semaphore::new(
-            crate::resources::LIMITS.max_streams_per_connection,
+        slots: Arc::new(crate::resources::Budget::new(
+            crate::resources::limits().max_streams_per_connection,
         )),
     });
 
@@ -289,7 +285,11 @@ pub(super) async fn run_naive_hyper_service<IO: AsyncStream + 'static>(
                 .initial_stream_window_size(WINDOW_SIZE)
                 .initial_connection_window_size(WINDOW_SIZE)
                 .max_frame_size(MAX_FRAME_SIZE)
-                .max_concurrent_streams(crate::resources::LIMITS.max_streams_per_connection as u32)
+                .max_concurrent_streams(
+                    crate::resources::limits()
+                        .max_streams_per_connection
+                        .map(|limit| limit as u32),
+                )
                 .serve_connection(io, service)
                 .await;
 
@@ -431,9 +431,7 @@ async fn naive_service(
 
     let Some(permits) = config
         .slots
-        .clone()
-        .try_acquire_owned()
-        .ok()
+        .acquire(1)
         .and_then(|local| crate::resources::try_stream().map(|global| (local, global)))
     else {
         return Ok(Response::builder()
@@ -517,7 +515,7 @@ async fn serve_fallback(
             .body(empty_body())
             .unwrap());
     };
-    let Ok(permit) = FALLBACK_TRANSFERS.clone().try_acquire_owned() else {
+    let Some(permit) = crate::resources::try_stream() else {
         return Ok(Response::builder()
             .status(StatusCode::SERVICE_UNAVAILABLE)
             .body(empty_body())

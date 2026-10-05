@@ -5,22 +5,27 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use crate::resources::BudgetPermit;
 use quinn::{AsyncUdpSocket, Runtime, UdpPoller};
-use tokio::sync::OwnedSemaphorePermit;
 
 tokio::task_local! {
-    static CONNECTION_MEMORY: RefCell<Option<OwnedSemaphorePermit>>;
+    static CONNECTION_MEMORY: RefCell<Option<BudgetPermit>>;
 }
 
 /// Quinn replaces connection pollers on rebind, so this wrapper deliberately
 /// exposes no rebinding API. Reload creates fresh endpoints instead.
 #[derive(Debug)]
-pub(crate) struct QuicEndpoint(quinn::Endpoint);
+pub(crate) struct QuicEndpoint {
+    inner: quinn::Endpoint,
+    // Transport windows belong to this endpoint, not the latest config generation.
+    memory_bytes: usize,
+}
 
 impl QuicEndpoint {
     pub fn new(
         config: Option<quinn::ServerConfig>,
         socket: std::net::UdpSocket,
+        memory_bytes: usize,
     ) -> io::Result<Self> {
         let socket = MemorySocket {
             inner: quinn::TokioRuntime.wrap_udp_socket(socket)?,
@@ -32,15 +37,19 @@ impl QuicEndpoint {
             Arc::new(socket),
             Arc::new(quinn::TokioRuntime),
         )
-        .map(Self)
+        .map(|inner| Self {
+            inner,
+            memory_bytes,
+        })
     }
 
     pub fn set_default_client_config(&mut self, config: quinn::ClientConfig) {
-        self.0.set_default_client_config(config);
+        self.inner.set_default_client_config(config);
     }
 
     pub fn connect(&self, address: SocketAddr, name: &str) -> io::Result<quinn::Connecting> {
-        let memory = crate::resources::try_quic_memory().ok_or_else(crate::resources::exhausted)?;
+        let memory = crate::resources::try_quic_memory(self.memory_bytes)
+            .ok_or_else(crate::resources::exhausted)?;
         self.connect_with_memory(address, name, memory)
     }
 
@@ -48,54 +57,60 @@ impl QuicEndpoint {
         &self,
         address: SocketAddr,
         name: &str,
-        memory: OwnedSemaphorePermit,
+        memory: BudgetPermit,
     ) -> io::Result<quinn::Connecting> {
         CONNECTION_MEMORY.sync_scope(RefCell::new(Some(memory)), || {
-            self.0.connect(address, name).map_err(io::Error::other)
+            self.inner.connect(address, name).map_err(io::Error::other)
         })
     }
 
     pub async fn accept(&self) -> Option<Incoming> {
-        self.0.accept().await.map(Incoming)
+        self.inner.accept().await.map(|inner| Incoming {
+            inner,
+            memory_bytes: self.memory_bytes,
+        })
     }
 
     pub fn close(&self, code: quinn::VarInt, reason: &[u8]) {
-        self.0.close(code, reason);
+        self.inner.close(code, reason);
     }
 
     #[cfg(test)]
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.0.local_addr()
+        self.inner.local_addr()
     }
 
     #[cfg(test)]
     async fn wait_idle(&self) {
-        self.0.wait_idle().await;
+        self.inner.wait_idle().await;
     }
 }
 
-pub(crate) struct Incoming(quinn::Incoming);
+pub(crate) struct Incoming {
+    inner: quinn::Incoming,
+    memory_bytes: usize,
+}
 
 impl Incoming {
     pub fn remote_address(&self) -> SocketAddr {
-        self.0.remote_address()
+        self.inner.remote_address()
     }
 
     pub fn refuse(self) {
-        self.0.refuse();
+        self.inner.refuse();
     }
 
     pub fn accept(self) -> io::Result<quinn::Connecting> {
-        let Some(memory) = crate::resources::try_quic_memory() else {
+        let Some(memory) = crate::resources::try_quic_memory(self.memory_bytes) else {
             self.refuse();
             return Err(crate::resources::exhausted());
         };
         self.accept_with_memory(memory)
     }
 
-    fn accept_with_memory(self, memory: OwnedSemaphorePermit) -> io::Result<quinn::Connecting> {
+    fn accept_with_memory(self, memory: BudgetPermit) -> io::Result<quinn::Connecting> {
         CONNECTION_MEMORY.sync_scope(RefCell::new(Some(memory)), || {
-            self.0.accept().map_err(io::Error::from)
+            self.inner.accept().map_err(io::Error::from)
         })
     }
 }
@@ -104,7 +119,7 @@ impl Incoming {
 /// Pooled endpoints must reserve each connection through QuicEndpoint instead.
 pub(crate) fn socket_with_memory(
     socket: std::net::UdpSocket,
-    memory: OwnedSemaphorePermit,
+    memory: BudgetPermit,
 ) -> io::Result<Arc<dyn AsyncUdpSocket>> {
     Ok(Arc::new(MemorySocket {
         inner: quinn::TokioRuntime.wrap_udp_socket(socket)?,
@@ -115,7 +130,7 @@ pub(crate) fn socket_with_memory(
 #[derive(Debug)]
 struct MemorySocket {
     inner: Arc<dyn AsyncUdpSocket>,
-    endpoint_memory: Option<OwnedSemaphorePermit>,
+    endpoint_memory: Option<BudgetPermit>,
 }
 
 impl AsyncUdpSocket for MemorySocket {
@@ -171,7 +186,7 @@ impl AsyncUdpSocket for MemorySocket {
 #[derive(Debug)]
 struct MemoryPoller {
     inner: Pin<Box<dyn UdpPoller>>,
-    _memory: OwnedSemaphorePermit,
+    _memory: BudgetPermit,
 }
 
 impl UdpPoller for MemoryPoller {
@@ -186,9 +201,18 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
+    use crate::resources::Budget;
     use bytes::Bytes;
-    use tokio::sync::Semaphore;
     use tokio::time::timeout;
+
+    async fn wait_for_slot(budget: &Arc<Budget>) -> BudgetPermit {
+        loop {
+            if let Some(permit) = budget.acquire(1) {
+                return permit;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
 
     fn configs() -> (quinn::ClientConfig, quinn::ServerConfig) {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
@@ -205,22 +229,213 @@ mod tests {
 
     fn endpoints() -> (QuicEndpoint, QuicEndpoint) {
         let (client_config, server_config) = configs();
+        endpoints_with_configs(client_config, server_config, 1)
+    }
+
+    fn endpoints_with_configs(
+        client_config: quinn::ClientConfig,
+        server_config: quinn::ServerConfig,
+        memory_bytes: usize,
+    ) -> (QuicEndpoint, QuicEndpoint) {
         let server = QuicEndpoint::new(
             Some(server_config),
             std::net::UdpSocket::bind("0.0.0.0:0").unwrap(),
+            memory_bytes,
         )
         .unwrap();
-        let mut client =
-            QuicEndpoint::new(None, std::net::UdpSocket::bind("0.0.0.0:0").unwrap()).unwrap();
+        let mut client = QuicEndpoint::new(
+            None,
+            std::net::UdpSocket::bind("0.0.0.0:0").unwrap(),
+            memory_bytes,
+        )
+        .unwrap();
         client.set_default_client_config(client_config);
         (client, server)
+    }
+
+    #[tokio::test]
+    async fn pending_handshake_backlog_does_not_limit_active_connections() {
+        let (client_config, mut server_config) = configs();
+        let memory_bytes = crate::resources::configure_quic(&mut server_config, 100, 0);
+        let server = QuicEndpoint::new(
+            Some(server_config),
+            std::net::UdpSocket::bind("0.0.0.0:0").unwrap(),
+            memory_bytes,
+        )
+        .unwrap();
+        let mut client = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap()).unwrap();
+        client.set_default_client_config(client_config);
+        let address = SocketAddr::from(([127, 0, 0, 1], server.local_addr().unwrap().port()));
+        let mut pending = Vec::new();
+        timeout(Duration::from_secs(5), async {
+            for _ in 0..128 {
+                let connecting = client.connect(address, "localhost").unwrap();
+                let incoming = server.accept().await.unwrap();
+                // Holding Incoming without accepting it keeps its transport backlog slot.
+                pending.push((connecting, incoming));
+            }
+        })
+        .await
+        .unwrap();
+
+        let extra = client.connect(address, "localhost").unwrap();
+        assert!(
+            timeout(Duration::from_secs(1), server.accept())
+                .await
+                .is_err(),
+            "pending handshakes exceeded the transport backlog",
+        );
+
+        let mut active = Vec::new();
+        timeout(Duration::from_secs(10), async {
+            for (connecting, incoming) in pending {
+                let (connected, accepted) = tokio::join!(connecting, incoming.accept().unwrap());
+                active.push((connected.unwrap(), accepted.unwrap()));
+            }
+            let incoming = server.accept().await.unwrap();
+            let (connected, accepted) = tokio::join!(extra, incoming.accept().unwrap());
+            active.push((connected.unwrap(), accepted.unwrap()));
+        })
+        .await
+        .unwrap();
+        assert_eq!(active.len(), 129);
+        for (connected, accepted) in [&active[0], active.last().unwrap()] {
+            connected
+                .send_datagram(Bytes::from_static(b"active"))
+                .unwrap();
+            assert_eq!(
+                timeout(Duration::from_secs(5), accepted.read_datagram())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                b"active"[..],
+            );
+        }
+        client.close(0u32.into(), b"done");
+        server.close(0u32.into(), b"done");
+        drop(active);
+    }
+
+    #[tokio::test]
+    async fn endpoint_reservations_survive_window_reload() {
+        use crate::config::GlobalLimits;
+
+        if std::env::var_os("SHOES_QUIC_RELOAD_TEST_CHILD").is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "quic_endpoint::tests::endpoint_reservations_survive_window_reload",
+                    "--nocapture",
+                ])
+                .env("SHOES_QUIC_RELOAD_TEST_CHILD", "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+
+        let configured_endpoints = || {
+            let (mut client_config, mut server_config) = configs();
+            let memory_bytes = crate::resources::configure_quic(&mut server_config, 100, 0);
+            let mut transport = quinn::TransportConfig::default();
+            assert_eq!(
+                crate::resources::configure_quic_transport(&mut transport),
+                memory_bytes,
+            );
+            client_config.transport_config(Arc::new(transport));
+            endpoints_with_configs(client_config, server_config, memory_bytes)
+        };
+        crate::resources::configure(GlobalLimits::default()).unwrap();
+        let (large_client, large_server) = configured_endpoints();
+        crate::resources::configure(GlobalLimits {
+            quic_memory_bytes: Some(1 << 20),
+            quic_receive_window: 65536,
+            quic_send_window: 65536,
+            quic_stream_window: 16384,
+            ..Default::default()
+        })
+        .unwrap();
+        let (small_client, small_server) = configured_endpoints();
+        let large_address =
+            SocketAddr::from(([127, 0, 0, 1], large_server.local_addr().unwrap().port()));
+        let small_address =
+            SocketAddr::from(([127, 0, 0, 1], small_server.local_addr().unwrap().port()));
+        assert_eq!(
+            large_client
+                .connect(small_address, "localhost")
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::ConnectionRefused,
+        );
+        let connecting = small_client.connect(large_address, "localhost").unwrap();
+        let incoming = timeout(Duration::from_secs(5), large_server.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            incoming.accept().err().unwrap().kind(),
+            io::ErrorKind::ConnectionRefused,
+        );
+        assert!(
+            timeout(Duration::from_secs(5), connecting)
+                .await
+                .unwrap()
+                .is_err()
+        );
+        timeout(Duration::from_secs(5), small_client.wait_idle())
+            .await
+            .unwrap();
+        assert_eq!(crate::resources::snapshot().quic_buffer_bytes.active, 0);
+
+        let small_reservation = 2 * 65536 + (512 << 10);
+        crate::resources::configure(GlobalLimits {
+            quic_memory_bytes: Some(2 * small_reservation),
+            ..Default::default()
+        })
+        .unwrap();
+        let (client, server) = timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                async {
+                    small_client
+                        .connect(small_address, "localhost")
+                        .unwrap()
+                        .await
+                        .unwrap()
+                },
+                async {
+                    small_server
+                        .accept()
+                        .await
+                        .unwrap()
+                        .accept()
+                        .unwrap()
+                        .await
+                        .unwrap()
+                },
+            )
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            crate::resources::snapshot().quic_buffer_bytes.active,
+            2 * small_reservation,
+        );
+        client.close(0u32.into(), b"done");
+        drop((client, server));
+        timeout(Duration::from_secs(5), async {
+            tokio::join!(small_client.wait_idle(), small_server.wait_idle());
+        })
+        .await
+        .unwrap();
+        assert_eq!(crate::resources::snapshot().quic_buffer_bytes.active, 0);
     }
 
     async fn connect(
         client: &QuicEndpoint,
         server: &QuicEndpoint,
-        client_budget: &Arc<Semaphore>,
-        server_budget: &Arc<Semaphore>,
+        client_budget: &Arc<Budget>,
+        server_budget: &Arc<Budget>,
     ) -> (quinn::Connection, quinn::Connection) {
         let address = SocketAddr::from(([127, 0, 0, 1], server.local_addr().unwrap().port()));
         timeout(Duration::from_secs(5), async {
@@ -230,7 +445,7 @@ mod tests {
                         .connect_with_memory(
                             address,
                             "localhost",
-                            client_budget.clone().try_acquire_owned().unwrap(),
+                            client_budget.acquire(1).unwrap(),
                         )
                         .unwrap()
                         .await
@@ -239,7 +454,7 @@ mod tests {
                 async {
                     let incoming = server.accept().await.unwrap();
                     let connecting = incoming
-                        .accept_with_memory(server_budget.clone().try_acquire_owned().unwrap())
+                        .accept_with_memory(server_budget.acquire(1).unwrap())
                         .unwrap();
                     // Exercise TUIC's incoming 0.5-RTT path as well as ordinary clients.
                     connecting.into_0rtt().unwrap().0
@@ -253,7 +468,7 @@ mod tests {
     struct Payload {
         bytes: Vec<u8>,
         live: Arc<AtomicUsize>,
-        budget: Arc<Semaphore>,
+        budget: Arc<Budget>,
     }
 
     impl AsRef<[u8]> for Payload {
@@ -273,7 +488,7 @@ mod tests {
         }
     }
 
-    fn payload(live: &Arc<AtomicUsize>, budget: &Arc<Semaphore>) -> Bytes {
+    fn payload(live: &Arc<AtomicUsize>, budget: &Arc<Budget>) -> Bytes {
         live.fetch_add(1, Ordering::SeqCst);
         Bytes::from_owner(Payload {
             bytes: vec![0; 1 << 20],
@@ -285,8 +500,8 @@ mod tests {
     #[tokio::test]
     async fn churn_reservations_cover_draining_without_waiting_for_other_connections() {
         let (client, server) = endpoints();
-        let client_budget = Arc::new(Semaphore::new(2));
-        let server_budget = Arc::new(Semaphore::new(2));
+        let client_budget = Arc::new(Budget::new(Some(2)));
+        let server_budget = Arc::new(Budget::new(Some(2)));
         let live = Arc::new(AtomicUsize::new(0));
         let (keeper, keeper_peer) = connect(&client, &server, &client_budget, &server_budget).await;
         for _ in 0..4 {
@@ -304,23 +519,15 @@ mod tests {
                 .unwrap();
             drop((connection, peer, send, recv, peer_send, peer_recv));
             assert_eq!(live.load(Ordering::SeqCst), 2);
-            assert!(client_budget.clone().try_acquire_owned().is_err());
-            assert!(server_budget.clone().try_acquire_owned().is_err());
+            assert!(client_budget.acquire(1).is_none());
+            assert!(server_budget.acquire(1).is_none());
 
-            let client_slot = timeout(
-                Duration::from_secs(5),
-                client_budget.clone().acquire_owned(),
-            )
-            .await
-            .unwrap()
-            .unwrap();
-            let server_slot = timeout(
-                Duration::from_secs(5),
-                server_budget.clone().acquire_owned(),
-            )
-            .await
-            .unwrap()
-            .unwrap();
+            let client_slot = timeout(Duration::from_secs(5), wait_for_slot(&client_budget))
+                .await
+                .unwrap();
+            let server_slot = timeout(Duration::from_secs(5), wait_for_slot(&server_budget))
+                .await
+                .unwrap();
             assert_eq!(live.load(Ordering::SeqCst), 0);
             drop((client_slot, server_slot));
             keeper
@@ -348,8 +555,8 @@ mod tests {
     #[tokio::test]
     async fn reservations_survive_driver_completion_until_last_stream_handle_drops() {
         let (client, server) = endpoints();
-        let client_budget = Arc::new(Semaphore::new(1));
-        let server_budget = Arc::new(Semaphore::new(1));
+        let client_budget = Arc::new(Budget::new(Some(1)));
+        let server_budget = Arc::new(Budget::new(Some(1)));
         let live = Arc::new(AtomicUsize::new(0));
         let (connection, peer) = connect(&client, &server, &client_budget, &server_budget).await;
         let (mut send, recv) = connection.open_bi().await.unwrap();
@@ -378,10 +585,10 @@ mod tests {
     #[tokio::test]
     async fn socket_reservation_survives_draining_and_retained_streams() {
         let (client_config, server_config) = configs();
-        let budget = Arc::new(Semaphore::new(1));
+        let budget = Arc::new(Budget::new(Some(1)));
         let socket = socket_with_memory(
             std::net::UdpSocket::bind("0.0.0.0:0").unwrap(),
-            budget.clone().try_acquire_owned().unwrap(),
+            budget.acquire(1).unwrap(),
         )
         .unwrap();
         let mut client = quinn::Endpoint::new_with_abstract_socket(
@@ -395,9 +602,10 @@ mod tests {
         let server = QuicEndpoint::new(
             Some(server_config),
             std::net::UdpSocket::bind("0.0.0.0:0").unwrap(),
+            1,
         )
         .unwrap();
-        let server_budget = Arc::new(Semaphore::new(1));
+        let server_budget = Arc::new(Budget::new(Some(1)));
         let address = SocketAddr::from(([127, 0, 0, 1], server.local_addr().unwrap().port()));
         let (connection, peer) = timeout(Duration::from_secs(5), async {
             tokio::join!(
@@ -407,7 +615,7 @@ mod tests {
                         .accept()
                         .await
                         .unwrap()
-                        .accept_with_memory(server_budget.clone().try_acquire_owned().unwrap())
+                        .accept_with_memory(server_budget.acquire(1).unwrap())
                         .unwrap()
                         .await
                         .unwrap()
@@ -429,9 +637,8 @@ mod tests {
         assert_eq!(budget.available_permits(), 0);
         assert_eq!(live.load(Ordering::SeqCst), 1);
         drop(recv);
-        let _returned = timeout(Duration::from_secs(5), budget.clone().acquire_owned())
+        let _returned = timeout(Duration::from_secs(5), wait_for_slot(&budget))
             .await
-            .unwrap()
             .unwrap();
         assert_eq!(live.load(Ordering::SeqCst), 0);
         drop(peer);
@@ -444,13 +651,13 @@ mod tests {
     #[tokio::test]
     async fn failed_and_cancelled_handshakes_return_reservations() {
         let (client, _server) = endpoints();
-        let budget = Arc::new(Semaphore::new(1));
+        let budget = Arc::new(Budget::new(Some(1)));
         assert!(
             client
                 .connect_with_memory(
                     "127.0.0.1:0".parse().unwrap(),
                     "localhost",
-                    budget.clone().try_acquire_owned().unwrap(),
+                    budget.acquire(1).unwrap(),
                 )
                 .is_err()
         );
@@ -458,11 +665,7 @@ mod tests {
         let unreachable = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
         let address = SocketAddr::from(([127, 0, 0, 1], unreachable.local_addr().unwrap().port()));
         let connecting = client
-            .connect_with_memory(
-                address,
-                "localhost",
-                budget.clone().try_acquire_owned().unwrap(),
-            )
+            .connect_with_memory(address, "localhost", budget.acquire(1).unwrap())
             .unwrap();
         drop(connecting);
         assert_eq!(budget.available_permits(), 0);

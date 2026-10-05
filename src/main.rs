@@ -113,25 +113,16 @@ fn print_usage_and_exit(arg0: String) {
     eprintln!("    -d, --dry-run        Parse the config and exit");
     eprintln!("    --no-reload          Disable automatic config reloading on file changes");
     eprintln!(
-        "    SHOES_RELOAD_GRACE_SECS sets the TCP reload drain deadline (default: 300, 0: immediate)"
+        "    global_limits.reload_grace_secs sets the TCP reload drain deadline (default: 300)"
     );
     eprintln!("    QUIC connections disconnect immediately on reload.");
     eprintln!("    -V, --version        Print version information and exit");
     eprintln!();
-    eprintln!("RESOURCE LIMITS (environment, read at startup; byte values are decimal):");
-    eprintln!("    SHOES_MAX_CONNECTIONS                  256");
-    eprintln!("    SHOES_MAX_CONNECTIONS_PER_IP           64");
-    eprintln!("    SHOES_MAX_STREAMS                      512 (includes pending UDP destinations)");
-    eprintln!("    SHOES_MAX_STREAMS_PER_CONNECTION       64");
-    eprintln!("    SHOES_MAX_UDP_DESTINATIONS              64 per router/QUIC association set");
-    eprintln!("    SHOES_QUIC_RECEIVE_WINDOW              2097152");
-    eprintln!("    SHOES_QUIC_SEND_WINDOW                 2097152");
-    eprintln!("    SHOES_QUIC_STREAM_WINDOW               262144");
+    eprintln!("RESOURCE LIMITS:");
+    eprintln!("    Optional YAML entry: - global_limits: {{ max_connections: 1024 }}");
     eprintln!(
-        "    SHOES_QUIC_MEMORY_BYTES                67108864 (shared inbound/outbound allowance)"
+        "    Admission is unlimited unless configured. Only one global_limits entry is allowed."
     );
-    eprintln!("    SHOES_QUIC_SOCKET_BUFFER               1048576 per endpoint direction");
-    eprintln!("    QUIC admission reserves receive + send + 524288 bytes per connection.");
     eprintln!();
     eprintln!("COMMANDS:");
     eprintln!(
@@ -335,7 +326,6 @@ fn main() {
         .expect("Could not build tokio runtime");
 
     runtime.block_on(async move {
-        let _resource_reporter = resources::ResourceReporter::start();
         let mut reload_state = if no_reload {
             None
         } else {
@@ -389,7 +379,10 @@ fn main() {
             let config::ValidatedConfigs {
                 configs: server_configs,
                 dns_groups,
+                global_limits,
             } = server_configs;
+            resources::configure(global_limits).expect("validated global limits");
+            let _resource_reporter = resources::ResourceReporter::start();
 
             // Build DNS registry from expanded groups (async - resolves hostnames)
             let mut dns_registry = match dns::build_dns_registry(dns_groups).await {

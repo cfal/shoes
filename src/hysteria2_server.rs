@@ -490,7 +490,9 @@ async fn run_udp_local_to_remote_loop(
                 continue;
             }
         };
-        if sessions.len() >= crate::resources::LIMITS.max_udp_destinations
+        if crate::resources::limits()
+            .max_udp_destinations
+            .is_some_and(|limit| sessions.len() >= limit)
             && !sessions.contains_key(&session_id)
         {
             continue;
@@ -578,7 +580,10 @@ async fn run_tcp_loop(
             }
         };
 
-        if tasks.len() >= crate::resources::LIMITS.max_streams_per_connection {
+        if crate::resources::limits()
+            .max_streams_per_connection
+            .is_some_and(|limit| tasks.len() >= limit)
+        {
             continue;
         }
         let Some(permit) = crate::resources::try_stream() else {
@@ -820,9 +825,11 @@ pub async fn start_hysteria2_server(
     let mut join_handles = vec![];
     let mut server_config = quinn::ServerConfig::with_crypto(quic_server_config);
 
-    crate::resources::configure_quic(&mut server_config, 16);
+    let memory_bytes = crate::resources::configure_quic(&mut server_config, 4096, 1024);
     Arc::get_mut(&mut server_config.transport)
         .unwrap()
+        // HTTP/3 control and QPACK streams are independent of application stream limits.
+        .max_concurrent_uni_streams(1024u32.into())
         .max_idle_timeout(Some(Duration::from_secs(30).try_into().unwrap()))
         .keep_alive_interval(Some(Duration::from_secs(10)))
         // MTU settings per official TUIC reference
@@ -835,9 +842,12 @@ pub async fn start_hysteria2_server(
         // Lower initial RTT estimate for faster initial window growth
         .initial_rtt(Duration::from_millis(100));
 
-    for endpoint in
-        crate::listener_tasks::QuicListener::bind_all(bind_address, server_config, num_endpoints)?
-    {
+    for endpoint in crate::listener_tasks::QuicListener::bind_all(
+        bind_address,
+        server_config,
+        num_endpoints,
+        memory_bytes,
+    )? {
         let resolver = resolver.clone();
         let client_proxy_selector = client_proxy_selector.clone();
         let hysteria2_password = hysteria2_password.clone();

@@ -148,7 +148,8 @@ impl SocketConnectorImpl {
                     quinn::ClientConfig::new(Arc::new(quic_client_config));
 
                 let mut transport_config = quinn::TransportConfig::default();
-                crate::resources::configure_quic_transport(&mut transport_config);
+                let memory_bytes =
+                    crate::resources::configure_quic_transport(&mut transport_config);
                 transport_config
                     .max_concurrent_bidi_streams(0_u32.into())
                     .max_concurrent_uni_streams(0_u8.into())
@@ -173,7 +174,7 @@ impl SocketConnectorImpl {
                     };
                     let udp_socket = udp_socket.into_std().unwrap();
 
-                    let mut endpoint = QuicEndpoint::new(None, udp_socket).unwrap();
+                    let mut endpoint = QuicEndpoint::new(None, udp_socket, memory_bytes).unwrap();
                     endpoint.set_default_client_config(quinn_client_config.clone());
                     endpoints.push(Arc::new(endpoint));
                 }

@@ -4,7 +4,7 @@
 
 ### New Features
 
-- Added configurable connection, stream, UDP destination, and QUIC buffer budgets through `SHOES_*` environment variables.
+- Added opt-in connection, stream, UDP destination, and QUIC memory budgets through a single top-level `global_limits` YAML entry. Omitted or `null` admission caps are unlimited; transport buffers remain bounded.
 - Added support for multiple bind addresses in server configurations.
 - Added file logging with `--log-file` and version reporting with `--version`.
 - Added Android AAR and iOS XCFramework release artifacts for mobile embedding.

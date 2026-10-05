@@ -14,7 +14,16 @@ fn start_process(
     config: &str,
     reload: bool,
 ) -> io::Result<(ProcessGuard, tempfile::NamedTempFile, u32)> {
+    start_process_with_limits(config, reload, "reload_grace_secs: 6")
+}
+
+fn start_process_with_limits(
+    config: &str,
+    reload: bool,
+    limits: &str,
+) -> io::Result<(ProcessGuard, tempfile::NamedTempFile, u32)> {
     let mut file = tempfile::NamedTempFile::new()?;
+    writeln!(file, "- global_limits: {{{limits}}}")?;
     file.write_all(config.as_bytes())?;
     file.flush()?;
     let binary = std::env::var_os("SHOES_TEST_SHOES_BIN")
@@ -23,7 +32,6 @@ fn start_process(
     command
         .args(["-t", "1"])
         .env("RUST_LOG", "warn")
-        .env("SHOES_RELOAD_GRACE_SECS", "6")
         .stdout(Stdio::null())
         .stderr(Stdio::inherit());
     if !reload {
@@ -44,6 +52,76 @@ async fn round_trip(stream: &mut TcpStream, message: &[u8]) -> io::Result<()> {
         Ok(())
     })
     .await?
+}
+
+#[tokio::test]
+async fn default_admission_exceeds_previous_connection_and_stream_caps() -> io::Result<()> {
+    let mut ports = PortHelper::new();
+    let (_, proxy_port) = ports.get_localhost_listener_port();
+    let (_, echo_port) = ports.get_localhost_listener_port();
+    let _echo = start_tcp_stream_echo_server("0.0.0.0", echo_port).await?;
+    let config = format!(
+        r#"- address: '0.0.0.0:{proxy_port}'
+  protocol:
+    type: forward
+    target: '127.0.0.1:{echo_port}'
+"#
+    );
+    let (_process, _config, _) = start_process(&config, false)?;
+    ports.wait_for_all_ports().await?;
+    let mut connections = Vec::new();
+    for _ in 0..520 {
+        let mut stream = TcpStream::connect(("127.0.0.1", proxy_port)).await?;
+        round_trip(&mut stream, b"admitted").await?;
+        connections.push(stream);
+    }
+    round_trip(&mut connections[0], b"still active").await?;
+    round_trip(connections.last_mut().unwrap(), b"also active").await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn yaml_connection_limit_rejects_new_work_without_closing_existing_work() -> io::Result<()> {
+    let mut ports = PortHelper::new();
+    let (_, proxy_port) = ports.get_localhost_listener_port();
+    let (_, echo_port) = ports.get_localhost_listener_port();
+    let _echo = start_tcp_stream_echo_server("0.0.0.0", echo_port).await?;
+    let config = format!(
+        r#"- address: '0.0.0.0:{proxy_port}'
+  protocol:
+    type: forward
+    target: '127.0.0.1:{echo_port}'
+"#
+    );
+    let (_process, _config, _) = start_process_with_limits(&config, false, "max_connections: 2")?;
+    ports.wait_for_all_ports().await?;
+    // The readiness probe must relinquish its reservation before both real connections open.
+    let mut connections = timeout(Duration::from_secs(3), async {
+        loop {
+            let mut streams = Vec::new();
+            for _ in 0..2 {
+                let mut stream = TcpStream::connect(("127.0.0.1", proxy_port)).await?;
+                if round_trip(&mut stream, b"accepted").await.is_err() {
+                    break;
+                }
+                streams.push(stream);
+            }
+            if streams.len() == 2 {
+                return Ok::<_, io::Error>(streams);
+            }
+            drop(streams);
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await??;
+    let mut rejected = TcpStream::connect(("127.0.0.1", proxy_port)).await?;
+    let mut byte = [0];
+    let result = timeout(Duration::from_secs(2), rejected.read(&mut byte)).await?;
+    assert!(matches!(result, Ok(0) | Err(_)));
+    for stream in &mut connections {
+        round_trip(stream, b"still active").await?;
+    }
+    Ok(())
 }
 
 #[tokio::test]
@@ -88,6 +166,88 @@ async fn tcp_reload_drains_existing_connections_within_grace() -> io::Result<()>
         "old generation survived its grace deadline"
     );
     round_trip(&mut replacement, b"still active").await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn hysteria2_control_streams_survive_small_application_caps()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use shoes_test_support::certs::generate_test_cert_files;
+    use std::sync::Arc;
+
+    let (cert, key) = generate_test_cert_files()?;
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in rustls_pemfile::certs(&mut std::io::Cursor::new(std::fs::read(&cert)?)) {
+        roots.add(cert?)?;
+    }
+    let mut tls = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    tls.alpn_protocols = vec![b"h3".to_vec()];
+    let client_config = quinn::ClientConfig::new(Arc::new(
+        quinn::crypto::rustls::QuicClientConfig::try_from(tls)?,
+    ));
+
+    for limit in [1, 2] {
+        let mut ports = PortHelper::new();
+        let (_, quic_port) = ports.get_quic_listener_port();
+        let (_, readiness_port) = ports.get_localhost_listener_port();
+        let config = format!(
+            r#"- address: '0.0.0.0:{quic_port}'
+  transport: quic
+  quic_settings:
+    cert: '{}'
+    key: '{}'
+    num_endpoints: 1
+    alpn_protocols: [h3]
+  protocol:
+    type: hysteria2
+    password: test-password
+- address: '0.0.0.0:{readiness_port}'
+  protocol:
+    type: socks
+"#,
+            cert.display(),
+            key.display(),
+        );
+        let (_process, _config, _) = start_process_with_limits(
+            &config,
+            false,
+            &format!("max_streams_per_connection: {limit}"),
+        )?;
+        ports.wait_for_all_ports().await?;
+        let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse()?)?;
+        endpoint.set_default_client_config(client_config.clone());
+        let connection = timeout(
+            Duration::from_secs(5),
+            endpoint.connect(([127, 0, 0, 1], quic_port).into(), "test.local")?,
+        )
+        .await??;
+        let (mut driver, mut requests) = timeout(
+            Duration::from_secs(5),
+            h3::client::new(h3_quinn::Connection::new(connection)),
+        )
+        .await??;
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("https://hysteria/auth")
+            .header("Hysteria-Auth", "test-password")
+            .body(())?;
+        let response = timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                result = async {
+                    let mut stream = requests.send_request(request).await?;
+                    stream.finish().await?;
+                    stream.recv_response().await
+                } => result.map_err(io::Error::other),
+                error = std::future::poll_fn(|cx| driver.poll_close(cx)) => {
+                    Err(io::Error::other(error))
+                }
+            }
+        })
+        .await??;
+        assert_eq!(response.status().as_u16(), 233, "stream cap {limit}");
+    }
     Ok(())
 }
 

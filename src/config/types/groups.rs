@@ -6,6 +6,7 @@ use crate::option_util::OneOrSome;
 
 use super::client::ClientConfig;
 use super::dns::DnsConfigGroup;
+use super::global::GlobalLimits;
 use super::rules::RuleConfig;
 use super::selection::ConfigSelection;
 use super::server::ServerConfig;
@@ -149,6 +150,7 @@ impl Serialize for NamedPem {
 #[derive(Debug, Clone)]
 #[allow(clippy::large_enum_variant)]
 pub enum Config {
+    GlobalLimits(GlobalLimits),
     Server(ServerConfig),
     /// TUN device server - accepts IP packets from a TUN device.
     /// This is separate from Server because TUN doesn't use bind_location or transport.
@@ -192,7 +194,16 @@ impl<'de> serde::de::Deserialize<'de> for Config {
         let is_tun_config = has_device_name || has_device_fd;
 
         // Try to determine which variant based on fields
-        if has_pem {
+        if map.contains_key(Value::String("global_limits".to_string())) {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct GlobalLimitsEntry {
+                global_limits: Option<GlobalLimits>,
+            }
+            serde_yaml::from_value::<GlobalLimitsEntry>(value)
+                .map(|entry| Config::GlobalLimits(entry.global_limits.unwrap_or_default()))
+                .map_err(|e| Error::custom(format!("invalid global limits: {e}")))
+        } else if has_pem {
             // NamedPem (pem field is unique to NamedPem)
             serde_yaml::from_value(value)
                 .map(Config::NamedPem)
@@ -234,7 +245,8 @@ impl<'de> serde::de::Deserialize<'de> for Config {
                 - Server config: must have 'address', 'addresses', or 'path' field\n\
                 - Client config group: must have 'client_group' field\n\
                 - Rule config group: must have 'rule_group' field\n\
-                - DNS config group: must have 'dns_group' field"
+                - DNS config group: must have 'dns_group' field\n\
+                - Global limits: must have 'global_limits' field"
             )))
         }
     }
@@ -246,6 +258,12 @@ impl serde::ser::Serialize for Config {
         S: serde::ser::Serializer,
     {
         match self {
+            Config::GlobalLimits(limits) => {
+                use serde::ser::SerializeMap;
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry("global_limits", limits)?;
+                map.end()
+            }
             Config::Server(server) => server.serialize(serializer),
             Config::TunServer(tun) => tun.serialize(serializer),
             Config::ClientConfigGroup(group) => group.serialize(serializer),

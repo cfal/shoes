@@ -10,6 +10,7 @@ impl QuicListener {
         address: std::net::SocketAddr,
         config: quinn::ServerConfig,
         count: usize,
+        memory_bytes: usize,
     ) -> std::io::Result<Vec<Self>> {
         (0..count)
             .map(|_| {
@@ -18,10 +19,14 @@ impl QuicListener {
                     None,
                     Some(address),
                     true,
-                    Some(crate::resources::LIMITS.quic_socket_buffer),
+                    Some(crate::resources::limits().quic_socket_buffer),
                 )?;
-                crate::quic_endpoint::QuicEndpoint::new(Some(config.clone()), socket.into())
-                    .map(Self)
+                crate::quic_endpoint::QuicEndpoint::new(
+                    Some(config.clone()),
+                    socket.into(),
+                    memory_bytes,
+                )
+                .map(Self)
             })
             .collect()
     }
@@ -54,17 +59,9 @@ impl ListenerTasks {
     }
 
     pub fn new() -> Self {
-        let seconds = match std::env::var("SHOES_RELOAD_GRACE_SECS") {
-            Ok(value) => match value.parse::<u64>() {
-                Ok(seconds) if seconds <= 86400 => seconds,
-                _ => {
-                    log::warn!("Invalid SHOES_RELOAD_GRACE_SECS; using 300 seconds");
-                    300
-                }
-            },
-            Err(_) => 300,
-        };
-        Self::with_grace(Duration::from_secs(seconds))
+        Self::with_grace(Duration::from_secs(
+            crate::resources::limits().reload_grace_secs,
+        ))
     }
 
     fn with_grace(grace: Duration) -> Self {
@@ -170,19 +167,25 @@ mod tests {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let mut roots = rustls::RootCertStore::empty();
         roots.add(cert.cert.der().clone()).unwrap();
-        let server_config = quinn::ServerConfig::with_single_cert(
+        let mut server_config = quinn::ServerConfig::with_single_cert(
             vec![cert.cert.der().clone()],
             rustls::pki_types::PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()).into(),
         )
         .unwrap();
+        let memory_bytes = crate::resources::configure_quic(&mut server_config, 100, 0);
         let client_config = quinn::ClientConfig::with_root_certificates(Arc::new(roots)).unwrap();
         let occupied = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
         assert!(
-            QuicListener::bind_all(occupied.local_addr().unwrap(), server_config.clone(), 1)
-                .is_err()
+            QuicListener::bind_all(
+                occupied.local_addr().unwrap(),
+                server_config.clone(),
+                1,
+                memory_bytes,
+            )
+            .is_err()
         );
         let create_listener = |address| {
-            QuicListener::bind_all(address, server_config.clone(), 1)
+            QuicListener::bind_all(address, server_config.clone(), 1, memory_bytes)
                 .unwrap()
                 .pop()
                 .unwrap()
