@@ -1183,6 +1183,141 @@ mod tests {
     }
 
     #[test]
+    fn record_preservation_survives_pending_between_fragments() {
+        for backend in BACKENDS {
+            let (mut sender, session) = connection_pair(backend);
+            let uuid = [7; 16];
+            let mut plaintext = uuid.to_vec();
+            plaintext.extend_from_slice(&[COMMAND_DIRECT, 0, 3, 0, 0]);
+            plaintext.extend_from_slice(b"one");
+            let ciphertext = encrypt(&mut sender, &plaintext);
+            let (io, mut peer) = tokio::io::duplex(4096);
+            let mut cx = Context::from_waker(noop_waker_ref());
+            assert!(matches!(
+                Pin::new(&mut peer).poll_write(&mut cx, &ciphertext[..3]),
+                Poll::Ready(Ok(3))
+            ));
+            let tls = CryptoTlsStream::new(io, session, Some(TlsDeframer::new()));
+            let mut vision = VisionStream::new_server(tls, uuid, b"").unwrap();
+            let mut bytes = [0; 16];
+            let mut buf = ReadBuf::new(&mut bytes);
+            assert!(
+                Pin::new(&mut vision)
+                    .poll_read(&mut cx, &mut buf)
+                    .is_pending()
+            );
+            assert!(buf.filled().is_empty());
+            let tail = [&ciphertext[3..], b"-raw"].concat();
+            assert!(matches!(
+                Pin::new(&mut peer).poll_write(&mut cx, &tail),
+                Poll::Ready(Ok(n)) if n == tail.len()
+            ));
+            assert_buffered_reads(&mut vision, b"one-raw");
+        }
+    }
+
+    #[tokio::test]
+    async fn vision_target_plain_udp_preserves_preread_and_following_records() {
+        use crate::client_proxy_selector::ClientProxySelector;
+        use crate::resolver::{NativeResolver, Resolver};
+        use crate::tcp::tcp_handler::TcpServerSetupResult;
+
+        for backend in BACKENDS {
+            let (mut client, server) = connection_pair(backend);
+            let uuid = [7; 16];
+            let mut request = vec![0];
+            request.extend_from_slice(&uuid);
+            request.extend_from_slice(&[0, 2, 0, 53, 1, 127, 0, 0, 1]);
+            request.extend_from_slice(&1000u16.to_be_bytes());
+            request.extend_from_slice(&[42; 1000]);
+            let mut first = encrypt(&mut client, &request);
+            let second = encrypt(&mut client, b"\x00\x03two");
+            first.extend_from_slice(&second[..3]);
+            let io = ScriptedIo {
+                reads: VecDeque::from([first.into(), second[3..].to_vec().into()]),
+            };
+            let tls = CryptoTlsStream::new(io, server, Some(TlsDeframer::new()));
+            let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+            let result =
+                super::super::vless_server_handler::setup_custom_tls_vision_vless_server_stream(
+                    tls,
+                    &uuid,
+                    true,
+                    Arc::new(ClientProxySelector::new(Vec::new())),
+                    &resolver,
+                    None,
+                )
+                .await
+                .unwrap();
+            let TcpServerSetupResult::BidirectionalUdp { mut stream, .. } = result else {
+                panic!("expected ordinary UDP on the Vision-enabled target");
+            };
+            for expected in [vec![42; 1000], b"two".to_vec()] {
+                let mut bytes = [0; 1024];
+                let mut buf = ReadBuf::new(&mut bytes);
+                futures::future::poll_fn(|cx| {
+                    Pin::new(&mut *stream).poll_read_message(cx, &mut buf)
+                })
+                .await
+                .unwrap();
+                assert_eq!(buf.filled(), expected);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn vision_target_auth_fallback_preserves_all_plaintext() {
+        use crate::client_proxy_selector::ClientProxySelector;
+        use crate::resolver::{NativeResolver, Resolver};
+        use crate::tcp::tcp_handler::TcpServerSetupResult;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        for backend in BACKENDS {
+            for invalid_version in [false, true] {
+                let (mut client, server) = connection_pair(backend);
+                let mut expected = vec![u8::from(invalid_version)];
+                expected.extend_from_slice(&[8; 16]);
+                let mut first = encrypt(&mut client, &expected);
+                let suffix = vec![42; 1000];
+                let second = encrypt(&mut client, &suffix);
+                expected.extend_from_slice(&suffix);
+                first.extend_from_slice(&second[..3]);
+                let mut remaining = second[3..].to_vec();
+                client.send_close_notify();
+                client.write_tls(&mut remaining).unwrap();
+                let io = ScriptedIo {
+                    reads: VecDeque::from([first.into(), remaining.into()]),
+                };
+                let tls = CryptoTlsStream::new(io, server, Some(TlsDeframer::new()));
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let fallback = NetLocation::new(
+                    Address::Ipv4(std::net::Ipv4Addr::LOCALHOST),
+                    listener.local_addr().unwrap().port(),
+                );
+                let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+                let result = super::super::vless_server_handler::setup_custom_tls_vision_vless_server_stream(
+                    tls, &[7; 16], true, Arc::new(ClientProxySelector::new(Vec::new())),
+                    &resolver, Some(fallback),
+                ).await.unwrap();
+                let TcpServerSetupResult::Session(session) = result else {
+                    panic!("expected authentication fallback");
+                };
+                tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                    tokio::join!(session, async {
+                        let (mut socket, _) = listener.accept().await.unwrap();
+                        let mut received = Vec::new();
+                        socket.read_to_end(&mut received).await.unwrap();
+                        assert_eq!(received, expected);
+                        socket.shutdown().await.unwrap();
+                    });
+                })
+                .await
+                .unwrap();
+            }
+        }
+    }
+
+    #[test]
     fn closure_framed_tls_rejects_unclean_eof() {
         for backend in [Backend::Tls12, Backend::Tls13] {
             for framed in [false, true] {
