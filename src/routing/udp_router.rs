@@ -25,7 +25,7 @@ use tokio::io::ReadBuf;
 use tokio::time::Instant;
 use tokio_util::time::{DelayQueue, delay_queue};
 
-use crate::address::{Address, NetLocation, ResolvedLocation};
+use crate::address::{Address, NetLocation};
 use crate::async_stream::{
     AsyncFlushMessage, AsyncMessageStream, AsyncPing, AsyncReadMessage, AsyncReadSessionMessage,
     AsyncReadTargetedMessage, AsyncSessionMessageStream, AsyncShutdownMessage,
@@ -33,7 +33,7 @@ use crate::async_stream::{
     AsyncWriteSessionMessage, AsyncWriteSourcedMessage, MessageSessionId,
 };
 use crate::client_proxy_selector::{ClientProxySelector, ConnectDecision};
-use crate::resolver::{Resolver, resolve_single_address};
+use crate::resolver::{Resolver, resolve_location};
 use crate::util::allocate_vec;
 
 /// Timeout for inactive sessions
@@ -1138,16 +1138,20 @@ impl<'a> UdpRouter<'a> {
         let dest_for_future = destination.clone();
 
         let future: SessionCreateFuture = Box::pin(async move {
-            let resolved_addr = resolve_single_address(&resolver, &dest_for_future).await?;
-            // Create ResolvedLocation with pre-resolved address
-            let resolved_location = ResolvedLocation::with_resolved(dest_for_future, resolved_addr);
-            let decision = selector.judge(resolved_location, &resolver).await?;
+            let original_addr = dest_for_future.to_socket_addr_nonblocking();
+            let decision = selector.judge(dest_for_future.into(), &resolver).await?;
 
             match decision {
                 ConnectDecision::Allow {
                     chain_group,
-                    remote_location,
+                    mut remote_location,
                 } => {
+                    // Keep literal reply addresses, but do not resolve a hostname
+                    // that routing replaced with another destination.
+                    let resolved_addr = match original_addr {
+                        Some(address) => address,
+                        None => resolve_location(&mut remote_location, &resolver).await?,
+                    };
                     let client_stream = chain_group
                         .connect_udp_bidirectional(&resolver, remote_location)
                         .await?;

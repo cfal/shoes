@@ -178,6 +178,19 @@ impl AsyncTargetedMessageStream for ChannelStream {}
 mod tests {
     use super::*;
     use crate::client_proxy_selector::{ConnectAction, ConnectRule};
+    use std::future::Future;
+
+    #[derive(Debug)]
+    struct NoHostnameResolver;
+
+    impl Resolver for NoHostnameResolver {
+        fn resolve_location(
+            &self,
+            _: &NetLocation,
+        ) -> Pin<Box<dyn Future<Output = io::Result<Vec<SocketAddr>>> + Send>> {
+            Box::pin(async { Err(io::ErrorKind::NotFound.into()) })
+        }
+    }
 
     #[tokio::test]
     async fn relay_honors_route_override_and_empty_datagrams() {
@@ -221,5 +234,40 @@ mod tests {
         drop(relay);
         tokio::task::yield_now().await;
         assert!(task.is_finished());
+    }
+
+    #[tokio::test]
+    async fn relay_applies_override_before_resolving_original_hostname() {
+        let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await.unwrap();
+        let address = SocketAddr::from(([127, 0, 0, 1], socket.local_addr().unwrap().port()));
+        let target = NetLocation::from_ip_addr(address.ip(), address.port());
+        let resolver: Arc<dyn Resolver> = Arc::new(NoHostnameResolver);
+        for mask in ["0.0.0.0/0", "unknown.invalid"] {
+            let selector = Arc::new(ClientProxySelector::new(vec![ConnectRule::new(
+                vec![crate::address::NetLocationMask::from(mask).unwrap()],
+                ConnectAction::new_allow(
+                    Some(target.clone()),
+                    crate::tcp::chain_builder::build_direct_chain_group(resolver.clone()),
+                ),
+            )]));
+            let relay = UdpRelay::new(selector, resolver.clone()).unwrap();
+            relay
+                .send_to(
+                    b"query",
+                    NetLocation::from_str("unknown.invalid:53", None).unwrap(),
+                )
+                .unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                let mut buf = [0; 64];
+                let (n, peer) = socket.recv_from(&mut buf).await.unwrap();
+                assert_eq!(&buf[..n], b"query");
+                socket.send_to(b"answer", peer).await.unwrap();
+                let (n, source) = relay.recv_from(&mut buf).await.unwrap();
+                assert_eq!(&buf[..n], b"answer");
+                assert_eq!(source, address);
+            })
+            .await
+            .expect("an overridden hostname must not require its own DNS record");
+        }
     }
 }
