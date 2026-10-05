@@ -41,7 +41,7 @@ const MAX_FRAME_SIZE: u32 = 16 * 1024;
 #[derive(Clone)]
 pub struct H2MuxClientSession {
     send_request: h2::client::SendRequest<Bytes>,
-    driver_handle: Arc<DriverHandle>,
+    _driver_handle: Arc<DriverHandle>,
     padding_enabled: bool,
     active_streams: Arc<AtomicU32>,
     /// Closed flag - set by ping failure or connection error
@@ -143,7 +143,7 @@ impl H2MuxClientSession {
 
         Ok(Self {
             send_request,
-            driver_handle: Arc::new(DriverHandle {
+            _driver_handle: Arc::new(DriverHandle {
                 _drain: drain_tx,
                 ping,
             }),
@@ -316,7 +316,7 @@ mod tests {
             let mut session = H2MuxClientSession::new(client, &H2MuxOptions::default())
                 .await
                 .unwrap();
-            let owner = Arc::downgrade(&session.driver_handle);
+            let owner = Arc::downgrade(&session._driver_handle);
             let closed = Arc::clone(&session.is_closed);
             let destination = NetLocation::from_str("example.com:443", None).unwrap();
             let mut stream = session.open_tcp(&destination).await.unwrap();

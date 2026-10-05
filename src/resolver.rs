@@ -455,6 +455,10 @@ impl ResolverCache {
     }
 
     /// Async resolve method for convenience.
+    #[allow(
+        dead_code,
+        reason = "Public library API; the binary uses poll_resolve_location"
+    )]
     pub async fn resolve_location(&mut self, target: &NetLocation) -> std::io::Result<SocketAddr> {
         self.pending = None;
 
