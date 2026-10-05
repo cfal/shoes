@@ -164,31 +164,24 @@ impl AsyncReadMessage for H2MuxUdpMessageStream {
         loop {
             match this.read_state {
                 ReadState::Header => {
-                    // Read the 2-byte length header
                     while this.read_header_pos < 2 {
                         let mut temp_buf =
                             ReadBuf::new(&mut this.read_header[this.read_header_pos..]);
-                        match Pin::new(&mut this.stream).poll_read(cx, &mut temp_buf) {
-                            Poll::Ready(Ok(())) => {
-                                let n = temp_buf.filled().len();
-                                if n == 0 {
-                                    if this.read_header_pos == 0 {
-                                        // EOF at message boundary - return empty
-                                        return Poll::Ready(Ok(()));
-                                    }
-                                    return Poll::Ready(Err(io::Error::new(
-                                        io::ErrorKind::UnexpectedEof,
-                                        "EOF while reading message header",
-                                    )));
-                                }
-                                this.read_header_pos += n;
+                        std::task::ready!(Pin::new(&mut this.stream).poll_read(cx, &mut temp_buf))?;
+                        let n = temp_buf.filled().len();
+                        if n == 0 {
+                            if this.read_header_pos == 0 {
+                                // EOF at message boundary - return empty
+                                return Poll::Ready(Ok(()));
                             }
-                            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                            Poll::Pending => return Poll::Pending,
+                            return Poll::Ready(Err(io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                "EOF while reading message header",
+                            )));
                         }
+                        this.read_header_pos += n;
                     }
 
-                    // Parse header
                     let len = u16::from_be_bytes(this.read_header) as usize;
                     this.read_header_pos = 0;
                     this.read_data_remaining = len;
@@ -209,36 +202,28 @@ impl AsyncReadMessage for H2MuxUdpMessageStream {
                     }
                 }
                 ReadState::Data => {
-                    // Read the message data
                     let offset = this.read_buffer.len() - this.read_data_remaining;
                     let mut temp_buf = ReadBuf::new(&mut this.read_buffer[offset..]);
-                    match Pin::new(&mut this.stream).poll_read(cx, &mut temp_buf) {
-                        Poll::Ready(Ok(())) => {
-                            let n = temp_buf.filled().len();
-                            if n == 0 {
-                                return Poll::Ready(Err(io::Error::new(
-                                    io::ErrorKind::UnexpectedEof,
-                                    "EOF while reading message data",
-                                )));
-                            }
-                            this.read_data_remaining -= n;
+                    std::task::ready!(Pin::new(&mut this.stream).poll_read(cx, &mut temp_buf))?;
+                    let n = temp_buf.filled().len();
+                    if n == 0 {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "EOF while reading message data",
+                        )));
+                    }
+                    this.read_data_remaining -= n;
 
-                            if this.read_data_remaining == 0 {
-                                // Message complete
-                                this.read_state = ReadState::Header;
-                                if this.read_buffer.len() > buf.remaining() {
-                                    return Poll::Ready(Err(io::Error::new(
-                                        io::ErrorKind::InvalidInput,
-                                        "UDP receive buffer too small",
-                                    )));
-                                }
-                                buf.put_slice(&this.read_buffer);
-                                return Poll::Ready(Ok(()));
-                            }
-                            // Continue reading
+                    if this.read_data_remaining == 0 {
+                        this.read_state = ReadState::Header;
+                        if this.read_buffer.len() > buf.remaining() {
+                            return Poll::Ready(Err(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "UDP receive buffer too small",
+                            )));
                         }
-                        Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                        Poll::Pending => return Poll::Pending,
+                        buf.put_slice(&this.read_buffer);
+                        return Poll::Ready(Ok(()));
                     }
                 }
             }
@@ -304,26 +289,61 @@ mod tests {
 
     #[tokio::test]
     async fn partial_message_read_preserves_payload_across_polls() {
-        let (stream, mut peer) = tokio::io::duplex(1024);
-        let mut stream = H2MuxUdpMessageStream::new(Box::new(stream));
-        peer.write_all(&[0, 3, b'a']).await.unwrap();
-        let waker = futures::task::noop_waker();
-        let mut cx = Context::from_waker(&waker);
-        let mut storage = [0; 32];
-        let mut first = ReadBuf::new(&mut storage);
-        assert!(
-            Pin::new(&mut stream)
-                .poll_read_message(&mut cx, &mut first)
-                .is_pending()
-        );
-        assert!(first.filled().is_empty());
-        peer.write_all(b"bc").await.unwrap();
-        let mut next = ReadBuf::new(&mut storage);
-        assert!(matches!(
-            Pin::new(&mut stream).poll_read_message(&mut cx, &mut next),
-            Poll::Ready(Ok(()))
-        ));
-        assert_eq!(next.filled(), b"abc");
+        let packet = b"\0\x03abc";
+        for split in 1..packet.len() {
+            let (stream, mut peer) = tokio::io::duplex(1024);
+            let mut stream = H2MuxUdpMessageStream::new(Box::new(stream));
+            peer.write_all(&packet[..split]).await.unwrap();
+            let waker = futures::task::noop_waker();
+            let mut cx = Context::from_waker(&waker);
+            let mut storage = [0; 32];
+            let mut first = ReadBuf::new(&mut storage);
+            assert!(
+                Pin::new(&mut stream)
+                    .poll_read_message(&mut cx, &mut first)
+                    .is_pending()
+            );
+            assert!(first.filled().is_empty());
+            peer.write_all(&packet[split..]).await.unwrap();
+            let mut next = ReadBuf::new(&mut storage);
+            assert!(matches!(
+                Pin::new(&mut stream).poll_read_message(&mut cx, &mut next),
+                Poll::Ready(Ok(()))
+            ));
+            assert_eq!(next.filled(), b"abc");
+        }
+    }
+
+    #[tokio::test]
+    async fn message_read_distinguishes_eof_from_truncated_frames() {
+        for (packet, expected_error) in [
+            (b"".as_slice(), None),
+            (b"\0".as_slice(), Some("EOF while reading message header")),
+            (
+                b"\0\x03a".as_slice(),
+                Some("EOF while reading message data"),
+            ),
+        ] {
+            let (stream, mut peer) = tokio::io::duplex(1024);
+            let mut stream = H2MuxUdpMessageStream::new(Box::new(stream));
+            peer.write_all(packet).await.unwrap();
+            peer.shutdown().await.unwrap();
+
+            let mut storage = [0; 32];
+            let mut buffer = ReadBuf::new(&mut storage);
+            let result = futures::future::poll_fn(|cx| {
+                Pin::new(&mut stream).poll_read_message(cx, &mut buffer)
+            })
+            .await;
+            if let Some(message) = expected_error {
+                let error = result.unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+                assert_eq!(error.to_string(), message);
+            } else {
+                result.unwrap();
+            }
+            assert!(buffer.filled().is_empty());
+        }
     }
 
     #[tokio::test]
