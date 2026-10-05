@@ -9,13 +9,14 @@ use crate::address::NetLocation;
 use crate::async_stream::AsyncStream;
 use crate::client_proxy_chain::ClientProxyChain;
 use crate::client_proxy_selector::ClientProxySelector;
+use crate::crypto::tls_deframer::TlsDeframer;
 use crate::crypto::{CryptoConnection, CryptoTlsStream, TlsReadMode};
+use crate::prepend_stream::PrependStream;
 use crate::resolver::Resolver;
 use crate::shadow_tls::{ParsedClientHello, parse_server_hello};
 use crate::tcp::tcp_handler::{TcpClientSetupResult, TcpServerSetupResult};
 use crate::tls_server_handler::InnerProtocol;
 use crate::util::{allocate_vec, write_all};
-use crate::crypto::tls_deframer::TlsDeframer;
 
 use super::{RealityServerConfig, RealityServerConnection};
 
@@ -101,6 +102,7 @@ pub async fn setup_reality_server_stream(
             dest_stream,
             vec![],
             Bytes::new(),
+            client_pending,
         ));
     }
 
@@ -169,6 +171,7 @@ pub async fn setup_reality_server_stream(
                             dest_stream,
                             new_records,
                             deframer.into_remaining_data(),
+                            client_pending,
                         ));
                     }
                     log::debug!("REALITY: Dest confirmed TLS 1.3");
@@ -180,6 +183,7 @@ pub async fn setup_reality_server_stream(
                         dest_stream,
                         new_records,
                         deframer.into_remaining_data(),
+                        client_pending,
                     ));
                 }
             }
@@ -225,6 +229,7 @@ pub async fn setup_reality_server_stream(
             dest_stream,
             dest_records,
             remaining_data,
+            client_pending,
         ));
     }
 
@@ -247,6 +252,7 @@ pub async fn setup_reality_server_stream(
                 dest_stream,
                 dest_records,
                 remaining_data,
+                client_pending,
             ));
         }
 
@@ -299,12 +305,20 @@ pub async fn setup_reality_server_stream(
 
 /// Return an owned fallback transfer after forwarding the ClientHello.
 fn start_forward_to_dest(
-    mut client_stream: Box<dyn AsyncStream>,
+    client_stream: Box<dyn AsyncStream>,
     mut dest_stream: Box<dyn AsyncStream>,
     dest_records: Vec<Bytes>,
     remaining_data: Bytes,
+    client_pending: Bytes,
 ) -> TcpServerSetupResult {
     TcpServerSetupResult::Session(Box::pin(async move {
+        // Replay preread bytes through the bidirectional pump so a blocked client
+        // write cannot prevent the destination's response from reaching the client.
+        let mut client_stream = PrependStream::new(
+            client_stream,
+            (!client_pending.is_empty()).then(|| client_pending.to_vec().into_boxed_slice()),
+        );
+
         for record in &dest_records {
             if let Err(e) = write_all(&mut client_stream, record).await {
                 log::debug!("REALITY FALLBACK: Error forwarding record: {}", e);
@@ -342,7 +356,7 @@ fn start_forward_to_dest(
         );
 
         let result = crate::copy_bidirectional::copy_bidirectional(
-            &mut *client_stream,
+            &mut client_stream,
             &mut dest_stream,
             !remaining_data.is_empty(), // flush the client if we wrote remaining data
             false,
@@ -469,6 +483,67 @@ mod cleanup_tests {
         assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
     }
 
+    #[tokio::test]
+    async fn fallback_preread_backpressure_does_not_block_server_response() {
+        let (client, mut client_peer) = tokio::io::duplex(64);
+        let (dest, mut dest_peer) = tokio::io::duplex(64);
+        let pending = vec![42; 128];
+        let TcpServerSetupResult::Session(session) = start_forward_to_dest(
+            Box::new(client),
+            Box::new(dest),
+            vec![Bytes::from_static(b"server")],
+            Bytes::new(),
+            Bytes::copy_from_slice(&pending),
+        ) else {
+            panic!("expected fallback session");
+        };
+        tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(session, async {
+                let mut response = [0; 6];
+                client_peer.read_exact(&mut response).await.unwrap();
+                assert_eq!(&response, b"server");
+                let mut received = vec![0; pending.len()];
+                dest_peer.read_exact(&mut received).await.unwrap();
+                assert_eq!(received, pending);
+                client_peer.shutdown().await.unwrap();
+                dest_peer.shutdown().await.unwrap();
+            });
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn fallback_preserves_preread_client_bytes() {
+        let (client, mut client_peer) = tokio::io::duplex(64);
+        let (dest, mut dest_peer) = tokio::io::duplex(64);
+        let TcpServerSetupResult::Session(session) = start_forward_to_dest(
+            Box::new(client),
+            Box::new(dest),
+            vec![Bytes::from_static(b"server")],
+            Bytes::from_static(b"-tail"),
+            Bytes::from_static(b"client"),
+        ) else {
+            panic!("expected fallback session");
+        };
+        tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(session, async {
+                client_peer.write_all(b"-live").await.unwrap();
+                client_peer.shutdown().await.unwrap();
+                let mut received = [0; 11];
+                dest_peer.read_exact(&mut received).await.unwrap();
+                assert_eq!(&received, b"client-live");
+                dest_peer.write_all(b"-reply").await.unwrap();
+                dest_peer.shutdown().await.unwrap();
+                let mut response = Vec::new();
+                client_peer.read_to_end(&mut response).await.unwrap();
+                assert_eq!(response, b"server-tail-reply");
+            });
+        })
+        .await
+        .unwrap();
+    }
+
     struct StalledShutdown {
         fail_write: bool,
         fail_flush: bool,
@@ -541,9 +616,13 @@ mod cleanup_tests {
                 fail_flush: false,
                 _marker: marker.clone(),
             };
-            let TcpServerSetupResult::Session(session) =
-                start_forward_to_dest(Box::new(client), Box::new(dest), records, remaining)
-            else {
+            let TcpServerSetupResult::Session(session) = start_forward_to_dest(
+                Box::new(client),
+                Box::new(dest),
+                records,
+                remaining,
+                Bytes::new(),
+            ) else {
                 panic!("fallback must remain owned by its caller")
             };
             let started = tokio::time::Instant::now();

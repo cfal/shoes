@@ -4,6 +4,8 @@ use std::task::{Context, Poll};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
+use crate::async_stream::{AsyncPing, AsyncStream};
+
 /// A stream wrapper that prepends initial data to reads.
 ///
 /// Used when the protocol detection leaves some data buffered that needs
@@ -70,3 +72,15 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for PrependStream<S> {
         Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
+
+impl<S: AsyncPing + Unpin> AsyncPing for PrependStream<S> {
+    fn supports_ping(&self) -> bool {
+        self.inner.supports_ping()
+    }
+
+    fn poll_write_ping(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
+        Pin::new(&mut self.get_mut().inner).poll_write_ping(cx)
+    }
+}
+
+impl<S: AsyncStream> AsyncStream for PrependStream<S> {}
