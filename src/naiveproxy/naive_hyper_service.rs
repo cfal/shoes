@@ -4,18 +4,25 @@
 //! It handles CONNECT requests with padding support and built-in static file fallback.
 
 use std::convert::Infallible;
+use std::future::Future;
 use std::io;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::pin::Pin;
+use std::sync::{Arc, LazyLock, Weak};
+use std::task::{Context, Poll};
 
 use bytes::Bytes;
+use futures::Stream;
 use http::{Method, Request, Response, StatusCode};
-use http_body_util::{BodyExt, Empty, Full, combinators::BoxBody};
-use hyper::body::Incoming;
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use http_body_util::{BodyExt, Empty, combinators::BoxBody};
+use hyper::body::{Body, Frame, Incoming, SizeHint};
+use hyper_util::rt::TokioIo;
 use log::debug;
+use parking_lot::Mutex;
 use rand::RngExt;
-use tokio::io::AsyncWriteExt;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::task::JoinSet;
+use tokio_util::io::ReaderStream;
 
 use crate::address::{Address, NetLocation};
 use crate::async_stream::{AsyncMessageStream, AsyncStream};
@@ -42,7 +49,7 @@ use super::user_lookup::UserLookup;
 ///
 /// This is needed because `TokioIo<Upgraded>` doesn't implement `AsyncStream`
 /// (which requires `Sync`), but we need `AsyncStream` for UoT stream wrappers.
-struct HyperUpgradedStream(TokioIo<hyper::upgrade::Upgraded>);
+struct HyperUpgradedStream(Mutex<TokioIo<hyper::upgrade::Upgraded>>);
 
 impl tokio::io::AsyncRead for HyperUpgradedStream {
     fn poll_read(
@@ -50,7 +57,74 @@ impl tokio::io::AsyncRead for HyperUpgradedStream {
         cx: &mut std::task::Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<io::Result<()>> {
-        std::pin::Pin::new(&mut self.0).poll_read(cx, buf)
+        std::pin::Pin::new(self.0.get_mut()).poll_read(cx, buf)
+    }
+}
+
+#[cfg(test)]
+mod fallback_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn connection_executor_cancels_children_without_a_reference_cycle() {
+        let tasks = Arc::new(Mutex::new(JoinSet::new()));
+        let executor = ConnectionExecutor(Arc::downgrade(&tasks));
+        let marker = Arc::new(());
+        let owned = marker.clone();
+        hyper::rt::Executor::execute(&executor, async move {
+            let _owned = owned;
+            std::future::pending::<()>().await;
+        });
+        tokio::task::yield_now().await;
+        drop(tasks);
+        tokio::task::yield_now().await;
+        assert_eq!(Arc::strong_count(&marker), 1);
+        assert!(executor.0.upgrade().is_none());
+    }
+
+    #[tokio::test]
+    async fn large_get_is_chunked_and_head_has_no_body() {
+        let dir = tempfile::tempdir_in(std::env::var_os("HOME").unwrap()).unwrap();
+        let file = std::fs::File::create(dir.path().join("large.bin")).unwrap();
+        file.set_len(64 * 1024 * 1024).unwrap();
+        let root = Some(dir.path().to_path_buf());
+        let head = serve_fallback("/large.bin", &root, true).await.unwrap();
+        assert_eq!(head.status(), StatusCode::OK);
+        assert_eq!(head.headers()["content-length"], "67108864");
+        assert!(
+            head.into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .is_empty()
+        );
+        let mut get = serve_fallback("/large.bin", &root, false).await.unwrap();
+        let chunk = get
+            .body_mut()
+            .frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap();
+        assert_eq!(chunk.len(), 16 * 1024);
+        assert_eq!(
+            get.body().size_hint().exact(),
+            Some(64 * 1024 * 1024 - 16 * 1024)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fallback_rejects_symlink_escape() {
+        let dir = tempfile::tempdir_in(std::env::var_os("HOME").unwrap()).unwrap();
+        let root = dir.path().join("public");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(dir.path().join("secret"), b"private").unwrap();
+        std::os::unix::fs::symlink(dir.path().join("secret"), root.join("escape")).unwrap();
+        let response = serve_fallback("/escape", &Some(root), false).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 }
 
@@ -60,21 +134,21 @@ impl tokio::io::AsyncWrite for HyperUpgradedStream {
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<io::Result<usize>> {
-        std::pin::Pin::new(&mut self.0).poll_write(cx, buf)
+        std::pin::Pin::new(self.0.get_mut()).poll_write(cx, buf)
     }
 
     fn poll_flush(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<io::Result<()>> {
-        std::pin::Pin::new(&mut self.0).poll_flush(cx)
+        std::pin::Pin::new(self.0.get_mut()).poll_flush(cx)
     }
 
     fn poll_shutdown(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<io::Result<()>> {
-        std::pin::Pin::new(&mut self.0).poll_shutdown(cx)
+        std::pin::Pin::new(self.0.get_mut()).poll_shutdown(cx)
     }
 }
 
@@ -91,12 +165,26 @@ impl crate::async_stream::AsyncPing for HyperUpgradedStream {
     }
 }
 
-// SAFETY: The underlying hyper Upgraded stream is used only from async contexts
-// in a single-threaded manner per connection. The Sync bound is required by
-// AsyncStream but the stream is never actually shared across threads.
-unsafe impl Sync for HyperUpgradedStream {}
-
 impl AsyncStream for HyperUpgradedStream {}
+
+#[derive(Clone)]
+struct ConnectionExecutor(Weak<Mutex<JoinSet<()>>>);
+
+impl<F> hyper::rt::Executor<F> for ConnectionExecutor
+where
+    F: Future + Send + 'static,
+    F::Output: Send,
+{
+    fn execute(&self, future: F) {
+        if let Some(tasks) = self.0.upgrade() {
+            let mut tasks = tasks.lock();
+            while tasks.try_join_next().is_some() {}
+            tasks.spawn(async move {
+                let _ = future.await;
+            });
+        }
+    }
+}
 
 /// Service configuration for hyper NaiveProxy handler
 struct NaiveServiceConfig {
@@ -106,6 +194,8 @@ struct NaiveServiceConfig {
     proxy_selector: Arc<ClientProxySelector>,
     udp_enabled: bool,
     padding_enabled: bool,
+    executor: ConnectionExecutor,
+    slots: Arc<Semaphore>,
 }
 
 fn empty_body() -> BoxBody<Bytes, io::Error> {
@@ -114,8 +204,42 @@ fn empty_body() -> BoxBody<Bytes, io::Error> {
         .boxed()
 }
 
-fn full_body(data: Bytes) -> BoxBody<Bytes, io::Error> {
-    Full::new(data).map_err(|never| match never {}).boxed()
+static FALLBACK_TRANSFERS: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(32)));
+
+struct FileBody {
+    reader: ReaderStream<tokio::io::Take<tokio::fs::File>>,
+    remaining: u64,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl Body for FileBody {
+    type Data = Bytes;
+    type Error = io::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, io::Error>>> {
+        match std::task::ready!(Pin::new(&mut self.reader).poll_next(cx)) {
+            Some(Ok(bytes)) => {
+                self.remaining -= bytes.len() as u64;
+                Poll::Ready(Some(Ok(Frame::data(bytes))))
+            }
+            None if self.remaining != 0 => {
+                self.remaining = 0;
+                Poll::Ready(Some(Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "fallback file truncated",
+                ))))
+            }
+            result => Poll::Ready(result.map(|r| r.map(Frame::data))),
+        }
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        SizeHint::with_exact(self.remaining)
+    }
 }
 
 /// Run the hyper-based NaiveProxy service
@@ -130,6 +254,8 @@ pub(super) async fn run_naive_hyper_service<IO: AsyncStream + 'static>(
     use_h2: bool,
 ) -> io::Result<TcpServerSetupResult> {
     let io = TokioIo::new(tls_stream);
+    let tasks = Arc::new(Mutex::new(JoinSet::new()));
+    let executor = ConnectionExecutor(Arc::downgrade(&tasks));
 
     let service_config = Arc::new(NaiveServiceConfig {
         users: naive_cfg.users.clone(),
@@ -138,11 +264,16 @@ pub(super) async fn run_naive_hyper_service<IO: AsyncStream + 'static>(
         proxy_selector: effective_selector,
         udp_enabled: naive_cfg.udp_enabled,
         padding_enabled: naive_cfg.padding_enabled,
+        executor: executor.clone(),
+        slots: Arc::new(Semaphore::new(
+            crate::resources::LIMITS.max_streams_per_connection,
+        )),
     });
 
     if use_h2 {
         // HTTP/2 for NaiveProxy clients
-        tokio::spawn(async move {
+        Ok(TcpServerSetupResult::Session(Box::pin(async move {
+            let _tasks = tasks;
             let service = hyper::service::service_fn(move |req| {
                 let config = service_config.clone();
                 async move { naive_service(req, config).await }
@@ -151,25 +282,25 @@ pub(super) async fn run_naive_hyper_service<IO: AsyncStream + 'static>(
             // H2 settings tuned for reasonable throughput without excessive memory
             // Reference naiveproxy uses ~64KB default, we use 256 KB for better throughput
             const WINDOW_SIZE: u32 = 256 * 1024; // 256 KB (was 16 MB)
-            const MAX_FRAME_SIZE: u32 = (1 << 24) - 1; // ~16 MB (max allowed by HTTP/2)
+            const MAX_FRAME_SIZE: u32 = 16 * 1024;
 
-            let result = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+            let result = hyper::server::conn::http2::Builder::new(executor)
                 .auto_date_header(false)
                 .initial_stream_window_size(WINDOW_SIZE)
                 .initial_connection_window_size(WINDOW_SIZE)
                 .max_frame_size(MAX_FRAME_SIZE)
-                .max_concurrent_streams(1024)
+                .max_concurrent_streams(crate::resources::LIMITS.max_streams_per_connection as u32)
                 .serve_connection(io, service)
                 .await;
 
             if let Err(e) = result {
                 debug!("Naive HTTP/2 connection error: {}", e);
             }
-        });
+        })))
     } else {
         // HTTP/1.1 for browsers and censors - serve static files only, no proxy
         let fallback_path = naive_cfg.fallback_path.clone();
-        tokio::spawn(async move {
+        Ok(TcpServerSetupResult::Session(Box::pin(async move {
             let service = hyper::service::service_fn(move |req| {
                 let path = fallback_path.clone();
                 async move { http1_fallback_service(req, path).await }
@@ -183,10 +314,8 @@ pub(super) async fn run_naive_hyper_service<IO: AsyncStream + 'static>(
             if let Err(e) = result {
                 debug!("Naive HTTP/1.1 fallback error: {}", e);
             }
-        });
+        })))
     }
-
-    Ok(TcpServerSetupResult::AlreadyHandled)
 }
 
 /// HTTP/1.1 fallback service - only serves static files, no proxy functionality
@@ -300,16 +429,30 @@ async fn naive_service(
         PaddingType::None
     };
 
+    let Some(permits) = config
+        .slots
+        .clone()
+        .try_acquire_owned()
+        .ok()
+        .and_then(|local| crate::resources::try_stream().map(|global| (local, global)))
+    else {
+        return Ok(Response::builder()
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .body(empty_body())
+            .unwrap());
+    };
+
     // Get upgrade future before moving the request
     let on_upgrade = hyper::upgrade::on(&mut req);
     let resolver = config.resolver.clone();
     let proxy_selector = config.proxy_selector.clone();
     let udp_enabled = config.udp_enabled;
 
-    tokio::spawn(async move {
+    hyper::rt::Executor::execute(&config.executor, async move {
+        let _permits = permits;
         match on_upgrade.await {
             Ok(upgraded) => {
-                let io = HyperUpgradedStream(TokioIo::new(upgraded));
+                let io = HyperUpgradedStream(Mutex::new(TokioIo::new(upgraded)));
 
                 if padding_type != PaddingType::None {
                     let stream =
@@ -374,6 +517,12 @@ async fn serve_fallback(
             .body(empty_body())
             .unwrap());
     };
+    let Ok(permit) = FALLBACK_TRANSFERS.clone().try_acquire_owned() else {
+        return Ok(Response::builder()
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .body(empty_body())
+            .unwrap());
+    };
 
     // Sanitize path to prevent directory traversal
     let request_path = uri_path.trim_start_matches('/');
@@ -392,12 +541,38 @@ async fn serve_fallback(
         }
     }
 
-    if file_path.is_dir() {
+    if tokio::fs::metadata(&file_path)
+        .await
+        .is_ok_and(|m| m.is_dir())
+    {
         file_path.push("index.html");
     }
 
-    match tokio::fs::read(&file_path).await {
-        Ok(contents) => {
+    let open = async {
+        let root = tokio::fs::canonicalize(base_path).await?;
+        let path = tokio::fs::canonicalize(&file_path).await?;
+        if !path.starts_with(&root) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "fallback path escapes root",
+            ));
+        }
+        let metadata = tokio::fs::metadata(&path).await?;
+        if !metadata.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "not a regular file",
+            ));
+        }
+        let file = if is_head {
+            None
+        } else {
+            Some(tokio::fs::File::open(path).await?)
+        };
+        Ok((file, metadata.len()))
+    };
+    match open.await {
+        Ok((file, length)) => {
             let mime = mime_guess::from_path(&file_path)
                 .first_or_octet_stream()
                 .to_string();
@@ -405,18 +580,27 @@ async fn serve_fallback(
             let body = if is_head {
                 empty_body()
             } else {
-                full_body(Bytes::from(contents.clone()))
+                FileBody {
+                    reader: ReaderStream::with_capacity(file.unwrap().take(length), 16 * 1024),
+                    remaining: length,
+                    _permit: permit,
+                }
+                .boxed()
             };
 
             Ok(Response::builder()
                 .status(StatusCode::OK)
                 .header("content-type", mime)
-                .header("content-length", contents.len())
+                .header("content-length", length)
                 .body(body)
                 .unwrap())
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Response::builder()
             .status(StatusCode::NOT_FOUND)
+            .body(empty_body())
+            .unwrap()),
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => Ok(Response::builder()
+            .status(StatusCode::FORBIDDEN)
             .body(empty_body())
             .unwrap()),
         Err(_) => Ok(Response::builder()
@@ -467,8 +651,12 @@ async fn handle_naive_stream<S: AsyncStream + 'static>(
             }
 
             // UoT V2 header: destination uses SOCKS5 address format
-            let is_connect = stream.read_u8().await?;
-            let destination = read_location_direct(&mut stream).await?;
+            let (is_connect, destination) = crate::util::timeout_stream_setup(async {
+                let is_connect = stream.read_u8().await?;
+                let destination = read_location_direct(&mut stream).await?;
+                Ok((is_connect, destination))
+            })
+            .await?;
 
             debug!(
                 "NaiveProxy stream (user: {}): UoT V2 connect={} -> {}",
@@ -478,18 +666,20 @@ async fn handle_naive_stream<S: AsyncStream + 'static>(
             if is_connect == 1 {
                 let uot_v2_stream = UotV2Stream::new(stream);
 
-                let action = proxy_selector
-                    .judge(destination.clone().into(), &resolver)
-                    .await?;
+                let action = crate::util::timeout_stream_setup(
+                    proxy_selector.judge(destination.clone().into(), &resolver),
+                )
+                .await?;
 
                 match action {
                     ConnectDecision::Allow {
                         chain_group,
                         remote_location,
                     } => {
-                        let client_stream = chain_group
-                            .connect_udp_bidirectional(&resolver, remote_location)
-                            .await?;
+                        let client_stream = crate::util::timeout_stream_setup(
+                            chain_group.connect_udp_bidirectional(&resolver, remote_location),
+                        )
+                        .await?;
 
                         return run_udp_copy(
                             Box::new(uot_v2_stream) as Box<dyn AsyncMessageStream>,
@@ -526,16 +716,20 @@ async fn handle_naive_stream<S: AsyncStream + 'static>(
         user_name, remote_location
     );
 
-    let action = proxy_selector
-        .judge(remote_location.clone().into(), &resolver)
-        .await?;
+    let action = crate::util::timeout_stream_setup(
+        proxy_selector.judge(remote_location.clone().into(), &resolver),
+    )
+    .await?;
 
     let mut client_stream: Box<dyn AsyncStream> = match action {
         ConnectDecision::Allow {
             chain_group,
             remote_location,
         } => {
-            let result = chain_group.connect_tcp(remote_location, &resolver).await?;
+            let result = crate::util::timeout_stream_setup(
+                chain_group.connect_tcp(remote_location, &resolver),
+            )
+            .await?;
             result.client_stream
         }
         ConnectDecision::Block => {
@@ -545,7 +739,7 @@ async fn handle_naive_stream<S: AsyncStream + 'static>(
     };
 
     // Use larger buffers for better throughput (default 8KB is too small)
-    const COPY_BUF_SIZE: usize = 256 * 1024;
+    const COPY_BUF_SIZE: usize = 32 * 1024;
     let result = copy_bidirectional_with_sizes(
         &mut stream,
         &mut client_stream,
@@ -556,8 +750,10 @@ async fn handle_naive_stream<S: AsyncStream + 'static>(
     )
     .await;
 
-    let _ = stream.shutdown().await;
-    let _ = client_stream.shutdown().await;
+    futures::join!(
+        crate::util::shutdown_stream(&mut stream),
+        crate::util::shutdown_stream(&mut client_stream),
+    );
 
     match result {
         Ok(()) => {

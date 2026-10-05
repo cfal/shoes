@@ -242,6 +242,10 @@ impl ResolvedLocation {
     }
 
     /// Create a location with a pre-resolved address.
+    #[allow(
+        dead_code,
+        reason = "Retained for tests; production routing now resolves lazily"
+    )]
     pub fn with_resolved(location: NetLocation, addr: SocketAddr) -> Self {
         Self {
             location,

@@ -1,4 +1,6 @@
 use std::fmt::Debug;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -38,9 +40,8 @@ pub enum TcpServerSetupResult {
         /// The proxy selector to use for routing this connection
         proxy_selector: Arc<ClientProxySelector>,
     },
-    /// Connection has been fully handled (e.g., spawned as a background task).
-    /// No further processing needed by the caller.
-    AlreadyHandled,
+    /// Long-lived work, polled outside the setup deadline and cancelled with its owner.
+    Session(Pin<Box<dyn Future<Output = ()> + Send>>),
 }
 
 impl TcpServerSetupResult {
@@ -64,12 +65,16 @@ impl TcpServerSetupResult {
             } => {
                 *flush = need_initial_flush;
             }
-            TcpServerSetupResult::AlreadyHandled => {}
+            TcpServerSetupResult::Session(_) => {}
         }
     }
 }
 
 #[async_trait]
+#[allow(
+    clippy::double_must_use,
+    reason = "async-trait adds must_use to boxed futures"
+)]
 pub trait TcpServerHandler: Send + Sync + Debug {
     async fn setup_server_stream(
         &self,
@@ -86,6 +91,10 @@ pub struct TcpClientSetupResult {
 }
 
 #[async_trait]
+#[allow(
+    clippy::double_must_use,
+    reason = "async-trait adds must_use to boxed futures"
+)]
 pub trait TcpClientHandler: Send + Sync + Debug {
     /// Setup a client connection through this proxy.
     ///

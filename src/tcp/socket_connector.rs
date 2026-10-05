@@ -29,6 +29,10 @@ use crate::resolver::Resolver;
 /// Only used at the first hop of a chain. Handles TCP and QUIC transports
 /// with optional bind_interface.
 #[async_trait]
+#[allow(
+    clippy::double_must_use,
+    reason = "async-trait adds must_use to boxed futures"
+)]
 pub trait SocketConnector: Send + Sync + Debug {
     /// Create a TCP/QUIC connection to the given address.
     ///

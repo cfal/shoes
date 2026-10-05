@@ -14,6 +14,7 @@
 //! 2. `copy_bidirectional` expects shutdown to complete before marking direction as done
 //! 3. Best-effort FIN could be silently dropped if the channel is full
 
+use super::anytls_client_session::{AnyTlsClientSession, OutgoingMessage};
 use crate::async_stream::{AsyncPing, AsyncStream};
 use bytes::Bytes;
 use std::io;
@@ -22,7 +23,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::PollSender;
 
 /// Buffer size for bounded channels (number of messages, not bytes)
@@ -33,6 +34,76 @@ pub const STREAM_CHANNEL_BUFFER: usize = 16;
 /// Maximum data payload per frame (u16::MAX = 65535)
 /// Writes larger than this must be chunked into multiple frames
 const MAX_FRAME_DATA_SIZE: usize = 65535;
+
+enum WriteChannel {
+    Server(PollSender<(u32, Bytes)>),
+    Client {
+        sender: PollSender<OutgoingMessage>,
+        flush: Option<oneshot::Receiver<()>>,
+    },
+}
+
+impl WriteChannel {
+    fn poll_pending_flush(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if matches!(self, Self::Client { flush: Some(_), .. }) {
+            self.poll_flush(cx)
+        } else {
+            Poll::Ready(Ok(()))
+        }
+    }
+    fn poll_reserve(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), ()>> {
+        match self {
+            Self::Server(sender) => sender.poll_reserve(cx).map_err(|_| ()),
+            Self::Client { sender, .. } => sender.poll_reserve(cx).map_err(|_| ()),
+        }
+    }
+
+    fn send_item(&mut self, (stream_id, data): (u32, Bytes)) -> Result<(), ()> {
+        match self {
+            Self::Server(sender) => sender.send_item((stream_id, data)).map_err(|_| ()),
+            Self::Client { sender, .. } => {
+                let message = if data.is_empty() {
+                    OutgoingMessage::Fin { stream_id }
+                } else {
+                    OutgoingMessage::Data { stream_id, data }
+                };
+                sender.send_item(message).map_err(|_| ())
+            }
+        }
+    }
+
+    fn try_send_fin(&mut self, stream_id: u32) -> Result<(), ()> {
+        match self {
+            Self::Server(sender) => sender
+                .get_ref()
+                .ok_or(())?
+                .try_send((stream_id, Bytes::new()))
+                .map_err(|_| ()),
+            Self::Client { sender, .. } => sender
+                .get_ref()
+                .ok_or(())?
+                .try_send(OutgoingMessage::Fin { stream_id })
+                .map_err(|_| ()),
+        }
+    }
+
+    fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let Self::Client { sender, flush } = self else {
+            return Poll::Ready(Ok(()));
+        };
+        if flush.is_none() {
+            std::task::ready!(sender.poll_reserve(cx)).map_err(|_| io::ErrorKind::BrokenPipe)?;
+            let (done, rx) = oneshot::channel();
+            sender
+                .send_item(OutgoingMessage::Flush { done })
+                .map_err(|_| io::ErrorKind::BrokenPipe)?;
+            *flush = Some(rx);
+        }
+        let result = std::task::ready!(Pin::new(flush.as_mut().unwrap()).poll(cx));
+        *flush = None;
+        Poll::Ready(result.map_err(|_| io::ErrorKind::BrokenPipe.into()))
+    }
+}
 
 /// AnyTlsStream represents a multiplexed stream within an AnyTLS session
 ///
@@ -58,7 +129,7 @@ pub struct AnyTlsStream {
     /// Poll-based sender for outgoing data to session (bounded with backpressure)
     /// Data sent here will be framed as PSH and written to the connection.
     /// PollSender provides poll_reserve() for non-blocking backpressure.
-    data_tx: PollSender<(u32, Bytes)>,
+    data_tx: WriteChannel,
 
     /// Shared flag indicating session closure
     session_closed: Arc<AtomicBool>,
@@ -69,13 +140,14 @@ pub struct AnyTlsStream {
     /// Flag indicating shutdown is in progress (FIN being sent)
     /// This tracks the multi-poll cycle of poll_reserve -> send_item
     shutdown_in_progress: bool,
+    fin_sent: bool,
 
     /// Flag to track if we've received EOF
     eof: bool,
 
     /// Keepalive reference to the session (client-side only)
     /// This ensures the session stays alive as long as any stream exists
-    _session_keepalive: Option<Arc<dyn std::any::Any + Send + Sync>>,
+    _session_keepalive: Option<Arc<AnyTlsClientSession>>,
 }
 
 impl AnyTlsStream {
@@ -97,10 +169,11 @@ impl AnyTlsStream {
             data_rx,
             read_buffer: Bytes::new(),
             read_offset: 0,
-            data_tx: PollSender::new(data_tx),
+            data_tx: WriteChannel::Server(PollSender::new(data_tx)),
             session_closed,
             stream_closed: false,
             shutdown_in_progress: false,
+            fin_sent: false,
             eof: false,
             _session_keepalive: None,
         }
@@ -110,22 +183,26 @@ impl AnyTlsStream {
     ///
     /// This variant holds an Arc reference to the session, ensuring it stays
     /// alive as long as the stream exists. Used by client-side streams.
-    pub fn with_keepalive<S: Send + Sync + 'static>(
+    pub(super) fn with_keepalive(
         id: u32,
         data_rx: mpsc::Receiver<Bytes>,
-        data_tx: mpsc::Sender<(u32, Bytes)>,
+        data_tx: mpsc::Sender<OutgoingMessage>,
         session_closed: Arc<AtomicBool>,
-        session: Arc<S>,
+        session: Arc<AnyTlsClientSession>,
     ) -> Self {
         Self {
             id,
             data_rx,
             read_buffer: Bytes::new(),
             read_offset: 0,
-            data_tx: PollSender::new(data_tx),
+            data_tx: WriteChannel::Client {
+                sender: PollSender::new(data_tx),
+                flush: None,
+            },
             session_closed,
             stream_closed: false,
             shutdown_in_progress: false,
+            fin_sent: false,
             eof: false,
             _session_keepalive: Some(session),
         }
@@ -145,8 +222,10 @@ impl AnyTlsStream {
     /// For proper shutdown semantics, use `poll_shutdown` which blocks until FIN is sent.
     fn send_fin_best_effort(&mut self) {
         // Don't abort pending data - just try to send FIN if there's room
-        if let Some(sender) = self.data_tx.get_ref() {
-            let _ = sender.try_send((self.id, Bytes::new()));
+        if self.data_tx.try_send_fin(self.id).is_err()
+            && let Some(session) = &self._session_keepalive
+        {
+            session.close();
         }
     }
 }
@@ -157,6 +236,9 @@ impl AsyncRead for AnyTlsStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
         // Check if stream/session is closed
         if self.stream_closed {
             return Poll::Ready(Err(io::Error::new(
@@ -222,6 +304,9 @@ impl AsyncWrite for AnyTlsStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
         if self.stream_closed {
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
@@ -243,6 +328,7 @@ impl AsyncWrite for AnyTlsStream {
             )));
         }
 
+        std::task::ready!(self.data_tx.poll_pending_flush(cx))?;
         // Use poll_reserve for backpressure - this will return Pending if channel is full
         match self.data_tx.poll_reserve(cx) {
             Poll::Ready(Ok(())) => {
@@ -273,62 +359,32 @@ impl AsyncWrite for AnyTlsStream {
         }
     }
 
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        // Data is sent through channels, actual flushing happens in process_outgoing
-        Poll::Ready(Ok(()))
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.data_tx.poll_flush(cx)
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        // Already fully closed
         if self.stream_closed {
             return Poll::Ready(Ok(()));
         }
-
-        // Session closed - can't send FIN anyway
         if self.session_closed.load(Ordering::Relaxed) {
             self.stream_closed = true;
             return Poll::Ready(Ok(()));
         }
-
-        // Mark that we're in the shutdown process
-        // This ensures we don't try to send data while shutting down
         self.shutdown_in_progress = true;
-
-        // Use poll_reserve to wait for channel capacity (respects backpressure)
-        // This ensures any pending data in the channel is sent before FIN
-        match self.data_tx.poll_reserve(cx) {
-            Poll::Ready(Ok(())) => {
-                // We have capacity - send the FIN (empty bytes)
-                let id = self.id;
-                match self.data_tx.send_item((id, Bytes::new())) {
-                    Ok(()) => {
-                        self.stream_closed = true;
-                        Poll::Ready(Ok(()))
-                    }
-                    Err(_) => {
-                        // Channel closed - session is gone, mark as closed
-                        self.stream_closed = true;
-                        Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::BrokenPipe,
-                            "session channel closed during shutdown",
-                        )))
-                    }
-                }
-            }
-            Poll::Ready(Err(_)) => {
-                // Channel closed - can't send FIN
-                self.stream_closed = true;
-                Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "session channel closed",
-                )))
-            }
-            Poll::Pending => {
-                // Channel full - wait for capacity (backpressure)
-                // This ensures FIN is queued after any pending data
-                Poll::Pending
-            }
+        if !self.fin_sent {
+            std::task::ready!(self.data_tx.poll_pending_flush(cx))?;
+            std::task::ready!(self.data_tx.poll_reserve(cx))
+                .map_err(|_| io::ErrorKind::BrokenPipe)?;
+            let id = self.id;
+            self.data_tx
+                .send_item((id, Bytes::new()))
+                .map_err(|_| io::ErrorKind::BrokenPipe)?;
+            self.fin_sent = true;
         }
+        std::task::ready!(self.data_tx.poll_flush(cx))?;
+        self.stream_closed = true;
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -336,9 +392,12 @@ impl Drop for AnyTlsStream {
     fn drop(&mut self) {
         // If stream wasn't properly shutdown, try best-effort FIN
         // This handles cases where the stream is dropped without calling shutdown()
-        if !self.stream_closed {
+        if !self.stream_closed && !self.fin_sent {
             self.stream_closed = true;
             self.send_fin_best_effort();
+        }
+        if let Some(session) = &self._session_keepalive {
+            session.remove_stream(self.id);
         }
     }
 }

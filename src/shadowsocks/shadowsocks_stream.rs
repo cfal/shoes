@@ -253,6 +253,16 @@ impl ShadowsocksStream {
                     [self.unprocessed_start_offset..self.unprocessed_start_offset + pending_len],
             );
 
+        if matches!(self.stream_type, ShadowsocksStreamType::Aead)
+            && let Some(salt) = self.decrypt_iv.take()
+            && let Some(checker) = &self.salt_checker
+            && !checker.lock().insert_and_check(&salt)
+        {
+            return Err(std::io::Error::other(
+                "salt replay or replay cache capacity exhausted",
+            ));
+        }
+
         self.processed_end_offset += pending_len;
         self.unprocessed_start_offset += pending_len_with_tag;
 
@@ -400,11 +410,8 @@ impl ShadowsocksStream {
     fn process_read_header(&mut self) -> std::io::Result<()> {
         match self.stream_type {
             ShadowsocksStreamType::Aead => {
-                if let Some(salt_checker) = &self.salt_checker {
-                    let decrypt_iv = &self.unprocessed_buf[0..self.salt_len];
-                    if !salt_checker.lock().insert_and_check(decrypt_iv) {
-                        return Err(std::io::Error::other("got duplicate salt"));
-                    }
+                if self.salt_checker.is_some() {
+                    self.decrypt_iv = Some(self.unprocessed_buf[..self.salt_len].into());
                 }
                 self.process_opening_key()?;
                 self.unprocessed_start_offset += self.salt_len;
@@ -911,4 +918,54 @@ impl AsyncMessageStream for ShadowsocksStream {}
 #[inline]
 fn current_time_secs() -> u64 {
     SystemTime::UNIX_EPOCH.elapsed().unwrap().as_secs()
+}
+
+#[cfg(test)]
+mod replay_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Debug)]
+    struct CountingChecker(Arc<AtomicUsize>);
+    impl SaltChecker for CountingChecker {
+        fn insert_and_check(&mut self, _: &[u8]) -> bool {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_salt_is_admitted_only_after_payload_authentication() {
+        let key: Arc<Box<dyn ShadowsocksKey>> = Arc::new(Box::new(
+            super::super::default_key::DefaultKey::new("secret", 32),
+        ));
+        let make_stream = |checker| {
+            let (stream, _peer) = tokio::io::duplex(4096);
+            ShadowsocksStream::new(
+                Box::new(stream),
+                ShadowsocksStreamType::Aead,
+                &aws_lc_rs::aead::AES_256_GCM,
+                32,
+                key.clone(),
+                checker,
+            )
+        };
+        let mut writer = make_stream(None);
+        writer.process_write_header(b"hello").unwrap();
+        let wire = writer.write_cache[..writer.write_cache_end_offset].to_vec();
+        for corrupt in [true, false] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut reader =
+                make_stream(Some(Arc::new(Mutex::new(CountingChecker(calls.clone())))));
+            reader.unprocessed_buf[..wire.len()].copy_from_slice(&wire);
+            reader.unprocessed_end_offset = wire.len();
+            if corrupt {
+                reader.unprocessed_buf[wire.len() - 1] ^= 1;
+            }
+            reader.process_read_header().unwrap();
+            assert_eq!(calls.load(Ordering::Relaxed), 0);
+            assert_eq!(reader.try_decrypt().is_ok(), !corrupt);
+            assert_eq!(calls.load(Ordering::Relaxed), usize::from(!corrupt));
+        }
+    }
 }

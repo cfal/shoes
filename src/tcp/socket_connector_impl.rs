@@ -17,6 +17,7 @@ use tokio::net::UdpSocket;
 use crate::address::{NetLocation, ResolvedLocation};
 use crate::async_stream::AsyncStream;
 use crate::config::{ClientConfig, ClientQuicConfig, Transport};
+use crate::quic_endpoint::QuicEndpoint;
 use crate::quic_stream::QuicStream;
 use crate::resolver::{Resolver, resolve_addresses, resolve_location};
 use crate::rustls_config_util::create_client_config;
@@ -34,7 +35,7 @@ enum TransportConfig {
     },
     Quic {
         sni_hostname: Option<String>,
-        endpoints: Vec<Arc<quinn::Endpoint>>,
+        endpoints: Vec<Arc<QuicEndpoint>>,
         next_endpoint_index: AtomicU8,
     },
 }
@@ -147,6 +148,7 @@ impl SocketConnectorImpl {
                     quinn::ClientConfig::new(Arc::new(quic_client_config));
 
                 let mut transport_config = quinn::TransportConfig::default();
+                crate::resources::configure_quic_transport(&mut transport_config);
                 transport_config
                     .max_concurrent_bidi_streams(0_u32.into())
                     .max_concurrent_uni_streams(0_u8.into())
@@ -171,13 +173,7 @@ impl SocketConnectorImpl {
                     };
                     let udp_socket = udp_socket.into_std().unwrap();
 
-                    let mut endpoint = quinn::Endpoint::new(
-                        quinn::EndpointConfig::default(),
-                        None,
-                        udp_socket,
-                        Arc::new(quinn::TokioRuntime),
-                    )
-                    .unwrap();
+                    let mut endpoint = QuicEndpoint::new(None, udp_socket).unwrap();
                     endpoint.set_default_client_config(quinn_client_config.clone());
                     endpoints.push(Arc::new(endpoint));
                 }
@@ -359,6 +355,9 @@ impl UnconnectedUdpSocket {
 }
 
 impl crate::async_stream::AsyncReadMessage for UnconnectedUdpSocket {
+    fn read_message_eof_on_empty(&self) -> bool {
+        false
+    }
     fn poll_read_message(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,

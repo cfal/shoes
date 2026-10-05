@@ -53,6 +53,7 @@ struct TcpConnectionInner {
     recv_state: TcpSocketState,
     /// Send side state
     send_state: TcpSocketState,
+    abandoned: bool,
 }
 
 impl TcpConnectionControl {
@@ -66,11 +67,16 @@ impl TcpConnectionControl {
                 recv_waker: None,
                 recv_state: TcpSocketState::Normal,
                 send_state: TcpSocketState::Normal,
+                abandoned: false,
             }),
         }
     }
 
     // --- Methods called by stack thread ---
+
+    pub fn is_abandoned(&self) -> bool {
+        self.inner.lock().abandoned
+    }
 
     /// Check if recv buffer is full.
     pub fn recv_buffer_full(&self) -> bool {
@@ -182,12 +188,7 @@ impl TcpConnection {
 impl Drop for TcpConnection {
     fn drop(&mut self) {
         let mut inner = self.control.inner.lock();
-        if matches!(inner.recv_state, TcpSocketState::Normal) {
-            inner.recv_state = TcpSocketState::Close;
-        }
-        if matches!(inner.send_state, TcpSocketState::Normal) {
-            inner.send_state = TcpSocketState::Close;
-        }
+        inner.abandoned = true;
         drop(inner);
         self.notify();
     }
@@ -200,6 +201,10 @@ impl AsyncRead for TcpConnection {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let mut inner = self.control.inner.lock();
+
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
 
         // Try to read from buffer first
         if !inner.recv_buffer.is_empty() {

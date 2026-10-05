@@ -1,28 +1,18 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::time::Duration;
 
 use log::{debug, error};
-use quinn::EndpointConfig;
-use tokio::io::AsyncWriteExt;
 use tokio::task::JoinHandle;
-use tokio::time::timeout;
 
-use crate::async_stream::AsyncStream;
-use crate::client_proxy_selector::ConnectDecision;
 use crate::config::{
     BindLocation, ConfigSelection, ServerConfig, ServerProxyConfig, ServerQuicConfig,
 };
-use crate::copy_bidirectional::copy_bidirectional;
 use crate::quic_stream::QuicStream;
 use crate::resolver::Resolver;
-use crate::routing::{ServerStream, run_udp_routing};
 use crate::rustls_config_util::create_server_config;
-use crate::socket_util::new_socket2_udp_socket;
 use crate::tcp::tcp_client_handler_factory::create_tcp_client_proxy_selector;
-use crate::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult};
-use crate::tcp::tcp_server::{run_udp_copy, setup_client_tcp_stream};
+use crate::tcp::tcp_handler::TcpServerHandler;
 use crate::tcp::tcp_server_handler_factory::create_tcp_server_handler;
 use crate::uuid_util::parse_uuid;
 
@@ -33,35 +23,39 @@ async fn start_quic_server(
     server_handler: Arc<dyn TcpServerHandler>,
     num_endpoints: usize,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
-    // TODO: consider setting transport config
-    //   Arc::get_mut(&mut server_config.transport)
-    //     .unwrap()
-    //     .max_concurrent_bidi_streams(1024_u32.into())
-    //     .max_concurrent_uni_streams(0_u8.into())
-    //     .keep_alive_interval(Some(Duration::from_secs(15)))
-    //     .max_idle_timeout(Some(Duration::from_secs(30).try_into().unwrap()));
-
     let mut join_handles = vec![];
-    for _ in 0..num_endpoints {
-        let server_config = quinn::ServerConfig::with_crypto(quic_server_config.clone());
-
-        let socket2_socket =
-            new_socket2_udp_socket(bind_address.is_ipv6(), None, Some(bind_address), true).unwrap();
-
-        let endpoint = quinn::Endpoint::new(
-            EndpointConfig::default(),
-            Some(server_config),
-            socket2_socket.into(),
-            Arc::new(quinn::TokioRuntime),
-        )?;
-
+    let mut server_config = quinn::ServerConfig::with_crypto(quic_server_config);
+    crate::resources::configure_quic(&mut server_config, 0);
+    for endpoint in
+        crate::listener_tasks::QuicListener::bind_all(bind_address, server_config, num_endpoints)?
+    {
         let resolver = resolver.clone();
         let server_handler = server_handler.clone();
         let join_handle = tokio::spawn(async move {
-            while let Some(conn) = endpoint.accept().await {
+            let mut tasks = crate::listener_tasks::ListenerTasks::immediate();
+            loop {
+                let conn = tokio::select! {
+                    conn = endpoint.accept() => conn,
+                    _ = tasks.join_next(), if !tasks.is_empty() => continue,
+                };
+                let Some(conn) = conn else { break };
+                let Some(permit) =
+                    crate::resources::try_connection(Some(conn.remote_address().ip()))
+                else {
+                    conn.refuse();
+                    continue;
+                };
+                let conn = match conn.accept() {
+                    Ok(conn) => conn,
+                    Err(e) => {
+                        debug!("QUIC accept failed: {e}");
+                        continue;
+                    }
+                };
                 let resolver = resolver.clone();
                 let server_handler = server_handler.clone();
-                tokio::spawn(async move {
+                tasks.spawn(async move {
+                    let _permit = permit;
                     if let Err(e) = process_connection(resolver, server_handler, conn).await {
                         error!("Connection ended with error: {e}");
                     }
@@ -78,12 +72,17 @@ async fn start_quic_server(
 async fn process_connection(
     resolver: Arc<dyn Resolver>,
     server_handler: Arc<dyn TcpServerHandler>,
-    conn: quinn::Incoming,
+    conn: quinn::Connecting,
 ) -> std::io::Result<()> {
     let connection = conn.await?;
+    let mut tasks = tokio::task::JoinSet::new();
 
     loop {
-        let stream = match connection.accept_bi().await {
+        let accepted = tokio::select! {
+            result = connection.accept_bi() => result,
+            _ = tasks.join_next(), if !tasks.is_empty() => continue,
+        };
+        let stream = match accepted {
             Err(quinn::ConnectionError::ApplicationClosed { .. }) => {
                 debug!("Connection closed");
                 break;
@@ -93,9 +92,12 @@ async fn process_connection(
             }
             Ok(s) => s,
         };
+        if tasks.len() >= crate::resources::LIMITS.max_streams_per_connection {
+            continue;
+        }
         let cloned_resolver = resolver.clone();
         let cloned_handler = server_handler.clone();
-        tokio::spawn(async move {
+        tasks.spawn(async move {
             if let Err(e) = process_streams(cloned_resolver, cloned_handler, stream).await {
                 error!("Failed to process streams: {e}");
             }
@@ -110,160 +112,8 @@ async fn process_streams(
     server_handler: Arc<dyn TcpServerHandler>,
     (send, recv): (quinn::SendStream, quinn::RecvStream),
 ) -> std::io::Result<()> {
-    let quic_stream: Box<dyn AsyncStream> = Box::new(QuicStream::from(send, recv));
-
-    let setup_server_stream_future = timeout(
-        Duration::from_secs(60),
-        server_handler.setup_server_stream(quic_stream),
-    );
-
-    let setup_result = match setup_server_stream_future.await {
-        Ok(Ok(r)) => r,
-        Ok(Err(e)) => {
-            return Err(std::io::Error::new(
-                e.kind(),
-                format!("failed to setup server stream: {e}"),
-            ));
-        }
-        Err(elapsed) => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                format!("server setup timed out: {elapsed}"),
-            ));
-        }
-    };
-
-    match setup_result {
-        TcpServerSetupResult::TcpForward {
-            remote_location,
-            stream: mut server_stream,
-            need_initial_flush: server_need_initial_flush,
-            proxy_selector,
-            connection_success_response,
-            initial_remote_data,
-        } => {
-            let setup_client_stream_future = timeout(
-                Duration::from_secs(60),
-                setup_client_tcp_stream(
-                    &mut server_stream,
-                    proxy_selector,
-                    resolver,
-                    remote_location.clone(),
-                ),
-            );
-
-            let mut client_stream = match setup_client_stream_future.await {
-                Ok(Ok(Some(s))) => s,
-                Ok(Ok(None)) => {
-                    // Must have been blocked.
-                    let _ = server_stream.shutdown().await;
-                    return Ok(());
-                }
-                Ok(Err(e)) => {
-                    let _ = server_stream.shutdown().await;
-                    return Err(std::io::Error::new(
-                        e.kind(),
-                        format!("failed to setup client stream to {remote_location}: {e}"),
-                    ));
-                }
-                Err(elapsed) => {
-                    let _ = server_stream.shutdown().await;
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        format!("client setup to {remote_location} timed out: {elapsed}"),
-                    ));
-                }
-            };
-
-            if let Some(data) = connection_success_response {
-                server_stream.write_all(&data).await?;
-                // server_need_initial_flush should be set to true by the handler if
-                // it's needed.
-            }
-
-            let client_need_initial_flush = match initial_remote_data {
-                Some(data) => {
-                    client_stream.write_all(&data).await?;
-                    true
-                }
-                None => false,
-            };
-
-            let copy_result = copy_bidirectional(
-                &mut server_stream,
-                &mut client_stream,
-                server_need_initial_flush,
-                client_need_initial_flush,
-            )
-            .await;
-
-            let (_, _) = futures::join!(server_stream.shutdown(), client_stream.shutdown());
-
-            copy_result?;
-            Ok(())
-        }
-        TcpServerSetupResult::BidirectionalUdp {
-            remote_location,
-            stream: server_stream,
-            need_initial_flush: server_need_initial_flush,
-            proxy_selector,
-        } => {
-            let action = proxy_selector
-                .judge(remote_location.into(), &resolver)
-                .await?;
-            match action {
-                ConnectDecision::Allow {
-                    chain_group,
-                    remote_location,
-                } => {
-                    let client_stream = chain_group
-                        .connect_udp_bidirectional(&resolver, remote_location)
-                        .await?;
-
-                    run_udp_copy(
-                        server_stream,
-                        client_stream,
-                        server_need_initial_flush,
-                        false,
-                    )
-                    .await
-                }
-                ConnectDecision::Block => Ok(()),
-            }
-        }
-        TcpServerSetupResult::MultiDirectionalUdp {
-            stream: server_stream,
-            need_initial_flush,
-            proxy_selector,
-        } => {
-            // Routes each packet based on its destination
-            run_udp_routing(
-                ServerStream::Targeted(server_stream),
-                proxy_selector,
-                resolver,
-                need_initial_flush,
-            )
-            .await
-        }
-        TcpServerSetupResult::SessionBasedUdp {
-            stream: server_stream,
-            need_initial_flush,
-            proxy_selector,
-        } => {
-            // Routes each session based on its destination
-            run_udp_routing(
-                ServerStream::Session(server_stream),
-                proxy_selector,
-                resolver,
-                need_initial_flush,
-            )
-            .await
-        }
-        TcpServerSetupResult::AlreadyHandled => {
-            // Connection already handled by a spawned task (e.g., Reality fallback)
-            Ok(())
-        }
-    }
+    crate::tcp::tcp_server::process_stream(QuicStream::from(send, recv), server_handler, resolver)
+        .await
 }
 
 pub async fn start_quic_servers(
@@ -345,23 +195,23 @@ pub async fn start_quic_servers(
             udp_enabled,
         } => {
             // TODO: hash password instead of passing directly
-            let hysteria2_password: &'static str = Box::leak(password.into_boxed_str());
+            let hysteria2_password: Arc<str> = password.into();
 
             for bind_address in bind_addresses.into_iter() {
                 let quic_server_config = quic_server_config.clone();
                 let client_proxy_selector = client_proxy_selector.clone();
                 let resolver = resolver.clone();
-                let hysteria2_handles = crate::hysteria2_server::start_hysteria2_server(
+                let result = crate::hysteria2_server::start_hysteria2_server(
                     bind_address,
                     quic_server_config,
-                    hysteria2_password,
+                    hysteria2_password.clone(),
                     client_proxy_selector,
                     resolver,
                     num_endpoints,
                     udp_enabled,
                 )
-                .await?;
-                handles.extend(hysteria2_handles);
+                .await;
+                collect_started_listeners(&mut handles, result).await?;
             }
         }
         ServerProxyConfig::TuicV5 {
@@ -369,24 +219,24 @@ pub async fn start_quic_servers(
             password,
             zero_rtt_handshake,
         } => {
-            let uuid: &'static [u8] = Box::leak(parse_uuid(&uuid)?.into_boxed_slice());
-            let password: &'static str = Box::leak(password.into_boxed_str());
+            let uuid: Arc<[u8]> = parse_uuid(&uuid)?.into();
+            let password: Arc<str> = password.into();
             for bind_address in bind_addresses.into_iter() {
                 let quic_server_config = quic_server_config.clone();
                 let client_proxy_selector = client_proxy_selector.clone();
                 let resolver = resolver.clone();
-                let tuic_handles = crate::tuic_server::start_tuic_server(
+                let result = crate::tuic_server::start_tuic_server(
                     bind_address,
                     quic_server_config,
-                    uuid,
-                    password,
+                    uuid.clone(),
+                    password.clone(),
                     client_proxy_selector,
                     resolver,
                     num_endpoints,
                     zero_rtt_handshake,
                 )
-                .await?;
-                handles.extend(tuic_handles);
+                .await;
+                collect_started_listeners(&mut handles, result).await?;
             }
         }
         tcp_protocol => {
@@ -408,19 +258,122 @@ pub async fn start_quic_servers(
                     .clone();
                 let quic_server_config = quic_server_config.clone();
                 let resolver = resolver.clone();
-                let quic_handles = start_quic_server(
+                let result = start_quic_server(
                     bind_address,
                     quic_server_config,
                     resolver,
                     tcp_handler,
                     num_endpoints,
                 )
-                .await?;
+                .await;
 
-                handles.extend(quic_handles);
+                collect_started_listeners(&mut handles, result).await?;
             }
         }
     }
 
     Ok(handles)
+}
+
+async fn collect_started_listeners(
+    handles: &mut Vec<JoinHandle<()>>,
+    result: std::io::Result<Vec<JoinHandle<()>>>,
+) -> std::io::Result<()> {
+    match result {
+        Ok(started) => {
+            handles.extend(started);
+            Ok(())
+        }
+        Err(error) => {
+            for handle in handles.iter() {
+                handle.abort();
+            }
+            for handle in handles.drain(..) {
+                let _ = handle.await;
+            }
+            Err(error)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::address::NetLocation;
+    use crate::config::{RuleConfig, Transport};
+    use crate::option_util::{NoneOrSome, OneOrSome};
+    use crate::resolver::NativeResolver;
+    use std::time::Duration;
+
+    async fn assert_partial_startup_cleanup(protocol: ServerProxyConfig) {
+        let first = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+        let first_addr = first.local_addr().unwrap();
+        let occupied = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+        let occupied_addr = occupied.local_addr().unwrap();
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let config = ServerConfig {
+            bind_location: BindLocation::Address(OneOrSome::Some(
+                [first_addr, occupied_addr]
+                    .into_iter()
+                    .map(|addr| NetLocation::from_ip_addr(addr.ip(), addr.port()).into())
+                    .collect(),
+            )),
+            protocol,
+            transport: Transport::Quic,
+            tcp_settings: None,
+            quic_settings: Some(ServerQuicConfig {
+                cert: cert.cert.pem(),
+                key: cert.signing_key.serialize_pem(),
+                alpn_protocols: NoneOrSome::One("h3".into()),
+                client_ca_certs: NoneOrSome::None,
+                client_fingerprints: NoneOrSome::None,
+                num_endpoints: 2,
+            }),
+            rules: NoneOrSome::One(ConfigSelection::Config(RuleConfig::default())),
+            dns: None,
+        };
+        drop(first);
+        let error = start_quic_servers(config, Arc::new(NativeResolver::new()))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Ok(socket) = std::net::UdpSocket::bind(first_addr) {
+                    break socket;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("partial startup left the first QUIC address bound");
+    }
+
+    #[tokio::test]
+    async fn partial_hysteria2_startup_releases_earlier_listeners() {
+        assert_partial_startup_cleanup(ServerProxyConfig::Hysteria2 {
+            password: "password".into(),
+            udp_enabled: true,
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn partial_tuic_startup_releases_earlier_listeners() {
+        assert_partial_startup_cleanup(ServerProxyConfig::TuicV5 {
+            uuid: "550e8400-e29b-41d4-a716-446655440000".into(),
+            password: "password".into(),
+            zero_rtt_handshake: false,
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn partial_generic_quic_startup_releases_earlier_listeners() {
+        assert_partial_startup_cleanup(ServerProxyConfig::Http {
+            username: None,
+            password: None,
+        })
+        .await;
+    }
 }

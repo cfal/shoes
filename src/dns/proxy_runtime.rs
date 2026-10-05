@@ -9,13 +9,11 @@ use std::time::Duration;
 
 use hickory_resolver::net::runtime::iocompat::AsyncIoTokioAsStd;
 use hickory_resolver::net::runtime::{QuicSocketBinder, RuntimeProvider, Spawn, TokioTime};
-use quinn::Runtime as QuinnRuntime;
 
 use crate::address::{Address, NetLocation};
 use crate::async_stream::AsyncStream;
 use crate::client_proxy_chain::ClientChainGroup;
 use crate::resolver::Resolver;
-use crate::socket_util::new_udp_socket;
 
 #[cfg(test)]
 const TEST_CONNECT_TIMEOUT: Duration = Duration::from_millis(100);
@@ -144,13 +142,12 @@ impl RuntimeProvider for ProxyRuntimeProvider {
         let bind_interface = self.bind_interface.clone();
 
         Box::pin(async move {
-            if bind_interface.is_some() {
-                // Use our socket_util which supports bind_interface.
-                new_udp_socket(local_addr.is_ipv6(), bind_interface)
-            } else {
-                // Default: bind directly.
-                tokio::net::UdpSocket::bind(local_addr).await
-            }
+            let socket = crate::socket_util::new_outbound_socket2_udp_socket(
+                local_addr.is_ipv6(),
+                bind_interface,
+                Some(local_addr),
+            )?;
+            tokio::net::UdpSocket::from_std(socket.into())
         })
     }
 
@@ -171,35 +168,14 @@ impl QuicSocketBinder for ProxyQuicBinder {
         local_addr: SocketAddr,
         _server_addr: SocketAddr,
     ) -> Result<Arc<dyn quinn::AsyncUdpSocket>, io::Error> {
-        let socket = if self.bind_interface.is_some() {
-            // Use socket2 for bind_interface support.
-            let socket2_socket = crate::socket_util::new_socket2_udp_socket(
-                local_addr.is_ipv6(),
-                self.bind_interface.clone(),
-                Some(local_addr),
-                false,
-            )?;
-            // Convert socket2 -> std::net::UdpSocket.
-            #[cfg(unix)]
-            {
-                use std::os::unix::io::FromRawFd;
-                use std::os::unix::io::IntoRawFd;
-                let raw_fd = socket2_socket.into_raw_fd();
-                unsafe { std::net::UdpSocket::from_raw_fd(raw_fd) }
-            }
-            #[cfg(windows)]
-            {
-                use std::os::windows::io::FromRawSocket;
-                use std::os::windows::io::IntoRawSocket;
-                let raw_socket = socket2_socket.into_raw_socket();
-                unsafe { std::net::UdpSocket::from_raw_socket(raw_socket) }
-            }
-        } else {
-            // Default: bind directly.
-            std::net::UdpSocket::bind(local_addr)?
-        };
-
-        quinn::TokioRuntime.wrap_udp_socket(socket)
+        let memory =
+            crate::resources::try_dns_quic_memory().ok_or_else(crate::resources::exhausted)?;
+        let socket = crate::socket_util::new_outbound_socket2_udp_socket(
+            local_addr.is_ipv6(),
+            self.bind_interface.clone(),
+            Some(local_addr),
+        )?;
+        crate::quic_endpoint::socket_with_memory(socket.into(), memory)
     }
 }
 
@@ -315,6 +291,190 @@ mod tests {
         let provider =
             ProxyRuntimeProvider::with_bootstrap(chain_group, resolver, TEST_CONNECT_TIMEOUT);
         assert!(provider.quic_binder().is_some());
+    }
+
+    fn run_quic_test_in_child(name: &str) -> bool {
+        if std::env::var("SHOES_DNS_QUIC_TEST_CHILD").as_deref() == Ok(name) {
+            return false;
+        }
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                &format!("dns::proxy_runtime::tests::{name}"),
+                "--nocapture",
+            ])
+            .env("SHOES_DNS_QUIC_TEST_CHILD", name)
+            .env("SHOES_QUIC_MEMORY_BYTES", (16 << 20).to_string())
+            .env("SHOES_QUIC_DNS_MEMORY_BYTES", (16 << 20).to_string())
+            .env("SHOES_QUIC_RECEIVE_WINDOW", (2 << 20).to_string())
+            .env("SHOES_QUIC_SEND_WINDOW", (2 << 20).to_string())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        true
+    }
+
+    #[tokio::test]
+    async fn quic_binder_reserves_shared_memory_until_last_socket_drop() {
+        if run_quic_test_in_child("quic_binder_reserves_shared_memory_until_last_socket_drop") {
+            return;
+        }
+        let binder = ProxyQuicBinder {
+            bind_interface: None,
+        };
+        let local_addr = "0.0.0.0:0".parse().unwrap();
+        let server_addr = "127.0.0.1:443".parse().unwrap();
+        assert!(crate::resources::try_quic_memory().is_some());
+        let socket = binder.bind_quic(local_addr, server_addr).unwrap();
+        assert_eq!(
+            crate::resources::snapshot().quic_buffer_bytes.active,
+            16 << 20
+        );
+        assert!(crate::resources::try_quic_memory().is_none());
+        assert_eq!(
+            binder
+                .bind_quic(local_addr, server_addr)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::ConnectionRefused,
+        );
+        let clone = socket.clone();
+        drop(socket);
+        assert_eq!(
+            crate::resources::snapshot().quic_buffer_bytes.active,
+            16 << 20
+        );
+        drop(clone);
+        assert_eq!(crate::resources::snapshot().quic_buffer_bytes.active, 0);
+
+        let occupied = std::net::UdpSocket::bind(local_addr).unwrap();
+        assert!(
+            binder
+                .bind_quic(occupied.local_addr().unwrap(), server_addr)
+                .is_err()
+        );
+        assert_eq!(crate::resources::snapshot().quic_buffer_bytes.active, 0);
+        assert!(binder.bind_quic(local_addr, server_addr).is_ok());
+    }
+
+    #[tokio::test]
+    async fn h3_lookup_uses_budgeted_socket_and_releases_it_on_teardown() {
+        use bytes::Buf;
+        use hickory_resolver::config::{
+            ConnectionConfig, NameServerConfig, ProtocolConfig, ResolverConfig,
+        };
+        use hickory_resolver::net::h3::h3_server::H3Server;
+        use hickory_resolver::proto::op::{Message, MessageType};
+        use hickory_resolver::proto::rr::{RData, Record, rdata::A};
+
+        if run_quic_test_in_child("h3_lookup_uses_budgeted_socket_and_releases_it_on_teardown") {
+            return;
+        }
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert.cert.der().clone()).unwrap();
+        let mut tls = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![cert.cert.der().clone()],
+                rustls::pki_types::PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der())
+                    .into(),
+            )
+            .unwrap();
+        tls.alpn_protocols = vec![b"h3".to_vec()];
+        let mut server = H3Server::with_socket_and_tls_config(
+            tokio::net::UdpSocket::bind("0.0.0.0:0").await.unwrap(),
+            Arc::new(tls),
+        )
+        .unwrap();
+        let mut connection_config = ConnectionConfig::new(ProtocolConfig::H3 {
+            server_name: "localhost".into(),
+            path: "/dns-query".into(),
+            disable_grease: true,
+        });
+        connection_config.port = server.local_addr().unwrap().port();
+        let config = ResolverConfig::from_parts(
+            None,
+            vec![],
+            vec![NameServerConfig::new(
+                "127.0.0.1".parse().unwrap(),
+                true,
+                vec![connection_config],
+            )],
+        );
+        let bootstrap = Arc::new(NativeResolver::new());
+        let provider = ProxyRuntimeProvider::with_bootstrap(
+            Arc::new(build_direct_chain_group(bootstrap.clone())),
+            bootstrap,
+            Duration::from_secs(5),
+        );
+        let tls = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let resolver = hickory_resolver::Resolver::builder_with_config(config, provider)
+            .with_tls_config(tls)
+            .build()
+            .unwrap();
+        let answer = RData::A(A::new(192, 0, 2, 42));
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let serve = async {
+            let (mut connection, _) = server.accept().await.unwrap().unwrap();
+            let (request, mut stream) = connection.accept().await.unwrap().unwrap();
+            assert_eq!(request.uri().path(), "/dns-query");
+            let respond = async {
+                let mut body = Vec::new();
+                while let Some(mut data) = stream.recv_data().await.unwrap() {
+                    body.extend_from_slice(&data.copy_to_bytes(data.remaining()));
+                }
+                let mut response = Message::from_vec(&body).unwrap();
+                response.metadata.message_type = MessageType::Response;
+                response.add_answer(Record::from_rdata(
+                    response.queries[0].name().clone(),
+                    60,
+                    answer.clone(),
+                ));
+                let body = response.to_vec().unwrap();
+                stream
+                    .send_response(
+                        http::Response::builder()
+                            .header("content-type", "application/dns-message")
+                            .header("content-length", body.len())
+                            .body(())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                stream.send_data(body.into()).await.unwrap();
+                stream.finish().await.unwrap();
+                done_rx.await.unwrap();
+            };
+            tokio::select! {
+                _ = respond => {},
+                _ = connection.accept() => panic!("unexpected extra H3 request or closure"),
+            }
+        };
+        let lookup = async {
+            let result = resolver.ipv4_lookup("memory.test.").await.unwrap();
+            assert_eq!(result.answers()[0].data, answer);
+            assert_eq!(
+                crate::resources::snapshot().quic_buffer_bytes.active,
+                16 << 20
+            );
+            done_tx.send(()).unwrap();
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(serve, lookup)
+        })
+        .await
+        .unwrap();
+        drop((resolver, server));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while crate::resources::snapshot().quic_buffer_bytes.active != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

@@ -95,10 +95,11 @@ pub async fn setup_reality_server_stream(
 
     if !parsed_client_hello.supports_tls13 {
         log::warn!("REALITY: Client does not support TLS 1.3, falling back to dest");
-        start_forward_to_dest(server_stream, dest_stream, vec![], Bytes::new());
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "REALITY: Client does not support TLS 1.3, forwarding to dest",
+        return Ok(start_forward_to_dest(
+            server_stream,
+            dest_stream,
+            vec![],
+            Bytes::new(),
         ));
     }
 
@@ -162,34 +163,23 @@ pub async fn setup_reality_server_stream(
                             "REALITY: Dest {} is TLS 1.2, falling back to transparent forward",
                             target.dest
                         );
-                        start_forward_to_dest(
+                        return Ok(start_forward_to_dest(
                             server_stream,
                             dest_stream,
                             new_records,
                             deframer.into_remaining_data(),
-                        );
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::Unsupported,
-                            format!(
-                                "REALITY: Dest {} does not support TLS 1.3, forwarding to dest",
-                                target.dest
-                            ),
                         ));
                     }
                     log::debug!("REALITY: Dest confirmed TLS 1.3");
                 }
                 Err(e) => {
                     log::error!("REALITY: Failed to parse dest ServerHello: {}", e);
-                    start_forward_to_dest(
+                    return Ok(start_forward_to_dest(
                         server_stream,
                         dest_stream,
                         new_records,
                         deframer.into_remaining_data(),
-                    );
-                    return Err(std::io::Error::other(format!(
-                        "REALITY: Failed to parse dest ServerHello: {}, forwarding to dest",
-                        e
-                    )));
+                    ));
                 }
             }
         }
@@ -229,10 +219,11 @@ pub async fn setup_reality_server_stream(
             "REALITY: Dest handshake failed (got {} records), falling back to transparent forward",
             dest_records.len()
         );
-        start_forward_to_dest(server_stream, dest_stream, dest_records, remaining_data);
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::ConnectionReset,
-            "REALITY: Dest TLS handshake incomplete, forwarding to dest",
+        return Ok(start_forward_to_dest(
+            server_stream,
+            dest_stream,
+            dest_records,
+            remaining_data,
         ));
     }
 
@@ -250,13 +241,11 @@ pub async fn setup_reality_server_stream(
                 "REALITY: Auth failed ({}), forwarding to dest transparently",
                 e
             );
-            start_forward_to_dest(server_stream, dest_stream, dest_records, remaining_data);
-
-            // Return auth error with forwarding note so clients see a meaningful error
-            // instead of connecting to the camouflage site and getting "reality verification failed".
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                format!("REALITY: Auth failed ({}), forwarding to dest", e),
+            return Ok(start_forward_to_dest(
+                server_stream,
+                dest_stream,
+                dest_records,
+                remaining_data,
             ));
         }
 
@@ -304,27 +293,29 @@ pub async fn setup_reality_server_stream(
     }
 }
 
-/// Forward dest records to client and spawn bidirectional copy.
-///
-/// Used when Reality auth fails or client doesn't support TLS 1.3.
-/// Forwards any already-read dest records to the client, then spawns
-/// bidirectional copy for the rest of the connection.
+/// Return an owned fallback transfer after forwarding the ClientHello.
 fn start_forward_to_dest(
     mut client_stream: Box<dyn AsyncStream>,
     mut dest_stream: Box<dyn AsyncStream>,
     dest_records: Vec<Bytes>,
     remaining_data: Bytes,
-) {
-    tokio::spawn(async move {
+) -> TcpServerSetupResult {
+    TcpServerSetupResult::Session(Box::pin(async move {
         for record in &dest_records {
             if let Err(e) = write_all(&mut client_stream, record).await {
                 log::debug!("REALITY FALLBACK: Error forwarding record: {}", e);
-                let _ = futures::join!(client_stream.shutdown(), dest_stream.shutdown());
+                futures::join!(
+                    crate::util::shutdown_stream(&mut client_stream),
+                    crate::util::shutdown_stream(&mut dest_stream),
+                );
                 return;
             }
             if let Err(e) = client_stream.flush().await {
                 log::debug!("REALITY FALLBACK: Error flushing record: {}", e);
-                let _ = futures::join!(client_stream.shutdown(), dest_stream.shutdown());
+                futures::join!(
+                    crate::util::shutdown_stream(&mut client_stream),
+                    crate::util::shutdown_stream(&mut dest_stream),
+                );
                 return;
             }
         }
@@ -333,7 +324,10 @@ fn start_forward_to_dest(
             && let Err(e) = write_all(&mut client_stream, &remaining_data).await
         {
             log::debug!("REALITY FALLBACK: Error forwarding remaining data: {}", e);
-            let _ = futures::join!(client_stream.shutdown(), dest_stream.shutdown());
+            futures::join!(
+                crate::util::shutdown_stream(&mut client_stream),
+                crate::util::shutdown_stream(&mut dest_stream),
+            );
             return;
         }
 
@@ -351,10 +345,108 @@ fn start_forward_to_dest(
         )
         .await;
 
-        let _ = futures::join!(client_stream.shutdown(), dest_stream.shutdown());
+        futures::join!(
+            crate::util::shutdown_stream(&mut client_stream),
+            crate::util::shutdown_stream(&mut dest_stream),
+        );
 
         if let Err(e) = result {
             log::debug!("REALITY FALLBACK: Connection ended with error: {}", e);
         }
-    });
+    }))
+}
+
+#[cfg(test)]
+mod cleanup_tests {
+    use super::*;
+    use std::io;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+    struct StalledShutdown {
+        fail_write: bool,
+        fail_flush: bool,
+        _marker: Arc<()>,
+    }
+
+    impl AsyncRead for StalledShutdown {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for StalledShutdown {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if self.fail_write {
+                Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()))
+            } else {
+                Poll::Ready(Ok(bytes.len()))
+            }
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            if self.fail_flush {
+                Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()))
+            } else {
+                Poll::Ready(Ok(()))
+            }
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl crate::async_stream::AsyncPing for StalledShutdown {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+        fn poll_write_ping(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+
+    impl AsyncStream for StalledShutdown {}
+
+    #[tokio::test(start_paused = true)]
+    async fn fallback_cleanup_is_bounded_after_copy_and_early_errors() {
+        let bytes = Bytes::from_static(b"handshake");
+        let cases = [
+            (false, false, vec![], Bytes::new(), 10),
+            (true, false, vec![bytes.clone()], Bytes::new(), 5),
+            (false, true, vec![bytes.clone()], Bytes::new(), 5),
+            (true, false, vec![], bytes, 5),
+        ];
+        for (fail_write, fail_flush, records, remaining, seconds) in cases {
+            let marker = Arc::new(());
+            let client = StalledShutdown {
+                fail_write,
+                fail_flush,
+                _marker: marker.clone(),
+            };
+            let dest = StalledShutdown {
+                fail_write: false,
+                fail_flush: false,
+                _marker: marker.clone(),
+            };
+            let TcpServerSetupResult::Session(session) =
+                start_forward_to_dest(Box::new(client), Box::new(dest), records, remaining)
+            else {
+                panic!("fallback must remain owned by its caller")
+            };
+            let started = tokio::time::Instant::now();
+            tokio::time::timeout(std::time::Duration::from_secs(11), session)
+                .await
+                .expect("fallback cleanup retained the streams indefinitely");
+            assert_eq!(started.elapsed(), std::time::Duration::from_secs(seconds));
+            assert_eq!(Arc::strong_count(&marker), 1);
+        }
+    }
 }

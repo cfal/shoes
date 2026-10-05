@@ -4,7 +4,6 @@ use async_trait::async_trait;
 use log::debug;
 use subtle::ConstantTimeEq;
 use tokio::io::AsyncWriteExt;
-use tokio::net::TcpStream;
 
 use crate::address::{Address, NetLocation};
 use crate::async_stream::AsyncStream;
@@ -85,7 +84,8 @@ async fn vless_fallback_to_dest<S: AsyncStream + 'static>(
 
     debug!("VLESS FALLBACK: Resolved {} to {}", fallback, dest_addr);
 
-    let mut dest_stream: Box<dyn AsyncStream> = Box::new(TcpStream::connect(dest_addr).await?);
+    let socket = crate::socket_util::new_tcp_socket(None, dest_addr.is_ipv6())?;
+    let mut dest_stream: Box<dyn AsyncStream> = Box::new(socket.connect(dest_addr).await?);
 
     debug!(
         "VLESS FALLBACK: Connected to fallback, forwarding {} bytes",
@@ -99,10 +99,8 @@ async fn vless_fallback_to_dest<S: AsyncStream + 'static>(
 
     debug!("VLESS FALLBACK: Spawning bidirectional copy");
 
-    // Spawn the long-running bidirectional copy as a background task.
-    // This allows the setup to complete within the timeout while the actual
-    // data transfer runs indefinitely.
-    tokio::spawn(async move {
+    // Return the transfer to the caller so cancellation owns the entire connection.
+    Ok(TcpServerSetupResult::Session(Box::pin(async move {
         let mut client_stream = client_stream;
         let result = crate::copy_bidirectional::copy_bidirectional(
             &mut client_stream,
@@ -112,17 +110,17 @@ async fn vless_fallback_to_dest<S: AsyncStream + 'static>(
         )
         .await;
 
-        let _ = client_stream.shutdown().await;
-        let _ = dest_stream.shutdown().await;
+        futures::join!(
+            crate::util::shutdown_stream(&mut client_stream),
+            crate::util::shutdown_stream(&mut dest_stream),
+        );
 
         if let Err(e) = result {
             debug!("VLESS FALLBACK: Connection ended: {}", e);
         } else {
             debug!("VLESS FALLBACK: Connection completed");
         }
-    });
-
-    Ok(TcpServerSetupResult::AlreadyHandled)
+    })))
 }
 
 #[async_trait]
@@ -200,7 +198,7 @@ impl TcpServerHandler for VlessTcpServerHandler {
                     // Pass any unparsed data for the h2mux session
                     let initial_data = stream_reader.unparsed_data_owned();
 
-                    tokio::spawn(async move {
+                    return Ok(TcpServerSetupResult::Session(Box::pin(async move {
                         if let Err(e) = handle_h2mux_session(
                             server_stream,
                             initial_data,
@@ -212,9 +210,7 @@ impl TcpServerHandler for VlessTcpServerHandler {
                         {
                             debug!("H2MUX session ended: {}", e);
                         }
-                    });
-
-                    return Ok(TcpServerSetupResult::AlreadyHandled);
+                    })));
                 }
 
                 let unparsed_data = stream_reader.unparsed_data();

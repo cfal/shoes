@@ -28,9 +28,6 @@ pub struct HttpTcpServerHandler {
     proxy_selector: Arc<ClientProxySelector>,
 }
 
-unsafe impl Send for HttpTcpServerHandler {}
-unsafe impl Sync for HttpTcpServerHandler {}
-
 impl HttpTcpServerHandler {
     pub fn new(
         auth_credentials: Option<(String, String)>,

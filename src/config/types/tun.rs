@@ -26,6 +26,86 @@ use super::dns::DnsConfig;
 use super::rules::RuleConfig;
 use super::selection::ConfigSelection;
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TunResourceLimits {
+    pub tcp_buffer_size: usize,
+    pub tcp_memory_bytes: usize,
+    pub max_tcp_connections: usize,
+    pub max_udp_sessions: usize,
+    pub max_udp_destinations: usize,
+    pub max_udp_destinations_per_session: usize,
+    /// Shared outbound payload allowance across session and destination queues.
+    pub max_udp_queued_bytes: usize,
+}
+
+impl Default for TunResourceLimits {
+    fn default() -> Self {
+        Self {
+            tcp_buffer_size: 32 * 1024,
+            tcp_memory_bytes: 32 * 1024 * 1024,
+            max_tcp_connections: 256,
+            max_udp_sessions: 64,
+            max_udp_destinations: 64,
+            max_udp_destinations_per_session: 16,
+            max_udp_queued_bytes: 2 * 1024 * 1024,
+        }
+    }
+}
+
+impl TunResourceLimits {
+    pub fn validate(&self) -> std::io::Result<()> {
+        if !(1024..=16 * 1024 * 1024).contains(&self.tcp_buffer_size)
+            || self.tcp_memory_bytes / 4 < self.tcp_buffer_size
+            || self.max_tcp_connections == 0
+            || self.max_udp_sessions == 0
+            || self.max_udp_destinations == 0
+            || self.max_udp_destinations > tokio::sync::Semaphore::MAX_PERMITS
+            || self.max_udp_destinations_per_session == 0
+            || !(65535..=tokio::sync::Semaphore::MAX_PERMITS).contains(&self.max_udp_queued_bytes)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid TUN resource limits",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn tcp_connection_limit(&self) -> usize {
+        self.max_tcp_connections
+            .min(self.tcp_memory_bytes / 4 / self.tcp_buffer_size)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tcp_budget_counts_all_four_buffers_and_validates_limits() {
+        let mut limits = TunResourceLimits::default();
+        limits.tcp_memory_bytes = 8 * limits.tcp_buffer_size;
+        assert_eq!(limits.tcp_connection_limit(), 2);
+        limits.validate().unwrap();
+        limits.tcp_memory_bytes = 1;
+        assert!(limits.validate().is_err());
+        limits.tcp_buffer_size = 0;
+        assert!(limits.validate().is_err());
+    }
+
+    #[test]
+    fn udp_queue_budget_must_fit_a_maximum_datagram() {
+        let mut limits = TunResourceLimits {
+            max_udp_queued_bytes: 65535,
+            ..Default::default()
+        };
+        limits.validate().unwrap();
+        limits.max_udp_queued_bytes = 65534;
+        assert!(limits.validate().is_err());
+    }
+}
+
 fn default_mtu() -> u16 {
     // Platform-specific MTU defaults based on sing-box research:
     // - iOS Network Extension: 4064 max (4096 - 32 byte UTUN_IF_HEADROOM_SIZE)
@@ -50,6 +130,10 @@ fn default_mtu() -> u16 {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TunConfig {
+    #[serde(default)]
+    pub resource_limits: TunResourceLimits,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub packet_information: Option<bool>,
     /// TUN device name (Linux only, e.g., "tun0").
     /// Ignored on iOS/Android where the device is provided via device_fd.
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -10,7 +10,6 @@ use async_trait::async_trait;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
-use tokio::net::TcpStream;
 
 use crate::address::NetLocation;
 use crate::anytls::anytls_padding::PaddingFactory;
@@ -171,14 +170,12 @@ impl TcpServerHandler for AnyTlsServerHandler {
             initial_data,
         );
 
-        // Run the session in a background task
-        tokio::spawn(async move {
+        // Keep the session outside the handshake timeout, but owned by the caller.
+        Ok(TcpServerSetupResult::Session(Box::pin(async move {
             if let Err(e) = session.run().await {
                 log::debug!("AnyTLS session ended: {}", e);
             }
-        });
-
-        Ok(TcpServerSetupResult::AlreadyHandled)
+        })))
     }
 }
 
@@ -203,7 +200,8 @@ impl AnyTlsServerHandler {
 
         log::debug!("AnyTLS FALLBACK: Resolved {} to {}", fallback, dest_addr);
 
-        let mut dest_stream: Box<dyn AsyncStream> = Box::new(TcpStream::connect(dest_addr).await?);
+        let socket = crate::socket_util::new_tcp_socket(None, dest_addr.is_ipv6())?;
+        let mut dest_stream: Box<dyn AsyncStream> = Box::new(socket.connect(dest_addr).await?);
 
         log::debug!(
             "AnyTLS FALLBACK: Connected to fallback, forwarding {} bytes",
@@ -218,10 +216,8 @@ impl AnyTlsServerHandler {
 
         log::debug!("AnyTLS FALLBACK: Spawning bidirectional copy");
 
-        // Spawn the long-running bidirectional copy as a background task.
-        // This allows the setup to complete within the timeout while the actual
-        // data transfer runs indefinitely.
-        tokio::spawn(async move {
+        // Return the transfer to the caller so cancellation owns the entire connection.
+        Ok(TcpServerSetupResult::Session(Box::pin(async move {
             let result = copy_bidirectional(
                 &mut *client_stream,
                 &mut *dest_stream,
@@ -230,17 +226,17 @@ impl AnyTlsServerHandler {
             )
             .await;
 
-            let _ = client_stream.shutdown().await;
-            let _ = dest_stream.shutdown().await;
+            futures::join!(
+                crate::util::shutdown_stream(&mut client_stream),
+                crate::util::shutdown_stream(&mut dest_stream),
+            );
 
             if let Err(e) = result {
                 log::debug!("AnyTLS FALLBACK: Connection ended: {}", e);
             } else {
                 log::debug!("AnyTLS FALLBACK: Connection completed");
             }
-        });
-
-        Ok(TcpServerSetupResult::AlreadyHandled)
+        })))
     }
 }
 

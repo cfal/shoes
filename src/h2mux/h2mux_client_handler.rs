@@ -1,12 +1,7 @@
 //! H2MUX Client Handler
 //!
 //! Wraps an inner TcpClientHandler to multiplex multiple streams over h2mux.
-//! Maintains a pool of H2MuxClientSession connections with session selection logic.
-//!
-//! TODO: Session pooling is not yet working. Currently each call to setup_client_tcp_stream
-//! creates a new session because the caller provides the transport stream. To enable true
-//! multiplexing, setup_client_tcp_stream and the proxy chain group need significant changes
-//! to allow the handler to manage its own transport connections.
+//! Each supplied transport belongs to its returned stream; idle sessions are not retained.
 
 use std::io;
 use std::pin::Pin;
@@ -16,8 +11,7 @@ use std::task::{Context, Poll};
 use async_trait::async_trait;
 use bytes::BytesMut;
 use log::debug;
-use parking_lot::Mutex;
-use tokio::io::{AsyncRead, ReadBuf};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::address::{Address, NetLocation, ResolvedLocation};
 use crate::async_stream::{
@@ -32,140 +26,36 @@ use super::{H2MuxOptions, MUX_DESTINATION_HOST, MUX_DESTINATION_PORT};
 /// H2MUX client handler that multiplexes streams over HTTP/2.
 ///
 /// This handler wraps an inner protocol handler (e.g., Shadowsocks, VLESS)
-/// and uses h2mux to multiplex multiple logical streams over pooled connections.
+/// and establishes h2mux on the transport supplied by the proxy chain.
 #[derive(Debug)]
 pub struct H2MuxClientHandler {
     /// Inner protocol handler used to establish connections to the proxy server
     inner: Arc<dyn TcpClientHandler>,
     /// H2MUX configuration options
     options: H2MuxOptions,
-    /// Pool of active sessions
-    sessions: Arc<Mutex<Vec<SessionEntry>>>,
-}
-
-/// Entry in the session pool, tracking session state
-#[derive(Debug)]
-struct SessionEntry {
-    session: H2MuxClientSession,
-    /// Estimated number of active streams (may be stale)
-    estimated_streams: u32,
 }
 
 impl H2MuxClientHandler {
     /// Create a new H2MUX client handler wrapping the given inner handler.
     pub fn new(inner: Arc<dyn TcpClientHandler>, options: H2MuxOptions) -> Self {
-        Self {
-            inner,
-            options,
-            sessions: Arc::new(Mutex::new(Vec::new())),
-        }
+        Self { inner, options }
     }
 
-    /// Get an existing session or create a new one.
-    /// Reserved for future session pooling.
-    #[allow(dead_code)]
-    async fn get_or_create_session(&self) -> io::Result<H2MuxClientSession> {
-        // First try to find an existing session
-        {
-            let mut sessions = self.sessions.lock();
-
-            // Remove closed sessions
-            sessions.retain(|entry| entry.session.is_ready());
-
-            // Find best session (fewest streams that can take new request)
-            let best_idx = sessions
-                .iter()
-                .enumerate()
-                .filter(|(_, e)| e.session.is_ready())
-                .min_by_key(|(_, e)| e.estimated_streams)
-                .map(|(idx, _)| idx);
-
-            if let Some(idx) = best_idx {
-                let num_sessions = sessions.len();
-                let num_streams = sessions[idx].estimated_streams;
-
-                // Use this session if it has no streams (idle)
-                if num_streams == 0 {
-                    sessions[idx].estimated_streams += 1;
-                    return Ok(sessions[idx].session.clone());
-                }
-
-                // Check if we should use existing vs create new
-                let should_use_existing = if self.options.max_connections > 0 {
-                    // Have connection limit: use existing if at limit or below min_streams
-                    num_sessions >= self.options.max_connections as usize
-                        || num_streams < self.options.min_streams
-                } else if self.options.max_streams > 0 {
-                    // No connection limit but have stream limit: use if below max
-                    num_streams < self.options.max_streams
-                } else {
-                    // No limits: always reuse
-                    true
-                };
-
-                if should_use_existing {
-                    sessions[idx].estimated_streams += 1;
-                    return Ok(sessions[idx].session.clone());
-                }
-            }
-        }
-
-        // Create new session
-        self.create_session().await
-    }
-
-    /// Create a new h2mux session by connecting through the inner handler.
-    /// Reserved for future session pooling.
-    #[allow(dead_code)]
-    async fn create_session(&self) -> io::Result<H2MuxClientSession> {
-        debug!("H2MuxClientHandler: creating new session");
-
-        // Connect to the proxy server using the inner handler with magic destination
-        let _magic_location = NetLocation::new(
+    async fn create_session(&self, stream: Box<dyn AsyncStream>) -> io::Result<H2MuxClientSession> {
+        let magic_location = ResolvedLocation::new(NetLocation::new(
             Address::Hostname(MUX_DESTINATION_HOST.to_string()),
             MUX_DESTINATION_PORT,
-        );
+        ));
+        let inner_result = self
+            .inner
+            .setup_client_tcp_stream(stream, magic_location)
+            .await?;
 
-        // We need a raw connection to the proxy server first.
-        // The inner handler will connect to the server and send the magic destination.
-        // We'll get back the wrapped stream.
-
-        // Note: We need a transport stream first. The caller should provide this
-        // via setup_client_tcp_stream. For connection pooling to work properly,
-        // we need access to the connection factory.
-        //
-        // For now, we implement a simpler model where each call to setup_client_tcp_stream
-        // that needs a new session will create one on-demand. The caller must provide
-        // the transport stream.
-
-        Err(io::Error::other(
-            "H2MuxClientHandler requires transport stream to be provided",
-        ))
-    }
-
-    /// Create a session from an existing transport stream.
-    ///
-    /// The session will handle padding internally if enabled in options.
-    async fn create_session_from_stream(
-        &self,
-        stream: Box<dyn AsyncStream>,
-    ) -> io::Result<H2MuxClientSession> {
         debug!("H2MuxClientHandler: creating session from stream");
 
         // Session handles padding internally: sends request header on raw stream,
         // then applies padding layer before HTTP/2 handshake.
-        let session = H2MuxClientSession::new(stream, &self.options).await?;
-
-        // Add to pool
-        {
-            let mut sessions = self.sessions.lock();
-            sessions.push(SessionEntry {
-                session: session.clone(),
-                estimated_streams: 0,
-            });
-        }
-
-        Ok(session)
+        H2MuxClientSession::new(inner_result.client_stream, &self.options).await
     }
 }
 
@@ -176,25 +66,7 @@ impl TcpClientHandler for H2MuxClientHandler {
         client_stream: Box<dyn AsyncStream>,
         remote_location: ResolvedLocation,
     ) -> io::Result<TcpClientSetupResult> {
-        // First, connect through the inner handler to the magic destination.
-        // This establishes the protocol layer (e.g., Shadowsocks, VLESS).
-        let magic_location = ResolvedLocation::new(NetLocation::new(
-            Address::Hostname(MUX_DESTINATION_HOST.to_string()),
-            MUX_DESTINATION_PORT,
-        ));
-
-        let inner_result = self
-            .inner
-            .setup_client_tcp_stream(client_stream, magic_location)
-            .await?;
-
-        // Now we have a stream connected to the magic destination
-        // Create an h2mux session over it
-        let mut session = self
-            .create_session_from_stream(inner_result.client_stream)
-            .await?;
-
-        // Open a stream to the actual destination
+        let mut session = self.create_session(client_stream).await?;
         let location = remote_location.into_location();
         let stream = session.open_tcp(&location).await?;
 
@@ -205,7 +77,6 @@ impl TcpClientHandler for H2MuxClientHandler {
     }
 
     fn supports_udp_over_tcp(&self) -> bool {
-        // H2MUX supports UDP through its own stream protocol
         true
     }
 
@@ -214,28 +85,10 @@ impl TcpClientHandler for H2MuxClientHandler {
         client_stream: Box<dyn AsyncStream>,
         target: ResolvedLocation,
     ) -> io::Result<Box<dyn AsyncMessageStream>> {
-        // First, connect through the inner handler to the magic destination
-        let magic_location = ResolvedLocation::new(NetLocation::new(
-            Address::Hostname(MUX_DESTINATION_HOST.to_string()),
-            MUX_DESTINATION_PORT,
-        ));
-
-        let inner_result = self
-            .inner
-            .setup_client_tcp_stream(client_stream, magic_location)
-            .await?;
-
-        // Create an h2mux session over it
-        let mut session = self
-            .create_session_from_stream(inner_result.client_stream)
-            .await?;
-
-        // Open a UDP stream to the target
+        let mut session = self.create_session(client_stream).await?;
         let location = target.into_location();
         let stream = session.open_udp(&location, false).await?;
 
-        // Wrap the stream as a message stream
-        // The H2MuxStream already handles length-prefixed UDP packets
         Ok(Box::new(H2MuxUdpMessageStream::new(stream)))
     }
 }
@@ -250,6 +103,7 @@ struct H2MuxUdpMessageStream {
     read_header: [u8; 2],
     read_header_pos: usize,
     read_data_remaining: usize,
+    read_buffer: Vec<u8>,
     // Write buffer for assembling length-prefixed messages
     write_buffer: BytesMut,
     write_pos: usize,
@@ -269,9 +123,25 @@ impl H2MuxUdpMessageStream {
             read_header: [0u8; 2],
             read_header_pos: 0,
             read_data_remaining: 0,
+            read_buffer: Vec::new(),
             write_buffer: BytesMut::with_capacity(65537),
             write_pos: 0,
         }
+    }
+
+    fn poll_drain_write(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        while self.write_pos < self.write_buffer.len() {
+            let n = std::task::ready!(
+                Pin::new(&mut self.stream).poll_write(cx, &self.write_buffer[self.write_pos..])
+            )?;
+            if n == 0 {
+                return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
+            }
+            self.write_pos += n;
+        }
+        self.write_buffer.clear();
+        self.write_pos = 0;
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -294,34 +164,28 @@ impl AsyncReadMessage for H2MuxUdpMessageStream {
         loop {
             match this.read_state {
                 ReadState::Header => {
-                    // Read the 2-byte length header
                     while this.read_header_pos < 2 {
                         let mut temp_buf =
                             ReadBuf::new(&mut this.read_header[this.read_header_pos..]);
-                        match Pin::new(&mut this.stream).poll_read(cx, &mut temp_buf) {
-                            Poll::Ready(Ok(())) => {
-                                let n = temp_buf.filled().len();
-                                if n == 0 {
-                                    if this.read_header_pos == 0 {
-                                        // EOF at message boundary - return empty
-                                        return Poll::Ready(Ok(()));
-                                    }
-                                    return Poll::Ready(Err(io::Error::new(
-                                        io::ErrorKind::UnexpectedEof,
-                                        "EOF while reading message header",
-                                    )));
-                                }
-                                this.read_header_pos += n;
+                        std::task::ready!(Pin::new(&mut this.stream).poll_read(cx, &mut temp_buf))?;
+                        let n = temp_buf.filled().len();
+                        if n == 0 {
+                            if this.read_header_pos == 0 {
+                                // EOF at message boundary - return empty
+                                return Poll::Ready(Ok(()));
                             }
-                            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                            Poll::Pending => return Poll::Pending,
+                            return Poll::Ready(Err(io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                "EOF while reading message header",
+                            )));
                         }
+                        this.read_header_pos += n;
                     }
 
-                    // Parse header
                     let len = u16::from_be_bytes(this.read_header) as usize;
                     this.read_header_pos = 0;
                     this.read_data_remaining = len;
+                    this.read_buffer.resize(len, 0);
                     this.read_state = ReadState::Data;
 
                     if len == 0 {
@@ -338,30 +202,28 @@ impl AsyncReadMessage for H2MuxUdpMessageStream {
                     }
                 }
                 ReadState::Data => {
-                    // Read the message data
-                    let to_read = this.read_data_remaining.min(buf.remaining());
-                    let mut temp_buf = ReadBuf::new(buf.initialize_unfilled_to(to_read));
-                    match Pin::new(&mut this.stream).poll_read(cx, &mut temp_buf) {
-                        Poll::Ready(Ok(())) => {
-                            let n = temp_buf.filled().len();
-                            if n == 0 {
-                                return Poll::Ready(Err(io::Error::new(
-                                    io::ErrorKind::UnexpectedEof,
-                                    "EOF while reading message data",
-                                )));
-                            }
-                            buf.advance(n);
-                            this.read_data_remaining -= n;
+                    let offset = this.read_buffer.len() - this.read_data_remaining;
+                    let mut temp_buf = ReadBuf::new(&mut this.read_buffer[offset..]);
+                    std::task::ready!(Pin::new(&mut this.stream).poll_read(cx, &mut temp_buf))?;
+                    let n = temp_buf.filled().len();
+                    if n == 0 {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "EOF while reading message data",
+                        )));
+                    }
+                    this.read_data_remaining -= n;
 
-                            if this.read_data_remaining == 0 {
-                                // Message complete
-                                this.read_state = ReadState::Header;
-                                return Poll::Ready(Ok(()));
-                            }
-                            // Continue reading
+                    if this.read_data_remaining == 0 {
+                        this.read_state = ReadState::Header;
+                        if this.read_buffer.len() > buf.remaining() {
+                            return Poll::Ready(Err(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "UDP receive buffer too small",
+                            )));
                         }
-                        Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                        Poll::Pending => return Poll::Pending,
+                        buf.put_slice(&this.read_buffer);
+                        return Poll::Ready(Ok(()));
                     }
                 }
             }
@@ -376,25 +238,6 @@ impl AsyncWriteMessage for H2MuxUdpMessageStream {
         buf: &[u8],
     ) -> Poll<io::Result<()>> {
         use bytes::BufMut;
-        use tokio::io::AsyncWrite;
-
-        let this = &mut *self;
-
-        // Flush any pending data first
-        while this.write_pos < this.write_buffer.len() {
-            let remaining = &this.write_buffer[this.write_pos..];
-            match Pin::new(&mut this.stream).poll_write(cx, remaining) {
-                Poll::Ready(Ok(n)) => {
-                    this.write_pos += n;
-                }
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
-            }
-        }
-
-        // Clear buffer after fully written
-        this.write_buffer.clear();
-        this.write_pos = 0;
 
         if buf.len() > 65535 {
             return Poll::Ready(Err(io::Error::new(
@@ -402,52 +245,18 @@ impl AsyncWriteMessage for H2MuxUdpMessageStream {
                 "UDP packet too large",
             )));
         }
-
-        // Build message: length prefix + data
-        this.write_buffer.put_u16(buf.len() as u16);
-        this.write_buffer.put_slice(buf);
-
-        // Write the message
-        while this.write_pos < this.write_buffer.len() {
-            let remaining = &this.write_buffer[this.write_pos..];
-            match Pin::new(&mut this.stream).poll_write(cx, remaining) {
-                Poll::Ready(Ok(n)) => {
-                    this.write_pos += n;
-                }
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
-            }
-        }
-
-        this.write_buffer.clear();
-        this.write_pos = 0;
-
+        std::task::ready!(self.poll_drain_write(cx))?;
+        self.write_buffer.put_u16(buf.len() as u16);
+        self.write_buffer.put_slice(buf);
+        // Accept exactly once; subsequent writes and flush drain this bounded buffer.
         Poll::Ready(Ok(()))
     }
 }
 
 impl AsyncFlushMessage for H2MuxUdpMessageStream {
     fn poll_flush_message(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        use tokio::io::AsyncWrite;
-
-        let this = &mut *self;
-
-        // Flush any pending data first
-        while this.write_pos < this.write_buffer.len() {
-            let remaining = &this.write_buffer[this.write_pos..];
-            match Pin::new(&mut this.stream).poll_write(cx, remaining) {
-                Poll::Ready(Ok(n)) => {
-                    this.write_pos += n;
-                }
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
-            }
-        }
-
-        this.write_buffer.clear();
-        this.write_pos = 0;
-
-        Pin::new(&mut this.stream).poll_flush(cx)
+        std::task::ready!(self.poll_drain_write(cx))?;
+        Pin::new(&mut self.stream).poll_flush(cx)
     }
 }
 
@@ -456,7 +265,7 @@ impl AsyncShutdownMessage for H2MuxUdpMessageStream {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<io::Result<()>> {
-        use tokio::io::AsyncWrite;
+        std::task::ready!(self.as_mut().poll_flush_message(cx))?;
         Pin::new(&mut self.stream).poll_shutdown(cx)
     }
 }
@@ -472,3 +281,96 @@ impl AsyncPing for H2MuxUdpMessageStream {
 }
 
 impl AsyncMessageStream for H2MuxUdpMessageStream {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn partial_message_read_preserves_payload_across_polls() {
+        let packet = b"\0\x03abc";
+        for split in 1..packet.len() {
+            let (stream, mut peer) = tokio::io::duplex(1024);
+            let mut stream = H2MuxUdpMessageStream::new(Box::new(stream));
+            peer.write_all(&packet[..split]).await.unwrap();
+            let waker = futures::task::noop_waker();
+            let mut cx = Context::from_waker(&waker);
+            let mut storage = [0; 32];
+            let mut first = ReadBuf::new(&mut storage);
+            assert!(
+                Pin::new(&mut stream)
+                    .poll_read_message(&mut cx, &mut first)
+                    .is_pending()
+            );
+            assert!(first.filled().is_empty());
+            peer.write_all(&packet[split..]).await.unwrap();
+            let mut next = ReadBuf::new(&mut storage);
+            assert!(matches!(
+                Pin::new(&mut stream).poll_read_message(&mut cx, &mut next),
+                Poll::Ready(Ok(()))
+            ));
+            assert_eq!(next.filled(), b"abc");
+        }
+    }
+
+    #[tokio::test]
+    async fn message_read_distinguishes_eof_from_truncated_frames() {
+        for (packet, expected_error) in [
+            (b"".as_slice(), None),
+            (b"\0".as_slice(), Some("EOF while reading message header")),
+            (
+                b"\0\x03a".as_slice(),
+                Some("EOF while reading message data"),
+            ),
+        ] {
+            let (stream, mut peer) = tokio::io::duplex(1024);
+            let mut stream = H2MuxUdpMessageStream::new(Box::new(stream));
+            peer.write_all(packet).await.unwrap();
+            peer.shutdown().await.unwrap();
+
+            let mut storage = [0; 32];
+            let mut buffer = ReadBuf::new(&mut storage);
+            let result = futures::future::poll_fn(|cx| {
+                Pin::new(&mut stream).poll_read_message(cx, &mut buffer)
+            })
+            .await;
+            if let Some(message) = expected_error {
+                let error = result.unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+                assert_eq!(error.to_string(), message);
+            } else {
+                result.unwrap();
+            }
+            assert!(buffer.filled().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_write_and_shutdown_preserve_packet_boundaries() {
+        let (stream, mut peer) = tokio::io::duplex(1);
+        let mut stream = H2MuxUdpMessageStream::new(Box::new(stream));
+        let writer = tokio::spawn(async move {
+            for payload in [b"abc".as_slice(), b"defg".as_slice()] {
+                futures::future::poll_fn(|cx| {
+                    Pin::new(&mut stream).poll_write_message(cx, payload)
+                })
+                .await
+                .unwrap();
+            }
+            futures::future::poll_fn(|cx| Pin::new(&mut stream).poll_shutdown_message(cx))
+                .await
+                .unwrap();
+        });
+        let mut bytes = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            peer.read_to_end(&mut bytes),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        writer.await.unwrap();
+        assert_eq!(&bytes, b"\0\x03abc\0\x04defg");
+    }
+}

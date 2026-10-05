@@ -193,7 +193,7 @@ impl TcpServerHandler for SnellServerHandler {
 
                 let initial_data = stream_reader.unparsed_data_owned();
 
-                tokio::spawn(async move {
+                return Ok(TcpServerSetupResult::Session(Box::pin(async move {
                     if let Err(e) = handle_h2mux_session(
                         server_stream,
                         initial_data,
@@ -205,9 +205,7 @@ impl TcpServerHandler for SnellServerHandler {
                     {
                         debug!("Snell h2mux session ended: {}", e);
                     }
-                });
-
-                return Ok(TcpServerSetupResult::AlreadyHandled);
+                })));
             }
 
             Ok(TcpServerSetupResult::TcpForward {

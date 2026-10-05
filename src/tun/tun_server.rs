@@ -45,6 +45,7 @@ use tun::{Configuration as TunConfiguration, Device};
 /// options. See module-level documentation for usage examples.
 #[derive(Clone, Debug)]
 pub struct TunServerConfig {
+    pub resource_limits: crate::config::tun::TunResourceLimits,
     /// MTU size for the TUN interface.
     /// Default: platform-specific (iOS: 4064, Android: 9000, others: 1500)
     pub mtu: u16,
@@ -107,6 +108,7 @@ impl Default for TunServerConfig {
         let default_mtu = 1500;
 
         Self {
+            resource_limits: Default::default(),
             mtu: default_mtu,
             tcp_enabled: true,
             udp_enabled: true,

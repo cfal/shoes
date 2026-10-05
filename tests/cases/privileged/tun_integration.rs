@@ -330,47 +330,49 @@ async fn test_tun_fixture_streaming_2gb() -> Result<(), Box<dyn std::error::Erro
 async fn test_tun_tcp_idle_connection() -> Result<(), Box<dyn std::error::Error>> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
+    use tokio::time::timeout;
 
-    let fixture = ProxyTestFixture::new()
-        .with_tun_entry()
-        .with_local_http_server()
-        .build()
-        .await?;
-
-    let tun_vip = fixture.tun_virtual_server_ip().expect("TUN VIP");
-    let server_port = fixture.local_server_port().expect("Server port");
-
-    // Connect through TUN to the virtual server IP (which routes to local server)
-    let mut stream = TcpStream::connect(format!("{}:{}", tun_vip, server_port)).await?;
-    eprintln!("[TEST] Connected to server through TUN");
-
-    // Send initial request
-    stream
-        .write_all(b"GET /bytes/100 HTTP/1.1\r\nHost: test\r\nConnection: keep-alive\r\n\r\n")
-        .await?;
-
-    let mut buf = vec![0u8; 4096];
-    let n = stream.read(&mut buf).await?;
-    assert!(n > 0, "Should receive initial response");
-    eprintln!("[TEST] Received initial response ({} bytes)", n);
-
-    // Wait six minutes before reusing the idle connection.
-    eprintln!("[TEST] Waiting 6 minutes to test idle connection survival...");
-    tokio::time::sleep(Duration::from_secs(360)).await;
-
-    // Try to use the connection again
-    eprintln!("[TEST] Sending request after 6 minutes idle...");
-    stream
-        .write_all(b"GET /bytes/100 HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n")
-        .await?;
-
-    let n = stream.read(&mut buf).await?;
-    assert!(n > 0, "Connection should still work after 6 minutes idle");
-    eprintln!(
-        "[TEST] SUCCESS: Connection survived 6 minutes idle, received {} bytes",
-        n
+    // A plain echo peer does not impose an HTTP header or keep-alive timeout.
+    let echo = common::test_servers::start_tcp_stream_echo_server("0.0.0.0", 0).await?;
+    let config = format!(
+        r#"
+- device_name: shoes_idle
+  address: "10.200.249.1"
+  netmask: 255.255.255.0
+  rules:
+    - masks: "0.0.0.0/0"
+      action: allow
+      override_address: "127.0.0.1:{}"
+      client_chain:
+        - protocol:
+            type: direct
+"#,
+        echo.local_addr().port(),
     );
+    let (_guard, _config) = start_shoes_server_with_sudo(&config)?;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let _route = add_route_via_device("10.200.249.2/32", "shoes_idle")?;
+    let mut stream = timeout(
+        Duration::from_secs(5),
+        TcpStream::connect(("10.200.249.2", echo.local_addr().port())),
+    )
+    .await??;
 
+    for (message, delay) in [(b"before idle", 0), (b"after idle!", 360)] {
+        if delay != 0 {
+            eprintln!("[TEST] Waiting 6 minutes to test idle connection survival...");
+            tokio::time::sleep(Duration::from_secs(delay)).await;
+        }
+        timeout(Duration::from_secs(5), async {
+            stream.write_all(message).await?;
+            let mut reply = [0; 11];
+            stream.read_exact(&mut reply).await?;
+            assert_eq!(&reply, message);
+            std::io::Result::Ok(())
+        })
+        .await??;
+    }
+    eprintln!("[TEST] SUCCESS: TCP connection survived 6 minutes idle");
     Ok(())
 }
 

@@ -44,6 +44,7 @@ async fn connect_vless_udp(
     .await
 }
 
+// Bind the wildcard decoy before allocating proxy ports so it cannot steal their reservations.
 async fn start_reality_decoy() -> std::io::Result<(TestServer, String)> {
     let (certificate, key, ca) = common::certs::generate_ca_signed_cert_bundle_files("test.local")?;
     let mut certificate_chain = std::fs::read(&certificate)?;
@@ -568,7 +569,6 @@ async fn test_vless_xudp_concurrent_connections() -> Result<(), Box<dyn std::err
 
 /// Test rapid burst of UDP packets
 #[tokio::test]
-#[ignore = "known XUDP burst-loss behavior under sustained packet bursts"]
 async fn test_vless_xudp_rapid_burst() -> Result<(), Box<dyn std::error::Error>> {
     let mut port_helper = common::port_helper::PortHelper::new();
     let (shoes_vless_ip, shoes_vless_port) = port_helper.get_listener_port();
@@ -993,6 +993,7 @@ fn generate_reality_keypair() -> (String, String) {
 /// Chain: manual VLESS UDP -> sing-box VLESS inbound -> shoes REALITY+Vision+XUDP server -> UDP echo
 #[tokio::test]
 async fn test_reality_vision_xudp_udp_echo() -> Result<(), Box<dyn std::error::Error>> {
+    let (_decoy, reality_destination) = start_reality_decoy().await?;
     let mut port_helper = common::port_helper::PortHelper::new();
     let (shoes_reality_ip, shoes_reality_port) = port_helper.get_listener_port();
     let (singbox_vless_ip, singbox_vless_port) = port_helper.get_listener_port();
@@ -1004,7 +1005,6 @@ async fn test_reality_vision_xudp_udp_echo() -> Result<(), Box<dyn std::error::E
     );
 
     let _echo_server = start_udp_echo_server(&udp_echo_ip, udp_echo_port).await?;
-    let (_decoy, reality_destination) = start_reality_decoy().await?;
 
     // Generate REALITY keypair
     let (private_key, public_key) = generate_reality_keypair();
@@ -1131,6 +1131,7 @@ async fn test_reality_vision_xudp_udp_echo() -> Result<(), Box<dyn std::error::E
 /// Test REALITY + Vision + XUDP with multiple sequential packets
 #[tokio::test]
 async fn test_reality_vision_xudp_multiple_packets() -> Result<(), Box<dyn std::error::Error>> {
+    let (_decoy, reality_destination) = start_reality_decoy().await?;
     let mut port_helper = common::port_helper::PortHelper::new();
     let (shoes_reality_ip, shoes_reality_port) = port_helper.get_listener_port();
     let (singbox_vless_ip, singbox_vless_port) = port_helper.get_listener_port();
@@ -1142,7 +1143,6 @@ async fn test_reality_vision_xudp_multiple_packets() -> Result<(), Box<dyn std::
     );
 
     let _echo_server = start_udp_echo_server(&udp_echo_ip, udp_echo_port).await?;
-    let (_decoy, reality_destination) = start_reality_decoy().await?;
 
     let (private_key, public_key) = generate_reality_keypair();
     let short_id = "0123456789abcdef";
@@ -1264,6 +1264,7 @@ async fn test_reality_vision_xudp_multiple_packets() -> Result<(), Box<dyn std::
 /// Test REALITY + Vision + XUDP with large UDP payloads (1KB, 3KB, 6KB)
 #[tokio::test]
 async fn test_reality_vision_xudp_large_payloads() -> Result<(), Box<dyn std::error::Error>> {
+    let (_decoy, reality_destination) = start_reality_decoy().await?;
     let mut port_helper = common::port_helper::PortHelper::new();
     let (shoes_reality_ip, shoes_reality_port) = port_helper.get_listener_port();
     let (singbox_vless_ip, singbox_vless_port) = port_helper.get_listener_port();
@@ -1275,7 +1276,6 @@ async fn test_reality_vision_xudp_large_payloads() -> Result<(), Box<dyn std::er
     );
 
     let _echo_server = start_udp_echo_server_with_suffix(&udp_echo_ip, udp_echo_port, b"").await?;
-    let (_decoy, reality_destination) = start_reality_decoy().await?;
 
     let (private_key, public_key) = generate_reality_keypair();
     let short_id = "0123456789abcdef";
@@ -1397,8 +1397,8 @@ async fn test_reality_vision_xudp_large_payloads() -> Result<(), Box<dyn std::er
 
 /// Test REALITY + Vision + XUDP rapid burst
 #[tokio::test]
-#[ignore = "known XUDP burst-loss behavior under sustained packet bursts"]
 async fn test_reality_vision_xudp_rapid_burst() -> Result<(), Box<dyn std::error::Error>> {
+    let (_decoy, reality_destination) = start_reality_decoy().await?;
     let mut port_helper = common::port_helper::PortHelper::new();
     let (shoes_reality_ip, shoes_reality_port) = port_helper.get_listener_port();
     let (singbox_vless_ip, singbox_vless_port) = port_helper.get_listener_port();
@@ -1410,7 +1410,6 @@ async fn test_reality_vision_xudp_rapid_burst() -> Result<(), Box<dyn std::error
     );
 
     let _echo_server = start_udp_echo_server(&udp_echo_ip, udp_echo_port).await?;
-    let (_decoy, reality_destination) = start_reality_decoy().await?;
 
     let (private_key, public_key) = generate_reality_keypair();
     let short_id = "0123456789abcdef";
@@ -1549,6 +1548,7 @@ async fn test_reality_vision_xudp_rapid_burst() -> Result<(), Box<dyn std::error
 /// can handle multiple connections correctly.
 #[tokio::test]
 async fn test_reality_vision_xudp_multi_connection() -> Result<(), Box<dyn std::error::Error>> {
+    let (_decoy, reality_destination) = start_reality_decoy().await?;
     let mut port_helper = common::port_helper::PortHelper::new();
     let (shoes_reality_ip, shoes_reality_port) = port_helper.get_listener_port();
     let (singbox_vless_ip, singbox_vless_port) = port_helper.get_listener_port();
@@ -1560,7 +1560,6 @@ async fn test_reality_vision_xudp_multi_connection() -> Result<(), Box<dyn std::
     );
 
     let _echo_server = start_udp_echo_server(&udp_echo_ip, udp_echo_port).await?;
-    let (_decoy, reality_destination) = start_reality_decoy().await?;
 
     let (private_key, public_key) = generate_reality_keypair();
     let short_id = "0123456789abcdef";
@@ -1688,6 +1687,7 @@ async fn test_reality_vision_xudp_multi_connection() -> Result<(), Box<dyn std::
 #[tokio::test]
 async fn test_reality_vision_xudp_concurrent_connections() -> Result<(), Box<dyn std::error::Error>>
 {
+    let (_decoy, reality_destination) = start_reality_decoy().await?;
     let mut port_helper = common::port_helper::PortHelper::new();
     let (shoes_reality_ip, shoes_reality_port) = port_helper.get_listener_port();
     let (singbox_vless_ip, singbox_vless_port) = port_helper.get_listener_port();
@@ -1699,7 +1699,6 @@ async fn test_reality_vision_xudp_concurrent_connections() -> Result<(), Box<dyn
     );
 
     let _echo_server = start_udp_echo_server(&udp_echo_ip, udp_echo_port).await?;
-    let (_decoy, reality_destination) = start_reality_decoy().await?;
 
     let (private_key, public_key) = generate_reality_keypair();
     let short_id = "0123456789abcdef";

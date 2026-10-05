@@ -12,11 +12,11 @@ use std::task::{Context, Poll};
 use bytes::{BufMut, Bytes, BytesMut};
 use h2::client::ResponseFuture;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::oneshot;
 
 use crate::address::NetLocation;
 use crate::async_stream::{AsyncPing, AsyncStream};
 
+use super::h2mux_client_session::H2MuxClientSession;
 use super::h2mux_protocol::{STATUS_ERROR, STATUS_SUCCESS, StreamRequest};
 
 /// Client stream that wraps h2 streams with sing-mux protocol handling.
@@ -30,7 +30,7 @@ pub struct H2MuxClientStream {
     /// Resolved RecvStream (set after first read resolves recv_pending)
     recv: Option<h2::RecvStream>,
     /// Pending receiver for lazy response resolution
-    recv_pending: Option<oneshot::Receiver<io::Result<h2::RecvStream>>>,
+    recv_pending: Option<ResponseFuture>,
     /// Buffered received data
     recv_buf: Bytes,
     /// Whether we've sent END_STREAM
@@ -43,42 +43,26 @@ pub struct H2MuxClientStream {
     destination: NetLocation,
     /// Whether we've read the status response
     response_read: bool,
+    session: H2MuxClientSession,
+}
+
+impl Drop for H2MuxClientStream {
+    fn drop(&mut self) {
+        self.session.release_stream();
+    }
 }
 
 impl H2MuxClientStream {
     /// Create a new client stream with lazy response resolution.
     ///
-    /// Spawns a task to await the HTTP response asynchronously.
     /// The caller can write immediately; RecvStream is resolved on first read.
     pub fn new(
         send: h2::SendStream<Bytes>,
         response_future: ResponseFuture,
         destination: NetLocation,
         is_tcp: bool,
+        session: H2MuxClientSession,
     ) -> io::Result<Self> {
-        let (tx, rx) = oneshot::channel();
-
-        tokio::spawn(async move {
-            match response_future.await {
-                Ok(response) => {
-                    if response.status() == http::StatusCode::OK {
-                        let _ = tx.send(Ok(response.into_body()));
-                    } else {
-                        let _ = tx.send(Err(io::Error::other(format!(
-                            "CONNECT failed with status: {}",
-                            response.status()
-                        ))));
-                    }
-                }
-                Err(e) => {
-                    let _ = tx.send(Err(io::Error::other(format!(
-                        "CONNECT response error: {}",
-                        e
-                    ))));
-                }
-            }
-        });
-
         let request = if is_tcp {
             StreamRequest::tcp(destination.clone())
         } else {
@@ -89,13 +73,14 @@ impl H2MuxClientStream {
         Ok(Self {
             send,
             recv: None,
-            recv_pending: Some(rx),
+            recv_pending: Some(response_future),
             recv_buf: Bytes::new(),
             shutdown_sent: false,
             request_bytes: Some(request_bytes),
             pending_write: None,
             destination,
             response_read: false,
+            session,
         })
     }
 
@@ -107,21 +92,22 @@ impl H2MuxClientStream {
 
         if let Some(rx) = self.recv_pending.as_mut() {
             match Pin::new(rx).poll(cx) {
-                Poll::Ready(Ok(Ok(recv))) => {
-                    self.recv = Some(recv);
+                Poll::Ready(Ok(response)) => {
                     self.recv_pending = None;
+                    if response.status() != http::StatusCode::OK {
+                        return Poll::Ready(Err(io::Error::other(format!(
+                            "CONNECT failed with status: {}",
+                            response.status()
+                        ))));
+                    }
+                    self.recv = Some(response.into_body());
                     Poll::Ready(Ok(()))
                 }
-                Poll::Ready(Ok(Err(e))) => {
+                Poll::Ready(Err(e)) => {
                     self.recv_pending = None;
-                    Poll::Ready(Err(e))
-                }
-                Poll::Ready(Err(_)) => {
-                    self.recv_pending = None;
-                    Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::BrokenPipe,
-                        "Response channel closed",
-                    )))
+                    Poll::Ready(Err(io::Error::other(format!(
+                        "CONNECT response error: {e}"
+                    ))))
                 }
                 Poll::Pending => Poll::Pending,
             }

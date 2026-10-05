@@ -5,12 +5,14 @@
 
 use aws_lc_rs::digest::{SHA256, digest};
 use bytes::{BufMut, Bytes, BytesMut};
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot};
+use tokio_util::sync::CancellationToken;
 
 use crate::address::NetLocation;
 use crate::anytls::anytls_padding::PaddingFactory;
@@ -20,10 +22,12 @@ use crate::async_stream::AsyncStream;
 use crate::socks_handler::write_location_to_vec;
 
 /// Outgoing message types for the unified writer channel
-enum OutgoingMessage {
+pub(super) enum OutgoingMessage {
     /// Buffered frames (Settings + SYN + destination) - sent as single TLS record
     /// This is used for the first stream to avoid fingerprinting
-    Buffered { data: Bytes },
+    Buffered {
+        data: Bytes,
+    },
     /// Control frame (Settings, SYN, etc.) - encoded in writer loop
     Control {
         cmd: Command,
@@ -31,9 +35,17 @@ enum OutgoingMessage {
         data: Bytes,
     },
     /// Data frame for a stream (PSH) - encoded in writer loop
-    Data { stream_id: u32, data: Bytes },
+    Data {
+        stream_id: u32,
+        data: Bytes,
+    },
     /// FIN frame for a stream - encoded in writer loop
-    Fin { stream_id: u32 },
+    Fin {
+        stream_id: u32,
+    },
+    Flush {
+        done: oneshot::Sender<()>,
+    },
 }
 
 /// AnyTLS client session - manages multiplexed streams over a connection
@@ -44,13 +56,18 @@ enum OutgoingMessage {
 /// - Stream multiplexing (multiple logical streams over one connection)
 /// - Frame-based communication
 pub struct AnyTlsClientSession {
+    state: Arc<ClientSessionState>,
+    tasks: Vec<tokio::task::AbortHandle>,
+}
+
+struct ClientSessionState {
     /// Stream management
-    streams: RwLock<HashMap<u32, mpsc::Sender<Bytes>>>,
+    streams: Mutex<HashMap<u32, mpsc::Sender<Bytes>>>,
     stream_id_counter: AtomicU32,
 
     /// Unified channel for all outgoing messages (control frames and data)
     /// Using a single channel ensures proper ordering of SYN/data frames
-    outgoing_tx: mpsc::UnboundedSender<OutgoingMessage>,
+    outgoing_tx: mpsc::Sender<OutgoingMessage>,
 
     /// Session state
     is_closed: Arc<AtomicBool>,
@@ -76,25 +93,90 @@ pub struct AnyTlsClientSession {
     initial_buffer: std::sync::Mutex<Option<BytesMut>>,
 
     /// Notify to break reader/writer loops when session is dropped
-    close_notify: Arc<tokio::sync::Notify>,
+    close_notify: CancellationToken,
+}
+
+struct StreamRegistration {
+    state: Arc<ClientSessionState>,
+    stream_id: u32,
+    armed: bool,
+}
+
+impl Drop for StreamRegistration {
+    fn drop(&mut self) {
+        if self.armed {
+            self.state.streams.lock().remove(&self.stream_id);
+            self.state.pending_opens.lock().remove(&self.stream_id);
+            if self
+                .state
+                .outgoing_tx
+                .try_send(OutgoingMessage::Fin {
+                    stream_id: self.stream_id,
+                })
+                .is_err()
+            {
+                self.state.close();
+            }
+        }
+    }
 }
 
 impl std::fmt::Debug for AnyTlsClientSession {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AnyTlsClientSession")
-            .field("is_closed", &self.is_closed.load(Ordering::Relaxed))
-            .field("peer_version", &self.peer_version.load(Ordering::Relaxed))
+            .field("is_closed", &self.state.is_closed.load(Ordering::Relaxed))
+            .field(
+                "peer_version",
+                &self.state.peer_version.load(Ordering::Relaxed),
+            )
             .finish()
     }
 }
 
 impl Drop for AnyTlsClientSession {
     fn drop(&mut self) {
-        self.close_notify.notify_waiters();
+        self.state.close();
+        for task in &self.tasks {
+            task.abort();
+        }
     }
 }
 
 impl AnyTlsClientSession {
+    pub async fn new(
+        transport: Box<dyn AsyncStream>,
+        password: &str,
+        padding: Arc<PaddingFactory>,
+    ) -> io::Result<Arc<Self>> {
+        let (state, tasks) = ClientSessionState::new(transport, password, padding).await?;
+        Ok(Arc::new(Self { state, tasks }))
+    }
+
+    pub async fn open_stream(
+        self: &Arc<Self>,
+        destination: NetLocation,
+    ) -> io::Result<AnyTlsStream> {
+        self.state.open_stream(destination, Arc::clone(self)).await
+    }
+
+    pub(super) fn remove_stream(&self, stream_id: u32) {
+        self.state.streams.lock().remove(&stream_id);
+        self.state.pending_opens.lock().remove(&stream_id);
+    }
+
+    pub(super) fn close(&self) {
+        self.state.close();
+    }
+}
+
+impl ClientSessionState {
+    fn close(&self) {
+        self.is_closed.store(true, Ordering::Relaxed);
+        self.close_notify.cancel();
+        self.streams.lock().clear();
+        self.pending_opens.lock().clear();
+    }
+
     /// Create a new client session on the given transport.
     ///
     /// This performs:
@@ -111,7 +193,7 @@ impl AnyTlsClientSession {
         mut transport: Box<dyn AsyncStream>,
         password: &str,
         padding: Arc<PaddingFactory>,
-    ) -> io::Result<Arc<Self>> {
+    ) -> io::Result<(Arc<Self>, Vec<tokio::task::AbortHandle>)> {
         let hash_result = digest(&SHA256, password.as_bytes());
         let mut password_hash = [0u8; 32];
         password_hash.copy_from_slice(hash_result.as_ref());
@@ -120,14 +202,14 @@ impl AnyTlsClientSession {
         Self::send_auth(&mut transport, &password_hash, &padding).await?;
 
         // Create unified channel for all outgoing messages
-        let (outgoing_tx, outgoing_rx) = mpsc::unbounded_channel();
+        let (outgoing_tx, outgoing_rx) = mpsc::channel(STREAM_CHANNEL_BUFFER);
 
         // Pre-encode Settings frame into initial buffer
         // This will be sent together with first SYN + destination as one TLS record
         let initial_buffer = Self::create_initial_buffer(&padding);
 
         let session = Arc::new(Self {
-            streams: RwLock::new(HashMap::new()),
+            streams: Mutex::new(HashMap::new()),
             stream_id_counter: AtomicU32::new(0),
             outgoing_tx,
             is_closed: Arc::new(AtomicBool::new(false)),
@@ -137,7 +219,7 @@ impl AnyTlsClientSession {
             send_padding: AtomicBool::new(true),
             pkt_counter: AtomicU32::new(0), // Start at 0, incremented before use
             initial_buffer: std::sync::Mutex::new(Some(initial_buffer)),
-            close_notify: Arc::new(tokio::sync::Notify::new()),
+            close_notify: CancellationToken::new(),
         });
 
         // NOTE: Settings is NOT sent here - it's in initial_buffer and will be
@@ -145,9 +227,9 @@ impl AnyTlsClientSession {
 
         // Spawn background tasks
         let (read_half, write_half) = tokio::io::split(transport);
-        Self::spawn_tasks(Arc::clone(&session), read_half, write_half, outgoing_rx);
+        let tasks = Self::spawn_tasks(Arc::clone(&session), read_half, write_half, outgoing_rx);
 
-        Ok(session)
+        Ok((session, tasks))
     }
 
     /// Create initial buffer with Settings frame pre-encoded
@@ -191,52 +273,69 @@ impl AnyTlsClientSession {
     }
 
     /// Send a control frame through the writer channel (zero-copy)
-    fn send_control_frame(&self, cmd: Command, stream_id: u32, data: Bytes) -> io::Result<()> {
+    async fn send_control_frame(
+        &self,
+        cmd: Command,
+        stream_id: u32,
+        data: Bytes,
+    ) -> io::Result<()> {
         self.outgoing_tx
             .send(OutgoingMessage::Control {
                 cmd,
                 stream_id,
                 data,
             })
+            .await
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "Session writer closed"))
     }
 
     /// Send buffered frames (Settings + SYN + destination) as single message
-    fn send_buffered(&self, data: Bytes) -> io::Result<()> {
+    async fn send_buffered(&self, data: Bytes) -> io::Result<()> {
         self.outgoing_tx
             .send(OutgoingMessage::Buffered { data })
+            .await
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "Session writer closed"))
     }
 
-    /// Spawn reader and writer tasks
     fn spawn_tasks<R, W>(
         session: Arc<Self>,
         reader: R,
         writer: W,
-        outgoing_rx: mpsc::UnboundedReceiver<OutgoingMessage>,
-    ) where
+        outgoing_rx: mpsc::Receiver<OutgoingMessage>,
+    ) -> Vec<tokio::task::AbortHandle>
+    where
         R: tokio::io::AsyncRead + Send + Unpin + 'static,
         W: tokio::io::AsyncWrite + Send + Unpin + 'static,
     {
-        // Writer task - handles all outgoing messages (control and data)
-        let session_weak_w = Arc::downgrade(&session);
-        let close_notify_w = Arc::clone(&session.close_notify);
-        tokio::spawn(async move {
-            if let Err(e) =
-                Self::writer_loop(session_weak_w, writer, outgoing_rx, close_notify_w).await
-            {
-                log::debug!("AnyTLS client writer ended: {}", e);
+        let writer_state = Arc::clone(&session);
+        let writer_task = tokio::spawn(async move {
+            tokio::select! {
+                result = Self::writer_loop(
+                    Arc::downgrade(&writer_state), writer, outgoing_rx,
+                    writer_state.close_notify.clone(),
+                ) => {
+                    if let Err(e) = result {
+                        log::debug!("AnyTLS client writer ended: {e}");
+                    }
+                }
+                _ = writer_state.close_notify.cancelled() => {}
             }
+            writer_state.close();
         });
-
-        // Reader task
-        let session_weak_r = Arc::downgrade(&session);
-        let close_notify_r = Arc::clone(&session.close_notify);
-        tokio::spawn(async move {
-            if let Err(e) = Self::reader_loop(session_weak_r, reader, close_notify_r).await {
-                log::debug!("AnyTLS client reader ended: {}", e);
+        let reader_task = tokio::spawn(async move {
+            tokio::select! {
+                result = Self::reader_loop(
+                    Arc::downgrade(&session), reader, session.close_notify.clone(),
+                ) => {
+                    if let Err(e) = result {
+                        log::debug!("AnyTLS client reader ended: {e}");
+                    }
+                }
+                _ = session.close_notify.cancelled() => {}
             }
+            session.close();
         });
+        vec![writer_task.abort_handle(), reader_task.abort_handle()]
     }
 
     /// Writer loop - sends frames to the transport with padding
@@ -252,8 +351,8 @@ impl AnyTlsClientSession {
     async fn writer_loop<W>(
         session_weak: std::sync::Weak<Self>,
         mut writer: W,
-        mut outgoing_rx: mpsc::UnboundedReceiver<OutgoingMessage>,
-        close_notify: Arc<tokio::sync::Notify>,
+        mut outgoing_rx: mpsc::Receiver<OutgoingMessage>,
+        close_notify: CancellationToken,
     ) -> io::Result<()>
     where
         W: tokio::io::AsyncWrite + Send + Unpin,
@@ -271,7 +370,7 @@ impl AnyTlsClientSession {
         loop {
             let msg = tokio::select! {
                 m = outgoing_rx.recv() => m,
-                _ = close_notify.notified() => {
+                _ = close_notify.cancelled() => {
                     log::debug!("AnyTLS client writer loop: close_notify triggered");
                     break;
                 }
@@ -298,6 +397,10 @@ impl AnyTlsClientSession {
             write_buf.clear();
 
             match msg {
+                OutgoingMessage::Flush { done } => {
+                    writer.flush().await?;
+                    let _ = done.send(());
+                }
                 OutgoingMessage::Buffered { data } => {
                     // Send buffered frames as single TLS record to avoid fingerprinting
                     log::debug!("AnyTLS client writer: buffered frames {} bytes", data.len());
@@ -337,7 +440,7 @@ impl AnyTlsClientSession {
                         .await?;
                     writer.flush().await?;
 
-                    let mut streams = session.streams.write().await;
+                    let mut streams = session.streams.lock();
                     streams.remove(&stream_id);
                 }
             }
@@ -461,7 +564,7 @@ impl AnyTlsClientSession {
     async fn reader_loop<R>(
         session_weak: std::sync::Weak<Self>,
         mut reader: R,
-        close_notify: Arc<tokio::sync::Notify>,
+        close_notify: CancellationToken,
     ) -> io::Result<()>
     where
         R: tokio::io::AsyncRead + Send + Unpin,
@@ -511,7 +614,7 @@ impl AnyTlsClientSession {
             // Wait for new data or close_notify
             let read_result = tokio::select! {
                 res = reader.read_buf(&mut buffer) => res,
-                _ = close_notify.notified() => {
+                _ = close_notify.cancelled() => {
                     log::debug!("AnyTLS client reader loop: close_notify triggered");
                     return Ok(());
                 }
@@ -524,7 +627,7 @@ impl AnyTlsClientSession {
                 // Re-upgrade to signal writer loop
                 if let Some(session) = session_weak.upgrade() {
                     session.is_closed.store(true, Ordering::Relaxed);
-                    session.close_notify.notify_waiters();
+                    session.close_notify.cancel();
                 }
                 return Ok(()); // Connection closed
             }
@@ -542,7 +645,7 @@ impl AnyTlsClientSession {
                 }
 
                 let tx = {
-                    let streams = self.streams.read().await;
+                    let streams = self.streams.lock();
                     streams.get(&frame.stream_id).cloned()
                 };
 
@@ -558,7 +661,7 @@ impl AnyTlsClientSession {
             Command::Fin => {
                 // Stream closed by server
                 let tx = {
-                    let mut streams = self.streams.write().await;
+                    let mut streams = self.streams.lock();
                     streams.remove(&frame.stream_id)
                 };
 
@@ -570,7 +673,7 @@ impl AnyTlsClientSession {
 
             Command::SynAck => {
                 // Stream open acknowledged (v2)
-                let mut pending = self.pending_opens.lock().await;
+                let mut pending = self.pending_opens.lock();
                 if let Some(sender) = pending.remove(&frame.stream_id) {
                     if frame.data.is_empty() {
                         let _ = sender.send(Ok(()));
@@ -626,8 +729,9 @@ impl AnyTlsClientSession {
 
             Command::HeartRequest => {
                 // Respond to heartbeat
-                let _ =
-                    self.send_control_frame(Command::HeartResponse, frame.stream_id, Bytes::new());
+                let _ = self
+                    .send_control_frame(Command::HeartResponse, frame.stream_id, Bytes::new())
+                    .await;
             }
 
             Command::HeartResponse => {
@@ -658,6 +762,7 @@ impl AnyTlsClientSession {
     pub async fn open_stream(
         self: &Arc<Self>,
         destination: NetLocation,
+        owner: Arc<AnyTlsClientSession>,
     ) -> io::Result<AnyTlsStream> {
         if self.is_closed.load(Ordering::Relaxed) {
             return Err(io::Error::new(
@@ -668,21 +773,36 @@ impl AnyTlsClientSession {
 
         // Allocate stream ID (sequential starting from 1, matching Go implementation)
         // fetch_add returns old value, so +1 gives us 1, 2, 3, ...
-        let stream_id = self.stream_id_counter.fetch_add(1, Ordering::Relaxed) + 1;
+        let stream_id = self
+            .stream_id_counter
+            .fetch_add(1, Ordering::Relaxed)
+            .checked_add(1)
+            .ok_or_else(|| {
+                self.close();
+                io::Error::other("AnyTLS stream IDs exhausted")
+            })?;
 
         // Create stream channels
         let (data_tx, data_rx) = mpsc::channel(STREAM_CHANNEL_BUFFER);
 
         // Register stream
         {
-            let mut streams = self.streams.write().await;
+            let mut streams = self.streams.lock();
+            if self.is_closed.load(Ordering::Relaxed) {
+                return Err(io::ErrorKind::NotConnected.into());
+            }
             streams.insert(stream_id, data_tx);
         }
+        let mut registration = StreamRegistration {
+            state: Arc::clone(self),
+            stream_id,
+            armed: true,
+        };
 
         // Set up SYNACK receiver if v2
         let synack_rx = if self.peer_version.load(Ordering::Relaxed) >= 2 {
             let (tx, rx) = oneshot::channel();
-            let mut pending = self.pending_opens.lock().await;
+            let mut pending = self.pending_opens.lock();
             pending.insert(stream_id, tx);
             Some(rx)
         } else {
@@ -717,11 +837,13 @@ impl AnyTlsClientSession {
                 data.len(),
                 stream_id
             );
-            self.send_buffered(data)?;
+            self.send_buffered(data).await?;
         } else {
             // Subsequent streams: send SYN and destination normally
-            self.send_control_frame(Command::Syn, stream_id, Bytes::new())?;
-            self.send_control_frame(Command::Psh, stream_id, Bytes::from(dest_data))?;
+            self.send_control_frame(Command::Syn, stream_id, Bytes::new())
+                .await?;
+            self.send_control_frame(Command::Psh, stream_id, Bytes::from(dest_data))
+                .await?;
         }
 
         // Wait for SYNACK if v2
@@ -733,7 +855,7 @@ impl AnyTlsClientSession {
                 }
                 Ok(Ok(Err(error))) => {
                     // Remove stream on error
-                    let mut streams = self.streams.write().await;
+                    let mut streams = self.streams.lock();
                     streams.remove(&stream_id);
                     return Err(io::Error::new(
                         io::ErrorKind::ConnectionRefused,
@@ -742,7 +864,7 @@ impl AnyTlsClientSession {
                 }
                 Ok(Err(_)) => {
                     // Sender dropped
-                    let mut streams = self.streams.write().await;
+                    let mut streams = self.streams.lock();
                     streams.remove(&stream_id);
                     return Err(io::Error::new(
                         io::ErrorKind::ConnectionAborted,
@@ -752,10 +874,10 @@ impl AnyTlsClientSession {
                 Err(_) => {
                     // Timeout - remove from pending and streams
                     {
-                        let mut pending = self.pending_opens.lock().await;
+                        let mut pending = self.pending_opens.lock();
                         pending.remove(&stream_id);
                     }
-                    let mut streams = self.streams.write().await;
+                    let mut streams = self.streams.lock();
                     streams.remove(&stream_id);
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
@@ -765,44 +887,151 @@ impl AnyTlsClientSession {
             }
         }
 
-        // Create bounded channel for the stream's write path
-        // This provides backpressure while keeping proper ordering via the unified channel
-        let (stream_write_tx, mut stream_write_rx) =
-            mpsc::channel::<(u32, Bytes)>(STREAM_CHANNEL_BUFFER);
-
-        // Spawn forwarding task: bounded channel -> unified channel
-        // Converts stream writes to OutgoingMessage variants
-        let outgoing_tx = self.outgoing_tx.clone();
-        let is_closed = Arc::clone(&self.is_closed);
-        tokio::spawn(async move {
-            while let Some((sid, data)) = stream_write_rx.recv().await {
-                if is_closed.load(Ordering::Relaxed) {
-                    break;
-                }
-                // Empty data signals FIN, non-empty is PSH data
-                let msg = if data.is_empty() {
-                    OutgoingMessage::Fin { stream_id: sid }
-                } else {
-                    OutgoingMessage::Data {
-                        stream_id: sid,
-                        data,
-                    }
-                };
-                if outgoing_tx.send(msg).is_err() {
-                    break;
-                }
-            }
-        });
-
-        // Create stream wrapper with session keepalive reference
         let stream = AnyTlsStream::with_keepalive(
             stream_id,
             data_rx,
-            stream_write_tx,
+            self.outgoing_tx.clone(),
             Arc::clone(&self.is_closed),
-            Arc::clone(self),
+            owner,
         );
+        registration.armed = false;
 
         Ok(stream)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    async fn open() -> (
+        Arc<AnyTlsClientSession>,
+        AnyTlsStream,
+        tokio::io::DuplexStream,
+    ) {
+        let (transport, peer) = tokio::io::duplex(128);
+        let session = AnyTlsClientSession::new(
+            Box::new(transport),
+            "test",
+            PaddingFactory::default_factory(),
+        )
+        .await
+        .unwrap();
+        let stream = session
+            .open_stream(NetLocation::from_str("127.0.0.1:12345", None).unwrap())
+            .await
+            .unwrap();
+        (session, stream, peer)
+    }
+
+    #[tokio::test]
+    async fn stalled_transport_backpressures_all_streams() {
+        let (session, mut stream, peer) = open().await;
+        let bytes = vec![1; 2 * 1024 * 1024];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), stream.write_all(&bytes))
+                .await
+                .is_err()
+        );
+        assert!(session.state.outgoing_tx.capacity() <= STREAM_CHANNEL_BUFFER);
+        drop(peer);
+    }
+
+    #[tokio::test]
+    async fn transport_eof_wakes_parked_reader() {
+        let (session, mut stream, mut peer) = open().await;
+        peer.shutdown().await.unwrap();
+        let mut byte = [0];
+        let result = tokio::time::timeout(Duration::from_secs(1), stream.read(&mut byte))
+            .await
+            .unwrap();
+        assert_eq!(result.unwrap(), 0);
+        assert!(session.state.streams.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn dropping_last_owner_cancels_stalled_io() {
+        let (session, mut stream, _peer) = open().await;
+        stream.write_all(b"payload").await.unwrap();
+        tokio::task::yield_now().await;
+        let state = Arc::downgrade(&session.state);
+        let tasks = session.tasks.clone();
+        drop(session);
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while tasks.iter().any(|task| !task.is_finished()) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(state.upgrade().is_none());
+    }
+
+    #[tokio::test]
+    async fn cancelled_stream_open_releases_registration() {
+        let (session, stream, _peer) = open().await;
+        session.state.peer_version.store(2, Ordering::Relaxed);
+        let destination = NetLocation::from_str("127.0.0.1:12345", None).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), session.open_stream(destination))
+                .await
+                .is_err()
+        );
+        assert_eq!(session.state.streams.lock().len(), 1);
+        assert!(session.state.pending_opens.lock().is_empty());
+        drop(stream);
+        assert!(session.state.streams.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_data_after_a_cancelled_flush() {
+        let (transport, mut peer) = tokio::io::duplex(64);
+        let padding = Arc::new(PaddingFactory::new(b"stop=1\n0=0-0").unwrap());
+        let session = AnyTlsClientSession::new(Box::new(transport), "test", padding)
+            .await
+            .unwrap();
+        let mut stream = session
+            .open_stream(NetLocation::from_str("127.0.0.1:12345", None).unwrap())
+            .await
+            .unwrap();
+        stream.write_all(b"first").await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), stream.flush())
+                .await
+                .is_err()
+        );
+        let reader = tokio::spawn(async move {
+            let mut auth = [0; 34];
+            peer.read_exact(&mut auth).await.unwrap();
+            let mut bytes = Vec::new();
+            peer.read_to_end(&mut bytes).await.unwrap();
+            let mut buffer = BytesMut::from(bytes.as_slice());
+            let mut payloads = Vec::new();
+            let mut fin = false;
+            while let Some(frame) = FrameCodec::decode(&mut buffer).unwrap() {
+                if frame.cmd == Command::Psh {
+                    assert!(!fin);
+                    payloads.push(frame.data);
+                }
+                if frame.cmd == Command::Fin {
+                    fin = true;
+                }
+            }
+            assert!(fin);
+            assert_eq!(
+                &payloads[1..],
+                &[Bytes::from_static(b"first"), Bytes::from_static(b"second")]
+            );
+        });
+        stream.write_all(b"second").await.unwrap();
+        stream.shutdown().await.unwrap();
+        drop(stream);
+        drop(session);
+        tokio::time::timeout(Duration::from_secs(1), reader)
+            .await
+            .unwrap()
+            .unwrap();
     }
 }

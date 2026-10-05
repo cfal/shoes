@@ -188,6 +188,8 @@ impl PlatformInterface {
 use std::sync::RwLock;
 
 static GLOBAL_SOCKET_PROTECTOR: RwLock<Option<Arc<dyn SocketProtector>>> = RwLock::new(None);
+static PROTECTION_REQUIRED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Set the global socket protector for Android VPN protection.
 ///
@@ -196,6 +198,21 @@ static GLOBAL_SOCKET_PROTECTOR: RwLock<Option<Arc<dyn SocketProtector>>> = RwLoc
 /// On other platforms, this can be left unset (no-op behavior).
 pub fn set_global_socket_protector(protector: Arc<dyn SocketProtector>) {
     *GLOBAL_SOCKET_PROTECTOR.write().unwrap() = Some(protector);
+    PROTECTION_REQUIRED.store(true, std::sync::atomic::Ordering::Release);
+}
+
+pub fn clear_global_socket_protector() {
+    *GLOBAL_SOCKET_PROTECTOR.write().unwrap() = None;
+}
+
+pub fn clear_global_socket_protector_if_current(protector: &Arc<dyn SocketProtector>) {
+    let mut current = GLOBAL_SOCKET_PROTECTOR.write().unwrap();
+    if current
+        .as_ref()
+        .is_some_and(|current| Arc::ptr_eq(current, protector))
+    {
+        *current = None;
+    }
 }
 
 /// Get the global socket protector.
@@ -221,7 +238,17 @@ pub fn get_global_socket_protector() -> Arc<dyn SocketProtector> {
 /// * `Err(...)` if protection failed.
 #[cfg(unix)]
 pub fn protect_socket(fd: RawFd) -> io::Result<()> {
-    get_global_socket_protector().protect(fd)
+    let protector = GLOBAL_SOCKET_PROTECTOR.read().unwrap().clone();
+    match protector {
+        Some(protector) => protector.protect(fd),
+        None if PROTECTION_REQUIRED.load(std::sync::atomic::Ordering::Acquire) => {
+            Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "VPN socket protector is no longer available",
+            ))
+        }
+        None => Ok(()),
+    }
 }
 
 /// Protect a socket using the global protector (non-Unix stub).

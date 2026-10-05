@@ -10,18 +10,68 @@ use std::path::Path;
 
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
+#[cfg(all(test, unix, feature = "ffi"))]
+mod protection_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn outbound_protection_fails_closed_without_affecting_listeners() {
+        struct Restore(Arc<dyn crate::tun::SocketProtector>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                crate::tun::set_global_socket_protector(self.0.clone());
+            }
+        }
+        let _restore = Restore(crate::tun::get_global_socket_protector());
+        let owner = std::thread::current().id();
+        crate::tun::set_global_socket_protector(Arc::new(crate::tun::FnSocketProtector::new(
+            move |_| {
+                if std::thread::current().id() == owner {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "protection denied",
+                    ))
+                } else {
+                    Ok(())
+                }
+            },
+        )));
+        assert!(new_tcp_socket(None, false).is_err());
+        assert!(new_udp_socket(false, None).is_err());
+        assert!(
+            new_outbound_socket2_udp_socket(false, None, Some("0.0.0.0:0".parse().unwrap()))
+                .is_err()
+        );
+        assert!(new_tcp_listener("0.0.0.0:0".parse().unwrap(), 10, None).is_ok());
+        assert!(
+            new_socket2_udp_socket(false, None, Some("0.0.0.0:0".parse().unwrap()), false).is_ok()
+        );
+    }
+}
+
 pub fn new_udp_socket(
     is_ipv6: bool,
     bind_interface: Option<String>,
 ) -> std::io::Result<tokio::net::UdpSocket> {
-    let socket = new_socket2_udp_socket(
+    let socket = new_outbound_socket2_udp_socket(
         is_ipv6,
         bind_interface,
         Some(get_unspecified_socket_addr(is_ipv6)),
-        false,
     )?;
 
     into_tokio_udp_socket(socket)
+}
+
+pub fn new_outbound_socket2_udp_socket(
+    is_ipv6: bool,
+    bind_interface: Option<String>,
+    bind_address: Option<SocketAddr>,
+) -> std::io::Result<Socket> {
+    let socket = new_socket2_udp_socket(is_ipv6, bind_interface, bind_address, false)?;
+    #[cfg(any(target_os = "android", target_os = "ios", all(unix, feature = "ffi")))]
+    crate::tun::protect_socket(socket.as_raw_fd())?;
+    Ok(socket)
 }
 
 fn get_unspecified_socket_addr(is_ipv6: bool) -> SocketAddr {
@@ -108,6 +158,8 @@ pub fn new_tcp_socket(
     } else {
         tokio::net::TcpSocket::new_v4()?
     };
+    #[cfg(any(target_os = "android", target_os = "ios", all(unix, feature = "ffi")))]
+    crate::tun::protect_socket(tcp_socket.as_raw_fd())?;
 
     if let Some(_b) = bind_interface {
         #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]

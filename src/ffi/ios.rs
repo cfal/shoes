@@ -128,6 +128,14 @@ pub unsafe extern "C" fn shoes_start(
     config_yaml: *const c_char,
     protect_callback: ProtectSocketCallback,
 ) -> c_long {
+    let _lifecycle = common::SERVICE_LIFECYCLE.lock();
+    if TUN_SERVICE
+        .get()
+        .is_some_and(|service| service.lock().is_some())
+    {
+        error!("Stop the previous shoes service before starting another");
+        return -1;
+    }
     if config_yaml.is_null() {
         error!("shoes_start: config_yaml is null");
         return -1;
@@ -150,6 +158,7 @@ pub unsafe extern "C" fn shoes_start(
 
     crate::tun::set_global_socket_protector(Arc::new(IosSocketProtector));
 
+    crate::thread_util::set_num_threads(2);
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .worker_threads(2)
@@ -158,29 +167,23 @@ pub unsafe extern "C" fn shoes_start(
         Ok(rt) => rt,
         Err(e) => {
             error!("shoes_start: failed to create runtime: {}", e);
+            crate::tun::clear_global_socket_protector();
             return -1;
         }
     };
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
-    let running_clone = running.clone();
-
-    runtime.spawn(async move {
-        match common::start_from_config(&config_str, shutdown_rx).await {
-            Ok(()) => info!("shoes service stopped normally"),
-            Err(e) => error!("shoes service error: {}", e),
-        }
-        running_clone.store(false, Ordering::SeqCst);
-    });
+    let task = common::spawn_service(&runtime, config_str, shutdown_rx, running.clone());
 
     let handle = TunServiceHandle {
         shutdown_tx: Some(shutdown_tx),
         running,
         runtime,
+        task,
     };
 
-    let mut guard = TUN_SERVICE.get().unwrap().lock();
+    let mut guard = TUN_SERVICE.get_or_init(|| Mutex::new(None)).lock();
     *guard = Some(handle);
 
     1

@@ -48,28 +48,29 @@ mod platform;
 )]
 pub use platform::{
     FnSocketProtector, NoOpPlatformCallbacks, NoOpSocketProtector, PlatformCallbacks,
-    PlatformInterface, SocketProtector, get_global_socket_protector, protect_socket,
+    PlatformInterface, SocketProtector, clear_global_socket_protector,
+    clear_global_socket_protector_if_current, get_global_socket_protector, protect_socket,
     set_global_socket_protector,
 };
 
 pub use tun_server::TunServerConfig;
 
 use std::net::SocketAddr;
-use std::os::unix::io::IntoRawFd;
+use std::os::fd::{BorrowedFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::sync::Arc;
 
 use log::{debug, info, warn};
 use tokio::sync::{mpsc, oneshot};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 
 use crate::address::{Address, NetLocation};
 use crate::client_proxy_selector::ClientProxySelector;
 use crate::config::TunConfig;
 use crate::config::selection::ConfigSelection;
-use crate::resolver::{NativeResolver, Resolver};
+use crate::resolver::Resolver;
 use crate::tcp::tcp_client_handler_factory::create_tcp_client_proxy_selector;
 
-use tcp_stack_direct::{NewTcpConnection, TcpStackDirect};
+use tcp_stack_direct::{NewTcpConnection, PACKET_QUEUE_CAPACITY, TcpStackDirect};
 use udp_manager::TunUdpManager;
 
 type PacketBuffer = Vec<u8>;
@@ -88,6 +89,7 @@ pub async fn run_tun_server(
     resolver: Arc<dyn Resolver>,
     mut shutdown_rx: oneshot::Receiver<()>,
 ) -> std::io::Result<()> {
+    config.resource_limits.validate()?;
     info!(
         "Starting TUN server (direct mode): mtu={}, tcp={}, udp={}, icmp={}",
         config.mtu, config.tcp_enabled, config.udp_enabled, config.icmp_enabled
@@ -95,41 +97,55 @@ pub async fn run_tun_server(
 
     let fd = if let Some(fd) = config.raw_fd {
         info!("Using provided raw FD: {}", fd);
-        fd
+        if config.close_fd_on_drop {
+            unsafe { OwnedFd::from_raw_fd(fd) }
+        } else {
+            unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned()?
+        }
     } else {
         let tun_device = config.create_sync_device()?;
         let fd = tun_device.into_raw_fd();
         info!("Created TUN device with FD: {}", fd);
-        fd
+        unsafe { OwnedFd::from_raw_fd(fd) }
     };
 
-    let mtu = config.mtu as usize;
-
     // Create the direct TCP stack (runs smoltcp in dedicated thread with select())
-    let mut tcp_stack = TcpStackDirect::new(fd, mtu);
+    let mut stack_config = config.clone();
+    if config.raw_fd.is_none() && cfg!(any(target_os = "macos", target_os = "ios")) {
+        stack_config.packet_information = true;
+    }
+    let mut tcp_stack = TcpStackDirect::with_config(fd, stack_config);
 
     // Get UDP receiver (stack thread filters UDP and sends here)
     let udp_from_stack_rx = tcp_stack.take_udp_rx().expect("udp_rx already taken");
 
     // Channel for sending UDP responses back (stack thread will write to TUN)
-    let (udp_to_stack_tx, udp_to_stack_rx) = mpsc::unbounded_channel::<PacketBuffer>();
+    let (udp_to_stack_tx, udp_to_stack_rx) = mpsc::channel::<PacketBuffer>(PACKET_QUEUE_CAPACITY);
     tcp_stack.set_udp_response_tx(udp_to_stack_rx);
 
-    let (tcp_conn_tx, mut tcp_conn_rx) = mpsc::unbounded_channel::<NewTcpConnection>();
+    let (tcp_conn_tx, mut tcp_conn_rx) = mpsc::channel::<NewTcpConnection>(PACKET_QUEUE_CAPACITY);
     tcp_stack.set_new_conn_tx(tcp_conn_tx);
 
-    let tcp_task: Option<JoinHandle<()>> = if config.tcp_enabled {
+    let mut tasks = JoinSet::new();
+    if config.tcp_enabled {
         let proxy_selector = proxy_selector.clone();
         let resolver = resolver.clone();
 
-        Some(tokio::spawn(async move {
+        tasks.spawn(async move {
             info!("Starting TCP connection handler");
-
-            while let Some(new_conn) = tcp_conn_rx.recv().await {
+            let mut connections = JoinSet::new();
+            loop {
+                let new_conn = tokio::select! {
+                    conn = tcp_conn_rx.recv() => match conn {
+                        Some(conn) => conn,
+                        None => break,
+                    },
+                    _ = connections.join_next(), if !connections.is_empty() => continue,
+                };
                 let proxy_selector = proxy_selector.clone();
                 let resolver = resolver.clone();
 
-                tokio::spawn(async move {
+                connections.spawn(async move {
                     let remote_addr = new_conn.remote_addr;
                     let target = socket_addr_to_net_location(remote_addr);
 
@@ -145,21 +161,25 @@ pub async fn run_tun_server(
             }
 
             debug!("TCP connection handler ended");
-        }))
-    } else {
-        None
-    };
+        });
+    }
 
-    let udp_task = if config.udp_enabled {
+    if config.udp_enabled {
         let proxy_selector = proxy_selector.clone();
         let resolver = resolver.clone();
+        let limits = config.resource_limits.clone();
 
-        Some(tokio::spawn(async move {
-            handle_udp_packets(udp_from_stack_rx, udp_to_stack_tx, proxy_selector, resolver).await;
-        }))
-    } else {
-        None
-    };
+        tasks.spawn(async move {
+            handle_udp_packets(
+                udp_from_stack_rx,
+                udp_to_stack_tx,
+                proxy_selector,
+                resolver,
+                limits,
+            )
+            .await;
+        });
+    }
 
     info!("TUN server started successfully");
 
@@ -178,12 +198,7 @@ pub async fn run_tun_server(
         }
     }
 
-    if let Some(t) = tcp_task {
-        t.abort();
-    }
-    if let Some(t) = udp_task {
-        t.abort();
-    }
+    tasks.shutdown().await;
 
     // tcp_stack is dropped here, which stops the stack thread
 
@@ -207,7 +222,13 @@ async fn handle_tcp_connection(
     proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
 ) -> std::io::Result<()> {
-    let decision = proxy_selector.judge(target.into(), &resolver).await?;
+    let _permit = crate::resources::try_stream().ok_or_else(crate::resources::exhausted)?;
+    let decision = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        proxy_selector.judge(target.into(), &resolver),
+    )
+    .await
+    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "TUN routing timed out"))??;
 
     match decision {
         crate::client_proxy_selector::ConnectDecision::Allow {
@@ -219,10 +240,14 @@ async fn handle_tcp_connection(
                 remote_location.location()
             );
 
-            match chain_group
-                .connect_tcp(remote_location.clone(), &resolver)
-                .await
-            {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                chain_group.connect_tcp(remote_location.clone(), &resolver),
+            )
+            .await
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "TUN TCP setup timed out")
+            })? {
                 Ok(setup_result) => {
                     debug!(
                         "TCP: connected to {}, starting bidirectional copy",
@@ -272,17 +297,18 @@ async fn handle_tcp_connection(
 /// - Stores the return address in each session
 /// - Routes responses using the stored address (no NAT table lookup)
 async fn handle_udp_packets(
-    from_stack_rx: mpsc::UnboundedReceiver<PacketBuffer>,
-    to_stack_tx: mpsc::UnboundedSender<PacketBuffer>,
+    from_stack_rx: mpsc::Receiver<PacketBuffer>,
+    to_stack_tx: mpsc::Sender<PacketBuffer>,
     proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
+    limits: crate::config::tun::TunResourceLimits,
 ) {
     info!("Starting UDP handler (session-based)");
 
     let udp_handler = udp_handler::UdpHandler::new(from_stack_rx, to_stack_tx);
     let (reader, writer) = udp_handler.split();
 
-    let manager = TunUdpManager::new(reader, writer, proxy_selector, resolver);
+    let manager = TunUdpManager::new(reader, writer, proxy_selector, resolver, limits);
 
     if let Err(e) = manager.run().await {
         warn!("UDP handler error: {}", e);
@@ -294,13 +320,13 @@ async fn handle_udp_packets(
 /// Start TUN server based on the provided configuration.
 pub async fn start_tun_server(
     config: TunConfig,
-    _resolver: std::sync::Arc<dyn crate::resolver::Resolver>,
+    resolver: std::sync::Arc<dyn crate::resolver::Resolver>,
 ) -> std::io::Result<JoinHandle<()>> {
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
     let handle = tokio::spawn(async move {
         let _keep_alive = shutdown_tx;
-        if let Err(e) = run_tun_from_config(config, shutdown_rx, true).await {
+        if let Err(e) = run_tun_from_config(config, shutdown_rx, true, resolver).await {
             warn!("TUN server error: {}", e);
         }
     });
@@ -313,6 +339,7 @@ pub async fn run_tun_from_config(
     config: TunConfig,
     shutdown_rx: tokio::sync::oneshot::Receiver<()>,
     close_fd_on_drop: bool,
+    resolver: Arc<dyn Resolver>,
 ) -> std::io::Result<()> {
     let mut tun_server_config = TunServerConfig::new()
         .mtu(config.mtu)
@@ -320,6 +347,7 @@ pub async fn run_tun_from_config(
         .udp_enabled(config.udp_enabled)
         .icmp_enabled(config.icmp_enabled)
         .close_fd_on_drop(close_fd_on_drop);
+    tun_server_config.resource_limits = config.resource_limits;
 
     if let Some(ref name) = config.device_name {
         tun_server_config = tun_server_config.tun_name(name.clone());
@@ -342,9 +370,11 @@ pub async fn run_tun_from_config(
     if let Some(dest) = config.destination {
         tun_server_config = tun_server_config.destination(dest);
     }
+    if let Some(packet_information) = config.packet_information {
+        tun_server_config.packet_information = packet_information;
+    }
 
     let rules = config.rules.map(ConfigSelection::unwrap_config).into_vec();
-    let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
     let client_proxy_selector = Arc::new(create_tcp_client_proxy_selector(rules, resolver.clone()));
 
     run_tun_server(
@@ -354,4 +384,29 @@ pub async fn run_tun_from_config(
         shutdown_rx,
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::fd::AsRawFd;
+
+    #[tokio::test]
+    async fn borrowed_tun_fd_remains_open_after_stop() {
+        let (_peer, client) = std::os::unix::net::UnixStream::pair().unwrap();
+        let config = TunServerConfig::new()
+            .raw_fd(client.as_raw_fd())
+            .close_fd_on_drop(false);
+        let (tx, rx) = oneshot::channel();
+        tx.send(()).unwrap();
+        run_tun_server(
+            config,
+            Arc::new(ClientProxySelector::new(Vec::new())),
+            Arc::new(crate::resolver::NativeResolver::new()),
+            rx,
+        )
+        .await
+        .unwrap();
+        assert!(unsafe { libc::fcntl(client.as_raw_fd(), libc::F_GETFD) } >= 0);
+    }
 }

@@ -59,7 +59,7 @@ impl ShadowsocksTcpHandler {
             cipher,
             key,
             aead2022: false,
-            salt_checker: None,
+            salt_checker: Some(Arc::new(Mutex::new(TimedSaltChecker::new(60)))),
             udp_enabled,
             proxy_selector: Some(proxy_selector),
             resolver: Some(resolver),
@@ -184,7 +184,7 @@ impl TcpServerHandler for ShadowsocksTcpHandler {
 
             let initial_data = stream_reader.unparsed_data_owned();
 
-            tokio::spawn(async move {
+            return Ok(TcpServerSetupResult::Session(Box::pin(async move {
                 if let Err(e) = handle_h2mux_session(
                     server_stream,
                     initial_data,
@@ -196,9 +196,7 @@ impl TcpServerHandler for ShadowsocksTcpHandler {
                 {
                     debug!("Shadowsocks h2mux session ended: {}", e);
                 }
-            });
-
-            return Ok(TcpServerSetupResult::AlreadyHandled);
+            })));
         }
 
         // Checks for UDP-over-TCP (UoT) magic addresses

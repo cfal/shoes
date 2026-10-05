@@ -84,13 +84,26 @@ impl TcpClientHandler for NaiveProxyTcpClientHandler {
     ) -> io::Result<TcpClientSetupResult> {
         let mut session = self.get_or_create_session(client_stream).await?;
 
-        let stream = session
+        let result = session
             .open_stream(
                 remote_location.location(),
                 &self.auth_header,
                 self.padding_enabled,
             )
-            .await?;
+            .await;
+        let stream = match result {
+            Ok(stream) => stream,
+            Err(e) => {
+                let mut slot = self.session.lock().await;
+                if slot
+                    .as_ref()
+                    .is_some_and(|current| current.same_generation(&session))
+                {
+                    *slot = None;
+                }
+                return Err(e);
+            }
+        };
 
         Ok(TcpClientSetupResult {
             client_stream: stream,
@@ -129,6 +142,100 @@ impl NaiveProxyTcpClientHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn rejected_connect_does_not_discard_retired_tunnels_tail() {
+        use bytes::Bytes;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (client, peer) = tokio::io::duplex(65536);
+        let peer = tokio::spawn(async move {
+            let mut connection = h2::server::handshake(peer).await.unwrap();
+            let (request, mut respond) = connection.accept().await.unwrap().unwrap();
+            let mut send = respond
+                .send_response(http::Response::new(()), false)
+                .unwrap();
+            let mut receive = request.into_body();
+            let read = async {
+                let warmup = receive.data().await.unwrap().unwrap();
+                assert_eq!(warmup, b"warmup"[..]);
+                receive
+                    .flow_control()
+                    .release_capacity(warmup.len())
+                    .unwrap();
+                send.send_data(Bytes::new(), true).unwrap();
+                let mut tail = Vec::new();
+                while let Some(data) = receive.data().await {
+                    let data = data.unwrap();
+                    receive.flow_control().release_capacity(data.len()).unwrap();
+                    tail.extend_from_slice(&data);
+                }
+                tail
+            };
+            tokio::pin!(read);
+            loop {
+                tokio::select! {
+                    tail = &mut read => break tail,
+                    accepted = connection.accept() => match accepted {
+                        Some(Ok((_, mut respond))) => {
+                            let response = http::Response::builder().status(503).body(()).unwrap();
+                            respond.send_response(response, true).unwrap();
+                        }
+                        _ => break read.await,
+                    }
+                }
+            }
+        });
+        let handler = NaiveProxyTcpClientHandler::new("user", "pass", false);
+        let target = crate::address::NetLocation::from_str("example.com:443", None).unwrap();
+        let mut stream = handler
+            .setup_client_tcp_stream(Box::new(client), target.clone().into())
+            .await
+            .unwrap()
+            .client_stream;
+        stream.write_all(b"warmup").await.unwrap();
+        stream.read_to_end(&mut Vec::new()).await.unwrap();
+        let (unused, _peer) = tokio::io::duplex(8192);
+        let result = handler
+            .setup_client_tcp_stream(Box::new(unused), target.into())
+            .await;
+        assert!(result.is_err());
+        assert!(handler.session.lock().await.is_none());
+        stream.write_all(b"FINAL-TAIL").await.unwrap();
+        stream.flush().await.unwrap();
+        stream.shutdown().await.unwrap();
+        drop(stream);
+        let tail = tokio::time::timeout(std::time::Duration::from_secs(1), peer)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(tail, b"FINAL-TAIL");
+    }
+
+    #[tokio::test]
+    async fn replaces_closed_session_with_supplied_transport() {
+        let handler = NaiveProxyTcpClientHandler::new("user", "pass", false);
+        let (client, peer) = tokio::io::duplex(8192);
+        let first = handler
+            .get_or_create_session(Box::new(client))
+            .await
+            .unwrap();
+        drop(peer);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while first.is_ready() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let (client, _peer) = tokio::io::duplex(8192);
+        let second = handler
+            .get_or_create_session(Box::new(client))
+            .await
+            .unwrap();
+        assert!(second.is_ready());
+        assert!(!first.same_generation(&second));
+    }
 
     #[test]
     fn test_handler_new_encodes_credentials() {
