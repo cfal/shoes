@@ -409,7 +409,9 @@ impl<IO: AsyncStream> AsyncPing for CryptoTlsStream<IO> {
     }
 
     fn poll_write_ping(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
-        Pin::new(&mut self.io).poll_write_ping(cx)
+        let written = ready!(Pin::new(&mut self.io).poll_write_ping(cx))?;
+        self.need_flush |= written;
+        Poll::Ready(Ok(written))
     }
 }
 
