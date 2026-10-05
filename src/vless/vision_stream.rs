@@ -19,7 +19,7 @@ use crate::crypto::feed_crypto_connection;
 use crate::sync_adapter::{SyncReadAdapter, SyncWriteAdapter};
 use crate::util::allocate_vec;
 
-use super::tls_deframer::TlsDeframer;
+use crate::crypto::tls_deframer::TlsDeframer;
 use super::tls_fuzzy_deframer::{DeframeResult, FuzzyTlsDeframer};
 use super::vision_filter::VisionFilter;
 use super::vision_unpad::{UnpadCommand, UnpadResult, VisionUnpadder};

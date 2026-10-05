@@ -5,7 +5,6 @@ pub mod vless_client_handler;
 pub mod vless_server_handler;
 
 // Internal implementation details
-pub mod tls_deframer;
 mod tls_fuzzy_deframer;
 mod tls_handshake_util;
 mod vision_filter;

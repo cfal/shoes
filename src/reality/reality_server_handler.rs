@@ -15,7 +15,7 @@ use crate::shadow_tls::{ParsedClientHello, parse_server_hello};
 use crate::tcp::tcp_handler::{TcpClientSetupResult, TcpServerSetupResult};
 use crate::tls_server_handler::InnerProtocol;
 use crate::util::{allocate_vec, write_all};
-use crate::vless::tls_deframer::TlsDeframer;
+use crate::crypto::tls_deframer::TlsDeframer;
 
 use super::{RealityServerConfig, RealityServerConnection};
 

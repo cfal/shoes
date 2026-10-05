@@ -7,6 +7,7 @@ mod crypto_connection;
 mod crypto_handshake;
 mod crypto_reader_writer;
 mod crypto_tls_stream;
+pub mod tls_deframer;
 
 // Re-export core types
 pub use crypto_connection::{CryptoConnection, feed_crypto_connection};
