@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use crate::address::ResolvedLocation;
 use crate::async_stream::AsyncMessageStream;
 use crate::async_stream::AsyncStream;
-use crate::crypto::{CryptoConnection, CryptoTlsStream, perform_crypto_handshake};
+use crate::crypto::{CryptoConnection, CryptoTlsStream, TlsReadMode};
 use crate::tcp::tcp_handler::{TcpClientHandler, TcpClientSetupResult};
 
 #[derive(Debug)]
@@ -57,7 +57,7 @@ impl TlsClientHandler {
 impl TcpClientHandler for TlsClientHandler {
     async fn setup_client_tcp_stream(
         &self,
-        mut client_stream: Box<dyn AsyncStream>,
+        client_stream: Box<dyn AsyncStream>,
         remote_location: ResolvedLocation,
     ) -> std::io::Result<TcpClientSetupResult> {
         let mut client_conn =
@@ -73,9 +73,12 @@ impl TcpClientHandler for TlsClientHandler {
             client_conn.set_buffer_limit(Some(size));
         }
 
-        let mut connection = CryptoConnection::new_rustls_client(client_conn);
-        perform_crypto_handshake(&mut connection, &mut client_stream, 16384).await?;
-        let tls_stream = CryptoTlsStream::new(client_stream, connection);
+        let connection = CryptoConnection::new_rustls_client(client_conn);
+        let mode = match self.handler {
+            TlsInnerClientHandler::VisionVless { .. } => TlsReadMode::PreserveRecords,
+            TlsInnerClientHandler::Default(_) => TlsReadMode::Stream,
+        };
+        let tls_stream = CryptoTlsStream::handshake(client_stream, connection, mode, &[]).await?;
 
         match &self.handler {
             TlsInnerClientHandler::Default(handler) => {
@@ -103,7 +106,7 @@ impl TcpClientHandler for TlsClientHandler {
 
     async fn setup_client_udp_bidirectional(
         &self,
-        mut client_stream: Box<dyn AsyncStream>,
+        client_stream: Box<dyn AsyncStream>,
         target: ResolvedLocation,
     ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
         let mut client_conn =
@@ -119,9 +122,9 @@ impl TcpClientHandler for TlsClientHandler {
             client_conn.set_buffer_limit(Some(size));
         }
 
-        let mut connection = CryptoConnection::new_rustls_client(client_conn);
-        perform_crypto_handshake(&mut connection, &mut client_stream, 16384).await?;
-        let tls_stream = CryptoTlsStream::new(client_stream, connection);
+        let connection = CryptoConnection::new_rustls_client(client_conn);
+        let tls_stream =
+            CryptoTlsStream::handshake(client_stream, connection, TlsReadMode::Stream, &[]).await?;
 
         match &self.handler {
             TlsInnerClientHandler::Default(handler) => {

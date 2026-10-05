@@ -8,7 +8,7 @@ use async_trait::async_trait;
 
 use crate::address::ResolvedLocation;
 use crate::async_stream::AsyncStream;
-use crate::crypto::{CryptoConnection, CryptoTlsStream, perform_crypto_handshake};
+use crate::crypto::{CryptoConnection, CryptoTlsStream, TlsReadMode};
 use crate::reality::{CipherSuite, RealityClientConfig, RealityClientConnection};
 use crate::tcp::tcp_handler::{TcpClientHandler, TcpClientSetupResult};
 
@@ -69,7 +69,8 @@ impl RealityClientHandler {
 
     async fn setup_client_stream_common(
         &self,
-        mut client_stream: Box<dyn AsyncStream>,
+        client_stream: Box<dyn AsyncStream>,
+        mode: TlsReadMode,
     ) -> std::io::Result<CryptoTlsStream<Box<dyn AsyncStream>>> {
         let server_name_str = match &self.server_name {
             rustls::pki_types::ServerName::DnsName(name) => name.as_ref(),
@@ -98,12 +99,11 @@ impl RealityClientHandler {
         let reality_conn = RealityClientConnection::new(reality_config)?;
 
         log::debug!("REALITY CLIENT: Creating Connection");
-        let mut connection = CryptoConnection::new_reality_client(reality_conn);
-
-        perform_crypto_handshake(&mut connection, &mut client_stream, 16384).await?;
+        let connection = CryptoConnection::new_reality_client(reality_conn);
+        let stream = CryptoTlsStream::handshake(client_stream, connection, mode, &[]).await?;
         log::debug!("REALITY CLIENT: Handshake completed successfully");
 
-        Ok(CryptoTlsStream::new(client_stream, connection))
+        Ok(stream)
     }
 }
 
@@ -114,7 +114,11 @@ impl TcpClientHandler for RealityClientHandler {
         client_stream: Box<dyn AsyncStream>,
         remote_location: ResolvedLocation,
     ) -> std::io::Result<TcpClientSetupResult> {
-        let tls_stream = self.setup_client_stream_common(client_stream).await?;
+        let mode = match self.handler {
+            RealityInnerClientHandler::VisionVless { .. } => TlsReadMode::PreserveRecords,
+            RealityInnerClientHandler::Default(_) => TlsReadMode::Stream,
+        };
+        let tls_stream = self.setup_client_stream_common(client_stream, mode).await?;
 
         match self.handler {
             RealityInnerClientHandler::Default(ref handler) => {
@@ -145,7 +149,9 @@ impl TcpClientHandler for RealityClientHandler {
         client_stream: Box<dyn AsyncStream>,
         target: ResolvedLocation,
     ) -> std::io::Result<Box<dyn crate::async_stream::AsyncMessageStream>> {
-        let tls_stream = self.setup_client_stream_common(client_stream).await?;
+        let tls_stream = self
+            .setup_client_stream_common(client_stream, TlsReadMode::Stream)
+            .await?;
 
         match &self.handler {
             RealityInnerClientHandler::Default(handler) => {

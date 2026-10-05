@@ -1,5 +1,9 @@
 use bytes::{Bytes, BytesMut};
+use futures::ready;
 use std::io;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use tokio::io::{AsyncRead, ReadBuf};
 
 /// TLS record header size (ContentType + ProtocolVersion + Length)
 const TLS_RECORD_HEADER_SIZE: usize = 5;
@@ -165,6 +169,46 @@ impl TlsDeframer {
         }
     }
 
+    pub fn poll_read_record<IO: AsyncRead + Unpin + ?Sized>(
+        &mut self,
+        io: &mut IO,
+        cx: &mut Context<'_>,
+        scratch: &mut [u8],
+        read_ahead: bool,
+    ) -> Poll<io::Result<Option<Bytes>>> {
+        loop {
+            if let Some(record) = self.next_record()? {
+                return Poll::Ready(Ok(Some(record)));
+            }
+
+            let read_len = if read_ahead {
+                scratch.len()
+            } else {
+                // Finish seeded input at a record boundary before returning to backend reads.
+                let record_len = match self.state {
+                    DeframerState::ReadingHeader => TLS_RECORD_HEADER_SIZE,
+                    DeframerState::ReadingPayload { payload_len } => {
+                        TLS_RECORD_HEADER_SIZE + payload_len
+                    }
+                };
+                scratch.len().min(record_len - self.buffer.len())
+            };
+            let mut buf = ReadBuf::new(&mut scratch[..read_len]);
+            ready!(Pin::new(&mut *io).poll_read(cx, &mut buf))?;
+            if buf.filled().is_empty() {
+                return if self.pending_bytes() == 0 {
+                    Poll::Ready(Ok(None))
+                } else {
+                    Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "EOF inside a TLS record",
+                    )))
+                };
+            }
+            self.feed(buf.filled());
+        }
+    }
+
     /// Get the number of bytes currently buffered
     pub fn pending_bytes(&self) -> usize {
         self.buffer.len()
@@ -220,6 +264,72 @@ impl Default for TlsDeframer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::task::noop_waker_ref;
+    use tokio::io::AsyncWriteExt;
+
+    #[tokio::test]
+    async fn poll_read_record_retains_partial_data_across_pending() {
+        let record = make_tls_record(0x17, b"payload");
+        for split in [2, 8] {
+            let (mut reader, mut writer) = tokio::io::duplex(64);
+            let mut deframer = TlsDeframer::new();
+            let mut scratch = [0; 32];
+            let mut cx = Context::from_waker(noop_waker_ref());
+            writer.write_all(&record[..split]).await.unwrap();
+            assert!(
+                deframer
+                    .poll_read_record(&mut reader, &mut cx, &mut scratch, true)
+                    .is_pending()
+            );
+            writer.write_all(&record[split..]).await.unwrap();
+            let Poll::Ready(Ok(Some(received))) =
+                deframer.poll_read_record(&mut reader, &mut cx, &mut scratch, true)
+            else {
+                panic!("complete record remained pending");
+            };
+            assert_eq!(received, record);
+        }
+    }
+
+    #[test]
+    fn bounded_record_read_leaves_the_next_record_on_the_transport() {
+        let record = make_tls_record(0x17, b"payload");
+        for split in [0, 2, 8] {
+            let mut deframer = TlsDeframer::new();
+            deframer.feed(&record[..split]);
+            let data = [&record[split..], b"opaque tail"].concat();
+            let mut reader = data.as_slice();
+            let mut scratch = [0; 64];
+            let mut cx = Context::from_waker(noop_waker_ref());
+            let Poll::Ready(Ok(Some(received))) =
+                deframer.poll_read_record(&mut reader, &mut cx, &mut scratch, false)
+            else {
+                panic!("complete record remained pending");
+            };
+            assert_eq!(received, record);
+            assert_eq!(reader, b"opaque tail");
+            assert_eq!(deframer.pending_bytes(), 0);
+        }
+    }
+
+    #[test]
+    fn poll_read_record_distinguishes_clean_and_truncated_eof() {
+        let record = make_tls_record(0x17, b"payload");
+        for length in 0..record.len() {
+            let mut reader = &record[..length];
+            let mut deframer = TlsDeframer::new();
+            let mut scratch = [0; 32];
+            let mut cx = Context::from_waker(noop_waker_ref());
+            let result = deframer.poll_read_record(&mut reader, &mut cx, &mut scratch, true);
+            if length == 0 {
+                assert!(matches!(result, Poll::Ready(Ok(None))));
+            } else {
+                assert!(
+                    matches!(result, Poll::Ready(Err(e)) if e.kind() == io::ErrorKind::UnexpectedEof)
+                );
+            }
+        }
+    }
 
     /// Helper to create a TLS record with given content type and payload
     fn make_tls_record(content_type: u8, payload: &[u8]) -> Vec<u8> {

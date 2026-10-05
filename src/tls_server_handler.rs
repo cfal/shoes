@@ -6,8 +6,7 @@ use rustc_hash::FxHashMap;
 
 use crate::async_stream::AsyncStream;
 use crate::client_proxy_selector::ClientProxySelector;
-use crate::crypto::perform_crypto_handshake;
-use crate::crypto::{CryptoConnection, CryptoTlsStream};
+use crate::crypto::{CryptoConnection, CryptoTlsStream, TlsReadMode};
 use crate::naiveproxy::UserLookup;
 use crate::reality::{RealityServerTarget, setup_reality_server_stream};
 use crate::resolver::Resolver;
@@ -157,20 +156,18 @@ impl TcpServerHandler for TlsServerHandler {
                     )
                 })?;
 
-                let unparsed_data = client_reader.unparsed_data();
-                if !unparsed_data.is_empty() {
-                    feed_rustls_server_connection(&mut server_conn, unparsed_data)?;
-                    server_conn.process_new_packets().map_err(|e| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            format!("Failed to process client handshake data: {e}"),
-                        )
-                    })?;
-                }
-
-                let mut connection = CryptoConnection::new_rustls_server(server_conn);
-                perform_crypto_handshake(&mut connection, &mut server_stream, 16384).await?;
-                let tls_stream = CryptoTlsStream::new(server_stream, connection);
+                let mode = match inner_protocol {
+                    InnerProtocol::VisionVless(_) => TlsReadMode::PreserveRecords,
+                    _ => TlsReadMode::Stream,
+                };
+                let connection = CryptoConnection::new_rustls_server(server_conn);
+                let tls_stream = CryptoTlsStream::handshake(
+                    server_stream,
+                    connection,
+                    mode,
+                    client_reader.unparsed_data(),
+                )
+                .await?;
 
                 let mut target_setup_result = match inner_protocol {
                     InnerProtocol::Normal(handler) => {

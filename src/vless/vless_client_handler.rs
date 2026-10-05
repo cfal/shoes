@@ -102,6 +102,7 @@ pub async fn setup_custom_tls_vision_vless_client_stream<IO>(
 where
     IO: crate::async_stream::AsyncStream + 'static,
 {
+    tls_stream.require_record_framing()?;
     write_vless_header(
         &mut tls_stream,
         user_id,
@@ -111,10 +112,9 @@ where
     .await?;
     tls_stream.flush().await?;
 
-    let (io, connection) = tls_stream.into_inner();
     let mut user_uuid = [0u8; 16];
     user_uuid.copy_from_slice(user_id);
-    let vision_stream = VisionStream::new_client(io, connection, user_uuid);
+    let vision_stream = VisionStream::new_client(tls_stream, user_uuid)?;
 
     Ok(TcpClientSetupResult {
         client_stream: Box::new(vision_stream),

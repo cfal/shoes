@@ -14,27 +14,6 @@ use crate::rustls_connection_util::{feed_rustls_client_connection, feed_rustls_s
 
 use super::crypto_reader_writer::{CryptoReader, CryptoWriter};
 
-/// Represents the I/O state after processing packets
-#[derive(Debug, Clone, Copy)]
-pub struct CryptoIoState {
-    /// Number of plaintext bytes available to read
-    plaintext_bytes_to_read: usize,
-}
-
-impl CryptoIoState {
-    /// Create a new IoState
-    pub fn new(plaintext_bytes_to_read: usize) -> Self {
-        CryptoIoState {
-            plaintext_bytes_to_read,
-        }
-    }
-
-    /// How many plaintext bytes could be obtained via Read without further I/O
-    pub fn plaintext_bytes_to_read(&self) -> usize {
-        self.plaintext_bytes_to_read
-    }
-}
-
 /// Unified connection type supporting multiple crypto protocols
 ///
 /// This enum allows switching between rustls and REALITY implementations
@@ -129,48 +108,48 @@ impl CryptoConnection {
     /// Process any buffered TLS messages and update internal state
     ///
     /// This decrypts data and advances the handshake state machine.
-    /// Returns the I/O state including how many plaintext bytes are available.
-    pub fn process_new_packets(&mut self) -> io::Result<CryptoIoState> {
+    /// Returns the number of buffered plaintext bytes.
+    pub fn process_new_packets(&mut self) -> io::Result<usize> {
         match self {
             CryptoConnection::RustlsServer(conn) => {
-                let io_state = conn.process_new_packets().map_err(|e| {
+                let state = conn.process_new_packets().map_err(|e| {
                     io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!("rustls server error processing new packets: {:?}", e),
                     )
                 })?;
 
-                Ok(CryptoIoState::new(io_state.plaintext_bytes_to_read()))
+                Ok(state.plaintext_bytes_to_read())
             }
             CryptoConnection::RustlsClient(conn) => {
-                let io_state = conn.process_new_packets().map_err(|e| {
+                let state = conn.process_new_packets().map_err(|e| {
                     io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!("rustls client error processing new packets: {:?}", e),
                     )
                 })?;
 
-                Ok(CryptoIoState::new(io_state.plaintext_bytes_to_read()))
+                Ok(state.plaintext_bytes_to_read())
             }
             CryptoConnection::RealityServer(conn) => {
-                let io_state = conn.process_new_packets().map_err(|e| {
+                let state = conn.process_new_packets().map_err(|e| {
                     io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!("reality server error processing new packets: {:?}", e),
                     )
                 })?;
 
-                Ok(CryptoIoState::new(io_state.plaintext_bytes_to_read()))
+                Ok(state.plaintext_bytes_to_read())
             }
             CryptoConnection::RealityClient(conn) => {
-                let io_state = conn.process_new_packets().map_err(|e| {
+                let state = conn.process_new_packets().map_err(|e| {
                     io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!("reality client error processing new packets: {:?}", e),
                     )
                 })?;
 
-                Ok(CryptoIoState::new(io_state.plaintext_bytes_to_read()))
+                Ok(state.plaintext_bytes_to_read())
             }
         }
     }

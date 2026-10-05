@@ -32,7 +32,6 @@ pub mod h2mux_protocol;
 mod h2mux_server_session;
 mod h2mux_server_stream;
 mod h2mux_stream;
-mod prepend_stream;
 
 // Re-exports for external use
 pub use h2mux_client_handler::H2MuxClientHandler;

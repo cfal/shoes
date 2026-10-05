@@ -17,10 +17,10 @@
 use bytes::{Bytes, BytesMut};
 use std::io;
 
-use super::tls_deframer::TlsDeframer;
 use super::tls_handshake_util::{
     MIN_TLS_HANDSHAKE_PATTERN_LEN, find_potential_tls_suffix_len, find_tls_handshake_start,
 };
+use crate::crypto::tls_deframer::TlsDeframer;
 
 /// Result of attempting to extract data from the fuzzy deframer
 #[derive(Debug, PartialEq)]

@@ -300,6 +300,7 @@ pub async fn setup_custom_tls_vision_vless_server_stream<IO>(
 where
     IO: AsyncStream + 'static,
 {
+    tls_stream.require_record_framing()?;
     let mut stream_reader = StreamReader::new_with_buffer_size(800);
 
     let client_version = stream_reader.peek_u8(&mut tls_stream).await?;
@@ -309,6 +310,7 @@ where
             client_version
         );
         if let Some(ref fb) = fallback {
+            tls_stream.allow_streaming_reads();
             return vless_fallback_to_dest(tls_stream, stream_reader, fb, resolver).await;
         }
         return Err(std::io::Error::other(format!(
@@ -323,6 +325,7 @@ where
     if user_id.ct_eq(target_id).unwrap_u8() == 0 {
         debug!("VLESS/Vision UUID mismatch");
         if let Some(ref fb) = fallback {
+            tls_stream.allow_streaming_reads();
             return vless_fallback_to_dest(tls_stream, stream_reader, fb, resolver).await;
         }
         return Err(std::io::Error::other("Unknown user id"));
@@ -354,23 +357,12 @@ where
             debug!("Remote location parsed: {}", remote_location);
             let unparsed_data = stream_reader.unparsed_data();
 
-            let flow_stream: Box<dyn AsyncStream> = if flow == XTLS_VISION_FLOW {
-                debug!("Creating VISION stream (Custom TLS) for flow: {}", flow);
-                let (io, session) = tls_stream.into_inner();
-
-                Box::new(VisionStream::new_server(
-                    io,
-                    session,
-                    user_uuid,
-                    unparsed_data,
-                )?)
-            } else {
-                Box::new(tls_stream)
-            };
+            debug!("Creating VISION stream (Custom TLS) for flow: {}", flow);
+            let vision_stream = VisionStream::new_server(tls_stream, user_uuid, unparsed_data)?;
 
             Ok(TcpServerSetupResult::TcpForward {
                 remote_location,
-                stream: flow_stream,
+                stream: Box::new(vision_stream),
                 need_initial_flush: false,
                 connection_success_response: None, // VisionStream will send VLESS response with first write
                 initial_remote_data: None,         // Data fed to VisionStream instead
@@ -391,6 +383,7 @@ where
             debug!("Remote location parsed: {}", remote_location);
             let unparsed_data = stream_reader.unparsed_data();
 
+            tls_stream.allow_streaming_reads();
             write_all(&mut tls_stream, SERVER_RESPONSE_HEADER).await?;
             let mut vless_stream = VlessMessageStream::new(tls_stream);
             if !unparsed_data.is_empty() {
@@ -418,12 +411,8 @@ where
             if flow == XTLS_VISION_FLOW {
                 debug!("Creating VISION+XUDP stream (Custom TLS) with session-based UDP sockets");
 
-                // Extract components from CryptoTlsStream
-                let (io, session) = tls_stream.into_inner();
-
                 // Create VISION stream (will send VLESS response automatically on first write)
-                let vision_stream =
-                    VisionStream::new_server(io, session, user_uuid, unparsed_data)?;
+                let vision_stream = VisionStream::new_server(tls_stream, user_uuid, unparsed_data)?;
 
                 // Wrap VISION stream in XUDP stream
                 let xudp_stream = XudpMessageStream::new(Box::new(vision_stream));
@@ -438,6 +427,7 @@ where
                     "Creating XUDP stream (Custom TLS, no VISION) with session-based UDP sockets"
                 );
 
+                tls_stream.allow_streaming_reads();
                 // Send VLESS response header immediately
                 write_all(&mut tls_stream, SERVER_RESPONSE_HEADER).await?;
 

@@ -825,3 +825,78 @@ fn pack_frame(opcode: u8, use_mask: bool, input: &[u8], output: &mut [u8]) -> us
 
     offset + input_len
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::address::{Address, NetLocation};
+    use crate::crypto::tls_deframer::TlsDeframer;
+    use crate::crypto::{CryptoConnection, CryptoTlsStream};
+    use crate::reality::{RealityServerConfig, RealityServerConnection};
+    use futures::task::noop_waker_ref;
+    use tokio::io::AsyncWriteExt;
+
+    #[tokio::test]
+    async fn idle_tls_transport_flushes_websocket_ping_and_pong() {
+        for framed in [false, true] {
+            for pong in [false, true] {
+                let (io, mut peer) = tokio::io::duplex(4096);
+                let websocket = WebsocketStream::new(
+                    Box::new(io),
+                    false,
+                    WebsocketPingType::PingFrame,
+                    if pong { &[0x89, 0] } else { &[] },
+                );
+                let session = RealityServerConnection::new(RealityServerConfig {
+                    private_key: [0; 32],
+                    short_ids: vec![[0; 8]],
+                    dest: NetLocation::new(Address::UNSPECIFIED, 443),
+                    max_time_diff: None,
+                    min_client_version: None,
+                    max_client_version: None,
+                    cipher_suites: Vec::new(),
+                })
+                .unwrap()
+                .complete_for_test()
+                .unwrap();
+                let mut tls = CryptoTlsStream::new(
+                    websocket,
+                    CryptoConnection::new_reality_server(session),
+                    framed.then(TlsDeframer::new),
+                );
+                tls.write_all(b"prior TLS traffic").await.unwrap();
+                tls.flush().await.unwrap();
+
+                let mut cx = Context::from_waker(noop_waker_ref());
+                let mut bytes = [0; 4096];
+                let mut buf = ReadBuf::new(&mut bytes);
+                assert!(matches!(
+                    Pin::new(&mut peer).poll_read(&mut cx, &mut buf),
+                    Poll::Ready(Ok(()))
+                ));
+                assert!(!buf.filled().is_empty());
+                buf.clear();
+                assert!(
+                    Pin::new(&mut peer)
+                        .poll_read(&mut cx, &mut buf)
+                        .is_pending()
+                );
+
+                if pong {
+                    assert!(Pin::new(&mut tls).poll_read(&mut cx, &mut buf).is_pending());
+                    assert!(buf.filled().is_empty());
+                }
+                assert!(matches!(
+                    Pin::new(&mut tls).poll_write_ping(&mut cx),
+                    Poll::Ready(Ok(true))
+                ));
+                tls.flush().await.unwrap();
+                assert!(matches!(
+                    Pin::new(&mut peer).poll_read(&mut cx, &mut buf),
+                    Poll::Ready(Ok(()))
+                ));
+                assert_eq!(buf.filled(), &[if pong { 0x8a } else { 0x89 }, 0]);
+            }
+        }
+    }
+}

@@ -9,13 +9,14 @@ use crate::address::NetLocation;
 use crate::async_stream::AsyncStream;
 use crate::client_proxy_chain::ClientProxyChain;
 use crate::client_proxy_selector::ClientProxySelector;
-use crate::crypto::{CryptoConnection, CryptoTlsStream, perform_crypto_handshake};
+use crate::crypto::tls_deframer::TlsDeframer;
+use crate::crypto::{CryptoConnection, CryptoTlsStream, TlsReadMode};
+use crate::prepend_stream::PrependStream;
 use crate::resolver::Resolver;
 use crate::shadow_tls::{ParsedClientHello, parse_server_hello};
 use crate::tcp::tcp_handler::{TcpClientSetupResult, TcpServerSetupResult};
 use crate::tls_server_handler::InnerProtocol;
 use crate::util::{allocate_vec, write_all};
-use crate::vless::tls_deframer::TlsDeframer;
 
 use super::{RealityServerConfig, RealityServerConnection};
 
@@ -53,12 +54,13 @@ pub struct RealityServerTarget {
 ///   - Auth succeeded: build REALITY response matching dest's structure
 #[inline]
 pub async fn setup_reality_server_stream(
-    mut server_stream: Box<dyn AsyncStream>,
+    server_stream: Box<dyn AsyncStream>,
     target: &RealityServerTarget,
     parsed_client_hello: ParsedClientHello,
     resolver: &Arc<dyn Resolver>,
 ) -> std::io::Result<TcpServerSetupResult> {
     let client_hello_frame = &parsed_client_hello.client_hello_frame;
+    let client_pending = Bytes::copy_from_slice(parsed_client_hello.client_reader.unparsed_data());
     log::debug!(
         "REALITY ClientHello frame length: {}",
         client_hello_frame.len()
@@ -100,6 +102,7 @@ pub async fn setup_reality_server_stream(
             dest_stream,
             vec![],
             Bytes::new(),
+            client_pending,
         ));
     }
 
@@ -168,6 +171,7 @@ pub async fn setup_reality_server_stream(
                             dest_stream,
                             new_records,
                             deframer.into_remaining_data(),
+                            client_pending,
                         ));
                     }
                     log::debug!("REALITY: Dest confirmed TLS 1.3");
@@ -179,6 +183,7 @@ pub async fn setup_reality_server_stream(
                         dest_stream,
                         new_records,
                         deframer.into_remaining_data(),
+                        client_pending,
                     ));
                 }
             }
@@ -224,6 +229,7 @@ pub async fn setup_reality_server_stream(
             dest_stream,
             dest_records,
             remaining_data,
+            client_pending,
         ));
     }
 
@@ -246,6 +252,7 @@ pub async fn setup_reality_server_stream(
                 dest_stream,
                 dest_records,
                 remaining_data,
+                client_pending,
             ));
         }
 
@@ -262,10 +269,13 @@ pub async fn setup_reality_server_stream(
     drop(dest_stream);
     reality_conn.build_server_response(dest_records)?;
 
-    let mut connection = CryptoConnection::new_reality_server(reality_conn);
-    perform_crypto_handshake(&mut connection, &mut server_stream, 16384).await?;
-
-    let tls_stream = CryptoTlsStream::new(server_stream, connection);
+    let connection = CryptoConnection::new_reality_server(reality_conn);
+    let mode = match target.inner_protocol {
+        InnerProtocol::VisionVless(_) => TlsReadMode::PreserveRecords,
+        _ => TlsReadMode::Stream,
+    };
+    let tls_stream =
+        CryptoTlsStream::handshake(server_stream, connection, mode, &client_pending).await?;
     log::debug!("REALITY: TLS 1.3 handshake completed successfully");
 
     match &target.inner_protocol {
@@ -295,12 +305,20 @@ pub async fn setup_reality_server_stream(
 
 /// Return an owned fallback transfer after forwarding the ClientHello.
 fn start_forward_to_dest(
-    mut client_stream: Box<dyn AsyncStream>,
+    client_stream: Box<dyn AsyncStream>,
     mut dest_stream: Box<dyn AsyncStream>,
     dest_records: Vec<Bytes>,
     remaining_data: Bytes,
+    client_pending: Bytes,
 ) -> TcpServerSetupResult {
     TcpServerSetupResult::Session(Box::pin(async move {
+        // Replay preread bytes through the bidirectional pump so a blocked client
+        // write cannot prevent the destination's response from reaching the client.
+        let mut client_stream = PrependStream::new(
+            client_stream,
+            (!client_pending.is_empty()).then(|| client_pending.to_vec().into_boxed_slice()),
+        );
+
         for record in &dest_records {
             if let Err(e) = write_all(&mut client_stream, record).await {
                 log::debug!("REALITY FALLBACK: Error forwarding record: {}", e);
@@ -338,7 +356,7 @@ fn start_forward_to_dest(
         );
 
         let result = crate::copy_bidirectional::copy_bidirectional(
-            &mut *client_stream,
+            &mut client_stream,
             &mut dest_stream,
             !remaining_data.is_empty(), // flush the client if we wrote remaining data
             false,
@@ -363,6 +381,168 @@ mod cleanup_tests {
     use std::pin::Pin;
     use std::task::{Context, Poll};
     use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+    #[tokio::test]
+    async fn authenticated_non_vision_oversized_preread_returns_error_without_panicking() {
+        use crate::client_proxy_chain::InitialHopEntry;
+        use crate::port_forward_handler::PortForwardServerHandler;
+        use crate::reality::{RealityClientConfig, RealityClientConnection};
+        use crate::tcp::socket_connector_impl::SocketConnectorImpl;
+        use aws_lc_rs::agreement;
+
+        let private_key = [1; 32];
+        let public_key = agreement::PrivateKey::from_private_key(&agreement::X25519, &private_key)
+            .unwrap()
+            .compute_public_key()
+            .unwrap();
+        let mut client = RealityClientConnection::new(RealityClientConfig {
+            public_key: public_key.as_ref().try_into().unwrap(),
+            short_id: [0; 8],
+            server_name: "localhost".into(),
+            cipher_suites: Vec::new(),
+        })
+        .unwrap();
+        let mut hello = Vec::new();
+        client.write_tls(&mut hello).unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let dest = NetLocation::new(
+            crate::address::Address::Hostname("localhost".into()),
+            address.port(),
+        );
+        let cert = rcgen::generate_simple_self_signed(
+            (0..100)
+                .map(|index| format!("host-{index}.example.test"))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let decoy_config =
+            rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+                .with_no_client_auth()
+                .with_single_cert(
+                    vec![cert.cert.der().clone()],
+                    rustls::pki_types::PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der())
+                        .into(),
+                )
+                .unwrap();
+        let mut decoy = CryptoConnection::new_rustls_server(
+            rustls::ServerConnection::new(Arc::new(decoy_config)).unwrap(),
+        );
+        crate::crypto::feed_crypto_connection(&mut decoy, &hello).unwrap();
+        decoy.process_new_packets().unwrap();
+        let mut response = Vec::new();
+        decoy.write_tls(&mut response).unwrap();
+        let selector = Arc::new(ClientProxySelector::new(Vec::new()));
+        let target = RealityServerTarget {
+            private_key,
+            short_ids: vec![[0; 8]],
+            dest: dest.clone(),
+            max_time_diff: None,
+            min_client_version: None,
+            max_client_version: None,
+            cipher_suites: Vec::new(),
+            effective_selector: selector.clone(),
+            inner_protocol: InnerProtocol::Normal(Box::new(PortForwardServerHandler::new(
+                vec![dest],
+                selector,
+            ))),
+            dest_client_chain: ClientProxyChain::new(
+                vec![InitialHopEntry::Direct(Box::new(
+                    SocketConnectorImpl::from_config(&crate::config::ClientConfig::default(), None)
+                        .unwrap(),
+                ))],
+                Vec::new(),
+            ),
+        };
+        let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
+        let (io, mut peer) = tokio::io::duplex(65540);
+        let mut flight = hello.clone();
+        flight.extend_from_slice(&[0x17, 0x03, 0x03, 0, 1, 0].repeat(6000));
+        peer.write_all(&flight).await.unwrap();
+        let mut io: Box<dyn AsyncStream> = Box::new(io);
+        let parsed = crate::shadow_tls::read_client_hello(&mut io).await.unwrap();
+        assert!(parsed.client_reader.unparsed_data().len() > 33290);
+
+        let decoy_io = async {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut forwarded_hello = vec![0; hello.len()];
+            socket.read_exact(&mut forwarded_hello).await.unwrap();
+            assert_eq!(forwarded_hello, hello);
+            socket.write_all(&response).await.unwrap();
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(
+                setup_reality_server_stream(io, &target, parsed, &resolver),
+                decoy_io,
+            )
+        })
+        .await
+        .unwrap();
+        let error = result.err().expect("invalid encrypted records must fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
+    }
+
+    #[tokio::test]
+    async fn fallback_preread_backpressure_does_not_block_server_response() {
+        let (client, mut client_peer) = tokio::io::duplex(64);
+        let (dest, mut dest_peer) = tokio::io::duplex(64);
+        let pending = vec![42; 128];
+        let TcpServerSetupResult::Session(session) = start_forward_to_dest(
+            Box::new(client),
+            Box::new(dest),
+            vec![Bytes::from_static(b"server")],
+            Bytes::new(),
+            Bytes::copy_from_slice(&pending),
+        ) else {
+            panic!("expected fallback session");
+        };
+        tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(session, async {
+                let mut response = [0; 6];
+                client_peer.read_exact(&mut response).await.unwrap();
+                assert_eq!(&response, b"server");
+                let mut received = vec![0; pending.len()];
+                dest_peer.read_exact(&mut received).await.unwrap();
+                assert_eq!(received, pending);
+                client_peer.shutdown().await.unwrap();
+                dest_peer.shutdown().await.unwrap();
+            });
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn fallback_preserves_preread_client_bytes() {
+        let (client, mut client_peer) = tokio::io::duplex(64);
+        let (dest, mut dest_peer) = tokio::io::duplex(64);
+        let TcpServerSetupResult::Session(session) = start_forward_to_dest(
+            Box::new(client),
+            Box::new(dest),
+            vec![Bytes::from_static(b"server")],
+            Bytes::from_static(b"-tail"),
+            Bytes::from_static(b"client"),
+        ) else {
+            panic!("expected fallback session");
+        };
+        tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(session, async {
+                client_peer.write_all(b"-live").await.unwrap();
+                client_peer.shutdown().await.unwrap();
+                let mut received = [0; 11];
+                dest_peer.read_exact(&mut received).await.unwrap();
+                assert_eq!(&received, b"client-live");
+                dest_peer.write_all(b"-reply").await.unwrap();
+                dest_peer.shutdown().await.unwrap();
+                let mut response = Vec::new();
+                client_peer.read_to_end(&mut response).await.unwrap();
+                assert_eq!(response, b"server-tail-reply");
+            });
+        })
+        .await
+        .unwrap();
+    }
 
     struct StalledShutdown {
         fail_write: bool,
@@ -436,9 +616,13 @@ mod cleanup_tests {
                 fail_flush: false,
                 _marker: marker.clone(),
             };
-            let TcpServerSetupResult::Session(session) =
-                start_forward_to_dest(Box::new(client), Box::new(dest), records, remaining)
-            else {
+            let TcpServerSetupResult::Session(session) = start_forward_to_dest(
+                Box::new(client),
+                Box::new(dest),
+                records,
+                remaining,
+                Bytes::new(),
+            ) else {
                 panic!("fallback must remain owned by its caller")
             };
             let started = tokio::time::Instant::now();
