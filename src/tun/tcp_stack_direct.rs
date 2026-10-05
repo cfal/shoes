@@ -118,7 +118,7 @@ struct SharedState {
     /// Channel for UDP responses to write to TUN
     udp_response_rx: Option<Receiver<PacketBuffer>>,
     /// Channel for notifying tokio about new TCP connections
-    new_conn_tx: Option<Sender<NewTcpConnection>>,
+    new_conn_tx: Option<mpsc::UnboundedSender<NewTcpConnection>>,
 }
 
 /// Direct TCP Stack Manager.
@@ -234,7 +234,7 @@ impl TcpStackDirect {
     }
 
     /// Set the channel for notifying about new TCP connections.
-    pub fn set_new_conn_tx(&mut self, tx: Sender<NewTcpConnection>) {
+    pub fn set_new_conn_tx(&mut self, tx: mpsc::UnboundedSender<NewTcpConnection>) {
         if let Ok(mut state) = self.shared_state.lock() {
             state.new_conn_tx = Some(tx);
         }
@@ -510,11 +510,12 @@ fn run_direct_stack_thread(
                                 trace!("TCP packet: {} -> {}, SYN={}", src_addr, dst_addr, is_syn);
                                 if is_syn && !active_connections.contains(&(src_addr, dst_addr)) {
                                     // Check connection limit
-                                    if sockets.len() >= limits.tcp_connection_limit() {
+                                    if let Some(limit) = limits.tcp_connection_limit()
+                                        && sockets.len() >= limit
+                                    {
                                         warn!(
                                             "Connection limit reached ({}), dropping SYN from {}",
-                                            limits.tcp_connection_limit(),
-                                            src_addr
+                                            limit, src_addr
                                         );
                                         continue;
                                     }
@@ -541,7 +542,7 @@ fn run_direct_stack_thread(
                                         if let Ok(state) = shared_state.try_lock()
                                             && let Some(ref tx) = state.new_conn_tx
                                         {
-                                            let _ = tx.try_send(new_conn.new_tcp_conn);
+                                            let _ = tx.send(new_conn.new_tcp_conn);
                                         }
                                     }
                                 }
@@ -1057,6 +1058,44 @@ mod tests {
     use std::os::unix::io::IntoRawFd;
     use std::os::unix::net::UnixStream;
 
+    #[test]
+    fn default_admission_preserves_bursts_beyond_old_queue_and_socket_caps() {
+        use std::os::unix::net::UnixDatagram;
+
+        let (peer, tun) = UnixDatagram::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut stack = TcpStackDirect::new(tun.into(), 1500);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        stack.set_new_conn_tx(tx);
+        let mut buf = [0; 1500];
+        for port in 10000..10300 {
+            let builder = etherparse::PacketBuilder::ipv4([10, 0, 0, 2], [1, 1, 1, 1], 64)
+                .tcp(port, 443, 101, 4096);
+            let mut syn = Vec::new();
+            builder.syn().write(&mut syn, b"").unwrap();
+            peer.send(&syn).unwrap();
+            let acknowledgement = loop {
+                let n = peer.recv(&mut buf).unwrap();
+                let ip = Ipv4Packet::new_checked(&buf[..n]).unwrap();
+                let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+                assert!(!tcp.rst(), "burst connection was reset");
+                if tcp.dst_port() == port && tcp.syn() && tcp.ack() {
+                    break (tcp.seq_number().0 as u32).wrapping_add(1);
+                }
+            };
+            let mut ack = Vec::new();
+            etherparse::PacketBuilder::ipv4([10, 0, 0, 2], [1, 1, 1, 1], 64)
+                .tcp(port, 443, 102, 4096)
+                .ack(acknowledgement)
+                .write(&mut ack, b"")
+                .unwrap();
+            peer.send(&ack).unwrap();
+        }
+        assert_eq!(rx.len(), 300);
+        let connections: Vec<_> = (0..300).map(|_| rx.try_recv().unwrap()).collect();
+        drop(connections);
+    }
+
     #[tokio::test]
     async fn abandoned_connection_sends_reset_before_releasing_socket() {
         use std::os::unix::net::UnixDatagram;
@@ -1065,7 +1104,7 @@ mod tests {
         let (peer, tun) = UnixDatagram::pair().unwrap();
         peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
         let mut stack = TcpStackDirect::new(tun.into(), 1500);
-        let (tx, mut rx) = mpsc::channel(4);
+        let (tx, mut rx) = mpsc::unbounded_channel();
         stack.set_new_conn_tx(tx);
         let packet = |sequence, acknowledgment: Option<u32>, payload: &[u8]| {
             let builder = etherparse::PacketBuilder::ipv4([10, 0, 0, 2], [1, 1, 1, 1], 64)

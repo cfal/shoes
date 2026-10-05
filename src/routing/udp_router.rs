@@ -148,7 +148,7 @@ enum SessionLookup {
 
 /// A routing session (one per unique flow)
 struct RoutingSession {
-    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    permit: Option<crate::resources::BudgetPermit>,
     /// The destination this session routes to
     destination: NetLocation,
 
@@ -377,7 +377,7 @@ struct InboundPacket {
 
 /// Result of session creation
 struct SessionCreateResult {
-    permit: tokio::sync::OwnedSemaphorePermit,
+    permit: crate::resources::BudgetPermit,
     remote: Box<dyn AsyncMessageStream>,
     resolved_addr: SocketAddr,
 }
@@ -395,7 +395,7 @@ struct PendingSessionCreate {
 }
 
 struct PendingShutdown {
-    _permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    _permit: Option<crate::resources::BudgetPermit>,
     stream: Box<dyn AsyncMessageStream>,
     deadline: Pin<Box<tokio::time::Sleep>>,
 }
@@ -678,8 +678,11 @@ impl<'a> UdpRouter<'a> {
                     }
 
                     if self.pending_creates.len() >= MAX_PENDING_CREATES
-                        || self.sessions.len() + self.pending_creates.len()
-                            >= crate::resources::LIMITS.max_udp_destinations
+                        || crate::resources::limits()
+                            .max_udp_destinations
+                            .is_some_and(|limit| {
+                                self.sessions.len() + self.pending_creates.len() >= limit
+                            })
                     {
                         debug!(
                             "Too many pending creates, dropping new session creation for {}",
@@ -1200,7 +1203,7 @@ impl<'a> UdpRouter<'a> {
     fn queue_shutdown(
         &mut self,
         stream: Box<dyn AsyncMessageStream>,
-        permit: Option<tokio::sync::OwnedSemaphorePermit>,
+        permit: Option<crate::resources::BudgetPermit>,
     ) {
         if self.pending_shutdowns.len() >= MAX_PENDING_SHUTDOWNS {
             self.pending_shutdowns.pop_front();

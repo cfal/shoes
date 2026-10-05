@@ -47,7 +47,7 @@ type UdpSessionMap = Arc<UdpState>;
 struct UdpState {
     sessions: DashMap<u16, Arc<UdpSession>>,
     fragments: parking_lot::Mutex<UdpFragments<(u16, u16)>>,
-    slots: Arc<tokio::sync::Semaphore>,
+    slots: Arc<crate::resources::Budget>,
 }
 
 impl UdpState {
@@ -55,8 +55,8 @@ impl UdpState {
         Self {
             sessions: DashMap::new(),
             fragments: parking_lot::Mutex::new(UdpFragments::new()),
-            slots: Arc::new(tokio::sync::Semaphore::new(
-                crate::resources::LIMITS.max_udp_destinations,
+            slots: Arc::new(crate::resources::Budget::new(
+                crate::resources::limits().max_udp_destinations,
             )),
         }
     }
@@ -279,7 +279,10 @@ async fn run_bidirectional_loop(
         };
 
         let conn = connection.clone();
-        if tasks.len() >= crate::resources::LIMITS.max_streams_per_connection {
+        if crate::resources::limits()
+            .max_streams_per_connection
+            .is_some_and(|limit| tasks.len() >= limit)
+        {
             continue;
         }
         let Some(permit) = crate::resources::try_stream() else {
@@ -502,7 +505,7 @@ struct UdpSession {
     // Cancellation token for this session's background task
     cancel_token: CancellationToken,
     task: Option<tokio::task::AbortHandle>,
-    _permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    _permit: Option<crate::resources::BudgetPermit>,
 }
 
 impl Drop for UdpSession {
@@ -523,7 +526,7 @@ impl UdpSession {
         override_local_write_location: Option<NetLocation>,
         pinned_location: Option<NetLocation>,
         parent_cancel_token: &CancellationToken,
-        permit: tokio::sync::OwnedSemaphorePermit,
+        permit: crate::resources::BudgetPermit,
     ) -> Self {
         // Create a child token so this session is cancelled when the parent (connection) is cancelled
         let session_cancel_token = parent_cancel_token.child_token();
@@ -564,7 +567,7 @@ impl UdpSession {
         override_local_write_location: Option<NetLocation>,
         pinned_location: Option<NetLocation>,
         parent_cancel_token: &CancellationToken,
-        permit: tokio::sync::OwnedSemaphorePermit,
+        permit: crate::resources::BudgetPermit,
     ) -> Self {
         // Create a child token so this session is cancelled when the parent (connection) is cancelled
         let session_cancel_token = parent_cancel_token.child_token();
@@ -815,7 +818,10 @@ async fn run_unidirectional_loop(
             }
         };
 
-        if tasks.len() > crate::resources::LIMITS.max_streams_per_connection {
+        if crate::resources::limits()
+            .max_streams_per_connection
+            .is_some_and(|limit| tasks.len() > limit)
+        {
             continue;
         }
         let Some(permit) = crate::resources::try_stream() else {
@@ -954,7 +960,9 @@ async fn process_udp_packet(
     else {
         return Ok(());
     };
-    if udp_session_map.sessions.len() >= crate::resources::LIMITS.max_udp_destinations
+    if crate::resources::limits()
+        .max_udp_destinations
+        .is_some_and(|limit| udp_session_map.sessions.len() >= limit)
         && !udp_session_map.sessions.contains_key(&assoc_id)
     {
         return Ok(());
@@ -968,16 +976,12 @@ async fn process_udp_packet(
         match existing {
             Some(s) => s,
             None => {
-                let permit = udp_session_map
-                    .slots
-                    .clone()
-                    .try_acquire_owned()
-                    .map_err(|_| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::WouldBlock,
-                            "TUIC UDP session limit reached",
-                        )
-                    })?;
+                let permit = udp_session_map.slots.acquire(1).ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        "TUIC UDP session limit reached",
+                    )
+                })?;
                 let action = client_proxy_selector
                     .judge(remote_location.clone().into(), resolver)
                     .await;
@@ -1230,10 +1234,7 @@ pub async fn start_tuic_server(
     let mut join_handles = vec![];
     let mut server_config = quinn::ServerConfig::with_crypto(quic_server_config);
 
-    crate::resources::configure_quic(
-        &mut server_config,
-        crate::resources::LIMITS.max_streams_per_connection as u32,
-    );
+    let memory_bytes = crate::resources::configure_quic(&mut server_config, 4096, 4096);
     Arc::get_mut(&mut server_config.transport)
         .unwrap()
         .max_idle_timeout(Some(Duration::from_secs(60).try_into().unwrap()))
@@ -1248,9 +1249,12 @@ pub async fn start_tuic_server(
         // Lower initial RTT estimate for faster initial window growth
         .initial_rtt(Duration::from_millis(100));
 
-    for endpoint in
-        crate::listener_tasks::QuicListener::bind_all(bind_address, server_config, num_endpoints)?
-    {
+    for endpoint in crate::listener_tasks::QuicListener::bind_all(
+        bind_address,
+        server_config,
+        num_endpoints,
+        memory_bytes,
+    )? {
         let resolver = resolver.clone();
         let client_proxy_selector = client_proxy_selector.clone();
         let uuid = uuid.clone();

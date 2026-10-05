@@ -1,116 +1,107 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 
-use parking_lot::Mutex;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use parking_lot::{Mutex, RwLock};
 
-fn setting(name: &str, default: usize, min: usize, max: usize) -> usize {
-    match std::env::var(name) {
-        Ok(value) => match value.parse::<usize>() {
-            Ok(value) if (min..=max).contains(&value) => value,
-            _ => {
-                log::warn!("Invalid {name}; using {default} (allowed {min}..={max})");
-                default
-            }
-        },
-        Err(_) => default,
-    }
+use crate::config::GlobalLimits;
+
+static LIMITS: LazyLock<RwLock<GlobalLimits>> = LazyLock::new(Default::default);
+
+pub(crate) fn limits() -> GlobalLimits {
+    *LIMITS.read()
 }
 
-/// Process-wide, startup-only settings. TUN-specific budgets remain in TunConfig.
+pub(crate) fn configure(limits: GlobalLimits) -> std::io::Result<()> {
+    limits.validate()?;
+    let mut current = LIMITS.write();
+    CONNECTIONS.set_limit(limits.max_connections);
+    STREAMS.set_limit(limits.max_streams);
+    QUIC_BYTES.set_limit(limits.quic_memory_bytes);
+    *current = limits;
+    Ok(())
+}
+
+#[derive(Debug, Default)]
+struct BudgetState {
+    limit: Option<usize>,
+    active: usize,
+    peak: usize,
+    rejected: u64,
+}
+
 #[derive(Debug)]
-pub struct ResourceLimits {
-    pub max_connections: usize,
-    pub max_connections_per_ip: usize,
-    pub max_streams: usize,
-    pub max_streams_per_connection: usize,
-    pub max_udp_destinations: usize,
-    pub quic_receive_window: usize,
-    pub quic_send_window: usize,
-    pub quic_stream_window: usize,
-    pub quic_memory_bytes: usize,
-    /// Admission estimate for Hickory's private H3 transport, not a hard buffer limit.
-    pub quic_dns_memory_bytes: usize,
-    pub quic_socket_buffer: usize,
-}
-
-pub static LIMITS: LazyLock<ResourceLimits> = LazyLock::new(|| ResourceLimits {
-    max_connections: setting("SHOES_MAX_CONNECTIONS", 256, 1, 1_000_000),
-    max_connections_per_ip: setting("SHOES_MAX_CONNECTIONS_PER_IP", 64, 1, 1_000_000),
-    max_streams: setting("SHOES_MAX_STREAMS", 512, 1, 1_000_000),
-    max_streams_per_connection: setting("SHOES_MAX_STREAMS_PER_CONNECTION", 64, 1, 65535),
-    max_udp_destinations: setting("SHOES_MAX_UDP_DESTINATIONS", 64, 1, 65535),
-    quic_receive_window: setting("SHOES_QUIC_RECEIVE_WINDOW", 2 << 20, 65536, 64 << 20),
-    quic_send_window: setting("SHOES_QUIC_SEND_WINDOW", 2 << 20, 65536, 64 << 20),
-    quic_stream_window: setting("SHOES_QUIC_STREAM_WINDOW", 256 << 10, 16384, 64 << 20),
-    quic_memory_bytes: setting(
-        "SHOES_QUIC_MEMORY_BYTES",
-        64 << 20,
-        1 << 20,
-        (1 << 30).min(Semaphore::MAX_PERMITS),
-    ),
-    quic_dns_memory_bytes: setting(
-        "SHOES_QUIC_DNS_MEMORY_BYTES",
-        16 << 20,
-        1 << 20,
-        (1 << 30).min(Semaphore::MAX_PERMITS),
-    ),
-    quic_socket_buffer: setting("SHOES_QUIC_SOCKET_BUFFER", 1 << 20, 65536, 16 << 20),
-});
-
-struct Budget {
-    slots: Arc<Semaphore>,
-    total: usize,
-    peak: AtomicUsize,
-    rejected: AtomicU64,
-}
+pub(crate) struct Budget(Mutex<BudgetState>);
 
 impl Budget {
-    fn new(total: usize) -> Self {
-        Self {
-            slots: Arc::new(Semaphore::new(total)),
-            total,
-            peak: AtomicUsize::new(0),
-            rejected: AtomicU64::new(0),
-        }
+    pub(crate) fn new(limit: Option<usize>) -> Self {
+        Self(Mutex::new(BudgetState {
+            limit,
+            ..Default::default()
+        }))
     }
 
-    fn acquire(&self, count: u32) -> Option<OwnedSemaphorePermit> {
-        match self.slots.clone().try_acquire_many_owned(count) {
-            Ok(permit) => {
-                self.peak.fetch_max(
-                    self.total - self.slots.available_permits(),
-                    Ordering::Relaxed,
-                );
-                Some(permit)
-            }
-            Err(_) => {
-                self.rejected.fetch_add(1, Ordering::Relaxed);
-                None
-            }
-        }
+    fn set_limit(&self, limit: Option<usize>) {
+        // Keep outstanding reservations when a config reload changes admission policy.
+        self.0.lock().limit = limit;
     }
 
-    fn snapshot(&self) -> BudgetSnapshot {
+    pub(crate) fn acquire(self: &Arc<Self>, count: usize) -> Option<BudgetPermit> {
+        let mut state = self.0.lock();
+        let active = state.active.checked_add(count)?;
+        if state.limit.is_some_and(|limit| active > limit) {
+            state.rejected += 1;
+            return None;
+        }
+        state.active = active;
+        state.peak = state.peak.max(active);
+        Some(BudgetPermit {
+            budget: self.clone(),
+            count,
+        })
+    }
+
+    pub(crate) fn snapshot(&self) -> BudgetSnapshot {
+        let state = self.0.lock();
         BudgetSnapshot {
-            active: self.total - self.slots.available_permits(),
-            peak: self.peak.load(Ordering::Relaxed),
-            rejected: self.rejected.load(Ordering::Relaxed),
+            active: state.active,
+            peak: state.peak,
+            rejected: state.rejected,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn available_permits(&self) -> usize {
+        let state = self.0.lock();
+        state
+            .limit
+            .unwrap_or(usize::MAX)
+            .saturating_sub(state.active)
     }
 }
 
-static CONNECTIONS: LazyLock<Budget> = LazyLock::new(|| Budget::new(LIMITS.max_connections));
-static STREAMS: LazyLock<Budget> = LazyLock::new(|| Budget::new(LIMITS.max_streams));
-static QUIC_BYTES: LazyLock<Budget> = LazyLock::new(|| Budget::new(LIMITS.quic_memory_bytes));
+#[derive(Debug)]
+pub(crate) struct BudgetPermit {
+    budget: Arc<Budget>,
+    count: usize,
+}
+
+impl Drop for BudgetPermit {
+    fn drop(&mut self) {
+        self.budget.0.lock().active -= self.count;
+    }
+}
+
+static CONNECTIONS: LazyLock<Arc<Budget>> = LazyLock::new(|| Arc::new(Budget::new(None)));
+static STREAMS: LazyLock<Arc<Budget>> = LazyLock::new(|| Arc::new(Budget::new(None)));
+static QUIC_BYTES: LazyLock<Arc<Budget>> = LazyLock::new(|| Arc::new(Budget::new(None)));
 static PEERS: LazyLock<Mutex<HashMap<IpAddr, usize>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static PEER_REJECTIONS: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) struct ConnectionPermit {
-    _global: OwnedSemaphorePermit,
+    _global: BudgetPermit,
     peer: Option<IpAddr>,
 }
 
@@ -129,6 +120,7 @@ impl Drop for ConnectionPermit {
 }
 
 pub(crate) fn try_connection(peer: Option<IpAddr>) -> Option<ConnectionPermit> {
+    let limits = LIMITS.read();
     let permit = CONNECTIONS.acquire(1)?;
     let peer = peer.map(|ip| match ip {
         IpAddr::V6(ip) => ip
@@ -140,7 +132,10 @@ pub(crate) fn try_connection(peer: Option<IpAddr>) -> Option<ConnectionPermit> {
     if let Some(peer) = peer {
         let mut peers = PEERS.lock();
         let count = peers.entry(peer).or_default();
-        if *count >= LIMITS.max_connections_per_ip {
+        if limits
+            .max_connections_per_ip
+            .is_some_and(|limit| *count >= limit)
+        {
             PEER_REJECTIONS.fetch_add(1, Ordering::Relaxed);
             return None;
         }
@@ -152,7 +147,7 @@ pub(crate) fn try_connection(peer: Option<IpAddr>) -> Option<ConnectionPermit> {
     })
 }
 
-pub(crate) fn try_stream() -> Option<OwnedSemaphorePermit> {
+pub(crate) fn try_stream() -> Option<BudgetPermit> {
     STREAMS.acquire(1)
 }
 
@@ -166,37 +161,55 @@ pub(crate) fn exhausted() -> std::io::Error {
 const DATAGRAM_BUFFER: usize = 256 << 10;
 
 /// Reserve configured QUIC buffering allowances, not an estimate of total RSS.
-pub(crate) fn try_quic_memory() -> Option<OwnedSemaphorePermit> {
-    QUIC_BYTES.acquire(
-        (LIMITS.quic_receive_window + LIMITS.quic_send_window + 2 * DATAGRAM_BUFFER) as u32,
-    )
+pub(crate) fn try_quic_memory(bytes: usize) -> Option<BudgetPermit> {
+    QUIC_BYTES.acquire(bytes)
 }
 
-pub(crate) fn try_dns_quic_memory() -> Option<OwnedSemaphorePermit> {
-    QUIC_BYTES.acquire(LIMITS.quic_dns_memory_bytes as u32)
+pub(crate) fn try_dns_quic_memory() -> Option<BudgetPermit> {
+    let limits = LIMITS.read();
+    QUIC_BYTES.acquire(limits.quic_dns_memory_bytes)
 }
 
-pub(crate) fn configure_quic(config: &mut quinn::ServerConfig, uni_streams: u32) {
+pub(crate) fn configure_quic(
+    config: &mut quinn::ServerConfig,
+    bidi_streams: u32,
+    uni_streams: u32,
+) -> usize {
+    let limits = limits();
+    // Pending Initials are buffered before connection memory is reserved.
     config
-        .max_incoming(LIMITS.max_connections.min(128))
+        .max_incoming(limits.max_connections.unwrap_or(128).min(128))
         .incoming_buffer_size(65536)
         .incoming_buffer_size_total(1 << 20);
     let transport = Arc::get_mut(&mut config.transport).unwrap();
-    configure_quic_transport(transport);
+    let memory_bytes = configure_quic_transport(transport);
+    // Quinn eagerly allocates advertised stream credit. Unlimited admission keeps
+    // the protocol's existing flow-control window rather than advertising infinity.
+    let (bidi_streams, uni_streams) = match limits.max_streams_per_connection {
+        Some(limit) => {
+            let limit = limit as u32;
+            (limit, uni_streams.min(limit))
+        }
+        None => (bidi_streams, uni_streams),
+    };
     transport
-        .max_concurrent_bidi_streams((LIMITS.max_streams_per_connection as u32).into())
+        .max_concurrent_bidi_streams(bidi_streams.into())
         .max_concurrent_uni_streams(uni_streams.into());
+    memory_bytes
 }
 
-pub(crate) fn configure_quic_transport(transport: &mut quinn::TransportConfig) {
+/// Returns the per-connection allowance from the same limits used to configure the windows.
+pub(crate) fn configure_quic_transport(transport: &mut quinn::TransportConfig) -> usize {
+    let limits = limits();
     transport
-        .receive_window((LIMITS.quic_receive_window as u32).into())
-        .send_window(LIMITS.quic_send_window as u64)
+        .receive_window((limits.quic_receive_window as u32).into())
+        .send_window(limits.quic_send_window as u64)
         .stream_receive_window(
-            (LIMITS.quic_stream_window.min(LIMITS.quic_receive_window) as u32).into(),
+            (limits.quic_stream_window.min(limits.quic_receive_window) as u32).into(),
         )
         .datagram_receive_buffer_size(Some(DATAGRAM_BUFFER))
         .datagram_send_buffer_size(DATAGRAM_BUFFER);
+    limits.quic_receive_window + limits.quic_send_window + 2 * DATAGRAM_BUFFER
 }
 
 #[derive(Debug)]
@@ -247,7 +260,7 @@ pub(crate) struct ResourceReporter(tokio::task::AbortHandle);
 
 impl ResourceReporter {
     pub fn start() -> Self {
-        log::info!("Process resource limits: {:?}", *LIMITS);
+        log::info!("Process resource limits: {:?}", limits());
         let task = tokio::spawn(async {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -272,48 +285,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn quic_memory_budget_respects_semaphore_limit() {
-        let maximum = (1 << 30).min(Semaphore::MAX_PERMITS);
-        if std::env::var_os("SHOES_QUIC_BUDGET_TEST_CHILD").is_some() {
-            let requested: usize = std::env::var("SHOES_QUIC_MEMORY_BYTES")
-                .unwrap()
-                .parse()
-                .unwrap();
-            let expected = if requested <= maximum {
-                requested
-            } else {
-                64 << 20
-            };
-            assert_eq!(LIMITS.quic_memory_bytes, expected);
-            assert_eq!(QUIC_BYTES.slots.available_permits(), expected);
-            let expected_dns = if requested <= maximum {
-                requested
-            } else {
-                16 << 20
-            };
-            assert_eq!(LIMITS.quic_dns_memory_bytes, expected_dns);
-            assert!(LIMITS.quic_dns_memory_bytes <= Semaphore::MAX_PERMITS);
-        } else {
-            for requested in [maximum, maximum + 1] {
-                let status = std::process::Command::new(std::env::current_exe().unwrap())
-                    .args([
-                        "--exact",
-                        "resources::tests::quic_memory_budget_respects_semaphore_limit",
-                        "--quiet",
-                    ])
-                    .env("SHOES_QUIC_BUDGET_TEST_CHILD", "1")
-                    .env("SHOES_QUIC_MEMORY_BYTES", requested.to_string())
-                    .env("SHOES_QUIC_DNS_MEMORY_BYTES", requested.to_string())
-                    .status()
-                    .unwrap();
-                assert!(status.success());
-            }
-        }
+    fn unlimited_budget_tracks_usage_without_a_semaphore_ceiling() {
+        let budget = Arc::new(Budget::new(None));
+        let permit = budget.acquire(usize::MAX).unwrap();
+        assert_eq!(budget.snapshot().active, usize::MAX);
+        assert!(budget.acquire(1).is_none());
+        drop(permit);
+        assert_eq!(budget.snapshot().active, 0);
+        assert!(budget.acquire(1024).is_some());
     }
 
     #[test]
     fn permits_bound_work_and_return_on_drop() {
-        let budget = Budget::new(3);
+        let budget = Arc::new(Budget::new(Some(3)));
         let first = budget.acquire(2).unwrap();
         assert!(budget.acquire(2).is_none());
         let second = budget.acquire(1).unwrap();
@@ -337,7 +321,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancelled_work_returns_its_budget() {
-        let budget = Budget::new(1);
+        let budget = Arc::new(Budget::new(Some(1)));
         let permit = budget.acquire(1).unwrap();
         let task = tokio::spawn(async move {
             let _permit = permit;
@@ -349,32 +333,100 @@ mod tests {
     }
 
     #[test]
-    fn environment_limits_apply_in_a_fresh_process() {
-        if std::env::var_os("SHOES_RESOURCE_TEST_CHILD").is_some() {
-            assert_eq!(LIMITS.max_connections, 2);
-            assert_eq!(LIMITS.max_connections_per_ip, 1);
-            let peer: IpAddr = "192.0.2.1".parse().unwrap();
-            let first = try_connection(Some(peer)).unwrap();
-            assert!(try_connection(Some(peer)).is_none());
-            let second = try_connection(None).unwrap();
-            assert!(try_connection(None).is_none());
-            drop(first);
-            drop(second);
-            assert_eq!(snapshot().connections.active, 0);
-            assert!(PEERS.lock().is_empty());
-        } else {
+    fn yaml_limits_apply_in_a_fresh_process() {
+        if std::env::var_os("SHOES_RESOURCE_TEST_CHILD").is_none() {
             let status = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
-                    "resources::tests::environment_limits_apply_in_a_fresh_process",
+                    "resources::tests::yaml_limits_apply_in_a_fresh_process",
                     "--quiet",
                 ])
                 .env("SHOES_RESOURCE_TEST_CHILD", "1")
-                .env("SHOES_MAX_CONNECTIONS", "2")
-                .env("SHOES_MAX_CONNECTIONS_PER_IP", "1")
                 .status()
                 .unwrap();
             assert!(status.success());
+            return;
         }
+
+        let defaults = limits();
+        assert!(defaults.max_connections.is_none());
+        assert!(defaults.max_connections_per_ip.is_none());
+        assert!(defaults.max_streams.is_none());
+        assert!(defaults.quic_memory_bytes.is_none());
+        let peer: IpAddr = "192.0.2.1".parse().unwrap();
+        let connections: Vec<_> = (0..1024)
+            .map(|_| try_connection(Some(peer)).unwrap())
+            .collect();
+        let streams: Vec<_> = (0..1024).map(|_| try_stream().unwrap()).collect();
+        let memory = QUIC_BYTES.acquire(128 << 20).unwrap();
+        drop((connections, streams, memory));
+
+        let configs = serde_yaml::from_str(
+            r#"- global_limits:
+    max_connections: 2
+    max_connections_per_ip: 1
+    max_streams: 1
+    quic_memory_bytes: 16777216
+"#,
+        )
+        .unwrap();
+        let config = crate::config::create_server_configs(configs).unwrap();
+        configure(config.global_limits).unwrap();
+        assert_eq!(limits().max_connections, Some(2));
+        assert_eq!(limits().max_connections_per_ip, Some(1));
+        let first = try_connection(Some(peer)).unwrap();
+        assert!(try_connection(Some(peer)).is_none());
+        let second = try_connection(None).unwrap();
+        assert!(try_connection(None).is_none());
+        drop(first);
+        drop(second);
+        assert_eq!(snapshot().connections.active, 0);
+        assert!(PEERS.lock().is_empty());
+
+        let stream = try_stream().unwrap();
+        assert!(try_stream().is_none());
+        configure(defaults).unwrap();
+        let second_stream = try_stream().unwrap();
+        assert_eq!(snapshot().streams.active, 2);
+        drop((stream, second_stream));
+        assert_eq!(snapshot().streams.active, 0);
+    }
+
+    #[test]
+    fn changing_limits_preserves_outstanding_reservations() {
+        let budget = Arc::new(Budget::new(None));
+        let first = budget.acquire(3).unwrap();
+        budget.set_limit(Some(2));
+        assert_eq!(budget.snapshot().active, 3);
+        assert!(budget.acquire(1).is_none());
+        drop(first);
+        let second = budget.acquire(2).unwrap();
+        assert!(budget.acquire(1).is_none());
+        budget.set_limit(None);
+        let third = budget.acquire(1024).unwrap();
+        drop((second, third));
+        assert_eq!(budget.snapshot().active, 0);
+    }
+
+    #[test]
+    fn concurrent_admission_does_not_exceed_explicit_limit() {
+        let budget = Arc::new(Budget::new(Some(4)));
+        let barrier = std::sync::Barrier::new(9);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    let permit = budget.acquire(1);
+                    barrier.wait();
+                    barrier.wait();
+                    drop(permit);
+                });
+            }
+            barrier.wait();
+            assert_eq!(budget.snapshot().active, 4);
+            assert_eq!(budget.snapshot().rejected, 4);
+            barrier.wait();
+        });
+        assert_eq!(budget.snapshot().active, 0);
+        assert_eq!(budget.snapshot().peak, 4);
     }
 }

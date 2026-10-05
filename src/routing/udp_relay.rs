@@ -23,7 +23,7 @@ type Reply = (Vec<u8>, SocketAddr);
 
 /// Channel transport for QUIC associations using the shared routing and proxy-chain machinery.
 pub struct UdpRelay {
-    _permit: tokio::sync::OwnedSemaphorePermit,
+    _permit: crate::resources::BudgetPermit,
     tx: mpsc::Sender<(Vec<u8>, NetLocation)>,
     rx: Mutex<mpsc::Receiver<Reply>>,
     task: tokio::task::AbortHandle,

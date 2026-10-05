@@ -180,7 +180,6 @@ pub async fn start_from_config(
     shutdown_rx: oneshot::Receiver<()>,
 ) -> std::io::Result<()> {
     info!("Parsing config for TUN server");
-    let _resource_reporter = crate::resources::ResourceReporter::start();
 
     let configs: Vec<Config> = load_config_str(config_yaml)?;
 
@@ -192,7 +191,10 @@ pub async fn start_from_config(
     let crate::config::ValidatedConfigs {
         configs: validated_configs,
         dns_groups,
+        global_limits,
     } = create_server_configs(configs)?;
+    crate::resources::configure(global_limits)?;
+    let _resource_reporter = crate::resources::ResourceReporter::start();
 
     // Build DNS registry from expanded groups
     let mut dns_registry = build_dns_registry(dns_groups).await?;

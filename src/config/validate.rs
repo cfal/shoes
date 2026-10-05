@@ -13,9 +13,10 @@ use super::pem::{embed_optional_pem_from_map, embed_pem_from_map};
 use super::types::{
     ClientChain, ClientChainHop, ClientConfig, ClientProxyConfig, Config, ConfigSelection,
     DEFAULT_REALITY_SHORT_ID, DnsConfig, DnsConfigGroup, DnsServerSpec, ExpandedDnsGroup,
-    ExpandedDnsSpec, PemSource, RuleActionConfig, RuleConfig, ServerConfig, ServerProxyConfig,
-    ServerQuicConfig, ShadowTlsServerConfig, ShadowTlsServerHandshakeConfig, ShadowsocksConfig,
-    TlsServerConfig, Transport, TunConfig, WebsocketServerConfig, direct_allow_rule,
+    ExpandedDnsSpec, GlobalLimits, PemSource, RuleActionConfig, RuleConfig, ServerConfig,
+    ServerProxyConfig, ServerQuicConfig, ShadowTlsServerConfig, ShadowTlsServerHandshakeConfig,
+    ShadowsocksConfig, TlsServerConfig, Transport, TunConfig, WebsocketServerConfig,
+    direct_allow_rule,
 };
 
 const MIN_TLS_BUFFER_SIZE: usize = 16 * 1024;
@@ -23,6 +24,7 @@ const MIN_TLS_BUFFER_SIZE: usize = 16 * 1024;
 /// Result of config validation containing server configs and expanded DNS groups.
 /// DNS resolvers are built at runtime from the expanded groups.
 pub struct ValidatedConfigs {
+    pub global_limits: GlobalLimits,
     pub configs: Vec<Config>,
     /// Expanded DNS groups in topological order (bootstrap deps first).
     pub dns_groups: Vec<ExpandedDnsGroup>,
@@ -38,6 +40,7 @@ pub struct ValidatedConfigs {
 /// - Validates all ServerConfigs and TunConfigs against the groups and PEMs
 /// - Returns ValidatedConfigs containing configs and expanded DNS groups
 pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<ValidatedConfigs> {
+    let mut global_limits = None;
     // First pass: collect raw groups with unresolved references
     let mut raw_client_groups: HashMap<String, OneOrSome<ConfigSelection<ClientConfig>>> =
         HashMap::new();
@@ -72,6 +75,15 @@ pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Valida
 
     for config in all_configs.into_iter() {
         match config {
+            Config::GlobalLimits(limits) => {
+                if global_limits.replace(limits).is_some() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "global_limits may only be specified once across all config files",
+                    ));
+                }
+                limits.validate()?;
+            }
             Config::ClientConfigGroup(group) => {
                 if raw_client_groups
                     .insert(group.client_group.clone(), group.client_proxies)
@@ -185,6 +197,7 @@ pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Valida
     result.extend(tun_configs.into_iter().map(Config::TunServer));
 
     Ok(ValidatedConfigs {
+        global_limits: global_limits.unwrap_or_default(),
         configs: result,
         dns_groups: final_dns_groups,
     })

@@ -43,8 +43,8 @@ const INBOUND_BUFFER: usize = 128;
 
 /// An incoming stream with its destination
 pub struct InboundStream {
-    _permit: tokio::sync::OwnedSemaphorePermit,
-    _local_permit: tokio::sync::OwnedSemaphorePermit,
+    _permit: crate::resources::BudgetPermit,
+    _local_permit: crate::resources::BudgetPermit,
     /// The multiplexed stream (wrapped with deferred status response)
     pub stream: H2MuxServerStream,
     /// Stream request with destination info
@@ -132,7 +132,11 @@ impl H2MuxServerSession {
             .initial_window_size(STREAM_WINDOW_SIZE)
             .initial_connection_window_size(CONNECTION_WINDOW_SIZE)
             .max_frame_size(MAX_FRAME_SIZE)
-            .max_concurrent_streams(crate::resources::LIMITS.max_streams_per_connection as u32)
+            .max_concurrent_streams(
+                crate::resources::limits()
+                    .max_streams_per_connection
+                    .unwrap_or(u32::MAX as usize) as u32,
+            )
             .handshake(conn)
             .await
             .map_err(|e| io::Error::other(format!("H2 server handshake failed: {}", e)))?;
@@ -171,8 +175,8 @@ impl H2MuxServerSession {
         // Skip the first tick which returns immediately
         idle_timer.tick().await;
         let mut tasks = JoinSet::new();
-        let slots = Arc::new(tokio::sync::Semaphore::new(
-            crate::resources::LIMITS.max_streams_per_connection,
+        let slots = Arc::new(crate::resources::Budget::new(
+            crate::resources::limits().max_streams_per_connection,
         ));
 
         loop {
@@ -255,9 +259,9 @@ impl H2MuxServerSession {
         request: http::Request<h2::RecvStream>,
         mut respond: h2::server::SendResponse<Bytes>,
         inbound_tx: mpsc::Sender<InboundStream>,
-        slots: Arc<tokio::sync::Semaphore>,
+        slots: Arc<crate::resources::Budget>,
     ) -> io::Result<()> {
-        let Ok(local_permit) = slots.try_acquire_owned() else {
+        let Some(local_permit) = slots.acquire(1) else {
             respond.send_reset(h2::Reason::REFUSED_STREAM);
             return Ok(());
         };

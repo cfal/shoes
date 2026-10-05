@@ -25,10 +25,13 @@ async fn start_quic_server(
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
     let mut join_handles = vec![];
     let mut server_config = quinn::ServerConfig::with_crypto(quic_server_config);
-    crate::resources::configure_quic(&mut server_config, 0);
-    for endpoint in
-        crate::listener_tasks::QuicListener::bind_all(bind_address, server_config, num_endpoints)?
-    {
+    let memory_bytes = crate::resources::configure_quic(&mut server_config, 100, 0);
+    for endpoint in crate::listener_tasks::QuicListener::bind_all(
+        bind_address,
+        server_config,
+        num_endpoints,
+        memory_bytes,
+    )? {
         let resolver = resolver.clone();
         let server_handler = server_handler.clone();
         let join_handle = tokio::spawn(async move {
@@ -92,7 +95,10 @@ async fn process_connection(
             }
             Ok(s) => s,
         };
-        if tasks.len() >= crate::resources::LIMITS.max_streams_per_connection {
+        if crate::resources::limits()
+            .max_streams_per_connection
+            .is_some_and(|limit| tasks.len() >= limit)
+        {
             continue;
         }
         let cloned_resolver = resolver.clone();

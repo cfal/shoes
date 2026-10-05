@@ -383,8 +383,9 @@ impl AnyTlsSession {
                 if self.streams.read().contains_key(&stream_id) {
                     return Ok(());
                 }
-                let permit = if self.stream_tasks.lock().len()
-                    < crate::resources::LIMITS.max_streams_per_connection
+                let permit = if crate::resources::limits()
+                    .max_streams_per_connection
+                    .is_none_or(|limit| self.stream_tasks.lock().len() < limit)
                 {
                     crate::resources::try_stream()
                 } else {

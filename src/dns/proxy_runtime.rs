@@ -295,6 +295,11 @@ mod tests {
 
     fn run_quic_test_in_child(name: &str) -> bool {
         if std::env::var("SHOES_DNS_QUIC_TEST_CHILD").as_deref() == Ok(name) {
+            crate::resources::configure(crate::config::GlobalLimits {
+                quic_memory_bytes: Some(16 << 20),
+                ..Default::default()
+            })
+            .unwrap();
             return false;
         }
         let status = std::process::Command::new(std::env::current_exe().unwrap())
@@ -304,10 +309,6 @@ mod tests {
                 "--nocapture",
             ])
             .env("SHOES_DNS_QUIC_TEST_CHILD", name)
-            .env("SHOES_QUIC_MEMORY_BYTES", (16 << 20).to_string())
-            .env("SHOES_QUIC_DNS_MEMORY_BYTES", (16 << 20).to_string())
-            .env("SHOES_QUIC_RECEIVE_WINDOW", (2 << 20).to_string())
-            .env("SHOES_QUIC_SEND_WINDOW", (2 << 20).to_string())
             .status()
             .unwrap();
         assert!(status.success());
@@ -324,13 +325,15 @@ mod tests {
         };
         let local_addr = "0.0.0.0:0".parse().unwrap();
         let server_addr = "127.0.0.1:443".parse().unwrap();
-        assert!(crate::resources::try_quic_memory().is_some());
+        let memory_bytes =
+            crate::resources::configure_quic_transport(&mut quinn::TransportConfig::default());
+        assert!(crate::resources::try_quic_memory(memory_bytes).is_some());
         let socket = binder.bind_quic(local_addr, server_addr).unwrap();
         assert_eq!(
             crate::resources::snapshot().quic_buffer_bytes.active,
             16 << 20
         );
-        assert!(crate::resources::try_quic_memory().is_none());
+        assert!(crate::resources::try_quic_memory(memory_bytes).is_none());
         assert_eq!(
             binder
                 .bind_quic(local_addr, server_addr)
