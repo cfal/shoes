@@ -11,6 +11,4 @@ pub mod tls_deframer;
 
 // Re-export core types
 pub use crypto_connection::{CryptoConnection, feed_crypto_connection};
-pub use crypto_handshake::perform_crypto_handshake;
-pub use crypto_tls_stream::CryptoTlsStream;
-// CryptoReader, CryptoWriter, and IoState are used internally within this module
+pub use crypto_tls_stream::{CryptoTlsStream, TlsReadMode};

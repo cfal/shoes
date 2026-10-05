@@ -7,19 +7,15 @@
 
 use bytes::{Buf, BytesMut};
 
-use crate::crypto::CryptoConnection;
+use crate::crypto::CryptoTlsStream;
 use futures::ready;
-use std::io::{self, BufRead, Write};
+use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::async_stream::AsyncStream;
-use crate::crypto::feed_crypto_connection;
-use crate::sync_adapter::{SyncReadAdapter, SyncWriteAdapter};
-use crate::util::allocate_vec;
 
-use crate::crypto::tls_deframer::TlsDeframer;
 use super::tls_fuzzy_deframer::{DeframeResult, FuzzyTlsDeframer};
 use super::vision_filter::VisionFilter;
 use super::vision_unpad::{UnpadCommand, UnpadResult, VisionUnpadder};
@@ -28,18 +24,6 @@ use super::vision_unpad::{UnpadCommand, UnpadResult, VisionUnpadder};
 const COMMAND_CONTINUE: u8 = 0x00;
 const COMMAND_END: u8 = 0x01;
 const COMMAND_DIRECT: u8 = 0x02;
-
-#[inline]
-fn feed_and_process_crypto_connection(
-    session: &mut CryptoConnection,
-    data: &[u8],
-) -> std::io::Result<usize> {
-    feed_crypto_connection(session, data)?;
-    Ok(session
-        .process_new_packets()
-        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?
-        .plaintext_bytes_to_read())
-}
 
 /// Current operating mode of the VISION stream
 #[derive(Debug, PartialEq)]
@@ -63,23 +47,13 @@ impl std::fmt::Display for VisionMode {
 }
 
 pub struct VisionStream<IO> {
-    /// The underlying transport stream (e.g., TcpStream)
-    tcp: IO,
-
-    /// rustls session for TLS encryption and decryption
-    /// Used in PaddingTls and Tls mode
-    session: CryptoConnection,
+    tls: CryptoTlsStream<IO>,
 
     /// Current READ operating mode (independent from write mode)
     read_mode: VisionMode,
 
     /// Current WRITE operating mode (independent from read mode)
     write_mode: VisionMode,
-
-    /// Outer TLS deframer for read path
-    /// Deframes TCP stream into complete TLS records before feeding to rustls
-    /// Used in PaddingTls mode
-    outer_read_deframer: Option<TlsDeframer>,
 
     /// Unpadding state machine for read path
     read_unpadder: VisionUnpadder,
@@ -131,83 +105,55 @@ pub struct VisionStream<IO> {
     /// Used in PaddingTls mode
     pending_tls_mode_switch: bool,
 
-    /// Reusable buffer for TLS read operations (TCP → read_tls → decrypt)
-    /// Used in PaddingTls mode
-    tls_read_buffer: Vec<u8>,
-
     /// Buffer for plaintext data waiting to be written to the TLS session buffer
     /// When the rustls Writer buffer fills (write length 0), we store the remainder here
     /// Used in PaddingTls mode - drained immediately before switching modes
     pending_plain_writes: BytesMut,
-
-    /// Caches whether we've hit EOF when reading
-    /// Used in PaddingTls and Tls mode
-    is_read_eof: bool,
 }
 
 impl<IO> VisionStream<IO>
 where
-    IO: AsyncRead + AsyncWrite + Unpin,
+    IO: AsyncStream,
 {
     /// Create a new VisionStream for server-side (inbound) connections with VLESS response writing
     pub fn new_server(
-        tcp: IO,
-        session: CryptoConnection,
+        tls: CryptoTlsStream<IO>,
         user_uuid: [u8; 16],
         initial_read_data: &[u8],
-    ) -> std::io::Result<Self> {
-        if !session.is_server() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
+    ) -> io::Result<Self> {
+        tls.require_record_framing()?;
+        if !tls.is_server() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
                 "VisionStream::new_server requires a server-side connection",
             ));
         }
-
-        let mut stream = Self::new_common(
-            tcp, session, user_uuid, false, // vless_response_pending
-            true,  // vless_response_to_send
-        );
-
-        // feed in the initial read data that came from reading the VLESS request
+        let mut stream = Self::new_common(tls, user_uuid, false, true);
         stream.feed_initial_read_data(initial_read_data)?;
-        // read all the remaining plaintext data from the session since we start directly
-        // with TCP reads in poll_read_padding_tls
-        stream.feed_initial_session_data()?;
-
         Ok(stream)
     }
 
-    /// Create a new VisionStream for client-side connections with VLESS response handling
-    pub fn new_client(tcp: IO, session: CryptoConnection, user_uuid: [u8; 16]) -> Self {
-        if !session.is_client() {
-            panic!("VisionStream::new_client requires a client-side connection");
+    pub fn new_client(tls: CryptoTlsStream<IO>, user_uuid: [u8; 16]) -> io::Result<Self> {
+        tls.require_record_framing()?;
+        if !tls.is_client() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "VisionStream::new_client requires a client-side connection",
+            ));
         }
-
-        Self::new_common(
-            tcp, session, user_uuid, true,  // vless_response_pending
-            false, // vless_response_to_send
-        )
+        Ok(Self::new_common(tls, user_uuid, true, false))
     }
 
     fn new_common(
-        tcp: IO,
-        session: CryptoConnection,
+        tls: CryptoTlsStream<IO>,
         user_uuid: [u8; 16],
         vless_response_pending: bool,
         vless_response_to_send: bool,
     ) -> Self {
         Self {
-            tcp,
-            session,
-            // this should be somewhat smaller than TLS_MAX_RECORD_SIZE when used with session.read_tls,
-            // else we will hit "message buffer full" (see other comment) - because if we set it at
-            // TLS_MAX_RECORD_SIZE, and a small record is read first, there can be a large partial record
-            // left in the buffer and then prevoius_record_size + TLS_MAX_RECORD_SIZE > TLS_MAX_RECORD_SIZE
-            // will trigger the error.
-            tls_read_buffer: allocate_vec(8192),
+            tls,
             read_mode: VisionMode::PaddingTls,
             write_mode: VisionMode::PaddingTls,
-            outer_read_deframer: Some(TlsDeframer::new()),
             inner_read_deframer: FuzzyTlsDeframer::new(),
             inner_write_deframer: FuzzyTlsDeframer::new(),
             read_unpadder: VisionUnpadder::new(user_uuid),
@@ -215,18 +161,15 @@ where
             user_uuid,
             filter: VisionFilter::new(),
             pending_read: BytesMut::new(),
-            vless_response_pending,
             partial_vless_response: BytesMut::new(),
+            vless_response_pending,
             vless_response_to_send,
             pending_direct_mode_switch: false,
             pending_tls_mode_switch: false,
             pending_plain_writes: BytesMut::new(),
-            is_read_eof: false,
         }
     }
 
-    /// Feed TLS plaintext buffered before the Vision handoff. An earlier chunk may
-    /// already have ended padding, so subsequent chunks must follow the new mode.
     fn feed_initial_read_data(&mut self, data: &[u8]) -> std::io::Result<()> {
         if data.is_empty() {
             return Ok(());
@@ -244,46 +187,6 @@ where
         }
 
         Ok(())
-    }
-
-    // Read all the available plaintext data from the session.
-    // This should only be necessary for server streams since a read occurred in order to read the
-    // VLESS request before the session is passed to VisionStream.
-    fn feed_initial_session_data(&mut self) -> std::io::Result<()> {
-        let plaintext_len = self
-            .session
-            .process_new_packets()
-            .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?
-            .plaintext_bytes_to_read();
-        let mut decrypted = Vec::with_capacity(plaintext_len);
-
-        let mut reader = self.session.reader();
-        let mut i = 0;
-        while i < plaintext_len {
-            match reader.fill_buf() {
-                Ok(buf) => {
-                    let len = buf.len();
-                    if len == 0 {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            "TLS session filled buffer with zero bytes",
-                        ));
-                    }
-                    decrypted.extend_from_slice(buf);
-                    reader.consume(len);
-                    log::debug!("VISION: Filled more unparsed data of length {}", len);
-                    i += len;
-                }
-                Err(e) => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!("failed to read TLS session: {e}"),
-                    ));
-                }
-            }
-        }
-
-        self.feed_initial_read_data(&decrypted)
     }
 
     fn switch_read_to_direct_mode(&mut self) -> io::Result<()> {
@@ -378,192 +281,23 @@ where
         // TODO: consider using an Option for all PaddingTls fields instead
         self.inner_read_deframer.deallocate();
         self.inner_write_deframer.deallocate();
-        self.tls_read_buffer = Vec::new();
         self.pending_plain_writes = BytesMut::new();
     }
 
-    /// Drain pending plaintext writes to TLS session buffer.
-    ///
-    /// Returns the number of bytes successfully written to the session.
-    /// - If returned > 0: progress was made, wants_write() should be true
-    /// - If returned == 0 and pending_plain_writes not empty: no progress (buffer full)
-    /// - If returned == 0 and pending_plain_writes empty: nothing to do
-    fn drain_pending_plain_writes(&mut self) -> io::Result<usize> {
-        if self.pending_plain_writes.is_empty() {
-            return Ok(0);
-        }
-
-        let initial_len = self.pending_plain_writes.len();
-
-        // Try to write pending plaintext to TLS session
-        while !self.pending_plain_writes.is_empty() {
-            match self.session.writer().write(&self.pending_plain_writes) {
-                Ok(0) => {
-                    // Session buffer full
-                    break;
-                }
-                Ok(n) => {
-                    self.pending_plain_writes.advance(n);
-                }
-                Err(e) => return Err(e),
-            }
-        }
-
-        let written = initial_len - self.pending_plain_writes.len();
-        if written > 0 {
-            log::debug!(
-                "VISION WRITE: Drained {} plaintext bytes to session ({} remaining)",
-                written,
-                self.pending_plain_writes.len()
-            );
-        }
-        Ok(written)
+    fn queue_padded_write(&mut self, data: &[u8]) {
+        self.pending_plain_writes.extend_from_slice(data);
     }
 
-    /// Drain all pending writes in PaddingTls mode: plain → TLS → TCP
-    ///
-    /// This drains the write pipeline in priority order:
-    /// 1. TLS session → TCP socket (highest priority, creates space in session)
-    /// 2. Plain buffer → TLS session (writes to session)
-    ///
-    /// Returns Poll::Ready(Ok(())) when all buffers are fully drained
-    /// Returns Poll::Pending if TCP blocks (backpressure - nothing else can make progress)
     fn drain_all_writes_padding(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        loop {
-            // Drain TLS session to TCP if there's data to send
-            if self.session.wants_write() {
-                match self.write_tls_direct(cx) {
-                    Poll::Ready(Ok(0)) => return Poll::Ready(Err(io::ErrorKind::WriteZero.into())),
-                    Poll::Ready(Ok(_)) => {
-                        // Wrote some data, freed up space in session buffer. Loop to continue.
-                        continue;
-                    }
-                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                    Poll::Pending => {
-                        // TCP blocked - waker is registered, return Pending
-                        return Poll::Pending;
-                    }
-                }
-            }
-
-            // Drain plaintext buffer to TLS session
-            if !self.pending_plain_writes.is_empty() {
-                let written = self.drain_pending_plain_writes()?;
-                if written > 0 {
-                    // Made progress - session now has data, wants_write() should be true
-                    continue;
-                } else {
-                    // No progress: session buffer was already full but wants_write() was false.
-                    // This shouldn't happen - if buffer is full, there should be data to send.
-                    log::error!(
-                        "DRAIN: stuck - couldn't write to session but wants_write=false, pending={}",
-                        self.pending_plain_writes.len()
-                    );
-                    return Poll::Ready(Err(io::Error::other(
-                        "drain stuck: session buffer full but wants_write is false",
-                    )));
-                }
-            }
-
-            // Both empty - done
-            return Poll::Ready(Ok(()));
-        }
-    }
-
-    /// Drain all pending writes in Tls mode
-    ///
-    /// This is simpler than PaddingTls mode because `pending_plain_writes` is no longer used.
-    ///
-    /// Returns Poll::Ready(Ok(())) when fully drained
-    /// Returns Poll::Pending if TCP blocks
-    fn drain_all_writes_tls(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        // Drain TLS session output directly to TCP
-        while self.session.wants_write() {
-            if ready!(self.write_tls_direct(cx))? == 0 {
+        while !self.pending_plain_writes.is_empty() {
+            let written =
+                ready!(Pin::new(&mut self.tls).poll_write(cx, &self.pending_plain_writes))?;
+            if written == 0 {
                 return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
             }
+            self.pending_plain_writes.advance(written);
         }
-
-        Poll::Ready(Ok(()))
-    }
-
-    /// Write data to TLS session, handling buffer full by saving to pending buffer
-    /// Used in PaddingTls mode
-    fn write_to_session(&mut self, data: &[u8]) -> io::Result<()> {
-        if !self.pending_plain_writes.is_empty() {
-            // If there's already pending data, just append to it
-            // (don't try to write, as that would require cx for polling)
-            self.pending_plain_writes.extend_from_slice(data);
-            return Ok(());
-        }
-
-        let mut written = 0;
-        while written < data.len() {
-            let n = self.session.writer().write(&data[written..])?;
-            if n == 0 {
-                // Session buffer full, save remainder
-                log::debug!(
-                    "VISION WRITE: Session buffer full, saving {} bytes to pending",
-                    data.len() - written
-                );
-                self.pending_plain_writes
-                    .extend_from_slice(&data[written..]);
-                return Ok(());
-            }
-            written += n;
-        }
-
-        Ok(())
-    }
-
-    /// Write TLS session output directly to TCP stream
-    /// Returns the number of bytes written from TLS session to TCP
-    fn write_tls_direct(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
-        let mut writer = SyncWriteAdapter {
-            io: &mut self.tcp,
-            cx,
-        };
-
-        // Write TLS output DIRECTLY to TCP (zero intermediate copies)
-        match self.session.write_tls(&mut writer) {
-            Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => Poll::Pending,
-            result => Poll::Ready(result),
-        }
-    }
-
-    /// Write data in Tls mode
-    fn poll_write_tls(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
-        let mut pos = 0;
-
-        while pos < buf.len() {
-            let mut would_block = false;
-
-            // Write plaintext to TLS session
-            match self.session.writer().write(&buf[pos..]) {
-                Ok(n) => pos += n,
-                Err(e) => return Poll::Ready(Err(e)),
-            };
-
-            // Drain TLS output to TCP stream
-            while self.session.wants_write() {
-                match self.write_tls_direct(cx) {
-                    Poll::Ready(Ok(0)) | Poll::Pending => {
-                        would_block = true;
-                        break;
-                    }
-                    Poll::Ready(Ok(_)) => (),
-                    Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
-                }
-            }
-
-            return match (pos, would_block) {
-                (0, true) => Poll::Pending,
-                (n, true) => Poll::Ready(Ok(n)), // Partial write
-                (_, false) => continue,          // Keep writing
-            };
-        }
-
-        Poll::Ready(Ok(pos))
+        self.tls.poll_drain_tls(cx)
     }
 
     /// Read the VLESS response header from the TLS session
@@ -578,126 +312,32 @@ where
     ///
     /// Returns any unused data that came after the response
     fn poll_read_vless_response(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<BytesMut>> {
-        log::debug!(
-            "VLESS: poll_read_vless_response called, partial_vless_response has {} bytes",
-            self.partial_vless_response.len()
-        );
-
         loop {
-            // Always read from TCP to feed the deframer
-            let mut read_buf = ReadBuf::new(&mut self.tls_read_buffer);
-            match ready!(Pin::new(&mut self.tcp).poll_read(cx, &mut read_buf)) {
-                Ok(()) => {}
-                Err(e) => return Poll::Ready(Err(e)),
-            };
+            if self.partial_vless_response.len() >= 2 {
+                let version = self.partial_vless_response[0];
+                if version != 0 {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("Invalid VLESS response version: {version}"),
+                    )));
+                }
+                let response_len = 2 + self.partial_vless_response[1] as usize;
+                if self.partial_vless_response.len() >= response_len {
+                    self.partial_vless_response.advance(response_len);
+                    return Poll::Ready(Ok(std::mem::take(&mut self.partial_vless_response)));
+                }
+            }
 
-            let tcp_bytes = read_buf.filled();
-
-            if tcp_bytes.is_empty() {
+            let mut scratch = [0; 8192];
+            let mut buf = ReadBuf::new(&mut scratch);
+            ready!(Pin::new(&mut self.tls).poll_read(cx, &mut buf))?;
+            if buf.filled().is_empty() {
                 return Poll::Ready(Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     "Connection closed while reading VLESS response",
                 )));
             }
-
-            log::debug!(
-                "VLESS: Read {} bytes from TCP for response header",
-                tcp_bytes.len()
-            );
-
-            // Feed to outer read deframer
-            self.outer_read_deframer
-                .as_mut()
-                .expect("outer_read_deframer must exist in PaddingTls mode")
-                .feed(tcp_bytes);
-
-            // We have to handle all packets and drain the outer_read_deframer because
-            // poll_read_padded_tls() will always read from the TCP and assume there's outstanding
-            // data.
-            // We don't have to worry about consuming some data post-Direct command because the TLS
-            // flow is one-directional atm and it's not possible to complete a handshake.
-            // If the peer sends a Direct command without handshake completing, this will error out
-            // when we feed the TLS record to the session.
-            let tls_records = self
-                .outer_read_deframer
-                .as_mut()
-                .expect("outer_read_deframer must exist in PaddingTls mode")
-                .next_records()?;
-
-            for tls_record in tls_records.into_iter() {
-                // Feed single TLS record to session
-                let plaintext_len =
-                    feed_and_process_crypto_connection(&mut self.session, tls_record.as_ref())?;
-
-                // Access the decrypted buffer and accumulate into partial_vless_response
-                let mut reader = self.session.reader();
-
-                let mut i = 0;
-                while i < plaintext_len {
-                    let decrypted_buf = match reader.fill_buf() {
-                        Ok(buf) => buf,
-                        Err(e) => return Poll::Ready(Err(e)),
-                    };
-
-                    if decrypted_buf.is_empty() {
-                        return Poll::Ready(Err(io::Error::other(
-                            "no plaintext data when some is available",
-                        )));
-                    }
-
-                    // Accumulate decrypted data into partial buffer
-                    self.partial_vless_response.extend_from_slice(decrypted_buf);
-
-                    let consumed_len = decrypted_buf.len();
-                    reader.consume(consumed_len);
-                    i += consumed_len;
-                }
-            }
-
-            log::debug!(
-                "VLESS: Accumulated vless response with {} bytes",
-                self.partial_vless_response.len()
-            );
-
-            // Try to parse the VLESS response from accumulated data
-            if self.partial_vless_response.len() < 2 {
-                // Need at least 2 bytes for header, try to read from the TCP stream again
-                continue;
-            }
-
-            // Read the 2-byte header
-            let version = self.partial_vless_response[0];
-            let addon_length = self.partial_vless_response[1];
-
-            // Validate version
-            if version != 0 {
-                return Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("Invalid VLESS response version: {}", version),
-                )));
-            }
-
-            // Check if we have enough data for the full response
-            let total_response_len = 2 + addon_length as usize;
-            if self.partial_vless_response.len() < total_response_len {
-                // Need more data - read more TCP
-                continue;
-            }
-
-            // We have the complete VLESS response! Consume it from the buffer
-            self.partial_vless_response.advance(total_response_len);
-
-            log::debug!(
-                "VLESS: Successfully parsed {} byte response header (version={}, addon_length={}), {} bytes remaining in buffer",
-                total_response_len,
-                version,
-                addon_length,
-                self.partial_vless_response.len()
-            );
-
-            // If there's any remaining data in partial buffer, it belongs to the actual payload
-            let remaining_data = std::mem::take(&mut self.partial_vless_response);
-            return Poll::Ready(Ok(remaining_data));
+            self.partial_vless_response.extend_from_slice(buf.filled());
         }
     }
 
@@ -706,133 +346,29 @@ where
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        if self.is_read_eof {
-            return Poll::Ready(Ok(()));
-        }
-
         loop {
-            // Read from TCP to feed the deframer.
-            // At this point, there is no data ready in neither the session or the outer read
-            // deframer.
-            let mut read_buf = ReadBuf::new(&mut self.tls_read_buffer);
-            match ready!(Pin::new(&mut self.tcp).poll_read(cx, &mut read_buf)) {
-                Ok(()) => {}
-                Err(e) => return Poll::Ready(Err(e)),
-            };
-
-            let tcp_bytes = read_buf.filled();
-
-            if tcp_bytes.is_empty() {
-                log::debug!("VISION READ: TCP connection EOF in PaddingTls mode");
-                self.is_read_eof = true;
+            let mut scratch = [0; 8192];
+            let mut plaintext = ReadBuf::new(&mut scratch);
+            ready!(Pin::new(&mut self.tls).poll_read(cx, &mut plaintext))?;
+            if plaintext.filled().is_empty() {
                 return Poll::Ready(Ok(()));
             }
-
-            log::debug!("VISION READ: Read {} bytes from TCP", tcp_bytes.len());
-
-            // Feed to outer TLS deframer
-            self.outer_read_deframer
-                .as_mut()
-                .expect("outer_read_deframer must exist in PaddingTls mode")
-                .feed(tcp_bytes);
-
-            // Process TLS records one at a time
-            loop {
-                let tls_record = match self
-                    .outer_read_deframer
-                    .as_mut()
-                    .expect("outer_read_deframer must exist in PaddingTls mode")
-                    .next_record()?
-                {
-                    Some(record) => record,
-                    None => {
-                        log::debug!(
-                            "VISION READ: No more complete TLS records in deframer, need more TCP data"
-                        );
-                        break; // Need more TCP data
-                    }
-                };
-
-                log::debug!(
-                    "VISION READ: Processing {} byte TLS record",
-                    tls_record.len()
-                );
-
-                // Feed single TLS record to session
-                let plaintext_len =
-                    feed_and_process_crypto_connection(&mut self.session, tls_record.as_ref())?;
-
-                if plaintext_len == 0 {
-                    continue; // Process next TLS record
-                }
-
-                let mut reader = self.session.reader();
-
-                let mut decrypted = Vec::with_capacity(plaintext_len);
-                let mut i = 0;
-                while i < plaintext_len {
-                    let decrypted_part = match reader.fill_buf() {
-                        Ok(buf) => buf,
-                        Err(e) => {
-                            // TODO: better error eg expected available plaintext but got error
-                            return Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidData, e)));
-                        }
-                    };
-
-                    let part_len = decrypted_part.len();
-                    decrypted.extend_from_slice(decrypted_part);
-                    reader.consume(part_len);
-                    i += part_len;
-                }
-
-                log::debug!("VISION READ: Got {} decrypted bytes", decrypted.len());
-                self.handle_padded_bytes(&decrypted)?;
-
-                // If the mode changed, the outer read deframer has been consumed and
-                // we should return any pending read data and use the new mode's read function
-                match self.read_mode {
-                    VisionMode::PaddingTls => {
-                        // Need more TCP data, loop back to read
-                    }
-                    VisionMode::Tls => {
-                        if !self.pending_read.is_empty() {
-                            let len = buf.remaining().min(self.pending_read.len());
-                            buf.put_slice(&self.pending_read[..len]);
-                            self.pending_read.advance(len);
-                            return Poll::Ready(Ok(()));
-                        }
-                        return self.poll_read_tls(cx, buf);
-                    }
-                    VisionMode::Direct => {
-                        if !self.pending_read.is_empty() {
-                            let len = buf.remaining().min(self.pending_read.len());
-                            buf.put_slice(&self.pending_read[..len]);
-                            self.pending_read.advance(len);
-                            return Poll::Ready(Ok(()));
-                        }
-                        return Pin::new(&mut self.tcp).poll_read(cx, buf);
-                    }
-                }
-            }
-
-            // Finished iterating through all TLS records, return data if we have any, else loop
-            // back to read more TCP data
+            self.handle_padded_bytes(plaintext.filled())?;
             if !self.pending_read.is_empty() {
                 let len = buf.remaining().min(self.pending_read.len());
                 buf.put_slice(&self.pending_read[..len]);
                 self.pending_read.advance(len);
                 return Poll::Ready(Ok(()));
             }
+            if self.read_mode != VisionMode::PaddingTls {
+                return Pin::new(&mut self.tls).poll_read(cx, buf);
+            }
         }
     }
 
     fn handle_padded_bytes(&mut self, decrypted: &[u8]) -> std::io::Result<()> {
-        // Feed newly decrypted bytes to the unpadder.
-        // All data should be consumed from the rustls session, as any actual content
-        // will eventually be returned by the unpadder.
-        // The unpadder maintains internal state for partial parsing
         let UnpadResult {
-            content: mut unpadded,
+            content: unpadded,
             command: maybe_command,
         } = self.read_unpadder.unpad(decrypted)?;
 
@@ -886,214 +422,19 @@ where
             }
         }
 
+        self.pending_read.extend_from_slice(&unpadded);
         match maybe_command {
             Some(UnpadCommand::Direct) => {
-                log::debug!(
-                    "VISION READ: Received DIRECT command with {} bytes",
-                    unpadded.len()
-                );
-
-                // The unpadded data already contains:
-                // 1. The Direct command content
-                // 2. Any remaining bytes after the padding (already appended by unpadder)
-
-                // Extract remaining data from outer read deframer (raw TCP data in Direct mode)
-                let remaining = self
-                    .outer_read_deframer
-                    .take()
-                    .expect("outer_read_deframer must exist")
-                    .into_remaining_data();
-
-                if !remaining.is_empty() {
-                    log::debug!(
-                        "VISION READ: Extracted {} bytes from deframer as raw data",
-                        remaining.len()
-                    );
-                    unpadded.extend_from_slice(&remaining);
-                }
-
-                self.pending_read.extend_from_slice(&unpadded);
-
+                self.tls.start_raw_read()?;
                 self.switch_read_to_direct_mode()?;
             }
             Some(UnpadCommand::End) => {
-                log::debug!("VISION READ: Received END command, switching to Tls mode");
-
-                // The `unpadded` data is already decrypted, store it in pending_read to be
-                // returned
-                if !unpadded.is_empty() {
-                    log::debug!(
-                        "VISION READ: Storing {} decrypted bytes in pending_read (End command - already decrypted)",
-                        unpadded.len()
-                    );
-                    self.pending_read.extend_from_slice(&unpadded);
-                }
-
-                // Process the remaining data from the outer read deframer.
-                // Previously we called into_remaining_data and fed it all at once to
-                // feed_and_process_crypto_connection, but if there was too much outstanding
-                // data, we hit "message buffer full" at
-                // https://github.com/rustls/rustls/blob/58fbe9e7ad91951a7df148c2854f57db728a717c/rustls/src/msgs/deframer/buffers.rs#L235
-
-                let mut outer_read_deframer = self
-                    .outer_read_deframer
-                    .take()
-                    .expect("outer_read_deframer must exist");
-
-                while let Some(record) = outer_read_deframer.next_record()? {
-                    // Feed the encrypted TLS records to the session
-                    let plaintext_len =
-                        feed_and_process_crypto_connection(&mut self.session, &record)?;
-
-                    if plaintext_len > 0 {
-                        // Extract the decrypted data
-                        let mut reader = self.session.reader();
-
-                        // Read all available decrypted data, possibly in multiple chunks
-                        let mut total_read = 0;
-                        while total_read < plaintext_len {
-                            let chunk = match reader.fill_buf() {
-                                Ok(buf) => buf,
-                                Err(e) => {
-                                    return Err(io::Error::new(io::ErrorKind::InvalidData, e));
-                                }
-                            };
-
-                            let chunk_len = chunk.len();
-                            self.pending_read.extend_from_slice(chunk);
-                            reader.consume(chunk_len);
-                            total_read += chunk_len;
-                        }
-
-                        log::debug!(
-                            "VISION READ: Decrypted {} bytes from deframer remaining data (End command)",
-                            total_read
-                        );
-                    }
-                }
-
-                let remaining = outer_read_deframer.into_remaining_data();
-
-                // The `remaining` data from the deframer is ENCRYPTED TLS record bytes
-                // We need to feed it to the TLS session for decryption
-                if !remaining.is_empty() {
-                    // This should only be a partial TLS record so there should be no new plaintext
-                    // to read
-                    let plaintext_len =
-                        feed_and_process_crypto_connection(&mut self.session, &remaining)?;
-                    assert!(plaintext_len == 0);
-                }
-
-                // Switch to Tls mode - End command means: stop padding, continue normal relay through outer TLS
+                self.tls.allow_streaming_reads();
                 self.switch_read_to_tls_mode()?;
             }
-            Some(UnpadCommand::Continue) => {
-                self.pending_read.extend_from_slice(&unpadded);
-            }
-            None => {
-                self.pending_read.extend_from_slice(&unpadded);
-            }
+            Some(UnpadCommand::Continue) | None => {}
         }
         Ok(())
-    }
-
-    fn poll_read_tls(
-        &mut self,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        // Check if rustls buffer has decrypted data available first
-        {
-            let mut reader = self.session.reader();
-            match reader.fill_buf() {
-                Ok(available) if !available.is_empty() => {
-                    // Copy directly from rustls buffer to user buffer (single copy)
-                    let len = buf.remaining().min(available.len());
-                    buf.put_slice(&available[..len]);
-                    reader.consume(len);
-                    // If we didn't consume all data, it stays in rustls buffer for next read
-                    return Poll::Ready(Ok(()));
-                }
-                Ok(_) => {
-                    // Empty buffer, fall through to slow path
-                }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    // No data available, fall through to slow path
-                }
-                Err(e) => return Poll::Ready(Err(e)),
-            }
-        }
-
-        if self.is_read_eof {
-            return Poll::Ready(Ok(()));
-        }
-
-        // No data in rustls buffer, need to read from TCP
-        // To prevent "message buffer full", we use a SyncReadAdapter to allow
-        // rustls to decide how much to read from TCP, versus reading to a buffer
-        // and then feeding like in PaddingTls mode.
-        //
-        // In read_tls, rustls will internally:
-        // 1. Check if it has buffer space via prepare_read()
-        // 2. Read only up to 4KB at a time
-        // 3. Prevent "message buffer full" by reading less
-        let mut reader = SyncReadAdapter {
-            io: &mut self.tcp,
-            cx,
-        };
-
-        loop {
-            match self.session.read_tls(&mut reader) {
-                Ok(n) => {
-                    if n == 0 {
-                        log::debug!("VISION READ: TCP connection EOF in Tls mode");
-                        self.is_read_eof = true;
-                        return Poll::Ready(Ok(()));
-                    }
-
-                    log::debug!("VISION READ: Read {} bytes from TCP via rustls", n);
-
-                    // Process the encrypted data
-                    let plaintext_len = self
-                        .session
-                        .process_new_packets()
-                        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?
-                        .plaintext_bytes_to_read();
-
-                    if plaintext_len == 0 {
-                        // No plaintext yet, need more TCP data
-                        continue;
-                    }
-
-                    // Extract plaintext from rustls and return it
-                    let mut reader = self.session.reader();
-                    match reader.fill_buf() {
-                        Ok(available) => {
-                            // TODO: this should probably be a debug_assert!
-                            if available.is_empty() {
-                                return Poll::Ready(Err(io::Error::new(
-                                    io::ErrorKind::UnexpectedEof,
-                                    "Read zero bytes when plaintext is available",
-                                )));
-                            }
-                            let len = buf.remaining().min(available.len());
-                            buf.put_slice(&available[..len]);
-                            reader.consume(len);
-                            return Poll::Ready(Ok(()));
-                        }
-                        Err(e) => {
-                            return Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidData, e)));
-                        }
-                    }
-                }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    return Poll::Pending;
-                }
-                Err(e) => {
-                    return Poll::Ready(Err(e));
-                }
-            }
-        }
     }
 
     fn poll_write_padding_tls(
@@ -1108,7 +449,7 @@ where
             const VLESS_RESPONSE: [u8; 2] = [0, 0];
 
             // Write VLESS response to TLS session (will be encrypted)
-            self.write_to_session(&VLESS_RESPONSE)?;
+            self.queue_padded_write(&VLESS_RESPONSE);
 
             // Clear flag so we don't send it again
             self.vless_response_to_send = false;
@@ -1117,22 +458,21 @@ where
         // Drain all pending writes - this must be done before mode switch
         // as the session could contain the DIRECT/END packet that triggered the mode switch flag,
         // and because we no longer use `pending_plain_writes` afterwards.
-        if !self.pending_plain_writes.is_empty() || self.session.wants_write() {
-            ready!(self.drain_all_writes_padding(cx))?;
-        }
+        ready!(self.drain_all_writes_padding(cx))?;
 
         if self.pending_direct_mode_switch {
             log::debug!("VISION WRITE: Switching to direct mode (flag set by previous write)");
+            ready!(self.tls.poll_start_raw_write(cx))?;
             self.pending_direct_mode_switch = false;
             self.switch_write_to_direct_mode()?;
-            return Pin::new(&mut self.tcp).poll_write(cx, buf);
+            return Pin::new(&mut self.tls).poll_write(cx, buf);
         }
 
         if self.pending_tls_mode_switch {
             log::debug!("VISION WRITE: Switching to Tls mode (flag set by previous write)");
             self.pending_tls_mode_switch = false;
             self.switch_write_to_tls_mode()?;
-            return self.poll_write_tls(cx, buf);
+            return Pin::new(&mut self.tls).poll_write(cx, buf);
         }
 
         // Feed write buffer to inner deframer and check for ApplicationData
@@ -1193,7 +533,7 @@ where
                             )
                         };
 
-                        self.write_to_session(&final_padded_packet)?;
+                        self.queue_padded_write(&final_padded_packet);
 
                         // this must be true because else we would have a successful next_record call on previous iteration
                         assert!(processed_len > existing_inner_len);
@@ -1239,7 +579,7 @@ where
                         )
                     };
 
-                    self.write_to_session(&padded_packet)?;
+                    self.queue_padded_write(&padded_packet);
                     match self.drain_all_writes_padding(cx) {
                         Poll::Pending => {
                             let unprocessed_buf_len =
@@ -1296,7 +636,7 @@ where
                             )
                         };
 
-                        self.write_to_session(&padded_packet)?;
+                        self.queue_padded_write(&padded_packet);
                         match self.drain_all_writes_padding(cx) {
                             Poll::Pending => {}
                             Poll::Ready(Ok(())) => {}
@@ -1328,7 +668,7 @@ where
                         // will never be used again.
                         self.inner_write_deframer.clear();
 
-                        self.write_to_session(&padded_packet)?;
+                        self.queue_padded_write(&padded_packet);
                         // Drain and handle result
                         match self.drain_all_writes_padding(cx) {
                             Poll::Ready(Ok(())) => {
@@ -1379,7 +719,7 @@ where
                         )
                     };
 
-                    self.write_to_session(&padded_packet)?;
+                    self.queue_padded_write(&padded_packet);
 
                     match self.drain_all_writes_padding(cx) {
                         Poll::Pending => {}
@@ -1399,19 +739,16 @@ where
     }
 }
 
-// AsyncRead implementation
-impl<IO> AsyncRead for VisionStream<IO>
-where
-    IO: AsyncRead + AsyncWrite + Unpin,
-{
+impl<IO: AsyncStream> AsyncRead for VisionStream<IO> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
-
-        // If we have leftover buffered data, return it first
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
         if !this.pending_read.is_empty() {
             let len = buf.remaining().min(this.pending_read.len());
             buf.put_slice(&this.pending_read[..len]);
@@ -1419,102 +756,825 @@ where
             return Poll::Ready(Ok(()));
         }
 
-        match this.read_mode {
-            VisionMode::PaddingTls => {
-                if this.vless_response_pending {
-                    let decrypted_data = ready!(this.poll_read_vless_response(cx))?;
-                    this.vless_response_pending = false;
-                    if !decrypted_data.is_empty() {
-                        this.handle_padded_bytes(&decrypted_data)?;
-                        if !this.pending_read.is_empty() {
-                            let len = buf.remaining().min(this.pending_read.len());
-                            buf.put_slice(&this.pending_read[..len]);
-                            this.pending_read.advance(len);
-                            return Poll::Ready(Ok(()));
-                        }
-                        match this.read_mode {
-                            VisionMode::PaddingTls => {
-                                // Fall-through
-                            }
-                            VisionMode::Tls => {
-                                return this.poll_read_tls(cx, buf);
-                            }
-                            VisionMode::Direct => {
-                                return Pin::new(&mut this.tcp).poll_read(cx, buf);
-                            }
-                        }
-                    }
-                }
-                this.poll_read_padding_tls(cx, buf)
+        if this.vless_response_pending {
+            let decrypted_data = ready!(this.poll_read_vless_response(cx))?;
+            this.vless_response_pending = false;
+            this.feed_initial_read_data(&decrypted_data)?;
+            if !this.pending_read.is_empty() {
+                let len = buf.remaining().min(this.pending_read.len());
+                buf.put_slice(&this.pending_read[..len]);
+                this.pending_read.advance(len);
+                return Poll::Ready(Ok(()));
             }
-            VisionMode::Tls => this.poll_read_tls(cx, buf),
-            VisionMode::Direct => Pin::new(&mut this.tcp).poll_read(cx, buf),
+        }
+
+        match this.read_mode {
+            VisionMode::PaddingTls => this.poll_read_padding_tls(cx, buf),
+            VisionMode::Tls | VisionMode::Direct => Pin::new(&mut this.tls).poll_read(cx, buf),
         }
     }
 }
 
-// AsyncWrite implementation
-impl<IO> AsyncWrite for VisionStream<IO>
-where
-    IO: AsyncRead + AsyncWrite + Unpin,
-{
+impl<IO: AsyncStream> AsyncWrite for VisionStream<IO> {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
-
         match this.write_mode {
             VisionMode::PaddingTls => this.poll_write_padding_tls(cx, buf),
-            VisionMode::Tls => this.poll_write_tls(cx, buf),
-            VisionMode::Direct => Pin::new(&mut this.tcp).poll_write(cx, buf),
+            VisionMode::Tls | VisionMode::Direct => Pin::new(&mut this.tls).poll_write(cx, buf),
         }
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
-
-        match this.write_mode {
-            VisionMode::PaddingTls => {
-                ready!(this.drain_all_writes_padding(cx))?;
-                Pin::new(&mut this.tcp).poll_flush(cx)
-            }
-            VisionMode::Tls => {
-                ready!(this.drain_all_writes_tls(cx))?;
-                Pin::new(&mut this.tcp).poll_flush(cx)
-            }
-            VisionMode::Direct => Pin::new(&mut this.tcp).poll_flush(cx),
+        if this.write_mode == VisionMode::PaddingTls {
+            ready!(this.drain_all_writes_padding(cx))?;
         }
+        Pin::new(&mut this.tls).poll_flush(cx)
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().tcp).poll_shutdown(cx)
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        ready!(self.as_mut().poll_flush(cx))?;
+        if self.pending_direct_mode_switch {
+            ready!(self.tls.poll_start_raw_write(cx))?;
+            self.pending_direct_mode_switch = false;
+            self.switch_write_to_direct_mode()?;
+        }
+        Pin::new(&mut self.tls).poll_shutdown(cx)
     }
 }
 
-// Implement AsyncPing trait
-impl<IO> crate::async_stream::AsyncPing for VisionStream<IO>
-where
-    IO: AsyncStream,
-{
+impl<IO: AsyncStream> crate::async_stream::AsyncPing for VisionStream<IO> {
     fn supports_ping(&self) -> bool {
-        self.tcp.supports_ping()
+        self.tls.supports_ping()
     }
 
     fn poll_write_ping(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
-        Pin::new(&mut self.get_mut().tcp).poll_write_ping(cx)
+        Pin::new(&mut self.get_mut().tls).poll_write_ping(cx)
     }
 }
 
-impl<IO> AsyncStream for VisionStream<IO> where IO: AsyncStream {}
+impl<IO: AsyncStream> AsyncStream for VisionStream<IO> {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::address::{Address, NetLocation};
-    use crate::reality::{RealityServerConfig, RealityServerConnection};
+    use crate::async_stream::AsyncPing;
+    use crate::crypto::tls_deframer::TlsDeframer;
+    use crate::crypto::{CryptoConnection, TlsReadMode, feed_crypto_connection};
+    use crate::reality::{
+        RealityClientConfig, RealityClientConnection, RealityServerConfig, RealityServerConnection,
+    };
     use futures::task::noop_waker_ref;
+    use std::collections::VecDeque;
+    use std::io::Write;
+    use std::sync::Arc;
+
+    fn feed_and_process_crypto_connection(
+        session: &mut CryptoConnection,
+        data: &[u8],
+    ) -> io::Result<()> {
+        feed_crypto_connection(session, data)?;
+        session.process_new_packets().map(|_| ())
+    }
+
+    struct ScriptedIo {
+        reads: VecDeque<bytes::Bytes>,
+    }
+
+    impl AsyncRead for ScriptedIo {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let this = self.get_mut();
+            let Some(chunk) = this.reads.front_mut() else {
+                return Poll::Pending;
+            };
+            let len = buf.remaining().min(chunk.len());
+            buf.put_slice(&chunk[..len]);
+            chunk.advance(len);
+            if chunk.is_empty() {
+                this.reads.pop_front();
+            }
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for ScriptedIo {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncPing for ScriptedIo {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+
+        fn poll_write_ping(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+
+    impl AsyncStream for ScriptedIo {}
+
+    #[derive(Default)]
+    struct WriteGate {
+        blocked: bool,
+        flush_blocked: bool,
+        output: Vec<u8>,
+    }
+
+    struct GatedIo {
+        input: ScriptedIo,
+        gate: Arc<std::sync::Mutex<WriteGate>>,
+    }
+
+    impl AsyncRead for GatedIo {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().input).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for GatedIo {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let mut gate = self.gate.lock().unwrap();
+            if gate.blocked {
+                return Poll::Pending;
+            }
+            gate.output.extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            if self.gate.lock().unwrap().flush_blocked {
+                Poll::Pending
+            } else {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.poll_flush(cx)
+        }
+    }
+
+    impl AsyncPing for GatedIo {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+
+        fn poll_write_ping(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+
+    impl AsyncStream for GatedIo {}
+
+    #[derive(Clone, Copy)]
+    enum Backend {
+        Tls12,
+        Tls13,
+        Reality,
+    }
+
+    const BACKENDS: [Backend; 3] = [Backend::Tls12, Backend::Tls13, Backend::Reality];
+
+    fn new_connections(backend: Backend) -> (CryptoConnection, CryptoConnection) {
+        let version = match backend {
+            Backend::Tls12 => &rustls::version::TLS12,
+            Backend::Tls13 => &rustls::version::TLS13,
+            Backend::Reality => return reality_connections(),
+        };
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert.cert.der().clone()).unwrap();
+        let mut config = rustls::ServerConfig::builder_with_protocol_versions(&[version])
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![cert.cert.der().clone()],
+                rustls::pki_types::PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der())
+                    .into(),
+            )
+            .unwrap();
+        config.send_tls13_tickets = 0;
+        let client_config = rustls::ClientConfig::builder_with_protocol_versions(&[version])
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let client = CryptoConnection::new_rustls_client(
+            rustls::ClientConnection::new(Arc::new(client_config), "localhost".try_into().unwrap())
+                .unwrap(),
+        );
+        let server = CryptoConnection::new_rustls_server(
+            rustls::ServerConnection::new(Arc::new(config)).unwrap(),
+        );
+        (client, server)
+    }
+
+    fn reality_connections() -> (CryptoConnection, CryptoConnection) {
+        use aws_lc_rs::agreement;
+        let private_key = [1; 32];
+        let public_key = agreement::PrivateKey::from_private_key(&agreement::X25519, &private_key)
+            .unwrap()
+            .compute_public_key()
+            .unwrap();
+        let mut client = RealityClientConnection::new(RealityClientConfig {
+            public_key: public_key.as_ref().try_into().unwrap(),
+            short_id: [0; 8],
+            server_name: "localhost".into(),
+            cipher_suites: Vec::new(),
+        })
+        .unwrap();
+        let mut hello = Vec::new();
+        client.write_tls(&mut hello).unwrap();
+        let mut server = RealityServerConnection::new(RealityServerConfig {
+            private_key,
+            short_ids: vec![[0; 8]],
+            dest: NetLocation::new(Address::Hostname("localhost".into()), 443),
+            max_time_diff: None,
+            min_client_version: None,
+            max_client_version: None,
+            cipher_suites: Vec::new(),
+        })
+        .unwrap();
+        server.validate_client_hello(&hello).unwrap();
+        server.build_server_response(Vec::new()).unwrap();
+        (
+            CryptoConnection::new_reality_client(client),
+            CryptoConnection::new_reality_server(server),
+        )
+    }
+
+    fn connection_pair(backend: Backend) -> (CryptoConnection, CryptoConnection) {
+        let (mut client, mut server) = new_connections(backend);
+        for _ in 0..8 {
+            transfer_tls(&mut client, &mut server);
+            transfer_tls(&mut server, &mut client);
+            if !client.is_handshaking() && !server.is_handshaking() {
+                return (client, server);
+            }
+        }
+        panic!("in-memory TLS handshake did not finish");
+    }
+
+    fn transfer_tls(sender: &mut CryptoConnection, receiver: &mut CryptoConnection) {
+        let mut bytes = Vec::new();
+        sender.write_tls(&mut bytes).unwrap();
+        if !bytes.is_empty() {
+            feed_and_process_crypto_connection(receiver, &bytes).unwrap();
+        }
+    }
+
+    fn encrypt(session: &mut CryptoConnection, plaintext: &[u8]) -> Vec<u8> {
+        session.writer().write_all(plaintext).unwrap();
+        let mut ciphertext = Vec::new();
+        session.write_tls(&mut ciphertext).unwrap();
+        ciphertext
+    }
+
+    fn assert_buffered_reads(stream: &mut (impl AsyncRead + Unpin), expected: &[u8]) {
+        let mut received = Vec::new();
+        let mut cx = Context::from_waker(noop_waker_ref());
+        while received.len() < expected.len() {
+            let mut bytes = [0; 3];
+            let mut buf = ReadBuf::new(&mut bytes);
+            match Pin::new(&mut *stream).poll_read(&mut cx, &mut buf) {
+                Poll::Ready(Ok(())) => {}
+                result => panic!("expected buffered data: {result:?}"),
+            }
+            assert!(!buf.filled().is_empty());
+            received.extend_from_slice(buf.filled());
+        }
+        assert_eq!(received, expected);
+
+        let mut bytes = [0; 3];
+        let mut buf = ReadBuf::new(&mut bytes);
+        assert!(Pin::new(stream).poll_read(&mut cx, &mut buf).is_pending());
+        assert!(buf.filled().is_empty());
+    }
+
+    #[test]
+    fn vision_rejects_streams_without_record_preservation() {
+        let (client, server) = connection_pair(Backend::Tls13);
+        for session in [client, server] {
+            let is_server = session.is_server();
+            let io = ScriptedIo {
+                reads: VecDeque::new(),
+            };
+            let tls = CryptoTlsStream::new(io, session, None);
+            let result = if is_server {
+                VisionStream::new_server(tls, [7; 16], b"")
+            } else {
+                VisionStream::new_client(tls, [7; 16])
+            };
+            let error = result.err().expect("missing framing must be rejected");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        }
+    }
+
+    #[test]
+    fn direct_write_waits_for_pending_tls_and_transport_flush() {
+        use std::io::Read;
+
+        for backend in BACKENDS {
+            let (mut peer, session) = connection_pair(backend);
+            let gate = Arc::new(std::sync::Mutex::new(WriteGate {
+                blocked: true,
+                flush_blocked: true,
+                output: Vec::new(),
+            }));
+            let io = GatedIo {
+                input: ScriptedIo {
+                    reads: VecDeque::new(),
+                },
+                gate: gate.clone(),
+            };
+            let mut tls = CryptoTlsStream::new(io, session, Some(TlsDeframer::new()));
+            let mut cx = Context::from_waker(noop_waker_ref());
+            assert!(matches!(
+                Pin::new(&mut tls).poll_write(&mut cx, b"before handoff"),
+                Poll::Ready(Ok(14))
+            ));
+            let mut vision = VisionStream::new_server(tls, [7; 16], b"").unwrap();
+            vision.vless_response_to_send = false;
+            vision.queue_padded_write(b"-final padded record");
+            vision.pending_direct_mode_switch = true;
+            assert!(
+                Pin::new(&mut vision)
+                    .poll_write(&mut cx, b"raw")
+                    .is_pending()
+            );
+            assert!(gate.lock().unwrap().output.is_empty());
+
+            gate.lock().unwrap().blocked = false;
+            assert!(
+                Pin::new(&mut vision)
+                    .poll_write(&mut cx, b"raw")
+                    .is_pending()
+            );
+            let ciphertext = gate.lock().unwrap().output.clone();
+            feed_and_process_crypto_connection(&mut peer, &ciphertext).unwrap();
+            let mut plaintext = [0; 34];
+            peer.reader().read_exact(&mut plaintext).unwrap();
+            assert_eq!(&plaintext, b"before handoff-final padded record");
+
+            gate.lock().unwrap().flush_blocked = false;
+            assert!(matches!(
+                Pin::new(&mut vision).poll_write(&mut cx, b"raw"),
+                Poll::Ready(Ok(3))
+            ));
+            assert!(matches!(
+                Pin::new(&mut vision).poll_shutdown(&mut cx),
+                Poll::Ready(Ok(()))
+            ));
+            assert_eq!(
+                gate.lock().unwrap().output,
+                [ciphertext.as_slice(), b"raw"].concat()
+            );
+        }
+    }
+
+    #[test]
+    fn raw_write_direction_never_sends_tls_alerts() {
+        let (_, session) = connection_pair(Backend::Tls13);
+        let gate = Arc::new(std::sync::Mutex::new(WriteGate::default()));
+        let io = GatedIo {
+            input: ScriptedIo {
+                reads: VecDeque::from([bytes::Bytes::from_static(b"\x17\x03\x03\x00\x03bad")]),
+            },
+            gate: gate.clone(),
+        };
+        let mut tls = CryptoTlsStream::new(io, session, Some(TlsDeframer::new()));
+        let mut cx = Context::from_waker(noop_waker_ref());
+        assert!(matches!(
+            tls.poll_start_raw_write(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
+        let mut bytes = [0; 8];
+        let result = Pin::new(&mut tls).poll_read(&mut cx, &mut ReadBuf::new(&mut bytes));
+        assert!(matches!(result, Poll::Ready(Err(_))));
+        assert!(gate.lock().unwrap().output.is_empty());
+    }
+
+    #[test]
+    fn closure_framed_tls_rejects_unclean_eof() {
+        for backend in [Backend::Tls12, Backend::Tls13] {
+            for framed in [false, true] {
+                let (_, session) = connection_pair(backend);
+                let io = ScriptedIo {
+                    reads: VecDeque::from([bytes::Bytes::new()]),
+                };
+                let mut stream = CryptoTlsStream::new(io, session, framed.then(TlsDeframer::new));
+                let mut cx = Context::from_waker(noop_waker_ref());
+                let mut bytes = [0; 8];
+                let mut buf = ReadBuf::new(&mut bytes);
+                let result = Pin::new(&mut stream).poll_read(&mut cx, &mut buf);
+                assert!(
+                    matches!(result, Poll::Ready(Err(ref error)) if error.kind() == io::ErrorKind::UnexpectedEof),
+                    "framed={framed}: {result:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn closure_vision_recognizes_close_notify_without_tcp_eof() {
+        for backend in BACKENDS {
+            let (mut client, server) = connection_pair(backend);
+            let uuid = [7; 16];
+            let mut plaintext = uuid.to_vec();
+            plaintext.extend_from_slice(&[COMMAND_CONTINUE, 0, 3, 0, 0]);
+            plaintext.extend_from_slice(b"one");
+            let mut ciphertext = encrypt(&mut client, &plaintext);
+            client.send_close_notify();
+            client.write_tls(&mut ciphertext).unwrap();
+            let io = ScriptedIo {
+                reads: VecDeque::from([ciphertext.into()]),
+            };
+            let mut stream = VisionStream::new_server(
+                CryptoTlsStream::new(io, server, Some(TlsDeframer::new())),
+                uuid,
+                b"",
+            )
+            .unwrap();
+            let mut cx = Context::from_waker(noop_waker_ref());
+            let mut bytes = [0; 8];
+            let mut buf = ReadBuf::new(&mut bytes);
+            assert!(matches!(
+                Pin::new(&mut stream).poll_read(&mut cx, &mut buf),
+                Poll::Ready(Ok(()))
+            ));
+            assert_eq!(buf.filled(), b"one");
+            buf.clear();
+            let result = Pin::new(&mut stream).poll_read(&mut cx, &mut buf);
+            assert!(matches!(result, Poll::Ready(Ok(()))), "{result:?}");
+            assert!(buf.filled().is_empty());
+        }
+    }
+
+    #[test]
+    fn tls_handoff_preserves_partial_record() {
+        for backend in BACKENDS {
+            for split in [1, 2, 3, 4, 5, 10, 5000, usize::MAX] {
+                let (mut client, server) = connection_pair(backend);
+                let uuid = [7; 16];
+                let mut first = vec![0];
+                first.extend_from_slice(&uuid);
+                first.extend_from_slice(&[COMMAND_CONTINUE, 0, 3, 0, 0]);
+                first.extend_from_slice(b"one");
+                let mut ciphertext = encrypt(&mut client, &first);
+                let mut second = vec![COMMAND_CONTINUE];
+                second.extend_from_slice(&10_000u16.to_be_bytes());
+                second.extend_from_slice(&[0, 0]);
+                second.resize(10_005, b'Z');
+                let next_record = encrypt(&mut client, &second);
+                let split = split.min(next_record.len() - 1);
+                ciphertext.extend_from_slice(&next_record[..split]);
+                let io = ScriptedIo {
+                    reads: VecDeque::from([
+                        ciphertext.into(),
+                        next_record[split..].to_vec().into(),
+                    ]),
+                };
+                let mut tls = CryptoTlsStream::new(io, server, Some(TlsDeframer::new()));
+                let mut cx = Context::from_waker(noop_waker_ref());
+                let mut header = [255];
+                let mut buf = ReadBuf::new(&mut header);
+                assert!(matches!(
+                    Pin::new(&mut tls).poll_read(&mut cx, &mut buf),
+                    Poll::Ready(Ok(()))
+                ));
+                assert_eq!(header, [0]);
+
+                let mut vision = VisionStream::new_server(tls, uuid, b"").unwrap();
+                let mut expected = b"one".to_vec();
+                expected.resize(10_003, b'Z');
+                assert_buffered_reads(&mut vision, &expected);
+            }
+        }
+    }
+
+    #[test]
+    fn direct_read_preserves_plaintext_beyond_the_read_buffer() {
+        for backend in BACKENDS {
+            for is_server in [false, true] {
+                let (client, server) = connection_pair(backend);
+                let (session, mut peer) = if is_server {
+                    (server, client)
+                } else {
+                    (client, server)
+                };
+                let uuid = [7; 16];
+                let mut plaintext = if is_server { Vec::new() } else { vec![0, 0] };
+                plaintext.extend_from_slice(&uuid);
+                plaintext.extend_from_slice(&[COMMAND_DIRECT, 0, 3, 0, 0]);
+                plaintext.extend_from_slice(b"one");
+                plaintext.extend_from_slice(&[b'Z'; 10_000]);
+                let mut ciphertext = encrypt(&mut peer, &plaintext);
+                ciphertext.extend_from_slice(b"\x17\x03\x03\x00\x03raw");
+                let io = ScriptedIo {
+                    reads: VecDeque::from([ciphertext.into()]),
+                };
+                let tls = CryptoTlsStream::new(io, session, Some(TlsDeframer::new()));
+                let mut vision = if is_server {
+                    VisionStream::new_server(tls, uuid, b"").unwrap()
+                } else {
+                    VisionStream::new_client(tls, uuid).unwrap()
+                };
+                let mut expected = b"one".to_vec();
+                expected.extend_from_slice(&[b'Z'; 10_000]);
+                expected.extend_from_slice(b"\x17\x03\x03\x00\x03raw");
+                assert_buffered_reads(&mut vision, &expected);
+            }
+        }
+    }
+
+    #[test]
+    fn tls_handoff_preserves_coalesced_direct_bytes() {
+        for backend in BACKENDS {
+            for raw_tail in [b"-three".as_slice(), b"\x17\x03\x03\x00\x03raw"] {
+                let (mut client, server) = connection_pair(backend);
+                let uuid = [7; 16];
+                let mut first = vec![0];
+                first.extend_from_slice(&uuid);
+                first.extend_from_slice(&[COMMAND_DIRECT, 0, 3, 0, 0]);
+                first.extend_from_slice(b"one-two");
+                let mut ciphertext = encrypt(&mut client, &first);
+                ciphertext.extend_from_slice(raw_tail);
+                let io = ScriptedIo {
+                    reads: VecDeque::from([ciphertext.into()]),
+                };
+                let mut tls = CryptoTlsStream::new(io, server, Some(TlsDeframer::new()));
+                let mut cx = Context::from_waker(noop_waker_ref());
+                let mut header = [255];
+                let mut buf = ReadBuf::new(&mut header);
+                assert!(matches!(
+                    Pin::new(&mut tls).poll_read(&mut cx, &mut buf),
+                    Poll::Ready(Ok(()))
+                ));
+                assert_eq!(header, [0]);
+
+                let mut vision = VisionStream::new_server(tls, uuid, b"").unwrap();
+                let mut expected = b"one-two".to_vec();
+                expected.extend_from_slice(raw_tail);
+                assert_buffered_reads(&mut vision, &expected);
+                assert_eq!(vision.read_mode, VisionMode::Direct);
+            }
+        }
+    }
+
+    #[test]
+    fn client_response_preserves_coalesced_direct_bytes() {
+        for backend in BACKENDS {
+            for header_split in [0, 1, 3] {
+                let (client, mut server) = connection_pair(backend);
+                let uuid = [7; 16];
+                let mut ciphertext = Vec::new();
+                let mut response = vec![0, 3, 1, 2, 3];
+                if header_split != 0 {
+                    ciphertext.extend(encrypt(&mut server, &response[..header_split]));
+                    response.drain(..header_split);
+                }
+                response.extend_from_slice(&uuid);
+                response.extend_from_slice(&[COMMAND_DIRECT, 0, 3, 0, 0]);
+                response.extend_from_slice(b"one-two");
+                ciphertext.extend(encrypt(&mut server, &response));
+                ciphertext.extend_from_slice(b"\x17\x03\x03\x00\x03raw");
+                let io = ScriptedIo {
+                    reads: VecDeque::from([ciphertext.into()]),
+                };
+                let mut vision = VisionStream::new_client(
+                    CryptoTlsStream::new(io, client, Some(TlsDeframer::new())),
+                    uuid,
+                )
+                .unwrap();
+                assert_buffered_reads(&mut vision, b"one-two\x17\x03\x03\x00\x03raw");
+                assert_eq!(vision.read_mode, VisionMode::Direct);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn handshake_handoff_preserves_partial_record() {
+        for backend in [Backend::Tls13, Backend::Reality] {
+            let (mut client, mut server) = new_connections(backend);
+            transfer_tls(&mut client, &mut server);
+            transfer_tls(&mut server, &mut client);
+            assert!(!client.is_handshaking());
+            assert!(server.is_handshaking());
+
+            let mut flight = Vec::new();
+            client.write_tls(&mut flight).unwrap();
+            let uuid = [7; 16];
+            let mut first = vec![0];
+            first.extend_from_slice(&uuid);
+            first.extend_from_slice(&[COMMAND_CONTINUE, 0, 3, 0, 0]);
+            first.extend_from_slice(b"one");
+            flight.extend(encrypt(&mut client, &first));
+            let next_record = encrypt(&mut client, b"\x00\x00\x04\x00\x00-two");
+            flight.extend_from_slice(&next_record[..10]);
+            let io: Box<dyn AsyncStream> = Box::new(ScriptedIo {
+                reads: VecDeque::from([
+                    flight[3..].to_vec().into(),
+                    next_record[10..].to_vec().into(),
+                ]),
+            });
+            let mut tls = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                CryptoTlsStream::handshake(io, server, TlsReadMode::PreserveRecords, &flight[..3]),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let mut cx = Context::from_waker(noop_waker_ref());
+            let mut header = [255];
+            let mut buf = ReadBuf::new(&mut header);
+            assert!(matches!(
+                Pin::new(&mut tls).poll_read(&mut cx, &mut buf),
+                Poll::Ready(Ok(()))
+            ));
+            assert_eq!(header, [0]);
+            let mut vision = VisionStream::new_server(tls, uuid, b"").unwrap();
+            assert_buffered_reads(&mut vision, b"one-two");
+        }
+    }
+
+    #[tokio::test]
+    async fn tls12_client_handshake_preserves_buffered_response() {
+        let (mut client, mut server) = new_connections(Backend::Tls12);
+        transfer_tls(&mut client, &mut server);
+        transfer_tls(&mut server, &mut client);
+        transfer_tls(&mut client, &mut server);
+        assert!(client.is_handshaking());
+
+        let mut flight = Vec::new();
+        server.write_tls(&mut flight).unwrap();
+        let uuid = [7; 16];
+        let mut response = vec![0, 0];
+        response.extend_from_slice(&uuid);
+        response.extend_from_slice(&[COMMAND_DIRECT, 0, 3, 0, 0]);
+        response.extend_from_slice(b"one");
+        let application_record = encrypt(&mut server, &response);
+        assert!(!application_record.is_empty());
+        flight.extend(application_record);
+        flight.extend_from_slice(b"-two");
+        let io: Box<dyn AsyncStream> = Box::new(ScriptedIo {
+            reads: VecDeque::from([flight.into()]),
+        });
+        let tls = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            CryptoTlsStream::handshake(io, client, TlsReadMode::PreserveRecords, &[]),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let mut vision = VisionStream::new_client(tls, uuid).unwrap();
+        assert_buffered_reads(&mut vision, b"one-two");
+    }
+
+    #[test]
+    fn transferred_records_are_read_before_polling_the_socket() {
+        for backend in BACKENDS {
+            let (client, mut server) = connection_pair(backend);
+            let uuid = [7; 16];
+            let mut response = vec![0, 0];
+            response.extend_from_slice(&uuid);
+            response.extend_from_slice(&[COMMAND_CONTINUE, 0, 3, 0, 0]);
+            response.extend_from_slice(b"one");
+            let mut deframer = TlsDeframer::new();
+            deframer.feed(&encrypt(&mut server, &response));
+            deframer.feed(&encrypt(&mut server, b"\x00\x00\x04\x00\x00-two"));
+            let io = ScriptedIo {
+                reads: VecDeque::new(),
+            };
+            let mut vision =
+                VisionStream::new_client(CryptoTlsStream::new(io, client, Some(deframer)), uuid)
+                    .unwrap();
+            assert_buffered_reads(&mut vision, b"one-two");
+        }
+    }
+
+    #[test]
+    fn initial_direct_orders_plaintext_before_deframer_tail() {
+        for backend in BACKENDS {
+            let (mut client, mut server) = connection_pair(backend);
+            let uuid = [7; 16];
+            let mut initial = uuid.to_vec();
+            initial.extend_from_slice(&[COMMAND_DIRECT, 0, 3, 0, 0]);
+            initial.extend_from_slice(b"one");
+            feed_and_process_crypto_connection(&mut server, &encrypt(&mut client, b"-two"))
+                .unwrap();
+            let mut deframer = TlsDeframer::new();
+            deframer.feed(b"-three");
+            let io = ScriptedIo {
+                reads: VecDeque::new(),
+            };
+            let mut vision = VisionStream::new_server(
+                CryptoTlsStream::new(io, server, Some(deframer)),
+                uuid,
+                &initial,
+            )
+            .unwrap();
+            assert_buffered_reads(&mut vision, b"one-two-three");
+        }
+    }
+
+    #[test]
+    fn initial_end_preserves_queued_records_and_partial_ciphertext() {
+        for backend in BACKENDS {
+            let (mut client, mut server) = connection_pair(backend);
+            let uuid = [7; 16];
+            let mut initial = uuid.to_vec();
+            initial.extend_from_slice(&[COMMAND_END, 0, 3, 0, 0]);
+            initial.extend_from_slice(b"one");
+            feed_and_process_crypto_connection(&mut server, &encrypt(&mut client, b"-two"))
+                .unwrap();
+            let mut deframer = TlsDeframer::new();
+            deframer.feed(&encrypt(&mut client, b"-three"));
+            let last = encrypt(&mut client, b"-four");
+            deframer.feed(&last[..10]);
+            let io = ScriptedIo {
+                reads: VecDeque::from([last[10..].to_vec().into()]),
+            };
+            let mut vision = VisionStream::new_server(
+                CryptoTlsStream::new(io, server, Some(deframer)),
+                uuid,
+                &initial,
+            )
+            .unwrap();
+            assert_buffered_reads(&mut vision, b"one-two-three-four");
+        }
+    }
+
+    #[test]
+    fn framed_tls_drains_large_preread_in_both_directions() {
+        let payload = vec![b'Q'; 40_000];
+        for backend in BACKENDS {
+            let (mut client, mut server) = connection_pair(backend);
+            let request = encrypt(&mut client, &payload);
+            let response = encrypt(&mut server, &payload);
+            for (session, ciphertext) in [(server, request), (client, response)] {
+                let mut deframer = TlsDeframer::new();
+                deframer.feed(&ciphertext);
+                let io = ScriptedIo {
+                    reads: VecDeque::new(),
+                };
+                let mut stream = CryptoTlsStream::new(io, session, Some(deframer));
+                assert_buffered_reads(&mut stream, &payload);
+            }
+        }
+    }
+
+    #[test]
+    fn framed_tls_without_vision_handoff_preserves_both_directions() {
+        for backend in BACKENDS {
+            let (mut client, mut server) = connection_pair(backend);
+            let request = [encrypt(&mut client, b"one"), encrypt(&mut client, b"-two")].concat();
+            let response = [
+                encrypt(&mut server, b"three"),
+                encrypt(&mut server, b"-four"),
+            ]
+            .concat();
+            for (session, ciphertext, expected) in [
+                (server, request, b"one-two".as_slice()),
+                (client, response, b"three-four".as_slice()),
+            ] {
+                let mut deframer = TlsDeframer::new();
+                deframer.feed(&ciphertext[..8]);
+                let io = ScriptedIo {
+                    reads: VecDeque::from([ciphertext[8..].to_vec().into()]),
+                };
+                let mut stream = CryptoTlsStream::new(io, session, Some(deframer));
+                assert_buffered_reads(&mut stream, expected);
+            }
+        }
+    }
 
     fn completed_reality_connection() -> CryptoConnection {
         let config = RealityServerConfig {
@@ -1550,7 +1610,12 @@ mod tests {
         }
 
         let (io, _peer) = tokio::io::duplex(64);
-        let mut stream = VisionStream::new_server(io, session, uuid, &initial).unwrap();
+        let mut stream = VisionStream::new_server(
+            CryptoTlsStream::new(io, session, Some(TlsDeframer::new())),
+            uuid,
+            &initial,
+        )
+        .unwrap();
         let expected_mode = match command {
             UnpadCommand::End => VisionMode::Tls,
             UnpadCommand::Direct => VisionMode::Direct,
@@ -1560,19 +1625,7 @@ mod tests {
 
         let mut expected = b"one-two".to_vec();
         expected.extend_from_slice(session_plaintext);
-        let mut received = Vec::new();
-        let mut cx = Context::from_waker(noop_waker_ref());
-        while received.len() < expected.len() {
-            let mut bytes = [0; 3];
-            let mut buf = ReadBuf::new(&mut bytes);
-            assert!(matches!(
-                Pin::new(&mut stream).poll_read(&mut cx, &mut buf),
-                Poll::Ready(Ok(()))
-            ));
-            assert!(!buf.filled().is_empty());
-            received.extend_from_slice(buf.filled());
-        }
-        assert_eq!(received, expected);
+        assert_buffered_reads(&mut stream, &expected);
         assert!(stream.pending_read.is_empty());
     }
 
