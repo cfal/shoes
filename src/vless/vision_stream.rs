@@ -225,21 +225,23 @@ where
         }
     }
 
-    /// Feed initial read data that was already decrypted by TLS but needs VISION unpadding
-    /// This is used when the VLESS header parser read extra bytes from the TLS stream.
-    /// This can be called multiple times in order to successfully drain the session.
-    /// Those bytes are already TLS-decrypted but still VISION-padded.
+    /// Feed TLS plaintext buffered before the Vision handoff. An earlier chunk may
+    /// already have ended padding, so subsequent chunks must follow the new mode.
     fn feed_initial_read_data(&mut self, data: &[u8]) -> std::io::Result<()> {
         if data.is_empty() {
             return Ok(());
         }
 
         log::debug!(
-            "VISION: Feeding {} initial bytes (already TLS-decrypted, needs unpadding)",
-            data.len()
+            "VISION: Feeding {} initial decrypted bytes in {} mode",
+            data.len(),
+            self.read_mode
         );
 
-        self.handle_padded_bytes(data)?;
+        match self.read_mode {
+            VisionMode::PaddingTls => self.handle_padded_bytes(data)?,
+            VisionMode::Tls | VisionMode::Direct => self.pending_read.extend_from_slice(data),
+        }
 
         Ok(())
     }
@@ -281,7 +283,7 @@ where
             }
         }
 
-        self.handle_padded_bytes(&decrypted)
+        self.feed_initial_read_data(&decrypted)
     }
 
     fn switch_read_to_direct_mode(&mut self) -> io::Result<()> {
@@ -1506,3 +1508,91 @@ where
 }
 
 impl<IO> AsyncStream for VisionStream<IO> where IO: AsyncStream {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::address::{Address, NetLocation};
+    use crate::reality::{RealityServerConfig, RealityServerConnection};
+    use futures::task::noop_waker_ref;
+
+    fn completed_reality_connection() -> CryptoConnection {
+        let config = RealityServerConfig {
+            private_key: [0; 32],
+            short_ids: vec![[0; 8]],
+            dest: NetLocation::new(Address::UNSPECIFIED, 443),
+            max_time_diff: None,
+            min_client_version: None,
+            max_client_version: None,
+            cipher_suites: Vec::new(),
+        };
+        CryptoConnection::new_reality_server(
+            RealityServerConnection::new(config)
+                .unwrap()
+                .complete_for_test()
+                .unwrap(),
+        )
+    }
+
+    fn assert_initial_mode_transition(command: UnpadCommand, session_plaintext: &[u8]) {
+        let uuid = [7; 16];
+        let mut initial = uuid.to_vec();
+        initial.extend_from_slice(&[command as u8, 0, 3, 0, 2]);
+        initial.extend_from_slice(b"one\0\0-two");
+
+        let mut session = completed_reality_connection();
+        if !session_plaintext.is_empty() {
+            let mut peer = completed_reality_connection();
+            peer.writer().write_all(session_plaintext).unwrap();
+            let mut ciphertext = Vec::new();
+            peer.write_tls(&mut ciphertext).unwrap();
+            feed_and_process_crypto_connection(&mut session, &ciphertext).unwrap();
+        }
+
+        let (io, _peer) = tokio::io::duplex(64);
+        let mut stream = VisionStream::new_server(io, session, uuid, &initial).unwrap();
+        let expected_mode = match command {
+            UnpadCommand::End => VisionMode::Tls,
+            UnpadCommand::Direct => VisionMode::Direct,
+            UnpadCommand::Continue => panic!("expected a final padding command"),
+        };
+        assert_eq!(stream.read_mode, expected_mode);
+
+        let mut expected = b"one-two".to_vec();
+        expected.extend_from_slice(session_plaintext);
+        let mut received = Vec::new();
+        let mut cx = Context::from_waker(noop_waker_ref());
+        while received.len() < expected.len() {
+            let mut bytes = [0; 3];
+            let mut buf = ReadBuf::new(&mut bytes);
+            assert!(matches!(
+                Pin::new(&mut stream).poll_read(&mut cx, &mut buf),
+                Poll::Ready(Ok(()))
+            ));
+            assert!(!buf.filled().is_empty());
+            received.extend_from_slice(buf.filled());
+        }
+        assert_eq!(received, expected);
+        assert!(stream.pending_read.is_empty());
+    }
+
+    #[test]
+    fn initial_end_preserves_session_plaintext() {
+        assert_initial_mode_transition(UnpadCommand::End, b"-three");
+    }
+
+    #[test]
+    fn initial_end_accepts_empty_session() {
+        assert_initial_mode_transition(UnpadCommand::End, b"");
+    }
+
+    #[test]
+    fn initial_direct_preserves_session_plaintext() {
+        assert_initial_mode_transition(UnpadCommand::Direct, b"-three");
+    }
+
+    #[test]
+    fn initial_direct_accepts_empty_session() {
+        assert_initial_mode_transition(UnpadCommand::Direct, b"");
+    }
+}
