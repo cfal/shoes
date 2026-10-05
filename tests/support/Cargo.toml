@@ -5,19 +5,19 @@ edition = "2024"
 publish = false
 
 [dependencies]
-aws-lc-rs = { version = "*", default-features = false }
-base64 = "*"
-bytes = "*"
-futures = "*"
-http-body-util = "*"
-hyper = { version = "*", features = ["server", "http1", "http2"] }
-hyper-util = { version = "*", features = ["tokio", "server"] }
-rand = "*"
-rcgen = { version = "*", default-features = false, features = ["aws_lc_rs", "pem"] }
-rustls = "*"
-rustls-pemfile = "*"
-tempfile = "*"
-tokio = { version = "*", features = [
+aws-lc-rs = { version = "1.18.1", default-features = false }
+base64 = "0.23.1"
+bytes = "1.12.1"
+futures = "0.3.34"
+http-body-util = "0.1.5"
+hyper = { version = "1.11.1", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1.21", features = ["tokio", "server"] }
+rand = "0.10.3"
+rcgen = { version = "0.14.10", default-features = false, features = ["aws_lc_rs", "pem"] }
+rustls = "0.23.45"
+rustls-pemfile = "2.2.0"
+tempfile = "3.27.0"
+tokio = { version = "1.53.2", features = [
     "fs",
     "io-util",
     "macros",
@@ -26,7 +26,7 @@ tokio = { version = "*", features = [
     "sync",
     "time",
 ] }
-tokio-rustls = "*"
+tokio-rustls = "0.26.6"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-libc = "*"
+libc = "0.2.190"
