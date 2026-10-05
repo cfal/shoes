@@ -205,6 +205,16 @@ pub fn clear_global_socket_protector() {
     *GLOBAL_SOCKET_PROTECTOR.write().unwrap() = None;
 }
 
+pub fn clear_global_socket_protector_if_current(protector: &Arc<dyn SocketProtector>) {
+    let mut current = GLOBAL_SOCKET_PROTECTOR.write().unwrap();
+    if current
+        .as_ref()
+        .is_some_and(|current| Arc::ptr_eq(current, protector))
+    {
+        *current = None;
+    }
+}
+
 /// Get the global socket protector.
 ///
 /// Returns the set protector, or a no-op protector if none was set.

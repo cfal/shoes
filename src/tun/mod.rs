@@ -48,8 +48,9 @@ mod platform;
 )]
 pub use platform::{
     FnSocketProtector, NoOpPlatformCallbacks, NoOpSocketProtector, PlatformCallbacks,
-    PlatformInterface, SocketProtector, clear_global_socket_protector, get_global_socket_protector,
-    protect_socket, set_global_socket_protector,
+    PlatformInterface, SocketProtector, clear_global_socket_protector,
+    clear_global_socket_protector_if_current, get_global_socket_protector, protect_socket,
+    set_global_socket_protector,
 };
 
 pub use tun_server::TunServerConfig;
