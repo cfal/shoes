@@ -97,10 +97,6 @@ pub struct VisionStream<IO> {
     /// Used in PaddingTls mode
     vless_response_to_send: bool,
 
-    /// Flag indicating we should switch to direct mode on the NEXT write call
-    /// Used in PaddingTls mode
-    pending_direct_mode_switch: bool,
-
     /// Flag indicating we should switch to Tls mode on the NEXT write call
     /// Used in PaddingTls mode
     pending_tls_mode_switch: bool,
@@ -164,7 +160,6 @@ where
             partial_vless_response: BytesMut::new(),
             vless_response_pending,
             vless_response_to_send,
-            pending_direct_mode_switch: false,
             pending_tls_mode_switch: false,
             pending_plain_writes: BytesMut::new(),
         }
@@ -229,8 +224,6 @@ where
         Ok(())
     }
 
-    /// Switch WRITE side from TLS mode to direct I/O mode
-    /// This doesn't need to preserve any data, just updates the mode
     fn switch_write_to_direct_mode(&mut self) -> io::Result<()> {
         if self.write_mode != VisionMode::PaddingTls {
             return Err(std::io::Error::other(format!(
@@ -243,7 +236,8 @@ where
             "VISION WRITE: Switching to direct copy mode (asymmetric - read side may still use padding)"
         );
 
-        // Set write mode to Direct
+        self.tls.start_raw_write(&self.pending_plain_writes)?;
+        self.pending_plain_writes.clear();
         self.write_mode = VisionMode::Direct;
 
         self.post_padding_cleanup();
@@ -455,18 +449,8 @@ where
             self.vless_response_to_send = false;
         }
 
-        // Drain all pending writes - this must be done before mode switch
-        // as the session could contain the DIRECT/END packet that triggered the mode switch flag,
-        // and because we no longer use `pending_plain_writes` afterwards.
+        // Finish earlier padded writes before applying END or accepting another record.
         ready!(self.drain_all_writes_padding(cx))?;
-
-        if self.pending_direct_mode_switch {
-            log::debug!("VISION WRITE: Switching to direct mode (flag set by previous write)");
-            ready!(self.tls.poll_start_raw_write(cx))?;
-            self.pending_direct_mode_switch = false;
-            self.switch_write_to_direct_mode()?;
-            return Pin::new(&mut self.tls).poll_write(cx, buf);
-        }
 
         if self.pending_tls_mode_switch {
             log::debug!("VISION WRITE: Switching to Tls mode (flag set by previous write)");
@@ -509,10 +493,7 @@ where
                             log::debug!("VISION WRITE: Filtering ended, not TLS 1.2 or above");
                         }
 
-                        // DIRECT or END command
-                        // Toggle mode switch flag, if `non_tls_filtering_ended`, it never supports XTLS
                         let command = if self.filter.supports_xtls() {
-                            self.pending_direct_mode_switch = true;
                             COMMAND_DIRECT
                         } else {
                             self.pending_tls_mode_switch = true;
@@ -534,6 +515,9 @@ where
                         };
 
                         self.queue_padded_write(&final_padded_packet);
+                        if command == COMMAND_DIRECT {
+                            self.switch_write_to_direct_mode()?;
+                        }
 
                         // this must be true because else we would have a successful next_record call on previous iteration
                         assert!(processed_len > existing_inner_len);
@@ -798,11 +782,6 @@ impl<IO: AsyncStream> AsyncWrite for VisionStream<IO> {
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         ready!(self.as_mut().poll_flush(cx))?;
-        if self.pending_direct_mode_switch {
-            ready!(self.tls.poll_start_raw_write(cx))?;
-            self.pending_direct_mode_switch = false;
-            self.switch_write_to_direct_mode()?;
-        }
         Pin::new(&mut self.tls).poll_shutdown(cx)
     }
 }
@@ -1058,6 +1037,16 @@ mod tests {
         ciphertext
     }
 
+    fn inner_server_hello() -> bytes::Bytes {
+        let (mut client, mut server) = new_connections(Backend::Tls13);
+        transfer_tls(&mut client, &mut server);
+        let mut flight = Vec::new();
+        server.write_tls(&mut flight).unwrap();
+        let mut deframer = TlsDeframer::new();
+        deframer.feed(&flight);
+        deframer.next_record().unwrap().unwrap()
+    }
+
     fn assert_buffered_reads(stream: &mut (impl AsyncRead + Unpin), expected: &[u8]) {
         let mut received = Vec::new();
         let mut cx = Context::from_waker(noop_waker_ref());
@@ -1124,7 +1113,7 @@ mod tests {
             let mut vision = VisionStream::new_server(tls, [7; 16], b"").unwrap();
             vision.vless_response_to_send = false;
             vision.queue_padded_write(b"-final padded record");
-            vision.pending_direct_mode_switch = true;
+            vision.switch_write_to_direct_mode().unwrap();
             assert!(
                 Pin::new(&mut vision)
                     .poll_write(&mut cx, b"raw")
@@ -1172,14 +1161,147 @@ mod tests {
         };
         let mut tls = CryptoTlsStream::new(io, session, Some(TlsDeframer::new()));
         let mut cx = Context::from_waker(noop_waker_ref());
-        assert!(matches!(
-            tls.poll_start_raw_write(&mut cx),
-            Poll::Ready(Ok(()))
-        ));
+        tls.start_raw_write(b"").unwrap();
         let mut bytes = [0; 8];
         let result = Pin::new(&mut tls).poll_read(&mut cx, &mut ReadBuf::new(&mut bytes));
         assert!(matches!(result, Poll::Ready(Err(_))));
         assert!(gate.lock().unwrap().output.is_empty());
+    }
+
+    #[test]
+    fn direct_write_never_sends_later_tls_alerts() {
+        use std::io::{BufRead, Read};
+
+        let hello = inner_server_hello();
+        let application = b"\x17\x03\x03\x00\x03app";
+        let uuid = [7; 16];
+        for backend in BACKENDS {
+            for flush_first in [false, true] {
+                for blocked in [false, true] {
+                    let (mut peer, session) = connection_pair(backend);
+                    let gate = Arc::new(std::sync::Mutex::new(WriteGate::default()));
+                    let io = GatedIo {
+                        input: ScriptedIo {
+                            reads: VecDeque::from([bytes::Bytes::from_static(
+                                b"\x17\x03\x03\x00\x03bad",
+                            )]),
+                        },
+                        gate: gate.clone(),
+                    };
+                    let tls = CryptoTlsStream::new(io, session, Some(TlsDeframer::new()));
+                    let mut vision = VisionStream::new_server(tls, uuid, b"").unwrap();
+                    let mut cx = Context::from_waker(noop_waker_ref());
+                    assert!(matches!(
+                        Pin::new(&mut vision).poll_write(&mut cx, &hello),
+                        Poll::Ready(Ok(n)) if n == hello.len()
+                    ));
+                    gate.lock().unwrap().blocked = blocked;
+                    assert!(matches!(
+                        Pin::new(&mut vision).poll_write(&mut cx, application),
+                        Poll::Ready(Ok(n)) if n == application.len()
+                    ));
+                    if flush_first {
+                        let result = Pin::new(&mut vision).poll_flush(&mut cx);
+                        if blocked {
+                            assert!(result.is_pending());
+                        } else {
+                            assert!(matches!(result, Poll::Ready(Ok(()))));
+                        }
+                    }
+                    let sent_before_read = gate.lock().unwrap().output.clone();
+                    let mut bytes = [0; 8];
+                    assert!(matches!(
+                        Pin::new(&mut vision).poll_read(&mut cx, &mut ReadBuf::new(&mut bytes)),
+                        Poll::Ready(Err(_))
+                    ));
+                    assert_eq!(gate.lock().unwrap().output, sent_before_read);
+
+                    gate.lock().unwrap().blocked = false;
+                    assert!(matches!(
+                        Pin::new(&mut vision).poll_flush(&mut cx),
+                        Poll::Ready(Ok(()))
+                    ));
+                    assert!(matches!(
+                        Pin::new(&mut vision).poll_shutdown(&mut cx),
+                        Poll::Ready(Ok(()))
+                    ));
+                    let ciphertext = gate.lock().unwrap().output.clone();
+                    feed_and_process_crypto_connection(&mut peer, &ciphertext).unwrap();
+                    let mut plaintext = Vec::new();
+                    if let Err(error) = peer.reader().read_to_end(&mut plaintext) {
+                        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+                    }
+                    assert!(matches!(peer.reader().fill_buf(),
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock));
+                    assert_eq!(&plaintext[..2], &[0, 0]);
+                    let result = VisionUnpadder::new(uuid).unpad(&plaintext[2..]).unwrap();
+                    assert_eq!(result.command, Some(UnpadCommand::Direct));
+                    assert_eq!(result.content, [hello.as_ref(), application].concat());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn direct_transition_keeps_reads_live_under_output_backpressure() {
+        let hello = inner_server_hello();
+        let application = b"\x17\x03\x03\x00\x03app";
+        let uuid = [7; 16];
+        for backend in BACKENDS {
+            let (mut peer, session) = connection_pair(backend);
+            let mut reply = uuid.to_vec();
+            reply.extend_from_slice(&[COMMAND_CONTINUE, 0, 5, 0, 0]);
+            reply.extend_from_slice(b"reply");
+            let gate = Arc::new(std::sync::Mutex::new(WriteGate::default()));
+            let io = GatedIo {
+                input: ScriptedIo {
+                    reads: VecDeque::from([encrypt(&mut peer, &reply).into()]),
+                },
+                gate: gate.clone(),
+            };
+            let tls = CryptoTlsStream::new(io, session, Some(TlsDeframer::new()));
+            let mut vision = VisionStream::new_server(tls, uuid, b"").unwrap();
+            let mut cx = Context::from_waker(noop_waker_ref());
+            assert!(matches!(
+                Pin::new(&mut vision).poll_write(&mut cx, &hello),
+                Poll::Ready(Ok(n)) if n == hello.len()
+            ));
+            gate.lock().unwrap().blocked = true;
+            gate.lock().unwrap().flush_blocked = true;
+            assert!(matches!(
+                Pin::new(&mut vision).poll_write(&mut cx, application),
+                Poll::Ready(Ok(n)) if n == application.len()
+            ));
+            assert!(
+                Pin::new(&mut vision)
+                    .poll_write(&mut cx, b"raw")
+                    .is_pending()
+            );
+            let mut bytes = [0; 8];
+            let mut buf = ReadBuf::new(&mut bytes);
+            assert!(matches!(
+                Pin::new(&mut vision).poll_read(&mut cx, &mut buf),
+                Poll::Ready(Ok(()))
+            ));
+            assert_eq!(buf.filled(), b"reply");
+
+            gate.lock().unwrap().blocked = false;
+            assert!(
+                Pin::new(&mut vision)
+                    .poll_write(&mut cx, b"raw")
+                    .is_pending()
+            );
+            let ciphertext = gate.lock().unwrap().output.clone();
+            gate.lock().unwrap().flush_blocked = false;
+            assert!(matches!(
+                Pin::new(&mut vision).poll_write(&mut cx, b"raw"),
+                Poll::Ready(Ok(3))
+            ));
+            assert_eq!(
+                gate.lock().unwrap().output,
+                [ciphertext.as_slice(), b"raw"].concat()
+            );
+        }
     }
 
     #[test]

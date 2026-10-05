@@ -85,6 +85,7 @@ pub struct CryptoTlsStream<IO> {
     input: TlsInput,
     transport_eof: bool,
     write_raw: bool,
+    raw_write_prefix: Option<Bytes>,
 }
 
 impl<IO: AsyncStream> CryptoTlsStream<IO> {
@@ -116,6 +117,7 @@ impl<IO: AsyncStream> CryptoTlsStream<IO> {
             input,
             transport_eof: false,
             write_raw: false,
+            raw_write_prefix: None,
         }
     }
 
@@ -208,12 +210,36 @@ impl<IO: AsyncStream> CryptoTlsStream<IO> {
         Ok(())
     }
 
-    pub fn poll_start_raw_write(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        if !self.write_raw {
-            ready!(Pin::new(&mut *self).poll_flush(cx))?;
-            self.write_raw = true;
+    pub fn start_raw_write(&mut self, mut final_plaintext: &[u8]) -> io::Result<()> {
+        if self.write_raw {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "TLS output has already switched to raw mode",
+            ));
         }
-        Poll::Ready(Ok(()))
+
+        // Freeze the final TLS flight before reads can queue alerts or KeyUpdate
+        // responses. Reads remain independent while this prefix drains and flushes.
+        let mut prefix = Vec::new();
+        loop {
+            while self.session.wants_write() {
+                if self.session.write_tls(&mut prefix)? == 0 {
+                    return Err(io::ErrorKind::WriteZero.into());
+                }
+            }
+            if final_plaintext.is_empty() {
+                break;
+            }
+            let written = self.session.writer().write(final_plaintext)?;
+            if written == 0 {
+                return Err(io::ErrorKind::WriteZero.into());
+            }
+            final_plaintext = &final_plaintext[written..];
+            self.session.writer().flush()?;
+        }
+        self.raw_write_prefix = Some(prefix.into());
+        self.write_raw = true;
+        Ok(())
     }
 
     pub(super) fn poll_receive_tls(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
@@ -273,7 +299,16 @@ impl<IO: AsyncStream> CryptoTlsStream<IO> {
 
     pub fn poll_drain_tls(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         // The peer no longer accepts TLS records once this direction is raw.
-        if !self.write_raw {
+        if let Some(prefix) = &mut self.raw_write_prefix {
+            while !prefix.is_empty() {
+                let written = ready!(Pin::new(&mut self.io).poll_write(cx, prefix))?;
+                if written == 0 {
+                    return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
+                }
+                prefix.advance(written);
+                self.need_flush = true;
+            }
+        } else if !self.write_raw {
             while self.session.wants_write() {
                 if ready!(self.write_tls_direct(cx))? == 0 {
                     return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
@@ -353,6 +388,9 @@ impl<IO: AsyncStream> AsyncWrite for CryptoTlsStream<IO> {
             )));
         }
         if self.write_raw {
+            if self.raw_write_prefix.is_some() {
+                ready!(self.as_mut().poll_flush(cx))?;
+            }
             return Pin::new(&mut self.io).poll_write(cx, buf);
         }
 
@@ -371,7 +409,11 @@ impl<IO: AsyncStream> AsyncWrite for CryptoTlsStream<IO> {
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         if self.write_raw {
-            return Pin::new(&mut self.io).poll_flush(cx);
+            ready!(self.poll_drain_tls(cx))?;
+            ready!(Pin::new(&mut self.io).poll_flush(cx))?;
+            self.raw_write_prefix = None;
+            self.need_flush = false;
+            return Poll::Ready(Ok(()));
         }
         self.session.writer().flush()?;
         ready!(self.poll_drain_tls(cx))?;
@@ -392,6 +434,7 @@ impl<IO: AsyncStream> AsyncWrite for CryptoTlsStream<IO> {
             }
             ready!(self.as_mut().poll_flush(cx))?;
         } else {
+            ready!(self.as_mut().poll_flush(cx))?;
             self.state.shutdown_write();
         }
         match Pin::new(&mut self.io).poll_shutdown(cx) {
