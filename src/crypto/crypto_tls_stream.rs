@@ -407,6 +407,51 @@ impl<IO: AsyncStream> AsyncWrite for CryptoTlsStream<IO> {
         Poll::Ready(Ok(pos))
     }
 
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        if !self.state.writeable() {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "write side is shut down",
+            )));
+        }
+        if self.write_raw {
+            if self.raw_write_prefix.is_some() {
+                ready!(self.as_mut().poll_flush(cx))?;
+            }
+            return Pin::new(&mut self.io).poll_write_vectored(cx, bufs);
+        }
+        if bufs.iter().all(|buf| buf.is_empty()) {
+            return Poll::Ready(Ok(0));
+        }
+
+        loop {
+            let written = self.session.writer().write_vectored(bufs)?;
+            let pending = match self.poll_drain_tls(cx) {
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Ready(Ok(())) => false,
+                Poll::Pending => true,
+            };
+            if written > 0 {
+                return Poll::Ready(Ok(written));
+            }
+            if pending {
+                return Poll::Pending;
+            }
+        }
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        if self.write_raw {
+            self.io.is_write_vectored()
+        } else {
+            !self.session.is_reality()
+        }
+    }
+
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         if self.write_raw {
             ready!(self.poll_drain_tls(cx))?;
@@ -565,6 +610,145 @@ mod tests {
             .unwrap()
             .complete_for_test()
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn vectored_tls_roundtrip_with_partial_transport_writes() {
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert.cert.der().clone()).unwrap();
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![cert.cert.der().clone()],
+                rustls::pki_types::PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der())
+                    .into(),
+            )
+            .unwrap();
+        let client_config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let server = CryptoConnection::new_rustls_server(
+            rustls::ServerConnection::new(Arc::new(server_config)).unwrap(),
+        );
+        let client = CryptoConnection::new_rustls_client(
+            rustls::ClientConnection::new(Arc::new(client_config), "localhost".try_into().unwrap())
+                .unwrap(),
+        );
+        let (client_io, server_io) = tokio::io::duplex(256);
+        let peer = tokio::spawn(async move {
+            let mut stream =
+                CryptoTlsStream::handshake(server_io, server, TlsReadMode::Stream, &[])
+                    .await
+                    .unwrap();
+            let mut received = Vec::new();
+            stream.read_to_end(&mut received).await.unwrap();
+            received
+        });
+        let mut stream = CryptoTlsStream::handshake(client_io, client, TlsReadMode::Stream, &[])
+            .await
+            .unwrap();
+        assert!(stream.is_write_vectored());
+        assert_eq!(
+            stream
+                .write_vectored(&[io::IoSlice::new(b"")])
+                .await
+                .unwrap(),
+            0
+        );
+        let payload: Vec<u8> = (0..70000).map(|i| (i ^ (i >> 8)) as u8).collect();
+        let mut slices = [
+            io::IoSlice::new(b""),
+            io::IoSlice::new(&payload[..9]),
+            io::IoSlice::new(&payload[9..40000]),
+            io::IoSlice::new(&payload[40000..]),
+        ];
+        let mut remaining = &mut slices[..];
+        while !remaining.is_empty() {
+            let written = stream.write_vectored(remaining).await.unwrap();
+            assert!(written > 0);
+            io::IoSlice::advance_slices(&mut remaining, written);
+        }
+        stream.shutdown().await.unwrap();
+        assert_eq!(peer.await.unwrap(), payload);
+        assert_eq!(
+            stream.write_vectored(&slices).await.unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
+    }
+
+    #[test]
+    fn vectored_reality_fallback_accounts_for_accepted_plaintext_under_backpressure() {
+        let mut stream = CryptoTlsStream::new(
+            PendingWriteIo,
+            CryptoConnection::new_reality_server(completed_reality_connection()),
+            None,
+        );
+        assert!(!stream.is_write_vectored());
+        let mut cx = Context::from_waker(noop_waker_ref());
+        let data = [7; 16384];
+        let slices = [
+            io::IoSlice::new(b""),
+            io::IoSlice::new(&data),
+            io::IoSlice::new(&data),
+        ];
+        let mut accepted = 0;
+        let mut blocked = false;
+        for _ in 0..16 {
+            match Pin::new(&mut stream).poll_write_vectored(&mut cx, &slices) {
+                Poll::Ready(Ok(n)) => {
+                    assert!(n > 0);
+                    accepted += n;
+                }
+                Poll::Pending => {
+                    blocked = true;
+                    break;
+                }
+                Poll::Ready(Err(error)) => panic!("unexpected error: {error}"),
+            }
+        }
+        assert!(blocked);
+        assert!(accepted > 0 && accepted <= 65536);
+    }
+
+    #[tokio::test]
+    async fn raw_vectors_follow_the_entire_encrypted_prefix() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (io, mut peer) = tokio::io::duplex(8);
+        let mut stream = CryptoTlsStream::new(
+            io,
+            CryptoConnection::new_reality_server(completed_reality_connection()),
+            None,
+        );
+        stream.start_raw_write(b"last encrypted bytes").unwrap();
+        let mut expected = stream.raw_write_prefix.as_ref().unwrap().to_vec();
+        expected.extend_from_slice(b"raw bytes");
+        let mut received = vec![0; expected.len()];
+        let slices = [io::IoSlice::new(b"raw "), io::IoSlice::new(b"bytes")];
+        let mut cx = Context::from_waker(noop_waker_ref());
+        assert!(
+            Pin::new(&mut stream)
+                .poll_write_vectored(&mut cx, &slices)
+                .is_pending()
+        );
+        assert!(stream.is_write_vectored());
+        let send = async {
+            let mut slices = slices;
+            let mut remaining = &mut slices[..];
+            while !remaining.is_empty() {
+                let n = stream.write_vectored(remaining).await.unwrap();
+                assert!(n > 0);
+                io::IoSlice::advance_slices(&mut remaining, n);
+            }
+            stream.flush().await.unwrap();
+        };
+        let ((), read) = tokio::join!(send, peer.read_exact(&mut received));
+        read.unwrap();
+        assert_eq!(received, expected);
     }
 
     #[tokio::test]

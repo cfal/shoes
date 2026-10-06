@@ -96,6 +96,15 @@ pub struct TcpClientSetupResult {
     reason = "async-trait adds must_use to boxed futures"
 )]
 pub trait TcpClientHandler: Send + Sync + Debug {
+    /// Opens a logical stream on an existing session without acquiring a new transport.
+    /// Only a miss permits cold setup; an open error must not retry the request.
+    async fn try_reuse_tcp_stream(
+        &self,
+        _target: &ResolvedLocation,
+    ) -> std::io::Result<Option<TcpClientSetupResult>> {
+        Ok(None)
+    }
+
     /// Setup a client connection through this proxy.
     ///
     /// # Arguments

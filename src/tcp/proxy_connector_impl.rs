@@ -62,6 +62,13 @@ impl ProxyConnector for ProxyConnectorImpl {
         self.client_handler.supports_udp_over_tcp()
     }
 
+    async fn try_reuse_tcp_stream(
+        &self,
+        target: &ResolvedLocation,
+    ) -> std::io::Result<Option<TcpClientSetupResult>> {
+        self.client_handler.try_reuse_tcp_stream(target).await
+    }
+
     async fn setup_tcp_stream(
         &self,
         stream: Box<dyn AsyncStream>,
@@ -100,6 +107,138 @@ mod tests {
 
     fn mock_resolver() -> Arc<dyn Resolver> {
         Arc::new(NativeResolver::new())
+    }
+
+    #[derive(Debug)]
+    struct OneTransport {
+        stream: std::sync::Mutex<Option<tokio::io::DuplexStream>>,
+        connects: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl crate::tcp::socket_connector::SocketConnector for OneTransport {
+        async fn connect(
+            &self,
+            _: &Arc<dyn Resolver>,
+            _: &ResolvedLocation,
+        ) -> std::io::Result<Box<dyn AsyncStream>> {
+            self.connects
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(Box::new(
+                self.stream
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("unexpected redundant dial"),
+            ))
+        }
+        async fn connect_udp_bidirectional(
+            &self,
+            _: &Arc<dyn Resolver>,
+            _: ResolvedLocation,
+        ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
+            unreachable!()
+        }
+        fn bind_interface(&self) -> Option<&str> {
+            None
+        }
+    }
+
+    #[tokio::test]
+    async fn warm_naive_streams_share_one_socket_and_tls_handshake() {
+        use crate::client_proxy_chain::{ClientProxyChain, InitialHopEntry};
+        use crate::naiveproxy::NaiveProxyTcpClientHandler;
+        use crate::tls_client_handler::TlsClientHandler;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert.cert.der().clone()).unwrap();
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![cert.cert.der().clone()],
+                rustls::pki_types::PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der())
+                    .into(),
+            )
+            .unwrap();
+        let client_config = Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        let (client, peer) = tokio::io::duplex(4096);
+        let peer = tokio::spawn(async move {
+            let tls = tokio_rustls::TlsAcceptor::from(Arc::new(server_config))
+                .accept(peer)
+                .await
+                .unwrap();
+            let mut h2 = h2::server::handshake(tls).await.unwrap();
+            let mut echoes = tokio::task::JoinSet::new();
+            while let Some(request) = h2.accept().await {
+                let (request, mut respond) = request.unwrap();
+                assert_eq!(
+                    request.uri().authority().unwrap().as_str(),
+                    "example.com:443"
+                );
+                let mut send = respond
+                    .send_response(http::Response::new(()), false)
+                    .unwrap();
+                echoes.spawn(async move {
+                    let mut receive = request.into_body();
+                    let mut payload = Vec::new();
+                    while let Some(data) = receive.data().await {
+                        let data = data.unwrap();
+                        receive.flow_control().release_capacity(data.len()).unwrap();
+                        payload.extend_from_slice(&data);
+                    }
+                    send.send_data(payload.into(), true).unwrap();
+                });
+            }
+        });
+        let connects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let proxy = ProxyConnectorImpl {
+            location: NetLocation::from_str("localhost:443", None).unwrap(),
+            client_handler: Box::new(TlsClientHandler::new(
+                client_config,
+                None,
+                "localhost".try_into().unwrap(),
+                Box::new(NaiveProxyTcpClientHandler::new("user", "pass", false)),
+            )),
+        };
+        let chain = ClientProxyChain::new(
+            vec![InitialHopEntry::Proxy {
+                socket: Box::new(OneTransport {
+                    stream: std::sync::Mutex::new(Some(client)),
+                    connects: connects.clone(),
+                }),
+                proxy: Box::new(proxy),
+            }],
+            vec![],
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            for payload in [b"cold request".as_slice(), b"warm request"] {
+                let target = NetLocation::from_str("example.com:443", None)
+                    .unwrap()
+                    .into();
+                let mut stream = chain
+                    .connect_tcp(target, &mock_resolver())
+                    .await
+                    .unwrap()
+                    .client_stream;
+                stream.write_all(payload).await.unwrap();
+                stream.shutdown().await.unwrap();
+                let mut response = Vec::new();
+                stream.read_to_end(&mut response).await.unwrap();
+                assert_eq!(response, payload);
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(connects.load(std::sync::atomic::Ordering::Relaxed), 1);
+        drop(chain);
+        peer.abort();
+        let _ = peer.await;
     }
 
     #[test]

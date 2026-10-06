@@ -325,14 +325,14 @@ async fn run_udp_remote_to_local_loop(
     };
 
     let mut next_packet_id: u16 = 0;
-    let mut buf = allocate_vec(65535);
     let mut loop_count: u8 = 0;
 
     loop {
-        let (payload_len, src_addr) = tokio::select! {
+        let (payload, src_addr) = tokio::select! {
             _ = cancel_token.cancelled() => return Ok(()),
-            result = socket.recv_from(&mut buf) => result?,
+            result = socket.recv() => result?,
         };
+        let payload_len = payload.len();
 
         // Yield periodically to allow quinn's internal tasks to run (keepalives, ACKs, etc.)
         // This prevents starvation during heavy UDP traffic.
@@ -373,7 +373,7 @@ async fn run_udp_remote_to_local_loop(
             datagram.extend_from_slice(&[0, 1]);
             datagram.extend_from_slice(&address_len_bytes);
             datagram.extend_from_slice(&address_bytes);
-            datagram.extend_from_slice(&buf[..payload_len]);
+            datagram.extend_from_slice(&payload);
 
             connection
                 .send_datagram(datagram.freeze())
@@ -393,7 +393,7 @@ async fn run_udp_remote_to_local_loop(
                 datagram.extend_from_slice(&[fragment_id, fragment_count]);
                 datagram.extend_from_slice(&address_len_bytes);
                 datagram.extend_from_slice(&address_bytes);
-                datagram.extend_from_slice(&buf[start..end]);
+                datagram.extend_from_slice(&payload[start..end]);
 
                 connection.send_datagram(datagram.freeze()).map_err(|e| {
                     std::io::Error::other(format!(
@@ -547,7 +547,7 @@ async fn run_udp_local_to_remote_loop(
         };
 
         let target = session.pinned_location.clone().unwrap_or(remote_location);
-        if let Err(e) = session.send_socket.send_to(&complete_payload, target) {
+        if let Err(e) = session.send_socket.send_to(complete_payload, target) {
             error!("Failed to forward UDP payload for session {session_id}: {e}");
             sessions.remove(&session_id);
         }

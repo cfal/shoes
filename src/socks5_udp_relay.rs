@@ -141,8 +141,8 @@ pub fn parse_socks5_udp_packet(data: &[u8]) -> std::io::Result<(NetLocation, &[u
 
 /// Encode a SOCKS5 UDP packet with the given source address and payload.
 ///
-/// Returns the complete packet ready to send to the client.
-pub fn encode_socks5_udp_packet(source: &NetLocation, payload: &[u8]) -> Vec<u8> {
+/// Replaces the output with the complete packet ready to send to the client.
+pub fn encode_socks5_udp_packet(source: &NetLocation, payload: &[u8], packet: &mut Vec<u8>) {
     let (address, port) = source.components();
 
     let addr_size = match address {
@@ -151,7 +151,8 @@ pub fn encode_socks5_udp_packet(source: &NetLocation, payload: &[u8]) -> Vec<u8>
         Address::Hostname(h) => 1 + 1 + h.len(), // ATYP + len + domain
     };
     let header_size = 2 + 1 + addr_size + 2; // RSV + FRAG + addr + PORT
-    let mut packet = Vec::with_capacity(header_size + payload.len());
+    packet.clear();
+    packet.reserve(header_size + payload.len());
 
     packet.extend_from_slice(&[0, 0, 0]); // RSV + FRAG
 
@@ -173,8 +174,6 @@ pub fn encode_socks5_udp_packet(source: &NetLocation, payload: &[u8]) -> Vec<u8>
 
     packet.extend_from_slice(&port.to_be_bytes());
     packet.extend_from_slice(payload);
-
-    packet
 }
 
 /// SOCKS5 UDP relay stream.
@@ -194,6 +193,7 @@ pub struct Socks5UdpRelayStream {
     receiver: mpsc::Receiver<(Box<[u8]>, SocketAddr)>,
     /// Handle to the socket reader task.
     reader_task: Option<tokio::task::JoinHandle<()>>,
+    write_buf: Vec<u8>,
 }
 
 impl Socks5UdpRelayStream {
@@ -236,6 +236,7 @@ impl Socks5UdpRelayStream {
             client_addr: None,
             receiver: rx,
             reader_task: Some(reader_task),
+            write_buf: Vec::new(),
         }
     }
 }
@@ -348,16 +349,16 @@ impl AsyncWriteSourcedMessage for Socks5UdpRelayStream {
             }
         };
         let source_location = NetLocation::new(address, source.port());
-        let packet = encode_socks5_udp_packet(&source_location, buf);
+        encode_socks5_udp_packet(&source_location, buf, &mut this.write_buf);
 
         log::debug!(
             "SOCKS5 UDP relay: sending {} byte response from {} to client {}",
-            packet.len(),
+            this.write_buf.len(),
             source_location,
             client_addr
         );
 
-        ready!(this.socket.poll_send_to(cx, &packet, client_addr))?;
+        ready!(this.socket.poll_send_to(cx, &this.write_buf, client_addr))?;
         Poll::Ready(Ok(()))
     }
 }
@@ -408,6 +409,22 @@ impl Drop for Socks5UdpRelayStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reply_storage_reuses_capacity_without_retaining_previous_packet() {
+        let mut packet = Vec::with_capacity(1024);
+        let pointer = packet.as_ptr();
+        for location in ["[::1]:53", "127.0.0.1:123", "example.com:443"] {
+            let location = NetLocation::from_str(location, None).unwrap();
+            for payload in [b"longer payload".as_slice(), b"", b"short"] {
+                encode_socks5_udp_packet(&location, payload, &mut packet);
+                assert_eq!(packet.as_ptr(), pointer);
+                let (decoded_location, decoded_payload) = parse_socks5_udp_packet(&packet).unwrap();
+                assert_eq!(decoded_location, location);
+                assert_eq!(decoded_payload, payload);
+            }
+        }
+    }
 
     #[tokio::test]
     async fn dropping_quiet_relay_releases_reader_and_socket() {
@@ -495,7 +512,8 @@ mod tests {
     #[test]
     fn test_encode_ipv4_packet() {
         let location = NetLocation::new(Address::Ipv4(Ipv4Addr::new(8, 8, 8, 8)), 53);
-        let packet = encode_socks5_udp_packet(&location, b"Hello");
+        let mut packet = Vec::new();
+        encode_socks5_udp_packet(&location, b"Hello", &mut packet);
 
         // Verify by parsing it back
         let (parsed_loc, payload) = parse_socks5_udp_packet(&packet).unwrap();
@@ -508,7 +526,8 @@ mod tests {
     fn test_roundtrip_domain() {
         let location = NetLocation::new(Address::Hostname("dns.google".to_string()), 443);
         let original_payload = b"test data";
-        let packet = encode_socks5_udp_packet(&location, original_payload);
+        let mut packet = Vec::new();
+        encode_socks5_udp_packet(&location, original_payload, &mut packet);
 
         let (parsed_loc, payload) = parse_socks5_udp_packet(&packet).unwrap();
         assert_eq!(parsed_loc.address(), location.address());

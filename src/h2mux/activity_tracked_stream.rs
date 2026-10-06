@@ -66,11 +66,50 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for ActivityTrackedStream<S> {
         result
     }
 
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        let result = Pin::new(&mut self.inner).poll_write_vectored(cx, bufs);
+        if let Poll::Ready(Ok(n)) = &result
+            && *n > 0
+        {
+            self.activity.record_activity();
+        }
+        result
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.inner).poll_flush(cx)
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn vectored_writes_forward_both_slices() {
+        let (writer, mut reader) = tokio::io::duplex(8);
+        let mut writer = ActivityTrackedStream::new(writer, ActivityTracker::new());
+        assert!(writer.is_write_vectored());
+        let written = writer
+            .write_vectored(&[io::IoSlice::new(b"abc"), io::IoSlice::new(b"def")])
+            .await
+            .unwrap();
+        assert_eq!(written, 6);
+        let mut output = [0; 6];
+        reader.read_exact(&mut output).await.unwrap();
+        assert_eq!(&output, b"abcdef");
     }
 }

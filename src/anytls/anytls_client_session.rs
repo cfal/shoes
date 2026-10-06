@@ -366,6 +366,8 @@ impl ClientSessionState {
         // Pre-allocate padding buffer for combining payload + WASTE frames
         // Used to ensure single write() call per padding segment
         let mut padding_buf = BytesMut::with_capacity(65536 + FRAME_HEADER_SIZE * 2 + 64);
+        let mut unflushed_bytes = 0;
+        const FLUSH_BATCH_BYTES: usize = 256 * 1024;
 
         loop {
             let msg = tokio::select! {
@@ -399,6 +401,7 @@ impl ClientSessionState {
             match msg {
                 OutgoingMessage::Flush { done } => {
                     writer.flush().await?;
+                    unflushed_bytes = 0;
                     let _ = done.send(());
                 }
                 OutgoingMessage::Buffered { data } => {
@@ -407,6 +410,7 @@ impl ClientSessionState {
                     Self::write_with_padding(&session, &mut writer, &data, &mut padding_buf)
                         .await?;
                     writer.flush().await?;
+                    unflushed_bytes = 0;
                 }
                 OutgoingMessage::Control {
                     cmd,
@@ -421,8 +425,10 @@ impl ClientSessionState {
                     Self::write_with_padding(&session, &mut writer, &write_buf, &mut padding_buf)
                         .await?;
                     writer.flush().await?;
+                    unflushed_bytes = 0;
                 }
                 OutgoingMessage::Data { stream_id, data } => {
+                    let padding_active = session.send_padding.load(Ordering::Relaxed);
                     Frame::data(stream_id, data).encode_into(&mut write_buf);
                     log::debug!(
                         "AnyTLS client writer: stream {} data {} bytes",
@@ -431,7 +437,15 @@ impl ClientSessionState {
                     );
                     Self::write_with_padding(&session, &mut writer, &write_buf, &mut padding_buf)
                         .await?;
-                    writer.flush().await?;
+                    unflushed_bytes += write_buf.len();
+                    let quota_reached = unflushed_bytes >= FLUSH_BATCH_BYTES;
+                    if padding_active || outgoing_rx.is_empty() || quota_reached {
+                        writer.flush().await?;
+                        unflushed_bytes = 0;
+                    }
+                    if quota_reached {
+                        tokio::task::yield_now().await;
+                    }
                 }
                 OutgoingMessage::Fin { stream_id } => {
                     Frame::control(Command::Fin, stream_id).encode_into(&mut write_buf);
@@ -439,6 +453,7 @@ impl ClientSessionState {
                     Self::write_with_padding(&session, &mut writer, &write_buf, &mut padding_buf)
                         .await?;
                     writer.flush().await?;
+                    unflushed_bytes = 0;
 
                     let mut streams = session.streams.lock();
                     streams.remove(&stream_id);
@@ -903,7 +918,204 @@ impl ClientSessionState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
     use std::time::Duration;
+
+    #[derive(Default)]
+    struct WriteLog {
+        pending: Vec<u8>,
+        flushed: Vec<Vec<u8>>,
+    }
+
+    struct RecordingWriter(Arc<Mutex<WriteLog>>);
+
+    impl tokio::io::AsyncWrite for RecordingWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            data: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.0.lock().pending.extend_from_slice(data);
+            Poll::Ready(Ok(data.len()))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            let mut log = self.0.lock();
+            let bytes = std::mem::take(&mut log.pending);
+            log.flushed.push(bytes);
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.poll_flush(cx)
+        }
+    }
+
+    fn writer_state() -> (Arc<ClientSessionState>, mpsc::Receiver<OutgoingMessage>) {
+        let (outgoing_tx, rx) = mpsc::channel(STREAM_CHANNEL_BUFFER);
+        let state = Arc::new(ClientSessionState {
+            streams: Mutex::new(HashMap::new()),
+            stream_id_counter: AtomicU32::new(1),
+            outgoing_tx,
+            is_closed: Arc::new(AtomicBool::new(false)),
+            padding: Arc::new(PaddingFactory::new(b"stop=1\n0=0-0").unwrap()),
+            peer_version: AtomicU8::new(1),
+            pending_opens: Mutex::new(HashMap::new()),
+            send_padding: AtomicBool::new(false),
+            pkt_counter: AtomicU32::new(0),
+            initial_buffer: std::sync::Mutex::new(None),
+            close_notify: CancellationToken::new(),
+        });
+        (state, rx)
+    }
+
+    #[tokio::test]
+    async fn writer_batches_ready_data_but_preserves_flush_and_fin_barriers() {
+        for (count, size, expected_flushes) in [(3, 64, 2), (5, 65535, 3)] {
+            let (state, rx) = writer_state();
+            for i in 0..count {
+                state
+                    .outgoing_tx
+                    .try_send(OutgoingMessage::Data {
+                        stream_id: 1,
+                        data: Bytes::from(vec![i as u8; size]),
+                    })
+                    .unwrap();
+            }
+            let (done, mut barrier) = oneshot::channel();
+            state
+                .outgoing_tx
+                .try_send(OutgoingMessage::Flush { done })
+                .unwrap();
+            state
+                .outgoing_tx
+                .try_send(OutgoingMessage::Fin { stream_id: 1 })
+                .unwrap();
+            let log = Arc::new(Mutex::new(WriteLog::default()));
+            let mut writer = Box::pin(ClientSessionState::writer_loop(
+                Arc::downgrade(&state),
+                RecordingWriter(log.clone()),
+                rx,
+                state.close_notify.clone(),
+            ));
+            // A quota can yield before the barrier; repeated polls must eventually reach it.
+            for _ in 0..4 {
+                assert!(
+                    writer
+                        .as_mut()
+                        .poll(&mut Context::from_waker(futures::task::noop_waker_ref()))
+                        .is_pending()
+                );
+                if barrier.try_recv().is_ok() {
+                    break;
+                }
+            }
+            let log = log.lock();
+            assert!(log.pending.is_empty());
+            assert_eq!(log.flushed.len(), expected_flushes);
+            let mut bytes = BytesMut::from(log.flushed.concat().as_slice());
+            for i in 0..count {
+                let frame = FrameCodec::decode(&mut bytes).unwrap().unwrap();
+                assert_eq!(frame.cmd, Command::Psh);
+                assert_eq!(frame.data.as_ref(), vec![i as u8; size]);
+            }
+            assert_eq!(
+                FrameCodec::decode(&mut bytes).unwrap().unwrap().cmd,
+                Command::Fin
+            );
+            assert!(bytes.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn writer_flushes_sparse_data_without_an_explicit_barrier() {
+        let (state, rx) = writer_state();
+        state
+            .outgoing_tx
+            .try_send(OutgoingMessage::Data {
+                stream_id: 1,
+                data: Bytes::from_static(b"request"),
+            })
+            .unwrap();
+        let log = Arc::new(Mutex::new(WriteLog::default()));
+        let mut writer = Box::pin(ClientSessionState::writer_loop(
+            Arc::downgrade(&state),
+            RecordingWriter(log.clone()),
+            rx,
+            state.close_notify.clone(),
+        ));
+        assert!(
+            writer
+                .as_mut()
+                .poll(&mut Context::from_waker(futures::task::noop_waker_ref()))
+                .is_pending()
+        );
+        assert!(log.lock().pending.is_empty());
+        assert_eq!(log.lock().flushed.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn padding_transition_preserves_data_under_transport_backpressure() {
+        use tokio::io::AsyncReadExt;
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (mut state, rx) = writer_state();
+            Arc::get_mut(&mut state).unwrap().padding =
+                Arc::new(PaddingFactory::new(b"stop=3\n0=0-0\n1=128-128\n2=128-128").unwrap());
+            state.send_padding.store(true, Ordering::Relaxed);
+            for index in 0..5 {
+                state
+                    .outgoing_tx
+                    .try_send(OutgoingMessage::Data {
+                        stream_id: 1,
+                        data: Bytes::from(vec![index; 64]),
+                    })
+                    .unwrap();
+            }
+            state
+                .outgoing_tx
+                .try_send(OutgoingMessage::Fin { stream_id: 1 })
+                .unwrap();
+            let (done, barrier) = oneshot::channel();
+            state
+                .outgoing_tx
+                .try_send(OutgoingMessage::Flush { done })
+                .unwrap();
+            let (writer, mut reader) = tokio::io::duplex(7);
+            let writing = tokio::spawn(ClientSessionState::writer_loop(
+                Arc::downgrade(&state),
+                writer,
+                rx,
+                state.close_notify.clone(),
+            ));
+            let reading = tokio::spawn(async move {
+                let mut received = Vec::new();
+                reader.read_to_end(&mut received).await.unwrap();
+                BytesMut::from(received.as_slice())
+            });
+            barrier.await.unwrap();
+            assert!(!state.send_padding.load(Ordering::Relaxed));
+            state.close();
+            writing.await.unwrap().unwrap();
+            let mut received = reading.await.unwrap();
+            for index in 0..5 {
+                let frame = FrameCodec::decode(&mut received).unwrap().unwrap();
+                assert_eq!(frame.cmd, Command::Psh);
+                assert_eq!(frame.data.as_ref(), [index; 64]);
+                if index < 2 {
+                    let padding = FrameCodec::decode(&mut received).unwrap().unwrap();
+                    assert_eq!(padding.cmd, Command::Waste);
+                }
+            }
+            assert_eq!(
+                FrameCodec::decode(&mut received).unwrap().unwrap().cmd,
+                Command::Fin
+            );
+            assert!(received.is_empty());
+        })
+        .await
+        .unwrap();
+    }
 
     async fn open() -> (
         Arc<AnyTlsClientSession>,

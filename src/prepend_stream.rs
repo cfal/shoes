@@ -68,6 +68,18 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for PrependStream<S> {
         Pin::new(&mut self.inner).poll_flush(cx)
     }
 
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.inner).poll_shutdown(cx)
     }
@@ -83,4 +95,8 @@ impl<S: AsyncPing + Unpin> AsyncPing for PrependStream<S> {
     }
 }
 
-impl<S: AsyncStream> AsyncStream for PrependStream<S> {}
+impl<S: AsyncStream> AsyncStream for PrependStream<S> {
+    fn preferred_write_size(&self) -> Option<std::num::NonZeroUsize> {
+        self.inner.preferred_write_size()
+    }
+}
