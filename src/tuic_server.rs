@@ -20,7 +20,7 @@ use crate::routing::udp_relay::UdpRelay;
 use crate::stream_reader::StreamReader;
 use crate::tcp::tcp_server::setup_client_tcp_stream;
 use crate::udp_fragments::UdpFragments;
-use crate::util::{allocate_vec, write_all};
+use crate::util::write_all;
 
 const COMMAND_TYPE_AUTHENTICATE: u8 = 0x00;
 const COMMAND_TYPE_CONNECT: u8 = 0x01;
@@ -612,14 +612,14 @@ async fn run_udp_remote_to_local_stream_loop(
         override_local_write_address.map(|a| serialize_address(&a).into());
 
     let mut next_packet_id: u16 = 0;
-    let mut buf = allocate_vec(MAX_HEADER_LEN + 65535).into_boxed_slice();
     let mut loop_count: u8 = 0;
 
     loop {
-        let (payload_len, src_addr) = tokio::select! {
+        let (payload, src_addr) = tokio::select! {
             _ = cancel_token.cancelled() => return Ok(()),
-            result = socket.recv_from(&mut buf[MAX_HEADER_LEN..]) => result?,
+            result = socket.recv() => result?,
         };
+        let payload_len = payload.len();
 
         // Yield periodically to allow quinn's internal tasks to run (keepalives, ACKs, etc.)
         loop_count = loop_count.wrapping_add(1);
@@ -642,7 +642,7 @@ async fn run_udp_remote_to_local_stream_loop(
         frame.extend_from_slice(&[1, 0]);
         frame.extend_from_slice(&(payload_len as u16).to_be_bytes());
         frame.extend_from_slice(&address_bytes);
-        frame.extend_from_slice(&buf[MAX_HEADER_LEN..MAX_HEADER_LEN + payload_len]);
+        frame.extend_from_slice(&payload);
         let mut send_stream = connection.open_uni().await?;
         write_all(&mut send_stream, &frame).await?;
         send_stream.finish()?;
@@ -666,14 +666,14 @@ async fn run_udp_remote_to_local_datagram_loop(
         override_local_write_location.map(|a| serialize_address(&a).into());
 
     let mut next_packet_id: u16 = 0;
-    let mut buf = allocate_vec(65535).into_boxed_slice();
     let mut loop_count: u8 = 0;
 
     loop {
-        let (payload_len, src_addr) = tokio::select! {
+        let (payload, src_addr) = tokio::select! {
             _ = cancel_token.cancelled() => return Ok(()),
-            result = client_socket.recv_from(&mut buf) => result?,
+            result = client_socket.recv() => result?,
         };
+        let payload_len = payload.len();
 
         // Yield periodically to allow quinn's internal tasks to run (keepalives, ACKs, etc.)
         loop_count = loop_count.wrapping_add(1);
@@ -707,7 +707,7 @@ async fn run_udp_remote_to_local_datagram_loop(
             datagram.put_u8(0); // frag_id = 0
             datagram.extend_from_slice(&(payload_len as u16).to_be_bytes());
             datagram.extend_from_slice(&address_bytes);
-            datagram.extend_from_slice(&buf[..payload_len]);
+            datagram.extend_from_slice(&payload);
 
             connection
                 .send_datagram(datagram.freeze())
@@ -752,7 +752,7 @@ async fn run_udp_remote_to_local_datagram_loop(
                 } else {
                     datagram.put_u8(0xff);
                 }
-                datagram.extend_from_slice(&buf[offset..offset + fragment_payload_len]);
+                datagram.extend_from_slice(&payload[offset..offset + fragment_payload_len]);
                 connection.send_datagram(datagram.freeze()).map_err(|e| {
                     std::io::Error::other(format!(
                         "Failed to send datagram fragment {fragment_id}: {e}"
@@ -1050,7 +1050,7 @@ async fn process_udp_packet(
     };
 
     let target = session.pinned_location.clone().unwrap_or(remote_location);
-    if let Err(e) = session.send_socket.send_to(&payload, target) {
+    if let Err(e) = session.send_socket.send_to(payload, target) {
         error!("Failed to forward UDP payload for session {assoc_id}: {e}");
         udp_session_map
             .sessions
