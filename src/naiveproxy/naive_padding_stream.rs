@@ -128,6 +128,8 @@ pub struct NaivePaddingStream<S> {
     write_end: usize,
     /// Original payload length for current write (to return correct count)
     write_payload_len: usize,
+    // A flush can finish a frame before poll_write acknowledges its payload.
+    write_ack_pending: bool,
 }
 
 impl<S> NaivePaddingStream<S> {
@@ -150,6 +152,7 @@ impl<S> NaivePaddingStream<S> {
             write_start: 0,
             write_end: 0,
             write_payload_len: 0,
+            write_ack_pending: false,
         }
     }
 
@@ -253,6 +256,7 @@ impl<S> NaivePaddingStream<S> {
         self.write_start = 0;
         self.write_end = frame_size;
         self.write_payload_len = payload.len();
+        self.write_ack_pending = true;
 
         Ok(())
     }
@@ -458,33 +462,19 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for NaivePaddingStream<S> {
     ) -> Poll<io::Result<usize>> {
         let this = &mut *self;
 
-        if !this.should_pad_writes() {
-            return Pin::new(&mut this.inner).poll_write(cx, buf);
-        }
-
-        // Finish writing buffered frame data first
-        if this.write_start < this.write_end {
-            match this.poll_write_buffered(cx) {
-                Poll::Ready(Ok(Some(payload_len))) => return Poll::Ready(Ok(payload_len)),
-                Poll::Ready(Ok(None)) => {
-                    cx.waker().wake_by_ref();
-                    return Poll::Pending;
-                }
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
+        if !this.write_ack_pending {
+            if !this.should_pad_writes() {
+                return Pin::new(&mut this.inner).poll_write(cx, buf);
             }
+            let payload = &buf[..buf.len().min(MAX_PAYLOAD_PER_FRAME)];
+            this.encode_frame(payload)?;
         }
-
-        let payload = if buf.len() > MAX_PAYLOAD_PER_FRAME {
-            &buf[..MAX_PAYLOAD_PER_FRAME]
-        } else {
-            buf
-        };
-
-        this.encode_frame(payload)?;
 
         match this.poll_write_buffered(cx) {
-            Poll::Ready(Ok(Some(payload_len))) => Poll::Ready(Ok(payload_len)),
+            Poll::Ready(Ok(Some(payload_len))) => {
+                this.write_ack_pending = false;
+                Poll::Ready(Ok(payload_len))
+            }
             Poll::Ready(Ok(None)) => {
                 cx.waker().wake_by_ref();
                 Poll::Pending
@@ -682,6 +672,65 @@ mod tests {
     }
 
     impl AsyncStream for MockStream {}
+
+    #[test]
+    fn flush_preserves_the_pending_write_acknowledgment() {
+        let payload = [42; 512];
+        for completed_frames in [0, NUM_FIRST_PADDINGS - 1] {
+            let mut stream = NaivePaddingStream::new(
+                MockStream::new(vec![]),
+                PaddingDirection::Server,
+                PaddingType::Variant1,
+            );
+            stream.num_written_frames = completed_frames;
+            let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+            assert!(
+                Pin::new(&mut stream)
+                    .poll_write(&mut cx, &payload)
+                    .is_pending()
+            );
+            assert!(matches!(
+                Pin::new(&mut stream).poll_flush(&mut cx),
+                Poll::Ready(Ok(()))
+            ));
+            let wire = stream.inner.written.clone();
+            assert!(matches!(
+                Pin::new(&mut stream).poll_write(&mut cx, &payload),
+                Poll::Ready(Ok(512))
+            ));
+            assert_eq!(stream.inner.written, wire);
+            assert_eq!(stream.num_written_frames, completed_frames + 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn batched_flushes_do_not_duplicate_pending_naive_frames() {
+        let payload: Vec<u8> = (0..65536u32).flat_map(u32::to_be_bytes).collect();
+        let mut source = MockStream::from_data(payload.clone());
+        let mut writer = NaivePaddingStream::new(
+            MockStream::new(vec![]),
+            PaddingDirection::Server,
+            PaddingType::Variant1,
+        );
+        crate::copy_bidirectional::copy_bidirectional_with_sizes(
+            &mut source,
+            &mut writer,
+            false,
+            false,
+            512,
+            512,
+        )
+        .await
+        .unwrap();
+        let mut reader = NaivePaddingStream::new(
+            MockStream::from_data(writer.inner.written),
+            PaddingDirection::Client,
+            PaddingType::Variant1,
+        );
+        let mut received = Vec::new();
+        reader.read_to_end(&mut received).await.unwrap();
+        assert_eq!(received, payload);
+    }
 
     #[tokio::test]
     async fn test_read_single_padded_frame() {
