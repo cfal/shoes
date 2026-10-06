@@ -1,9 +1,11 @@
 use super::*;
 use etherparse::PacketBuilder;
+use futures::FutureExt;
 use smoltcp::wire::{IpAddress, IpProtocol, Ipv4Packet, Ipv6Packet, UdpPacket};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixDatagram;
+use std::panic::AssertUnwindSafe;
 use std::time::Duration;
 use tokio::net::{UdpSocket, UnixDatagram as AsyncDatagram};
 use tokio::time::timeout;
@@ -45,6 +47,7 @@ fn check_reply(packet: &[u8], src: SocketAddr, dst: SocketAddr, payload: &[u8], 
         let ip = Ipv6Packet::new_checked(packet).unwrap();
         assert_eq!(ip.next_header(), IpProtocol::Udp);
         assert_eq!(usize::from(ip.payload_len()) + 40, packet.len());
+        assert_eq!(usize::from(ip.payload_len()), payload.len() + 8);
         assert_eq!(IpAddr::V6(ip.src_addr()), src.ip());
         assert_eq!(IpAddr::V6(ip.dst_addr()), dst.ip());
         (
@@ -58,6 +61,10 @@ fn check_reply(packet: &[u8], src: SocketAddr, dst: SocketAddr, payload: &[u8], 
         assert_eq!(ip.next_header(), IpProtocol::Udp);
         assert!(ip.verify_checksum());
         assert_eq!(usize::from(ip.total_len()), packet.len());
+        assert_eq!(
+            packet.len(),
+            usize::from(ip.header_len()) + 8 + payload.len()
+        );
         assert_eq!(IpAddr::V4(ip.src_addr()), src.ip());
         assert_eq!(IpAddr::V4(ip.dst_addr()), dst.ip());
         (
@@ -91,7 +98,7 @@ async fn roundtrips(ipv6: bool, framed: bool) {
     let mut tasks = JoinSet::new();
     tasks.spawn(run_tun_server(config, selector, resolver, shutdown_rx));
 
-    let outcome = timeout(DEADLINE, async {
+    let outcome = AssertUnwindSafe(timeout(DEADLINE, async {
         let bind = if ipv6 { "[::]:0" } else { "0.0.0.0:0" };
         let destinations = [
             UdpSocket::bind(bind).await.unwrap(),
@@ -136,7 +143,8 @@ async fn roundtrips(ipv6: bool, framed: bool) {
                 }
             }
         }
-    })
+    }))
+    .catch_unwind()
     .await;
 
     let _ = shutdown.send(());
@@ -144,8 +152,12 @@ async fn roundtrips(ipv6: bool, framed: bool) {
     // A rescue packet is allowed only after the liveness check has failed.
     if stopped.is_err() {
         let _ = wire.send(&[0]).await;
+        let _ = timeout(DEADLINE, tasks.join_next()).await;
     }
-    outcome.expect("raw-FD UDP pipeline stalled");
+    match outcome {
+        Ok(result) => result.expect("raw-FD UDP pipeline stalled"),
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
     stopped
         .expect("TUN shutdown stalled")
         .unwrap()

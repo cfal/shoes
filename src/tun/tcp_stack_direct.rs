@@ -1610,9 +1610,21 @@ mod tests {
         use super::super::udp_handler::{UdpHandler, build_udp_packet};
         let (peer, tun) = UnixDatagram::pair().unwrap();
         peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        let (mut stack, gate) = stack_at_wait(tun.into());
+        let (wake, mut receiver) = Wake::new().unwrap();
+        let (setup_gate, setup) = TestGate::new();
+        let (wait_gate, waiting) = TestGate::new();
+        receiver.before_clear = Some(setup_gate);
+        receiver.before_wait = Some(wait_gate);
+        wake.notify();
+        tun.set_nonblocking(true).unwrap();
+        let mut stack =
+            TcpStackDirect::start(tun.into(), TunServerConfig::new(), wake, receiver).unwrap();
+        setup.wait();
         let (tx, rx) = mpsc::channel(PACKET_QUEUE_CAPACITY);
         stack.set_udp_response_tx(rx);
+        // Setup coalesces into the drained notification, leaving only the writer able to wake poll.
+        drop(setup);
+        waiting.wait();
         let (_, from_tun) = mpsc::channel(1);
         let (_, writer) = UdpHandler::new(from_tun, tx, stack.wake_handle()).split();
         let src = "1.1.1.1:53".parse().unwrap();
@@ -1620,7 +1632,7 @@ mod tests {
         writer
             .send_sync((PacketBuffer::copy_from_slice(b"reply"), src, dst))
             .unwrap();
-        drop(gate);
+        drop(waiting);
         let expected = build_udp_packet(b"reply", src, dst).unwrap();
         let mut reply = [0; 1500];
         let length = peer.recv(&mut reply).unwrap();
