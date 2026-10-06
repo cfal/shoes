@@ -508,9 +508,11 @@ fn run_direct_stack_thread(
                                         );
                                         active_connections.insert((src_addr, dst_addr));
 
-                                        if let Some(ref tx) = new_conn_tx {
-                                            let _ = tx.send(new_conn.new_tcp_conn);
-                                        }
+                                        publish_connection(
+                                            new_conn.new_tcp_conn,
+                                            &mut new_conn_tx,
+                                            &shared_state,
+                                        );
                                     }
                                 }
                             }
@@ -703,6 +705,22 @@ fn run_direct_stack_thread(
 
 fn stack_now() -> SmolInstant {
     std::time::Instant::now().into()
+}
+
+fn publish_connection(
+    connection: NewTcpConnection,
+    sender: &mut Option<mpsc::UnboundedSender<NewTcpConnection>>,
+    shared_state: &Mutex<SharedState>,
+) {
+    // Setup can publish the handler after this iteration's initial snapshot.
+    if sender.is_none()
+        && let Ok(mut state) = shared_state.lock()
+    {
+        *sender = state.new_conn_tx.take();
+    }
+    if let Some(sender) = sender {
+        let _ = sender.send(connection);
+    }
 }
 
 fn reconcile_sockets(
@@ -1037,6 +1055,35 @@ mod tests {
     use super::*;
     use std::os::unix::io::IntoRawFd;
     use std::os::unix::net::{UnixDatagram, UnixStream};
+
+    #[test]
+    fn handler_published_after_setup_snapshot_receives_the_connection() {
+        let state = Mutex::new(SharedState {
+            udp_response_rx: None,
+            new_conn_tx: None,
+        });
+        let mut snapshot = state.lock().unwrap().new_conn_tx.take();
+        assert!(snapshot.is_none());
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        state.lock().unwrap().new_conn_tx = Some(sender);
+
+        let (wake, _wake_rx) = Wake::new().unwrap();
+        let control = Arc::new(TcpConnectionControl::new(1024, 1024));
+        let address = "192.0.2.1:443".parse().unwrap();
+        publish_connection(
+            NewTcpConnection {
+                connection: TcpConnection::new(control.clone(), wake),
+                remote_addr: address,
+            },
+            &mut snapshot,
+            &state,
+        );
+        let connection = receiver.try_recv().unwrap();
+        assert_eq!(connection.remote_addr, address);
+        assert!(!control.is_abandoned());
+        assert!(snapshot.is_some());
+        assert!(state.lock().unwrap().new_conn_tx.is_none());
+    }
 
     #[test]
     fn transmit_storage_is_reused_and_initialized() {
