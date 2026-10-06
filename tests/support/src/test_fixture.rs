@@ -34,11 +34,26 @@ pub fn start_shoes_server_with_sudo(
 pub struct RouteGuard {
     destination: String,
     device: String,
+    family: &'static str,
 }
 
 pub fn add_route_via_device(destination: &str, device: &str) -> std::io::Result<RouteGuard> {
+    let address = destination.split('/').next().unwrap_or(destination);
+    let address: std::net::IpAddr = address
+        .parse()
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    let family = if address.is_ipv6() { "-6" } else { "-4" };
     let output = Command::new("sudo")
-        .args(["-n", "ip", "route", "add", destination, "dev", device])
+        .args([
+            "-n",
+            "ip",
+            family,
+            "route",
+            "add",
+            destination,
+            "dev",
+            device,
+        ])
         .output()?;
     if !output.status.success() {
         return Err(std::io::Error::other(format!(
@@ -49,6 +64,7 @@ pub fn add_route_via_device(destination: &str, device: &str) -> std::io::Result<
     Ok(RouteGuard {
         destination: destination.to_string(),
         device: device.to_string(),
+        family,
     })
 }
 
@@ -58,6 +74,7 @@ impl Drop for RouteGuard {
             .args([
                 "-n",
                 "ip",
+                self.family,
                 "route",
                 "del",
                 &self.destination,

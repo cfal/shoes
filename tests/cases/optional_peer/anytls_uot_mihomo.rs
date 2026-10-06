@@ -86,7 +86,7 @@ rules:
     );
 
     let (shoes, shoes_config) = start_shoes_server(&shoes_config)?;
-    let (mihomo, mihomo_config) = start_mihomo_server(&mihomo_config)?;
+    let (mihomo, mihomo_config) = start_mihomo_server(&mihomo_config).await?;
     ports.wait_for_all_ports().await?;
     let association = Socks5UdpAssociation::connect(&mihomo_ip, mihomo_port).await?;
 

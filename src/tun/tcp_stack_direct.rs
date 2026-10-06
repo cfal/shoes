@@ -114,6 +114,16 @@ impl TcpStackDirect {
         let fd = tun_fd.as_raw_fd();
         set_nonblocking(fd)?;
         let (wake, wake_rx) = Wake::new()?;
+        Self::start(tun_fd, config, wake, wake_rx)
+    }
+
+    fn start(
+        tun_fd: OwnedFd,
+        config: TunServerConfig,
+        wake: Wake,
+        wake_rx: WakeReceiver,
+    ) -> io::Result<Self> {
+        let fd = tun_fd.as_raw_fd();
         let (udp_tx, udp_rx) = mpsc::channel(PACKET_QUEUE_CAPACITY);
 
         let running = Arc::new(AtomicBool::new(true));
@@ -692,6 +702,11 @@ fn run_direct_stack_thread(
         }
 
         let delay = iface.poll_delay(stack_now(), &socket_set);
+        #[cfg(test)]
+        if let Some(gate) = wake_rx.before_wait.take() {
+            assert!(delay.is_none(), "idle test must not rely on a timer wakeup");
+            gate.pause();
+        }
         match wake_rx.wait(fd, delay.map(Into::into)) {
             Ok(_) => wait_error_count = 0,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
@@ -1061,9 +1076,20 @@ fn write_packet_with(
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_gate::{GateControl, TestGate};
     use super::*;
     use std::os::unix::io::IntoRawFd;
     use std::os::unix::net::{UnixDatagram, UnixStream};
+
+    fn stack_at_wait(tun: OwnedFd) -> (TcpStackDirect, GateControl) {
+        let (wake, mut receiver) = Wake::new().unwrap();
+        let (gate, control) = TestGate::new();
+        receiver.before_wait = Some(gate);
+        set_nonblocking(tun.as_raw_fd()).unwrap();
+        let stack = TcpStackDirect::start(tun, TunServerConfig::new(), wake, receiver).unwrap();
+        control.wait();
+        (stack, control)
+    }
 
     #[test]
     fn handler_published_after_setup_snapshot_receives_the_connection() {
@@ -1276,6 +1302,10 @@ mod tests {
     #[test]
     fn closed_socket_keeps_its_pending_reset_until_a_complete_egress_sweep() {
         let (peer, tun) = UnixDatagram::pair().unwrap();
+        // A full sweep must fit before reads start, including on macOS's smaller default queue.
+        socket2::SockRef::from(&peer)
+            .set_recv_buffer_size(256 * 1024)
+            .unwrap();
         peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
         let mut device = DirectDevice::new(tun.as_raw_fd(), 1500, false);
         let mut iface = Interface::new(
@@ -1319,8 +1349,10 @@ mod tests {
         iface.poll_egress(stack_now(), &mut device, &mut socket_set);
         let mut reset = false;
         let mut data = [0; 1500];
-        for _ in 0..70 {
-            let length = peer.recv(&mut data).unwrap();
+        for index in 0..70 {
+            let length = peer
+                .recv(&mut data)
+                .unwrap_or_else(|error| panic!("missing egress packet {index} of 70: {error}"));
             let ip = Ipv4Packet::new_checked(&data[..length]).unwrap();
             let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
             if tcp.src_port() == 10069 {
@@ -1582,30 +1614,44 @@ mod tests {
     #[test]
     fn idle_stack_delivers_udp_output_without_inbound_traffic() {
         use super::super::udp_handler::{UdpHandler, build_udp_packet};
-        for pause in [Duration::ZERO, Duration::from_millis(30)] {
-            let (peer, tun) = UnixDatagram::pair().unwrap();
-            peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
-            let mut stack = TcpStackDirect::new(tun.into(), 1500);
-            let (tx, rx) = mpsc::channel(PACKET_QUEUE_CAPACITY);
-            stack.set_udp_response_tx(rx);
-            let (_, from_tun) = mpsc::channel(1);
-            let (_, writer) = UdpHandler::new(from_tun, tx, stack.wake_handle()).split();
-            thread::sleep(pause);
-            let src = "1.1.1.1:53".parse().unwrap();
-            let dst = "10.0.0.2:10001".parse().unwrap();
-            writer
-                .send_sync((PacketBuffer::copy_from_slice(b"reply"), src, dst))
-                .unwrap();
-            let expected = build_udp_packet(b"reply", src, dst).unwrap();
-            let mut reply = [0; 1500];
-            let length = peer.recv(&mut reply).unwrap();
-            assert_eq!(&reply[..length], &*expected);
-        }
+        let (peer, tun) = UnixDatagram::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let (wake, mut receiver) = Wake::new().unwrap();
+        let (setup_gate, setup) = TestGate::new();
+        let (wait_gate, waiting) = TestGate::new();
+        receiver.before_clear = Some(setup_gate);
+        receiver.before_wait = Some(wait_gate);
+        wake.notify();
+        tun.set_nonblocking(true).unwrap();
+        let mut stack =
+            TcpStackDirect::start(tun.into(), TunServerConfig::new(), wake, receiver).unwrap();
+        setup.wait();
+        let (tx, rx) = mpsc::channel(PACKET_QUEUE_CAPACITY);
+        stack.set_udp_response_tx(rx);
+        // Setup coalesces into the drained notification, leaving only the writer able to wake poll.
+        drop(setup);
+        waiting.wait();
+        let (_, from_tun) = mpsc::channel(1);
+        let (_, writer) = UdpHandler::new(from_tun, tx, stack.wake_handle()).split();
+        let src = "1.1.1.1:53".parse().unwrap();
+        let dst = "10.0.0.2:10001".parse().unwrap();
+        writer
+            .send_sync((PacketBuffer::copy_from_slice(b"reply"), src, dst))
+            .unwrap();
+        drop(waiting);
+        let expected = build_udp_packet(b"reply", src, dst).unwrap();
+        let mut reply = [0; 1500];
+        let length = peer.recv(&mut reply).unwrap();
+        assert_eq!(&reply[..length], &*expected);
     }
 
     #[test]
     fn one_notification_drains_more_than_one_response_batch() {
         let (peer, tun) = UnixDatagram::pair().unwrap();
+        // The entire burst must fit even if the receiving thread is not scheduled yet.
+        socket2::SockRef::from(&peer)
+            .set_recv_buffer_size(256 * 1024)
+            .unwrap();
         peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
         let mut stack = TcpStackDirect::new(tun.into(), 1500);
         let (tx, rx) = mpsc::channel(2 * MAX_PACKET_BATCH + 1);
@@ -1616,24 +1662,24 @@ mod tests {
         stack.set_udp_response_tx(rx);
         for index in 0..2 * MAX_PACKET_BATCH + 1 {
             let mut reply = [0; 2];
-            assert_eq!(peer.recv(&mut reply).unwrap(), 1);
+            let length = peer
+                .recv(&mut reply)
+                .unwrap_or_else(|error| panic!("response {index}: {error}"));
+            assert_eq!(length, 1);
             assert_eq!(reply[0], index as u8);
         }
     }
 
     #[test]
-    fn setup_publication_is_not_lost_while_its_lock_is_held() {
+    fn setup_published_after_the_snapshot_interrupts_the_idle_wait() {
         let (peer, tun) = UnixDatagram::pair().unwrap();
         peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
-        let stack = TcpStackDirect::new(tun.into(), 1500);
+        let (mut stack, gate) = stack_at_wait(tun.into());
         let (tx, rx) = mpsc::channel(1);
         tx.try_send(PacketBuffer::copy_from_slice(b"reply"))
             .unwrap();
-        let mut state = stack.shared_state.lock().unwrap();
-        stack.wake.notify();
-        thread::sleep(Duration::from_millis(30));
-        state.udp_response_rx = Some(rx);
-        drop(state);
+        stack.set_udp_response_tx(rx);
+        drop(gate);
         let mut reply = [0; 5];
         assert_eq!(peer.recv(&mut reply).unwrap(), 5);
         assert_eq!(&reply, b"reply");
@@ -1693,14 +1739,14 @@ mod tests {
     #[test]
     fn idle_stack_drop_does_not_require_incoming_io() {
         let (peer, client) = UnixStream::pair().unwrap();
-        let stack = TcpStackDirect::new(client.into(), 1500);
-        thread::sleep(Duration::from_millis(100));
+        let (stack, gate) = stack_at_wait(client.into());
         let (tx, rx) = std::sync::mpsc::channel();
         let dropper = thread::spawn(move || {
             drop(stack);
             let _ = tx.send(());
         });
-        let result = rx.recv_timeout(Duration::from_millis(300));
+        drop(gate);
+        let result = rx.recv_timeout(Duration::from_secs(5));
         drop(peer);
         dropper.join().unwrap();
         assert!(result.is_ok());

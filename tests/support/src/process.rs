@@ -1,4 +1,4 @@
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 #[cfg(target_os = "linux")]
 use std::fs;
 use std::io::{self, Write};
@@ -6,8 +6,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 #[cfg(target_os = "linux")]
 use std::thread;
+use std::time::Duration;
 #[cfg(target_os = "linux")]
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 #[cfg(target_os = "linux")]
 const PROCESS_GROUP_TERM_TIMEOUT: Duration = Duration::from_secs(1);
@@ -97,7 +98,6 @@ impl ProcessGuard {
         }
     }
 
-    #[cfg(target_os = "linux")]
     fn child_mut(&mut self) -> &mut Child {
         self.process.as_mut().expect("process guard has no child")
     }
@@ -693,18 +693,69 @@ fn validate_mihomo_binary(path: &Path) -> io::Result<String> {
     ))
 }
 
-pub fn start_mihomo_server(config: &str) -> io::Result<(ProcessGuard, tempfile::NamedTempFile)> {
+pub async fn start_mihomo_server(
+    config: &str,
+) -> io::Result<(ProcessGuard, tempfile::NamedTempFile)> {
     let mut config_file = tempfile::NamedTempFile::new()?;
     config_file.write_all(config.as_bytes())?;
     config_file.flush()?;
 
+    let startup_directory = tempfile::tempdir()?;
+    let ready_file = startup_directory.path().join("ready");
+    let (post_up, ready_path) = if cfg!(windows) {
+        // Go escapes argument quotes for a CRT parser, but cmd.exe needs literal quotes.
+        let mut quoted_path = OsString::from("\"");
+        quoted_path.push(&ready_file);
+        quoted_path.push("\"");
+        ("echo ready>%SHOES_TEST_MIHOMO_READY%", quoted_path)
+    } else {
+        (
+            "printf ready > \"$SHOES_TEST_MIHOMO_READY\"",
+            ready_file.as_os_str().to_owned(),
+        )
+    };
+    // Mihomo accepts SOCKS connections before enabling routing; post-up runs afterward.
     let child = Command::new(find_mihomo_binary()?)
         .arg("-f")
         .arg(config_file.path())
+        .args(["-post-up", post_up])
+        .env("SHOES_TEST_MIHOMO_READY", ready_path)
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()?;
-    Ok((ProcessGuard::new(child, "mihomo"), config_file))
+    let mut guard = ProcessGuard::new(child, "mihomo");
+    wait_for_mihomo_startup(guard.child_mut(), &ready_file, Duration::from_secs(10)).await?;
+    Ok((guard, config_file))
+}
+
+async fn wait_for_mihomo_startup(
+    process: &mut Child,
+    ready_file: &Path,
+    timeout: Duration,
+) -> io::Result<()> {
+    tokio::time::timeout(timeout, async {
+        loop {
+            if let Some(status) = process.try_wait()? {
+                return Err(io::Error::other(format!(
+                    "Mihomo exited before routing became ready: {status}"
+                )));
+            }
+            match std::fs::read_to_string(ready_file) {
+                Ok(contents) if contents.trim() == "ready" => return Ok(()),
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            "Mihomo routing did not become ready",
+        )
+    })?
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -712,6 +763,59 @@ mod tests {
     use super::*;
     use std::io::BufRead;
     use std::sync::mpsc;
+
+    fn blocked_startup_process() -> io::Result<ProcessGuard> {
+        let child = Command::new("sh")
+            .args(["-c", "read -r ignored"])
+            .stdin(Stdio::piped())
+            .spawn()?;
+        Ok(ProcessGuard::new(child, "startup-test"))
+    }
+
+    #[tokio::test]
+    async fn mihomo_startup_waits_for_post_up_marker() -> io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let ready_file = directory.path().join("ready");
+        let mut guard = blocked_startup_process()?;
+        let startup =
+            wait_for_mihomo_startup(guard.child_mut(), &ready_file, Duration::from_secs(2));
+        tokio::pin!(startup);
+
+        assert!(futures::poll!(startup.as_mut()).is_pending());
+        fs::write(&ready_file, "ready\n")?;
+        startup.await
+    }
+
+    #[tokio::test]
+    async fn mihomo_startup_reports_early_exit() -> io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let ready_file = directory.path().join("ready");
+        let child = Command::new("sh").args(["-c", "exit 7"]).spawn()?;
+        let mut guard = ProcessGuard::new(child, "startup-exit-test");
+        let error = wait_for_mihomo_startup(guard.child_mut(), &ready_file, Duration::from_secs(2))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(
+            error
+                .to_string()
+                .contains("exited before routing became ready")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mihomo_startup_has_bounded_deadline() -> io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let ready_file = directory.path().join("ready");
+        let mut guard = blocked_startup_process()?;
+        let error =
+            wait_for_mihomo_startup(guard.child_mut(), &ready_file, Duration::from_millis(25))
+                .await
+                .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        Ok(())
+    }
 
     const NESTED_SERVICE_SCRIPT: &str = r#"
 set -eu
