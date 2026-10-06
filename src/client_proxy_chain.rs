@@ -277,6 +277,11 @@ impl ClientProxyChain {
                 }
             }
             InitialHopEntry::Proxy { socket, proxy } => {
+                if subsequent_proxies.is_empty()
+                    && let Some(result) = proxy.try_reuse_tcp_stream(&remote_location).await?
+                {
+                    return Ok(result);
+                }
                 // Socket connects to this proxy's location
                 debug!(
                     "Initial hop: Proxy {} -> {}",
@@ -650,6 +655,99 @@ mod tests {
                 supports_udp,
             }
         }
+    }
+
+    #[derive(Debug)]
+    struct ReusableProxy {
+        location: NetLocation,
+        fail: bool,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ProxyConnector for ReusableProxy {
+        fn proxy_location(&self) -> &NetLocation {
+            &self.location
+        }
+        fn supports_udp_over_tcp(&self) -> bool {
+            false
+        }
+        async fn try_reuse_tcp_stream(
+            &self,
+            target: &ResolvedLocation,
+        ) -> std::io::Result<Option<TcpClientSetupResult>> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            if self.fail {
+                return Err(std::io::Error::other("CONNECT rejected"));
+            }
+            Ok(Some(TcpClientSetupResult {
+                client_stream: Box::new(tokio::io::duplex(8).0),
+                early_data: Some(target.to_string().into_bytes()),
+            }))
+        }
+        async fn setup_tcp_stream(
+            &self,
+            _: Box<dyn AsyncStream>,
+            _: &ResolvedLocation,
+        ) -> std::io::Result<TcpClientSetupResult> {
+            panic!("a warm proxy must not run cold setup")
+        }
+        async fn setup_udp_bidirectional(
+            &self,
+            _: Box<dyn AsyncStream>,
+            _: ResolvedLocation,
+        ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
+            unreachable!()
+        }
+    }
+
+    #[tokio::test]
+    async fn reuse_respects_selected_entry_target_and_multihop_boundaries() {
+        let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let warm = || InitialHopEntry::Proxy {
+            socket: mock_socket(0),
+            proxy: Box::new(ReusableProxy {
+                location: NetLocation::from_str("127.0.0.1:1080", None).unwrap(),
+                fail: false,
+                calls: calls.clone(),
+            }),
+        };
+        let target: ResolvedLocation = NetLocation::from_str("example.com:443", None)
+            .unwrap()
+            .into();
+        let chain = ClientProxyChain::new(vec![warm(), proxy_entry(1, 1081, false)], vec![]);
+        let result = chain.connect_tcp(target.clone(), &resolver).await.unwrap();
+        assert_eq!(result.early_data.unwrap(), target.to_string().as_bytes());
+        // The next selected entry is cold; it must not borrow the previous entry's session.
+        assert!(chain.connect_tcp(target.clone(), &resolver).await.is_err());
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        let chain = ClientProxyChain::new(vec![warm()], vec![vec![mock_proxy(1082, false)]]);
+        assert!(chain.connect_tcp(target, &resolver).await.is_err());
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn rejected_reuse_does_not_fall_back_to_a_fresh_connect() {
+        let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let chain = ClientProxyChain::new(
+            vec![InitialHopEntry::Proxy {
+                socket: mock_socket(0),
+                proxy: Box::new(ReusableProxy {
+                    location: NetLocation::from_str("127.0.0.1:1080", None).unwrap(),
+                    fail: true,
+                    calls: calls.clone(),
+                }),
+            }],
+            vec![],
+        );
+        let target = NetLocation::from_str("example.com:443", None)
+            .unwrap()
+            .into();
+        let error = chain.connect_tcp(target, &resolver).await.err().unwrap();
+        assert_eq!(error.to_string(), "CONNECT rejected");
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
     }
 
     #[async_trait]

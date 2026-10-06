@@ -46,6 +46,13 @@ pub trait ProxyConnector: Send + Sync + Debug {
     /// Check if this connector supports UDP-over-TCP tunneling.
     fn supports_udp_over_tcp(&self) -> bool;
 
+    async fn try_reuse_tcp_stream(
+        &self,
+        _target: &ResolvedLocation,
+    ) -> std::io::Result<Option<TcpClientSetupResult>> {
+        Ok(None)
+    }
+
     /// Setup protocol on existing stream.
     ///
     /// # Arguments

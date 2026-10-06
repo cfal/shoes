@@ -55,6 +55,16 @@ impl TlsClientHandler {
 
 #[async_trait]
 impl TcpClientHandler for TlsClientHandler {
+    async fn try_reuse_tcp_stream(
+        &self,
+        target: &ResolvedLocation,
+    ) -> std::io::Result<Option<TcpClientSetupResult>> {
+        match &self.handler {
+            TlsInnerClientHandler::Default(handler) => handler.try_reuse_tcp_stream(target).await,
+            TlsInnerClientHandler::VisionVless { .. } => Ok(None),
+        }
+    }
+
     async fn setup_client_tcp_stream(
         &self,
         client_stream: Box<dyn AsyncStream>,
@@ -140,6 +150,96 @@ impl TcpClientHandler for TlsClientHandler {
                 )
                 .await
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug)]
+    struct RejectReuse;
+
+    #[async_trait]
+    impl TcpClientHandler for RejectReuse {
+        async fn try_reuse_tcp_stream(
+            &self,
+            _: &ResolvedLocation,
+        ) -> std::io::Result<Option<TcpClientSetupResult>> {
+            Err(std::io::Error::other("CONNECT rejected"))
+        }
+        async fn setup_client_tcp_stream(
+            &self,
+            _: Box<dyn AsyncStream>,
+            _: ResolvedLocation,
+        ) -> std::io::Result<TcpClientSetupResult> {
+            panic!("reuse must not acquire a new transport")
+        }
+    }
+
+    #[tokio::test]
+    async fn only_default_tls_and_reality_handlers_forward_reuse() {
+        use crate::reality_client_handler::RealityClientHandler;
+        let config = Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(rustls::RootCertStore::empty())
+                .with_no_client_auth(),
+        );
+        let target = crate::address::NetLocation::from_str("example.com:443", None)
+            .unwrap()
+            .into();
+        let defaults: Vec<Box<dyn TcpClientHandler>> = vec![
+            Box::new(TlsClientHandler::new(
+                config.clone(),
+                None,
+                "localhost".try_into().unwrap(),
+                Box::new(RejectReuse),
+            )),
+            Box::new(RealityClientHandler::new(
+                [0; 32],
+                [0; 8],
+                "localhost".try_into().unwrap(),
+                vec![],
+                Box::new(RejectReuse),
+            )),
+        ];
+        for handler in defaults {
+            assert_eq!(
+                handler
+                    .try_reuse_tcp_stream(&target)
+                    .await
+                    .err()
+                    .unwrap()
+                    .to_string(),
+                "CONNECT rejected"
+            );
+        }
+        let vision: Vec<Box<dyn TcpClientHandler>> = vec![
+            Box::new(TlsClientHandler::new_vision_vless(
+                config,
+                None,
+                "localhost".try_into().unwrap(),
+                Box::new([0; 16]),
+                false,
+            )),
+            Box::new(RealityClientHandler::new_vision_vless(
+                [0; 32],
+                [0; 8],
+                "localhost".try_into().unwrap(),
+                vec![],
+                Box::new([0; 16]),
+                false,
+            )),
+        ];
+        for handler in vision {
+            assert!(
+                handler
+                    .try_reuse_tcp_stream(&target)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
         }
     }
 }

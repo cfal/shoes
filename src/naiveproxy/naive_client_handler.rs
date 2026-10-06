@@ -77,19 +77,41 @@ impl NaiveProxyTcpClientHandler {
 
 #[async_trait]
 impl TcpClientHandler for NaiveProxyTcpClientHandler {
+    async fn try_reuse_tcp_stream(
+        &self,
+        target: &ResolvedLocation,
+    ) -> io::Result<Option<TcpClientSetupResult>> {
+        let session = {
+            // A cold handshake holds this lock; preflight must not wait behind it.
+            let Ok(slot) = self.session.try_lock() else {
+                return Ok(None);
+            };
+            slot.as_ref().filter(|session| session.is_ready()).cloned()
+        };
+        match session {
+            Some(session) => self.open_stream(session, target).await.map(Some),
+            None => Ok(None),
+        }
+    }
+
     async fn setup_client_tcp_stream(
         &self,
         client_stream: Box<dyn AsyncStream>,
         remote_location: ResolvedLocation,
     ) -> io::Result<TcpClientSetupResult> {
-        let mut session = self.get_or_create_session(client_stream).await?;
+        let session = self.get_or_create_session(client_stream).await?;
+        self.open_stream(session, &remote_location).await
+    }
+}
 
+impl NaiveProxyTcpClientHandler {
+    async fn open_stream(
+        &self,
+        mut session: NaiveClientSession,
+        target: &ResolvedLocation,
+    ) -> io::Result<TcpClientSetupResult> {
         let result = session
-            .open_stream(
-                remote_location.location(),
-                &self.auth_header,
-                self.padding_enabled,
-            )
+            .open_stream(target.location(), &self.auth_header, self.padding_enabled)
             .await;
         let stream = match result {
             Ok(stream) => stream,
@@ -110,9 +132,6 @@ impl TcpClientHandler for NaiveProxyTcpClientHandler {
             early_data: None,
         })
     }
-}
-
-impl NaiveProxyTcpClientHandler {
     /// Get an existing session or create a new one, returning a clone.
     ///
     /// The session is cloned so we can release the lock before calling open_stream.
@@ -142,6 +161,80 @@ impl NaiveProxyTcpClientHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn reuse_miss_does_not_wait_for_a_cold_handshake() {
+        let handler = NaiveProxyTcpClientHandler::new("user", "pass", false);
+        let target = crate::address::NetLocation::from_str("example.com:443", None)
+            .unwrap()
+            .into();
+        assert!(
+            handler
+                .try_reuse_tcp_stream(&target)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let _guard = handler.session.lock().await;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            handler.try_reuse_tcp_stream(&target),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn failed_warm_open_cannot_retire_a_replacement_session() {
+        let handler = NaiveProxyTcpClientHandler::new("user", "pass", false);
+        let (client, peer) = tokio::io::duplex(8192);
+        handler
+            .get_or_create_session(Box::new(client))
+            .await
+            .unwrap();
+        let (arrived, arrival) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let peer = tokio::spawn(async move {
+            let mut connection = h2::server::handshake(peer).await.unwrap();
+            let (_request, mut respond) = connection.accept().await.unwrap().unwrap();
+            arrived.send(()).unwrap();
+            released.await.unwrap();
+            respond
+                .send_response(
+                    http::Response::builder().status(503).body(()).unwrap(),
+                    true,
+                )
+                .unwrap();
+            while connection.accept().await.is_some() {}
+        });
+        let opener = handler.clone();
+        let opening = tokio::spawn(async move {
+            let target = crate::address::NetLocation::from_str("example.com:443", None)
+                .unwrap()
+                .into();
+            opener.try_reuse_tcp_stream(&target).await
+        });
+        arrival.await.unwrap();
+        assert!(handler.session.try_lock().is_ok());
+        let (transport, _peer) = tokio::io::duplex(8192);
+        let replacement = NaiveClientSession::new(Box::new(transport)).await.unwrap();
+        *handler.session.lock().await = Some(replacement.clone());
+        release.send(()).unwrap();
+        assert!(opening.await.unwrap().is_err());
+        assert!(
+            handler
+                .session
+                .lock()
+                .await
+                .as_ref()
+                .unwrap()
+                .same_generation(&replacement)
+        );
+        peer.abort();
+        let _ = peer.await;
+    }
 
     #[tokio::test]
     async fn rejected_connect_does_not_discard_retired_tunnels_tail() {
@@ -195,10 +288,7 @@ mod tests {
             .client_stream;
         stream.write_all(b"warmup").await.unwrap();
         stream.read_to_end(&mut Vec::new()).await.unwrap();
-        let (unused, _peer) = tokio::io::duplex(8192);
-        let result = handler
-            .setup_client_tcp_stream(Box::new(unused), target.into())
-            .await;
+        let result = handler.try_reuse_tcp_stream(&target.into()).await;
         assert!(result.is_err());
         assert!(handler.session.lock().await.is_none());
         stream.write_all(b"FINAL-TAIL").await.unwrap();
@@ -228,6 +318,16 @@ mod tests {
         })
         .await
         .unwrap();
+        let target = crate::address::NetLocation::from_str("example.com:443", None)
+            .unwrap()
+            .into();
+        assert!(
+            handler
+                .try_reuse_tcp_stream(&target)
+                .await
+                .unwrap()
+                .is_none()
+        );
         let (client, _peer) = tokio::io::duplex(8192);
         let second = handler
             .get_or_create_session(Box::new(client))
