@@ -10,7 +10,7 @@ use std::time::Duration;
 use tokio::net::{UdpSocket, UnixDatagram as AsyncDatagram};
 use tokio::time::timeout;
 
-const DEADLINE: Duration = Duration::from_secs(10);
+const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn packet_information(ipv6: bool) -> [u8; 4] {
     #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -42,7 +42,7 @@ fn check_reply(packet: &[u8], src: SocketAddr, dst: SocketAddr, payload: &[u8], 
     } else {
         packet
     };
-    let (udp, source, destination) = if src.is_ipv6() {
+    let (udp_bytes, source, destination) = if src.is_ipv6() {
         assert_eq!(packet[0] >> 4, 6);
         let ip = Ipv6Packet::new_checked(packet).unwrap();
         assert_eq!(ip.next_header(), IpProtocol::Udp);
@@ -51,7 +51,7 @@ fn check_reply(packet: &[u8], src: SocketAddr, dst: SocketAddr, payload: &[u8], 
         assert_eq!(IpAddr::V6(ip.src_addr()), src.ip());
         assert_eq!(IpAddr::V6(ip.dst_addr()), dst.ip());
         (
-            UdpPacket::new_checked(&packet[40..]).unwrap(),
+            &packet[40..],
             IpAddress::from(ip.src_addr()),
             IpAddress::from(ip.dst_addr()),
         )
@@ -68,11 +68,12 @@ fn check_reply(packet: &[u8], src: SocketAddr, dst: SocketAddr, payload: &[u8], 
         assert_eq!(IpAddr::V4(ip.src_addr()), src.ip());
         assert_eq!(IpAddr::V4(ip.dst_addr()), dst.ip());
         (
-            UdpPacket::new_checked(&packet[usize::from(ip.header_len())..]).unwrap(),
+            &packet[usize::from(ip.header_len())..],
             IpAddress::from(ip.src_addr()),
             IpAddress::from(ip.dst_addr()),
         )
     };
+    let udp = UdpPacket::new_checked(udp_bytes).unwrap();
     assert_eq!(udp.src_port(), src.port());
     assert_eq!(udp.dst_port(), dst.port());
     assert_eq!(usize::from(udp.len()), payload.len() + 8);
@@ -98,7 +99,7 @@ async fn roundtrips(ipv6: bool, framed: bool) {
     let mut tasks = JoinSet::new();
     tasks.spawn(run_tun_server(config, selector, resolver, shutdown_rx));
 
-    let outcome = AssertUnwindSafe(timeout(DEADLINE, async {
+    let outcome = AssertUnwindSafe(timeout(TEST_TIMEOUT, async {
         let bind = if ipv6 { "[::]:0" } else { "0.0.0.0:0" };
         let destinations = [
             UdpSocket::bind(bind).await.unwrap(),
@@ -148,11 +149,11 @@ async fn roundtrips(ipv6: bool, framed: bool) {
     .await;
 
     let _ = shutdown.send(());
-    let stopped = timeout(DEADLINE, tasks.join_next()).await;
+    let stopped = timeout(TEST_TIMEOUT, tasks.join_next()).await;
     // A rescue packet is allowed only after the liveness check has failed.
     if stopped.is_err() {
         let _ = wire.send(&[0]).await;
-        let _ = timeout(DEADLINE, tasks.join_next()).await;
+        let _ = timeout(TEST_TIMEOUT, tasks.join_next()).await;
     }
     match outcome {
         Ok(result) => result.expect("raw-FD UDP pipeline stalled"),

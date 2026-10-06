@@ -19,7 +19,7 @@ use tokio::sync::{Barrier, watch};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 
-const DEADLINE: Duration = Duration::from_secs(60);
+const TEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 struct KernelTun {
     _route: RouteGuard,
@@ -29,7 +29,7 @@ struct KernelTun {
     target: IpAddr,
 }
 
-fn ip(args: &[&str]) -> io::Result<String> {
+fn run_ip(args: &[&str]) -> io::Result<String> {
     let output = Command::new("sudo")
         .args(["-n", "ip"])
         .args(args)
@@ -86,7 +86,7 @@ impl KernelTun {
         let (process, config) = start_shoes_server_with_sudo(&config)?;
         timeout(Duration::from_secs(10), async {
             loop {
-                if let Ok(addresses) = ip(&["-j", "-4", "address", "show", "dev", &name]) {
+                if let Ok(addresses) = run_ip(&["-j", "-4", "address", "show", "dev", &name]) {
                     let devices: serde_json::Value = serde_json::from_str(&addresses).unwrap();
                     if devices[0]["addr_info"].as_array().is_some_and(|addresses| {
                         addresses
@@ -102,7 +102,7 @@ impl KernelTun {
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TUN interface did not appear"))?;
         if ipv6 {
-            ip(&[
+            run_ip(&[
                 "-6",
                 "addr",
                 "add",
@@ -114,7 +114,7 @@ impl KernelTun {
         }
         let route = add_route_via_device(&destination, &name)?;
         let family = if ipv6 { "-6" } else { "-4" };
-        let lookup = ip(&["-j", family, "route", "get", &target, "from", &source])?;
+        let lookup = run_ip(&["-j", family, "route", "get", &target, "from", &source])?;
         let routes: serde_json::Value = serde_json::from_str(&lookup)?;
         assert_eq!(routes[0]["dev"], name, "wrong TUN route: {lookup}");
         assert_ne!(routes[0]["type"], "local", "test traffic would bypass TUN");
@@ -138,7 +138,7 @@ impl KernelTun {
         Ok(tun)
     }
 
-    async fn tcp(&self, port: u16) -> io::Result<TcpStream> {
+    async fn connect_tcp(&self, port: u16) -> io::Result<TcpStream> {
         let socket = if self.source.is_ipv6() {
             TcpSocket::new_v6()?
         } else {
@@ -192,7 +192,7 @@ async fn tcp_eof(stream: &mut TcpStream) -> io::Result<()> {
 
 #[tokio::test]
 async fn ipv6_udp_and_tcp_roundtrip_through_kernel_tun() -> io::Result<()> {
-    timeout(DEADLINE, async {
+    timeout(TEST_TIMEOUT, async {
         let udp_peer = start_udp_echo_server_with_suffix("::", 0, b"").await?;
         let tcp_peer = start_tcp_stream_echo_server("::", 0).await?;
         let tun = KernelTun::start(true).await?;
@@ -201,7 +201,7 @@ async fn ipv6_udp_and_tcp_roundtrip_through_kernel_tun() -> io::Result<()> {
         for (sequence, length) in [0, 1, 64, 1200, 0, 512].into_iter().enumerate() {
             udp_exchange(&socket, target, &payload(1, sequence, length)).await?;
         }
-        let mut stream = tun.tcp(tcp_peer.local_addr().port()).await?;
+        let mut stream = tun.connect_tcp(tcp_peer.local_addr().port()).await?;
         for sequence in 0..16 {
             tcp_exchange(&mut stream, &payload(2, sequence, 32 * 1024)).await?;
         }
@@ -212,7 +212,7 @@ async fn ipv6_udp_and_tcp_roundtrip_through_kernel_tun() -> io::Result<()> {
 
 #[tokio::test]
 async fn sustained_udp_preserves_all_flow_ids() -> io::Result<()> {
-    timeout(DEADLINE, async {
+    timeout(TEST_TIMEOUT, async {
         let peer = start_udp_echo_server_with_suffix("0.0.0.0", 0, b"").await?;
         let tun = KernelTun::start(false).await?;
         let target = SocketAddr::new(tun.target, peer.local_addr().port());
@@ -239,7 +239,7 @@ async fn sustained_udp_preserves_all_flow_ids() -> io::Result<()> {
 
 #[tokio::test]
 async fn tcp_and_udp_make_progress_during_overlapping_load() -> io::Result<()> {
-    timeout(DEADLINE, async {
+    timeout(TEST_TIMEOUT, async {
         const TCP_FLOWS: usize = 8;
         const UDP_FLOWS: usize = 16;
         let tcp_peer = start_tcp_stream_echo_server("0.0.0.0", 0).await?;
@@ -248,24 +248,24 @@ async fn tcp_and_udp_make_progress_during_overlapping_load() -> io::Result<()> {
         let start = Arc::new(Barrier::new(TCP_FLOWS + UDP_FLOWS + 1));
         let (stop_tx, stop_rx) = watch::channel(false);
         let udp_in_flight = Arc::new(AtomicUsize::new(0));
-        let checkpoint = Arc::new(Barrier::new(UDP_FLOWS));
-        let progress: Arc<Vec<AtomicUsize>> =
+        let udp_midpoint = Arc::new(Barrier::new(UDP_FLOWS));
+        let tcp_progress: Arc<Vec<AtomicUsize>> =
             Arc::new((0..TCP_FLOWS).map(|_| AtomicUsize::new(0)).collect());
         let mut tcp = JoinSet::new();
         for flow in 0..TCP_FLOWS {
-            let mut stream = tun.tcp(tcp_peer.local_addr().port()).await?;
+            let mut stream = tun.connect_tcp(tcp_peer.local_addr().port()).await?;
             tcp_exchange(&mut stream, &payload(flow, 0, 256)).await?;
             let start = start.clone();
             let stop = stop_rx.clone();
             let in_flight = udp_in_flight.clone();
-            let progress = progress.clone();
+            let tcp_progress = tcp_progress.clone();
             tcp.spawn(async move {
                 start.wait().await;
                 let mut sequence = 1;
                 while !*stop.borrow() {
                     tcp_exchange(&mut stream, &payload(flow, sequence, 16 * 1024)).await?;
                     if in_flight.load(Ordering::Acquire) != 0 {
-                        progress[flow].fetch_add(1, Ordering::Release);
+                        tcp_progress[flow].fetch_add(1, Ordering::Release);
                     }
                     sequence += 1;
                 }
@@ -277,22 +277,23 @@ async fn tcp_and_udp_make_progress_during_overlapping_load() -> io::Result<()> {
             let socket = UdpSocket::bind(SocketAddr::new(tun.source, 0)).await?;
             let target = SocketAddr::new(tun.target, udp_peer.local_addr().port());
             let start = start.clone();
-            let checkpoint = checkpoint.clone();
+            let udp_midpoint = udp_midpoint.clone();
             let in_flight = udp_in_flight.clone();
             udp.spawn(async move {
                 start.wait().await;
                 for sequence in 0..256 {
                     let data = payload(flow, sequence, 256);
-                    if sequence >= 128 {
+                    let second_phase = sequence >= 128;
+                    if second_phase {
                         in_flight.fetch_add(1, Ordering::AcqRel);
                     }
                     let result = udp_exchange(&socket, target, &data).await;
-                    if sequence >= 128 {
+                    if second_phase {
                         in_flight.fetch_sub(1, Ordering::AcqRel);
                     }
                     result?;
                     if sequence == 127 {
-                        checkpoint.wait().await;
+                        udp_midpoint.wait().await;
                     }
                 }
                 io::Result::Ok(())
@@ -303,7 +304,7 @@ async fn tcp_and_udp_make_progress_during_overlapping_load() -> io::Result<()> {
             result??;
         }
         assert_eq!(udp_in_flight.load(Ordering::Acquire), 0);
-        for (flow, count) in progress.iter().enumerate() {
+        for (flow, count) in tcp_progress.iter().enumerate() {
             assert!(
                 count.load(Ordering::Acquire) > 0,
                 "TCP flow {flow} made no progress with second-phase UDP exchanges in flight"
@@ -320,32 +321,32 @@ async fn tcp_and_udp_make_progress_during_overlapping_load() -> io::Result<()> {
 
 #[tokio::test]
 async fn udp_progresses_while_a_tcp_reader_is_stalled() -> io::Result<()> {
-    timeout(DEADLINE, async {
+    timeout(TEST_TIMEOUT, async {
         let tcp_peer = start_tcp_stream_echo_server("0.0.0.0", 0).await?;
         let udp_peer = start_udp_echo_server_with_suffix("0.0.0.0", 0, b"").await?;
         let tun = KernelTun::start(false).await?;
-        let mut stream = tun.tcp(tcp_peer.local_addr().port()).await?;
+        let mut stream = tun.connect_tcp(tcp_peer.local_addr().port()).await?;
         tcp_exchange(&mut stream, b"ready").await?;
         socket2::SockRef::from(&stream).set_recv_buffer_size(16 * 1024)?;
         let socket = UdpSocket::bind(SocketAddr::new(tun.source, 0)).await?;
         let target = SocketAddr::new(tun.target, udp_peer.local_addr().port());
         let data = payload(1, 0, 4 * 1024 * 1024);
-        let (started, waiting) = tokio::sync::oneshot::channel();
+        let (write_stalled_tx, write_stalled_rx) = tokio::sync::oneshot::channel();
         let (mut reader, mut writer) = stream.split();
         let sending = async {
             writer.write_all(&data[..64 * 1024]).await?;
-            let remaining = writer.write_all(&data[64 * 1024..]);
-            tokio::pin!(remaining);
+            let remaining_write = writer.write_all(&data[64 * 1024..]);
+            tokio::pin!(remaining_write);
             assert!(
-                futures::poll!(remaining.as_mut()).is_pending(),
+                futures::poll!(remaining_write.as_mut()).is_pending(),
                 "TCP write must stall before starting UDP"
             );
-            let _ = started.send(());
-            remaining.await?;
+            let _ = write_stalled_tx.send(());
+            remaining_write.await?;
             writer.shutdown().await
         };
         let receiving = async {
-            waiting.await.map_err(io::Error::other)?;
+            write_stalled_rx.await.map_err(io::Error::other)?;
             for sequence in 0..128 {
                 udp_exchange(&socket, target, &payload(2, sequence, 1200)).await?;
             }
