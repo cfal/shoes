@@ -1648,6 +1648,10 @@ mod tests {
     #[test]
     fn one_notification_drains_more_than_one_response_batch() {
         let (peer, tun) = UnixDatagram::pair().unwrap();
+        // The entire burst must fit even if the receiving thread is not scheduled yet.
+        socket2::SockRef::from(&peer)
+            .set_recv_buffer_size(256 * 1024)
+            .unwrap();
         peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
         let mut stack = TcpStackDirect::new(tun.into(), 1500);
         let (tx, rx) = mpsc::channel(2 * MAX_PACKET_BATCH + 1);
@@ -1658,7 +1662,10 @@ mod tests {
         stack.set_udp_response_tx(rx);
         for index in 0..2 * MAX_PACKET_BATCH + 1 {
             let mut reply = [0; 2];
-            assert_eq!(peer.recv(&mut reply).unwrap(), 1);
+            let length = peer
+                .recv(&mut reply)
+                .unwrap_or_else(|error| panic!("response {index}: {error}"));
+            assert_eq!(length, 1);
             assert_eq!(reply[0], index as u8);
         }
     }
