@@ -13,7 +13,7 @@
 //! ```
 //!
 //! The smoltcp stack runs in a dedicated OS thread with direct fd access,
-//! using `select()` for efficient event-driven I/O.
+//! using `poll()` for TUN readiness and cross-thread wakeups.
 //!
 //! # Platform Support
 //!
@@ -33,6 +33,7 @@ mod tcp_stack_direct;
 mod tun_server;
 mod udp_handler;
 mod udp_manager;
+mod wake;
 
 // Platform module only needed for mobile FFI targets
 #[cfg(any(target_os = "android", target_os = "ios", feature = "ffi"))]
@@ -80,7 +81,7 @@ type PacketBuffer = Vec<u8>;
 /// This function:
 /// 1. Creates/wraps a TUN device
 /// 2. Sets up our smoltcp-based TCP/IP stack with direct fd access
-/// 3. The stack thread reads packets directly from TUN using select()
+/// 3. The stack thread reads packets directly from TUN using poll()
 /// 4. Handles TCP connections through the proxy chain
 /// 5. Handles UDP packets through tokio (forwarded from stack thread)
 pub async fn run_tun_server(
@@ -109,12 +110,12 @@ pub async fn run_tun_server(
         unsafe { OwnedFd::from_raw_fd(fd) }
     };
 
-    // Create the direct TCP stack (runs smoltcp in dedicated thread with select())
+    // Creates the direct TCP stack in a dedicated thread.
     let mut stack_config = config.clone();
     if config.raw_fd.is_none() && cfg!(any(target_os = "macos", target_os = "ios")) {
         stack_config.packet_information = true;
     }
-    let mut tcp_stack = TcpStackDirect::with_config(fd, stack_config);
+    let mut tcp_stack = TcpStackDirect::with_config(fd, stack_config)?;
 
     // Get UDP receiver (stack thread filters UDP and sends here)
     let udp_from_stack_rx = tcp_stack.take_udp_rx().expect("udp_rx already taken");
@@ -168,6 +169,7 @@ pub async fn run_tun_server(
         let proxy_selector = proxy_selector.clone();
         let resolver = resolver.clone();
         let limits = config.resource_limits.clone();
+        let wake = tcp_stack.wake_handle();
 
         tasks.spawn(async move {
             handle_udp_packets(
@@ -176,6 +178,7 @@ pub async fn run_tun_server(
                 proxy_selector,
                 resolver,
                 limits,
+                wake,
             )
             .await;
         });
@@ -302,10 +305,11 @@ async fn handle_udp_packets(
     proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
     limits: crate::config::tun::TunResourceLimits,
+    wake: wake::Wake,
 ) {
     info!("Starting UDP handler (session-based)");
 
-    let udp_handler = udp_handler::UdpHandler::new(from_stack_rx, to_stack_tx);
+    let udp_handler = udp_handler::UdpHandler::new(from_stack_rx, to_stack_tx, wake);
     let (reader, writer) = udp_handler.split();
 
     let manager = TunUdpManager::new(reader, writer, proxy_selector, resolver, limits);

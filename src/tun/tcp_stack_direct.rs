@@ -1,7 +1,7 @@
 //! Direct TCP Stack Manager for smoltcp integration.
 //!
 //! This module manages the smoltcp TCP/IP stack in a dedicated OS thread,
-//! using `select()` on the TUN fd for event-driven I/O instead of polling.
+//! using `poll()` on TUN and wake fds for event-driven I/O.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -14,7 +14,7 @@ use std::{
         Arc, LazyLock, Mutex,
         atomic::{AtomicBool, Ordering},
     },
-    thread::{self, JoinHandle, Thread},
+    thread::{self, JoinHandle},
     time::Duration,
 };
 
@@ -23,7 +23,7 @@ use bytes::BytesMut;
 use log::{debug, error, info, trace, warn};
 use smoltcp::{
     iface::{Config as InterfaceConfig, Interface, SocketHandle, SocketSet},
-    phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken, wait as phy_wait},
+    phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken},
     socket::tcp::{
         CongestionControl, Socket as TcpSocket, SocketBuffer as TcpSocketBuffer, State as TcpState,
     },
@@ -37,6 +37,7 @@ use tokio::sync::mpsc::{self, Receiver, Sender};
 
 use super::TunServerConfig;
 use super::tcp_conn::{TcpConnection, TcpConnectionControl, TcpSocketState};
+use super::wake::{Wake, WakeReceiver};
 
 pub type PacketBuffer = Vec<u8>;
 pub const PACKET_QUEUE_CAPACITY: usize = 64;
@@ -127,8 +128,7 @@ struct SharedState {
 pub struct TcpStackDirect {
     /// Handle to the stack thread
     thread_handle: Option<JoinHandle<()>>,
-    /// Thread handle for waking the stack thread
-    stack_thread: Thread,
+    wake: Wake,
     /// Flag to signal thread shutdown
     running: Arc<AtomicBool>,
     /// Receiver for UDP packets (filtered from TUN by the stack thread)
@@ -143,7 +143,7 @@ impl Drop for TcpStackDirect {
     fn drop(&mut self) {
         // Signal thread to stop
         self.running.store(false, Ordering::Relaxed);
-        self.stack_thread.unpark();
+        self.wake.notify();
 
         // Wait for thread to finish
         if let Some(handle) = self.thread_handle.take() {
@@ -160,14 +160,16 @@ impl TcpStackDirect {
     /// * `mtu` - Maximum transmission unit
     ///
     /// This spawns a dedicated OS thread for running the smoltcp interface.
-    /// The thread uses `select()` on the fd for efficient event-driven I/O.
+    /// The thread waits for TUN readiness and cross-thread notifications.
     #[cfg(test)]
     pub fn new(tun_fd: OwnedFd, mtu: usize) -> Self {
-        Self::with_config(tun_fd, TunServerConfig::new().mtu(mtu as u16))
+        Self::with_config(tun_fd, TunServerConfig::new().mtu(mtu as u16)).unwrap()
     }
 
-    pub fn with_config(tun_fd: OwnedFd, config: TunServerConfig) -> Self {
+    pub fn with_config(tun_fd: OwnedFd, config: TunServerConfig) -> io::Result<Self> {
         let fd = tun_fd.as_raw_fd();
+        set_nonblocking(fd)?;
+        let (wake, wake_rx) = Wake::new()?;
         let (udp_tx, udp_rx) = mpsc::channel(PACKET_QUEUE_CAPACITY);
 
         let running = Arc::new(AtomicBool::new(true));
@@ -179,12 +181,21 @@ impl TcpStackDirect {
         let thread_handle = {
             let running = running.clone();
             let shared_state = shared_state.clone();
+            let stack_wake = wake.clone();
 
             thread::Builder::new()
                 .name("shoes-smoltcp-direct".to_owned())
                 .spawn(move || {
                     let result = panic::catch_unwind(AssertUnwindSafe(|| {
-                        run_direct_stack_thread(fd, config, udp_tx, running.clone(), shared_state);
+                        run_direct_stack_thread(
+                            fd,
+                            config,
+                            udp_tx,
+                            running.clone(),
+                            shared_state,
+                            stack_wake,
+                            wake_rx,
+                        );
                     }));
 
                     match result {
@@ -204,20 +215,21 @@ impl TcpStackDirect {
                     }
 
                     running.store(false, Ordering::Relaxed);
-                })
-                .expect("failed to spawn smoltcp direct thread")
+                })?
         };
 
-        let stack_thread = thread_handle.thread().clone();
-
-        Self {
+        Ok(Self {
             thread_handle: Some(thread_handle),
-            stack_thread,
+            wake,
             running,
             udp_rx: Some(udp_rx),
             shared_state,
             _tun_fd: tun_fd,
-        }
+        })
+    }
+
+    pub fn wake_handle(&self) -> Wake {
+        self.wake.clone()
     }
 
     /// Take the receiver for UDP packets (filtered from TUN by the stack).
@@ -230,7 +242,7 @@ impl TcpStackDirect {
         if let Ok(mut state) = self.shared_state.lock() {
             state.udp_response_rx = Some(rx);
         }
-        self.stack_thread.unpark();
+        self.wake.notify();
     }
 
     /// Set the channel for notifying about new TCP connections.
@@ -238,7 +250,7 @@ impl TcpStackDirect {
         if let Ok(mut state) = self.shared_state.lock() {
             state.new_conn_tx = Some(tx);
         }
-        self.stack_thread.unpark();
+        self.wake.notify();
     }
 
     /// Check if the stack thread is still running.
@@ -406,14 +418,10 @@ fn run_direct_stack_thread(
     udp_tx: Sender<PacketBuffer>,
     running: Arc<AtomicBool>,
     shared_state: Arc<Mutex<SharedState>>,
+    stack_wake: Wake,
+    mut wake_rx: WakeReceiver,
 ) {
     info!("smoltcp direct stack thread initializing...");
-
-    // Sets fd to non-blocking mode once at startup for performance.
-    if let Err(e) = set_nonblocking(fd) {
-        error!("Failed to set TUN fd to non-blocking: {}", e);
-        return;
-    }
 
     let limits = &config.resource_limits;
     let mut device = DirectDevice::new(fd, config.mtu as usize, config.packet_information);
@@ -454,20 +462,32 @@ fn run_direct_stack_thread(
     let mut poll_count: u64 = 0;
     let mut last_log_time = std::time::Instant::now();
 
-    let stack_thread = thread::current();
-
     let mut phy_wait_error_count: u32 = 0;
     const MAX_PHY_WAIT_ERRORS: u32 = 10;
+    let mut udp_response_rx = None;
+    let mut new_conn_tx = None;
 
     info!("smoltcp direct stack thread started, entering main loop");
 
     while running.load(Ordering::Relaxed) {
+        if let Err(error) = wake_rx.drain() {
+            error!("TUN wake channel failed: {error}");
+            break;
+        }
+        if let Ok(mut state) = shared_state.lock() {
+            if let Some(rx) = state.udp_response_rx.take() {
+                udp_response_rx = Some(rx);
+            }
+            if let Some(tx) = state.new_conn_tx.take() {
+                new_conn_tx = Some(tx);
+            }
+        }
+        let mut responses_written = 0;
         // Checks for UDP responses to write to TUN.
-        if let Ok(mut state) = shared_state.try_lock()
-            && let Some(ref mut udp_rx) = state.udp_response_rx
-        {
+        if let Some(ref mut udp_rx) = udp_response_rx {
             for _ in 0..MAX_PACKET_BATCH {
                 let Ok(pkt) = udp_rx.try_recv() else { break };
+                responses_written += 1;
                 if let Err(e) = device.write_packet(&pkt) {
                     warn!("Failed to write UDP response to TUN: {}", e);
                 }
@@ -525,7 +545,7 @@ fn run_direct_stack_thread(
                                         src_addr,
                                         dst_addr,
                                         &mut socket_set,
-                                        &stack_thread,
+                                        &stack_wake,
                                         limits.tcp_buffer_size,
                                     ) {
                                         sockets.insert(
@@ -538,9 +558,7 @@ fn run_direct_stack_thread(
                                         );
                                         active_connections.insert((src_addr, dst_addr));
 
-                                        if let Ok(state) = shared_state.try_lock()
-                                            && let Some(ref tx) = state.new_conn_tx
-                                        {
+                                        if let Some(ref tx) = new_conn_tx {
                                             let _ = tx.send(new_conn.new_tcp_conn);
                                         }
                                     }
@@ -712,34 +730,20 @@ fn run_direct_stack_thread(
             last_log_time = std::time::Instant::now();
         }
 
-        // Wait for data using select() - this is the key for event-driven I/O
-        if packets_read < MAX_PACKET_BATCH && !local_work {
-            // Cap poll_delay at 10ms to balance CPU usage vs throughput
+        if packets_read < MAX_PACKET_BATCH && responses_written < MAX_PACKET_BATCH && !local_work {
             let delay = iface.poll_delay(stack_now(), &socket_set);
-            let wait_duration = Some(delay.map_or(SmolDuration::from_millis(10), |d| {
-                let millis = d.total_millis().min(10);
-                SmolDuration::from_millis(millis)
-            }));
-
-            // phy_wait calls select() on the TUN fd to sleep until data
-            // arrives. If the fd becomes invalid (e.g. device removed),
-            // select() returns EBADF immediately with no sleep, creating a
-            // hot spin loop. The try_recv path usually catches this first,
-            // but this counter acts as a backstop: after 10 consecutive
-            // non-EINTR errors with no successful reads in between, treat
-            // the fd as dead.
-            if let Err(e) = phy_wait(fd, wait_duration)
-                && e.kind() != io::ErrorKind::Interrupted
-            {
-                phy_wait_error_count += 1;
-                if phy_wait_error_count >= MAX_PHY_WAIT_ERRORS {
-                    error!(
-                        "select() failed {} consecutive times (last: {}). Stack thread stopping.",
-                        phy_wait_error_count, e
-                    );
-                    running.store(false, Ordering::Relaxed);
-                } else {
-                    warn!("select() error ({}): {}", phy_wait_error_count, e);
+            match wake_rx.wait(fd, delay.map(Into::into)) {
+                Ok(_) => phy_wait_error_count = 0,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => {
+                    phy_wait_error_count += 1;
+                    if phy_wait_error_count >= MAX_PHY_WAIT_ERRORS {
+                        error!(
+                            "TUN poll failed {phy_wait_error_count} consecutive times (last: {e}). Stack thread stopping."
+                        );
+                        break;
+                    }
+                    warn!("TUN poll error ({phy_wait_error_count}): {e}");
                 }
             }
         }
@@ -791,7 +795,7 @@ fn create_tcp_connection(
     src_addr: SocketAddr,
     dst_addr: SocketAddr,
     socket_set: &mut SocketSet<'static>,
-    stack_thread: &Thread,
+    wake: &Wake,
     buffer_size: usize,
 ) -> Option<(CreateConnectionResult, Arc<TcpConnectionControl>)> {
     let mut socket = TcpSocket::new(
@@ -817,7 +821,7 @@ fn create_tcp_connection(
     let control = Arc::new(TcpConnectionControl::new(buffer_size, buffer_size));
 
     let handle = socket_set.add(socket);
-    let connection = TcpConnection::new(control.clone(), stack_thread.clone());
+    let connection = TcpConnection::new(control.clone(), wake.clone());
 
     Some((
         CreateConnectionResult {
@@ -1091,7 +1095,7 @@ mod tests {
             src_addr,
             dst_addr,
             &mut socket_set,
-            &thread::current(),
+            &Wake::new().unwrap().0,
             4096,
         )
         .unwrap();
@@ -1357,7 +1361,8 @@ mod tests {
         use std::os::unix::net::UnixDatagram;
         let (peer, tun) = UnixDatagram::pair().unwrap();
         let mut stack =
-            TcpStackDirect::with_config(tun.into(), TunServerConfig::new().udp_enabled(false));
+            TcpStackDirect::with_config(tun.into(), TunServerConfig::new().udp_enabled(false))
+                .unwrap();
         let mut rx = stack.take_udp_rx().unwrap();
         let builder =
             etherparse::PacketBuilder::ipv4([10, 0, 0, 2], [1, 1, 1, 1], 64).udp(1000, 53);
@@ -1399,7 +1404,8 @@ mod tests {
             let stack = TcpStackDirect::with_config(
                 tun.into(),
                 TunServerConfig::new().icmp_enabled(enabled),
-            );
+            )
+            .unwrap();
             for request in [&ipv4_request, &ipv6_request] {
                 peer.send(request).unwrap();
                 let mut response = [0; 1500];
@@ -1454,7 +1460,7 @@ mod tests {
         let waker = waker(flag.clone());
         let mut cx = Context::from_waker(&waker);
         let control = Arc::new(TcpConnectionControl::new(1, 1));
-        let mut conn = TcpConnection::new(control.clone(), thread::current());
+        let mut conn = TcpConnection::new(control.clone(), Wake::new().unwrap().0);
         let info = SocketInfo {
             control: control.clone(),
             src_addr: "127.0.0.1:1".parse().unwrap(),
@@ -1482,17 +1488,87 @@ mod tests {
 
     #[test]
     fn idle_stack_delivers_udp_output_without_inbound_traffic() {
-        use std::io::Read;
-        let (mut peer, client) = UnixStream::pair().unwrap();
+        use super::super::udp_handler::{UdpHandler, build_udp_packet};
+        for pause in [Duration::ZERO, Duration::from_millis(30)] {
+            let (peer, tun) = UnixDatagram::pair().unwrap();
+            peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+            let mut stack = TcpStackDirect::new(tun.into(), 1500);
+            let (tx, rx) = mpsc::channel(PACKET_QUEUE_CAPACITY);
+            stack.set_udp_response_tx(rx);
+            let (_, from_tun) = mpsc::channel(1);
+            let (_, writer) = UdpHandler::new(from_tun, tx, stack.wake_handle()).split();
+            thread::sleep(pause);
+            let src = "1.1.1.1:53".parse().unwrap();
+            let dst = "10.0.0.2:10001".parse().unwrap();
+            writer.send_sync((b"reply".to_vec(), src, dst)).unwrap();
+            let expected = build_udp_packet(b"reply", src, dst).unwrap();
+            let mut reply = [0; 1500];
+            let length = peer.recv(&mut reply).unwrap();
+            assert_eq!(&reply[..length], &expected);
+        }
+    }
+
+    #[test]
+    fn one_notification_drains_more_than_one_response_batch() {
+        let (peer, tun) = UnixDatagram::pair().unwrap();
         peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
-        let mut stack = TcpStackDirect::new(client.into(), 1500);
-        let (tx, rx) = mpsc::channel(PACKET_QUEUE_CAPACITY);
+        let mut stack = TcpStackDirect::new(tun.into(), 1500);
+        let (tx, rx) = mpsc::channel(2 * MAX_PACKET_BATCH + 1);
+        for index in 0..2 * MAX_PACKET_BATCH + 1 {
+            tx.try_send(vec![index as u8]).unwrap();
+        }
         stack.set_udp_response_tx(rx);
-        thread::sleep(Duration::from_millis(30));
+        for index in 0..2 * MAX_PACKET_BATCH + 1 {
+            let mut reply = [0; 2];
+            assert_eq!(peer.recv(&mut reply).unwrap(), 1);
+            assert_eq!(reply[0], index as u8);
+        }
+    }
+
+    #[test]
+    fn setup_publication_is_not_lost_while_its_lock_is_held() {
+        let (peer, tun) = UnixDatagram::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let stack = TcpStackDirect::new(tun.into(), 1500);
+        let (tx, rx) = mpsc::channel(1);
         tx.try_send(b"reply".to_vec()).unwrap();
+        let mut state = stack.shared_state.lock().unwrap();
+        stack.wake.notify();
+        thread::sleep(Duration::from_millis(30));
+        state.udp_response_rx = Some(rx);
+        drop(state);
         let mut reply = [0; 5];
-        peer.read_exact(&mut reply).unwrap();
+        assert_eq!(peer.recv(&mut reply).unwrap(), 5);
         assert_eq!(&reply, b"reply");
+    }
+
+    #[test]
+    fn retransmission_deadline_runs_without_new_input() {
+        let (peer, tun) = UnixDatagram::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let mut stack = TcpStackDirect::new(tun.into(), 1500);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        stack.set_new_conn_tx(tx);
+        let mut syn = Vec::new();
+        etherparse::PacketBuilder::ipv4([10, 0, 0, 2], [1, 1, 1, 1], 64)
+            .tcp(10001, 443, 101, 4096)
+            .syn()
+            .write(&mut syn, b"")
+            .unwrap();
+        peer.send(&syn).unwrap();
+        let _connection = rx.blocking_recv().unwrap();
+        let mut buf = [0; 1500];
+        let mut sequence = None;
+        for _ in 0..2 {
+            let length = peer.recv(&mut buf).unwrap();
+            let ip = Ipv4Packet::new_checked(&buf[..length]).unwrap();
+            let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+            assert!(tcp.syn() && tcp.ack());
+            if let Some(sequence) = sequence {
+                assert_eq!(tcp.seq_number(), sequence);
+            }
+            sequence = Some(tcp.seq_number());
+        }
     }
 
     #[test]

@@ -11,12 +11,13 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::{Context, Poll, Waker},
-    thread::Thread,
 };
 
 use parking_lot::Mutex;
 use smoltcp::storage::RingBuffer;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+use super::wake::Wake;
 
 /// TCP socket state machine.
 ///
@@ -170,18 +171,18 @@ impl TcpConnectionControl {
 /// Implements AsyncRead and AsyncWrite for use with tokio.
 pub struct TcpConnection {
     control: Arc<TcpConnectionControl>,
-    thread: Thread,
+    wake: Wake,
 }
 
 impl TcpConnection {
     /// Create a new TCP connection.
-    pub fn new(control: Arc<TcpConnectionControl>, thread: Thread) -> Self {
-        Self { control, thread }
+    pub fn new(control: Arc<TcpConnectionControl>, wake: Wake) -> Self {
+        Self { control, wake }
     }
 
     /// Wake up the stack thread.
     fn notify(&self) {
-        self.thread.unpark();
+        self.wake.notify();
     }
 }
 
@@ -307,6 +308,58 @@ impl AsyncWrite for TcpConnection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn async_buffer_and_lifecycle_changes_notify_the_wait_fd() {
+        use std::os::{fd::AsRawFd, unix::net::UnixStream};
+        use std::time::Duration;
+
+        let (_peer, tun) = UnixStream::pair().unwrap();
+        let (wake, mut receiver) = Wake::new().unwrap();
+        let control = Arc::new(TcpConnectionControl::new(32, 32));
+        let mut connection = TcpConnection::new(control.clone(), wake);
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(
+            Pin::new(&mut connection)
+                .poll_write(&mut cx, b"request")
+                .is_ready()
+        );
+        assert!(
+            receiver
+                .wait(tun.as_raw_fd(), Some(Duration::ZERO))
+                .unwrap()
+        );
+        receiver.drain().unwrap();
+        control.enqueue_recv_data(b"reply");
+        assert!(
+            Pin::new(&mut connection)
+                .poll_read(&mut cx, &mut ReadBuf::new(&mut [0; 32]))
+                .is_ready()
+        );
+        assert!(
+            receiver
+                .wait(tun.as_raw_fd(), Some(Duration::ZERO))
+                .unwrap()
+        );
+        receiver.drain().unwrap();
+        assert!(
+            Pin::new(&mut connection)
+                .poll_shutdown(&mut cx)
+                .is_pending()
+        );
+        assert!(
+            receiver
+                .wait(tun.as_raw_fd(), Some(Duration::ZERO))
+                .unwrap()
+        );
+        receiver.drain().unwrap();
+        drop(connection);
+        assert!(
+            receiver
+                .wait(tun.as_raw_fd(), Some(Duration::ZERO))
+                .unwrap()
+        );
+    }
 
     #[test]
     fn test_control_basic() {

@@ -583,7 +583,9 @@ mod lifecycle_tests {
     async fn default_session_admission_does_not_evict_at_the_old_limit() {
         let (_, from_tun) = mpsc::channel(1);
         let (to_tun, _) = mpsc::channel(1);
-        let (reader, writer) = super::super::udp_handler::UdpHandler::new(from_tun, to_tun).split();
+        let (wake, _receiver) = super::super::wake::Wake::new().unwrap();
+        let (reader, writer) =
+            super::super::udp_handler::UdpHandler::new(from_tun, to_tun, wake).split();
         let mut manager = TunUdpManager::new(
             reader,
             writer,
@@ -611,7 +613,9 @@ mod lifecycle_tests {
         limits.validate().unwrap();
         let (_, from_tun) = mpsc::channel(1);
         let (to_tun, _) = mpsc::channel(1);
-        let (reader, writer) = super::super::udp_handler::UdpHandler::new(from_tun, to_tun).split();
+        let (wake, _receiver) = super::super::wake::Wake::new().unwrap();
+        let (reader, writer) =
+            super::super::udp_handler::UdpHandler::new(from_tun, to_tun, wake).split();
         let manager = TunUdpManager::new(
             reader,
             writer,

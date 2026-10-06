@@ -17,6 +17,8 @@ use futures::{Sink, Stream, ready};
 use smoltcp::wire::{IpProtocol, Ipv4Packet, Ipv6Packet, UdpPacket};
 use tokio::sync::mpsc::{Receiver, Sender, error::TrySendError};
 
+use super::wake::Wake;
+
 pub type PacketBuffer = Vec<u8>;
 
 /// UDP message: (payload, local_addr, remote_addr)
@@ -28,14 +30,20 @@ pub struct UdpHandler {
     from_tun_rx: Receiver<PacketBuffer>,
     /// Sender for UDP packets to TUN
     to_tun_tx: Sender<PacketBuffer>,
+    wake: Wake,
 }
 
 impl UdpHandler {
     /// Create a new UDP handler.
-    pub fn new(from_tun_rx: Receiver<PacketBuffer>, to_tun_tx: Sender<PacketBuffer>) -> Self {
+    pub fn new(
+        from_tun_rx: Receiver<PacketBuffer>,
+        to_tun_tx: Sender<PacketBuffer>,
+        wake: Wake,
+    ) -> Self {
         Self {
             from_tun_rx,
             to_tun_tx,
+            wake,
         }
     }
 
@@ -47,6 +55,7 @@ impl UdpHandler {
             },
             UdpWriter {
                 to_tun_tx: self.to_tun_tx,
+                wake: self.wake,
             },
         )
     }
@@ -60,6 +69,7 @@ pub struct UdpReader {
 /// Write half for sending UDP packets.
 pub struct UdpWriter {
     to_tun_tx: Sender<PacketBuffer>,
+    wake: Wake,
 }
 
 impl UdpWriter {
@@ -68,7 +78,11 @@ impl UdpWriter {
         let (payload, src_addr, dst_addr) = message;
         let packet = build_udp_packet(&payload, src_addr, dst_addr)?;
         match self.to_tun_tx.try_send(packet) {
-            Ok(()) | Err(TrySendError::Full(_)) => Ok(()),
+            Ok(()) => {
+                self.wake.notify();
+                Ok(())
+            }
+            Err(TrySendError::Full(_)) => Ok(()),
             Err(TrySendError::Closed(_)) => {
                 Err(io::Error::new(io::ErrorKind::BrokenPipe, "channel closed"))
             }
@@ -243,6 +257,50 @@ pub fn build_udp_packet(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_successful_response_enqueues_notify_the_stack() {
+        use std::os::{fd::AsRawFd, unix::net::UnixStream};
+        use std::time::Duration;
+        use tokio::sync::mpsc;
+
+        let (_peer, tun) = UnixStream::pair().unwrap();
+        let (wake, mut receiver) = Wake::new().unwrap();
+        let (_, input) = mpsc::channel(1);
+        let (output, queued) = mpsc::channel(1);
+        let (_, writer) = UdpHandler::new(input, output, wake).split();
+        let message = || {
+            (
+                b"reply".to_vec(),
+                "1.1.1.1:53".parse().unwrap(),
+                "10.0.0.2:1000".parse().unwrap(),
+            )
+        };
+        writer.send_sync(message()).unwrap();
+        assert!(
+            receiver
+                .wait(tun.as_raw_fd(), Some(Duration::ZERO))
+                .unwrap()
+        );
+        receiver.drain().unwrap();
+        writer.send_sync(message()).unwrap();
+        assert_eq!(queued.len(), 1);
+        assert!(
+            !receiver
+                .wait(tun.as_raw_fd(), Some(Duration::ZERO))
+                .unwrap()
+        );
+        drop(queued);
+        assert_eq!(
+            writer.send_sync(message()).unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        assert!(
+            !receiver
+                .wait(tun.as_raw_fd(), Some(Duration::ZERO))
+                .unwrap()
+        );
+    }
 
     #[test]
     fn test_build_and_parse_ipv4_udp() {
