@@ -1054,6 +1054,69 @@ mod tests {
         assert_eq!(log.lock().flushed.len(), 1);
     }
 
+    #[tokio::test]
+    async fn padding_transition_preserves_data_under_transport_backpressure() {
+        use tokio::io::AsyncReadExt;
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (mut state, rx) = writer_state();
+            Arc::get_mut(&mut state).unwrap().padding =
+                Arc::new(PaddingFactory::new(b"stop=3\n0=0-0\n1=128-128\n2=128-128").unwrap());
+            state.send_padding.store(true, Ordering::Relaxed);
+            for index in 0..5 {
+                state
+                    .outgoing_tx
+                    .try_send(OutgoingMessage::Data {
+                        stream_id: 1,
+                        data: Bytes::from(vec![index; 64]),
+                    })
+                    .unwrap();
+            }
+            state
+                .outgoing_tx
+                .try_send(OutgoingMessage::Fin { stream_id: 1 })
+                .unwrap();
+            let (done, barrier) = oneshot::channel();
+            state
+                .outgoing_tx
+                .try_send(OutgoingMessage::Flush { done })
+                .unwrap();
+            let (writer, mut reader) = tokio::io::duplex(7);
+            let writing = tokio::spawn(ClientSessionState::writer_loop(
+                Arc::downgrade(&state),
+                writer,
+                rx,
+                state.close_notify.clone(),
+            ));
+            let reading = tokio::spawn(async move {
+                let mut received = Vec::new();
+                reader.read_to_end(&mut received).await.unwrap();
+                BytesMut::from(received.as_slice())
+            });
+            barrier.await.unwrap();
+            assert!(!state.send_padding.load(Ordering::Relaxed));
+            state.close();
+            writing.await.unwrap().unwrap();
+            let mut received = reading.await.unwrap();
+            for index in 0..5 {
+                let frame = FrameCodec::decode(&mut received).unwrap().unwrap();
+                assert_eq!(frame.cmd, Command::Psh);
+                assert_eq!(frame.data.as_ref(), [index; 64]);
+                if index < 2 {
+                    let padding = FrameCodec::decode(&mut received).unwrap().unwrap();
+                    assert_eq!(padding.cmd, Command::Waste);
+                }
+            }
+            assert_eq!(
+                FrameCodec::decode(&mut received).unwrap().unwrap().cmd,
+                Command::Fin
+            );
+            assert!(received.is_empty());
+        })
+        .await
+        .unwrap();
+    }
+
     async fn open() -> (
         Arc<AnyTlsClientSession>,
         AnyTlsStream,
