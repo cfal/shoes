@@ -61,48 +61,48 @@ path = "tests/stress.rs"
 required-features = ["stress-tests"]
 
 [dependencies]
-async-trait = "*"
-aws-lc-rs = { version = "*", default-features = false }
-base64 = "*"
-blake3 = "*"
-bytes = "*"
-chrono = "*"
-dashmap = "*"
-digest = "*"
-etherparse = "*"
-futures = "*"
-h2 = "*"
-h3 = "*"
-h3-quinn = "*"
-hickory-resolver = { version = "*", default-features = false, features = ["tokio", "tls-aws-lc-rs", "https-aws-lc-rs", "h3-aws-lc-rs"] }
-http = "*"
-http-body-util = "*"
-hyper = { version = "*", features = ["server", "http1", "http2"] }
-hyper-util = { version = "*", features = ["tokio", "server"] }
-indexmap = "*"
-libc = "*"
-log = { version = "*", features = ["std", "release_max_level_info"] }
-lru = "*"
-md-5 = "*"
-memchr = "*"
-mime_guess = "*"
-notify = "*"
-parking_lot = "*"
-percent-encoding = "*"
-quinn = { version = "*", default-features = false, features = ["log", "platform-verifier", "runtime-tokio", "rustls-aws-lc-rs"] }
-rand = "*"
-rand_core = "*"
-rcgen = { version = "*", default-features = false, features = ["aws_lc_rs", "pem"] }
-rust-argon2 = "*"
-rustc-hash = "*"
-rustls = "*"
-serde = { version = "*", features = ["derive", "std"] }
-serde_yaml = "*"
-shake = "*"
-smoltcp = { version = "*", default-features = false, features = ["std", "log", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-icmp", "auto-icmp-echo-reply", "socket-udp", "socket-tcp", "socket-tcp-cubic", "phy-tuntap_interface", "assembler-max-segment-count-32"] }
-socket2 = "*"
-subtle = "*"
-tokio = { version = "*", features = [
+async-trait = "0.1.92"
+aws-lc-rs = { version = "1.18.1", default-features = false }
+base64 = "0.23.1"
+blake3 = "1.8.7"
+bytes = "1.12.1"
+chrono = "0.4.45"
+dashmap = "6.2.1"
+digest = "0.11.3"
+etherparse = "0.21.0"
+futures = "0.3.34"
+h2 = "0.4.19"
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+hickory-resolver = { version = "0.26.3", default-features = false, features = ["tokio", "tls-aws-lc-rs", "https-aws-lc-rs", "h3-aws-lc-rs"] }
+http = "1.5.0"
+http-body-util = "0.1.5"
+hyper = { version = "1.11.1", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1.21", features = ["tokio", "server"] }
+indexmap = "2.14.2"
+libc = "0.2.190"
+log = { version = "0.4.34", features = ["std", "release_max_level_info"] }
+lru = "0.18.5"
+md-5 = "0.11.0"
+memchr = "2.8.3"
+mime_guess = "2.0.5"
+notify = "8.2.0"
+parking_lot = "0.12.5"
+percent-encoding = "2.3.2"
+quinn = { version = "0.11.12", default-features = false, features = ["log", "platform-verifier", "runtime-tokio", "rustls-aws-lc-rs"] }
+rand = "0.10.3"
+rand_core = "0.10.1"
+rcgen = { version = "0.14.10", default-features = false, features = ["aws_lc_rs", "pem"] }
+rust-argon2 = "3.0.0"
+rustc-hash = "2.1.3"
+rustls = "0.23.45"
+serde = { version = "1.0.229", features = ["derive", "std"] }
+serde_yaml = "0.9.34"
+shake = "0.1.0"
+smoltcp = { version = "0.14.0", default-features = false, features = ["std", "log", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-icmp", "auto-icmp-echo-reply", "socket-udp", "socket-tcp", "socket-tcp-cubic", "phy-tuntap_interface", "assembler-max-segment-count-32"] }
+socket2 = "0.6.5"
+subtle = "2.6.1"
+tokio = { version = "1.53.2", features = [
     "fs",
     "io-util",
     "macros",
@@ -111,29 +111,29 @@ tokio = { version = "*", features = [
     "sync",
     "time",
 ] }
-tokio-util = { version = "*", features = ["time", "io"] }
-tun = { version = "*", features = ["async"] }
-url = "*"
-webpki-roots = { version = "*" }
-x509-parser = { version = "*", default-features = false, features = ["verify-aws"] }
+tokio-util = { version = "0.7.19", features = ["time", "io"] }
+tun = { version = "0.8.14", features = ["async"] }
+url = "2.5.8"
+webpki-roots = { version = "1.0.9" }
+x509-parser = { version = "0.18.1", default-features = false, features = ["verify-aws"] }
 
 [dev-dependencies]
-tokio = { version = "*", features = ["test-util"] }
-rcgen = { version = "*", default-features = false, features = ["aws_lc_rs", "pem"] }
-rustls-pemfile = "*"
-serde_json = "*"
+tokio = { version = "1.53.2", features = ["test-util"] }
+rcgen = { version = "0.14.10", default-features = false, features = ["aws_lc_rs", "pem"] }
+rustls-pemfile = "2.2.0"
+serde_json = "1.0.151"
 shoes-test-support = { path = "tests/support" }
-tempfile = "*"
-tokio-rustls = "*"
+tempfile = "3.27.0"
+tokio-rustls = "0.26.6"
 
 # jemalloc for better memory performance (not supported on Windows MSVC, iOS, or Android)
 [target.'cfg(not(any(target_env = "msvc", target_os = "ios", target_os = "android")))'.dependencies]
-tikv-jemallocator = "*"
+tikv-jemallocator = "0.7.0"
 
 [target.'cfg(target_os = "android")'.dependencies]
-android_logger = "*"
-jni = "0.22"
-ndk-sys = "*"
+android_logger = "0.15.1"
+jni = "0.22.4"
+ndk-sys = "0.6.0"
 
 [profile.release]
 opt-level = 3
