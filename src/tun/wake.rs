@@ -182,7 +182,7 @@ mod tests {
         let bytes = [0; 4096];
         loop {
             match (&wake.0.writer).write(&bytes) {
-                Ok(_) => {}
+                Ok(written) => assert!(written > 0),
                 Err(error) => {
                     assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
                     break;
