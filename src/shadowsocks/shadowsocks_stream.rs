@@ -930,6 +930,128 @@ fn current_time_secs() -> u64 {
 }
 
 #[cfg(test)]
+mod flush_tests {
+    use super::*;
+    use crate::copy_bidirectional::tests::copy_response_with_flush_pressure;
+    use crate::prepend_stream::PrependStream;
+    use aws_lc_rs::aead::{AES_128_GCM, AES_256_GCM, CHACHA20_POLY1305};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn check_response_flushes(payload: &[u8]) {
+        for (algorithm, aead2022) in [
+            (&AES_128_GCM, false),
+            (&AES_256_GCM, false),
+            (&CHACHA20_POLY1305, false),
+            (&AES_128_GCM, true),
+            (&AES_256_GCM, true),
+        ] {
+            let salt_len = algorithm.key_len();
+            let key: Arc<Box<dyn ShadowsocksKey>> = Arc::new(if aead2022 {
+                Box::new(super::super::blake3_key::Blake3Key::new(
+                    vec![42; salt_len].into_boxed_slice(),
+                    salt_len,
+                ))
+            } else {
+                Box::new(super::super::DefaultKey::new("secret", salt_len))
+            });
+            let (transport, mut peer) = tokio::io::duplex(4096);
+            let mut client = ShadowsocksStream::new(
+                Box::new(transport),
+                if aead2022 {
+                    ShadowsocksStreamType::AEAD2022Client
+                } else {
+                    ShadowsocksStreamType::Aead
+                },
+                algorithm,
+                salt_len,
+                key.clone(),
+                None,
+            );
+            let request = b"\x01\x7f\x00\x00\x01\x00\x50\x00\x00";
+            client.write_all(request).await.unwrap();
+            client.flush().await.unwrap();
+            let metadata_len = if aead2022 {
+                11 + 2 * TAG_LEN
+            } else {
+                METADATA_SIZE
+            };
+            let mut request_wire = vec![0; salt_len + metadata_len + request.len()];
+            peer.read_exact(&mut request_wire).await.unwrap();
+
+            let capture = copy_response_with_flush_pressure(
+                |stream| async move {
+                    let mut server = ShadowsocksStream::new(
+                        Box::new(PrependStream::new(
+                            stream,
+                            Some(request_wire.into_boxed_slice()),
+                        )),
+                        if aead2022 {
+                            ShadowsocksStreamType::AEAD2022Server
+                        } else {
+                            ShadowsocksStreamType::Aead
+                        },
+                        algorithm,
+                        salt_len,
+                        key,
+                        None,
+                    );
+                    let mut received_request = [0; 9];
+                    server.read_exact(&mut received_request).await.unwrap();
+                    assert_eq!(&received_request, request);
+                    server
+                },
+                payload,
+            )
+            .await;
+
+            if payload.is_empty() {
+                assert!(capture.data.is_empty());
+                assert!(capture.first_write.is_empty());
+            } else {
+                let overhead = if aead2022 {
+                    salt_len + 11 + salt_len + 2 * TAG_LEN
+                } else {
+                    salt_len + METADATA_SIZE
+                };
+                assert!(capture.first_write.len() > overhead);
+                if payload.len() < 1024 {
+                    assert_eq!(capture.first_write.len(), overhead + payload.len());
+                }
+            }
+
+            let (transport, _) = tokio::io::duplex(1);
+            client.stream = Box::new(PrependStream::new(
+                transport,
+                Some(capture.data.into_boxed_slice()),
+            ));
+            let mut decoded = Vec::new();
+            client.read_to_end(&mut decoded).await.unwrap();
+            assert_eq!(decoded, payload);
+        }
+    }
+
+    #[tokio::test]
+    async fn response_salt_waits_for_content_across_copier_flushes() {
+        check_response_flushes(b"first response").await;
+    }
+
+    #[tokio::test]
+    async fn response_survives_copier_quota_flushes_and_eof() {
+        let quota = 1024 * 1024;
+        let payload: Vec<u8> = (0..2 * quota + 37)
+            .map(|i| (i ^ (i >> 8) ^ (i >> 16)) as u8)
+            .collect();
+        assert!(payload[..quota] != payload[quota..2 * quota]);
+        check_response_flushes(&payload).await;
+    }
+
+    #[tokio::test]
+    async fn empty_response_never_emits_a_salt() {
+        check_response_flushes(b"").await;
+    }
+}
+
+#[cfg(test)]
 mod replay_tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};

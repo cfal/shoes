@@ -1158,14 +1158,153 @@ impl AsyncMessageStream for VmessStream {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aws_lc_rs::aead::{CHACHA20_POLY1305, UnboundKey};
+    use crate::copy_bidirectional::tests::copy_response_with_flush_pressure;
+    use crate::prepend_stream::PrependStream;
+    use aws_lc_rs::aead::{Algorithm, CHACHA20_POLY1305, UnboundKey};
     use shake::Shake128;
     use shake::digest::{ExtendableOutput, Update};
+    use tokio::io::AsyncReadExt;
 
     fn create_shake128_reader(iv: &[u8]) -> VmessReader {
         let mut hasher = Shake128::default();
         hasher.update(iv);
         hasher.finalize_xof()
+    }
+
+    fn response_test_stream(
+        stream: Box<dyn AsyncStream>,
+        algorithm: Option<&'static Algorithm>,
+        masked: bool,
+        padding: bool,
+        prefix: Option<BytesMut>,
+    ) -> VmessStream {
+        let keys = algorithm.map(|algorithm| {
+            let key = vec![42; algorithm.key_len()];
+            (
+                OpeningKey::new(
+                    UnboundKey::new(algorithm, &key).unwrap(),
+                    VmessNonceSequence::new(&[23; 16]),
+                ),
+                SealingKey::new(
+                    UnboundKey::new(algorithm, &key).unwrap(),
+                    VmessNonceSequence::new(&[23; 16]),
+                ),
+            )
+        });
+        VmessStream::new(
+            stream,
+            false,
+            keys,
+            masked.then(|| create_shake128_reader(&[23; 16])),
+            masked.then(|| create_shake128_reader(&[23; 16])),
+            padding,
+            prefix,
+            None,
+        )
+    }
+
+    async fn check_response_flushes(payload: &[u8]) {
+        // The handler supplies an opaque, already encrypted 38-byte response prefix.
+        let prefix = [0x5a; 38];
+        for algorithm in [None, Some(&AES_128_GCM), Some(&CHACHA20_POLY1305)] {
+            for (masked, padding) in [(false, false), (true, false), (true, true)] {
+                let capture = copy_response_with_flush_pressure(
+                    |stream| async move {
+                        response_test_stream(
+                            stream,
+                            algorithm,
+                            masked,
+                            padding,
+                            Some(BytesMut::from(&prefix[..])),
+                        )
+                    },
+                    payload,
+                )
+                .await;
+                assert!(capture.first_write.starts_with(&prefix));
+                assert!(capture.first_write.len() > prefix.len());
+                assert!(capture.data.starts_with(&prefix));
+
+                let (transport, _) = tokio::io::duplex(1);
+                let mut decoder = response_test_stream(
+                    Box::new(PrependStream::new(
+                        transport,
+                        Some(capture.data[prefix.len()..].into()),
+                    )),
+                    algorithm,
+                    masked,
+                    padding,
+                    None,
+                );
+                let mut decoded = Vec::new();
+                decoder.read_to_end(&mut decoded).await.unwrap();
+                assert_eq!(decoded, payload);
+
+                let mut mask =
+                    masked.then(|| LengthMask::new(create_shake128_reader(&[23; 16]), padding));
+                let tag_len = if algorithm.is_some() {
+                    ENCRYPTION_TAG_LEN
+                } else {
+                    0
+                };
+                let mut offset = prefix.len();
+                let mut eof_count = 0;
+                while offset < capture.data.len() {
+                    let (padding_len, length_mask) =
+                        mask.as_mut().map_or((0, 0), LengthMask::next_values);
+                    let len =
+                        u16::from_be_bytes(capture.data[offset..offset + 2].try_into().unwrap())
+                            ^ length_mask;
+                    let len = usize::from(len);
+                    assert!(len >= padding_len + tag_len);
+                    let end = offset + 2 + len;
+                    assert!(end <= capture.data.len());
+                    if offset == prefix.len() {
+                        // The first offered write contains a complete body frame, not just its prefix.
+                        assert!(capture.first_write.len() >= end);
+                        assert_eq!(len == padding_len + tag_len, payload.is_empty());
+                    }
+                    if len == padding_len + tag_len {
+                        eof_count += 1;
+                        assert_eq!(end, capture.data.len());
+                        assert_eq!(
+                            capture.before_shutdown,
+                            if payload.is_empty() { 0 } else { offset }
+                        );
+                        if let Some(key) = &mut decoder.opening_key {
+                            let mut tag = capture.data[offset + 2..end - padding_len].to_vec();
+                            assert!(
+                                key.open_in_place(Aad::empty(), &mut tag)
+                                    .unwrap()
+                                    .is_empty()
+                            );
+                        }
+                    }
+                    offset = end;
+                }
+                assert_eq!(eof_count, 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn response_header_waits_for_content_across_copier_flushes() {
+        check_response_flushes(b"first response").await;
+    }
+
+    #[tokio::test]
+    async fn response_survives_copier_quota_flushes_and_eof() {
+        let quota = 1024 * 1024;
+        let payload: Vec<u8> = (0..2 * quota + 37)
+            .map(|i| (i ^ (i >> 8) ^ (i >> 16)) as u8)
+            .collect();
+        assert!(payload[..quota] != payload[quota..2 * quota]);
+        check_response_flushes(&payload).await;
+    }
+
+    #[tokio::test]
+    async fn empty_response_pairs_header_with_eof_only_at_shutdown() {
+        check_response_flushes(b"").await;
     }
 
     #[test]
