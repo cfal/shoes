@@ -1302,6 +1302,10 @@ mod tests {
     #[test]
     fn closed_socket_keeps_its_pending_reset_until_a_complete_egress_sweep() {
         let (peer, tun) = UnixDatagram::pair().unwrap();
+        // A full sweep must fit before reads start, including on macOS's smaller default queue.
+        socket2::SockRef::from(&peer)
+            .set_recv_buffer_size(256 * 1024)
+            .unwrap();
         peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
         let mut device = DirectDevice::new(tun.as_raw_fd(), 1500, false);
         let mut iface = Interface::new(
@@ -1345,8 +1349,10 @@ mod tests {
         iface.poll_egress(stack_now(), &mut device, &mut socket_set);
         let mut reset = false;
         let mut data = [0; 1500];
-        for _ in 0..70 {
-            let length = peer.recv(&mut data).unwrap();
+        for index in 0..70 {
+            let length = peer
+                .recv(&mut data)
+                .unwrap_or_else(|error| panic!("missing egress packet {index} of 70: {error}"));
             let ip = Ipv4Packet::new_checked(&data[..length]).unwrap();
             let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
             if tcp.src_port() == 10069 {
