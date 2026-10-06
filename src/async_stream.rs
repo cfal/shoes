@@ -185,7 +185,12 @@ impl AsyncShutdownMessage for UdpSocket {
     }
 }
 
-pub trait AsyncStream: AsyncRead + AsyncWrite + AsyncPing + Unpin + Send + Sync {}
+pub trait AsyncStream: AsyncRead + AsyncWrite + AsyncPing + Unpin + Send + Sync {
+    /// Limits relay chunks for writers that packetize each write separately.
+    fn preferred_write_size(&self) -> Option<std::num::NonZeroUsize> {
+        None
+    }
+}
 
 pub trait AsyncMessageStream:
     AsyncReadMessage
@@ -488,8 +493,16 @@ impl<T: ?Sized + AsyncWriteSourcedMessage + Unpin> AsyncWriteSourcedMessage for 
     }
 }
 
-impl<T: ?Sized + AsyncStream + Unpin> AsyncStream for Box<T> {}
-impl<T: ?Sized + AsyncStream + Unpin> AsyncStream for &mut T {}
+impl<T: ?Sized + AsyncStream + Unpin> AsyncStream for Box<T> {
+    fn preferred_write_size(&self) -> Option<std::num::NonZeroUsize> {
+        (**self).preferred_write_size()
+    }
+}
+impl<T: ?Sized + AsyncStream + Unpin> AsyncStream for &mut T {
+    fn preferred_write_size(&self) -> Option<std::num::NonZeroUsize> {
+        (**self).preferred_write_size()
+    }
+}
 
 impl<T: ?Sized + AsyncMessageStream + Unpin> AsyncMessageStream for Box<T> {}
 impl<T: ?Sized + AsyncMessageStream + Unpin> AsyncMessageStream for &mut T {}

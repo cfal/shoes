@@ -912,7 +912,16 @@ impl AsyncShutdownMessage for ShadowsocksStream {
     }
 }
 
-impl AsyncStream for ShadowsocksStream {}
+impl AsyncStream for ShadowsocksStream {
+    fn preferred_write_size(&self) -> Option<std::num::NonZeroUsize> {
+        match self.stream_type {
+            ShadowsocksStreamType::Aead => {
+                std::num::NonZeroUsize::new(self.stream_type.max_payload_len())
+            }
+            ShadowsocksStreamType::AEAD2022Server | ShadowsocksStreamType::AEAD2022Client => None,
+        }
+    }
+}
 impl AsyncMessageStream for ShadowsocksStream {}
 
 #[inline]

@@ -83,4 +83,8 @@ impl<S: AsyncPing + Unpin> AsyncPing for PrependStream<S> {
     }
 }
 
-impl<S: AsyncStream> AsyncStream for PrependStream<S> {}
+impl<S: AsyncStream> AsyncStream for PrependStream<S> {
+    fn preferred_write_size(&self) -> Option<std::num::NonZeroUsize> {
+        self.inner.preferred_write_size()
+    }
+}

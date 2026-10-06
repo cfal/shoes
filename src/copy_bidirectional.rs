@@ -342,6 +342,8 @@ where
         None
     };
 
+    let a_to_b_buf_size = copy_buffer_size(a_to_b_buf_size, b);
+    let b_to_a_buf_size = copy_buffer_size(b_to_a_buf_size, a);
     CopyBidirectional {
         a,
         b,
@@ -357,11 +359,126 @@ where
     .await
 }
 
+fn copy_buffer_size(requested: usize, writer: &(impl AsyncStream + ?Sized)) -> usize {
+    match writer.preferred_write_size() {
+        Some(preferred) => requested.min(preferred.get()),
+        None => requested,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::async_stream::AsyncPing;
+    use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+    #[derive(Default)]
+    struct Capture {
+        data: Vec<u8>,
+        writes: Vec<usize>,
+    }
+
+    #[derive(Default)]
+    struct MemoryStream {
+        input: std::io::Cursor<Vec<u8>>,
+        output: Arc<Mutex<Capture>>,
+    }
+
+    impl AsyncRead for MemoryStream {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.input).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for MemoryStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            data: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let mut output = self.output.lock().unwrap();
+            output.data.extend_from_slice(data);
+            output.writes.push(data.len());
+            Poll::Ready(Ok(data.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncPing for MemoryStream {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+
+        fn poll_write_ping(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+
+    impl AsyncStream for MemoryStream {}
+
+    #[tokio::test]
+    async fn legacy_shadowsocks_copy_avoids_one_byte_records() {
+        use crate::shadowsocks::{
+            DefaultKey, ShadowsocksKey, ShadowsocksStream, ShadowsocksStreamType,
+        };
+
+        let key: Arc<Box<dyn ShadowsocksKey>> = Arc::new(Box::new(DefaultKey::new("test", 32)));
+        let encrypted = |stream: MemoryStream| {
+            ShadowsocksStream::new(
+                Box::new(stream),
+                ShadowsocksStreamType::Aead,
+                &aws_lc_rs::aead::AES_256_GCM,
+                32,
+                key.clone(),
+                None,
+            )
+        };
+        let payload: Vec<u8> = (0..1024 * 1024).map(|i| (i ^ (i >> 8)) as u8).collect();
+        let sink = MemoryStream::default();
+        let capture = sink.output.clone();
+        let mut writer: Box<dyn AsyncStream> = Box::new(encrypted(sink));
+        writer.write_all(b"warm").await.unwrap();
+        writer.flush().await.unwrap();
+        capture.lock().unwrap().writes.clear();
+        let mut writer = crate::prepend_stream::PrependStream::new(&mut writer, None);
+        assert_eq!(copy_buffer_size(16384, &writer), 16383);
+        assert_eq!(copy_buffer_size(1024, &writer), 1024);
+        assert_eq!(copy_buffer_size(16384, &MemoryStream::default()), 16384);
+
+        let mut source = MemoryStream {
+            input: std::io::Cursor::new(payload.clone()),
+            ..Default::default()
+        };
+        copy_bidirectional(&mut source, &mut writer, false, false)
+            .await
+            .unwrap();
+        let wire = {
+            let captured = capture.lock().unwrap();
+            assert_eq!(captured.writes.len(), 65);
+            assert!(!captured.writes.contains(&35));
+            captured.data.clone()
+        };
+        let mut reader = encrypted(MemoryStream {
+            input: std::io::Cursor::new(wire),
+            ..Default::default()
+        });
+        let mut decoded = Vec::new();
+        reader.read_to_end(&mut decoded).await.unwrap();
+        assert_eq!(&decoded[..4], b"warm");
+        assert_eq!(&decoded[4..], payload);
+    }
 
     struct StalledShutdown;
 
