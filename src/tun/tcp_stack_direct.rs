@@ -208,6 +208,7 @@ struct DirectDevice {
     fd: RawFd,
     mtu: usize,
     pending_rx: Option<PacketBuffer>,
+    tx_buffer: Vec<u8>,
     packet_information: bool,
 }
 
@@ -217,6 +218,7 @@ impl DirectDevice {
             fd,
             mtu,
             pending_rx: None,
+            tx_buffer: Vec::with_capacity(mtu),
             packet_information,
         }
     }
@@ -280,7 +282,7 @@ impl DirectDevice {
 
 impl Device for DirectDevice {
     type RxToken<'a> = DirectRxToken;
-    type TxToken<'a> = DirectTxToken;
+    type TxToken<'a> = DirectTxToken<'a>;
 
     fn receive(
         &mut self,
@@ -291,6 +293,7 @@ impl Device for DirectDevice {
             let tx = DirectTxToken {
                 fd: self.fd,
                 packet_information: self.packet_information,
+                buffer: &mut self.tx_buffer,
             };
             Some((rx, tx))
         } else {
@@ -302,6 +305,7 @@ impl Device for DirectDevice {
         Some(DirectTxToken {
             fd: self.fd,
             packet_information: self.packet_information,
+            buffer: &mut self.tx_buffer,
         })
     }
 
@@ -332,20 +336,22 @@ impl RxToken for DirectRxToken {
     }
 }
 
-struct DirectTxToken {
+struct DirectTxToken<'a> {
     fd: RawFd,
     packet_information: bool,
+    buffer: &'a mut Vec<u8>,
 }
 
-impl TxToken for DirectTxToken {
+impl TxToken for DirectTxToken<'_> {
     fn consume<R, F>(self, len: usize, f: F) -> R
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        let mut buffer = vec![0u8; len];
-        let result = f(&mut buffer);
+        self.buffer.clear();
+        self.buffer.resize(len, 0);
+        let result = f(self.buffer);
 
-        if let Err(e) = write_packet(self.fd, &buffer, self.packet_information) {
+        if let Err(e) = write_packet(self.fd, self.buffer, self.packet_information) {
             warn!("Failed to write to TUN: {}", e);
         }
 
@@ -952,17 +958,28 @@ fn packet_header(first_byte: u8) -> io::Result<[u8; 4]> {
 }
 
 fn write_packet(fd: RawFd, data: &[u8], packet_information: bool) -> io::Result<()> {
-    if packet_information {
-        let Some(&first_byte) = data.first() else {
-            return Ok(());
+    write_packet_with(data, packet_information, |header, payload| {
+        let n = if header.is_empty() {
+            unsafe { libc::write(fd, payload.as_ptr().cast(), payload.len()) }
+        } else {
+            let buffers = [
+                libc::iovec {
+                    iov_base: header.as_ptr().cast_mut().cast(),
+                    iov_len: header.len(),
+                },
+                libc::iovec {
+                    iov_base: payload.as_ptr().cast_mut().cast(),
+                    iov_len: payload.len(),
+                },
+            ];
+            unsafe { libc::writev(fd, buffers.as_ptr(), buffers.len() as libc::c_int) }
         };
-        let mut framed = Vec::with_capacity(data.len() + 4);
-        framed.extend_from_slice(&packet_header(first_byte)?);
-        framed.extend_from_slice(data);
-        write_all(fd, &framed)
-    } else {
-        write_all(fd, data)
-    }
+        if n < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(n as usize)
+        }
+    })
 }
 
 /// Non-blocking read from a file descriptor (fd must already be non-blocking).
@@ -977,35 +994,42 @@ fn read_nonblocking(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
     }
 }
 
-/// Write all data to a file descriptor.
-fn write_all(fd: RawFd, buf: &[u8]) -> io::Result<()> {
-    let mut written = 0;
-    while written < buf.len() {
-        let n = unsafe {
-            libc::write(
-                fd,
-                buf[written..].as_ptr() as *const libc::c_void,
-                buf.len() - written,
-            )
-        };
-        if n < 0 {
-            let err = io::Error::last_os_error();
-            if err.raw_os_error() == Some(libc::ENOBUFS) || err.kind() == io::ErrorKind::WouldBlock
+fn write_packet_with(
+    data: &[u8],
+    packet_information: bool,
+    mut write: impl FnMut(&[u8], &[u8]) -> io::Result<usize>,
+) -> io::Result<()> {
+    let Some(&first_byte) = data.first() else {
+        return Ok(());
+    };
+    let header = if packet_information {
+        Some(packet_header(first_byte)?)
+    } else {
+        None
+    };
+    let header = header.as_ref().map_or(&[][..], |header| &header[..]);
+    let length = header.len() + data.len();
+    loop {
+        match write(header, data) {
+            Ok(n) if n == length => return Ok(()),
+            // A suffix write would become a second, malformed TUN packet.
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "short TUN packet write",
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error)
+                if error.raw_os_error() == Some(libc::ENOBUFS)
+                    || error.kind() == io::ErrorKind::WouldBlock =>
             {
-                trace!("TUN write {}, packet dropped", err);
+                trace!("TUN write {}, packet dropped", error);
                 return Ok(());
             }
-            return Err(err);
+            Err(error) => return Err(error),
         }
-        if n == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::WriteZero,
-                "TUN write made no progress",
-            ));
-        }
-        written += n as usize;
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1013,6 +1037,78 @@ mod tests {
     use super::*;
     use std::os::unix::io::IntoRawFd;
     use std::os::unix::net::{UnixDatagram, UnixStream};
+
+    #[test]
+    fn transmit_storage_is_reused_and_initialized() {
+        let (peer, tun) = UnixDatagram::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let mut device = DirectDevice::new(tun.as_raw_fd(), 1500, false);
+        let pointer = device.tx_buffer.as_ptr();
+        for length in [1000, 100, 1500] {
+            let token = device.transmit(stack_now()).unwrap();
+            let result = token.consume(length, |buffer| {
+                assert_eq!(buffer.as_ptr(), pointer);
+                assert!(buffer.iter().all(|&byte| byte == 0));
+                buffer.fill(42);
+                123
+            });
+            assert_eq!(result, 123);
+            let mut received = [0; 1500];
+            assert_eq!(peer.recv(&mut received).unwrap(), length);
+            assert!(received[..length].iter().all(|&byte| byte == 42));
+        }
+    }
+
+    #[test]
+    fn packet_writes_retry_only_interruptions_and_never_a_suffix() {
+        let payload = [0x45, 1, 2, 3, 4];
+        for framed in [false, true] {
+            let expected_header = if framed {
+                packet_header(payload[0]).unwrap().to_vec()
+            } else {
+                Vec::new()
+            };
+            let expected_length = payload.len() + expected_header.len();
+            let mut attempts = 0;
+            write_packet_with(&payload, framed, |header, data| {
+                assert_eq!(header, expected_header);
+                assert_eq!(data, payload);
+                attempts += 1;
+                if attempts < 3 {
+                    Err(io::Error::from_raw_os_error(libc::EINTR))
+                } else {
+                    Ok(expected_length)
+                }
+            })
+            .unwrap();
+            assert_eq!(attempts, 3);
+
+            for length in 0..expected_length {
+                let mut attempts = 0;
+                let error = write_packet_with(&payload, framed, |_, _| {
+                    attempts += 1;
+                    Ok(length)
+                })
+                .unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::WriteZero);
+                assert_eq!(attempts, 1);
+            }
+            for code in [libc::EAGAIN, libc::ENOBUFS, libc::EIO] {
+                let mut attempts = 0;
+                let result = write_packet_with(&payload, framed, |_, _| {
+                    attempts += 1;
+                    Err(io::Error::from_raw_os_error(code))
+                });
+                assert_eq!(attempts, 1);
+                if code == libc::EIO {
+                    assert_eq!(result.unwrap_err().raw_os_error(), Some(code));
+                } else {
+                    result.unwrap();
+                }
+            }
+            write_packet_with(&[], framed, |_, _| panic!("empty packet write")).unwrap();
+        }
+    }
 
     #[test]
     fn time_wait_cleanup_does_not_depend_on_egress_progress() {
@@ -1578,8 +1674,8 @@ mod tests {
     }
 
     #[test]
-    fn test_write_all_eagain() {
-        // Fill a non-blocking socket's write buffer, then verify write_all
+    fn test_write_packet_eagain() {
+        // Fill a non-blocking socket's write buffer, then verify write_packet
         // treats EAGAIN the same as ENOBUFS (drops the packet, returns Ok).
         let (reader, writer) = UnixStream::pair().expect("Failed to create socket pair");
         let writer_fd = writer.into_raw_fd();
@@ -1608,11 +1704,11 @@ mod tests {
             }
         }
 
-        // Now write_all should drop the packet gracefully
-        let result = write_all(writer_fd, &[1, 2, 3]);
+        // Now write_packet should drop the packet gracefully
+        let result = write_packet(writer_fd, &[1, 2, 3], false);
         assert!(
             result.is_ok(),
-            "write_all should return Ok on EAGAIN, got {:?}",
+            "write_packet should return Ok on EAGAIN, got {:?}",
             result
         );
 
