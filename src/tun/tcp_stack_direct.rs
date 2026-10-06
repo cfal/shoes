@@ -5,20 +5,17 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    io, mem,
+    io,
     net::SocketAddr,
-    ops::{Deref, DerefMut},
     os::fd::{AsRawFd, OwnedFd, RawFd},
     panic::{self, AssertUnwindSafe},
     sync::{
-        Arc, LazyLock, Mutex,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     thread::{self, JoinHandle},
     time::Duration,
 };
-
-use bytes::BytesMut;
 
 use log::{debug, error, info, trace, warn};
 use smoltcp::{
@@ -36,64 +33,11 @@ use smoltcp::{
 use tokio::sync::mpsc::{self, Receiver, Sender};
 
 use super::TunServerConfig;
+use super::packet::PacketBuffer;
 use super::tcp_conn::{TcpConnection, TcpConnectionControl, TcpSocketState};
 use super::wake::{Wake, WakeReceiver};
 
-pub type PacketBuffer = Vec<u8>;
 pub const PACKET_QUEUE_CAPACITY: usize = 64;
-
-/// Maximum number of buffers cached globally.
-/// Each buffer has capacity ~65536, so 64 * 65536 = 4MB max.
-const BUFFER_POOL_MAX_SIZE: usize = 64;
-
-static BUFFER_POOL: LazyLock<Mutex<Vec<BytesMut>>> = LazyLock::new(|| Mutex::new(Vec::new()));
-
-/// Pooled buffer that returns to pool on drop instead of deallocating.
-pub struct PooledBuffer {
-    buffer: BytesMut,
-}
-
-impl Drop for PooledBuffer {
-    fn drop(&mut self) {
-        if let Ok(mut pool) = BUFFER_POOL.lock()
-            && pool.len() < BUFFER_POOL_MAX_SIZE
-        {
-            let empty = BytesMut::new();
-            let mut buffer = mem::replace(&mut self.buffer, empty);
-            buffer.clear();
-            pool.push(buffer);
-        }
-    }
-}
-
-impl PooledBuffer {
-    /// Get a buffer from the pool or create a new one.
-    pub fn with_capacity(cap: usize) -> Self {
-        if let Ok(mut pool) = BUFFER_POOL.lock()
-            && let Some(mut buffer) = pool.pop()
-        {
-            buffer.reserve(cap);
-            return Self { buffer };
-        }
-        Self {
-            buffer: BytesMut::with_capacity(cap),
-        }
-    }
-}
-
-impl Deref for PooledBuffer {
-    type Target = BytesMut;
-
-    fn deref(&self) -> &Self::Target {
-        &self.buffer
-    }
-}
-
-impl DerefMut for PooledBuffer {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.buffer
-    }
-}
 
 /// Tracks socket info including addresses for proper cleanup.
 struct SocketInfo {
@@ -263,7 +207,7 @@ impl TcpStackDirect {
 struct DirectDevice {
     fd: RawFd,
     mtu: usize,
-    pending_rx: Option<PooledBuffer>,
+    pending_rx: Option<PacketBuffer>,
     packet_information: bool,
 }
 
@@ -282,14 +226,14 @@ impl DirectDevice {
     /// - Ok(Some(packet)) if a packet was read
     /// - Ok(None) if no packet was available (WouldBlock)
     /// - Err(e) if a fatal error occurred (including EOF)
-    fn try_recv(&mut self) -> io::Result<Option<PooledBuffer>> {
+    fn try_recv(&mut self) -> io::Result<Option<PacketBuffer>> {
         if let Some(pkt) = self.pending_rx.take() {
             return Ok(Some(pkt));
         }
 
         // Get a buffer from the pool
-        let mut buffer = PooledBuffer::with_capacity(self.mtu + 4);
-        buffer.resize(self.mtu + 4, 0);
+        let mut buffer = PacketBuffer::with_capacity(self.mtu + 4);
+        buffer.resize(self.mtu + 4);
 
         match read_nonblocking(self.fd, &mut buffer) {
             Ok(n) if n > 0 => {
@@ -301,7 +245,7 @@ impl DirectDevice {
                             "invalid TUN packet information",
                         ));
                     }
-                    let _ = buffer.split_to(4);
+                    buffer.retain_range(4..n);
                 }
                 Ok(Some(buffer))
             }
@@ -324,7 +268,7 @@ impl DirectDevice {
     }
 
     /// Store a packet for later processing by smoltcp.
-    fn store_packet(&mut self, pkt: PooledBuffer) {
+    fn store_packet(&mut self, pkt: PacketBuffer) {
         self.pending_rx = Some(pkt);
     }
 
@@ -375,7 +319,7 @@ impl Device for DirectDevice {
 }
 
 struct DirectRxToken {
-    buffer: PooledBuffer,
+    buffer: PacketBuffer,
 }
 
 impl RxToken for DirectRxToken {
@@ -495,7 +439,7 @@ fn run_direct_stack_thread(
         }
 
         // Reads packets from TUN and filters by protocol (batch processing).
-        let mut tcp_packets: Vec<PooledBuffer> = Vec::new();
+        let mut tcp_packets: Vec<PacketBuffer> = Vec::new();
         let mut packets_read = 0;
 
         while packets_read < MAX_PACKET_BATCH {
@@ -576,8 +520,7 @@ fn run_direct_stack_thread(
                         tcp_packets.push(pkt);
                     }
                     IpProtocol::Udp if config.udp_enabled => {
-                        // UDP goes to tokio - convert to Vec since it leaves our pool
-                        let _ = udp_tx.try_send(pkt.to_vec());
+                        let _ = udp_tx.try_send(pkt);
                     }
                     _ => {
                         trace!("ignoring packet with protocol {:?}", protocol);
@@ -1127,9 +1070,7 @@ mod tests {
                 }
                 let mut packet = Vec::new();
                 builder.write(&mut packet, b"").unwrap();
-                let mut pooled = PooledBuffer::with_capacity(packet.len());
-                pooled.extend_from_slice(&packet);
-                device.store_packet(pooled);
+                device.store_packet(PacketBuffer::copy_from_slice(&packet));
                 iface.poll_ingress_single(SmolInstant::from_millis(1), device, sockets);
             };
         ingress(&mut iface, &mut device, &mut socket_set, None, false);
@@ -1500,11 +1441,13 @@ mod tests {
             thread::sleep(pause);
             let src = "1.1.1.1:53".parse().unwrap();
             let dst = "10.0.0.2:10001".parse().unwrap();
-            writer.send_sync((b"reply".to_vec(), src, dst)).unwrap();
+            writer
+                .send_sync((PacketBuffer::copy_from_slice(b"reply"), src, dst))
+                .unwrap();
             let expected = build_udp_packet(b"reply", src, dst).unwrap();
             let mut reply = [0; 1500];
             let length = peer.recv(&mut reply).unwrap();
-            assert_eq!(&reply[..length], &expected);
+            assert_eq!(&reply[..length], &*expected);
         }
     }
 
@@ -1515,7 +1458,8 @@ mod tests {
         let mut stack = TcpStackDirect::new(tun.into(), 1500);
         let (tx, rx) = mpsc::channel(2 * MAX_PACKET_BATCH + 1);
         for index in 0..2 * MAX_PACKET_BATCH + 1 {
-            tx.try_send(vec![index as u8]).unwrap();
+            tx.try_send(PacketBuffer::copy_from_slice(&[index as u8]))
+                .unwrap();
         }
         stack.set_udp_response_tx(rx);
         for index in 0..2 * MAX_PACKET_BATCH + 1 {
@@ -1531,7 +1475,8 @@ mod tests {
         peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
         let stack = TcpStackDirect::new(tun.into(), 1500);
         let (tx, rx) = mpsc::channel(1);
-        tx.try_send(b"reply".to_vec()).unwrap();
+        tx.try_send(PacketBuffer::copy_from_slice(b"reply"))
+            .unwrap();
         let mut state = stack.shared_state.lock().unwrap();
         stack.wake.notify();
         thread::sleep(Duration::from_millis(30));

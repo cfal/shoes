@@ -28,6 +28,7 @@
 //!   Use `TunServerConfig::packet_information(true)` if using the socket FD
 //!   directly, or `false` if using the readPackets/writePackets API.
 
+mod packet;
 mod tcp_conn;
 mod tcp_stack_direct;
 mod tun_server;
@@ -71,10 +72,9 @@ use crate::config::selection::ConfigSelection;
 use crate::resolver::Resolver;
 use crate::tcp::tcp_client_handler_factory::create_tcp_client_proxy_selector;
 
+use packet::PacketBuffer;
 use tcp_stack_direct::{NewTcpConnection, PACKET_QUEUE_CAPACITY, TcpStackDirect};
 use udp_manager::TunUdpManager;
-
-type PacketBuffer = Vec<u8>;
 
 /// Run the TUN server with the given configuration.
 ///
