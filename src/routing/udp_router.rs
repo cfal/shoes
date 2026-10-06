@@ -59,6 +59,9 @@ const MAX_PENDING_SERVER_WRITES_PER_SESSION: usize = 4;
 
 /// Max concurrent session creation attempts (limits resource usage under burst)
 const MAX_PENDING_CREATES: usize = 16;
+const MAX_STARTUP_PACKETS_PER_CREATE: usize = 4;
+const MAX_STARTUP_PACKETS: usize = MAX_PENDING_CREATES * MAX_STARTUP_PACKETS_PER_CREATE;
+const MAX_STARTUP_BYTES: usize = MAX_PENDING_CREATES * MAX_UDP_PACKET_SIZE;
 const MAX_PENDING_SHUTDOWNS: usize = 16;
 const SESSION_SETUP_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -245,8 +248,35 @@ impl RoutingSession {
 /// A pending write waiting to be sent to remote
 struct PendingWrite {
     id: SessionKey,
-    buf: Box<[u8]>,
+    buf: PendingWriteBuffer,
     len: usize,
+}
+
+struct StartupPacket {
+    data: Box<[u8]>,
+    _bytes: crate::resources::BudgetPermit,
+    _slot: crate::resources::BudgetPermit,
+}
+
+enum PendingWriteBuffer {
+    Pooled(Box<[u8]>),
+    Startup(StartupPacket),
+}
+
+impl PendingWriteBuffer {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Pooled(buf) => buf,
+            Self::Startup(packet) => &packet.data,
+        }
+    }
+
+    fn release(self, pool: &mut BufferPool) {
+        // Compact startup storage must never enter the fixed-size receive pool.
+        if let Self::Pooled(buf) = self {
+            pool.release(buf);
+        }
+    }
 }
 
 struct PendingResponse {
@@ -390,7 +420,7 @@ struct PendingSessionCreate {
     lookup_key: LookupKey,
     destination: NetLocation,
     session_id: MessageSessionId,
-    initial_data: Vec<u8>,
+    packets: Vec<StartupPacket>,
     future: SessionCreateFuture,
 }
 
@@ -414,6 +444,11 @@ pub struct UdpRouter<'a> {
     blocked: LruCache<NetLocation, ()>,
 
     pending_creates: Vec<PendingSessionCreate>,
+    startup_bytes: Arc<crate::resources::Budget>,
+    startup_slots: Arc<crate::resources::Budget>,
+    startup_admitted: u64,
+    startup_written: u64,
+    startup_queue_drops: u64,
 
     remote_write_queue: VecDeque<PendingWrite>,
     remote_flush_queue: VecDeque<SessionKey>,
@@ -462,6 +497,11 @@ impl<'a> UdpRouter<'a> {
             session_poll_position: 0,
             blocked: LruCache::new(NonZeroUsize::new(MAX_BLOCKED_ENTRIES).unwrap()),
             pending_creates: Vec::new(),
+            startup_bytes: Arc::new(crate::resources::Budget::new(Some(MAX_STARTUP_BYTES))),
+            startup_slots: Arc::new(crate::resources::Budget::new(Some(MAX_STARTUP_PACKETS))),
+            startup_admitted: 0,
+            startup_written: 0,
+            startup_queue_drops: 0,
             remote_write_queue: VecDeque::with_capacity(REMOTE_WRITE_POOL_SIZE),
             remote_flush_queue: VecDeque::with_capacity(REMOTE_WRITE_POOL_SIZE),
             server_write_queue: VecDeque::with_capacity(SERVER_WRITE_POOL_SIZE),
@@ -651,8 +691,11 @@ impl<'a> UdpRouter<'a> {
                         }
                         Poll::Pending => {
                             session.in_remote_write_queue += 1;
-                            self.remote_write_queue
-                                .push_back(PendingWrite { id: *id, buf, len });
+                            self.remote_write_queue.push_back(PendingWrite {
+                                id: *id,
+                                buf: PendingWriteBuffer::Pooled(buf),
+                                len,
+                            });
                             let Some(new_buf) = self.remote_write_pool.acquire() else {
                                 return (server_read_progress, remote_writes_progress);
                             };
@@ -668,7 +711,24 @@ impl<'a> UdpRouter<'a> {
                     }
                 }
                 Some(KeyState::Pending) => {
-                    // Creation in progress - drop packet
+                    let index =
+                        self.pending_creates
+                            .iter()
+                            .position(|pending| match &pending.lookup_key {
+                                LookupKey::Destination(destination) => {
+                                    *destination == packet.destination
+                                }
+                                LookupKey::SessionId(id) => *id == packet.session_id,
+                            });
+                    if let Some(index) = index {
+                        if self.pending_creates[index].packets.len()
+                            == MAX_STARTUP_PACKETS_PER_CREATE
+                        {
+                            self.startup_queue_drops += 1;
+                        } else if let Some(packet) = self.retain_startup_packet(&buf[..len]) {
+                            self.pending_creates[index].packets.push(packet);
+                        }
+                    }
                 }
                 None => {
                     // No session - check blocked before creating
@@ -716,21 +776,21 @@ impl<'a> UdpRouter<'a> {
 
             let Some(session) = self.sessions.get_mut(&id) else {
                 // Session gone, release buffer
-                self.remote_write_pool.release(buf);
+                buf.release(&mut self.remote_write_pool);
                 continue;
             };
 
             // If remote_write_eof, can't write - release buffer
             if session.remote_write_eof {
                 session.in_remote_write_queue -= 1;
-                self.remote_write_pool.release(buf);
+                buf.release(&mut self.remote_write_pool);
                 if session.should_remove() {
                     self.sessions_to_remove.insert(id);
                 }
                 continue;
             }
 
-            let data = &buf[..len];
+            let data = &buf.as_slice()[..len];
 
             match Pin::new(&mut session.remote).poll_write_message(cx, data) {
                 Poll::Ready(Ok(())) => {
@@ -741,7 +801,10 @@ impl<'a> UdpRouter<'a> {
                         session.in_remote_flush_queue = true;
                         self.remote_flush_queue.push_back(id);
                     }
-                    self.remote_write_pool.release(buf);
+                    if matches!(buf, PendingWriteBuffer::Startup(_)) {
+                        self.startup_written += 1;
+                    }
+                    buf.release(&mut self.remote_write_pool);
                 }
                 Poll::Pending => {
                     blocked.insert(id);
@@ -751,7 +814,7 @@ impl<'a> UdpRouter<'a> {
                 Poll::Ready(Err(e)) => {
                     warn!("remote write error: {}", e);
                     session.in_remote_write_queue -= 1;
-                    self.remote_write_pool.release(buf);
+                    buf.release(&mut self.remote_write_pool);
                     session.remote_write_eof = true;
                     if session.should_remove() {
                         self.sessions_to_remove.insert(id);
@@ -1011,7 +1074,7 @@ impl<'a> UdpRouter<'a> {
             lookup_key,
             destination,
             session_id,
-            initial_data,
+            packets,
             future: _,
         } = pending;
 
@@ -1051,41 +1114,13 @@ impl<'a> UdpRouter<'a> {
                     .insert(id, Duration::from_secs(SESSION_TIMEOUT_SECS));
                 session.expiry_key = Some(expiry_key);
 
-                // Try to write immediately
-                if !initial_data.is_empty() || !self.server.eof_on_empty() {
-                    debug!(
-                        "Writing initial_data ({} bytes) to session for {}",
-                        initial_data.len(),
-                        session.destination
-                    );
-                    match Pin::new(&mut session.remote).poll_write_message(cx, &initial_data) {
-                        Poll::Ready(Ok(())) => {
-                            debug!("Initial data write succeeded, queueing flush");
-                            session.last_write = Instant::now();
-                            // Note: expiry was just set above when inserting into expiry_queue
-                            if !session.in_remote_flush_queue {
-                                session.in_remote_flush_queue = true;
-                                self.remote_flush_queue.push_back(id);
-                            }
-                        }
-                        Poll::Pending => {
-                            debug!("Initial data write pending, queueing for later");
-                            if let Some(mut buf) = self.remote_write_pool.acquire() {
-                                let len = initial_data.len();
-                                buf[..len].copy_from_slice(&initial_data);
-                                session.in_remote_write_queue += 1;
-                                self.remote_write_queue
-                                    .push_back(PendingWrite { id, buf, len });
-                            }
-                        }
-                        Poll::Ready(Err(e)) => {
-                            warn!("remote write error: {}", e);
-                            session.remote_write_eof = true;
-                            if session.should_remove() {
-                                self.sessions_to_remove.insert(id);
-                            }
-                        }
-                    }
+                session.in_remote_write_queue = packets.len();
+                for packet in packets {
+                    self.remote_write_queue.push_back(PendingWrite {
+                        id,
+                        len: packet.data.len(),
+                        buf: PendingWriteBuffer::Startup(packet),
+                    });
                 }
                 self.sessions.insert(id, session);
                 true
@@ -1117,6 +1152,9 @@ impl<'a> UdpRouter<'a> {
         let Some(permit) = crate::resources::try_stream() else {
             return;
         };
+        let Some(packet_data) = self.retain_startup_packet(data) else {
+            return;
+        };
         let InboundPacket {
             destination,
             session_id,
@@ -1135,7 +1173,6 @@ impl<'a> UdpRouter<'a> {
 
         debug!("Creating session for {}", destination);
 
-        let initial_data = data.to_vec();
         let selector = Arc::clone(&self.selector);
         let resolver = Arc::clone(&self.resolver);
         let dest_for_future = destination.clone();
@@ -1184,10 +1221,21 @@ impl<'a> UdpRouter<'a> {
             lookup_key,
             destination,
             session_id,
-            initial_data,
+            packets: vec![packet_data],
             future,
         });
         let _ = self.poll_pending_create(cx, index);
+    }
+
+    fn retain_startup_packet(&mut self, data: &[u8]) -> Option<StartupPacket> {
+        let slot = self.startup_slots.acquire(1)?;
+        let bytes = self.startup_bytes.acquire(data.len())?;
+        self.startup_admitted += 1;
+        Some(StartupPacket {
+            data: data.into(),
+            _bytes: bytes,
+            _slot: slot,
+        })
     }
 
     /// Remove a session (split-borrow friendly version)
@@ -1225,6 +1273,16 @@ impl<'a> UdpRouter<'a> {
         let mut session = self.sessions.swap_remove(&id)?;
 
         debug!("Session removed: {}", session.destination);
+
+        let count = self.remote_write_queue.len();
+        for _ in 0..count {
+            let pending = self.remote_write_queue.pop_front().unwrap();
+            if pending.id == id {
+                pending.buf.release(&mut self.remote_write_pool);
+            } else {
+                self.remote_write_queue.push_back(pending);
+            }
+        }
 
         // Cancel expiry timer
         if let Some(key) = session.expiry_key.take() {
@@ -1322,6 +1380,23 @@ impl<'a> UdpRouter<'a> {
         }
 
         made_progress
+    }
+}
+
+impl Drop for UdpRouter<'_> {
+    fn drop(&mut self) {
+        let bytes = self.startup_bytes.snapshot();
+        let slots = self.startup_slots.snapshot();
+        debug!(
+            "UDP startup: admitted={}, written={}, abandoned={}, queue_full={}, slot_full={}, byte_full={}, peak_bytes={}",
+            self.startup_admitted,
+            self.startup_written,
+            self.startup_admitted - self.startup_written,
+            self.startup_queue_drops,
+            slots.rejected,
+            bytes.rejected,
+            bytes.peak,
+        );
     }
 }
 
@@ -1530,11 +1605,12 @@ mod tests {
             unreachable!()
         };
         lookup.insert(destination.clone(), KeyState::Pending);
+        let packet = router.retain_startup_packet(b"accepted").unwrap();
         router.pending_creates.push(PendingSessionCreate {
             lookup_key: LookupKey::Destination(destination.clone()),
             destination,
             session_id: 0,
-            initial_data: b"accepted".to_vec(),
+            packets: vec![packet],
             future: Box::pin(async move {
                 Ok(SessionCreateResult {
                     permit: crate::resources::try_stream().unwrap(),
@@ -1659,6 +1735,7 @@ mod tests {
         writes: Mutex<Vec<Vec<u8>>>,
         pending_write: Mutex<Option<Vec<u8>>>,
         blocked: AtomicBool,
+        fail_write: AtomicBool,
         shutdown_polls: AtomicUsize,
         drops: AtomicUsize,
     }
@@ -1689,6 +1766,9 @@ mod tests {
             _cx: &mut Context<'_>,
             buf: &[u8],
         ) -> Poll<io::Result<()>> {
+            if self.state.fail_write.load(Ordering::SeqCst) {
+                return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
+            }
             let mut pending = self.state.pending_write.lock().unwrap();
             if let Some(previous) = pending.as_ref() {
                 assert_eq!(
@@ -1733,6 +1813,369 @@ mod tests {
     }
 
     impl AsyncMessageStream for RecordingRemote {}
+
+    type PacketQueue = Arc<Mutex<VecDeque<(NetLocation, Vec<u8>)>>>;
+
+    #[derive(Clone, Default)]
+    struct PacketSource {
+        packets: PacketQueue,
+        closed: Arc<Mutex<VecDeque<MessageSessionId>>>,
+    }
+
+    impl AsyncReadTargetedMessage for PacketSource {
+        fn targeted_eof_on_empty(&self) -> bool {
+            false
+        }
+        fn poll_read_targeted_message(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<NetLocation>> {
+            match self.packets.lock().unwrap().pop_front() {
+                Some((destination, payload)) => {
+                    buf.put_slice(&payload);
+                    Poll::Ready(Ok(destination))
+                }
+                None => Poll::Pending,
+            }
+        }
+    }
+    impl AsyncReadSessionMessage for PacketSource {
+        fn poll_read_session_message(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<(MessageSessionId, SocketAddr)>> {
+            self.poll_read_targeted_message(cx, buf)
+                .map_ok(|location| (1, location.to_socket_addr_nonblocking().unwrap()))
+        }
+        fn take_closed_session(&mut self) -> Option<MessageSessionId> {
+            self.closed.lock().unwrap().pop_front()
+        }
+    }
+    impl AsyncWriteSourcedMessage for PacketSource {
+        fn poll_write_sourced_message(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: &[u8],
+            _: &SocketAddr,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+    impl AsyncWriteSessionMessage for PacketSource {
+        fn poll_write_session_message(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: MessageSessionId,
+            _: &[u8],
+            _: &SocketAddr,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+    impl AsyncFlushMessage for PacketSource {
+        fn poll_flush_message(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+    impl AsyncShutdownMessage for PacketSource {
+        fn poll_shutdown_message(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+    impl AsyncPing for PacketSource {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+        fn poll_write_ping(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+    impl AsyncTargetedMessageStream for PacketSource {}
+    impl AsyncSessionMessageStream for PacketSource {}
+
+    fn test_router(server: &mut ServerStream) -> UdpRouter<'_> {
+        UdpRouter::new(
+            server,
+            Arc::new(ClientProxySelector::new(Vec::new())),
+            Arc::new(NativeResolver::new()),
+            false,
+        )
+    }
+
+    fn seed_pending(router: &mut UdpRouter<'_>, key: LookupKey, data: &[u8]) {
+        let destination = NetLocation::from_str("127.0.0.1:53", None).unwrap();
+        let packet = router.retain_startup_packet(data).unwrap();
+        match (&mut router.session_lookup, &key) {
+            (SessionLookup::ByDestination(map), LookupKey::Destination(destination)) => {
+                map.insert(destination.clone(), KeyState::Pending);
+            }
+            (SessionLookup::BySessionId(map), LookupKey::SessionId(id)) => {
+                map.insert(*id, KeyState::Pending);
+            }
+            _ => unreachable!(),
+        }
+        router.pending_creates.push(PendingSessionCreate {
+            lookup_key: key,
+            destination,
+            session_id: 1,
+            packets: vec![packet],
+            future: Box::pin(std::future::pending()),
+        });
+    }
+
+    fn finish_setup(router: &mut UdpRouter<'_>, state: Arc<RemoteState>) {
+        router.pending_creates[0].future = Box::pin(async move {
+            Ok(SessionCreateResult {
+                permit: crate::resources::try_stream().unwrap(),
+                remote: Box::new(RecordingRemote { state }),
+                resolved_addr: "127.0.0.1:53".parse().unwrap(),
+            })
+        });
+        assert!(
+            router
+                .poll_pending_create(&mut Context::from_waker(futures::task::noop_waker_ref()), 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_burst_survives_pool_exhaustion_and_keeps_owned_and_pooled_order() {
+        let source = PacketSource::default();
+        let destination = NetLocation::from_str("127.0.0.1:53", None).unwrap();
+        let mut server = ServerStream::Targeted(Box::new(source.clone()));
+        let mut router = test_router(&mut server);
+        seed_pending(
+            &mut router,
+            LookupKey::Destination(destination.clone()),
+            b"",
+        );
+        for i in 1..=4 {
+            source
+                .packets
+                .lock()
+                .unwrap()
+                .push_back((destination.clone(), vec![i]));
+        }
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        router.poll_read_server(&mut cx);
+        assert_eq!(router.pending_creates[0].packets.len(), 4);
+        assert_eq!(router.startup_queue_drops, 1);
+        assert_eq!(router.startup_slots.snapshot().active, 4);
+        assert_eq!(router.startup_bytes.snapshot().active, 3);
+        let pointers: Vec<_> = router.pending_creates[0]
+            .packets
+            .iter()
+            .map(|packet| packet.data.as_ptr())
+            .collect();
+
+        let mut held = Vec::new();
+        while let Some(buffer) = router.remote_write_pool.acquire() {
+            held.push(buffer);
+        }
+        let state = Arc::new(RemoteState::default());
+        state.blocked.store(true, Ordering::SeqCst);
+        finish_setup(&mut router, state.clone());
+        assert_eq!(router.startup_slots.snapshot().active, 4);
+        assert!(!router.drain_remote_writes(&mut cx));
+        assert_eq!(
+            router
+                .remote_write_queue
+                .iter()
+                .map(|packet| packet.buf.as_slice().as_ptr())
+                .collect::<Vec<_>>(),
+            pointers
+        );
+        assert!(!router.drain_remote_writes(&mut cx));
+
+        router.remote_write_pool.release(held.pop().unwrap());
+        source
+            .packets
+            .lock()
+            .unwrap()
+            .push_back((destination, vec![9]));
+        router.poll_read_server(&mut cx);
+        assert_eq!(router.remote_write_queue.len(), 5);
+        assert!(!router.drain_remote_writes(&mut cx));
+        state.blocked.store(false, Ordering::SeqCst);
+        assert!(router.drain_remote_writes(&mut cx));
+        assert_eq!(
+            *state.writes.lock().unwrap(),
+            vec![vec![], vec![1], vec![2], vec![3], vec![9]]
+        );
+        assert_eq!(router.startup_written, 4);
+        assert_eq!(router.startup_slots.snapshot().active, 0);
+        assert_eq!(router.startup_bytes.snapshot().active, 0);
+        for buffer in held {
+            router.remote_write_pool.release(buffer);
+        }
+        assert_eq!(
+            router.remote_write_pool.buffers.len(),
+            REMOTE_WRITE_POOL_SIZE
+        );
+        assert!(
+            router
+                .remote_write_pool
+                .buffers
+                .iter()
+                .all(|buffer| buffer.len() == MAX_UDP_PACKET_SIZE)
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_packet_and_byte_budgets_cover_active_backlogs_and_drop() {
+        let mut server = ServerStream::Targeted(Box::new(PacketSource::default()));
+        let mut router = test_router(&mut server);
+        let mut packets = Vec::new();
+        for _ in 0..MAX_STARTUP_PACKETS {
+            packets.push(router.retain_startup_packet(b"").unwrap());
+        }
+        assert!(router.retain_startup_packet(b"").is_none());
+        assert_eq!(router.startup_slots.snapshot().rejected, 1);
+        drop(packets);
+        let packet = router
+            .retain_startup_packet(&vec![0; MAX_STARTUP_BYTES])
+            .unwrap();
+        assert!(router.retain_startup_packet(b"x").is_none());
+        assert_eq!(router.startup_slots.snapshot().active, 1);
+        assert_eq!(router.startup_bytes.snapshot().rejected, 1);
+        drop(packet);
+        let destination = NetLocation::from_str("127.0.0.1:53", None).unwrap();
+        seed_pending(&mut router, LookupKey::Destination(destination), b"owned");
+        let bytes = router.startup_bytes.clone();
+        let slots = router.startup_slots.clone();
+        finish_setup(&mut router, Arc::new(RemoteState::default()));
+        assert_eq!(bytes.snapshot().active, 5);
+        drop(router);
+        assert_eq!(bytes.snapshot().active, 0);
+        assert_eq!(slots.snapshot().active, 0);
+    }
+
+    #[tokio::test]
+    async fn startup_setup_failure_write_error_and_session_close_release_owners() {
+        for outcome in ["setup", "write", "close", "active_close"] {
+            let source = PacketSource::default();
+            let mut server = ServerStream::Session(Box::new(source.clone()));
+            let mut router = test_router(&mut server);
+            seed_pending(&mut router, LookupKey::SessionId(1), b"first");
+            let second = router.retain_startup_packet(b"second").unwrap();
+            router.pending_creates[0].packets.push(second);
+            let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+            match outcome {
+                "setup" => {
+                    router.pending_creates[0].future =
+                        Box::pin(async { Err(io::ErrorKind::ConnectionRefused.into()) });
+                    router.poll_pending_create(&mut cx, 0);
+                }
+                "write" => {
+                    let state = Arc::new(RemoteState::default());
+                    state.fail_write.store(true, Ordering::SeqCst);
+                    finish_setup(&mut router, state);
+                    router.drain_remote_writes(&mut cx);
+                    router.cancel_session(0);
+                }
+                "close" => {
+                    source.closed.lock().unwrap().push_back(1);
+                    router.drain_closed_server_sessions();
+                }
+                "active_close" => {
+                    finish_setup(&mut router, Arc::new(RemoteState::default()));
+                    source.closed.lock().unwrap().push_back(1);
+                    router.drain_closed_server_sessions();
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(router.startup_slots.snapshot().active, 0);
+            assert_eq!(router.startup_bytes.snapshot().active, 0);
+            assert_eq!(router.startup_written, 0);
+            assert!(router.pending_creates.is_empty());
+            assert!(router.remote_write_queue.is_empty());
+            let SessionLookup::BySessionId(lookup) = &router.session_lookup else {
+                unreachable!()
+            };
+            assert!(lookup.is_empty());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn startup_admission_precedes_setup_and_timeout_releases_the_burst() {
+        use crate::client_proxy_selector::{ConnectAction, ConnectRule};
+        #[derive(Debug)]
+        struct StalledResolver;
+        impl Resolver for StalledResolver {
+            fn resolve_location(
+                &self,
+                _: &NetLocation,
+            ) -> Pin<Box<dyn Future<Output = io::Result<Vec<SocketAddr>>> + Send>> {
+                Box::pin(std::future::pending())
+            }
+        }
+        let source = PacketSource::default();
+        let mut server = ServerStream::Targeted(Box::new(source.clone()));
+        let resolver: Arc<dyn Resolver> = Arc::new(StalledResolver);
+        let selector = Arc::new(ClientProxySelector::new(vec![ConnectRule::new(
+            vec![crate::address::NetLocationMask::from("0.0.0.0/0").unwrap()],
+            ConnectAction::new_allow(
+                None,
+                crate::tcp::chain_builder::build_direct_chain_group(resolver.clone()),
+            ),
+        )]));
+        let mut router = UdpRouter::new(&mut server, selector, resolver, false);
+        let destination = NetLocation::from_str("delayed.invalid:53", None).unwrap();
+        for i in 0..5 {
+            source
+                .packets
+                .lock()
+                .unwrap()
+                .push_back((destination.clone(), vec![i]));
+        }
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        router.poll_read_server(&mut cx);
+        assert_eq!(router.pending_creates.len(), 1);
+        assert_eq!(router.pending_creates[0].packets.len(), 4);
+        assert_eq!(router.startup_queue_drops, 1);
+        tokio::time::advance(SESSION_SETUP_TIMEOUT).await;
+        router.poll_pending_creates(&mut cx);
+        assert!(router.pending_creates.is_empty());
+        assert_eq!(router.startup_slots.snapshot().active, 0);
+        assert_eq!(router.startup_bytes.snapshot().active, 0);
+        router.startup_bytes = Arc::new(crate::resources::Budget::new(Some(0)));
+        router.start_session_creation(
+            &mut cx,
+            InboundPacket {
+                destination,
+                session_id: 0,
+            },
+            b"cannot fit",
+        );
+        assert!(router.pending_creates.is_empty());
+        let SessionLookup::ByDestination(lookup) = &router.session_lookup else {
+            unreachable!()
+        };
+        assert!(lookup.is_empty());
+        assert_eq!(router.startup_slots.snapshot().active, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn session_expiry_releases_an_active_startup_backlog() {
+        let mut server = ServerStream::Targeted(Box::new(PacketSource::default()));
+        let mut router = test_router(&mut server);
+        let destination = NetLocation::from_str("127.0.0.1:53", None).unwrap();
+        seed_pending(
+            &mut router,
+            LookupKey::Destination(destination),
+            b"retained",
+        );
+        finish_setup(&mut router, Arc::new(RemoteState::default()));
+        tokio::time::advance(Duration::from_secs(SESSION_TIMEOUT_SECS)).await;
+        router.process_expired(&mut Context::from_waker(futures::task::noop_waker_ref()));
+        assert!(router.remote_write_queue.is_empty());
+        assert_eq!(router.startup_slots.snapshot().active, 0);
+        assert_eq!(router.startup_bytes.snapshot().active, 0);
+    }
 
     #[tokio::test]
     async fn pending_packets_keep_order_and_a_single_flow_burst_uses_bounded_backpressure() {
@@ -1914,7 +2357,7 @@ mod tests {
                     index as u16 + 1,
                 ),
                 session_id: 10_000 + index as u64,
-                initial_data: Vec::new(),
+                packets: Vec::new(),
                 future: Box::pin(std::future::pending()),
             });
         }
