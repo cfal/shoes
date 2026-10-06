@@ -667,8 +667,14 @@ fn run_direct_stack_thread(
             }
         }
 
-        // One complete sweep gives every socket a turn, including pending resets.
-        iface.poll_egress(stack_now(), &mut device, &mut socket_set);
+        // Amortizes loop overhead without starving later sockets or draining indefinitely.
+        for _ in 0..8 {
+            if iface.poll_egress(stack_now(), &mut device, &mut socket_set)
+                == smoltcp::iface::PollResult::None
+            {
+                break;
+            }
+        }
         let local_work = reconcile_sockets(&mut sockets, &mut socket_set, &mut active_connections);
 
         poll_count += 1;
