@@ -346,7 +346,7 @@ pub struct CachingNativeResolver {
 
 struct CachedResolveResult {
     timestamp: Instant,
-    addr: SocketAddr,
+    addrs: Vec<SocketAddr>,
 }
 
 impl std::fmt::Debug for CachingNativeResolver {
@@ -389,8 +389,8 @@ impl Resolver for CachingNativeResolver {
                 && Instant::now().duration_since(cached.timestamp)
                     <= Duration::from_secs(self.result_timeout_secs)
             {
-                let addr = cached.addr;
-                return Box::pin(async move { Ok(vec![addr]) });
+                let addrs = cached.addrs.clone();
+                return Box::pin(async move { Ok(addrs) });
             }
             cache.pop(location);
         }
@@ -412,12 +412,11 @@ impl Resolver for CachingNativeResolver {
                 )));
             }
 
-            // Cache the first result
             cache.lock().put(
                 location,
                 CachedResolveResult {
                     timestamp: Instant::now(),
-                    addr: addrs[0],
+                    addrs: addrs.clone(),
                 },
             );
 
@@ -644,13 +643,52 @@ mod tests {
                 unique_location(index),
                 CachedResolveResult {
                     timestamp: Instant::now(),
-                    addr: "127.0.0.1:443".parse().unwrap(),
+                    addrs: vec!["127.0.0.1:443".parse().unwrap()],
                 },
             );
         }
 
         assert_eq!(cache.len(), CACHING_NATIVE_RESOLVER_CACHE_CAPACITY);
         assert!(cache.peek(&unique_location(0)).is_none());
+    }
+
+    #[tokio::test]
+    async fn native_cache_preserves_all_candidates_and_order() {
+        let resolver = CachingNativeResolver::new();
+        let location = test_location();
+        let addrs = vec![
+            "[2001:db8::1]:80".parse().unwrap(),
+            "192.0.2.1:80".parse().unwrap(),
+            "192.0.2.2:80".parse().unwrap(),
+        ];
+        resolver.cache.lock().put(
+            location.clone(),
+            CachedResolveResult {
+                timestamp: Instant::now(),
+                addrs: addrs.clone(),
+            },
+        );
+        let mut result = resolver.resolve_location(&location).await.unwrap();
+        assert_eq!(result, addrs);
+        result.clear();
+        assert_eq!(resolver.resolve_location(&location).await.unwrap(), addrs);
+    }
+
+    #[tokio::test]
+    async fn native_cache_expires_and_stores_the_complete_cold_result() {
+        let resolver = CachingNativeResolver::with_timeout(1);
+        let location = NetLocation::from_str("127.0.0.1:80", None).unwrap();
+        resolver.cache.lock().put(
+            location.clone(),
+            CachedResolveResult {
+                timestamp: Instant::now() - Duration::from_secs(2),
+                addrs: vec!["192.0.2.1:80".parse().unwrap()],
+            },
+        );
+        let cold = resolver.resolve_location(&location).await.unwrap();
+        assert_eq!(cold, vec!["127.0.0.1:80".parse::<SocketAddr>().unwrap()]);
+        assert_eq!(resolver.cache.lock().peek(&location).unwrap().addrs, cold);
+        assert_eq!(resolver.resolve_location(&location).await.unwrap(), cold);
     }
 
     #[tokio::test]
