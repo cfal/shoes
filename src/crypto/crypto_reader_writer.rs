@@ -3,7 +3,7 @@
 // These types provide a consistent API for reading decrypted plaintext
 // and writing plaintext to be encrypted, working with both rustls and REALITY.
 
-use std::io::{self, BufRead, Read, Write};
+use std::io::{self, BufRead, IoSlice, Read, Write};
 
 use crate::reality::{RealityReader, RealityWriter};
 
@@ -49,6 +49,13 @@ impl<'a> Write for CryptoWriter<'a> {
         match self {
             CryptoWriter::Rustls(writer) => writer.write(buf),
             CryptoWriter::Reality(writer) => writer.write(buf),
+        }
+    }
+
+    fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
+        match self {
+            CryptoWriter::Rustls(writer) => writer.write_vectored(bufs),
+            CryptoWriter::Reality(writer) => writer.write_vectored(bufs),
         }
     }
 
