@@ -1,6 +1,6 @@
 use std::io;
 use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, ready};
 
 use rand::RngExt;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -126,10 +126,8 @@ pub struct NaivePaddingStream<S> {
     write_buffer: Box<[u8]>,
     write_start: usize,
     write_end: usize,
-    /// Original payload length for current write (to return correct count)
+    /// Payload length used to choose the current frame's fragment size
     write_payload_len: usize,
-    // A flush can finish a frame before poll_write acknowledges its payload.
-    write_ack_pending: bool,
 }
 
 impl<S> NaivePaddingStream<S> {
@@ -152,7 +150,6 @@ impl<S> NaivePaddingStream<S> {
             write_start: 0,
             write_end: 0,
             write_payload_len: 0,
-            write_ack_pending: false,
         }
     }
 
@@ -256,7 +253,6 @@ impl<S> NaivePaddingStream<S> {
         self.write_start = 0;
         self.write_end = frame_size;
         self.write_payload_len = payload.len();
-        self.write_ack_pending = true;
 
         Ok(())
     }
@@ -360,30 +356,25 @@ impl<S> NaivePaddingStream<S> {
 }
 
 impl<S: AsyncWrite + Unpin> NaivePaddingStream<S> {
-    /// Write buffered frame data to inner stream with fragmentation support.
-    /// Returns Ok(Some(payload_len)) when frame is complete, Ok(None) if partial.
-    fn poll_write_buffered(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Option<usize>>> {
+    /// Writes at most one fragment of the buffered frame.
+    fn poll_write_buffered(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let remaining = self.write_end - self.write_start;
         if remaining == 0 {
-            return Poll::Ready(Ok(Some(self.write_payload_len)));
+            return Poll::Ready(Ok(()));
         }
 
         let fragment_limit = self.compute_fragment_limit(self.write_payload_len, remaining);
         let to_write = &self.write_buffer[self.write_start..self.write_start + fragment_limit];
 
-        match Pin::new(&mut self.inner).poll_write(cx, to_write) {
-            Poll::Ready(Ok(n)) => {
-                self.write_start += n;
-                if self.write_start >= self.write_end {
-                    self.num_written_frames += 1;
-                    Poll::Ready(Ok(Some(self.write_payload_len)))
-                } else {
-                    Poll::Ready(Ok(None))
-                }
-            }
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-            Poll::Pending => Poll::Pending,
+        let written = ready!(Pin::new(&mut self.inner).poll_write(cx, to_write))?;
+        if written == 0 {
+            return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
         }
+        self.write_start += written;
+        if self.write_start == self.write_end {
+            self.num_written_frames += 1;
+        }
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -462,26 +453,26 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for NaivePaddingStream<S> {
     ) -> Poll<io::Result<usize>> {
         let this = &mut *self;
 
-        if !this.write_ack_pending {
-            if !this.should_pad_writes() {
-                return Pin::new(&mut this.inner).poll_write(cx, buf);
+        if this.write_start < this.write_end {
+            ready!(this.poll_write_buffered(cx))?;
+            if this.write_start < this.write_end {
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
             }
-            let payload = &buf[..buf.len().min(MAX_PAYLOAD_PER_FRAME)];
-            this.encode_frame(payload)?;
         }
 
-        match this.poll_write_buffered(cx) {
-            Poll::Ready(Ok(Some(payload_len))) => {
-                this.write_ack_pending = false;
-                Poll::Ready(Ok(payload_len))
-            }
-            Poll::Ready(Ok(None)) => {
-                cx.waker().wake_by_ref();
-                Poll::Pending
-            }
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-            Poll::Pending => Poll::Pending,
+        if !this.should_pad_writes() {
+            return Pin::new(&mut this.inner).poll_write(cx, buf);
         }
+
+        let payload = &buf[..buf.len().min(MAX_PAYLOAD_PER_FRAME)];
+        this.encode_frame(payload)?;
+        if let Poll::Ready(Err(error)) = this.poll_write_buffered(cx) {
+            this.write_end = 0;
+            return Poll::Ready(Err(error));
+        }
+        // Owned input is accepted even when its encoded frame still needs draining.
+        Poll::Ready(Ok(payload.len()))
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -489,11 +480,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for NaivePaddingStream<S> {
 
         // Complete any pending buffered write first
         while this.write_start < this.write_end {
-            match this.poll_write_buffered(cx) {
-                Poll::Ready(Ok(_)) => {}
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
-            }
+            ready!(this.poll_write_buffered(cx))?;
         }
 
         Pin::new(&mut this.inner).poll_flush(cx)
@@ -504,11 +491,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for NaivePaddingStream<S> {
 
         // Complete any pending buffered write first
         while this.write_start < this.write_end {
-            match this.poll_write_buffered(cx) {
-                Poll::Ready(Ok(_)) => {}
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
-            }
+            ready!(this.poll_write_buffered(cx))?;
         }
 
         Pin::new(&mut this.inner).poll_shutdown(cx)
@@ -674,7 +657,7 @@ mod tests {
     impl AsyncStream for MockStream {}
 
     #[test]
-    fn flush_preserves_the_pending_write_acknowledgment() {
+    fn buffered_write_is_acknowledged_before_flush() {
         let payload = [42; 512];
         for completed_frames in [0, NUM_FIRST_PADDINGS - 1] {
             let mut stream = NaivePaddingStream::new(
@@ -684,22 +667,67 @@ mod tests {
             );
             stream.num_written_frames = completed_frames;
             let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-            assert!(
-                Pin::new(&mut stream)
-                    .poll_write(&mut cx, &payload)
-                    .is_pending()
-            );
+            assert!(matches!(
+                Pin::new(&mut stream).poll_write(&mut cx, &payload),
+                Poll::Ready(Ok(512))
+            ));
+            assert!(stream.write_start < stream.write_end);
             assert!(matches!(
                 Pin::new(&mut stream).poll_flush(&mut cx),
                 Poll::Ready(Ok(()))
             ));
             let wire = stream.inner.written.clone();
             assert!(matches!(
-                Pin::new(&mut stream).poll_write(&mut cx, &payload),
-                Poll::Ready(Ok(512))
+                Pin::new(&mut stream).poll_flush(&mut cx),
+                Poll::Ready(Ok(()))
             ));
             assert_eq!(stream.inner.written, wire);
             assert_eq!(stream.num_written_frames, completed_frames + 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_write_does_not_consume_replacement_after_flush() {
+        for completed_frames in [0, NUM_FIRST_PADDINGS - 1] {
+            let (inner, mut peer) = tokio::io::duplex(7);
+            let mut stream =
+                NaivePaddingStream::new(inner, PaddingDirection::Server, PaddingType::Variant1);
+            stream.num_written_frames = completed_frames;
+            let payload = [42; 512];
+            assert!(matches!(
+                futures::poll!(std::pin::pin!(stream.write(&payload))),
+                Poll::Ready(Ok(512))
+            ));
+            assert!(futures::poll!(std::pin::pin!(stream.write(b"cancelled"))).is_pending());
+            assert!(futures::poll!(std::pin::pin!(stream.flush())).is_pending());
+
+            let mut wire = Vec::new();
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::try_join!(
+                    async {
+                        stream.flush().await?;
+                        assert_eq!(stream.num_written_frames, completed_frames + 1);
+                        assert_eq!(stream.write(b"x").await?, 1);
+                        stream.shutdown().await
+                    },
+                    peer.read_to_end(&mut wire),
+                )
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+            let mut reader = NaivePaddingStream::new(
+                MockStream::from_data(wire),
+                PaddingDirection::Client,
+                PaddingType::Variant1,
+            );
+            reader.num_read_frames = completed_frames;
+            let mut received = Vec::new();
+            reader.read_to_end(&mut received).await.unwrap();
+            let mut expected = payload.to_vec();
+            expected.push(b'x');
+            assert_eq!(received, expected);
         }
     }
 
