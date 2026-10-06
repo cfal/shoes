@@ -18,7 +18,7 @@ use crate::async_stream::AsyncStream;
 use crate::util::allocate_vec;
 
 const DEFAULT_BUF_SIZE: usize = 16384;
-const MAX_COPY_BYTES_PER_POLL: usize = 256 * 1024;
+const MAX_COPY_BYTES_PER_POLL: usize = 1024 * 1024;
 
 #[derive(Debug)]
 struct CopyBuffer {
@@ -380,6 +380,7 @@ fn copy_buffer_size(requested: usize, writer: &(impl AsyncStream + ?Sized)) -> u
 mod tests {
     use super::*;
     use crate::async_stream::AsyncPing;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -397,6 +398,7 @@ mod tests {
         block_flush: bool,
         pending_at_eof: bool,
         write_limit: Option<usize>,
+        write_release: Option<tokio::sync::oneshot::Receiver<()>>,
     }
 
     impl AsyncRead for MemoryStream {
@@ -414,10 +416,15 @@ mod tests {
 
     impl AsyncWrite for MemoryStream {
         fn poll_write(
-            self: Pin<&mut Self>,
-            _: &mut Context<'_>,
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
             data: &[u8],
         ) -> Poll<io::Result<usize>> {
+            let already_written = !self.output.lock().unwrap().data.is_empty();
+            if already_written && let Some(release) = &mut self.write_release {
+                ready!(Pin::new(release).poll(cx)).unwrap();
+                self.write_release = None;
+            }
             let data = &data[..data.len().min(self.write_limit.unwrap_or(usize::MAX))];
             let mut output = self.output.lock().unwrap();
             output.data.extend_from_slice(data);
@@ -425,7 +432,11 @@ mod tests {
             Poll::Ready(Ok(data.len()))
         }
 
-        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            if let Some(release) = &mut self.write_release {
+                ready!(Pin::new(release).poll(cx)).unwrap();
+                self.write_release = None;
+            }
             if self.block_flush {
                 return Poll::Pending;
             }
@@ -450,15 +461,16 @@ mod tests {
 
     impl AsyncStream for MemoryStream {}
 
+    struct WakeCount(AtomicUsize);
+
+    impl std::task::Wake for WakeCount {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     #[tokio::test]
     async fn ready_copy_batches_flushes_and_yields_at_a_byte_quota() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        struct WakeCount(AtomicUsize);
-        impl std::task::Wake for WakeCount {
-            fn wake(self: Arc<Self>) {
-                self.0.fetch_add(1, Ordering::Relaxed);
-            }
-        }
         let wakes = Arc::new(WakeCount(AtomicUsize::new(0)));
         let waker = std::task::Waker::from(wakes.clone());
         let mut cx = Context::from_waker(&waker);
@@ -491,6 +503,48 @@ mod tests {
         let output = writer.output.lock().unwrap();
         assert_eq!(output.data, payload);
         assert_eq!(output.flushes, 4);
+    }
+
+    #[tokio::test]
+    async fn write_pressure_resumes_after_a_pending_flush_wakes() {
+        let payload: Vec<u8> = (0..128).collect();
+        let mut reader = MemoryStream {
+            input: std::io::Cursor::new(payload.clone()),
+            ..Default::default()
+        };
+        let (release, blocked) = tokio::sync::oneshot::channel();
+        let mut writer = MemoryStream {
+            write_limit: Some(7),
+            write_release: Some(blocked),
+            ..Default::default()
+        };
+        let mut buffer = CopyBuffer::new(32, false);
+        let wakes = Arc::new(WakeCount(AtomicUsize::new(0)));
+        let waker = std::task::Waker::from(wakes.clone());
+        let mut cx = Context::from_waker(&waker);
+        for _ in 0..2 {
+            assert!(
+                buffer
+                    .poll_copy(&mut cx, Pin::new(&mut reader), Pin::new(&mut writer))
+                    .is_pending()
+            );
+            assert_eq!(reader.input.position(), 32);
+            assert_eq!(writer.output.lock().unwrap().data, payload[..7]);
+            assert!(buffer.need_flush);
+        }
+        assert_eq!(wakes.0.load(Ordering::Relaxed), 0);
+        release.send(()).unwrap();
+        assert_eq!(wakes.0.load(Ordering::Relaxed), 1);
+
+        std::future::poll_fn(|cx| {
+            buffer.poll_copy(cx, Pin::new(&mut reader), Pin::new(&mut writer))
+        })
+        .await
+        .unwrap();
+        let output = writer.output.lock().unwrap();
+        assert_eq!(output.data, payload);
+        assert_eq!(output.flushes, 2);
+        assert!(!buffer.need_flush);
     }
 
     #[test]
