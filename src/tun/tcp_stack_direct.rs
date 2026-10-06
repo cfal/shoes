@@ -4,7 +4,7 @@
 //! using `select()` on the TUN fd for event-driven I/O instead of polling.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io, mem,
     net::SocketAddr,
     ops::{Deref, DerefMut},
@@ -421,7 +421,7 @@ fn run_direct_stack_thread(
     let mut iface_config = InterfaceConfig::new(HardwareAddress::Ip);
     iface_config.random_seed = rand::random();
 
-    let mut iface = Interface::new(iface_config, &mut device, SmolInstant::now());
+    let mut iface = Interface::new(iface_config, &mut device, stack_now());
 
     iface.update_ip_addrs(|addrs| {
         if let Err(e) = addrs.push(IpCidr::new(IpAddress::v4(0, 0, 0, 1), 0)) {
@@ -449,8 +449,7 @@ fn run_direct_stack_thread(
 
     let mut socket_set = SocketSet::new(vec![]);
     let mut sockets: HashMap<SocketHandle, SocketInfo> = HashMap::new();
-    let mut active_connections: std::collections::HashSet<(SocketAddr, SocketAddr)> =
-        std::collections::HashSet::new();
+    let mut active_connections = HashSet::new();
 
     let mut poll_count: u64 = 0;
     let mut last_log_time = std::time::Instant::now();
@@ -578,18 +577,11 @@ fn run_direct_stack_thread(
             break;
         }
 
-        // Processes batched TCP/ICMP packets through smoltcp.
-        let has_tcp_packet = !tcp_packets.is_empty();
+        iface.poll_maintenance(stack_now());
         for pkt in tcp_packets {
             device.store_packet(pkt);
-            let now = SmolInstant::now();
-            iface.poll(now, &mut device, &mut socket_set);
+            iface.poll_ingress_single(stack_now(), &mut device, &mut socket_set);
         }
-
-        let now = SmolInstant::now();
-        iface.poll(now, &mut device, &mut socket_set);
-
-        let mut sockets_to_remove = Vec::new();
 
         for (handle, socket_info) in sockets.iter() {
             let handle = *handle;
@@ -600,11 +592,7 @@ fn run_direct_stack_thread(
                 socket.abort();
             }
 
-            // Remove socket only when smoltcp reports Closed state
             if socket.state() == TcpState::Closed {
-                sockets_to_remove.push(handle);
-                control.set_closed();
-                trace!("socket {:?} closed", handle);
                 continue;
             }
 
@@ -710,20 +698,9 @@ fn run_direct_stack_thread(
             }
         }
 
-        // Dispatch queued data and abort resets before removing closed sockets.
-        let after_transfer = SmolInstant::now();
-        iface.poll(after_transfer, &mut device, &mut socket_set);
-
-        for handle in sockets_to_remove {
-            if let Some(socket_info) = sockets.remove(&handle) {
-                active_connections.remove(&(socket_info.src_addr, socket_info.dst_addr));
-                trace!(
-                    "Cleaned up connection: {} -> {}",
-                    socket_info.src_addr, socket_info.dst_addr
-                );
-            }
-            socket_set.remove(handle);
-        }
+        // One complete sweep gives every socket a turn, including pending resets.
+        iface.poll_egress(stack_now(), &mut device, &mut socket_set);
+        let local_work = reconcile_sockets(&mut sockets, &mut socket_set, &mut active_connections);
 
         poll_count += 1;
         if last_log_time.elapsed() >= Duration::from_secs(30) {
@@ -736,9 +713,9 @@ fn run_direct_stack_thread(
         }
 
         // Wait for data using select() - this is the key for event-driven I/O
-        if !has_tcp_packet && device.pending_rx.is_none() {
+        if packets_read < MAX_PACKET_BATCH && !local_work {
             // Cap poll_delay at 10ms to balance CPU usage vs throughput
-            let delay = iface.poll_delay(after_transfer, &socket_set);
+            let delay = iface.poll_delay(stack_now(), &socket_set);
             let wait_duration = Some(delay.map_or(SmolDuration::from_millis(10), |d| {
                 let millis = d.total_millis().min(10);
                 SmolDuration::from_millis(millis)
@@ -769,6 +746,38 @@ fn run_direct_stack_thread(
     }
 
     info!("smoltcp direct stack thread stopped");
+}
+
+fn stack_now() -> SmolInstant {
+    std::time::Instant::now().into()
+}
+
+fn reconcile_sockets(
+    sockets: &mut HashMap<SocketHandle, SocketInfo>,
+    socket_set: &mut SocketSet<'_>,
+    active_connections: &mut HashSet<(SocketAddr, SocketAddr)>,
+) -> bool {
+    let mut local_work = false;
+    sockets.retain(|handle, info| {
+        let socket = socket_set.get::<TcpSocket>(*handle);
+        // Timer expiry can close a socket without poll_egress reporting progress.
+        // A retained tuple on a closed socket still needs its reset dispatched.
+        if socket.state() == TcpState::Closed && socket.remote_endpoint().is_none() {
+            active_connections.remove(&(info.src_addr, info.dst_addr));
+            socket_set.remove(*handle);
+            return false;
+        }
+        let control = &info.control;
+        local_work |= (socket.state() != TcpState::Closed && control.is_abandoned())
+            || (socket.can_recv() && !control.recv_buffer_full())
+            || (socket.can_send() && !control.send_buffer_empty())
+            || (socket.state() != TcpState::Closed
+                && control.send_state() == TcpSocketState::Close
+                && control.send_buffer_empty()
+                && socket.send_queue() == 0);
+        true
+    });
+    local_work
 }
 
 /// Result of creating a TCP connection.
@@ -1056,7 +1065,176 @@ fn write_all(fd: RawFd, buf: &[u8]) -> io::Result<()> {
 mod tests {
     use super::*;
     use std::os::unix::io::IntoRawFd;
-    use std::os::unix::net::UnixStream;
+    use std::os::unix::net::{UnixDatagram, UnixStream};
+
+    #[test]
+    fn time_wait_cleanup_does_not_depend_on_egress_progress() {
+        use smoltcp::iface::PollResult;
+
+        let (peer, tun) = UnixDatagram::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let mut device = DirectDevice::new(tun.as_raw_fd(), 1500, false);
+        let mut iface = Interface::new(
+            InterfaceConfig::new(HardwareAddress::Ip),
+            &mut device,
+            SmolInstant::from_millis(0),
+        );
+        iface.update_ip_addrs(|addresses| {
+            addresses
+                .push(IpCidr::new(IpAddress::v4(1, 1, 1, 1), 0))
+                .unwrap();
+        });
+        let mut socket_set = SocketSet::new(vec![]);
+        let src_addr = "10.0.0.2:10001".parse().unwrap();
+        let dst_addr = "1.1.1.1:443".parse().unwrap();
+        let (connection, control) = create_tcp_connection(
+            src_addr,
+            dst_addr,
+            &mut socket_set,
+            &thread::current(),
+            4096,
+        )
+        .unwrap();
+        let handle = connection.handle;
+        let mut sockets = HashMap::from([(
+            handle,
+            SocketInfo {
+                control: control.clone(),
+                src_addr,
+                dst_addr,
+            },
+        )]);
+        let mut active = HashSet::from([(src_addr, dst_addr)]);
+        let ingress =
+            |iface: &mut Interface,
+             device: &mut DirectDevice,
+             sockets: &mut SocketSet<'_>,
+             ack: Option<u32>,
+             fin| {
+                let mut builder = etherparse::PacketBuilder::ipv4([10, 0, 0, 2], [1, 1, 1, 1], 64)
+                    .tcp(10001, 443, if ack.is_some() { 102 } else { 101 }, 4096);
+                builder = if let Some(ack) = ack {
+                    builder.ack(ack)
+                } else {
+                    builder.syn()
+                };
+                if fin {
+                    builder = builder.fin();
+                }
+                let mut packet = Vec::new();
+                builder.write(&mut packet, b"").unwrap();
+                let mut pooled = PooledBuffer::with_capacity(packet.len());
+                pooled.extend_from_slice(&packet);
+                device.store_packet(pooled);
+                iface.poll_ingress_single(SmolInstant::from_millis(1), device, sockets);
+            };
+        ingress(&mut iface, &mut device, &mut socket_set, None, false);
+        iface.poll_egress(SmolInstant::from_millis(1), &mut device, &mut socket_set);
+        let mut data = [0; 1500];
+        let length = peer.recv(&mut data).unwrap();
+        let ip = Ipv4Packet::new_checked(&data[..length]).unwrap();
+        let syn_ack = TcpPacket::new_checked(ip.payload()).unwrap();
+        let acknowledgement = (syn_ack.seq_number().0 as u32).wrapping_add(1);
+        ingress(
+            &mut iface,
+            &mut device,
+            &mut socket_set,
+            Some(acknowledgement),
+            false,
+        );
+        socket_set.get_mut::<TcpSocket>(handle).close();
+        iface.poll_egress(SmolInstant::from_millis(1), &mut device, &mut socket_set);
+        ingress(
+            &mut iface,
+            &mut device,
+            &mut socket_set,
+            Some(acknowledgement.wrapping_add(1)),
+            true,
+        );
+        assert_eq!(
+            socket_set.get::<TcpSocket>(handle).state(),
+            TcpState::TimeWait
+        );
+        iface.poll_egress(SmolInstant::from_millis(1), &mut device, &mut socket_set);
+
+        assert_eq!(
+            iface.poll_egress(
+                SmolInstant::from_millis(60_001),
+                &mut device,
+                &mut socket_set
+            ),
+            PollResult::None
+        );
+        assert!(!reconcile_sockets(
+            &mut sockets,
+            &mut socket_set,
+            &mut active
+        ));
+        assert!(sockets.is_empty());
+        assert!(active.is_empty());
+        assert_eq!(control.recv_state(), TcpSocketState::Closed);
+        assert_eq!(control.send_state(), TcpSocketState::Closed);
+    }
+
+    #[test]
+    fn closed_socket_keeps_its_pending_reset_until_a_complete_egress_sweep() {
+        let (peer, tun) = UnixDatagram::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let mut device = DirectDevice::new(tun.as_raw_fd(), 1500, false);
+        let mut iface = Interface::new(
+            InterfaceConfig::new(HardwareAddress::Ip),
+            &mut device,
+            stack_now(),
+        );
+        iface.update_ip_addrs(|addresses| {
+            addresses
+                .push(IpCidr::new(IpAddress::v4(1, 1, 1, 1), 0))
+                .unwrap();
+        });
+        let mut socket_set = SocketSet::new(vec![]);
+        let mut sockets = HashMap::new();
+        let mut active = HashSet::new();
+        let dst_addr: SocketAddr = "10.0.0.2:443".parse().unwrap();
+        let mut last_handle = None;
+        for port in 10000..10070 {
+            let src_addr = SocketAddr::from(([1, 1, 1, 1], port));
+            let mut socket = TcpSocket::new(
+                TcpSocketBuffer::new(vec![0; 1024]),
+                TcpSocketBuffer::new(vec![0; 1024]),
+            );
+            socket.connect(iface.context(), dst_addr, src_addr).unwrap();
+            let handle = socket_set.add(socket);
+            sockets.insert(
+                handle,
+                SocketInfo {
+                    control: Arc::new(TcpConnectionControl::new(1024, 1024)),
+                    src_addr,
+                    dst_addr,
+                },
+            );
+            active.insert((src_addr, dst_addr));
+            last_handle = Some(handle);
+        }
+        let last_handle = last_handle.unwrap();
+        socket_set.get_mut::<TcpSocket>(last_handle).abort();
+        reconcile_sockets(&mut sockets, &mut socket_set, &mut active);
+        assert_eq!(sockets.len(), 70);
+        iface.poll_egress(stack_now(), &mut device, &mut socket_set);
+        let mut reset = false;
+        let mut data = [0; 1500];
+        for _ in 0..70 {
+            let length = peer.recv(&mut data).unwrap();
+            let ip = Ipv4Packet::new_checked(&data[..length]).unwrap();
+            let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+            if tcp.src_port() == 10069 {
+                reset = tcp.rst();
+            }
+        }
+        assert!(reset);
+        reconcile_sockets(&mut sockets, &mut socket_set, &mut active);
+        assert_eq!(sockets.len(), 69);
+        assert!(!sockets.contains_key(&last_handle));
+    }
 
     #[test]
     fn default_admission_preserves_bursts_beyond_old_queue_and_socket_caps() {
