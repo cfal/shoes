@@ -932,7 +932,7 @@ fn current_time_secs() -> u64 {
 #[cfg(test)]
 mod flush_tests {
     use super::*;
-    use crate::copy_bidirectional::tests::copy_response_with_flush_pressure;
+    use crate::copy_bidirectional::tests::{copy_response_with_flush_pressure, quota_test_payload};
     use crate::prepend_stream::PrependStream;
     use aws_lc_rs::aead::{AES_128_GCM, AES_256_GCM, CHACHA20_POLY1305};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1006,16 +1006,16 @@ mod flush_tests {
 
             if payload.is_empty() {
                 assert!(capture.data.is_empty());
-                assert!(capture.first_write.is_empty());
+                assert!(capture.first_write_offer.is_empty());
             } else {
                 let overhead = if aead2022 {
                     salt_len + 11 + salt_len + 2 * TAG_LEN
                 } else {
                     salt_len + METADATA_SIZE
                 };
-                assert!(capture.first_write.len() > overhead);
+                assert!(capture.first_write_offer.len() > overhead);
                 if payload.len() < 1024 {
-                    assert_eq!(capture.first_write.len(), overhead + payload.len());
+                    assert_eq!(capture.first_write_offer.len(), overhead + payload.len());
                 }
             }
 
@@ -1037,11 +1037,7 @@ mod flush_tests {
 
     #[tokio::test]
     async fn response_survives_copier_quota_flushes_and_eof() {
-        let quota = 1024 * 1024;
-        let payload: Vec<u8> = (0..2 * quota + 37)
-            .map(|i| (i ^ (i >> 8) ^ (i >> 16)) as u8)
-            .collect();
-        assert!(payload[..quota] != payload[quota..2 * quota]);
+        let payload = quota_test_payload();
         check_response_flushes(&payload).await;
     }
 

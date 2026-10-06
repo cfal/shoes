@@ -1158,7 +1158,7 @@ impl AsyncMessageStream for VmessStream {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::copy_bidirectional::tests::copy_response_with_flush_pressure;
+    use crate::copy_bidirectional::tests::{copy_response_with_flush_pressure, quota_test_payload};
     use crate::prepend_stream::PrependStream;
     use aws_lc_rs::aead::{Algorithm, CHACHA20_POLY1305, UnboundKey};
     use shake::Shake128;
@@ -1221,8 +1221,8 @@ mod tests {
                     payload,
                 )
                 .await;
-                assert!(capture.first_write.starts_with(&prefix));
-                assert!(capture.first_write.len() > prefix.len());
+                assert!(capture.first_write_offer.starts_with(&prefix));
+                assert!(capture.first_write_offer.len() > prefix.len());
                 assert!(capture.data.starts_with(&prefix));
 
                 let (transport, _) = tokio::io::duplex(1);
@@ -1247,40 +1247,44 @@ mod tests {
                 } else {
                     0
                 };
-                let mut offset = prefix.len();
+                let mut frame_start = prefix.len();
                 let mut eof_count = 0;
-                while offset < capture.data.len() {
+                while frame_start < capture.data.len() {
                     let (padding_len, length_mask) =
                         mask.as_mut().map_or((0, 0), LengthMask::next_values);
-                    let len =
-                        u16::from_be_bytes(capture.data[offset..offset + 2].try_into().unwrap())
-                            ^ length_mask;
-                    let len = usize::from(len);
-                    assert!(len >= padding_len + tag_len);
-                    let end = offset + 2 + len;
-                    assert!(end <= capture.data.len());
-                    if offset == prefix.len() {
+                    let encoded_len = u16::from_be_bytes(
+                        capture.data[frame_start..frame_start + 2]
+                            .try_into()
+                            .unwrap(),
+                    );
+                    let frame_len = usize::from(encoded_len ^ length_mask);
+                    assert!(frame_len >= padding_len + tag_len);
+                    let frame_end = frame_start + 2 + frame_len;
+                    assert!(frame_end <= capture.data.len());
+                    let is_eof = frame_len == padding_len + tag_len;
+                    if frame_start == prefix.len() {
                         // The first offered write contains a complete body frame, not just its prefix.
-                        assert!(capture.first_write.len() >= end);
-                        assert_eq!(len == padding_len + tag_len, payload.is_empty());
+                        assert!(capture.first_write_offer.len() >= frame_end);
+                        assert_eq!(is_eof, payload.is_empty());
                     }
-                    if len == padding_len + tag_len {
+                    if is_eof {
                         eof_count += 1;
-                        assert_eq!(end, capture.data.len());
+                        assert_eq!(frame_end, capture.data.len());
                         assert_eq!(
-                            capture.before_shutdown,
-                            if payload.is_empty() { 0 } else { offset }
+                            capture.bytes_before_shutdown,
+                            if payload.is_empty() { 0 } else { frame_start }
                         );
                         if let Some(key) = &mut decoder.opening_key {
-                            let mut tag = capture.data[offset + 2..end - padding_len].to_vec();
+                            let mut eof_tag =
+                                capture.data[frame_start + 2..frame_end - padding_len].to_vec();
                             assert!(
-                                key.open_in_place(Aad::empty(), &mut tag)
+                                key.open_in_place(Aad::empty(), &mut eof_tag)
                                     .unwrap()
                                     .is_empty()
                             );
                         }
                     }
-                    offset = end;
+                    frame_start = frame_end;
                 }
                 assert_eq!(eof_count, 1);
             }
@@ -1294,11 +1298,7 @@ mod tests {
 
     #[tokio::test]
     async fn response_survives_copier_quota_flushes_and_eof() {
-        let quota = 1024 * 1024;
-        let payload: Vec<u8> = (0..2 * quota + 37)
-            .map(|i| (i ^ (i >> 8) ^ (i >> 16)) as u8)
-            .collect();
-        assert!(payload[..quota] != payload[quota..2 * quota]);
+        let payload = quota_test_payload();
         check_response_flushes(&payload).await;
     }
 

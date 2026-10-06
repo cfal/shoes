@@ -387,8 +387,8 @@ pub(crate) mod tests {
     #[derive(Default)]
     pub(crate) struct Capture {
         pub(crate) data: Vec<u8>,
-        pub(crate) first_write: Vec<u8>,
-        pub(crate) before_shutdown: usize,
+        pub(crate) first_write_offer: Vec<u8>,
+        pub(crate) bytes_before_shutdown: usize,
         writes: Vec<usize>,
         flushes: usize,
         write_release: Option<tokio::sync::oneshot::Receiver<()>>,
@@ -402,7 +402,7 @@ pub(crate) mod tests {
         block_flush: bool,
         pending_at_eof: bool,
         write_limit: Option<usize>,
-        write_release: Option<tokio::sync::oneshot::Receiver<()>>,
+        write_flush_release: Option<tokio::sync::oneshot::Receiver<()>>,
     }
 
     impl AsyncRead for MemoryStream {
@@ -425,17 +425,17 @@ pub(crate) mod tests {
             data: &[u8],
         ) -> Poll<io::Result<usize>> {
             let already_written = !self.output.lock().unwrap().data.is_empty();
-            if already_written && let Some(release) = &mut self.write_release {
+            if already_written && let Some(release) = &mut self.write_flush_release {
                 ready!(Pin::new(release).poll(cx)).unwrap();
-                self.write_release = None;
+                self.write_flush_release = None;
             }
             let mut output = self.output.lock().unwrap();
             if already_written && let Some(release) = &mut output.write_release {
                 ready!(Pin::new(release).poll(cx)).unwrap();
                 output.write_release = None;
             }
-            if output.first_write.is_empty() {
-                output.first_write.extend_from_slice(data);
+            if output.first_write_offer.is_empty() {
+                output.first_write_offer.extend_from_slice(data);
             }
             let data = &data[..data.len().min(self.write_limit.unwrap_or(usize::MAX))];
             output.data.extend_from_slice(data);
@@ -444,9 +444,9 @@ pub(crate) mod tests {
         }
 
         fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-            if let Some(release) = &mut self.write_release {
+            if let Some(release) = &mut self.write_flush_release {
                 ready!(Pin::new(release).poll(cx)).unwrap();
-                self.write_release = None;
+                self.write_flush_release = None;
             }
             if self.block_flush {
                 return Poll::Pending;
@@ -483,6 +483,15 @@ pub(crate) mod tests {
         fn wake(self: Arc<Self>) {
             self.0.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    pub(crate) fn quota_test_payload() -> Vec<u8> {
+        let quota = MAX_COPY_BYTES_PER_POLL;
+        let payload: Vec<u8> = (0..2 * quota + 37)
+            .map(|i| (i ^ (i >> 8) ^ (i >> 16)) as u8)
+            .collect();
+        assert!(payload[..quota] != payload[quota..2 * quota]);
+        payload
     }
 
     pub(crate) async fn copy_response_with_flush_pressure<W, F>(
@@ -571,17 +580,14 @@ pub(crate) mod tests {
             std::future::poll_fn(|cx| {
                 let result = buffer.poll_copy(cx, Pin::new(&mut reader), Pin::new(&mut writer));
                 assert!(result.is_pending(), "copy did not suspend: {result:?}");
-                if reader.input.position() as usize == payload.len()
-                    && buffer.cache_length == 0
-                    && !buffer.need_flush
-                {
-                    Poll::Ready(())
-                } else {
-                    if buffer.cache_length == 0 && !buffer.need_flush {
-                        quota_yields += 1;
-                    }
-                    Poll::Pending
+                if buffer.cache_length > 0 || buffer.need_flush {
+                    return Poll::Pending;
                 }
+                if reader.input.position() as usize == payload.len() {
+                    return Poll::Ready(());
+                }
+                quota_yields += 1;
+                Poll::Pending
             }),
         )
         .await
@@ -592,7 +598,7 @@ pub(crate) mod tests {
 
         {
             let mut output = capture.lock().unwrap();
-            output.before_shutdown = output.data.len();
+            output.bytes_before_shutdown = output.data.len();
         }
         reader.pending_at_eof = false;
         let mut state = TransferState::Running;
@@ -653,7 +659,7 @@ pub(crate) mod tests {
         let (release, blocked) = tokio::sync::oneshot::channel();
         let mut writer = MemoryStream {
             write_limit: Some(7),
-            write_release: Some(blocked),
+            write_flush_release: Some(blocked),
             ..Default::default()
         };
         let mut buffer = CopyBuffer::new(32, false);
