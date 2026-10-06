@@ -1,4 +1,4 @@
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 #[cfg(target_os = "linux")]
 use std::fs;
 use std::io::{self, Write};
@@ -702,17 +702,24 @@ pub async fn start_mihomo_server(
 
     let startup_directory = tempfile::tempdir()?;
     let ready_file = startup_directory.path().join("ready");
-    let post_up = if cfg!(windows) {
-        "echo ready>\"%SHOES_TEST_MIHOMO_READY%\""
+    let (post_up, ready_path) = if cfg!(windows) {
+        // Go escapes argument quotes for a CRT parser, but cmd.exe needs literal quotes.
+        let mut quoted_path = OsString::from("\"");
+        quoted_path.push(&ready_file);
+        quoted_path.push("\"");
+        ("echo ready>%SHOES_TEST_MIHOMO_READY%", quoted_path)
     } else {
-        "printf ready > \"$SHOES_TEST_MIHOMO_READY\""
+        (
+            "printf ready > \"$SHOES_TEST_MIHOMO_READY\"",
+            ready_file.as_os_str().to_owned(),
+        )
     };
     // Mihomo accepts SOCKS connections before enabling routing; post-up runs afterward.
     let child = Command::new(find_mihomo_binary()?)
         .arg("-f")
         .arg(config_file.path())
         .args(["-post-up", post_up])
-        .env("SHOES_TEST_MIHOMO_READY", &ready_file)
+        .env("SHOES_TEST_MIHOMO_READY", ready_path)
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()?;
