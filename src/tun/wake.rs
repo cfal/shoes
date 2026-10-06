@@ -22,6 +22,10 @@ struct WakeInner {
 pub(super) struct WakeReceiver {
     reader: UnixStream,
     wake: Wake,
+    #[cfg(test)]
+    pub before_clear: Option<super::test_gate::TestGate>,
+    #[cfg(test)]
+    pub before_wait: Option<super::test_gate::TestGate>,
 }
 
 impl Wake {
@@ -36,6 +40,10 @@ impl Wake {
         let receiver = WakeReceiver {
             reader,
             wake: wake.clone(),
+            #[cfg(test)]
+            before_clear: None,
+            #[cfg(test)]
+            before_wait: None,
         };
         Ok((wake, receiver))
     }
@@ -78,6 +86,10 @@ impl WakeReceiver {
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
                 Err(error) => return Err(error),
             }
+        }
+        #[cfg(test)]
+        if let Some(gate) = self.before_clear.take() {
+            gate.pause();
         }
         self.wake.0.pending.swap(false, Ordering::AcqRel);
         Ok(())
@@ -221,12 +233,23 @@ mod tests {
     fn notification_during_acknowledgment_is_observed_as_shared_work() {
         let (wake, mut receiver) = Wake::new().unwrap();
         let (tx, rx) = mpsc::channel();
+        let (gate, control) = super::super::test_gate::TestGate::new();
+        receiver.before_clear = Some(gate);
         wake.notify();
-        assert_eq!(receiver.reader.read(&mut [0]).unwrap(), 1);
+        let consumer = thread::spawn(move || {
+            receiver.drain().unwrap();
+            assert_eq!(rx.try_recv().unwrap(), 42);
+            receiver
+        });
+        control.wait();
         tx.send(42).unwrap();
         wake.notify();
-        receiver.drain().unwrap();
-        assert_eq!(rx.try_recv().unwrap(), 42);
+        drop(control);
+        let mut receiver = consumer.join().unwrap();
+        assert_eq!(
+            receiver.reader.read(&mut [0]).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
         wake.notify();
         assert_eq!(receiver.reader.read(&mut [0]).unwrap(), 1);
     }

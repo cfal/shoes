@@ -36,6 +36,9 @@ mod udp_handler;
 mod udp_manager;
 mod wake;
 
+#[cfg(test)]
+mod test_gate;
+
 // Platform module only needed for mobile FFI targets
 #[cfg(any(target_os = "android", target_os = "ios", feature = "ffi"))]
 #[cfg_attr(
