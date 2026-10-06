@@ -27,6 +27,7 @@ use crate::config::tun::TunResourceLimits;
 use crate::resolver::Resolver;
 use crate::resources::{Budget, BudgetPermit};
 
+use super::packet::PacketBuffer;
 use super::udp_handler::{UdpMessage, UdpReader, UdpWriter};
 
 /// Session timeout - sessions without activity are expired
@@ -73,18 +74,19 @@ pub struct TunUdpManager {
     destination_slots: Arc<Budget>,
     destinations_per_session: Option<usize>,
     queued_bytes: Arc<Budget>,
+    compact_payloads: bool,
 }
 
 struct QueuedPacket {
-    payload: Vec<u8>,
+    payload: PacketBuffer,
     _permit: BudgetPermit,
 }
 
 impl QueuedPacket {
-    fn reserve(payload: Vec<u8>, budget: &Arc<Budget>) -> Option<Self> {
+    fn reserve(payload: PacketBuffer, budget: &Arc<Budget>, compact: bool) -> Option<Self> {
         let permit = budget.acquire(payload.len().max(1))?;
         Some(Self {
-            payload,
+            payload: payload.into_payload(compact),
             _permit: permit,
         })
     }
@@ -138,6 +140,7 @@ impl TunUdpManager {
             destination_slots: Arc::new(Budget::new(limits.max_udp_destinations)),
             destinations_per_session: limits.max_udp_destinations_per_session,
             queued_bytes: Arc::new(Budget::new(limits.max_udp_queued_bytes)),
+            compact_payloads: limits.max_udp_queued_bytes.is_some(),
         }
     }
 
@@ -156,7 +159,7 @@ impl TunUdpManager {
                         src_addr, dst_addr, payload.len()
                     );
 
-                    if let Err(e) = self.write_to_tun(&payload, src_addr, dst_addr) {
+                    if let Err(e) = self.writer.send_sync((payload, src_addr, dst_addr)) {
                         debug!("[TunUdpManager] Failed to write response to TUN: {}", e);
                     }
                 }
@@ -194,8 +197,15 @@ impl TunUdpManager {
     ///
     /// Uses try_send to avoid blocking the manager event loop on a single
     /// overloaded session (prevents head-of-line blocking at the manager level).
-    fn handle_packet(&mut self, local_addr: SocketAddr, remote_addr: SocketAddr, payload: Vec<u8>) {
-        let Some(packet) = QueuedPacket::reserve(payload, &self.queued_bytes) else {
+    fn handle_packet(
+        &mut self,
+        local_addr: SocketAddr,
+        remote_addr: SocketAddr,
+        payload: PacketBuffer,
+    ) {
+        let Some(packet) =
+            QueuedPacket::reserve(payload, &self.queued_bytes, self.compact_payloads)
+        else {
             debug!("[TunUdpManager] UDP queued byte budget exhausted, dropping packet");
             return;
         };
@@ -261,17 +271,6 @@ impl TunUdpManager {
         };
 
         self.sessions.push(peer_addr, session);
-    }
-
-    /// Write a response packet to the TUN.
-    fn write_to_tun(
-        &mut self,
-        payload: &[u8],
-        src_addr: SocketAddr,
-        dst_addr: SocketAddr,
-    ) -> io::Result<()> {
-        let message = (payload.to_vec(), src_addr, dst_addr);
-        self.writer.send_sync(message)
     }
 
     /// Clean up expired and dead sessions.
@@ -489,7 +488,11 @@ async fn destination_task(
 
                 // (payload, src=remote, dst=local_app)
                 if response_tx
-                    .try_send((buf.filled().to_vec(), source_addr, peer_addr))
+                    .try_send((
+                        PacketBuffer::copy_from_slice(buf.filled()),
+                        source_addr,
+                        peer_addr,
+                    ))
                     .is_err()
                 {
                     debug!(
@@ -578,12 +581,141 @@ async fn send_message(stream: &mut Box<dyn AsyncMessageStream>, data: &[u8]) -> 
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
+    use crate::async_stream::{
+        AsyncFlushMessage, AsyncPing, AsyncReadMessage, AsyncShutdownMessage, AsyncWriteMessage,
+    };
+    use std::sync::atomic::{AtomicU8, Ordering};
+    use std::task::{Context, Poll};
+
+    #[derive(Default)]
+    struct FlushState {
+        mode: AtomicU8,
+        entered: tokio::sync::Notify,
+        waker: futures::task::AtomicWaker,
+    }
+
+    struct StalledFlush(Arc<FlushState>);
+
+    impl AsyncReadMessage for StalledFlush {
+        fn poll_read_message(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWriteMessage for StalledFlush {
+        fn poll_write_message(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            data: &[u8],
+        ) -> Poll<io::Result<()>> {
+            assert_eq!(data, b"packet");
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncFlushMessage for StalledFlush {
+        fn poll_flush_message(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.0.waker.register(cx.waker());
+            self.0.entered.notify_one();
+            match self.0.mode.load(Ordering::Acquire) {
+                1 => Poll::Ready(Ok(())),
+                2 => Poll::Ready(Err(io::ErrorKind::BrokenPipe.into())),
+                _ => Poll::Pending,
+            }
+        }
+    }
+
+    impl AsyncShutdownMessage for StalledFlush {
+        fn poll_shutdown_message(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncPing for StalledFlush {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+        fn poll_write_ping(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+
+    impl AsyncMessageStream for StalledFlush {}
+
+    #[tokio::test(start_paused = true)]
+    async fn packet_permit_survives_pending_flush_and_all_termination_paths() {
+        for completion in ["success", "error", "timeout", "cancel"] {
+            let budget = Arc::new(Budget::new(Some(6)));
+            let slots = Arc::new(Budget::new(Some(1)));
+            let state = Arc::new(FlushState::default());
+            let (write_tx, write_rx) = mpsc::channel(1);
+            let (response_tx, _response_rx) = mpsc::channel(1);
+            let packet =
+                QueuedPacket::reserve(PacketBuffer::copy_from_slice(b"packet"), &budget, true)
+                    .unwrap();
+            assert!(write_tx.try_send(packet).is_ok());
+            let task = tokio::spawn(destination_task(
+                "127.0.0.1:1234".parse().unwrap(),
+                "127.0.0.1:4321".parse().unwrap(),
+                Box::new(StalledFlush(state.clone())),
+                write_rx,
+                response_tx,
+                slots.acquire(1).unwrap(),
+            ));
+            state.entered.notified().await;
+            assert_eq!(budget.available_permits(), 0);
+            assert_eq!(slots.available_permits(), 0);
+            match completion {
+                "success" | "error" => {
+                    state.mode.store(
+                        if completion == "success" { 1 } else { 2 },
+                        Ordering::Release,
+                    );
+                    state.waker.wake();
+                }
+                "timeout" => tokio::time::advance(WRITE_TIMEOUT + Duration::from_secs(1)).await,
+                "cancel" => task.abort(),
+                _ => unreachable!(),
+            }
+            drop(write_tx);
+            let result = task.await;
+            assert!(result.is_ok() || completion == "cancel" && result.unwrap_err().is_cancelled());
+            assert_eq!(budget.available_permits(), 6);
+            assert_eq!(slots.available_permits(), 1);
+        }
+    }
+
+    #[test]
+    fn rejected_queue_packets_release_their_payload_permits() {
+        let budget = Arc::new(Budget::new(Some(64)));
+        let packet = || {
+            QueuedPacket::reserve(PacketBuffer::copy_from_slice(b"packet"), &budget, true).unwrap()
+        };
+        let (tx, mut rx) = mpsc::channel(1);
+        assert!(tx.try_send(packet()).is_ok());
+        assert!(tx.try_send(packet()).is_err());
+        assert_eq!(budget.available_permits(), 58);
+        rx.close();
+        assert!(tx.try_send(packet()).is_err());
+        assert_eq!(budget.available_permits(), 58);
+        drop(rx);
+        assert_eq!(budget.available_permits(), 64);
+    }
 
     #[tokio::test]
     async fn default_session_admission_does_not_evict_at_the_old_limit() {
         let (_, from_tun) = mpsc::channel(1);
         let (to_tun, _) = mpsc::channel(1);
-        let (reader, writer) = super::super::udp_handler::UdpHandler::new(from_tun, to_tun).split();
+        let (wake, _receiver) = super::super::wake::Wake::new().unwrap();
+        let (reader, writer) =
+            super::super::udp_handler::UdpHandler::new(from_tun, to_tun, wake).split();
         let mut manager = TunUdpManager::new(
             reader,
             writer,
@@ -611,7 +743,9 @@ mod lifecycle_tests {
         limits.validate().unwrap();
         let (_, from_tun) = mpsc::channel(1);
         let (to_tun, _) = mpsc::channel(1);
-        let (reader, writer) = super::super::udp_handler::UdpHandler::new(from_tun, to_tun).split();
+        let (wake, _receiver) = super::super::wake::Wake::new().unwrap();
+        let (reader, writer) =
+            super::super::udp_handler::UdpHandler::new(from_tun, to_tun, wake).split();
         let manager = TunUdpManager::new(
             reader,
             writer,
@@ -629,11 +763,15 @@ mod lifecycle_tests {
         let (session_tx, mut session_rx) = mpsc::channel(CHANNEL_SIZE);
         let (destination_tx, destination_rx) = mpsc::channel(CHANNEL_SIZE);
         for _ in 0..64 {
-            let packet = QueuedPacket::reserve(vec![0; 10], &budget).unwrap();
+            let packet =
+                QueuedPacket::reserve(PacketBuffer::copy_from_slice(&[0; 10]), &budget, true)
+                    .unwrap();
             assert!(session_tx.try_send(packet).is_ok());
         }
         assert_eq!(budget.available_permits(), 0);
-        assert!(QueuedPacket::reserve(vec![0], &budget).is_none());
+        assert!(
+            QueuedPacket::reserve(PacketBuffer::copy_from_slice(&[0]), &budget, true).is_none()
+        );
         for _ in 0..64 {
             assert!(
                 destination_tx
@@ -644,8 +782,12 @@ mod lifecycle_tests {
         assert_eq!(budget.available_permits(), 0);
         drop(destination_rx);
         assert_eq!(budget.available_permits(), 640);
-        assert!(QueuedPacket::reserve(vec![0; 641], &budget).is_none());
-        let empty = QueuedPacket::reserve(Vec::new(), &budget).unwrap();
+        assert!(
+            QueuedPacket::reserve(PacketBuffer::copy_from_slice(&[0; 641]), &budget, true)
+                .is_none()
+        );
+        let empty =
+            QueuedPacket::reserve(PacketBuffer::copy_from_slice(&[]), &budget, true).unwrap();
         assert_eq!(budget.available_permits(), 639);
         drop(empty);
         assert_eq!(budget.available_permits(), 640);
@@ -673,7 +815,14 @@ mod lifecycle_tests {
         for payload in [b"".as_slice(), b"still open".as_slice()] {
             assert!(
                 write_tx
-                    .try_send(QueuedPacket::reserve(payload.to_vec(), &budget).unwrap())
+                    .try_send(
+                        QueuedPacket::reserve(
+                            PacketBuffer::copy_from_slice(payload),
+                            &budget,
+                            true
+                        )
+                        .unwrap()
+                    )
                     .is_ok()
             );
             let mut bytes = [0; 64];
@@ -687,7 +836,7 @@ mod lifecycle_tests {
                 .await
                 .unwrap()
                 .unwrap();
-            assert_eq!(response, payload);
+            assert_eq!(&*response, payload);
         }
     }
 

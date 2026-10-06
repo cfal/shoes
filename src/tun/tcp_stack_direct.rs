@@ -1,29 +1,26 @@
 //! Direct TCP Stack Manager for smoltcp integration.
 //!
 //! This module manages the smoltcp TCP/IP stack in a dedicated OS thread,
-//! using `select()` on the TUN fd for event-driven I/O instead of polling.
+//! using `poll()` on TUN and wake fds for event-driven I/O.
 
 use std::{
-    collections::HashMap,
-    io, mem,
+    collections::{HashMap, HashSet},
+    io,
     net::SocketAddr,
-    ops::{Deref, DerefMut},
     os::fd::{AsRawFd, OwnedFd, RawFd},
     panic::{self, AssertUnwindSafe},
     sync::{
-        Arc, LazyLock, Mutex,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
-    thread::{self, JoinHandle, Thread},
+    thread::{self, JoinHandle},
     time::Duration,
 };
-
-use bytes::BytesMut;
 
 use log::{debug, error, info, trace, warn};
 use smoltcp::{
     iface::{Config as InterfaceConfig, Interface, SocketHandle, SocketSet},
-    phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken, wait as phy_wait},
+    phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken},
     socket::tcp::{
         CongestionControl, Socket as TcpSocket, SocketBuffer as TcpSocketBuffer, State as TcpState,
     },
@@ -36,63 +33,11 @@ use smoltcp::{
 use tokio::sync::mpsc::{self, Receiver, Sender};
 
 use super::TunServerConfig;
+use super::packet::PacketBuffer;
 use super::tcp_conn::{TcpConnection, TcpConnectionControl, TcpSocketState};
+use super::wake::{Wake, WakeReceiver};
 
-pub type PacketBuffer = Vec<u8>;
 pub const PACKET_QUEUE_CAPACITY: usize = 64;
-
-/// Maximum number of buffers cached globally.
-/// Each buffer has capacity ~65536, so 64 * 65536 = 4MB max.
-const BUFFER_POOL_MAX_SIZE: usize = 64;
-
-static BUFFER_POOL: LazyLock<Mutex<Vec<BytesMut>>> = LazyLock::new(|| Mutex::new(Vec::new()));
-
-/// Pooled buffer that returns to pool on drop instead of deallocating.
-pub struct PooledBuffer {
-    buffer: BytesMut,
-}
-
-impl Drop for PooledBuffer {
-    fn drop(&mut self) {
-        if let Ok(mut pool) = BUFFER_POOL.lock()
-            && pool.len() < BUFFER_POOL_MAX_SIZE
-        {
-            let empty = BytesMut::new();
-            let mut buffer = mem::replace(&mut self.buffer, empty);
-            buffer.clear();
-            pool.push(buffer);
-        }
-    }
-}
-
-impl PooledBuffer {
-    /// Get a buffer from the pool or create a new one.
-    pub fn with_capacity(cap: usize) -> Self {
-        if let Ok(mut pool) = BUFFER_POOL.lock()
-            && let Some(mut buffer) = pool.pop()
-        {
-            buffer.reserve(cap);
-            return Self { buffer };
-        }
-        Self {
-            buffer: BytesMut::with_capacity(cap),
-        }
-    }
-}
-
-impl Deref for PooledBuffer {
-    type Target = BytesMut;
-
-    fn deref(&self) -> &Self::Target {
-        &self.buffer
-    }
-}
-
-impl DerefMut for PooledBuffer {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.buffer
-    }
-}
 
 /// Tracks socket info including addresses for proper cleanup.
 struct SocketInfo {
@@ -127,8 +72,7 @@ struct SharedState {
 pub struct TcpStackDirect {
     /// Handle to the stack thread
     thread_handle: Option<JoinHandle<()>>,
-    /// Thread handle for waking the stack thread
-    stack_thread: Thread,
+    wake: Wake,
     /// Flag to signal thread shutdown
     running: Arc<AtomicBool>,
     /// Receiver for UDP packets (filtered from TUN by the stack thread)
@@ -143,7 +87,7 @@ impl Drop for TcpStackDirect {
     fn drop(&mut self) {
         // Signal thread to stop
         self.running.store(false, Ordering::Relaxed);
-        self.stack_thread.unpark();
+        self.wake.notify();
 
         // Wait for thread to finish
         if let Some(handle) = self.thread_handle.take() {
@@ -160,14 +104,16 @@ impl TcpStackDirect {
     /// * `mtu` - Maximum transmission unit
     ///
     /// This spawns a dedicated OS thread for running the smoltcp interface.
-    /// The thread uses `select()` on the fd for efficient event-driven I/O.
+    /// The thread waits for TUN readiness and cross-thread notifications.
     #[cfg(test)]
     pub fn new(tun_fd: OwnedFd, mtu: usize) -> Self {
-        Self::with_config(tun_fd, TunServerConfig::new().mtu(mtu as u16))
+        Self::with_config(tun_fd, TunServerConfig::new().mtu(mtu as u16)).unwrap()
     }
 
-    pub fn with_config(tun_fd: OwnedFd, config: TunServerConfig) -> Self {
+    pub fn with_config(tun_fd: OwnedFd, config: TunServerConfig) -> io::Result<Self> {
         let fd = tun_fd.as_raw_fd();
+        set_nonblocking(fd)?;
+        let (wake, wake_rx) = Wake::new()?;
         let (udp_tx, udp_rx) = mpsc::channel(PACKET_QUEUE_CAPACITY);
 
         let running = Arc::new(AtomicBool::new(true));
@@ -179,12 +125,21 @@ impl TcpStackDirect {
         let thread_handle = {
             let running = running.clone();
             let shared_state = shared_state.clone();
+            let stack_wake = wake.clone();
 
             thread::Builder::new()
                 .name("shoes-smoltcp-direct".to_owned())
                 .spawn(move || {
                     let result = panic::catch_unwind(AssertUnwindSafe(|| {
-                        run_direct_stack_thread(fd, config, udp_tx, running.clone(), shared_state);
+                        run_direct_stack_thread(
+                            fd,
+                            config,
+                            udp_tx,
+                            running.clone(),
+                            shared_state,
+                            stack_wake,
+                            wake_rx,
+                        );
                     }));
 
                     match result {
@@ -204,20 +159,21 @@ impl TcpStackDirect {
                     }
 
                     running.store(false, Ordering::Relaxed);
-                })
-                .expect("failed to spawn smoltcp direct thread")
+                })?
         };
 
-        let stack_thread = thread_handle.thread().clone();
-
-        Self {
+        Ok(Self {
             thread_handle: Some(thread_handle),
-            stack_thread,
+            wake,
             running,
             udp_rx: Some(udp_rx),
             shared_state,
             _tun_fd: tun_fd,
-        }
+        })
+    }
+
+    pub fn wake_handle(&self) -> Wake {
+        self.wake.clone()
     }
 
     /// Take the receiver for UDP packets (filtered from TUN by the stack).
@@ -230,7 +186,7 @@ impl TcpStackDirect {
         if let Ok(mut state) = self.shared_state.lock() {
             state.udp_response_rx = Some(rx);
         }
-        self.stack_thread.unpark();
+        self.wake.notify();
     }
 
     /// Set the channel for notifying about new TCP connections.
@@ -238,7 +194,7 @@ impl TcpStackDirect {
         if let Ok(mut state) = self.shared_state.lock() {
             state.new_conn_tx = Some(tx);
         }
-        self.stack_thread.unpark();
+        self.wake.notify();
     }
 
     /// Check if the stack thread is still running.
@@ -251,7 +207,8 @@ impl TcpStackDirect {
 struct DirectDevice {
     fd: RawFd,
     mtu: usize,
-    pending_rx: Option<PooledBuffer>,
+    pending_rx: Option<PacketBuffer>,
+    tx_buffer: Vec<u8>,
     packet_information: bool,
 }
 
@@ -261,6 +218,7 @@ impl DirectDevice {
             fd,
             mtu,
             pending_rx: None,
+            tx_buffer: Vec::with_capacity(mtu),
             packet_information,
         }
     }
@@ -270,14 +228,14 @@ impl DirectDevice {
     /// - Ok(Some(packet)) if a packet was read
     /// - Ok(None) if no packet was available (WouldBlock)
     /// - Err(e) if a fatal error occurred (including EOF)
-    fn try_recv(&mut self) -> io::Result<Option<PooledBuffer>> {
+    fn try_recv(&mut self) -> io::Result<Option<PacketBuffer>> {
         if let Some(pkt) = self.pending_rx.take() {
             return Ok(Some(pkt));
         }
 
         // Get a buffer from the pool
-        let mut buffer = PooledBuffer::with_capacity(self.mtu + 4);
-        buffer.resize(self.mtu + 4, 0);
+        let mut buffer = PacketBuffer::with_capacity(self.mtu + 4);
+        buffer.resize(self.mtu + 4);
 
         match read_nonblocking(self.fd, &mut buffer) {
             Ok(n) if n > 0 => {
@@ -289,7 +247,7 @@ impl DirectDevice {
                             "invalid TUN packet information",
                         ));
                     }
-                    let _ = buffer.split_to(4);
+                    buffer.retain_range(4..n);
                 }
                 Ok(Some(buffer))
             }
@@ -312,7 +270,7 @@ impl DirectDevice {
     }
 
     /// Store a packet for later processing by smoltcp.
-    fn store_packet(&mut self, pkt: PooledBuffer) {
+    fn store_packet(&mut self, pkt: PacketBuffer) {
         self.pending_rx = Some(pkt);
     }
 
@@ -324,28 +282,27 @@ impl DirectDevice {
 
 impl Device for DirectDevice {
     type RxToken<'a> = DirectRxToken;
-    type TxToken<'a> = DirectTxToken;
+    type TxToken<'a> = DirectTxToken<'a>;
 
     fn receive(
         &mut self,
         _timestamp: SmolInstant,
     ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        if let Some(buffer) = self.pending_rx.take() {
-            let rx = DirectRxToken { buffer };
-            let tx = DirectTxToken {
-                fd: self.fd,
-                packet_information: self.packet_information,
-            };
-            Some((rx, tx))
-        } else {
-            None
-        }
+        let buffer = self.pending_rx.take()?;
+        let rx = DirectRxToken { buffer };
+        let tx = DirectTxToken {
+            fd: self.fd,
+            packet_information: self.packet_information,
+            buffer: &mut self.tx_buffer,
+        };
+        Some((rx, tx))
     }
 
     fn transmit(&mut self, _timestamp: SmolInstant) -> Option<Self::TxToken<'_>> {
         Some(DirectTxToken {
             fd: self.fd,
             packet_information: self.packet_information,
+            buffer: &mut self.tx_buffer,
         })
     }
 
@@ -363,7 +320,7 @@ impl Device for DirectDevice {
 }
 
 struct DirectRxToken {
-    buffer: PooledBuffer,
+    buffer: PacketBuffer,
 }
 
 impl RxToken for DirectRxToken {
@@ -376,20 +333,22 @@ impl RxToken for DirectRxToken {
     }
 }
 
-struct DirectTxToken {
+struct DirectTxToken<'a> {
     fd: RawFd,
     packet_information: bool,
+    buffer: &'a mut Vec<u8>,
 }
 
-impl TxToken for DirectTxToken {
+impl TxToken for DirectTxToken<'_> {
     fn consume<R, F>(self, len: usize, f: F) -> R
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        let mut buffer = vec![0u8; len];
-        let result = f(&mut buffer);
+        self.buffer.clear();
+        self.buffer.resize(len, 0);
+        let result = f(self.buffer);
 
-        if let Err(e) = write_packet(self.fd, &buffer, self.packet_information) {
+        if let Err(e) = write_packet(self.fd, self.buffer, self.packet_information) {
             warn!("Failed to write to TUN: {}", e);
         }
 
@@ -397,7 +356,8 @@ impl TxToken for DirectTxToken {
     }
 }
 
-const MAX_PACKET_BATCH: usize = 64; // Process more packets per poll iteration
+const MAX_PACKET_BATCH: usize = 64;
+const MAX_EGRESS_SWEEPS: usize = 8;
 
 /// Run the direct smoltcp stack thread.
 fn run_direct_stack_thread(
@@ -406,14 +366,10 @@ fn run_direct_stack_thread(
     udp_tx: Sender<PacketBuffer>,
     running: Arc<AtomicBool>,
     shared_state: Arc<Mutex<SharedState>>,
+    stack_wake: Wake,
+    mut wake_rx: WakeReceiver,
 ) {
     info!("smoltcp direct stack thread initializing...");
-
-    // Sets fd to non-blocking mode once at startup for performance.
-    if let Err(e) = set_nonblocking(fd) {
-        error!("Failed to set TUN fd to non-blocking: {}", e);
-        return;
-    }
 
     let limits = &config.resource_limits;
     let mut device = DirectDevice::new(fd, config.mtu as usize, config.packet_information);
@@ -421,7 +377,7 @@ fn run_direct_stack_thread(
     let mut iface_config = InterfaceConfig::new(HardwareAddress::Ip);
     iface_config.random_seed = rand::random();
 
-    let mut iface = Interface::new(iface_config, &mut device, SmolInstant::now());
+    let mut iface = Interface::new(iface_config, &mut device, stack_now());
 
     iface.update_ip_addrs(|addrs| {
         if let Err(e) = addrs.push(IpCidr::new(IpAddress::v4(0, 0, 0, 1), 0)) {
@@ -449,26 +405,36 @@ fn run_direct_stack_thread(
 
     let mut socket_set = SocketSet::new(vec![]);
     let mut sockets: HashMap<SocketHandle, SocketInfo> = HashMap::new();
-    let mut active_connections: std::collections::HashSet<(SocketAddr, SocketAddr)> =
-        std::collections::HashSet::new();
+    let mut active_connections = HashSet::new();
 
     let mut poll_count: u64 = 0;
     let mut last_log_time = std::time::Instant::now();
 
-    let stack_thread = thread::current();
-
-    let mut phy_wait_error_count: u32 = 0;
-    const MAX_PHY_WAIT_ERRORS: u32 = 10;
+    let mut wait_error_count: u32 = 0;
+    const MAX_WAIT_ERRORS: u32 = 10;
+    let mut udp_response_rx = None;
+    let mut new_conn_tx = None;
 
     info!("smoltcp direct stack thread started, entering main loop");
 
     while running.load(Ordering::Relaxed) {
-        // Checks for UDP responses to write to TUN.
-        if let Ok(mut state) = shared_state.try_lock()
-            && let Some(ref mut udp_rx) = state.udp_response_rx
-        {
+        if let Err(error) = wake_rx.drain() {
+            error!("TUN wake channel failed: {error}");
+            break;
+        }
+        if let Ok(mut state) = shared_state.lock() {
+            if let Some(rx) = state.udp_response_rx.take() {
+                udp_response_rx = Some(rx);
+            }
+            if let Some(tx) = state.new_conn_tx.take() {
+                new_conn_tx = Some(tx);
+            }
+        }
+        let mut responses_written = 0;
+        if let Some(ref mut udp_rx) = udp_response_rx {
             for _ in 0..MAX_PACKET_BATCH {
                 let Ok(pkt) = udp_rx.try_recv() else { break };
+                responses_written += 1;
                 if let Err(e) = device.write_packet(&pkt) {
                     warn!("Failed to write UDP response to TUN: {}", e);
                 }
@@ -476,7 +442,7 @@ fn run_direct_stack_thread(
         }
 
         // Reads packets from TUN and filters by protocol (batch processing).
-        let mut tcp_packets: Vec<PooledBuffer> = Vec::new();
+        let mut stack_packets = Vec::new();
         let mut packets_read = 0;
 
         while packets_read < MAX_PACKET_BATCH {
@@ -526,7 +492,7 @@ fn run_direct_stack_thread(
                                         src_addr,
                                         dst_addr,
                                         &mut socket_set,
-                                        &stack_thread,
+                                        &stack_wake,
                                         limits.tcp_buffer_size,
                                     ) {
                                         sockets.insert(
@@ -539,11 +505,11 @@ fn run_direct_stack_thread(
                                         );
                                         active_connections.insert((src_addr, dst_addr));
 
-                                        if let Ok(state) = shared_state.try_lock()
-                                            && let Some(ref tx) = state.new_conn_tx
-                                        {
-                                            let _ = tx.send(new_conn.new_tcp_conn);
-                                        }
+                                        publish_connection(
+                                            new_conn.new_tcp_conn,
+                                            &mut new_conn_tx,
+                                            &shared_state,
+                                        );
                                     }
                                 }
                             }
@@ -552,15 +518,13 @@ fn run_direct_stack_thread(
                             }
                         }
 
-                        tcp_packets.push(pkt);
+                        stack_packets.push(pkt);
                     }
                     IpProtocol::Icmp | IpProtocol::Icmpv6 if config.icmp_enabled => {
-                        // ICMP goes to smoltcp immediately
-                        tcp_packets.push(pkt);
+                        stack_packets.push(pkt);
                     }
                     IpProtocol::Udp if config.udp_enabled => {
-                        // UDP goes to tokio - convert to Vec since it leaves our pool
-                        let _ = udp_tx.try_send(pkt.to_vec());
+                        let _ = udp_tx.try_send(pkt);
                     }
                     _ => {
                         trace!("ignoring packet with protocol {:?}", protocol);
@@ -570,7 +534,7 @@ fn run_direct_stack_thread(
         }
 
         if packets_read > 0 {
-            phy_wait_error_count = 0;
+            wait_error_count = 0;
         }
 
         // Skip remaining work if a fatal read error was detected above.
@@ -578,18 +542,11 @@ fn run_direct_stack_thread(
             break;
         }
 
-        // Processes batched TCP/ICMP packets through smoltcp.
-        let has_tcp_packet = !tcp_packets.is_empty();
-        for pkt in tcp_packets {
+        iface.poll_maintenance(stack_now());
+        for pkt in stack_packets {
             device.store_packet(pkt);
-            let now = SmolInstant::now();
-            iface.poll(now, &mut device, &mut socket_set);
+            iface.poll_ingress_single(stack_now(), &mut device, &mut socket_set);
         }
-
-        let now = SmolInstant::now();
-        iface.poll(now, &mut device, &mut socket_set);
-
-        let mut sockets_to_remove = Vec::new();
 
         for (handle, socket_info) in sockets.iter() {
             let handle = *handle;
@@ -600,11 +557,7 @@ fn run_direct_stack_thread(
                 socket.abort();
             }
 
-            // Remove socket only when smoltcp reports Closed state
             if socket.state() == TcpState::Closed {
-                sockets_to_remove.push(handle);
-                control.set_closed();
-                trace!("socket {:?} closed", handle);
                 continue;
             }
 
@@ -710,20 +663,16 @@ fn run_direct_stack_thread(
             }
         }
 
-        // Dispatch queued data and abort resets before removing closed sockets.
-        let after_transfer = SmolInstant::now();
-        iface.poll(after_transfer, &mut device, &mut socket_set);
-
-        for handle in sockets_to_remove {
-            if let Some(socket_info) = sockets.remove(&handle) {
-                active_connections.remove(&(socket_info.src_addr, socket_info.dst_addr));
-                trace!(
-                    "Cleaned up connection: {} -> {}",
-                    socket_info.src_addr, socket_info.dst_addr
-                );
+        // Amortizes loop overhead without starving later sockets or draining indefinitely.
+        for _ in 0..MAX_EGRESS_SWEEPS {
+            if iface.poll_egress(stack_now(), &mut device, &mut socket_set)
+                == smoltcp::iface::PollResult::None
+            {
+                break;
             }
-            socket_set.remove(handle);
         }
+        let has_local_work =
+            reconcile_sockets(&mut sockets, &mut socket_set, &mut active_connections);
 
         poll_count += 1;
         if last_log_time.elapsed() >= Duration::from_secs(30) {
@@ -735,40 +684,80 @@ fn run_direct_stack_thread(
             last_log_time = std::time::Instant::now();
         }
 
-        // Wait for data using select() - this is the key for event-driven I/O
-        if !has_tcp_packet && device.pending_rx.is_none() {
-            // Cap poll_delay at 10ms to balance CPU usage vs throughput
-            let delay = iface.poll_delay(after_transfer, &socket_set);
-            let wait_duration = Some(delay.map_or(SmolDuration::from_millis(10), |d| {
-                let millis = d.total_millis().min(10);
-                SmolDuration::from_millis(millis)
-            }));
+        if packets_read >= MAX_PACKET_BATCH
+            || responses_written >= MAX_PACKET_BATCH
+            || has_local_work
+        {
+            continue;
+        }
 
-            // phy_wait calls select() on the TUN fd to sleep until data
-            // arrives. If the fd becomes invalid (e.g. device removed),
-            // select() returns EBADF immediately with no sleep, creating a
-            // hot spin loop. The try_recv path usually catches this first,
-            // but this counter acts as a backstop: after 10 consecutive
-            // non-EINTR errors with no successful reads in between, treat
-            // the fd as dead.
-            if let Err(e) = phy_wait(fd, wait_duration)
-                && e.kind() != io::ErrorKind::Interrupted
-            {
-                phy_wait_error_count += 1;
-                if phy_wait_error_count >= MAX_PHY_WAIT_ERRORS {
+        let delay = iface.poll_delay(stack_now(), &socket_set);
+        match wake_rx.wait(fd, delay.map(Into::into)) {
+            Ok(_) => wait_error_count = 0,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => {
+                wait_error_count += 1;
+                if wait_error_count >= MAX_WAIT_ERRORS {
                     error!(
-                        "select() failed {} consecutive times (last: {}). Stack thread stopping.",
-                        phy_wait_error_count, e
+                        "TUN poll failed {wait_error_count} consecutive times (last: {e}). Stack thread stopping."
                     );
-                    running.store(false, Ordering::Relaxed);
-                } else {
-                    warn!("select() error ({}): {}", phy_wait_error_count, e);
+                    break;
                 }
+                warn!("TUN poll error ({wait_error_count}): {e}");
             }
         }
     }
 
     info!("smoltcp direct stack thread stopped");
+}
+
+fn stack_now() -> SmolInstant {
+    std::time::Instant::now().into()
+}
+
+fn publish_connection(
+    connection: NewTcpConnection,
+    sender: &mut Option<mpsc::UnboundedSender<NewTcpConnection>>,
+    shared_state: &Mutex<SharedState>,
+) {
+    // Setup can publish the handler after this iteration's initial snapshot.
+    if sender.is_none()
+        && let Ok(mut state) = shared_state.lock()
+    {
+        *sender = state.new_conn_tx.take();
+    }
+    if let Some(sender) = sender {
+        let _ = sender.send(connection);
+    }
+}
+
+fn reconcile_sockets(
+    sockets: &mut HashMap<SocketHandle, SocketInfo>,
+    socket_set: &mut SocketSet<'_>,
+    active_connections: &mut HashSet<(SocketAddr, SocketAddr)>,
+) -> bool {
+    let mut has_local_work = false;
+    sockets.retain(|handle, info| {
+        let socket = socket_set.get::<TcpSocket>(*handle);
+        let is_closed = socket.state() == TcpState::Closed;
+        // Timer expiry can close a socket without poll_egress reporting progress.
+        // A retained tuple on a closed socket still needs its reset dispatched.
+        if is_closed && socket.remote_endpoint().is_none() {
+            active_connections.remove(&(info.src_addr, info.dst_addr));
+            socket_set.remove(*handle);
+            return false;
+        }
+        let control = &info.control;
+        has_local_work |= (!is_closed && control.is_abandoned())
+            || (socket.can_recv() && !control.recv_buffer_full())
+            || (socket.can_send() && !control.send_buffer_empty())
+            || (!is_closed
+                && control.send_state() == TcpSocketState::Close
+                && control.send_buffer_empty()
+                && socket.send_queue() == 0);
+        true
+    });
+    has_local_work
 }
 
 /// Result of creating a TCP connection.
@@ -782,7 +771,7 @@ fn create_tcp_connection(
     src_addr: SocketAddr,
     dst_addr: SocketAddr,
     socket_set: &mut SocketSet<'static>,
-    stack_thread: &Thread,
+    wake: &Wake,
     buffer_size: usize,
 ) -> Option<(CreateConnectionResult, Arc<TcpConnectionControl>)> {
     let mut socket = TcpSocket::new(
@@ -808,7 +797,7 @@ fn create_tcp_connection(
     let control = Arc::new(TcpConnectionControl::new(buffer_size, buffer_size));
 
     let handle = socket_set.add(socket);
-    let connection = TcpConnection::new(control.clone(), stack_thread.clone());
+    let connection = TcpConnection::new(control.clone(), wake.clone());
 
     Some((
         CreateConnectionResult {
@@ -996,17 +985,28 @@ fn packet_header(first_byte: u8) -> io::Result<[u8; 4]> {
 }
 
 fn write_packet(fd: RawFd, data: &[u8], packet_information: bool) -> io::Result<()> {
-    if packet_information {
-        let Some(&first_byte) = data.first() else {
-            return Ok(());
+    write_packet_with(data, packet_information, |header, payload| {
+        let n = if header.is_empty() {
+            unsafe { libc::write(fd, payload.as_ptr().cast(), payload.len()) }
+        } else {
+            let buffers = [
+                libc::iovec {
+                    iov_base: header.as_ptr().cast_mut().cast(),
+                    iov_len: header.len(),
+                },
+                libc::iovec {
+                    iov_base: payload.as_ptr().cast_mut().cast(),
+                    iov_len: payload.len(),
+                },
+            ];
+            unsafe { libc::writev(fd, buffers.as_ptr(), buffers.len() as libc::c_int) }
         };
-        let mut framed = Vec::with_capacity(data.len() + 4);
-        framed.extend_from_slice(&packet_header(first_byte)?);
-        framed.extend_from_slice(data);
-        write_all(fd, &framed)
-    } else {
-        write_all(fd, data)
-    }
+        if n < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(n as usize)
+        }
+    })
 }
 
 /// Non-blocking read from a file descriptor (fd must already be non-blocking).
@@ -1021,42 +1021,317 @@ fn read_nonblocking(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
     }
 }
 
-/// Write all data to a file descriptor.
-fn write_all(fd: RawFd, buf: &[u8]) -> io::Result<()> {
-    let mut written = 0;
-    while written < buf.len() {
-        let n = unsafe {
-            libc::write(
-                fd,
-                buf[written..].as_ptr() as *const libc::c_void,
-                buf.len() - written,
-            )
-        };
-        if n < 0 {
-            let err = io::Error::last_os_error();
-            if err.raw_os_error() == Some(libc::ENOBUFS) || err.kind() == io::ErrorKind::WouldBlock
+fn write_packet_with(
+    data: &[u8],
+    packet_information: bool,
+    mut write: impl FnMut(&[u8], &[u8]) -> io::Result<usize>,
+) -> io::Result<()> {
+    let Some(&first_byte) = data.first() else {
+        return Ok(());
+    };
+    let header = if packet_information {
+        Some(packet_header(first_byte)?)
+    } else {
+        None
+    };
+    let header = header.as_ref().map_or(&[][..], |header| &header[..]);
+    let length = header.len() + data.len();
+    loop {
+        match write(header, data) {
+            Ok(n) if n == length => return Ok(()),
+            // A suffix write would become a second, malformed TUN packet.
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "short TUN packet write",
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error)
+                if error.raw_os_error() == Some(libc::ENOBUFS)
+                    || error.kind() == io::ErrorKind::WouldBlock =>
             {
-                trace!("TUN write {}, packet dropped", err);
+                trace!("TUN write {}, packet dropped", error);
                 return Ok(());
             }
-            return Err(err);
+            Err(error) => return Err(error),
         }
-        if n == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::WriteZero,
-                "TUN write made no progress",
-            ));
-        }
-        written += n as usize;
     }
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::io::IntoRawFd;
-    use std::os::unix::net::UnixStream;
+    use std::os::unix::net::{UnixDatagram, UnixStream};
+
+    #[test]
+    fn handler_published_after_setup_snapshot_receives_the_connection() {
+        let state = Mutex::new(SharedState {
+            udp_response_rx: None,
+            new_conn_tx: None,
+        });
+        let mut snapshot = state.lock().unwrap().new_conn_tx.take();
+        assert!(snapshot.is_none());
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        state.lock().unwrap().new_conn_tx = Some(sender);
+
+        let (wake, _wake_rx) = Wake::new().unwrap();
+        let control = Arc::new(TcpConnectionControl::new(1024, 1024));
+        let address = "192.0.2.1:443".parse().unwrap();
+        publish_connection(
+            NewTcpConnection {
+                connection: TcpConnection::new(control.clone(), wake),
+                remote_addr: address,
+            },
+            &mut snapshot,
+            &state,
+        );
+        let connection = receiver.try_recv().unwrap();
+        assert_eq!(connection.remote_addr, address);
+        assert!(!control.is_abandoned());
+        assert!(snapshot.is_some());
+        assert!(state.lock().unwrap().new_conn_tx.is_none());
+    }
+
+    #[test]
+    fn transmit_storage_is_reused_and_initialized() {
+        let (peer, tun) = UnixDatagram::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let mut device = DirectDevice::new(tun.as_raw_fd(), 1500, false);
+        let pointer = device.tx_buffer.as_ptr();
+        for length in [1000, 100, 1500] {
+            let token = device.transmit(stack_now()).unwrap();
+            let result = token.consume(length, |buffer| {
+                assert_eq!(buffer.as_ptr(), pointer);
+                assert!(buffer.iter().all(|&byte| byte == 0));
+                buffer.fill(42);
+                123
+            });
+            assert_eq!(result, 123);
+            let mut received = [0; 1500];
+            assert_eq!(peer.recv(&mut received).unwrap(), length);
+            assert!(received[..length].iter().all(|&byte| byte == 42));
+        }
+    }
+
+    #[test]
+    fn packet_writes_retry_only_interruptions_and_never_a_suffix() {
+        let payload = [0x45, 1, 2, 3, 4];
+        for framed in [false, true] {
+            let expected_header = if framed {
+                packet_header(payload[0]).unwrap().to_vec()
+            } else {
+                Vec::new()
+            };
+            let expected_length = payload.len() + expected_header.len();
+            let mut attempts = 0;
+            write_packet_with(&payload, framed, |header, data| {
+                assert_eq!(header, expected_header);
+                assert_eq!(data, payload);
+                attempts += 1;
+                if attempts < 3 {
+                    Err(io::Error::from_raw_os_error(libc::EINTR))
+                } else {
+                    Ok(expected_length)
+                }
+            })
+            .unwrap();
+            assert_eq!(attempts, 3);
+
+            for length in 0..expected_length {
+                let mut attempts = 0;
+                let error = write_packet_with(&payload, framed, |_, _| {
+                    attempts += 1;
+                    Ok(length)
+                })
+                .unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::WriteZero);
+                assert_eq!(attempts, 1);
+            }
+            for code in [libc::EAGAIN, libc::ENOBUFS, libc::EIO] {
+                let mut attempts = 0;
+                let result = write_packet_with(&payload, framed, |_, _| {
+                    attempts += 1;
+                    Err(io::Error::from_raw_os_error(code))
+                });
+                assert_eq!(attempts, 1);
+                if code == libc::EIO {
+                    assert_eq!(result.unwrap_err().raw_os_error(), Some(code));
+                } else {
+                    result.unwrap();
+                }
+            }
+            write_packet_with(&[], framed, |_, _| panic!("empty packet write")).unwrap();
+        }
+    }
+
+    #[test]
+    fn time_wait_cleanup_does_not_depend_on_egress_progress() {
+        use smoltcp::iface::PollResult;
+
+        let (peer, tun) = UnixDatagram::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let mut device = DirectDevice::new(tun.as_raw_fd(), 1500, false);
+        let mut iface = Interface::new(
+            InterfaceConfig::new(HardwareAddress::Ip),
+            &mut device,
+            SmolInstant::from_millis(0),
+        );
+        iface.update_ip_addrs(|addresses| {
+            addresses
+                .push(IpCidr::new(IpAddress::v4(1, 1, 1, 1), 0))
+                .unwrap();
+        });
+        let mut socket_set = SocketSet::new(vec![]);
+        let src_addr = "10.0.0.2:10001".parse().unwrap();
+        let dst_addr = "1.1.1.1:443".parse().unwrap();
+        let (connection, control) = create_tcp_connection(
+            src_addr,
+            dst_addr,
+            &mut socket_set,
+            &Wake::new().unwrap().0,
+            4096,
+        )
+        .unwrap();
+        let handle = connection.handle;
+        let mut sockets = HashMap::from([(
+            handle,
+            SocketInfo {
+                control: control.clone(),
+                src_addr,
+                dst_addr,
+            },
+        )]);
+        let mut active = HashSet::from([(src_addr, dst_addr)]);
+        let ingress =
+            |iface: &mut Interface,
+             device: &mut DirectDevice,
+             sockets: &mut SocketSet<'_>,
+             ack: Option<u32>,
+             fin| {
+                let mut builder = etherparse::PacketBuilder::ipv4([10, 0, 0, 2], [1, 1, 1, 1], 64)
+                    .tcp(10001, 443, if ack.is_some() { 102 } else { 101 }, 4096);
+                builder = if let Some(ack) = ack {
+                    builder.ack(ack)
+                } else {
+                    builder.syn()
+                };
+                if fin {
+                    builder = builder.fin();
+                }
+                let mut packet = Vec::new();
+                builder.write(&mut packet, b"").unwrap();
+                device.store_packet(PacketBuffer::copy_from_slice(&packet));
+                iface.poll_ingress_single(SmolInstant::from_millis(1), device, sockets);
+            };
+        ingress(&mut iface, &mut device, &mut socket_set, None, false);
+        iface.poll_egress(SmolInstant::from_millis(1), &mut device, &mut socket_set);
+        let mut data = [0; 1500];
+        let length = peer.recv(&mut data).unwrap();
+        let ip = Ipv4Packet::new_checked(&data[..length]).unwrap();
+        let syn_ack = TcpPacket::new_checked(ip.payload()).unwrap();
+        let acknowledgement = (syn_ack.seq_number().0 as u32).wrapping_add(1);
+        ingress(
+            &mut iface,
+            &mut device,
+            &mut socket_set,
+            Some(acknowledgement),
+            false,
+        );
+        socket_set.get_mut::<TcpSocket>(handle).close();
+        iface.poll_egress(SmolInstant::from_millis(1), &mut device, &mut socket_set);
+        ingress(
+            &mut iface,
+            &mut device,
+            &mut socket_set,
+            Some(acknowledgement.wrapping_add(1)),
+            true,
+        );
+        assert_eq!(
+            socket_set.get::<TcpSocket>(handle).state(),
+            TcpState::TimeWait
+        );
+        iface.poll_egress(SmolInstant::from_millis(1), &mut device, &mut socket_set);
+
+        assert_eq!(
+            iface.poll_egress(
+                SmolInstant::from_millis(60_001),
+                &mut device,
+                &mut socket_set
+            ),
+            PollResult::None
+        );
+        assert!(!reconcile_sockets(
+            &mut sockets,
+            &mut socket_set,
+            &mut active
+        ));
+        assert!(sockets.is_empty());
+        assert!(active.is_empty());
+        assert_eq!(control.recv_state(), TcpSocketState::Closed);
+        assert_eq!(control.send_state(), TcpSocketState::Closed);
+    }
+
+    #[test]
+    fn closed_socket_keeps_its_pending_reset_until_a_complete_egress_sweep() {
+        let (peer, tun) = UnixDatagram::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let mut device = DirectDevice::new(tun.as_raw_fd(), 1500, false);
+        let mut iface = Interface::new(
+            InterfaceConfig::new(HardwareAddress::Ip),
+            &mut device,
+            stack_now(),
+        );
+        iface.update_ip_addrs(|addresses| {
+            addresses
+                .push(IpCidr::new(IpAddress::v4(1, 1, 1, 1), 0))
+                .unwrap();
+        });
+        let mut socket_set = SocketSet::new(vec![]);
+        let mut sockets = HashMap::new();
+        let mut active = HashSet::new();
+        let dst_addr: SocketAddr = "10.0.0.2:443".parse().unwrap();
+        let mut last_handle = None;
+        for port in 10000..10070 {
+            let src_addr = SocketAddr::from(([1, 1, 1, 1], port));
+            let mut socket = TcpSocket::new(
+                TcpSocketBuffer::new(vec![0; 1024]),
+                TcpSocketBuffer::new(vec![0; 1024]),
+            );
+            socket.connect(iface.context(), dst_addr, src_addr).unwrap();
+            let handle = socket_set.add(socket);
+            sockets.insert(
+                handle,
+                SocketInfo {
+                    control: Arc::new(TcpConnectionControl::new(1024, 1024)),
+                    src_addr,
+                    dst_addr,
+                },
+            );
+            active.insert((src_addr, dst_addr));
+            last_handle = Some(handle);
+        }
+        let last_handle = last_handle.unwrap();
+        socket_set.get_mut::<TcpSocket>(last_handle).abort();
+        reconcile_sockets(&mut sockets, &mut socket_set, &mut active);
+        assert_eq!(sockets.len(), 70);
+        iface.poll_egress(stack_now(), &mut device, &mut socket_set);
+        let mut reset = false;
+        let mut data = [0; 1500];
+        for _ in 0..70 {
+            let length = peer.recv(&mut data).unwrap();
+            let ip = Ipv4Packet::new_checked(&data[..length]).unwrap();
+            let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+            if tcp.src_port() == 10069 {
+                reset = tcp.rst();
+            }
+        }
+        assert!(reset);
+        reconcile_sockets(&mut sockets, &mut socket_set, &mut active);
+        assert_eq!(sockets.len(), 69);
+        assert!(!sockets.contains_key(&last_handle));
+    }
 
     #[test]
     fn default_admission_preserves_bursts_beyond_old_queue_and_socket_caps() {
@@ -1179,7 +1454,8 @@ mod tests {
         use std::os::unix::net::UnixDatagram;
         let (peer, tun) = UnixDatagram::pair().unwrap();
         let mut stack =
-            TcpStackDirect::with_config(tun.into(), TunServerConfig::new().udp_enabled(false));
+            TcpStackDirect::with_config(tun.into(), TunServerConfig::new().udp_enabled(false))
+                .unwrap();
         let mut rx = stack.take_udp_rx().unwrap();
         let builder =
             etherparse::PacketBuilder::ipv4([10, 0, 0, 2], [1, 1, 1, 1], 64).udp(1000, 53);
@@ -1221,7 +1497,8 @@ mod tests {
             let stack = TcpStackDirect::with_config(
                 tun.into(),
                 TunServerConfig::new().icmp_enabled(enabled),
-            );
+            )
+            .unwrap();
             for request in [&ipv4_request, &ipv6_request] {
                 peer.send(request).unwrap();
                 let mut response = [0; 1500];
@@ -1276,7 +1553,7 @@ mod tests {
         let waker = waker(flag.clone());
         let mut cx = Context::from_waker(&waker);
         let control = Arc::new(TcpConnectionControl::new(1, 1));
-        let mut conn = TcpConnection::new(control.clone(), thread::current());
+        let mut conn = TcpConnection::new(control.clone(), Wake::new().unwrap().0);
         let info = SocketInfo {
             control: control.clone(),
             src_addr: "127.0.0.1:1".parse().unwrap(),
@@ -1304,17 +1581,91 @@ mod tests {
 
     #[test]
     fn idle_stack_delivers_udp_output_without_inbound_traffic() {
-        use std::io::Read;
-        let (mut peer, client) = UnixStream::pair().unwrap();
+        use super::super::udp_handler::{UdpHandler, build_udp_packet};
+        for pause in [Duration::ZERO, Duration::from_millis(30)] {
+            let (peer, tun) = UnixDatagram::pair().unwrap();
+            peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+            let mut stack = TcpStackDirect::new(tun.into(), 1500);
+            let (tx, rx) = mpsc::channel(PACKET_QUEUE_CAPACITY);
+            stack.set_udp_response_tx(rx);
+            let (_, from_tun) = mpsc::channel(1);
+            let (_, writer) = UdpHandler::new(from_tun, tx, stack.wake_handle()).split();
+            thread::sleep(pause);
+            let src = "1.1.1.1:53".parse().unwrap();
+            let dst = "10.0.0.2:10001".parse().unwrap();
+            writer
+                .send_sync((PacketBuffer::copy_from_slice(b"reply"), src, dst))
+                .unwrap();
+            let expected = build_udp_packet(b"reply", src, dst).unwrap();
+            let mut reply = [0; 1500];
+            let length = peer.recv(&mut reply).unwrap();
+            assert_eq!(&reply[..length], &*expected);
+        }
+    }
+
+    #[test]
+    fn one_notification_drains_more_than_one_response_batch() {
+        let (peer, tun) = UnixDatagram::pair().unwrap();
         peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
-        let mut stack = TcpStackDirect::new(client.into(), 1500);
-        let (tx, rx) = mpsc::channel(PACKET_QUEUE_CAPACITY);
+        let mut stack = TcpStackDirect::new(tun.into(), 1500);
+        let (tx, rx) = mpsc::channel(2 * MAX_PACKET_BATCH + 1);
+        for index in 0..2 * MAX_PACKET_BATCH + 1 {
+            tx.try_send(PacketBuffer::copy_from_slice(&[index as u8]))
+                .unwrap();
+        }
         stack.set_udp_response_tx(rx);
+        for index in 0..2 * MAX_PACKET_BATCH + 1 {
+            let mut reply = [0; 2];
+            assert_eq!(peer.recv(&mut reply).unwrap(), 1);
+            assert_eq!(reply[0], index as u8);
+        }
+    }
+
+    #[test]
+    fn setup_publication_is_not_lost_while_its_lock_is_held() {
+        let (peer, tun) = UnixDatagram::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let stack = TcpStackDirect::new(tun.into(), 1500);
+        let (tx, rx) = mpsc::channel(1);
+        tx.try_send(PacketBuffer::copy_from_slice(b"reply"))
+            .unwrap();
+        let mut state = stack.shared_state.lock().unwrap();
+        stack.wake.notify();
         thread::sleep(Duration::from_millis(30));
-        tx.try_send(b"reply".to_vec()).unwrap();
+        state.udp_response_rx = Some(rx);
+        drop(state);
         let mut reply = [0; 5];
-        peer.read_exact(&mut reply).unwrap();
+        assert_eq!(peer.recv(&mut reply).unwrap(), 5);
         assert_eq!(&reply, b"reply");
+    }
+
+    #[test]
+    fn retransmission_deadline_runs_without_new_input() {
+        let (peer, tun) = UnixDatagram::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let mut stack = TcpStackDirect::new(tun.into(), 1500);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        stack.set_new_conn_tx(tx);
+        let mut syn = Vec::new();
+        etherparse::PacketBuilder::ipv4([10, 0, 0, 2], [1, 1, 1, 1], 64)
+            .tcp(10001, 443, 101, 4096)
+            .syn()
+            .write(&mut syn, b"")
+            .unwrap();
+        peer.send(&syn).unwrap();
+        let _connection = rx.blocking_recv().unwrap();
+        let mut buf = [0; 1500];
+        let mut sequence = None;
+        for _ in 0..2 {
+            let length = peer.recv(&mut buf).unwrap();
+            let ip = Ipv4Packet::new_checked(&buf[..length]).unwrap();
+            let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+            assert!(tcp.syn() && tcp.ack());
+            if let Some(sequence) = sequence {
+                assert_eq!(tcp.seq_number(), sequence);
+            }
+            sequence = Some(tcp.seq_number());
+        }
     }
 
     #[test]
@@ -1379,8 +1730,8 @@ mod tests {
     }
 
     #[test]
-    fn test_write_all_eagain() {
-        // Fill a non-blocking socket's write buffer, then verify write_all
+    fn test_write_packet_eagain() {
+        // Fill a non-blocking socket's write buffer, then verify write_packet
         // treats EAGAIN the same as ENOBUFS (drops the packet, returns Ok).
         let (reader, writer) = UnixStream::pair().expect("Failed to create socket pair");
         let writer_fd = writer.into_raw_fd();
@@ -1409,11 +1760,11 @@ mod tests {
             }
         }
 
-        // Now write_all should drop the packet gracefully
-        let result = write_all(writer_fd, &[1, 2, 3]);
+        // Now write_packet should drop the packet gracefully
+        let result = write_packet(writer_fd, &[1, 2, 3], false);
         assert!(
             result.is_ok(),
-            "write_all should return Ok on EAGAIN, got {:?}",
+            "write_packet should return Ok on EAGAIN, got {:?}",
             result
         );
 

@@ -8,6 +8,7 @@
 use std::{
     io,
     net::SocketAddr,
+    ops::Range,
     pin::Pin,
     task::{Context, Poll},
 };
@@ -17,10 +18,11 @@ use futures::{Sink, Stream, ready};
 use smoltcp::wire::{IpProtocol, Ipv4Packet, Ipv6Packet, UdpPacket};
 use tokio::sync::mpsc::{Receiver, Sender, error::TrySendError};
 
-pub type PacketBuffer = Vec<u8>;
+use super::packet::PacketBuffer;
+use super::wake::Wake;
 
 /// UDP message: (payload, local_addr, remote_addr)
-pub type UdpMessage = (Vec<u8>, SocketAddr, SocketAddr);
+pub type UdpMessage = (PacketBuffer, SocketAddr, SocketAddr);
 
 /// UDP handler for reading/writing UDP packets from/to TUN.
 pub struct UdpHandler {
@@ -28,14 +30,20 @@ pub struct UdpHandler {
     from_tun_rx: Receiver<PacketBuffer>,
     /// Sender for UDP packets to TUN
     to_tun_tx: Sender<PacketBuffer>,
+    wake: Wake,
 }
 
 impl UdpHandler {
     /// Create a new UDP handler.
-    pub fn new(from_tun_rx: Receiver<PacketBuffer>, to_tun_tx: Sender<PacketBuffer>) -> Self {
+    pub fn new(
+        from_tun_rx: Receiver<PacketBuffer>,
+        to_tun_tx: Sender<PacketBuffer>,
+        wake: Wake,
+    ) -> Self {
         Self {
             from_tun_rx,
             to_tun_tx,
+            wake,
         }
     }
 
@@ -47,6 +55,7 @@ impl UdpHandler {
             },
             UdpWriter {
                 to_tun_tx: self.to_tun_tx,
+                wake: self.wake,
             },
         )
     }
@@ -60,6 +69,7 @@ pub struct UdpReader {
 /// Write half for sending UDP packets.
 pub struct UdpWriter {
     to_tun_tx: Sender<PacketBuffer>,
+    wake: Wake,
 }
 
 impl UdpWriter {
@@ -68,7 +78,11 @@ impl UdpWriter {
         let (payload, src_addr, dst_addr) = message;
         let packet = build_udp_packet(&payload, src_addr, dst_addr)?;
         match self.to_tun_tx.try_send(packet) {
-            Ok(()) | Err(TrySendError::Full(_)) => Ok(()),
+            Ok(()) => {
+                self.wake.notify();
+                Ok(())
+            }
+            Err(TrySendError::Full(_)) => Ok(()),
             Err(TrySendError::Closed(_)) => {
                 Err(io::Error::new(io::ErrorKind::BrokenPipe, "channel closed"))
             }
@@ -80,18 +94,12 @@ impl Stream for UdpReader {
     type Item = UdpMessage;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        loop {
-            match ready!(self.from_tun_rx.poll_recv(cx)) {
-                Some(packet) => {
-                    if let Some(msg) = parse_udp_packet(&packet) {
-                        return Poll::Ready(Some(msg));
-                    }
-                    // Invalid packet, try next
-                    continue;
-                }
-                None => return Poll::Ready(None),
+        while let Some(packet) = ready!(self.from_tun_rx.poll_recv(cx)) {
+            if let Some(message) = parse_udp_packet(packet) {
+                return Poll::Ready(Some(message));
             }
         }
+        Poll::Ready(None)
     }
 }
 
@@ -117,22 +125,17 @@ impl Sink<UdpMessage> for UdpWriter {
 }
 
 /// Parse a raw IP packet containing UDP data.
-fn parse_udp_packet(packet: &[u8]) -> Option<UdpMessage> {
-    if packet.is_empty() {
-        return None;
-    }
-
-    // Determine IP version from first nibble
-    let version = packet[0] >> 4;
-
-    match version {
-        4 => parse_ipv4_udp(packet),
-        6 => parse_ipv6_udp(packet),
+fn parse_udp_packet(mut packet: PacketBuffer) -> Option<UdpMessage> {
+    let (range, src, dst) = match packet.first()? >> 4 {
+        4 => parse_ipv4_udp(&packet),
+        6 => parse_ipv6_udp(&packet),
         _ => None,
-    }
+    }?;
+    packet.retain_range(range);
+    Some((packet, src, dst))
 }
 
-fn parse_ipv4_udp(packet: &[u8]) -> Option<UdpMessage> {
+fn parse_ipv4_udp(packet: &[u8]) -> Option<(Range<usize>, SocketAddr, SocketAddr)> {
     let ip_packet = Ipv4Packet::new_checked(packet).ok()?;
 
     if ip_packet.next_header() != IpProtocol::Udp {
@@ -166,10 +169,15 @@ fn parse_ipv4_udp(packet: &[u8]) -> Option<UdpMessage> {
         dst_port,
     );
 
-    Some((udp_packet.payload().to_vec(), src_addr, dst_addr))
+    let start = usize::from(ip_packet.header_len()) + 8;
+    Some((
+        start..start + udp_packet.payload().len(),
+        src_addr,
+        dst_addr,
+    ))
 }
 
-fn parse_ipv6_udp(packet: &[u8]) -> Option<UdpMessage> {
+fn parse_ipv6_udp(packet: &[u8]) -> Option<(Range<usize>, SocketAddr, SocketAddr)> {
     let ip_packet = Ipv6Packet::new_checked(packet).ok()?;
 
     if ip_packet.next_header() != IpProtocol::Udp {
@@ -193,7 +201,12 @@ fn parse_ipv6_udp(packet: &[u8]) -> Option<UdpMessage> {
         dst_port,
     );
 
-    Some((udp_packet.payload().to_vec(), src_addr, dst_addr))
+    let start = 40 + 8;
+    Some((
+        start..start + udp_packet.payload().len(),
+        src_addr,
+        dst_addr,
+    ))
 }
 
 /// Build a raw IP packet containing UDP data.
@@ -202,47 +215,168 @@ pub fn build_udp_packet(
     src_addr: SocketAddr,
     dst_addr: SocketAddr,
 ) -> io::Result<PacketBuffer> {
-    match (src_addr, dst_addr) {
+    let builder = match (src_addr, dst_addr) {
         (SocketAddr::V4(src), SocketAddr::V4(dst)) => {
-            let builder = PacketBuilder::ipv4(
+            PacketBuilder::ipv4(
                 src.ip().octets(),
                 dst.ip().octets(),
                 20, // TTL
             )
-            .udp(src.port(), dst.port());
-
-            let mut packet = Vec::with_capacity(builder.size(payload.len()));
-            builder
-                .write(&mut packet, payload)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-
-            Ok(packet)
+            .udp(src.port(), dst.port())
         }
         (SocketAddr::V6(src), SocketAddr::V6(dst)) => {
-            let builder = PacketBuilder::ipv6(
+            PacketBuilder::ipv6(
                 src.ip().octets(),
                 dst.ip().octets(),
                 20, // Hop limit
             )
-            .udp(src.port(), dst.port());
-
-            let mut packet = Vec::with_capacity(builder.size(payload.len()));
-            builder
-                .write(&mut packet, payload)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-
-            Ok(packet)
+            .udp(src.port(), dst.port())
         }
-        _ => Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "IP version mismatch between source and destination",
-        )),
-    }
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "IP version mismatch between source and destination",
+            ));
+        }
+    };
+    let packet_len = builder.size(payload.len());
+    let mut packet = PacketBuffer::with_capacity(packet_len);
+    packet.resize(packet_len);
+    builder
+        .write(&mut &mut packet[..], payload)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    Ok(packet)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reader_skips_invalid_packets_before_pending_delivery_and_eof() {
+        let (sender, from_tun_rx) = tokio::sync::mpsc::channel(2);
+        let mut reader = UdpReader { from_tun_rx };
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+
+        sender
+            .try_send(PacketBuffer::copy_from_slice(&[0]))
+            .unwrap();
+        assert!(Pin::new(&mut reader).poll_next(&mut cx).is_pending());
+
+        let src = "192.0.2.1:1234".parse().unwrap();
+        let dst = "198.51.100.1:53".parse().unwrap();
+        sender
+            .try_send(PacketBuffer::copy_from_slice(&[0]))
+            .unwrap();
+        sender
+            .try_send(build_udp_packet(b"payload", src, dst).unwrap())
+            .unwrap();
+        let Poll::Ready(Some((payload, actual_src, actual_dst))) =
+            Pin::new(&mut reader).poll_next(&mut cx)
+        else {
+            panic!("queued UDP packet was not delivered");
+        };
+        assert_eq!(&*payload, b"payload");
+        assert_eq!((actual_src, actual_dst), (src, dst));
+
+        sender
+            .try_send(PacketBuffer::copy_from_slice(&[0]))
+            .unwrap();
+        drop(sender);
+        assert!(matches!(
+            Pin::new(&mut reader).poll_next(&mut cx),
+            Poll::Ready(None)
+        ));
+    }
+
+    #[test]
+    fn payload_ranges_preserve_ipv4_options_and_ignore_padding() {
+        let src = "192.0.2.1:1234".parse().unwrap();
+        let dst = "198.51.100.1:53".parse().unwrap();
+        let mut bytes = build_udp_packet(b"payload", src, dst).unwrap().to_vec();
+        bytes.splice(20..20, [0; 4]);
+        bytes.extend_from_slice(b"padding");
+        let length = bytes.len();
+        let mut ip = Ipv4Packet::new_unchecked(&mut bytes);
+        ip.set_header_len(24);
+        ip.set_total_len(length as u16);
+        ip.fill_checksum();
+        let packet = PacketBuffer::copy_from_slice(&bytes);
+        let pointer = packet.as_ptr();
+        let (payload, actual_src, actual_dst) = parse_udp_packet(packet).unwrap();
+        assert_eq!(payload.as_ptr(), pointer.wrapping_add(32));
+        assert_eq!(&*payload, b"payload");
+        assert_eq!((actual_src, actual_dst), (src, dst));
+    }
+
+    #[test]
+    fn empty_udp_payloads_keep_addresses_for_both_families() {
+        for (src, dst) in [
+            ("192.0.2.1:1234", "198.51.100.1:53"),
+            ("[2001:db8::1]:1234", "[2001:db8::2]:53"),
+        ] {
+            let (src, dst) = (src.parse().unwrap(), dst.parse().unwrap());
+            let packet = build_udp_packet(b"", src, dst).unwrap();
+            let (payload, actual_src, actual_dst) = parse_udp_packet(packet).unwrap();
+            assert!(payload.is_empty());
+            assert_eq!((actual_src, actual_dst), (src, dst));
+        }
+    }
+
+    #[test]
+    fn malformed_udp_lengths_do_not_create_payload_views() {
+        let src = "192.0.2.1:1234".parse().unwrap();
+        let dst = "198.51.100.1:53".parse().unwrap();
+        for length in [7, 12] {
+            let mut packet = build_udp_packet(b"abc", src, dst).unwrap();
+            UdpPacket::new_unchecked(&mut packet[20..]).set_len(length);
+            assert!(parse_udp_packet(packet).is_none());
+        }
+    }
+
+    #[test]
+    fn only_successful_response_enqueues_notify_the_stack() {
+        use std::os::{fd::AsRawFd, unix::net::UnixStream};
+        use std::time::Duration;
+        use tokio::sync::mpsc;
+
+        let (_peer, tun) = UnixStream::pair().unwrap();
+        let (wake, mut receiver) = Wake::new().unwrap();
+        let (_, input) = mpsc::channel(1);
+        let (output, queued) = mpsc::channel(1);
+        let (_, writer) = UdpHandler::new(input, output, wake).split();
+        let message = || {
+            (
+                PacketBuffer::copy_from_slice(b"reply"),
+                "1.1.1.1:53".parse().unwrap(),
+                "10.0.0.2:1000".parse().unwrap(),
+            )
+        };
+        writer.send_sync(message()).unwrap();
+        assert!(
+            receiver
+                .wait(tun.as_raw_fd(), Some(Duration::ZERO))
+                .unwrap()
+        );
+        receiver.drain().unwrap();
+        writer.send_sync(message()).unwrap();
+        assert_eq!(queued.len(), 1);
+        assert!(
+            !receiver
+                .wait(tun.as_raw_fd(), Some(Duration::ZERO))
+                .unwrap()
+        );
+        drop(queued);
+        assert_eq!(
+            writer.send_sync(message()).unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        assert!(
+            !receiver
+                .wait(tun.as_raw_fd(), Some(Duration::ZERO))
+                .unwrap()
+        );
+    }
 
     #[test]
     fn test_build_and_parse_ipv4_udp() {
@@ -251,9 +385,9 @@ mod tests {
         let dst = "10.0.0.1:80".parse().unwrap();
 
         let packet = build_udp_packet(payload, src, dst).unwrap();
-        let (parsed_payload, parsed_src, parsed_dst) = parse_udp_packet(&packet).unwrap();
+        let (parsed_payload, parsed_src, parsed_dst) = parse_udp_packet(packet).unwrap();
 
-        assert_eq!(parsed_payload, payload);
+        assert_eq!(&*parsed_payload, payload);
         assert_eq!(parsed_src, src);
         assert_eq!(parsed_dst, dst);
     }
@@ -265,9 +399,9 @@ mod tests {
         let dst: SocketAddr = "[2001:db8::2]:80".parse().unwrap();
 
         let packet = build_udp_packet(payload, src, dst).unwrap();
-        let (parsed_payload, parsed_src, parsed_dst) = parse_udp_packet(&packet).unwrap();
+        let (parsed_payload, parsed_src, parsed_dst) = parse_udp_packet(packet).unwrap();
 
-        assert_eq!(parsed_payload, payload);
+        assert_eq!(&*parsed_payload, payload);
         assert_eq!(parsed_src, src);
         assert_eq!(parsed_dst, dst);
     }
