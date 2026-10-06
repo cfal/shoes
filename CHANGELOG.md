@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.3.2
+
+### Fixes
+
+- Fixed TLS record ownership across Vision handshakes and mode transitions, preserving fragmented records and buffered data. This resolves the Vision TLS handoff limitation documented in v0.3.1.
+- Improved TLS closure, output backpressure, and transport keepalive handling, and preserved REALITY preread bytes during fallback forwarding.
+- Fixed a TUN TCP handler setup race that could reset a valid connection.
+
+### Performance
+
+- Replaced the TUN stack's 10 ms polling fallback with coalesced wakeups for TCP and UDP work, reducing latency and idle wakeups.
+- Reduced TUN packet-processing overhead with bounded ingress batches and TCP egress sweeps.
+- Reduced UDP packet copies and allocations by carrying owned buffers through forwarding queues and reusing transmit storage, while preserving configured queue limits and packet-atomic writes.
+
 ## v0.3.1
 
 ### Fixes
