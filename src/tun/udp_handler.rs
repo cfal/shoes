@@ -94,18 +94,12 @@ impl Stream for UdpReader {
     type Item = UdpMessage;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        loop {
-            match ready!(self.from_tun_rx.poll_recv(cx)) {
-                Some(packet) => {
-                    if let Some(msg) = parse_udp_packet(packet) {
-                        return Poll::Ready(Some(msg));
-                    }
-                    // Invalid packet, try next
-                    continue;
-                }
-                None => return Poll::Ready(None),
+        while let Some(packet) = ready!(self.from_tun_rx.poll_recv(cx)) {
+            if let Some(message) = parse_udp_packet(packet) {
+                return Poll::Ready(Some(message));
             }
         }
+        Poll::Ready(None)
     }
 }
 
@@ -245,8 +239,9 @@ pub fn build_udp_packet(
             ));
         }
     };
-    let mut packet = PacketBuffer::with_capacity(builder.size(payload.len()));
-    packet.resize(builder.size(payload.len()));
+    let packet_len = builder.size(payload.len());
+    let mut packet = PacketBuffer::with_capacity(packet_len);
+    packet.resize(packet_len);
     builder
         .write(&mut &mut packet[..], payload)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -256,6 +251,43 @@ pub fn build_udp_packet(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reader_skips_invalid_packets_before_pending_delivery_and_eof() {
+        let (sender, from_tun_rx) = tokio::sync::mpsc::channel(2);
+        let mut reader = UdpReader { from_tun_rx };
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+
+        sender
+            .try_send(PacketBuffer::copy_from_slice(&[0]))
+            .unwrap();
+        assert!(Pin::new(&mut reader).poll_next(&mut cx).is_pending());
+
+        let src = "192.0.2.1:1234".parse().unwrap();
+        let dst = "198.51.100.1:53".parse().unwrap();
+        sender
+            .try_send(PacketBuffer::copy_from_slice(&[0]))
+            .unwrap();
+        sender
+            .try_send(build_udp_packet(b"payload", src, dst).unwrap())
+            .unwrap();
+        let Poll::Ready(Some((payload, actual_src, actual_dst))) =
+            Pin::new(&mut reader).poll_next(&mut cx)
+        else {
+            panic!("queued UDP packet was not delivered");
+        };
+        assert_eq!(&*payload, b"payload");
+        assert_eq!((actual_src, actual_dst), (src, dst));
+
+        sender
+            .try_send(PacketBuffer::copy_from_slice(&[0]))
+            .unwrap();
+        drop(sender);
+        assert!(matches!(
+            Pin::new(&mut reader).poll_next(&mut cx),
+            Poll::Ready(None)
+        ));
+    }
 
     #[test]
     fn payload_ranges_preserve_ipv4_options_and_ignore_padding() {

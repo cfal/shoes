@@ -288,17 +288,14 @@ impl Device for DirectDevice {
         &mut self,
         _timestamp: SmolInstant,
     ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        if let Some(buffer) = self.pending_rx.take() {
-            let rx = DirectRxToken { buffer };
-            let tx = DirectTxToken {
-                fd: self.fd,
-                packet_information: self.packet_information,
-                buffer: &mut self.tx_buffer,
-            };
-            Some((rx, tx))
-        } else {
-            None
-        }
+        let buffer = self.pending_rx.take()?;
+        let rx = DirectRxToken { buffer };
+        let tx = DirectTxToken {
+            fd: self.fd,
+            packet_information: self.packet_information,
+            buffer: &mut self.tx_buffer,
+        };
+        Some((rx, tx))
     }
 
     fn transmit(&mut self, _timestamp: SmolInstant) -> Option<Self::TxToken<'_>> {
@@ -359,7 +356,8 @@ impl TxToken for DirectTxToken<'_> {
     }
 }
 
-const MAX_PACKET_BATCH: usize = 64; // Process more packets per poll iteration
+const MAX_PACKET_BATCH: usize = 64;
+const MAX_EGRESS_SWEEPS: usize = 8;
 
 /// Run the direct smoltcp stack thread.
 fn run_direct_stack_thread(
@@ -412,8 +410,8 @@ fn run_direct_stack_thread(
     let mut poll_count: u64 = 0;
     let mut last_log_time = std::time::Instant::now();
 
-    let mut phy_wait_error_count: u32 = 0;
-    const MAX_PHY_WAIT_ERRORS: u32 = 10;
+    let mut wait_error_count: u32 = 0;
+    const MAX_WAIT_ERRORS: u32 = 10;
     let mut udp_response_rx = None;
     let mut new_conn_tx = None;
 
@@ -433,7 +431,6 @@ fn run_direct_stack_thread(
             }
         }
         let mut responses_written = 0;
-        // Checks for UDP responses to write to TUN.
         if let Some(ref mut udp_rx) = udp_response_rx {
             for _ in 0..MAX_PACKET_BATCH {
                 let Ok(pkt) = udp_rx.try_recv() else { break };
@@ -445,7 +442,7 @@ fn run_direct_stack_thread(
         }
 
         // Reads packets from TUN and filters by protocol (batch processing).
-        let mut tcp_packets: Vec<PacketBuffer> = Vec::new();
+        let mut stack_packets = Vec::new();
         let mut packets_read = 0;
 
         while packets_read < MAX_PACKET_BATCH {
@@ -521,11 +518,10 @@ fn run_direct_stack_thread(
                             }
                         }
 
-                        tcp_packets.push(pkt);
+                        stack_packets.push(pkt);
                     }
                     IpProtocol::Icmp | IpProtocol::Icmpv6 if config.icmp_enabled => {
-                        // ICMP goes to smoltcp immediately
-                        tcp_packets.push(pkt);
+                        stack_packets.push(pkt);
                     }
                     IpProtocol::Udp if config.udp_enabled => {
                         let _ = udp_tx.try_send(pkt);
@@ -538,7 +534,7 @@ fn run_direct_stack_thread(
         }
 
         if packets_read > 0 {
-            phy_wait_error_count = 0;
+            wait_error_count = 0;
         }
 
         // Skip remaining work if a fatal read error was detected above.
@@ -547,7 +543,7 @@ fn run_direct_stack_thread(
         }
 
         iface.poll_maintenance(stack_now());
-        for pkt in tcp_packets {
+        for pkt in stack_packets {
             device.store_packet(pkt);
             iface.poll_ingress_single(stack_now(), &mut device, &mut socket_set);
         }
@@ -668,14 +664,15 @@ fn run_direct_stack_thread(
         }
 
         // Amortizes loop overhead without starving later sockets or draining indefinitely.
-        for _ in 0..8 {
+        for _ in 0..MAX_EGRESS_SWEEPS {
             if iface.poll_egress(stack_now(), &mut device, &mut socket_set)
                 == smoltcp::iface::PollResult::None
             {
                 break;
             }
         }
-        let local_work = reconcile_sockets(&mut sockets, &mut socket_set, &mut active_connections);
+        let has_local_work =
+            reconcile_sockets(&mut sockets, &mut socket_set, &mut active_connections);
 
         poll_count += 1;
         if last_log_time.elapsed() >= Duration::from_secs(30) {
@@ -687,21 +684,26 @@ fn run_direct_stack_thread(
             last_log_time = std::time::Instant::now();
         }
 
-        if packets_read < MAX_PACKET_BATCH && responses_written < MAX_PACKET_BATCH && !local_work {
-            let delay = iface.poll_delay(stack_now(), &socket_set);
-            match wake_rx.wait(fd, delay.map(Into::into)) {
-                Ok(_) => phy_wait_error_count = 0,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                Err(e) => {
-                    phy_wait_error_count += 1;
-                    if phy_wait_error_count >= MAX_PHY_WAIT_ERRORS {
-                        error!(
-                            "TUN poll failed {phy_wait_error_count} consecutive times (last: {e}). Stack thread stopping."
-                        );
-                        break;
-                    }
-                    warn!("TUN poll error ({phy_wait_error_count}): {e}");
+        if packets_read >= MAX_PACKET_BATCH
+            || responses_written >= MAX_PACKET_BATCH
+            || has_local_work
+        {
+            continue;
+        }
+
+        let delay = iface.poll_delay(stack_now(), &socket_set);
+        match wake_rx.wait(fd, delay.map(Into::into)) {
+            Ok(_) => wait_error_count = 0,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => {
+                wait_error_count += 1;
+                if wait_error_count >= MAX_WAIT_ERRORS {
+                    error!(
+                        "TUN poll failed {wait_error_count} consecutive times (last: {e}). Stack thread stopping."
+                    );
+                    break;
                 }
+                warn!("TUN poll error ({wait_error_count}): {e}");
             }
         }
     }
@@ -734,27 +736,28 @@ fn reconcile_sockets(
     socket_set: &mut SocketSet<'_>,
     active_connections: &mut HashSet<(SocketAddr, SocketAddr)>,
 ) -> bool {
-    let mut local_work = false;
+    let mut has_local_work = false;
     sockets.retain(|handle, info| {
         let socket = socket_set.get::<TcpSocket>(*handle);
+        let is_closed = socket.state() == TcpState::Closed;
         // Timer expiry can close a socket without poll_egress reporting progress.
         // A retained tuple on a closed socket still needs its reset dispatched.
-        if socket.state() == TcpState::Closed && socket.remote_endpoint().is_none() {
+        if is_closed && socket.remote_endpoint().is_none() {
             active_connections.remove(&(info.src_addr, info.dst_addr));
             socket_set.remove(*handle);
             return false;
         }
         let control = &info.control;
-        local_work |= (socket.state() != TcpState::Closed && control.is_abandoned())
+        has_local_work |= (!is_closed && control.is_abandoned())
             || (socket.can_recv() && !control.recv_buffer_full())
             || (socket.can_send() && !control.send_buffer_empty())
-            || (socket.state() != TcpState::Closed
+            || (!is_closed
                 && control.send_state() == TcpSocketState::Close
                 && control.send_buffer_empty()
                 && socket.send_queue() == 0);
         true
     });
-    local_work
+    has_local_work
 }
 
 /// Result of creating a TCP connection.

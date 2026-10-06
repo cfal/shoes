@@ -55,10 +55,10 @@ impl PacketBuffer {
     }
 
     pub fn into_payload(self, compact: bool) -> Self {
+        let capacity = self.storage.capacity();
+        let payload_len = self.len();
         // Tiny datagrams must not pin jumbo/MTU storage in per-flow queues.
-        if (compact && self.storage.capacity() != self.len())
-            || self.storage.capacity() > self.len().saturating_mul(2)
-        {
+        if (compact && capacity != payload_len) || capacity > payload_len.saturating_mul(2) {
             Self::copy_from_slice(&self)
         } else {
             self
