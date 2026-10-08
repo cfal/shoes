@@ -132,7 +132,7 @@ async fn drain_buffered(
     mut pending: usize,
     copied: &mut usize,
 ) -> io::Result<()> {
-    let mut buffer = vec![0; pending.min(16 * 1024)];
+    let mut buffer = vec![0; pending.min(BUFFER_SIZE)];
     while pending != 0 {
         let len = pending
             .min(buffer.len())
@@ -159,7 +159,7 @@ async fn copy_direction(
 ) -> io::Result<()> {
     let mut copied = 0;
     let mut buffer = vec![0; BUFFER_SIZE];
-    loop {
+    'bursts: loop {
         source.readable().await?;
         // Small bursts are cheaper to copy than allocating and releasing a pipe.
         let length = buffer.len().min(MAX_COPY_BYTES_PER_POLL - copied);
@@ -179,7 +179,7 @@ async fn copy_direction(
         // changes the copy strategy, not connection admission.
         let pipe = match operations.pipe() {
             Ok(pipe) => pipe,
-            Err(_) => return copy_buffered(source, destination, copied, buffer).await,
+            Err(_) => break 'bursts,
         };
         loop {
             let result = source.try_io(Interest::READABLE, || {
@@ -204,10 +204,7 @@ async fn copy_direction(
                 Ok(0) => return socket2::SockRef::from(destination).shutdown(Shutdown::Write),
                 Ok(n) => n,
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-                Err(error) if unsupported(&error) => {
-                    drop(pipe);
-                    return copy_buffered(source, destination, copied, buffer).await;
-                }
+                Err(error) if unsupported(&error) => break 'bursts,
                 Err(error) => return Err(error),
             };
             while pending != 0 {
@@ -227,14 +224,14 @@ async fn copy_direction(
                         // The source already consumed these bytes. Recover them
                         // before switching this direction permanently to copying.
                         drain_buffered(&pipe, destination, pending, &mut copied).await?;
-                        drop(pipe);
-                        return copy_buffered(source, destination, copied, buffer).await;
+                        break 'bursts;
                     }
                     Err(error) => return Err(error),
                 }
             }
         }
     }
+    copy_buffered(source, destination, copied, buffer).await
 }
 
 fn at_urgent_mark(fd: RawFd) -> io::Result<bool> {
