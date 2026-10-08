@@ -121,8 +121,18 @@ impl Drop for RunningServers {
 
 fn watch(paths: &[String], tx: mpsc::Sender<()>) -> io::Result<RecommendedWatcher> {
     let mut files = HashSet::new();
+    let mut required_directories = HashSet::new();
     for path in paths {
         let path = std::path::absolute(path)?;
+        if let Some(parent) = path.parent() {
+            required_directories.insert(parent.to_path_buf());
+        }
+        if let Ok(canonical) = std::fs::canonicalize(&path) {
+            if let Some(parent) = canonical.parent() {
+                required_directories.insert(parent.to_path_buf());
+            }
+            files.insert(canonical);
+        }
         files.insert(path.clone());
         resolve_watch_path(&path, &mut files, &mut 0)?;
     }
@@ -146,9 +156,15 @@ fn watch(paths: &[String], tx: mpsc::Sender<()>) -> io::Result<RecommendedWatche
         })
         .map_err(io::Error::other)?;
     for directory in directories {
-        watcher
-            .watch(&directory, RecursiveMode::NonRecursive)
-            .map_err(io::Error::other)?;
+        if let Err(error) = watcher.watch(&directory, RecursiveMode::NonRecursive) {
+            if required_directories.contains(&directory) {
+                return Err(io::Error::other(error));
+            }
+            log::warn!(
+                "Could not watch intermediate config directory {}: {error}",
+                directory.display()
+            );
+        }
     }
     Ok(watcher)
 }

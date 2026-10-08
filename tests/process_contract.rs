@@ -499,8 +499,54 @@ async fn symlink_targets_remain_watched_after_retargeting() {
     child.wait_for("Reload rejected").await;
     std::fs::write(&missing, &config).unwrap();
     child.wait_for("Servers ready").await;
+    let missing_directory = targets.path().join("missing-directory");
+    let nested = missing_directory.join("config.yaml");
+    let link = directory.path().join("replacement.yaml");
+    std::os::unix::fs::symlink(&nested, &link).unwrap();
+    std::fs::rename(link, &path).unwrap();
+    child.wait_for("Reload rejected").await;
+    std::fs::create_dir(&missing_directory).unwrap();
+    child.wait_for("Reload rejected").await;
+    std::fs::write(&nested, &config).unwrap();
+    child.wait_for("Servers ready").await;
     child.signal(libc::SIGTERM);
     assert_eq!(child.exit().await.code(), Some(0));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn intermediate_symlink_directories_need_only_traverse_permission() {
+    use std::os::unix::fs::PermissionsExt;
+    struct RestorePermissions(std::path::PathBuf);
+    impl Drop for RestorePermissions {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let private = directory.path().join("private");
+    let config_dir = private.join("config");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let alias = directory.path().join("alias");
+    std::os::unix::fs::symlink(&config_dir, &alias).unwrap();
+    let path = alias.join("config.yaml");
+    let config = format!(
+        "- address: '{}'\n  protocol: {{type: http}}\n",
+        available_address()
+    );
+    std::fs::write(&path, &config).unwrap();
+    std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o111)).unwrap();
+    let _restore = RestorePermissions(private.clone());
+    assert!(std::fs::read_dir(&private).is_err());
+    let mut child = Process::start(&path, &[]);
+    child.wait_for("Servers ready").await;
+    std::fs::write(&path, &config).unwrap();
+    child.wait_for("Servers ready").await;
+    child.signal(libc::SIGTERM);
+    assert!(child.exit().await.success());
 }
 
 #[cfg(unix)]
