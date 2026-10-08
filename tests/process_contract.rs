@@ -463,6 +463,95 @@ async fn atomic_replace_keeps_serving_through_debounce() {
     assert_eq!(child.exit().await.code(), Some(0));
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[tokio::test]
+async fn hard_link_updates_trigger_reload() {
+    let directory = tempfile::tempdir().unwrap();
+    let aliases = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.yaml");
+    let config = format!(
+        "- address: '{}'\n  protocol: {{type: http}}\n",
+        available_address()
+    );
+    std::fs::write(&path, &config).unwrap();
+    let mut child = Process::start(&path, &[]);
+    child.wait_for("Servers ready").await;
+    for alias in [
+        directory.path().join("alias.yaml"),
+        aliases.path().join("alias.yaml"),
+    ] {
+        std::fs::hard_link(&path, &alias).unwrap();
+        std::fs::write(&alias, &config).unwrap();
+        child.wait_for("Servers ready").await;
+    }
+    child.signal(libc::SIGTERM);
+    assert!(child.exit().await.success());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn quic_reload_readiness_excludes_retired_sockets() {
+    use std::sync::Arc;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.yaml");
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let address = socket.local_addr().unwrap();
+    drop(socket);
+    let echo = shoes_test_support::test_servers::start_tcp_stream_echo_server("127.0.0.1", 0)
+        .await
+        .unwrap();
+    let certificate = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let config = serde_json::json!([{
+        "address": address.to_string(), "transport": "quic",
+        "quic_settings": {"cert": certificate.cert.pem(), "key": certificate.signing_key.serialize_pem(), "num_endpoints": 2},
+        "protocol": {"type": "forward", "target": echo.local_addr().to_string()}
+    }]);
+    std::fs::write(&path, serde_yaml::to_string(&config).unwrap()).unwrap();
+    let mut child = Process::start(&path, &["--no-reload"]);
+    child.wait_for("Servers ready").await;
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(certificate.cert.der().clone()).unwrap();
+    let config = quinn::ClientConfig::with_root_certificates(Arc::new(roots)).unwrap();
+    let connect = || async {
+        let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap()).unwrap();
+        endpoint.set_default_client_config(config.clone());
+        let connection = timeout(
+            Duration::from_secs(2),
+            endpoint.connect(address, "localhost").unwrap(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let (mut send, mut recv) = connection.open_bi().await.unwrap();
+        send.write_all(b"ping").await.unwrap();
+        let mut response = [0; 4];
+        timeout(Duration::from_secs(2), recv.read_exact(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&response, b"ping");
+        (endpoint, connection, send, recv)
+    };
+    let mut old = Vec::new();
+    for _ in 0..8 {
+        old.push(connect().await);
+    }
+    child.signal(libc::SIGHUP);
+    child.wait_for("Servers ready").await;
+    for _ in 0..24 {
+        let (_endpoint, connection, _send, _recv) = connect().await;
+        connection.close(0u32.into(), b"done");
+    }
+    for (_, connection, _, _) in &old {
+        assert!(matches!(
+            connection.close_reason(),
+            Some(quinn::ConnectionError::ApplicationClosed(_))
+        ));
+    }
+    child.signal(libc::SIGTERM);
+    assert!(child.exit().await.success());
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn symlink_targets_remain_watched_after_retargeting() {

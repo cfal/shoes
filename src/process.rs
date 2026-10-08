@@ -75,6 +75,7 @@ async fn prepare(paths: &[String]) -> io::Result<PreparedServers> {
 struct RunningServers {
     listeners: Vec<JoinHandle<()>>,
     reporter: Option<resources::ResourceReporter>,
+    quic_retirements: crate::listener_tasks::QuicRetirements,
 }
 
 impl RunningServers {
@@ -98,7 +99,8 @@ impl RunningServers {
                 _ => None,
             };
             let resolver = prepared.dns.get_for_server(dns_ref);
-            match crate::tcp::tcp_server::start_servers(config.clone(), resolver).await {
+            let startup = crate::tcp::tcp_server::start_servers(config.clone(), resolver);
+            match self.quic_retirements.track(startup).await {
                 Ok(tasks) => self.listeners.extend(tasks),
                 Err(error) => {
                     self.stop().await;
@@ -136,11 +138,21 @@ fn watch(paths: &[String], tx: mpsc::Sender<()>) -> io::Result<RecommendedWatche
         files.insert(path.clone());
         resolve_watch_path(&path, &mut files, &mut 0)?;
     }
+    let required_directories: HashSet<_> = required_directories
+        .iter()
+        .map(|path| watch_directory(path))
+        .collect();
     let directories: HashSet<_> = files
         .iter()
         .filter_map(|path| path.parent()?.ancestors().find(|parent| parent.is_dir()))
-        .map(PathBuf::from)
+        .map(watch_directory)
         .collect();
+    let direct_files: HashSet<_> = files
+        .iter()
+        .filter_map(|path| std::fs::canonicalize(path).ok())
+        .filter(|path| path.is_file())
+        .collect();
+    files.extend(direct_files.iter().cloned());
     let mut watcher =
         notify::recommended_watcher(move |result: notify::Result<notify::Event>| match result {
             Ok(event)
@@ -166,7 +178,28 @@ fn watch(paths: &[String], tx: mpsc::Sender<()>) -> io::Result<RecommendedWatche
             );
         }
     }
+    for file in direct_files {
+        if let Err(error) = watcher.watch(&file, RecursiveMode::NonRecursive) {
+            let missing = match &error.kind {
+                notify::ErrorKind::PathNotFound => true,
+                notify::ErrorKind::Io(error) => error.kind() == io::ErrorKind::NotFound,
+                _ => false,
+            };
+            if !missing {
+                log::warn!("Could not watch config file {}: {error}", file.display());
+            }
+        }
+    }
     Ok(watcher)
+}
+
+fn watch_directory(path: &Path) -> PathBuf {
+    // inotify keeps one event path per inode; register directory aliases only once.
+    #[cfg(unix)]
+    if let Ok(canonical) = std::fs::canonicalize(path) {
+        return canonical;
+    }
+    path.to_path_buf()
 }
 
 fn resolve_watch_path(
@@ -190,12 +223,18 @@ fn resolve_watch_path(
                         "too many config symlinks",
                     ));
                 }
-                files.insert(resolved.clone());
                 let target = resolved
                     .parent()
                     .unwrap()
                     .join(std::fs::read_link(&resolved)?);
-                resolved = resolve_watch_path(&target, files, symlinks)?;
+                if cfg!(target_os = "macos") && resolved.parent() == Some(Path::new("/")) {
+                    // System-volume links cannot be retargeted; tracking them subscribes
+                    // FSEvents to the entire filesystem even with NonRecursive watches.
+                    resolved = resolve_watch_path(&target, &mut HashSet::new(), symlinks)?;
+                } else {
+                    files.insert(resolved.clone());
+                    resolved = resolve_watch_path(&target, files, symlinks)?;
+                }
             }
             // Retain missing components so creating a target or its parent triggers another reload.
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -330,7 +369,11 @@ pub async fn run(paths: Vec<String>, dry_run: bool, no_reload: bool) -> io::Resu
             }
         };
         running.stop().await;
-        // Quinn may retain its UDP socket briefly while closing old connections.
+        tokio::select! {
+            biased;
+            _ = shutdown.recv() => return Ok(()),
+            result = running.quic_retirements.wait() => result?,
+        }
         let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
         loop {
             let result = tokio::select! {
@@ -347,7 +390,12 @@ pub async fn run(paths: Vec<String>, dry_run: bool, no_reload: bool) -> io::Resu
                     tokio::select! {
                         biased;
                         _ = shutdown.recv() => return Ok(()),
-                        _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+                        result = running.quic_retirements.wait() => result?,
+                    }
+                    tokio::select! {
+                        biased;
+                        _ = shutdown.recv() => return Ok(()),
+                        _ = tokio::time::sleep(Duration::from_millis(50)) => {},
                     }
                 }
                 Err(error) => return Err(error),
@@ -360,6 +408,43 @@ pub async fn run(paths: Vec<String>, dry_run: bool, no_reload: bool) -> io::Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn directory_aliases_preserve_missing_target_notifications() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let target = root.join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::os::unix::fs::symlink(&target, root.join("alias")).unwrap();
+        let existing = root.join("alias/existing.yaml");
+        std::fs::write(&existing, "existing").unwrap();
+        let missing = target.join("missing.yaml");
+        let (tx, mut events) = mpsc::channel(1);
+        let _watcher = watch(
+            &[
+                existing.to_str().unwrap().to_owned(),
+                missing.to_str().unwrap().to_owned(),
+            ],
+            tx,
+        )
+        .unwrap();
+        std::fs::write(&missing, "created").unwrap();
+        tokio::time::timeout(Duration::from_secs(3), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn system_symlinks_do_not_add_root_directory_watches() {
+        let mut files = HashSet::new();
+        resolve_watch_path(Path::new("/var/db/config.yaml"), &mut files, &mut 0).unwrap();
+        assert!(files.contains(Path::new("/private/var/db/config.yaml")));
+        assert!(!files.contains(Path::new("/var")));
+        assert!(!files.contains(Path::new("/private/var")));
+    }
 
     #[tokio::test]
     async fn preparation_preserves_ipv6_scope_ids_and_port_ranges() {

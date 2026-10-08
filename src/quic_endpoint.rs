@@ -7,6 +7,7 @@ use std::task::{Context, Poll};
 
 use crate::resources::BudgetPermit;
 use quinn::{AsyncUdpSocket, Runtime, UdpPoller};
+use tokio::sync::oneshot;
 
 tokio::task_local! {
     static CONNECTION_MEMORY: RefCell<Option<BudgetPermit>>;
@@ -27,9 +28,29 @@ impl QuicEndpoint {
         socket: std::net::UdpSocket,
         memory_bytes: usize,
     ) -> io::Result<Self> {
+        Self::with_release(config, socket, memory_bytes, None)
+    }
+
+    pub fn listen(
+        config: quinn::ServerConfig,
+        socket: std::net::UdpSocket,
+        memory_bytes: usize,
+    ) -> io::Result<(Self, oneshot::Receiver<()>)> {
+        let (release, released) = oneshot::channel();
+        let endpoint = Self::with_release(Some(config), socket, memory_bytes, Some(release))?;
+        Ok((endpoint, released))
+    }
+
+    fn with_release(
+        config: Option<quinn::ServerConfig>,
+        socket: std::net::UdpSocket,
+        memory_bytes: usize,
+        release: Option<oneshot::Sender<()>>,
+    ) -> io::Result<Self> {
         let socket = MemorySocket {
             inner: quinn::TokioRuntime.wrap_udp_socket(socket)?,
             endpoint_memory: None,
+            _release: release,
         };
         quinn::Endpoint::new_with_abstract_socket(
             quinn::EndpointConfig::default(),
@@ -124,6 +145,7 @@ pub(crate) fn socket_with_memory(
     Ok(Arc::new(MemorySocket {
         inner: quinn::TokioRuntime.wrap_udp_socket(socket)?,
         endpoint_memory: Some(memory),
+        _release: None,
     }))
 }
 
@@ -131,6 +153,8 @@ pub(crate) fn socket_with_memory(
 struct MemorySocket {
     inner: Arc<dyn AsyncUdpSocket>,
     endpoint_memory: Option<BudgetPermit>,
+    // Field order signals retirement only after the native socket has been dropped.
+    _release: Option<oneshot::Sender<()>>,
 }
 
 impl AsyncUdpSocket for MemorySocket {
@@ -150,6 +174,7 @@ impl AsyncUdpSocket for MemorySocket {
         Box::pin(MemoryPoller {
             inner: self.inner.clone().create_io_poller(),
             _memory: memory,
+            _socket: self,
         })
     }
 
@@ -187,6 +212,8 @@ impl AsyncUdpSocket for MemorySocket {
 struct MemoryPoller {
     inner: Pin<Box<dyn UdpPoller>>,
     _memory: BudgetPermit,
+    // The delegated poller owns a socket reference and must drop before the release signal.
+    _socket: Arc<MemorySocket>,
 }
 
 impl UdpPoller for MemoryPoller {
@@ -204,6 +231,32 @@ mod tests {
     use crate::resources::Budget;
     use bytes::Bytes;
     use tokio::time::timeout;
+
+    #[tokio::test]
+    async fn socket_release_waits_for_delegated_poller() {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let address = socket.local_addr().unwrap();
+        let (release, mut released) = oneshot::channel();
+        let socket = Arc::new(MemorySocket {
+            inner: quinn::TokioRuntime.wrap_udp_socket(socket).unwrap(),
+            endpoint_memory: None,
+            _release: Some(release),
+        });
+        let budget = Arc::new(Budget::new(Some(1)));
+        let poller = CONNECTION_MEMORY.sync_scope(RefCell::new(budget.acquire(1)), || {
+            socket.clone().create_io_poller()
+        });
+        drop(socket);
+        assert_eq!(
+            released.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        );
+        assert!(std::net::UdpSocket::bind(address).is_err());
+        drop(poller);
+        assert!(released.await.is_err());
+        assert_eq!(budget.available_permits(), 1);
+        drop(std::net::UdpSocket::bind(address).unwrap());
+    }
 
     async fn wait_for_slot(budget: &Arc<Budget>) -> BudgetPermit {
         loop {

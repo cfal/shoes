@@ -1,7 +1,42 @@
 use std::future::Future;
+use std::io;
+use std::sync::Arc;
 use std::time::Duration;
 
+use parking_lot::Mutex;
+use tokio::sync::oneshot;
 use tokio::task::JoinSet;
+
+tokio::task_local! {
+    static QUIC_RETIREMENTS: QuicRetirements;
+}
+
+/// Collects listener socket releases without including outbound QUIC used by draining TCP tasks.
+#[derive(Clone, Default)]
+pub(crate) struct QuicRetirements(Arc<Mutex<Vec<oneshot::Receiver<()>>>>);
+
+impl QuicRetirements {
+    pub async fn track<F: Future>(&self, startup: F) -> F::Output {
+        QUIC_RETIREMENTS.scope(self.clone(), startup).await
+    }
+
+    pub async fn wait(&self) -> io::Result<()> {
+        let releases = std::mem::take(&mut *self.0.lock());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            for released in releases {
+                // Sender destruction, rather than a sent value, confirms socket release.
+                let _ = released.await;
+            }
+        })
+        .await
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "QUIC listener sockets did not retire",
+            )
+        })
+    }
+}
 
 pub(crate) struct QuicListener(pub crate::quic_endpoint::QuicEndpoint);
 
@@ -26,12 +61,15 @@ impl QuicListener {
                     reuse_port,
                     Some(crate::resources::limits().quic_socket_buffer),
                 )?;
-                crate::quic_endpoint::QuicEndpoint::new(
-                    Some(config.clone()),
+                let (endpoint, released) = crate::quic_endpoint::QuicEndpoint::listen(
+                    config.clone(),
                     socket.into(),
                     memory_bytes,
-                )
-                .map(Self)
+                )?;
+                let _ = QUIC_RETIREMENTS.try_with(|retirements| {
+                    retirements.0.lock().push(released);
+                });
+                Ok(Self(endpoint))
             })
             .collect()
     }
@@ -124,8 +162,17 @@ impl Drop for ListenerTasks {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
-    use tokio::sync::oneshot;
+
+    #[tokio::test(start_paused = true)]
+    async fn retirement_timeout_is_an_error() {
+        let retirements = QuicRetirements::default();
+        let (_socket, released) = oneshot::channel();
+        retirements.0.lock().push(released);
+        assert_eq!(
+            retirements.wait().await.unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+    }
 
     #[tokio::test(start_paused = true)]
     async fn reload_preserves_active_work_then_cancels_stalled_connections() {
@@ -207,7 +254,10 @@ mod tests {
                 .pop()
                 .unwrap()
         };
-        let listener = create_listener("0.0.0.0:0".parse().unwrap());
+        let retirements = QuicRetirements::default();
+        let listener = retirements
+            .track(async { create_listener("0.0.0.0:0".parse().unwrap()) })
+            .await;
         let bind_address = listener.local_addr().unwrap();
         let target = std::net::SocketAddr::from(([127, 0, 0, 1], bind_address.port()));
         let create_client = || {
@@ -249,8 +299,9 @@ mod tests {
         ));
         drop(server_conn);
         drop(client_conn);
-        // Match the config watcher's debounce before rebinding the listener.
-        tokio::time::sleep(Duration::from_secs(3)).await;
+        retirements.wait().await.unwrap();
+        // A non-reuse socket proves retirement released the kernel port, not just Quinn state.
+        drop(std::net::UdpSocket::bind(bind_address).unwrap());
         let listener = create_listener(bind_address);
         for _ in 0..12 {
             let client = create_client();
