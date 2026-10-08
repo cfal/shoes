@@ -24,7 +24,7 @@ use crate::shadow_tls::{ShadowTlsServerTarget, ShadowTlsServerTargetHandshake};
 use crate::shadowsocks::ShadowsocksTcpHandler;
 use crate::snell::snell_handler::SnellServerHandler;
 use crate::socks_handler::SocksTcpServerHandler;
-use crate::tcp::chain_builder::build_client_proxy_chain;
+use crate::tcp::chain_builder::try_build_client_proxy_chain;
 use crate::tcp::tcp_handler::TcpServerHandler;
 use crate::tls_server_handler::NaiveConfig;
 use crate::tls_server_handler::{
@@ -64,8 +64,8 @@ pub fn create_tcp_server_handler(
     client_proxy_selector: &Arc<ClientProxySelector>,
     resolver: &Arc<dyn Resolver>,
     bind_ip: Option<IpAddr>,
-) -> Box<dyn TcpServerHandler> {
-    match server_proxy_config {
+) -> std::io::Result<Box<dyn TcpServerHandler>> {
+    Ok(match server_proxy_config {
         ServerProxyConfig::Http { username, password } => Box::new(HttpTcpServerHandler::new(
             create_auth_credentials(username, password),
             client_proxy_selector.clone(),
@@ -164,44 +164,46 @@ pub fn create_tcp_server_handler(
             let mut all_targets = tls_targets
                 .into_iter()
                 .map(|(sni, config)| {
-                    (
+                    Ok((
                         sni,
-                        create_tls_server_target(config, client_proxy_selector, resolver, bind_ip),
-                    )
+                        create_tls_server_target(config, client_proxy_selector, resolver, bind_ip)?,
+                    ))
                 })
-                .collect::<FxHashMap<String, TlsServerTarget>>();
-            let default_tls_target = default_tls_target.map(|config| {
-                create_tls_server_target(*config, client_proxy_selector, resolver, bind_ip)
-            });
+                .collect::<std::io::Result<FxHashMap<String, TlsServerTarget>>>()?;
+            let default_tls_target = default_tls_target
+                .map(|config| {
+                    create_tls_server_target(*config, client_proxy_selector, resolver, bind_ip)
+                })
+                .transpose()?;
             let shadowtls_targets = shadowtls_targets
                 .into_iter()
                 .map(|(sni, config)| {
-                    (
+                    Ok((
                         sni,
                         create_shadow_tls_server_target(
                             config,
                             client_proxy_selector,
                             resolver,
                             bind_ip,
-                        ),
-                    )
+                        )?,
+                    ))
                 })
-                .collect::<FxHashMap<String, TlsServerTarget>>();
+                .collect::<std::io::Result<FxHashMap<String, TlsServerTarget>>>()?;
             all_targets.extend(shadowtls_targets);
             let reality_server_targets = reality_targets
                 .into_iter()
                 .map(|(sni, config)| {
-                    (
+                    Ok((
                         sni,
                         create_reality_server_target(
                             config,
                             client_proxy_selector,
                             resolver,
                             bind_ip,
-                        ),
-                    )
+                        )?,
+                    ))
                 })
-                .collect::<FxHashMap<String, TlsServerTarget>>();
+                .collect::<std::io::Result<FxHashMap<String, TlsServerTarget>>>()?;
             all_targets.extend(reality_server_targets);
             Box::new(TlsServerHandler::new(
                 all_targets,
@@ -228,7 +230,7 @@ pub fn create_tcp_server_handler(
                 .map(|config| {
                     create_websocket_server_target(config, client_proxy_selector, resolver, bind_ip)
                 })
-                .collect::<Vec<_>>();
+                .collect::<std::io::Result<Vec<_>>>()?;
             Box::new(WebsocketTcpServerHandler::new(server_targets))
         }
         ServerProxyConfig::PortForward { targets } => {
@@ -281,7 +283,7 @@ pub fn create_tcp_server_handler(
         unknown_config => {
             panic!("Unsupported TCP proxy config: {unknown_config:?}")
         }
-    }
+    })
 }
 
 fn create_tls_server_target(
@@ -289,7 +291,7 @@ fn create_tls_server_target(
     client_proxy_selector: &Arc<ClientProxySelector>,
     resolver: &Arc<dyn Resolver>,
     bind_ip: Option<IpAddr>,
-) -> TlsServerTarget {
+) -> std::io::Result<TlsServerTarget> {
     let TlsServerConfig {
         cert,
         key,
@@ -339,7 +341,7 @@ fn create_tls_server_target(
         let rules = override_rules
             .map(ConfigSelection::unwrap_config)
             .into_vec();
-        Arc::new(create_tcp_client_proxy_selector(rules, resolver.clone()))
+        Arc::new(create_tcp_client_proxy_selector(rules, resolver.clone())?)
     } else {
         client_proxy_selector.clone()
     };
@@ -385,15 +387,15 @@ fn create_tls_server_target(
             unreachable!("Vision requires VLESS (should be validated during config load)")
         }
     } else {
-        let handler = create_tcp_server_handler(protocol, &effective_selector, resolver, bind_ip);
+        let handler = create_tcp_server_handler(protocol, &effective_selector, resolver, bind_ip)?;
         InnerProtocol::Normal(handler)
     };
 
-    TlsServerTarget::Tls {
+    Ok(TlsServerTarget::Tls {
         server_config,
         effective_selector,
         inner_protocol,
-    }
+    })
 }
 
 fn create_shadow_tls_server_target(
@@ -401,7 +403,7 @@ fn create_shadow_tls_server_target(
     client_proxy_selector: &Arc<ClientProxySelector>,
     resolver: &Arc<dyn Resolver>,
     bind_ip: Option<IpAddr>,
-) -> TlsServerTarget {
+) -> std::io::Result<TlsServerTarget> {
     let ShadowTlsServerConfig {
         password,
         handshake,
@@ -434,7 +436,8 @@ fn create_shadow_tls_server_target(
         ShadowTlsServerHandshakeConfig::Remote(handshake) => {
             // Build ClientProxyChain from client_chain
             // client_chain is guaranteed to be non-empty (defaults to direct hop)
-            let client_chain = build_client_proxy_chain(handshake.client_chain, resolver.clone());
+            let client_chain =
+                try_build_client_proxy_chain(handshake.client_chain, resolver.clone())?;
             ShadowTlsServerTargetHandshake::new_remote(handshake.address, client_chain)
         }
     };
@@ -444,18 +447,18 @@ fn create_shadow_tls_server_target(
         let rules = override_rules
             .map(ConfigSelection::unwrap_config)
             .into_vec();
-        Arc::new(create_tcp_client_proxy_selector(rules, resolver.clone()))
+        Arc::new(create_tcp_client_proxy_selector(rules, resolver.clone())?)
     } else {
         client_proxy_selector.clone()
     };
 
-    let handler = create_tcp_server_handler(protocol, &effective_selector, resolver, bind_ip);
+    let handler = create_tcp_server_handler(protocol, &effective_selector, resolver, bind_ip)?;
 
-    TlsServerTarget::ShadowTls(ShadowTlsServerTarget::new(
+    Ok(TlsServerTarget::ShadowTls(ShadowTlsServerTarget::new(
         password,
         target_handshake,
         handler,
-    ))
+    )))
 }
 
 fn create_reality_server_target(
@@ -463,7 +466,7 @@ fn create_reality_server_target(
     client_proxy_selector: &Arc<ClientProxySelector>,
     resolver: &Arc<dyn Resolver>,
     bind_ip: Option<IpAddr>,
-) -> TlsServerTarget {
+) -> std::io::Result<TlsServerTarget> {
     let RealityServerConfig {
         private_key,
         short_ids,
@@ -498,7 +501,7 @@ fn create_reality_server_target(
         let rules = override_rules
             .map(ConfigSelection::unwrap_config)
             .into_vec();
-        Arc::new(create_tcp_client_proxy_selector(rules, resolver.clone()))
+        Arc::new(create_tcp_client_proxy_selector(rules, resolver.clone())?)
     } else {
         client_proxy_selector.clone()
     };
@@ -544,7 +547,7 @@ fn create_reality_server_target(
             unreachable!("Vision requires VLESS (should be validated during config load)")
         }
     } else {
-        let handler = create_tcp_server_handler(protocol, &effective_selector, resolver, bind_ip);
+        let handler = create_tcp_server_handler(protocol, &effective_selector, resolver, bind_ip)?;
         InnerProtocol::Normal(handler)
     };
 
@@ -553,23 +556,23 @@ fn create_reality_server_target(
         let hops = dest_client_chain.into_vec();
         if hops.is_empty() {
             // Default to direct connection
-            build_client_proxy_chain(
+            try_build_client_proxy_chain(
                 OneOrSome::One(ClientChainHop::Single(ConfigSelection::Config(
                     ClientConfig::default(),
                 ))),
                 resolver.clone(),
             )
         } else if hops.len() == 1 {
-            build_client_proxy_chain(
+            try_build_client_proxy_chain(
                 OneOrSome::One(hops.into_iter().next().unwrap()),
                 resolver.clone(),
             )
         } else {
-            build_client_proxy_chain(OneOrSome::Some(hops), resolver.clone())
+            try_build_client_proxy_chain(OneOrSome::Some(hops), resolver.clone())
         }
-    };
+    }?;
 
-    TlsServerTarget::Reality(RealityServerTarget {
+    Ok(TlsServerTarget::Reality(RealityServerTarget {
         private_key: private_key_bytes,
         short_ids: short_id_bytes,
         dest,
@@ -580,7 +583,7 @@ fn create_reality_server_target(
         effective_selector,
         inner_protocol,
         dest_client_chain,
-    })
+    }))
 }
 
 fn create_websocket_server_target(
@@ -588,7 +591,7 @@ fn create_websocket_server_target(
     client_proxy_selector: &Arc<ClientProxySelector>,
     resolver: &Arc<dyn Resolver>,
     bind_ip: Option<IpAddr>,
-) -> WebsocketServerTarget {
+) -> std::io::Result<WebsocketServerTarget> {
     let WebsocketServerConfig {
         matching_path,
         matching_headers,
@@ -611,17 +614,17 @@ fn create_websocket_server_target(
         let rules = override_rules
             .map(ConfigSelection::unwrap_config)
             .into_vec();
-        Arc::new(create_tcp_client_proxy_selector(rules, resolver.clone()))
+        Arc::new(create_tcp_client_proxy_selector(rules, resolver.clone())?)
     } else {
         client_proxy_selector.clone()
     };
 
-    let handler = create_tcp_server_handler(protocol, &effective_selector, resolver, bind_ip);
+    let handler = create_tcp_server_handler(protocol, &effective_selector, resolver, bind_ip)?;
 
-    WebsocketServerTarget {
+    Ok(WebsocketServerTarget {
         matching_path,
         matching_headers,
         ping_type,
         handler,
-    }
+    })
 }

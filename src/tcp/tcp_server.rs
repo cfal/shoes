@@ -420,7 +420,7 @@ async fn start_tcp_servers(
     let client_proxy_selector = Arc::new(create_tcp_client_proxy_selector(
         rules.clone(),
         resolver.clone(),
-    ));
+    )?);
 
     let mut handles = vec![];
 
@@ -432,18 +432,19 @@ async fn start_tcp_servers(
             for address in addresses.into_vec() {
                 for socket_addr in address.to_socket_addrs()? {
                     let listener = new_tcp_listener(socket_addr, 4096, None)?;
-                    let tcp_handler = handlers
-                        .entry(socket_addr.ip())
-                        .or_insert_with(|| {
+                    let tcp_handler = match handlers.entry(socket_addr.ip()) {
+                        std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                        std::collections::hash_map::Entry::Vacant(entry) => entry.insert(
                             create_tcp_server_handler(
                                 protocol.clone(),
                                 &client_proxy_selector,
                                 &resolver,
                                 Some(socket_addr.ip()),
-                            )
-                            .into()
-                        })
-                        .clone();
+                            )?
+                            .into(),
+                        ),
+                    }
+                    .clone();
                     listeners.push((listener, tcp_handler));
                 }
             }
@@ -471,7 +472,7 @@ async fn start_tcp_servers(
                 }
                 let listener = crate::socket_util::new_unix_listener(path_buf, 4096)?;
                 let tcp_handler: Arc<dyn TcpServerHandler> =
-                    create_tcp_server_handler(protocol, &client_proxy_selector, &resolver, None)
+                    create_tcp_server_handler(protocol, &client_proxy_selector, &resolver, None)?
                         .into();
                 let handle = tokio::spawn(async move {
                     if let Err(error) = run_unix_server(listener, resolver, tcp_handler).await {

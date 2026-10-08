@@ -91,10 +91,13 @@ async fn roundtrips(ipv6: bool, framed: bool) {
         .close_fd_on_drop(false)
         .packet_information(framed);
     let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
-    let selector = Arc::new(create_tcp_client_proxy_selector(
-        vec![crate::config::RuleConfig::default()],
-        resolver.clone(),
-    ));
+    let selector = Arc::new(
+        create_tcp_client_proxy_selector(
+            vec![crate::config::RuleConfig::default()],
+            resolver.clone(),
+        )
+        .unwrap(),
+    );
     let (shutdown, shutdown_rx) = oneshot::channel();
     let mut tasks = JoinSet::new();
     tasks.spawn(run_tun_server(config, selector, resolver, shutdown_rx));

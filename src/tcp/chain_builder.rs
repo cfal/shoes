@@ -16,10 +16,18 @@ use crate::tcp::socket_connector_impl::SocketConnectorImpl;
 /// Creates InitialHopEntry (socket + optional proxy paired) from hop 0.
 /// Creates ProxyConnectors for subsequent hops (1+).
 /// `protocol: direct` at hop 0 creates InitialHopEntry::Direct.
+#[cfg(test)]
 pub fn build_client_proxy_chain(
     client_chain: crate::option_util::OneOrSome<ClientChainHop>,
     resolver: Arc<dyn Resolver>,
 ) -> ClientProxyChain {
+    try_build_client_proxy_chain(client_chain, resolver).expect("Failed to create client chain")
+}
+
+pub fn try_build_client_proxy_chain(
+    client_chain: crate::option_util::OneOrSome<ClientChainHop>,
+    resolver: Arc<dyn Resolver>,
+) -> std::io::Result<ClientProxyChain> {
     let hops: Vec<Vec<ClientConfig>> = client_chain
         .into_vec()
         .into_iter()
@@ -62,21 +70,24 @@ pub fn build_client_proxy_chain(
             let target_address = find_first_proxy_address(&hops, config);
 
             let socket = SocketConnectorImpl::from_config(config, target_address)
-                .map(|s| Box::new(s) as Box<dyn SocketConnector>)
-                .expect("Failed to create SocketConnector");
+                .map(|s| Box::new(s) as Box<dyn SocketConnector>)?;
 
             if config.protocol.is_direct() {
                 // Direct: socket only, no proxy
-                InitialHopEntry::Direct(socket)
+                Ok(InitialHopEntry::Direct(socket))
             } else {
                 // Proxy: socket + proxy paired
                 let proxy = ProxyConnectorImpl::from_config(config.clone(), resolver.clone())
                     .map(|p| Box::new(p) as Box<dyn ProxyConnector>)
-                    .expect("Failed to create ProxyConnector for non-direct config");
-                InitialHopEntry::Proxy { socket, proxy }
+                    .ok_or_else(|| {
+                        std::io::Error::other(
+                            "Missing proxy connector for non-direct configuration",
+                        )
+                    })?;
+                Ok(InitialHopEntry::Proxy { socket, proxy })
             }
         })
-        .collect();
+        .collect::<std::io::Result<_>>()?;
 
     // Build proxy connectors for subsequent hops (1+)
     let subsequent_hops: Vec<Vec<Box<dyn ProxyConnector>>> = hops
@@ -105,7 +116,7 @@ pub fn build_client_proxy_chain(
         })
         .collect();
 
-    ClientProxyChain::new(initial_hop, subsequent_hops)
+    Ok(ClientProxyChain::new(initial_hop, subsequent_hops))
 }
 
 /// Find the first proxy address in the chain (for socket connector target).
@@ -141,22 +152,30 @@ pub fn build_client_chain_group(
     client_chains: crate::option_util::NoneOrSome<crate::config::ClientChain>,
     resolver: Arc<dyn Resolver>,
 ) -> ClientChainGroup {
+    try_build_client_chain_group(client_chains, resolver)
+        .expect("Failed to create client chain group")
+}
+
+pub fn try_build_client_chain_group(
+    client_chains: crate::option_util::NoneOrSome<crate::config::ClientChain>,
+    resolver: Arc<dyn Resolver>,
+) -> std::io::Result<ClientChainGroup> {
     let chains: Vec<ClientProxyChain> = if client_chains.is_empty() {
-        vec![build_client_proxy_chain(
+        vec![try_build_client_proxy_chain(
             crate::option_util::OneOrSome::One(ClientChainHop::Single(ConfigSelection::Config(
                 ClientConfig::default(),
             ))),
             resolver,
-        )]
+        )?]
     } else {
         client_chains
             .into_vec()
             .into_iter()
-            .map(|chain| build_client_proxy_chain(chain.hops, resolver.clone()))
-            .collect()
+            .map(|chain| try_build_client_proxy_chain(chain.hops, resolver.clone()))
+            .collect::<std::io::Result<_>>()?
     };
 
-    ClientChainGroup::new(chains)
+    Ok(ClientChainGroup::new(chains))
 }
 
 #[cfg(test)]
@@ -167,6 +186,17 @@ mod tests {
     use crate::option_util::{NoneOrSome, OneOrSome};
     use crate::resolver::NativeResolver;
     use std::net::{IpAddr, Ipv4Addr};
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn socket_initialization_failure_is_returned() {
+        let config: ClientConfig = serde_yaml::from_str("address: '127.0.0.1:443'\ntransport: quic\nbind_interface: shoes-missing-interface\nprotocol: {type: socks}\n").unwrap();
+        let result = try_build_client_proxy_chain(
+            OneOrSome::One(ClientChainHop::Single(ConfigSelection::Config(config))),
+            mock_resolver(),
+        );
+        assert!(result.is_err());
+    }
 
     fn mock_resolver() -> Arc<dyn Resolver> {
         Arc::new(NativeResolver::new())

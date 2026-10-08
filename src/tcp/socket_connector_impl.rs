@@ -21,7 +21,7 @@ use crate::config::{ClientConfig, ClientQuicConfig, Transport};
 use crate::quic_endpoint::QuicEndpoint;
 use crate::quic_stream::QuicStream;
 use crate::resolver::{Resolver, resolve_addresses, resolve_location};
-use crate::rustls_config_util::create_client_config;
+use crate::rustls_config_util::try_create_client_config;
 use crate::socket_util::{new_tcp_socket, new_udp_socket, set_tcp_keepalive};
 use crate::thread_util::get_num_threads;
 
@@ -140,11 +140,11 @@ impl SocketConnectorImpl {
     ///   Pass None for direct protocol (QUIC is not supported for direct).
     ///
     /// # Returns
-    /// None if QUIC endpoint creation fails.
+    /// Returns any socket or QUIC endpoint initialization error.
     pub fn from_config(
         config: &ClientConfig,
         target_address: Option<&NetLocation>,
-    ) -> Option<Self> {
+    ) -> std::io::Result<Self> {
         let bind_interface = config.bind_interface.clone().into_option();
 
         let default_sni_hostname =
@@ -168,9 +168,12 @@ impl SocketConnectorImpl {
             }
             Transport::Quic => {
                 // QUIC requires a target address for endpoint creation
-                let target_address = target_address.expect(
-                    "QUIC transport requires target_address (direct protocol should use TCP)",
-                );
+                let target_address = target_address.ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "QUIC transport requires a target address",
+                    )
+                })?;
 
                 let ClientQuicConfig {
                     verify,
@@ -207,20 +210,20 @@ impl SocketConnectorImpl {
                     (key_bytes, cert_bytes)
                 });
 
-                let rustls_client_config = create_client_config(
+                let rustls_client_config = try_create_client_config(
                     verify,
                     server_fingerprints.into_vec(),
                     alpn_protocols.into_vec(),
                     sni_hostname.is_some(),
                     key_and_cert_bytes,
                     false, // tls13_only - QUIC enforces TLS 1.3 anyway
-                );
+                )?;
 
                 let quic_client_config = quinn::crypto::rustls::QuicClientConfig::with_initial(
                     Arc::new(rustls_client_config),
                     tls13_suite.quic_suite().unwrap(),
                 )
-                .unwrap();
+                .map_err(std::io::Error::other)?;
 
                 let mut quinn_client_config =
                     quinn::ClientConfig::new(Arc::new(quic_client_config));
@@ -240,19 +243,13 @@ impl SocketConnectorImpl {
                 let mut endpoints = Vec::with_capacity(endpoints_len);
 
                 for _ in 0..endpoints_len {
-                    let udp_socket = match new_udp_socket(
-                        target_address.address().is_ipv6(),
+                    let udp_socket = new_udp_socket(
+                        !matches!(target_address.address(), crate::address::Address::Ipv4(_)),
                         bind_interface.clone(),
-                    ) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            error!("Failed to bind new UDP socket for QUIC: {e}");
-                            return None;
-                        }
-                    };
-                    let udp_socket = udp_socket.into_std().unwrap();
+                    )?;
+                    let udp_socket = udp_socket.into_std()?;
 
-                    let mut endpoint = QuicEndpoint::new(None, udp_socket, memory_bytes).unwrap();
+                    let mut endpoint = QuicEndpoint::new(None, udp_socket, memory_bytes)?;
                     endpoint.set_default_client_config(quinn_client_config.clone());
                     endpoints.push(Arc::new(endpoint));
                 }
@@ -265,7 +262,7 @@ impl SocketConnectorImpl {
             }
         };
 
-        Some(Self {
+        Ok(Self {
             bind_interface,
             transport,
         })
@@ -693,7 +690,7 @@ mod tests {
     fn test_from_config_direct_protocol() {
         let config = ClientConfig::default(); // default is direct protocol
         let connector = SocketConnectorImpl::from_config(&config, None);
-        assert!(connector.is_some());
+        assert!(connector.is_ok());
         assert!(matches!(
             connector.unwrap().transport,
             TransportConfig::Tcp { .. }

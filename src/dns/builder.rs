@@ -14,7 +14,7 @@ use crate::resolver::{
     CachingNativeResolver, NativeResolver, RefreshPolicy, RefreshingResolver, Resolver,
     ResolverFactory, TimeoutResolver,
 };
-use crate::tcp::chain_builder::{build_client_chain_group, build_direct_chain_group};
+use crate::tcp::chain_builder::{build_direct_chain_group, try_build_client_chain_group};
 
 /// Registry of resolved DNS groups with lazy default resolver.
 pub struct DnsRegistry {
@@ -570,7 +570,7 @@ async fn build_entry_and_plan(
         } else {
             NoneOrSome::Some(spec.client_chains.clone())
         };
-        Arc::new(build_client_chain_group(chains, chain_resolver))
+        Arc::new(try_build_client_chain_group(chains, chain_resolver)?)
     };
 
     // Build or get bootstrap resolver

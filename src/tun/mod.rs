@@ -89,11 +89,22 @@ use udp_manager::TunUdpManager;
 /// 3. The stack thread reads packets directly from TUN using poll()
 /// 4. Handles TCP connections through the proxy chain
 /// 5. Handles UDP packets through tokio (forwarded from stack thread)
+#[allow(dead_code)]
 pub async fn run_tun_server(
     config: TunServerConfig,
     proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
+    shutdown_rx: oneshot::Receiver<()>,
+) -> std::io::Result<()> {
+    run_tun_server_inner(config, proxy_selector, resolver, shutdown_rx, &mut None).await
+}
+
+async fn run_tun_server_inner(
+    config: TunServerConfig,
+    proxy_selector: Arc<ClientProxySelector>,
+    resolver: Arc<dyn Resolver>,
     mut shutdown_rx: oneshot::Receiver<()>,
+    ready: &mut Option<oneshot::Sender<std::io::Result<()>>>,
 ) -> std::io::Result<()> {
     config.resource_limits.validate()?;
     info!(
@@ -190,6 +201,9 @@ pub async fn run_tun_server(
     }
 
     info!("TUN server started successfully");
+    if let Some(ready) = ready.take() {
+        let _ = ready.send(Ok(()));
+    }
 
     // Wait for shutdown signal or stack thread exit
     tokio::select! {
@@ -335,23 +349,45 @@ pub async fn start_tun_server(
     resolver: std::sync::Arc<dyn crate::resolver::Resolver>,
 ) -> std::io::Result<JoinHandle<()>> {
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let (ready_tx, ready_rx) = oneshot::channel();
 
     let handle = tokio::spawn(async move {
         let _keep_alive = shutdown_tx;
-        if let Err(e) = run_tun_from_config(config, shutdown_rx, true, resolver).await {
-            warn!("TUN server error: {}", e);
+        let mut ready = Some(ready_tx);
+        if let Err(error) =
+            run_tun_from_config_inner(config, shutdown_rx, true, resolver, &mut ready).await
+        {
+            if let Some(ready) = ready.take() {
+                let _ = ready.send(Err(error));
+            } else {
+                warn!("TUN server error: {error}");
+            }
         }
     });
-
-    Ok(handle)
+    let handle = tokio_util::task::AbortOnDropHandle::new(handle);
+    ready_rx
+        .await
+        .map_err(|_| std::io::Error::other("TUN task exited before startup completed"))??;
+    Ok(handle.detach())
 }
 
 /// Run TUN server from config with external shutdown control.
+#[allow(dead_code)]
 pub async fn run_tun_from_config(
     config: TunConfig,
     shutdown_rx: tokio::sync::oneshot::Receiver<()>,
     close_fd_on_drop: bool,
     resolver: Arc<dyn Resolver>,
+) -> std::io::Result<()> {
+    run_tun_from_config_inner(config, shutdown_rx, close_fd_on_drop, resolver, &mut None).await
+}
+
+async fn run_tun_from_config_inner(
+    config: TunConfig,
+    shutdown_rx: tokio::sync::oneshot::Receiver<()>,
+    close_fd_on_drop: bool,
+    resolver: Arc<dyn Resolver>,
+    ready: &mut Option<oneshot::Sender<std::io::Result<()>>>,
 ) -> std::io::Result<()> {
     let mut tun_server_config = TunServerConfig::new()
         .mtu(config.mtu)
@@ -387,13 +423,15 @@ pub async fn run_tun_from_config(
     }
 
     let rules = config.rules.map(ConfigSelection::unwrap_config).into_vec();
-    let client_proxy_selector = Arc::new(create_tcp_client_proxy_selector(rules, resolver.clone()));
+    let client_proxy_selector =
+        Arc::new(create_tcp_client_proxy_selector(rules, resolver.clone())?);
 
-    run_tun_server(
+    run_tun_server_inner(
         tun_server_config,
         client_proxy_selector,
         resolver,
         shutdown_rx,
+        ready,
     )
     .await
 }
@@ -402,6 +440,28 @@ pub async fn run_tun_from_config(
 mod tests {
     use super::*;
     use std::os::fd::AsRawFd;
+
+    #[tokio::test]
+    async fn startup_acknowledges_initialization_and_returns_errors() {
+        use std::os::fd::IntoRawFd;
+        let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
+        let invalid = serde_yaml::from_str("resource_limits: {tcp_buffer_size: 0}").unwrap();
+        assert_eq!(
+            start_tun_server(invalid, resolver.clone())
+                .await
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        let (_peer, device) = std::os::unix::net::UnixDatagram::pair().unwrap();
+        let fd = device.into_raw_fd();
+        let config = serde_yaml::from_str(&format!("device_fd: {fd}")).unwrap();
+        let task = start_tun_server(config, resolver).await.unwrap();
+        assert!(!task.is_finished());
+        assert!(unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0);
+        task.abort();
+        let _ = task.await;
+    }
 
     #[tokio::test]
     async fn proxy_handshake_bytes_reach_the_tun_connection_before_relay_data() {
@@ -413,10 +473,8 @@ mod tests {
         ))
         .unwrap();
         let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
-        let selector = Arc::new(create_tcp_client_proxy_selector(
-            vec![rule],
-            resolver.clone(),
-        ));
+        let selector =
+            Arc::new(create_tcp_client_proxy_selector(vec![rule], resolver.clone()).unwrap());
         let control = Arc::new(tcp_conn::TcpConnectionControl::new(1024, 1024));
         let (wake, _wake_rx) = wake::Wake::new().unwrap();
         let connection = tcp_conn::TcpConnection::new(control.clone(), wake);

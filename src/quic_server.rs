@@ -191,7 +191,7 @@ pub async fn start_quic_servers(
     let client_proxy_selector = Arc::new(create_tcp_client_proxy_selector(
         rules.clone(),
         resolver.clone(),
-    ));
+    )?);
 
     let mut handles = vec![];
 
@@ -248,20 +248,24 @@ pub async fn start_quic_servers(
         tcp_protocol => {
             // Shares protocol state across ports without reusing an interface-specific UDP bind IP.
             let mut handlers: HashMap<IpAddr, Arc<dyn TcpServerHandler>> = HashMap::new();
-
-            for bind_address in bind_addresses.into_iter() {
-                let tcp_handler: Arc<dyn TcpServerHandler> = handlers
-                    .entry(bind_address.ip())
-                    .or_insert_with(|| {
+            // Construct every handler before spawning listeners so errors cannot detach tasks.
+            for bind_address in &bind_addresses {
+                if let std::collections::hash_map::Entry::Vacant(entry) =
+                    handlers.entry(bind_address.ip())
+                {
+                    entry.insert(
                         create_tcp_server_handler(
                             tcp_protocol.clone(),
                             &client_proxy_selector,
                             &resolver,
                             Some(bind_address.ip()),
-                        )
-                        .into()
-                    })
-                    .clone();
+                        )?
+                        .into(),
+                    );
+                }
+            }
+            for bind_address in bind_addresses.into_iter() {
+                let tcp_handler = handlers[&bind_address.ip()].clone();
                 let quic_server_config = quic_server_config.clone();
                 let resolver = resolver.clone();
                 let result = start_quic_server(

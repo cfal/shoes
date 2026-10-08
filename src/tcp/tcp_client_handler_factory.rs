@@ -20,7 +20,7 @@ use crate::shadow_tls::ShadowTlsClientHandler;
 use crate::shadowsocks::ShadowsocksTcpHandler;
 use crate::snell::snell_handler::SnellClientHandler;
 use crate::socks_handler::SocksTcpClientHandler;
-use crate::tcp::chain_builder::build_client_chain_group;
+use crate::tcp::chain_builder::try_build_client_chain_group;
 use crate::tcp::tcp_handler::TcpClientHandler;
 use crate::tls_client_handler::TlsClientHandler;
 use crate::trojan_handler::TrojanTcpHandler;
@@ -364,7 +364,7 @@ pub fn create_tcp_client_handler(
 pub fn create_tcp_client_proxy_selector(
     rules: Vec<RuleConfig>,
     resolver: Arc<dyn Resolver>,
-) -> ClientProxySelector {
+) -> std::io::Result<ClientProxySelector> {
     let rules = rules
         .into_iter()
         .map(|rule_config| {
@@ -374,13 +374,14 @@ pub fn create_tcp_client_proxy_selector(
                     override_address,
                     client_chains,
                 } => {
-                    let chain_group = build_client_chain_group(client_chains, resolver.clone());
+                    let chain_group =
+                        try_build_client_chain_group(client_chains, resolver.clone())?;
                     ConnectAction::new_allow(override_address, chain_group)
                 }
                 RuleActionConfig::Block => ConnectAction::new_block(),
             };
-            ConnectRule::new(masks.into_vec(), connect_action)
+            Ok(ConnectRule::new(masks.into_vec(), connect_action))
         })
-        .collect::<Vec<_>>();
-    ClientProxySelector::new(rules)
+        .collect::<std::io::Result<Vec<_>>>()?;
+    Ok(ClientProxySelector::new(rules))
 }

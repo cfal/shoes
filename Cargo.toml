@@ -111,7 +111,7 @@ tokio = { version = "*", features = [
     "sync",
     "time",
 ] }
-tokio-util = { version = "*", features = ["time", "io"] }
+tokio-util = { version = "*", features = ["time", "io", "rt"] }
 tun = { version = "*", features = ["async"] }
 url = "*"
 webpki-roots = { version = "*" }
