@@ -118,21 +118,38 @@ fn invalid_protocol_configs(address: SocketAddr) -> Vec<String> {
     bad_key["public_key"] = json!("invalid");
     let mut bad_sni = reality.clone();
     bad_sni["sni_hostname"] = json!("invalid name");
+    let mut ipv4_sni = reality.clone();
+    ipv4_sni["sni_hostname"] = json!("127.0.0.1");
+    let mut ipv6_sni = reality.clone();
+    ipv6_sni["sni_hostname"] = json!("::1");
+    let mut nested_direct = reality.clone();
+    nested_direct["protocol"] = json!({"type": "direct"});
     let mut missing_sni = reality;
     missing_sni.as_object_mut().unwrap().remove("sni_hostname");
     let padding = json!({"type": "anytls", "password": "test", "padding_scheme": ["stop=invalid"]});
-    let mut configs: Vec<_> = [bad_key, bad_sni, missing_sni, padding.clone()]
-        .into_iter()
-        .map(|protocol| {
-            serde_yaml::to_string(&json!([{
-                "address": address.to_string(), "protocol": {"type": "http"},
-                "rules": [{"masks": "0.0.0.0/0", "client_proxy": {
-                    "address": "127.0.0.1:443", "protocol": protocol
-                }}]
-            }]))
-            .unwrap()
-        })
-        .collect();
+    let mut configs: Vec<_> = [
+        bad_key,
+        bad_sni,
+        missing_sni,
+        ipv4_sni,
+        ipv6_sni,
+        nested_direct,
+        padding.clone(),
+        json!({"type": "tls", "protocol": {"type": "direct"}}),
+        json!({"type": "shadowtls", "password": "test", "protocol": {"type": "direct"}}),
+        json!({"type": "websocket", "protocol": {"type": "direct"}}),
+    ]
+    .into_iter()
+    .map(|protocol| {
+        serde_yaml::to_string(&json!([{
+            "address": address.to_string(), "protocol": {"type": "http"},
+            "rules": [{"masks": "0.0.0.0/0", "client_proxy": {
+                "address": "127.0.0.1:443", "protocol": protocol
+            }}]
+        }]))
+        .unwrap()
+    })
+    .collect();
     configs.push(
         serde_yaml::to_string(&json!([{"address": address.to_string(), "protocol": padding}]))
             .unwrap(),

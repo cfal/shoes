@@ -19,6 +19,7 @@ mod reality_tls13_messages;
 mod reality_util;
 
 pub use reality_cipher_suite::{CipherSuite, DEFAULT_CIPHER_SUITES};
+pub(crate) use reality_util::parse_server_name;
 // generate_keypair is used by binary, not by library's public API
 #[allow(unused_imports)]
 pub use reality_util::{decode_private_key, decode_public_key, decode_short_id, generate_keypair};

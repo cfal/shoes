@@ -250,6 +250,12 @@ mod tests {
             serde_json::json!({"type": "reality", "public_key": "invalid", "sni_hostname": "example.com", "protocol": {"type": "socks"}}),
             serde_json::json!({"type": "reality", "public_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "protocol": {"type": "socks"}}),
             serde_json::json!({"type": "anytls", "password": "test", "padding_scheme": ["stop=invalid"]}),
+            serde_json::json!({"type": "reality", "public_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "sni_hostname": "127.0.0.1", "protocol": {"type": "socks"}}),
+            serde_json::json!({"type": "reality", "public_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "sni_hostname": "::1", "protocol": {"type": "socks"}}),
+            serde_json::json!({"type": "reality", "public_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "sni_hostname": "example.com", "protocol": {"type": "direct"}}),
+            serde_json::json!({"type": "tls", "protocol": {"type": "direct"}}),
+            serde_json::json!({"type": "shadowtls", "password": "test", "protocol": {"type": "direct"}}),
+            serde_json::json!({"type": "websocket", "protocol": {"type": "direct"}}),
         ] {
             let config = serde_json::from_value(serde_json::json!({
                 "address": "127.0.0.1:443", "protocol": protocol

@@ -869,24 +869,29 @@ fn validate_client_vision_protocol(
 
 /// Recursive validation of client proxy config structure (Vision rules, etc.)
 fn validate_client_proxy_structure(config: &ClientProxyConfig) -> std::io::Result<()> {
-    match config {
+    let inner = match config {
         ClientProxyConfig::Tls(tls_config) => {
             validate_client_vision_protocol(tls_config.vision, &tls_config.protocol, "TLS")?;
-            validate_client_proxy_structure(&tls_config.protocol)?;
+            Some(tls_config.protocol.as_ref())
         }
         ClientProxyConfig::Reality {
             vision, protocol, ..
         } => {
             validate_client_vision_protocol(*vision, protocol, "Reality")?;
-            validate_client_proxy_structure(protocol)?;
+            Some(protocol.as_ref())
         }
-        ClientProxyConfig::ShadowTls { protocol, .. } => {
-            validate_client_proxy_structure(protocol)?;
+        ClientProxyConfig::ShadowTls { protocol, .. } => Some(protocol.as_ref()),
+        ClientProxyConfig::Websocket(ws_config) => Some(ws_config.protocol.as_ref()),
+        _ => None,
+    };
+    if let Some(inner) = inner {
+        if inner.is_direct() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "direct cannot be used as an inner proxy protocol",
+            ));
         }
-        ClientProxyConfig::Websocket(ws_config) => {
-            validate_client_proxy_structure(&ws_config.protocol)?;
-        }
-        _ => {}
+        validate_client_proxy_structure(inner)?;
     }
     Ok(())
 }
@@ -1004,7 +1009,7 @@ fn validate_client_proxy_config(
                     "REALITY client requires sni_hostname",
                 )
             })?;
-            validate_sni(sni)?;
+            crate::reality::parse_server_name(sni)?;
             validate_reality_client_short_id(short_id)?;
 
             if short_id == DEFAULT_REALITY_SHORT_ID {

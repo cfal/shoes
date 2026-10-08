@@ -5,6 +5,18 @@ use rand::Rng;
 use super::reality_cipher_suite::CipherSuite;
 use crate::buf_reader::BufReader;
 
+pub(crate) fn parse_server_name(
+    name: &str,
+) -> std::io::Result<rustls::pki_types::ServerName<'static>> {
+    match rustls::pki_types::ServerName::try_from(name.to_owned()) {
+        Ok(name @ rustls::pki_types::ServerName::DnsName(_)) => Ok(name),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "REALITY requires a valid DNS server name",
+        )),
+    }
+}
+
 /// Decodes a base64url-encoded public key
 pub fn decode_public_key(encoded: &str) -> Result<[u8; 32], std::io::Error> {
     let decoded = URL_SAFE_NO_PAD.decode(encoded).map_err(|e| {

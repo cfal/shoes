@@ -46,7 +46,10 @@ pub fn create_tcp_client_handler(
 ) -> std::io::Result<Box<dyn TcpClientHandler>> {
     Ok(match client_proxy_config {
         ClientProxyConfig::Direct => {
-            panic!("Tried to create a direct tcp client handler");
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "direct cannot be used as an inner proxy protocol",
+            ));
         }
         ClientProxyConfig::Http {
             username,
@@ -222,9 +225,7 @@ pub fn create_tcp_client_handler(
             // Determine SNI hostname
             let sni_hostname = sni_hostname.or(default_sni_hostname.clone());
             let server_name = match sni_hostname {
-                Some(s) => rustls::pki_types::ServerName::try_from(s)
-                    .map_err(std::io::Error::other)?
-                    .to_owned(),
+                Some(s) => crate::reality::parse_server_name(&s)?,
                 None => {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
