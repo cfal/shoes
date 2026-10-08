@@ -141,7 +141,6 @@ fn invalid_protocol_configs(address: SocketAddr) -> Vec<String> {
     ];
     let mut configs: Vec<_> = protocols
         .iter()
-        .cloned()
         .map(|protocol| {
             serde_yaml::to_string(&json!([{
                 "address": address.to_string(), "protocol": {"type": "http"},
