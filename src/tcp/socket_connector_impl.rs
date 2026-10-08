@@ -523,14 +523,10 @@ mod tests {
     #[tokio::test]
     async fn hostname_quic_prefers_ipv4_without_waiting_for_stalled_ipv6() {
         use tokio::io::AsyncWriteExt;
-        let blackhole = crate::socket_util::new_hostname_udp_socket(None).unwrap();
-        if blackhole.local_addr().unwrap().is_ipv4() {
+        let Ok(blackhole) = UdpSocket::bind("[::1]:0").await else {
             return;
-        }
-        let stalled = SocketAddr::from((
-            std::net::Ipv6Addr::LOCALHOST,
-            blackhole.local_addr().unwrap().port(),
-        ));
+        };
+        let stalled = blackhole.local_addr().unwrap();
         let certificate = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let server_config = quinn::ServerConfig::with_single_cert(
             vec![certificate.cert.der().clone()],
