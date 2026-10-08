@@ -168,15 +168,13 @@ where
         } => {
             let setup_client_stream_future = timeout(
                 Duration::from_secs(60),
-                setup_client_tcp_stream(
-                    &mut server_stream,
-                    proxy_selector,
-                    resolver,
-                    remote_location.clone(),
-                ),
+                setup_client_tcp_stream(proxy_selector, resolver, remote_location.clone()),
             );
 
-            let mut client_stream = match setup_client_stream_future.await {
+            let TcpClientSetupResult {
+                mut client_stream,
+                early_data,
+            } = match setup_client_stream_future.await {
                 Ok(Ok(Some(s))) => s,
                 Ok(Ok(None)) => {
                     // Must have been blocked.
@@ -203,6 +201,11 @@ where
                 write_all(&mut server_stream, &data).await?;
                 // server_need_initial_flush should be set to true by the handler if
                 // it's needed.
+            }
+
+            if let Some(data) = early_data {
+                write_all(&mut server_stream, &data).await?;
+                server_stream.flush().await?;
             }
 
             let client_need_initial_flush = match initial_remote_data {
@@ -306,11 +309,10 @@ where
 }
 
 pub async fn setup_client_tcp_stream(
-    server_stream: &mut Box<dyn AsyncStream>,
     client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
     remote_location: NetLocation,
-) -> std::io::Result<Option<Box<dyn AsyncStream>>> {
+) -> std::io::Result<Option<TcpClientSetupResult>> {
     let action = client_proxy_selector
         .judge(remote_location.into(), &resolver)
         .await?;
@@ -319,19 +321,10 @@ pub async fn setup_client_tcp_stream(
         ConnectDecision::Allow {
             chain_group,
             remote_location,
-        } => {
-            let TcpClientSetupResult {
-                client_stream,
-                early_data,
-            } = chain_group.connect_tcp(remote_location, &resolver).await?;
-
-            if let Some(data) = early_data {
-                server_stream.write_all(&data).await?;
-                server_stream.flush().await?;
-            }
-
-            Ok(Some(client_stream))
-        }
+        } => chain_group
+            .connect_tcp(remote_location, &resolver)
+            .await
+            .map(Some),
         ConnectDecision::Block => Ok(None),
     }
 }
@@ -528,8 +521,7 @@ mod lifetime_tests {
             occupied.local_addr().unwrap()
         );
         let configs =
-            crate::config::create_server_configs(serde_yaml::from_str(&config).unwrap())
-                .unwrap();
+            crate::config::create_server_configs(serde_yaml::from_str(&config).unwrap()).unwrap();
         drop(first);
         let error = start_servers(
             configs.configs.into_iter().next().unwrap(),

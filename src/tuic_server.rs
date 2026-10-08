@@ -3,6 +3,7 @@ use std::str;
 use std::sync::Arc;
 use std::time::Duration;
 use subtle::ConstantTimeEq;
+use tokio::io::AsyncWriteExt;
 
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
@@ -435,15 +436,13 @@ async fn process_tcp_stream(
     let mut server_stream: Box<dyn AsyncStream> = Box::new(QuicStream::from(send, recv));
     let setup_client_stream_future = timeout(
         Duration::from_secs(60),
-        setup_client_tcp_stream(
-            &mut server_stream,
-            client_proxy_selector,
-            resolver,
-            remote_location.clone(),
-        ),
+        setup_client_tcp_stream(client_proxy_selector, resolver, remote_location.clone()),
     );
 
-    let mut client_stream = match setup_client_stream_future.await {
+    let crate::tcp::tcp_handler::TcpClientSetupResult {
+        mut client_stream,
+        early_data,
+    } = match setup_client_stream_future.await {
         Ok(Ok(Some(s))) => s,
         Ok(Ok(None)) => {
             // Must have been blocked.
@@ -465,6 +464,11 @@ async fn process_tcp_stream(
             ));
         }
     };
+
+    if let Some(data) = early_data {
+        write_all(&mut server_stream, &data).await?;
+        server_stream.flush().await?;
+    }
 
     let unparsed_data = stream_reader.unparsed_data();
     let client_requires_flush = if unparsed_data.is_empty() {
