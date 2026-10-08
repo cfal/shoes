@@ -128,59 +128,6 @@ impl ShadowsocksTcpHandler {
     }
 }
 
-#[cfg(test)]
-mod replay_tests {
-    use super::*;
-    use tokio::io::AsyncReadExt;
-
-    #[tokio::test]
-    async fn classic_client_rejects_authenticated_response_replays() {
-        let handler = ShadowsocksTcpHandler::new_client(
-            ShadowsocksCipher::try_from("aes-128-gcm").unwrap(),
-            "test",
-            false,
-        );
-        let (transport, mut wire_reader) = tokio::io::duplex(4096);
-        let mut response = ShadowsocksStream::new(
-            Box::new(transport),
-            ShadowsocksStreamType::Aead,
-            handler.cipher.algorithm(),
-            handler.cipher.salt_len(),
-            handler.key.clone(),
-            None,
-        );
-        response.write_all(b"hello").await.unwrap();
-        response.flush().await.unwrap();
-        let mut wire = vec![0; handler.cipher.salt_len() + 2 + 16 + 5 + 16];
-        wire_reader.read_exact(&mut wire).await.unwrap();
-
-        for attempt in 0..3 {
-            let (transport, mut peer) = tokio::io::duplex(4096);
-            let mut client = handler
-                .setup_client_tcp_stream(
-                    Box::new(transport),
-                    NetLocation::from_str("127.0.0.1:80", None).unwrap().into(),
-                )
-                .await
-                .unwrap()
-                .client_stream;
-            let mut packet = wire.clone();
-            if attempt == 0 {
-                *packet.last_mut().unwrap() ^= 1;
-            }
-            peer.write_all(&packet).await.unwrap();
-            let mut plaintext = [0; 5];
-            let result = client.read_exact(&mut plaintext).await;
-            if attempt == 1 {
-                result.unwrap();
-                assert_eq!(&plaintext, b"hello");
-            } else {
-                assert!(result.is_err());
-            }
-        }
-    }
-}
-
 #[async_trait]
 impl TcpServerHandler for ShadowsocksTcpHandler {
     async fn setup_server_stream(
@@ -453,5 +400,58 @@ impl TcpClientHandler for ShadowsocksTcpHandler {
         let message_stream = UotV2Stream::new(client_stream);
 
         Ok(Box::new(message_stream))
+    }
+}
+
+#[cfg(test)]
+mod replay_tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn classic_client_rejects_authenticated_response_replays() {
+        let handler = ShadowsocksTcpHandler::new_client(
+            ShadowsocksCipher::try_from("aes-128-gcm").unwrap(),
+            "test",
+            false,
+        );
+        let (transport, mut wire_reader) = tokio::io::duplex(4096);
+        let mut response = ShadowsocksStream::new(
+            Box::new(transport),
+            ShadowsocksStreamType::Aead,
+            handler.cipher.algorithm(),
+            handler.cipher.salt_len(),
+            handler.key.clone(),
+            None,
+        );
+        response.write_all(b"hello").await.unwrap();
+        response.flush().await.unwrap();
+        let mut wire = vec![0; handler.cipher.salt_len() + 2 + 16 + 5 + 16];
+        wire_reader.read_exact(&mut wire).await.unwrap();
+
+        for attempt in 0..3 {
+            let (transport, mut peer) = tokio::io::duplex(4096);
+            let mut client = handler
+                .setup_client_tcp_stream(
+                    Box::new(transport),
+                    NetLocation::from_str("127.0.0.1:80", None).unwrap().into(),
+                )
+                .await
+                .unwrap()
+                .client_stream;
+            let mut packet = wire.clone();
+            if attempt == 0 {
+                *packet.last_mut().unwrap() ^= 1;
+            }
+            peer.write_all(&packet).await.unwrap();
+            let mut plaintext = [0; 5];
+            let result = client.read_exact(&mut plaintext).await;
+            if attempt == 1 {
+                result.unwrap();
+                assert_eq!(&plaintext, b"hello");
+            } else {
+                assert!(result.is_err());
+            }
+        }
     }
 }

@@ -262,17 +262,17 @@ impl AsyncReadTargetedMessage for Socks5UdpRelayStream {
                     cx.waker().wake_by_ref();
                     return Poll::Pending;
                 }
-                if let Some(expected) = this.client_addr {
-                    if from_addr != expected {
-                        // Packet from unexpected source, ignore
-                        log::debug!(
-                            "SOCKS5 UDP relay: ignoring packet from {} (expected {})",
-                            from_addr,
-                            expected
-                        );
-                        cx.waker().wake_by_ref();
-                        return Poll::Pending;
-                    }
+                if let Some(expected) = this.client_addr
+                    && from_addr != expected
+                {
+                    // Packet from unexpected source, ignore
+                    log::debug!(
+                        "SOCKS5 UDP relay: ignoring packet from {} (expected {})",
+                        from_addr,
+                        expected
+                    );
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
                 }
 
                 match parse_socks5_udp_packet(&packet) {

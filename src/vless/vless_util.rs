@@ -185,6 +185,34 @@ fn read_varint(data: &[u8]) -> std::io::Result<(u64, usize)> {
     ))
 }
 
+/// Encode a flow string as protobuf addon data
+/// Format: field_tag(0x0a) + length + data
+/// Field 1 = flow (string), wire type 2 (length-delimited)
+fn encode_flow_addon(flow: &str) -> std::io::Result<Vec<u8>> {
+    let flow_bytes = flow.as_bytes();
+    let flow_len = flow_bytes.len();
+
+    if flow_len > 127 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Flow string too long for simple varint encoding",
+        ));
+    }
+
+    let mut result = Vec::new();
+
+    // Field 1, wire type 2 (0x0a = (1 << 3) | 2)
+    result.push(0x0a);
+
+    // Length as varint (simple case: < 128)
+    result.push(flow_len as u8);
+
+    // Flow string data
+    result.extend_from_slice(flow_bytes);
+
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -218,32 +246,4 @@ mod tests {
         long.extend([b'x'; 128]);
         assert_eq!(parse_addons(&long).unwrap(), "x".repeat(128));
     }
-}
-
-/// Encode a flow string as protobuf addon data
-/// Format: field_tag(0x0a) + length + data
-/// Field 1 = flow (string), wire type 2 (length-delimited)
-fn encode_flow_addon(flow: &str) -> std::io::Result<Vec<u8>> {
-    let flow_bytes = flow.as_bytes();
-    let flow_len = flow_bytes.len();
-
-    if flow_len > 127 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "Flow string too long for simple varint encoding",
-        ));
-    }
-
-    let mut result = Vec::new();
-
-    // Field 1, wire type 2 (0x0a = (1 << 3) | 2)
-    result.push(0x0a);
-
-    // Length as varint (simple case: < 128)
-    result.push(flow_len as u8);
-
-    // Flow string data
-    result.extend_from_slice(flow_bytes);
-
-    Ok(result)
 }

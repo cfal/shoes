@@ -686,90 +686,6 @@ struct AeadHeaderReader {
     cursor: usize,
 }
 
-#[cfg(test)]
-mod header_tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn replay_protection_survives_handler_recreation() {
-        let uuid = crate::uuid_util::generate_uuid();
-        let client = VmessTcpClientHandler::new("none", &uuid, false);
-        let make_auth_id = |valid_checksum: bool, timestamp: u64| {
-            let mut id = [0; 16];
-            id[..8].copy_from_slice(&timestamp.to_be_bytes());
-            let checksum = super::super::crc32::crc32c(&id[..12]) ^ u32::from(!valid_checksum);
-            id[12..].copy_from_slice(&checksum.to_be_bytes());
-            client
-                .aead_encrypting_key
-                .less_safe_encrypt(&mut id, EncryptionContext::None)
-                .unwrap();
-            id
-        };
-        let now = unix_time_secs(SystemTime::now()).unwrap();
-        for (id, expected) in [
-            (make_auth_id(false, now), std::io::ErrorKind::InvalidData),
-            (
-                make_auth_id(true, now.saturating_sub(121)),
-                std::io::ErrorKind::InvalidData,
-            ),
-            (
-                make_auth_id(true, now),
-                std::io::ErrorKind::ConnectionAborted,
-            ),
-            (
-                make_auth_id(true, now),
-                std::io::ErrorKind::PermissionDenied,
-            ),
-        ] {
-            let handler = VmessTcpServerHandler::new(
-                "none",
-                &uuid,
-                false,
-                Arc::new(ClientProxySelector::new(vec![])),
-                Arc::new(crate::resolver::NativeResolver::new()),
-            );
-            let (server, mut peer) = tokio::io::duplex(64);
-            peer.write_all(&id).await.unwrap();
-            drop(peer);
-            let error = match handler.setup_server_stream(Box::new(server)).await {
-                Err(error) => error,
-                Ok(_) => panic!("header unexpectedly accepted"),
-            };
-            assert_eq!(error.kind(), expected, "{error}");
-        }
-    }
-
-    #[tokio::test]
-    async fn decrypted_header_reads_are_bounded_and_non_consuming_on_error() {
-        for len in [0, 1, 16, 37, 38] {
-            let (stream, _) = tokio::io::duplex(1);
-            let mut reader = AeadHeaderReader {
-                server_stream: Box::new(stream),
-                decrypted_header: vec![7; len].into_boxed_slice(),
-                cursor: 0,
-            };
-            assert_eq!(reader.read_slice_into(&mut [0; 38]).is_ok(), len == 38);
-            if len < 38 {
-                assert_eq!(reader.cursor, 0);
-                reader.read_slice_into(&mut vec![0; len]).unwrap();
-            }
-            reader.read_slice_into(&mut []).unwrap();
-            assert_eq!(
-                reader.read_slice_into(&mut [0]).unwrap_err().kind(),
-                std::io::ErrorKind::UnexpectedEof
-            );
-        }
-    }
-
-    #[test]
-    fn clock_before_epoch_is_an_error() {
-        assert!(
-            unix_time_secs(SystemTime::UNIX_EPOCH - std::time::Duration::from_secs(1)).is_err()
-        );
-        assert_eq!(unix_time_secs(SystemTime::UNIX_EPOCH).unwrap(), 0);
-    }
-}
-
 impl AeadHeaderReader {
     fn read_slice_into(&mut self, data: &mut [u8]) -> std::io::Result<()> {
         let len = data.len();
@@ -1345,5 +1261,89 @@ impl VmessTcpClientHandler {
         );
 
         Ok(Box::new(vmess_stream))
+    }
+}
+
+#[cfg(test)]
+mod header_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn replay_protection_survives_handler_recreation() {
+        let uuid = crate::uuid_util::generate_uuid();
+        let client = VmessTcpClientHandler::new("none", &uuid, false);
+        let make_auth_id = |valid_checksum: bool, timestamp: u64| {
+            let mut id = [0; 16];
+            id[..8].copy_from_slice(&timestamp.to_be_bytes());
+            let checksum = super::super::crc32::crc32c(&id[..12]) ^ u32::from(!valid_checksum);
+            id[12..].copy_from_slice(&checksum.to_be_bytes());
+            client
+                .aead_encrypting_key
+                .less_safe_encrypt(&mut id, EncryptionContext::None)
+                .unwrap();
+            id
+        };
+        let now = unix_time_secs(SystemTime::now()).unwrap();
+        for (id, expected) in [
+            (make_auth_id(false, now), std::io::ErrorKind::InvalidData),
+            (
+                make_auth_id(true, now.saturating_sub(121)),
+                std::io::ErrorKind::InvalidData,
+            ),
+            (
+                make_auth_id(true, now),
+                std::io::ErrorKind::ConnectionAborted,
+            ),
+            (
+                make_auth_id(true, now),
+                std::io::ErrorKind::PermissionDenied,
+            ),
+        ] {
+            let handler = VmessTcpServerHandler::new(
+                "none",
+                &uuid,
+                false,
+                Arc::new(ClientProxySelector::new(vec![])),
+                Arc::new(crate::resolver::NativeResolver::new()),
+            );
+            let (server, mut peer) = tokio::io::duplex(64);
+            peer.write_all(&id).await.unwrap();
+            drop(peer);
+            let error = match handler.setup_server_stream(Box::new(server)).await {
+                Err(error) => error,
+                Ok(_) => panic!("header unexpectedly accepted"),
+            };
+            assert_eq!(error.kind(), expected, "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn decrypted_header_reads_are_bounded_and_non_consuming_on_error() {
+        for len in [0, 1, 16, 37, 38] {
+            let (stream, _) = tokio::io::duplex(1);
+            let mut reader = AeadHeaderReader {
+                server_stream: Box::new(stream),
+                decrypted_header: vec![7; len].into_boxed_slice(),
+                cursor: 0,
+            };
+            assert_eq!(reader.read_slice_into(&mut [0; 38]).is_ok(), len == 38);
+            if len < 38 {
+                assert_eq!(reader.cursor, 0);
+                reader.read_slice_into(&mut vec![0; len]).unwrap();
+            }
+            reader.read_slice_into(&mut []).unwrap();
+            assert_eq!(
+                reader.read_slice_into(&mut [0]).unwrap_err().kind(),
+                std::io::ErrorKind::UnexpectedEof
+            );
+        }
+    }
+
+    #[test]
+    fn clock_before_epoch_is_an_error() {
+        assert!(
+            unix_time_secs(SystemTime::UNIX_EPOCH - std::time::Duration::from_secs(1)).is_err()
+        );
+        assert_eq!(unix_time_secs(SystemTime::UNIX_EPOCH).unwrap(), 0);
     }
 }
