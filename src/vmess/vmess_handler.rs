@@ -209,8 +209,7 @@ impl TcpServerHandler for VmessTcpServerHandler {
             &[b"VMess Header AEAD Nonce", &cert_hash, &nonce],
         );
 
-        let mut encrypted_header =
-            allocate_vec(payload_length as usize + TAG_LEN).into_boxed_slice();
+        let mut encrypted_header = allocate_vec(payload_length as usize + TAG_LEN);
 
         stream_reader
             .read_slice_into(&mut server_stream, &mut encrypted_header)
@@ -229,9 +228,10 @@ impl TcpServerHandler for VmessTcpServerHandler {
             return Err(std::io::Error::other("failed to open encrypted header"));
         }
 
+        encrypted_header.truncate(payload_length as usize);
         let mut header_reader = AeadHeaderReader {
             server_stream,
-            decrypted_header: encrypted_header[..payload_length as usize].into(),
+            decrypted_header: encrypted_header,
             cursor: 0,
         };
 
@@ -682,7 +682,7 @@ impl TcpServerHandler for VmessTcpServerHandler {
 
 struct AeadHeaderReader {
     server_stream: Box<dyn AsyncStream>,
-    decrypted_header: Box<[u8]>,
+    decrypted_header: Vec<u8>,
     cursor: usize,
 }
 
@@ -1323,7 +1323,7 @@ mod header_tests {
             let (stream, _) = tokio::io::duplex(1);
             let mut reader = AeadHeaderReader {
                 server_stream: Box::new(stream),
-                decrypted_header: vec![7; len].into_boxed_slice(),
+                decrypted_header: vec![7; len],
                 cursor: 0,
             };
             assert_eq!(reader.read_slice_into(&mut [0; 38]).is_ok(), len == 38);

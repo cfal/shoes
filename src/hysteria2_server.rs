@@ -251,21 +251,17 @@ struct UdpSession {
     send_socket: Arc<UdpRelay>,
     pinned_location: Option<NetLocation>,
     cancel_token: CancellationToken,
-    task: Option<tokio::task::AbortHandle>,
+    task: tokio::task::AbortHandle,
 }
 
 impl Drop for UdpSession {
     fn drop(&mut self) {
         self.cancel_token.cancel();
-        if let Some(task) = &self.task {
-            task.abort();
-        }
+        self.task.abort();
     }
 }
 
 impl UdpSession {
-    // TODO: remove this function completely and inline?
-    #[allow(clippy::too_many_arguments)]
     fn start(
         session_id: u32,
         connection: quinn::Connection,
@@ -277,31 +273,29 @@ impl UdpSession {
         // Create a child token so this session is cancelled when the parent (connection) is cancelled
         let session_cancel_token = parent_cancel_token.child_token();
 
-        let mut session = UdpSession {
-            send_socket: client_socket.clone(),
+        let send_socket = client_socket.clone();
+        let cancel_token = session_cancel_token.clone();
+        let task = tokio::spawn(async move {
+            if let Err(e) = run_udp_remote_to_local_loop(
+                session_id,
+                connection,
+                client_socket,
+                override_local_write_location,
+                session_cancel_token,
+            )
+            .await
+            {
+                error!("UDP remote-to-local write loop ended with error: {e}");
+            }
+        })
+        .abort_handle();
+
+        Self {
+            send_socket,
             pinned_location,
-            cancel_token: session_cancel_token.clone(),
-            task: None,
-        };
-
-        session.task = Some(
-            tokio::spawn(async move {
-                if let Err(e) = run_udp_remote_to_local_loop(
-                    session_id,
-                    connection,
-                    client_socket,
-                    override_local_write_location,
-                    session_cancel_token,
-                )
-                .await
-                {
-                    error!("UDP remote-to-local write loop ended with error: {e}");
-                }
-            })
-            .abort_handle(),
-        );
-
-        session
+            cancel_token,
+            task,
+        }
     }
 }
 

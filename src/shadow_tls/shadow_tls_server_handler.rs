@@ -870,32 +870,32 @@ async fn setup_remote_handshake(
 
                 if client_content_type == CONTENT_TYPE_APPLICATION_DATA
                     && hmac_client_data.authenticates_record(client_payload_bytes) {
-                        let initial_client_data = &client_payload_bytes[4..];
+                    let initial_client_data = &client_payload_bytes[4..];
 
-                        hmac_client_data.update(initial_client_data);
-                        hmac_client_data.update(&hmac_client_data.digest());
+                    hmac_client_data.update(initial_client_data);
+                    hmac_client_data.update(&hmac_client_data.digest());
 
-                        let _ = client_stream.shutdown().await;
+                    let _ = client_stream.shutdown().await;
 
-                        let mut shadow_tls_stream = ShadowTlsStream::new(
-                            server_stream,
-                            initial_client_data,
-                            hmac_client_data,
-                            hmac_server_data,
-                            None,
-                        ).map_err(|e| std::io::Error::other(
-                            format!("failed to create ShadowTlsStream: {e}")
-                        ))?;
+                    let mut shadow_tls_stream = ShadowTlsStream::new(
+                        server_stream,
+                        initial_client_data,
+                        hmac_client_data,
+                        hmac_server_data,
+                        None,
+                    ).map_err(|e| std::io::Error::other(
+                        format!("failed to create ShadowTlsStream: {e}")
+                    ))?;
 
-                        let unparsed_data = client_reader.unparsed_data();
-                        if !unparsed_data.is_empty() {
-                            shadow_tls_stream.feed_initial_read_data(unparsed_data)
-                                .map_err(|e| std::io::Error::other(
-                                    format!("failed to feed initial data to ShadowTlsStream: {e}")
-                                ))?;
-                        }
+                    let unparsed_data = client_reader.unparsed_data();
+                    if !unparsed_data.is_empty() {
+                        shadow_tls_stream.feed_initial_read_data(unparsed_data)
+                            .map_err(|e| std::io::Error::other(
+                                format!("failed to feed initial data to ShadowTlsStream: {e}")
+                            ))?;
+                    }
 
-                        return Ok(shadow_tls_stream);
+                    return Ok(shadow_tls_stream);
                 }
 
                 client_frame.extend_from_slice(client_payload_bytes);

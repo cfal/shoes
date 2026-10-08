@@ -130,19 +130,16 @@ impl TcpServerHandler for SnellServerHandler {
         );
 
         let mut stream_reader = StreamReader::new_with_buffer_size(400);
+        let mut header_stream = HeaderReader(&mut server_stream);
 
-        let version = stream_reader
-            .read_u8(&mut HeaderReader(&mut server_stream))
-            .await?;
+        let version = stream_reader.read_u8(&mut header_stream).await?;
         if version != 1 {
             return Err(std::io::Error::other(format!(
                 "unexpected snell version: {version}"
             )));
         }
 
-        let command_type = stream_reader
-            .read_u8(&mut HeaderReader(&mut server_stream))
-            .await?;
+        let command_type = stream_reader.read_u8(&mut header_stream).await?;
         let is_udp = match command_type {
             0 => {
                 // Ping command
@@ -169,25 +166,18 @@ impl TcpServerHandler for SnellServerHandler {
             }
         };
 
-        let client_id_len = stream_reader
-            .read_u8(&mut HeaderReader(&mut server_stream))
-            .await?;
+        let client_id_len = stream_reader.read_u8(&mut header_stream).await?;
         if client_id_len > 0 {
             stream_reader
-                .read_slice(
-                    &mut HeaderReader(&mut server_stream),
-                    client_id_len as usize,
-                )
+                .read_slice(&mut header_stream, client_id_len as usize)
                 .await?;
         }
 
         if !is_udp {
-            let hostname_len = stream_reader
-                .read_u8(&mut HeaderReader(&mut server_stream))
-                .await? as usize;
+            let hostname_len = stream_reader.read_u8(&mut header_stream).await? as usize;
 
             let hostname_and_port_bytes = stream_reader
-                .read_slice(&mut HeaderReader(&mut server_stream), hostname_len + 2)
+                .read_slice(&mut header_stream, hostname_len + 2)
                 .await?;
 
             let hostname_str = match std::str::from_utf8(&hostname_and_port_bytes[0..hostname_len])
