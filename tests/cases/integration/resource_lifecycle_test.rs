@@ -133,24 +133,26 @@ async fn tcp_reload_drains_existing_connections_within_grace() -> io::Result<()>
     let config = format!(
         "- address: '0.0.0.0:{proxy_port}'\n  protocol:\n    type: forward\n    target: '127.0.0.1:{echo_port}'\n"
     );
-    let (_process, mut file, _) = start_process(&config, true)?;
+    let (_process, file, _) = start_process(&config, true)?;
     ports.wait_for_all_ports().await?;
     let mut existing = TcpStream::connect(("127.0.0.1", proxy_port)).await?;
     round_trip(&mut existing, b"before reload").await?;
-    file.write_all(b"\n# trigger reload\n")?;
-    file.flush()?;
-
-    // Observe listener retirement rather than assuming notification timing.
-    timeout(Duration::from_secs(3), async {
-        while TcpStream::connect(("127.0.0.1", proxy_port)).await.is_ok() {
-            sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await?;
+    let reserved = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let replacement_port = reserved.local_addr()?.port();
+    drop(reserved);
+    let replacement_config = config.replace(
+        &format!("0.0.0.0:{proxy_port}"),
+        &format!("0.0.0.0:{replacement_port}"),
+    );
+    std::fs::write(
+        file.path(),
+        format!("- global_limits: {{reload_grace_secs: 6}}\n{replacement_config}"),
+    )?;
     round_trip(&mut existing, b"during reload").await?;
+    // A distinct listener identifies the new generation without requiring an outage.
     let mut replacement = timeout(Duration::from_secs(5), async {
         loop {
-            if let Ok(stream) = TcpStream::connect(("127.0.0.1", proxy_port)).await {
+            if let Ok(stream) = TcpStream::connect(("127.0.0.1", replacement_port)).await {
                 break stream;
             }
             sleep(Duration::from_millis(20)).await;
@@ -160,7 +162,7 @@ async fn tcp_reload_drains_existing_connections_within_grace() -> io::Result<()>
     round_trip(&mut existing, b"after reload").await?;
     round_trip(&mut replacement, b"new generation").await?;
     let mut byte = [0];
-    let closed = timeout(Duration::from_secs(5), existing.read(&mut byte)).await?;
+    let closed = timeout(Duration::from_secs(8), existing.read(&mut byte)).await?;
     assert!(
         matches!(closed, Ok(0) | Err(_)),
         "old generation survived its grace deadline"

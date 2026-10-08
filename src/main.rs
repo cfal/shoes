@@ -19,6 +19,7 @@ mod naiveproxy;
 mod option_util;
 mod port_forward_handler;
 mod prepend_stream;
+mod process;
 mod quic_endpoint;
 mod quic_server;
 mod quic_stream;
@@ -63,45 +64,14 @@ use tikv_jemallocator::Jemalloc;
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
 
-use std::path::Path;
-
 use aws_lc_rs::rand::{SecureRandom, SystemRandom};
 use base64::engine::{Engine as _, general_purpose::STANDARD};
 use log::debug;
-use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use tcp_server::start_servers;
 use tokio::runtime::Builder;
-use tokio::sync::mpsc::{Receiver, channel};
 
 use crate::reality::generate_keypair;
 use crate::shadowsocks::ShadowsocksCipher;
 use crate::thread_util::set_num_threads;
-use tcp::*;
-
-#[derive(Debug)]
-struct ConfigChanged;
-
-fn start_notify_thread(config_paths: Vec<String>) -> (RecommendedWatcher, Receiver<ConfigChanged>) {
-    let (tx, rx) = channel(1);
-
-    let mut watcher = notify::recommended_watcher(move |res: notify::Result<Event>| match res {
-        Ok(event) => {
-            if matches!(event.kind, EventKind::Modify(..)) {
-                let _ = tx.try_send(ConfigChanged {});
-            }
-        }
-        Err(e) => println!("watch error: {e:?}"),
-    })
-    .unwrap();
-
-    for config_path in config_paths {
-        watcher
-            .watch(Path::new(&config_path), RecursiveMode::NonRecursive)
-            .unwrap();
-    }
-
-    (watcher, rx)
-}
 
 fn print_usage_and_exit(arg0: String) {
     eprintln!("{arg0} [OPTIONS] <config.yaml> [config.yaml...]");
@@ -126,6 +96,10 @@ fn print_usage_and_exit(arg0: String) {
     );
     eprintln!();
     eprintln!("COMMANDS:");
+    eprintln!("    check <config.yaml>                            Validate configuration and exit");
+    eprintln!("    version                                        Print version information");
+    eprintln!("    SIGHUP reloads configuration even with --no-reload.");
+    eprintln!("    SIGINT/SIGTERM stop listeners and exit without waiting for TCP reload drains.");
     eprintln!(
         "    generate-reality-keypair                       Generate a new Reality X25519 keypair"
     );
@@ -139,6 +113,11 @@ fn print_usage_and_exit(arg0: String) {
 fn main() {
     let mut args: Vec<String> = std::env::args().collect();
     let arg0 = args.remove(0);
+    if args.first().is_some_and(|arg| arg == "check") {
+        args[0] = "--dry-run".into();
+    } else if args.first().is_some_and(|arg| arg == "version") {
+        args[0] = "--version".into();
+    }
     let mut num_threads = 0usize;
     let mut dry_run = false;
     let mut no_reload = false;
@@ -326,113 +305,14 @@ fn main() {
         .build()
         .expect("Could not build tokio runtime");
 
-    runtime.block_on(async move {
-        let mut reload_state = if no_reload {
-            None
-        } else {
-            let (watcher, rx) = start_notify_thread(args.clone());
-            Some((watcher, rx))
-        };
-
-        loop {
-            let configs = match config::load_configs(&args).await {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("Failed to load server configs: {e}\n");
-                    print_usage_and_exit(arg0);
-                    return;
-                }
-            };
-
-            let (configs, load_file_count) = match config::convert_cert_paths(configs).await {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("Failed to load cert files: {e}\n");
-                    print_usage_and_exit(arg0);
-                    return;
-                }
-            };
-
-            if load_file_count > 0 {
-                println!("Loaded {load_file_count} certs/keys from files");
-            }
-
-            if dry_run {
-                if let Err(e) = config::create_server_configs(configs) {
-                    eprintln!("Dry run failed, could not create server configs: {e}\n");
-                } else {
-                    println!("Finishing dry run, config parsed successfully.");
-                }
-                return;
-            }
-
-            let mut join_handles = vec![];
-
-            let server_configs = match config::create_server_configs(configs) {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("Failed to create server configs: {e}\n");
-                    print_usage_and_exit(arg0);
-                    return;
-                }
-            };
-
-            let config::ValidatedConfigs {
-                configs: server_configs,
-                dns_groups,
-                global_limits,
-            } = server_configs;
-            resources::configure(global_limits).expect("validated global limits");
-            let _resource_reporter = resources::ResourceReporter::start();
-
-            // Build DNS registry from expanded groups (async - resolves hostnames)
-            let mut dns_registry = match dns::build_dns_registry(dns_groups).await {
-                Ok(r) => r,
-                Err(e) => {
-                    eprintln!("Failed to build DNS registry: {e}\n");
-                    print_usage_and_exit(arg0);
-                    return;
-                }
-            };
-
-            println!("\nStarting {} server(s)..", server_configs.len());
-
-            for server_config in server_configs {
-                // Get the resolver for this server from the registry
-                let dns_ref = match &server_config {
-                    config::Config::Server(s) => s.dns.as_ref(),
-                    config::Config::TunServer(t) => t.dns.as_ref(),
-                    _ => None,
-                };
-                let resolver = dns_registry.get_for_server(dns_ref);
-                join_handles.extend(start_servers(server_config, resolver).await.unwrap());
-            }
-
-            match reload_state.as_mut() {
-                Some((_watcher, rx)) => {
-                    rx.recv().await.unwrap();
-
-                    println!("Configs changed, restarting servers in 3 seconds..");
-
-                    for join_handle in &join_handles {
-                        join_handle.abort();
-                    }
-                    for join_handle in join_handles {
-                        let _ = join_handle.await;
-                    }
-
-                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-
-                    // Remove any extra events
-                    while rx.try_recv().is_ok() {}
-                }
-                None => {
-                    // No reload mode - wait forever
-                    // TODO: signal handling?
-                    futures::future::pending::<()>().await;
-                    unreachable!();
-                }
-            }
+    let code = match runtime.block_on(process::run(args, dry_run, no_reload)) {
+        Ok(code) => code,
+        Err(error) => {
+            eprintln!("shoes: {error}");
+            1
         }
-    });
+    };
+    runtime.shutdown_timeout(std::time::Duration::from_secs(5));
+    log::logger().flush();
+    std::process::exit(code);
 }
