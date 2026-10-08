@@ -513,6 +513,71 @@ mod lifetime_tests {
     use crate::tcp::socket_connector::SocketConnector;
 
     #[tokio::test]
+    async fn protocol_response_precedes_chained_greeting() {
+        use tokio::io::AsyncReadExt;
+        #[derive(Debug)]
+        struct Handler(Arc<ClientProxySelector>);
+        #[async_trait]
+        impl TcpServerHandler for Handler {
+            async fn setup_server_stream(
+                &self,
+                stream: Box<dyn AsyncStream>,
+            ) -> io::Result<TcpServerSetupResult> {
+                Ok(TcpServerSetupResult::TcpForward {
+                    remote_location: NetLocation::from_str("127.0.0.1:80", None)?,
+                    stream,
+                    need_initial_flush: true,
+                    proxy_selector: self.0.clone(),
+                    connection_success_response: Some(b"response".to_vec().into_boxed_slice()),
+                    initial_remote_data: Some(b"request".to_vec().into_boxed_slice()),
+                })
+            }
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let rule = serde_yaml::from_str(&format!(
+            "masks: '0.0.0.0/0'\nclient_proxy:\n  address: '{}'\n  protocol: {{type: socks}}\n",
+            listener.local_addr().unwrap()
+        ))
+        .unwrap();
+        let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
+        let handler = Arc::new(Handler(Arc::new(
+            create_tcp_client_proxy_selector(vec![rule], resolver.clone()).unwrap(),
+        )));
+        let (server, mut peer) = tokio::io::duplex(512);
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            socket.read_exact(&mut [0; 3]).await.unwrap();
+            socket.write_all(&[5, 0]).await.unwrap();
+            socket.read_exact(&mut [0; 10]).await.unwrap();
+            socket
+                .write_all(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00greeting")
+                .await
+                .unwrap();
+            let mut request = [0; 7];
+            socket.read_exact(&mut request).await.unwrap();
+            assert_eq!(&request, b"request");
+            socket.write_all(b"later").await.unwrap();
+        });
+        tasks.spawn(async move {
+            process_stream(server, handler, resolver).await.unwrap();
+        });
+        let mut response = [0; 21];
+        timeout(Duration::from_secs(3), peer.read_exact(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&response, b"responsegreetinglater");
+        drop(peer);
+        while let Some(result) = timeout(Duration::from_secs(3), tasks.join_next())
+            .await
+            .unwrap()
+        {
+            result.unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn tcp_bind_failure_releases_all_prepared_listeners() {
         let first = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let first_addr = first.local_addr().unwrap();

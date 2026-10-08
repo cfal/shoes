@@ -247,6 +247,7 @@ async fn hysteria2_control_streams_survive_small_application_caps()
         })
         .await??;
         assert_eq!(response.status().as_u16(), 233, "stream cap {limit}");
+        assert_eq!(response.headers()["Hysteria-CC-RX"], "auto");
     }
     Ok(())
 }
