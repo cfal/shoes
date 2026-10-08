@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
@@ -112,16 +112,16 @@ impl Drop for RunningServers {
 }
 
 fn watch(paths: &[String], tx: mpsc::Sender<()>) -> io::Result<RecommendedWatcher> {
-    let mut files: HashSet<PathBuf> = paths
-        .iter()
-        .map(std::path::absolute)
-        .collect::<io::Result<_>>()?;
+    let mut files = HashSet::new();
     for path in paths {
-        files.insert(std::fs::canonicalize(path)?);
+        let path = std::path::absolute(path)?;
+        files.insert(path.clone());
+        resolve_watch_path(&path, &mut files, &mut 0)?;
     }
     let directories: HashSet<_> = files
         .iter()
-        .filter_map(|path| path.parent().map(PathBuf::from))
+        .filter_map(|path| path.parent()?.ancestors().find(|parent| parent.is_dir()))
+        .map(PathBuf::from)
         .collect();
     let mut watcher =
         notify::recommended_watcher(move |result: notify::Result<notify::Event>| match result {
@@ -143,6 +143,46 @@ fn watch(paths: &[String], tx: mpsc::Sender<()>) -> io::Result<RecommendedWatche
             .map_err(io::Error::other)?;
     }
     Ok(watcher)
+}
+
+fn resolve_watch_path(
+    path: &Path,
+    files: &mut HashSet<PathBuf>,
+    symlinks: &mut usize,
+) -> io::Result<PathBuf> {
+    let mut resolved = PathBuf::new();
+    for component in path.components() {
+        if component == Component::ParentDir {
+            resolved.pop();
+            continue;
+        }
+        resolved.push(component);
+        match std::fs::symlink_metadata(&resolved) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                *symlinks += 1;
+                if *symlinks > 40 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "too many config symlinks",
+                    ));
+                }
+                files.insert(resolved.clone());
+                let target = resolved
+                    .parent()
+                    .unwrap()
+                    .join(std::fs::read_link(&resolved)?);
+                resolved = resolve_watch_path(&target, files, symlinks)?;
+            }
+            // Retain missing components so creating a target or its parent triggers another reload.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                files.insert(resolved.clone());
+            }
+            Err(error) => return Err(error),
+            Ok(_) => {}
+        }
+    }
+    files.insert(resolved.clone());
+    Ok(resolved)
 }
 
 #[cfg(unix)]
@@ -291,5 +331,44 @@ pub async fn run(paths: Vec<String>, dry_run: bool, no_reload: bool) -> io::Resu
             }
         }
         drop(std::mem::replace(&mut prepared, candidate));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn watch_paths_include_missing_targets_and_symlinked_parents() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join("targets")).unwrap();
+        std::os::unix::fs::symlink("targets", root.join("alias")).unwrap();
+        std::os::unix::fs::symlink("alias/missing/config.yaml", root.join("config.yaml")).unwrap();
+        let mut files = HashSet::new();
+        resolve_watch_path(&root.join("config.yaml"), &mut files, &mut 0).unwrap();
+        for path in [
+            "config.yaml",
+            "alias",
+            "targets/missing",
+            "targets/missing/config.yaml",
+        ] {
+            assert!(files.contains(&root.join(path)), "missing {path}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn watch_paths_reject_symlink_cycles() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.yaml");
+        std::os::unix::fs::symlink("config.yaml", &path).unwrap();
+        assert_eq!(
+            resolve_watch_path(&path, &mut HashSet::new(), &mut 0)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
     }
 }

@@ -493,6 +493,13 @@ async fn symlink_targets_remain_watched_after_retargeting() {
     child.wait_for("Reload rejected").await;
     std::fs::write(&second, &config).unwrap();
     child.wait_for("Servers ready").await;
+    let missing = targets.path().join("missing.yaml");
+    let link = directory.path().join("replacement.yaml");
+    std::os::unix::fs::symlink(&missing, &link).unwrap();
+    std::fs::rename(link, &path).unwrap();
+    child.wait_for("Reload rejected").await;
+    std::fs::write(&missing, &config).unwrap();
+    child.wait_for("Servers ready").await;
     child.signal(libc::SIGTERM);
     assert_eq!(child.exit().await.code(), Some(143));
 }
