@@ -230,23 +230,6 @@ pub fn create_dns_client_config() -> rustls::ClientConfig {
         .with_no_client_auth()
 }
 
-pub fn create_server_config(
-    cert_bytes: &[u8],
-    key_bytes: &[u8],
-    ca_cert_bytes: Vec<Vec<u8>>,
-    alpn_protocols: &[String],
-    client_fingerprints: &[String],
-) -> rustls::ServerConfig {
-    try_create_server_config(
-        cert_bytes,
-        key_bytes,
-        ca_cert_bytes,
-        alpn_protocols,
-        client_fingerprints,
-    )
-    .expect("validated TLS server configuration")
-}
-
 pub fn try_create_server_config(
     cert_bytes: &[u8],
     key_bytes: &[u8],

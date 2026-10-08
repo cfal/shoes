@@ -19,7 +19,7 @@ use crate::option_util::OneOrSome;
 use crate::port_forward_handler::PortForwardServerHandler;
 use crate::reality::RealityServerTarget;
 use crate::resolver::Resolver;
-use crate::rustls_config_util::create_server_config;
+use crate::rustls_config_util::try_create_server_config;
 use crate::shadow_tls::{ShadowTlsServerTarget, ShadowTlsServerTargetHandshake};
 use crate::shadowsocks::ShadowsocksTcpHandler;
 use crate::snell::snell_handler::SnellServerHandler;
@@ -325,13 +325,13 @@ fn create_tls_server_target(
         alpn_protocols.into_vec()
     };
 
-    let server_config = Arc::new(create_server_config(
+    let server_config = Arc::new(try_create_server_config(
         &cert_bytes,
         &key_bytes,
         client_ca_certs,
         &effective_alpn,
         &client_fingerprints.into_vec(),
-    ));
+    )?);
 
     // Compute effective selector: if override_rules exist, create new selector; otherwise use parent's
     let effective_selector = if !override_rules.is_empty() {
@@ -420,13 +420,13 @@ fn create_shadow_tls_server_target(
                 .map(|cert| cert.as_bytes().to_vec())
                 .collect();
 
-            let server_config = Arc::new(create_server_config(
+            let server_config = Arc::new(try_create_server_config(
                 &cert_bytes,
                 &key_bytes,
                 client_ca_certs,
                 &handshake.alpn_protocols.into_vec(),
                 &handshake.client_fingerprints.into_vec(),
-            ));
+            )?);
 
             ShadowTlsServerTargetHandshake::new_local(server_config)
         }

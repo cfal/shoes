@@ -10,7 +10,7 @@ use crate::config::{
 };
 use crate::quic_stream::QuicStream;
 use crate::resolver::Resolver;
-use crate::rustls_config_util::create_server_config;
+use crate::rustls_config_util::try_create_server_config;
 use crate::tcp::tcp_client_handler_factory::create_tcp_client_proxy_selector;
 use crate::tcp::tcp_handler::TcpServerHandler;
 use crate::tcp::tcp_server_handler_factory::create_tcp_server_handler;
@@ -174,13 +174,13 @@ pub async fn start_quic_servers(
         processed_ca_certs.push(cert.as_bytes().to_vec());
     }
 
-    let server_config = Arc::new(create_server_config(
+    let server_config = Arc::new(try_create_server_config(
         &cert_bytes,
         &key_bytes,
         processed_ca_certs,
         &alpn_protocols.into_vec(),
         &client_fingerprints.into_vec(),
-    ));
+    )?);
 
     let quic_server_config: quinn::crypto::rustls::QuicServerConfig = server_config
         .try_into()
