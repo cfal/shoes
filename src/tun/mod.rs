@@ -263,6 +263,9 @@ async fn handle_tcp_connection(
                     );
 
                     let mut remote = setup_result.client_stream;
+                    if let Some(early_data) = setup_result.early_data {
+                        tokio::io::AsyncWriteExt::write_all(&mut connection, &early_data).await?;
+                    }
                     let result = tokio::io::copy_bidirectional(&mut connection, &mut remote).await;
 
                     match result {
@@ -399,6 +402,76 @@ pub async fn run_tun_from_config(
 mod tests {
     use super::*;
     use std::os::fd::AsRawFd;
+
+    #[tokio::test]
+    async fn proxy_handshake_bytes_reach_the_tun_connection_before_relay_data() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let rule: crate::config::RuleConfig = serde_yaml::from_str(&format!(
+            "masks: '0.0.0.0/0'\nclient_proxy:\n  address: '{}'\n  protocol:\n    type: socks\n",
+            proxy.local_addr().unwrap()
+        ))
+        .unwrap();
+        let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
+        let selector = Arc::new(create_tcp_client_proxy_selector(
+            vec![rule],
+            resolver.clone(),
+        ));
+        let control = Arc::new(tcp_conn::TcpConnectionControl::new(1024, 1024));
+        let (wake, _wake_rx) = wake::Wake::new().unwrap();
+        let connection = tcp_conn::TcpConnection::new(control.clone(), wake);
+        let (release, released) = tokio::sync::oneshot::channel();
+        let mut tasks = JoinSet::new();
+        tasks.spawn(async move {
+            let (mut socket, _) = proxy.accept().await.unwrap();
+            let mut greeting = [0; 3];
+            socket.read_exact(&mut greeting).await.unwrap();
+            socket.write_all(&[5, 0]).await.unwrap();
+            let mut request = [0; 10];
+            socket.read_exact(&mut request).await.unwrap();
+            socket
+                .write_all(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00greeting")
+                .await
+                .unwrap();
+            released.await.unwrap();
+            socket.write_all(b"later").await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        tasks.spawn(async move {
+            handle_tcp_connection(
+                connection,
+                NetLocation::from_str("127.0.0.1:80", None).unwrap(),
+                selector,
+                resolver,
+            )
+            .await
+            .unwrap();
+        });
+        let mut received = Vec::new();
+        receive_tun_bytes(&control, &mut received, b"greeting").await;
+        release.send(()).unwrap();
+        receive_tun_bytes(&control, &mut received, b"greetinglater").await;
+        tasks.shutdown().await;
+    }
+
+    async fn receive_tun_bytes(
+        control: &tcp_conn::TcpConnectionControl,
+        received: &mut Vec<u8>,
+        expected: &[u8],
+    ) {
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while received.len() < expected.len() {
+                let mut bytes = [0; 64];
+                let count = control.dequeue_send_data(&mut bytes);
+                received.extend_from_slice(&bytes[..count]);
+                control.wake_sender();
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(received, expected);
+    }
 
     #[tokio::test]
     async fn borrowed_tun_fd_remains_open_after_stop() {
