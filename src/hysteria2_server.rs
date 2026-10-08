@@ -729,12 +729,13 @@ async fn process_tcp_stream(
     .await?;
 
     let unparsed_data = stream_reader.unparsed_data();
-    let client_requires_flush = if unparsed_data.is_empty() {
-        false
-    } else {
-        timeout_stream_setup(write_all(&mut client_stream, unparsed_data)).await?;
-        true
-    };
+    if !unparsed_data.is_empty() {
+        timeout_stream_setup(async {
+            write_all(&mut client_stream, unparsed_data).await?;
+            client_stream.flush().await
+        })
+        .await?;
+    }
     drop(stream_reader);
 
     // Use 32KB buffers to match hysteria2/sing-box reference implementations
@@ -743,7 +744,7 @@ async fn process_tcp_stream(
         &mut client_stream,
         // no need to flush even through we wrote this response since it's quic
         false,
-        client_requires_flush,
+        false,
         32768,
         32768,
     )

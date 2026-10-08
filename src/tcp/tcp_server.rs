@@ -197,30 +197,27 @@ where
                 }
             };
 
-            let client_need_initial_flush = crate::util::timeout_stream_setup(async {
+            crate::util::timeout_stream_setup(async {
+                let flush_server = server_need_initial_flush || early_data.is_some();
                 if let Some(data) = connection_success_response {
                     write_all(&mut server_stream, &data).await?;
                 }
                 if let Some(data) = early_data {
                     write_all(&mut server_stream, &data).await?;
+                }
+                if flush_server {
                     server_stream.flush().await?;
                 }
                 if let Some(data) = initial_remote_data {
                     write_all(&mut client_stream, &data).await?;
-                    Ok(true)
-                } else {
-                    Ok(false)
+                    client_stream.flush().await?;
                 }
+                Ok(())
             })
             .await?;
 
-            let copy_result = copy_bidirectional(
-                &mut server_stream,
-                &mut client_stream,
-                server_need_initial_flush,
-                client_need_initial_flush,
-            )
-            .await;
+            let copy_result =
+                copy_bidirectional(&mut server_stream, &mut client_stream, false, false).await;
 
             futures::join!(
                 crate::util::shutdown_stream(&mut server_stream),
@@ -530,7 +527,55 @@ mod lifetime_tests {
     }
 
     #[derive(Debug)]
-    struct ReadyConnector(std::sync::Mutex<Option<tokio::io::DuplexStream>>);
+    struct ReadyConnector(std::sync::Mutex<Option<FlushStream>>);
+
+    #[derive(Debug)]
+    struct FlushStream {
+        inner: tokio::io::DuplexStream,
+        stalled: bool,
+        flushes: Arc<AtomicUsize>,
+    }
+
+    impl tokio::io::AsyncRead for FlushStream {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl tokio::io::AsyncWrite for FlushStream {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.flushes.fetch_add(1, Ordering::Relaxed);
+            if self.stalled {
+                Poll::Pending
+            } else {
+                Pin::new(&mut self.inner).poll_flush(cx)
+            }
+        }
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    impl AsyncPing for FlushStream {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+        fn poll_write_ping(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+    impl AsyncStream for FlushStream {}
 
     #[async_trait]
     impl SocketConnector for ReadyConnector {
@@ -554,11 +599,28 @@ mod lifetime_tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn initial_response_and_request_writes_have_deadlines() {
+    async fn initial_writes_and_flushes_have_deadlines() {
         use tokio::io::AsyncReadExt;
-        for (inbound_capacity, outbound_capacity) in [(1, 64), (64, 1)] {
+        for (inbound_capacity, outbound_capacity, stall_response, stall_request) in [
+            (1, 64, false, false),
+            (64, 1, false, false),
+            (64, 64, true, false),
+            (64, 64, false, true),
+        ] {
             let (inbound, mut peer) = tokio::io::duplex(inbound_capacity);
             let (outbound, mut target) = tokio::io::duplex(outbound_capacity);
+            let response_flushes = Arc::new(AtomicUsize::new(0));
+            let request_flushes = Arc::new(AtomicUsize::new(0));
+            let inbound = FlushStream {
+                inner: inbound,
+                stalled: stall_response,
+                flushes: response_flushes.clone(),
+            };
+            let outbound = FlushStream {
+                inner: outbound,
+                stalled: stall_request,
+                flushes: request_flushes.clone(),
+            };
             let chain = ClientProxyChain::new(
                 vec![InitialHopEntry::Direct(Box::new(ReadyConnector(
                     std::sync::Mutex::new(Some(outbound)),
@@ -583,6 +645,12 @@ mod lifetime_tests {
             .unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::TimedOut);
             assert_eq!(started.elapsed(), Duration::from_secs(60));
+            if stall_response {
+                assert!(response_flushes.load(Ordering::Relaxed) > 0);
+            }
+            if stall_request {
+                assert!(request_flushes.load(Ordering::Relaxed) > 0);
+            }
             peer.read_to_end(&mut Vec::new()).await.unwrap();
             target.read_to_end(&mut Vec::new()).await.unwrap();
         }

@@ -465,18 +465,17 @@ async fn process_tcp_stream(
         }
     };
 
-    let client_requires_flush = crate::util::timeout_stream_setup(async {
+    crate::util::timeout_stream_setup(async {
         if let Some(data) = early_data {
             write_all(&mut server_stream, &data).await?;
             server_stream.flush().await?;
         }
         let unparsed_data = stream_reader.unparsed_data();
-        if unparsed_data.is_empty() {
-            Ok(false)
-        } else {
+        if !unparsed_data.is_empty() {
             write_all(&mut client_stream, unparsed_data).await?;
-            Ok(true)
+            client_stream.flush().await?;
         }
+        Ok(())
     })
     .await?;
     drop(stream_reader);
@@ -486,7 +485,7 @@ async fn process_tcp_stream(
         &mut server_stream,
         &mut client_stream,
         false, // no need to flush since it's QUIC
-        client_requires_flush,
+        false,
         32768,
         32768,
     )
