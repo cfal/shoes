@@ -186,6 +186,12 @@ impl AsyncShutdownMessage for UdpSocket {
 }
 
 pub trait AsyncStream: AsyncRead + AsyncWrite + AsyncPing + Unpin + Send + Sync {
+    /// All remaining I/O is raw socket I/O, with no buffered bytes or wrapper side effects.
+    #[cfg(target_os = "linux")]
+    fn plain_tcp(&self) -> Option<&TcpStream> {
+        None
+    }
+
     /// Limits relay chunks for writers that packetize each write separately.
     fn preferred_write_size(&self) -> Option<std::num::NonZeroUsize> {
         None
@@ -252,7 +258,12 @@ impl AsyncPing for TcpStream {
     }
 }
 
-impl AsyncStream for TcpStream {}
+impl AsyncStream for TcpStream {
+    #[cfg(target_os = "linux")]
+    fn plain_tcp(&self) -> Option<&TcpStream> {
+        Some(self)
+    }
+}
 
 #[cfg(test)]
 impl AsyncPing for tokio::io::DuplexStream {
@@ -494,11 +505,21 @@ impl<T: ?Sized + AsyncWriteSourcedMessage + Unpin> AsyncWriteSourcedMessage for 
 }
 
 impl<T: ?Sized + AsyncStream + Unpin> AsyncStream for Box<T> {
+    #[cfg(target_os = "linux")]
+    fn plain_tcp(&self) -> Option<&TcpStream> {
+        (**self).plain_tcp()
+    }
+
     fn preferred_write_size(&self) -> Option<std::num::NonZeroUsize> {
         (**self).preferred_write_size()
     }
 }
 impl<T: ?Sized + AsyncStream + Unpin> AsyncStream for &mut T {
+    #[cfg(target_os = "linux")]
+    fn plain_tcp(&self) -> Option<&TcpStream> {
+        (**self).plain_tcp()
+    }
+
     fn preferred_write_size(&self) -> Option<std::num::NonZeroUsize> {
         (**self).preferred_write_size()
     }
