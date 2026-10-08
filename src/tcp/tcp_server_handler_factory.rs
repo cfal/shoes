@@ -559,11 +559,6 @@ fn create_reality_server_target(
                 ))),
                 resolver.clone(),
             )
-        } else if hops.len() == 1 {
-            try_build_client_proxy_chain(
-                OneOrSome::One(hops.into_iter().next().unwrap()),
-                resolver.clone(),
-            )
         } else {
             try_build_client_proxy_chain(OneOrSome::Some(hops), resolver.clone())
         }
