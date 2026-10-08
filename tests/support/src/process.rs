@@ -63,6 +63,14 @@ pub struct ProcessGuard {
 }
 
 impl ProcessGuard {
+    #[cfg(target_os = "linux")]
+    pub fn process_group_id(&self) -> Option<i32> {
+        match self.cleanup_target {
+            CleanupTarget::ProcessGroup { id, .. } => Some(id),
+            CleanupTarget::Child => None,
+        }
+    }
+
     pub fn new(process: Child, name: impl Into<String>) -> Self {
         let name = name.into();
         eprintln!("[GUARD] Created guard for {} (PID: {})", name, process.id());

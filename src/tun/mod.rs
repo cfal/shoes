@@ -28,6 +28,7 @@
 //!   Use `TunServerConfig::packet_information(true)` if using the socket FD
 //!   directly, or `false` if using the readPackets/writePackets API.
 
+mod offload;
 mod packet;
 mod tcp_conn;
 mod tcp_stack_direct;
@@ -63,6 +64,8 @@ pub use platform::{
 pub use tun_server::TunServerConfig;
 
 use std::net::SocketAddr;
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
 use std::os::fd::{BorrowedFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::sync::Arc;
 
@@ -107,23 +110,40 @@ async fn run_tun_server_inner(
     ready: &mut Option<oneshot::Sender<std::io::Result<()>>>,
 ) -> std::io::Result<()> {
     config.resource_limits.validate()?;
+    let offload = config.offload_enabled()?;
     info!(
         "Starting TUN server (direct mode): mtu={}, tcp={}, udp={}, icmp={}",
         config.mtu, config.tcp_enabled, config.udp_enabled, config.icmp_enabled
     );
 
-    let fd = if let Some(fd) = config.raw_fd {
+    let (fd, offload) = if let Some(fd) = config.raw_fd {
         info!("Using provided raw FD: {}", fd);
-        if config.close_fd_on_drop {
+        let fd = if config.close_fd_on_drop {
             unsafe { OwnedFd::from_raw_fd(fd) }
         } else {
             unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned()?
-        }
+        };
+        (fd, false)
     } else {
-        let tun_device = config.create_sync_device()?;
-        let fd = tun_device.into_raw_fd();
-        info!("Created TUN device with FD: {}", fd);
-        unsafe { OwnedFd::from_raw_fd(fd) }
+        let create = |offload| -> std::io::Result<_> {
+            let device = config.create_device(offload)?;
+            #[cfg(target_os = "linux")]
+            if offload {
+                offload::configure(device.as_raw_fd())?;
+            }
+            Ok((
+                unsafe { OwnedFd::from_raw_fd(device.into_raw_fd()) },
+                offload,
+            ))
+        };
+        match create(offload) {
+            Ok(device) => device,
+            Err(error) if offload && config.segmentation_offload.is_none() => {
+                log::warn!("TUN transmit offload unavailable: {error}; using ordinary packets");
+                create(false)?
+            }
+            Err(error) => return Err(error),
+        }
     };
 
     // Creates the direct TCP stack in a dedicated thread.
@@ -131,7 +151,7 @@ async fn run_tun_server_inner(
     if config.raw_fd.is_none() && cfg!(any(target_os = "macos", target_os = "ios")) {
         stack_config.packet_information = true;
     }
-    let mut tcp_stack = TcpStackDirect::with_config(fd, stack_config)?;
+    let mut tcp_stack = TcpStackDirect::with_offload(fd, stack_config, offload)?;
 
     // Get UDP receiver (stack thread filters UDP and sends here)
     let udp_from_stack_rx = tcp_stack.take_udp_rx().expect("udp_rx already taken");
@@ -397,6 +417,7 @@ async fn run_tun_from_config_inner(
         .icmp_enabled(config.icmp_enabled)
         .close_fd_on_drop(close_fd_on_drop);
     tun_server_config.resource_limits = config.resource_limits;
+    tun_server_config.segmentation_offload = config.segmentation_offload;
 
     if let Some(ref name) = config.device_name {
         tun_server_config = tun_server_config.tun_name(name.clone());
@@ -549,5 +570,27 @@ mod tests {
         .await
         .unwrap();
         assert!(unsafe { libc::fcntl(client.as_raw_fd(), libc::F_GETFD) } >= 0);
+    }
+
+    #[tokio::test]
+    async fn explicit_offload_rejects_provided_fd_before_taking_ownership() {
+        for close in [false, true] {
+            let (_peer, client) = std::os::unix::net::UnixDatagram::pair().unwrap();
+            let config = TunServerConfig::new()
+                .raw_fd(client.as_raw_fd())
+                .close_fd_on_drop(close)
+                .segmentation_offload(true);
+            let (_tx, rx) = oneshot::channel();
+            let error = run_tun_server(
+                config,
+                Arc::new(ClientProxySelector::new(Vec::new())),
+                Arc::new(crate::resolver::NativeResolver::new()),
+                rx,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(unsafe { libc::fcntl(client.as_raw_fd(), libc::F_GETFD) } >= 0);
+        }
     }
 }

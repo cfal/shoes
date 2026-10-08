@@ -5,7 +5,7 @@ use std::{
 };
 
 const BUFFER_POOL_MAX_SIZE: usize = 64;
-const BUFFER_POOL_MAX_CAPACITY: usize = 65_539;
+const BUFFER_POOL_MAX_CAPACITY: usize = 65_535 + super::offload::HEADER_LEN + 1;
 static BUFFER_POOL: LazyLock<Mutex<Vec<Vec<u8>>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 
 /// Owns packet storage independently of the visible IP packet or UDP payload range.
