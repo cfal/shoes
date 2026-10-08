@@ -34,6 +34,20 @@ use crate::uuid_util::parse_uuid;
 use crate::xudp::XudpMessageStream;
 
 const TAG_LEN: usize = 16;
+const AUTH_ID_TIME_WINDOW_SECS: u64 = 120;
+
+fn unix_time_secs(time: SystemTime) -> std::io::Result<u64> {
+    time.duration_since(SystemTime::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .map_err(|_| std::io::Error::other("system clock is before the Unix epoch"))
+}
+
+fn random_auth_id_timestamp() -> std::io::Result<u64> {
+    let now = unix_time_secs(SystemTime::now())?;
+    Ok(rand::rng().random_range(
+        now.saturating_sub(AUTH_ID_TIME_WINDOW_SECS)..=now.saturating_add(AUTH_ID_TIME_WINDOW_SECS),
+    ))
+}
 
 // VMess protocol command types
 const COMMAND_TCP: u8 = 1;
@@ -144,9 +158,9 @@ impl TcpServerHandler for VmessTcpServerHandler {
         }
 
         let time_secs = u64::from_be_bytes(aead_bytes[0..8].try_into().unwrap());
-        let current_time_secs = SystemTime::UNIX_EPOCH.elapsed().unwrap().as_secs();
+        let current_time_secs = unix_time_secs(SystemTime::now())?;
         let time_delta = time_secs.abs_diff(current_time_secs);
-        if time_delta > 120 {
+        if time_delta > AUTH_ID_TIME_WINDOW_SECS {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("Hash timestamp is too old ({time_secs} is {time_delta} seconds old)"),
@@ -224,7 +238,7 @@ impl TcpServerHandler for VmessTcpServerHandler {
 
         let mut header_reader = AeadHeaderReader {
             server_stream,
-            decrypted_header: encrypted_header,
+            decrypted_header: encrypted_header[..payload_length as usize].into(),
             cursor: 0,
         };
 
@@ -688,10 +702,52 @@ struct AeadHeaderReader {
     cursor: usize,
 }
 
+#[cfg(test)]
+mod header_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn decrypted_header_reads_are_bounded_and_non_consuming_on_error() {
+        for len in [0, 1, 16, 37, 38] {
+            let (stream, _) = tokio::io::duplex(1);
+            let mut reader = AeadHeaderReader {
+                server_stream: Box::new(stream),
+                decrypted_header: vec![7; len].into_boxed_slice(),
+                cursor: 0,
+            };
+            assert_eq!(reader.read_slice_into(&mut [0; 38]).is_ok(), len == 38);
+            if len < 38 {
+                assert_eq!(reader.cursor, 0);
+                reader.read_slice_into(&mut vec![0; len]).unwrap();
+            }
+            reader.read_slice_into(&mut []).unwrap();
+            assert_eq!(
+                reader.read_slice_into(&mut [0]).unwrap_err().kind(),
+                std::io::ErrorKind::UnexpectedEof
+            );
+        }
+    }
+
+    #[test]
+    fn clock_before_epoch_is_an_error() {
+        assert!(
+            unix_time_secs(SystemTime::UNIX_EPOCH - std::time::Duration::from_secs(1)).is_err()
+        );
+        assert_eq!(unix_time_secs(SystemTime::UNIX_EPOCH).unwrap(), 0);
+    }
+}
+
 impl AeadHeaderReader {
     fn read_slice_into(&mut self, data: &mut [u8]) -> std::io::Result<()> {
         let len = data.len();
-        data.copy_from_slice(&self.decrypted_header[self.cursor..self.cursor + len]);
+        let chunk = self
+            .decrypted_header
+            .get(self.cursor..)
+            .and_then(|remaining| remaining.get(..len))
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "truncated VMess header")
+            })?;
+        data.copy_from_slice(chunk);
         self.cursor += len;
         Ok(())
     }
@@ -745,9 +801,7 @@ impl TcpClientHandler for VmessTcpClientHandler {
     ) -> std::io::Result<TcpClientSetupResult> {
         // AEAD allows 120 second delta from the current time.
         // See authid.go in v2ray-core.
-        let random_delta: u64 = rand::rng().random_range(0..241);
-        let time_secs: u64 =
-            SystemTime::UNIX_EPOCH.elapsed().unwrap().as_secs() - 120u64 + random_delta;
+        let time_secs = random_auth_id_timestamp()?;
 
         let mut aead_bytes = [0u8; 16];
         let time_bytes = time_secs.to_be_bytes();
@@ -1028,9 +1082,7 @@ impl VmessTcpClientHandler {
         // Same as TCP setup but with command=2 and is_udp=true for VmessStream.
 
         // AEAD allows 120 second delta from the current time.
-        let random_delta: u64 = rand::rng().random_range(0..241);
-        let time_secs: u64 =
-            SystemTime::UNIX_EPOCH.elapsed().unwrap().as_secs() - 120u64 + random_delta;
+        let time_secs = random_auth_id_timestamp()?;
 
         let mut aead_bytes = [0u8; 16];
         let time_bytes = time_secs.to_be_bytes();
