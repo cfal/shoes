@@ -258,6 +258,16 @@ fn gather_pem_file_paths_from_server_proxy(
                 {
                     process_pem_path(&mut handshake.cert, known_pem_paths, unknown_pem_paths);
                     process_pem_path(&mut handshake.key, known_pem_paths, unknown_pem_paths);
+                } else if let ShadowTlsServerHandshakeConfig::Remote(handshake) =
+                    &mut shadowtls_config.handshake
+                {
+                    for hop in handshake.client_chain.iter_mut() {
+                        gather_pem_file_paths_from_chain_hop(
+                            hop,
+                            known_pem_paths,
+                            unknown_pem_paths,
+                        );
+                    }
                 }
                 // Recurse into inner protocol
                 gather_pem_file_paths_from_server_proxy(
@@ -273,6 +283,9 @@ fn gather_pem_file_paths_from_server_proxy(
 
             // Process Reality targets
             for (sni, reality_config) in reality_targets.iter_mut() {
+                for hop in reality_config.dest_client_chain.iter_mut() {
+                    gather_pem_file_paths_from_chain_hop(hop, known_pem_paths, unknown_pem_paths);
+                }
                 // Validate Vision configuration
                 validate_vision_protocol(
                     reality_config.vision,

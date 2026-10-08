@@ -1273,6 +1273,13 @@ fn validate_server_proxy_config(
                         &local_handshake.client_ca_certs,
                     )?;
                     validate_client_fingerprints(&mut local_handshake.client_fingerprints)?;
+                } else if let ShadowTlsServerHandshakeConfig::Remote(remote_handshake) = handshake {
+                    validate_client_chain(
+                        &mut remote_handshake.client_chain,
+                        0,
+                        client_groups,
+                        named_pems,
+                    )?;
                 }
 
                 validate_server_proxy_config(
@@ -1314,6 +1321,14 @@ fn validate_server_proxy_config(
 
                 validate_reality_private_key(&reality_config.private_key, sni_hostname)?;
                 validate_reality_server_short_ids(&reality_config.short_ids, sni_hostname)?;
+
+                if !reality_config.dest_client_chain.is_empty() {
+                    let mut hops = OneOrSome::Some(
+                        std::mem::take(&mut reality_config.dest_client_chain).into_vec(),
+                    );
+                    validate_client_chain(&mut hops, 0, client_groups, named_pems)?;
+                    reality_config.dest_client_chain = NoneOrSome::Some(hops.into_vec());
+                }
 
                 validate_server_proxy_config(
                     &mut reality_config.protocol,
@@ -1477,20 +1492,25 @@ fn validate_rule_config(
             ));
         }
 
-        // Validate each chain
         for (chain_index, chain) in client_chains.iter_mut().enumerate() {
-            // First validate all hops in this chain
-            for hop in chain.hops.iter_mut() {
-                validate_client_chain_hop(hop, client_groups, named_pems)?;
-            }
-            // Then expand group references to inline configs
-            expand_client_chain(&mut chain.hops, client_groups)?;
-            // Validate that direct connectors only appear at hop 0
-            validate_direct_connector_positions(&chain.hops, chain_index)?;
+            validate_client_chain(&mut chain.hops, chain_index, client_groups, named_pems)?;
         }
     }
 
     Ok(())
+}
+
+fn validate_client_chain(
+    hops: &mut OneOrSome<ClientChainHop>,
+    chain_index: usize,
+    client_groups: &HashMap<String, Vec<ClientConfig>>,
+    named_pems: &HashMap<String, String>,
+) -> std::io::Result<()> {
+    for hop in hops.iter_mut() {
+        validate_client_chain_hop(hop, client_groups, named_pems)?;
+    }
+    expand_client_chain(hops, client_groups)?;
+    validate_direct_connector_positions(hops, chain_index)
 }
 
 /// Validates that direct connectors only appear at hop 0.

@@ -39,34 +39,31 @@ fn build_client_proxy_chain_with_limits(
     let hops: Vec<Vec<ClientConfig>> = client_chain
         .into_vec()
         .into_iter()
-        .map(|hop| match hop {
-            ClientChainHop::Single(selection) => match selection {
-                ConfigSelection::Config(config) => vec![config],
-                ConfigSelection::GroupName(group_name) => {
-                    panic!(
-                        "Group reference '{}' was not resolved during config validation.",
-                        group_name
-                    );
-                }
-            },
-            ClientChainHop::Pool(selections) => selections
-                .into_vec()
+        .map(|hop| {
+            let selections = match hop {
+                ClientChainHop::Single(selection) => vec![selection],
+                ClientChainHop::Pool(selections) => selections.into_vec(),
+            };
+            selections
                 .into_iter()
-                .flat_map(|selection| match selection {
-                    ConfigSelection::Config(config) => vec![config],
-                    ConfigSelection::GroupName(group_name) => {
-                        panic!(
-                            "Group reference '{}' was not resolved during config validation.",
-                            group_name
-                        );
-                    }
+                .map(|selection| match selection {
+                    ConfigSelection::Config(config) => Ok(config),
+                    ConfigSelection::GroupName(group_name) => Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "Group reference '{group_name}' was not resolved during config validation."
+                        ),
+                    )),
                 })
-                .collect(),
+                .collect::<std::io::Result<_>>()
         })
-        .collect();
+        .collect::<std::io::Result<_>>()?;
 
     if hops.is_empty() {
-        panic!("Client chain must have at least one hop");
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Client chain must have at least one hop",
+        ));
     }
 
     // Build initial hop entries from hop 0.
@@ -110,11 +107,13 @@ fn build_client_proxy_chain_with_limits(
                 .map(|config| {
                     // Subsequent hops MUST NOT have direct protocol
                     if config.protocol.is_direct() {
-                        panic!(
-                            "protocol: direct is only valid at hop 0. Found direct at hop {} with address {}",
-                            hop_index,
-                            config.address
-                        );
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            format!(
+                                "protocol: direct is only valid at hop 0. Found direct at hop {} with address {}",
+                                hop_index, config.address
+                            ),
+                        ));
                     }
 
                     ProxyConnectorImpl::from_config(config, resolver.clone())?
@@ -178,11 +177,12 @@ pub fn build_client_chain_group_with_limits(
     limits: crate::config::GlobalLimits,
 ) -> std::io::Result<ClientChainGroup> {
     let chains: Vec<ClientProxyChain> = if client_chains.is_empty() {
-        vec![try_build_client_proxy_chain(
+        vec![build_client_proxy_chain_with_limits(
             crate::option_util::OneOrSome::One(ClientChainHop::Single(ConfigSelection::Config(
                 ClientConfig::default(),
             ))),
             resolver,
+            limits,
         )?]
     } else {
         client_chains
@@ -331,21 +331,23 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "protocol: direct is only valid at hop 0")]
-    fn test_direct_at_hop1_panics() {
-        build_client_proxy_chain(
+    fn test_direct_at_hop1_returns_error() {
+        let result = try_build_client_proxy_chain(
             OneOrSome::Some(vec![
                 ClientChainHop::Single(ConfigSelection::Config(socks_config(1080))),
                 ClientChainHop::Single(ConfigSelection::Config(direct_config())),
             ]),
             mock_resolver(),
         );
+        assert_eq!(
+            result.err().unwrap().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
     }
 
     #[test]
-    #[should_panic(expected = "protocol: direct is only valid at hop 0")]
-    fn test_direct_in_pool_at_hop1_panics() {
-        build_client_proxy_chain(
+    fn test_direct_in_pool_at_hop1_returns_error() {
+        let result = try_build_client_proxy_chain(
             OneOrSome::Some(vec![
                 ClientChainHop::Single(ConfigSelection::Config(socks_config(1080))),
                 ClientChainHop::Pool(OneOrSome::Some(vec![
@@ -355,17 +357,25 @@ mod tests {
             ]),
             mock_resolver(),
         );
+        assert_eq!(
+            result.err().unwrap().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
     }
 
     #[test]
-    #[should_panic(expected = "was not resolved during config validation")]
-    fn test_unresolved_group_reference_panics() {
-        build_client_proxy_chain(
-            OneOrSome::One(ClientChainHop::Single(ConfigSelection::GroupName(
-                "unresolved_group".to_string(),
-            ))),
-            mock_resolver(),
-        );
+    fn test_unresolved_group_reference_returns_error() {
+        let selection = ConfigSelection::GroupName("unresolved_group".to_string());
+        for hop in [
+            ClientChainHop::Single(selection.clone()),
+            ClientChainHop::Pool(OneOrSome::One(selection)),
+        ] {
+            let result = try_build_client_proxy_chain(OneOrSome::One(hop), mock_resolver());
+            assert_eq!(
+                result.err().unwrap().kind(),
+                std::io::ErrorKind::InvalidInput
+            );
+        }
     }
 
     #[test]

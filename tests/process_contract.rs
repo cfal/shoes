@@ -127,7 +127,7 @@ fn invalid_protocol_configs(address: SocketAddr) -> Vec<String> {
     let mut missing_sni = reality;
     missing_sni.as_object_mut().unwrap().remove("sni_hostname");
     let padding = json!({"type": "anytls", "password": "test", "padding_scheme": ["stop=invalid"]});
-    let mut configs: Vec<_> = [
+    let protocols = [
         bad_key,
         bad_sni,
         missing_sni,
@@ -138,23 +138,104 @@ fn invalid_protocol_configs(address: SocketAddr) -> Vec<String> {
         json!({"type": "tls", "protocol": {"type": "direct"}}),
         json!({"type": "shadowtls", "password": "test", "protocol": {"type": "direct"}}),
         json!({"type": "websocket", "protocol": {"type": "direct"}}),
-    ]
-    .into_iter()
-    .map(|protocol| {
-        serde_yaml::to_string(&json!([{
-            "address": address.to_string(), "protocol": {"type": "http"},
-            "rules": [{"masks": "0.0.0.0/0", "client_proxy": {
+    ];
+    let mut configs: Vec<_> = protocols
+        .iter()
+        .cloned()
+        .map(|protocol| {
+            serde_yaml::to_string(&json!([{
+                "address": address.to_string(), "protocol": {"type": "http"},
+                "rules": [{"masks": "0.0.0.0/0", "client_proxy": {
+                    "address": "127.0.0.1:443", "protocol": protocol
+                }}]
+            }]))
+            .unwrap()
+        })
+        .collect();
+    let mut invalid_chains: Vec<_> = protocols
+        .into_iter()
+        .map(|protocol| {
+            json!({
                 "address": "127.0.0.1:443", "protocol": protocol
-            }}]
-        }]))
-        .unwrap()
-    })
-    .collect();
+            })
+        })
+        .collect();
+    invalid_chains.extend([
+        json!("missing-group"),
+        json!(["direct", "direct"]),
+        json!({"address": "127.0.0.1:443", "protocol": {
+            "type": "tls", "cert": "-----BEGIN CERTIFICATE-----bad",
+            "key": "-----BEGIN PRIVATE KEY-----bad", "protocol": {"type": "socks"}
+        }}),
+    ]);
+    for chain in invalid_chains {
+        for protocol in handshake_protocols(chain) {
+            configs.push(
+                serde_yaml::to_string(&json!([{
+                    "address": address.to_string(), "protocol": protocol
+                }]))
+                .unwrap(),
+            );
+        }
+    }
     configs.push(
         serde_yaml::to_string(&json!([{"address": address.to_string(), "protocol": padding}]))
             .unwrap(),
     );
     configs
+}
+
+fn handshake_protocols(chain: serde_json::Value) -> [serde_json::Value; 2] {
+    use serde_json::json;
+    [
+        json!({"type": "tls", "reality_targets": {"example.com": {
+            "private_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "dest": "example.com:443", "dest_client_chain": chain,
+            "protocol": {"type": "socks"}
+        }}}),
+        json!({"type": "tls", "shadowtls_targets": {"example.com": {
+            "password": "test", "handshake": {
+                "address": "example.com:443", "client_chain": chain
+            }, "protocol": {"type": "socks"}
+        }}}),
+    ]
+}
+
+#[tokio::test]
+async fn handshake_chains_expand_groups_and_load_certificates() {
+    use serde_json::json;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.yaml");
+    let cert_path = directory.path().join("client.pem");
+    let key_path = directory.path().join("client.key");
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    std::fs::write(&cert_path, cert.cert.pem()).unwrap();
+    std::fs::write(&key_path, cert.signing_key.serialize_pem()).unwrap();
+    let client = json!({"address": "127.0.0.1:443", "protocol": {
+        "type": "tls", "cert": cert_path, "key": key_path,
+        "protocol": {"type": "socks"}
+    }});
+    for chain in [json!("fallback"), client.clone()] {
+        for protocol in handshake_protocols(chain) {
+            let config = json!([
+                {"client_group": "fallback", "client_proxies": [client.clone(), client.clone()]},
+                {"address": available_address().to_string(), "protocol": protocol}
+            ]);
+            std::fs::write(&path, serde_yaml::to_string(&config).unwrap()).unwrap();
+            let output = Command::new(env!("CARGO_BIN_EXE_shoes"))
+                .args(["check", "-t", "1"])
+                .arg(&path)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let mut child = Process::start(&path, &["--no-reload"]);
+            child.wait_for("Servers ready").await;
+        }
+    }
 }
 
 #[test]
