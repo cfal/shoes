@@ -368,6 +368,39 @@ async fn atomic_replace_keeps_serving_through_debounce() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn symlink_targets_remain_watched_after_retargeting() {
+    let directory = tempfile::tempdir().unwrap();
+    let targets = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.yaml");
+    let first = targets.path().join("first.yaml");
+    let second = targets.path().join("second.yaml");
+    let config = format!(
+        "- address: '{}'\n  protocol: {{type: http}}\n",
+        available_address()
+    );
+    std::fs::write(&first, &config).unwrap();
+    std::fs::write(&second, &config).unwrap();
+    std::os::unix::fs::symlink(&first, &path).unwrap();
+    let mut child = Process::start(&path, &[]);
+    child.wait_for("Servers ready").await;
+    std::fs::write(&first, &config).unwrap();
+    child.wait_for("Servers ready").await;
+    let link = directory.path().join("replacement.yaml");
+    std::os::unix::fs::symlink(&second, &link).unwrap();
+    std::fs::rename(link, &path).unwrap();
+    child.wait_for("Servers ready").await;
+    std::fs::write(&second, &config).unwrap();
+    child.wait_for("Servers ready").await;
+    std::fs::remove_file(&second).unwrap();
+    child.wait_for("Reload rejected").await;
+    std::fs::write(&second, &config).unwrap();
+    child.wait_for("Servers ready").await;
+    child.signal(libc::SIGTERM);
+    assert_eq!(child.exit().await.code(), Some(143));
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn shutdown_interrupts_dns_preparation_without_retiring_listeners() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("config.yaml");

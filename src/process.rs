@@ -110,10 +110,13 @@ impl Drop for Running {
 }
 
 fn watch(paths: &[String], tx: mpsc::Sender<()>) -> io::Result<RecommendedWatcher> {
-    let files: HashSet<PathBuf> = paths
+    let mut files: HashSet<PathBuf> = paths
         .iter()
-        .map(|path| std::path::absolute(path))
+        .map(std::path::absolute)
         .collect::<io::Result<_>>()?;
+    for path in paths {
+        files.insert(std::fs::canonicalize(path)?);
+    }
     let directories: HashSet<_> = files
         .iter()
         .filter_map(|path| path.parent().map(PathBuf::from))
@@ -210,7 +213,7 @@ pub async fn run(paths: Vec<String>, dry_run: bool, no_reload: bool) -> io::Resu
     let mut shutdown = ShutdownSignals::new()?;
     let mut reload = ReloadSignal::new()?;
     let (change_tx, mut changes) = mpsc::channel(1);
-    let _watcher = if no_reload {
+    let mut _watcher = if no_reload {
         None
     } else {
         Some(watch(&paths, change_tx.clone())?)
@@ -242,6 +245,13 @@ pub async fn run(paths: Vec<String>, dry_run: bool, no_reload: bool) -> io::Resu
             }
         }
         while changes.try_recv().is_ok() {}
+        if !no_reload {
+            // A symlink may now point outside the directories watched by the previous generation.
+            match watch(&paths, change_tx.clone()) {
+                Ok(watcher) => _watcher = Some(watcher),
+                Err(error) => log::warn!("Could not refresh config watches: {error}"),
+            }
+        }
         let candidate = tokio::select! {
             biased;
             code = shutdown.recv() => { running.stop().await; return Ok(code); }
