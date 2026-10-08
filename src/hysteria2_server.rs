@@ -9,6 +9,7 @@ use log::{debug, error, warn};
 use rand::distr::Alphanumeric;
 use rand::{Rng, RngExt};
 use rustc_hash::FxHashMap;
+use subtle::ConstantTimeEq;
 use tokio::io::AsyncWriteExt;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::timeout;
@@ -168,7 +169,7 @@ fn validate_auth_request<T>(req: http::Request<T>, password: &str) -> std::io::R
     let auth_str = auth_value
         .to_str()
         .map_err(|e| std::io::Error::other(format!("invalid auth header value: {e}")))?;
-    if auth_str != password {
+    if !bool::from(auth_str.as_bytes().ct_eq(password.as_bytes())) {
         return Err(std::io::Error::other("incorrect auth password"));
     }
 

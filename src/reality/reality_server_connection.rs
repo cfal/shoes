@@ -379,13 +379,10 @@ impl RealityServerConnection {
         });
 
         if !short_id_ok {
-            log::warn!(
-                "REALITY: Client short_id {:02x?} not in configured list",
-                client_short_id
-            );
+            log::warn!("REALITY: Client short_id not in configured list");
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                format!("Invalid short_id: {:02x?}", client_short_id),
+                "Invalid short_id",
             ));
         }
 
@@ -454,8 +451,7 @@ impl RealityServerConnection {
         }
 
         log::debug!(
-            "REALITY: Client authentication successful - short_id: {:02x?}, version: {:?}, timestamp: {}",
-            client_short_id,
+            "REALITY: Client authentication successful - version: {:?}, timestamp: {}",
             client_version,
             client_timestamp
         );

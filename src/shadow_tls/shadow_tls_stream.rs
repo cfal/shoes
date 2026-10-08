@@ -1,5 +1,6 @@
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use subtle::ConstantTimeEq;
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
@@ -195,7 +196,7 @@ impl ShadowTlsStream {
         if let Some(ref mut handshake_hmac) = self.handshake_hmac {
             handshake_hmac.update(payload);
             let expected_digest = handshake_hmac.digest();
-            if received_digest == expected_digest {
+            if bool::from(received_digest.ct_eq(&expected_digest)) {
                 if total_len < self.unprocessed_end_offset {
                     self.unprocessed_buf
                         .copy_within(total_len..self.unprocessed_end_offset, 0);
@@ -213,7 +214,7 @@ impl ShadowTlsStream {
 
         self.read_hmac.update(payload);
         let expected_digest = self.read_hmac.digest();
-        if received_digest != expected_digest {
+        if !bool::from(received_digest.ct_eq(&expected_digest)) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "HMAC verification failed",

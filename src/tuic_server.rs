@@ -2,6 +2,7 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::str;
 use std::sync::Arc;
 use std::time::Duration;
+use subtle::ConstantTimeEq;
 
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
@@ -233,18 +234,13 @@ async fn auth_connection(
             continue;
         }
 
-        let specified_uuid = stream_reader.read_slice(&mut recv_stream, 16).await?;
-        if specified_uuid != uuid {
+        let credentials = stream_reader.read_slice(&mut recv_stream, 48).await?;
+        let authenticated =
+            credentials[..16].ct_eq(uuid) & credentials[16..].ct_eq(&expected_token_bytes);
+        if !bool::from(authenticated) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
-                "incorrect uuid",
-            ));
-        }
-        let token_bytes = stream_reader.read_slice(&mut recv_stream, 32).await?;
-        if token_bytes != expected_token_bytes {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "incorrect token",
+                "incorrect credentials",
             ));
         }
 
