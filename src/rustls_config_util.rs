@@ -4,25 +4,6 @@ use std::sync::OnceLock;
 
 use rustls::pki_types::pem::PemObject;
 
-pub fn create_client_config(
-    verify_webpki: bool,
-    server_fingerprints: Vec<String>,
-    alpn_protocols: Vec<String>,
-    enable_sni: bool,
-    client_key_and_cert: Option<(Vec<u8>, Vec<u8>)>,
-    tls13_only: bool,
-) -> rustls::ClientConfig {
-    try_create_client_config(
-        verify_webpki,
-        server_fingerprints,
-        alpn_protocols,
-        enable_sni,
-        client_key_and_cert,
-        tls13_only,
-    )
-    .expect("validated TLS client configuration")
-}
-
 pub fn try_create_client_config(
     verify_webpki: bool,
     server_fingerprints: Vec<String>,

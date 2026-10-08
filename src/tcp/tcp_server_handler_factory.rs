@@ -254,10 +254,7 @@ pub fn create_tcp_server_handler(
 
             let padding = if let Some(scheme_lines) = padding_scheme {
                 let scheme_str = scheme_lines.join("\n");
-                Arc::new(
-                    PaddingFactory::new(scheme_str.as_bytes())
-                        .expect("Invalid padding scheme (should be validated during config load)"),
-                )
+                Arc::new(PaddingFactory::new(scheme_str.as_bytes()).map_err(std::io::Error::other)?)
             } else {
                 PaddingFactory::default_factory()
             };

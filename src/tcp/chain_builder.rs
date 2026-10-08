@@ -77,7 +77,7 @@ pub fn try_build_client_proxy_chain(
                 Ok(InitialHopEntry::Direct(socket))
             } else {
                 // Proxy: socket + proxy paired
-                let proxy = ProxyConnectorImpl::from_config(config.clone(), resolver.clone())
+                let proxy = ProxyConnectorImpl::from_config(config.clone(), resolver.clone())?
                     .map(|p| Box::new(p) as Box<dyn ProxyConnector>)
                     .ok_or_else(|| {
                         std::io::Error::other(
@@ -108,13 +108,13 @@ pub fn try_build_client_proxy_chain(
                         );
                     }
 
-                    ProxyConnectorImpl::from_config(config, resolver.clone())
+                    ProxyConnectorImpl::from_config(config, resolver.clone())?
                         .map(|p| Box::new(p) as Box<dyn ProxyConnector>)
-                        .expect("Failed to create ProxyConnector for subsequent hop")
+                        .ok_or_else(|| std::io::Error::other("Missing proxy connector for subsequent hop"))
                 })
-                .collect()
+                .collect::<std::io::Result<_>>()
         })
-        .collect();
+        .collect::<std::io::Result<_>>()?;
 
     Ok(ClientProxyChain::new(initial_hop, subsequent_hops))
 }

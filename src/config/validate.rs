@@ -937,7 +937,11 @@ fn validate_client_config(
         ));
     }
 
-    validate_client_proxy_config(&mut client_config.protocol, named_pems)?;
+    validate_client_proxy_config(
+        &mut client_config.protocol,
+        named_pems,
+        client_config.address.address().hostname(),
+    )?;
 
     Ok(())
 }
@@ -963,6 +967,7 @@ fn validate_server_fingerprints(
 fn validate_client_proxy_config(
     client_proxy_config: &mut ClientProxyConfig,
     named_pems: &HashMap<String, String>,
+    default_sni: Option<&str>,
 ) -> std::io::Result<()> {
     validate_client_proxy_structure(client_proxy_config)?;
 
@@ -986,8 +991,20 @@ fn validate_client_proxy_config(
             ));
         }
         ClientProxyConfig::Reality {
-            short_id, protocol, ..
+            public_key,
+            short_id,
+            sni_hostname,
+            protocol,
+            ..
         } => {
+            crate::reality::decode_public_key(public_key).map_err(std::io::Error::other)?;
+            let sni = sni_hostname.as_deref().or(default_sni).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "REALITY client requires sni_hostname",
+                )
+            })?;
+            validate_sni(sni)?;
             validate_reality_client_short_id(short_id)?;
 
             if short_id == DEFAULT_REALITY_SHORT_ID {
@@ -997,10 +1014,21 @@ fn validate_client_proxy_config(
                 );
             }
 
-            validate_client_proxy_config(protocol, named_pems)?;
+            validate_client_proxy_config(protocol, named_pems, None)?;
         }
 
         ClientProxyConfig::Tls(tls_config) => {
+            let sni = if tls_config.sni_hostname.is_unspecified() {
+                default_sni
+            } else {
+                match &tls_config.sni_hostname {
+                    crate::option_util::NoneOrOne::One(sni) => Some(sni.as_str()),
+                    _ => None,
+                }
+            };
+            if let Some(sni) = sni {
+                validate_sni(sni)?;
+            }
             embed_optional_pem_from_map(&mut tls_config.cert, named_pems);
             embed_optional_pem_from_map(&mut tls_config.key, named_pems);
 
@@ -1013,20 +1041,43 @@ fn validate_client_proxy_config(
             validate_server_fingerprints(&mut tls_config.server_fingerprints)?;
             validate_client_certificates(tls_config.cert.as_deref(), tls_config.key.as_deref())?;
 
-            validate_client_proxy_config(&mut tls_config.protocol, named_pems)?;
+            validate_client_proxy_config(&mut tls_config.protocol, named_pems, None)?;
         }
 
-        ClientProxyConfig::ShadowTls { protocol, .. } => {
-            validate_client_proxy_config(protocol, named_pems)?;
+        ClientProxyConfig::ShadowTls {
+            protocol,
+            sni_hostname,
+            ..
+        } => {
+            if let Some(sni) = sni_hostname.as_deref().or(default_sni) {
+                validate_sni(sni)?;
+            }
+            validate_client_proxy_config(protocol, named_pems, None)?;
         }
 
         ClientProxyConfig::Websocket(ws_config) => {
-            validate_client_proxy_config(&mut ws_config.protocol, named_pems)?;
+            validate_client_proxy_config(&mut ws_config.protocol, named_pems, None)?;
+        }
+
+        ClientProxyConfig::Anytls {
+            padding_scheme: Some(lines),
+            ..
+        } => {
+            crate::anytls::PaddingFactory::new(lines.join("\n").as_bytes())
+                .map_err(std::io::Error::other)?;
         }
 
         _ => {}
     }
     Ok(())
+}
+
+fn validate_sni(sni: &str) -> std::io::Result<()> {
+    rustls::pki_types::ServerName::try_from(sni)
+        .map(|_| ())
+        .map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid TLS server name")
+        })
 }
 
 fn validate_server_certificates(
@@ -1078,6 +1129,13 @@ fn validate_server_proxy_config(
     inside_tls_or_reality: bool,
 ) -> std::io::Result<()> {
     match server_proxy_config {
+        ServerProxyConfig::Anytls {
+            padding_scheme: Some(lines),
+            ..
+        } => {
+            crate::anytls::PaddingFactory::new(lines.join("\n").as_bytes())
+                .map_err(std::io::Error::other)?;
+        }
         ServerProxyConfig::Naiveproxy { .. } if !inside_tls_or_reality => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -1602,6 +1660,32 @@ mod tests {
     use super::*;
     use crate::config::pem::convert_cert_paths;
     use crate::dns::IpStrategy;
+
+    #[test]
+    fn reality_sni_defaults_only_at_the_outer_client_layer() {
+        let protocol = serde_json::json!({
+            "type": "reality", "public_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "protocol": {"type": "socks"}
+        });
+        for (address, protocol, valid) in [
+            ("example.com:443", protocol.clone(), true),
+            ("127.0.0.1:443", protocol.clone(), false),
+            (
+                "example.com:443",
+                serde_json::json!({"type": "websocket", "protocol": protocol}),
+                false,
+            ),
+        ] {
+            let mut config: ClientConfig = serde_json::from_value(serde_json::json!({
+                "address": address, "protocol": protocol
+            }))
+            .unwrap();
+            assert_eq!(
+                validate_client_config(&mut config, &HashMap::new()).is_ok(),
+                valid
+            );
+        }
+    }
 
     async fn validate_configs_test(configs: Vec<Config>) -> std::io::Result<Vec<Config>> {
         let (converted_configs, _) = convert_cert_paths(configs).await?;

@@ -108,6 +108,55 @@ async fn roundtrip(stream: &mut TcpStream) {
     .unwrap();
 }
 
+fn invalid_protocol_configs(address: SocketAddr) -> Vec<String> {
+    use serde_json::json;
+    let reality = json!({
+        "type": "reality", "public_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "sni_hostname": "example.com", "protocol": {"type": "socks"}
+    });
+    let mut bad_key = reality.clone();
+    bad_key["public_key"] = json!("invalid");
+    let mut bad_sni = reality.clone();
+    bad_sni["sni_hostname"] = json!("invalid name");
+    let mut missing_sni = reality;
+    missing_sni.as_object_mut().unwrap().remove("sni_hostname");
+    let padding = json!({"type": "anytls", "password": "test", "padding_scheme": ["stop=invalid"]});
+    let mut configs: Vec<_> = [bad_key, bad_sni, missing_sni, padding.clone()]
+        .into_iter()
+        .map(|protocol| {
+            serde_yaml::to_string(&json!([{
+                "address": address.to_string(), "protocol": {"type": "http"},
+                "rules": [{"masks": "0.0.0.0/0", "client_proxy": {
+                    "address": "127.0.0.1:443", "protocol": protocol
+                }}]
+            }]))
+            .unwrap()
+        })
+        .collect();
+    configs.push(
+        serde_yaml::to_string(&json!([{"address": address.to_string(), "protocol": padding}]))
+            .unwrap(),
+    );
+    configs
+}
+
+#[test]
+fn check_rejects_invalid_protocol_constructor_settings() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.yaml");
+    for config in invalid_protocol_configs(available_address()) {
+        std::fs::write(&path, config).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_shoes"))
+            .args(["check", "-t", "1"])
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(!error.contains("panicked"), "{error}");
+    }
+}
+
 #[tokio::test]
 async fn check_alias_and_validation_exit_codes() {
     let directory = tempfile::tempdir().unwrap();
@@ -214,6 +263,7 @@ async fn rejected_reload_preserves_traffic_and_valid_reload_drains_tcp() {
         ),
         mismatched_identity,
     ];
+    invalid_configs.extend(invalid_protocol_configs(address));
     if cfg!(target_os = "linux") {
         invalid_configs.push(format!("{valid}\n- dns_group: failing\n  dns_servers:\n    - url: udp://127.0.0.1\n      client_chain:\n        address: '127.0.0.1:443'\n        transport: quic\n        bind_interface: shoes-missing-interface\n        protocol: {{type: socks}}\n"));
     }
