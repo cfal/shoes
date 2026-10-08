@@ -262,24 +262,25 @@ async fn handle_tcp_connection(
                 remote_location.location()
             );
 
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(30),
-                chain_group.connect_tcp(remote_location.clone(), &resolver),
-            )
+            match tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                let setup = chain_group
+                    .connect_tcp(remote_location.clone(), &resolver)
+                    .await?;
+                if let Some(data) = setup.early_data {
+                    tokio::io::AsyncWriteExt::write_all(&mut connection, &data).await?;
+                }
+                Ok::<_, std::io::Error>(setup.client_stream)
+            })
             .await
             .map_err(|_| {
                 std::io::Error::new(std::io::ErrorKind::TimedOut, "TUN TCP setup timed out")
             })? {
-                Ok(setup_result) => {
+                Ok(mut remote) => {
                     debug!(
                         "TCP: connected to {}, starting bidirectional copy",
                         remote_location.location()
                     );
 
-                    let mut remote = setup_result.client_stream;
-                    if let Some(early_data) = setup_result.early_data {
-                        tokio::io::AsyncWriteExt::write_all(&mut connection, &early_data).await?;
-                    }
                     let result = tokio::io::copy_bidirectional(&mut connection, &mut remote).await;
 
                     match result {
