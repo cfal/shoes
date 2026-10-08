@@ -34,9 +34,9 @@ use crate::uuid_util::parse_uuid;
 use crate::xudp::XudpMessageStream;
 
 const TAG_LEN: usize = 16;
-const AUTH_ID_TIME_WINDOW_SECS: u64 = 120;
+pub(super) const AUTH_ID_TIME_WINDOW_SECS: u64 = 120;
 
-fn unix_time_secs(time: SystemTime) -> std::io::Result<u64> {
+pub(super) fn unix_time_secs(time: SystemTime) -> std::io::Result<u64> {
     time.duration_since(SystemTime::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs())
         .map_err(|_| std::io::Error::other("system clock is before the Unix epoch"))
@@ -158,14 +158,7 @@ impl TcpServerHandler for VmessTcpServerHandler {
         }
 
         let time_secs = u64::from_be_bytes(aead_bytes[0..8].try_into().unwrap());
-        let current_time_secs = unix_time_secs(SystemTime::now())?;
-        let time_delta = time_secs.abs_diff(current_time_secs);
-        if time_delta > AUTH_ID_TIME_WINDOW_SECS {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("Hash timestamp is too old ({time_secs} is {time_delta} seconds old)"),
-            ));
-        }
+        super::replay::admit(self.instruction_key, cert_hash, time_secs)?;
 
         let mut encrypted_payload_length = [0u8; 18];
         stream_reader
@@ -345,31 +338,22 @@ impl TcpServerHandler for VmessTcpServerHandler {
         };
 
         let margin_len: u8 = fixed_header[35] >> 4;
-        log::info!("VMess margin_len: {}, command: {}", margin_len, command);
+        log::debug!("VMess margin_len: {}, command: {}", margin_len, command);
         if margin_len > 0 {
             let mut margin_bytes = allocate_vec(margin_len as usize).into_boxed_slice();
             header_reader.read_slice_into(&mut margin_bytes)?;
-            log::info!("VMess margin_bytes: {:?}", &margin_bytes[..]);
             fnv_hasher.write(&margin_bytes);
         }
 
         let mut check_bytes = [0u8; 4];
         header_reader.read_slice_into(&mut check_bytes)?;
-        log::info!("VMess check_bytes: {:?}", check_bytes);
 
         let expected_check_value = u32::from_be_bytes(check_bytes[0..4].try_into().unwrap());
         let actual_check_value = fnv_hasher.finish();
-        log::info!(
-            "VMess FNV1a: expected={}, actual={}",
-            expected_check_value,
-            actual_check_value
-        );
         if expected_check_value != actual_check_value {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!(
-                    "Bad fnv1a checksum, expected {expected_check_value}, got {actual_check_value}"
-                ),
+                "Bad VMess header checksum",
             ));
         }
 
@@ -705,6 +689,55 @@ struct AeadHeaderReader {
 #[cfg(test)]
 mod header_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn replay_protection_survives_handler_recreation() {
+        let uuid = crate::uuid_util::generate_uuid();
+        let client = VmessTcpClientHandler::new("none", &uuid, false);
+        let make_auth_id = |valid_checksum: bool, timestamp: u64| {
+            let mut id = [0; 16];
+            id[..8].copy_from_slice(&timestamp.to_be_bytes());
+            let checksum = super::super::crc32::crc32c(&id[..12]) ^ u32::from(!valid_checksum);
+            id[12..].copy_from_slice(&checksum.to_be_bytes());
+            client
+                .aead_encrypting_key
+                .less_safe_encrypt(&mut id, EncryptionContext::None)
+                .unwrap();
+            id
+        };
+        let now = unix_time_secs(SystemTime::now()).unwrap();
+        for (id, expected) in [
+            (make_auth_id(false, now), std::io::ErrorKind::InvalidData),
+            (
+                make_auth_id(true, now.saturating_sub(121)),
+                std::io::ErrorKind::InvalidData,
+            ),
+            (
+                make_auth_id(true, now),
+                std::io::ErrorKind::ConnectionAborted,
+            ),
+            (
+                make_auth_id(true, now),
+                std::io::ErrorKind::PermissionDenied,
+            ),
+        ] {
+            let handler = VmessTcpServerHandler::new(
+                "none",
+                &uuid,
+                false,
+                Arc::new(ClientProxySelector::new(vec![])),
+                Arc::new(crate::resolver::NativeResolver::new()),
+            );
+            let (server, mut peer) = tokio::io::duplex(64);
+            peer.write_all(&id).await.unwrap();
+            drop(peer);
+            let error = match handler.setup_server_stream(Box::new(server)).await {
+                Err(error) => error,
+                Ok(_) => panic!("header unexpectedly accepted"),
+            };
+            assert_eq!(error.kind(), expected, "{error}");
+        }
+    }
 
     #[tokio::test]
     async fn decrypted_header_reads_are_bounded_and_non_consuming_on_error() {
