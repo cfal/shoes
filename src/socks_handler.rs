@@ -373,7 +373,8 @@ async fn handle_udp_associate(
     mut server_stream: Box<dyn AsyncStream>,
     stream_reader: &mut StreamReader,
 ) -> std::io::Result<TcpServerSetupResult> {
-    let client_hint = read_location(&mut server_stream, stream_reader).await?;
+    // NAT and some clients make this hint differ from the actual UDP source.
+    let _client_hint = read_location(&mut server_stream, stream_reader).await?;
 
     // Uses 2MB buffer to prevent packet drops during bursts.
     const UDP_BUFFER_SIZE: usize = 2 * 1024 * 1024;
@@ -403,12 +404,7 @@ async fn handle_udp_associate(
     write_all(&mut server_stream, &response).await?;
     server_stream.flush().await?;
 
-    let relay_stream = Socks5UdpRelayStream::new(
-        udp_socket,
-        client_hint
-            .to_socket_addr_nonblocking()
-            .map(|address| address.ip()),
-    );
+    let relay_stream = Socks5UdpRelayStream::new(udp_socket);
     let proxy_selector = proxy_selector.clone();
     let resolver = resolver.clone();
 

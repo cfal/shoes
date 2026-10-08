@@ -187,9 +187,8 @@ pub fn encode_socks5_udp_packet(source: &NetLocation, payload: &[u8], packet: &m
 ///   and sends it to the client.
 pub struct Socks5UdpRelayStream {
     socket: Arc<UdpSocket>,
-    /// The client's UDP address, learned from the first received packet.
+    /// The client's UDP address, learned from the first valid, non-empty packet.
     client_addr: Option<SocketAddr>,
-    client_ip_hint: Option<IpAddr>,
     /// Receiver for incoming packets from the socket reader task.
     receiver: mpsc::Receiver<(Box<[u8]>, SocketAddr)>,
     /// Handle to the socket reader task.
@@ -202,7 +201,7 @@ impl Socks5UdpRelayStream {
     ///
     /// # Arguments
     /// * `socket` - The bound UDP socket for the relay
-    pub fn new(socket: UdpSocket, client_ip_hint: Option<IpAddr>) -> Self {
+    pub fn new(socket: UdpSocket) -> Self {
         let socket = Arc::new(socket);
         let local_addr = socket.local_addr().ok();
         log::debug!(
@@ -235,9 +234,6 @@ impl Socks5UdpRelayStream {
         Self {
             socket,
             client_addr: None,
-            client_ip_hint: client_ip_hint
-                .map(|ip| ip.to_canonical())
-                .filter(|ip| !ip.is_unspecified()),
             receiver: rx,
             reader_task: Some(reader_task),
             write_buf: Vec::new(),
@@ -255,13 +251,6 @@ impl AsyncReadTargetedMessage for Socks5UdpRelayStream {
 
         match Pin::new(&mut this.receiver).poll_recv(cx) {
             Poll::Ready(Some((packet, from_addr))) => {
-                if this
-                    .client_ip_hint
-                    .is_some_and(|ip| from_addr.ip().to_canonical() != ip)
-                {
-                    cx.waker().wake_by_ref();
-                    return Poll::Pending;
-                }
                 if let Some(expected) = this.client_addr
                     && from_addr != expected
                 {
@@ -418,15 +407,10 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn only_a_valid_packet_from_the_hinted_ip_can_claim_an_association() {
-        for hint in [
-            None,
-            Some("0.0.0.0".parse().unwrap()),
-            Some("127.0.0.1".parse().unwrap()),
-            Some("::ffff:127.0.0.1".parse().unwrap()),
-        ] {
+    async fn only_a_valid_nonempty_packet_can_claim_an_association() {
+        for invalid in [vec![0; 2], vec![0, 0, 0, 1, 127, 0, 0, 1, 0, 53]] {
             let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-            let mut relay = Socks5UdpRelayStream::new(socket, hint);
+            let mut relay = Socks5UdpRelayStream::new(socket);
             let (tx, rx) = mpsc::channel(8);
             relay.receiver = rx;
             let client: SocketAddr = "127.0.0.1:1234".parse().unwrap();
@@ -434,14 +418,9 @@ mod tests {
             let target = NetLocation::from_str("127.0.0.1:53", None).unwrap();
             let mut packet = Vec::new();
             encode_socks5_udp_packet(&target, b"valid", &mut packet);
-            tx.send((vec![0; 2].into_boxed_slice(), foreign))
+            tx.send((invalid.into_boxed_slice(), foreign))
                 .await
                 .unwrap();
-            if hint.is_some_and(|ip| !ip.is_unspecified()) {
-                tx.send((packet.clone().into_boxed_slice(), foreign))
-                    .await
-                    .unwrap();
-            }
             tx.send((packet.clone().into_boxed_slice(), client))
                 .await
                 .unwrap();
@@ -487,7 +466,7 @@ mod tests {
     #[tokio::test]
     async fn dropping_quiet_relay_releases_reader_and_socket() {
         let socket = UdpSocket::bind("0.0.0.0:0").await.unwrap();
-        let relay = Socks5UdpRelayStream::new(socket, None);
+        let relay = Socks5UdpRelayStream::new(socket);
         let socket = Arc::downgrade(&relay.socket);
         let reader = relay.reader_task.as_ref().unwrap().abort_handle();
         tokio::task::yield_now().await;
