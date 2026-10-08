@@ -125,22 +125,19 @@ async fn run_tun_server_inner(
         };
         (fd, false)
     } else {
-        let create = |offload| -> std::io::Result<_> {
+        let create = |offload| -> std::io::Result<OwnedFd> {
             let device = config.create_device(offload)?;
             #[cfg(target_os = "linux")]
             if offload {
                 offload::configure(device.as_raw_fd())?;
             }
-            Ok((
-                unsafe { OwnedFd::from_raw_fd(device.into_raw_fd()) },
-                offload,
-            ))
+            Ok(unsafe { OwnedFd::from_raw_fd(device.into_raw_fd()) })
         };
         match create(offload) {
-            Ok(device) => device,
+            Ok(fd) => (fd, offload),
             Err(error) if offload && config.segmentation_offload.is_none() => {
                 log::warn!("TUN transmit offload unavailable: {error}; using ordinary packets");
-                create(false)?
+                (create(false)?, false)
             }
             Err(error) => return Err(error),
         }

@@ -5,6 +5,12 @@ use smoltcp::wire::{IpAddress, IpProtocol, Ipv4Packet, Ipv6Packet, TcpPacket, ch
 pub(super) const HEADER_LEN: usize = 10;
 pub(super) const MAX_PACKET_LEN: usize = u16::MAX as usize;
 
+const VIRTIO_NET_HDR_F_NEEDS_CSUM: u8 = 1;
+const VIRTIO_NET_HDR_F_DATA_VALID: u8 = 2;
+const VIRTIO_NET_HDR_GSO_NONE: u8 = 0;
+const VIRTIO_NET_HDR_GSO_TCPV4: u8 = 1;
+const TCP_CHECKSUM_OFFSET: u16 = 16;
+
 #[cfg(target_os = "linux")]
 pub(super) fn configure(fd: std::os::fd::RawFd) -> io::Result<()> {
     let size: libc::c_int = HEADER_LEN as _;
@@ -36,7 +42,7 @@ pub(super) fn validate_rx(frame: &[u8], mtu: usize) -> io::Result<()> {
         return Err(invalid("invalid TUN virtio packet length"));
     }
     // DATA_VALID is harmless, but partial checksums and receive GSO were not negotiated.
-    if frame[0] & !2 != 0 || frame[1] != 0 {
+    if frame[0] & !VIRTIO_NET_HDR_F_DATA_VALID != 0 || frame[1] != VIRTIO_NET_HDR_GSO_NONE {
         return Err(invalid("unexpected TUN receive offload"));
     }
     Ok(())
@@ -50,7 +56,7 @@ pub(super) fn tx_header(
     if packet.is_empty() || packet.len() > MAX_PACKET_LEN {
         return Err(invalid("invalid TUN offload packet length"));
     }
-    let (start, protocol, source, destination) = match packet[0] >> 4 {
+    let (transport_offset, protocol, source, destination) = match packet[0] >> 4 {
         4 => {
             let ip =
                 Ipv4Packet::new_checked(&*packet).map_err(|_| invalid("invalid IPv4 packet"))?;
@@ -88,25 +94,25 @@ pub(super) fn tx_header(
         }
         return Ok(header);
     }
-    let length = packet.len() - start;
-    let mut tcp =
-        TcpPacket::new_checked(&mut packet[start..]).map_err(|_| invalid("invalid TCP packet"))?;
-    let header_len = start + usize::from(tcp.header_len());
+    let tcp_len = packet.len() - transport_offset;
+    let mut tcp = TcpPacket::new_checked(&mut packet[transport_offset..])
+        .map_err(|_| invalid("invalid TCP packet"))?;
+    let headers_len = transport_offset + usize::from(tcp.header_len());
     tcp.set_checksum(checksum::pseudo_header(
         &source,
         &destination,
         IpProtocol::Tcp,
-        length as u32,
+        tcp_len as u32,
     ));
-    header[0] = 1; // VIRTIO_NET_HDR_F_NEEDS_CSUM
-    header[6..8].copy_from_slice(&(start as u16).to_le_bytes());
-    header[8..10].copy_from_slice(&16u16.to_le_bytes());
+    header[0] = VIRTIO_NET_HDR_F_NEEDS_CSUM;
+    header[6..8].copy_from_slice(&(transport_offset as u16).to_le_bytes());
+    header[8..10].copy_from_slice(&TCP_CHECKSUM_OFFSET.to_le_bytes());
     if let Some(size) = segment_size {
-        if header_len + usize::from(size.get()) >= packet.len() {
+        if headers_len + usize::from(size.get()) >= packet.len() {
             return Err(invalid("segmentation metadata without multiple segments"));
         }
-        header[1] = 1; // VIRTIO_NET_HDR_GSO_TCPV4
-        header[2..4].copy_from_slice(&(header_len as u16).to_le_bytes());
+        header[1] = VIRTIO_NET_HDR_GSO_TCPV4;
+        header[2..4].copy_from_slice(&(headers_len as u16).to_le_bytes());
         header[4..6].copy_from_slice(&size.get().to_le_bytes());
     }
     Ok(header)

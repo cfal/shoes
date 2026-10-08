@@ -327,18 +327,11 @@ impl Device for DirectDevice {
 
     fn receive(
         &mut self,
-        _timestamp: SmolInstant,
+        timestamp: SmolInstant,
     ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         let buffer = self.pending_rx.take()?;
         let rx = DirectRxToken { buffer };
-        let tx = DirectTxToken {
-            fd: self.fd,
-            packet_information: self.packet_information,
-            buffer: &mut self.tx_buffer,
-            offload: self.offload,
-            segment_size: None,
-            gso_packets: &mut self.gso_packets,
-        };
+        let tx = self.transmit(timestamp)?;
         Some((rx, tx))
     }
 
