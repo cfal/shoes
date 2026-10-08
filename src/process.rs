@@ -269,11 +269,11 @@ impl ReloadSignal {
     }
 }
 
-pub async fn run(paths: Vec<String>, dry_run: bool, no_reload: bool) -> io::Result<i32> {
+pub async fn run(paths: Vec<String>, dry_run: bool, no_reload: bool) -> io::Result<()> {
     if dry_run {
         load_validated(&paths).await?;
         println!("Configuration valid");
-        return Ok(0);
+        return Ok(());
     }
     let mut shutdown = ShutdownSignals::new()?;
     let mut reload = ReloadSignal::new()?;
@@ -285,26 +285,26 @@ pub async fn run(paths: Vec<String>, dry_run: bool, no_reload: bool) -> io::Resu
     };
     let mut prepared = tokio::select! {
         biased;
-        _ = shutdown.recv() => return Ok(0),
+        _ = shutdown.recv() => return Ok(()),
         result = prepare(&paths) => result?,
     };
     let mut running = RunningServers::default();
     tokio::select! {
         biased;
-        _ = shutdown.recv() => { running.stop().await; return Ok(0); }
+        _ = shutdown.recv() => { running.stop().await; return Ok(()); }
         result = running.start(&mut prepared) => result?,
     }
     loop {
         let debounce = tokio::select! {
             biased;
-            _ = shutdown.recv() => { running.stop().await; return Ok(0); }
+            _ = shutdown.recv() => { running.stop().await; return Ok(()); }
             _ = reload.recv() => false,
             _ = changes.recv() => true,
         };
         if debounce {
             tokio::select! {
                 biased;
-                _ = shutdown.recv() => { running.stop().await; return Ok(0); }
+                _ = shutdown.recv() => { running.stop().await; return Ok(()); }
                 _ = reload.recv() => {}
                 _ = tokio::time::sleep(Duration::from_secs(3)) => {}
             }
@@ -319,7 +319,7 @@ pub async fn run(paths: Vec<String>, dry_run: bool, no_reload: bool) -> io::Resu
         }
         let candidate = tokio::select! {
             biased;
-            _ = shutdown.recv() => { running.stop().await; return Ok(0); }
+            _ = shutdown.recv() => { running.stop().await; return Ok(()); }
             result = prepare(&paths) => result,
         };
         let mut candidate = match candidate {
@@ -335,7 +335,7 @@ pub async fn run(paths: Vec<String>, dry_run: bool, no_reload: bool) -> io::Resu
         loop {
             let result = tokio::select! {
                 biased;
-                _ = shutdown.recv() => { running.stop().await; return Ok(0); }
+                _ = shutdown.recv() => { running.stop().await; return Ok(()); }
                 result = running.start(&mut candidate) => result,
             };
             match result {
@@ -346,7 +346,7 @@ pub async fn run(paths: Vec<String>, dry_run: bool, no_reload: bool) -> io::Resu
                 {
                     tokio::select! {
                         biased;
-                        _ = shutdown.recv() => return Ok(0),
+                        _ = shutdown.recv() => return Ok(()),
                         _ = tokio::time::sleep(Duration::from_millis(50)) => {}
                     }
                 }

@@ -306,7 +306,7 @@ fn main() {
         .expect("Could not build tokio runtime");
 
     let code = match runtime.block_on(process::run(args, dry_run, no_reload)) {
-        Ok(code) => code,
+        Ok(()) => 0,
         Err(error) => {
             eprintln!("shoes: {error}");
             1
