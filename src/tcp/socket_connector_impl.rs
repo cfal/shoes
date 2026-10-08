@@ -299,7 +299,7 @@ impl SocketConnector for SocketConnectorImpl {
         resolver: &Arc<dyn Resolver>,
         address: &ResolvedLocation,
     ) -> std::io::Result<Box<dyn AsyncStream>> {
-        let target_addrs = match address.resolved_addr() {
+        let mut target_addrs = match address.resolved_addr() {
             Some(r) => vec![r],
             None => resolve_addresses(resolver, address.location()).await?,
         };
@@ -328,6 +328,10 @@ impl SocketConnector for SocketConnectorImpl {
                 next_endpoint_index,
                 sni_hostname,
             } => {
+                // Preserve IPv4 preference for hostnames without excluding IPv6-only targets.
+                if address.address().hostname().is_some() {
+                    target_addrs.sort_by_key(SocketAddr::is_ipv6);
+                }
                 let domain = match sni_hostname {
                     Some(s) => s.as_str(),
                     None => address.address().hostname().unwrap_or("example.com"),
@@ -501,6 +505,79 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
     use tokio::time::Instant;
+
+    #[derive(Debug)]
+    struct FixedResolver(Vec<SocketAddr>);
+
+    impl Resolver for FixedResolver {
+        fn resolve_location(
+            &self,
+            _location: &NetLocation,
+        ) -> Pin<Box<dyn std::future::Future<Output = std::io::Result<Vec<SocketAddr>>> + Send>>
+        {
+            let addresses = self.0.clone();
+            Box::pin(async move { Ok(addresses) })
+        }
+    }
+
+    #[tokio::test]
+    async fn hostname_quic_prefers_ipv4_without_waiting_for_stalled_ipv6() {
+        use tokio::io::AsyncWriteExt;
+        let blackhole = crate::socket_util::new_hostname_udp_socket(None).unwrap();
+        if blackhole.local_addr().unwrap().is_ipv4() {
+            return;
+        }
+        let stalled = SocketAddr::from((
+            std::net::Ipv6Addr::LOCALHOST,
+            blackhole.local_addr().unwrap().port(),
+        ));
+        let certificate = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let server_config = quinn::ServerConfig::with_single_cert(
+            vec![certificate.cert.der().clone()],
+            rustls::pki_types::PrivatePkcs8KeyDer::from(certificate.signing_key.serialize_der())
+                .into(),
+        )
+        .unwrap();
+        for bind in ["127.0.0.1:0", "[::1]:0"] {
+            let server =
+                quinn::Endpoint::server(server_config.clone(), bind.parse().unwrap()).unwrap();
+            let server_addr = server.local_addr().unwrap();
+            let addresses = if server_addr.is_ipv4() {
+                vec![stalled, server_addr]
+            } else {
+                vec![server_addr]
+            };
+            let resolver: Arc<dyn Resolver> = Arc::new(FixedResolver(addresses));
+            let config: ClientConfig = serde_yaml::from_str("address: 'localhost:443'\ntransport: quic\nquic_settings: {verify: false}\nprotocol: {type: socks}\n").unwrap();
+            let connector =
+                SocketConnectorImpl::from_config(&config, Some(&config.address)).unwrap();
+            tokio::time::timeout(Duration::from_secs(3), async {
+                let (client, received) = tokio::join!(
+                    async {
+                        let mut stream = connector
+                            .connect(&resolver, &ResolvedLocation::new(config.address.clone()))
+                            .await
+                            .unwrap();
+                        stream.write_all(b"ping").await.unwrap();
+                        stream.flush().await.unwrap();
+                        stream
+                    },
+                    async {
+                        let connection = server.accept().await.unwrap().await.unwrap();
+                        let (_send, mut recv) = connection.accept_bi().await.unwrap();
+                        let mut data = [0; 4];
+                        recv.read_exact(&mut data).await.unwrap();
+                        assert_eq!(&data, b"ping");
+                        connection
+                    },
+                );
+                drop((client, received));
+            })
+            .await
+            .unwrap();
+            server.close(0u32.into(), b"done");
+        }
+    }
 
     fn addresses(count: u16) -> Vec<SocketAddr> {
         (1..=count)
