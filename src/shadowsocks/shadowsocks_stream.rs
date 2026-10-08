@@ -88,6 +88,57 @@ enum DecryptState {
 
 const METADATA_SIZE: usize = 2 + (2 * TAG_LEN);
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn full_output_buffer_preserves_the_decrypted_length_and_nonce() {
+        let algorithm = &aws_lc_rs::aead::AES_128_GCM;
+        let (transport, _) = tokio::io::duplex(1);
+        let mut stream = ShadowsocksStream::new(
+            Box::new(transport),
+            ShadowsocksStreamType::Aead,
+            algorithm,
+            16,
+            Arc::new(Box::new(super::super::default_key::DefaultKey::new(
+                "test", 16,
+            ))),
+            None,
+        );
+        let mut seal = SealingKey::new(
+            UnboundKey::new(algorithm, &[7; 16]).unwrap(),
+            IncreasingSequence::new(),
+        );
+        stream.opening_key = Some(OpeningKey::new(
+            UnboundKey::new(algorithm, &[7; 16]).unwrap(),
+            IncreasingSequence::new(),
+        ));
+        let mut packet = Vec::new();
+        for plaintext in [&[0, 3][..], b"abc"] {
+            let mut chunk = plaintext.to_vec();
+            seal.seal_in_place_append_tag(Aad::empty(), &mut chunk)
+                .unwrap();
+            packet.extend(chunk);
+        }
+        stream.unprocessed_buf[..packet.len()].copy_from_slice(&packet);
+        stream.unprocessed_end_offset = packet.len();
+        stream.processed_end_offset = stream.processed_buf.len();
+        assert!(matches!(
+            stream.try_decrypt().unwrap(),
+            DecryptState::BufferFull
+        ));
+        assert_eq!(stream.unprocessed_pending_len, Some(3));
+        stream.processed_end_offset = 0;
+        assert!(matches!(
+            stream.try_decrypt().unwrap(),
+            DecryptState::Success
+        ));
+        assert_eq!(&stream.processed_buf[..3], b"abc");
+        assert_eq!(stream.unprocessed_pending_len, None);
+    }
+}
+
 impl ShadowsocksStream {
     pub fn new(
         stream: Box<dyn AsyncStream>,
@@ -222,6 +273,8 @@ impl ShadowsocksStream {
                 }
 
                 if self.processed_end_offset + data_len_no_tag > self.processed_buf.len() {
+                    // The length nonce has already advanced; retry the payload, not its header.
+                    self.unprocessed_pending_len = Some(data_len_no_tag);
                     return Ok(DecryptState::BufferFull);
                 }
 
