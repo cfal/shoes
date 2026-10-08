@@ -465,18 +465,20 @@ async fn process_tcp_stream(
         }
     };
 
-    if let Some(data) = early_data {
-        write_all(&mut server_stream, &data).await?;
-        server_stream.flush().await?;
-    }
-
-    let unparsed_data = stream_reader.unparsed_data();
-    let client_requires_flush = if unparsed_data.is_empty() {
-        false
-    } else {
-        write_all(&mut client_stream, unparsed_data).await?;
-        true
-    };
+    let client_requires_flush = crate::util::timeout_stream_setup(async {
+        if let Some(data) = early_data {
+            write_all(&mut server_stream, &data).await?;
+            server_stream.flush().await?;
+        }
+        let unparsed_data = stream_reader.unparsed_data();
+        if unparsed_data.is_empty() {
+            Ok(false)
+        } else {
+            write_all(&mut client_stream, unparsed_data).await?;
+            Ok(true)
+        }
+    })
+    .await?;
     drop(stream_reader);
 
     // Use 32KB buffers to match reference implementations

@@ -197,24 +197,22 @@ where
                 }
             };
 
-            if let Some(data) = connection_success_response {
-                write_all(&mut server_stream, &data).await?;
-                // server_need_initial_flush should be set to true by the handler if
-                // it's needed.
-            }
-
-            if let Some(data) = early_data {
-                write_all(&mut server_stream, &data).await?;
-                server_stream.flush().await?;
-            }
-
-            let client_need_initial_flush = match initial_remote_data {
-                Some(data) => {
-                    write_all(&mut client_stream, &data).await?;
-                    true
+            let client_need_initial_flush = crate::util::timeout_stream_setup(async {
+                if let Some(data) = connection_success_response {
+                    write_all(&mut server_stream, &data).await?;
                 }
-                None => false,
-            };
+                if let Some(data) = early_data {
+                    write_all(&mut server_stream, &data).await?;
+                    server_stream.flush().await?;
+                }
+                if let Some(data) = initial_remote_data {
+                    write_all(&mut client_stream, &data).await?;
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
+            })
+            .await?;
 
             let copy_result = copy_bidirectional(
                 &mut server_stream,
@@ -512,27 +510,87 @@ mod lifetime_tests {
     use crate::client_proxy_selector::{ConnectAction, ConnectRule};
     use crate::tcp::socket_connector::SocketConnector;
 
+    #[derive(Debug)]
+    struct Handler(Arc<ClientProxySelector>);
+    #[async_trait]
+    impl TcpServerHandler for Handler {
+        async fn setup_server_stream(
+            &self,
+            stream: Box<dyn AsyncStream>,
+        ) -> io::Result<TcpServerSetupResult> {
+            Ok(TcpServerSetupResult::TcpForward {
+                remote_location: NetLocation::from_str("127.0.0.1:80", None)?,
+                stream,
+                need_initial_flush: true,
+                proxy_selector: self.0.clone(),
+                connection_success_response: Some(b"response".to_vec().into_boxed_slice()),
+                initial_remote_data: Some(b"request".to_vec().into_boxed_slice()),
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct ReadyConnector(std::sync::Mutex<Option<tokio::io::DuplexStream>>);
+
+    #[async_trait]
+    impl SocketConnector for ReadyConnector {
+        async fn connect(
+            &self,
+            _: &Arc<dyn Resolver>,
+            _: &crate::address::ResolvedLocation,
+        ) -> io::Result<Box<dyn AsyncStream>> {
+            Ok(Box::new(self.0.lock().unwrap().take().unwrap()))
+        }
+        async fn connect_udp_bidirectional(
+            &self,
+            _: &Arc<dyn Resolver>,
+            _: crate::address::ResolvedLocation,
+        ) -> io::Result<Box<dyn AsyncMessageStream>> {
+            unreachable!()
+        }
+        fn bind_interface(&self) -> Option<&str> {
+            None
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn initial_response_and_request_writes_have_deadlines() {
+        use tokio::io::AsyncReadExt;
+        for (inbound_capacity, outbound_capacity) in [(1, 64), (64, 1)] {
+            let (inbound, mut peer) = tokio::io::duplex(inbound_capacity);
+            let (outbound, mut target) = tokio::io::duplex(outbound_capacity);
+            let chain = ClientProxyChain::new(
+                vec![InitialHopEntry::Direct(Box::new(ReadyConnector(
+                    std::sync::Mutex::new(Some(outbound)),
+                )))],
+                vec![],
+            );
+            let selector = Arc::new(ClientProxySelector::new(vec![ConnectRule::new(
+                vec![crate::address::NetLocationMask::ANY],
+                ConnectAction::new_allow(None, ClientChainGroup::new(vec![chain])),
+            )]));
+            let started = tokio::time::Instant::now();
+            let error = timeout(
+                Duration::from_secs(61),
+                process_stream(
+                    inbound,
+                    Arc::new(Handler(selector)),
+                    Arc::new(PendingResolver),
+                ),
+            )
+            .await
+            .expect("initial writes retained the stream indefinitely")
+            .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+            assert_eq!(started.elapsed(), Duration::from_secs(60));
+            peer.read_to_end(&mut Vec::new()).await.unwrap();
+            target.read_to_end(&mut Vec::new()).await.unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn protocol_response_precedes_chained_greeting() {
         use tokio::io::AsyncReadExt;
-        #[derive(Debug)]
-        struct Handler(Arc<ClientProxySelector>);
-        #[async_trait]
-        impl TcpServerHandler for Handler {
-            async fn setup_server_stream(
-                &self,
-                stream: Box<dyn AsyncStream>,
-            ) -> io::Result<TcpServerSetupResult> {
-                Ok(TcpServerSetupResult::TcpForward {
-                    remote_location: NetLocation::from_str("127.0.0.1:80", None)?,
-                    stream,
-                    need_initial_flush: true,
-                    proxy_selector: self.0.clone(),
-                    connection_success_response: Some(b"response".to_vec().into_boxed_slice()),
-                    initial_remote_data: Some(b"request".to_vec().into_boxed_slice()),
-                })
-            }
-        }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let rule = serde_yaml::from_str(&format!(
             "masks: '0.0.0.0/0'\nclient_proxy:\n  address: '{}'\n  protocol: {{type: socks}}\n",
