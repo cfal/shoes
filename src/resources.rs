@@ -165,6 +165,20 @@ pub(crate) fn try_quic_memory(bytes: usize) -> Option<BudgetPermit> {
     QUIC_BYTES.acquire(bytes)
 }
 
+pub(crate) fn quic_memory_exhausted(bytes: usize) -> std::io::Error {
+    let state = QUIC_BYTES.0.lock();
+    let limit = state
+        .limit
+        .map_or_else(|| "unlimited".to_owned(), |limit| limit.to_string());
+    std::io::Error::new(
+        std::io::ErrorKind::ConnectionRefused,
+        format!(
+            "QUIC memory budget exhausted: requested {bytes} bytes, active {} bytes, live cap {limit}",
+            state.active,
+        ),
+    )
+}
+
 pub(crate) fn configure_quic(
     config: &mut quinn::ServerConfig,
     bidi_streams: u32,

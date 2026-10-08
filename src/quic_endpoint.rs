@@ -70,7 +70,7 @@ impl QuicEndpoint {
 
     pub fn connect(&self, address: SocketAddr, name: &str) -> io::Result<quinn::Connecting> {
         let memory = crate::resources::try_quic_memory(self.memory_bytes)
-            .ok_or_else(crate::resources::exhausted)?;
+            .ok_or_else(|| crate::resources::quic_memory_exhausted(self.memory_bytes))?;
         self.connect_with_memory(address, name, memory)
     }
 
@@ -123,8 +123,9 @@ impl Incoming {
 
     pub fn accept(self) -> io::Result<quinn::Connecting> {
         let Some(memory) = crate::resources::try_quic_memory(self.memory_bytes) else {
+            let error = crate::resources::quic_memory_exhausted(self.memory_bytes);
             self.refuse();
-            return Err(crate::resources::exhausted());
+            return Err(error);
         };
         self.accept_with_memory(memory)
     }

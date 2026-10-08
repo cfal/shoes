@@ -753,6 +753,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dns_bootstrap_uses_live_quic_admission_before_activation() {
+        if std::env::var_os("SHOES_DNS_ADMISSION_TEST_CHILD").is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "dns::builder::tests::dns_bootstrap_uses_live_quic_admission_before_activation",
+                ])
+                .env("SHOES_DNS_ADMISSION_TEST_CHILD", "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let blackhole = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = blackhole.local_addr().unwrap();
+        let live = GlobalLimits {
+            quic_memory_bytes: Some(1),
+            ..Default::default()
+        };
+        let candidate = GlobalLimits {
+            quic_memory_bytes: Some(64 << 20),
+            ..live
+        };
+        crate::resources::configure(live).unwrap();
+        for server in [
+            format!("url: h3://{address}/dns-query"),
+            format!(
+                "url: tcp://127.0.0.1\n      client_chain:\n        address: '{address}'\n        transport: quic\n        protocol: {{type: socks}}"
+            ),
+        ] {
+            let config = format!(
+                "- dns_group: bootstrap\n  dns_servers:\n    - {server}\n      timeout_secs: 1\n      attempts: 1\n- dns_group: candidate\n  dns_servers:\n    - url: https://candidate.test/dns-query\n      bootstrap_url: bootstrap\n"
+            );
+            let validated =
+                crate::config::create_server_configs(serde_yaml::from_str(&config).unwrap())
+                    .unwrap();
+            let rejected = crate::resources::snapshot().quic_buffer_bytes.rejected;
+            assert!(
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    build_dns_registry_with_limits(validated.dns_groups, candidate)
+                )
+                .await
+                .unwrap()
+                .is_err()
+            );
+            assert!(crate::resources::snapshot().quic_buffer_bytes.rejected > rejected);
+            assert_eq!(crate::resources::snapshot().quic_buffer_bytes.active, 0);
+            assert_eq!(
+                crate::resources::limits().quic_memory_bytes,
+                live.quic_memory_bytes
+            );
+            assert!(blackhole.try_recv(&mut [0; 1500]).is_err());
+        }
+    }
+
+    #[tokio::test]
     async fn prepared_dns_chains_use_candidate_quic_windows() {
         if std::env::var_os("SHOES_DNS_CANDIDATE_TEST_CHILD").is_none() {
             let status = std::process::Command::new(std::env::current_exe().unwrap())

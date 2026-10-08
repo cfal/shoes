@@ -176,7 +176,7 @@ impl QuicSocketBinder for ProxyQuicBinder {
         _server_addr: SocketAddr,
     ) -> Result<Arc<dyn quinn::AsyncUdpSocket>, io::Error> {
         let memory = crate::resources::try_quic_memory(self.memory_bytes)
-            .ok_or_else(crate::resources::exhausted)?;
+            .ok_or_else(|| crate::resources::quic_memory_exhausted(self.memory_bytes))?;
         let socket = crate::socket_util::new_outbound_socket2_udp_socket(
             local_addr.is_ipv6(),
             self.bind_interface.clone(),
@@ -337,24 +337,51 @@ mod tests {
         )
         .with_quic_memory(1 << 20);
         assert_eq!(crate::resources::limits().quic_dns_memory_bytes, 16 << 20);
+        let binder = provider.quic_binder().unwrap();
+        let bind = || {
+            binder.bind_quic(
+                "0.0.0.0:0".parse().unwrap(),
+                "127.0.0.1:443".parse().unwrap(),
+            )
+        };
+        crate::resources::configure(crate::config::GlobalLimits {
+            quic_memory_bytes: Some(512 << 10),
+            ..Default::default()
+        })
+        .unwrap();
+        let error = bind().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
+        assert!(
+            error
+                .to_string()
+                .contains("requested 1048576 bytes, active 0 bytes, live cap 524288")
+        );
         crate::resources::configure(crate::config::GlobalLimits {
             quic_memory_bytes: Some(2 << 20),
             ..Default::default()
         })
         .unwrap();
-        let binder = provider.quic_binder().unwrap();
-        let socket = binder
-            .bind_quic(
-                "0.0.0.0:0".parse().unwrap(),
-                "127.0.0.1:443".parse().unwrap(),
-            )
-            .unwrap();
+        let socket = bind().unwrap();
         assert_eq!(
             crate::resources::snapshot().quic_buffer_bytes.active,
             1 << 20
         );
+        let second = bind().unwrap();
+        crate::resources::configure(crate::config::GlobalLimits {
+            quic_memory_bytes: Some(1 << 20),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            crate::resources::snapshot().quic_buffer_bytes.active,
+            2 << 20
+        );
+        assert!(bind().is_err());
+        drop(second);
+        assert!(bind().is_err());
         drop(socket);
         assert_eq!(crate::resources::snapshot().quic_buffer_bytes.active, 0);
+        assert!(bind().is_ok());
     }
 
     #[tokio::test]

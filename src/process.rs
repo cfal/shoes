@@ -67,7 +67,18 @@ async fn prepare(paths: &[String]) -> io::Result<PreparedServers> {
         std::mem::take(&mut validated.dns_groups),
         validated.global_limits,
     )
-    .await?;
+    .await
+    .map_err(|error| {
+        let live = resources::limits().quic_memory_bytes;
+        let candidate = validated.global_limits.quic_memory_bytes;
+        if live == candidate {
+            error
+        } else {
+            io::Error::new(error.kind(), format!(
+                "{error}; DNS preparation uses the live QUIC cap {live:?}, not the candidate cap {candidate:?}"
+            ))
+        }
+    })?;
     Ok(PreparedServers { validated, dns })
 }
 
