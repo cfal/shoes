@@ -48,15 +48,25 @@ mod tests {
 
     #[tokio::test]
     async fn hostname_socket_prefers_dual_stack_and_enforces_interface_binding() {
+        let ipv6_available =
+            match new_socket2_udp_socket(true, None, Some("[::]:0".parse().unwrap()), false) {
+                Ok(_) => true,
+                Err(error) if ipv6_unavailable(&error) => false,
+                Err(error) => panic!("IPv6 socket probe failed: {error}"),
+            };
         let socket = new_hostname_udp_socket(None).unwrap();
-        assert!(socket.local_addr().unwrap().is_ipv6());
+        assert_eq!(socket.local_addr().unwrap().is_ipv6(), ipv6_available);
         assert!(new_hostname_udp_socket(Some("shoes-missing-interface".into())).is_err());
     }
 
     #[tokio::test]
     async fn ipv6_udp_listener_accepts_both_address_families() {
         let socket =
-            new_socket2_udp_socket(true, None, Some("[::]:0".parse().unwrap()), false).unwrap();
+            match new_socket2_udp_socket(true, None, Some("[::]:0".parse().unwrap()), false) {
+                Ok(socket) => socket,
+                Err(error) if ipv6_unavailable(&error) => return,
+                Err(error) => panic!("IPv6 socket creation failed: {error}"),
+            };
         assert!(!socket.only_v6().unwrap());
         let socket = into_tokio_udp_socket(socket).unwrap();
         let port = socket.local_addr().unwrap().port();
@@ -65,7 +75,11 @@ mod tests {
             ("[::1]:0", format!("[::1]:{port}")),
         ] {
             tokio::time::timeout(std::time::Duration::from_secs(2), async {
-                let peer = tokio::net::UdpSocket::bind(bind).await.unwrap();
+                let peer = match tokio::net::UdpSocket::bind(bind).await {
+                    Ok(peer) => peer,
+                    Err(error) if bind == "[::1]:0" && ipv6_unavailable(&error) => return,
+                    Err(error) => panic!("UDP peer bind failed: {error}"),
+                };
                 peer.send_to(b"request", destination).await.unwrap();
                 let mut buf = [0; 16];
                 let (len, sender) = socket.recv_from(&mut buf).await.unwrap();

@@ -807,7 +807,7 @@ mod tests {
                 }
                 assert_eq!(
                     crate::resources::snapshot().quic_buffer_bytes.active,
-                    window as usize * 2 + (512 << 10)
+                    window * 2 + (512 << 10)
                 );
             }
             drop((resolver, registry));
