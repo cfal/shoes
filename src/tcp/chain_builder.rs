@@ -364,6 +364,15 @@ mod tests {
     }
 
     #[test]
+    fn test_empty_chain_returns_error() {
+        let result = try_build_client_proxy_chain(OneOrSome::Some(vec![]), mock_resolver());
+        assert_eq!(
+            result.err().unwrap().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
     fn test_unresolved_group_reference_returns_error() {
         let selection = ConfigSelection::GroupName("unresolved_group".to_string());
         for hop in [

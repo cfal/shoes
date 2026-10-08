@@ -966,22 +966,25 @@ mod tcp_tests {
 
     #[tokio::test(start_paused = true)]
     async fn failed_dials_report_failure_without_exposing_internal_errors() {
-        for kind in [
-            std::io::ErrorKind::PermissionDenied,
-            std::io::ErrorKind::ConnectionRefused,
-            std::io::ErrorKind::TimedOut,
+        for (kind, blocked) in [
+            (std::io::ErrorKind::PermissionDenied, true),
+            (std::io::ErrorKind::PermissionDenied, false),
+            (std::io::ErrorKind::ConnectionRefused, false),
+            (std::io::ErrorKind::TimedOut, false),
         ] {
             let (server, mut peer) = tokio::io::duplex(512);
             let mut server: Box<dyn AsyncStream> = Box::new(server);
             let result = complete_tcp_setup(&mut server, async {
-                match kind {
-                    std::io::ErrorKind::PermissionDenied => Ok(None),
-                    std::io::ErrorKind::TimedOut => std::future::pending().await,
-                    _ => Err(std::io::Error::new(kind, "private target details")),
+                if blocked {
+                    Ok(None)
+                } else if kind == std::io::ErrorKind::TimedOut {
+                    std::future::pending().await
+                } else {
+                    Err(std::io::Error::new(kind, "private target details"))
                 }
             })
             .await;
-            if kind == std::io::ErrorKind::PermissionDenied {
+            if blocked {
                 assert!(result.unwrap().is_none());
             } else {
                 assert_eq!(result.err().unwrap().kind(), kind);
