@@ -360,6 +360,7 @@ impl AsyncWrite for AnyTlsStream {
             return Poll::Ready(Ok(()));
         }
         if self.session_closed.load(Ordering::Relaxed) {
+            self.data_rx.close();
             self.stream_closed = true;
             return Poll::Ready(Ok(()));
         }
@@ -375,6 +376,7 @@ impl AsyncWrite for AnyTlsStream {
             self.fin_sent = true;
         }
         std::task::ready!(self.data_tx.poll_flush(cx))?;
+        self.data_rx.close();
         self.stream_closed = true;
         Poll::Ready(Ok(()))
     }
@@ -420,7 +422,6 @@ mod tests {
             AnyTlsStream::new(1, incoming_rx, outgoing, Arc::new(AtomicBool::new(false)));
         incoming.send(Bytes::from_static(b"first")).await.unwrap();
         incoming.send(Bytes::from_static(b"second")).await.unwrap();
-        drop(incoming);
         let mut first = [0; 1];
         stream.read_exact(&mut first).await.unwrap();
         stream.shutdown().await.unwrap();
