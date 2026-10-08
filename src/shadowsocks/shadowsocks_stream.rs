@@ -92,6 +92,17 @@ const METADATA_SIZE: usize = 2 + (2 * TAG_LEN);
 mod tests {
     use super::*;
 
+    #[test]
+    fn timestamp_window_is_symmetric_and_inclusive() {
+        for timestamp in [970, 1000, 1030] {
+            assert!(validate_timestamp(timestamp, 1000).is_ok());
+        }
+        for timestamp in [969, 1031, u64::MAX] {
+            assert!(validate_timestamp(timestamp, 1000).is_err());
+        }
+        assert!(validate_timestamp(0, 0).is_ok());
+    }
+
     #[tokio::test]
     async fn full_output_buffer_preserves_the_decrypted_length_and_nonce() {
         let algorithm = &aws_lc_rs::aead::AES_128_GCM;
@@ -502,21 +513,7 @@ impl ShadowsocksStream {
                 let timestamp_bytes = &self.unprocessed_buf[self.salt_len + 1..self.salt_len + 9];
                 let timestamp_secs = u64::from_be_bytes(timestamp_bytes.try_into().unwrap());
                 let current_time_secs = current_time_secs();
-                if current_time_secs >= timestamp_secs {
-                    if current_time_secs - timestamp_secs > 30 {
-                        return Err(std::io::Error::other(
-                            "timestamp is greater than 30 seconds",
-                        ));
-                    }
-                } else {
-                    // Make sure times aren't too far in the future.
-                    if timestamp_secs - current_time_secs > 2 {
-                        return Err(std::io::Error::other(format!(
-                            "timestamp is {} seconds in the future",
-                            timestamp_secs - current_time_secs
-                        )));
-                    }
-                }
+                validate_timestamp(timestamp_secs, current_time_secs)?;
 
                 let decrypt_iv = &self.unprocessed_buf[0..self.salt_len];
                 if let Some(salt_checker) = &self.salt_checker
@@ -569,21 +566,7 @@ impl ShadowsocksStream {
                 let timestamp_bytes = &self.unprocessed_buf[self.salt_len + 1..self.salt_len + 9];
                 let timestamp_secs = u64::from_be_bytes(timestamp_bytes.try_into().unwrap());
                 let current_time_secs = current_time_secs();
-                if current_time_secs >= timestamp_secs {
-                    if current_time_secs - timestamp_secs > 30 {
-                        return Err(std::io::Error::other(
-                            "timestamp is greater than 30 seconds",
-                        ));
-                    }
-                } else {
-                    // Make sure times aren't too far in the future.
-                    if timestamp_secs - current_time_secs > 2 {
-                        return Err(std::io::Error::other(format!(
-                            "timestamp is {} seconds in the future",
-                            timestamp_secs - current_time_secs
-                        )));
-                    }
-                }
+                validate_timestamp(timestamp_secs, current_time_secs)?;
 
                 if let Some(salt_checker) = &self.salt_checker {
                     let decrypt_iv = &self.unprocessed_buf[0..self.salt_len];
@@ -980,6 +963,16 @@ impl AsyncMessageStream for ShadowsocksStream {}
 #[inline]
 fn current_time_secs() -> u64 {
     SystemTime::UNIX_EPOCH.elapsed().unwrap().as_secs()
+}
+
+fn validate_timestamp(timestamp: u64, now: u64) -> std::io::Result<()> {
+    if timestamp.abs_diff(now) > 30 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "timestamp outside the 30-second window",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
