@@ -12,13 +12,18 @@ impl QuicListener {
         count: usize,
         memory_bytes: usize,
     ) -> std::io::Result<Vec<Self>> {
+        let reuse_port = cfg!(all(
+            unix,
+            not(any(target_os = "solaris", target_os = "illumos"))
+        ));
+        let count = if reuse_port { count } else { count.min(1) };
         (0..count)
             .map(|_| {
                 let socket = crate::socket_util::new_socket2_udp_socket_with_buffer_size(
                     address.is_ipv6(),
                     None,
                     Some(address),
-                    true,
+                    reuse_port,
                     Some(crate::resources::limits().quic_socket_buffer),
                 )?;
                 crate::quic_endpoint::QuicEndpoint::new(
@@ -174,6 +179,18 @@ mod tests {
         .unwrap();
         let memory_bytes = crate::resources::configure_quic(&mut server_config, 100, 0);
         let client_config = quinn::ClientConfig::with_root_certificates(Arc::new(roots)).unwrap();
+        #[cfg(windows)]
+        assert_eq!(
+            QuicListener::bind_all(
+                "0.0.0.0:0".parse().unwrap(),
+                server_config.clone(),
+                4,
+                memory_bytes,
+            )
+            .unwrap()
+            .len(),
+            1,
+        );
         let occupied = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
         assert!(
             QuicListener::bind_all(

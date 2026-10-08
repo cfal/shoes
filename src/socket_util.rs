@@ -10,6 +10,37 @@ use std::path::Path;
 
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn ipv6_udp_listener_accepts_both_address_families() {
+        let socket =
+            new_socket2_udp_socket(true, None, Some("[::]:0".parse().unwrap()), false).unwrap();
+        assert!(!socket.only_v6().unwrap());
+        let socket = into_tokio_udp_socket(socket).unwrap();
+        let port = socket.local_addr().unwrap().port();
+        for (bind, destination) in [
+            ("127.0.0.1:0", format!("127.0.0.1:{port}")),
+            ("[::1]:0", format!("[::1]:{port}")),
+        ] {
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                let peer = tokio::net::UdpSocket::bind(bind).await.unwrap();
+                peer.send_to(b"request", destination).await.unwrap();
+                let mut buf = [0; 16];
+                let (len, sender) = socket.recv_from(&mut buf).await.unwrap();
+                assert_eq!(&buf[..len], b"request");
+                socket.send_to(b"reply", sender).await.unwrap();
+                let len = peer.recv(&mut buf).await.unwrap();
+                assert_eq!(&buf[..len], b"reply");
+            })
+            .await
+            .unwrap();
+        }
+    }
+}
+
 #[cfg(all(test, unix, feature = "ffi"))]
 mod protection_tests {
     use super::*;
@@ -101,6 +132,10 @@ pub fn new_socket2_udp_socket_with_buffer_size(
     let domain = if is_ipv6 { Domain::IPV6 } else { Domain::IPV4 };
     let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
 
+    if is_ipv6 {
+        socket.set_only_v6(false)?;
+    }
+
     socket.set_nonblocking(true)?;
 
     // Set socket buffer sizes if specified.
@@ -116,7 +151,10 @@ pub fn new_socket2_udp_socket_with_buffer_size(
         socket.set_reuse_port(true)?;
 
         #[cfg(any(not(unix), target_os = "solaris", target_os = "illumos"))]
-        panic!("Cannot support reuse sockets");
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "UDP port reuse is unsupported on this platform",
+        ));
     }
 
     if let Some(ref interface) = bind_interface {
