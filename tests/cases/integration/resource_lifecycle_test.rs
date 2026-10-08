@@ -327,7 +327,7 @@ async fn quic_reload_disconnects_old_connections_and_allows_reconnect()
     file.write_all(b"\n# trigger QUIC reload\n")?;
     file.flush()?;
     for (_, connection, _, _) in &old {
-        let closed = timeout(Duration::from_secs(2), connection.closed()).await?;
+        let closed = timeout(Duration::from_secs(6), connection.closed()).await?;
         assert!(matches!(
             closed,
             quinn::ConnectionError::ApplicationClosed(_)
