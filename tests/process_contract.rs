@@ -382,7 +382,7 @@ async fn rejected_reload_preserves_traffic_and_valid_reload_drains_tcp() {
         .unwrap();
     assert!(result.is_err());
     child.signal(libc::SIGTERM);
-    assert_eq!(child.exit().await.code(), Some(143));
+    assert_eq!(child.exit().await.code(), Some(0));
 }
 
 #[cfg(unix)]
@@ -405,7 +405,7 @@ async fn shutdown_interrupts_watcher_debounce() {
             .await
             .unwrap()
             .code(),
-        Some(143)
+        Some(0)
     );
 }
 
@@ -437,7 +437,7 @@ async fn sighup_completes_pending_file_reload_without_waiting_for_debounce() {
         .is_err()
     );
     child.signal(libc::SIGTERM);
-    assert_eq!(child.exit().await.code(), Some(143));
+    assert_eq!(child.exit().await.code(), Some(0));
 }
 
 #[cfg(unix)]
@@ -461,7 +461,7 @@ async fn atomic_replace_keeps_serving_through_debounce() {
     child.wait_for("Servers ready").await;
     roundtrip(&mut TcpStream::connect(address).await.unwrap()).await;
     child.signal(libc::SIGINT);
-    assert_eq!(child.exit().await.code(), Some(130));
+    assert_eq!(child.exit().await.code(), Some(0));
 }
 
 #[cfg(unix)]
@@ -501,7 +501,7 @@ async fn symlink_targets_remain_watched_after_retargeting() {
     std::fs::write(&missing, &config).unwrap();
     child.wait_for("Servers ready").await;
     child.signal(libc::SIGTERM);
-    assert_eq!(child.exit().await.code(), Some(143));
+    assert_eq!(child.exit().await.code(), Some(0));
 }
 
 #[cfg(unix)]
@@ -531,7 +531,7 @@ async fn shutdown_interrupts_dns_preparation_without_retiring_listeners() {
             .await
             .unwrap()
             .code(),
-        Some(143)
+        Some(0)
     );
 }
 
