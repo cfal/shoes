@@ -189,6 +189,7 @@ pub struct Socks5UdpRelayStream {
     socket: Arc<UdpSocket>,
     /// The client's UDP address, learned from the first received packet.
     client_addr: Option<SocketAddr>,
+    client_ip_hint: Option<IpAddr>,
     /// Receiver for incoming packets from the socket reader task.
     receiver: mpsc::Receiver<(Box<[u8]>, SocketAddr)>,
     /// Handle to the socket reader task.
@@ -201,7 +202,7 @@ impl Socks5UdpRelayStream {
     ///
     /// # Arguments
     /// * `socket` - The bound UDP socket for the relay
-    pub fn new(socket: UdpSocket) -> Self {
+    pub fn new(socket: UdpSocket, client_ip_hint: Option<IpAddr>) -> Self {
         let socket = Arc::new(socket);
         let local_addr = socket.local_addr().ok();
         log::debug!(
@@ -234,6 +235,9 @@ impl Socks5UdpRelayStream {
         Self {
             socket,
             client_addr: None,
+            client_ip_hint: client_ip_hint
+                .map(|ip| ip.to_canonical())
+                .filter(|ip| !ip.is_unspecified()),
             receiver: rx,
             reader_task: Some(reader_task),
             write_buf: Vec::new(),
@@ -251,7 +255,13 @@ impl AsyncReadTargetedMessage for Socks5UdpRelayStream {
 
         match Pin::new(&mut this.receiver).poll_recv(cx) {
             Poll::Ready(Some((packet, from_addr))) => {
-                // Learn/verify client address
+                if this
+                    .client_ip_hint
+                    .is_some_and(|ip| from_addr.ip().to_canonical() != ip)
+                {
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
                 if let Some(expected) = this.client_addr {
                     if from_addr != expected {
                         // Packet from unexpected source, ignore
@@ -263,10 +273,6 @@ impl AsyncReadTargetedMessage for Socks5UdpRelayStream {
                         cx.waker().wake_by_ref();
                         return Poll::Pending;
                     }
-                } else {
-                    // Learn client address from first packet
-                    log::debug!("SOCKS5 UDP relay: learned client address: {}", from_addr);
-                    this.client_addr = Some(from_addr);
                 }
 
                 match parse_socks5_udp_packet(&packet) {
@@ -292,6 +298,7 @@ impl AsyncReadTargetedMessage for Socks5UdpRelayStream {
                                 ),
                             )));
                         }
+                        this.client_addr = Some(from_addr);
                         buf.put_slice(payload);
                         Poll::Ready(Ok(target))
                     }
@@ -410,6 +417,57 @@ impl Drop for Socks5UdpRelayStream {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn only_a_valid_packet_from_the_hinted_ip_can_claim_an_association() {
+        for hint in [
+            None,
+            Some("0.0.0.0".parse().unwrap()),
+            Some("127.0.0.1".parse().unwrap()),
+            Some("::ffff:127.0.0.1".parse().unwrap()),
+        ] {
+            let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let mut relay = Socks5UdpRelayStream::new(socket, hint);
+            let (tx, rx) = mpsc::channel(8);
+            relay.receiver = rx;
+            let client: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+            let foreign: SocketAddr = "127.0.0.2:5678".parse().unwrap();
+            let target = NetLocation::from_str("127.0.0.1:53", None).unwrap();
+            let mut packet = Vec::new();
+            encode_socks5_udp_packet(&target, b"valid", &mut packet);
+            tx.send((vec![0; 2].into_boxed_slice(), foreign))
+                .await
+                .unwrap();
+            if hint.is_some_and(|ip| !ip.is_unspecified()) {
+                tx.send((packet.clone().into_boxed_slice(), foreign))
+                    .await
+                    .unwrap();
+            }
+            tx.send((packet.clone().into_boxed_slice(), client))
+                .await
+                .unwrap();
+            let mut output = [0; 64];
+            let mut output = ReadBuf::new(&mut output);
+            let read_target = std::future::poll_fn(|cx| {
+                Pin::new(&mut relay).poll_read_targeted_message(cx, &mut output)
+            })
+            .await
+            .unwrap();
+            assert_eq!(read_target, target);
+            assert_eq!(output.filled(), b"valid");
+            assert_eq!(relay.client_addr, Some(client));
+            tx.send((packet.clone().into_boxed_slice(), foreign))
+                .await
+                .unwrap();
+            let mut cx = Context::from_waker(std::task::Waker::noop());
+            assert!(
+                Pin::new(&mut relay)
+                    .poll_read_targeted_message(&mut cx, &mut output)
+                    .is_pending()
+            );
+            assert_eq!(relay.client_addr, Some(client));
+        }
+    }
+
     #[test]
     fn reply_storage_reuses_capacity_without_retaining_previous_packet() {
         let mut packet = Vec::with_capacity(1024);
@@ -429,7 +487,7 @@ mod tests {
     #[tokio::test]
     async fn dropping_quiet_relay_releases_reader_and_socket() {
         let socket = UdpSocket::bind("0.0.0.0:0").await.unwrap();
-        let relay = Socks5UdpRelayStream::new(socket);
+        let relay = Socks5UdpRelayStream::new(socket, None);
         let socket = Arc::downgrade(&relay.socket);
         let reader = relay.reader_task.as_ref().unwrap().abort_handle();
         tokio::task::yield_now().await;
