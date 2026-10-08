@@ -1,6 +1,5 @@
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
-use std::path::PathBuf;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -28,14 +27,13 @@ use crate::tun::start_tun_server;
 use crate::util::write_all;
 
 async fn run_tcp_server(
-    bind_address: SocketAddr,
+    listener: tokio::net::TcpListener,
     tcp_config: TcpConfig,
     resolver: Arc<dyn Resolver>,
     server_handler: Arc<dyn TcpServerHandler>,
 ) -> std::io::Result<()> {
     let TcpConfig { no_delay } = tcp_config;
 
-    let listener = new_tcp_listener(bind_address, 4096, None)?;
     let mut tasks = crate::listener_tasks::ListenerTasks::new();
 
     loop {
@@ -82,19 +80,10 @@ async fn run_tcp_server(
 
 #[cfg(target_family = "unix")]
 async fn run_unix_server(
-    path_buf: PathBuf,
+    listener: tokio::net::UnixListener,
     resolver: Arc<dyn Resolver>,
     server_handler: Arc<dyn TcpServerHandler>,
 ) -> std::io::Result<()> {
-    if tokio::fs::symlink_metadata(&path_buf).await.is_ok() {
-        println!(
-            "WARNING: replacing file at socket path {}",
-            path_buf.display()
-        );
-        let _ = tokio::fs::remove_file(&path_buf).await;
-    }
-
-    let listener = crate::socket_util::new_unix_listener(path_buf, 4096)?;
     let mut tasks = crate::listener_tasks::ListenerTasks::new();
 
     loop {
@@ -398,38 +387,17 @@ async fn start_tcp_or_quic_servers(
     config: ServerConfig,
     resolver: Arc<dyn Resolver>,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
-    let mut join_handles = Vec::with_capacity(3);
-
-    match config.transport {
-        Transport::Tcp => match start_tcp_servers(config.clone(), resolver).await {
-            Ok(handles) => {
-                join_handles.extend(handles);
-            }
-            Err(e) => {
-                for join_handle in join_handles {
-                    join_handle.abort();
-                }
-                return Err(e);
-            }
-        },
-        Transport::Quic => match start_quic_servers(config.clone(), resolver).await {
-            Ok(handles) => {
-                join_handles.extend(handles);
-            }
-            Err(e) => {
-                for join_handle in join_handles {
-                    join_handle.abort();
-                }
-                return Err(e);
-            }
-        },
+    let bind_location = config.bind_location.to_string();
+    let join_handles = match config.transport {
+        Transport::Tcp => start_tcp_servers(config, resolver).await?,
+        Transport::Quic => start_quic_servers(config, resolver).await?,
         Transport::Udp => todo!(),
-    }
+    };
 
     if join_handles.is_empty() {
         return Err(std::io::Error::other(format!(
             "failed to start servers at {}",
-            config.bind_location
+            bind_location
         )));
     }
 
@@ -467,8 +435,10 @@ async fn start_tcp_servers(
         BindLocation::Address(addresses) => {
             // Shares protocol state across ports without reusing an interface-specific UDP bind IP.
             let mut handlers: HashMap<IpAddr, Arc<dyn TcpServerHandler>> = HashMap::new();
+            let mut listeners = Vec::new();
             for address in addresses.into_vec() {
                 for socket_addr in address.to_socket_addrs()? {
+                    let listener = new_tcp_listener(socket_addr, 4096, None)?;
                     let tcp_handler = handlers
                         .entry(socket_addr.ip())
                         .or_insert_with(|| {
@@ -481,27 +451,39 @@ async fn start_tcp_servers(
                             .into()
                         })
                         .clone();
-                    let tcp_config = tcp_config.clone();
-                    let resolver = resolver.clone();
-                    let handle = tokio::spawn(async move {
-                        run_tcp_server(socket_addr, tcp_config, resolver, tcp_handler)
-                            .await
-                            .unwrap();
-                    });
-                    handles.push(handle);
+                    listeners.push((listener, tcp_handler));
                 }
+            }
+            for (listener, tcp_handler) in listeners {
+                let tcp_config = tcp_config.clone();
+                let resolver = resolver.clone();
+                handles.push(tokio::spawn(async move {
+                    if let Err(error) =
+                        run_tcp_server(listener, tcp_config, resolver, tcp_handler).await
+                    {
+                        error!("TCP listener stopped: {error}");
+                    }
+                }));
             }
         }
         BindLocation::Path(path_buf) => {
             #[cfg(target_family = "unix")]
             {
+                if tokio::fs::symlink_metadata(&path_buf).await.is_ok() {
+                    println!(
+                        "WARNING: replacing file at socket path {}",
+                        path_buf.display()
+                    );
+                    tokio::fs::remove_file(&path_buf).await?;
+                }
+                let listener = crate::socket_util::new_unix_listener(path_buf, 4096)?;
                 let tcp_handler: Arc<dyn TcpServerHandler> =
                     create_tcp_server_handler(protocol, &client_proxy_selector, &resolver, None)
                         .into();
                 let handle = tokio::spawn(async move {
-                    run_unix_server(path_buf, resolver, tcp_handler)
-                        .await
-                        .unwrap();
+                    if let Err(error) = run_unix_server(listener, resolver, tcp_handler).await {
+                        error!("Unix listener stopped: {error}");
+                    }
                 });
                 handles.push(handle);
             }
@@ -523,6 +505,7 @@ mod lifetime_tests {
     use super::*;
     use async_trait::async_trait;
     use std::io;
+    use std::net::SocketAddr;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::{Context, Poll};
@@ -534,6 +517,29 @@ mod lifetime_tests {
     use crate::client_proxy_chain::{ClientChainGroup, ClientProxyChain, InitialHopEntry};
     use crate::client_proxy_selector::{ConnectAction, ConnectRule};
     use crate::tcp::socket_connector::SocketConnector;
+
+    #[tokio::test]
+    async fn tcp_bind_failure_releases_all_prepared_listeners() {
+        let first = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let first_addr = first.local_addr().unwrap();
+        let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let config = format!(
+            "- address: ['{first_addr}', '{}']\n  protocol:\n    type: http\n",
+            occupied.local_addr().unwrap()
+        );
+        let configs =
+            crate::config::create_server_configs(serde_yaml::from_str(&config).unwrap())
+                .unwrap();
+        drop(first);
+        let error = start_servers(
+            configs.configs.into_iter().next().unwrap(),
+            Arc::new(crate::resolver::NativeResolver::new()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+        std::net::TcpListener::bind(first_addr).expect("earlier bind leaked after startup failed");
+    }
 
     #[derive(Debug)]
     struct StalledMessageShutdown {
