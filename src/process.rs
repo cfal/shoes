@@ -37,7 +37,15 @@ async fn prepare(paths: &[String]) -> io::Result<PreparedServers> {
         let resolved = tokio::task::spawn_blocking(move || {
             let mut resolved = Vec::new();
             for address in addresses.iter() {
-                for socket_addr in address.to_socket_addrs()? {
+                let socket_addrs = address.to_socket_addrs()?;
+                // NetLocation has no scope ID; retain scoped literals in their original form.
+                if socket_addrs.iter().any(
+                    |addr| matches!(addr, std::net::SocketAddr::V6(addr) if addr.scope_id() != 0),
+                ) {
+                    resolved.push(address.clone());
+                    continue;
+                }
+                for socket_addr in socket_addrs {
                     resolved.push(
                         NetLocation::from_ip_addr(socket_addr.ip(), socket_addr.port()).into(),
                     );
@@ -337,6 +345,35 @@ pub async fn run(paths: Vec<String>, dry_run: bool, no_reload: bool) -> io::Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn preparation_preserves_ipv6_scope_ids_and_port_ranges() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.yaml");
+        std::fs::write(
+            &path,
+            "- address: '[fe80::1%2]:8080-8081'\n  protocol: {type: http}\n",
+        )
+        .unwrap();
+        let prepared = prepare(&[path.to_str().unwrap().to_owned()]).await.unwrap();
+        let Config::Server(server) = &prepared.validated.configs[0] else {
+            panic!()
+        };
+        let BindLocation::Address(addresses) = &server.bind_location else {
+            panic!()
+        };
+        let resolved: Vec<_> = addresses
+            .iter()
+            .flat_map(|address| address.to_socket_addrs().unwrap())
+            .collect();
+        assert_eq!(
+            resolved,
+            [
+                "[fe80::1%2]:8080".parse().unwrap(),
+                "[fe80::1%2]:8081".parse().unwrap()
+            ]
+        );
+    }
 
     #[cfg(unix)]
     #[test]
