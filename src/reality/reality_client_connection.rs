@@ -355,7 +355,7 @@ impl RealityClientConnection {
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Buffer too short"))?
             as usize;
 
-        let total_record_len = TLS_RECORD_HEADER_SIZE + record_len;
+        let total_record_len = super::common::checked_record_size(record_len)?;
         if self.ciphertext_read_buf.len() < total_record_len {
             return Ok(false);
         }
@@ -518,7 +518,7 @@ impl RealityClientConnection {
             record_len
         );
 
-        let total_record_len = TLS_RECORD_HEADER_SIZE + record_len;
+        let total_record_len = super::common::checked_record_size(record_len)?;
         if self.ciphertext_read_buf.len() < total_record_len {
             return Ok(false);
         }
@@ -793,7 +793,7 @@ impl RealityClientConnection {
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Buffer too short"))?
                 as usize;
 
-            let total_record_len = TLS_RECORD_HEADER_SIZE + record_len;
+            let total_record_len = super::common::checked_record_size(record_len)?;
             if self.ciphertext_read_buf.len() < total_record_len {
                 break;
             }

@@ -63,6 +63,16 @@ pub const TLS_RECORD_HEADER_SIZE: usize = 5;
 /// Maximum TLS record size (ciphertext + header)
 pub const TLS_MAX_RECORD_SIZE: usize = MAX_TLS_CIPHERTEXT_LEN + TLS_RECORD_HEADER_SIZE;
 
+pub(crate) fn checked_record_size(payload_len: usize) -> std::io::Result<usize> {
+    if payload_len > MAX_TLS_CIPHERTEXT_LEN {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "TLS record length exceeds maximum",
+        ));
+    }
+    Ok(TLS_RECORD_HEADER_SIZE + payload_len)
+}
+
 /// Buffer capacity for ciphertext read (2x TLS max record for safety)
 pub const CIPHERTEXT_READ_BUF_CAPACITY: usize = TLS_MAX_RECORD_SIZE * 2;
 
@@ -158,6 +168,23 @@ pub fn strip_content_type_with_padding(plaintext: &mut Vec<u8>) -> io::Result<u8
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn record_lengths_are_checked_before_buffering() {
+        assert_eq!(
+            super::checked_record_size(super::MAX_TLS_CIPHERTEXT_LEN).unwrap(),
+            super::TLS_MAX_RECORD_SIZE
+        );
+        for size in [
+            super::MAX_TLS_CIPHERTEXT_LEN + 1,
+            u16::MAX as usize,
+            usize::MAX,
+        ] {
+            assert_eq!(
+                super::checked_record_size(size).unwrap_err().kind(),
+                std::io::ErrorKind::InvalidData
+            );
+        }
+    }
     use super::*;
 
     #[test]

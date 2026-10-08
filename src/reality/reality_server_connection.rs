@@ -762,7 +762,7 @@ impl RealityServerConnection {
             as usize;
 
         // Check if we have the complete record
-        let total_record_len = TLS_RECORD_HEADER_SIZE + record_len;
+        let total_record_len = super::common::checked_record_size(record_len)?;
         if self.ciphertext_read_buf.len() < total_record_len {
             return Ok(false); // Need more data
         }
@@ -903,7 +903,7 @@ impl RealityServerConnection {
                 as usize;
 
             // Check if we have the complete record
-            let total_record_len = TLS_RECORD_HEADER_SIZE + record_len;
+            let total_record_len = super::common::checked_record_size(record_len)?;
             if self.ciphertext_read_buf.len() < total_record_len {
                 break; // Need more data
             }

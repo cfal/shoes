@@ -18,6 +18,29 @@ const PROXY_AUTH_HEADER_PREFIX: &str = "proxy-authorization: basic ";
 const CONNECTION_HEADER_PREFIX: &str = "connection: ";
 const PROXY_CONNECTION_HEADER_PREFIX: &str = "proxy-connection: ";
 
+#[cfg(test)]
+mod request_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn non_ascii_auth_header_does_not_panic_at_prefix_boundary() {
+        let (mut client, server) = tokio::io::duplex(1024);
+        let header = format!(
+            "{}\u{e9}invalid",
+            "x".repeat(PROXY_AUTH_HEADER_PREFIX.len() - 1)
+        );
+        client
+            .write_all(format!("CONNECT example.com:443 HTTP/1.1\r\n{header}\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let handler = HttpTcpServerHandler::new(
+            Some(("user".into(), "password".into())),
+            Arc::new(ClientProxySelector::new(vec![])),
+        );
+        assert!(handler.setup_server_stream(Box::new(server)).await.is_err());
+    }
+}
+
 fn create_http_auth_token(username: &str, password: &str) -> String {
     BASE64.encode(format!("{username}:{password}"))
 }
@@ -106,8 +129,8 @@ pub async fn setup_http_server_stream_inner(
                 }
                 if need_auth
                     && line.len() > PROXY_AUTH_HEADER_PREFIX.len() + 1
-                    && line[0..PROXY_AUTH_HEADER_PREFIX.len()].to_ascii_lowercase()
-                        == PROXY_AUTH_HEADER_PREFIX
+                    && line.as_bytes()[0..PROXY_AUTH_HEADER_PREFIX.len()]
+                        .eq_ignore_ascii_case(PROXY_AUTH_HEADER_PREFIX.as_bytes())
                 {
                     if &line[PROXY_AUTH_HEADER_PREFIX.len()..] != auth_token.unwrap() {
                         debug!(
