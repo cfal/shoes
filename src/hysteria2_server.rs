@@ -667,17 +667,12 @@ fn tcp_response(success: bool, message: &str) -> Vec<u8> {
 async fn complete_tcp_setup(
     server: &mut Box<dyn AsyncStream>,
     setup: impl std::future::Future<Output = std::io::Result<Option<TcpClientSetupResult>>>,
-) -> std::io::Result<Box<dyn AsyncStream>> {
-    let result = timeout_stream_setup(setup).await.and_then(|result| {
-        result.ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::PermissionDenied, "connection blocked")
-        })
-    });
-    match result {
-        Ok(TcpClientSetupResult {
+) -> std::io::Result<Option<Box<dyn AsyncStream>>> {
+    match timeout_stream_setup(setup).await {
+        Ok(Some(TcpClientSetupResult {
             client_stream,
             early_data,
-        }) => {
+        })) => {
             timeout_stream_setup(async {
                 write_all(server, &tcp_response(true, "")).await?;
                 if let Some(data) = early_data {
@@ -686,12 +681,17 @@ async fn complete_tcp_setup(
                 server.flush().await
             })
             .await?;
-            Ok(client_stream)
+            Ok(Some(client_stream))
         }
-        Err(error) => {
-            let message = match error.kind() {
-                std::io::ErrorKind::PermissionDenied => "connection blocked",
-                std::io::ErrorKind::TimedOut => "connection timed out",
+        result => {
+            let message = match &result {
+                Ok(None) => "connection blocked",
+                Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                    "connection blocked"
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+                    "connection timed out"
+                }
                 _ => "connection failed",
             };
             let _ = timeout(crate::util::SHUTDOWN_TIMEOUT, async {
@@ -700,7 +700,7 @@ async fn complete_tcp_setup(
             })
             .await;
             crate::util::shutdown_stream(server).await;
-            Err(error)
+            result.map(|_| None)
         }
     }
 }
@@ -722,11 +722,20 @@ async fn process_tcp_stream(
 
     let mut server_stream: Box<dyn AsyncStream> = Box::new(QuicStream::from(send, recv));
 
-    let mut client_stream = complete_tcp_setup(
+    let Some(mut client_stream) = complete_tcp_setup(
         &mut server_stream,
-        setup_client_tcp_stream(client_proxy_selector, resolver, remote_location),
+        setup_client_tcp_stream(client_proxy_selector, resolver, remote_location.clone()),
     )
-    .await?;
+    .await
+    .map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!("TCP setup for {remote_location} failed: {error}"),
+        )
+    })?
+    else {
+        return Ok(());
+    };
 
     let unparsed_data = stream_reader.unparsed_data();
     if !unparsed_data.is_empty() {
@@ -978,7 +987,11 @@ mod tcp_tests {
                 }
             })
             .await;
-            assert_eq!(result.err().unwrap().kind(), kind);
+            if kind == std::io::ErrorKind::PermissionDenied {
+                assert!(result.unwrap().is_none());
+            } else {
+                assert_eq!(result.err().unwrap().kind(), kind);
+            }
             let mut wire = Vec::new();
             peer.read_to_end(&mut wire).await.unwrap();
             assert_eq!(wire[0], 1);
