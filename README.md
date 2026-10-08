@@ -67,10 +67,12 @@ shoes [OPTIONS] <config.yaml> [config.yaml...]
 
 OPTIONS:
     -t, --threads NUM    Set the number of worker threads (default: CPU count)
-    -d, --dry-run        Parse the config and exit
+    -d, --dry-run        Validate the config and certificates, then exit
     --no-reload          Disable automatic config reloading on file changes
 
 COMMANDS:
+    check <config.yaml>                       Alias for --dry-run
+    version                                  Alias for --version
     generate-reality-keypair                  Generate a new Reality X25519 keypair
     generate-shadowsocks-2022-password <cipher>    Generate a Shadowsocks password
 ```

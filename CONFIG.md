@@ -778,7 +778,17 @@ client_chain:
 
 ### Hot Reloading
 
-Configuration changes are automatically detected and applied without restarting. Disable with `--no-reload` flag.
+Configuration changes are automatically detected. `--no-reload` disables file watching; on Unix, SIGHUP still requests a reload.
+
+Replacement configurations, certificates, and DNS resolvers are prepared while the current listeners continue serving. A preparation failure leaves the current configuration running. Once preparation succeeds, listeners are replaced. A failure to activate replacements exits with status 1; there is no rollback after listeners are retired. Existing TCP connections may drain for `global_limits.reload_grace_secs` during successful reloads; QUIC connections are closed.
+
+QUIC listener sockets must finish closing before replacements bind. Retirement is bounded to five seconds; exceeding that deadline exits with an error rather than announcing a partially ready generation.
+
+Candidate QUIC buffer sizes are used during DNS preparation, but `global_limits` admission caps change only at activation. DNS bootstrap over HTTP/3 or QUIC proxy chains therefore needs headroom under the live cap. A cap-increasing reload may require a restart if preparation cannot fit. Lowering a cap does not revoke existing reservations, including those made during preparation; new admissions are blocked until usage falls sufficiently. At cold startup, preparation uses the initial unlimited admission caps.
+
+On macOS, edit the configured file path or use SIGHUP when writing through a hard-link alias in another directory. Automatic detection of such alias writes is backend-dependent. System-volume directory symlinks are resolved without watching their immutable links.
+
+SIGINT/SIGTERM (or Ctrl-C on Windows) stop listeners and exit with status 0. Process shutdown does not wait for the TCP reload grace period.
 
 ### mTLS (Mutual TLS)
 
@@ -813,13 +823,17 @@ shoes [OPTIONS] <config.yaml> [config.yaml...]
 
 OPTIONS:
   -t, --threads NUM    Worker threads (default: CPU count)
-  -d, --dry-run        Parse config and exit
-  --no-reload          Disable hot-reloading
+  -d, --dry-run        Validate config and certificates without starting listeners
+  --no-reload          Disable automatic reloads on file changes
 
 COMMANDS:
+  check <config.yaml>                           Alias for --dry-run
+  version                                      Alias for --version
   generate-reality-keypair                       Generate Reality X25519 keypair
   generate-shadowsocks-2022-password <cipher>    Generate Shadowsocks 2022 password
 ```
+
+`check` and `--dry-run` exit with status 0 for valid configuration and 1 for errors. They do not open listeners, create a file watcher, or perform DNS bootstrap networking. Runtime failures such as unavailable bind addresses remain possible after a successful check.
 
 ## Tips
 

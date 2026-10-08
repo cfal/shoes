@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- Hardened malformed protocol framing, credential comparisons, replay rejection, and secret-safe diagnostics.
+- Preserved handshake early data and response ordering in TCP, TUN, Hysteria2, and TUIC forwarding; bounded initial writes and flushes.
+- Added `check` and `version` aliases, nonzero validation failures, last-good configuration preparation, and explicit signal handling. SIGHUP reloads even with `--no-reload`; orderly signal shutdown exits with status 0.
+- Corrected Snell salts to 16 bytes for all ciphers. ChaCha20 and AES-256 connections to older Shoes versions using 32-byte salts are not wire-compatible; upgrade both ends together.
+- Hysteria2 now reports actual connection outcomes, emits bracketed IPv6 addresses, and advertises `Hysteria-CC-RX: auto`. Compatible clients select automatic congestion control (BBR in sing-box), even when a client bandwidth is configured.
+- Unsupported VMess cipher names, including `auto`, are rejected during validation instead of panicking at startup. Use `any` for automatic cipher selection.
+- Improved QUIC socket portability, SOCKS UDP compatibility with NAT clients, and synchronous mobile lifecycle safety.
+
 ## v0.3.2
 
 ### Fixes
