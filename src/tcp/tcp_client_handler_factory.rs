@@ -214,25 +214,17 @@ pub fn create_tcp_client_handler(
             vision,
             protocol,
         } => {
-            // Decode public key from base64url
             let public_key_bytes =
                 crate::reality::decode_public_key(&public_key).map_err(std::io::Error::other)?;
-
-            // Decode short ID from hex string
             let short_id_bytes =
                 crate::reality::decode_short_id(&short_id).map_err(std::io::Error::other)?;
-
-            // Determine SNI hostname
-            let sni_hostname = sni_hostname.or(default_sni_hostname.clone());
-            let server_name = match sni_hostname {
-                Some(s) => crate::reality::parse_server_name(&s)?,
-                None => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "REALITY client requires sni_hostname",
-                    ));
-                }
+            let Some(sni_hostname) = sni_hostname.or(default_sni_hostname) else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "REALITY client requires sni_hostname",
+                ));
             };
+            let server_name = crate::reality::parse_server_name(&sni_hostname)?;
 
             let cipher_suites = cipher_suites.into_vec();
 

@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::address::NetLocationMask;
 use crate::dns::ParsedDnsUrl;
-use crate::option_util::{NoneOrSome, OneOrSome};
+use crate::option_util::{NoneOrOne, NoneOrSome, OneOrSome};
 use crate::reality::{decode_private_key, decode_short_id};
 use crate::thread_util::get_num_threads;
 use crate::uuid_util::parse_uuid;
@@ -942,6 +942,7 @@ fn validate_client_config(
         ));
     }
 
+    validate_client_proxy_structure(&client_config.protocol)?;
     validate_client_proxy_config(
         &mut client_config.protocol,
         named_pems,
@@ -974,8 +975,6 @@ fn validate_client_proxy_config(
     named_pems: &HashMap<String, String>,
     default_sni: Option<&str>,
 ) -> std::io::Result<()> {
-    validate_client_proxy_structure(client_proxy_config)?;
-
     match client_proxy_config {
         ClientProxyConfig::Vmess {
             user_id, cipher, ..
@@ -1023,13 +1022,10 @@ fn validate_client_proxy_config(
         }
 
         ClientProxyConfig::Tls(tls_config) => {
-            let sni = if tls_config.sni_hostname.is_unspecified() {
-                default_sni
-            } else {
-                match &tls_config.sni_hostname {
-                    crate::option_util::NoneOrOne::One(sni) => Some(sni.as_str()),
-                    _ => None,
-                }
+            let sni = match &tls_config.sni_hostname {
+                NoneOrOne::Unspecified => default_sni,
+                NoneOrOne::None => None,
+                NoneOrOne::One(sni) => Some(sni.as_str()),
             };
             if let Some(sni) = sni {
                 validate_sni(sni)?;
@@ -1665,6 +1661,48 @@ mod tests {
     use super::*;
     use crate::config::pem::convert_cert_paths;
     use crate::dns::IpStrategy;
+
+    #[test]
+    fn nested_structure_errors_precede_protocol_field_errors() {
+        let mut config = serde_json::from_value(serde_json::json!({
+            "address": "example.com:443",
+            "protocol": {
+                "type": "reality", "public_key": "invalid",
+                "protocol": {"type": "websocket", "protocol": {"type": "direct"}}
+            }
+        }))
+        .unwrap();
+        let error = validate_client_config(&mut config, &HashMap::new()).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(
+            error.to_string(),
+            "direct cannot be used as an inner proxy protocol"
+        );
+    }
+
+    #[test]
+    fn tls_sni_distinguishes_inheritance_disable_and_override() {
+        for (sni, valid) in [
+            (NoneOrOne::Unspecified, false),
+            (NoneOrOne::None, true),
+            (NoneOrOne::One("example.com".to_owned()), true),
+            (NoneOrOne::One("invalid name".to_owned()), false),
+        ] {
+            let mut protocol = serde_json::from_value(serde_json::json!({
+                "type": "tls", "protocol": {"type": "socks"}
+            }))
+            .unwrap();
+            let ClientProxyConfig::Tls(ref mut tls) = protocol else {
+                unreachable!()
+            };
+            tls.sni_hostname = sni;
+            assert_eq!(
+                validate_client_proxy_config(&mut protocol, &HashMap::new(), Some("invalid name"))
+                    .is_ok(),
+                valid,
+            );
+        }
+    }
 
     #[test]
     fn reality_sni_defaults_only_at_the_outer_client_layer() {
