@@ -243,10 +243,11 @@ impl SocketConnectorImpl {
                 let mut endpoints = Vec::with_capacity(endpoints_len);
 
                 for _ in 0..endpoints_len {
-                    let udp_socket = new_udp_socket(
-                        !matches!(target_address.address(), crate::address::Address::Ipv4(_)),
-                        bind_interface.clone(),
-                    )?;
+                    let udp_socket = if target_address.address().hostname().is_some() {
+                        crate::socket_util::new_hostname_udp_socket(bind_interface.clone())?
+                    } else {
+                        new_udp_socket(target_address.address().is_ipv6(), bind_interface.clone())?
+                    };
                     let udp_socket = udp_socket.into_std()?;
 
                     let mut endpoint = QuicEndpoint::new(None, udp_socket, memory_bytes)?;

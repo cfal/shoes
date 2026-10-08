@@ -14,6 +14,45 @@ use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 mod tests {
     use super::*;
 
+    #[test]
+    fn hostname_socket_fallback_is_limited_to_family_errors() {
+        #[cfg(unix)]
+        let unavailable = libc::EAFNOSUPPORT;
+        #[cfg(windows)]
+        let unavailable = 10047;
+        let mut attempts = Vec::new();
+        let socket = prefer_ipv6_socket(|ipv6| {
+            attempts.push(ipv6);
+            if ipv6 {
+                Err(std::io::Error::from_raw_os_error(unavailable))
+            } else {
+                new_socket2_udp_socket(false, None, Some("0.0.0.0:0".parse().unwrap()), false)
+            }
+        })
+        .unwrap();
+        assert_eq!(attempts, [true, false]);
+        assert!(socket.local_addr().unwrap().as_socket().unwrap().is_ipv4());
+
+        attempts.clear();
+        let error = prefer_ipv6_socket(|ipv6| {
+            attempts.push(ipv6);
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "denied",
+            ))
+        })
+        .unwrap_err();
+        assert_eq!(attempts, [true]);
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn hostname_socket_prefers_dual_stack_and_enforces_interface_binding() {
+        let socket = new_hostname_udp_socket(None).unwrap();
+        assert!(socket.local_addr().unwrap().is_ipv6());
+        assert!(new_hostname_udp_socket(Some("shoes-missing-interface".into())).is_err());
+    }
+
     #[tokio::test]
     async fn ipv6_udp_listener_accepts_both_address_families() {
         let socket =
@@ -70,6 +109,7 @@ mod protection_tests {
         )));
         assert!(new_tcp_socket(None, false).is_err());
         assert!(new_udp_socket(false, None).is_err());
+        assert!(new_hostname_udp_socket(None).is_err());
         assert!(
             new_outbound_socket2_udp_socket(false, None, Some("0.0.0.0:0".parse().unwrap()))
                 .is_err()
@@ -92,6 +132,59 @@ pub fn new_udp_socket(
     )?;
 
     into_tokio_udp_socket(socket)
+}
+
+pub fn new_hostname_udp_socket(
+    bind_interface: Option<String>,
+) -> std::io::Result<tokio::net::UdpSocket> {
+    let socket = prefer_ipv6_socket(|ipv6| {
+        new_socket2_udp_socket(ipv6, None, Some(get_unspecified_socket_addr(ipv6)), false)
+    })?;
+    bind_udp_interface(&socket, bind_interface.as_deref())?;
+    #[cfg(any(target_os = "android", target_os = "ios", all(unix, feature = "ffi")))]
+    crate::tun::protect_socket(socket.as_raw_fd())?;
+    into_tokio_udp_socket(socket)
+}
+
+fn prefer_ipv6_socket(
+    mut create: impl FnMut(bool) -> std::io::Result<Socket>,
+) -> std::io::Result<Socket> {
+    match create(true) {
+        Err(error) if ipv6_unavailable(&error) => create(false),
+        result => result,
+    }
+}
+
+fn ipv6_unavailable(error: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    let codes = [
+        libc::EAFNOSUPPORT,
+        libc::EPROTONOSUPPORT,
+        libc::ENOPROTOOPT,
+        libc::EADDRNOTAVAIL,
+    ];
+    // WSAENOPROTOOPT, WSAEPROTONOSUPPORT, WSAEAFNOSUPPORT, WSAEADDRNOTAVAIL.
+    #[cfg(windows)]
+    let codes = [10042, 10043, 10047, 10049];
+    error
+        .raw_os_error()
+        .is_some_and(|code| codes.contains(&code))
+}
+
+fn bind_udp_interface(socket: &Socket, interface: Option<&str>) -> std::io::Result<()> {
+    if let Some(interface) = interface {
+        #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+        socket.bind_device(Some(interface.as_bytes()))?;
+        #[cfg(not(any(target_os = "android", target_os = "fuchsia", target_os = "linux")))]
+        {
+            let _ = (socket, interface);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "binding UDP sockets to an interface is unsupported",
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub fn new_outbound_socket2_udp_socket(
@@ -157,14 +250,7 @@ pub fn new_socket2_udp_socket_with_buffer_size(
         ));
     }
 
-    if let Some(ref interface) = bind_interface {
-        #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
-        socket.bind_device(Some(interface.as_bytes()))?;
-
-        // This should be handled during config validation.
-        #[cfg(not(any(target_os = "android", target_os = "fuchsia", target_os = "linux")))]
-        panic!("Could not bind to device, unsupported platform.")
-    }
+    bind_udp_interface(&socket, bind_interface.as_deref())?;
 
     if let Some(bind_address) = bind_address {
         socket.bind(&SockAddr::from(bind_address))?;
