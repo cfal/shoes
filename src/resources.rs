@@ -165,11 +165,6 @@ pub(crate) fn try_quic_memory(bytes: usize) -> Option<BudgetPermit> {
     QUIC_BYTES.acquire(bytes)
 }
 
-pub(crate) fn try_dns_quic_memory() -> Option<BudgetPermit> {
-    let limits = LIMITS.read();
-    QUIC_BYTES.acquire(limits.quic_dns_memory_bytes)
-}
-
 pub(crate) fn configure_quic(
     config: &mut quinn::ServerConfig,
     bidi_streams: u32,
@@ -200,7 +195,13 @@ pub(crate) fn configure_quic(
 
 /// Returns the per-connection allowance from the same limits used to configure the windows.
 pub(crate) fn configure_quic_transport(transport: &mut quinn::TransportConfig) -> usize {
-    let limits = limits();
+    configure_quic_transport_with_limits(transport, limits())
+}
+
+pub(crate) fn configure_quic_transport_with_limits(
+    transport: &mut quinn::TransportConfig,
+    limits: GlobalLimits,
+) -> usize {
     transport
         .receive_window((limits.quic_receive_window as u32).into())
         .send_window(limits.quic_send_window as u64)

@@ -53,7 +53,11 @@ async fn prepare(paths: &[String]) -> io::Result<Prepared> {
                 config::BindLocation::Address(crate::option_util::OneOrSome::Some(resolved));
         }
     }
-    let dns = dns::build_dns_registry(std::mem::take(&mut validated.dns_groups)).await?;
+    let dns = dns::build_dns_registry_with_limits(
+        std::mem::take(&mut validated.dns_groups),
+        validated.global_limits,
+    )
+    .await?;
     Ok(Prepared { validated, dns })
 }
 

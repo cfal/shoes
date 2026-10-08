@@ -141,9 +141,18 @@ impl SocketConnectorImpl {
     ///
     /// # Returns
     /// Returns any socket or QUIC endpoint initialization error.
+    #[cfg(test)]
     pub fn from_config(
         config: &ClientConfig,
         target_address: Option<&NetLocation>,
+    ) -> std::io::Result<Self> {
+        Self::from_config_with_limits(config, target_address, crate::resources::limits())
+    }
+
+    pub fn from_config_with_limits(
+        config: &ClientConfig,
+        target_address: Option<&NetLocation>,
+        limits: crate::config::GlobalLimits,
     ) -> std::io::Result<Self> {
         let bind_interface = config.bind_interface.clone().into_option();
 
@@ -229,8 +238,10 @@ impl SocketConnectorImpl {
                     quinn::ClientConfig::new(Arc::new(quic_client_config));
 
                 let mut transport_config = quinn::TransportConfig::default();
-                let memory_bytes =
-                    crate::resources::configure_quic_transport(&mut transport_config);
+                let memory_bytes = crate::resources::configure_quic_transport_with_limits(
+                    &mut transport_config,
+                    limits,
+                );
                 transport_config
                     .max_concurrent_bidi_streams(0_u32.into())
                     .max_concurrent_uni_streams(0_u8.into())

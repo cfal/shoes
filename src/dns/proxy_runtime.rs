@@ -44,6 +44,7 @@ impl ProxyRuntimeProvider {
         let bind_interface = chain_group.get_bind_interface().map(ToString::to_string);
         let quic_binder = ProxyQuicBinder {
             bind_interface: bind_interface.clone(),
+            memory_bytes: crate::resources::limits().quic_dns_memory_bytes,
         };
         Self {
             chain_group,
@@ -52,6 +53,11 @@ impl ProxyRuntimeProvider {
             quic_binder,
             connect_timeout,
         }
+    }
+
+    pub fn with_quic_memory(mut self, bytes: usize) -> Self {
+        self.quic_binder.memory_bytes = bytes;
+        self
     }
 }
 
@@ -160,6 +166,7 @@ impl RuntimeProvider for ProxyRuntimeProvider {
 #[derive(Clone)]
 struct ProxyQuicBinder {
     bind_interface: Option<String>,
+    memory_bytes: usize,
 }
 
 impl QuicSocketBinder for ProxyQuicBinder {
@@ -168,8 +175,8 @@ impl QuicSocketBinder for ProxyQuicBinder {
         local_addr: SocketAddr,
         _server_addr: SocketAddr,
     ) -> Result<Arc<dyn quinn::AsyncUdpSocket>, io::Error> {
-        let memory =
-            crate::resources::try_dns_quic_memory().ok_or_else(crate::resources::exhausted)?;
+        let memory = crate::resources::try_quic_memory(self.memory_bytes)
+            .ok_or_else(crate::resources::exhausted)?;
         let socket = crate::socket_util::new_outbound_socket2_udp_socket(
             local_addr.is_ipv6(),
             self.bind_interface.clone(),
@@ -316,12 +323,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn quic_binder_keeps_candidate_reservation_without_publishing_limits() {
+        if run_quic_test_in_child(
+            "quic_binder_keeps_candidate_reservation_without_publishing_limits",
+        ) {
+            return;
+        }
+        let resolver = Arc::new(NativeResolver::new());
+        let provider = ProxyRuntimeProvider::with_bootstrap(
+            Arc::new(build_direct_chain_group(resolver.clone())),
+            resolver,
+            TEST_CONNECT_TIMEOUT,
+        )
+        .with_quic_memory(1 << 20);
+        assert_eq!(crate::resources::limits().quic_dns_memory_bytes, 16 << 20);
+        crate::resources::configure(crate::config::GlobalLimits {
+            quic_memory_bytes: Some(2 << 20),
+            ..Default::default()
+        })
+        .unwrap();
+        let binder = provider.quic_binder().unwrap();
+        let socket = binder
+            .bind_quic(
+                "0.0.0.0:0".parse().unwrap(),
+                "127.0.0.1:443".parse().unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            crate::resources::snapshot().quic_buffer_bytes.active,
+            1 << 20
+        );
+        drop(socket);
+        assert_eq!(crate::resources::snapshot().quic_buffer_bytes.active, 0);
+    }
+
+    #[tokio::test]
     async fn quic_binder_reserves_shared_memory_until_last_socket_drop() {
         if run_quic_test_in_child("quic_binder_reserves_shared_memory_until_last_socket_drop") {
             return;
         }
         let binder = ProxyQuicBinder {
             bind_interface: None,
+            memory_bytes: crate::resources::limits().quic_dns_memory_bytes,
         };
         let local_addr = "0.0.0.0:0".parse().unwrap();
         let server_addr = "127.0.0.1:443".parse().unwrap();

@@ -28,6 +28,14 @@ pub fn try_build_client_proxy_chain(
     client_chain: crate::option_util::OneOrSome<ClientChainHop>,
     resolver: Arc<dyn Resolver>,
 ) -> std::io::Result<ClientProxyChain> {
+    build_client_proxy_chain_with_limits(client_chain, resolver, crate::resources::limits())
+}
+
+fn build_client_proxy_chain_with_limits(
+    client_chain: crate::option_util::OneOrSome<ClientChainHop>,
+    resolver: Arc<dyn Resolver>,
+    limits: crate::config::GlobalLimits,
+) -> std::io::Result<ClientProxyChain> {
     let hops: Vec<Vec<ClientConfig>> = client_chain
         .into_vec()
         .into_iter()
@@ -69,8 +77,9 @@ pub fn try_build_client_proxy_chain(
             // Find the first proxy address for QUIC socket configuration
             let target_address = find_first_proxy_address(&hops, config);
 
-            let socket = SocketConnectorImpl::from_config(config, target_address)
-                .map(|s| Box::new(s) as Box<dyn SocketConnector>)?;
+            let socket =
+                SocketConnectorImpl::from_config_with_limits(config, target_address, limits)
+                    .map(|s| Box::new(s) as Box<dyn SocketConnector>)?;
 
             if config.protocol.is_direct() {
                 // Direct: socket only, no proxy
@@ -160,6 +169,14 @@ pub fn try_build_client_chain_group(
     client_chains: crate::option_util::NoneOrSome<crate::config::ClientChain>,
     resolver: Arc<dyn Resolver>,
 ) -> std::io::Result<ClientChainGroup> {
+    build_client_chain_group_with_limits(client_chains, resolver, crate::resources::limits())
+}
+
+pub fn build_client_chain_group_with_limits(
+    client_chains: crate::option_util::NoneOrSome<crate::config::ClientChain>,
+    resolver: Arc<dyn Resolver>,
+    limits: crate::config::GlobalLimits,
+) -> std::io::Result<ClientChainGroup> {
     let chains: Vec<ClientProxyChain> = if client_chains.is_empty() {
         vec![try_build_client_proxy_chain(
             crate::option_util::OneOrSome::One(ClientChainHop::Single(ConfigSelection::Config(
@@ -171,7 +188,7 @@ pub fn try_build_client_chain_group(
         client_chains
             .into_vec()
             .into_iter()
-            .map(|chain| try_build_client_proxy_chain(chain.hops, resolver.clone()))
+            .map(|chain| build_client_proxy_chain_with_limits(chain.hops, resolver.clone(), limits))
             .collect::<std::io::Result<_>>()?
     };
 
