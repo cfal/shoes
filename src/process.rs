@@ -7,8 +7,10 @@ use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::config::{self, Config, ValidatedConfigs};
+use crate::address::NetLocation;
+use crate::config::{self, BindLocation, Config, ValidatedConfigs};
 use crate::dns::{self, DnsRegistry};
+use crate::option_util::OneOrSome;
 use crate::resources;
 
 async fn load_validated(paths: &[String]) -> io::Result<ValidatedConfigs> {
@@ -17,57 +19,57 @@ async fn load_validated(paths: &[String]) -> io::Result<ValidatedConfigs> {
     config::create_server_configs(configs)
 }
 
-struct Prepared {
+struct PreparedServers {
     validated: ValidatedConfigs,
     dns: DnsRegistry,
 }
 
-async fn prepare(paths: &[String]) -> io::Result<Prepared> {
+async fn prepare(paths: &[String]) -> io::Result<PreparedServers> {
     let mut validated = load_validated(paths).await?;
     for config in &mut validated.configs {
-        if let Config::Server(server) = config
-            && let config::BindLocation::Address(addresses) = &server.bind_location
-        {
-            let addresses = addresses.clone();
-            let resolved = tokio::task::spawn_blocking(move || {
-                let mut resolved = Vec::new();
-                for address in addresses.iter() {
-                    for address in address.to_socket_addrs()? {
-                        resolved.push(
-                            crate::address::NetLocation::from_ip_addr(address.ip(), address.port())
-                                .into(),
-                        );
-                    }
+        let Config::Server(server) = config else {
+            continue;
+        };
+        let BindLocation::Address(addresses) = &server.bind_location else {
+            continue;
+        };
+        let addresses = addresses.clone();
+        let resolved = tokio::task::spawn_blocking(move || {
+            let mut resolved = Vec::new();
+            for address in addresses.iter() {
+                for socket_addr in address.to_socket_addrs()? {
+                    resolved.push(
+                        NetLocation::from_ip_addr(socket_addr.ip(), socket_addr.port()).into(),
+                    );
                 }
-                Ok::<_, io::Error>(resolved)
-            })
-            .await
-            .map_err(io::Error::other)??;
-            if resolved.is_empty() {
-                return Err(io::Error::new(
-                    io::ErrorKind::AddrNotAvailable,
-                    "listener address resolved to no addresses",
-                ));
             }
-            server.bind_location =
-                config::BindLocation::Address(crate::option_util::OneOrSome::Some(resolved));
+            Ok::<_, io::Error>(resolved)
+        })
+        .await
+        .map_err(io::Error::other)??;
+        if resolved.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                "listener address resolved to no addresses",
+            ));
         }
+        server.bind_location = BindLocation::Address(OneOrSome::Some(resolved));
     }
     let dns = dns::build_dns_registry_with_limits(
         std::mem::take(&mut validated.dns_groups),
         validated.global_limits,
     )
     .await?;
-    Ok(Prepared { validated, dns })
+    Ok(PreparedServers { validated, dns })
 }
 
 #[derive(Default)]
-struct Running {
+struct RunningServers {
     listeners: Vec<JoinHandle<()>>,
     reporter: Option<resources::ResourceReporter>,
 }
 
-impl Running {
+impl RunningServers {
     async fn stop(&mut self) {
         for task in &self.listeners {
             task.abort();
@@ -78,7 +80,7 @@ impl Running {
         self.reporter = None;
     }
 
-    async fn start(&mut self, prepared: &mut Prepared) -> io::Result<()> {
+    async fn start(&mut self, prepared: &mut PreparedServers) -> io::Result<()> {
         resources::configure(prepared.validated.global_limits)?;
         self.reporter = Some(resources::ResourceReporter::start());
         for config in &prepared.validated.configs {
@@ -101,7 +103,7 @@ impl Running {
     }
 }
 
-impl Drop for Running {
+impl Drop for RunningServers {
     fn drop(&mut self) {
         for task in &self.listeners {
             task.abort();
@@ -223,7 +225,7 @@ pub async fn run(paths: Vec<String>, dry_run: bool, no_reload: bool) -> io::Resu
         code = shutdown.recv() => return Ok(code),
         result = prepare(&paths) => result?,
     };
-    let mut running = Running::default();
+    let mut running = RunningServers::default();
     tokio::select! {
         biased;
         code = shutdown.recv() => { running.stop().await; return Ok(code); }
