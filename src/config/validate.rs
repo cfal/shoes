@@ -642,6 +642,12 @@ fn validate_server_config(
     rule_groups: &HashMap<String, Vec<RuleConfig>>,
     named_pems: &HashMap<String, String>,
 ) -> std::io::Result<()> {
+    if server_config.transport == Transport::Udp {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "UDP listener transport is not supported",
+        ));
+    }
     // First handle QUIC settings certificates
     if let Some(ref mut quic_settings) = server_config.quic_settings {
         embed_pem_from_map(&mut quic_settings.cert, named_pems);
@@ -649,6 +655,11 @@ fn validate_server_config(
         for cert in quic_settings.client_ca_certs.iter_mut() {
             embed_pem_from_map(cert, named_pems);
         }
+        validate_server_certificates(
+            &quic_settings.cert,
+            &quic_settings.key,
+            &quic_settings.client_ca_certs,
+        )?;
     }
     if server_config.transport != Transport::Tcp && server_config.tcp_settings.is_some() {
         return Err(std::io::Error::new(
@@ -915,6 +926,7 @@ fn validate_client_config(
             ));
         }
         validate_server_fingerprints(server_fingerprints)?;
+        validate_client_certificates(cert.as_deref(), key.as_deref())?;
     }
 
     #[cfg(not(any(target_os = "android", target_os = "fuchsia", target_os = "linux")))]
@@ -955,6 +967,24 @@ fn validate_client_proxy_config(
     validate_client_proxy_structure(client_proxy_config)?;
 
     match client_proxy_config {
+        ClientProxyConfig::Vmess {
+            user_id, cipher, ..
+        } => {
+            parse_uuid(user_id)?;
+            validate_vmess_cipher(cipher)?;
+        }
+        ClientProxyConfig::Vless { user_id, .. } => {
+            parse_uuid(user_id)?;
+        }
+        ClientProxyConfig::Snell {
+            config: super::types::ShadowsocksConfig::Aead2022 { .. },
+            ..
+        } => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Snell does not support shadowsocks 2022 ciphers",
+            ));
+        }
         ClientProxyConfig::Reality {
             short_id, protocol, ..
         } => {
@@ -981,6 +1011,7 @@ fn validate_client_proxy_config(
                 ));
             }
             validate_server_fingerprints(&mut tls_config.server_fingerprints)?;
+            validate_client_certificates(tls_config.cert.as_deref(), tls_config.key.as_deref())?;
 
             validate_client_proxy_config(&mut tls_config.protocol, named_pems)?;
         }
@@ -996,6 +1027,47 @@ fn validate_client_proxy_config(
         _ => {}
     }
     Ok(())
+}
+
+fn validate_server_certificates(
+    cert: &str,
+    key: &str,
+    ca: &NoneOrSome<String>,
+) -> std::io::Result<()> {
+    crate::rustls_config_util::try_create_server_config(
+        cert.as_bytes(),
+        key.as_bytes(),
+        ca.iter().map(|pem| pem.as_bytes().to_vec()).collect(),
+        &[],
+        &[],
+    )
+    .map(|_| ())
+}
+
+fn validate_client_certificates(cert: Option<&str>, key: Option<&str>) -> std::io::Result<()> {
+    if let (Some(cert), Some(key)) = (cert, key) {
+        crate::rustls_config_util::try_create_client_config(
+            false,
+            vec![],
+            vec![],
+            true,
+            Some((key.as_bytes().to_vec(), cert.as_bytes().to_vec())),
+            false,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_vmess_cipher(cipher: &str) -> std::io::Result<()> {
+    match cipher {
+        "" | "any" | "none" | "aes-128-gcm" | "chacha20-poly1305" | "chacha20-ietf-poly1305" => {
+            Ok(())
+        }
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("unsupported VMess cipher: {cipher}"),
+        )),
+    }
 }
 
 fn validate_server_proxy_config(
@@ -1016,8 +1088,11 @@ fn validate_server_proxy_config(
         ServerProxyConfig::Vless { user_id, .. } => {
             parse_uuid(user_id)?;
         }
-        ServerProxyConfig::Vmess { user_id, .. } => {
+        ServerProxyConfig::Vmess {
+            user_id, cipher, ..
+        } => {
             parse_uuid(user_id)?;
+            validate_vmess_cipher(cipher)?;
         }
         ServerProxyConfig::Tls {
             tls_targets,
@@ -1042,6 +1117,11 @@ fn validate_server_proxy_config(
                 for cert in tls_server_config.client_ca_certs.iter_mut() {
                     embed_pem_from_map(cert, named_pems);
                 }
+                validate_server_certificates(
+                    &tls_server_config.cert,
+                    &tls_server_config.key,
+                    &tls_server_config.client_ca_certs,
+                )?;
 
                 let TlsServerConfig {
                     ref mut protocol,
@@ -1076,6 +1156,12 @@ fn validate_server_proxy_config(
                 for cert in tls_server_config.client_ca_certs.iter_mut() {
                     embed_pem_from_map(cert, named_pems);
                 }
+                validate_server_certificates(
+                    &tls_server_config.cert,
+                    &tls_server_config.key,
+                    &tls_server_config.client_ca_certs,
+                )?;
+                validate_client_fingerprints(&mut tls_server_config.client_fingerprints)?;
 
                 let TlsServerConfig {
                     ref mut protocol,
@@ -1119,6 +1205,14 @@ fn validate_server_proxy_config(
                 if let ShadowTlsServerHandshakeConfig::Local(local_handshake) = handshake {
                     embed_pem_from_map(&mut local_handshake.cert, named_pems);
                     embed_pem_from_map(&mut local_handshake.key, named_pems);
+                    for cert in local_handshake.client_ca_certs.iter_mut() {
+                        embed_pem_from_map(cert, named_pems);
+                    }
+                    validate_server_certificates(
+                        &local_handshake.cert,
+                        &local_handshake.key,
+                        &local_handshake.client_ca_certs,
+                    )?;
                     validate_client_fingerprints(&mut local_handshake.client_fingerprints)?;
                 }
 
@@ -1235,6 +1329,9 @@ fn validate_server_proxy_config(
                 std::io::ErrorKind::InvalidInput,
                 "Snell does not support shadowsocks 2022 ciphers",
             ));
+        }
+        ServerProxyConfig::Snell { cipher, .. } => {
+            crate::shadowsocks::ShadowsocksCipher::try_from(cipher.as_str())?;
         }
         _ => (),
     }
@@ -1695,8 +1792,11 @@ mod tests {
         let cert_dir = test_dir.path().join("certs");
         tokio::fs::create_dir_all(&cert_dir).await.unwrap();
 
-        let test_cert = "-----BEGIN CERTIFICATE-----\nTEST CERT CONTENT\n-----END CERTIFICATE-----";
-        let test_key = "-----BEGIN PRIVATE KEY-----\nTEST KEY CONTENT\n-----END PRIVATE KEY-----";
+        let certificate = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let cert_pem = certificate.cert.pem();
+        let key_pem = certificate.signing_key.serialize_pem();
+        let test_cert = cert_pem.as_str();
+        let test_key = key_pem.as_str();
 
         let cert_files = vec![
             ("quic.crt", test_cert),
@@ -1738,7 +1838,7 @@ mod tests {
             - matching_path: "/ws"
               protocol:
                 type: vmess
-                cipher: auto
+                cipher: any
                 user_id: "123e4567-e89b-42d3-a456-426614174000"
     shadowtls_targets:
       "shadow.com":
