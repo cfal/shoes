@@ -119,3 +119,81 @@ impl TcpServerHandler for MixedTcpServerHandler {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::address::NetLocation;
+    use crate::resolver::NativeResolver;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn handler() -> MixedTcpServerHandler {
+        MixedTcpServerHandler::new(
+            Some(("user".into(), "password".into())),
+            false,
+            "0.0.0.0".parse().unwrap(),
+            Arc::new(ClientProxySelector::new(vec![])),
+            Arc::new(NativeResolver::new()),
+        )
+    }
+
+    fn socks_request(password: &[u8]) -> Vec<u8> {
+        let mut request = b"\x05\x02\x00\x02\x01\x04user".to_vec();
+        request.push(password.len() as u8);
+        request.extend_from_slice(password);
+        request.extend_from_slice(b"\x05\x01\x00\x03\x0bexample.com\x01\xbbpayload");
+        request
+    }
+
+    #[tokio::test]
+    async fn coalesced_http_and_socks_preserve_destination_and_payload() {
+        let token = BASE64.encode("user:password");
+        let http_request = format!(
+            "CONNECT example.com:443 HTTP/1.1\r\nProxy-Authorization: Basic {token}\r\n\r\npayload"
+        )
+        .into_bytes();
+        for (request, auth_response) in [
+            (http_request, &b""[..]),
+            (socks_request(b"password"), &b"\x05\x02\x01\x00"[..]),
+        ] {
+            let (mut client, server) = tokio::io::duplex(1024);
+            client.write_all(&request).await.unwrap();
+            client.shutdown().await.unwrap();
+            let result = handler()
+                .setup_server_stream(Box::new(server))
+                .await
+                .unwrap();
+            let TcpServerSetupResult::TcpForward {
+                remote_location,
+                initial_remote_data,
+                ..
+            } = result
+            else {
+                panic!("expected TCP forwarding");
+            };
+            assert_eq!(
+                remote_location,
+                NetLocation::from_str("example.com:443", None).unwrap()
+            );
+            assert_eq!(initial_remote_data.as_deref(), Some(&b"payload"[..]));
+            let mut response = vec![0; auth_response.len()];
+            client.read_exact(&mut response).await.unwrap();
+            assert_eq!(response, auth_response);
+        }
+    }
+
+    #[tokio::test]
+    async fn neither_protocol_can_bypass_configured_authentication() {
+        for request in [
+            b"CONNECT example.com:443 HTTP/1.1\r\nProxy-Authorization: Basic dXNlcjp3cm9uZw==\r\n\r\n".to_vec(),
+            socks_request(b"wrong"),
+            b"\x05\x01\x00\x05\x01\x00\x01\x7f\x00\x00\x01\x01\xbb".to_vec(),
+        ] {
+            let (mut client, server) = tokio::io::duplex(1024);
+            client.write_all(&request).await.unwrap();
+            client.shutdown().await.unwrap();
+            let error = handler().setup_server_stream(Box::new(server)).await.err().unwrap();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        }
+    }
+}
