@@ -373,9 +373,8 @@ async fn handle_udp_associate(
     mut server_stream: Box<dyn AsyncStream>,
     stream_reader: &mut StreamReader,
 ) -> std::io::Result<TcpServerSetupResult> {
-    // Read client's hint address (DST.ADDR:DST.PORT) - we ignore this per RFC
+    // NAT and some clients make this hint differ from the actual UDP source.
     let _client_hint = read_location(&mut server_stream, stream_reader).await?;
-    log::debug!("SOCKS5 UDP ASSOCIATE: client hint = {:?}", _client_hint);
 
     // Uses 2MB buffer to prevent packet drops during bursts.
     const UDP_BUFFER_SIZE: usize = 2 * 1024 * 1024;

@@ -35,6 +35,31 @@ impl WebsocketTcpServerHandler {
     }
 }
 
+#[cfg(test)]
+mod request_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn malformed_request_targets_are_errors_not_panics() {
+        for line in [
+            "GET HTTP/1.1",
+            "GET  HTTP/1.1",
+            "GET / a HTTP/1.1",
+            "POST / HTTP/1.1",
+        ] {
+            let (mut client, server) = tokio::io::duplex(256);
+            client
+                .write_all(format!("{line}\r\n\r\n").as_bytes())
+                .await
+                .unwrap();
+            let result = WebsocketTcpServerHandler::new(vec![])
+                .setup_server_stream(Box::new(server))
+                .await;
+            assert!(result.is_err(), "{line}");
+        }
+    }
+}
+
 #[async_trait]
 impl TcpServerHandler for WebsocketTcpServerHandler {
     async fn setup_server_stream(
@@ -42,7 +67,7 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
         mut server_stream: Box<dyn AsyncStream>,
     ) -> std::io::Result<TcpServerSetupResult> {
         let ParsedHttpData {
-            mut first_line,
+            first_line,
             headers: mut request_headers,
             stream_reader,
         } = ParsedHttpData::parse(&mut server_stream).await?;
@@ -59,11 +84,13 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
                 )));
             }
 
-            // remove ' HTTP/1.x'
-            first_line.truncate(first_line.len() - 9);
-
-            // return the path after 'GET '
-            first_line.split_off(4)
+            let path = first_line
+                .get(4..first_line.len() - 9)
+                .filter(|path| {
+                    !path.is_empty() && !path.bytes().any(|byte| byte.is_ascii_whitespace())
+                })
+                .ok_or_else(|| std::io::Error::other("invalid HTTP request target"))?;
+            path.to_owned()
         };
 
         let websocket_key = request_headers

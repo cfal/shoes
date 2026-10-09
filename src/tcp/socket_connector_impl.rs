@@ -21,7 +21,7 @@ use crate::config::{ClientConfig, ClientQuicConfig, Transport};
 use crate::quic_endpoint::QuicEndpoint;
 use crate::quic_stream::QuicStream;
 use crate::resolver::{Resolver, resolve_addresses, resolve_location};
-use crate::rustls_config_util::create_client_config;
+use crate::rustls_config_util::try_create_client_config;
 use crate::socket_util::{new_tcp_socket, new_udp_socket, set_tcp_keepalive};
 use crate::thread_util::get_num_threads;
 
@@ -140,11 +140,20 @@ impl SocketConnectorImpl {
     ///   Pass None for direct protocol (QUIC is not supported for direct).
     ///
     /// # Returns
-    /// None if QUIC endpoint creation fails.
+    /// Returns any socket or QUIC endpoint initialization error.
+    #[cfg(test)]
     pub fn from_config(
         config: &ClientConfig,
         target_address: Option<&NetLocation>,
-    ) -> Option<Self> {
+    ) -> std::io::Result<Self> {
+        Self::from_config_with_limits(config, target_address, crate::resources::limits())
+    }
+
+    pub fn from_config_with_limits(
+        config: &ClientConfig,
+        target_address: Option<&NetLocation>,
+        limits: crate::config::GlobalLimits,
+    ) -> std::io::Result<Self> {
         let bind_interface = config.bind_interface.clone().into_option();
 
         let default_sni_hostname =
@@ -168,9 +177,12 @@ impl SocketConnectorImpl {
             }
             Transport::Quic => {
                 // QUIC requires a target address for endpoint creation
-                let target_address = target_address.expect(
-                    "QUIC transport requires target_address (direct protocol should use TCP)",
-                );
+                let target_address = target_address.ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "QUIC transport requires a target address",
+                    )
+                })?;
 
                 let ClientQuicConfig {
                     verify,
@@ -207,27 +219,29 @@ impl SocketConnectorImpl {
                     (key_bytes, cert_bytes)
                 });
 
-                let rustls_client_config = create_client_config(
+                let rustls_client_config = try_create_client_config(
                     verify,
                     server_fingerprints.into_vec(),
                     alpn_protocols.into_vec(),
                     sni_hostname.is_some(),
                     key_and_cert_bytes,
                     false, // tls13_only - QUIC enforces TLS 1.3 anyway
-                );
+                )?;
 
                 let quic_client_config = quinn::crypto::rustls::QuicClientConfig::with_initial(
                     Arc::new(rustls_client_config),
                     tls13_suite.quic_suite().unwrap(),
                 )
-                .unwrap();
+                .map_err(std::io::Error::other)?;
 
                 let mut quinn_client_config =
                     quinn::ClientConfig::new(Arc::new(quic_client_config));
 
                 let mut transport_config = quinn::TransportConfig::default();
-                let memory_bytes =
-                    crate::resources::configure_quic_transport(&mut transport_config);
+                let memory_bytes = crate::resources::configure_quic_transport_with_limits(
+                    &mut transport_config,
+                    limits,
+                );
                 transport_config
                     .max_concurrent_bidi_streams(0_u32.into())
                     .max_concurrent_uni_streams(0_u8.into())
@@ -240,19 +254,14 @@ impl SocketConnectorImpl {
                 let mut endpoints = Vec::with_capacity(endpoints_len);
 
                 for _ in 0..endpoints_len {
-                    let udp_socket = match new_udp_socket(
-                        target_address.address().is_ipv6(),
-                        bind_interface.clone(),
-                    ) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            error!("Failed to bind new UDP socket for QUIC: {e}");
-                            return None;
-                        }
+                    let udp_socket = if target_address.address().hostname().is_some() {
+                        crate::socket_util::new_hostname_udp_socket(bind_interface.clone())?
+                    } else {
+                        new_udp_socket(target_address.address().is_ipv6(), bind_interface.clone())?
                     };
-                    let udp_socket = udp_socket.into_std().unwrap();
+                    let udp_socket = udp_socket.into_std()?;
 
-                    let mut endpoint = QuicEndpoint::new(None, udp_socket, memory_bytes).unwrap();
+                    let mut endpoint = QuicEndpoint::new(None, udp_socket, memory_bytes)?;
                     endpoint.set_default_client_config(quinn_client_config.clone());
                     endpoints.push(Arc::new(endpoint));
                 }
@@ -265,7 +274,7 @@ impl SocketConnectorImpl {
             }
         };
 
-        Some(Self {
+        Ok(Self {
             bind_interface,
             transport,
         })
@@ -290,7 +299,7 @@ impl SocketConnector for SocketConnectorImpl {
         resolver: &Arc<dyn Resolver>,
         address: &ResolvedLocation,
     ) -> std::io::Result<Box<dyn AsyncStream>> {
-        let target_addrs = match address.resolved_addr() {
+        let mut target_addrs = match address.resolved_addr() {
             Some(r) => vec![r],
             None => resolve_addresses(resolver, address.location()).await?,
         };
@@ -319,6 +328,10 @@ impl SocketConnector for SocketConnectorImpl {
                 next_endpoint_index,
                 sni_hostname,
             } => {
+                // Preserve IPv4 preference for hostnames without excluding IPv6-only targets.
+                if address.address().hostname().is_some() {
+                    target_addrs.sort_by_key(SocketAddr::is_ipv6);
+                }
                 let domain = match sni_hostname {
                     Some(s) => s.as_str(),
                     None => address.address().hostname().unwrap_or("example.com"),
@@ -492,6 +505,75 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
     use tokio::time::Instant;
+
+    #[derive(Debug)]
+    struct FixedResolver(Vec<SocketAddr>);
+
+    impl Resolver for FixedResolver {
+        fn resolve_location(
+            &self,
+            _location: &NetLocation,
+        ) -> Pin<Box<dyn std::future::Future<Output = std::io::Result<Vec<SocketAddr>>> + Send>>
+        {
+            let addresses = self.0.clone();
+            Box::pin(async move { Ok(addresses) })
+        }
+    }
+
+    #[tokio::test]
+    async fn hostname_quic_prefers_ipv4_without_waiting_for_stalled_ipv6() {
+        use tokio::io::AsyncWriteExt;
+        let Ok(blackhole) = UdpSocket::bind("[::1]:0").await else {
+            return;
+        };
+        let stalled = blackhole.local_addr().unwrap();
+        let certificate = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let server_config = quinn::ServerConfig::with_single_cert(
+            vec![certificate.cert.der().clone()],
+            rustls::pki_types::PrivatePkcs8KeyDer::from(certificate.signing_key.serialize_der())
+                .into(),
+        )
+        .unwrap();
+        for bind in ["127.0.0.1:0", "[::1]:0"] {
+            let server =
+                quinn::Endpoint::server(server_config.clone(), bind.parse().unwrap()).unwrap();
+            let server_addr = server.local_addr().unwrap();
+            let addresses = if server_addr.is_ipv4() {
+                vec![stalled, server_addr]
+            } else {
+                vec![server_addr]
+            };
+            let resolver: Arc<dyn Resolver> = Arc::new(FixedResolver(addresses));
+            let config: ClientConfig = serde_yaml::from_str("address: 'localhost:443'\ntransport: quic\nquic_settings: {verify: false}\nprotocol: {type: socks}\n").unwrap();
+            let connector =
+                SocketConnectorImpl::from_config(&config, Some(&config.address)).unwrap();
+            tokio::time::timeout(Duration::from_secs(3), async {
+                let (client, received) = tokio::join!(
+                    async {
+                        let mut stream = connector
+                            .connect(&resolver, &ResolvedLocation::new(config.address.clone()))
+                            .await
+                            .unwrap();
+                        stream.write_all(b"ping").await.unwrap();
+                        stream.flush().await.unwrap();
+                        stream
+                    },
+                    async {
+                        let connection = server.accept().await.unwrap().await.unwrap();
+                        let (_send, mut recv) = connection.accept_bi().await.unwrap();
+                        let mut data = [0; 4];
+                        recv.read_exact(&mut data).await.unwrap();
+                        assert_eq!(&data, b"ping");
+                        connection
+                    },
+                );
+                drop((client, received));
+            })
+            .await
+            .unwrap();
+            server.close(0u32.into(), b"done");
+        }
+    }
 
     fn addresses(count: u16) -> Vec<SocketAddr> {
         (1..=count)
@@ -693,7 +775,7 @@ mod tests {
     fn test_from_config_direct_protocol() {
         let config = ClientConfig::default(); // default is direct protocol
         let connector = SocketConnectorImpl::from_config(&config, None);
-        assert!(connector.is_some());
+        assert!(connector.is_ok());
         assert!(matches!(
             connector.unwrap().transport,
             TransportConfig::Tcp { .. }

@@ -36,6 +36,10 @@ privileged-tests = ["integration-tests"]
 stress-tests = ["integration-tests"]
 
 [[test]]
+name = "process_contract"
+path = "tests/process_contract.rs"
+
+[[test]]
 name = "integration"
 path = "tests/integration.rs"
 required-features = ["integration-tests"]
@@ -108,10 +112,11 @@ tokio = { version = "*", features = [
     "macros",
     "net",
     "rt-multi-thread",
+    "signal",
     "sync",
     "time",
 ] }
-tokio-util = { version = "*", features = ["time", "io"] }
+tokio-util = { version = "*", features = ["time", "io", "rt"] }
 tun = { version = "*", features = ["async"] }
 url = "*"
 webpki-roots = { version = "*" }

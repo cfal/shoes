@@ -22,12 +22,10 @@ pub async fn parse_addons_from_reader<S: AsyncReadExt + Unpin>(
         .read_slice(stream, addon_length as usize)
         .await?;
 
-    log::debug!(
-        "Parsing addons: length={}, bytes={:?}",
-        addon_length,
-        addon_bytes
-    );
+    parse_addons(addon_bytes)
+}
 
+fn parse_addons(addon_bytes: &[u8]) -> std::io::Result<String> {
     // Parse protobuf-encoded addons
     // Format: field_tag length data [field_tag length data ...]
     // Field 1 = flow (string)
@@ -38,13 +36,13 @@ pub async fn parse_addons_from_reader<S: AsyncReadExt + Unpin>(
 
     while addon_cursor < addon_bytes.len() {
         // Read field tag
-        let field_tag = addon_bytes[addon_cursor];
-        addon_cursor += 1;
+        let (field_tag, bytes_used) = read_varint(&addon_bytes[addon_cursor..])?;
+        addon_cursor += bytes_used;
 
         let field_number = field_tag >> 3;
         let wire_type = field_tag & 0x07;
 
-        if wire_type != 2 {
+        if wire_type != 2 || field_number == 0 || field_number > 0x1fff_ffff {
             return Err(std::io::Error::other(format!(
                 "Unexpected wire type {} for field {}",
                 wire_type, field_number
@@ -61,7 +59,7 @@ pub async fn parse_addons_from_reader<S: AsyncReadExt + Unpin>(
         addon_cursor += bytes_used;
 
         // Validate field_length is within bounds
-        if addon_cursor + field_length as usize > addon_bytes.len() {
+        if field_length > (addon_bytes.len() - addon_cursor) as u64 {
             return Err(std::io::Error::other(format!(
                 "Field {} length {} exceeds remaining addon bytes (cursor: {}, total: {})",
                 field_number,
@@ -168,21 +166,23 @@ pub fn vision_flow_addon_data() -> &'static [u8] {
 }
 
 fn read_varint(data: &[u8]) -> std::io::Result<(u64, usize)> {
-    let mut cursor = 0usize;
-    let mut length = 0u64;
-    loop {
-        let byte = data[cursor];
-        if (byte & 0b10000000) != 0 {
-            length = (length << 8) | ((byte ^ 0b10000000) as u64);
-        } else {
-            length = (length << 8) | (byte as u64);
-            return Ok((length, cursor + 1));
+    let mut value = 0;
+    for (index, &byte) in data.iter().take(10).enumerate() {
+        if index == 9 && byte > 1 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Varint overflow",
+            ));
         }
-        if cursor == 7 || cursor == data.len() {
-            return Err(std::io::Error::other("Varint is too long"));
+        value |= u64::from(byte & 0x7f) << (index * 7);
+        if byte & 0x80 == 0 {
+            return Ok((value, index + 1));
         }
-        cursor += 1;
     }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::UnexpectedEof,
+        "Truncated varint",
+    ))
 }
 
 /// Encode a flow string as protobuf addon data
@@ -211,4 +211,39 @@ fn encode_flow_addon(flow: &str) -> std::io::Result<Vec<u8>> {
     result.extend_from_slice(flow_bytes);
 
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn protobuf_varints_are_bounded_little_endian() {
+        assert_eq!(read_varint(&[0xac, 2]).unwrap(), (300, 2));
+        let mut maximum = vec![0xff; 9];
+        maximum.push(1);
+        assert_eq!(read_varint(&maximum).unwrap(), (u64::MAX, 10));
+        maximum[9] = 2;
+        assert!(read_varint(&maximum).is_err());
+        for invalid in [&[][..], &[0x80], &[0x80; 10]] {
+            assert!(read_varint(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn addon_lengths_cannot_wrap_or_escape_the_header() {
+        let mut addon = vec![0x0a];
+        addon.extend([0xff; 9]);
+        addon.push(1);
+        assert!(parse_addons(&addon).is_err());
+        assert!(parse_addons(&[0x0a, 2, b'a']).is_err());
+        assert!(parse_addons(&[2, 0]).is_err());
+        assert_eq!(
+            parse_addons(vision_flow_addon_data()).unwrap(),
+            XTLS_VISION_FLOW
+        );
+        let mut long = vec![0x0a, 0x80, 1];
+        long.extend([b'x'; 128]);
+        assert_eq!(parse_addons(&long).unwrap(), "x".repeat(128));
+    }
 }

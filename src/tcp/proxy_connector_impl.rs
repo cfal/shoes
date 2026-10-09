@@ -34,21 +34,24 @@ impl ProxyConnectorImpl {
     /// Create a ProxyConnector from a ClientConfig's protocol-related fields.
     ///
     /// Returns None for direct protocol (direct has no ProxyConnector).
-    pub fn from_config(config: ClientConfig, resolver: Arc<dyn Resolver>) -> Option<Self> {
+    pub fn from_config(
+        config: ClientConfig,
+        resolver: Arc<dyn Resolver>,
+    ) -> std::io::Result<Option<Self>> {
         if config.protocol.is_direct() {
-            return None;
+            return Ok(None);
         }
 
         let default_sni_hostname = config.address.address().hostname().map(ToString::to_string);
 
-        Some(Self {
+        Ok(Some(Self {
             location: config.address,
             client_handler: create_tcp_client_handler(
                 config.protocol,
                 default_sni_hostname,
                 resolver,
-            ),
-        })
+            )?,
+        }))
     }
 }
 
@@ -242,10 +245,35 @@ mod tests {
     }
 
     #[test]
+    fn malformed_protocol_settings_return_errors_without_validation() {
+        for protocol in [
+            serde_json::json!({"type": "reality", "public_key": "invalid", "sni_hostname": "example.com", "protocol": {"type": "socks"}}),
+            serde_json::json!({"type": "reality", "public_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "protocol": {"type": "socks"}}),
+            serde_json::json!({"type": "anytls", "password": "test", "padding_scheme": ["stop=invalid"]}),
+            serde_json::json!({"type": "reality", "public_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "sni_hostname": "127.0.0.1", "protocol": {"type": "socks"}}),
+            serde_json::json!({"type": "reality", "public_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "sni_hostname": "::1", "protocol": {"type": "socks"}}),
+            serde_json::json!({"type": "reality", "public_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "sni_hostname": "example.com", "protocol": {"type": "direct"}}),
+            serde_json::json!({"type": "tls", "protocol": {"type": "direct"}}),
+            serde_json::json!({"type": "shadowtls", "password": "test", "protocol": {"type": "direct"}}),
+            serde_json::json!({"type": "websocket", "protocol": {"type": "direct"}}),
+        ] {
+            let config = serde_json::from_value(serde_json::json!({
+                "address": "127.0.0.1:443", "protocol": protocol
+            }))
+            .unwrap();
+            assert!(ProxyConnectorImpl::from_config(config, mock_resolver()).is_err());
+        }
+    }
+
+    #[test]
     fn test_from_direct_config_returns_none() {
         let config = ClientConfig::default();
         assert!(config.protocol.is_direct());
-        assert!(ProxyConnectorImpl::from_config(config, mock_resolver()).is_none());
+        assert!(
+            ProxyConnectorImpl::from_config(config, mock_resolver())
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -258,7 +286,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let connector = ProxyConnectorImpl::from_config(config, mock_resolver());
+        let connector = ProxyConnectorImpl::from_config(config, mock_resolver()).unwrap();
         assert!(connector.is_some());
         let connector = connector.unwrap();
         assert_eq!(connector.proxy_location().port(), 1080);

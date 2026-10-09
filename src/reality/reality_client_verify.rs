@@ -139,10 +139,6 @@ pub fn verify_certificate_hmac(cert_der: &[u8], auth_key: &[u8; 32]) -> io::Resu
         pubkey_data
     );
     log::debug!(
-        "REALITY CLIENT: HMAC verification - expected_sig={:02x?}",
-        expected_signature
-    );
-    log::debug!(
         "REALITY CLIENT: HMAC verification - actual_sig={:02x?}",
         signature
     );

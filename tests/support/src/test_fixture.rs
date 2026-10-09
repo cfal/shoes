@@ -3168,6 +3168,17 @@ impl ProxyTestFixture {
         let proxies_clone = self.proxies.clone();
         for proxy in &proxies_clone {
             if let Some(config) = self.generate_singbox_config(proxy)? {
+                let mut config: serde_json::Value = serde_json::from_str(&config)?;
+                if self
+                    .local_server
+                    .as_ref()
+                    .is_some_and(|server| server.ip == "127.0.0.1")
+                {
+                    config["dns"] = serde_json::json!({"servers": [{
+                        "type": "hosts", "predefined": {"localhost": ["127.0.0.1"]}
+                    }]});
+                }
+                let config = serde_json::to_string(&config)?;
                 let (guard, config_file) = start_singbox_server(&config)?;
                 guards.push(guard);
                 config_files.push(config_file);

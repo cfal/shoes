@@ -105,6 +105,16 @@ mod tests {
     use super::*;
 
     #[tokio::test(start_paused = true)]
+    async fn ss2022_future_timestamp_is_protected_at_its_last_valid_second() {
+        let mut checker = TimedSaltChecker::new(61);
+        assert!(checker.insert_and_check(b"future salt"));
+        tokio::time::advance(Duration::from_secs(60)).await;
+        assert!(!checker.insert_and_check(b"future salt"));
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(checker.insert_and_check(b"future salt"));
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn capacity_is_replay_safe_and_idle_entries_expire() {
         let mut checker = TimedSaltChecker::with_capacity(60, 2);
         assert!(checker.insert_and_check(b"first"));

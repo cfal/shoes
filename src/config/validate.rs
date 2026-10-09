@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::address::NetLocationMask;
 use crate::dns::ParsedDnsUrl;
-use crate::option_util::{NoneOrSome, OneOrSome};
+use crate::option_util::{NoneOrOne, NoneOrSome, OneOrSome};
 use crate::reality::{decode_private_key, decode_short_id};
 use crate::thread_util::get_num_threads;
 use crate::uuid_util::parse_uuid;
@@ -642,6 +642,12 @@ fn validate_server_config(
     rule_groups: &HashMap<String, Vec<RuleConfig>>,
     named_pems: &HashMap<String, String>,
 ) -> std::io::Result<()> {
+    if server_config.transport == Transport::Udp {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "UDP listener transport is not supported",
+        ));
+    }
     // First handle QUIC settings certificates
     if let Some(ref mut quic_settings) = server_config.quic_settings {
         embed_pem_from_map(&mut quic_settings.cert, named_pems);
@@ -649,6 +655,11 @@ fn validate_server_config(
         for cert in quic_settings.client_ca_certs.iter_mut() {
             embed_pem_from_map(cert, named_pems);
         }
+        validate_server_certificates(
+            &quic_settings.cert,
+            &quic_settings.key,
+            &quic_settings.client_ca_certs,
+        )?;
     }
     if server_config.transport != Transport::Tcp && server_config.tcp_settings.is_some() {
         return Err(std::io::Error::new(
@@ -858,24 +869,29 @@ fn validate_client_vision_protocol(
 
 /// Recursive validation of client proxy config structure (Vision rules, etc.)
 fn validate_client_proxy_structure(config: &ClientProxyConfig) -> std::io::Result<()> {
-    match config {
+    let inner = match config {
         ClientProxyConfig::Tls(tls_config) => {
             validate_client_vision_protocol(tls_config.vision, &tls_config.protocol, "TLS")?;
-            validate_client_proxy_structure(&tls_config.protocol)?;
+            Some(tls_config.protocol.as_ref())
         }
         ClientProxyConfig::Reality {
             vision, protocol, ..
         } => {
             validate_client_vision_protocol(*vision, protocol, "Reality")?;
-            validate_client_proxy_structure(protocol)?;
+            Some(protocol.as_ref())
         }
-        ClientProxyConfig::ShadowTls { protocol, .. } => {
-            validate_client_proxy_structure(protocol)?;
+        ClientProxyConfig::ShadowTls { protocol, .. } => Some(protocol.as_ref()),
+        ClientProxyConfig::Websocket(ws_config) => Some(ws_config.protocol.as_ref()),
+        _ => None,
+    };
+    if let Some(inner) = inner {
+        if inner.is_direct() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "direct cannot be used as an inner proxy protocol",
+            ));
         }
-        ClientProxyConfig::Websocket(ws_config) => {
-            validate_client_proxy_structure(&ws_config.protocol)?;
-        }
-        _ => {}
+        validate_client_proxy_structure(inner)?;
     }
     Ok(())
 }
@@ -915,6 +931,7 @@ fn validate_client_config(
             ));
         }
         validate_server_fingerprints(server_fingerprints)?;
+        validate_client_certificates(cert.as_deref(), key.as_deref())?;
     }
 
     #[cfg(not(any(target_os = "android", target_os = "fuchsia", target_os = "linux")))]
@@ -925,7 +942,12 @@ fn validate_client_config(
         ));
     }
 
-    validate_client_proxy_config(&mut client_config.protocol, named_pems)?;
+    validate_client_proxy_structure(&client_config.protocol)?;
+    validate_client_proxy_config(
+        &mut client_config.protocol,
+        named_pems,
+        client_config.address.address().hostname(),
+    )?;
 
     Ok(())
 }
@@ -951,13 +973,42 @@ fn validate_server_fingerprints(
 fn validate_client_proxy_config(
     client_proxy_config: &mut ClientProxyConfig,
     named_pems: &HashMap<String, String>,
+    default_sni: Option<&str>,
 ) -> std::io::Result<()> {
-    validate_client_proxy_structure(client_proxy_config)?;
-
     match client_proxy_config {
-        ClientProxyConfig::Reality {
-            short_id, protocol, ..
+        ClientProxyConfig::Vmess {
+            user_id, cipher, ..
         } => {
+            parse_uuid(user_id)?;
+            validate_vmess_cipher(cipher)?;
+        }
+        ClientProxyConfig::Vless { user_id, .. } => {
+            parse_uuid(user_id)?;
+        }
+        ClientProxyConfig::Snell {
+            config: super::types::ShadowsocksConfig::Aead2022 { .. },
+            ..
+        } => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Snell does not support shadowsocks 2022 ciphers",
+            ));
+        }
+        ClientProxyConfig::Reality {
+            public_key,
+            short_id,
+            sni_hostname,
+            protocol,
+            ..
+        } => {
+            crate::reality::decode_public_key(public_key).map_err(std::io::Error::other)?;
+            let sni = sni_hostname.as_deref().or(default_sni).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "REALITY client requires sni_hostname",
+                )
+            })?;
+            crate::reality::parse_server_name(sni)?;
             validate_reality_client_short_id(short_id)?;
 
             if short_id == DEFAULT_REALITY_SHORT_ID {
@@ -967,10 +1018,18 @@ fn validate_client_proxy_config(
                 );
             }
 
-            validate_client_proxy_config(protocol, named_pems)?;
+            validate_client_proxy_config(protocol, named_pems, None)?;
         }
 
         ClientProxyConfig::Tls(tls_config) => {
+            let sni = match &tls_config.sni_hostname {
+                NoneOrOne::Unspecified => default_sni,
+                NoneOrOne::None => None,
+                NoneOrOne::One(sni) => Some(sni.as_str()),
+            };
+            if let Some(sni) = sni {
+                validate_sni(sni)?;
+            }
             embed_optional_pem_from_map(&mut tls_config.cert, named_pems);
             embed_optional_pem_from_map(&mut tls_config.key, named_pems);
 
@@ -981,21 +1040,78 @@ fn validate_client_proxy_config(
                 ));
             }
             validate_server_fingerprints(&mut tls_config.server_fingerprints)?;
+            validate_client_certificates(tls_config.cert.as_deref(), tls_config.key.as_deref())?;
 
-            validate_client_proxy_config(&mut tls_config.protocol, named_pems)?;
+            validate_client_proxy_config(&mut tls_config.protocol, named_pems, None)?;
         }
 
-        ClientProxyConfig::ShadowTls { protocol, .. } => {
-            validate_client_proxy_config(protocol, named_pems)?;
+        ClientProxyConfig::ShadowTls {
+            protocol,
+            sni_hostname,
+            ..
+        } => {
+            if let Some(sni) = sni_hostname.as_deref().or(default_sni) {
+                validate_sni(sni)?;
+            }
+            validate_client_proxy_config(protocol, named_pems, None)?;
         }
 
         ClientProxyConfig::Websocket(ws_config) => {
-            validate_client_proxy_config(&mut ws_config.protocol, named_pems)?;
+            validate_client_proxy_config(&mut ws_config.protocol, named_pems, None)?;
+        }
+
+        ClientProxyConfig::Anytls {
+            padding_scheme: Some(lines),
+            ..
+        } => {
+            crate::anytls::PaddingFactory::new(lines.join("\n").as_bytes())
+                .map_err(std::io::Error::other)?;
         }
 
         _ => {}
     }
     Ok(())
+}
+
+fn validate_sni(sni: &str) -> std::io::Result<()> {
+    rustls::pki_types::ServerName::try_from(sni)
+        .map(|_| ())
+        .map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid TLS server name")
+        })
+}
+
+fn validate_server_certificates(
+    cert: &str,
+    key: &str,
+    ca: &NoneOrSome<String>,
+) -> std::io::Result<()> {
+    crate::rustls_config_util::try_create_server_config(
+        cert.as_bytes(),
+        key.as_bytes(),
+        ca.iter().map(|pem| pem.as_bytes().to_vec()).collect(),
+        &[],
+        &[],
+    )
+    .map(|_| ())
+}
+
+fn validate_client_certificates(cert: Option<&str>, key: Option<&str>) -> std::io::Result<()> {
+    if let (Some(cert), Some(key)) = (cert, key) {
+        crate::rustls_config_util::try_create_client_config(
+            false,
+            vec![],
+            vec![],
+            true,
+            Some((key.as_bytes().to_vec(), cert.as_bytes().to_vec())),
+            false,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_vmess_cipher(cipher: &str) -> std::io::Result<()> {
+    crate::vmess::DataCipher::try_from(cipher).map(|_| ())
 }
 
 fn validate_server_proxy_config(
@@ -1006,6 +1122,13 @@ fn validate_server_proxy_config(
     inside_tls_or_reality: bool,
 ) -> std::io::Result<()> {
     match server_proxy_config {
+        ServerProxyConfig::Anytls {
+            padding_scheme: Some(lines),
+            ..
+        } => {
+            crate::anytls::PaddingFactory::new(lines.join("\n").as_bytes())
+                .map_err(std::io::Error::other)?;
+        }
         ServerProxyConfig::Naiveproxy { .. } if !inside_tls_or_reality => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -1016,8 +1139,11 @@ fn validate_server_proxy_config(
         ServerProxyConfig::Vless { user_id, .. } => {
             parse_uuid(user_id)?;
         }
-        ServerProxyConfig::Vmess { user_id, .. } => {
+        ServerProxyConfig::Vmess {
+            user_id, cipher, ..
+        } => {
             parse_uuid(user_id)?;
+            validate_vmess_cipher(cipher)?;
         }
         ServerProxyConfig::Tls {
             tls_targets,
@@ -1042,6 +1168,11 @@ fn validate_server_proxy_config(
                 for cert in tls_server_config.client_ca_certs.iter_mut() {
                     embed_pem_from_map(cert, named_pems);
                 }
+                validate_server_certificates(
+                    &tls_server_config.cert,
+                    &tls_server_config.key,
+                    &tls_server_config.client_ca_certs,
+                )?;
 
                 let TlsServerConfig {
                     ref mut protocol,
@@ -1076,6 +1207,12 @@ fn validate_server_proxy_config(
                 for cert in tls_server_config.client_ca_certs.iter_mut() {
                     embed_pem_from_map(cert, named_pems);
                 }
+                validate_server_certificates(
+                    &tls_server_config.cert,
+                    &tls_server_config.key,
+                    &tls_server_config.client_ca_certs,
+                )?;
+                validate_client_fingerprints(&mut tls_server_config.client_fingerprints)?;
 
                 let TlsServerConfig {
                     ref mut protocol,
@@ -1119,7 +1256,22 @@ fn validate_server_proxy_config(
                 if let ShadowTlsServerHandshakeConfig::Local(local_handshake) = handshake {
                     embed_pem_from_map(&mut local_handshake.cert, named_pems);
                     embed_pem_from_map(&mut local_handshake.key, named_pems);
+                    for cert in local_handshake.client_ca_certs.iter_mut() {
+                        embed_pem_from_map(cert, named_pems);
+                    }
+                    validate_server_certificates(
+                        &local_handshake.cert,
+                        &local_handshake.key,
+                        &local_handshake.client_ca_certs,
+                    )?;
                     validate_client_fingerprints(&mut local_handshake.client_fingerprints)?;
+                } else if let ShadowTlsServerHandshakeConfig::Remote(remote_handshake) = handshake {
+                    validate_client_chain(
+                        &mut remote_handshake.client_chain,
+                        0,
+                        client_groups,
+                        named_pems,
+                    )?;
                 }
 
                 validate_server_proxy_config(
@@ -1161,6 +1313,14 @@ fn validate_server_proxy_config(
 
                 validate_reality_private_key(&reality_config.private_key, sni_hostname)?;
                 validate_reality_server_short_ids(&reality_config.short_ids, sni_hostname)?;
+
+                if !reality_config.dest_client_chain.is_empty() {
+                    let mut hops = OneOrSome::Some(
+                        std::mem::take(&mut reality_config.dest_client_chain).into_vec(),
+                    );
+                    validate_client_chain(&mut hops, 0, client_groups, named_pems)?;
+                    reality_config.dest_client_chain = NoneOrSome::Some(hops.into_vec());
+                }
 
                 validate_server_proxy_config(
                     &mut reality_config.protocol,
@@ -1235,6 +1395,9 @@ fn validate_server_proxy_config(
                 std::io::ErrorKind::InvalidInput,
                 "Snell does not support shadowsocks 2022 ciphers",
             ));
+        }
+        ServerProxyConfig::Snell { cipher, .. } => {
+            crate::shadowsocks::ShadowsocksCipher::try_from(cipher.as_str())?;
         }
         _ => (),
     }
@@ -1321,20 +1484,25 @@ fn validate_rule_config(
             ));
         }
 
-        // Validate each chain
         for (chain_index, chain) in client_chains.iter_mut().enumerate() {
-            // First validate all hops in this chain
-            for hop in chain.hops.iter_mut() {
-                validate_client_chain_hop(hop, client_groups, named_pems)?;
-            }
-            // Then expand group references to inline configs
-            expand_client_chain(&mut chain.hops, client_groups)?;
-            // Validate that direct connectors only appear at hop 0
-            validate_direct_connector_positions(&chain.hops, chain_index)?;
+            validate_client_chain(&mut chain.hops, chain_index, client_groups, named_pems)?;
         }
     }
 
     Ok(())
+}
+
+fn validate_client_chain(
+    hops: &mut OneOrSome<ClientChainHop>,
+    chain_index: usize,
+    client_groups: &HashMap<String, Vec<ClientConfig>>,
+    named_pems: &HashMap<String, String>,
+) -> std::io::Result<()> {
+    for hop in hops.iter_mut() {
+        validate_client_chain_hop(hop, client_groups, named_pems)?;
+    }
+    expand_client_chain(hops, client_groups)?;
+    validate_direct_connector_positions(hops, chain_index)
 }
 
 /// Validates that direct connectors only appear at hop 0.
@@ -1505,6 +1673,74 @@ mod tests {
     use super::*;
     use crate::config::pem::convert_cert_paths;
     use crate::dns::IpStrategy;
+
+    #[test]
+    fn nested_structure_errors_precede_protocol_field_errors() {
+        let mut config = serde_json::from_value(serde_json::json!({
+            "address": "example.com:443",
+            "protocol": {
+                "type": "reality", "public_key": "invalid",
+                "protocol": {"type": "websocket", "protocol": {"type": "direct"}}
+            }
+        }))
+        .unwrap();
+        let error = validate_client_config(&mut config, &HashMap::new()).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(
+            error.to_string(),
+            "direct cannot be used as an inner proxy protocol"
+        );
+    }
+
+    #[test]
+    fn tls_sni_distinguishes_inheritance_disable_and_override() {
+        for (sni, valid) in [
+            (NoneOrOne::Unspecified, false),
+            (NoneOrOne::None, true),
+            (NoneOrOne::One("example.com".to_owned()), true),
+            (NoneOrOne::One("invalid name".to_owned()), false),
+        ] {
+            let mut protocol = serde_json::from_value(serde_json::json!({
+                "type": "tls", "protocol": {"type": "socks"}
+            }))
+            .unwrap();
+            let ClientProxyConfig::Tls(ref mut tls) = protocol else {
+                unreachable!()
+            };
+            tls.sni_hostname = sni;
+            assert_eq!(
+                validate_client_proxy_config(&mut protocol, &HashMap::new(), Some("invalid name"))
+                    .is_ok(),
+                valid,
+            );
+        }
+    }
+
+    #[test]
+    fn reality_sni_defaults_only_at_the_outer_client_layer() {
+        let protocol = serde_json::json!({
+            "type": "reality", "public_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "protocol": {"type": "socks"}
+        });
+        for (address, protocol, valid) in [
+            ("example.com:443", protocol.clone(), true),
+            ("127.0.0.1:443", protocol.clone(), false),
+            (
+                "example.com:443",
+                serde_json::json!({"type": "websocket", "protocol": protocol}),
+                false,
+            ),
+        ] {
+            let mut config: ClientConfig = serde_json::from_value(serde_json::json!({
+                "address": address, "protocol": protocol
+            }))
+            .unwrap();
+            assert_eq!(
+                validate_client_config(&mut config, &HashMap::new()).is_ok(),
+                valid
+            );
+        }
+    }
 
     async fn validate_configs_test(configs: Vec<Config>) -> std::io::Result<Vec<Config>> {
         let (converted_configs, _) = convert_cert_paths(configs).await?;
@@ -1695,8 +1931,11 @@ mod tests {
         let cert_dir = test_dir.path().join("certs");
         tokio::fs::create_dir_all(&cert_dir).await.unwrap();
 
-        let test_cert = "-----BEGIN CERTIFICATE-----\nTEST CERT CONTENT\n-----END CERTIFICATE-----";
-        let test_key = "-----BEGIN PRIVATE KEY-----\nTEST KEY CONTENT\n-----END PRIVATE KEY-----";
+        let certificate = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let cert_pem = certificate.cert.pem();
+        let key_pem = certificate.signing_key.serialize_pem();
+        let test_cert = cert_pem.as_str();
+        let test_key = key_pem.as_str();
 
         let cert_files = vec![
             ("quic.crt", test_cert),
@@ -1738,7 +1977,7 @@ mod tests {
             - matching_path: "/ws"
               protocol:
                 type: vmess
-                cipher: auto
+                cipher: any
                 user_id: "123e4567-e89b-42d3-a456-426614174000"
     shadowtls_targets:
       "shadow.com":

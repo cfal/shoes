@@ -34,6 +34,20 @@ use crate::uuid_util::parse_uuid;
 use crate::xudp::XudpMessageStream;
 
 const TAG_LEN: usize = 16;
+pub(super) const AUTH_ID_TIME_WINDOW_SECS: u64 = 120;
+
+pub(super) fn unix_time_secs(time: SystemTime) -> std::io::Result<u64> {
+    time.duration_since(SystemTime::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .map_err(|_| std::io::Error::other("system clock is before the Unix epoch"))
+}
+
+fn random_auth_id_timestamp() -> std::io::Result<u64> {
+    let now = unix_time_secs(SystemTime::now())?;
+    Ok(rand::rng().random_range(
+        now.saturating_sub(AUTH_ID_TIME_WINDOW_SECS)..=now.saturating_add(AUTH_ID_TIME_WINDOW_SECS),
+    ))
+}
 
 // VMess protocol command types
 const COMMAND_TCP: u8 = 1;
@@ -41,24 +55,29 @@ const COMMAND_UDP: u8 = 2;
 const COMMAND_MUX: u8 = 3; // MUX/XUDP mode
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum DataCipher {
+pub(crate) enum DataCipher {
     Any,
     Aes128Gcm,
     ChaCha20Poly1305,
     None,
 }
 
-impl From<&str> for DataCipher {
-    fn from(name: &str) -> Self {
-        match name {
+impl TryFrom<&str> for DataCipher {
+    type Error = std::io::Error;
+
+    fn try_from(name: &str) -> Result<Self, Self::Error> {
+        Ok(match name {
             "" | "any" => DataCipher::Any,
             "aes-128-gcm" => DataCipher::Aes128Gcm,
             "chacha20-poly1305" | "chacha20-ietf-poly1305" => DataCipher::ChaCha20Poly1305,
             "none" => DataCipher::None,
             _ => {
-                panic!("Unknown cipher: {name}");
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("unsupported VMess cipher: {name}"),
+                ));
             }
-        }
+        })
     }
 }
 
@@ -87,8 +106,8 @@ impl VmessTcpServerHandler {
         udp_enabled: bool,
         proxy_selector: Arc<ClientProxySelector>,
         resolver: Arc<dyn Resolver>,
-    ) -> Self {
-        let mut user_id_bytes = parse_uuid(user_id).unwrap();
+    ) -> std::io::Result<Self> {
+        let mut user_id_bytes = parse_uuid(user_id)?;
         user_id_bytes.extend(b"c48619fe-8f02-49e0-b9e9-edf763e17e21");
         let instruction_key: [u8; 16] = compute_md5(&user_id_bytes);
 
@@ -96,14 +115,14 @@ impl VmessTcpServerHandler {
         let unbound_key = UnboundCipherKey::new(&AES_128, &derived_key[0..16]).unwrap();
         let aead_decrypting_key = CipherDecryptingKey::ecb(unbound_key).unwrap();
 
-        Self {
-            data_cipher: cipher_name.into(),
+        Ok(Self {
+            data_cipher: DataCipher::try_from(cipher_name)?,
             aead_decrypting_key,
             instruction_key,
             udp_enabled,
             proxy_selector,
             resolver,
-        }
+        })
     }
 }
 
@@ -144,14 +163,7 @@ impl TcpServerHandler for VmessTcpServerHandler {
         }
 
         let time_secs = u64::from_be_bytes(aead_bytes[0..8].try_into().unwrap());
-        let current_time_secs = SystemTime::UNIX_EPOCH.elapsed().unwrap().as_secs();
-        let time_delta = time_secs.abs_diff(current_time_secs);
-        if time_delta > 120 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("Hash timestamp is too old ({time_secs} is {time_delta} seconds old)"),
-            ));
-        }
+        super::replay::admit(self.instruction_key, cert_hash, time_secs)?;
 
         let mut encrypted_payload_length = [0u8; 18];
         stream_reader
@@ -202,8 +214,7 @@ impl TcpServerHandler for VmessTcpServerHandler {
             &[b"VMess Header AEAD Nonce", &cert_hash, &nonce],
         );
 
-        let mut encrypted_header =
-            allocate_vec(payload_length as usize + TAG_LEN).into_boxed_slice();
+        let mut encrypted_header = allocate_vec(payload_length as usize + TAG_LEN);
 
         stream_reader
             .read_slice_into(&mut server_stream, &mut encrypted_header)
@@ -222,6 +233,7 @@ impl TcpServerHandler for VmessTcpServerHandler {
             return Err(std::io::Error::other("failed to open encrypted header"));
         }
 
+        encrypted_header.truncate(payload_length as usize);
         let mut header_reader = AeadHeaderReader {
             server_stream,
             decrypted_header: encrypted_header,
@@ -331,31 +343,22 @@ impl TcpServerHandler for VmessTcpServerHandler {
         };
 
         let margin_len: u8 = fixed_header[35] >> 4;
-        log::info!("VMess margin_len: {}, command: {}", margin_len, command);
+        log::debug!("VMess margin_len: {}, command: {}", margin_len, command);
         if margin_len > 0 {
             let mut margin_bytes = allocate_vec(margin_len as usize).into_boxed_slice();
             header_reader.read_slice_into(&mut margin_bytes)?;
-            log::info!("VMess margin_bytes: {:?}", &margin_bytes[..]);
             fnv_hasher.write(&margin_bytes);
         }
 
         let mut check_bytes = [0u8; 4];
         header_reader.read_slice_into(&mut check_bytes)?;
-        log::info!("VMess check_bytes: {:?}", check_bytes);
 
         let expected_check_value = u32::from_be_bytes(check_bytes[0..4].try_into().unwrap());
         let actual_check_value = fnv_hasher.finish();
-        log::info!(
-            "VMess FNV1a: expected={}, actual={}",
-            expected_check_value,
-            actual_check_value
-        );
         if expected_check_value != actual_check_value {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!(
-                    "Bad fnv1a checksum, expected {expected_check_value}, got {actual_check_value}"
-                ),
+                "Bad VMess header checksum",
             ));
         }
 
@@ -684,14 +687,21 @@ impl TcpServerHandler for VmessTcpServerHandler {
 
 struct AeadHeaderReader {
     server_stream: Box<dyn AsyncStream>,
-    decrypted_header: Box<[u8]>,
+    decrypted_header: Vec<u8>,
     cursor: usize,
 }
 
 impl AeadHeaderReader {
     fn read_slice_into(&mut self, data: &mut [u8]) -> std::io::Result<()> {
         let len = data.len();
-        data.copy_from_slice(&self.decrypted_header[self.cursor..self.cursor + len]);
+        let chunk = self
+            .decrypted_header
+            .get(self.cursor..)
+            .and_then(|remaining| remaining.get(..len))
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "truncated VMess header")
+            })?;
+        data.copy_from_slice(chunk);
         self.cursor += len;
         Ok(())
     }
@@ -718,8 +728,8 @@ impl std::fmt::Debug for VmessTcpClientHandler {
 }
 
 impl VmessTcpClientHandler {
-    pub fn new(cipher_name: &str, user_id: &str, udp_enabled: bool) -> Self {
-        let mut user_id_bytes = parse_uuid(user_id).unwrap();
+    pub fn new(cipher_name: &str, user_id: &str, udp_enabled: bool) -> std::io::Result<Self> {
+        let mut user_id_bytes = parse_uuid(user_id)?;
         user_id_bytes.extend(b"c48619fe-8f02-49e0-b9e9-edf763e17e21");
         let instruction_key: [u8; 16] = compute_md5(&user_id_bytes);
 
@@ -727,12 +737,12 @@ impl VmessTcpClientHandler {
         let unbound_key = UnboundCipherKey::new(&AES_128, &derived_key[0..16]).unwrap();
         let aead_encrypting_key = CipherEncryptingKey::ecb(unbound_key).unwrap();
 
-        Self {
-            data_cipher: cipher_name.into(),
+        Ok(Self {
+            data_cipher: DataCipher::try_from(cipher_name)?,
             aead_encrypting_key,
             instruction_key,
             udp_enabled,
-        }
+        })
     }
 }
 
@@ -745,9 +755,7 @@ impl TcpClientHandler for VmessTcpClientHandler {
     ) -> std::io::Result<TcpClientSetupResult> {
         // AEAD allows 120 second delta from the current time.
         // See authid.go in v2ray-core.
-        let random_delta: u64 = rand::rng().random_range(0..241);
-        let time_secs: u64 =
-            SystemTime::UNIX_EPOCH.elapsed().unwrap().as_secs() - 120u64 + random_delta;
+        let time_secs = random_auth_id_timestamp()?;
 
         let mut aead_bytes = [0u8; 16];
         let time_bytes = time_secs.to_be_bytes();
@@ -1028,9 +1036,7 @@ impl VmessTcpClientHandler {
         // Same as TCP setup but with command=2 and is_udp=true for VmessStream.
 
         // AEAD allows 120 second delta from the current time.
-        let random_delta: u64 = rand::rng().random_range(0..241);
-        let time_secs: u64 =
-            SystemTime::UNIX_EPOCH.elapsed().unwrap().as_secs() - 120u64 + random_delta;
+        let time_secs = random_auth_id_timestamp()?;
 
         let mut aead_bytes = [0u8; 16];
         let time_bytes = time_secs.to_be_bytes();
@@ -1260,5 +1266,124 @@ impl VmessTcpClientHandler {
         );
 
         Ok(Box::new(vmess_stream))
+    }
+}
+
+#[cfg(test)]
+mod header_tests {
+    use super::*;
+
+    #[test]
+    fn configured_ciphers_share_one_fallible_parser() {
+        for (name, cipher) in [
+            ("", DataCipher::Any),
+            ("any", DataCipher::Any),
+            ("none", DataCipher::None),
+            ("aes-128-gcm", DataCipher::Aes128Gcm),
+            ("chacha20-poly1305", DataCipher::ChaCha20Poly1305),
+            ("chacha20-ietf-poly1305", DataCipher::ChaCha20Poly1305),
+        ] {
+            assert_eq!(DataCipher::try_from(name).unwrap(), cipher);
+        }
+        let uuid = crate::uuid_util::generate_uuid();
+        for name in ["auto", "AES-128-GCM", "unsupported"] {
+            let expected = format!("unsupported VMess cipher: {name}");
+            let server = VmessTcpServerHandler::new(
+                name,
+                &uuid,
+                false,
+                Arc::new(ClientProxySelector::new(vec![])),
+                Arc::new(crate::resolver::NativeResolver::new()),
+            );
+            let client = VmessTcpClientHandler::new(name, &uuid, false);
+            for error in [
+                DataCipher::try_from(name).unwrap_err(),
+                server.unwrap_err(),
+                client.unwrap_err(),
+            ] {
+                assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+                assert_eq!(error.to_string(), expected);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn replay_protection_survives_handler_recreation() {
+        let uuid = crate::uuid_util::generate_uuid();
+        let client = VmessTcpClientHandler::new("none", &uuid, false).unwrap();
+        let make_auth_id = |valid_checksum: bool, timestamp: u64| {
+            let mut id = [0; 16];
+            id[..8].copy_from_slice(&timestamp.to_be_bytes());
+            let checksum = super::super::crc32::crc32c(&id[..12]) ^ u32::from(!valid_checksum);
+            id[12..].copy_from_slice(&checksum.to_be_bytes());
+            client
+                .aead_encrypting_key
+                .less_safe_encrypt(&mut id, EncryptionContext::None)
+                .unwrap();
+            id
+        };
+        let now = unix_time_secs(SystemTime::now()).unwrap();
+        for (id, expected) in [
+            (make_auth_id(false, now), std::io::ErrorKind::InvalidData),
+            (
+                make_auth_id(true, now.saturating_sub(121)),
+                std::io::ErrorKind::InvalidData,
+            ),
+            (
+                make_auth_id(true, now),
+                std::io::ErrorKind::ConnectionAborted,
+            ),
+            (
+                make_auth_id(true, now),
+                std::io::ErrorKind::PermissionDenied,
+            ),
+        ] {
+            let handler = VmessTcpServerHandler::new(
+                "none",
+                &uuid,
+                false,
+                Arc::new(ClientProxySelector::new(vec![])),
+                Arc::new(crate::resolver::NativeResolver::new()),
+            )
+            .unwrap();
+            let (server, mut peer) = tokio::io::duplex(64);
+            peer.write_all(&id).await.unwrap();
+            drop(peer);
+            let error = match handler.setup_server_stream(Box::new(server)).await {
+                Err(error) => error,
+                Ok(_) => panic!("header unexpectedly accepted"),
+            };
+            assert_eq!(error.kind(), expected, "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn decrypted_header_reads_are_bounded_and_non_consuming_on_error() {
+        for len in [0, 1, 16, 37, 38] {
+            let (stream, _) = tokio::io::duplex(1);
+            let mut reader = AeadHeaderReader {
+                server_stream: Box::new(stream),
+                decrypted_header: vec![7; len],
+                cursor: 0,
+            };
+            assert_eq!(reader.read_slice_into(&mut [0; 38]).is_ok(), len == 38);
+            if len < 38 {
+                assert_eq!(reader.cursor, 0);
+                reader.read_slice_into(&mut vec![0; len]).unwrap();
+            }
+            reader.read_slice_into(&mut []).unwrap();
+            assert_eq!(
+                reader.read_slice_into(&mut [0]).unwrap_err().kind(),
+                std::io::ErrorKind::UnexpectedEof
+            );
+        }
+    }
+
+    #[test]
+    fn clock_before_epoch_is_an_error() {
+        assert!(
+            unix_time_secs(SystemTime::UNIX_EPOCH - std::time::Duration::from_secs(1)).is_err()
+        );
+        assert_eq!(unix_time_secs(SystemTime::UNIX_EPOCH).unwrap(), 0);
     }
 }

@@ -423,6 +423,12 @@ impl VmessStream {
                     ));
                 }
 
+                if data_len < padding_len {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "padding exceeds VMess chunk length",
+                    ));
+                }
                 if self.tag_len > 0 && (data_len - padding_len) < self.tag_len {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
@@ -450,7 +456,7 @@ impl VmessStream {
                 }
 
                 let processed_data_len = data_len - padding_len - self.tag_len;
-                if self.processed_end_offset + processed_data_len >= self.processed_buf.len() {
+                if self.processed_end_offset + processed_data_len > self.processed_buf.len() {
                     self.unprocessed_pending_len = Some((padding_len, data_len));
                     if self.unprocessed_start_offset == self.unprocessed_end_offset {
                         self.unprocessed_start_offset = 0;
@@ -468,7 +474,7 @@ impl VmessStream {
                 }
 
                 let processed_data_len = data_len - padding_len - self.tag_len;
-                if self.processed_end_offset + processed_data_len >= self.processed_buf.len() {
+                if self.processed_end_offset + processed_data_len > self.processed_buf.len() {
                     return Ok(DecryptState::BufferFull);
                 }
 
@@ -1164,6 +1170,42 @@ mod tests {
     use shake::Shake128;
     use shake::digest::{ExtendableOutput, Update};
     use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn full_output_chunk_is_accepted_with_or_without_pending_length() {
+        for pending in [false, true] {
+            let (transport, _) = tokio::io::duplex(1);
+            let mut stream = response_test_stream(Box::new(transport), None, false, false, None);
+            let len = stream.processed_buf.len();
+            assert!(len <= u16::MAX as usize);
+            stream.unprocessed_buf[..2].copy_from_slice(&(len as u16).to_be_bytes());
+            stream.unprocessed_buf[2..2 + len].fill(42);
+            stream.unprocessed_end_offset = 2 + len;
+            if pending {
+                stream.unprocessed_pending_len = Some((0, len));
+                stream.unprocessed_start_offset = 2;
+            }
+            assert!(matches!(
+                stream.try_decrypt().unwrap(),
+                DecryptState::Success
+            ));
+            assert_eq!(&*stream.processed_buf, vec![42; len]);
+        }
+    }
+
+    #[tokio::test]
+    async fn padding_larger_than_chunk_is_rejected() {
+        let (transport, _) = tokio::io::duplex(1);
+        let mut stream = response_test_stream(Box::new(transport), None, true, true, None);
+        let (padding, mask) =
+            LengthMask::new(create_shake128_reader(&[23; 16]), true).next_values();
+        assert!(padding > 0);
+        stream.unprocessed_buf[..2].copy_from_slice(&mask.to_be_bytes());
+        stream.unprocessed_end_offset = 2;
+        assert!(
+            matches!(stream.try_decrypt(), Err(error) if error.kind() == std::io::ErrorKind::InvalidData)
+        );
+    }
 
     fn create_shake128_reader(iv: &[u8]) -> VmessReader {
         let mut hasher = Shake128::default();

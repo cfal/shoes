@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use rustc_hash::FxHashMap;
 
-use crate::config::{DnsConfig, ExpandedDnsGroup, ExpandedDnsSpec};
+use crate::config::{DnsConfig, ExpandedDnsGroup, ExpandedDnsSpec, GlobalLimits};
 use crate::dns::composite_resolver::CompositeResolver;
 use crate::dns::hickory_resolver::{HickoryResolver, HickoryResolverOptions};
 use crate::dns::parsed::{ParsedDnsServer, ParsedDnsServerEntry, ParsedDnsUrl};
@@ -14,10 +14,11 @@ use crate::resolver::{
     CachingNativeResolver, NativeResolver, RefreshPolicy, RefreshingResolver, Resolver,
     ResolverFactory, TimeoutResolver,
 };
-use crate::tcp::chain_builder::{build_client_chain_group, build_direct_chain_group};
+use crate::tcp::chain_builder::{build_client_chain_group_with_limits, build_direct_chain_group};
 
 /// Registry of resolved DNS groups with lazy default resolver.
 pub struct DnsRegistry {
+    limits: GlobalLimits,
     groups: FxHashMap<String, Arc<dyn Resolver>>,
     /// Default resolver, created lazily only if needed.
     default_resolver: Option<Arc<dyn Resolver>>,
@@ -27,6 +28,7 @@ impl DnsRegistry {
     /// Creates a new empty registry.
     pub fn new() -> Self {
         Self {
+            limits: crate::resources::limits(),
             groups: FxHashMap::default(),
             default_resolver: None,
         }
@@ -380,13 +382,21 @@ fn server_to_ns_config(
 /// Build a resolver from parsed DNS server entries.
 /// When all entries are hickory-backed with compatible settings, pools them
 /// into a single hickory resolver instead of using CompositeResolver.
+#[cfg(test)]
 pub fn build_resolver(entries: Vec<ParsedDnsServerEntry>) -> std::io::Result<Arc<dyn Resolver>> {
+    build_resolver_with_limits(entries, crate::resources::limits())
+}
+
+fn build_resolver_with_limits(
+    entries: Vec<ParsedDnsServerEntry>,
+    limits: GlobalLimits,
+) -> std::io::Result<Arc<dyn Resolver>> {
     if entries.is_empty() {
         return Err(std::io::Error::other("no DNS servers configured"));
     }
 
     // Try to pool all hickory-backed entries into one resolver.
-    if let Some(pooled) = try_build_hickory_pool(&entries)? {
+    if let Some(pooled) = try_build_hickory_pool(&entries, limits)? {
         return Ok(pooled);
     }
 
@@ -401,6 +411,7 @@ pub fn build_resolver(entries: Vec<ParsedDnsServerEntry>) -> std::io::Result<Arc
             request_timeout: (timeout_secs > 0).then(|| Duration::from_secs(timeout_secs as u64)),
             connect_timeout: Duration::from_secs(entry.connect_timeout_secs as u64),
             attempts: entry.attempts,
+            quic_memory_bytes: limits.quic_dns_memory_bytes,
         };
 
         let resolver: Arc<dyn Resolver> = match entry.server {
@@ -431,6 +442,7 @@ pub fn build_resolver(entries: Vec<ParsedDnsServerEntry>) -> std::io::Result<Arc
 /// nameservers.
 fn try_build_hickory_pool(
     entries: &[ParsedDnsServerEntry],
+    limits: GlobalLimits,
 ) -> std::io::Result<Option<Arc<dyn Resolver>>> {
     if entries.is_empty() || entries.len() < 2 {
         return Ok(None);
@@ -468,6 +480,7 @@ fn try_build_hickory_pool(
         request_timeout: (timeout_secs > 0).then(|| Duration::from_secs(timeout_secs as u64)),
         connect_timeout: Duration::from_secs(first.connect_timeout_secs as u64),
         attempts: first.attempts,
+        quic_memory_bytes: limits.quic_dns_memory_bytes,
     };
 
     let descriptions: Vec<String> = entries.iter().map(|e| format!("{:?}", e.server)).collect();
@@ -491,8 +504,19 @@ fn try_build_hickory_pool(
 /// - Builds client chain groups from expanded client chains
 /// - Resolves hostnames in DNS URLs using bootstrap resolvers
 /// - Creates HickoryResolver instances
+#[allow(dead_code)] // Public library entry point; the binary prepares with explicit limits.
 pub async fn build_dns_registry(groups: Vec<ExpandedDnsGroup>) -> std::io::Result<DnsRegistry> {
-    let mut registry = DnsRegistry::new();
+    build_dns_registry_with_limits(groups, crate::resources::limits()).await
+}
+
+pub async fn build_dns_registry_with_limits(
+    groups: Vec<ExpandedDnsGroup>,
+    limits: GlobalLimits,
+) -> std::io::Result<DnsRegistry> {
+    let mut registry = DnsRegistry {
+        limits,
+        ..DnsRegistry::new()
+    };
 
     for group in groups {
         let resolver = build_resolver_from_specs(&group.specs, &registry, &group.name).await?;
@@ -546,7 +570,7 @@ async fn build_resolver_from_specs(
         let refreshing = RefreshingResolver::new(factory, policy, description).await?;
         Ok(Arc::new(refreshing))
     } else {
-        build_resolver(entries)
+        build_resolver_with_limits(entries, registry.limits)
     }
 }
 
@@ -570,7 +594,11 @@ async fn build_entry_and_plan(
         } else {
             NoneOrSome::Some(spec.client_chains.clone())
         };
-        Arc::new(build_client_chain_group(chains, chain_resolver))
+        Arc::new(build_client_chain_group_with_limits(
+            chains,
+            chain_resolver,
+            registry.limits,
+        )?)
     };
 
     // Build or get bootstrap resolver
@@ -604,7 +632,7 @@ async fn build_entry_and_plan(
                     5,  // Default connect timeout for bootstrap
                     2,  // Default attempts for bootstrap
                 );
-                build_resolver(vec![bootstrap_entry])?
+                build_resolver_with_limits(vec![bootstrap_entry], registry.limits)?
             }
         }
         None => Arc::new(NativeResolver::new()),
@@ -616,6 +644,7 @@ async fn build_entry_and_plan(
         request_timeout: (timeout_secs > 0).then(|| Duration::from_secs(timeout_secs as u64)),
         connect_timeout: Duration::from_secs(spec.connect_timeout_secs as u64),
         attempts: spec.attempts,
+        quic_memory_bytes: registry.limits.quic_dns_memory_bytes,
     };
 
     // Build plan for hickory-backed resolvers (not system)
@@ -720,6 +749,134 @@ mod tests {
             timeout_secs: 5,
             connect_timeout_secs: 5,
             attempts: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn dns_bootstrap_uses_live_quic_admission_before_activation() {
+        if std::env::var_os("SHOES_DNS_ADMISSION_TEST_CHILD").is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "dns::builder::tests::dns_bootstrap_uses_live_quic_admission_before_activation",
+                ])
+                .env("SHOES_DNS_ADMISSION_TEST_CHILD", "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let blackhole = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = blackhole.local_addr().unwrap();
+        let live = GlobalLimits {
+            quic_memory_bytes: Some(1),
+            ..Default::default()
+        };
+        let candidate = GlobalLimits {
+            quic_memory_bytes: Some(64 << 20),
+            ..live
+        };
+        crate::resources::configure(live).unwrap();
+        for server in [
+            format!("url: h3://{address}/dns-query"),
+            format!(
+                "url: tcp://127.0.0.1\n      client_chain:\n        address: '{address}'\n        transport: quic\n        protocol: {{type: socks}}"
+            ),
+        ] {
+            let config = format!(
+                "- dns_group: bootstrap\n  dns_servers:\n    - {server}\n      timeout_secs: 1\n      attempts: 1\n- dns_group: candidate\n  dns_servers:\n    - url: https://candidate.test/dns-query\n      bootstrap_url: bootstrap\n"
+            );
+            let validated =
+                crate::config::create_server_configs(serde_yaml::from_str(&config).unwrap())
+                    .unwrap();
+            let rejected = crate::resources::snapshot().quic_buffer_bytes.rejected;
+            assert!(
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    build_dns_registry_with_limits(validated.dns_groups, candidate)
+                )
+                .await
+                .unwrap()
+                .is_err()
+            );
+            assert!(crate::resources::snapshot().quic_buffer_bytes.rejected > rejected);
+            assert_eq!(crate::resources::snapshot().quic_buffer_bytes.active, 0);
+            assert_eq!(
+                crate::resources::limits().quic_memory_bytes,
+                live.quic_memory_bytes
+            );
+            assert!(blackhole.try_recv(&mut [0; 1500]).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn prepared_dns_chains_use_candidate_quic_windows() {
+        if std::env::var_os("SHOES_DNS_CANDIDATE_TEST_CHILD").is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "dns::builder::tests::prepared_dns_chains_use_candidate_quic_windows",
+                ])
+                .env("SHOES_DNS_CANDIDATE_TEST_CHILD", "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let blackhole = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let config = format!(
+            "- dns_group: candidate\n  dns_servers:\n    - url: tcp://127.0.0.1\n      client_chain:\n        address: '{}'\n        transport: quic\n        protocol: {{type: socks}}\n",
+            blackhole.local_addr().unwrap()
+        );
+        crate::resources::configure(GlobalLimits {
+            quic_memory_bytes: Some(1 << 20),
+            ..Default::default()
+        })
+        .unwrap();
+        for window in [65536, 131072] {
+            let previous = crate::resources::limits();
+            let candidate = GlobalLimits {
+                quic_receive_window: window,
+                quic_send_window: window,
+                quic_stream_window: 16384,
+                ..previous
+            };
+            let configs =
+                crate::config::create_server_configs(serde_yaml::from_str(&config).unwrap())
+                    .unwrap();
+            let registry = build_dns_registry_with_limits(configs.dns_groups, candidate)
+                .await
+                .unwrap();
+            assert_eq!(
+                crate::resources::limits().quic_receive_window,
+                previous.quic_receive_window
+            );
+            let resolver = registry.get_by_name("candidate").unwrap();
+            {
+                let target =
+                    crate::address::NetLocation::from_str("candidate.test:80", None).unwrap();
+                let lookup = resolver.resolve_location(&target);
+                tokio::pin!(lookup);
+                let mut packet = [0; 1500];
+                tokio::select! {
+                    result = &mut lookup => panic!("lookup completed before QUIC packet: {result:?}"),
+                    result = tokio::time::timeout(std::time::Duration::from_secs(2), blackhole.recv(&mut packet)) => { result.unwrap().unwrap(); }
+                }
+                assert_eq!(
+                    crate::resources::snapshot().quic_buffer_bytes.active,
+                    window * 2 + (512 << 10)
+                );
+            }
+            drop((resolver, registry));
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while crate::resources::snapshot().quic_buffer_bytes.active != 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            crate::resources::configure(candidate).unwrap();
+            while blackhole.try_recv(&mut [0; 1500]).is_ok() {}
         }
     }
 

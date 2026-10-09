@@ -10,6 +10,90 @@ use std::path::Path;
 
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hostname_socket_fallback_is_limited_to_family_errors() {
+        #[cfg(unix)]
+        let unavailable = libc::EAFNOSUPPORT;
+        #[cfg(windows)]
+        let unavailable = 10047;
+        let mut attempts = Vec::new();
+        let socket = prefer_ipv6_socket(|ipv6| {
+            attempts.push(ipv6);
+            if ipv6 {
+                Err(std::io::Error::from_raw_os_error(unavailable))
+            } else {
+                new_socket2_udp_socket(false, None, Some("0.0.0.0:0".parse().unwrap()), false)
+            }
+        })
+        .unwrap();
+        assert_eq!(attempts, [true, false]);
+        assert!(socket.local_addr().unwrap().as_socket().unwrap().is_ipv4());
+
+        attempts.clear();
+        let error = prefer_ipv6_socket(|ipv6| {
+            attempts.push(ipv6);
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "denied",
+            ))
+        })
+        .unwrap_err();
+        assert_eq!(attempts, [true]);
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn hostname_socket_prefers_dual_stack_and_enforces_interface_binding() {
+        let ipv6_available =
+            match new_socket2_udp_socket(true, None, Some("[::]:0".parse().unwrap()), false) {
+                Ok(_) => true,
+                Err(error) if ipv6_unavailable(&error) => false,
+                Err(error) => panic!("IPv6 socket probe failed: {error}"),
+            };
+        let socket = new_hostname_udp_socket(None).unwrap();
+        assert_eq!(socket.local_addr().unwrap().is_ipv6(), ipv6_available);
+        assert!(new_hostname_udp_socket(Some("shoes-missing-interface".into())).is_err());
+    }
+
+    #[tokio::test]
+    async fn ipv6_udp_listener_accepts_both_address_families() {
+        let socket =
+            match new_socket2_udp_socket(true, None, Some("[::]:0".parse().unwrap()), false) {
+                Ok(socket) => socket,
+                Err(error) if ipv6_unavailable(&error) => return,
+                Err(error) => panic!("IPv6 socket creation failed: {error}"),
+            };
+        assert!(!socket.only_v6().unwrap());
+        let socket = into_tokio_udp_socket(socket).unwrap();
+        let port = socket.local_addr().unwrap().port();
+        for (bind, destination) in [
+            ("127.0.0.1:0", format!("127.0.0.1:{port}")),
+            ("[::1]:0", format!("[::1]:{port}")),
+        ] {
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                let peer = match tokio::net::UdpSocket::bind(bind).await {
+                    Ok(peer) => peer,
+                    Err(error) if bind == "[::1]:0" && ipv6_unavailable(&error) => return,
+                    Err(error) => panic!("UDP peer bind failed: {error}"),
+                };
+                peer.send_to(b"request", destination).await.unwrap();
+                let mut buf = [0; 16];
+                let (len, sender) = socket.recv_from(&mut buf).await.unwrap();
+                assert_eq!(&buf[..len], b"request");
+                socket.send_to(b"reply", sender).await.unwrap();
+                let len = peer.recv(&mut buf).await.unwrap();
+                assert_eq!(&buf[..len], b"reply");
+            })
+            .await
+            .unwrap();
+        }
+    }
+}
+
 #[cfg(all(test, unix, feature = "ffi"))]
 mod protection_tests {
     use super::*;
@@ -39,6 +123,7 @@ mod protection_tests {
         )));
         assert!(new_tcp_socket(None, false).is_err());
         assert!(new_udp_socket(false, None).is_err());
+        assert!(new_hostname_udp_socket(None).is_err());
         assert!(
             new_outbound_socket2_udp_socket(false, None, Some("0.0.0.0:0".parse().unwrap()))
                 .is_err()
@@ -61,6 +146,59 @@ pub fn new_udp_socket(
     )?;
 
     into_tokio_udp_socket(socket)
+}
+
+pub fn new_hostname_udp_socket(
+    bind_interface: Option<String>,
+) -> std::io::Result<tokio::net::UdpSocket> {
+    let socket = prefer_ipv6_socket(|ipv6| {
+        new_socket2_udp_socket(ipv6, None, Some(get_unspecified_socket_addr(ipv6)), false)
+    })?;
+    bind_udp_interface(&socket, bind_interface.as_deref())?;
+    #[cfg(any(target_os = "android", target_os = "ios", all(unix, feature = "ffi")))]
+    crate::tun::protect_socket(socket.as_raw_fd())?;
+    into_tokio_udp_socket(socket)
+}
+
+fn prefer_ipv6_socket(
+    mut create: impl FnMut(bool) -> std::io::Result<Socket>,
+) -> std::io::Result<Socket> {
+    match create(true) {
+        Err(error) if ipv6_unavailable(&error) => create(false),
+        result => result,
+    }
+}
+
+fn ipv6_unavailable(error: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    let codes = [
+        libc::EAFNOSUPPORT,
+        libc::EPROTONOSUPPORT,
+        libc::ENOPROTOOPT,
+        libc::EADDRNOTAVAIL,
+    ];
+    // WSAENOPROTOOPT, WSAEPROTONOSUPPORT, WSAEAFNOSUPPORT, WSAEADDRNOTAVAIL.
+    #[cfg(windows)]
+    let codes = [10042, 10043, 10047, 10049];
+    error
+        .raw_os_error()
+        .is_some_and(|code| codes.contains(&code))
+}
+
+fn bind_udp_interface(socket: &Socket, interface: Option<&str>) -> std::io::Result<()> {
+    if let Some(interface) = interface {
+        #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+        socket.bind_device(Some(interface.as_bytes()))?;
+        #[cfg(not(any(target_os = "android", target_os = "fuchsia", target_os = "linux")))]
+        {
+            let _ = (socket, interface);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "binding UDP sockets to an interface is unsupported",
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub fn new_outbound_socket2_udp_socket(
@@ -101,6 +239,10 @@ pub fn new_socket2_udp_socket_with_buffer_size(
     let domain = if is_ipv6 { Domain::IPV6 } else { Domain::IPV4 };
     let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
 
+    if is_ipv6 {
+        socket.set_only_v6(false)?;
+    }
+
     socket.set_nonblocking(true)?;
 
     // Set socket buffer sizes if specified.
@@ -116,17 +258,13 @@ pub fn new_socket2_udp_socket_with_buffer_size(
         socket.set_reuse_port(true)?;
 
         #[cfg(any(not(unix), target_os = "solaris", target_os = "illumos"))]
-        panic!("Cannot support reuse sockets");
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "UDP port reuse is unsupported on this platform",
+        ));
     }
 
-    if let Some(ref interface) = bind_interface {
-        #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
-        socket.bind_device(Some(interface.as_bytes()))?;
-
-        // This should be handled during config validation.
-        #[cfg(not(any(target_os = "android", target_os = "fuchsia", target_os = "linux")))]
-        panic!("Could not bind to device, unsupported platform.")
-    }
+    bind_udp_interface(&socket, bind_interface.as_deref())?;
 
     if let Some(bind_address) = bind_address {
         socket.bind(&SockAddr::from(bind_address))?;

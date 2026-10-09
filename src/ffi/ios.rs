@@ -47,9 +47,9 @@ struct IosSocketProtector;
 
 impl crate::tun::SocketProtector for IosSocketProtector {
     fn protect(&self, fd: std::os::unix::io::RawFd) -> std::io::Result<()> {
-        let callback_guard = PROTECT_CALLBACK.get_or_init(|| Mutex::new(None)).lock();
+        let callback = *PROTECT_CALLBACK.get_or_init(|| Mutex::new(None)).lock();
 
-        if let Some(callback) = *callback_guard {
+        if let Some(callback) = callback {
             if callback(fd as c_int) {
                 Ok(())
             } else {
@@ -61,6 +61,24 @@ impl crate::tun::SocketProtector for IosSocketProtector {
         } else {
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tun::SocketProtector;
+
+    #[test]
+    fn protection_callback_runs_without_holding_its_slot() {
+        extern "C" fn callback(_: c_int) -> bool {
+            PROTECT_CALLBACK.get().unwrap().try_lock().is_some()
+        }
+        let slot = PROTECT_CALLBACK.get_or_init(|| Mutex::new(None));
+        let previous = slot.lock().replace(callback);
+        let result = IosSocketProtector.protect(-1);
+        *slot.lock() = previous;
+        result.unwrap();
     }
 }
 
@@ -128,6 +146,9 @@ pub unsafe extern "C" fn shoes_start(
     config_yaml: *const c_char,
     protect_callback: ProtectSocketCallback,
 ) -> c_long {
+    if !common::is_lifecycle_thread() {
+        return -1;
+    }
     let _lifecycle = common::SERVICE_LIFECYCLE.lock();
     if TUN_SERVICE
         .get()
@@ -195,7 +216,9 @@ pub unsafe extern "C" fn shoes_start(
 /// * `handle` - Handle returned by shoes_start (currently unused, we use global state)
 #[unsafe(no_mangle)]
 pub extern "C" fn shoes_stop(_handle: c_long) {
-    common::stop_service();
+    if !common::stop_service() {
+        return;
+    }
 
     if let Some(callback) = PROTECT_CALLBACK.get() {
         let mut guard = callback.lock();

@@ -171,7 +171,6 @@ impl NetLocation {
         Ok(Self { address, port })
     }
 
-    #[cfg(test)]
     pub fn from_ip_addr(ip: IpAddr, port: u16) -> Self {
         let address = match ip {
             IpAddr::V4(addr) => Address::Ipv4(addr),

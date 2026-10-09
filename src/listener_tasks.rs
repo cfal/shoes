@@ -1,7 +1,42 @@
 use std::future::Future;
+use std::io;
+use std::sync::Arc;
 use std::time::Duration;
 
+use parking_lot::Mutex;
+use tokio::sync::oneshot;
 use tokio::task::JoinSet;
+
+tokio::task_local! {
+    static QUIC_RETIREMENTS: QuicRetirements;
+}
+
+/// Collects listener socket releases without including outbound QUIC used by draining TCP tasks.
+#[derive(Clone, Default)]
+pub(crate) struct QuicRetirements(Arc<Mutex<Vec<oneshot::Receiver<()>>>>);
+
+impl QuicRetirements {
+    pub async fn track<F: Future>(&self, startup: F) -> F::Output {
+        QUIC_RETIREMENTS.scope(self.clone(), startup).await
+    }
+
+    pub async fn wait(&self) -> io::Result<()> {
+        let releases = std::mem::take(&mut *self.0.lock());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            for released in releases {
+                // Sender destruction, rather than a sent value, confirms socket release.
+                let _ = released.await;
+            }
+        })
+        .await
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "QUIC listener sockets did not retire",
+            )
+        })
+    }
+}
 
 pub(crate) struct QuicListener(pub crate::quic_endpoint::QuicEndpoint);
 
@@ -12,21 +47,29 @@ impl QuicListener {
         count: usize,
         memory_bytes: usize,
     ) -> std::io::Result<Vec<Self>> {
+        let reuse_port = cfg!(all(
+            unix,
+            not(any(target_os = "solaris", target_os = "illumos"))
+        ));
+        let count = if reuse_port { count } else { count.min(1) };
         (0..count)
             .map(|_| {
                 let socket = crate::socket_util::new_socket2_udp_socket_with_buffer_size(
                     address.is_ipv6(),
                     None,
                     Some(address),
-                    true,
+                    reuse_port,
                     Some(crate::resources::limits().quic_socket_buffer),
                 )?;
-                crate::quic_endpoint::QuicEndpoint::new(
-                    Some(config.clone()),
+                let (endpoint, released) = crate::quic_endpoint::QuicEndpoint::listen(
+                    config.clone(),
                     socket.into(),
                     memory_bytes,
-                )
-                .map(Self)
+                )?;
+                let _ = QUIC_RETIREMENTS.try_with(|retirements| {
+                    retirements.0.lock().push(released);
+                });
+                Ok(Self(endpoint))
             })
             .collect()
     }
@@ -119,8 +162,61 @@ impl Drop for ListenerTasks {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
-    use tokio::sync::oneshot;
+
+    #[tokio::test(start_paused = true)]
+    async fn retirement_timeout_is_an_error() {
+        let retirements = QuicRetirements::default();
+        let (_socket, released) = oneshot::channel();
+        retirements.0.lock().push(released);
+        assert_eq!(
+            retirements.wait().await.unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+    }
+
+    #[tokio::test]
+    async fn retirement_does_not_wait_for_a_slow_peer_close_timer() {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert.cert.der().clone()).unwrap();
+        let mut config = quinn::ServerConfig::with_single_cert(
+            vec![cert.cert.der().clone()],
+            rustls::pki_types::PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()).into(),
+        )
+        .unwrap();
+        Arc::get_mut(&mut config.transport)
+            .unwrap()
+            .initial_rtt(Duration::from_secs(2));
+        let retirements = QuicRetirements::default();
+        let listener = retirements
+            .track(async {
+                QuicListener::bind_all("127.0.0.1:0".parse().unwrap(), config, 1, 1)
+                    .unwrap()
+                    .pop()
+                    .unwrap()
+            })
+            .await;
+        let address = listener.local_addr().unwrap();
+        let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        client.set_default_client_config(
+            quinn::ClientConfig::with_root_certificates(Arc::new(roots)).unwrap(),
+        );
+        let connecting = client.connect(address, "localhost").unwrap();
+        let incoming = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        client.close(0u32.into(), b"abandon handshake");
+        drop((connecting, client));
+        let pending = incoming.accept().unwrap();
+        drop(pending);
+        drop(listener);
+        tokio::time::timeout(Duration::from_secs(3), retirements.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(std::net::UdpSocket::bind(address).unwrap());
+    }
 
     #[tokio::test(start_paused = true)]
     async fn reload_preserves_active_work_then_cancels_stalled_connections() {
@@ -174,6 +270,18 @@ mod tests {
         .unwrap();
         let memory_bytes = crate::resources::configure_quic(&mut server_config, 100, 0);
         let client_config = quinn::ClientConfig::with_root_certificates(Arc::new(roots)).unwrap();
+        #[cfg(windows)]
+        assert_eq!(
+            QuicListener::bind_all(
+                "0.0.0.0:0".parse().unwrap(),
+                server_config.clone(),
+                4,
+                memory_bytes,
+            )
+            .unwrap()
+            .len(),
+            1,
+        );
         let occupied = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
         assert!(
             QuicListener::bind_all(
@@ -190,7 +298,10 @@ mod tests {
                 .pop()
                 .unwrap()
         };
-        let listener = create_listener("0.0.0.0:0".parse().unwrap());
+        let retirements = QuicRetirements::default();
+        let listener = retirements
+            .track(async { create_listener("0.0.0.0:0".parse().unwrap()) })
+            .await;
         let bind_address = listener.local_addr().unwrap();
         let target = std::net::SocketAddr::from(([127, 0, 0, 1], bind_address.port()));
         let create_client = || {
@@ -232,8 +343,9 @@ mod tests {
         ));
         drop(server_conn);
         drop(client_conn);
-        // Match the config watcher's debounce before rebinding the listener.
-        tokio::time::sleep(Duration::from_secs(3)).await;
+        retirements.wait().await.unwrap();
+        // A non-reuse socket proves retirement released the kernel port, not just Quinn state.
+        drop(std::net::UdpSocket::bind(bind_address).unwrap());
         let listener = create_listener(bind_address);
         for _ in 0..12 {
             let client = create_client();

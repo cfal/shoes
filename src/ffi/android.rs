@@ -179,6 +179,9 @@ pub extern "system" fn Java_com_shoesproxy_ShoesNative_start<'local>(
     config_yaml: JString<'local>,
     protect_callback: JObject<'local>,
 ) -> jlong {
+    if !common::is_lifecycle_thread() {
+        return -1;
+    }
     let _lifecycle = common::SERVICE_LIFECYCLE.lock();
     if TUN_SERVICE
         .get()

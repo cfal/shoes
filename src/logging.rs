@@ -429,3 +429,53 @@ mod tests {
         assert!(!logger.matches(Level::Error, "shoes"));
     }
 }
+#[cfg(test)]
+pub(crate) mod test_capture {
+    use std::cell::RefCell;
+    use std::sync::Once;
+
+    thread_local! {
+        static RECORDS: RefCell<Option<String>> = const { RefCell::new(None) };
+    }
+
+    struct Logger;
+
+    impl log::Log for Logger {
+        fn enabled(&self, _: &log::Metadata<'_>) -> bool {
+            true
+        }
+        fn log(&self, record: &log::Record<'_>) {
+            use std::fmt::Write;
+            RECORDS.with(|records| {
+                if let Some(output) = records.borrow_mut().as_mut() {
+                    let _ = writeln!(output, "{}", record.args());
+                }
+            });
+        }
+        fn flush(&self) {}
+    }
+
+    pub struct Capture;
+
+    impl Capture {
+        pub fn new() -> Self {
+            static INIT: Once = Once::new();
+            INIT.call_once(|| {
+                log::set_logger(&Logger).unwrap();
+                log::set_max_level(log::LevelFilter::Trace);
+            });
+            RECORDS.with(|records| assert!(records.replace(Some(String::new())).is_none()));
+            Self
+        }
+
+        pub fn finish(self) -> String {
+            RECORDS.with(|records| records.take().unwrap())
+        }
+    }
+
+    impl Drop for Capture {
+        fn drop(&mut self) {
+            RECORDS.with(|records| records.take());
+        }
+    }
+}

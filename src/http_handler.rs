@@ -3,6 +3,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use log::debug;
+use subtle::ConstantTimeEq;
 use tokio::io::AsyncWriteExt;
 
 use crate::address::{Address, NetLocation, ResolvedLocation};
@@ -17,6 +18,51 @@ use crate::tcp::tcp_handler::{
 const PROXY_AUTH_HEADER_PREFIX: &str = "proxy-authorization: basic ";
 const CONNECTION_HEADER_PREFIX: &str = "connection: ";
 const PROXY_CONNECTION_HEADER_PREFIX: &str = "proxy-connection: ";
+
+#[cfg(test)]
+mod request_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn rejected_credentials_are_not_logged() {
+        let capture = crate::logging::test_capture::Capture::new();
+        for request in ["CONNECT example.com:443", "GET http://example.com/"] {
+            let (mut client, server) = tokio::io::duplex(1024);
+            client.write_all(format!("{request} HTTP/1.1\r\nProxy-Authorization: Basic rejected-secret-token\r\n\r\n").as_bytes()).await.unwrap();
+            let handler = HttpTcpServerHandler::new(
+                Some(("user".into(), "password".into())),
+                Arc::new(ClientProxySelector::new(vec![])),
+            );
+            let error = handler
+                .setup_server_stream(Box::new(server))
+                .await
+                .err()
+                .unwrap();
+            assert!(!error.to_string().contains("rejected-secret-token"));
+        }
+        let logs = capture.finish();
+        assert!(logs.contains("authentication"));
+        assert!(!logs.contains("rejected-secret-token"));
+    }
+
+    #[tokio::test]
+    async fn non_ascii_auth_header_does_not_panic_at_prefix_boundary() {
+        let (mut client, server) = tokio::io::duplex(1024);
+        let header = format!(
+            "{}\u{e9}invalid",
+            "x".repeat(PROXY_AUTH_HEADER_PREFIX.len() - 1)
+        );
+        client
+            .write_all(format!("CONNECT example.com:443 HTTP/1.1\r\n{header}\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let handler = HttpTcpServerHandler::new(
+            Some(("user".into(), "password".into())),
+            Arc::new(ClientProxySelector::new(vec![])),
+        );
+        assert!(handler.setup_server_stream(Box::new(server)).await.is_err());
+    }
+}
 
 fn create_http_auth_token(username: &str, password: &str) -> String {
     BASE64.encode(format!("{username}:{password}"))
@@ -106,14 +152,14 @@ pub async fn setup_http_server_stream_inner(
                 }
                 if need_auth
                     && line.len() > PROXY_AUTH_HEADER_PREFIX.len() + 1
-                    && line[0..PROXY_AUTH_HEADER_PREFIX.len()].to_ascii_lowercase()
-                        == PROXY_AUTH_HEADER_PREFIX
+                    && line.as_bytes()[0..PROXY_AUTH_HEADER_PREFIX.len()]
+                        .eq_ignore_ascii_case(PROXY_AUTH_HEADER_PREFIX.as_bytes())
                 {
-                    if &line[PROXY_AUTH_HEADER_PREFIX.len()..] != auth_token.unwrap() {
-                        debug!(
-                            "Received incorrect HTTP CONNECT authentication: {}",
-                            &line[PROXY_AUTH_HEADER_PREFIX.len()..]
-                        );
+                    if !bool::from(
+                        line.as_bytes()[PROXY_AUTH_HEADER_PREFIX.len()..]
+                            .ct_eq(auth_token.unwrap().as_bytes()),
+                    ) {
+                        debug!("Received incorrect HTTP CONNECT authentication");
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidInput,
                             "Incorrect HTTP CONNECT authentication",
@@ -122,7 +168,7 @@ pub async fn setup_http_server_stream_inner(
                     need_auth = false;
                     continue;
                 }
-                debug!("Ignored HTTP CONNECT request header: {line}");
+                debug!("Ignored HTTP CONNECT request header");
             }
 
             if need_auth {
@@ -203,11 +249,11 @@ pub async fn setup_http_server_stream_inner(
                     && lowercase_line.starts_with(PROXY_AUTH_HEADER_PREFIX)
                 {
                     if need_auth {
-                        if &line[PROXY_AUTH_HEADER_PREFIX.len()..] != auth_token.unwrap() {
-                            debug!(
-                                "Received incorrect HTTP GET authentication: {}",
-                                &line[PROXY_AUTH_HEADER_PREFIX.len()..]
-                            );
+                        if !bool::from(
+                            line.as_bytes()[PROXY_AUTH_HEADER_PREFIX.len()..]
+                                .ct_eq(auth_token.unwrap().as_bytes()),
+                        ) {
+                            debug!("Received incorrect HTTP GET authentication");
                             return Err(std::io::Error::new(
                                 std::io::ErrorKind::InvalidInput,
                                 "Incorrect HTTP GET authentication",

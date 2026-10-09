@@ -1,6 +1,5 @@
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
-use std::path::PathBuf;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -28,14 +27,13 @@ use crate::tun::start_tun_server;
 use crate::util::write_all;
 
 async fn run_tcp_server(
-    bind_address: SocketAddr,
+    listener: tokio::net::TcpListener,
     tcp_config: TcpConfig,
     resolver: Arc<dyn Resolver>,
     server_handler: Arc<dyn TcpServerHandler>,
 ) -> std::io::Result<()> {
     let TcpConfig { no_delay } = tcp_config;
 
-    let listener = new_tcp_listener(bind_address, 4096, None)?;
     let mut tasks = crate::listener_tasks::ListenerTasks::new();
 
     loop {
@@ -82,19 +80,10 @@ async fn run_tcp_server(
 
 #[cfg(target_family = "unix")]
 async fn run_unix_server(
-    path_buf: PathBuf,
+    listener: tokio::net::UnixListener,
     resolver: Arc<dyn Resolver>,
     server_handler: Arc<dyn TcpServerHandler>,
 ) -> std::io::Result<()> {
-    if tokio::fs::symlink_metadata(&path_buf).await.is_ok() {
-        println!(
-            "WARNING: replacing file at socket path {}",
-            path_buf.display()
-        );
-        let _ = tokio::fs::remove_file(&path_buf).await;
-    }
-
-    let listener = crate::socket_util::new_unix_listener(path_buf, 4096)?;
     let mut tasks = crate::listener_tasks::ListenerTasks::new();
 
     loop {
@@ -179,15 +168,13 @@ where
         } => {
             let setup_client_stream_future = timeout(
                 Duration::from_secs(60),
-                setup_client_tcp_stream(
-                    &mut server_stream,
-                    proxy_selector,
-                    resolver,
-                    remote_location.clone(),
-                ),
+                setup_client_tcp_stream(proxy_selector, resolver, remote_location.clone()),
             );
 
-            let mut client_stream = match setup_client_stream_future.await {
+            let TcpClientSetupResult {
+                mut client_stream,
+                early_data,
+            } = match setup_client_stream_future.await {
                 Ok(Ok(Some(s))) => s,
                 Ok(Ok(None)) => {
                     // Must have been blocked.
@@ -210,27 +197,27 @@ where
                 }
             };
 
-            if let Some(data) = connection_success_response {
-                write_all(&mut server_stream, &data).await?;
-                // server_need_initial_flush should be set to true by the handler if
-                // it's needed.
-            }
-
-            let client_need_initial_flush = match initial_remote_data {
-                Some(data) => {
-                    write_all(&mut client_stream, &data).await?;
-                    true
+            crate::util::timeout_stream_setup(async {
+                let flush_server = server_need_initial_flush || early_data.is_some();
+                if let Some(data) = connection_success_response {
+                    write_all(&mut server_stream, &data).await?;
                 }
-                None => false,
-            };
+                if let Some(data) = early_data {
+                    write_all(&mut server_stream, &data).await?;
+                }
+                if flush_server {
+                    server_stream.flush().await?;
+                }
+                if let Some(data) = initial_remote_data {
+                    write_all(&mut client_stream, &data).await?;
+                    client_stream.flush().await?;
+                }
+                Ok(())
+            })
+            .await?;
 
-            let copy_result = copy_bidirectional(
-                &mut server_stream,
-                &mut client_stream,
-                server_need_initial_flush,
-                client_need_initial_flush,
-            )
-            .await;
+            let copy_result =
+                copy_bidirectional(&mut server_stream, &mut client_stream, false, false).await;
 
             futures::join!(
                 crate::util::shutdown_stream(&mut server_stream),
@@ -317,11 +304,10 @@ where
 }
 
 pub async fn setup_client_tcp_stream(
-    server_stream: &mut Box<dyn AsyncStream>,
     client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
     remote_location: NetLocation,
-) -> std::io::Result<Option<Box<dyn AsyncStream>>> {
+) -> std::io::Result<Option<TcpClientSetupResult>> {
     let action = client_proxy_selector
         .judge(remote_location.into(), &resolver)
         .await?;
@@ -330,19 +316,10 @@ pub async fn setup_client_tcp_stream(
         ConnectDecision::Allow {
             chain_group,
             remote_location,
-        } => {
-            let TcpClientSetupResult {
-                client_stream,
-                early_data,
-            } = chain_group.connect_tcp(remote_location, &resolver).await?;
-
-            if let Some(data) = early_data {
-                server_stream.write_all(&data).await?;
-                server_stream.flush().await?;
-            }
-
-            Ok(Some(client_stream))
-        }
+        } => chain_group
+            .connect_tcp(remote_location, &resolver)
+            .await
+            .map(Some),
         ConnectDecision::Block => Ok(None),
     }
 }
@@ -398,38 +375,17 @@ async fn start_tcp_or_quic_servers(
     config: ServerConfig,
     resolver: Arc<dyn Resolver>,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
-    let mut join_handles = Vec::with_capacity(3);
-
-    match config.transport {
-        Transport::Tcp => match start_tcp_servers(config.clone(), resolver).await {
-            Ok(handles) => {
-                join_handles.extend(handles);
-            }
-            Err(e) => {
-                for join_handle in join_handles {
-                    join_handle.abort();
-                }
-                return Err(e);
-            }
-        },
-        Transport::Quic => match start_quic_servers(config.clone(), resolver).await {
-            Ok(handles) => {
-                join_handles.extend(handles);
-            }
-            Err(e) => {
-                for join_handle in join_handles {
-                    join_handle.abort();
-                }
-                return Err(e);
-            }
-        },
+    let bind_location = config.bind_location.to_string();
+    let join_handles = match config.transport {
+        Transport::Tcp => start_tcp_servers(config, resolver).await?,
+        Transport::Quic => start_quic_servers(config, resolver).await?,
         Transport::Udp => todo!(),
-    }
+    };
 
     if join_handles.is_empty() {
         return Err(std::io::Error::other(format!(
             "failed to start servers at {}",
-            config.bind_location
+            bind_location
         )));
     }
 
@@ -459,7 +415,7 @@ async fn start_tcp_servers(
     let client_proxy_selector = Arc::new(create_tcp_client_proxy_selector(
         rules.clone(),
         resolver.clone(),
-    ));
+    )?);
 
     let mut handles = vec![];
 
@@ -467,41 +423,56 @@ async fn start_tcp_servers(
         BindLocation::Address(addresses) => {
             // Shares protocol state across ports without reusing an interface-specific UDP bind IP.
             let mut handlers: HashMap<IpAddr, Arc<dyn TcpServerHandler>> = HashMap::new();
+            let mut listeners = Vec::new();
             for address in addresses.into_vec() {
                 for socket_addr in address.to_socket_addrs()? {
-                    let tcp_handler = handlers
-                        .entry(socket_addr.ip())
-                        .or_insert_with(|| {
+                    let listener = new_tcp_listener(socket_addr, 4096, None)?;
+                    let tcp_handler = match handlers.entry(socket_addr.ip()) {
+                        std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                        std::collections::hash_map::Entry::Vacant(entry) => entry.insert(
                             create_tcp_server_handler(
                                 protocol.clone(),
                                 &client_proxy_selector,
                                 &resolver,
                                 Some(socket_addr.ip()),
-                            )
-                            .into()
-                        })
-                        .clone();
-                    let tcp_config = tcp_config.clone();
-                    let resolver = resolver.clone();
-                    let handle = tokio::spawn(async move {
-                        run_tcp_server(socket_addr, tcp_config, resolver, tcp_handler)
-                            .await
-                            .unwrap();
-                    });
-                    handles.push(handle);
+                            )?
+                            .into(),
+                        ),
+                    }
+                    .clone();
+                    listeners.push((listener, tcp_handler));
                 }
+            }
+            for (listener, tcp_handler) in listeners {
+                let tcp_config = tcp_config.clone();
+                let resolver = resolver.clone();
+                handles.push(tokio::spawn(async move {
+                    if let Err(error) =
+                        run_tcp_server(listener, tcp_config, resolver, tcp_handler).await
+                    {
+                        error!("TCP listener stopped: {error}");
+                    }
+                }));
             }
         }
         BindLocation::Path(path_buf) => {
             #[cfg(target_family = "unix")]
             {
+                if tokio::fs::symlink_metadata(&path_buf).await.is_ok() {
+                    println!(
+                        "WARNING: replacing file at socket path {}",
+                        path_buf.display()
+                    );
+                    tokio::fs::remove_file(&path_buf).await?;
+                }
+                let listener = crate::socket_util::new_unix_listener(path_buf, 4096)?;
                 let tcp_handler: Arc<dyn TcpServerHandler> =
-                    create_tcp_server_handler(protocol, &client_proxy_selector, &resolver, None)
+                    create_tcp_server_handler(protocol, &client_proxy_selector, &resolver, None)?
                         .into();
                 let handle = tokio::spawn(async move {
-                    run_unix_server(path_buf, resolver, tcp_handler)
-                        .await
-                        .unwrap();
+                    if let Err(error) = run_unix_server(listener, resolver, tcp_handler).await {
+                        error!("Unix listener stopped: {error}");
+                    }
                 });
                 handles.push(handle);
             }
@@ -523,6 +494,7 @@ mod lifetime_tests {
     use super::*;
     use async_trait::async_trait;
     use std::io;
+    use std::net::SocketAddr;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::{Context, Poll};
@@ -534,6 +506,224 @@ mod lifetime_tests {
     use crate::client_proxy_chain::{ClientChainGroup, ClientProxyChain, InitialHopEntry};
     use crate::client_proxy_selector::{ConnectAction, ConnectRule};
     use crate::tcp::socket_connector::SocketConnector;
+
+    #[derive(Debug)]
+    struct Handler(Arc<ClientProxySelector>);
+    #[async_trait]
+    impl TcpServerHandler for Handler {
+        async fn setup_server_stream(
+            &self,
+            stream: Box<dyn AsyncStream>,
+        ) -> io::Result<TcpServerSetupResult> {
+            Ok(TcpServerSetupResult::TcpForward {
+                remote_location: NetLocation::from_str("127.0.0.1:80", None)?,
+                stream,
+                need_initial_flush: true,
+                proxy_selector: self.0.clone(),
+                connection_success_response: Some(b"response".to_vec().into_boxed_slice()),
+                initial_remote_data: Some(b"request".to_vec().into_boxed_slice()),
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct ReadyConnector(std::sync::Mutex<Option<FlushStream>>);
+
+    #[derive(Debug)]
+    struct FlushStream {
+        inner: tokio::io::DuplexStream,
+        stalled: bool,
+        flushes: Arc<AtomicUsize>,
+    }
+
+    impl tokio::io::AsyncRead for FlushStream {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl tokio::io::AsyncWrite for FlushStream {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.flushes.fetch_add(1, Ordering::Relaxed);
+            if self.stalled {
+                Poll::Pending
+            } else {
+                Pin::new(&mut self.inner).poll_flush(cx)
+            }
+        }
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    impl AsyncPing for FlushStream {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+        fn poll_write_ping(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+    impl AsyncStream for FlushStream {}
+
+    #[async_trait]
+    impl SocketConnector for ReadyConnector {
+        async fn connect(
+            &self,
+            _: &Arc<dyn Resolver>,
+            _: &crate::address::ResolvedLocation,
+        ) -> io::Result<Box<dyn AsyncStream>> {
+            Ok(Box::new(self.0.lock().unwrap().take().unwrap()))
+        }
+        async fn connect_udp_bidirectional(
+            &self,
+            _: &Arc<dyn Resolver>,
+            _: crate::address::ResolvedLocation,
+        ) -> io::Result<Box<dyn AsyncMessageStream>> {
+            unreachable!()
+        }
+        fn bind_interface(&self) -> Option<&str> {
+            None
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn initial_writes_and_flushes_have_deadlines() {
+        use tokio::io::AsyncReadExt;
+        for (inbound_capacity, outbound_capacity, stall_response, stall_request) in [
+            (1, 64, false, false),
+            (64, 1, false, false),
+            (64, 64, true, false),
+            (64, 64, false, true),
+        ] {
+            let (inbound, mut peer) = tokio::io::duplex(inbound_capacity);
+            let (outbound, mut target) = tokio::io::duplex(outbound_capacity);
+            let response_flushes = Arc::new(AtomicUsize::new(0));
+            let request_flushes = Arc::new(AtomicUsize::new(0));
+            let inbound = FlushStream {
+                inner: inbound,
+                stalled: stall_response,
+                flushes: response_flushes.clone(),
+            };
+            let outbound = FlushStream {
+                inner: outbound,
+                stalled: stall_request,
+                flushes: request_flushes.clone(),
+            };
+            let chain = ClientProxyChain::new(
+                vec![InitialHopEntry::Direct(Box::new(ReadyConnector(
+                    std::sync::Mutex::new(Some(outbound)),
+                )))],
+                vec![],
+            );
+            let selector = Arc::new(ClientProxySelector::new(vec![ConnectRule::new(
+                vec![crate::address::NetLocationMask::ANY],
+                ConnectAction::new_allow(None, ClientChainGroup::new(vec![chain])),
+            )]));
+            let started = tokio::time::Instant::now();
+            let error = timeout(
+                Duration::from_secs(61),
+                process_stream(
+                    inbound,
+                    Arc::new(Handler(selector)),
+                    Arc::new(PendingResolver),
+                ),
+            )
+            .await
+            .expect("initial writes retained the stream indefinitely")
+            .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+            assert_eq!(started.elapsed(), Duration::from_secs(60));
+            if stall_response {
+                assert!(response_flushes.load(Ordering::Relaxed) > 0);
+            }
+            if stall_request {
+                assert!(request_flushes.load(Ordering::Relaxed) > 0);
+            }
+            peer.read_to_end(&mut Vec::new()).await.unwrap();
+            target.read_to_end(&mut Vec::new()).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn protocol_response_precedes_chained_greeting() {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let rule = serde_yaml::from_str(&format!(
+            "masks: '0.0.0.0/0'\nclient_proxy:\n  address: '{}'\n  protocol: {{type: socks}}\n",
+            listener.local_addr().unwrap()
+        ))
+        .unwrap();
+        let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
+        let handler = Arc::new(Handler(Arc::new(
+            create_tcp_client_proxy_selector(vec![rule], resolver.clone()).unwrap(),
+        )));
+        let (server, mut peer) = tokio::io::duplex(512);
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            socket.read_exact(&mut [0; 3]).await.unwrap();
+            socket.write_all(&[5, 0]).await.unwrap();
+            socket.read_exact(&mut [0; 10]).await.unwrap();
+            socket
+                .write_all(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00greeting")
+                .await
+                .unwrap();
+            let mut request = [0; 7];
+            socket.read_exact(&mut request).await.unwrap();
+            assert_eq!(&request, b"request");
+            socket.write_all(b"later").await.unwrap();
+        });
+        tasks.spawn(async move {
+            process_stream(server, handler, resolver).await.unwrap();
+        });
+        let mut response = [0; 21];
+        timeout(Duration::from_secs(3), peer.read_exact(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&response, b"responsegreetinglater");
+        drop(peer);
+        while let Some(result) = timeout(Duration::from_secs(3), tasks.join_next())
+            .await
+            .unwrap()
+        {
+            result.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn tcp_bind_failure_releases_all_prepared_listeners() {
+        let first = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let first_addr = first.local_addr().unwrap();
+        let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let config = format!(
+            "- address: ['{first_addr}', '{}']\n  protocol:\n    type: http\n",
+            occupied.local_addr().unwrap()
+        );
+        let configs =
+            crate::config::create_server_configs(serde_yaml::from_str(&config).unwrap()).unwrap();
+        drop(first);
+        let error = start_servers(
+            configs.configs.into_iter().next().unwrap(),
+            Arc::new(crate::resolver::NativeResolver::new()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+        std::net::TcpListener::bind(first_addr).expect("earlier bind leaked after startup failed");
+    }
 
     #[derive(Debug)]
     struct StalledMessageShutdown {

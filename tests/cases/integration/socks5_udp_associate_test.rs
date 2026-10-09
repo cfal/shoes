@@ -39,6 +39,48 @@ use tokio::time::{sleep, timeout};
 
 // BASIC FUNCTIONALITY TESTS
 
+#[tokio::test]
+async fn udp_associate_accepts_private_and_cross_family_hints()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut ports = PortHelper::new();
+    let (ip, port) = ports.get_listener_port();
+    let (echo_ip, echo_port) = ports.get_port();
+    let _echo = start_udp_echo_server(&echo_ip, echo_port).await?;
+    let (_server, _config) = start_shoes_server(&format!(
+        "- address: '{ip}:{port}'\n  protocol: {{type: socks, udp_enabled: true}}\n"
+    ))?;
+    ports.wait_for_all_ports().await?;
+    let target: std::net::SocketAddr = format!("{echo_ip}:{echo_port}").parse()?;
+    for hint in ["[::1]:0", "10.0.0.1:0", "[fd00::1]:0", "127.0.0.2:0"] {
+        let mut control = TcpStream::connect((ip.as_str(), port)).await?;
+        control.write_all(&[5, 1, 0]).await?;
+        let mut auth = [0; 2];
+        control.read_exact(&mut auth).await?;
+        assert_eq!(auth, [5, 0]);
+        let mut request = encode_udp_datagram(&SocksDestination::Ip(hint.parse()?), b"")?;
+        request[..3].copy_from_slice(&[5, 3, 0]);
+        control.write_all(&request).await?;
+        let mut reply = [0; 10];
+        control.read_exact(&mut reply).await?;
+        assert_eq!(&reply[..4], &[5, 0, 0, 1]);
+        let relay = std::net::SocketAddr::from((
+            [reply[4], reply[5], reply[6], reply[7]],
+            u16::from_be_bytes([reply[8], reply[9]]),
+        ));
+        let socket = tokio::net::UdpSocket::bind((ip.as_str(), 0)).await?;
+        let response = send_udp_datagram(
+            &socket,
+            relay,
+            &SocksDestination::Ip(target),
+            b"hint",
+            Duration::from_secs(3),
+        )
+        .await?;
+        assert_eq!(response, b"hint [ECHO]");
+    }
+    Ok(())
+}
+
 /// Test basic UDP ASSOCIATE - single packet echo
 #[tokio::test]
 async fn test_udp_associate_basic() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {

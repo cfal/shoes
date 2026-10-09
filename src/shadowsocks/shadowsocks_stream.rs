@@ -88,6 +88,68 @@ enum DecryptState {
 
 const METADATA_SIZE: usize = 2 + (2 * TAG_LEN);
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timestamp_window_is_symmetric_and_inclusive() {
+        for timestamp in [970, 1000, 1030] {
+            assert!(validate_timestamp(timestamp, 1000).is_ok());
+        }
+        for timestamp in [969, 1031, u64::MAX] {
+            assert!(validate_timestamp(timestamp, 1000).is_err());
+        }
+        assert!(validate_timestamp(0, 0).is_ok());
+    }
+
+    #[tokio::test]
+    async fn full_output_buffer_preserves_the_decrypted_length_and_nonce() {
+        let algorithm = &aws_lc_rs::aead::AES_128_GCM;
+        let (transport, _) = tokio::io::duplex(1);
+        let mut stream = ShadowsocksStream::new(
+            Box::new(transport),
+            ShadowsocksStreamType::Aead,
+            algorithm,
+            16,
+            Arc::new(Box::new(super::super::default_key::DefaultKey::new(
+                "test", 16,
+            ))),
+            None,
+        );
+        let mut seal = SealingKey::new(
+            UnboundKey::new(algorithm, &[7; 16]).unwrap(),
+            IncreasingSequence::new(),
+        );
+        stream.opening_key = Some(OpeningKey::new(
+            UnboundKey::new(algorithm, &[7; 16]).unwrap(),
+            IncreasingSequence::new(),
+        ));
+        let mut packet = Vec::new();
+        for plaintext in [&[0, 3][..], b"abc"] {
+            let mut chunk = plaintext.to_vec();
+            seal.seal_in_place_append_tag(Aad::empty(), &mut chunk)
+                .unwrap();
+            packet.extend(chunk);
+        }
+        stream.unprocessed_buf[..packet.len()].copy_from_slice(&packet);
+        stream.unprocessed_end_offset = packet.len();
+        stream.processed_end_offset = stream.processed_buf.len();
+        assert!(matches!(
+            stream.try_decrypt().unwrap(),
+            DecryptState::BufferFull
+        ));
+        assert_eq!(stream.unprocessed_pending_len, Some(3));
+        stream.processed_end_offset = 0;
+        assert!(matches!(
+            stream.try_decrypt().unwrap(),
+            DecryptState::Success
+        ));
+        assert_eq!(&stream.processed_buf[..3], b"abc");
+        assert_eq!(stream.unprocessed_pending_len, None);
+    }
+}
+
 impl ShadowsocksStream {
     pub fn new(
         stream: Box<dyn AsyncStream>,
@@ -222,6 +284,8 @@ impl ShadowsocksStream {
                 }
 
                 if self.processed_end_offset + data_len_no_tag > self.processed_buf.len() {
+                    // The length nonce has already advanced; retry the payload, not its header.
+                    self.unprocessed_pending_len = Some(data_len_no_tag);
                     return Ok(DecryptState::BufferFull);
                 }
 
@@ -449,21 +513,7 @@ impl ShadowsocksStream {
                 let timestamp_bytes = &self.unprocessed_buf[self.salt_len + 1..self.salt_len + 9];
                 let timestamp_secs = u64::from_be_bytes(timestamp_bytes.try_into().unwrap());
                 let current_time_secs = current_time_secs();
-                if current_time_secs >= timestamp_secs {
-                    if current_time_secs - timestamp_secs > 30 {
-                        return Err(std::io::Error::other(
-                            "timestamp is greater than 30 seconds",
-                        ));
-                    }
-                } else {
-                    // Make sure times aren't too far in the future.
-                    if timestamp_secs - current_time_secs > 2 {
-                        return Err(std::io::Error::other(format!(
-                            "timestamp is {} seconds in the future",
-                            timestamp_secs - current_time_secs
-                        )));
-                    }
-                }
+                validate_timestamp(timestamp_secs, current_time_secs)?;
 
                 let decrypt_iv = &self.unprocessed_buf[0..self.salt_len];
                 if let Some(salt_checker) = &self.salt_checker
@@ -516,21 +566,7 @@ impl ShadowsocksStream {
                 let timestamp_bytes = &self.unprocessed_buf[self.salt_len + 1..self.salt_len + 9];
                 let timestamp_secs = u64::from_be_bytes(timestamp_bytes.try_into().unwrap());
                 let current_time_secs = current_time_secs();
-                if current_time_secs >= timestamp_secs {
-                    if current_time_secs - timestamp_secs > 30 {
-                        return Err(std::io::Error::other(
-                            "timestamp is greater than 30 seconds",
-                        ));
-                    }
-                } else {
-                    // Make sure times aren't too far in the future.
-                    if timestamp_secs - current_time_secs > 2 {
-                        return Err(std::io::Error::other(format!(
-                            "timestamp is {} seconds in the future",
-                            timestamp_secs - current_time_secs
-                        )));
-                    }
-                }
+                validate_timestamp(timestamp_secs, current_time_secs)?;
 
                 if let Some(salt_checker) = &self.salt_checker {
                     let decrypt_iv = &self.unprocessed_buf[0..self.salt_len];
@@ -927,6 +963,16 @@ impl AsyncMessageStream for ShadowsocksStream {}
 #[inline]
 fn current_time_secs() -> u64 {
     SystemTime::UNIX_EPOCH.elapsed().unwrap().as_secs()
+}
+
+fn validate_timestamp(timestamp: u64, now: u64) -> std::io::Result<()> {
+    if timestamp.abs_diff(now) > 30 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "timestamp outside the 30-second window",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

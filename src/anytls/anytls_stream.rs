@@ -239,14 +239,6 @@ impl AsyncRead for AnyTlsStream {
         if buf.remaining() == 0 {
             return Poll::Ready(Ok(()));
         }
-        // Check if stream/session is closed
-        if self.stream_closed {
-            return Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "stream closed",
-            )));
-        }
-
         // Check EOF with empty buffer
         let remaining_in_buffer = self.read_buffer.len() - self.read_offset;
         if self.eof && remaining_in_buffer == 0 {
@@ -368,6 +360,7 @@ impl AsyncWrite for AnyTlsStream {
             return Poll::Ready(Ok(()));
         }
         if self.session_closed.load(Ordering::Relaxed) {
+            self.data_rx.close();
             self.stream_closed = true;
             return Poll::Ready(Ok(()));
         }
@@ -383,6 +376,7 @@ impl AsyncWrite for AnyTlsStream {
             self.fin_sent = true;
         }
         std::task::ready!(self.data_tx.poll_flush(cx))?;
+        self.data_rx.close();
         self.stream_closed = true;
         Poll::Ready(Ok(()))
     }
@@ -419,6 +413,24 @@ impl AsyncStream for AnyTlsStream {}
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn shutdown_keeps_buffered_and_queued_response_bytes_readable() {
+        let (outgoing, _outgoing_rx) = mpsc::channel(STREAM_CHANNEL_BUFFER);
+        let (incoming, incoming_rx) = mpsc::channel(STREAM_CHANNEL_BUFFER);
+        let mut stream =
+            AnyTlsStream::new(1, incoming_rx, outgoing, Arc::new(AtomicBool::new(false)));
+        incoming.send(Bytes::from_static(b"first")).await.unwrap();
+        incoming.send(Bytes::from_static(b"second")).await.unwrap();
+        let mut first = [0; 1];
+        stream.read_exact(&mut first).await.unwrap();
+        stream.shutdown().await.unwrap();
+        assert!(stream.write_all(b"closed").await.is_err());
+        let mut rest = Vec::new();
+        stream.read_to_end(&mut rest).await.unwrap();
+        assert_eq!(first, *b"f");
+        assert_eq!(rest, b"irstsecond");
+    }
 
     #[tokio::test]
     async fn test_stream_write() {

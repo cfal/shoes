@@ -2,6 +2,8 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::str;
 use std::sync::Arc;
 use std::time::Duration;
+use subtle::ConstantTimeEq;
+use tokio::io::AsyncWriteExt;
 
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
@@ -233,18 +235,13 @@ async fn auth_connection(
             continue;
         }
 
-        let specified_uuid = stream_reader.read_slice(&mut recv_stream, 16).await?;
-        if specified_uuid != uuid {
+        let credentials = stream_reader.read_slice(&mut recv_stream, 48).await?;
+        let authenticated =
+            credentials[..16].ct_eq(uuid) & credentials[16..].ct_eq(&expected_token_bytes);
+        if !bool::from(authenticated) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
-                "incorrect uuid",
-            ));
-        }
-        let token_bytes = stream_reader.read_slice(&mut recv_stream, 32).await?;
-        if token_bytes != expected_token_bytes {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "incorrect token",
+                "incorrect credentials",
             ));
         }
 
@@ -439,15 +436,13 @@ async fn process_tcp_stream(
     let mut server_stream: Box<dyn AsyncStream> = Box::new(QuicStream::from(send, recv));
     let setup_client_stream_future = timeout(
         Duration::from_secs(60),
-        setup_client_tcp_stream(
-            &mut server_stream,
-            client_proxy_selector,
-            resolver,
-            remote_location.clone(),
-        ),
+        setup_client_tcp_stream(client_proxy_selector, resolver, remote_location.clone()),
     );
 
-    let mut client_stream = match setup_client_stream_future.await {
+    let crate::tcp::tcp_handler::TcpClientSetupResult {
+        mut client_stream,
+        early_data,
+    } = match setup_client_stream_future.await {
         Ok(Ok(Some(s))) => s,
         Ok(Ok(None)) => {
             // Must have been blocked.
@@ -470,13 +465,19 @@ async fn process_tcp_stream(
         }
     };
 
-    let unparsed_data = stream_reader.unparsed_data();
-    let client_requires_flush = if unparsed_data.is_empty() {
-        false
-    } else {
-        write_all(&mut client_stream, unparsed_data).await?;
-        true
-    };
+    crate::util::timeout_stream_setup(async {
+        if let Some(data) = early_data {
+            write_all(&mut server_stream, &data).await?;
+            server_stream.flush().await?;
+        }
+        let unparsed_data = stream_reader.unparsed_data();
+        if !unparsed_data.is_empty() {
+            write_all(&mut client_stream, unparsed_data).await?;
+            client_stream.flush().await?;
+        }
+        Ok(())
+    })
+    .await?;
     drop(stream_reader);
 
     // Use 32KB buffers to match reference implementations
@@ -484,7 +485,7 @@ async fn process_tcp_stream(
         &mut server_stream,
         &mut client_stream,
         false, // no need to flush since it's QUIC
-        client_requires_flush,
+        false,
         32768,
         32768,
     )

@@ -379,13 +379,10 @@ impl RealityServerConnection {
         });
 
         if !short_id_ok {
-            log::warn!(
-                "REALITY: Client short_id {:02x?} not in configured list",
-                client_short_id
-            );
+            log::warn!("REALITY: Client short_id not in configured list");
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                format!("Invalid short_id: {:02x?}", client_short_id),
+                "Invalid short_id",
             ));
         }
 
@@ -454,8 +451,7 @@ impl RealityServerConnection {
         }
 
         log::debug!(
-            "REALITY: Client authentication successful - short_id: {:02x?}, version: {:?}, timestamp: {}",
-            client_short_id,
+            "REALITY: Client authentication successful - version: {:?}, timestamp: {}",
             client_version,
             client_timestamp
         );
@@ -738,15 +734,26 @@ impl RealityServerConnection {
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Buffer too short"))?
                 as usize;
 
-            // Need complete ChangeCipherSpec record
-            if self.ciphertext_read_buf.len() < TLS_RECORD_HEADER_SIZE + ccs_len {
+            let record_size = super::common::checked_record_size(ccs_len)?;
+            if ccs_len != 1 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid ChangeCipherSpec length",
+                ));
+            }
+            if self.ciphertext_read_buf.len() < record_size {
                 return Ok(false); // Need more data
+            }
+            if self.ciphertext_read_buf[TLS_RECORD_HEADER_SIZE] != 1 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid ChangeCipherSpec payload",
+                ));
             }
 
             // Skip ChangeCipherSpec (compatibility message)
             log::debug!("REALITY: Skipping ChangeCipherSpec (compatibility message)");
-            self.ciphertext_read_buf
-                .consume(TLS_RECORD_HEADER_SIZE + ccs_len);
+            self.ciphertext_read_buf.consume(record_size);
 
             // Check if we have the next record header
             if self.ciphertext_read_buf.len() < TLS_RECORD_HEADER_SIZE {
@@ -762,7 +769,7 @@ impl RealityServerConnection {
             as usize;
 
         // Check if we have the complete record
-        let total_record_len = TLS_RECORD_HEADER_SIZE + record_len;
+        let total_record_len = super::common::checked_record_size(record_len)?;
         if self.ciphertext_read_buf.len() < total_record_len {
             return Ok(false); // Need more data
         }
@@ -903,7 +910,7 @@ impl RealityServerConnection {
                 as usize;
 
             // Check if we have the complete record
-            let total_record_len = TLS_RECORD_HEADER_SIZE + record_len;
+            let total_record_len = super::common::checked_record_size(record_len)?;
             if self.ciphertext_read_buf.len() < total_record_len {
                 break; // Need more data
             }
@@ -1111,6 +1118,38 @@ pub fn feed_reality_server_connection(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fragmented_change_cipher_spec_rejects_invalid_length_before_buffering_payload() {
+        for length in [0u16, 2, 65535] {
+            let mut connection = RealityServerConnection::new(RealityServerConfig {
+                private_key: [0; 32],
+                short_ids: vec![[0; 8]],
+                dest: NetLocation::new(Address::UNSPECIFIED, 443),
+                max_time_diff: None,
+                min_client_version: None,
+                max_client_version: None,
+                cipher_suites: vec![],
+            })
+            .unwrap();
+            let header = [
+                CONTENT_TYPE_CHANGE_CIPHER_SPEC,
+                3,
+                3,
+                (length >> 8) as u8,
+                length as u8,
+            ];
+            for byte in &header[..4] {
+                connection.read_tls(&mut &[*byte][..]).unwrap();
+                assert!(!connection.process_client_finished().unwrap());
+            }
+            connection.read_tls(&mut &header[4..]).unwrap();
+            assert_eq!(
+                connection.process_client_finished().unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+    }
 
     #[test]
     fn test_reality_server_connection_creation() {

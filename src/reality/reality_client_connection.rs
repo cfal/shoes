@@ -355,7 +355,7 @@ impl RealityClientConnection {
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Buffer too short"))?
             as usize;
 
-        let total_record_len = TLS_RECORD_HEADER_SIZE + record_len;
+        let total_record_len = super::common::checked_record_size(record_len)?;
         if self.ciphertext_read_buf.len() < total_record_len {
             return Ok(false);
         }
@@ -488,14 +488,6 @@ impl RealityClientConnection {
         let (server_hs_key, server_hs_iv) =
             derive_traffic_keys(server_handshake_traffic_secret, *cipher_suite)?;
 
-        if *handshake_seq == 0 {
-            log::debug!(
-                "REALITY CLIENT: Server HS key={:02x?}, iv={:02x?}",
-                &server_hs_key[..16],
-                server_hs_iv
-            );
-        }
-
         if self.ciphertext_read_buf.len() < TLS_RECORD_HEADER_SIZE {
             return Ok(false);
         }
@@ -518,7 +510,7 @@ impl RealityClientConnection {
             record_len
         );
 
-        let total_record_len = TLS_RECORD_HEADER_SIZE + record_len;
+        let total_record_len = super::common::checked_record_size(record_len)?;
         if self.ciphertext_read_buf.len() < total_record_len {
             return Ok(false);
         }
@@ -793,7 +785,7 @@ impl RealityClientConnection {
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Buffer too short"))?
                 as usize;
 
-            let total_record_len = TLS_RECORD_HEADER_SIZE + record_len;
+            let total_record_len = super::common::checked_record_size(record_len)?;
             if self.ciphertext_read_buf.len() < total_record_len {
                 break;
             }
@@ -1004,6 +996,46 @@ pub fn feed_reality_client_connection(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn handshake_key_material_is_not_logged() {
+        let private =
+            agreement::PrivateKey::from_private_key(&agreement::X25519, &[1; 32]).unwrap();
+        let mut client = RealityClientConnection::new(RealityClientConfig {
+            public_key: private
+                .compute_public_key()
+                .unwrap()
+                .as_ref()
+                .try_into()
+                .unwrap(),
+            short_id: [2; 8],
+            server_name: "localhost".into(),
+            cipher_suites: vec![],
+        })
+        .unwrap();
+        let cipher = CipherSuite::AES_128_GCM_SHA256;
+        let secret = vec![0xab; 32];
+        let (key, iv) = derive_traffic_keys(&secret, cipher).unwrap();
+        client.handshake_state = HandshakeState::ProcessingHandshake {
+            client_handshake_traffic_secret: vec![3; 32],
+            server_handshake_traffic_secret: secret,
+            master_secret: vec![4; 32],
+            cipher_suite: cipher,
+            handshake_transcript_bytes: vec![],
+            auth_key: [5; 32],
+            handshake_seq: 0,
+            accumulated_plaintext: vec![],
+            messages_found: 0,
+            certificate_verified: false,
+            ed25519_public_key: None,
+            cert_verify_offset: None,
+        };
+        let capture = crate::logging::test_capture::Capture::new();
+        assert!(!client.process_encrypted_handshake().unwrap());
+        let logs = capture.finish();
+        assert!(!logs.contains(&format!("{:02x?}", key)));
+        assert!(!logs.contains(&format!("{:02x?}", iv)));
+    }
 
     #[test]
     fn handshake_plaintext_is_bounded() {

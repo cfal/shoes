@@ -125,7 +125,10 @@ pub fn flush_log_file() {
 /// Stop the TUN service and wait for shutdown.
 ///
 /// This is the common shutdown logic used by both iOS and Android.
-pub fn stop_service() {
+pub fn stop_service() -> bool {
+    if !is_lifecycle_thread() {
+        return false;
+    }
     let _lifecycle = SERVICE_LIFECYCLE.lock();
     info!("Stopping TUN service");
 
@@ -157,6 +160,16 @@ pub fn stop_service() {
     }
 
     info!("TUN service stop completed");
+    true
+}
+
+pub fn is_lifecycle_thread() -> bool {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        log::error!("Synchronous service lifecycle calls require a thread outside Tokio");
+        false
+    } else {
+        true
+    }
 }
 
 /// Check if the TUN service is running.
@@ -275,6 +288,19 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn lifecycle_requires_a_non_runtime_thread() {
+        assert!(is_lifecycle_thread());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            assert!(!is_lifecycle_thread());
+            assert!(!stop_service());
+        });
+        assert!(is_lifecycle_thread());
+    }
 
     fn start_test_service(
         config: String,

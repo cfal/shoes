@@ -10,7 +10,7 @@ use crate::config::{
 };
 use crate::quic_stream::QuicStream;
 use crate::resolver::Resolver;
-use crate::rustls_config_util::create_server_config;
+use crate::rustls_config_util::try_create_server_config;
 use crate::tcp::tcp_client_handler_factory::create_tcp_client_proxy_selector;
 use crate::tcp::tcp_handler::TcpServerHandler;
 use crate::tcp::tcp_server_handler_factory::create_tcp_server_handler;
@@ -174,13 +174,13 @@ pub async fn start_quic_servers(
         processed_ca_certs.push(cert.as_bytes().to_vec());
     }
 
-    let server_config = Arc::new(create_server_config(
+    let server_config = Arc::new(try_create_server_config(
         &cert_bytes,
         &key_bytes,
         processed_ca_certs,
         &alpn_protocols.into_vec(),
         &client_fingerprints.into_vec(),
-    ));
+    )?);
 
     let quic_server_config: quinn::crypto::rustls::QuicServerConfig = server_config
         .try_into()
@@ -191,7 +191,7 @@ pub async fn start_quic_servers(
     let client_proxy_selector = Arc::new(create_tcp_client_proxy_selector(
         rules.clone(),
         resolver.clone(),
-    ));
+    )?);
 
     let mut handles = vec![];
 
@@ -248,20 +248,24 @@ pub async fn start_quic_servers(
         tcp_protocol => {
             // Shares protocol state across ports without reusing an interface-specific UDP bind IP.
             let mut handlers: HashMap<IpAddr, Arc<dyn TcpServerHandler>> = HashMap::new();
-
-            for bind_address in bind_addresses.into_iter() {
-                let tcp_handler: Arc<dyn TcpServerHandler> = handlers
-                    .entry(bind_address.ip())
-                    .or_insert_with(|| {
+            // Construct every handler before spawning listeners so errors cannot detach tasks.
+            for bind_address in &bind_addresses {
+                if let std::collections::hash_map::Entry::Vacant(entry) =
+                    handlers.entry(bind_address.ip())
+                {
+                    entry.insert(
                         create_tcp_server_handler(
                             tcp_protocol.clone(),
                             &client_proxy_selector,
                             &resolver,
                             Some(bind_address.ip()),
-                        )
-                        .into()
-                    })
-                    .clone();
+                        )?
+                        .into(),
+                    );
+                }
+            }
+            for bind_address in bind_addresses.into_iter() {
+                let tcp_handler = handlers[&bind_address.ip()].clone();
                 let quic_server_config = quic_server_config.clone();
                 let resolver = resolver.clone();
                 let result = start_quic_server(
