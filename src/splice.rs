@@ -75,10 +75,17 @@ fn retry_interrupted<T>(mut operation: impl FnMut() -> io::Result<T>) -> io::Res
     }
 }
 
-fn unsupported(error: &io::Error) -> bool {
+fn can_fallback(error: &io::Error) -> bool {
     matches!(
         error.raw_os_error(),
-        Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP | libc::EPERM)
+        Some(
+            libc::EINVAL
+                | libc::ENOSYS
+                | libc::EOPNOTSUPP
+                | libc::EPERM
+                | libc::EACCES
+                | libc::ENOMEM
+        )
     )
 }
 
@@ -131,8 +138,8 @@ async fn drain_buffered(
     destination: &TcpStream,
     mut pending: usize,
     copied: &mut usize,
+    buffer: &mut [u8],
 ) -> io::Result<()> {
-    let mut buffer = vec![0; pending.min(BUFFER_SIZE)];
     while pending != 0 {
         let len = pending
             .min(buffer.len())
@@ -204,7 +211,7 @@ async fn copy_direction(
                 Ok(0) => return socket2::SockRef::from(destination).shutdown(Shutdown::Write),
                 Ok(n) => n,
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-                Err(error) if unsupported(&error) => break 'bursts,
+                Err(error) if can_fallback(&error) => break 'bursts,
                 Err(error) => return Err(error),
             };
             while pending != 0 {
@@ -220,10 +227,11 @@ async fn copy_direction(
                         account(&mut copied, n).await;
                     }
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
-                    Err(error) if unsupported(&error) => {
+                    Err(error) if can_fallback(&error) => {
                         // The source already consumed these bytes. Recover them
                         // before switching this direction permanently to copying.
-                        drain_buffered(&pipe, destination, pending, &mut copied).await?;
+                        drain_buffered(&pipe, destination, pending, &mut copied, &mut buffer)
+                            .await?;
                         break 'bursts;
                     }
                     Err(error) => return Err(error),
@@ -354,6 +362,7 @@ mod tests {
         max_chunk: usize,
         pipe_reads: Mutex<Vec<RawFd>>,
         pending: AtomicUsize,
+        pending_at_fault: AtomicUsize,
         pipes: Mutex<Vec<std::path::PathBuf>>,
     }
 
@@ -367,6 +376,7 @@ mod tests {
                 max_chunk: 997,
                 pipe_reads: Mutex::new(Vec::new()),
                 pending: AtomicUsize::new(0),
+                pending_at_fault: AtomicUsize::new(0),
                 pipes: Mutex::new(Vec::new()),
             }
         }
@@ -387,6 +397,8 @@ mod tests {
 
         fn splice(&self, from: RawFd, to: RawFd, len: usize) -> io::Result<usize> {
             if self.calls.fetch_add(1, Ordering::Relaxed) + 1 == self.error_at {
+                self.pending_at_fault
+                    .store(self.pending.load(Ordering::Relaxed), Ordering::Relaxed);
                 if self.error == 0 {
                     return Ok(0);
                 }
@@ -425,6 +437,12 @@ mod tests {
             (1, libc::EPERM),
             (2, libc::EPERM),
             (3, libc::EPERM),
+            (1, libc::EACCES),
+            (2, libc::EACCES),
+            (3, libc::EACCES),
+            (1, libc::ENOMEM),
+            (2, libc::ENOMEM),
+            (3, libc::ENOMEM),
             (5, libc::ENOSYS),
             (6, libc::EOPNOTSUPP),
             (0, 0),
@@ -452,6 +470,16 @@ mod tests {
             })
             .await
             .unwrap();
+            assert!(operations.calls.load(Ordering::Relaxed) >= at);
+            if matches!(error, libc::EACCES | libc::ENOMEM) {
+                let pending = operations.pending_at_fault.load(Ordering::Relaxed);
+                match at {
+                    1 => assert_eq!(pending, 0),
+                    2 => assert_eq!(pending, operations.max_chunk),
+                    3 => assert_eq!(pending, operations.max_chunk - 101),
+                    _ => unreachable!(),
+                }
+            }
             assert_pipes_closed(&operations);
         }
     }
@@ -611,8 +639,10 @@ mod tests {
         let (destination, mut peer) = pair(false).await;
         destination.writable().await.unwrap();
         let mut copied = MAX_COPY_BYTES_PER_POLL - 100;
+        let mut buffer = [0; 120];
         {
-            let draining = drain_buffered(&pipe, &destination, data.len(), &mut copied);
+            let draining =
+                drain_buffered(&pipe, &destination, data.len(), &mut copied, &mut buffer);
             tokio::pin!(draining);
             assert!(futures::poll!(draining.as_mut()).is_pending());
             let mut received = [0; 100];
