@@ -1,13 +1,62 @@
 use std::cell::RefCell;
+use std::future::Future;
 use std::io::{self, IoSliceMut};
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 
 use crate::resources::BudgetPermit;
 use quinn::{AsyncUdpSocket, Runtime, UdpPoller};
 use tokio::sync::oneshot;
+use tokio_util::sync::{CancellationToken, DropGuard};
+use tokio_util::task::AbortOnDropHandle;
+
+const LISTENER_CLOSE_GRACE: Duration = Duration::from_secs(1);
+
+#[derive(Debug)]
+struct ListenerRuntime {
+    endpoint_started: AtomicBool,
+    retired: CancellationToken,
+}
+
+impl Runtime for ListenerRuntime {
+    fn new_timer(&self, deadline: Instant) -> Pin<Box<dyn quinn::AsyncTimer>> {
+        quinn::TokioRuntime.new_timer(deadline)
+    }
+
+    fn spawn(&self, future: Pin<Box<dyn Future<Output = ()> + Send>>) {
+        // Quinn 0.11 spawns the endpoint driver synchronously before exposing the
+        // endpoint. Later spawns are connection drivers; recheck this on upgrades.
+        if self.endpoint_started.swap(true, Ordering::Relaxed) {
+            quinn::TokioRuntime.spawn(future);
+            return;
+        }
+        let mut driver = AbortOnDropHandle::new(tokio::spawn(future));
+        let retired = self.retired.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = &mut driver => {},
+                _ = async {
+                    retired.cancelled().await;
+                    tokio::time::sleep(LISTENER_CLOSE_GRACE).await;
+                } => {},
+            }
+            // Dropping the endpoint driver closes its connection-event channels.
+            // Connection drivers then terminate and wake application waiters.
+        });
+    }
+
+    fn wrap_udp_socket(&self, socket: std::net::UdpSocket) -> io::Result<Arc<dyn AsyncUdpSocket>> {
+        quinn::TokioRuntime.wrap_udp_socket(socket)
+    }
+
+    fn now(&self) -> Instant {
+        quinn::TokioRuntime.now()
+    }
+}
 
 tokio::task_local! {
     static CONNECTION_MEMORY: RefCell<Option<BudgetPermit>>;
@@ -20,6 +69,7 @@ pub(crate) struct QuicEndpoint {
     inner: quinn::Endpoint,
     // Transport windows belong to this endpoint, not the latest config generation.
     memory_bytes: usize,
+    _driver_retirement: Option<DropGuard>,
 }
 
 impl QuicEndpoint {
@@ -47,6 +97,16 @@ impl QuicEndpoint {
         memory_bytes: usize,
         release: Option<oneshot::Sender<()>>,
     ) -> io::Result<Self> {
+        let (runtime, retirement): (Arc<dyn Runtime>, _) = if release.is_some() {
+            let retired = CancellationToken::new();
+            let runtime = ListenerRuntime {
+                endpoint_started: AtomicBool::new(false),
+                retired: retired.clone(),
+            };
+            (Arc::new(runtime), Some(retired.drop_guard()))
+        } else {
+            (Arc::new(quinn::TokioRuntime), None)
+        };
         let socket = MemorySocket {
             inner: quinn::TokioRuntime.wrap_udp_socket(socket)?,
             endpoint_memory: None,
@@ -56,11 +116,12 @@ impl QuicEndpoint {
             quinn::EndpointConfig::default(),
             config,
             Arc::new(socket),
-            Arc::new(quinn::TokioRuntime),
+            runtime,
         )
         .map(|inner| Self {
             inner,
             memory_bytes,
+            _driver_retirement: retirement,
         })
     }
 
@@ -232,6 +293,111 @@ mod tests {
     use crate::resources::Budget;
     use bytes::Bytes;
     use tokio::time::timeout;
+
+    #[tokio::test(start_paused = true)]
+    async fn listener_runtime_cancels_only_the_endpoint_driver_after_grace() {
+        let retired = CancellationToken::new();
+        let runtime = ListenerRuntime {
+            endpoint_started: AtomicBool::new(false),
+            retired: retired.clone(),
+        };
+        let endpoint = Arc::new(());
+        let owned_endpoint = endpoint.clone();
+        runtime.spawn(Box::pin(async move {
+            let _owned = owned_endpoint;
+            std::future::pending::<()>().await;
+        }));
+        let connection = Arc::new(());
+        let owned_connection = connection.clone();
+        let (finish, finished) = oneshot::channel();
+        runtime.spawn(Box::pin(async move {
+            let _owned = owned_connection;
+            let _ = finished.await;
+        }));
+        tokio::task::yield_now().await;
+        retired.cancel();
+        tokio::task::yield_now().await;
+        tokio::time::advance(LISTENER_CLOSE_GRACE - Duration::from_millis(1)).await;
+        assert_eq!(Arc::strong_count(&endpoint), 2);
+        tokio::time::advance(Duration::from_millis(2)).await;
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(Arc::strong_count(&endpoint), 1);
+        assert_eq!(Arc::strong_count(&connection), 2);
+        finish.send(()).unwrap();
+        tokio::task::yield_now().await;
+        assert_eq!(Arc::strong_count(&connection), 1);
+    }
+
+    #[tokio::test]
+    async fn listener_runtime_reaps_a_completed_driver_and_its_watcher() {
+        let metrics = tokio::runtime::Handle::current().metrics();
+        let baseline = metrics.num_alive_tasks();
+        let runtime = ListenerRuntime {
+            endpoint_started: AtomicBool::new(false),
+            retired: CancellationToken::new(),
+        };
+        runtime.spawn(Box::pin(async {}));
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(metrics.num_alive_tasks(), baseline);
+    }
+
+    #[tokio::test]
+    async fn endpoint_cancellation_wakes_retained_handles_before_releasing_memory() {
+        let (client_config, server_config) = configs();
+        let (server, mut released) = QuicEndpoint::listen(
+            server_config,
+            std::net::UdpSocket::bind("127.0.0.1:0").unwrap(),
+            1,
+        )
+        .unwrap();
+        let address = server.local_addr().unwrap();
+        let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        client.set_default_client_config(client_config);
+        let budget = Arc::new(Budget::new(Some(1)));
+        let (client_conn, server_conn) = tokio::join!(
+            async { client.connect(address, "localhost").unwrap().await.unwrap() },
+            async {
+                server
+                    .accept()
+                    .await
+                    .unwrap()
+                    .accept_with_memory(budget.acquire(1).unwrap())
+                    .unwrap()
+                    .await
+                    .unwrap()
+            },
+        );
+        let (mut client_send, _client_recv) = client_conn.open_bi().await.unwrap();
+        client_send.write_all(b"x").await.unwrap();
+        let (mut server_send, mut server_recv) = server_conn.accept_bi().await.unwrap();
+        server_recv.read_exact(&mut [0]).await.unwrap();
+        // No close() here: channel termination must wake handles on its own.
+        drop(server);
+        timeout(Duration::from_secs(3), server_conn.closed())
+            .await
+            .unwrap();
+        assert!(server_send.write_all(b"x").await.is_err());
+        assert!(server_recv.read(&mut [0]).await.is_err());
+        assert_eq!(
+            released.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        );
+        assert_eq!(budget.snapshot().active, 1);
+        drop((server_conn, server_send, server_recv));
+        assert!(
+            timeout(Duration::from_secs(1), released)
+                .await
+                .unwrap()
+                .is_err()
+        );
+        assert_eq!(budget.snapshot().active, 0);
+        drop(std::net::UdpSocket::bind(address).unwrap());
+        client.close(0u32.into(), b"done");
+    }
 
     #[tokio::test]
     async fn socket_release_waits_for_delegated_poller() {

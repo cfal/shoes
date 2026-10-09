@@ -782,7 +782,7 @@ Configuration changes are automatically detected. `--no-reload` disables file wa
 
 Replacement configurations, certificates, and DNS resolvers are prepared while the current listeners continue serving. A preparation failure leaves the current configuration running. Once preparation succeeds, listeners are replaced. A failure to activate replacements exits with status 1; there is no rollback after listeners are retired. Existing TCP connections may drain for `global_limits.reload_grace_secs` during successful reloads; QUIC connections are closed.
 
-QUIC listener sockets must finish closing before replacements bind. Retirement is bounded to five seconds; exceeding that deadline exits with an error rather than announcing a partially ready generation.
+QUIC listener sockets must finish closing before replacements bind. Closing endpoints get up to one second for best-effort close delivery, then their drivers are stopped locally so peer-controlled timers cannot delay reloads. A five-second socket-release guard remains; exceeding it indicates a local cleanup failure and exits with an error rather than announcing a partially ready generation.
 
 Candidate QUIC buffer sizes are used during DNS preparation, but `global_limits` admission caps change only at activation. DNS bootstrap over HTTP/3 or QUIC proxy chains therefore needs headroom under the live cap. A cap-increasing reload may require a restart if preparation cannot fit. Lowering a cap does not revoke existing reservations, including those made during preparation; new admissions are blocked until usage falls sufficiently. At cold startup, preparation uses the initial unlimited admission caps.
 

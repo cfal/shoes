@@ -174,6 +174,50 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn retirement_does_not_wait_for_a_slow_peer_close_timer() {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert.cert.der().clone()).unwrap();
+        let mut config = quinn::ServerConfig::with_single_cert(
+            vec![cert.cert.der().clone()],
+            rustls::pki_types::PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()).into(),
+        )
+        .unwrap();
+        Arc::get_mut(&mut config.transport)
+            .unwrap()
+            .initial_rtt(Duration::from_secs(2));
+        let retirements = QuicRetirements::default();
+        let listener = retirements
+            .track(async {
+                QuicListener::bind_all("127.0.0.1:0".parse().unwrap(), config, 1, 1)
+                    .unwrap()
+                    .pop()
+                    .unwrap()
+            })
+            .await;
+        let address = listener.local_addr().unwrap();
+        let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        client.set_default_client_config(
+            quinn::ClientConfig::with_root_certificates(Arc::new(roots)).unwrap(),
+        );
+        let connecting = client.connect(address, "localhost").unwrap();
+        let incoming = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        client.close(0u32.into(), b"abandon handshake");
+        drop((connecting, client));
+        let pending = incoming.accept().unwrap();
+        drop(pending);
+        drop(listener);
+        tokio::time::timeout(Duration::from_secs(3), retirements.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(std::net::UdpSocket::bind(address).unwrap());
+    }
+
     #[tokio::test(start_paused = true)]
     async fn reload_preserves_active_work_then_cancels_stalled_connections() {
         let marker = Arc::new(());
