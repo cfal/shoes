@@ -4,6 +4,8 @@ mod anytls;
 mod anytls_uot;
 #[path = "cases/integration/h2mux_integration.rs"]
 mod h2mux;
+#[path = "cases/integration/h2mux_backpressure.rs"]
+mod h2mux_backpressure;
 #[path = "cases/integration/hysteria2_integration.rs"]
 mod hysteria2;
 #[path = "cases/integration/hysteria2_udp_integration.rs"]
