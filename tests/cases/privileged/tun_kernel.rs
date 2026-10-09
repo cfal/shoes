@@ -1,6 +1,9 @@
 //! Linux kernel-TUN coverage; requires /dev/net/tun, IPv6 loopback and passwordless sudo.
 //! Run with --features privileged-tests --test privileged tun_kernel:: -- --test-threads=1.
 
+#[path = "tun_kernel/offload_failure.rs"]
+mod offload_failure;
+
 use shoes_test_support::test_fixture::{
     ProcessGuard, RouteGuard, add_route_via_device, start_shoes_server_with_sudo,
 };
@@ -25,6 +28,7 @@ struct KernelTun {
     _route: RouteGuard,
     _process: ProcessGuard,
     _config: tempfile::NamedTempFile,
+    name: String,
     source: IpAddr,
     target: IpAddr,
 }
@@ -45,6 +49,32 @@ fn run_ip(args: &[&str]) -> io::Result<String> {
 
 impl KernelTun {
     async fn start(ipv6: bool) -> io::Result<Self> {
+        Self::start_options(ipv6, None, 1500, 32768).await
+    }
+
+    async fn start_options(
+        ipv6: bool,
+        offload: Option<bool>,
+        mtu: u16,
+        tcp_buffer_size: usize,
+    ) -> io::Result<Self> {
+        Self::start_with(
+            ipv6,
+            offload,
+            mtu,
+            tcp_buffer_size,
+            start_shoes_server_with_sudo,
+        )
+        .await
+    }
+
+    async fn start_with(
+        ipv6: bool,
+        offload: Option<bool>,
+        mtu: u16,
+        tcp_buffer_size: usize,
+        start: impl FnOnce(&str) -> io::Result<(ProcessGuard, tempfile::NamedTempFile)>,
+    ) -> io::Result<Self> {
         std::fs::metadata("/dev/net/tun")?;
         let id: u32 = rand::random();
         let name = format!("shcov{id:08x}");
@@ -73,7 +103,10 @@ impl KernelTun {
 - device_name: {name}
   address: "{management}"
   netmask: 255.255.255.255
-  mtu: 1500
+  mtu: {mtu}
+  segmentation_offload: {offload}
+  resource_limits:
+    tcp_buffer_size: {tcp_buffer_size}
   rules:
     - masks: "{destination}"
       action: allow
@@ -81,9 +114,10 @@ impl KernelTun {
       client_chain:
         - protocol:
             type: direct
-"#
+"#,
+            offload = offload.map_or("null", |enabled| if enabled { "true" } else { "false" }),
         );
-        let (process, config) = start_shoes_server_with_sudo(&config)?;
+        let (process, config) = start(&config)?;
         timeout(Duration::from_secs(10), async {
             loop {
                 if let Ok(addresses) = run_ip(&["-j", "-4", "address", "show", "dev", &name]) {
@@ -122,6 +156,7 @@ impl KernelTun {
             _route: route,
             _process: process,
             _config: config,
+            name,
             source: source.parse().unwrap(),
             target: target.parse().unwrap(),
         };
@@ -147,6 +182,133 @@ impl KernelTun {
         socket.bind(SocketAddr::new(self.source, 0))?;
         socket.connect(SocketAddr::new(self.target, port)).await
     }
+}
+
+async fn bulk_echo(mut stream: TcpStream, bytes: usize, flow: usize) -> io::Result<()> {
+    let data = payload(flow, 0, bytes);
+    let (mut reader, mut writer) = stream.split();
+    tokio::try_join!(
+        async {
+            writer.write_all(&data).await?;
+            writer.shutdown().await
+        },
+        async {
+            let mut received = vec![0; bytes];
+            reader.read_exact(&mut received).await?;
+            assert_eq!(received, data);
+            assert_eq!(reader.read(&mut [0]).await?, 0);
+            io::Result::Ok(())
+        }
+    )?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn offload_on_off_bulk_dual_stack_and_mtu_variants() -> io::Result<()> {
+    timeout(Duration::from_secs(120), async {
+        for ipv6 in [false, true] {
+            let peer = start_tcp_stream_echo_server(if ipv6 { "::" } else { "0.0.0.0" }, 0).await?;
+            for offload in [false, true] {
+                for (mtu, buffer) in [(1280, 4096), (1500, 32768), (9000, 131072), (65535, 131072)]
+                {
+                    let tun = KernelTun::start_options(ipv6, Some(offload), mtu, buffer).await?;
+                    let mut flows = JoinSet::new();
+                    for flow in 0..4 {
+                        let stream = tun.connect_tcp(peer.local_addr().port()).await?;
+                        flows.spawn(bulk_echo(stream, 1_000_007, flow));
+                    }
+                    while let Some(result) = flows.join_next().await {
+                        result??;
+                    }
+                    // A reset must not poison the next flow or leave a stuck writer.
+                    let reset = tun.connect_tcp(peer.local_addr().port()).await?;
+                    socket2::SockRef::from(&reset).set_linger(Some(Duration::ZERO))?;
+                    drop(reset);
+                    bulk_echo(tun.connect_tcp(peer.local_addr().port()).await?, 4097, 17).await?;
+                }
+            }
+        }
+        Ok(())
+    })
+    .await?
+}
+
+fn process_group_cpu_seconds(process: &ProcessGuard) -> io::Result<f64> {
+    let group = process
+        .process_group_id()
+        .expect("privileged test process group");
+    let mut ticks = 0u64;
+    for entry in std::fs::read_dir("/proc")? {
+        let path = entry?.path();
+        if !path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .bytes()
+            .all(|b| b.is_ascii_digit())
+        {
+            continue;
+        }
+        let Ok(stat) = std::fs::read_to_string(path.join("stat")) else {
+            continue;
+        };
+        let Some((_, fields)) = stat.rsplit_once(')') else {
+            continue;
+        };
+        let fields: Vec<_> = fields.split_whitespace().collect();
+        if fields.get(2).and_then(|s| s.parse::<i32>().ok()) == Some(group) {
+            ticks += fields[11].parse::<u64>().unwrap() + fields[12].parse::<u64>().unwrap();
+        }
+    }
+    Ok(ticks as f64 / unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as f64)
+}
+
+#[tokio::test]
+#[ignore = "alternating kernel TUN A/B and idle-socket scaling benchmark; run alone in release mode"]
+async fn benchmark_offload_and_idle_scaling() -> io::Result<()> {
+    let peer = start_tcp_stream_echo_server("0.0.0.0", 0).await?;
+    for idle in [0, 100, 500, 1000] {
+        for round in 0..6 {
+            let offload = round % 2 == 1;
+            let tun = KernelTun::start_options(false, Some(offload), 1500, 32768).await?;
+            let mut idle_sockets = Vec::new();
+            for _ in 0..idle {
+                let mut stream = tun.connect_tcp(peer.local_addr().port()).await?;
+                tcp_exchange(&mut stream, b"idle").await?;
+                idle_sockets.push(stream);
+            }
+            for flows in [1, 8] {
+                let mut streams = Vec::new();
+                for _ in 0..flows {
+                    streams.push(tun.connect_tcp(peer.local_addr().port()).await?);
+                }
+                let cpu = process_group_cpu_seconds(&tun._process)?;
+                let start = std::time::Instant::now();
+                let mut jobs = JoinSet::new();
+                let bytes = 64 * 1024 * 1024;
+                for (flow, stream) in streams.into_iter().enumerate() {
+                    jobs.spawn(bulk_echo(stream, bytes / flows, flow));
+                }
+                timeout(Duration::from_secs(120), async {
+                    while let Some(result) = jobs.join_next().await {
+                        result??;
+                    }
+                    io::Result::Ok(())
+                })
+                .await??;
+                let elapsed = start.elapsed().as_secs_f64();
+                let cpu = process_group_cpu_seconds(&tun._process)? - cpu;
+                eprintln!(
+                    "tun_bench offload={offload} idle={idle} flows={flows} seconds={elapsed:.6} cpu_seconds={cpu:.6} bytes_per_direction={bytes}"
+                );
+            }
+            for mut stream in idle_sockets {
+                tcp_exchange(&mut stream, b"reactivated").await?;
+                tcp_eof(&mut stream).await?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn payload(flow: usize, sequence: usize, size: usize) -> Vec<u8> {

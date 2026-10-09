@@ -103,7 +103,7 @@ rustls = "*"
 serde = { version = "*", features = ["derive", "std"] }
 serde_yaml = "*"
 shake = "*"
-smoltcp = { version = "*", default-features = false, features = ["std", "log", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-icmp", "auto-icmp-echo-reply", "socket-udp", "socket-tcp", "socket-tcp-cubic", "phy-tuntap_interface", "assembler-max-segment-count-32"] }
+smoltcp = { version = "*", default-features = false, features = ["std", "log", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-icmp", "auto-icmp-echo-reply", "socket-udp", "socket-tcp", "socket-tcp-cubic", "phy-tuntap_interface", "assembler-max-segment-count-32", "segmentation-offload"] }
 socket2 = "*"
 subtle = "*"
 tokio = { version = "*", features = [

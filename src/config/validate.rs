@@ -1411,6 +1411,16 @@ fn validate_tun_config(
     rule_groups: &HashMap<String, Vec<RuleConfig>>,
 ) -> std::io::Result<()> {
     config.resource_limits.validate()?;
+    if config.segmentation_offload == Some(true)
+        && (!cfg!(target_os = "linux")
+            || config.device_fd.is_some()
+            || config.packet_information == Some(true))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "TUN segmentation offload requires a created Linux device without packet information",
+        ));
+    }
     // Validate ICMP requires TCP
     if !config.tcp_enabled && config.icmp_enabled {
         return Err(std::io::Error::new(
@@ -2285,6 +2295,7 @@ mod tests {
     async fn test_tun_icmp_requires_tcp() {
         // ICMP requires TCP to be enabled
         let tun_config = TunConfig {
+            segmentation_offload: None,
             resource_limits: Default::default(),
             packet_information: None,
             device_name: Some("tun0".to_string()),

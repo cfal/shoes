@@ -263,6 +263,14 @@ See the [examples](./examples) directory for all examples.
             user_id: b85798ef-e9dc-46a4-9a87-8da4499d36d0
 ```
 
+On created Linux devices, TCPv4 transmit segmentation offload is selected
+automatically when available. IPv6 continues using ordinary MTU-sized packets;
+the configured MTU and TCP buffer sizes are unchanged. Set
+`segmentation_offload: false` to disable it, or `true` to require it at startup.
+Explicit enablement is not supported with `device_fd`, packet-information
+headers, or non-Linux devices. Automatic setup falls back to ordinary packets
+if offload initialization fails.
+
 ## Similar Projects
 
 - [apernet/hysteria](https://github.com/apernet/hysteria)

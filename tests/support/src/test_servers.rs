@@ -501,6 +501,7 @@ pub async fn start_local_http_server(ip: &str, port: u16) -> std::io::Result<Tes
                     let io = TokioIo::new(tcp);
                     connections.spawn(async move {
                         if let Err(error) = http1::Builder::new()
+                            .half_close(true)
                             .timer(TokioTimer::new())
                             .serve_connection(io, service_fn(handle_request))
                             .await
@@ -782,6 +783,29 @@ mod tests {
     #[tokio::test]
     async fn test_local_http_server_works() -> Result<(), Box<dyn std::error::Error>> {
         test_local_http_with_size(1024).await
+    }
+
+    #[tokio::test]
+    async fn http_server_accepts_request_followed_by_fin() -> std::io::Result<()> {
+        let server = start_local_http_server("0.0.0.0", 0).await?;
+        // Queues the request and FIN before the current-thread runtime can accept it.
+        let mut client = std::net::TcpStream::connect(("127.0.0.1", server.local_addr().port()))?;
+        std::io::Write::write_all(
+            &mut client,
+            b"GET /bytes/1024 HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n",
+        )?;
+        client.shutdown(std::net::Shutdown::Write)?;
+        client.set_nonblocking(true)?;
+        let mut client = tokio::net::TcpStream::from_std(client)?;
+        let mut response = Vec::new();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            tokio::io::AsyncReadExt::read_to_end(&mut client, &mut response),
+        )
+        .await??;
+        assert!(response.starts_with(b"HTTP/1.1 200"));
+        assert!(response.len() >= 1024);
+        Ok(())
     }
 
     #[tokio::test]

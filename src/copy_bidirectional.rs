@@ -18,7 +18,7 @@ use crate::async_stream::AsyncStream;
 use crate::util::allocate_vec;
 
 const DEFAULT_BUF_SIZE: usize = 16384;
-const MAX_COPY_BYTES_PER_POLL: usize = 1024 * 1024;
+pub(crate) const MAX_COPY_BYTES_PER_POLL: usize = 1024 * 1024;
 
 #[derive(Debug)]
 struct CopyBuffer {
@@ -317,6 +317,12 @@ where
     A: AsyncStream + ?Sized,
     B: AsyncStream + ?Sized,
 {
+    #[cfg(target_os = "linux")]
+    if let (Some(a), Some(b)) = (a.plain_tcp(), b.plain_tcp()) {
+        // Raw Tokio sockets have no userspace output to flush.
+        return crate::splice::copy_bidirectional(a, b).await;
+    }
+
     copy_bidirectional_with_sizes(
         a,
         b,

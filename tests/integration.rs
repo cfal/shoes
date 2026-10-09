@@ -10,6 +10,8 @@ mod hysteria2;
 mod hysteria2_udp;
 #[path = "cases/integration/naiveproxy_integration.rs"]
 mod naiveproxy;
+#[path = "cases/integration/plain_tcp_relay.rs"]
+mod plain_tcp_relay;
 #[path = "cases/integration/quic_udp_routing_test.rs"]
 mod quic_udp_routing;
 #[path = "cases/integration/resource_lifecycle_test.rs"]

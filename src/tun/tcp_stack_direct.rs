@@ -110,11 +110,20 @@ impl TcpStackDirect {
         Self::with_config(tun_fd, TunServerConfig::new().mtu(mtu as u16)).unwrap()
     }
 
+    #[cfg(test)]
     pub fn with_config(tun_fd: OwnedFd, config: TunServerConfig) -> io::Result<Self> {
+        Self::with_offload(tun_fd, config, false)
+    }
+
+    pub fn with_offload(
+        tun_fd: OwnedFd,
+        config: TunServerConfig,
+        offload: bool,
+    ) -> io::Result<Self> {
         let fd = tun_fd.as_raw_fd();
         set_nonblocking(fd)?;
         let (wake, wake_rx) = Wake::new()?;
-        Self::start(tun_fd, config, wake, wake_rx)
+        Self::start(tun_fd, config, wake, wake_rx, offload)
     }
 
     fn start(
@@ -122,6 +131,7 @@ impl TcpStackDirect {
         config: TunServerConfig,
         wake: Wake,
         wake_rx: WakeReceiver,
+        offload: bool,
     ) -> io::Result<Self> {
         let fd = tun_fd.as_raw_fd();
         let (udp_tx, udp_rx) = mpsc::channel(PACKET_QUEUE_CAPACITY);
@@ -141,8 +151,11 @@ impl TcpStackDirect {
                 .name("shoes-smoltcp-direct".to_owned())
                 .spawn(move || {
                     let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                        let mut device =
+                            DirectDevice::new(fd, config.mtu as usize, config.packet_information);
+                        device.offload = offload;
                         run_direct_stack_thread(
-                            fd,
+                            device,
                             config,
                             udp_tx,
                             running.clone(),
@@ -220,6 +233,8 @@ struct DirectDevice {
     pending_rx: Option<PacketBuffer>,
     tx_buffer: Vec<u8>,
     packet_information: bool,
+    offload: bool,
+    gso_packets: u64,
 }
 
 impl DirectDevice {
@@ -230,6 +245,8 @@ impl DirectDevice {
             pending_rx: None,
             tx_buffer: Vec::with_capacity(mtu),
             packet_information,
+            offload: false,
+            gso_packets: 0,
         }
     }
 
@@ -244,12 +261,22 @@ impl DirectDevice {
         }
 
         // Get a buffer from the pool
-        let mut buffer = PacketBuffer::with_capacity(self.mtu + 4);
-        buffer.resize(self.mtu + 4);
+        let length = self.mtu
+            + if self.offload {
+                super::offload::HEADER_LEN + 1
+            } else {
+                4
+            };
+        let mut buffer = PacketBuffer::with_capacity(length);
+        buffer.resize(length);
 
         match read_nonblocking(self.fd, &mut buffer) {
             Ok(n) if n > 0 => {
                 buffer.truncate(n);
+                if self.offload {
+                    super::offload::validate_rx(&buffer, self.mtu)?;
+                    buffer.retain_range(super::offload::HEADER_LEN..n);
+                }
                 if self.packet_information {
                     if n < 5 || buffer[..4] != packet_header(buffer[4])? {
                         return Err(io::Error::new(
@@ -286,7 +313,11 @@ impl DirectDevice {
 
     /// Write a packet to TUN.
     fn write_packet(&self, data: &[u8]) -> io::Result<()> {
-        write_packet(self.fd, data, self.packet_information)
+        if self.offload {
+            write_framed_packet(self.fd, data, &[0; super::offload::HEADER_LEN]).map(|_| ())
+        } else {
+            write_packet(self.fd, data, self.packet_information)
+        }
     }
 }
 
@@ -296,15 +327,11 @@ impl Device for DirectDevice {
 
     fn receive(
         &mut self,
-        _timestamp: SmolInstant,
+        timestamp: SmolInstant,
     ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         let buffer = self.pending_rx.take()?;
         let rx = DirectRxToken { buffer };
-        let tx = DirectTxToken {
-            fd: self.fd,
-            packet_information: self.packet_information,
-            buffer: &mut self.tx_buffer,
-        };
+        let tx = self.transmit(timestamp)?;
         Some((rx, tx))
     }
 
@@ -313,6 +340,9 @@ impl Device for DirectDevice {
             fd: self.fd,
             packet_information: self.packet_information,
             buffer: &mut self.tx_buffer,
+            offload: self.offload,
+            segment_size: None,
+            gso_packets: &mut self.gso_packets,
         })
     }
 
@@ -322,6 +352,12 @@ impl Device for DirectDevice {
         caps.max_transmission_unit = self.mtu;
         caps.checksum.ipv4 = smoltcp::phy::Checksum::Tx;
         caps.checksum.tcp = smoltcp::phy::Checksum::Tx;
+        if self.offload {
+            caps.checksum.tcp = smoltcp::phy::Checksum::None;
+            caps.segmentation.tcpv4 = std::num::NonZeroUsize::new(super::offload::MAX_PACKET_LEN);
+            // smoltcp 0.14 does not forward IPv6 segmentation metadata.
+            caps.segmentation.tcpv6 = None;
+        }
         caps.checksum.udp = smoltcp::phy::Checksum::Tx;
         caps.checksum.icmpv4 = smoltcp::phy::Checksum::Tx;
         caps.checksum.icmpv6 = smoltcp::phy::Checksum::Tx;
@@ -347,9 +383,16 @@ struct DirectTxToken<'a> {
     fd: RawFd,
     packet_information: bool,
     buffer: &'a mut Vec<u8>,
+    offload: bool,
+    segment_size: Option<std::num::NonZeroU16>,
+    gso_packets: &'a mut u64,
 }
 
 impl TxToken for DirectTxToken<'_> {
+    fn set_meta(&mut self, meta: smoltcp::phy::PacketMeta) {
+        self.segment_size = meta.segmentation_offload_size;
+    }
+
     fn consume<R, F>(self, len: usize, f: F) -> R
     where
         F: FnOnce(&mut [u8]) -> R,
@@ -358,7 +401,19 @@ impl TxToken for DirectTxToken<'_> {
         self.buffer.resize(len, 0);
         let result = f(self.buffer);
 
-        if let Err(e) = write_packet(self.fd, self.buffer, self.packet_information) {
+        let write_result = if self.offload {
+            super::offload::tx_header(self.buffer, self.segment_size)
+                .and_then(|header| write_framed_packet(self.fd, self.buffer, &header))
+        } else {
+            write_packet(self.fd, self.buffer, self.packet_information).map(|_| true)
+        };
+        if self.segment_size.is_some() && matches!(write_result, Ok(true)) {
+            *self.gso_packets += 1;
+            if *self.gso_packets == 1 {
+                info!("TUN TCPv4 transmit segmentation active");
+            }
+        }
+        if let Err(e) = write_result {
             warn!("Failed to write to TUN: {}", e);
         }
 
@@ -371,7 +426,7 @@ const MAX_EGRESS_SWEEPS: usize = 8;
 
 /// Run the direct smoltcp stack thread.
 fn run_direct_stack_thread(
-    fd: RawFd,
+    mut device: DirectDevice,
     config: TunServerConfig,
     udp_tx: Sender<PacketBuffer>,
     running: Arc<AtomicBool>,
@@ -382,7 +437,6 @@ fn run_direct_stack_thread(
     info!("smoltcp direct stack thread initializing...");
 
     let limits = &config.resource_limits;
-    let mut device = DirectDevice::new(fd, config.mtu as usize, config.packet_information);
 
     let mut iface_config = InterfaceConfig::new(HardwareAddress::Ip);
     iface_config.random_seed = rand::random();
@@ -707,7 +761,7 @@ fn run_direct_stack_thread(
             assert!(delay.is_none(), "idle test must not rely on a timer wakeup");
             gate.pause();
         }
-        match wake_rx.wait(fd, delay.map(Into::into)) {
+        match wake_rx.wait(device.fd, delay.map(Into::into)) {
             Ok(_) => wait_error_count = 0,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
             Err(e) => {
@@ -1000,7 +1054,15 @@ fn packet_header(first_byte: u8) -> io::Result<[u8; 4]> {
 }
 
 fn write_packet(fd: RawFd, data: &[u8], packet_information: bool) -> io::Result<()> {
-    write_packet_with(data, packet_information, |header, payload| {
+    let header = match data.first() {
+        Some(first) if packet_information => Some(packet_header(*first)?),
+        _ => None,
+    };
+    write_framed_packet(fd, data, header.as_ref().map_or(&[], |v| &v[..])).map(|_| ())
+}
+
+fn write_framed_packet(fd: RawFd, data: &[u8], header: &[u8]) -> io::Result<bool> {
+    write_framed_packet_with(data, header, |header, payload| {
         let n = if header.is_empty() {
             unsafe { libc::write(fd, payload.as_ptr().cast(), payload.len()) }
         } else {
@@ -1036,10 +1098,11 @@ fn read_nonblocking(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
     }
 }
 
+#[cfg(test)]
 fn write_packet_with(
     data: &[u8],
     packet_information: bool,
-    mut write: impl FnMut(&[u8], &[u8]) -> io::Result<usize>,
+    write: impl FnMut(&[u8], &[u8]) -> io::Result<usize>,
 ) -> io::Result<()> {
     let Some(&first_byte) = data.first() else {
         return Ok(());
@@ -1050,10 +1113,21 @@ fn write_packet_with(
         None
     };
     let header = header.as_ref().map_or(&[][..], |header| &header[..]);
+    write_framed_packet_with(data, header, write).map(|_| ())
+}
+
+fn write_framed_packet_with(
+    data: &[u8],
+    header: &[u8],
+    mut write: impl FnMut(&[u8], &[u8]) -> io::Result<usize>,
+) -> io::Result<bool> {
+    if data.is_empty() {
+        return Ok(false);
+    }
     let length = header.len() + data.len();
     loop {
         match write(header, data) {
-            Ok(n) if n == length => return Ok(()),
+            Ok(n) if n == length => return Ok(true),
             // A suffix write would become a second, malformed TUN packet.
             Ok(_) => {
                 return Err(io::Error::new(
@@ -1067,7 +1141,7 @@ fn write_packet_with(
                     || error.kind() == io::ErrorKind::WouldBlock =>
             {
                 trace!("TUN write {}, packet dropped", error);
-                return Ok(());
+                return Ok(false);
             }
             Err(error) => return Err(error),
         }
@@ -1081,12 +1155,134 @@ mod tests {
     use std::os::unix::io::IntoRawFd;
     use std::os::unix::net::{UnixDatagram, UnixStream};
 
+    #[test]
+    fn dropped_framed_writes_are_not_counted_as_transmitted() {
+        for error in [libc::EAGAIN, libc::ENOBUFS] {
+            assert!(
+                !write_framed_packet_with(b"packet", &[0; 10], |_, _| {
+                    Err(io::Error::from_raw_os_error(error))
+                })
+                .unwrap()
+            );
+        }
+        assert!(
+            write_framed_packet_with(b"packet", &[0; 10], |header, data| {
+                Ok(header.len() + data.len())
+            })
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn interface_forwards_ipv4_segmentation_and_keeps_ipv6_mtu() {
+        for ipv6 in [false, true] {
+            let (peer, tun) = UnixDatagram::pair().unwrap();
+            let frame_capacity =
+                super::super::offload::HEADER_LEN + super::super::offload::MAX_PACKET_LEN;
+            // macOS defaults cannot hold a full offloaded datagram.
+            socket2::SockRef::from(&tun)
+                .set_send_buffer_size(frame_capacity)
+                .unwrap();
+            socket2::SockRef::from(&peer)
+                .set_recv_buffer_size(frame_capacity)
+                .unwrap();
+            peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+            let mut device = DirectDevice::new(tun.as_raw_fd(), 1500, false);
+            device.offload = true;
+            let now = SmolInstant::from_millis(1);
+            let mut iface =
+                Interface::new(InterfaceConfig::new(HardwareAddress::Ip), &mut device, now);
+            let (src, dst): (SocketAddr, SocketAddr) = if ipv6 {
+                (
+                    "[fd00::2]:1001".parse().unwrap(),
+                    "[fd00::3]:443".parse().unwrap(),
+                )
+            } else {
+                (
+                    "192.0.2.1:1001".parse().unwrap(),
+                    "198.51.100.2:443".parse().unwrap(),
+                )
+            };
+            iface.update_ip_addrs(|addresses| {
+                addresses.push(IpCidr::new(dst.ip().into(), 0)).unwrap();
+            });
+            let mut sockets = SocketSet::new(vec![]);
+            let (connection, _) =
+                create_tcp_connection(src, dst, &mut sockets, &Wake::new().unwrap().0, 65536)
+                    .unwrap();
+            let packet = |ack: Option<u32>| {
+                let builder = match (src.ip(), dst.ip()) {
+                    (std::net::IpAddr::V4(src), std::net::IpAddr::V4(dst)) => {
+                        etherparse::PacketBuilder::ipv4(src.octets(), dst.octets(), 64)
+                    }
+                    (std::net::IpAddr::V6(src), std::net::IpAddr::V6(dst)) => {
+                        etherparse::PacketBuilder::ipv6(src.octets(), dst.octets(), 64)
+                    }
+                    _ => unreachable!(),
+                };
+                let tcp = builder.tcp(1001, 443, if ack.is_some() { 102 } else { 101 }, 65535);
+                let tcp = if let Some(ack) = ack {
+                    tcp.ack(ack)
+                } else {
+                    tcp.syn()
+                };
+                let mut data = Vec::new();
+                tcp.write(&mut data, b"").unwrap();
+                PacketBuffer::copy_from_slice(&data)
+            };
+            device.store_packet(packet(None));
+            iface.poll(now, &mut device, &mut sockets);
+            let mut frame = vec![0; frame_capacity];
+            let n = peer.recv(&mut frame).unwrap();
+            let ip_len = if ipv6 { 40 } else { 20 };
+            let syn_ack = TcpPacket::new_checked(&frame[10 + ip_len..n]).unwrap();
+            let ack = (syn_ack.seq_number().0 as u32).wrapping_add(1);
+            device.store_packet(packet(Some(ack)));
+            iface.poll(now, &mut device, &mut sockets);
+            let socket = sockets.get_mut::<TcpSocket>(connection.handle);
+            assert_eq!(socket.state(), TcpState::Established);
+            socket.send_slice(&vec![23; 16001]).unwrap();
+            iface.poll_egress(now, &mut device, &mut sockets);
+            let n = peer.recv(&mut frame).unwrap();
+            assert_eq!(frame[0], 1);
+            if ipv6 {
+                assert!(n <= 1510);
+                assert_eq!(frame[1], 0);
+                assert_eq!(device.gso_packets, 0);
+            } else {
+                assert!(n > 1510, "native segmentation not used: {n}");
+                assert_eq!(frame[1], 1);
+                assert_eq!(device.gso_packets, 1);
+            }
+        }
+    }
+
+    #[test]
+    fn virtio_framing_is_present_on_udp_and_validated_on_ingress() {
+        let (peer, tun) = UnixDatagram::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let mut device = DirectDevice::new(tun.as_raw_fd(), 1500, false);
+        device.offload = true;
+        let packet = [0x45, 1, 2, 3];
+        device.write_packet(&packet).unwrap();
+        let mut frame = [0; 64];
+        let n = peer.recv(&mut frame).unwrap();
+        assert_eq!(n, 14);
+        assert_eq!(&frame[..10], &[0; 10]);
+        peer.send(&frame[..n]).unwrap();
+        assert_eq!(&device.try_recv().unwrap().unwrap()[..], &packet);
+        frame[0] = 1;
+        peer.send(&frame[..n]).unwrap();
+        assert!(device.try_recv().is_err());
+    }
+
     fn stack_at_wait(tun: OwnedFd) -> (TcpStackDirect, GateControl) {
         let (wake, mut receiver) = Wake::new().unwrap();
         let (gate, control) = TestGate::new();
         receiver.before_wait = Some(gate);
         set_nonblocking(tun.as_raw_fd()).unwrap();
-        let stack = TcpStackDirect::start(tun, TunServerConfig::new(), wake, receiver).unwrap();
+        let stack =
+            TcpStackDirect::start(tun, TunServerConfig::new(), wake, receiver, false).unwrap();
         control.wait();
         (stack, control)
     }
@@ -1624,7 +1820,8 @@ mod tests {
         wake.notify();
         tun.set_nonblocking(true).unwrap();
         let mut stack =
-            TcpStackDirect::start(tun.into(), TunServerConfig::new(), wake, receiver).unwrap();
+            TcpStackDirect::start(tun.into(), TunServerConfig::new(), wake, receiver, false)
+                .unwrap();
         setup.wait();
         let (tx, rx) = mpsc::channel(PACKET_QUEUE_CAPACITY);
         stack.set_udp_response_tx(rx);

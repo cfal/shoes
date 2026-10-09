@@ -28,6 +28,7 @@
 //!   Use `TunServerConfig::packet_information(true)` if using the socket FD
 //!   directly, or `false` if using the readPackets/writePackets API.
 
+mod offload;
 mod packet;
 mod tcp_conn;
 mod tcp_stack_direct;
@@ -63,6 +64,8 @@ pub use platform::{
 pub use tun_server::TunServerConfig;
 
 use std::net::SocketAddr;
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
 use std::os::fd::{BorrowedFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::sync::Arc;
 
@@ -107,23 +110,37 @@ async fn run_tun_server_inner(
     ready: &mut Option<oneshot::Sender<std::io::Result<()>>>,
 ) -> std::io::Result<()> {
     config.resource_limits.validate()?;
+    let offload = config.offload_enabled()?;
     info!(
         "Starting TUN server (direct mode): mtu={}, tcp={}, udp={}, icmp={}",
         config.mtu, config.tcp_enabled, config.udp_enabled, config.icmp_enabled
     );
 
-    let fd = if let Some(fd) = config.raw_fd {
+    let (fd, offload) = if let Some(fd) = config.raw_fd {
         info!("Using provided raw FD: {}", fd);
-        if config.close_fd_on_drop {
+        let fd = if config.close_fd_on_drop {
             unsafe { OwnedFd::from_raw_fd(fd) }
         } else {
             unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned()?
-        }
+        };
+        (fd, false)
     } else {
-        let tun_device = config.create_sync_device()?;
-        let fd = tun_device.into_raw_fd();
-        info!("Created TUN device with FD: {}", fd);
-        unsafe { OwnedFd::from_raw_fd(fd) }
+        let create = |offload| -> std::io::Result<OwnedFd> {
+            let device = config.create_device(offload)?;
+            #[cfg(target_os = "linux")]
+            if offload {
+                offload::configure(device.as_raw_fd())?;
+            }
+            Ok(unsafe { OwnedFd::from_raw_fd(device.into_raw_fd()) })
+        };
+        match create(offload) {
+            Ok(fd) => (fd, offload),
+            Err(error) if offload && config.segmentation_offload.is_none() => {
+                log::warn!("TUN transmit offload unavailable: {error}; using ordinary packets");
+                (create(false)?, false)
+            }
+            Err(error) => return Err(error),
+        }
     };
 
     // Creates the direct TCP stack in a dedicated thread.
@@ -131,7 +148,7 @@ async fn run_tun_server_inner(
     if config.raw_fd.is_none() && cfg!(any(target_os = "macos", target_os = "ios")) {
         stack_config.packet_information = true;
     }
-    let mut tcp_stack = TcpStackDirect::with_config(fd, stack_config)?;
+    let mut tcp_stack = TcpStackDirect::with_offload(fd, stack_config, offload)?;
 
     // Get UDP receiver (stack thread filters UDP and sends here)
     let udp_from_stack_rx = tcp_stack.take_udp_rx().expect("udp_rx already taken");
@@ -397,6 +414,7 @@ async fn run_tun_from_config_inner(
         .icmp_enabled(config.icmp_enabled)
         .close_fd_on_drop(close_fd_on_drop);
     tun_server_config.resource_limits = config.resource_limits;
+    tun_server_config.segmentation_offload = config.segmentation_offload;
 
     if let Some(ref name) = config.device_name {
         tun_server_config = tun_server_config.tun_name(name.clone());
@@ -533,6 +551,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn startup_propagates_required_offload_validation_failure() {
+        let (_peer, device) = std::os::unix::net::UnixDatagram::pair().unwrap();
+        let config: TunConfig = serde_yaml::from_str(&format!(
+            "device_fd: {}\nsegmentation_offload: true\n",
+            device.as_raw_fd()
+        ))
+        .unwrap();
+        let result =
+            start_tun_server(config, Arc::new(crate::resolver::NativeResolver::new())).await;
+        match result {
+            Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput),
+            Ok(handle) => {
+                handle.abort();
+                let _ = handle.await;
+                panic!("TUN startup incorrectly succeeded");
+            }
+        }
+        assert!(unsafe { libc::fcntl(device.as_raw_fd(), libc::F_GETFD) } >= 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn startup_propagates_device_creation_failure() {
+        let config: TunConfig = serde_yaml::from_str(&format!(
+            "device_name: {}\nsegmentation_offload: true\n",
+            "x".repeat(libc::IFNAMSIZ + 1)
+        ))
+        .unwrap();
+        let result =
+            start_tun_server(config, Arc::new(crate::resolver::NativeResolver::new())).await;
+        match result {
+            Err(error) => assert!(error.to_string().contains("Failed to create TUN device")),
+            Ok(handle) => {
+                handle.abort();
+                let _ = handle.await;
+                panic!("TUN startup incorrectly succeeded");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_initializes_device_before_returning_and_abort_releases_it() {
+        use std::io::Read;
+        let (mut peer, device) = std::os::unix::net::UnixStream::pair().unwrap();
+        peer.set_nonblocking(true).unwrap();
+        let fd = device.into_raw_fd();
+        let config: TunConfig = serde_yaml::from_str(&format!("device_fd: {fd}\n")).unwrap();
+        let handle = start_tun_server(config, Arc::new(crate::resolver::NativeResolver::new()))
+            .await
+            .unwrap();
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        handle.abort();
+        assert!(handle.await.unwrap_err().is_cancelled());
+        assert!(flags >= 0 && flags & libc::O_NONBLOCK != 0);
+        assert_eq!(peer.read(&mut [0]).unwrap(), 0);
+    }
+
+    #[tokio::test]
     async fn borrowed_tun_fd_remains_open_after_stop() {
         let (_peer, client) = std::os::unix::net::UnixStream::pair().unwrap();
         let config = TunServerConfig::new()
@@ -549,5 +625,27 @@ mod tests {
         .await
         .unwrap();
         assert!(unsafe { libc::fcntl(client.as_raw_fd(), libc::F_GETFD) } >= 0);
+    }
+
+    #[tokio::test]
+    async fn explicit_offload_rejects_provided_fd_before_taking_ownership() {
+        for close in [false, true] {
+            let (_peer, client) = std::os::unix::net::UnixDatagram::pair().unwrap();
+            let config = TunServerConfig::new()
+                .raw_fd(client.as_raw_fd())
+                .close_fd_on_drop(close)
+                .segmentation_offload(true);
+            let (_tx, rx) = oneshot::channel();
+            let error = run_tun_server(
+                config,
+                Arc::new(ClientProxySelector::new(Vec::new())),
+                Arc::new(crate::resolver::NativeResolver::new()),
+                rx,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(unsafe { libc::fcntl(client.as_raw_fd(), libc::F_GETFD) } >= 0);
+        }
     }
 }

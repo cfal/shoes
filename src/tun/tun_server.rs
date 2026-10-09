@@ -45,6 +45,8 @@ use tun::{Configuration as TunConfiguration, Device};
 /// options. See module-level documentation for usage examples.
 #[derive(Clone, Debug)]
 pub struct TunServerConfig {
+    /// None selects offload automatically for created Linux devices.
+    pub segmentation_offload: Option<bool>,
     pub resource_limits: crate::config::tun::TunResourceLimits,
     /// MTU size for the TUN interface.
     /// Default: platform-specific (iOS: 4064, Android: 9000, others: 1500)
@@ -108,6 +110,7 @@ impl Default for TunServerConfig {
         let default_mtu = 1500;
 
         Self {
+            segmentation_offload: None,
             resource_limits: Default::default(),
             mtu: default_mtu,
             tcp_enabled: true,
@@ -125,6 +128,26 @@ impl Default for TunServerConfig {
 }
 
 impl TunServerConfig {
+    #[allow(dead_code)] // Public library API.
+    pub fn segmentation_offload(mut self, enabled: bool) -> Self {
+        self.segmentation_offload = Some(enabled);
+        self
+    }
+
+    pub(crate) fn offload_enabled(&self) -> std::io::Result<bool> {
+        let eligible =
+            cfg!(target_os = "linux") && self.raw_fd.is_none() && !self.packet_information;
+        if self.segmentation_offload == Some(true) && !eligible {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "TUN segmentation offload requires a created Linux device without packet information",
+            ));
+        }
+        Ok(self
+            .segmentation_offload
+            .unwrap_or(eligible && self.tcp_enabled))
+    }
+
     /// Create a new TunServerConfig with default values.
     pub fn new() -> Self {
         Self::default()
@@ -210,9 +233,15 @@ impl TunServerConfig {
 
     /// Create a synchronous TUN device from this configuration.
     ///
-    /// This is used by the direct mode stack which reads/writes directly
-    /// from the TUN fd using select() for event-driven I/O.
+    /// Returns ordinary IP framing. Segmentation offload is managed by `run_tun_server`.
+    #[allow(dead_code)] // Public library API.
     pub fn create_sync_device(&self) -> std::io::Result<Device> {
+        self.create_device(false)
+    }
+
+    pub(super) fn create_device(&self, offload: bool) -> std::io::Result<Device> {
+        #[cfg(not(target_os = "linux"))]
+        let _ = offload;
         let mut config = TunConfiguration::default();
         config.mtu(self.mtu);
 
@@ -232,6 +261,7 @@ impl TunServerConfig {
             }
             config.platform_config(|p| {
                 p.ensure_root_privileges(true);
+                p.vnet_hdr(offload);
             });
             config.up();
         }
@@ -276,5 +306,58 @@ impl TunServerConfig {
 
         tun::create(&config)
             .map_err(|e| std::io::Error::other(format!("Failed to create TUN device: {}", e)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[ignore = "requires CAP_NET_ADMIN and /dev/net/tun"]
+    fn public_device_factory_preserves_unframed_packets() {
+        use std::os::fd::AsRawFd;
+        for config in [
+            TunServerConfig::new(),
+            TunServerConfig::new().segmentation_offload(true),
+        ] {
+            let device = config.create_sync_device().unwrap();
+            let mut request: libc::ifreq = unsafe { std::mem::zeroed() };
+            assert_eq!(
+                unsafe { libc::ioctl(device.as_raw_fd(), libc::TUNGETIFF, &mut request) },
+                0
+            );
+            assert_eq!(
+                unsafe { request.ifr_ifru.ifru_flags } as libc::c_int & libc::IFF_VNET_HDR,
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn offload_selection_never_mutates_provided_descriptors() {
+        let owned = TunServerConfig::new();
+        assert_eq!(owned.offload_enabled().unwrap(), cfg!(target_os = "linux"));
+        assert!(
+            !owned
+                .clone()
+                .segmentation_offload(false)
+                .offload_enabled()
+                .unwrap()
+        );
+        for close in [false, true] {
+            let provided = owned.clone().raw_fd(-1).close_fd_on_drop(close);
+            assert!(!provided.offload_enabled().unwrap());
+            assert!(
+                provided
+                    .segmentation_offload(true)
+                    .offload_enabled()
+                    .is_err()
+            );
+        }
+        let framed = owned.packet_information(true);
+        assert!(!framed.offload_enabled().unwrap());
+        assert!(framed.segmentation_offload(true).offload_enabled().is_err());
     }
 }

@@ -63,6 +63,14 @@ pub struct ProcessGuard {
 }
 
 impl ProcessGuard {
+    #[cfg(target_os = "linux")]
+    pub fn process_group_id(&self) -> Option<i32> {
+        match self.cleanup_target {
+            CleanupTarget::ProcessGroup { id, .. } => Some(id),
+            CleanupTarget::Child => None,
+        }
+    }
+
     pub fn new(process: Child, name: impl Into<String>) -> Self {
         let name = name.into();
         eprintln!("[GUARD] Created guard for {} (PID: {})", name, process.id());
@@ -152,7 +160,7 @@ impl Drop for ProcessGuard {
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn spawn_privileged_process(
+pub fn spawn_privileged_process(
     program: &Path,
     name: impl Into<String>,
     configure: impl FnOnce(&mut Command),
@@ -196,7 +204,7 @@ pub(crate) fn spawn_privileged_process(
 }
 
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn spawn_privileged_process(
+pub fn spawn_privileged_process(
     _program: &Path,
     _name: impl Into<String>,
     _configure: impl FnOnce(&mut Command),
