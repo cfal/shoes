@@ -32,6 +32,11 @@ struct CopyBuffer {
 }
 
 impl CopyBuffer {
+    #[cfg(target_os = "linux")]
+    fn can_handoff(&self) -> bool {
+        !self.read_done && self.cache_length == 0 && !self.need_flush && !self.need_write_ping
+    }
+
     pub fn new(size: usize, need_initial_flush: bool) -> Self {
         let buf = allocate_vec(size);
         Self {
@@ -192,6 +197,12 @@ enum TransferState {
     Done,
 }
 
+enum CopyOutcome {
+    Complete,
+    #[cfg(target_os = "linux")]
+    Splice,
+}
+
 struct CopyBidirectional<'a, A: ?Sized, B: ?Sized> {
     a: &'a mut A,
     b: &'a mut B,
@@ -200,6 +211,42 @@ struct CopyBidirectional<'a, A: ?Sized, B: ?Sized> {
     a_to_b: TransferState,
     b_to_a: TransferState,
     sleep_future: Option<Pin<Box<tokio::time::Sleep>>>,
+    #[cfg(target_os = "linux")]
+    allow_splice: bool,
+}
+
+impl<'a, A: AsyncStream + ?Sized, B: AsyncStream + ?Sized> CopyBidirectional<'a, A, B> {
+    fn new(
+        a: &'a mut A,
+        b: &'a mut B,
+        a_need_initial_flush: bool,
+        b_need_initial_flush: bool,
+        a_to_b_buf_size: usize,
+        b_to_a_buf_size: usize,
+    ) -> Self {
+        let sleep_future = if a.supports_ping() || b.supports_ping() {
+            Some(Box::pin(tokio::time::sleep(
+                std::time::Duration::from_secs(60),
+            )))
+        } else {
+            None
+        };
+
+        let a_to_b_buf_size = copy_buffer_size(a_to_b_buf_size, b);
+        let b_to_a_buf_size = copy_buffer_size(b_to_a_buf_size, a);
+        Self {
+            a,
+            b,
+            // Each buffer's flush obligation belongs to its writer, not its reader.
+            a_buf: CopyBuffer::new(a_to_b_buf_size, b_need_initial_flush),
+            b_buf: CopyBuffer::new(b_to_a_buf_size, a_need_initial_flush),
+            a_to_b: TransferState::Running,
+            b_to_a: TransferState::Running,
+            sleep_future,
+            #[cfg(target_os = "linux")]
+            allow_splice: false,
+        }
+    }
 }
 
 fn transfer_one_direction<A, B>(
@@ -247,7 +294,7 @@ where
     A: AsyncStream + ?Sized,
     B: AsyncStream + ?Sized,
 {
-    type Output = io::Result<()>;
+    type Output = io::Result<CopyOutcome>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let CopyBidirectional {
@@ -258,6 +305,8 @@ where
             a_to_b,
             b_to_a,
             sleep_future,
+            #[cfg(target_os = "linux")]
+            allow_splice,
         } = &mut *self;
 
         if let Some(sleep) = sleep_future {
@@ -273,14 +322,33 @@ where
             }
         }
 
-        let a_to_b = transfer_one_direction(cx, a_to_b, &mut *a_buf, &mut *a, &mut *b);
-        let b_to_a = transfer_one_direction(cx, b_to_a, &mut *b_buf, &mut *b, &mut *a);
+        let a_result = transfer_one_direction(cx, a_to_b, &mut *a_buf, &mut *a, &mut *b);
+        let b_result = transfer_one_direction(cx, b_to_a, &mut *b_buf, &mut *b, &mut *a);
 
-        match (a_to_b, b_to_a) {
-            (Poll::Ready(Err(e)), _) | (_, Poll::Ready(Err(e))) => Poll::Ready(Err(e)),
-            (Poll::Ready(Ok(())), Poll::Ready(Ok(()))) => Poll::Ready(Ok(())),
-            _ => Poll::Pending,
+        match (a_result, b_result) {
+            (Poll::Ready(Err(e)), _) | (_, Poll::Ready(Err(e))) => return Poll::Ready(Err(e)),
+            (Poll::Ready(Ok(())), Poll::Ready(Ok(()))) => {
+                return Poll::Ready(Ok(CopyOutcome::Complete));
+            }
+            _ => {}
         }
+
+        // A final transition read/flush can return Pending without another
+        // packet to wake us. Recheck after both directions have been polled.
+        #[cfg(target_os = "linux")]
+        if *allow_splice
+            && matches!(a_to_b, TransferState::Running)
+            && matches!(b_to_a, TransferState::Running)
+            && a_buf.can_handoff()
+            && b_buf.can_handoff()
+            && !a.supports_ping()
+            && !b.supports_ping()
+            && a.plain_tcp().is_some()
+            && b.plain_tcp().is_some()
+        {
+            return Poll::Ready(Ok(CopyOutcome::Splice));
+        }
+        Poll::Pending
     }
 }
 
@@ -323,21 +391,39 @@ where
         return crate::splice::copy_bidirectional(a, b).await;
     }
 
-    copy_bidirectional_with_sizes(
+    let copy = CopyBidirectional::new(
         a,
         b,
         a_need_initial_flush,
         b_need_initial_flush,
         DEFAULT_BUF_SIZE,
         DEFAULT_BUF_SIZE,
-    )
-    .await
+    );
+    #[cfg(target_os = "linux")]
+    let copy = CopyBidirectional {
+        allow_splice: true,
+        ..copy
+    };
+    match copy.await? {
+        CopyOutcome::Complete => Ok(()),
+        #[cfg(target_os = "linux")]
+        CopyOutcome::Splice => {
+            // The buffered stage may have exhausted its byte quota in this poll.
+            tokio::task::yield_now().await;
+            crate::splice::copy_bidirectional(
+                a.plain_tcp().expect("raw stream after handoff"),
+                b.plain_tcp().expect("raw stream after handoff"),
+            )
+            .await
+        }
+    }
 }
 
 /// Copies data in both directions between `a` and `b` using buffers of the specified size.
 ///
 /// This method is the same as the [`copy_bidirectional()`], except that it allows you to set the
 /// size of the internal buffers used when copying data.
+/// This path always uses buffered copying, including after protocol transitions.
 pub async fn copy_bidirectional_with_sizes<A, B>(
     a: &mut A,
     b: &mut B,
@@ -350,29 +436,16 @@ where
     A: AsyncStream + ?Sized,
     B: AsyncStream + ?Sized,
 {
-    let sleep_future = if a.supports_ping() || b.supports_ping() {
-        Some(Box::pin(tokio::time::sleep(
-            std::time::Duration::from_secs(60),
-        )))
-    } else {
-        None
-    };
-
-    let a_to_b_buf_size = copy_buffer_size(a_to_b_buf_size, b);
-    let b_to_a_buf_size = copy_buffer_size(b_to_a_buf_size, a);
-    CopyBidirectional {
+    CopyBidirectional::new(
         a,
         b,
-        // this is correctly reversed - CopyBuffer will copy from a (reader) to b (writer) using
-        // a_buf, which means that the need_flush signal is for the writer (b), and vice versa for
-        // b_buf.
-        a_buf: CopyBuffer::new(a_to_b_buf_size, b_need_initial_flush),
-        b_buf: CopyBuffer::new(b_to_a_buf_size, a_need_initial_flush),
-        a_to_b: TransferState::Running,
-        b_to_a: TransferState::Running,
-        sleep_future,
-    }
+        a_need_initial_flush,
+        b_need_initial_flush,
+        a_to_b_buf_size,
+        b_to_a_buf_size,
+    )
     .await
+    .map(|_| ())
 }
 
 fn copy_buffer_size(requested: usize, writer: &(impl AsyncStream + ?Sized)) -> usize {
@@ -389,6 +462,23 @@ pub(crate) mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn handoff_requires_empty_open_buffers_without_flush_or_ping_debt() {
+        let mut buffer = CopyBuffer::new(16, true);
+        assert!(!buffer.can_handoff());
+        buffer.need_flush = false;
+        assert!(buffer.can_handoff());
+        buffer.cache_length = 1;
+        assert!(!buffer.can_handoff());
+        buffer.cache_length = 0;
+        buffer.need_write_ping = true;
+        assert!(!buffer.can_handoff());
+        buffer.need_write_ping = false;
+        buffer.read_done = true;
+        assert!(!buffer.can_handoff());
+    }
 
     #[derive(Default)]
     pub(crate) struct Capture {

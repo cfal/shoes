@@ -187,6 +187,7 @@ impl AsyncShutdownMessage for UdpSocket {
 
 pub trait AsyncStream: AsyncRead + AsyncWrite + AsyncPing + Unpin + Send + Sync {
     /// All remaining I/O is raw socket I/O, with no buffered bytes or wrapper side effects.
+    /// May become available after a protocol transition and its buffered I/O have drained.
     #[cfg(target_os = "linux")]
     fn plain_tcp(&self) -> Option<&TcpStream> {
         None
