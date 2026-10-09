@@ -551,6 +551,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn startup_propagates_required_offload_validation_failure() {
+        let (_peer, device) = std::os::unix::net::UnixDatagram::pair().unwrap();
+        let config: TunConfig = serde_yaml::from_str(&format!(
+            "device_fd: {}\nsegmentation_offload: true\n",
+            device.as_raw_fd()
+        ))
+        .unwrap();
+        let result =
+            start_tun_server(config, Arc::new(crate::resolver::NativeResolver::new())).await;
+        match result {
+            Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput),
+            Ok(handle) => {
+                handle.abort();
+                let _ = handle.await;
+                panic!("TUN startup incorrectly succeeded");
+            }
+        }
+        assert!(unsafe { libc::fcntl(device.as_raw_fd(), libc::F_GETFD) } >= 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn startup_propagates_device_creation_failure() {
+        let config: TunConfig = serde_yaml::from_str(&format!(
+            "device_name: {}\nsegmentation_offload: true\n",
+            "x".repeat(libc::IFNAMSIZ + 1)
+        ))
+        .unwrap();
+        let result =
+            start_tun_server(config, Arc::new(crate::resolver::NativeResolver::new())).await;
+        match result {
+            Err(error) => assert!(error.to_string().contains("Failed to create TUN device")),
+            Ok(handle) => {
+                handle.abort();
+                let _ = handle.await;
+                panic!("TUN startup incorrectly succeeded");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_initializes_device_before_returning_and_abort_releases_it() {
+        use std::io::Read;
+        let (mut peer, device) = std::os::unix::net::UnixStream::pair().unwrap();
+        peer.set_nonblocking(true).unwrap();
+        let fd = device.into_raw_fd();
+        let config: TunConfig = serde_yaml::from_str(&format!("device_fd: {fd}\n")).unwrap();
+        let handle = start_tun_server(config, Arc::new(crate::resolver::NativeResolver::new()))
+            .await
+            .unwrap();
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        handle.abort();
+        assert!(handle.await.unwrap_err().is_cancelled());
+        assert!(flags >= 0 && flags & libc::O_NONBLOCK != 0);
+        assert_eq!(peer.read(&mut [0]).unwrap(), 0);
+    }
+
+    #[tokio::test]
     async fn borrowed_tun_fd_remains_open_after_stop() {
         let (_peer, client) = std::os::unix::net::UnixStream::pair().unwrap();
         let config = TunServerConfig::new()
