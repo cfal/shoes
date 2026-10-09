@@ -144,6 +144,8 @@ protocol:
 
 **Note:** VMess AEAD mode is always enabled. The legacy `force_aead` field is deprecated and non-AEAD mode is no longer supported.
 
+Replay protection uses a process-wide cache of at most 65,536 Auth-IDs, shared across credentials, listeners, and reloads. Entries remain protected through their timestamp's 120-second validity window; future-dated IDs can occupy a slot for about four minutes. A full cache rejects new authentication rather than evicting live entries. Heavy traffic from one credential can therefore exhaust capacity for other VMess users in the same process. A backward system-clock step also pauses authentication until the clock catches up.
+
 ### VLESS
 ```yaml
 protocol:
