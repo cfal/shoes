@@ -62,9 +62,9 @@ async fn sing_box_padded_single_carrier_survives_concurrent_streams()
         let (_, socks_port) = ports.get_localhost_listener_port();
         let echo = start_tcp_stream_echo_server("0.0.0.0", 0).await?;
         let udp_echo = start_udp_echo_server("0.0.0.0", 0).await?;
-        let (cert, key) = generate_test_cert_files()?;
-        let cert = AsRef::<Path>::as_ref(&cert).display();
-        let key = AsRef::<Path>::as_ref(&key).display();
+        let (cert_path, key_path) = generate_test_cert_files()?;
+        let cert = AsRef::<Path>::as_ref(&cert_path).display();
+        let key = AsRef::<Path>::as_ref(&key_path).display();
         let config = format!(
             r#"- address: '0.0.0.0:{shoes_port}'
   protocol:

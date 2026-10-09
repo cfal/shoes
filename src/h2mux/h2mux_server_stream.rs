@@ -140,12 +140,12 @@ mod tests {
     use tokio::time::{Duration, timeout};
 
     async fn stream_pair(
-        window: u32,
+        receive_window: u32,
         drivers: &mut JoinSet<()>,
     ) -> (H2MuxServerStream, h2::RecvStream, h2::SendStream<Bytes>) {
         let (client, server) = tokio::io::duplex(65536);
         let (mut sender, connection) = h2::client::Builder::new()
-            .initial_window_size(window)
+            .initial_window_size(receive_window)
             .handshake(client)
             .await
             .unwrap();
@@ -179,6 +179,19 @@ mod tests {
         )
     }
 
+    async fn read_response_body(response: &mut h2::RecvStream) -> Vec<u8> {
+        let mut body = Vec::new();
+        while let Some(chunk) = response.data().await {
+            let chunk = chunk.unwrap();
+            response
+                .flow_control()
+                .release_capacity(chunk.len())
+                .unwrap();
+            body.extend_from_slice(&chunk);
+        }
+        body
+    }
+
     #[tokio::test]
     async fn status_only_write_waits_for_payload_credit() {
         timeout(Duration::from_secs(5), async {
@@ -198,16 +211,8 @@ mod tests {
             };
             let receive = async {
                 response.flow_control().release_capacity(1).unwrap();
-                let mut data = Vec::new();
-                while let Some(chunk) = response.data().await {
-                    let chunk = chunk.unwrap();
-                    response
-                        .flow_control()
-                        .release_capacity(chunk.len())
-                        .unwrap();
-                    data.extend_from_slice(&chunk);
-                }
-                assert_eq!(data, b"first responsesecond response");
+                let body = read_response_body(&mut response).await;
+                assert_eq!(body, b"first responsesecond response");
             };
             tokio::join!(send, receive);
             drivers.shutdown().await;
@@ -283,16 +288,8 @@ mod tests {
                     stream.shutdown().await.unwrap();
                 };
                 let receive = async {
-                    let mut received = Vec::new();
-                    while let Some(chunk) = response.data().await {
-                        let chunk = chunk.unwrap();
-                        response
-                            .flow_control()
-                            .release_capacity(chunk.len())
-                            .unwrap();
-                        received.extend_from_slice(&chunk);
-                    }
-                    assert_eq!(received, b"\0firstsecond");
+                    let body = read_response_body(&mut response).await;
+                    assert_eq!(body, b"\0firstsecond");
                 };
                 tokio::join!(send, receive);
                 drivers.shutdown().await;
