@@ -1177,6 +1177,15 @@ mod tests {
     fn interface_forwards_ipv4_segmentation_and_keeps_ipv6_mtu() {
         for ipv6 in [false, true] {
             let (peer, tun) = UnixDatagram::pair().unwrap();
+            let frame_capacity =
+                super::super::offload::HEADER_LEN + super::super::offload::MAX_PACKET_LEN;
+            // macOS defaults cannot hold a full offloaded datagram.
+            socket2::SockRef::from(&tun)
+                .set_send_buffer_size(frame_capacity)
+                .unwrap();
+            socket2::SockRef::from(&peer)
+                .set_recv_buffer_size(frame_capacity)
+                .unwrap();
             peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
             let mut device = DirectDevice::new(tun.as_raw_fd(), 1500, false);
             device.offload = true;
@@ -1223,7 +1232,7 @@ mod tests {
             };
             device.store_packet(packet(None));
             iface.poll(now, &mut device, &mut sockets);
-            let mut frame = vec![0; 65545];
+            let mut frame = vec![0; frame_capacity];
             let n = peer.recv(&mut frame).unwrap();
             let ip_len = if ipv6 { 40 } else { 20 };
             let syn_ack = TcpPacket::new_checked(&frame[10 + ip_len..n]).unwrap();
