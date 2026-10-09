@@ -354,6 +354,99 @@ mod tests {
         .unwrap();
     }
 
+    #[test]
+    fn saturated_pipe_budget_falls_back_and_recovers() {
+        if std::env::var_os("SHOES_SPLICE_SATURATION_CHILD").is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "splice::tests::saturated_pipe_budget_falls_back_and_recovers",
+                    "--nocapture",
+                ])
+                .env("SHOES_SPLICE_SATURATION_CHILD", "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+
+        struct Saturated(AtomicUsize);
+        impl Operations for Saturated {
+            fn pipe(&self) -> io::Result<Pipe> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                let error = Pipe::new().err().expect("pipe budget was not exhausted");
+                assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+                Err(error)
+            }
+
+            fn splice(&self, _: RawFd, _: RawFd, _: usize) -> io::Result<usize> {
+                panic!("saturated relay must use buffered I/O");
+            }
+        }
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                assert_eq!(PIPE_BUDGET.available_permits(), 128);
+                let pipes: Vec<_> = (0..128).map(|_| Pipe::new().unwrap()).collect();
+                let descriptors: Vec<_> = pipes
+                    .iter()
+                    .flat_map(|pipe| [pipe.read.as_raw_fd(), pipe.write.as_raw_fd()])
+                    .collect();
+                assert_eq!(PIPE_BUDGET.available_permits(), 0);
+                assert_eq!(Pipe::new().err().unwrap().kind(), io::ErrorKind::WouldBlock);
+
+                let (mut left, a) = pair(false).await;
+                let (b, mut right) = pair(false).await;
+                let request = payload(256_123, 17);
+                let response = payload(300_007, 239);
+                let operations = Saturated(AtomicUsize::new(0));
+                timeout(Duration::from_secs(10), async {
+                    left.write_all(&request[..BUFFER_SIZE]).await.unwrap();
+                    let (result, (), ()) = tokio::join!(
+                        async {
+                            tokio::try_join!(
+                                copy_direction(&a, &b, &operations),
+                                copy_direction(&b, &a, &operations)
+                            )
+                        },
+                        async {
+                            left.write_all(&request[BUFFER_SIZE..]).await.unwrap();
+                            left.shutdown().await.unwrap();
+                            let mut received = Vec::new();
+                            left.read_to_end(&mut received).await.unwrap();
+                            assert_eq!(received, response);
+                        },
+                        async {
+                            let mut received = Vec::new();
+                            right.read_to_end(&mut received).await.unwrap();
+                            assert_eq!(received, request);
+                            right.write_all(&response).await.unwrap();
+                            right.shutdown().await.unwrap();
+                        }
+                    );
+                    result.unwrap();
+                })
+                .await
+                .unwrap();
+                assert_eq!(operations.0.load(Ordering::Relaxed), 2);
+                assert_eq!(PIPE_BUDGET.available_permits(), 0);
+
+                drop(pipes);
+                assert_eq!(PIPE_BUDGET.available_permits(), 128);
+                for fd in descriptors {
+                    assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
+                    assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+                }
+                let recovered: Vec<_> = (0..128).map(|_| Pipe::new().unwrap()).collect();
+                assert_eq!(PIPE_BUDGET.available_permits(), 0);
+                drop(recovered);
+                assert_eq!(PIPE_BUDGET.available_permits(), 128);
+            });
+    }
+
     struct Faults {
         error_at: usize,
         error: i32,
