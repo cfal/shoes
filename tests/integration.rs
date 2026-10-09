@@ -14,6 +14,8 @@ mod naiveproxy;
 mod plain_tcp_relay;
 #[path = "cases/integration/quic_udp_routing_test.rs"]
 mod quic_udp_routing;
+#[path = "cases/integration/reality_integration.rs"]
+mod reality;
 #[path = "cases/integration/resource_lifecycle_test.rs"]
 mod resource_lifecycle;
 #[path = "cases/integration/shadowsocks_integration.rs"]
