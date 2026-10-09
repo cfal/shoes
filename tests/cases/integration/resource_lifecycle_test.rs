@@ -121,6 +121,28 @@ async fn yaml_connection_limit_rejects_new_work_without_closing_existing_work() 
     for stream in &mut connections {
         round_trip(stream, b"still active").await?;
     }
+    drop(connections.pop().unwrap());
+    let mut replacement = timeout(Duration::from_secs(3), async {
+        loop {
+            if let Ok(mut stream) = TcpStream::connect(("127.0.0.1", proxy_port)).await
+                && round_trip(&mut stream, b"replacement admitted")
+                    .await
+                    .is_ok()
+            {
+                return stream;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await?;
+    round_trip(&mut connections[0], b"survivor still active").await?;
+    round_trip(&mut replacement, b"replacement still active").await?;
+    let result = timeout(Duration::from_secs(2), async {
+        let mut rejected = TcpStream::connect(("127.0.0.1", proxy_port)).await?;
+        rejected.read(&mut byte).await
+    })
+    .await?;
+    assert!(matches!(result, Ok(0) | Err(_)));
     Ok(())
 }
 

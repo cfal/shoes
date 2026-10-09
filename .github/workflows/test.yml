@@ -50,6 +50,9 @@ jobs:
     - name: Run local tests
       run: cargo test --workspace --locked --lib --bins --verbose
 
+    - name: Run process contract tests
+      run: cargo test -p shoes --locked --test process_contract --verbose -- --test-threads=1
+
     - name: Run host FFI tests
       run: cargo test -p shoes --locked --lib --features ffi -- --test-threads=1
 

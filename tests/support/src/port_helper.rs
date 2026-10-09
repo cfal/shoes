@@ -182,9 +182,10 @@ mod tests {
 
     #[tokio::test]
     async fn readiness_uses_the_shared_deadline() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
+        // Reserve the port without listening so it cannot be reused while probing.
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = socket.local_addr().unwrap();
 
         let wait_timeout = Duration::from_millis(25);
         let started = Instant::now();

@@ -281,3 +281,156 @@ impl StreamReader {
         self.start_offset == 0 && self.end_offset == self.buf.len()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, AsyncWriteExt, ReadBuf};
+
+    #[tokio::test]
+    async fn split_crlf_preserves_following_lines_and_payload() {
+        let (mut writer, mut stream) = tokio::io::duplex(64);
+        let mut reader = StreamReader::new_with_buffer_size(32);
+        writer.write_all(b"first\r").await.unwrap();
+        let mut line = Box::pin(reader.read_line(&mut stream));
+        assert!(futures::poll!(&mut line).is_pending());
+        drop(line);
+        writer.write_all(b"\nsecond\r\npayload").await.unwrap();
+        assert_eq!(reader.read_line(&mut stream).await.unwrap(), "first");
+        assert_eq!(reader.read_line(&mut stream).await.unwrap(), "second");
+        assert_eq!(reader.unparsed_data(), b"payload");
+    }
+
+    #[tokio::test]
+    async fn cancelled_line_read_preserves_compacted_input() {
+        let (mut writer, mut stream) = tokio::io::duplex(16);
+        let mut reader = StreamReader::new_with_buffer_size(8);
+        writer.write_all(b"ab\r\ncdef").await.unwrap();
+        assert_eq!(reader.read_line(&mut stream).await.unwrap(), "ab");
+        assert_eq!(reader.start_offset, 4);
+
+        let mut line = Box::pin(reader.read_line(&mut stream));
+        assert!(futures::poll!(&mut line).is_pending());
+        drop(line);
+        assert_eq!(reader.start_offset, 0);
+        assert_eq!(reader.unparsed_data(), b"cdef");
+
+        writer.write_all(b"\r\n!").await.unwrap();
+        assert_eq!(reader.read_line(&mut stream).await.unwrap(), "cdef");
+        assert_eq!(reader.unparsed_data(), b"!");
+        assert_eq!(reader.read_u8(&mut stream).await.unwrap(), b'!');
+        assert!(reader.unparsed_data_owned().is_none());
+    }
+
+    #[tokio::test]
+    async fn peek_consume_and_owned_snapshots_preserve_offsets() {
+        let mut stream = &b"\x01\x02\x03ABtail"[..];
+        let mut reader = StreamReader::new_with_buffer_size(16);
+        for _ in 0..2 {
+            assert_eq!(reader.peek_u8(&mut stream).await.unwrap(), 1);
+            assert_eq!(reader.peek_slice(&mut stream, 3).await.unwrap(), [1, 2, 3]);
+        }
+        reader.consume(1);
+        assert_eq!(reader.read_u16_be(&mut stream).await.unwrap(), 0x0203);
+        assert_eq!(reader.read_slice(&mut stream, 2).await.unwrap(), b"AB");
+        let snapshot = reader.unparsed_data_owned().unwrap();
+        let mut tail = [0; 4];
+        reader
+            .read_slice_into(&mut stream, &mut tail)
+            .await
+            .unwrap();
+        assert_eq!(&tail, b"tail");
+        assert_eq!(&*snapshot, b"tail");
+        assert!(reader.unparsed_data().is_empty());
+        assert!(reader.unparsed_data_owned().is_none());
+        assert!(reader.peek_slice(&mut stream, 0).await.unwrap().is_empty());
+        assert!(reader.read_slice(&mut stream, 0).await.unwrap().is_empty());
+        assert_eq!(
+            reader.read_u8(&mut stream).await.unwrap_err().kind(),
+            io::ErrorKind::ConnectionAborted
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_lines_and_slices_report_exact_error_kinds() {
+        let mut reader = StreamReader::new_with_buffer_size(8);
+        assert_eq!(
+            reader.read_line(&mut &b"123456\r\n"[..]).await.unwrap(),
+            "123456"
+        );
+        for (input, kind) in [
+            (&b"12345678"[..], io::ErrorKind::ConnectionAborted),
+            (&b"1234567\r\n"[..], io::ErrorKind::ConnectionAborted),
+            (&b"untermin"[..], io::ErrorKind::ConnectionAborted),
+            (&b"abc"[..], io::ErrorKind::ConnectionAborted),
+            (&b"abc\n"[..], io::ErrorKind::InvalidData),
+            (&b"\n"[..], io::ErrorKind::InvalidData),
+            (&b"\xff\r\n"[..], io::ErrorKind::InvalidData),
+        ] {
+            let mut reader = StreamReader::new_with_buffer_size(8);
+            let mut stream = input;
+            assert_eq!(
+                reader.read_line(&mut stream).await.unwrap_err().kind(),
+                kind,
+                "input: {input:?}"
+            );
+        }
+        let mut reader = StreamReader::new_with_buffer_size(4);
+        let mut input = &b"test"[..];
+        assert_eq!(
+            reader.peek_slice(&mut input, 5).await.unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            reader.read_slice(&mut input, 5).await.unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(input, b"test");
+        assert_eq!(reader.read_slice(&mut input, 4).await.unwrap(), b"test");
+        let mut reader = StreamReader::new_with_buffer_size(4);
+        assert_eq!(
+            reader.read_line_bytes(&mut &b"\xff\r\n"[..]).await.unwrap(),
+            [255]
+        );
+        assert_eq!(reader.read_line(&mut &b"\r\n"[..]).await.unwrap(), "");
+    }
+
+    struct FailingRead {
+        error: Option<io::ErrorKind>,
+        remaining: &'static [u8],
+    }
+
+    impl AsyncRead for FailingRead {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            if let Some(error) = self.error.take() {
+                return Poll::Ready(Err(error.into()));
+            }
+            Pin::new(&mut self.remaining).poll_read(cx, buf)
+        }
+    }
+
+    #[tokio::test]
+    async fn interrupted_reads_retry_and_other_errors_propagate() {
+        for kind in [io::ErrorKind::Interrupted, io::ErrorKind::ConnectionReset] {
+            let mut reader = StreamReader::new();
+            let mut stream = FailingRead {
+                error: Some(kind),
+                remaining: b"line\r\n",
+            };
+            if kind != io::ErrorKind::Interrupted {
+                assert_eq!(
+                    reader.read_line(&mut stream).await.unwrap_err().kind(),
+                    kind
+                );
+            }
+            assert_eq!(reader.read_line(&mut stream).await.unwrap(), "line");
+        }
+    }
+}

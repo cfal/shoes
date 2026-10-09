@@ -22,6 +22,180 @@ const PROXY_CONNECTION_HEADER_PREFIX: &str = "proxy-connection: ";
 #[cfg(test)]
 mod request_tests {
     use super::*;
+    use tokio::io::AsyncReadExt;
+
+    async fn server_request(
+        request: &[u8],
+    ) -> (
+        std::io::Result<TcpServerSetupResult>,
+        tokio::io::DuplexStream,
+    ) {
+        let (mut client, server) = tokio::io::duplex(4096);
+        client.write_all(request).await.unwrap();
+        client.shutdown().await.unwrap();
+        let handler = HttpTcpServerHandler::new(
+            Some(("user".into(), "password".into())),
+            Arc::new(ClientProxySelector::new(vec![])),
+        );
+        (handler.setup_server_stream(Box::new(server)).await, client)
+    }
+
+    #[tokio::test]
+    async fn authenticated_connect_preserves_coalesced_payload() {
+        let token = create_http_auth_token("user", "password");
+        let request = format!(
+            "CONNECT example.com:443 HTTP/1.1\r\npRoXy-AuThOrIzAtIoN: bAsIc {token}\r\n\r\npayload"
+        );
+        let (result, _) = server_request(request.as_bytes()).await;
+        let TcpServerSetupResult::TcpForward {
+            remote_location,
+            need_initial_flush,
+            connection_success_response,
+            initial_remote_data,
+            ..
+        } = result.unwrap()
+        else {
+            panic!("expected TCP forwarding");
+        };
+        assert_eq!(
+            remote_location,
+            NetLocation::from_str("example.com:443", None).unwrap()
+        );
+        assert!(need_initial_flush);
+        assert_eq!(
+            connection_success_response.as_deref(),
+            Some(&b"HTTP/1.1 200 Connection established\r\n\r\n"[..])
+        );
+        assert_eq!(initial_remote_data.as_deref(), Some(&b"payload"[..]));
+
+        let changed_token = token.to_ascii_lowercase();
+        assert_ne!(changed_token, token);
+        let request = request.replace(&token, &changed_token);
+        assert_eq!(
+            server_request(request.as_bytes())
+                .await
+                .0
+                .err()
+                .unwrap()
+                .kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_credentials_return_proxy_authentication_challenge() {
+        for request in ["CONNECT example.com:443", "GET http://example.com/"] {
+            let (result, mut client) =
+                server_request(format!("{request} HTTP/1.1\r\n\r\n").as_bytes()).await;
+            assert_eq!(
+                result.err().unwrap().kind(),
+                std::io::ErrorKind::InvalidInput
+            );
+            let mut response = Vec::new();
+            client.read_to_end(&mut response).await.unwrap();
+            assert_eq!(response, b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"proxy\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        }
+    }
+
+    #[tokio::test]
+    async fn absolute_form_rewrites_headers_without_losing_body() {
+        let token = create_http_auth_token("user", "password");
+        let request = format!(
+            "POST http://example.com:8080/path?q=1 HTTP/1.0\r\nHost: example.com\r\nProxy-Authorization: Basic {token}\r\nCoNnEcTiOn: keep-alive\r\nProxy-Connection: keep-alive\r\nContent-Length: 4\r\n\r\nbody"
+        );
+        let (result, _) = server_request(request.as_bytes()).await;
+        let TcpServerSetupResult::TcpForward {
+            remote_location,
+            need_initial_flush,
+            connection_success_response,
+            initial_remote_data,
+            ..
+        } = result.unwrap()
+        else {
+            panic!("expected TCP forwarding");
+        };
+        assert_eq!(
+            remote_location,
+            NetLocation::from_str("example.com:8080", None).unwrap()
+        );
+        assert!(!need_initial_flush);
+        assert!(connection_success_response.is_none());
+        assert_eq!(initial_remote_data.as_deref(), Some(&b"POST /path?q=1 HTTP/1.0\r\nHost: example.com\r\nContent-Length: 4\r\nConnection: close\r\n\r\nbody"[..]));
+    }
+
+    #[tokio::test]
+    async fn unsupported_schemes_and_malformed_requests_are_rejected() {
+        for (request, kind) in [
+            (
+                &b"GET https://example.com/ HTTP/1.1\r\n\r\n"[..],
+                std::io::ErrorKind::InvalidInput,
+            ),
+            (
+                &b"CONNECT example.com:443 HTTP/2.0\r\n\r\n"[..],
+                std::io::ErrorKind::InvalidInput,
+            ),
+            (
+                &b"CONNECT example.com:443 HTTP/1.1\n\n"[..],
+                std::io::ErrorKind::InvalidData,
+            ),
+            (
+                &b"CONNECT example.com:443 HTTP/1.1\r\n"[..],
+                std::io::ErrorKind::ConnectionAborted,
+            ),
+        ] {
+            assert_eq!(server_request(request).await.0.err().unwrap().kind(), kind);
+        }
+    }
+
+    async fn client_response(status: &str) -> std::io::Result<TcpClientSetupResult> {
+        let (client, mut server) = tokio::io::duplex(4096);
+        server
+            .write_all(format!("{status}\r\nProxy-Agent: test\r\n\r\nbanner").as_bytes())
+            .await
+            .unwrap();
+        server.shutdown().await.unwrap();
+        let result = HttpTcpClientHandler::new(None, None)
+            .setup_client_tcp_stream(
+                Box::new(client),
+                NetLocation::from_str("example.com:443", None)
+                    .unwrap()
+                    .into(),
+            )
+            .await;
+        let mut request = vec![0; b"CONNECT example.com:443 HTTP/1.1\r\n\r\n".len()];
+        server.read_exact(&mut request).await.unwrap();
+        assert_eq!(request, b"CONNECT example.com:443 HTTP/1.1\r\n\r\n");
+        result
+    }
+
+    #[tokio::test]
+    async fn connect_client_requires_exact_success_status() {
+        for status in [
+            "HTTP/1.1 2000 OK",
+            "HTTP/1.0 200evil",
+            "HTTP/1.1 407 Authentication Required",
+            "HTTP/2.0 200 OK",
+        ] {
+            assert_eq!(
+                client_response(status).await.err().expect(status).kind(),
+                std::io::ErrorKind::InvalidData
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_client_preserves_payload_after_success_response() {
+        for status in [
+            "HTTP/1.1 200 Connection established",
+            "HTTP/1.0 200 OK",
+            "HTTP/1.1 200",
+        ] {
+            assert_eq!(
+                client_response(status).await.unwrap().early_data.as_deref(),
+                Some(&b"banner"[..])
+            );
+        }
+    }
 
     #[tokio::test]
     async fn rejected_credentials_are_not_logged() {
@@ -439,7 +613,8 @@ impl TcpClientHandler for HttpTcpClientHandler {
         let line = stream_reader.read_line(&mut client_stream).await?;
 
         // Expected response: HTTP/1.1 200 Connection established\r\n\r\n
-        if !line.starts_with("HTTP/1.1 200") && !line.starts_with("HTTP/1.0 200") {
+        let mut status = line.split(' ');
+        if !matches!(status.next(), Some("HTTP/1.1" | "HTTP/1.0")) || status.next() != Some("200") {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("HTTP CONNECT request failed: {line}"),
