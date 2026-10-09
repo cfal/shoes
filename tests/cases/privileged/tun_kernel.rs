@@ -1,6 +1,9 @@
 //! Linux kernel-TUN coverage; requires /dev/net/tun, IPv6 loopback and passwordless sudo.
 //! Run with --features privileged-tests --test privileged tun_kernel:: -- --test-threads=1.
 
+#[path = "tun_kernel/offload_failure.rs"]
+mod offload_failure;
+
 use shoes_test_support::test_fixture::{
     ProcessGuard, RouteGuard, add_route_via_device, start_shoes_server_with_sudo,
 };
@@ -25,6 +28,7 @@ struct KernelTun {
     _route: RouteGuard,
     _process: ProcessGuard,
     _config: tempfile::NamedTempFile,
+    name: String,
     source: IpAddr,
     target: IpAddr,
 }
@@ -53,6 +57,23 @@ impl KernelTun {
         offload: Option<bool>,
         mtu: u16,
         tcp_buffer_size: usize,
+    ) -> io::Result<Self> {
+        Self::start_with(
+            ipv6,
+            offload,
+            mtu,
+            tcp_buffer_size,
+            start_shoes_server_with_sudo,
+        )
+        .await
+    }
+
+    async fn start_with(
+        ipv6: bool,
+        offload: Option<bool>,
+        mtu: u16,
+        tcp_buffer_size: usize,
+        start: impl FnOnce(&str) -> io::Result<(ProcessGuard, tempfile::NamedTempFile)>,
     ) -> io::Result<Self> {
         std::fs::metadata("/dev/net/tun")?;
         let id: u32 = rand::random();
@@ -96,7 +117,7 @@ impl KernelTun {
 "#,
             offload = offload.map_or("null", |enabled| if enabled { "true" } else { "false" }),
         );
-        let (process, config) = start_shoes_server_with_sudo(&config)?;
+        let (process, config) = start(&config)?;
         timeout(Duration::from_secs(10), async {
             loop {
                 if let Ok(addresses) = run_ip(&["-j", "-4", "address", "show", "dev", &name]) {
@@ -135,6 +156,7 @@ impl KernelTun {
             _route: route,
             _process: process,
             _config: config,
+            name,
             source: source.parse().unwrap(),
             target: target.parse().unwrap(),
         };

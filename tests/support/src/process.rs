@@ -160,7 +160,7 @@ impl Drop for ProcessGuard {
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn spawn_privileged_process(
+pub fn spawn_privileged_process(
     program: &Path,
     name: impl Into<String>,
     configure: impl FnOnce(&mut Command),
@@ -204,7 +204,7 @@ pub(crate) fn spawn_privileged_process(
 }
 
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn spawn_privileged_process(
+pub fn spawn_privileged_process(
     _program: &Path,
     _name: impl Into<String>,
     _configure: impl FnOnce(&mut Command),
