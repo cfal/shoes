@@ -7,4 +7,5 @@ mod sha2;
 mod typed;
 mod vmess_handler;
 mod vmess_stream;
+pub(crate) use vmess_handler::DataCipher;
 pub use vmess_handler::{VmessTcpClientHandler, VmessTcpServerHandler};

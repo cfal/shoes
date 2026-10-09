@@ -306,7 +306,7 @@ pub fn create_tcp_client_handler(
             h2mux,
         } => {
             let handler: Box<dyn TcpClientHandler> =
-                Box::new(VmessTcpClientHandler::new(&cipher, &user_id, udp_enabled));
+                Box::new(VmessTcpClientHandler::new(&cipher, &user_id, udp_enabled)?);
             if let Some(h2mux_config) = h2mux {
                 Box::new(H2MuxClientHandler::new(
                     Arc::from(handler),

@@ -1111,15 +1111,7 @@ fn validate_client_certificates(cert: Option<&str>, key: Option<&str>) -> std::i
 }
 
 fn validate_vmess_cipher(cipher: &str) -> std::io::Result<()> {
-    match cipher {
-        "" | "any" | "none" | "aes-128-gcm" | "chacha20-poly1305" | "chacha20-ietf-poly1305" => {
-            Ok(())
-        }
-        _ => Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("unsupported VMess cipher: {cipher}"),
-        )),
-    }
+    crate::vmess::DataCipher::try_from(cipher).map(|_| ())
 }
 
 fn validate_server_proxy_config(
