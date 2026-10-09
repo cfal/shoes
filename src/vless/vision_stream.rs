@@ -787,10 +787,30 @@ impl<IO: AsyncStream> crate::async_stream::AsyncPing for VisionStream<IO> {
     }
 }
 
-impl<IO: AsyncStream> AsyncStream for VisionStream<IO> {}
+impl<IO: AsyncStream> AsyncStream for VisionStream<IO> {
+    #[cfg(target_os = "linux")]
+    fn plain_tcp(&self) -> Option<&tokio::net::TcpStream> {
+        if self.read_mode != VisionMode::Direct
+            || self.write_mode != VisionMode::Direct
+            || !self.pending_read.is_empty()
+            || self.vless_response_pending
+            || !self.partial_vless_response.is_empty()
+            || self.vless_response_to_send
+            || !self.pending_plain_writes.is_empty()
+            || self.pending_tls_mode_switch
+            || self.inner_write_deframer.pending_bytes() != 0
+        {
+            return None;
+        }
+        self.tls.plain_tcp()
+    }
+}
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    mod splice;
+
     use super::*;
     use crate::address::{Address, NetLocation};
     use crate::async_stream::AsyncPing;

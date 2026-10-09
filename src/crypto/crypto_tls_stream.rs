@@ -503,7 +503,20 @@ impl<IO: AsyncStream> AsyncPing for CryptoTlsStream<IO> {
     }
 }
 
-impl<IO: AsyncStream> AsyncStream for CryptoTlsStream<IO> {}
+impl<IO: AsyncStream> AsyncStream for CryptoTlsStream<IO> {
+    #[cfg(target_os = "linux")]
+    fn plain_tcp(&self) -> Option<&tokio::net::TcpStream> {
+        if self.state != TlsState::Stream
+            || !matches!(&self.input, TlsInput::Raw(pending) if pending.is_empty())
+            || !self.write_raw
+            || self.raw_write_prefix.is_some()
+            || self.need_flush
+        {
+            return None;
+        }
+        self.io.plain_tcp()
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -610,6 +623,54 @@ mod tests {
             .unwrap()
             .complete_for_test()
             .unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn raw_tcp_capability_requires_drained_io_and_open_directions() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{TcpListener, TcpStream};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (socket, peer) = tokio::join!(
+            TcpStream::connect(listener.local_addr().unwrap()),
+            listener.accept()
+        );
+        let _peer = peer.unwrap();
+        let session = CryptoConnection::new_reality_server(completed_reality_connection());
+        let mut stream = CryptoTlsStream::new(socket.unwrap(), session, Some(TlsDeframer::new()));
+        assert!(stream.plain_tcp().is_none());
+        stream.start_raw_read().unwrap();
+        assert!(stream.plain_tcp().is_none());
+        stream.start_raw_write(b"").unwrap();
+        assert!(stream.plain_tcp().is_none());
+        stream.flush().await.unwrap();
+        assert!(stream.plain_tcp().is_some());
+
+        stream.input = TlsInput::Raw(Bytes::from_static(b"transport tail"));
+        assert!(stream.plain_tcp().is_none());
+        let mut tail = [0; 14];
+        stream.read_exact(&mut tail[..1]).await.unwrap();
+        assert!(stream.plain_tcp().is_none());
+        stream.read_exact(&mut tail[1..]).await.unwrap();
+        assert_eq!(&tail, b"transport tail");
+        assert!(stream.plain_tcp().is_some());
+
+        stream.need_flush = true;
+        assert!(stream.plain_tcp().is_none());
+        stream.flush().await.unwrap();
+        // TLS responses queued after DIRECT must not be sent on the raw wire.
+        stream.session.send_close_notify();
+        assert!(stream.plain_tcp().is_some());
+
+        for state in [
+            TlsState::ReadShutdown,
+            TlsState::WriteShutdown,
+            TlsState::FullyShutdown,
+        ] {
+            stream.state = state;
+            assert!(stream.plain_tcp().is_none());
+        }
     }
 
     #[tokio::test]
