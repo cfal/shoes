@@ -1119,9 +1119,17 @@ pub fn feed_reality_server_connection(
 mod tests {
     use super::*;
 
+    #[track_caller]
+    fn complete_tls_records(flight: &[u8]) -> Vec<bytes::Bytes> {
+        let mut deframer = crate::crypto::tls_deframer::TlsDeframer::new();
+        deframer.feed(flight);
+        let records = deframer.next_records().unwrap();
+        assert!(deframer.into_remaining_data().is_empty());
+        records
+    }
+
     #[test]
     fn fragmented_tls_template_completes_separate_mode_handshake() {
-        use crate::crypto::tls_deframer::TlsDeframer;
         use crate::reality::reality_client_connection::feed_reality_client_connection;
         use crate::reality::{RealityClientConfig, RealityClientConnection};
         use crate::shadow_tls::parse_server_hello;
@@ -1139,16 +1147,19 @@ mod tests {
             cipher_suites: vec![CipherSuite::AES_128_GCM_SHA256],
         })
         .unwrap();
-        let mut hello = Vec::new();
-        client.write_tls(&mut hello).unwrap();
+        let mut client_hello = Vec::new();
+        client.write_tls(&mut client_hello).unwrap();
 
         let mut template =
             rustls::ServerConnection::new(reality_tls_template_config().unwrap()).unwrap();
-        assert_eq!(template.read_tls(&mut &hello[..]).unwrap(), hello.len());
+        assert_eq!(
+            template.read_tls(&mut &client_hello[..]).unwrap(),
+            client_hello.len()
+        );
         template.process_new_packets().unwrap();
-        let mut flight = Vec::new();
+        let mut template_flight = Vec::new();
         while template.wants_write() {
-            assert!(template.write_tls(&mut flight).unwrap() > 0);
+            assert!(template.write_tls(&mut template_flight).unwrap() > 0);
         }
         assert!(template.is_handshaking());
         assert_eq!(
@@ -1156,15 +1167,12 @@ mod tests {
             Some(rustls::ProtocolVersion::TLSv1_3)
         );
 
-        let mut deframer = TlsDeframer::new();
-        deframer.feed(&flight);
-        let records = deframer.next_records().unwrap();
-        assert!(deframer.into_remaining_data().is_empty());
+        let template_records = complete_tls_records(&template_flight);
         assert!(
-            records.len() >= 6,
+            template_records.len() >= 6,
             "template must emit its full flight before client Finished"
         );
-        let server_hello = &records[0];
+        let server_hello = &template_records[0];
         assert_eq!(server_hello[0], CONTENT_TYPE_HANDSHAKE);
         assert_eq!(server_hello[5], 2);
         let handshake_length =
@@ -1175,10 +1183,10 @@ mod tests {
         );
         assert!(parse_server_hello(server_hello).unwrap().is_tls13);
         assert_eq!(
-            &records[1][..],
+            &template_records[1][..],
             &[CONTENT_TYPE_CHANGE_CIPHER_SPEC, 3, 3, 0, 1, 1]
         );
-        for record in &records[2..] {
+        for record in &template_records[2..] {
             assert_eq!(record[0], CONTENT_TYPE_APPLICATION_DATA);
             assert!(record.len() <= 512);
         }
@@ -1193,28 +1201,25 @@ mod tests {
             cipher_suites: vec![CipherSuite::AES_128_GCM_SHA256],
         })
         .unwrap();
-        server.validate_client_hello(&hello).unwrap();
-        server.build_server_response(records).unwrap();
-        let mut response = Vec::new();
-        server.write_tls(&mut response).unwrap();
-        let mut deframer = TlsDeframer::new();
-        deframer.feed(&response);
-        let records = deframer.next_records().unwrap();
-        assert!(deframer.into_remaining_data().is_empty());
-        assert_eq!(records.len(), 6);
-        assert!(parse_server_hello(&records[0]).unwrap().is_tls13);
+        server.validate_client_hello(&client_hello).unwrap();
+        server.build_server_response(template_records).unwrap();
+        let mut server_flight = Vec::new();
+        server.write_tls(&mut server_flight).unwrap();
+        let server_records = complete_tls_records(&server_flight);
+        assert_eq!(server_records.len(), 6);
+        assert!(parse_server_hello(&server_records[0]).unwrap().is_tls13);
         assert_eq!(
-            &records[1][..],
+            &server_records[1][..],
             &[CONTENT_TYPE_CHANGE_CIPHER_SPEC, 3, 3, 0, 1, 1]
         );
-        for record in &records[2..] {
+        for record in &server_records[2..] {
             assert_eq!(record[0], CONTENT_TYPE_APPLICATION_DATA);
         }
 
-        for (index, record) in records.iter().enumerate() {
+        for (index, record) in server_records.iter().enumerate() {
             feed_reality_client_connection(&mut client, record).unwrap();
             client.process_new_packets().unwrap();
-            assert_eq!(client.is_handshaking(), index + 1 < records.len());
+            assert_eq!(client.is_handshaking(), index + 1 < server_records.len());
         }
         let mut finished = Vec::new();
         client.write_tls(&mut finished).unwrap();
