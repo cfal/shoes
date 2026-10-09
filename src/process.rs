@@ -181,12 +181,20 @@ fn watch(paths: &[String], tx: mpsc::Sender<()>) -> io::Result<RecommendedWatche
     for directory in directories {
         if let Err(error) = watcher.watch(&directory, RecursiveMode::NonRecursive) {
             if required_directories.contains(&directory) {
-                return Err(io::Error::other(error));
+                if !matches!(&error.kind, notify::ErrorKind::Io(error) if error.kind() == io::ErrorKind::PermissionDenied)
+                {
+                    return Err(io::Error::other(error));
+                }
+                log::warn!(
+                    "Could not watch config directory {}: {error}; using file watches, atomic replacements may be missed",
+                    directory.display()
+                );
+            } else {
+                log::warn!(
+                    "Could not watch intermediate config directory {}: {error}",
+                    directory.display()
+                );
             }
-            log::warn!(
-                "Could not watch intermediate config directory {}: {error}",
-                directory.display()
-            );
         }
     }
     for file in direct_files {

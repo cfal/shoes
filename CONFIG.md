@@ -782,6 +782,8 @@ client_chain:
 
 Configuration changes are automatically detected. `--no-reload` disables file watching; on Unix, SIGHUP still requests a reload.
 
+If directory permissions prevent watching a readable configuration's parent, startup falls back to direct file watches and logs a warning. In-place edits remain detectable, but atomic replacements may be missed; use SIGHUP or grant directory read permission when replacing files.
+
 Replacement configurations, certificates, and DNS resolvers are prepared while the current listeners continue serving. A preparation failure leaves the current configuration running. Once preparation succeeds, listeners are replaced. A failure to activate replacements exits with status 1; there is no rollback after listeners are retired. Existing TCP connections may drain for `global_limits.reload_grace_secs` during successful reloads; QUIC connections are closed.
 
 QUIC listener sockets must finish closing before replacements bind. Closing endpoints get up to one second for best-effort close delivery, then their drivers are stopped locally so peer-controlled timers cannot delay reloads. A five-second socket-release guard remains; exceeding it indicates a local cleanup failure and exits with an error rather than announcing a partially ready generation.

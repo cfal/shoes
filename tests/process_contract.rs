@@ -604,7 +604,7 @@ async fn symlink_targets_remain_watched_after_retargeting() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn intermediate_symlink_directories_need_only_traverse_permission() {
+async fn config_watch_directories_need_only_traverse_permission() {
     use std::os::unix::fs::PermissionsExt;
     struct RestorePermissions(std::path::PathBuf);
     impl Drop for RestorePermissions {
@@ -627,15 +627,17 @@ async fn intermediate_symlink_directories_need_only_traverse_permission() {
         available_address()
     );
     std::fs::write(&path, &config).unwrap();
-    std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o111)).unwrap();
-    let _restore = RestorePermissions(private.clone());
-    assert!(std::fs::read_dir(&private).is_err());
-    let mut child = Process::start(&path, &[]);
-    child.wait_for("Servers ready").await;
-    std::fs::write(&path, &config).unwrap();
-    child.wait_for("Servers ready").await;
-    child.signal(libc::SIGTERM);
-    assert!(child.exit().await.success());
+    for restricted in [&private, &config_dir] {
+        std::fs::set_permissions(restricted, std::fs::Permissions::from_mode(0o111)).unwrap();
+        let _restore = RestorePermissions(restricted.clone());
+        assert!(std::fs::read_dir(restricted).is_err());
+        let mut child = Process::start(&path, &[]);
+        child.wait_for("Servers ready").await;
+        std::fs::write(&path, &config).unwrap();
+        child.wait_for("Servers ready").await;
+        child.signal(libc::SIGTERM);
+        assert!(child.exit().await.success());
+    }
 }
 
 #[cfg(unix)]
