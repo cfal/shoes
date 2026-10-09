@@ -40,7 +40,7 @@ fn start_singbox_server(config: &str) -> std::io::Result<(ProcessGuard, tempfile
     )
 }
 
-async fn connect_tcp_via_socks5(
+pub(super) async fn connect_tcp_via_socks5(
     socks_ip: &str,
     socks_port: u16,
     target_host: &str,
