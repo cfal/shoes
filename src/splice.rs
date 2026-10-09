@@ -530,7 +530,7 @@ mod tests {
         let (socket, _peer) = pair(false).await;
         let mut boxed: Box<dyn AsyncStream> = Box::new(socket);
         assert!(boxed.plain_tcp().is_some());
-        assert!((&mut boxed).plain_tcp().is_some());
+        assert!(<&mut Box<dyn AsyncStream> as AsyncStream>::plain_tcp(&&mut boxed).is_some());
         let prepend =
             crate::prepend_stream::PrependStream::new(boxed, Some(Box::from(&b"prefix"[..])));
         assert!(prepend.plain_tcp().is_none());

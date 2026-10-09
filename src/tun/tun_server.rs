@@ -95,59 +95,6 @@ pub struct TunServerConfig {
     pub packet_information: bool,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    #[cfg(target_os = "linux")]
-    #[ignore = "requires CAP_NET_ADMIN and /dev/net/tun"]
-    fn public_device_factory_preserves_unframed_packets() {
-        use std::os::fd::AsRawFd;
-        for config in [
-            TunServerConfig::new(),
-            TunServerConfig::new().segmentation_offload(true),
-        ] {
-            let device = config.create_sync_device().unwrap();
-            let mut request: libc::ifreq = unsafe { std::mem::zeroed() };
-            assert_eq!(
-                unsafe { libc::ioctl(device.as_raw_fd(), libc::TUNGETIFF, &mut request) },
-                0
-            );
-            assert_eq!(
-                unsafe { request.ifr_ifru.ifru_flags } as libc::c_int & libc::IFF_VNET_HDR,
-                0
-            );
-        }
-    }
-
-    #[test]
-    fn offload_selection_never_mutates_provided_descriptors() {
-        let owned = TunServerConfig::new();
-        assert_eq!(owned.offload_enabled().unwrap(), cfg!(target_os = "linux"));
-        assert!(
-            !owned
-                .clone()
-                .segmentation_offload(false)
-                .offload_enabled()
-                .unwrap()
-        );
-        for close in [false, true] {
-            let provided = owned.clone().raw_fd(-1).close_fd_on_drop(close);
-            assert!(!provided.offload_enabled().unwrap());
-            assert!(
-                provided
-                    .segmentation_offload(true)
-                    .offload_enabled()
-                    .is_err()
-            );
-        }
-        let framed = owned.packet_information(true);
-        assert!(!framed.offload_enabled().unwrap());
-        assert!(framed.segmentation_offload(true).offload_enabled().is_err());
-    }
-}
-
 impl Default for TunServerConfig {
     fn default() -> Self {
         // Platform-specific MTU defaults based on sing-box research:
@@ -359,5 +306,58 @@ impl TunServerConfig {
 
         tun::create(&config)
             .map_err(|e| std::io::Error::other(format!("Failed to create TUN device: {}", e)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[ignore = "requires CAP_NET_ADMIN and /dev/net/tun"]
+    fn public_device_factory_preserves_unframed_packets() {
+        use std::os::fd::AsRawFd;
+        for config in [
+            TunServerConfig::new(),
+            TunServerConfig::new().segmentation_offload(true),
+        ] {
+            let device = config.create_sync_device().unwrap();
+            let mut request: libc::ifreq = unsafe { std::mem::zeroed() };
+            assert_eq!(
+                unsafe { libc::ioctl(device.as_raw_fd(), libc::TUNGETIFF, &mut request) },
+                0
+            );
+            assert_eq!(
+                unsafe { request.ifr_ifru.ifru_flags } as libc::c_int & libc::IFF_VNET_HDR,
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn offload_selection_never_mutates_provided_descriptors() {
+        let owned = TunServerConfig::new();
+        assert_eq!(owned.offload_enabled().unwrap(), cfg!(target_os = "linux"));
+        assert!(
+            !owned
+                .clone()
+                .segmentation_offload(false)
+                .offload_enabled()
+                .unwrap()
+        );
+        for close in [false, true] {
+            let provided = owned.clone().raw_fd(-1).close_fd_on_drop(close);
+            assert!(!provided.offload_enabled().unwrap());
+            assert!(
+                provided
+                    .segmentation_offload(true)
+                    .offload_enabled()
+                    .is_err()
+            );
+        }
+        let framed = owned.packet_information(true);
+        assert!(!framed.offload_enabled().unwrap());
+        assert!(framed.segmentation_offload(true).offload_enabled().is_err());
     }
 }

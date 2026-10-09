@@ -10,131 +10,6 @@ use std::path::Path;
 
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn hostname_socket_fallback_is_limited_to_family_errors() {
-        #[cfg(unix)]
-        let unavailable = libc::EAFNOSUPPORT;
-        #[cfg(windows)]
-        let unavailable = 10047;
-        let mut attempts = Vec::new();
-        let socket = prefer_ipv6_socket(|ipv6| {
-            attempts.push(ipv6);
-            if ipv6 {
-                Err(std::io::Error::from_raw_os_error(unavailable))
-            } else {
-                new_socket2_udp_socket(false, None, Some("0.0.0.0:0".parse().unwrap()), false)
-            }
-        })
-        .unwrap();
-        assert_eq!(attempts, [true, false]);
-        assert!(socket.local_addr().unwrap().as_socket().unwrap().is_ipv4());
-
-        attempts.clear();
-        let error = prefer_ipv6_socket(|ipv6| {
-            attempts.push(ipv6);
-            Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "denied",
-            ))
-        })
-        .unwrap_err();
-        assert_eq!(attempts, [true]);
-        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
-    }
-
-    #[tokio::test]
-    async fn hostname_socket_prefers_dual_stack_and_enforces_interface_binding() {
-        let ipv6_available =
-            match new_socket2_udp_socket(true, None, Some("[::]:0".parse().unwrap()), false) {
-                Ok(_) => true,
-                Err(error) if ipv6_unavailable(&error) => false,
-                Err(error) => panic!("IPv6 socket probe failed: {error}"),
-            };
-        let socket = new_hostname_udp_socket(None).unwrap();
-        assert_eq!(socket.local_addr().unwrap().is_ipv6(), ipv6_available);
-        assert!(new_hostname_udp_socket(Some("shoes-missing-interface".into())).is_err());
-    }
-
-    #[tokio::test]
-    async fn ipv6_udp_listener_accepts_both_address_families() {
-        let socket =
-            match new_socket2_udp_socket(true, None, Some("[::]:0".parse().unwrap()), false) {
-                Ok(socket) => socket,
-                Err(error) if ipv6_unavailable(&error) => return,
-                Err(error) => panic!("IPv6 socket creation failed: {error}"),
-            };
-        assert!(!socket.only_v6().unwrap());
-        let socket = into_tokio_udp_socket(socket).unwrap();
-        let port = socket.local_addr().unwrap().port();
-        for (bind, destination) in [
-            ("127.0.0.1:0", format!("127.0.0.1:{port}")),
-            ("[::1]:0", format!("[::1]:{port}")),
-        ] {
-            tokio::time::timeout(std::time::Duration::from_secs(2), async {
-                let peer = match tokio::net::UdpSocket::bind(bind).await {
-                    Ok(peer) => peer,
-                    Err(error) if bind == "[::1]:0" && ipv6_unavailable(&error) => return,
-                    Err(error) => panic!("UDP peer bind failed: {error}"),
-                };
-                peer.send_to(b"request", destination).await.unwrap();
-                let mut buf = [0; 16];
-                let (len, sender) = socket.recv_from(&mut buf).await.unwrap();
-                assert_eq!(&buf[..len], b"request");
-                socket.send_to(b"reply", sender).await.unwrap();
-                let len = peer.recv(&mut buf).await.unwrap();
-                assert_eq!(&buf[..len], b"reply");
-            })
-            .await
-            .unwrap();
-        }
-    }
-}
-
-#[cfg(all(test, unix, feature = "ffi"))]
-mod protection_tests {
-    use super::*;
-    use std::sync::Arc;
-
-    #[tokio::test]
-    async fn outbound_protection_fails_closed_without_affecting_listeners() {
-        struct Restore(Arc<dyn crate::tun::SocketProtector>);
-        impl Drop for Restore {
-            fn drop(&mut self) {
-                crate::tun::set_global_socket_protector(self.0.clone());
-            }
-        }
-        let _restore = Restore(crate::tun::get_global_socket_protector());
-        let owner = std::thread::current().id();
-        crate::tun::set_global_socket_protector(Arc::new(crate::tun::FnSocketProtector::new(
-            move |_| {
-                if std::thread::current().id() == owner {
-                    Err(std::io::Error::new(
-                        std::io::ErrorKind::PermissionDenied,
-                        "protection denied",
-                    ))
-                } else {
-                    Ok(())
-                }
-            },
-        )));
-        assert!(new_tcp_socket(None, false).is_err());
-        assert!(new_udp_socket(false, None).is_err());
-        assert!(new_hostname_udp_socket(None).is_err());
-        assert!(
-            new_outbound_socket2_udp_socket(false, None, Some("0.0.0.0:0".parse().unwrap()))
-                .is_err()
-        );
-        assert!(new_tcp_listener("0.0.0.0:0".parse().unwrap(), 10, None).is_ok());
-        assert!(
-            new_socket2_udp_socket(false, None, Some("0.0.0.0:0".parse().unwrap()), false).is_ok()
-        );
-    }
-}
-
 pub fn new_udp_socket(
     is_ipv6: bool,
     bind_interface: Option<String>,
@@ -391,4 +266,129 @@ pub fn new_unix_listener<P: AsRef<Path>>(
 
     let std_listener: std::os::unix::net::UnixListener = socket.into();
     tokio::net::UnixListener::from_std(std_listener)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hostname_socket_fallback_is_limited_to_family_errors() {
+        #[cfg(unix)]
+        let unavailable = libc::EAFNOSUPPORT;
+        #[cfg(windows)]
+        let unavailable = 10047;
+        let mut attempts = Vec::new();
+        let socket = prefer_ipv6_socket(|ipv6| {
+            attempts.push(ipv6);
+            if ipv6 {
+                Err(std::io::Error::from_raw_os_error(unavailable))
+            } else {
+                new_socket2_udp_socket(false, None, Some("0.0.0.0:0".parse().unwrap()), false)
+            }
+        })
+        .unwrap();
+        assert_eq!(attempts, [true, false]);
+        assert!(socket.local_addr().unwrap().as_socket().unwrap().is_ipv4());
+
+        attempts.clear();
+        let error = prefer_ipv6_socket(|ipv6| {
+            attempts.push(ipv6);
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "denied",
+            ))
+        })
+        .unwrap_err();
+        assert_eq!(attempts, [true]);
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn hostname_socket_prefers_dual_stack_and_enforces_interface_binding() {
+        let ipv6_available =
+            match new_socket2_udp_socket(true, None, Some("[::]:0".parse().unwrap()), false) {
+                Ok(_) => true,
+                Err(error) if ipv6_unavailable(&error) => false,
+                Err(error) => panic!("IPv6 socket probe failed: {error}"),
+            };
+        let socket = new_hostname_udp_socket(None).unwrap();
+        assert_eq!(socket.local_addr().unwrap().is_ipv6(), ipv6_available);
+        assert!(new_hostname_udp_socket(Some("shoes-missing-interface".into())).is_err());
+    }
+
+    #[tokio::test]
+    async fn ipv6_udp_listener_accepts_both_address_families() {
+        let socket =
+            match new_socket2_udp_socket(true, None, Some("[::]:0".parse().unwrap()), false) {
+                Ok(socket) => socket,
+                Err(error) if ipv6_unavailable(&error) => return,
+                Err(error) => panic!("IPv6 socket creation failed: {error}"),
+            };
+        assert!(!socket.only_v6().unwrap());
+        let socket = into_tokio_udp_socket(socket).unwrap();
+        let port = socket.local_addr().unwrap().port();
+        for (bind, destination) in [
+            ("127.0.0.1:0", format!("127.0.0.1:{port}")),
+            ("[::1]:0", format!("[::1]:{port}")),
+        ] {
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                let peer = match tokio::net::UdpSocket::bind(bind).await {
+                    Ok(peer) => peer,
+                    Err(error) if bind == "[::1]:0" && ipv6_unavailable(&error) => return,
+                    Err(error) => panic!("UDP peer bind failed: {error}"),
+                };
+                peer.send_to(b"request", destination).await.unwrap();
+                let mut buf = [0; 16];
+                let (len, sender) = socket.recv_from(&mut buf).await.unwrap();
+                assert_eq!(&buf[..len], b"request");
+                socket.send_to(b"reply", sender).await.unwrap();
+                let len = peer.recv(&mut buf).await.unwrap();
+                assert_eq!(&buf[..len], b"reply");
+            })
+            .await
+            .unwrap();
+        }
+    }
+}
+
+#[cfg(all(test, unix, feature = "ffi"))]
+mod protection_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn outbound_protection_fails_closed_without_affecting_listeners() {
+        struct Restore(Arc<dyn crate::tun::SocketProtector>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                crate::tun::set_global_socket_protector(self.0.clone());
+            }
+        }
+        let _restore = Restore(crate::tun::get_global_socket_protector());
+        let owner = std::thread::current().id();
+        crate::tun::set_global_socket_protector(Arc::new(crate::tun::FnSocketProtector::new(
+            move |_| {
+                if std::thread::current().id() == owner {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "protection denied",
+                    ))
+                } else {
+                    Ok(())
+                }
+            },
+        )));
+        assert!(new_tcp_socket(None, false).is_err());
+        assert!(new_udp_socket(false, None).is_err());
+        assert!(new_hostname_udp_socket(None).is_err());
+        assert!(
+            new_outbound_socket2_udp_socket(false, None, Some("0.0.0.0:0".parse().unwrap()))
+                .is_err()
+        );
+        assert!(new_tcp_listener("0.0.0.0:0".parse().unwrap(), 10, None).is_ok());
+        assert!(
+            new_socket2_udp_socket(false, None, Some("0.0.0.0:0".parse().unwrap()), false).is_ok()
+        );
+    }
 }
