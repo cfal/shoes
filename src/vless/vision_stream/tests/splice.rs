@@ -1,9 +1,12 @@
 use super::*;
 use crate::copy_bidirectional::{copy_bidirectional, copy_bidirectional_with_sizes};
+use std::future::Future;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{Notify, oneshot};
 use tokio::time::timeout;
 
 const DEADLINE: Duration = Duration::from_secs(20);
@@ -38,7 +41,6 @@ async fn tcp_pair() -> (TcpStream, TcpStream) {
 }
 
 async fn vision_pair(backend: Backend, hide_tcp: bool) -> (Vision, Vision) {
-    let (client, server) = connection_pair(backend);
     let (a, b) = tcp_pair().await;
     let wrap = |socket| -> Box<dyn AsyncStream> {
         if hide_tcp {
@@ -47,8 +49,17 @@ async fn vision_pair(backend: Backend, hide_tcp: bool) -> (Vision, Vision) {
             Box::new(socket)
         }
     };
-    let client = CryptoTlsStream::new(wrap(a), client, Some(TlsDeframer::new()));
-    let server = CryptoTlsStream::new(wrap(b), server, Some(TlsDeframer::new()));
+    wrap_vision_pair(backend, wrap(a), wrap(b))
+}
+
+fn wrap_vision_pair(
+    backend: Backend,
+    client_io: Box<dyn AsyncStream>,
+    server_io: Box<dyn AsyncStream>,
+) -> (Vision, Vision) {
+    let (client, server) = connection_pair(backend);
+    let client = CryptoTlsStream::new(client_io, client, Some(TlsDeframer::new()));
+    let server = CryptoTlsStream::new(server_io, server, Some(TlsDeframer::new()));
     (
         VisionStream::new_client(client, [7; 16]).unwrap(),
         VisionStream::new_server(server, [7; 16], b"").unwrap(),
@@ -146,6 +157,223 @@ impl AsyncStream for HandoffWitness {
         }
         Some(socket)
     }
+}
+
+#[derive(Default)]
+struct OutputState {
+    bytes_before_block: usize,
+    write_release: Option<oneshot::Receiver<()>>,
+    flush_release: Option<oneshot::Receiver<()>>,
+}
+
+#[derive(Default)]
+struct OutputGate {
+    state: Mutex<OutputState>,
+    write_blocked: Notify,
+    flush_blocked: Notify,
+}
+
+impl OutputGate {
+    fn block(&self) -> (oneshot::Sender<()>, oneshot::Sender<()>) {
+        let (write, write_release) = oneshot::channel();
+        let (flush, flush_release) = oneshot::channel();
+        *self.state.lock().unwrap() = OutputState {
+            bytes_before_block: 7,
+            write_release: Some(write_release),
+            flush_release: Some(flush_release),
+        };
+        (write, flush)
+    }
+}
+
+struct GatedTcp {
+    socket: TcpStream,
+    output: Arc<OutputGate>,
+}
+
+impl AsyncRead for GatedTcp {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.socket).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for GatedTcp {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        let mut state = this.output.state.lock().unwrap();
+        if state.bytes_before_block == 0
+            && let Some(release) = &mut state.write_release
+        {
+            match Pin::new(release).poll(cx) {
+                Poll::Pending => {
+                    this.output.write_blocked.notify_one();
+                    return Poll::Pending;
+                }
+                Poll::Ready(result) => result.unwrap(),
+            }
+            state.write_release = None;
+        }
+        let len = if state.write_release.is_some() {
+            buf.len().min(state.bytes_before_block)
+        } else {
+            buf.len()
+        };
+        let written = ready!(Pin::new(&mut this.socket).poll_write(cx, &buf[..len]))?;
+        state.bytes_before_block = state.bytes_before_block.saturating_sub(written);
+        Poll::Ready(Ok(written))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let mut state = this.output.state.lock().unwrap();
+        if let Some(release) = &mut state.flush_release {
+            match Pin::new(release).poll(cx) {
+                Poll::Pending => {
+                    if state.write_release.is_none() {
+                        this.output.flush_blocked.notify_one();
+                    }
+                    return Poll::Pending;
+                }
+                Poll::Ready(result) => result.unwrap(),
+            }
+            state.flush_release = None;
+        }
+        Pin::new(&mut this.socket).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.socket).poll_shutdown(cx)
+    }
+}
+
+impl AsyncPing for GatedTcp {
+    fn supports_ping(&self) -> bool {
+        false
+    }
+
+    fn poll_write_ping(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<bool>> {
+        panic!("unexpected ping")
+    }
+}
+
+impl AsyncStream for GatedTcp {
+    fn plain_tcp(&self) -> Option<&TcpStream> {
+        let state = self.output.state.lock().unwrap();
+        assert!(state.write_release.is_none(), "handoff with blocked writes");
+        assert!(state.flush_release.is_none(), "handoff with blocked flush");
+        Some(&self.socket)
+    }
+}
+
+#[tokio::test]
+async fn two_vision_endpoints_drain_bidirectional_backpressure_before_handoff() {
+    timeout(DEADLINE, async {
+        for backend in BACKENDS {
+            let (client_io, inbound_io) = tcp_pair().await;
+            let (outbound_io, server_io) = tcp_pair().await;
+            let inbound_gate = Arc::new(OutputGate::default());
+            let outbound_gate = Arc::new(OutputGate::default());
+            let (mut client, mut inbound) = wrap_vision_pair(
+                backend,
+                Box::new(client_io),
+                Box::new(GatedTcp {
+                    socket: inbound_io,
+                    output: inbound_gate.clone(),
+                }),
+            );
+            let (outbound, mut server) = wrap_vision_pair(
+                backend,
+                Box::new(GatedTcp {
+                    socket: outbound_io,
+                    output: outbound_gate.clone(),
+                }),
+                Box::new(server_io),
+            );
+            // The second endpoint is probed only after both relay buffers and
+            // the first endpoint are eligible, so this witnesses the joint handoff.
+            let mut outbound = HandoffWitness::new(outbound);
+            let handed_off = outbound.handed_off.clone();
+            let ready = outbound.ready.clone();
+            let relay = tokio::spawn(async move {
+                copy_bidirectional(&mut inbound, &mut outbound, false, false).await
+            });
+            transfer(&mut client, &mut server, &inner_client_hello()).await;
+            transfer(&mut server, &mut client, &inner_server_hello()).await;
+
+            let (inbound_write, inbound_flush) = inbound_gate.block();
+            let (outbound_write, outbound_flush) = outbound_gate.block();
+            let tail: Vec<u8> = (0..32 * 1024 + 37).map(|i| (i ^ (i >> 8)) as u8).collect();
+            let uploaded = [APPLICATION_DATA, tail.as_slice()].concat();
+            let downloaded = [APPLICATION_DATA, &tail[..tail.len() - 18]].concat();
+            let spliced_before = crate::splice::TEST_SPLICED_BYTES.get();
+            tokio::try_join!(
+                async {
+                    client.write_all(&uploaded).await?;
+                    client.flush().await
+                },
+                async {
+                    server.write_all(&downloaded).await?;
+                    server.flush().await
+                }
+            )
+            .unwrap();
+            inbound_gate.write_blocked.notified().await;
+            outbound_gate.write_blocked.notified().await;
+            assert!(!handed_off.load(Ordering::Relaxed));
+            assert_eq!(crate::splice::TEST_SPLICED_BYTES.get(), spliced_before);
+
+            inbound_write.send(()).unwrap();
+            inbound_gate.flush_blocked.notified().await;
+            outbound_write.send(()).unwrap();
+            outbound_gate.flush_blocked.notified().await;
+            assert!(!handed_off.load(Ordering::Relaxed));
+            assert_eq!(crate::splice::TEST_SPLICED_BYTES.get(), spliced_before);
+
+            inbound_flush.send(()).unwrap();
+            let mut received = vec![0; downloaded.len()];
+            client.read_exact(&mut received).await.unwrap();
+            assert_eq!(received, downloaded);
+            assert!(!handed_off.load(Ordering::Relaxed));
+            assert_eq!(crate::splice::TEST_SPLICED_BYTES.get(), spliced_before);
+
+            outbound_flush.send(()).unwrap();
+            let mut received = vec![0; uploaded.len()];
+            server.read_exact(&mut received).await.unwrap();
+            assert_eq!(received, uploaded);
+            // Releasing the final flush must wake the handoff without another write.
+            ready.notified().await;
+            assert!(client.plain_tcp().is_some());
+            assert!(server.plain_tcp().is_some());
+
+            let payload = crate::copy_bidirectional::tests::quota_test_payload();
+            let before_upload = crate::splice::TEST_SPLICED_BYTES.get();
+            transfer(&mut client, &mut server, &payload).await;
+            let after_upload = crate::splice::TEST_SPLICED_BYTES.get();
+            assert!(after_upload > before_upload, "upload must use splice");
+            transfer(&mut server, &mut client, &payload).await;
+            assert!(
+                crate::splice::TEST_SPLICED_BYTES.get() > after_upload,
+                "download must use splice"
+            );
+
+            client.shutdown().await.unwrap();
+            assert_eq!(server.read(&mut [0; 1]).await.unwrap(), 0);
+            transfer(&mut server, &mut client, b"response after EOF").await;
+            server.shutdown().await.unwrap();
+            assert_eq!(client.read(&mut [0; 1]).await.unwrap(), 0);
+            relay.await.unwrap().unwrap();
+        }
+    })
+    .await
+    .unwrap();
 }
 
 async fn direct_relay(backend: Backend, is_server: bool, mode: RelayMode) {
