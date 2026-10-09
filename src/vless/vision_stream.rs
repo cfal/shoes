@@ -808,6 +808,9 @@ impl<IO: AsyncStream> AsyncStream for VisionStream<IO> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    mod splice;
+
     use super::*;
     use crate::address::{Address, NetLocation};
     use crate::async_stream::AsyncPing;

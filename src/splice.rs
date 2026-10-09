@@ -12,6 +12,11 @@ use crate::copy_bidirectional::MAX_COPY_BYTES_PER_POLL;
 static PIPE_BUDGET: Semaphore = Semaphore::const_new(128);
 const BUFFER_SIZE: usize = 16 * 1024;
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static TEST_SPLICED_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 struct Pipe {
     read: OwnedFd,
     write: OwnedFd,
@@ -121,7 +126,7 @@ async fn copy_buffered(
         source.readable().await?;
         let length = buffer.len().min(MAX_COPY_BYTES_PER_POLL - copied);
         match source.try_read(&mut buffer[..length]) {
-            Ok(0) => return socket2::SockRef::from(destination).shutdown(Shutdown::Write),
+            Ok(0) => return shutdown_write(destination),
             Ok(n) => {
                 write_all(destination, &buffer[..n]).await?;
                 account(&mut copied, n).await;
@@ -171,7 +176,7 @@ async fn copy_direction(
         // Small bursts are cheaper to copy than allocating and releasing a pipe.
         let length = buffer.len().min(MAX_COPY_BYTES_PER_POLL - copied);
         let n = match source.try_read(&mut buffer[..length]) {
-            Ok(0) => return socket2::SockRef::from(destination).shutdown(Shutdown::Write),
+            Ok(0) => return shutdown_write(destination),
             Ok(n) => n,
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
@@ -208,7 +213,7 @@ async fn copy_direction(
                 result
             });
             let mut pending = match result {
-                Ok(0) => return socket2::SockRef::from(destination).shutdown(Shutdown::Write),
+                Ok(0) => return shutdown_write(destination),
                 Ok(n) => n,
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
                 Err(error) if can_fallback(&error) => break 'bursts,
@@ -223,6 +228,8 @@ async fn copy_direction(
                 }) {
                     Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
                     Ok(n) => {
+                        #[cfg(test)]
+                        TEST_SPLICED_BYTES.update(|bytes| bytes + n);
                         pending -= n;
                         account(&mut copied, n).await;
                     }
@@ -240,6 +247,14 @@ async fn copy_direction(
         }
     }
     copy_buffered(source, destination, copied, buffer).await
+}
+
+fn shutdown_write(socket: &TcpStream) -> io::Result<()> {
+    match socket2::SockRef::from(socket).shutdown(Shutdown::Write) {
+        // Match raw CryptoTlsStream shutdown when the peer is already gone.
+        Err(error) if error.kind() == io::ErrorKind::NotConnected => Ok(()),
+        result => result,
+    }
 }
 
 fn at_urgent_mark(fd: RawFd) -> io::Result<bool> {
@@ -265,6 +280,22 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tokio::time::timeout;
+
+    #[tokio::test]
+    async fn shutdown_tolerates_an_already_disconnected_socket() {
+        let socket =
+            socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let stream = TcpStream::from_std(socket.into()).unwrap();
+        assert_eq!(
+            socket2::SockRef::from(&stream)
+                .shutdown(Shutdown::Write)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotConnected
+        );
+        shutdown_write(&stream).unwrap();
+    }
 
     async fn pair(ipv6: bool) -> (TcpStream, TcpStream) {
         let listener = TcpListener::bind(if ipv6 { "[::1]:0" } else { "127.0.0.1:0" })
