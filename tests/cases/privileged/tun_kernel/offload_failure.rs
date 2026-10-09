@@ -3,6 +3,7 @@ use shoes_test_support::process::spawn_privileged_process;
 use std::fs::{self, File};
 use std::io::Write;
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Stdio;
 
@@ -48,6 +49,9 @@ fn filtered_server() -> io::Result<()> {
     let result = std::env::var_os("SHOES_TEST_OFFLOAD_RESULT").expect("missing child result path");
     let result = Path::new(&result);
 
+    // Handoff must work even when sudo creates root-only files by default.
+    unsafe { libc::umask(0o077) };
+
     let instruction = |code, jt, jf, k| libc::sock_filter { code, jt, jf, k };
     let load = (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16;
     let equal = (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16;
@@ -87,16 +91,21 @@ fn filtered_server() -> io::Result<()> {
         io::Error::last_os_error().raw_os_error(),
         Some(libc::EACCES)
     );
-    fs::write(result.with_extension("armed"), request.to_string())?;
+    publish_handoff(&result.with_extension("armed"), &request.to_string())?;
 
     let status = Command::new(env!("CARGO_BIN_EXE_shoes"))
         .args(["-t", "2", "--no-reload"])
         .arg(config)
         .env("RUST_LOG", "info")
         .status()?;
-    let temporary = result.with_extension("tmp");
-    fs::write(&temporary, status.code().unwrap_or(-1).to_string())?;
-    fs::rename(temporary, result)
+    publish_handoff(result, &status.code().unwrap_or(-1).to_string())
+}
+
+fn publish_handoff(path: &Path, contents: &str) -> io::Result<()> {
+    let temporary = path.with_extension("tmp");
+    fs::write(&temporary, contents)?;
+    fs::set_permissions(&temporary, fs::Permissions::from_mode(0o644))?;
+    fs::rename(temporary, path)
 }
 
 async fn wait_for_exit(directory: &Path) -> io::Result<i32> {
@@ -170,14 +179,10 @@ async fn negotiation_failure_obeys_startup_policy() -> io::Result<()> {
             let flags = u32::from_str_radix(flags.trim().trim_start_matches("0x"), 16)
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
             assert_eq!(flags & libc::IFF_VNET_HDR as u32, 0);
-            timeout(
-                TEST_TIMEOUT,
-                bulk_echo(
-                    tun.connect_tcp(peer.local_addr().port()).await?,
-                    4 * 1024 * 1024 + 7,
-                    0,
-                ),
-            )
+            timeout(TEST_TIMEOUT, async {
+                let connection = tun.connect_tcp(peer.local_addr().port()).await?;
+                bulk_echo(connection, 4 * 1024 * 1024 + 7, 0).await
+            })
             .await??;
             let log = fs::read_to_string(directory.path().join("server.log"))?;
             assert_eq!(
