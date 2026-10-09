@@ -17,7 +17,7 @@ struct CopyBuffer {
     read_done: bool,
     need_flush: bool,
     need_write_ping: bool,
-    cache_length: usize,
+    cache_length: Option<usize>,
     buf: Box<[u8]>,
     read_count: usize,
 }
@@ -28,7 +28,7 @@ impl CopyBuffer {
             read_done: false,
             need_flush,
             need_write_ping: false,
-            cache_length: 0,
+            cache_length: None,
             buf: allocate_vec(65535).into_boxed_slice(),
             read_count: 0,
         }
@@ -53,19 +53,19 @@ impl CopyBuffer {
             let mut read_pending = false;
             let mut write_pending = false;
 
-            if !self.read_done && self.cache_length == 0 {
+            if !self.read_done && self.cache_length.is_none() {
                 let me = &mut *self;
                 let mut buf = ReadBuf::new(&mut me.buf);
                 match reader.as_mut().poll_read_message(cx, &mut buf) {
                     Poll::Ready(val) => {
                         val?;
                         let n = buf.filled().len();
-                        if n == 0 {
+                        if n == 0 && reader.read_message_eof_on_empty() {
                             self.read_done = true;
                         } else {
-                            self.cache_length = n;
+                            self.cache_length = Some(n);
                             did_read = true;
-                            self.read_count = self.read_count.wrapping_add(n);
+                            self.read_count = self.read_count.wrapping_add(n.max(1));
                             coop.made_progress();
                         }
                     }
@@ -75,15 +75,12 @@ impl CopyBuffer {
                 }
             }
 
-            if self.cache_length > 0 {
+            if let Some(length) = self.cache_length {
                 let me = &mut *self;
-                match writer
-                    .as_mut()
-                    .poll_write_message(cx, &me.buf[0..me.cache_length])
-                {
+                match writer.as_mut().poll_write_message(cx, &me.buf[..length]) {
                     Poll::Ready(val) => {
                         val?;
-                        self.cache_length = 0;
+                        self.cache_length = None;
                         self.need_flush = true;
                         // Don't bother writing ping, since we just wrote.
                         self.need_write_ping = false;
@@ -124,7 +121,7 @@ impl CopyBuffer {
             }
 
             // If we've written all the data and we've seen EOF, finish the transfer.
-            if self.read_done && self.cache_length == 0 {
+            if self.read_done && self.cache_length.is_none() {
                 return Poll::Ready(Ok(()));
             }
 
@@ -289,4 +286,136 @@ where
         last_active: Instant::now(),
     }
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::async_stream::{
+        AsyncFlushMessage, AsyncPing, AsyncReadMessage, AsyncShutdownMessage, AsyncWriteMessage,
+    };
+    use std::collections::VecDeque;
+
+    #[derive(Default)]
+    struct Messages {
+        incoming: VecDeque<Vec<u8>>,
+        outgoing: Vec<Vec<u8>>,
+        eof_on_empty: bool,
+        write_ready: bool,
+    }
+
+    impl AsyncReadMessage for Messages {
+        fn read_message_eof_on_empty(&self) -> bool {
+            self.eof_on_empty
+        }
+
+        fn poll_read_message(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let Some(message) = self.incoming.pop_front() else {
+                return Poll::Pending;
+            };
+            buf.put_slice(&message);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWriteMessage for Messages {
+        fn poll_write_message(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<()>> {
+            if !self.write_ready {
+                return Poll::Pending;
+            }
+            self.write_ready = false;
+            self.outgoing.push(buf.to_vec());
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncFlushMessage for Messages {
+        fn poll_flush_message(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+    impl AsyncShutdownMessage for Messages {
+        fn poll_shutdown_message(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+    impl AsyncPing for Messages {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+        fn poll_write_ping(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+    impl AsyncMessageStream for Messages {}
+
+    #[tokio::test]
+    async fn empty_datagrams_survive_pending_writes_and_count_as_activity() {
+        let mut reader = Messages {
+            incoming: [vec![], b"next".to_vec()].into(),
+            ..Messages::default()
+        };
+        let mut writer = Messages::default();
+        let mut buffer = CopyBuffer::new(false);
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        for _ in 0..2 {
+            assert!(
+                buffer
+                    .poll_copy(&mut cx, Pin::new(&mut reader), Pin::new(&mut writer))
+                    .is_pending()
+            );
+            assert_eq!(reader.incoming.len(), 1);
+            assert!(writer.outgoing.is_empty());
+            assert_ne!(buffer.read_count, 0, "empty datagram must refresh activity");
+        }
+        writer.write_ready = true;
+        assert!(
+            buffer
+                .poll_copy(&mut cx, Pin::new(&mut reader), Pin::new(&mut writer))
+                .is_pending()
+        );
+        assert_eq!(writer.outgoing, [Vec::<u8>::new()]);
+        assert!(reader.incoming.is_empty());
+        writer.write_ready = true;
+        assert!(
+            buffer
+                .poll_copy(&mut cx, Pin::new(&mut reader), Pin::new(&mut writer))
+                .is_pending()
+        );
+        assert_eq!(writer.outgoing, [vec![], b"next".to_vec()]);
+        assert!(!buffer.read_done);
+    }
+
+    #[tokio::test]
+    async fn empty_reads_still_end_eof_based_streams() {
+        let mut reader = Messages {
+            incoming: [vec![], b"unread".to_vec()].into(),
+            eof_on_empty: true,
+            ..Messages::default()
+        };
+        let mut writer = Messages {
+            write_ready: true,
+            ..Messages::default()
+        };
+        let mut buffer = CopyBuffer::new(false);
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(matches!(
+            buffer.poll_copy(&mut cx, Pin::new(&mut reader), Pin::new(&mut writer)),
+            Poll::Ready(Ok(()))
+        ));
+        assert!(writer.outgoing.is_empty());
+        assert_eq!(reader.incoming.len(), 1);
+        assert_eq!(buffer.read_count, 0);
+    }
 }
