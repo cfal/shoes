@@ -10,6 +10,13 @@ const DEADLINE: Duration = Duration::from_secs(20);
 const APPLICATION_DATA: &[u8] = b"\x17\x03\x03\x00\x04data";
 type Vision = VisionStream<Box<dyn AsyncStream>>;
 
+#[derive(Clone, Copy)]
+enum RelayMode {
+    Adaptive,
+    Buffered,
+    Wrapped,
+}
+
 fn inner_client_hello() -> Vec<u8> {
     let (mut client, _) = new_connections(Backend::Tls13);
     let mut hello = Vec::new();
@@ -73,6 +80,14 @@ struct HandoffWitness {
 }
 
 impl HandoffWitness {
+    fn new(stream: Vision) -> Self {
+        Self {
+            stream,
+            handed_off: Arc::new(AtomicBool::new(false)),
+            ready: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
     fn check_buffered(&self) {
         assert!(
             !self.handed_off.load(Ordering::Relaxed),
@@ -133,50 +148,49 @@ impl AsyncStream for HandoffWitness {
     }
 }
 
-async fn direct_relay(backend: Backend, server: bool, buffered: bool, hide_tcp: bool) {
-    let (client, inbound) = vision_pair(backend, hide_tcp).await;
-    let (mut peer, stream) = if server {
+async fn direct_relay(backend: Backend, is_server: bool, mode: RelayMode) {
+    let (client, inbound) = vision_pair(backend, matches!(mode, RelayMode::Wrapped)).await;
+    let (mut peer, stream) = if is_server {
         (client, inbound)
     } else {
         (inbound, client)
     };
     let (mut remote, mut destination) = tcp_pair().await;
-    let handed_off = Arc::new(AtomicBool::new(false));
-    let ready = Arc::new(tokio::sync::Notify::new());
-    let mut witness = HandoffWitness {
-        stream,
-        handed_off: handed_off.clone(),
-        ready: ready.clone(),
-    };
+    let mut witness = HandoffWitness::new(stream);
+    let handed_off = witness.handed_off.clone();
+    let ready = witness.ready.clone();
     let relay = tokio::spawn(async move {
-        if buffered {
-            copy_bidirectional_with_sizes(&mut witness, &mut remote, false, false, 16384, 16384)
-                .await
-        } else {
-            copy_bidirectional(&mut witness, &mut remote, false, false).await
+        match mode {
+            RelayMode::Buffered => {
+                copy_bidirectional_with_sizes(&mut witness, &mut remote, false, false, 16384, 16384)
+                    .await
+            }
+            RelayMode::Adaptive | RelayMode::Wrapped => {
+                copy_bidirectional(&mut witness, &mut remote, false, false).await
+            }
         }
     });
 
     let hello = inner_client_hello();
-    if server {
+    if is_server {
         transfer(&mut peer, &mut destination, &hello).await;
     } else {
         transfer(&mut destination, &mut peer, &hello).await;
     }
     let flight = [inner_server_hello().as_ref(), APPLICATION_DATA].concat();
-    if server {
+    if is_server {
         transfer(&mut destination, &mut peer, &flight).await;
     } else {
         transfer(&mut peer, &mut destination, &flight).await;
     }
     assert!(peer.plain_tcp().is_none(), "only one direction is DIRECT");
     assert!(!handed_off.load(Ordering::Relaxed));
-    if server {
+    if is_server {
         transfer(&mut peer, &mut destination, APPLICATION_DATA).await;
     } else {
         transfer(&mut destination, &mut peer, APPLICATION_DATA).await;
     }
-    let expect_handoff = !buffered && !hide_tcp;
+    let expect_handoff = matches!(mode, RelayMode::Adaptive);
     if expect_handoff {
         // No more request traffic is needed to enter the raw relay.
         ready.notified().await;
@@ -186,7 +200,7 @@ async fn direct_relay(backend: Backend, server: bool, buffered: bool, hide_tcp: 
     let payload: Vec<u8> = (0..4 * 1024 * 1024 + 37)
         .map(|i| (i ^ (i >> 8) ^ (i >> 16)) as u8)
         .collect();
-    if server {
+    if is_server {
         transfer(&mut destination, &mut peer, &payload).await;
     } else {
         transfer(&mut peer, &mut destination, &payload).await;
@@ -212,8 +226,8 @@ async fn direct_relay(backend: Backend, server: bool, buffered: bool, hide_tcp: 
 async fn direct_download_hands_off_client_and_server_without_more_upload() {
     timeout(DEADLINE, async {
         for backend in BACKENDS {
-            for server in [false, true] {
-                direct_relay(backend, server, false, false).await;
+            for is_server in [false, true] {
+                direct_relay(backend, is_server, RelayMode::Adaptive).await;
             }
         }
     })
@@ -224,8 +238,8 @@ async fn direct_download_hands_off_client_and_server_without_more_upload() {
 #[tokio::test]
 async fn explicit_buffered_and_hidden_tcp_paths_never_handoff() {
     timeout(DEADLINE, async {
-        direct_relay(Backend::Tls13, true, true, false).await;
-        direct_relay(Backend::Tls13, false, false, true).await;
+        direct_relay(Backend::Tls13, true, RelayMode::Buffered).await;
+        direct_relay(Backend::Tls13, false, RelayMode::Wrapped).await;
     })
     .await
     .unwrap();
@@ -270,12 +284,8 @@ async fn empty_direct_read_hands_off_even_when_read_returns_pending() {
         assert!(server.plain_tcp().is_none());
 
         let (mut remote, _destination) = tcp_pair().await;
-        let ready = Arc::new(tokio::sync::Notify::new());
-        let mut witness = HandoffWitness {
-            stream: server,
-            handed_off: Arc::new(AtomicBool::new(false)),
-            ready: ready.clone(),
-        };
+        let mut witness = HandoffWitness::new(server);
+        let ready = witness.ready.clone();
         let relay = tokio::spawn(async move {
             copy_bidirectional(&mut witness, &mut remote, false, false).await
         });
@@ -298,12 +308,8 @@ async fn half_close_before_second_direct_transition_stays_buffered() {
     timeout(DEADLINE, async {
         let (mut client, server) = vision_pair(Backend::Tls13, false).await;
         let (mut remote, mut destination) = tcp_pair().await;
-        let handed_off = Arc::new(AtomicBool::new(false));
-        let mut witness = HandoffWitness {
-            stream: server,
-            handed_off: handed_off.clone(),
-            ready: Arc::new(tokio::sync::Notify::new()),
-        };
+        let mut witness = HandoffWitness::new(server);
+        let handed_off = witness.handed_off.clone();
         let relay = tokio::spawn(async move {
             copy_bidirectional(&mut witness, &mut remote, false, false).await
         });

@@ -326,27 +326,29 @@ where
         let b_result = transfer_one_direction(cx, b_to_a, &mut *b_buf, &mut *b, &mut *a);
 
         match (a_result, b_result) {
-            (Poll::Ready(Err(e)), _) | (_, Poll::Ready(Err(e))) => Poll::Ready(Err(e)),
-            (Poll::Ready(Ok(())), Poll::Ready(Ok(()))) => Poll::Ready(Ok(CopyOutcome::Complete)),
-            _ => {
-                // A final transition read/flush can return Pending without another
-                // packet to wake us. Recheck after both directions have been polled.
-                #[cfg(target_os = "linux")]
-                if *allow_splice
-                    && matches!(a_to_b, TransferState::Running)
-                    && matches!(b_to_a, TransferState::Running)
-                    && a_buf.can_handoff()
-                    && b_buf.can_handoff()
-                    && !a.supports_ping()
-                    && !b.supports_ping()
-                    && a.plain_tcp().is_some()
-                    && b.plain_tcp().is_some()
-                {
-                    return Poll::Ready(Ok(CopyOutcome::Splice));
-                }
-                Poll::Pending
+            (Poll::Ready(Err(e)), _) | (_, Poll::Ready(Err(e))) => return Poll::Ready(Err(e)),
+            (Poll::Ready(Ok(())), Poll::Ready(Ok(()))) => {
+                return Poll::Ready(Ok(CopyOutcome::Complete));
             }
+            _ => {}
         }
+
+        // A final transition read/flush can return Pending without another
+        // packet to wake us. Recheck after both directions have been polled.
+        #[cfg(target_os = "linux")]
+        if *allow_splice
+            && matches!(a_to_b, TransferState::Running)
+            && matches!(b_to_a, TransferState::Running)
+            && a_buf.can_handoff()
+            && b_buf.can_handoff()
+            && !a.supports_ping()
+            && !b.supports_ping()
+            && a.plain_tcp().is_some()
+            && b.plain_tcp().is_some()
+        {
+            return Poll::Ready(Ok(CopyOutcome::Splice));
+        }
+        Poll::Pending
     }
 }
 
