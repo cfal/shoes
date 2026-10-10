@@ -4,6 +4,10 @@ mod anytls;
 mod anytls_uot;
 #[path = "cases/integration/h2mux_integration.rs"]
 mod h2mux;
+#[path = "cases/integration/h2mux_backpressure.rs"]
+mod h2mux_backpressure;
+#[path = "cases/integration/h2mux_singbox.rs"]
+mod h2mux_singbox;
 #[path = "cases/integration/hysteria2_integration.rs"]
 mod hysteria2;
 #[path = "cases/integration/hysteria2_udp_integration.rs"]
@@ -14,6 +18,8 @@ mod naiveproxy;
 mod plain_tcp_relay;
 #[path = "cases/integration/quic_udp_routing_test.rs"]
 mod quic_udp_routing;
+#[path = "cases/integration/reality_integration.rs"]
+mod reality;
 #[path = "cases/integration/resource_lifecycle_test.rs"]
 mod resource_lifecycle;
 #[path = "cases/integration/shadowsocks_integration.rs"]

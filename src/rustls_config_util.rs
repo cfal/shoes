@@ -324,8 +324,6 @@ pub fn try_create_server_config(
     if key_exchange_groups.requires_hybrid() {
         config.max_early_data_size = 0;
         config.send_half_rtt_data = false;
-    } else {
-        config.max_early_data_size = u32::MAX;
     }
     config.ignore_client_order = true;
 
@@ -368,6 +366,151 @@ pub fn process_fingerprints(client_fingerprints: &[String]) -> std::io::Result<B
 #[cfg(test)]
 mod material_tests {
     use super::*;
+    use std::io::{Read, Write};
+
+    fn resumption_configs() -> (Arc<rustls::ClientConfig>, rustls::ServerConfig) {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let server = try_create_server_config(
+            cert.cert.pem().as_bytes(),
+            cert.signing_key.serialize_pem().as_bytes(),
+            vec![],
+            &[],
+            &[],
+            &Default::default(),
+        )
+        .unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert.cert.der().clone()).unwrap();
+        let mut client = rustls::ClientConfig::builder_with_provider(get_crypto_provider())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        client.enable_early_data = true;
+        (Arc::new(client), server)
+    }
+
+    fn transfer_tls(
+        from: &mut rustls::Connection,
+        to: &mut rustls::Connection,
+    ) -> Result<(), rustls::Error> {
+        let mut wire = Vec::new();
+        from.write_tls(&mut wire).unwrap();
+        let mut wire = std::io::Cursor::new(wire);
+        while wire.position() < wire.get_ref().len() as u64 {
+            assert!(to.read_tls(&mut wire).unwrap() > 0);
+            to.process_new_packets()?;
+        }
+        Ok(())
+    }
+
+    fn finish_handshake(client: &mut rustls::Connection, server: &mut rustls::Connection) {
+        for _ in 0..8 {
+            transfer_tls(client, server).unwrap();
+            transfer_tls(server, client).unwrap();
+            if !client.is_handshaking()
+                && !server.is_handshaking()
+                && !client.wants_write()
+                && !server.wants_write()
+            {
+                return;
+            }
+        }
+        panic!("TLS handshake did not complete");
+    }
+
+    #[test]
+    fn tcp_tls_disables_early_data_without_disabling_resumption() {
+        let (client_config, server_config) = resumption_configs();
+        assert_eq!(server_config.max_early_data_size, 0);
+        let server_config = Arc::new(server_config);
+        for expected in [rustls::HandshakeKind::Full, rustls::HandshakeKind::Resumed] {
+            let mut client = rustls::ClientConnection::new(
+                client_config.clone(),
+                "localhost".try_into().unwrap(),
+            )
+            .unwrap();
+            assert!(client.early_data().is_none());
+            let mut client = rustls::Connection::Client(client);
+            let mut server = rustls::Connection::Server(
+                rustls::ServerConnection::new(server_config.clone()).unwrap(),
+            );
+            finish_handshake(&mut client, &mut server);
+            assert_eq!(client.handshake_kind(), Some(expected));
+            assert_eq!(server.handshake_kind(), Some(expected));
+            client.writer().write_all(b"proxy request").unwrap();
+            transfer_tls(&mut client, &mut server).unwrap();
+            let mut request = [0; 13];
+            server.reader().read_exact(&mut request).unwrap();
+            assert_eq!(&request, b"proxy request");
+        }
+    }
+
+    #[test]
+    fn tcp_tls_rejects_stale_early_data_and_bounds_discarded_bytes() {
+        for early_len in [1024, 32 * 1024] {
+            let (client_config, mut previous_config) = resumption_configs();
+            previous_config.max_early_data_size = u32::MAX;
+            let mut current_config = previous_config.clone();
+            current_config.max_early_data_size = 0;
+            let mut client = rustls::Connection::Client(
+                rustls::ClientConnection::new(
+                    client_config.clone(),
+                    "localhost".try_into().unwrap(),
+                )
+                .unwrap(),
+            );
+            let mut server = rustls::Connection::Server(
+                rustls::ServerConnection::new(Arc::new(previous_config)).unwrap(),
+            );
+            finish_handshake(&mut client, &mut server);
+
+            let mut resumed =
+                rustls::ClientConnection::new(client_config, "localhost".try_into().unwrap())
+                    .unwrap();
+            resumed.set_buffer_limit(None);
+            resumed
+                .early_data()
+                .unwrap()
+                .write_all(&vec![b'x'; early_len])
+                .unwrap();
+            let mut client = rustls::Connection::Client(resumed);
+            let mut server = rustls::Connection::Server(
+                rustls::ServerConnection::new(Arc::new(current_config)).unwrap(),
+            );
+            let result = transfer_tls(&mut client, &mut server);
+            if early_len > 16 * 1024 {
+                assert!(
+                    result.is_err(),
+                    "stale early data must not be discarded without a bound"
+                );
+                continue;
+            }
+            result.unwrap();
+            finish_handshake(&mut client, &mut server);
+            let rustls::Connection::Client(ref client_conn) = client else {
+                unreachable!()
+            };
+            assert!(!client_conn.is_early_data_accepted());
+            assert_eq!(
+                client.handshake_kind(),
+                Some(rustls::HandshakeKind::Resumed)
+            );
+            let rustls::Connection::Server(ref mut server_conn) = server else {
+                unreachable!()
+            };
+            assert!(server_conn.early_data().is_none());
+            assert_eq!(
+                server.reader().read(&mut [0]).unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+            client.writer().write_all(b"retried").unwrap();
+            transfer_tls(&mut client, &mut server).unwrap();
+            let mut request = [0; 7];
+            server.reader().read_exact(&mut request).unwrap();
+            assert_eq!(&request, b"retried");
+        }
+    }
 
     #[test]
     fn certificate_errors_are_fallible_for_both_roles() {

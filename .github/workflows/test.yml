@@ -50,6 +50,9 @@ jobs:
     - name: Run local tests
       run: cargo test --workspace --locked --lib --bins --verbose
 
+    - name: Run process contract tests
+      run: cargo test -p shoes --locked --test process_contract --verbose -- --test-threads=1
+
     - name: Run host FFI tests
       run: cargo test -p shoes --locked --lib --features ffi -- --test-threads=1
 
@@ -160,6 +163,12 @@ jobs:
         gzip --decompress --stdout "$archive" > "$binary"
         chmod +x "$binary"
         echo "SHOES_TEST_MIHOMO_BIN=$binary" >> "$GITHUB_ENV"
+
+    - name: Run sing-box mux lifecycle tests
+      if: matrix.name == 'local protocols'
+      run: >-
+        cargo test -p shoes --locked --lib --features integration-tests
+        h2mux::h2mux_server_session::singbox_interop_tests:: -- --test-threads=1
 
     - name: Run integration tests
       env:

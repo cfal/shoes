@@ -687,6 +687,62 @@ pub async fn start_tls_stream_echo_server(
     Ok(TestServer::new(task, address))
 }
 
+pub fn reality_tls_template_config() -> std::io::Result<Arc<ServerConfig>> {
+    use rustls::crypto::aws_lc_rs::{cipher_suite, kx_group};
+
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])
+        .map_err(std::io::Error::other)?;
+    let mut provider = rustls::crypto::aws_lc_rs::default_provider();
+    provider.cipher_suites = vec![cipher_suite::TLS13_AES_128_GCM_SHA256];
+    provider.kx_groups = vec![kx_group::X25519];
+    let mut config = ServerConfig::builder_with_provider(Arc::new(provider))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(std::io::Error::other)?
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![cert.cert.der().clone()],
+            rustls::pki_types::PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()).into(),
+        )
+        .map_err(std::io::Error::other)?;
+    // Keeps ServerHello whole but fragments the encrypted flight into at least four
+    // records below REALITY's 512-byte separate-mode threshold.
+    config.max_fragment_size = Some(128);
+    Ok(Arc::new(config))
+}
+
+pub async fn start_reality_tls_template() -> std::io::Result<TestServer> {
+    let acceptor = TlsAcceptor::from(reality_tls_template_config()?);
+    let listener = TcpListener::bind("0.0.0.0:0").await?;
+    let address = listener.local_addr()?;
+    let task = tokio::spawn(async move {
+        let mut connections = JoinSet::new();
+        loop {
+            tokio::select! {
+                accepted = listener.accept() => match accepted {
+                    Ok((stream, _)) => {
+                        let acceptor = acceptor.clone();
+                        connections.spawn(async move {
+                            // REALITY drops the template after the server flight, before
+                            // sending client Finished. An incomplete handshake is expected.
+                            let _ = acceptor.accept(stream).await;
+                        });
+                    }
+                    Err(error) => {
+                        eprintln!("[TEST_SERVER] TLS template accept failed: {error}");
+                        break;
+                    }
+                },
+                result = connections.join_next(), if !connections.is_empty() => {
+                    if let Some(Err(error)) = result {
+                        eprintln!("[TEST_SERVER] TLS template task failed: {error}");
+                    }
+                }
+            }
+        }
+    });
+    Ok(TestServer::new(task, address))
+}
+
 // Re-export certificate generation from certs module
 pub use super::certs::generate_test_cert_files as generate_test_cert;
 
@@ -826,6 +882,45 @@ mod tests {
         .await?;
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn dropping_tls_template_closes_pending_handshake()
+    -> Result<(), Box<dyn std::error::Error>> {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let server = start_reality_tls_template().await?;
+            let address = ("127.0.0.1", server.local_addr().port());
+            let mut stream = tokio::net::TcpStream::connect(address).await?;
+            let config = rustls::ClientConfig::builder_with_provider(
+                reality_tls_template_config()?.crypto_provider().clone(),
+            )
+            .with_protocol_versions(&[&rustls::version::TLS13])?
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth();
+            let mut client =
+                rustls::ClientConnection::new(Arc::new(config), "localhost".try_into()?)?;
+            let mut hello = Vec::new();
+            client.write_tls(&mut hello)?;
+            stream.write_all(&hello).await?;
+
+            // Receiving ServerHello proves the connection is owned by a handshake task,
+            // not merely queued on the listener. No client Finished is sent.
+            let mut header = [0; 5];
+            stream.read_exact(&mut header).await?;
+            assert_eq!(header[0], 22);
+            let mut body = vec![0; u16::from_be_bytes([header[3], header[4]]) as usize];
+            stream.read_exact(&mut body).await?;
+            assert_eq!(body[0], 2);
+            assert!(client.is_handshaking());
+
+            drop(server);
+            stream.read_to_end(&mut Vec::new()).await?;
+            while tokio::net::TcpStream::connect(address).await.is_ok() {
+                tokio::task::yield_now().await;
+            }
+            Ok::<_, Box<dyn std::error::Error>>(())
+        })
+        .await?
     }
 
     #[tokio::test]

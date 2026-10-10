@@ -731,7 +731,11 @@ fn validate_server_config(
         client_groups,
         rule_groups,
         named_pems,
-        false, // top-level, not inside TLS/Reality
+        if server_config.transport == Transport::Quic {
+            ServerProtocolContext::Quic
+        } else {
+            ServerProtocolContext::Stream
+        },
     )?;
 
     Ok(())
@@ -1128,14 +1132,111 @@ fn validate_vmess_cipher(cipher: &str) -> std::io::Result<()> {
     crate::vmess::DataCipher::try_from(cipher).map(|_| ())
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ServerProtocolContext {
+    Stream,
+    Tls,
+    Quic,
+}
+
+fn validate_server_vision(vision: bool, protocol: &ServerProxyConfig) -> std::io::Result<()> {
+    if vision && !matches!(protocol, ServerProxyConfig::Vless { .. }) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Server Vision requires VLESS as the inner protocol",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_nonempty_secret(secret: &str, protocol: &str) -> std::io::Result<()> {
+    if secret.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{protocol} server password must not be empty"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_server_auth(protocol: &ServerProxyConfig) -> std::io::Result<()> {
+    match protocol {
+        ServerProxyConfig::Http { username, password } => {
+            if username.is_some() || password.is_some() {
+                validate_nonempty_secret(password.as_deref().unwrap_or_default(), "HTTP")?;
+            }
+        }
+        ServerProxyConfig::Socks {
+            username, password, ..
+        }
+        | ServerProxyConfig::Mixed {
+            username, password, ..
+        } => {
+            if username.is_none() && password.is_none() {
+                return Ok(());
+            }
+
+            let username_len = username.as_deref().unwrap_or_default().len();
+            let password_len = password.as_deref().unwrap_or_default().len();
+            if !(1..=255).contains(&username_len) || !(1..=255).contains(&password_len) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "SOCKS/mixed server authentication requires a username and password of 1-255 bytes each",
+                ));
+            }
+        }
+        ServerProxyConfig::Trojan {
+            password,
+            shadowsocks,
+        } => {
+            validate_nonempty_secret(password, "Trojan")?;
+            if let Some(ShadowsocksConfig::Legacy { password, .. }) = shadowsocks {
+                validate_nonempty_secret(password, "Trojan Shadowsocks")?;
+            }
+        }
+        ServerProxyConfig::Snell { password, .. }
+        | ServerProxyConfig::Hysteria2 { password, .. }
+        | ServerProxyConfig::TuicV5 { password, .. } => {
+            validate_nonempty_secret(password, &protocol.to_string())?;
+        }
+        ServerProxyConfig::Shadowsocks { config, .. } => {
+            if let ShadowsocksConfig::Legacy { password, .. } = config {
+                validate_nonempty_secret(password, "Shadowsocks")?;
+            }
+            config.validate_key_len()?;
+        }
+        ServerProxyConfig::Anytls { users, .. } => {
+            for user in users.iter() {
+                validate_nonempty_secret(&user.password, "AnyTLS")?;
+            }
+        }
+        ServerProxyConfig::Naiveproxy { users, .. } => {
+            for user in users.iter() {
+                validate_nonempty_secret(&user.password, "NaiveProxy")?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 fn validate_server_proxy_config(
     server_proxy_config: &mut ServerProxyConfig,
     client_groups: &HashMap<String, Vec<ClientConfig>>,
     rule_groups: &HashMap<String, Vec<RuleConfig>>,
     named_pems: &HashMap<String, String>,
-    inside_tls_or_reality: bool,
+    context: ServerProtocolContext,
 ) -> std::io::Result<()> {
+    validate_server_auth(server_proxy_config)?;
     match server_proxy_config {
+        ServerProxyConfig::Hysteria2 { .. } | ServerProxyConfig::TuicV5 { .. }
+            if context != ServerProtocolContext::Quic =>
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("{server_proxy_config} requires a top-level QUIC listener"),
+            ));
+        }
         ServerProxyConfig::Anytls {
             padding_scheme: Some(lines),
             ..
@@ -1143,7 +1244,7 @@ fn validate_server_proxy_config(
             crate::anytls::PaddingFactory::new(lines.join("\n").as_bytes())
                 .map_err(std::io::Error::other)?;
         }
-        ServerProxyConfig::Naiveproxy { .. } if !inside_tls_or_reality => {
+        ServerProxyConfig::Naiveproxy { .. } if context != ServerProtocolContext::Tls => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "NaiveProxy must be used inside a TLS or Reality protocol. \
@@ -1180,6 +1281,7 @@ fn validate_server_proxy_config(
                 tls_server_config
                     .key_exchange_groups
                     .validate_vision(tls_server_config.vision)?;
+                validate_server_vision(tls_server_config.vision, &tls_server_config.protocol)?;
                 embed_pem_from_map(&mut tls_server_config.cert, named_pems);
                 embed_pem_from_map(&mut tls_server_config.key, named_pems);
                 for cert in tls_server_config.client_ca_certs.iter_mut() {
@@ -1205,7 +1307,7 @@ fn validate_server_proxy_config(
                     client_groups,
                     rule_groups,
                     named_pems,
-                    true,
+                    ServerProtocolContext::Tls,
                 )?;
 
                 ConfigSelection::replace_none_or_some_groups(override_rules, rule_groups)?;
@@ -1222,6 +1324,7 @@ fn validate_server_proxy_config(
                 tls_server_config
                     .key_exchange_groups
                     .validate_vision(tls_server_config.vision)?;
+                validate_server_vision(tls_server_config.vision, &tls_server_config.protocol)?;
                 embed_pem_from_map(&mut tls_server_config.cert, named_pems);
                 embed_pem_from_map(&mut tls_server_config.key, named_pems);
                 for cert in tls_server_config.client_ca_certs.iter_mut() {
@@ -1244,7 +1347,7 @@ fn validate_server_proxy_config(
                     client_groups,
                     rule_groups,
                     named_pems,
-                    true,
+                    ServerProtocolContext::Tls,
                 )?;
 
                 ConfigSelection::replace_none_or_some_groups(override_rules, rule_groups)?;
@@ -1258,6 +1361,7 @@ fn validate_server_proxy_config(
                 }
             }
             for (sni_hostname, tls_server_config) in shadowtls_targets.iter_mut() {
+                validate_nonempty_secret(&tls_server_config.password, "ShadowTLS")?;
                 if tls_targets.contains_key(sni_hostname) {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
@@ -1299,7 +1403,7 @@ fn validate_server_proxy_config(
                     client_groups,
                     rule_groups,
                     named_pems,
-                    true,
+                    ServerProtocolContext::Stream,
                 )?;
 
                 ConfigSelection::replace_none_or_some_groups(override_rules, rule_groups)?;
@@ -1314,6 +1418,7 @@ fn validate_server_proxy_config(
             }
 
             for (sni_hostname, reality_config) in reality_targets.iter_mut() {
+                validate_server_vision(reality_config.vision, &reality_config.protocol)?;
                 if tls_targets.contains_key(sni_hostname) {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
@@ -1347,7 +1452,7 @@ fn validate_server_proxy_config(
                     client_groups,
                     rule_groups,
                     named_pems,
-                    true,
+                    ServerProtocolContext::Tls,
                 )?;
 
                 ConfigSelection::replace_none_or_some_groups(
@@ -1385,7 +1490,7 @@ fn validate_server_proxy_config(
                     client_groups,
                     rule_groups,
                     named_pems,
-                    false,
+                    ServerProtocolContext::Stream,
                 )?;
 
                 ConfigSelection::replace_none_or_some_groups(override_rules, rule_groups)?;
@@ -1720,6 +1825,171 @@ mod tests {
     use crate::dns::IpStrategy;
 
     #[test]
+    fn server_secrets_must_be_nonempty() {
+        use serde_json::json;
+        for mut value in [
+            json!({"type": "trojan", "password": ""}),
+            json!({"type": "snell", "cipher": "aes-128-gcm", "password": ""}),
+            json!({"type": "shadowsocks", "cipher": "aes-128-gcm", "password": ""}),
+            json!({"type": "hysteria2", "password": ""}),
+            json!({"type": "tuic", "uuid": "550e8400-e29b-41d4-a716-446655440000", "password": ""}),
+        ] {
+            for password in ["", "do-not-log-this-secret", " "] {
+                value["password"] = json!(password);
+                let protocol = serde_json::from_value(value.clone()).unwrap();
+                let result = validate_server_auth(&protocol);
+                assert_eq!(result.is_ok(), !password.is_empty());
+                if let Err(error) = result {
+                    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+                    assert!(!error.to_string().contains("do-not-log-this-secret"));
+                }
+            }
+        }
+        for password in ["", "do-not-log-this-secret"] {
+            let protocol = serde_json::from_value(json!({
+                "type": "trojan", "password": "do-not-log-this-secret",
+                "shadowsocks": {"cipher": "aes-128-gcm", "password": password}
+            }))
+            .unwrap();
+            assert_eq!(
+                validate_server_auth(&protocol).is_ok(),
+                !password.is_empty()
+            );
+            for protocol_type in ["anytls", "naive"] {
+                let mut user = json!({"password": password});
+                if protocol_type == "naive" {
+                    user["username"] = json!("user");
+                }
+                let mut valid_user = user.clone();
+                valid_user["password"] = json!("do-not-log-this-secret");
+                for users in [user.clone(), json!([valid_user, user])] {
+                    let protocol = serde_json::from_value(json!({
+                        "type": protocol_type, "users": users
+                    }))
+                    .unwrap();
+                    let result = validate_server_auth(&protocol);
+                    assert_eq!(result.is_ok(), !password.is_empty());
+                    if let Err(error) = result {
+                        assert!(!error.to_string().contains("do-not-log-this-secret"));
+                    }
+                }
+            }
+        }
+        let protocol = ServerProxyConfig::Shadowsocks {
+            config: ShadowsocksConfig::Aead2022 {
+                cipher: "aes-128-gcm".try_into().unwrap(),
+                key_bytes: vec![0; 1].into_boxed_slice(),
+            },
+            udp_enabled: true,
+        };
+        assert!(validate_server_auth(&protocol).is_err());
+    }
+
+    #[test]
+    fn optional_server_auth_preserves_no_auth_and_http_empty_username() {
+        use serde_json::json;
+        for protocol_type in ["http", "socks", "mixed"] {
+            for (username, password, http_valid, socks_valid) in [
+                (None, None, true, true),
+                (Some("user"), Some("secret"), true, true),
+                (None, Some("secret"), true, false),
+                (Some(""), Some("secret"), true, false),
+                (Some("user"), None, false, false),
+                (Some("user"), Some(""), false, false),
+                (None, Some(""), false, false),
+                (Some(""), None, false, false),
+                (Some(""), Some(""), false, false),
+            ] {
+                let protocol = serde_json::from_value(json!({
+                    "type": protocol_type, "username": username, "password": password
+                }))
+                .unwrap();
+                assert_eq!(
+                    validate_server_auth(&protocol).is_ok(),
+                    if protocol_type == "http" {
+                        http_valid
+                    } else {
+                        socks_valid
+                    },
+                    "{protocol_type}: {username:?}, {password:?}"
+                );
+            }
+            for value in [
+                "a".to_string(),
+                "a".repeat(255),
+                "a".repeat(256),
+                format!("{}a", "\u{e9}".repeat(127)),
+                "\u{e9}".repeat(128),
+            ] {
+                for field in ["username", "password"] {
+                    let mut protocol = json!({
+                        "type": protocol_type, "username": "user", "password": "secret"
+                    });
+                    protocol[field] = json!(value);
+                    let protocol = serde_json::from_value(protocol).unwrap();
+                    assert_eq!(
+                        validate_server_auth(&protocol).is_ok(),
+                        protocol_type == "http" || value.len() <= 255,
+                        "{protocol_type}: {field}, {} bytes",
+                        value.len()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn server_protocol_context_enforces_transport_and_termination() {
+        use serde_json::json;
+        for (value, valid_context) in [
+            (
+                json!({"type": "hysteria2", "password": "secret"}),
+                ServerProtocolContext::Quic,
+            ),
+            (
+                json!({"type": "tuic", "uuid": "550e8400-e29b-41d4-a716-446655440000", "password": "secret"}),
+                ServerProtocolContext::Quic,
+            ),
+            (
+                json!({"type": "naive", "users": [{"username": "user", "password": "secret"}]}),
+                ServerProtocolContext::Tls,
+            ),
+        ] {
+            for context in [
+                ServerProtocolContext::Stream,
+                ServerProtocolContext::Tls,
+                ServerProtocolContext::Quic,
+            ] {
+                let mut protocol = serde_json::from_value(value.clone()).unwrap();
+                let result = validate_server_proxy_config(
+                    &mut protocol,
+                    &HashMap::new(),
+                    &HashMap::new(),
+                    &HashMap::new(),
+                    context,
+                );
+                assert_eq!(result.is_ok(), context == valid_context);
+                if let Err(error) = result {
+                    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+                    assert!(!error.to_string().contains("secret"));
+                }
+            }
+        }
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        for protocol in [
+            json!({"type": "hysteria2", "password": "secret"}),
+            json!({"type": "tuic", "uuid": "550e8400-e29b-41d4-a716-446655440000", "password": "secret"}),
+        ] {
+            let configs = serde_json::from_value(json!([{
+                "address": "127.0.0.1:9000", "transport": "quic", "protocol": protocol,
+                "quic_settings": {"cert": cert.cert.pem(), "key": cert.signing_key.serialize_pem()}
+            }]))
+            .unwrap();
+            assert!(create_server_configs(configs).is_ok());
+        }
+    }
+
+    #[test]
     fn nested_structure_errors_precede_protocol_field_errors() {
         let mut config = serde_json::from_value(serde_json::json!({
             "address": "example.com:443",
@@ -1811,7 +2081,7 @@ mod tests {
                 &HashMap::new(),
                 &HashMap::new(),
                 &HashMap::new(),
-                false,
+                ServerProtocolContext::Stream,
             )
             .unwrap_err();
             assert!(error.to_string().contains("hybrid-only"), "{error}");

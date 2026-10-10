@@ -7,6 +7,52 @@ use common::test_fixture::{ProxyTestFixture, TEST_UUID, start_shoes_server, star
 use std::path::Path;
 
 #[tokio::test]
+async fn fixed_target_udp_preserves_empty_reply_and_keeps_connection_open()
+-> Result<(), Box<dyn std::error::Error>> {
+    use common::port_helper::PortHelper;
+    use common::test_servers::start_udp_response_server;
+    use common::vless::{VlessDestination, VlessUdpClient, parse_uuid};
+    use std::time::Duration;
+    use tokio::net::TcpStream;
+    use tokio::time::timeout;
+
+    let peer = start_udp_response_server("0.0.0.0", 0, |payload, _| {
+        if payload == b"empty reply" {
+            vec![]
+        } else {
+            payload.to_vec()
+        }
+    })
+    .await?;
+    let mut ports = PortHelper::new();
+    let (_, proxy_port) = ports.get_localhost_listener_port();
+    let config = format!(
+        "- address: '0.0.0.0:{proxy_port}'\n  protocol:\n    type: vless\n    user_id: '{TEST_UUID}'\n    udp_enabled: true\n"
+    );
+    let (_process, _config) = start_shoes_server(&config)?;
+    ports.wait_for_all_ports().await?;
+    timeout(Duration::from_secs(5), async {
+        let stream = TcpStream::connect(("127.0.0.1", proxy_port)).await?;
+        let mut client = VlessUdpClient::connect(
+            stream,
+            parse_uuid(TEST_UUID)?,
+            VlessDestination::Ip(([127, 0, 0, 1], peer.local_addr().port()).into()),
+        )
+        .await?;
+        client.send_packet(b"empty reply").await?;
+        assert!(client.recv_packet(Duration::from_secs(2)).await?.is_empty());
+        client.send_packet(b"next reply").await?;
+        assert_eq!(
+            client.recv_packet(Duration::from_secs(2)).await?,
+            b"next reply"
+        );
+        std::io::Result::Ok(())
+    })
+    .await??;
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_shoes_vless_tls_vision_server() -> Result<(), Box<dyn std::error::Error>> {
     // Chain: curl -> sing-box HTTP proxy -> shoes VLESS+Vision server -> local HTTPS
     ProxyTestFixture::new()

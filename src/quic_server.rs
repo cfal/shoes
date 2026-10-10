@@ -181,14 +181,19 @@ pub async fn start_quic_servers(
         processed_ca_certs.push(cert.as_bytes().to_vec());
     }
 
-    let server_config = Arc::new(try_create_server_config(
+    let mut server_config = try_create_server_config(
         &cert_bytes,
         &key_bytes,
         processed_ca_certs,
         &alpn_protocols.into_vec(),
         &client_fingerprints.into_vec(),
         &key_exchange_groups,
-    )?);
+    )?;
+    // QUIC manages early data separately; its TLS limit must be zero or u32::MAX.
+    if !key_exchange_groups.requires_hybrid() {
+        server_config.max_early_data_size = u32::MAX;
+    }
+    let server_config = Arc::new(server_config);
 
     let quic_server_config: quinn::crypto::rustls::QuicServerConfig = server_config
         .try_into()

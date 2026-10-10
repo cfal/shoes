@@ -35,6 +35,14 @@ pub struct ActivityTracker {
 }
 
 impl ActivityTracker {
+    #[cfg(test)]
+    pub(super) fn already_idle() -> Self {
+        Self {
+            last_activity_ms: Arc::new(AtomicU64::new(0)),
+            created: Instant::now() - IDLE_TIMEOUT,
+        }
+    }
+
     /// Create a new tracker. Initial state is "just had activity".
     pub fn new() -> Self {
         Self {
