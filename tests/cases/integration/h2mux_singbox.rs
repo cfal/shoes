@@ -1,10 +1,13 @@
+use serde_json::{Value, json};
 use shoes_test_support::certs::generate_test_cert_files;
 use shoes_test_support::port_helper::PortHelper;
 use shoes_test_support::socks5::Socks5UdpAssociation;
 use shoes_test_support::test_fixture::{
-    SingBoxCapability, start_shoes_server, start_singbox_server_with,
+    SingBoxCapability, generate_reality_keypair, start_shoes_server, start_singbox_server_with,
 };
-use shoes_test_support::test_servers::{start_tcp_stream_echo_server, start_udp_echo_server};
+use shoes_test_support::test_servers::{
+    start_reality_tls_template, start_tcp_stream_echo_server, start_udp_echo_server,
+};
 use std::io;
 use std::net::Ipv4Addr;
 use std::path::Path;
@@ -56,30 +59,58 @@ async fn bulk_echo(
 #[tokio::test]
 async fn sing_box_padded_single_carrier_survives_concurrent_streams()
 -> Result<(), Box<dyn std::error::Error>> {
-    timeout(Duration::from_secs(60), async {
+    let (cert_path, key_path) = generate_test_cert_files()?;
+    let protocol = json!({
+        "type": "tls",
+        "tls_targets": {"test.local": {
+            "cert": AsRef::<Path>::as_ref(&cert_path),
+            "key": AsRef::<Path>::as_ref(&key_path),
+            "protocol": {"type": "vless", "user_id": TEST_UUID, "udp_enabled": true}
+        }}
+    });
+    let tls = json!({"enabled": true, "server_name": "test.local", "insecure": true});
+    exercise_single_carrier(protocol, tls, Duration::ZERO).await
+}
+
+#[tokio::test]
+async fn sing_box_reality_padded_single_carrier_survives_concurrency_and_idle()
+-> Result<(), Box<dyn std::error::Error>> {
+    let template = start_reality_tls_template().await?;
+    let (private_key, public_key) = generate_reality_keypair();
+    let short_id = "0123456789abcdef";
+    let protocol = json!({
+        "type": "tls",
+        "reality_targets": {"localhost": {
+            "private_key": private_key,
+            "short_ids": [short_id],
+            "dest": format!("localhost:{}", template.local_addr().port()),
+            "protocol": {"type": "vless", "user_id": TEST_UUID, "udp_enabled": true}
+        }}
+    });
+    let tls = json!({
+        "enabled": true,
+        "server_name": "localhost",
+        "utls": {"enabled": true, "fingerprint": "chrome"},
+        "reality": {"enabled": true, "public_key": public_key, "short_id": short_id}
+    });
+    // Exceeds Shoes' 60s idle timeout and its 10s check interval. Sing-box PINGs
+    // must keep the original carrier reusable without application traffic.
+    exercise_single_carrier(protocol, tls, Duration::from_secs(75)).await
+}
+
+async fn exercise_single_carrier(
+    protocol: Value,
+    tls: Value,
+    idle: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    timeout(Duration::from_secs(60) + idle, async {
         let mut ports = PortHelper::new();
         let (_, shoes_port) = ports.get_localhost_listener_port();
         let (_, socks_port) = ports.get_localhost_listener_port();
         let echo = start_tcp_stream_echo_server("0.0.0.0", 0).await?;
         let udp_echo = start_udp_echo_server("0.0.0.0", 0).await?;
-        let (cert_path, key_path) = generate_test_cert_files()?;
-        let cert = AsRef::<Path>::as_ref(&cert_path).display();
-        let key = AsRef::<Path>::as_ref(&key_path).display();
-        let config = format!(
-            r#"- address: '0.0.0.0:{shoes_port}'
-  protocol:
-    type: tls
-    tls_targets:
-      "test.local":
-        cert: '{cert}'
-        key: '{key}'
-        protocol:
-          type: vless
-          user_id: '{TEST_UUID}'
-          udp_enabled: true
-"#
-        );
-        let (_shoes, _shoes_config) = start_shoes_server(&config)?;
+        let config = json!([{"address": format!("0.0.0.0:{shoes_port}"), "protocol": protocol}]);
+        let (_shoes, _shoes_config) = start_shoes_server(&config.to_string())?;
 
         // A second carrier fails the test instead of hiding broken stream isolation.
         let listener = TcpListener::bind("0.0.0.0:0").await?;
@@ -96,7 +127,7 @@ async fn sing_box_padded_single_carrier_survives_concurrent_streams()
                 _ = listener.accept() => Err(io::Error::other("unexpected second mux carrier")),
             }
         });
-        let singbox_config = serde_json::json!({
+        let singbox_config = json!({
             "log": {"level": "warn"},
             "inbounds": [{"type": "socks", "listen": "0.0.0.0", "listen_port": socks_port}],
             "outbounds": [{
@@ -104,7 +135,7 @@ async fn sing_box_padded_single_carrier_survives_concurrent_streams()
                 "server": "127.0.0.1",
                 "server_port": carrier_port,
                 "uuid": TEST_UUID,
-                "tls": {"enabled": true, "server_name": "test.local", "insecure": true},
+                "tls": tls,
                 "multiplex": {
                     "enabled": true,
                     "protocol": "h2mux",
@@ -163,6 +194,12 @@ async fn sing_box_padded_single_carrier_survives_concurrent_streams()
             small_streams,
         )?;
         echo_round_trip(&mut interactive, b"surviving stream").await?;
+        drop(association);
+        tokio::select! {
+            _ = tokio::time::sleep(idle) => {}
+            result = carrier.join_next() => panic!("carrier failed while idle: {result:?}"),
+        }
+        echo_round_trip(&mut interactive, b"surviving stream after idle").await?;
         let mut replacement = super::h2mux::connect_tcp_via_socks5(
             "127.0.0.1",
             socks_port,
@@ -171,6 +208,11 @@ async fn sing_box_padded_single_carrier_survives_concurrent_streams()
         )
         .await?;
         echo_round_trip(&mut replacement, b"new stream on the same carrier").await?;
+        let association = Socks5UdpAssociation::connect("127.0.0.1", socks_port).await?;
+        assert_eq!(
+            association.send_to(udp_target, b"UDP after idle").await?,
+            b"UDP after idle [ECHO]"
+        );
         assert!(
             carrier.try_join_next().is_none(),
             "single carrier did not survive"
