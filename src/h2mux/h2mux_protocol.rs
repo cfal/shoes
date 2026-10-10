@@ -233,21 +233,18 @@ impl StreamResponse {
         buf.put_u8(self.status);
 
         if self.status == STATUS_ERROR {
-            if let Some(ref msg) = self.message {
-                let mut len = msg.len().min(MAX_ERROR_MESSAGE_LEN);
-                while !msg.is_char_boundary(len) {
-                    len -= 1;
-                }
-                if len < 128 {
-                    buf.put_u8(len as u8);
-                } else {
-                    buf.put_u8((len & 0x7F) as u8 | 0x80);
-                    buf.put_u8((len >> 7) as u8);
-                }
-                buf.put_slice(&msg.as_bytes()[..len]);
-            } else {
-                buf.put_u8(0);
+            let message = self.message.as_deref().unwrap_or_default();
+            let mut len = message.len().min(MAX_ERROR_MESSAGE_LEN);
+            while !message.is_char_boundary(len) {
+                len -= 1;
             }
+            if len < 128 {
+                buf.put_u8(len as u8);
+            } else {
+                buf.put_u8((len & 0x7F) as u8 | 0x80);
+                buf.put_u8((len >> 7) as u8);
+            }
+            buf.put_slice(&message.as_bytes()[..len]);
         }
         buf
     }
@@ -438,6 +435,17 @@ async fn read_error_length<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<u
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn absent_and_empty_error_messages_have_identical_encoding() {
+        for message in [None, Some(String::new())] {
+            let response = StreamResponse {
+                status: STATUS_ERROR,
+                message,
+            };
+            assert_eq!(response.encode().as_ref(), &[STATUS_ERROR, 0]);
+        }
+    }
 
     #[tokio::test]
     async fn error_lengths_are_bounded_before_reading_bodies() {

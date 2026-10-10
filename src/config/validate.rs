@@ -1158,14 +1158,13 @@ fn validate_server_auth(protocol: &ServerProxyConfig) -> std::io::Result<()> {
         | ServerProxyConfig::Mixed {
             username, password, ..
         } => {
-            if (username.is_some() || password.is_some())
-                && (!username
-                    .as_ref()
-                    .is_some_and(|v| (1..=255).contains(&v.len()))
-                    || !password
-                        .as_ref()
-                        .is_some_and(|v| (1..=255).contains(&v.len())))
-            {
+            if username.is_none() && password.is_none() {
+                return Ok(());
+            }
+
+            let username_len = username.as_deref().unwrap_or_default().len();
+            let password_len = password.as_deref().unwrap_or_default().len();
+            if !(1..=255).contains(&username_len) || !(1..=255).contains(&password_len) {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     "SOCKS/mixed server authentication requires a username and password of 1-255 bytes each",

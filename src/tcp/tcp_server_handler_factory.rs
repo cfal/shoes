@@ -285,6 +285,26 @@ pub fn create_tcp_server_handler(
     })
 }
 
+fn create_vision_vless_config(protocol: &ServerProxyConfig) -> std::io::Result<VisionVlessConfig> {
+    let ServerProxyConfig::Vless {
+        user_id,
+        udp_enabled,
+        fallback,
+    } = protocol
+    else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Vision requires VLESS",
+        ));
+    };
+
+    Ok(VisionVlessConfig {
+        user_id: parse_uuid(user_id)?.into_boxed_slice(),
+        udp_enabled: *udp_enabled,
+        fallback: fallback.clone(),
+    })
+}
+
 fn create_tls_server_target(
     tls_server_config: TlsServerConfig,
     client_proxy_selector: &Arc<ClientProxySelector>,
@@ -374,25 +394,7 @@ fn create_tls_server_target(
             padding_enabled: padding,
         })
     } else if vision {
-        // Vision requires VLESS protocol (validated in config/mod.rs)
-        if let ServerProxyConfig::Vless {
-            user_id,
-            udp_enabled,
-            fallback,
-        } = &protocol
-        {
-            let user_id_bytes = parse_uuid(user_id)?.into_boxed_slice();
-            InnerProtocol::VisionVless(VisionVlessConfig {
-                user_id: user_id_bytes,
-                udp_enabled: *udp_enabled,
-                fallback: fallback.clone(),
-            })
-        } else {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "Vision requires VLESS",
-            ));
-        }
+        InnerProtocol::VisionVless(create_vision_vless_config(&protocol)?)
     } else {
         let handler = create_tcp_server_handler(protocol, &effective_selector, resolver, bind_ip)?;
         InnerProtocol::Normal(handler)
@@ -538,25 +540,7 @@ fn create_reality_server_target(
             padding_enabled: padding,
         })
     } else if vision {
-        // Vision requires VLESS protocol (validated in config/mod.rs)
-        if let ServerProxyConfig::Vless {
-            user_id,
-            udp_enabled,
-            fallback,
-        } = &protocol
-        {
-            let user_id_bytes = parse_uuid(user_id)?.into_boxed_slice();
-            InnerProtocol::VisionVless(VisionVlessConfig {
-                user_id: user_id_bytes,
-                udp_enabled: *udp_enabled,
-                fallback: fallback.clone(),
-            })
-        } else {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "Vision requires VLESS",
-            ));
-        }
+        InnerProtocol::VisionVless(create_vision_vless_config(&protocol)?)
     } else {
         let handler = create_tcp_server_handler(protocol, &effective_selector, resolver, bind_ip)?;
         InnerProtocol::Normal(handler)
@@ -639,21 +623,44 @@ fn create_websocket_server_target(
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::io::ErrorKind;
 
     #[test]
     fn unsupported_protocols_return_errors_without_credentials() {
         let selector = Arc::new(ClientProxySelector::new(vec![]));
         let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
-        for value in [
-            json!({"type": "hysteria2", "password": "do-not-log"}),
-            json!({"type": "tuic", "uuid": "550e8400-e29b-41d4-a716-446655440000", "password": "do-not-log"}),
-            json!({"type": "naive", "users": [{"username": "user", "password": "do-not-log"}]}),
-            json!({"type": "tls", "default_target": {"cert": "unused", "key": "unused", "vision": true, "protocol": {"type": "trojan", "password": "do-not-log"}}}),
-            json!({"type": "tls", "reality_targets": {"localhost": {"private_key": "unused", "dest": "localhost:443", "vision": true, "protocol": {"type": "trojan", "password": "do-not-log"}}}}),
+        for (value, expected_kind, expected_message) in [
+            (
+                json!({"type": "hysteria2", "password": "do-not-log"}),
+                ErrorKind::Unsupported,
+                "Unsupported TCP proxy protocol: Hysteria2",
+            ),
+            (
+                json!({"type": "tuic", "uuid": "550e8400-e29b-41d4-a716-446655440000", "password": "do-not-log"}),
+                ErrorKind::Unsupported,
+                "Unsupported TCP proxy protocol: TuicV5",
+            ),
+            (
+                json!({"type": "naive", "users": [{"username": "user", "password": "do-not-log"}]}),
+                ErrorKind::InvalidInput,
+                "NaiveProxy must be used inside a TLS or Reality protocol",
+            ),
+            (
+                json!({"type": "tls", "default_target": {"cert": "unused", "key": "unused", "vision": true, "protocol": {"type": "trojan", "password": "do-not-log"}}}),
+                ErrorKind::InvalidInput,
+                "Vision requires VLESS",
+            ),
+            (
+                json!({"type": "tls", "reality_targets": {"localhost": {"private_key": "unused", "dest": "localhost:443", "vision": true, "protocol": {"type": "trojan", "password": "do-not-log"}}}}),
+                ErrorKind::InvalidInput,
+                "Vision requires VLESS",
+            ),
         ] {
             let protocol = serde_json::from_value(value).unwrap();
             let error =
                 create_tcp_server_handler(protocol, &selector, &resolver, None).unwrap_err();
+            assert_eq!(error.kind(), expected_kind);
+            assert_eq!(error.to_string(), expected_message);
             assert!(!error.to_string().contains("do-not-log"));
         }
     }
