@@ -164,6 +164,12 @@ jobs:
         chmod +x "$binary"
         echo "SHOES_TEST_MIHOMO_BIN=$binary" >> "$GITHUB_ENV"
 
+    - name: Run sing-box mux lifecycle tests
+      if: matrix.name == 'local protocols'
+      run: >-
+        cargo test -p shoes --locked --lib --features integration-tests
+        h2mux::h2mux_server_session::singbox_interop_tests:: -- --test-threads=1
+
     - name: Run integration tests
       env:
         TEST_FILTERS: ${{ matrix.filters }}
