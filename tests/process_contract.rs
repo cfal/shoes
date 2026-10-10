@@ -181,7 +181,53 @@ fn invalid_protocol_configs(address: SocketAddr) -> Vec<String> {
         serde_yaml::to_string(&json!([{"address": address.to_string(), "protocol": padding}]))
             .unwrap(),
     );
+    configs.extend(invalid_server_protocol_configs(address));
     configs
+}
+
+fn invalid_server_protocol_configs(address: SocketAddr) -> Vec<String> {
+    use serde_json::json;
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let mut protocols = Vec::new();
+    for inner in [
+        json!({"type": "hysteria2", "password": "do-not-log-this-secret"}),
+        json!({"type": "tuic", "uuid": "550e8400-e29b-41d4-a716-446655440000", "password": "do-not-log-this-secret"}),
+        json!({"type": "naive", "users": [{"username": "user", "password": "do-not-log-this-secret"}]}),
+    ] {
+        protocols.push(inner.clone());
+        protocols.push(json!({"type": "websocket", "targets": {"protocol": inner}}));
+        protocols.push(json!({"type": "tls", "shadowtls_targets": {"localhost": {
+            "password": "do-not-log-this-secret", "handshake": {"address": "localhost:443"}, "protocol": inner
+        }}}));
+        if inner["type"] != "naive" {
+            let tls_target = json!({"cert": cert.cert.pem(), "key": cert.signing_key.serialize_pem(), "protocol": inner});
+            protocols.push(json!({"type": "tls", "default_target": tls_target}));
+            protocols.push(json!({"type": "tls", "tls_targets": {"localhost": tls_target}}));
+            protocols.push(json!({"type": "tls", "reality_targets": {"localhost": {
+                "private_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "dest": "localhost:443", "protocol": inner
+            }}}));
+        }
+    }
+    for inner in [
+        json!({"type": "trojan", "password": "do-not-log-this-secret"}),
+        json!({"type": "naive", "users": [{"username": "user", "password": "do-not-log-this-secret"}]}),
+    ] {
+        let target = json!({"cert": cert.cert.pem(), "key": cert.signing_key.serialize_pem(), "vision": true, "protocol": inner});
+        protocols.push(json!({"type": "tls", "default_target": target}));
+        protocols.push(json!({"type": "tls", "tls_targets": {"localhost": target}}));
+        protocols.push(json!({"type": "tls", "reality_targets": {"localhost": {
+            "private_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "dest": "localhost:443", "vision": true, "protocol": inner
+        }}}));
+    }
+    protocols
+        .into_iter()
+        .map(|protocol| {
+            serde_yaml::to_string(&json!([{
+                "address": address.to_string(), "protocol": protocol
+            }]))
+            .unwrap()
+        })
+        .collect()
 }
 
 fn handshake_protocols(chain: serde_json::Value) -> [serde_json::Value; 2] {
@@ -251,6 +297,25 @@ fn check_rejects_invalid_protocol_constructor_settings() {
         assert_eq!(output.status.code(), Some(1));
         let error = String::from_utf8_lossy(&output.stderr);
         assert!(!error.contains("panicked"), "{error}");
+        assert!(!error.contains("do-not-log-this-secret"), "{error}");
+    }
+}
+
+#[test]
+fn startup_rejects_invalid_server_protocols_without_panics_or_credentials() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.yaml");
+    for config in invalid_server_protocol_configs(available_address()) {
+        std::fs::write(&path, config).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_shoes"))
+            .args(["--no-reload", "-t", "1"])
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(!error.contains("panicked"), "{error}");
+        assert!(!error.contains("do-not-log-this-secret"), "{error}");
     }
 }
 

@@ -271,14 +271,16 @@ pub fn create_tcp_server_handler(
             ))
         }
         ServerProxyConfig::Naiveproxy { .. } => {
-            // This should be caught at config validation time
-            unreachable!(
-                "NaiveProxy must be used inside a TLS or Reality protocol - \
-                 config validation should have rejected this"
-            )
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "NaiveProxy must be used inside a TLS or Reality protocol",
+            ));
         }
         unknown_config => {
-            panic!("Unsupported TCP proxy config: {unknown_config:?}")
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                format!("Unsupported TCP proxy protocol: {unknown_config}"),
+            ));
         }
     })
 }
@@ -299,6 +301,13 @@ fn create_tls_server_target(
         protocol,
         override_rules,
     } = tls_server_config;
+
+    if vision && !matches!(protocol, ServerProxyConfig::Vless { .. }) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Vision requires VLESS",
+        ));
+    }
 
     // Certificates are already embedded as PEM data during config validation
     let cert_bytes = cert.as_bytes().to_vec();
@@ -372,16 +381,17 @@ fn create_tls_server_target(
             fallback,
         } = &protocol
         {
-            let user_id_bytes = parse_uuid(user_id)
-                .expect("Invalid user_id UUID")
-                .into_boxed_slice();
+            let user_id_bytes = parse_uuid(user_id)?.into_boxed_slice();
             InnerProtocol::VisionVless(VisionVlessConfig {
                 user_id: user_id_bytes,
                 udp_enabled: *udp_enabled,
                 fallback: fallback.clone(),
             })
         } else {
-            unreachable!("Vision requires VLESS (should be validated during config load)")
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Vision requires VLESS",
+            ));
         }
     } else {
         let handler = create_tcp_server_handler(protocol, &effective_selector, resolver, bind_ip)?;
@@ -478,20 +488,23 @@ fn create_reality_server_target(
         override_rules,
     } = reality_server_config;
 
+    if vision && !matches!(protocol, ServerProxyConfig::Vless { .. }) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Vision requires VLESS",
+        ));
+    }
+
     // Decode private key from base64url (validated during config load)
-    let private_key_bytes = crate::reality::decode_private_key(&private_key)
-        .expect("Invalid REALITY private key (should be validated during config load)");
+    let private_key_bytes = crate::reality::decode_private_key(&private_key)?;
 
     // Decode short IDs from hex strings (validated during config load)
     // OneOrSome ensures at least one short_id is always present (default is all zeros)
     let short_id_bytes: Vec<[u8; 8]> = short_ids
         .into_vec()
         .into_iter()
-        .map(|s| {
-            crate::reality::decode_short_id(&s)
-                .expect("Invalid REALITY short_id (should be validated during config load)")
-        })
-        .collect();
+        .map(|s| crate::reality::decode_short_id(&s))
+        .collect::<std::io::Result<_>>()?;
 
     // Compute effective selector: if override_rules exist, create new selector; otherwise use parent's
     let effective_selector = if !override_rules.is_empty() {
@@ -532,16 +545,17 @@ fn create_reality_server_target(
             fallback,
         } = &protocol
         {
-            let user_id_bytes = parse_uuid(user_id)
-                .expect("Invalid user_id UUID")
-                .into_boxed_slice();
+            let user_id_bytes = parse_uuid(user_id)?.into_boxed_slice();
             InnerProtocol::VisionVless(VisionVlessConfig {
                 user_id: user_id_bytes,
                 udp_enabled: *udp_enabled,
                 fallback: fallback.clone(),
             })
         } else {
-            unreachable!("Vision requires VLESS (should be validated during config load)")
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Vision requires VLESS",
+            ));
         }
     } else {
         let handler = create_tcp_server_handler(protocol, &effective_selector, resolver, bind_ip)?;
@@ -619,4 +633,28 @@ fn create_websocket_server_target(
         ping_type,
         handler,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn unsupported_protocols_return_errors_without_credentials() {
+        let selector = Arc::new(ClientProxySelector::new(vec![]));
+        let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
+        for value in [
+            json!({"type": "hysteria2", "password": "do-not-log"}),
+            json!({"type": "tuic", "uuid": "550e8400-e29b-41d4-a716-446655440000", "password": "do-not-log"}),
+            json!({"type": "naive", "users": [{"username": "user", "password": "do-not-log"}]}),
+            json!({"type": "tls", "default_target": {"cert": "unused", "key": "unused", "vision": true, "protocol": {"type": "trojan", "password": "do-not-log"}}}),
+            json!({"type": "tls", "reality_targets": {"localhost": {"private_key": "unused", "dest": "localhost:443", "vision": true, "protocol": {"type": "trojan", "password": "do-not-log"}}}}),
+        ] {
+            let protocol = serde_json::from_value(value).unwrap();
+            let error =
+                create_tcp_server_handler(protocol, &selector, &resolver, None).unwrap_err();
+            assert!(!error.to_string().contains("do-not-log"));
+        }
+    }
 }
