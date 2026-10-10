@@ -182,7 +182,79 @@ fn invalid_protocol_configs(address: SocketAddr) -> Vec<String> {
             .unwrap(),
     );
     configs.extend(invalid_server_protocol_configs(address));
+    configs.extend(invalid_server_auth_configs(address));
     configs
+}
+
+fn invalid_server_auth_configs(address: SocketAddr) -> Vec<String> {
+    use serde_json::json;
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let empty = json!({"type": "trojan", "password": ""});
+    let tls_target = json!({"cert": cert.cert.pem(), "key": cert.signing_key.serialize_pem(), "protocol": empty});
+    let mut protocols = vec![
+        empty.clone(),
+        json!({"type": "snell", "cipher": "aes-128-gcm", "password": ""}),
+        json!({"type": "shadowsocks", "cipher": "aes-128-gcm", "password": ""}),
+        json!({"type": "trojan", "password": "do-not-log-this-secret", "shadowsocks": {"cipher": "aes-128-gcm", "password": ""}}),
+        json!({"type": "anytls", "users": [{"password": "do-not-log-this-secret"}, {"password": ""}]}),
+        json!({"type": "websocket", "targets": {"protocol": empty}}),
+        json!({"type": "tls", "default_target": tls_target}),
+        json!({"type": "tls", "tls_targets": {"localhost": tls_target}}),
+        json!({"type": "tls", "reality_targets": {"localhost": {
+            "private_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "dest": "localhost:443", "protocol": empty
+        }}}),
+        json!({"type": "tls", "shadowtls_targets": {"localhost": {
+            "password": "do-not-log-this-secret", "handshake": {"address": "localhost:443"}, "protocol": empty
+        }}}),
+    ];
+    for handshake in [
+        json!({"address": "localhost:443"}),
+        json!({"cert": cert.cert.pem(), "key": cert.signing_key.serialize_pem()}),
+    ] {
+        protocols.push(json!({"type": "tls", "shadowtls_targets": {"localhost": {
+            "password": "", "handshake": handshake, "protocol": {"type": "socks"}
+        }}}));
+    }
+    let mut naive = tls_target;
+    naive["protocol"] = json!({"type": "naive", "users": [
+        {"username": "valid", "password": "do-not-log-this-secret"},
+        {"username": "invalid", "password": ""}
+    ]});
+    protocols.push(json!({"type": "tls", "default_target": naive}));
+    for cipher in ["2022-blake3-aes-128-gcm", "2022-blake3-aes-256-gcm"] {
+        for password in ["", "eA=="] {
+            protocols.push(json!({"type": "shadowsocks", "cipher": cipher, "password": password}));
+        }
+    }
+    for protocol_type in ["http", "socks", "mixed"] {
+        protocols.push(json!({"type": protocol_type, "username": "user", "password": ""}));
+        protocols.push(json!({"type": protocol_type, "username": "user"}));
+        if protocol_type != "http" {
+            protocols.push(json!({"type": protocol_type, "password": "do-not-log-this-secret"}));
+            protocols.push(json!({"type": protocol_type, "username": "u".repeat(256), "password": "do-not-log-this-secret"}));
+        }
+    }
+    let mut configs: Vec<_> = protocols
+        .into_iter()
+        .map(|protocol| {
+            json!([{
+                "address": address.to_string(), "protocol": protocol
+            }])
+        })
+        .collect();
+    for protocol in [
+        json!({"type": "hysteria2", "password": ""}),
+        json!({"type": "tuic", "uuid": "550e8400-e29b-41d4-a716-446655440000", "password": ""}),
+    ] {
+        configs.push(json!([{
+            "address": address.to_string(), "transport": "quic", "protocol": protocol,
+            "quic_settings": {"cert": cert.cert.pem(), "key": cert.signing_key.serialize_pem()}
+        }]));
+    }
+    configs
+        .into_iter()
+        .map(|config| serde_yaml::to_string(&config).unwrap())
+        .collect()
 }
 
 fn invalid_server_protocol_configs(address: SocketAddr) -> Vec<String> {
@@ -305,7 +377,10 @@ fn check_rejects_invalid_protocol_constructor_settings() {
 fn startup_rejects_invalid_server_protocols_without_panics_or_credentials() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("config.yaml");
-    for config in invalid_server_protocol_configs(available_address()) {
+    for config in invalid_server_protocol_configs(available_address())
+        .into_iter()
+        .chain(invalid_server_auth_configs(available_address()))
+    {
         std::fs::write(&path, config).unwrap();
         let output = Command::new(env!("CARGO_BIN_EXE_shoes"))
             .args(["--no-reload", "-t", "1"])
