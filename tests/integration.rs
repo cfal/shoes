@@ -12,6 +12,8 @@ mod h2mux_singbox;
 mod hysteria2;
 #[path = "cases/integration/hysteria2_udp_integration.rs"]
 mod hysteria2_udp;
+#[path = "cases/integration/library_embedding_integration.rs"]
+mod library_embedding;
 #[path = "cases/integration/naiveproxy_integration.rs"]
 mod naiveproxy;
 #[path = "cases/integration/plain_tcp_relay.rs"]
