@@ -22,14 +22,11 @@ pub fn try_create_client_config(
         key_exchange_groups,
     ));
     let builder = if tls13_only || key_exchange_groups.requires_hybrid() {
-        builder
-            .with_protocol_versions(&[&rustls::version::TLS13])
-            .map_err(std::io::Error::other)?
+        builder.with_protocol_versions(&[&rustls::version::TLS13])
     } else {
-        builder
-            .with_safe_default_protocol_versions()
-            .map_err(std::io::Error::other)?
-    };
+        builder.with_safe_default_protocol_versions()
+    }
+    .map_err(std::io::Error::other)?;
 
     let builder = if verify_webpki {
         let webpki_verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
@@ -324,13 +321,11 @@ pub fn try_create_server_config(
         .collect();
 
     config.max_fragment_size = None;
-    config.max_early_data_size = if key_exchange_groups.requires_hybrid() {
-        0
-    } else {
-        u32::MAX
-    };
     if key_exchange_groups.requires_hybrid() {
+        config.max_early_data_size = 0;
         config.send_half_rtt_data = false;
+    } else {
+        config.max_early_data_size = u32::MAX;
     }
     config.ignore_client_order = true;
 

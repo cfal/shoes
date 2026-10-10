@@ -2,30 +2,34 @@ use super::*;
 use rustls::{ClientConnection, HandshakeKind, NamedGroup, ServerConnection};
 use std::io::{Read, Write};
 
-fn groups(names: &str) -> TlsKeyExchangeGroups {
+fn configured_groups(names: &str) -> TlsKeyExchangeGroups {
+    if names.is_empty() {
+        return TlsKeyExchangeGroups::default();
+    }
     serde_yaml::from_str(&format!("[{names}]")).unwrap()
 }
 
-fn configs(client: &str, server: &str) -> (rustls::ClientConfig, rustls::ServerConfig) {
-    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
-    let fingerprint = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, cert.cert.der());
-    let fingerprint = fingerprint
+fn fingerprint(cert: &rcgen::Certificate) -> String {
+    aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, cert.der())
         .as_ref()
         .iter()
         .map(|b| format!("{b:02x}"))
-        .collect();
+        .collect()
+}
+
+fn configs(
+    client_groups: &str,
+    server_groups: &str,
+) -> (rustls::ClientConfig, rustls::ServerConfig) {
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     let client = try_create_client_config(
         false,
-        vec![fingerprint],
+        vec![fingerprint(&cert.cert)],
         vec!["hybrid-test".into()],
         true,
         None,
         false,
-        &if client.is_empty() {
-            Default::default()
-        } else {
-            groups(client)
-        },
+        &configured_groups(client_groups),
     )
     .unwrap();
     let server = try_create_server_config(
@@ -34,11 +38,7 @@ fn configs(client: &str, server: &str) -> (rustls::ClientConfig, rustls::ServerC
         vec![],
         &["hybrid-test".into()],
         &[],
-        &if server.is_empty() {
-            Default::default()
-        } else {
-            groups(server)
-        },
+        &configured_groups(server_groups),
     )
     .unwrap();
     (client, server)
@@ -232,13 +232,6 @@ fn hybrid_exchange_preserves_mutual_authentication_and_pinning() {
     for group in ["X25519MLKEM768", "SecP256r1MLKEM768"] {
         let server_cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let client_cert = rcgen::generate_simple_self_signed(vec!["client".into()]).unwrap();
-        let fingerprint = |cert: &rcgen::CertifiedKey<_>| -> String {
-            aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, cert.cert.der())
-                .as_ref()
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect()
-        };
         for (client_auth, pin_matches, success) in [
             (true, true, true),
             (false, true, false),
@@ -247,7 +240,7 @@ fn hybrid_exchange_preserves_mutual_authentication_and_pinning() {
             let client = try_create_client_config(
                 false,
                 vec![if pin_matches {
-                    fingerprint(&server_cert)
+                    fingerprint(&server_cert.cert)
                 } else {
                     "00".repeat(32)
                 }],
@@ -260,7 +253,7 @@ fn hybrid_exchange_preserves_mutual_authentication_and_pinning() {
                     )
                 }),
                 false,
-                &groups(group),
+                &configured_groups(group),
             )
             .unwrap();
             let server = try_create_server_config(
@@ -268,8 +261,8 @@ fn hybrid_exchange_preserves_mutual_authentication_and_pinning() {
                 server_cert.signing_key.serialize_pem().as_bytes(),
                 vec![],
                 &[],
-                &[fingerprint(&client_cert)],
-                &groups(group),
+                &[fingerprint(&client_cert.cert)],
+                &configured_groups(group),
             )
             .unwrap();
             assert_eq!(

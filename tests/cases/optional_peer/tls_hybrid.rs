@@ -54,12 +54,16 @@ async fn echo_through_http(port: u16, target_port: u16) -> io::Result<()> {
 
 #[tokio::test]
 async fn xray_both_native_hybrids_in_both_directions() -> Result<(), Box<dyn std::error::Error>> {
-    tokio::time::timeout(Duration::from_secs(45), async {
+    let scenario = async {
         let (cert_path, key_path) = generate_test_cert_files()?;
         let pem = std::fs::read(&cert_path)?;
         let cert = CertificateDer::from_pem_slice(&pem)?;
         let fingerprint = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, &cert);
-        let fingerprint: String = fingerprint.as_ref().iter().map(|b| format!("{b:02x}")).collect();
+        let fingerprint: String = fingerprint
+            .as_ref()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
         let echo = start_tcp_stream_echo_server("0.0.0.0", 0).await?;
         for group in ["X25519MLKEM768", "SecP256r1MLKEM768"] {
             for shoes_is_server in [false, true] {
@@ -85,7 +89,7 @@ async fn xray_both_native_hybrids_in_both_directions() -> Result<(), Box<dyn std
                                     "serverName": "test.local", "pinnedPeerCertSha256": fingerprint,
                                     "minVersion": "1.3", "curvePreferences": [group], "fingerprint": "unsafe"
                                 }}}]
-                        })
+                        }),
                     )
                 } else {
                     (
@@ -105,7 +109,7 @@ async fn xray_both_native_hybrids_in_both_directions() -> Result<(), Box<dyn std
                                     "certificates": [{"certificateFile": cert_path.to_str().unwrap(), "keyFile": key_path.to_str().unwrap()}]
                                 }}}],
                             "outbounds": [{"protocol": "freedom", "settings": {"finalRules": [{"action": "allow", "ip": ["127.0.0.0/8"]}]}}]
-                        })
+                        }),
                     )
                 };
                 let _shoes = start_shoes_server(&serde_yaml::to_string(&shoes_config)?)?;
@@ -115,12 +119,13 @@ async fn xray_both_native_hybrids_in_both_directions() -> Result<(), Box<dyn std
             }
         }
         Ok::<_, Box<dyn std::error::Error>>(())
-    }).await?
+    };
+    tokio::time::timeout(Duration::from_secs(45), scenario).await?
 }
 
 #[tokio::test]
 async fn singbox_hybrid_quic_tuic_and_hysteria2() -> Result<(), Box<dyn std::error::Error>> {
-    tokio::time::timeout(Duration::from_secs(30), async {
+    let scenario = async {
         let (cert_path, key_path) = generate_test_cert_files()?;
         let echo = start_tcp_stream_echo_server("0.0.0.0", 0).await?;
         for protocol in ["tuic", "hysteria2"] {
@@ -129,7 +134,9 @@ async fn singbox_hybrid_quic_tuic_and_hysteria2() -> Result<(), Box<dyn std::err
             let (_, client_port) = ports.get_localhost_listener_port();
             let uuid = "550e8400-e29b-41d4-a716-446655440000";
             let mut inner = json!({"type": protocol, "password": "hybrid-test"});
-            if protocol == "tuic" { inner["uuid"] = uuid.into(); }
+            if protocol == "tuic" {
+                inner["uuid"] = uuid.into();
+            }
             let shoes = json!([{
                 "address": format!("0.0.0.0:{server_port}"), "transport": "quic", "protocol": inner,
                 "quic_settings": {"cert": cert_path.to_str().unwrap(), "key": key_path.to_str().unwrap(),
@@ -137,14 +144,18 @@ async fn singbox_hybrid_quic_tuic_and_hysteria2() -> Result<(), Box<dyn std::err
             }]);
             let mut outbound = json!({"type": protocol, "tag": "peer", "server": "127.0.0.1", "server_port": server_port, "password": "hybrid-test",
                 "tls": {"enabled": true, "insecure": true, "alpn": ["h3"], "curve_preferences": ["X25519MLKEM768"]}});
-            if protocol == "tuic" { outbound["uuid"] = uuid.into(); }
+            if protocol == "tuic" {
+                outbound["uuid"] = uuid.into();
+            }
             let singbox = json!({"log": {"level": "warn"}, "inbounds": [{"type": "http", "listen": "0.0.0.0", "listen_port": client_port}],
                 "outbounds": [outbound], "route": {"final": "peer"}});
             let _shoes = start_shoes_server(&serde_yaml::to_string(&shoes)?)?;
-            let _singbox = shoes_test_support::test_fixture::start_singbox_server(&singbox.to_string())?;
+            let _singbox =
+                shoes_test_support::test_fixture::start_singbox_server(&singbox.to_string())?;
             ports.wait_for_all_ports().await?;
             echo_through_http(client_port, echo.local_addr().port()).await?;
         }
         Ok::<_, Box<dyn std::error::Error>>(())
-    }).await?
+    };
+    tokio::time::timeout(Duration::from_secs(30), scenario).await?
 }
