@@ -13,6 +13,8 @@ env:
   SING_BOX_SHA256: 12cb2816b52febb356f6a885b740cc8758c3f30b8ae0ca8edba80f0d2d35343f
   MIHOMO_VERSION: 1.19.31
   MIHOMO_SHA256: 04cf9f09671704f839ddbee2e93069dc831a4123a75281e725d1d96ab9ac1afc
+  XRAY_VERSION: 26.3.27
+  XRAY_SHA256: 23cd9af937744d97776ee35ecad4972cf4b2109d1e0fe6be9930467608f7c8ae
 
 jobs:
   unit-tests:
@@ -139,7 +141,7 @@ jobs:
         key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
 
     - name: Install sing-box test peer
-      if: matrix.peer == 'sing-box'
+      if: matrix.peer == 'sing-box' || matrix.target == 'optional_peer'
       run: |
         archive="$RUNNER_TEMP/sing-box.tar.gz"
         curl --fail --location --retry 3 \
@@ -163,6 +165,19 @@ jobs:
         gzip --decompress --stdout "$archive" > "$binary"
         chmod +x "$binary"
         echo "SHOES_TEST_MIHOMO_BIN=$binary" >> "$GITHUB_ENV"
+
+    - name: Install Xray test peer
+      if: matrix.target == 'optional_peer'
+      run: |
+        archive="$RUNNER_TEMP/xray.zip"
+        curl --fail --location --retry 3 \
+          --output "$archive" \
+          "https://github.com/XTLS/Xray-core/releases/download/v${XRAY_VERSION}/Xray-linux-64.zip"
+        echo "${XRAY_SHA256}  ${archive}" | sha256sum --check --strict
+        unzip "$archive" xray -d "$RUNNER_TEMP/xray-peer"
+        binary="$RUNNER_TEMP/xray-peer/xray"
+        chmod +x "$binary"
+        echo "SHOES_TEST_XRAY_BIN=$binary" >> "$GITHUB_ENV"
 
     - name: Run sing-box mux lifecycle tests
       if: matrix.name == 'local protocols'
