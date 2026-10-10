@@ -17,7 +17,9 @@ use crate::address::NetLocation;
 use crate::async_stream::{AsyncPing, AsyncStream};
 
 use super::h2mux_client_session::H2MuxClientSession;
-use super::h2mux_protocol::{STATUS_ERROR, STATUS_SUCCESS, StreamRequest};
+use super::h2mux_protocol::{
+    MAX_ERROR_RESPONSE_LEN, STATUS_ERROR, STATUS_SUCCESS, StreamRequest, decode_error_length,
+};
 
 /// Client stream that wraps h2 streams with sing-mux protocol handling.
 ///
@@ -169,37 +171,15 @@ impl H2MuxClientStream {
             ));
         }
 
-        // Parse varint starting after status byte
-        let mut pos = 1;
-        let mut len: usize = 0;
-        let mut shift = 0;
-
-        loop {
-            if pos >= self.recv_buf.len() {
-                return Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "need more data for varint",
-                ));
-            }
-
-            let byte = self.recv_buf[pos];
-            pos += 1;
-            len |= ((byte & 0x7F) as usize) << shift;
-
-            if byte & 0x80 == 0 {
-                break;
-            }
-            shift += 7;
-            if shift >= 64 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "varint too large",
-                ));
-            }
-        }
+        let (len, prefix_len) = decode_error_length(&self.recv_buf[1..])?.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::WouldBlock, "need more data for error length")
+        })?;
+        let pos = 1 + prefix_len;
 
         // Check if we have the full message
-        let total_len = pos + len;
+        let total_len = pos.checked_add(len).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "h2mux error length overflow")
+        })?;
         if self.recv_buf.len() < total_len {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
@@ -336,11 +316,28 @@ impl AsyncRead for H2MuxClientStream {
                             continue;
                         }
 
-                        // Append new data to recv_buf
-                        let mut new_buf = BytesMut::with_capacity(self.recv_buf.len() + data.len());
-                        new_buf.put_slice(&self.recv_buf);
-                        new_buf.put_slice(&data);
-                        self.recv_buf = new_buf.freeze();
+                        let total_len =
+                            self.recv_buf.len().checked_add(data.len()).ok_or_else(|| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "h2mux response length overflow",
+                                )
+                            })?;
+                        let status = self.recv_buf.first().or_else(|| data.first());
+                        if status == Some(&STATUS_ERROR) && total_len > MAX_ERROR_RESPONSE_LEN {
+                            return Poll::Ready(Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "h2mux error response exceeds limit",
+                            )));
+                        }
+                        if self.recv_buf.is_empty() {
+                            self.recv_buf = data;
+                        } else {
+                            let mut new_buf = BytesMut::with_capacity(total_len);
+                            new_buf.put_slice(&self.recv_buf);
+                            new_buf.put_slice(&data);
+                            self.recv_buf = new_buf.freeze();
+                        }
 
                         match self.read_status_response() {
                             Ok(()) => break,
@@ -496,3 +493,117 @@ impl AsyncPing for H2MuxClientStream {
 impl Unpin for H2MuxClientStream {}
 
 impl AsyncStream for H2MuxClientStream {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::h2mux::H2MuxOptions;
+    use crate::h2mux::h2mux_protocol::{SessionRequest, StreamResponse};
+    use tokio::io::AsyncReadExt;
+
+    async fn read_response(frames: Vec<Bytes>) -> io::Result<Vec<u8>> {
+        let (client, mut peer) = tokio::io::duplex(65536);
+        let peer = tokio::spawn(async move {
+            SessionRequest::decode(&mut peer).await.unwrap();
+            let mut connection = h2::server::handshake(peer).await.unwrap();
+            let (_request, mut response) = connection.accept().await.unwrap().unwrap();
+            let mut send = response
+                .send_response(http::Response::new(()), false)
+                .unwrap();
+            for frame in frames {
+                send.send_data(frame, false).unwrap();
+            }
+            send.send_data(Bytes::new(), true).unwrap();
+            while connection.accept().await.is_some() {}
+        });
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut session = H2MuxClientSession::new(client, &H2MuxOptions::default())
+                .await
+                .unwrap();
+            let destination = NetLocation::from_str("example.com:443", None).unwrap();
+            let mut stream = session.open_tcp(&destination).await.unwrap();
+            let mut result = Vec::new();
+            stream.read_to_end(&mut result).await?;
+            Ok(result)
+        })
+        .await;
+        peer.abort();
+        let _ = peer.await;
+        result.expect("response parsing stalled")
+    }
+
+    #[tokio::test]
+    async fn peer_error_lengths_do_not_panic_or_wait_for_oversized_bodies() {
+        for payload in [
+            vec![STATUS_ERROR, 0x81, 0x20],
+            vec![STATUS_ERROR, 0x80, 0x80, 0],
+            vec![STATUS_ERROR, 0xff, 0xff, 0xff, 0xff, 0x0f],
+            vec![
+                STATUS_ERROR,
+                0xff,
+                0xff,
+                0xff,
+                0xff,
+                0xff,
+                0xff,
+                0xff,
+                0xff,
+                0xff,
+                1,
+            ],
+        ] {
+            for frames in [
+                vec![Bytes::from(payload.clone())],
+                payload
+                    .iter()
+                    .map(|b| Bytes::copy_from_slice(&[*b]))
+                    .collect(),
+            ] {
+                assert_eq!(
+                    read_response(frames).await.unwrap_err().kind(),
+                    io::ErrorKind::InvalidData
+                );
+            }
+        }
+        let mut oversized = vec![STATUS_ERROR, 0x80, 0x20];
+        oversized.extend(vec![b'x'; MAX_ERROR_RESPONSE_LEN]);
+        assert_eq!(
+            read_response(vec![oversized.into()])
+                .await
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[tokio::test]
+    async fn valid_and_truncated_responses_work_across_frames() {
+        for len in [0, 127, 128, 4096] {
+            let encoded = StreamResponse::error("x".repeat(len)).encode().freeze();
+            let frames = encoded.chunks(1).map(Bytes::copy_from_slice).collect();
+            assert_eq!(
+                read_response(frames).await.unwrap_err().kind(),
+                io::ErrorKind::Other
+            );
+        }
+        for payload in [
+            vec![STATUS_ERROR],
+            vec![STATUS_ERROR, 0x80],
+            vec![STATUS_ERROR, 3, b'x'],
+        ] {
+            assert_eq!(
+                read_response(vec![payload.into()])
+                    .await
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::UnexpectedEof
+            );
+        }
+        let mut success = vec![STATUS_SUCCESS];
+        success.extend(vec![b'x'; 8192]);
+        assert_eq!(
+            read_response(vec![success.into()]).await.unwrap(),
+            vec![b'x'; 8192]
+        );
+    }
+}
