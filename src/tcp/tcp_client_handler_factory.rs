@@ -126,6 +126,7 @@ pub fn create_tcp_client_handler(
         }
         ClientProxyConfig::Tls(tls_client_config) => {
             let TlsClientConfig {
+                key_exchange_groups,
                 verify,
                 server_fingerprints,
                 sni_hostname,
@@ -136,6 +137,7 @@ pub fn create_tcp_client_handler(
                 cert,
                 vision,
             } = tls_client_config;
+            key_exchange_groups.validate_vision(vision)?;
 
             let sni_hostname = if sni_hostname.is_unspecified() {
                 if let Some(ref hostname) = default_sni_hostname {
@@ -164,6 +166,7 @@ pub fn create_tcp_client_handler(
                 sni_hostname.is_some(),
                 key_and_cert_bytes,
                 false, // tls13_only
+                &key_exchange_groups,
             )?);
 
             let server_name = match sni_hostname {
@@ -288,6 +291,7 @@ pub fn create_tcp_client_handler(
                 enable_sni, // Enable SNI if hostname provided
                 None,       // No client cert
                 true,       // tls13_only - required for ShadowTLS v3
+                &Default::default(),
             )?);
 
             let handler = create_tcp_client_handler(*protocol, None, resolver.clone())?;

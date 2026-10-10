@@ -4,6 +4,11 @@ use std::sync::OnceLock;
 
 use rustls::pki_types::pem::PemObject;
 
+use crate::config::TlsKeyExchangeGroups;
+
+#[cfg(test)]
+mod hybrid_tests;
+
 pub fn try_create_client_config(
     verify_webpki: bool,
     server_fingerprints: Vec<String>,
@@ -11,14 +16,19 @@ pub fn try_create_client_config(
     enable_sni: bool,
     client_key_and_cert: Option<(Vec<u8>, Vec<u8>)>,
     tls13_only: bool,
+    key_exchange_groups: &TlsKeyExchangeGroups,
 ) -> std::io::Result<rustls::ClientConfig> {
-    let builder = rustls::ClientConfig::builder_with_provider(get_crypto_provider());
-    let builder = if tls13_only {
+    let builder = rustls::ClientConfig::builder_with_provider(crypto_provider_with_groups(
+        key_exchange_groups,
+    ));
+    let builder = if tls13_only || key_exchange_groups.requires_hybrid() {
         builder
             .with_protocol_versions(&[&rustls::version::TLS13])
-            .unwrap()
+            .map_err(std::io::Error::other)?
     } else {
-        builder.with_safe_default_protocol_versions().unwrap()
+        builder
+            .with_safe_default_protocol_versions()
+            .map_err(std::io::Error::other)?
     };
 
     let builder = if verify_webpki {
@@ -75,6 +85,9 @@ pub fn try_create_client_config(
         .collect();
 
     config.enable_sni = enable_sni;
+    if key_exchange_groups.requires_hybrid() {
+        config.enable_early_data = false;
+    }
     Ok(config)
 }
 
@@ -197,6 +210,17 @@ fn get_supported_algorithms() -> rustls::crypto::WebPkiSupportedAlgorithms {
     get_crypto_provider().signature_verification_algorithms
 }
 
+fn crypto_provider_with_groups(
+    groups: &TlsKeyExchangeGroups,
+) -> Arc<rustls::crypto::CryptoProvider> {
+    let Some(groups) = groups.groups() else {
+        return get_crypto_provider();
+    };
+    let mut provider = (*get_crypto_provider()).clone();
+    provider.kx_groups = groups.iter().map(|group| group.rustls_group()).collect();
+    Arc::new(provider)
+}
+
 fn get_disabled_verifier() -> Arc<DisabledVerifier> {
     static INSTANCE: OnceLock<Arc<DisabledVerifier>> = OnceLock::new();
     INSTANCE
@@ -236,6 +260,7 @@ pub fn try_create_server_config(
     ca_cert_bytes: Vec<Vec<u8>>,
     alpn_protocols: &[String],
     client_fingerprints: &[String],
+    key_exchange_groups: &TlsKeyExchangeGroups,
 ) -> std::io::Result<rustls::ServerConfig> {
     // Parse all certificates from the PEM file (server cert + intermediates)
     let certs: Vec<_> = rustls::pki_types::CertificateDer::pem_slice_iter(cert_bytes)
@@ -269,9 +294,15 @@ pub fn try_create_server_config(
         Some(verifier)
     };
 
-    let builder = rustls::ServerConfig::builder_with_provider(get_crypto_provider())
-        .with_safe_default_protocol_versions()
-        .unwrap();
+    let builder = rustls::ServerConfig::builder_with_provider(crypto_provider_with_groups(
+        key_exchange_groups,
+    ));
+    let builder = if key_exchange_groups.requires_hybrid() {
+        builder.with_protocol_versions(&[&rustls::version::TLS13])
+    } else {
+        builder.with_safe_default_protocol_versions()
+    }
+    .map_err(std::io::Error::other)?;
     // Always wraps in ClientFingerprintVerifier even for CA-only auth, because
     // WebPkiClientVerifier's root_hint_subjects() leaks CA names to unauthenticated clients.
     let builder = if client_fingerprints.is_empty() && webpki_verifier.is_none() {
@@ -293,7 +324,14 @@ pub fn try_create_server_config(
         .collect();
 
     config.max_fragment_size = None;
-    config.max_early_data_size = u32::MAX;
+    config.max_early_data_size = if key_exchange_groups.requires_hybrid() {
+        0
+    } else {
+        u32::MAX
+    };
+    if key_exchange_groups.requires_hybrid() {
+        config.send_half_rtt_data = false;
+    }
     config.ignore_client_order = true;
 
     Ok(config)
@@ -350,7 +388,15 @@ mod material_tests {
             (pem.as_str(), wrong_key.as_str(), false),
         ] {
             assert_eq!(
-                try_create_server_config(cert.as_bytes(), key.as_bytes(), vec![], &[], &[]).is_ok(),
+                try_create_server_config(
+                    cert.as_bytes(),
+                    key.as_bytes(),
+                    vec![],
+                    &[],
+                    &[],
+                    &Default::default()
+                )
+                .is_ok(),
                 valid
             );
             assert_eq!(
@@ -360,7 +406,8 @@ mod material_tests {
                     vec![],
                     true,
                     Some((key.as_bytes().to_vec(), cert.as_bytes().to_vec())),
-                    false
+                    false,
+                    &Default::default(),
                 )
                 .is_ok(),
                 valid
@@ -372,7 +419,8 @@ mod material_tests {
                 key.as_bytes(),
                 vec![b"invalid".to_vec()],
                 &[],
-                &[]
+                &[],
+                &Default::default(),
             )
             .is_err()
         );

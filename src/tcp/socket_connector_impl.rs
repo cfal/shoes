@@ -154,6 +154,7 @@ impl SocketConnectorImpl {
         target_address: Option<&NetLocation>,
         limits: crate::config::GlobalLimits,
     ) -> std::io::Result<Self> {
+        config.validate_quic_key_exchange(true)?;
         let bind_interface = config.bind_interface.clone().into_option();
 
         let default_sni_hostname =
@@ -185,6 +186,7 @@ impl SocketConnectorImpl {
                 })?;
 
                 let ClientQuicConfig {
+                    key_exchange_groups,
                     verify,
                     server_fingerprints,
                     alpn_protocols,
@@ -226,6 +228,7 @@ impl SocketConnectorImpl {
                     sni_hostname.is_some(),
                     key_and_cert_bytes,
                     false, // tls13_only - QUIC enforces TLS 1.3 anyway
+                    &key_exchange_groups,
                 )?;
 
                 let quic_client_config = quinn::crypto::rustls::QuicClientConfig::with_initial(

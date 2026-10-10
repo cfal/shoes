@@ -194,6 +194,8 @@ where
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     struct TlsClientConfigTemp {
+        #[serde(default)]
+        key_exchange_groups: super::tls::TlsKeyExchangeGroups,
         #[serde(default = "default_true")]
         verify: bool,
         #[serde(alias = "server_fingerprint", default)]
@@ -228,6 +230,11 @@ where
 
     // Check if deprecated shadowtls_password was used
     if let Some(password) = temp.shadowtls_password {
+        if !temp.key_exchange_groups.is_default() {
+            return Err(Error::custom(
+                "key_exchange_groups requires ordinary TLS, not deprecated shadowtls_password",
+            ));
+        }
         log::warn!(
             "The 'shadowtls_password' field in TLS client configuration is deprecated. \
              Please use 'type: shadowtls' with 'password' field instead. \
@@ -236,6 +243,7 @@ where
 
         // Transform to ShadowTLS variant internally by wrapping protocol
         return Ok(TlsClientConfig {
+            key_exchange_groups: temp.key_exchange_groups,
             verify: temp.verify,
             server_fingerprints: temp.server_fingerprints,
             sni_hostname: temp.sni_hostname.clone(),
@@ -254,6 +262,7 @@ where
 
     // Normal case - no shadowtls_password
     Ok(TlsClientConfig {
+        key_exchange_groups: temp.key_exchange_groups,
         verify: temp.verify,
         server_fingerprints: temp.server_fingerprints,
         sni_hostname: temp.sni_hostname,
@@ -272,6 +281,24 @@ where
     D: serde::Deserializer<'de>,
 {
     deserialize_tls_client_config(deserializer)
+}
+
+fn deserialize_shadowtls_variant<'de, D>(
+    deserializer: D,
+) -> Result<(String, Option<String>, Box<ClientProxyConfig>), D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct ShadowTlsFields {
+        password: String,
+        #[serde(default)]
+        sni_hostname: Option<String>,
+        protocol: Box<ClientProxyConfig>,
+    }
+    let fields = ShadowTlsFields::deserialize(deserializer)?;
+    Ok((fields.password, fields.sni_hostname, fields.protocol))
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -303,6 +330,24 @@ impl Default for ClientConfig {
             tcp_settings: None,
             quic_settings: None,
         }
+    }
+}
+
+impl ClientConfig {
+    pub fn validate_quic_key_exchange(&self, initial_hop: bool) -> std::io::Result<()> {
+        let explicit_groups = self
+            .quic_settings
+            .as_ref()
+            .is_some_and(|settings| !settings.key_exchange_groups.is_default());
+        if explicit_groups
+            && (!initial_hop || self.protocol.is_direct() || self.transport != Transport::Quic)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "QUIC key_exchange_groups requires a non-direct client at chain hop 0 with transport: quic",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -384,7 +429,10 @@ pub enum ClientProxyConfig {
 
         protocol: Box<ClientProxyConfig>,
     },
-    #[serde(alias = "shadowtls")]
+    #[serde(
+        alias = "shadowtls",
+        deserialize_with = "deserialize_shadowtls_variant"
+    )]
     ShadowTls {
         /// ShadowTLS password for authentication
         password: String,
@@ -466,6 +514,11 @@ impl ClientProxyConfig {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TlsClientConfig {
+    #[serde(
+        default,
+        skip_serializing_if = "super::tls::TlsKeyExchangeGroups::is_default"
+    )]
+    pub key_exchange_groups: super::tls::TlsKeyExchangeGroups,
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub verify: bool,
     #[serde(

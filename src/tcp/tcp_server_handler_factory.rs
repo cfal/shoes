@@ -290,6 +290,7 @@ fn create_tls_server_target(
     bind_ip: Option<IpAddr>,
 ) -> std::io::Result<TlsServerTarget> {
     let TlsServerConfig {
+        key_exchange_groups,
         cert,
         key,
         alpn_protocols,
@@ -299,6 +300,7 @@ fn create_tls_server_target(
         protocol,
         override_rules,
     } = tls_server_config;
+    key_exchange_groups.validate_vision(vision)?;
 
     // Certificates are already embedded as PEM data during config validation
     let cert_bytes = cert.as_bytes().to_vec();
@@ -331,6 +333,7 @@ fn create_tls_server_target(
         client_ca_certs,
         &effective_alpn,
         &client_fingerprints.into_vec(),
+        &key_exchange_groups,
     )?);
 
     // Compute effective selector: if override_rules exist, create new selector; otherwise use parent's
@@ -426,6 +429,7 @@ fn create_shadow_tls_server_target(
                 client_ca_certs,
                 &handshake.alpn_protocols.into_vec(),
                 &handshake.client_fingerprints.into_vec(),
+                &Default::default(),
             )?);
 
             ShadowTlsServerTargetHandshake::new_local(server_config)
