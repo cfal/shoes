@@ -157,6 +157,7 @@ pub async fn start_quic_servers(
     };
 
     let ServerQuicConfig {
+        key_exchange_groups,
         cert,
         key,
         client_ca_certs,
@@ -164,6 +165,12 @@ pub async fn start_quic_servers(
         client_fingerprints,
         num_endpoints,
     } = quic_settings.unwrap();
+    if let ServerProxyConfig::TuicV5 {
+        zero_rtt_handshake, ..
+    } = &protocol
+    {
+        key_exchange_groups.validate_zero_rtt(*zero_rtt_handshake)?;
+    }
 
     // Certificates are already embedded as PEM data during config validation
     let cert_bytes = cert.as_bytes().to_vec();
@@ -180,9 +187,12 @@ pub async fn start_quic_servers(
         processed_ca_certs,
         &alpn_protocols.into_vec(),
         &client_fingerprints.into_vec(),
+        &key_exchange_groups,
     )?;
     // QUIC manages early data separately; its TLS limit must be zero or u32::MAX.
-    server_config.max_early_data_size = u32::MAX;
+    if !key_exchange_groups.requires_hybrid() {
+        server_config.max_early_data_size = u32::MAX;
+    }
     let server_config = Arc::new(server_config);
 
     let quic_server_config: quinn::crypto::rustls::QuicServerConfig = server_config
@@ -335,6 +345,7 @@ mod tests {
             transport: Transport::Quic,
             tcp_settings: None,
             quic_settings: Some(ServerQuicConfig {
+                key_exchange_groups: Default::default(),
                 cert: cert.cert.pem(),
                 key: cert.signing_key.serialize_pem(),
                 alpn_protocols: NoneOrSome::One("h3".into()),

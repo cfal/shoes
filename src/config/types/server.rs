@@ -348,6 +348,11 @@ pub struct RealityServerConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TlsServerConfig {
+    #[serde(
+        default,
+        skip_serializing_if = "super::tls::TlsKeyExchangeGroups::is_default"
+    )]
+    pub key_exchange_groups: super::tls::TlsKeyExchangeGroups,
     pub cert: String,
     pub key: String,
     #[serde(alias = "alpn_protocol", default)]
@@ -389,6 +394,7 @@ pub struct TlsServerConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ShadowTlsServerConfig {
     pub password: String,
     pub handshake: ShadowTlsServerHandshakeConfig,
@@ -903,6 +909,7 @@ mod tests {
             transport: Transport::Quic,
             tcp_settings: None,
             quic_settings: Some(ServerQuicConfig {
+                key_exchange_groups: Default::default(),
                 cert: "server.crt".to_string(),
                 key: "server.key".to_string(),
                 alpn_protocols: NoneOrSome::Some(vec!["h3".to_string()]),
@@ -942,6 +949,7 @@ mod tests {
         tls_targets.insert(
             "example.com".to_string(),
             TlsServerConfig {
+                key_exchange_groups: Default::default(),
                 cert: "example.crt".to_string(),
                 key: "example.key".to_string(),
                 alpn_protocols: NoneOrSome::Some(vec!["h2".to_string(), "http/1.1".to_string()]),
@@ -962,6 +970,7 @@ mod tests {
             protocol: ServerProxyConfig::Tls {
                 tls_targets,
                 default_tls_target: Some(Box::new(TlsServerConfig {
+                    key_exchange_groups: Default::default(),
                     cert: "default.crt".to_string(),
                     key: "default.key".to_string(),
                     alpn_protocols: NoneOrSome::None,
@@ -1059,6 +1068,7 @@ mod tests {
             transport: Transport::Quic,
             tcp_settings: None,
             quic_settings: Some(ServerQuicConfig {
+                key_exchange_groups: Default::default(),
                 cert: "hysteria.crt".to_string(),
                 key: "hysteria.key".to_string(),
                 alpn_protocols: NoneOrSome::One("hysteria".to_string()),
@@ -1083,6 +1093,7 @@ mod tests {
             transport: Transport::Quic,
             tcp_settings: None,
             quic_settings: Some(ServerQuicConfig {
+                key_exchange_groups: Default::default(),
                 cert: "tuic.crt".to_string(),
                 key: "tuic.key".to_string(),
                 alpn_protocols: NoneOrSome::None,

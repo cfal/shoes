@@ -442,6 +442,33 @@ async fn check_alias_and_validation_exit_codes() {
 }
 
 #[tokio::test]
+async fn unsupported_quic_allowlists_fail_validation_and_start() {
+    use serde_json::json;
+    let groups = json!({"key_exchange_groups": ["X25519MLKEM768"]});
+    let direct = json!({"protocol": {"type": "direct"}});
+    let guarded_direct =
+        json!({"protocol": {"type": "direct"}, "transport": "quic", "quic_settings": groups});
+    let guarded_proxy = json!({"address": "127.0.0.1:443", "protocol": {"type": "portforward"}, "transport": "quic", "quic_settings": groups});
+    for chain in [
+        json!([guarded_direct]),
+        json!([direct, guarded_proxy]),
+        json!([direct, {"pool": ["guarded"]}]),
+    ] {
+        let config = json!([
+            {"client_group": "guarded", "client_proxies": [guarded_proxy]},
+            {"address": "0.0.0.0:0", "protocol": {"type": "http"}, "rules": [{"mask": "0.0.0.0/0", "action": "allow", "client_chain": chain}]}
+        ]);
+        let config_file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(config_file.path(), serde_yaml::to_string(&config).unwrap()).unwrap();
+        for mode in ["--dry-run", "--no-reload"] {
+            let mut process = Process::start(config_file.path(), &[mode]);
+            process.wait_for("QUIC key_exchange_groups").await;
+            assert_eq!(process.exit().await.code(), Some(1));
+        }
+    }
+}
+
+#[tokio::test]
 async fn initial_partial_bind_failure_exits_and_releases_addresses() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("config.yaml");

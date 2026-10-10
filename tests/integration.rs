@@ -40,6 +40,8 @@ mod socks;
 mod socks5_udp_associate;
 #[path = "cases/integration/socks_uot_integration.rs"]
 mod socks_uot;
+#[path = "cases/integration/tls_hybrid.rs"]
+mod tls_hybrid;
 #[path = "cases/integration/tuic_integration.rs"]
 mod tuic;
 #[path = "cases/integration/tuic_udp_integration.rs"]

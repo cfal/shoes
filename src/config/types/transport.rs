@@ -64,6 +64,11 @@ impl Default for TcpConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ServerQuicConfig {
+    #[serde(
+        default,
+        skip_serializing_if = "super::tls::TlsKeyExchangeGroups::is_default"
+    )]
+    pub key_exchange_groups: super::tls::TlsKeyExchangeGroups,
     pub cert: String,
     pub key: String,
     #[serde(alias = "alpn_protocol", default)]
@@ -79,6 +84,11 @@ pub struct ServerQuicConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ClientQuicConfig {
+    #[serde(
+        default,
+        skip_serializing_if = "super::tls::TlsKeyExchangeGroups::is_default"
+    )]
+    pub key_exchange_groups: super::tls::TlsKeyExchangeGroups,
     #[serde(default = "default_true")]
     pub verify: bool,
     #[serde(alias = "server_fingerprint", default)]
@@ -96,6 +106,7 @@ pub struct ClientQuicConfig {
 impl Default for ClientQuicConfig {
     fn default() -> Self {
         Self {
+            key_exchange_groups: Default::default(),
             verify: true,
             server_fingerprints: NoneOrSome::Unspecified,
             sni_hostname: NoneOrOne::Unspecified,

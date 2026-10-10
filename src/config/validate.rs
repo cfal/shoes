@@ -650,6 +650,14 @@ fn validate_server_config(
     }
     // First handle QUIC settings certificates
     if let Some(ref mut quic_settings) = server_config.quic_settings {
+        if let ServerProxyConfig::TuicV5 {
+            zero_rtt_handshake, ..
+        } = &server_config.protocol
+        {
+            quic_settings
+                .key_exchange_groups
+                .validate_zero_rtt(*zero_rtt_handshake)?;
+        }
         embed_pem_from_map(&mut quic_settings.cert, named_pems);
         embed_pem_from_map(&mut quic_settings.key, named_pems);
         for cert in quic_settings.client_ca_certs.iter_mut() {
@@ -875,6 +883,9 @@ fn validate_client_vision_protocol(
 fn validate_client_proxy_structure(config: &ClientProxyConfig) -> std::io::Result<()> {
     let inner = match config {
         ClientProxyConfig::Tls(tls_config) => {
+            tls_config
+                .key_exchange_groups
+                .validate_vision(tls_config.vision)?;
             validate_client_vision_protocol(tls_config.vision, &tls_config.protocol, "TLS")?;
             Some(tls_config.protocol.as_ref())
         }
@@ -904,6 +915,7 @@ fn validate_client_config(
     client_config: &mut ClientConfig,
     named_pems: &HashMap<String, String>,
 ) -> std::io::Result<()> {
+    client_config.validate_quic_key_exchange(true)?;
     if client_config.transport != Transport::Tcp && client_config.tcp_settings.is_some() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -1096,6 +1108,7 @@ fn validate_server_certificates(
         ca.iter().map(|pem| pem.as_bytes().to_vec()).collect(),
         &[],
         &[],
+        &Default::default(),
     )
     .map(|_| ())
 }
@@ -1109,6 +1122,7 @@ fn validate_client_certificates(cert: Option<&str>, key: Option<&str>) -> std::i
             true,
             Some((key.as_bytes().to_vec(), cert.as_bytes().to_vec())),
             false,
+            &Default::default(),
         )?;
     }
     Ok(())
@@ -1264,6 +1278,9 @@ fn validate_server_proxy_config(
                 ));
             }
             for tls_server_config in tls_targets.values_mut() {
+                tls_server_config
+                    .key_exchange_groups
+                    .validate_vision(tls_server_config.vision)?;
                 validate_server_vision(tls_server_config.vision, &tls_server_config.protocol)?;
                 embed_pem_from_map(&mut tls_server_config.cert, named_pems);
                 embed_pem_from_map(&mut tls_server_config.key, named_pems);
@@ -1304,6 +1321,9 @@ fn validate_server_proxy_config(
                 }
             }
             if let Some(tls_server_config) = default_tls_target {
+                tls_server_config
+                    .key_exchange_groups
+                    .validate_vision(tls_server_config.vision)?;
                 validate_server_vision(tls_server_config.vision, &tls_server_config.protocol)?;
                 embed_pem_from_map(&mut tls_server_config.cert, named_pems);
                 embed_pem_from_map(&mut tls_server_config.key, named_pems);
@@ -1725,6 +1745,21 @@ fn expand_client_chain(
         .map(|hop| expand_chain_hop(hop, client_groups))
         .collect::<std::io::Result<Vec<_>>>()?;
 
+    for (index, hop) in expanded_hops.iter().enumerate() {
+        let validate = |selection: &ConfigSelection<ClientConfig>| match selection {
+            ConfigSelection::Config(config) => config.validate_quic_key_exchange(index == 0),
+            ConfigSelection::GroupName(_) => unreachable!("groups have been expanded"),
+        };
+        match hop {
+            ClientChainHop::Single(selection) => validate(selection)?,
+            ClientChainHop::Pool(selections) => {
+                for selection in selections.iter() {
+                    validate(selection)?;
+                }
+            }
+        }
+    }
+
     *client_chain = if expanded_hops.len() == 1 {
         OneOrSome::One(expanded_hops.into_iter().next().unwrap())
     } else {
@@ -2026,6 +2061,111 @@ mod tests {
         let (converted_configs, _) = convert_cert_paths(configs).await?;
         let validated = create_server_configs(converted_configs)?;
         Ok(validated.configs)
+    }
+
+    #[test]
+    fn hybrid_only_rejects_vision_and_tuic_early_handshakes() {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let tls_target = serde_json::json!({
+            "cert": cert.cert.pem(), "key": cert.signing_key.serialize_pem(),
+            "key_exchange_groups": ["X25519MLKEM768"], "vision": true,
+            "protocol": {"type": "vless", "user_id": "550e8400-e29b-41d4-a716-446655440000"}
+        });
+        for protocol in [
+            serde_json::json!({"type": "tls", "tls_targets": {"localhost": tls_target}}),
+            serde_json::json!({"type": "tls", "default_tls_target": tls_target}),
+        ] {
+            let mut server: ServerProxyConfig = serde_json::from_value(protocol).unwrap();
+            let error = validate_server_proxy_config(
+                &mut server,
+                &HashMap::new(),
+                &HashMap::new(),
+                &HashMap::new(),
+                ServerProtocolContext::Stream,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("hybrid-only"), "{error}");
+        }
+        let client: ClientProxyConfig = serde_json::from_value(serde_json::json!({
+            "type": "tls", "key_exchange_groups": ["SecP256r1MLKEM768"], "vision": true,
+            "protocol": {"type": "vless", "user_id": "550e8400-e29b-41d4-a716-446655440000"}
+        }))
+        .unwrap();
+        assert!(
+            validate_client_proxy_structure(&client)
+                .unwrap_err()
+                .to_string()
+                .contains("hybrid-only")
+        );
+        let mut server: ServerConfig = serde_json::from_value(serde_json::json!({
+            "address": "0.0.0.0:443", "transport": "quic",
+            "quic_settings": {"cert": cert.cert.pem(), "key": cert.signing_key.serialize_pem(), "key_exchange_groups": ["X25519MLKEM768"]},
+            "protocol": {"type": "tuic", "uuid": "550e8400-e29b-41d4-a716-446655440000", "password": "test", "zero_rtt_handshake": true}
+        })).unwrap();
+        assert!(
+            validate_server_config(
+                &mut server,
+                &HashMap::new(),
+                &HashMap::new(),
+                &HashMap::new()
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("zero_rtt_handshake")
+        );
+    }
+
+    #[test]
+    fn quic_allowlists_cannot_be_ignored_by_direct_or_later_hops() {
+        use serde_json::json;
+        for groups in [
+            None,
+            Some(json!(["X25519MLKEM768"])),
+            Some(json!(["X25519"])),
+        ] {
+            let mut settings = json!({});
+            if let Some(ref groups) = groups {
+                settings["key_exchange_groups"] = groups.clone();
+            }
+            let direct = json!({"protocol": {"type": "direct"}, "transport": "quic", "quic_settings": settings});
+            let mut config: ClientConfig = serde_json::from_value(direct).unwrap();
+            let result = validate_client_config(&mut config, &HashMap::new());
+            assert_eq!(result.is_err(), groups.is_some());
+
+            let proxy = json!({"address": "127.0.0.1:443", "protocol": {"type": "socks"}, "transport": "quic", "quic_settings": settings});
+            let group_configs = HashMap::from([(
+                "proxy".into(),
+                vec![serde_json::from_value::<ClientConfig>(proxy.clone()).unwrap()],
+            )]);
+            for hop in [
+                proxy.clone(),
+                json!("proxy"),
+                json!({"pool": ["proxy", proxy.clone()]}),
+            ] {
+                let direct = json!({"protocol": {"type": "direct"}});
+                for chain in [json!([hop]), json!([direct, hop])] {
+                    let later_hop = chain.as_array().unwrap().len() > 1;
+                    let mut parsed: super::super::types::ClientChain =
+                        serde_json::from_value(chain.clone()).unwrap();
+                    let result =
+                        validate_client_chain(&mut parsed.hops, 0, &group_configs, &HashMap::new());
+                    assert_eq!(result.is_err(), later_hop && groups.is_some(), "{chain}");
+                    if let Err(error) = result {
+                        assert!(error.to_string().contains("QUIC key_exchange_groups"));
+                    }
+                    let spec: DnsServerSpec = serde_json::from_value(json!({
+                        "url": "https://1.1.1.1/dns-query", "client_chain": {"chain": chain}
+                    }))
+                    .unwrap();
+                    let result =
+                        expand_dns_specs(&[spec], &group_configs, &HashMap::new(), &HashSet::new());
+                    assert_eq!(result.is_err(), later_hop && groups.is_some());
+                    if let Err(error) = result {
+                        assert!(error.to_string().contains("QUIC key_exchange_groups"));
+                    }
+                }
+            }
+        }
     }
 
     #[tokio::test]
