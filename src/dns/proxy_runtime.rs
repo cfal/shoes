@@ -224,7 +224,7 @@ mod tests {
 
     fn build_pending_chain_group() -> ClientChainGroup {
         ClientChainGroup::new(vec![ClientProxyChain::new(
-            vec![InitialHopEntry::Direct(Box::new(PendingSocketConnector))],
+            vec![InitialHopEntry::Direct(Arc::new(PendingSocketConnector))],
             vec![],
         )])
     }

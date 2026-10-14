@@ -34,6 +34,17 @@ use crate::resolver::Resolver;
     reason = "async-trait adds must_use to boxed futures"
 )]
 pub trait SocketConnector: Send + Sync + Debug {
+    async fn connect_quic(
+        &self,
+        _resolver: &Arc<dyn Resolver>,
+        _address: &ResolvedLocation,
+    ) -> std::io::Result<super::carrier_dialer::QuicCarrier> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "not a QUIC socket connector",
+        ))
+    }
+
     /// Create a TCP/QUIC connection to the given address.
     ///
     /// # Arguments

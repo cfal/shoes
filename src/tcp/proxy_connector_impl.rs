@@ -211,7 +211,7 @@ mod tests {
         };
         let chain = ClientProxyChain::new(
             vec![InitialHopEntry::Proxy {
-                socket: Box::new(OneTransport {
+                socket: Arc::new(OneTransport {
                     stream: std::sync::Mutex::new(Some(client)),
                     connects: connects.clone(),
                 }),

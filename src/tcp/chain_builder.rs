@@ -82,7 +82,7 @@ fn build_client_proxy_chain_with_limits(
 
             let socket =
                 SocketConnectorImpl::from_config_with_limits(config, target_address, limits)
-                    .map(|s| Box::new(s) as Box<dyn SocketConnector>)?;
+                    .map(|s| Arc::new(s) as Arc<dyn SocketConnector>)?;
 
             if config.protocol.is_direct() {
                 // Direct: socket only, no proxy

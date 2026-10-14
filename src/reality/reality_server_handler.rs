@@ -613,7 +613,7 @@ mod cleanup_tests {
                     selector,
                 ))),
                 dest_client_chain: ClientProxyChain::new(
-                    vec![InitialHopEntry::Direct(Box::new(
+                    vec![InitialHopEntry::Direct(Arc::new(
                         SocketConnectorImpl::from_config(
                             &crate::config::ClientConfig::default(),
                             None,
@@ -739,7 +739,7 @@ mod cleanup_tests {
                 selector,
             ))),
             dest_client_chain: ClientProxyChain::new(
-                vec![InitialHopEntry::Direct(Box::new(
+                vec![InitialHopEntry::Direct(Arc::new(
                     SocketConnectorImpl::from_config(&crate::config::ClientConfig::default(), None)
                         .unwrap(),
                 ))],

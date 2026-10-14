@@ -630,7 +630,7 @@ mod lifetime_tests {
                 flushes: request_flushes.clone(),
             };
             let chain = ClientProxyChain::new(
-                vec![InitialHopEntry::Direct(Box::new(ReadyConnector(
+                vec![InitialHopEntry::Direct(Arc::new(ReadyConnector(
                     std::sync::Mutex::new(Some(outbound)),
                 )))],
                 vec![],
@@ -855,7 +855,7 @@ mod lifetime_tests {
             let marker = Arc::new(());
             let shutdowns = Arc::new(AtomicUsize::new(0));
             let chain = ClientProxyChain::new(
-                vec![InitialHopEntry::Direct(Box::new(PendingConnector))],
+                vec![InitialHopEntry::Direct(Arc::new(PendingConnector))],
                 vec![],
             );
             let selector = Arc::new(ClientProxySelector::new(vec![ConnectRule::new(
