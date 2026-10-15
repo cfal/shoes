@@ -308,6 +308,14 @@ covering all three modes and HTTP versions. `type: splithttp` is an alias for
   Split legs may use different carriers on the same selected route. H2/H3 admission
   respects peer stream capacity; draining carriers retain their connection slots.
   A full pool refuses new sessions rather than exceeding its configured cap.
+- Shoes H2/H3 packet-up clients can transmit four POST bodies concurrently.
+  Budget the server's `max_session_buffered_bytes` for at least four maximum
+  `sc_max_each_post_bytes` packets, plus room for duplex pipe buffers; the defaults
+  provide this. Smaller budgets remain valid for H1 or lower-concurrency clients,
+  but concurrent bodies can exhaust shared transport credit before their
+  predecessors finish. Byte caps do not provide per-session transport isolation:
+  stalled consumers or global byte-budget exhaustion can also block other sessions
+  on the same carrier. Packet deadlines still bound these waits.
 - The server bounds the initial TCP HTTP header/preface to four seconds after
   transport setup (or the shorter configured setup timeout). H1 keep-alive idle
   periods and subsequent partial headers have no deadline. For exposed listeners,

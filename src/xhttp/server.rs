@@ -726,6 +726,186 @@ mod tests {
         .unwrap();
     }
 
+    async fn reserved_predecessors(attach_late: bool) {
+        let mut state = service();
+        {
+            let state = Arc::get_mut(&mut state).unwrap();
+            state.config.sc_max_buffered_posts = 4;
+            state.config.limits.max_session_buffered_bytes = 64;
+        }
+        let session = state.session("a").unwrap();
+        let mut reader = None;
+        if !attach_late {
+            let mut session = session.state.lock();
+            session.downloaded = true;
+            reader = session.reader.take();
+        }
+        let mut writers = Vec::new();
+        let mut posts = tokio::task::JoinSet::new();
+        for sequence in 0..4 {
+            let post = Request::post(format!("http://localhost/t/a/{sequence}"))
+                .header("referer", format!("/?x_padding={}", "X".repeat(100)))
+                .header("content-length", "16")
+                .body(())
+                .unwrap();
+            let (writer, body) = pipe(Memory::new(state.memory.clone(), 1024));
+            writers.push(writer);
+            let state = state.clone();
+            posts.spawn(async move { state.handle(post, body).await.status() });
+            tokio::task::yield_now().await;
+        }
+        let mut last = writers.pop().unwrap();
+        last.write_all(&[3; 16]).await.unwrap();
+        let download = {
+            let mut admitted = Box::pin(last.flush());
+            let download = if attach_late {
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(50), &mut admitted)
+                        .await
+                        .is_err(),
+                    "detached sessions keep predecessor headroom"
+                );
+                Some(request(&state, "GET", "a", b"").await)
+            } else {
+                None
+            };
+            tokio::time::timeout(Duration::from_secs(1), admitted)
+                .await
+                .expect("reserved predecessors must not hold back the successor body")
+                .unwrap();
+            download
+        };
+        for (sequence, writer) in writers.iter_mut().enumerate() {
+            writer.write_all(&[sequence as u8; 16]).await.unwrap();
+            writer.shutdown().await.unwrap();
+        }
+        last.shutdown().await.unwrap();
+        let mut data = Vec::new();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            if let Some(reader) = reader.as_mut() {
+                data.resize(64, 0);
+                reader.read_exact(&mut data).await.unwrap();
+            } else {
+                let mut body = download.unwrap().into_body();
+                while data.len() < 64 {
+                    data.extend(body.frame().await.unwrap().unwrap().into_data().unwrap());
+                }
+            }
+            while let Some(status) = posts.join_next().await {
+                assert_eq!(status.unwrap(), StatusCode::OK);
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(data, [[0u8; 16], [1; 16], [2; 16], [3; 16]].concat());
+    }
+
+    #[tokio::test]
+    async fn reserved_predecessors_admit_successor_bodies() {
+        reserved_predecessors(false).await;
+    }
+
+    #[tokio::test]
+    async fn download_attachment_wakes_reserved_predecessor_waiters() {
+        reserved_predecessors(true).await;
+    }
+
+    #[tokio::test]
+    async fn new_packet_reservations_wake_admission_waiters() {
+        let mut state = service();
+        {
+            let state = Arc::get_mut(&mut state).unwrap();
+            state.config.sc_max_buffered_posts = 4;
+            state.config.limits.max_session_buffered_bytes = 24;
+        }
+        let session = state.session("a").unwrap();
+        session.state.lock().downloaded = true;
+        let mut posts = tokio::task::JoinSet::new();
+        let mut writers = Vec::new();
+        for sequence in [1, 2, 0] {
+            let post = Request::post(format!("http://localhost/t/a/{sequence}"))
+                .header("referer", format!("/?x_padding={}", "X".repeat(100)))
+                .header("content-length", "8")
+                .body(())
+                .unwrap();
+            let (mut writer, body) = pipe(Memory::new(state.memory.clone(), 1024));
+            let state = state.clone();
+            posts.spawn(async move { state.handle(post, body).await.status() });
+            if sequence == 2 {
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(10), writer.flush())
+                        .await
+                        .is_err()
+                );
+            } else {
+                tokio::time::timeout(Duration::from_secs(1), writer.flush())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
+            writers.push(writer);
+        }
+        tokio::time::timeout(Duration::from_secs(1), writers[1].flush())
+            .await
+            .expect("reserving the missing predecessor must wake admission")
+            .unwrap();
+        assert_eq!(session.state.lock().reserved.len(), 3);
+        posts.abort_all();
+        while posts.join_next().await.is_some() {}
+        assert!(session.state.lock().reserved.is_empty());
+        assert!(session.memory.reserve_packet(24, 0).is_some());
+    }
+
+    #[tokio::test]
+    async fn duplicate_packet_reservations_are_released_on_cancellation() {
+        for close_session in [false, true] {
+            let mut state = service();
+            Arc::get_mut(&mut state)
+                .unwrap()
+                .config
+                .limits
+                .max_session_buffered_bytes = 64;
+            let session = state.session("a").unwrap();
+            let mut posts = Vec::new();
+            let mut writers = Vec::new();
+            for _ in 0..2 {
+                let post = Request::post("http://localhost/t/a/0")
+                    .header("referer", format!("/?x_padding={}", "X".repeat(100)))
+                    .header("content-length", "16")
+                    .body(())
+                    .unwrap();
+                let (mut writer, body) = pipe(Memory::new(state.memory.clone(), 1024));
+                let state = state.clone();
+                posts.push(tokio::spawn(async move {
+                    state.handle(post, body).await.status()
+                }));
+                tokio::time::timeout(Duration::from_secs(1), writer.flush())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                writers.push(writer);
+            }
+            assert_eq!(session.state.lock().reserved.get(&0), Some(&2));
+            let first = posts.pop().unwrap();
+            first.abort();
+            assert!(first.await.is_err());
+            assert_eq!(session.state.lock().reserved.get(&0), Some(&1));
+            assert_eq!(session.state.lock().receiving.get(&0), Some(&1));
+            assert!(session.memory.reserve_packet(48, 0).is_some());
+            let second = posts.pop().unwrap();
+            if close_session {
+                state.close("a");
+                assert_eq!(second.await.unwrap(), StatusCode::SERVICE_UNAVAILABLE);
+            } else {
+                second.abort();
+                assert!(second.await.is_err());
+            }
+            assert!(session.state.lock().reserved.is_empty());
+            assert!(session.state.lock().receiving.is_empty());
+            assert!(session.memory.reserve_packet(64, 0).is_some());
+        }
+    }
+
     #[tokio::test]
     async fn attached_duplicate_packets_wait_for_forwarding() {
         let state = service();
@@ -862,6 +1042,7 @@ struct SessionState {
     reader: Option<Reader>,
     pending: BTreeMap<u64, Packet>,
     receiving: BTreeMap<u64, usize>,
+    reserved: BTreeMap<u64, usize>,
     forwarding: Option<(u64, CancellationToken)>,
     next: u64,
     downloaded: bool,
@@ -900,22 +1081,34 @@ struct Session {
 struct PacketRequest {
     session: Arc<Session>,
     sequence: u64,
+    reserved: bool,
 }
 
 impl PacketRequest {
     fn new(session: Arc<Session>, sequence: u64) -> Self {
         *session.state.lock().receiving.entry(sequence).or_default() += 1;
-        Self { session, sequence }
+        Self {
+            session,
+            sequence,
+            reserved: false,
+        }
+    }
+
+    fn decrement(counts: &mut BTreeMap<u64, usize>, sequence: u64) {
+        let count = counts.get_mut(&sequence).unwrap();
+        *count -= 1;
+        if *count == 0 {
+            counts.remove(&sequence);
+        }
     }
 }
 
 impl Drop for PacketRequest {
     fn drop(&mut self) {
         let mut state = self.session.state.lock();
-        let count = state.receiving.get_mut(&self.sequence).unwrap();
-        *count -= 1;
-        if *count == 0 {
-            state.receiving.remove(&self.sequence);
+        Self::decrement(&mut state.receiving, self.sequence);
+        if self.reserved {
+            Self::decrement(&mut state.reserved, self.sequence);
         }
         self.session.progress.notify_waiters();
     }
@@ -1231,6 +1424,7 @@ impl State {
                 reader: Some(reader),
                 pending: BTreeMap::new(),
                 receiving: BTreeMap::new(),
+                reserved: BTreeMap::new(),
                 forwarding: None,
                 next: 0,
                 downloaded: false,
@@ -1340,6 +1534,7 @@ impl State {
                     state.downloaded = true;
                     (state.reader.take().unwrap(), state.permit.take().unwrap())
                 };
+                session.progress.notify_waiters();
                 let (writer, output) = pipe(session.memory.clone());
                 let tasks = Arc::new(Tasks::new());
                 let stream = Stream {
@@ -1461,8 +1656,8 @@ impl State {
                 }
                 let deadline = tokio::time::Instant::now()
                     + Duration::from_secs(self.config.limits.packet_timeout_secs);
-                let _request = PacketRequest::new(session.clone(), sequence);
                 let ingest = async {
+                    let mut packet_request = PacketRequest::new(session.clone(), sequence);
                     let mut memory = loop {
                         let released = session.memory.packet_space_released();
                         let progress = session.progress.notified();
@@ -1479,8 +1674,10 @@ impl State {
                                 return Ok(state.acknowledgement(sequence));
                             }
                             let contiguous = state.downloaded
-                                && (state.next..sequence)
-                                    .all(|number| state.pending.contains_key(&number));
+                                && (state.next..sequence).all(|number| {
+                                    state.pending.contains_key(&number)
+                                        || state.reserved.contains_key(&number)
+                                });
                             if sequence.saturating_sub(state.next)
                                 >= self.config.buffered_posts() as u64
                             {
@@ -1502,6 +1699,9 @@ impl State {
                                 if let Some(memory) =
                                     session.memory.reserve_packet(reservation, headroom)
                                 {
+                                    *state.reserved.entry(sequence).or_default() += 1;
+                                    packet_request.reserved = true;
+                                    session.progress.notify_waiters();
                                     break memory;
                                 }
                             }
