@@ -18,6 +18,7 @@ use crate::tcp::tcp_handler::{TcpClientSetupResult, TcpServerSetupResult};
 use crate::tls_server_handler::InnerProtocol;
 use crate::util::{allocate_vec, write_all};
 
+use super::reality_key_exchange::extract_server_key_share;
 use super::{RealityServerConfig, RealityServerConnection};
 
 #[derive(Debug)]
@@ -161,9 +162,9 @@ pub async fn setup_reality_server_stream(
         if dest_records.is_empty() && !new_records.is_empty() {
             match parse_server_hello(&new_records[0]) {
                 Ok(parsed) => {
-                    if !parsed.is_tls13 {
+                    if !parsed.is_tls13 || extract_server_key_share(&new_records[0]).is_err() {
                         log::error!(
-                            "REALITY: Dest {} is TLS 1.2, falling back to transparent forward",
+                            "REALITY: Dest {} has an unsupported TLS hello, forwarding transparently",
                             target.dest
                         );
                         return Ok(start_forward_to_dest(
@@ -242,7 +243,14 @@ pub async fn setup_reality_server_stream(
     // Branch based on auth result. We don't short circuit on permission denied before the
     // read loop above so that the timing is always the same.
     match auth_result {
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::PermissionDenied
+                    | std::io::ErrorKind::InvalidData
+                    | std::io::ErrorKind::UnexpectedEof
+            ) =>
+        {
             log::warn!(
                 "REALITY: Auth failed ({}), forwarding to dest transparently",
                 e
@@ -266,8 +274,23 @@ pub async fn setup_reality_server_stream(
 
     log::debug!("REALITY: Auth succeeded, building response matching dest structure");
 
+    if let Err(e) = reality_conn.build_server_response(&dest_records) {
+        if matches!(
+            e.kind(),
+            std::io::ErrorKind::InvalidData | std::io::ErrorKind::UnexpectedEof
+        ) {
+            log::debug!("REALITY: Cannot synthesize target handshake ({e}), forwarding");
+            return Ok(start_forward_to_dest(
+                server_stream,
+                dest_stream,
+                dest_records,
+                remaining_data,
+                client_pending,
+            ));
+        }
+        return Err(e);
+    }
     drop(dest_stream);
-    reality_conn.build_server_response(dest_records)?;
 
     let connection = CryptoConnection::new_reality_server(reality_conn);
     let mode = match target.inner_protocol {

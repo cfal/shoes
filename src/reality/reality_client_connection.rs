@@ -2,8 +2,12 @@
 
 use std::io::{self, Read, Write};
 
-use aws_lc_rs::{agreement, digest};
+use super::reality_key_exchange::{
+    KeyShareRef, RealityGroup, complete_client_exchange, extract_server_key_share, generate_mlkem,
+};
+use aws_lc_rs::{agreement, digest, kem};
 use rand::Rng;
+use subtle::ConstantTimeEq;
 
 use super::common::{
     ALERT_DESC_CLOSE_NOTIFY, ALERT_LEVEL_WARNING, CIPHERTEXT_READ_BUF_CAPACITY, CONTENT_TYPE_ALERT,
@@ -29,7 +33,7 @@ use super::reality_tls13_keys::{
 use super::reality_tls13_messages::{
     DEFAULT_ALPN_PROTOCOLS, construct_client_hello, construct_finished, write_record_header,
 };
-use super::reality_util::{extract_server_cipher_suite, extract_server_public_key};
+use super::reality_util::extract_server_cipher_suite;
 use crate::slide_buffer::SlideBuffer;
 use crate::util::allocate_vec;
 
@@ -67,6 +71,7 @@ enum HandshakeState {
     AwaitingServerHello {
         client_hello_bytes: Vec<u8>, // Full ClientHello handshake message (raw bytes for transcript)
         client_private_key: [u8; 32],
+        mlkem_private: Option<kem::DecapsulationKey>,
         auth_key: [u8; 32], // REALITY authentication key for HMAC verification
     },
     /// ServerHello received, processing encrypted handshake messages
@@ -80,8 +85,9 @@ enum HandshakeState {
         // State for handling multiple encrypted handshake records (separate mode)
         handshake_seq: u64,             // Sequence number for decrypting records
         accumulated_plaintext: Vec<u8>, // Accumulated plaintext across records
-        messages_found: u8,             // Number of handshake messages found so far
-        certificate_verified: bool,     // Whether Certificate HMAC was verified
+        parsed_plaintext: usize,
+        messages_found: u8,         // Number of handshake messages found so far
+        certificate_verified: bool, // Whether Certificate HMAC was verified
         ed25519_public_key: Option<[u8; 32]>, // Public key from Certificate for CV verification
         cert_verify_offset: Option<usize>, // Offset of CertificateVerify in accumulated plaintext
     },
@@ -106,6 +112,7 @@ pub struct RealityClientConnection {
     read_seq: u64,
     write_seq: u64,
     cipher_suite: Option<CipherSuite>,
+    negotiated_group: Option<RealityGroup>,
 
     // Pre-allocated buffer for TLS read operations (reused across calls)
     tls_read_buffer: Box<[u8]>,
@@ -129,6 +136,7 @@ impl RealityClientConnection {
             handshake_state: HandshakeState::AwaitingServerHello {
                 client_hello_bytes: Vec::new(),
                 client_private_key: [0u8; 32],
+                mlkem_private: None,
                 auth_key: [0u8; 32],
             },
             app_read_key: None,
@@ -138,6 +146,7 @@ impl RealityClientConnection {
             read_seq: 0,
             write_seq: 0,
             cipher_suite: None,
+            negotiated_group: None,
             tls_read_buffer: allocate_vec(TLS_MAX_RECORD_SIZE).into_boxed_slice(),
             ciphertext_read_buf: SlideBuffer::new(CIPHERTEXT_READ_BUF_CAPACITY),
             ciphertext_write_buf: Vec::new(),
@@ -165,6 +174,19 @@ impl RealityClientConnection {
         let our_public_key_bytes = our_private_key
             .compute_public_key()
             .map_err(|_| io::Error::other("Failed to compute public key"))?;
+
+        let (mlkem_private, mut hybrid_share) = generate_mlkem()?;
+        hybrid_share.extend_from_slice(our_public_key_bytes.as_ref());
+        let key_shares = [
+            KeyShareRef {
+                group: RealityGroup::X25519MlKem768,
+                data: &hybrid_share,
+            },
+            KeyShareRef {
+                group: RealityGroup::X25519,
+                data: our_public_key_bytes.as_ref(),
+            },
+        ];
 
         let mut client_random = [0u8; 32];
         rng.fill_bytes(&mut client_random);
@@ -208,7 +230,7 @@ impl RealityClientConnection {
         let mut client_hello = construct_client_hello(
             &client_random,
             &session_id_for_hello,
-            our_public_key_bytes.as_ref(),
+            &key_shares,
             &self.config.server_name,
             &cipher_suite_ids,
             DEFAULT_ALPN_PROTOCOLS,
@@ -251,6 +273,7 @@ impl RealityClientConnection {
         self.handshake_state = HandshakeState::AwaitingServerHello {
             client_hello_bytes: client_hello, // Save the actual ClientHello bytes
             client_private_key: our_private_bytes,
+            mlkem_private: Some(mlkem_private),
             auth_key, // Save auth_key for HMAC certificate verification
         };
 
@@ -339,6 +362,7 @@ impl RealityClientConnection {
         let HandshakeState::AwaitingServerHello {
             client_hello_bytes,
             client_private_key,
+            mlkem_private,
             auth_key,
         } = &self.handshake_state
         else {
@@ -373,7 +397,13 @@ impl RealityClientConnection {
             server_hello
         );
 
-        let server_public_key = extract_server_public_key(&record)?;
+        let server_share = extract_server_key_share(&record)?;
+        if super::reality_util::extract_session_id_slice(&record)? != &client_hello_bytes[39..71] {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "ServerHello session ID mismatch",
+            ));
+        }
         let cipher_suite_id = extract_server_cipher_suite(&record)?;
         let cipher_suite = CipherSuite::from_id(cipher_suite_id).ok_or_else(|| {
             io::Error::new(
@@ -384,6 +414,14 @@ impl RealityClientConnection {
                 ),
             )
         })?;
+        if !self.config.cipher_suites.is_empty()
+            && !self.config.cipher_suites.contains(&cipher_suite)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Server selected unoffered cipher suite",
+            ));
+        }
         log::debug!(
             "REALITY CLIENT: Server selected cipher suite 0x{:04x}",
             cipher_suite_id
@@ -412,24 +450,15 @@ impl RealityClientConnection {
             ctx.finish().as_ref().to_vec()
         };
 
-        let peer_public_key =
-            agreement::UnparsedPublicKey::new(&agreement::X25519, &server_public_key);
-        let my_private_key =
-            agreement::PrivateKey::from_private_key(&agreement::X25519, client_private_key)
-                .map_err(|_| io::Error::other("Failed to create private key"))?;
-
-        let mut tls_shared_secret = [0u8; 32];
-        agreement::agree(
-            &my_private_key,
-            peer_public_key,
-            io::Error::other("ECDH failed"),
-            |key_material| {
-                tls_shared_secret.copy_from_slice(key_material);
-                Ok(())
-            },
+        let tls_shared_secret = complete_client_exchange(
+            client_private_key,
+            mlkem_private.as_ref().expect("ClientHello generated"),
+            &server_share,
         )?;
+        self.negotiated_group = Some(server_share.group);
 
         let hs_keys = derive_handshake_keys(
+            server_share.group,
             cipher_suite,
             &tls_shared_secret,
             &client_hello_hash_vec,
@@ -453,6 +482,7 @@ impl RealityClientConnection {
             // Initialize state for handling multiple encrypted handshake records
             handshake_seq: 0,
             accumulated_plaintext: Vec::new(),
+            parsed_plaintext: 0,
             messages_found: 0,
             certificate_verified: false,
             ed25519_public_key: None,
@@ -476,6 +506,7 @@ impl RealityClientConnection {
             auth_key,
             handshake_seq,
             accumulated_plaintext,
+            parsed_plaintext,
             messages_found,
             certificate_verified,
             ed25519_public_key,
@@ -578,12 +609,9 @@ impl RealityClientConnection {
 
         handshake_seq += 1;
 
-        // Track where new plaintext starts in accumulated buffer
-        let prev_accumulated_len =
-            append_handshake_plaintext(&mut accumulated_plaintext, &plaintext)?;
-
-        // Parse newly added messages from the plaintext we just added
-        let mut offset = prev_accumulated_len;
+        append_handshake_plaintext(&mut accumulated_plaintext, &plaintext)?;
+        // Resumes at the last complete message, including across TLS record boundaries.
+        let mut offset = *parsed_plaintext;
         while offset < accumulated_plaintext.len() && messages_found < 4 {
             // Each handshake message has: type (1 byte) + length (3 bytes) + data
             if offset + 4 > accumulated_plaintext.len() {
@@ -600,6 +628,36 @@ impl RealityClientConnection {
 
             if offset + 4 + msg_len > accumulated_plaintext.len() {
                 break; // Incomplete message body, need more data
+            }
+
+            let expected = [
+                HANDSHAKE_TYPE_ENCRYPTED_EXTENSIONS,
+                HANDSHAKE_TYPE_CERTIFICATE,
+                HANDSHAKE_TYPE_CERTIFICATE_VERIFY,
+                HANDSHAKE_TYPE_FINISHED,
+            ][messages_found as usize];
+            if msg_type != expected {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Unexpected REALITY handshake message",
+                ));
+            }
+            if msg_type == HANDSHAKE_TYPE_FINISHED {
+                let mut transcript = digest::Context::new(cipher_suite.digest_algorithm());
+                transcript.update(&transcript_bytes);
+                transcript.update(&accumulated_plaintext[..offset]);
+                let expected = compute_finished_verify_data(
+                    cipher_suite,
+                    &server_hs_secret,
+                    transcript.finish().as_ref(),
+                )?;
+                let received = &accumulated_plaintext[offset + 4..offset + 4 + msg_len];
+                if expected.as_slice().ct_eq(received).unwrap_u8() != 1 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "REALITY server Finished verification failed",
+                    ));
+                }
             }
 
             let msg_name = match msg_type {
@@ -649,12 +707,20 @@ impl RealityClientConnection {
                 auth_key,
                 handshake_seq,
                 accumulated_plaintext,
+                parsed_plaintext: offset,
                 messages_found,
                 certificate_verified,
                 ed25519_public_key,
                 cert_verify_offset,
             };
             return Ok(true); // Processed a record, but need more
+        }
+
+        if offset != accumulated_plaintext.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Trailing handshake plaintext",
+            ));
         }
 
         log::debug!(
@@ -764,6 +830,12 @@ impl RealityClientConnection {
         self.write_seq = 0;
         self.cipher_suite = Some(cipher_suite);
         self.handshake_state = HandshakeState::Complete;
+        log::debug!(
+            "REALITY: negotiated_group={}",
+            self.negotiated_group()
+                .map(RealityGroup::name)
+                .unwrap_or("unknown")
+        );
         log::debug!("REALITY CLIENT: Handshake complete, application keys derived");
 
         Ok(true)
@@ -913,6 +985,12 @@ impl RealityClientConnection {
         !matches!(self.handshake_state, HandshakeState::Complete)
     }
 
+    pub fn negotiated_group(&self) -> Option<RealityGroup> {
+        (!self.is_handshaking())
+            .then_some(self.negotiated_group)
+            .flatten()
+    }
+
     /// Check if the connection wants to read more TLS data
     ///
     /// Returns true if we need more data to make progress (handshake or decryption).
@@ -1025,6 +1103,7 @@ mod tests {
             auth_key: [5; 32],
             handshake_seq: 0,
             accumulated_plaintext: vec![],
+            parsed_plaintext: 0,
             messages_found: 0,
             certificate_verified: false,
             ed25519_public_key: None,

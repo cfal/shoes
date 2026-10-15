@@ -3,7 +3,11 @@
 // This implements a rustls-compatible API for REALITY protocol server connections,
 // allowing REALITY to be used as a drop-in replacement for rustls.
 
-use aws_lc_rs::{agreement, digest};
+use super::reality_key_exchange::{
+    ClientKeyShares, RealityGroup, extract_client_key_shares, extract_server_key_share,
+    server_exchange,
+};
+use aws_lc_rs::digest;
 use rand::Rng;
 use std::io::{self, Read, Write};
 use subtle::ConstantTimeEq;
@@ -30,8 +34,8 @@ use super::reality_tls13_messages::{
     construct_finished, construct_server_hello, write_record_header,
 };
 use super::reality_util::{
-    extract_client_cipher_suites, extract_client_public_key, extract_client_random,
-    extract_session_id_slice, negotiate_cipher_suite,
+    extract_client_cipher_suites, extract_client_random, extract_session_id_slice,
+    negotiate_cipher_suite,
 };
 use crate::address::{Address, NetLocation};
 use crate::slide_buffer::SlideBuffer;
@@ -79,8 +83,8 @@ enum HandshakeState {
 pub struct ClientHelloInfo {
     /// Session ID from ClientHello (echoed back in ServerHello)
     pub session_id: Vec<u8>,
-    /// Client's X25519 public key from key_share extension
-    pub client_public_key: [u8; 32],
+    /// Keeps authentication and negotiated TLS shares separate for Chrome clients.
+    pub key_shares: ClientKeyShares,
     /// Derived auth key for HMAC certificate
     pub auth_key: [u8; 32],
     /// Negotiated cipher suite
@@ -106,6 +110,7 @@ pub struct RealityServerConnection {
     read_seq: u64,
     write_seq: u64,
     cipher_suite: Option<CipherSuite>,
+    negotiated_group: Option<RealityGroup>,
 
     // Pre-allocated buffer for TLS read operations (reused across calls)
     tls_read_buffer: Box<[u8]>,
@@ -134,6 +139,7 @@ impl RealityServerConnection {
             read_seq: 0,
             write_seq: 0,
             cipher_suite: None,
+            negotiated_group: None,
             tls_read_buffer: allocate_vec(TLS_MAX_RECORD_SIZE).into_boxed_slice(),
             ciphertext_read_buf: SlideBuffer::new(CIPHERTEXT_READ_BUF_CAPACITY),
             ciphertext_write_buf: Vec::new(),
@@ -282,7 +288,7 @@ impl RealityServerConnection {
     /// received from the destination server to match their structure.
     ///
     /// dest_records should contain: [ServerHello, CCS, encrypted_handshake..., NewSessionTicket...]
-    pub fn build_server_response(&mut self, dest_records: Vec<bytes::Bytes>) -> io::Result<()> {
+    pub fn build_server_response(&mut self, dest_records: &[bytes::Bytes]) -> io::Result<()> {
         // Must be in ClientHelloValidated state
         if !matches!(
             self.handshake_state,
@@ -294,7 +300,7 @@ impl RealityServerConnection {
             ));
         }
 
-        self.build_server_response_internal(&dest_records)
+        self.build_server_response_internal(dest_records)
     }
 
     /// Phase 1: Validate ClientHello and extract info for later response building
@@ -311,7 +317,8 @@ impl RealityServerConnection {
         // Extract fields from ClientHello
         let client_random = extract_client_random(client_hello)?;
         let session_id = extract_session_id_slice(client_hello)?;
-        let client_public_key = extract_client_public_key(client_hello)?;
+        let key_shares = extract_client_key_shares(client_hello)?;
+        let client_public_key = key_shares.authentication_public_key()?;
 
         log::debug!(
             "REALITY: ClientHello received, client_random: {:?}",
@@ -319,7 +326,7 @@ impl RealityServerConnection {
         );
 
         // Perform ECDH to derive auth key
-        let shared_secret = perform_ecdh(&self.config.private_key, &client_public_key)
+        let shared_secret = perform_ecdh(&self.config.private_key, client_public_key)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
         let salt = &client_random[0..20];
@@ -480,7 +487,7 @@ impl RealityServerConnection {
         self.handshake_state = HandshakeState::ClientHelloValidated {
             info: ClientHelloInfo {
                 session_id: session_id.to_vec(),
-                client_public_key,
+                key_shares,
                 auth_key,
                 cipher_suite,
                 client_hello_handshake: client_hello_handshake.to_vec(),
@@ -501,17 +508,13 @@ impl RealityServerConnection {
 
         let cipher_suite = info.cipher_suite;
 
-        // Generate our server X25519 keypair
+        let target_hello = dest_records.first().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "Missing target ServerHello")
+        })?;
+        let group = extract_server_key_share(target_hello)?.group;
+        let (server_share, tls_shared_secret) = server_exchange(group, &info.key_shares)?;
+        self.negotiated_group = Some(group);
         let mut rng = rand::rng();
-        let mut our_private_bytes = [0u8; 32];
-        rng.fill_bytes(&mut our_private_bytes);
-
-        let our_private_key =
-            agreement::PrivateKey::from_private_key(&agreement::X25519, &our_private_bytes)
-                .map_err(|_| io::Error::other("Failed to create X25519 key"))?;
-        let our_public_key_bytes = our_private_key
-            .compute_public_key()
-            .map_err(|_| io::Error::other("Failed to compute public key"))?;
 
         // Generate server random
         let mut server_random = [0u8; 32];
@@ -522,7 +525,8 @@ impl RealityServerConnection {
             &server_random,
             &info.session_id,
             cipher_suite.id(),
-            our_public_key_bytes.as_ref(),
+            group,
+            &server_share,
         )?;
 
         // Compute transcript hashes using cipher suite's digest algorithm
@@ -539,22 +543,9 @@ impl RealityServerConnection {
         let mut handshake_transcript = ch_sh_transcript.clone();
         let server_hello_hash = ch_sh_transcript.finish();
 
-        // Perform ECDH for TLS 1.3 key derivation
-        let peer_public_key =
-            agreement::UnparsedPublicKey::new(&agreement::X25519, &info.client_public_key);
-        let mut tls_shared_secret = [0u8; 32];
-        agreement::agree(
-            &our_private_key,
-            peer_public_key,
-            io::Error::other("ECDH failed"),
-            |key_material| {
-                tls_shared_secret.copy_from_slice(key_material);
-                Ok(())
-            },
-        )?;
-
         // Derive TLS 1.3 keys
         let hs_keys = derive_handshake_keys(
+            group,
             cipher_suite,
             &tls_shared_secret,
             client_hello_hash.as_ref(),
@@ -886,6 +877,12 @@ impl RealityServerConnection {
         // Handshake state already set to Complete above
 
         log::debug!("REALITY: Handshake complete, application keys derived");
+        log::debug!(
+            "REALITY: negotiated_group={}",
+            self.negotiated_group()
+                .map(RealityGroup::name)
+                .unwrap_or("unknown")
+        );
 
         Ok(true)
     }
@@ -1035,6 +1032,12 @@ impl RealityServerConnection {
     /// Check if handshake is still in progress
     pub fn is_handshaking(&self) -> bool {
         !matches!(self.handshake_state, HandshakeState::Complete)
+    }
+
+    pub fn negotiated_group(&self) -> Option<RealityGroup> {
+        (!self.is_handshaking())
+            .then_some(self.negotiated_group)
+            .flatten()
     }
 
     /// Check if the connection wants to read more TLS data

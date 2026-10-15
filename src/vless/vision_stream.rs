@@ -1014,7 +1014,9 @@ mod tests {
         })
         .unwrap();
         server.validate_client_hello(&hello).unwrap();
-        server.build_server_response(Vec::new()).unwrap();
+        server
+            .build_server_response(&crate::reality::default_target_records(&hello[44..76]))
+            .unwrap();
         (
             CryptoConnection::new_reality_client(client),
             CryptoConnection::new_reality_server(server),
