@@ -165,7 +165,12 @@ pub async fn setup_reality_server_stream(
             match parse_server_hello(&new_records[0]) {
                 Ok(parsed) => {
                     if !parsed.is_tls13 || extract_server_key_share(&new_records[0]).is_err() {
-                        log::error!(
+                        log::log!(
+                            if auth_result.is_ok() {
+                                log::Level::Warn
+                            } else {
+                                log::Level::Debug
+                            },
                             "REALITY: Dest {} has an unsupported TLS hello, forwarding transparently",
                             target.dest
                         );
@@ -180,7 +185,15 @@ pub async fn setup_reality_server_stream(
                     log::debug!("REALITY: Dest confirmed TLS 1.3");
                 }
                 Err(e) => {
-                    log::error!("REALITY: Failed to parse dest ServerHello: {}", e);
+                    log::log!(
+                        if auth_result.is_ok() {
+                            log::Level::Warn
+                        } else {
+                            log::Level::Debug
+                        },
+                        "REALITY: Failed to parse dest ServerHello: {}, forwarding transparently",
+                        e
+                    );
                     return Ok(start_forward_to_dest(
                         server_stream,
                         dest_stream,
@@ -276,21 +289,14 @@ pub async fn setup_reality_server_stream(
 
     log::debug!("REALITY: Auth succeeded, building response matching dest structure");
 
-    if let Err(e) = reality_conn.build_server_response(&dest_records) {
-        if matches!(
-            e.kind(),
-            std::io::ErrorKind::InvalidData | std::io::ErrorKind::UnexpectedEof
-        ) {
-            log::debug!("REALITY: Cannot synthesize target handshake ({e}), forwarding");
-            return Ok(start_forward_to_dest(
-                server_stream,
-                dest_stream,
-                dest_records,
-                remaining_data,
-                client_pending,
-            ));
-        }
-        return Err(e);
+    if should_forward_to_dest(reality_conn.build_server_response(&dest_records))? {
+        return Ok(start_forward_to_dest(
+            server_stream,
+            dest_stream,
+            dest_records,
+            remaining_data,
+            client_pending,
+        ));
     }
     drop(dest_stream);
 
@@ -325,6 +331,18 @@ pub async fn setup_reality_server_stream(
             )
             .await
         }
+    }
+}
+
+fn should_forward_to_dest(response: std::io::Result<()>) -> std::io::Result<bool> {
+    match response {
+        Ok(()) => Ok(false),
+        // Only explicitly classified target incompatibilities permit fallback.
+        Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
+            log::warn!("REALITY: Cannot synthesize target handshake ({e}), forwarding");
+            Ok(true)
+        }
+        Err(e) => Err(e),
     }
 }
 
@@ -406,6 +424,22 @@ mod cleanup_tests {
     use std::pin::Pin;
     use std::task::{Context, Poll};
     use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+    #[test]
+    fn synthesis_failures_only_forward_explicit_incompatibilities() {
+        assert!(!should_forward_to_dest(Ok(())).unwrap());
+        assert!(should_forward_to_dest(Err(io::ErrorKind::Unsupported.into())).unwrap());
+        for kind in [
+            io::ErrorKind::InvalidData,
+            io::ErrorKind::UnexpectedEof,
+            io::ErrorKind::Other,
+        ] {
+            let error = io::Error::new(kind, "injected synthesis failure");
+            let propagated = should_forward_to_dest(Err(error)).unwrap_err();
+            assert_eq!(propagated.kind(), kind);
+            assert_eq!(propagated.to_string(), "injected synthesis failure");
+        }
+    }
 
     #[tokio::test]
     async fn unsupported_and_undersized_target_flights_forward_unchanged() {

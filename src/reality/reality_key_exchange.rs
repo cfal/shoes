@@ -247,7 +247,9 @@ pub fn server_exchange(
     group: RealityGroup,
     shares: &ClientKeyShares,
 ) -> io::Result<(Vec<u8>, Vec<u8>)> {
-    let client = shares.get(group)?;
+    let client = shares
+        .get(group)
+        .map_err(|e| io::Error::new(io::ErrorKind::Unsupported, e))?;
     let mut private_bytes = [0; 32];
     rand::rng().fill_bytes(&mut private_bytes);
     let private = agreement::PrivateKey::from_private_key(&agreement::X25519, &private_bytes)
@@ -261,16 +263,16 @@ pub fn server_exchange(
         0
     };
     let peer = client[kem_public_len..].try_into().unwrap();
-    let x25519 =
-        perform_ecdh(&private_bytes, peer).map_err(|_| invalid("Invalid client X25519 key"))?;
+    let x25519 = perform_ecdh(&private_bytes, peer)
+        .map_err(|_| io::Error::new(io::ErrorKind::Unsupported, "Invalid client X25519 key"))?;
     let mut response = Vec::with_capacity(group.share_len(false));
     let mut secret = Vec::with_capacity(group.secret_len());
     if group == RealityGroup::X25519MlKem768 {
         let kem_public = kem::EncapsulationKey::new(&kem::ML_KEM_768, &client[..kem_public_len])
-            .map_err(|_| invalid("Invalid ML-KEM public key"))?;
+            .map_err(|_| io::Error::new(io::ErrorKind::Unsupported, "Invalid ML-KEM public key"))?;
         let (ciphertext, kem_secret) = kem_public
             .encapsulate()
-            .map_err(|_| invalid("ML-KEM encapsulation failed"))?;
+            .map_err(|_| io::Error::other("ML-KEM encapsulation failed"))?;
         response.extend_from_slice(ciphertext.as_ref());
         secret.extend_from_slice(kem_secret.as_ref());
     }

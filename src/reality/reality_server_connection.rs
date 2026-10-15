@@ -289,6 +289,7 @@ impl RealityServerConnection {
     /// received from the destination server to match their structure.
     ///
     /// dest_records should contain: [ServerHello, CCS, encrypted_handshake..., NewSessionTicket...]
+    /// Unsupported indicates an incompatible target or peer share; other errors are fatal.
     pub fn build_server_response(&mut self, dest_records: &[bytes::Bytes]) -> io::Result<()> {
         // Must be in ClientHelloValidated state
         if !matches!(
@@ -510,9 +511,11 @@ impl RealityServerConnection {
         let cipher_suite = info.cipher_suite;
 
         let target_hello = dest_records.first().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "Missing target ServerHello")
+            io::Error::new(io::ErrorKind::Unsupported, "Missing target ServerHello")
         })?;
-        let group = extract_server_key_share(target_hello)?.group;
+        let group = extract_server_key_share(target_hello)
+            .map_err(|e| io::Error::new(io::ErrorKind::Unsupported, e))?
+            .group;
         let (server_share, tls_shared_secret) = server_exchange(group, &info.key_shares)?;
         self.negotiated_group = Some(group);
         let mut rng = rand::rng();
@@ -792,7 +795,7 @@ impl RealityServerConnection {
 
         // NOW we're committed to processing - take ownership of handshake state
         // This avoids cloning Vec<u8> fields
-        let old_state = std::mem::replace(&mut self.handshake_state, HandshakeState::Complete);
+        let old_state = std::mem::replace(&mut self.handshake_state, HandshakeState::Initial);
         let HandshakeState::ServerHelloSent {
             client_handshake_traffic_secret,
             master_secret,
@@ -888,7 +891,7 @@ impl RealityServerConnection {
         self.write_seq = 0;
         self.cipher_suite = Some(cipher_suite);
 
-        // Handshake state already set to Complete above
+        self.handshake_state = HandshakeState::Complete;
 
         log::debug!("REALITY: Handshake complete, application keys derived");
         log::debug!(
@@ -1122,7 +1125,7 @@ fn check_mldsa_record_capacity(plaintext_len: usize, target_size: usize) -> io::
         || target_size > super::common::MAX_TLS_PLAINTEXT_LEN + overhead
     {
         return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
+            io::ErrorKind::Unsupported,
             "Camouflage target record has insufficient capacity for ML-DSA-65 handshake",
         ));
     }
@@ -1151,6 +1154,74 @@ pub fn feed_reality_server_connection(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejected_client_finished_never_completes_handshake() {
+        use crate::reality::RealityClientConnection;
+        use crate::reality::reality_pq_tests::{configs, default_target_records};
+
+        for corrupt_record in [false, true] {
+            let cipher = CipherSuite::AES_128_GCM_SHA256;
+            let (cc, sc) = configs(cipher);
+            let mut client = RealityClientConnection::new(cc).unwrap();
+            let mut server = RealityServerConnection::new(sc).unwrap();
+            let mut hello = Vec::new();
+            client.write_tls(&mut hello).unwrap();
+            server.validate_client_hello(&hello).unwrap();
+            server
+                .build_server_response(&default_target_records(&hello[44..76]))
+                .unwrap();
+            let mut response = Vec::new();
+            server.write_tls(&mut response).unwrap();
+            client.read_tls(&mut response.as_slice()).unwrap();
+            client.process_new_packets().unwrap();
+            let mut finished = Vec::new();
+            client.write_tls(&mut finished).unwrap();
+            if corrupt_record {
+                *finished.last_mut().unwrap() ^= 1;
+            } else {
+                let HandshakeState::ServerHelloSent {
+                    client_handshake_traffic_secret,
+                    ..
+                } = &server.handshake_state
+                else {
+                    panic!("expected pending client Finished");
+                };
+                let (key, iv) =
+                    derive_traffic_keys(client_handshake_traffic_secret, cipher).unwrap();
+                let start = if finished[0] == CONTENT_TYPE_CHANGE_CIPHER_SPEC {
+                    6
+                } else {
+                    0
+                };
+                let record = &finished[start..];
+                let len = u16::from_be_bytes([record[3], record[4]]);
+                let mut plaintext =
+                    decrypt_handshake_message(cipher, &key, &iv, 0, &record[5..], len).unwrap();
+                *plaintext.last_mut().unwrap() ^= 1;
+                finished.truncate(start);
+                let aead = AeadKey::new(cipher, &key).unwrap();
+                let mut seq = 0;
+                RecordEncryptor::new(&aead, &iv, &mut seq)
+                    .encrypt_handshake(&plaintext, &mut finished)
+                    .unwrap();
+            }
+            assert!(server.is_handshaking());
+            assert_eq!(server.negotiated_group(), None);
+            server.read_tls(&mut finished.as_slice()).unwrap();
+            let error = server.process_new_packets().unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            if !corrupt_record {
+                assert_eq!(error.to_string(), "Client Finished verify_data mismatch");
+            }
+            assert!(server.is_handshaking());
+            assert_eq!(server.negotiated_group(), None);
+            assert!(server.app_read_key.is_none());
+            assert!(server.app_write_key.is_none());
+            assert!(server.plaintext_read_buf.is_empty());
+            assert!(server.process_new_packets().is_err());
+        }
+    }
 
     #[test]
     fn fragmented_change_cipher_spec_rejects_invalid_length_before_buffering_payload() {
