@@ -219,7 +219,7 @@ impl Client {
         );
         let tasks = Arc::new(Tasks::new());
         let (mut write, upload_reader) = pipe(memory.clone());
-        write.flush_before_shutdown = self.mode == XhttpMode::PacketUp;
+        write.drain_before_shutdown = self.mode == XhttpMode::PacketUp;
         let (mut download_writer, read) = pipe(memory.clone());
         let client = self.clone();
         // The stream owns cancellation; workers must not retain the task owner.
@@ -413,27 +413,22 @@ impl Client {
             };
             match event {
                 Event::Data(data) => {
-                    loop {
-                        tokio::select! {
-                            _ = tokio::time::sleep_until(next_post_at) => break,
-                            done = inflight.next(), if !inflight.is_empty() => {
-                                done.unwrap()?;
-                            }
-                        }
-                    }
-                    let mut chunks = Vec::new();
+                    let mut chunks = std::collections::VecDeque::new();
                     let mut size = 0;
                     let mut event = Some(Event::Data(data));
                     while let Some(item) = event {
                         match item {
                             Event::Data(mut data) => {
                                 let len = data.len().min(max_packet_bytes - size);
-                                chunks.push(data.split_to(len));
+                                chunks.push_back(data.split_to(len));
                                 size += len;
                                 if !data.is_empty() {
                                     pending.push_front(Event::Data(data));
                                     break;
                                 }
+                            }
+                            Event::Flush(ack) => {
+                                let _ = ack.send(());
                             }
                             barrier => {
                                 pending.push_front(barrier);
@@ -443,22 +438,34 @@ impl Client {
                         if size == max_packet_bytes {
                             break;
                         }
-                        event = reader.receiver.try_recv().ok();
+                        event = match reader.receiver.try_recv() {
+                            Ok(event) => Some(event),
+                            Err(_) if tokio::time::Instant::now() < next_post_at => loop {
+                                tokio::select! {
+                                    biased;
+                                    _ = tokio::time::sleep_until(next_post_at) => break None,
+                                    done = inflight.next(), if !inflight.is_empty() => {
+                                        done.unwrap()?;
+                                    }
+                                    event = reader.receiver.recv() => break event,
+                                }
+                            },
+                            Err(_) => None,
+                        };
                     }
-                    let packet = if chunks.len() == 1 {
-                        chunks.pop().unwrap()
-                    } else {
-                        memory.concat(&chunks)?
-                    };
+                    loop {
+                        tokio::select! {
+                            _ = tokio::time::sleep_until(next_post_at) => break,
+                            done = inflight.next(), if !inflight.is_empty() => {
+                                done.unwrap()?;
+                            }
+                        }
+                    }
                     if self.version == XhttpVersion::H1 && carrier.closed() {
                         carrier = self.dial(&dialer).await?;
                     }
-                    let request = self.request(
-                        session,
-                        Some(sequence),
-                        true,
-                        Body::Full(Some(packet.clone())),
-                    )?;
+                    let request =
+                        self.request(session, Some(sequence), true, Body::Chunks(chunks.clone()))?;
                     next_post_at = tokio::time::Instant::now()
                         + Duration::from_millis(wire::sample(
                             self.config
@@ -468,7 +475,7 @@ impl Client {
                     let carrier = carrier.clone();
                     let memory = memory.clone();
                     inflight.push(async move {
-                        let _retained_until_ack = packet;
+                        let _retained_until_ack = chunks;
                         tokio::time::timeout(
                             Duration::from_secs(self.config.limits.packet_timeout_secs),
                             async {
@@ -497,6 +504,9 @@ impl Client {
                         .ok_or_else(|| io::Error::other("XHTTP sequence exhausted"))?;
                 }
                 Event::Flush(ack) => {
+                    let _ = ack.send(());
+                }
+                Event::Drain(ack) => {
                     while let Some(result) = inflight.next().await {
                         result?;
                     }

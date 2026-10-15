@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     io,
     pin::Pin,
     sync::Arc,
@@ -140,30 +141,6 @@ impl Memory {
         }
     }
 
-    pub fn concat(&self, chunks: &[Bytes]) -> io::Result<Bytes> {
-        let size = chunks
-            .iter()
-            .try_fold(0usize, |n, b| n.checked_add(b.len()))
-            .ok_or_else(crate::resources::exhausted)?;
-        let global = self
-            .global
-            .acquire(size)
-            .ok_or_else(crate::resources::exhausted)?;
-        let session = self
-            .session
-            .acquire(size)
-            .ok_or_else(crate::resources::exhausted)?;
-        let mut data = Vec::with_capacity(size);
-        for chunk in chunks {
-            data.extend_from_slice(chunk);
-        }
-        Ok(Bytes::from_owner(Allocation {
-            data: Bytes::from(data),
-            _global: global,
-            _session: session,
-        }))
-    }
-
     pub fn new(global: Arc<Budget>, session_limit: usize) -> Self {
         Self {
             global,
@@ -216,6 +193,7 @@ impl Drop for Tasks {
 pub enum Event {
     Data(Bytes),
     Flush(oneshot::Sender<()>),
+    Drain(oneshot::Sender<()>),
     Finish,
     Error(io::Error),
 }
@@ -229,10 +207,10 @@ pub struct Reader {
 pub struct Writer {
     sender: parking_lot::Mutex<PollSender<Event>>,
     memory: Memory,
-    flush: Option<oneshot::Receiver<()>>,
+    flush: Option<(bool, oneshot::Receiver<()>)>,
     finished: bool,
     allocation: parking_lot::Mutex<Option<(usize, Reservation)>>,
-    pub flush_before_shutdown: bool,
+    pub drain_before_shutdown: bool,
 }
 
 type Reservation = Pin<Box<dyn Future<Output = io::Result<(BudgetPermit, BudgetPermit)>> + Send>>;
@@ -246,7 +224,7 @@ pub fn pipe(memory: Memory) -> (Writer, Reader) {
             flush: None,
             finished: false,
             allocation: parking_lot::Mutex::new(None),
-            flush_before_shutdown: false,
+            drain_before_shutdown: false,
         },
         Reader {
             receiver,
@@ -293,6 +271,30 @@ impl Writer {
             .send_item(event()?)
             .map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))?;
         Poll::Ready(Ok(()))
+    }
+
+    fn poll_barrier(&mut self, cx: &mut Context<'_>, drain: bool) -> Poll<io::Result<()>> {
+        loop {
+            if self.flush.is_none() {
+                let (send, recv) = oneshot::channel();
+                ready!(self.event(cx, || {
+                    Ok(if drain {
+                        Event::Drain(send)
+                    } else {
+                        Event::Flush(send)
+                    })
+                }))?;
+                self.flush = Some((drain, recv));
+            }
+            let (was_drain, recv) = self.flush.as_mut().unwrap();
+            ready!(Pin::new(recv).poll(cx))
+                .map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))?;
+            let complete = !drain || *was_drain;
+            self.flush = None;
+            if complete {
+                return Poll::Ready(Ok(()));
+            }
+        }
     }
 }
 
@@ -356,21 +358,13 @@ impl AsyncWrite for Writer {
         if self.finished {
             return Poll::Ready(Ok(()));
         }
-        if self.flush.is_none() {
-            let (send, recv) = oneshot::channel();
-            ready!(self.event(cx, || Ok(Event::Flush(send))))?;
-            self.flush = Some(recv);
-        }
-        ready!(Pin::new(self.flush.as_mut().unwrap()).poll(cx))
-            .map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))?;
-        self.flush = None;
-        Poll::Ready(Ok(()))
+        self.poll_barrier(cx, false)
     }
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         if !self.finished {
-            if self.flush_before_shutdown {
-                ready!(self.as_mut().poll_flush(cx))?;
-                self.flush_before_shutdown = false;
+            if self.drain_before_shutdown {
+                ready!(self.poll_barrier(cx, true))?;
+                self.drain_before_shutdown = false;
             }
             ready!(self.event(cx, || Ok(Event::Finish)))?;
             self.finished = true;
@@ -403,7 +397,7 @@ impl AsyncRead for Reader {
             }
             match ready!(self.receiver.poll_recv(cx)) {
                 Some(Event::Data(data)) => self.current = data,
-                Some(Event::Flush(ack)) => {
+                Some(Event::Flush(ack) | Event::Drain(ack)) => {
                     let _ = ack.send(());
                 }
                 Some(Event::Finish) => self.ended = true,
@@ -460,7 +454,7 @@ impl AsyncStream for Stream {}
 
 pub enum Body {
     Empty,
-    Full(Option<Bytes>),
+    Chunks(VecDeque<Bytes>),
     Stream {
         reader: Reader,
         _guard: Option<Box<dyn Send + Sync>>,
@@ -492,7 +486,9 @@ impl HttpBody for Body {
     ) -> Poll<Option<io::Result<Frame<Bytes>>>> {
         match &mut *self {
             Self::Empty => Poll::Ready(None),
-            Self::Full(data) => Poll::Ready(data.take().map(|data| Ok(Frame::data(data)))),
+            Self::Chunks(chunks) => {
+                Poll::Ready(chunks.pop_front().map(|data| Ok(Frame::data(data))))
+            }
             Self::Stream { reader, .. } => {
                 if reader.ended {
                     return Poll::Ready(None);
@@ -500,7 +496,7 @@ impl HttpBody for Body {
                 loop {
                     match ready!(reader.receiver.poll_recv(cx)) {
                         Some(Event::Data(data)) => return Poll::Ready(Some(Ok(Frame::data(data)))),
-                        Some(Event::Flush(ack)) => {
+                        Some(Event::Flush(ack) | Event::Drain(ack)) => {
                             let _ = ack.send(());
                         }
                         Some(Event::Finish) => {
@@ -521,13 +517,16 @@ impl HttpBody for Body {
         }
     }
     fn is_end_stream(&self) -> bool {
-        matches!(self, Self::Empty | Self::Full(None))
+        matches!(self, Self::Empty)
+            || matches!(self, Self::Chunks(chunks) if chunks.is_empty())
             || matches!(self, Self::Stream { reader, .. } if reader.ended)
     }
     fn size_hint(&self) -> SizeHint {
         match self {
-            Self::Empty | Self::Full(None) => SizeHint::with_exact(0),
-            Self::Full(Some(data)) => SizeHint::with_exact(data.len() as u64),
+            Self::Empty => SizeHint::with_exact(0),
+            Self::Chunks(chunks) => {
+                SizeHint::with_exact(chunks.iter().map(|b| b.len() as u64).sum())
+            }
             _ => SizeHint::default(),
         }
     }

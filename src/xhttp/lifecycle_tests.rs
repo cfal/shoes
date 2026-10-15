@@ -340,6 +340,10 @@ async fn packet_shutdown_waits_for_acknowledgement() {
             .await
             .unwrap();
         stream.write_all(b"pending packet").await.unwrap();
+        tokio::time::timeout(Duration::from_millis(100), stream.flush())
+            .await
+            .expect("flush must not wait for the remote acknowledgement")
+            .unwrap();
         let mut shutdown = Box::pin(stream.shutdown());
         assert!(futures::poll!(&mut shutdown).is_pending());
         assert_eq!(received.await.unwrap(), b"pending packet");
@@ -418,6 +422,9 @@ async fn h1_packet_connection_close_redials_without_replaying_packets() {
         for byte in 0..3 {
             stream.write_all(&[byte]).await.unwrap();
             stream.flush().await.unwrap();
+            while received.lock().len() <= byte as usize {
+                tokio::task::yield_now().await;
+            }
         }
         stream.shutdown().await.unwrap();
         assert_eq!(dialer.opens.load(Ordering::Relaxed), 4);
@@ -427,6 +434,79 @@ async fn h1_packet_connection_close_redials_without_replaying_packets() {
             assert!(path.ends_with(&format!("/{sequence}")));
             assert_eq!(bytes.as_ref(), &[sequence as u8]);
         }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn packet_pacing_stages_more_than_one_pipe_without_serializing_flushes() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let address = ([127, 0, 0, 1], listener.local_addr().unwrap().port()).into();
+        let packets = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let received = packets.clone();
+        let tasks = Tasks::new();
+        tasks.spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut connection = h2::server::handshake(socket).await.unwrap();
+            let mut downloads = Vec::new();
+            let mut requests = tokio::task::JoinSet::new();
+            while let Some(Ok((request, mut respond))) = connection.accept().await {
+                if request.method() == http::Method::GET {
+                    downloads.push(respond.send_response(Response::new(()), false).unwrap());
+                    continue;
+                }
+                let received = received.clone();
+                requests.spawn(async move {
+                    let mut body = request.into_body();
+                    let mut size = 0;
+                    while let Some(data) = body.data().await {
+                        let data = data.unwrap();
+                        assert!(data.iter().all(|byte| *byte == 42));
+                        size += data.len();
+                        body.flow_control().release_capacity(data.len()).unwrap();
+                    }
+                    received.lock().push(size);
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    respond.send_response(Response::new(()), true).unwrap();
+                });
+            }
+        });
+        let config = serde_json::from_value(serde_json::json!({
+            "sc_min_posts_interval_ms":100,
+            "limits":{"max_session_buffered_bytes": 1200000},
+            "protocol":{"type":"socks"}
+        }))
+        .unwrap();
+        let client = Arc::new(
+            Client::new(
+                config,
+                NetLocation::from_str("localhost:80", None).unwrap(),
+                "localhost".into(),
+                XhttpVersion::H2,
+                XhttpMode::PacketUp,
+                Security::Plain,
+            )
+            .unwrap(),
+        );
+        let mut stream = client
+            .open(Arc::new(Dialer {
+                address,
+                key: RouteKey(vec![1]),
+                opens: AtomicUsize::new(0),
+            }))
+            .await
+            .unwrap();
+        for _ in 0..64 {
+            stream.write_all(&[42; 16 * 1024]).await.unwrap();
+            stream.flush().await.unwrap();
+        }
+        stream.shutdown().await.unwrap();
+        let packets = packets.lock();
+        assert_eq!(packets.iter().sum::<usize>(), 1024 * 1024);
+        assert!(packets.iter().any(|size| *size > 64 * 1024), "{packets:?}");
+        assert!(packets.len() < 10, "{packets:?}");
     })
     .await
     .unwrap();
@@ -492,7 +572,7 @@ async fn split_requests_share_service_across_listener_addresses() {
             request(
                 "POST",
                 "shared/0",
-                Body::Full(Some(Bytes::from_static(&[5, 1, 0]))),
+                Body::Chunks([Bytes::from_static(&[5, 1, 0])].into()),
             ),
             memory.clone(),
             &tasks,
