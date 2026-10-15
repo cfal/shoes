@@ -13,6 +13,28 @@ struct Process {
     lines: tokio::sync::mpsc::UnboundedReceiver<String>,
 }
 
+#[test]
+fn reality_mldsa_keygen_outputs_interoperable_seed_and_key() {
+    use aws_lc_rs::signature::{self, KeyPair};
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    let output = Command::new(env!("CARGO_BIN_EXE_shoes"))
+        .arg("generate-reality-mldsa65-keypair")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let values: serde_yaml::Value = serde_yaml::from_slice(&output.stdout).unwrap();
+    let seed = URL_SAFE_NO_PAD
+        .decode(values["mldsa65_seed"].as_str().unwrap())
+        .unwrap();
+    let verify = URL_SAFE_NO_PAD
+        .decode(values["mldsa65_verify"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(seed.len(), 32);
+    assert_eq!(verify.len(), 1952);
+    let signing = signature::PqdsaKeyPair::from_seed(&signature::ML_DSA_65_SIGNING, &seed).unwrap();
+    assert_eq!(signing.public_key().as_ref(), verify);
+}
+
 impl Process {
     fn start(path: &Path, arguments: &[&str]) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_shoes"))

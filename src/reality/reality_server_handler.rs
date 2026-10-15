@@ -23,6 +23,7 @@ use super::{RealityServerConfig, RealityServerConnection};
 
 #[derive(Debug)]
 pub struct RealityServerTarget {
+    pub mldsa65_key: Option<Arc<aws_lc_rs::signature::PqdsaKeyPair>>,
     pub private_key: [u8; 32],
     pub short_ids: Vec<[u8; 8]>,
     pub dest: NetLocation,
@@ -108,6 +109,7 @@ pub async fn setup_reality_server_stream(
     }
 
     let reality_config = RealityServerConfig {
+        mldsa65_key: target.mldsa65_key.clone(),
         private_key: target.private_key,
         short_ids: target.short_ids.clone(),
         dest: target.dest.clone(),
@@ -419,6 +421,7 @@ mod cleanup_tests {
             .compute_public_key()
             .unwrap();
         let mut client = RealityClientConnection::new(RealityClientConfig {
+            mldsa65_verify: None,
             public_key: public_key.as_ref().try_into().unwrap(),
             short_id: [0; 8],
             server_name: "localhost".into(),
@@ -458,6 +461,7 @@ mod cleanup_tests {
         decoy.write_tls(&mut response).unwrap();
         let selector = Arc::new(ClientProxySelector::new(Vec::new()));
         let target = RealityServerTarget {
+            mldsa65_key: None,
             private_key,
             short_ids: vec![[0; 8]],
             dest: dest.clone(),

@@ -26,6 +26,7 @@ All server protocols plus:
 - **TLS**
 - **WebSocket** (Shadowsocks SIP003)
 - **XTLS Reality**
+  - Hybrid-first X25519MLKEM768 key exchange and optional ML-DSA-65 server authentication
 - **XTLS Vision** (for VLESS)
 
 ### TUN/VPN Mode
@@ -74,6 +75,7 @@ COMMANDS:
     check <config.yaml>                       Alias for --dry-run
     version                                  Alias for --version
     generate-reality-keypair                  Generate a new Reality X25519 keypair
+    generate-reality-mldsa65-keypair           Generate optional Reality ML-DSA-65 keys
     generate-shadowsocks-2022-password <cipher>    Generate a Shadowsocks password
 ```
 

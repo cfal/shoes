@@ -299,6 +299,8 @@ impl<'de> serde::de::Deserialize<'de> for ServerConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RealityServerConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mldsa65_seed: Option<String>,
     /// X25519 private key (32 bytes, base64url encoded)
     pub private_key: String,
 

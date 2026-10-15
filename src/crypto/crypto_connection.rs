@@ -271,6 +271,7 @@ mod tests {
 
         // Test with REALITY server connection
         let server_config = RealityServerConfig {
+            mldsa65_key: None,
             private_key: [0u8; 32],
             short_ids: vec![[0u8; 8]],
             dest: NetLocation::new(Address::UNSPECIFIED, 443),
@@ -293,6 +294,7 @@ mod tests {
         // Test with REALITY client connection
         // Using a valid X25519 test public key (derived from private key [1u8; 32])
         let client_config = RealityClientConfig {
+            mldsa65_verify: None,
             public_key: [
                 0x25, 0x31, 0x51, 0x68, 0x12, 0x8f, 0xf3, 0x7b, 0x46, 0x5e, 0x0c, 0x0c, 0xd8, 0x28,
                 0x3d, 0xd5, 0x35, 0x86, 0x8d, 0x8d, 0x3e, 0x8c, 0x1c, 0x85, 0x1e, 0x0e, 0x86, 0x28,

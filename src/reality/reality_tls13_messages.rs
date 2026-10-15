@@ -485,7 +485,7 @@ mod tests {
     fn test_construct_certificate() {
         use crate::reality::reality_certificate::generate_hmac_certificate;
         let auth_key = [0x42u8; 32];
-        let (cert, _) = generate_hmac_certificate(&auth_key, "test.example.com").unwrap();
+        let (cert, _) = generate_hmac_certificate(&auth_key, "test.example.com", None).unwrap();
         let result = construct_certificate(cert);
         assert!(result.is_ok());
         let msg = result.unwrap();

@@ -55,6 +55,7 @@ fn append_handshake_plaintext(accumulated: &mut Vec<u8>, plaintext: &[u8]) -> io
 /// Configuration for REALITY client connections
 #[derive(Clone)]
 pub struct RealityClientConfig {
+    pub mldsa65_verify: Option<super::reality_mldsa::VerifyKey>,
     /// Server's X25519 public key (32 bytes)
     pub public_key: [u8; 32],
     /// Short ID for authentication (8 bytes)
@@ -680,6 +681,14 @@ impl RealityClientConnection {
                 let cert_der =
                     extract_certificate_der(&accumulated_plaintext[offset..offset + 4 + msg_len])?;
                 verify_certificate_hmac(cert_der, &auth_key)?;
+                if let Some(key) = &self.config.mldsa65_verify {
+                    super::reality_client_verify::verify_certificate_mldsa(
+                        cert_der,
+                        &auth_key,
+                        &transcript_bytes,
+                        key,
+                    )?;
+                }
                 ed25519_public_key = Some(extract_ed25519_public_key(cert_der)?);
                 certificate_verified = true;
             }
@@ -1075,11 +1084,75 @@ pub fn feed_reality_client_connection(
 mod tests {
     use super::*;
 
+    fn fragmented_server_flight(corrupt_finished: bool) -> io::Result<()> {
+        use crate::reality::{
+            RealityServerConnection, decode_mldsa65_verify, generate_mldsa65_keypair,
+            mldsa65_signing_key,
+        };
+        let cipher = CipherSuite::AES_128_GCM_SHA256;
+        let (mut cc, mut sc) = super::super::reality_pq_tests::configs(cipher);
+        let (seed, verify) = generate_mldsa65_keypair().unwrap();
+        sc.mldsa65_key = Some(mldsa65_signing_key(&seed).unwrap());
+        cc.mldsa65_verify = Some(decode_mldsa65_verify(&verify).unwrap());
+        let mut client = RealityClientConnection::new(cc)?;
+        let mut server = RealityServerConnection::new(sc)?;
+        let mut hello = Vec::new();
+        client.write_tls(&mut hello)?;
+        server.validate_client_hello(&hello)?;
+        server.build_server_response(&crate::reality::default_target_records(&hello[44..76]))?;
+        let mut flight = Vec::new();
+        server.write_tls(&mut flight)?;
+        let hello_len = 5 + u16::from_be_bytes([flight[3], flight[4]]) as usize;
+        client.read_tls(&mut &flight[..hello_len])?;
+        client.process_new_packets()?;
+        let HandshakeState::ProcessingHandshake {
+            server_handshake_traffic_secret,
+            ..
+        } = &client.handshake_state
+        else {
+            panic!("expected ServerHello")
+        };
+        let (key, iv) = derive_traffic_keys(server_handshake_traffic_secret, cipher)?;
+        let encrypted_start = hello_len + 6;
+        let encrypted = &flight[encrypted_start..];
+        let len = u16::from_be_bytes([encrypted[3], encrypted[4]]);
+        let mut plaintext = decrypt_handshake_message(cipher, &key, &iv, 0, &encrypted[5..], len)?;
+        if corrupt_finished {
+            *plaintext.last_mut().unwrap() ^= 1;
+        }
+        let aead = AeadKey::new(cipher, &key)?;
+        let mut seq = 0;
+        let mut encryptor = RecordEncryptor::new(&aead, &iv, &mut seq);
+        let mut fragmented = Vec::new();
+        for chunk in plaintext.chunks(47) {
+            encryptor.encrypt_handshake(chunk, &mut fragmented)?;
+        }
+        for chunk in fragmented.chunks(31) {
+            client.read_tls(&mut &chunk[..])?;
+            client.process_new_packets()?;
+        }
+        assert!(!client.is_handshaking());
+        Ok(())
+    }
+
+    #[test]
+    fn mldsa_certificate_across_tls_records() {
+        fragmented_server_flight(false).unwrap();
+    }
+
+    #[test]
+    fn server_finished_must_verify() {
+        let error = fragmented_server_flight(true).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("Finished"));
+    }
+
     #[test]
     fn handshake_key_material_is_not_logged() {
         let private =
             agreement::PrivateKey::from_private_key(&agreement::X25519, &[1; 32]).unwrap();
         let mut client = RealityClientConnection::new(RealityClientConfig {
+            mldsa65_verify: None,
             public_key: private
                 .compute_public_key()
                 .unwrap()
@@ -1136,6 +1209,7 @@ mod tests {
         server_public.copy_from_slice(server_public_key.as_ref());
 
         let config = RealityClientConfig {
+            mldsa65_verify: None,
             public_key: server_public,
             short_id: [1, 2, 3, 4, 5, 6, 7, 8],
             server_name: "example.com".to_string(),

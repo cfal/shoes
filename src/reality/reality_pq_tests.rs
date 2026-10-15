@@ -17,16 +17,18 @@ fn public_key(private: &[u8; 32]) -> [u8; 32] {
         .unwrap()
 }
 
-fn configs(cipher: CipherSuite) -> (RealityClientConfig, RealityServerConfig) {
+pub(super) fn configs(cipher: CipherSuite) -> (RealityClientConfig, RealityServerConfig) {
     let private = [42; 32];
     (
         RealityClientConfig {
+            mldsa65_verify: None,
             public_key: public_key(&private),
             short_id: [1; 8],
             server_name: "cover.test".into(),
             cipher_suites: vec![cipher],
         },
         RealityServerConfig {
+            mldsa65_key: None,
             private_key: private,
             short_ids: vec![[1; 8]],
             dest: crate::address::NetLocation::from_str("cover.test:443", None).unwrap(),
@@ -148,4 +150,71 @@ fn reality_pq_handshake_and_data_all_suites() {
             assert_eq!(server.reader().read(&mut response).unwrap(), 0);
         }
     }
+}
+
+#[test]
+fn reality_pq_mldsa_optional_and_required() {
+    let (seed, verify) = generate_mldsa65_keypair().unwrap();
+    let signer = mldsa65_signing_key(&seed).unwrap();
+    let key = decode_mldsa65_verify(&verify).unwrap();
+    for &cipher in DEFAULT_CIPHER_SUITES {
+        for group in [RealityGroup::X25519MlKem768, RealityGroup::X25519] {
+            for required in [false, true] {
+                let (mut cc, mut sc) = configs(cipher);
+                sc.mldsa65_key = Some(signer.clone());
+                cc.mldsa65_verify = required.then(|| key.clone());
+                handshake(cc, sc, group, 19);
+            }
+        }
+    }
+}
+
+#[test]
+fn reality_pq_mldsa_required_fails_closed() {
+    let (seed, verify) = generate_mldsa65_keypair().unwrap();
+    let (_, wrong) = generate_mldsa65_keypair().unwrap();
+    for sign in [false, true] {
+        let (mut cc, mut sc) = configs(CipherSuite::AES_128_GCM_SHA256);
+        cc.mldsa65_verify =
+            Some(decode_mldsa65_verify(if sign { &wrong } else { &verify }).unwrap());
+        sc.mldsa65_key = sign.then(|| mldsa65_signing_key(&seed).unwrap());
+        let mut client = RealityClientConnection::new(cc).unwrap();
+        let mut server = RealityServerConnection::new(sc).unwrap();
+        let mut hello = Vec::new();
+        client.write_tls(&mut hello).unwrap();
+        server.validate_client_hello(&hello).unwrap();
+        server
+            .build_server_response(&default_target_records(&hello[44..76]))
+            .unwrap();
+        let mut flight = Vec::new();
+        server.write_tls(&mut flight).unwrap();
+        client.read_tls(&mut flight.as_slice()).unwrap();
+        assert_eq!(
+            client.process_new_packets().unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert!(client.is_handshaking());
+        let _ = client.writer().write(b"forbidden");
+        let mut output = Vec::new();
+        client.write_tls(&mut output).unwrap();
+        assert!(output.is_empty());
+    }
+}
+
+#[test]
+fn reality_pq_mldsa_small_target_does_not_emit_synthetic_bytes() {
+    let (cc, mut sc) = configs(CipherSuite::AES_128_GCM_SHA256);
+    let (seed, _) = generate_mldsa65_keypair().unwrap();
+    sc.mldsa65_key = Some(mldsa65_signing_key(&seed).unwrap());
+    let mut client = RealityClientConnection::new(cc).unwrap();
+    let mut server = RealityServerConnection::new(sc).unwrap();
+    let mut hello = Vec::new();
+    client.write_tls(&mut hello).unwrap();
+    server.validate_client_hello(&hello).unwrap();
+    let mut records = default_target_records(&hello[44..76]);
+    records[2] = vec![0; 600].into();
+    assert!(server.build_server_response(&records).is_err());
+    let mut output = Vec::new();
+    server.write_tls(&mut output).unwrap();
+    assert!(output.is_empty());
 }

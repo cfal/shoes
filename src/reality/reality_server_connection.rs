@@ -44,6 +44,7 @@ use crate::util::allocate_vec;
 /// Configuration for REALITY server connections
 #[derive(Clone)]
 pub struct RealityServerConfig {
+    pub mldsa65_key: Option<std::sync::Arc<aws_lc_rs::signature::PqdsaKeyPair>>,
     /// Server's X25519 private key (32 bytes)
     pub private_key: [u8; 32],
     /// List of valid short IDs for authentication (8 bytes each)
@@ -564,7 +565,14 @@ impl RealityServerConnection {
         };
 
         // Generate HMAC-signed certificate
-        let (cert, signing_key) = generate_hmac_certificate(&info.auth_key, dest_hostname)?;
+        let mldsa = self.config.mldsa65_key.as_deref().map(|key| {
+            (
+                key,
+                info.client_hello_handshake.as_slice(),
+                server_hello.as_slice(),
+            )
+        });
+        let (cert, signing_key) = generate_hmac_certificate(&info.auth_key, dest_hostname, mldsa)?;
 
         // Build encrypted handshake messages
         let encrypted_extensions = construct_encrypted_extensions()?;
@@ -628,6 +636,9 @@ impl RealityServerConnection {
             }
 
             let target_size = dest_encrypted_records.first().map(|r| r.len()).unwrap_or(0);
+            if self.config.mldsa65_key.is_some() {
+                check_mldsa_record_capacity(combined_plaintext.len(), target_size)?;
+            }
 
             log::debug!(
                 "REALITY SERVER: Combined mode - EE={}, Cert={}, CV={}, Fin={}, Total={}, target={}",
@@ -659,6 +670,9 @@ impl RealityServerConnection {
 
             for (i, msg) in messages.iter().enumerate() {
                 let target_size = dest_encrypted_records.get(i).map(|r| r.len()).unwrap_or(0);
+                if self.config.mldsa65_key.is_some() {
+                    check_mldsa_record_capacity(msg.len(), target_size)?;
+                }
                 encryptor.encrypt_handshake_with_padding(
                     msg,
                     &mut handshake_ciphertext,
@@ -1099,6 +1113,20 @@ impl RealityServerConnection {
     }
 }
 
+fn check_mldsa_record_capacity(plaintext_len: usize, target_size: usize) -> io::Result<()> {
+    let overhead = TLS_RECORD_HEADER_SIZE + 1 + 16;
+    if plaintext_len > super::common::MAX_TLS_PLAINTEXT_LEN
+        || target_size < plaintext_len + overhead
+        || target_size > super::common::MAX_TLS_PLAINTEXT_LEN + overhead
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Camouflage target record has insufficient capacity for ML-DSA-65 handshake",
+        ));
+    }
+    Ok(())
+}
+
 #[inline]
 pub fn feed_reality_server_connection(
     server_connection: &mut RealityServerConnection,
@@ -1126,6 +1154,7 @@ mod tests {
     fn fragmented_change_cipher_spec_rejects_invalid_length_before_buffering_payload() {
         for length in [0u16, 2, 65535] {
             let mut connection = RealityServerConnection::new(RealityServerConfig {
+                mldsa65_key: None,
                 private_key: [0; 32],
                 short_ids: vec![[0; 8]],
                 dest: NetLocation::new(Address::UNSPECIFIED, 443),
@@ -1157,6 +1186,7 @@ mod tests {
     #[test]
     fn test_reality_server_connection_creation() {
         let config = RealityServerConfig {
+            mldsa65_key: None,
             private_key: [0u8; 32],
             short_ids: vec![[0u8; 8]],
             dest: NetLocation::new(Address::UNSPECIFIED, 443),
@@ -1176,6 +1206,7 @@ mod tests {
     #[test]
     fn test_io_state() {
         let config = RealityServerConfig {
+            mldsa65_key: None,
             private_key: [0u8; 32],
             short_ids: vec![[0u8; 8]],
             dest: NetLocation::new(Address::UNSPECIFIED, 443),

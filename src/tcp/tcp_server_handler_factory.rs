@@ -465,6 +465,7 @@ fn create_reality_server_target(
     bind_ip: Option<IpAddr>,
 ) -> std::io::Result<TlsServerTarget> {
     let RealityServerConfig {
+        mldsa65_seed,
         private_key,
         short_ids,
         dest,
@@ -565,6 +566,10 @@ fn create_reality_server_target(
     }?;
 
     Ok(TlsServerTarget::Reality(RealityServerTarget {
+        mldsa65_key: mldsa65_seed
+            .as_deref()
+            .map(crate::reality::mldsa65_signing_key)
+            .transpose()?,
         private_key: private_key_bytes,
         short_ids: short_id_bytes,
         dest,

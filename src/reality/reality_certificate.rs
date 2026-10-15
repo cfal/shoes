@@ -49,6 +49,7 @@ impl rcgen::PublicKeyData for HmacSigningKey {
 pub fn generate_hmac_certificate(
     auth_key: &[u8; 32],
     hostname: &str,
+    mldsa: Option<(&aws_lc_rs::signature::PqdsaKeyPair, &[u8], &[u8])>,
 ) -> Result<(rcgen::Certificate, Ed25519KeyPair)> {
     // Keypair is needed for CertificateVerify signing
     let ed25519_keypair = Ed25519KeyPair::generate()
@@ -75,6 +76,20 @@ pub fn generate_hmac_certificate(
     params.distinguished_name = rcgen::DistinguishedName::new();
     params.serial_number = Some(rcgen::SerialNumber::from(vec![0u8]));
 
+    if let Some((signer, client_hello, server_hello)) = mldsa {
+        let message = super::reality_mldsa::certificate_message(
+            auth_key,
+            &public_key,
+            &[client_hello, server_hello],
+        );
+        let signature = super::reality_mldsa::sign(signer, &message)?;
+        // Xray reads Extensions[0]; rcgen emits SAN before custom extensions.
+        params.subject_alt_names.clear();
+        params
+            .custom_extensions
+            .push(rcgen::CustomExtension::from_oid_content(&[0, 0], signature));
+    }
+
     let cert = params
         .self_signed(&hmac_key)
         .map_err(|e| Error::other(format!("Failed to create certificate: {e}")))?;
@@ -91,6 +106,41 @@ pub fn generate_hmac_certificate(
 mod tests {
     use super::*;
     use aws_lc_rs::signature::KeyPair;
+
+    #[test]
+    fn mldsa_extension_precedes_standard_extensions() {
+        use x509_parser::prelude::FromDer;
+        let (seed, verify) = crate::reality::generate_mldsa65_keypair().unwrap();
+        let signer = crate::reality::mldsa65_signing_key(&seed).unwrap();
+        let key = crate::reality::decode_mldsa65_verify(&verify).unwrap();
+        let auth = [42; 32];
+        let (cert, _) =
+            generate_hmac_certificate(&auth, "cover.test", Some((&signer, b"client", b"server")))
+                .unwrap();
+        let (_, parsed) = x509_parser::certificate::X509Certificate::from_der(cert.der()).unwrap();
+        let extensions = parsed.extensions();
+        assert_eq!(extensions.len(), 1);
+        assert_eq!(extensions[0].oid.as_bytes(), [0]);
+        assert!(!extensions[0].critical);
+        assert_eq!(extensions[0].value.len(), 3309);
+        super::super::reality_client_verify::verify_certificate_hmac(cert.der(), &auth).unwrap();
+        super::super::reality_client_verify::verify_certificate_mldsa(
+            cert.der(),
+            &auth,
+            b"clientserver",
+            &key,
+        )
+        .unwrap();
+        assert!(
+            super::super::reality_client_verify::verify_certificate_mldsa(
+                cert.der(),
+                &auth,
+                b"Clientserver",
+                &key
+            )
+            .is_err()
+        );
+    }
 
     /// Find the signature bytes in a DER-encoded certificate.
     /// Returns the offset where the 64-byte Ed25519 signature starts.
@@ -110,7 +160,7 @@ mod tests {
     #[test]
     fn test_generate_hmac_certificate() {
         let auth_key = [42u8; 32];
-        let result = generate_hmac_certificate(&auth_key, "test.example.com");
+        let result = generate_hmac_certificate(&auth_key, "test.example.com", None);
 
         assert!(result.is_ok());
 
@@ -132,7 +182,8 @@ mod tests {
 
         let auth_key = [0x42u8; 32];
 
-        let (cert, signing_key) = generate_hmac_certificate(&auth_key, "test.example.com").unwrap();
+        let (cert, signing_key) =
+            generate_hmac_certificate(&auth_key, "test.example.com", None).unwrap();
         let cert_der = cert.der();
 
         // Find where the signature should be
@@ -159,8 +210,8 @@ mod tests {
     fn test_different_keys_produce_different_hmacs() {
         let auth_key = [99u8; 32];
 
-        let (cert1, key1) = generate_hmac_certificate(&auth_key, "test.example.com").unwrap();
-        let (cert2, key2) = generate_hmac_certificate(&auth_key, "test.example.com").unwrap();
+        let (cert1, key1) = generate_hmac_certificate(&auth_key, "test.example.com", None).unwrap();
+        let (cert2, key2) = generate_hmac_certificate(&auth_key, "test.example.com", None).unwrap();
         let cert1_der = cert1.der();
         let cert2_der = cert2.der();
 
@@ -204,7 +255,7 @@ mod tests {
         let mut sizes = Vec::new();
 
         for _ in 0..5 {
-            let (cert, _) = generate_hmac_certificate(&auth_key, "example.com").unwrap();
+            let (cert, _) = generate_hmac_certificate(&auth_key, "example.com", None).unwrap();
             let cert_der = cert.der();
             let offset = find_signature_offset(cert_der).unwrap();
             offsets.push(offset);

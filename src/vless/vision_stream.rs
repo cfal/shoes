@@ -995,6 +995,7 @@ mod tests {
             .compute_public_key()
             .unwrap();
         let mut client = RealityClientConnection::new(RealityClientConfig {
+            mldsa65_verify: None,
             public_key: public_key.as_ref().try_into().unwrap(),
             short_id: [0; 8],
             server_name: "localhost".into(),
@@ -1004,6 +1005,7 @@ mod tests {
         let mut hello = Vec::new();
         client.write_tls(&mut hello).unwrap();
         let mut server = RealityServerConnection::new(RealityServerConfig {
+            mldsa65_key: None,
             private_key,
             short_ids: vec![[0; 8]],
             dest: NetLocation::new(Address::Hostname("localhost".into()), 443),
@@ -1848,6 +1850,7 @@ mod tests {
 
     fn completed_reality_connection() -> CryptoConnection {
         let config = RealityServerConfig {
+            mldsa65_key: None,
             private_key: [0; 32],
             short_ids: vec![[0; 8]],
             dest: NetLocation::new(Address::UNSPECIFIED, 443),
