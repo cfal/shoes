@@ -277,13 +277,18 @@ impl XhttpServerConfig {
         if self.x_padding_bytes.bounds((100, 1000), false)?.1 > 65536 {
             return Err(invalid("XHTTP padding must not exceed 65536 bytes"));
         }
-        if self
+        let (min, max) = self
             .sc_max_each_post_bytes
-            .bounds((1_000_000, 1_000_000), false)?
-            .0
-            == 0
-        {
+            .bounds((1_000_000, 1_000_000), false)?;
+        if min == 0 {
             return Err(invalid("XHTTP packet size must be positive"));
+        }
+        if matches!(self.mode, XhttpMode::Auto | XhttpMode::PacketUp)
+            && max as usize > self.limits.max_session_buffered_bytes
+        {
+            return Err(invalid(
+                "XHTTP maximum packet size exceeds the session byte budget",
+            ));
         }
         self.sc_stream_up_server_secs.bounds((20, 80), true)?;
         Ok(())
@@ -495,6 +500,29 @@ mod tests {
                 bad[field] = serde_json::json!({});
                 assert!(serde_json::from_value::<ClientProxyConfig>(bad).is_err());
             }
+        }
+    }
+}
+#[test]
+fn server_packet_size_must_fit_the_session_budget() {
+    for mode in ["auto", "packet-up", "stream-up", "stream-one"] {
+        for (packet, fits) in [
+            (serde_json::json!(32), true),
+            (serde_json::json!(33), false),
+            (serde_json::json!("16-32"), true),
+            (serde_json::json!("16-33"), false),
+            (serde_json::json!(0), false),
+        ] {
+            let config: XhttpServerConfig = serde_json::from_value(serde_json::json!({
+                "mode": mode, "sc_max_each_post_bytes": packet,
+                "limits": {"max_session_buffered_bytes": 32},
+                "protocol": {"type": "socks"}
+            }))
+            .unwrap();
+            assert_eq!(
+                config.validate().is_ok(),
+                fits || mode.starts_with("stream-")
+            );
         }
     }
 }
