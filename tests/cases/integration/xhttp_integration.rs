@@ -163,7 +163,7 @@ async fn matrix(
             let _xray = xray::start(xray_config).await?;
             xray::wait_socks(socks).await?;
             tokio::time::timeout(Duration::from_secs(20), async {
-                for _ in 0..2 {
+                for session in 0..2 {
                     let mut stream = xray::connect(socks, target).await?;
                     for size in [1, 32768, 300_000] {
                         let data: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
@@ -171,6 +171,18 @@ async fn matrix(
                         let (mut read, mut write) = stream.split();
                         tokio::try_join!(write.write_all(&data), read.read_exact(&mut response))?;
                         assert_eq!(data, response);
+                    }
+                    if !shoes_client
+                        && protocol == "vless"
+                        && version == "plain"
+                        && mode == "packet-up"
+                        && session == 0
+                    {
+                        tokio::time::sleep(Duration::from_secs(6)).await;
+                        stream.write_all(b"idle").await?;
+                        let mut response = [0; 4];
+                        stream.read_exact(&mut response).await?;
+                        assert_eq!(&response, b"idle");
                     }
                     stream.shutdown().await?;
                     // Packet mode has no upload FIN. Xray may also couple the

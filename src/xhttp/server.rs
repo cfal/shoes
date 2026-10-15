@@ -152,6 +152,43 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn h1_packet_connection_survives_idle_between_requests() {
+        let (mut client, server) = tokio::io::duplex(8192);
+        let task = tokio::spawn(service().serve_h1(
+            Box::new(server),
+            tokio::time::Instant::now() + Duration::from_secs(4),
+        ));
+        for sequence in 0..2 {
+            client
+                .write_all(
+                    format!(
+                        "POST /t/a/{sequence} HTTP/1.1\r\nHost: localhost\r\nReferer: /?x_padding={}\r\nContent-Length: 1\r\n\r\nx",
+                        "X".repeat(100),
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let response = tokio::time::timeout(Duration::from_secs(1), async {
+                let mut header = Vec::new();
+                while !header.ends_with(b"\r\n\r\n") {
+                    header.push(client.read_u8().await.unwrap());
+                }
+                String::from_utf8(header).unwrap()
+            })
+            .await
+            .unwrap();
+            assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+            assert!(response.to_ascii_lowercase().contains("content-length: 0"));
+            if sequence == 0 {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+            }
+        }
+        drop(client);
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn tcp_header_deadline_includes_preface_detection() {
         for prefix in [b"GET", b"PRI"] {
             let server = XhttpServer { state: service() };
@@ -1345,7 +1382,6 @@ impl State {
         deadline: tokio::time::Instant,
     ) -> io::Result<()> {
         let header_limit = self.config.header_limit();
-        let header_timeout = Duration::from_secs(self.config.limits.setup_timeout_secs.min(4));
         let first_header = Arc::new(Notify::new());
         let received_header = first_header.clone();
         let service = hyper::service::service_fn(move |request: Request<hyper::body::Incoming>| {
@@ -1382,7 +1418,8 @@ impl State {
         builder
             .max_buf_size(header_limit.max(8192))
             .timer(hyper_util::rt::TokioTimer::new())
-            .header_read_timeout(header_timeout);
+            // Hyper starts this timer while idle, not at the first header byte.
+            .header_read_timeout(None);
         let connection = builder.serve_connection(hyper_util::rt::TokioIo::new(stream), service);
         tokio::pin!(connection);
         tokio::select! {
