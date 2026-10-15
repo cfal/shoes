@@ -22,6 +22,80 @@ use crate::tcp::tcp_handler::{
 };
 use crate::util::write_all;
 
+#[cfg(test)]
+mod client_handshake_tests {
+    use super::*;
+    use std::{
+        io,
+        pin::Pin,
+        task::{Context, Poll},
+    };
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+    #[derive(Debug, Default)]
+    struct RecordingStream(Arc<parking_lot::Mutex<Vec<Vec<u8>>>>);
+
+    impl AsyncRead for RecordingStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for RecordingStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.0.lock().push(bytes.to_vec());
+            Poll::Ready(Ok(bytes.len()))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl crate::async_stream::AsyncPing for RecordingStream {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+        fn poll_write_ping(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+    impl AsyncStream for RecordingStream {}
+
+    #[tokio::test]
+    async fn client_submits_complete_handshake_in_one_write() {
+        for address in ["example.com:443", "127.0.0.1:80", "[::1]:8080"] {
+            let handler = TrojanTcpHandler::new_client("password", &None);
+            let location = crate::address::NetLocation::from_str(address, None).unwrap();
+            let stream = RecordingStream::default();
+            let writes = stream.0.clone();
+            handler
+                .setup_client_tcp_stream(Box::new(stream), (&location).into())
+                .await
+                .unwrap();
+            let expected = [
+                create_password_hash("password").as_ref(),
+                &CRLF_BYTES,
+                &[CMD_CONNECT],
+                &write_location_to_vec(&location),
+                &CRLF_BYTES,
+            ]
+            .concat();
+            assert_eq!(*writes.lock(), vec![expected]);
+        }
+    }
+}
+
 #[derive(Debug)]
 struct ShadowsocksData {
     cipher: ShadowsocksCipher,
@@ -225,12 +299,15 @@ impl TcpClientHandler for TrojanTcpHandler {
             ));
         }
 
-        write_all(&mut client_stream, &self.password_hash).await?;
-        write_all(&mut client_stream, &CRLF_BYTES).await?;
-        write_all(&mut client_stream, &[CMD_CONNECT]).await?;
         let location_bytes = write_location_to_vec(remote_location.location());
-        write_all(&mut client_stream, &location_bytes).await?;
-        write_all(&mut client_stream, &CRLF_BYTES).await?;
+        // Xray's Trojan inbound requires the credentials in its first read.
+        let mut header = Vec::with_capacity(self.password_hash.len() + location_bytes.len() + 5);
+        header.extend_from_slice(&self.password_hash);
+        header.extend_from_slice(&CRLF_BYTES);
+        header.push(CMD_CONNECT);
+        header.extend_from_slice(&location_bytes);
+        header.extend_from_slice(&CRLF_BYTES);
+        write_all(&mut client_stream, &header).await?;
         client_stream.flush().await?;
         Ok(TcpClientSetupResult {
             client_stream,
