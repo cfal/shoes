@@ -269,6 +269,55 @@ async fn shoes_reality_client_and_udp_through_a_tcp_prefix()
 }
 
 #[tokio::test]
+async fn xray_packet_upload_survives_a_slow_consumer() -> Result<(), Box<dyn std::error::Error>> {
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await?;
+    socket2::SockRef::from(&listener).set_recv_buffer_size(65536)?;
+    let target: SocketAddr = ([127, 0, 0, 1], listener.local_addr()?.port()).into();
+    let size = 16 * 1024 * 1024;
+    let mut tasks = tokio::task::JoinSet::new();
+    tasks.spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut received = 0;
+        let mut buffer = [0; 16 * 1024];
+        while received < size {
+            let len = socket.read(&mut buffer).await.unwrap();
+            assert_ne!(len, 0, "upload ended after {received} bytes");
+            assert!(buffer[..len].iter().all(|byte| *byte == 73));
+            received += len;
+            tokio::time::sleep(Duration::from_millis(8)).await;
+        }
+        socket.write_all(b"ok").await.unwrap();
+    });
+    let remote = port();
+    let socks_port = port();
+    let _shoes = start_shoes_server(&serde_yaml::to_string(&json!([
+        {"address":format!("0.0.0.0:{remote}"),"protocol":{"type":"xhttp","path":"/slow",
+            "protocol":{"type":"vless","user_id":UUID}}}
+    ]))?)?;
+    let _xray = xray::start(json!({
+        "log":{"loglevel":"warning"},
+        "inbounds":[{"listen":"0.0.0.0","port":socks_port,"protocol":"socks","settings":{"auth":"noauth"}}],
+        "outbounds":[{"protocol":"vless","settings":{"vnext":[{
+            "address":"127.0.0.1","port":remote,"users":[{"id":UUID,"encryption":"none"}]
+        }]},"streamSettings":{"network":"xhttp","security":"none",
+            "xhttpSettings":{"path":"/slow","mode":"packet-up"}}}]
+    })).await?;
+    let socks = ([127, 0, 0, 1], socks_port).into();
+    xray::wait_socks(socks).await?;
+    tokio::time::timeout(Duration::from_secs(25), async {
+        let mut stream = xray::connect(socks, target).await?;
+        stream.write_all(&vec![73; size]).await?;
+        let mut response = [0; 2];
+        stream.read_exact(&mut response).await?;
+        assert_eq!(&response, b"ok");
+        tasks.join_next().await.unwrap().unwrap();
+        Ok::<_, std::io::Error>(())
+    })
+    .await??;
+    Ok(())
+}
+
+#[tokio::test]
 #[ignore = "Existing Shoes REALITY client lacks the X25519MLKEM768 key share required by Xray 26.10.10"]
 async fn shoes_client_xray_reality_server() -> Result<(), Box<dyn std::error::Error>> {
     matrix(true, "vless", &["reality"]).await

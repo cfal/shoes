@@ -90,6 +90,7 @@ mod tests {
                 "referer",
                 format!("https://localhost/t/?x_padding={}", "X".repeat(100)),
             )
+            .header("content-length", data.len())
             .body(())
             .unwrap();
         let (mut writer, body) = pipe(Memory::new(state.memory.clone(), 1024));
@@ -379,6 +380,119 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn packet_memory_pressure_waits_for_the_inner_reader() {
+        let mut state = service();
+        Arc::get_mut(&mut state)
+            .unwrap()
+            .config
+            .limits
+            .max_session_buffered_bytes = 32;
+        let session = state.session("a").unwrap();
+        let mut reader = {
+            let mut session = session.state.lock();
+            session.downloaded = true;
+            session.reader.take().unwrap()
+        };
+        for sequence in 0..4 {
+            assert_eq!(
+                request(&state, "POST", &format!("a/{sequence}"), b"12345678")
+                    .await
+                    .status(),
+                StatusCode::OK
+            );
+        }
+        let mut blocked = Box::pin(request(&state, "POST", "a/4", b"abcdefgh"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut blocked)
+                .await
+                .is_err()
+        );
+        reader.read_exact(&mut [0; 8]).await.unwrap();
+        assert_eq!(blocked.await.status(), StatusCode::OK);
+        assert!(!session.cancel.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn reordered_packets_leave_memory_for_the_missing_predecessor() {
+        let mut state = service();
+        Arc::get_mut(&mut state)
+            .unwrap()
+            .config
+            .limits
+            .max_session_buffered_bytes = 32;
+        let session = state.session("a").unwrap();
+        let mut reader = {
+            let mut session = session.state.lock();
+            session.downloaded = true;
+            session.reader.take().unwrap()
+        };
+        for sequence in 0..4 {
+            assert_eq!(
+                request(&state, "POST", &format!("a/{sequence}"), b"12345678")
+                    .await
+                    .status(),
+                StatusCode::OK
+            );
+        }
+        let mut later = Box::pin(request(&state, "POST", "a/5", b"abcdefgh"));
+        assert!(futures::poll!(&mut later).is_pending());
+        let mut next = Box::pin(request(&state, "POST", "a/4", b"ABCDEFGH"));
+        assert!(futures::poll!(&mut next).is_pending());
+        let mut received = [0; 48];
+        tokio::time::timeout(Duration::from_secs(1), async {
+            let (later, next, read) = tokio::join!(later, next, reader.read_exact(&mut received));
+            read.unwrap();
+            assert_eq!(later.status(), StatusCode::OK);
+            assert_eq!(next.status(), StatusCode::OK);
+        })
+        .await
+        .unwrap();
+        assert_eq!(&received[32..], b"ABCDEFGHabcdefgh");
+    }
+
+    #[tokio::test]
+    async fn contiguous_packets_wait_when_the_post_queue_is_full() {
+        let state = service();
+        let session = state.session("a").unwrap();
+        let mut reader = {
+            let mut session = session.state.lock();
+            session.downloaded = true;
+            session.reader.take().unwrap()
+        };
+        for sequence in 0..4 {
+            assert_eq!(
+                request(&state, "POST", &format!("a/{sequence}"), b"12345678")
+                    .await
+                    .status(),
+                StatusCode::OK
+            );
+        }
+        let mut requests = tokio::task::JoinSet::new();
+        for sequence in 4..8 {
+            let state = state.clone();
+            requests.spawn(async move {
+                request(&state, "POST", &format!("a/{sequence}"), b"abcdefgh")
+                    .await
+                    .status()
+            });
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            requests.try_join_next().is_none(),
+            "full queues must backpressure, not reject"
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            reader.read_exact(&mut [0; 64]).await.unwrap();
+            while let Some(response) = requests.join_next().await {
+                assert_eq!(response.unwrap(), StatusCode::OK);
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
     async fn closing_an_idle_h1_download_releases_its_session() {
         let state = service();
         let (mut client, server) = tokio::io::duplex(8192);
@@ -483,7 +597,7 @@ struct Session {
     cancel: CancellationToken,
     created: tokio::time::Instant,
     admission: parking_lot::Mutex<Option<BudgetPermit>>,
-    ingest: tokio::sync::Mutex<()>,
+    progress: Notify,
 }
 
 struct DownloadGuard {
@@ -786,7 +900,7 @@ impl State {
             cancel: CancellationToken::new(),
             created: tokio::time::Instant::now(),
             admission: parking_lot::Mutex::new(Some(admission)),
-            ingest: tokio::sync::Mutex::new(()),
+            progress: Notify::new(),
         });
         sessions.insert(id.into(), Entry::Live(session.clone()));
         Ok(session)
@@ -977,9 +1091,6 @@ impl State {
                     if sequence < state.next {
                         return Ok((Body::Empty, false));
                     }
-                    if sequence.saturating_sub(state.next) >= self.config.buffered_posts() as u64 {
-                        return Err(StatusCode::SERVICE_UNAVAILABLE);
-                    }
                 }
                 let max = self
                     .config
@@ -990,6 +1101,7 @@ impl State {
                 let initial =
                     wire::header_payload(request.headers()).map_err(|_| StatusCode::BAD_REQUEST)?;
                 let mut size = initial.len();
+                let mut reservation = max.min(self.config.limits.max_session_buffered_bytes);
                 if let Some(length) = request.headers().get(http::header::CONTENT_LENGTH) {
                     let length = length
                         .to_str()
@@ -999,32 +1111,75 @@ impl State {
                     if length > max.saturating_sub(size) as u64 {
                         return Err(StatusCode::PAYLOAD_TOO_LARGE);
                     }
+                    reservation = size + length as usize;
                 }
                 if size > max {
                     return Err(StatusCode::PAYLOAD_TOO_LARGE);
                 }
+                if reservation > self.config.limits.max_session_buffered_bytes {
+                    return Err(StatusCode::SERVICE_UNAVAILABLE);
+                }
                 let deadline = tokio::time::Instant::now()
                     + Duration::from_secs(self.config.limits.packet_timeout_secs);
                 let work = async {
-                    // One assembling packet cannot strand the budget in several partial packets.
-                    let ingest = session.ingest.lock().await;
-                    let in_order = {
-                        let mut state = session.state.lock();
-                        if state.upload == Upload::Stream {
-                            return Err(StatusCode::CONFLICT);
+                    let mut memory = loop {
+                        let released = session.memory.packet_space_released();
+                        let progress = session.progress.notified();
+                        tokio::pin!(released, progress);
+                        released.as_mut().enable();
+                        progress.as_mut().enable();
+                        let wait = {
+                            let mut state = session.state.lock();
+                            if state.upload == Upload::Stream {
+                                return Err(StatusCode::CONFLICT);
+                            }
+                            state.upload = Upload::Packet;
+                            if sequence < state.next {
+                                return Ok((Body::Empty, false));
+                            }
+                            let contiguous = state.downloaded
+                                && (state.next..sequence)
+                                    .all(|number| state.pending.contains_key(&number));
+                            if sequence.saturating_sub(state.next)
+                                >= self.config.buffered_posts() as u64
+                            {
+                                if !contiguous {
+                                    return Err(StatusCode::SERVICE_UNAVAILABLE);
+                                }
+                                Some(state.pending[&state.next].forwarded.clone())
+                            } else {
+                                // Out-of-order packets must leave space for their missing predecessor.
+                                let headroom = if contiguous || sequence == state.next {
+                                    0
+                                } else {
+                                    max.min(self.config.limits.max_session_buffered_bytes)
+                                };
+                                if let Some(memory) =
+                                    session.memory.reserve_packet(reservation, headroom)
+                                {
+                                    break memory;
+                                }
+                                None
+                            }
+                        };
+                        if let Some(wait) = wait {
+                            wait.cancelled().await;
+                        } else {
+                            tokio::select! {
+                                _ = released => {},
+                                _ = progress => {},
+                            }
                         }
-                        state.upload = Upload::Packet;
-                        if sequence < state.next {
-                            return Ok((Body::Empty, false));
-                        }
-                        sequence == state.next && state.downloaded
                     };
-                    let first = if in_order {
-                        session.memory.copy_wait(&initial).await
-                    } else {
-                        session.memory.copy(&initial)
-                    };
-                    let mut chunks = vec![first.map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?];
+                    let mut chunks = Vec::new();
+                    if !initial.is_empty() {
+                        chunks.push(
+                            memory
+                                .copy(&initial)
+                                .await
+                                .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?,
+                        );
+                    }
                     loop {
                         let data = match body.receiver.recv().await {
                             Some(Event::Data(data)) => data,
@@ -1042,10 +1197,8 @@ impl State {
                             return Err(StatusCode::PAYLOAD_TOO_LARGE);
                         }
                         chunks.push(
-                            session
-                                .memory
-                                .retain(data, in_order)
-                                .await
+                            memory
+                                .retain(data)
                                 .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?,
                         );
                     }
@@ -1079,7 +1232,7 @@ impl State {
                         );
                         state.writer.take()
                     };
-                    drop(ingest);
+                    drop(memory);
                     if let Some(mut writer) = writer {
                         let session = session.clone();
                         self.tasks.spawn(async move {
@@ -1093,6 +1246,7 @@ impl State {
                                             state.next = next.checked_add(1).ok_or_else(|| {
                                                 io::Error::other("sequence exhausted")
                                             })?;
+                                            session.progress.notify_waiters();
                                         }
                                         chunks
                                     };
@@ -1141,6 +1295,7 @@ impl State {
                     .unwrap();
             }
             Err(status) => {
+                log::debug!("XHTTP request {} rejected: {status}", request.uri().path());
                 if status != StatusCode::CONFLICT
                     && let Ok(Kind::Packet(id, _)) =
                         wire::classify(&self.config, &self.path, &request)

@@ -112,6 +112,45 @@ struct Retained {
     data: Bytes,
     _session: BudgetPermit,
 }
+
+pub struct PacketMemory {
+    global: Arc<Budget>,
+    session: BudgetPermit,
+    remaining: usize,
+}
+
+impl PacketMemory {
+    pub fn retain(&mut self, data: Bytes) -> io::Result<Bytes> {
+        if data.len() > self.remaining {
+            return Err(crate::resources::exhausted());
+        }
+        self.remaining -= data.len();
+        Ok(Bytes::from_owner(Retained {
+            _session: self.session.split(data.len()),
+            data,
+        }))
+    }
+
+    pub async fn copy(&mut self, bytes: &[u8]) -> io::Result<Bytes> {
+        if bytes.len() > self.remaining {
+            return Err(crate::resources::exhausted());
+        }
+        loop {
+            let released = self.global.released();
+            tokio::pin!(released);
+            released.as_mut().enable();
+            if let Some(global) = self.global.acquire(bytes.len()) {
+                self.remaining -= bytes.len();
+                return Ok(Bytes::from_owner(Allocation {
+                    data: Bytes::copy_from_slice(bytes),
+                    _global: global,
+                    _session: self.session.split(bytes.len()),
+                }));
+            }
+            released.await;
+        }
+    }
+}
 impl AsRef<[u8]> for Retained {
     fn as_ref(&self) -> &[u8] {
         &self.data
@@ -150,35 +189,17 @@ impl Memory {
         }
     }
 
-    pub async fn copy_wait(&self, bytes: &[u8]) -> io::Result<Bytes> {
-        let (global, session) = self.reserve(bytes.len()).await?;
-        Ok(Bytes::from_owner(Allocation {
-            data: Bytes::copy_from_slice(bytes),
-            _global: global,
-            _session: session,
-        }))
+    pub fn packet_space_released(&self) -> tokio::sync::futures::OwnedNotified {
+        self.session.released()
     }
 
-    pub async fn retain(&self, data: Bytes, wait: bool) -> io::Result<Bytes> {
-        if self.session.limit().is_some_and(|limit| data.len() > limit) {
-            return Err(crate::resources::exhausted());
-        }
-        loop {
-            let released = self.session.released();
-            tokio::pin!(released);
-            released.as_mut().enable();
-            if let Some(permit) = self.session.acquire(data.len()) {
-                // The incoming pipe already owns the global byte reservation.
-                return Ok(Bytes::from_owner(Retained {
-                    data,
-                    _session: permit,
-                }));
-            }
-            if !wait {
-                return Err(crate::resources::exhausted());
-            }
-            released.await;
-        }
+    pub fn reserve_packet(&self, size: usize, headroom: usize) -> Option<PacketMemory> {
+        let mut permit = self.session.acquire(size.checked_add(headroom)?)?;
+        Some(PacketMemory {
+            global: self.global.clone(),
+            session: permit.split(size),
+            remaining: size,
+        })
     }
 
     pub fn new(global: Arc<Budget>, session_limit: usize) -> Self {
@@ -187,6 +208,7 @@ impl Memory {
             session: Arc::new(Budget::new(Some(session_limit))),
         }
     }
+    #[cfg(test)]
     pub fn copy(&self, bytes: &[u8]) -> io::Result<Bytes> {
         let global = self
             .global

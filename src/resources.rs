@@ -99,6 +99,17 @@ pub(crate) struct BudgetPermit {
     count: usize,
 }
 
+impl BudgetPermit {
+    pub(crate) fn split(&mut self, count: usize) -> Self {
+        assert!(count <= self.count);
+        self.count -= count;
+        Self {
+            budget: self.budget.clone(),
+            count,
+        }
+    }
+}
+
 impl Drop for BudgetPermit {
     fn drop(&mut self) {
         self.budget.0.lock().active -= self.count;
