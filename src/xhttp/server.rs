@@ -907,6 +907,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancellation_removes_reservation_markers_before_releasing_bytes() {
+        use std::{
+            future::Future,
+            sync::atomic::{AtomicUsize, Ordering},
+            task::Context,
+        };
+
+        struct ReleaseObserver {
+            session: Arc<Session>,
+            reserved: AtomicUsize,
+        }
+        impl futures::task::ArcWake for ReleaseObserver {
+            fn wake_by_ref(observer: &Arc<Self>) {
+                observer.reserved.store(
+                    observer
+                        .session
+                        .state
+                        .lock()
+                        .reserved
+                        .get(&0)
+                        .copied()
+                        .unwrap_or(0),
+                    Ordering::SeqCst,
+                );
+            }
+        }
+
+        for buffered in [false, true] {
+            let state = service();
+            let session = state.session("a").unwrap();
+            let post = Request::post("http://localhost/t/a/0")
+                .header("referer", format!("/?x_padding={}", "X".repeat(100)))
+                .header("content-length", "16")
+                .body(())
+                .unwrap();
+            let (mut writer, body) = pipe(Memory::new(state.memory.clone(), 1024));
+            let post = tokio::spawn(async move { state.handle(post, body).await.status() });
+            if buffered {
+                writer.write_all(b"partial").await.unwrap();
+            }
+            tokio::time::timeout(Duration::from_secs(1), writer.flush())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(session.state.lock().reserved.get(&0), Some(&1));
+            let observer = Arc::new(ReleaseObserver {
+                session: session.clone(),
+                reserved: AtomicUsize::new(usize::MAX),
+            });
+            let mut released = Box::pin(session.memory.packet_space_released());
+            {
+                // Inspect state synchronously inside the byte-release wakeup.
+                let waker = futures::task::waker_ref(&observer);
+                let mut cx = Context::from_waker(&waker);
+                assert!(released.as_mut().poll(&mut cx).is_pending());
+            }
+            post.abort();
+            assert!(post.await.is_err());
+            assert_eq!(observer.reserved.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
     async fn attached_duplicate_packets_wait_for_forwarding() {
         let state = service();
         let session = state.session("a").unwrap();
@@ -1712,6 +1775,8 @@ impl State {
                         }
                     };
                     let mut chunks = Vec::new();
+                    // On cancellation, remove admission markers before releasing byte permits.
+                    let _packet_request = packet_request;
                     if !initial.is_empty() {
                         chunks.push(
                             memory
