@@ -81,7 +81,7 @@ digest = "*"
 etherparse = "*"
 futures = "*"
 h2 = "*"
-h3 = "*"
+h3 = { version = "*", features = ["i-implement-a-third-party-backend-and-opt-into-breaking-changes"] }
 h3-quinn = "*"
 hickory-resolver = { version = "*", default-features = false, features = ["tokio", "tls-aws-lc-rs", "https-aws-lc-rs", "h3-aws-lc-rs"] }
 http = "*"

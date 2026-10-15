@@ -204,6 +204,106 @@ async fn delayed_headers_half_close_and_pool_isolation() {
 }
 
 #[tokio::test]
+async fn idle_routes_are_evicted_and_failed_dials_do_not_fill_the_pool() {
+    let (address, _server) = echo_peer(XhttpVersion::H2, false).await;
+    let client = client(XhttpVersion::H2);
+    let dial = |key, address| {
+        Arc::new(Dialer {
+            address,
+            key: RouteKey(vec![key]),
+            opens: AtomicUsize::new(0),
+        })
+    };
+    let unavailable = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+    let bad_address = ([127, 0, 0, 1], unavailable.local_addr().unwrap().port()).into();
+    drop(unavailable);
+    assert!(client.open(dial(99, bad_address)).await.is_err());
+    tokio::time::timeout(Duration::from_secs(5), async {
+        for key in 0..6 {
+            let dialer = dial(key, address);
+            let mut stream = client.open(dialer.clone()).await.unwrap();
+            stream.write_all(b"route").await.unwrap();
+            stream.shutdown().await.unwrap();
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).await.unwrap();
+            assert_eq!(response, b"route");
+            assert_eq!(dialer.opens.load(Ordering::Relaxed), 1);
+            drop(stream);
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn carrier_idle_timeout_starts_after_the_last_session_finishes() {
+    let (address, _server) = echo_peer(XhttpVersion::H2, false).await;
+    let client = client(XhttpVersion::H2);
+    let dialer = Arc::new(Dialer {
+        address,
+        key: RouteKey(vec![1]),
+        opens: AtomicUsize::new(0),
+    });
+    let mut first = client.open(dialer.clone()).await.unwrap();
+    first.write_all(b"a").await.unwrap();
+    assert_eq!(first.read_u8().await.unwrap(), b'a');
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    first.shutdown().await.unwrap();
+    assert_eq!(first.read(&mut [0; 1]).await.unwrap(), 0);
+    drop(first);
+    tokio::task::yield_now().await;
+    let second = client.open(dialer.clone()).await.unwrap();
+    assert_eq!(dialer.opens.load(Ordering::Relaxed), 1);
+    drop(second);
+}
+
+#[tokio::test]
+async fn draining_carriers_keep_their_physical_pool_slots_until_tails_finish() {
+    let (address, _server) = echo_peer(XhttpVersion::H2, true).await;
+    let config = serde_json::from_value(serde_json::json!({
+        "pool":{"max_connections":1},"protocol":{"type":"socks"}
+    }))
+    .unwrap();
+    let client = Arc::new(
+        Client::new(
+            config,
+            NetLocation::from_str("localhost:80", None).unwrap(),
+            "localhost".into(),
+            XhttpVersion::H2,
+            XhttpMode::StreamOne,
+            Security::Plain,
+        )
+        .unwrap(),
+    );
+    let dialer = Arc::new(Dialer {
+        address,
+        key: RouteKey(vec![1]),
+        opens: AtomicUsize::new(0),
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut first = client.open(dialer.clone()).await.unwrap();
+        first.write_all(b"a").await.unwrap();
+        assert_eq!(first.read_u8().await.unwrap(), b'a');
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(client.open(dialer.clone()).await.is_err());
+        assert_eq!(dialer.opens.load(Ordering::Relaxed), 1);
+        first.write_all(b"tail").await.unwrap();
+        first.shutdown().await.unwrap();
+        let mut tail = Vec::new();
+        first.read_to_end(&mut tail).await.unwrap();
+        assert_eq!(tail, b"tail");
+        drop(first);
+        tokio::task::yield_now().await;
+        let second = client.open(dialer.clone()).await.unwrap();
+        assert_eq!(dialer.opens.load(Ordering::Relaxed), 2);
+        drop(second);
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn h2_goaway_retires_carrier_without_closing_active_response() {
     tokio::time::timeout(Duration::from_secs(5), async {
         let (address, _server) = echo_peer(XhttpVersion::H2, true).await;
@@ -602,4 +702,344 @@ async fn split_requests_share_service_across_listener_addresses() {
         .unwrap()
         .unwrap();
     assert_eq!(greeting, [5, 0]);
+}
+
+async fn h3_peer(
+    limit: u32,
+) -> (
+    Arc<super::carrier::Carrier>,
+    h3::server::Connection<h3_quinn::Connection, Bytes>,
+    quinn::Endpoint,
+) {
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(cert.cert.der().clone()).unwrap();
+    let mut server_config = quinn::ServerConfig::with_single_cert(
+        vec![cert.cert.der().clone()],
+        rustls::pki_types::PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()).into(),
+    )
+    .unwrap();
+    Arc::get_mut(&mut server_config.transport)
+        .unwrap()
+        .max_concurrent_bidi_streams(limit.into());
+    let server = quinn::Endpoint::server(server_config, "0.0.0.0:0".parse().unwrap()).unwrap();
+    let mut client = crate::quic_endpoint::QuicEndpoint::new(
+        None,
+        std::net::UdpSocket::bind("0.0.0.0:0").unwrap(),
+        0,
+    )
+    .unwrap();
+    client.set_default_client_config(
+        quinn::ClientConfig::with_root_certificates(Arc::new(roots)).unwrap(),
+    );
+    let client = Arc::new(client);
+    let address = ([127, 0, 0, 1], server.local_addr().unwrap().port()).into();
+    let (outgoing, incoming) = tokio::join!(client.connect(address, "localhost").unwrap(), async {
+        server.accept().await.unwrap().await.unwrap()
+    });
+    let carrier = super::carrier::Carrier::quic(
+        crate::tcp::carrier_dialer::QuicCarrier {
+            connection: outgoing.unwrap(),
+            _endpoint: client,
+        },
+        8192,
+    )
+    .await
+    .unwrap();
+    let driver = h3::server::builder()
+        .build(h3_quinn::Connection::new(incoming))
+        .await
+        .unwrap();
+    (carrier, driver, server)
+}
+
+#[tokio::test]
+async fn h3_unused_stream_reservations_reset_without_transmitting_requests() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let (carrier, mut driver, _endpoint) = h3_peer(1).await;
+        let reservation = carrier.try_reserve().unwrap().unwrap();
+        assert!(carrier.try_reserve().unwrap().is_none());
+        let seen = Arc::new(AtomicUsize::new(0));
+        let requests = seen.clone();
+        let tasks = Tasks::new();
+        tasks.spawn(async move {
+            while let Ok(Some(resolver)) = driver.accept().await {
+                if let Ok((_, mut stream)) = resolver.resolve_request().await {
+                    requests.fetch_add(1, Ordering::Relaxed);
+                    stream.send_response(Response::new(())).await.unwrap();
+                    stream.finish().await.unwrap();
+                }
+            }
+        });
+        drop(reservation);
+        let reservation = tokio::time::timeout(Duration::from_secs(1), carrier.reserve())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(seen.load(Ordering::Relaxed), 0);
+        let memory = Memory::new(Arc::new(Budget::new(Some(1024))), 1024);
+        let mut response = carrier
+            .request_reserved(
+                Request::get("https://localhost/")
+                    .body(Body::Empty)
+                    .unwrap(),
+                memory,
+                &tasks,
+                Duration::from_secs(1),
+                reservation,
+            )
+            .await
+            .unwrap()
+            .into_body();
+        assert_eq!(response.read(&mut [0; 1]).await.unwrap(), 0);
+        assert_eq!(seen.load(Ordering::Relaxed), 1);
+        assert!(!carrier.closed());
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn h3_goaway_preserves_active_response_and_refuses_new_reservations() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let (carrier, mut driver, _endpoint) = h3_peer(2).await;
+        let release = tokio_util::sync::CancellationToken::new();
+        let released = release.clone();
+        let tasks = Tasks::new();
+        tasks.spawn(async move {
+            let resolver = driver.accept().await.unwrap().unwrap();
+            let (_, mut stream) = resolver.resolve_request().await.unwrap();
+            stream.send_response(Response::new(())).await.unwrap();
+            stream.send_data(Bytes::from_static(b"head")).await.unwrap();
+            driver.shutdown(0).await.unwrap();
+            tokio::select! {
+                _ = driver.accept() => panic!("connection ended before its response tail"),
+                _ = released.cancelled() => {},
+            }
+            stream.send_data(Bytes::from_static(b"tail")).await.unwrap();
+            stream.finish().await.unwrap();
+            let _ = driver.accept().await;
+        });
+        let memory = Memory::new(Arc::new(Budget::new(Some(1024))), 1024);
+        let mut response = carrier
+            .request(
+                Request::get("https://localhost/")
+                    .body(Body::Empty)
+                    .unwrap(),
+                memory,
+                &tasks,
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap()
+            .into_body();
+        let mut head = [0; 4];
+        response.read_exact(&mut head).await.unwrap();
+        assert_eq!(&head, b"head");
+        while !carrier.closed() {
+            tokio::task::yield_now().await;
+        }
+        assert!(carrier.try_reserve().unwrap().is_none());
+        release.cancel();
+        let mut tail = Vec::new();
+        response.read_to_end(&mut tail).await.unwrap();
+        assert_eq!(tail, b"tail");
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn h3_idle_upload_observes_stop_sending_without_closing_the_carrier() {
+    let (carrier, mut driver, _endpoint) = h3_peer(2).await;
+    let peer = Tasks::new();
+    peer.spawn(async move {
+        let resolver = driver.accept().await.unwrap().unwrap();
+        let (_, stream) = resolver.resolve_request().await.unwrap();
+        let (mut send, mut receive) = stream.split();
+        send.send_response(Response::new(())).await.unwrap();
+        receive.stop_sending(h3::error::Code::H3_REQUEST_CANCELLED);
+        let _send = send;
+        let _ = driver.accept().await;
+    });
+    let tasks = Tasks::new();
+    let memory = Memory::new(Arc::new(Budget::new(Some(1024))), 1024);
+    let (_writer, reader) = pipe(memory.clone());
+    let _response = carrier
+        .request(
+            Request::post("https://localhost/")
+                .body(Body::stream(reader))
+                .unwrap(),
+            memory,
+            &tasks,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(12), tasks.cancel.cancelled())
+        .await
+        .unwrap();
+    assert!(!carrier.closed());
+}
+
+#[tokio::test]
+async fn split_allocation_rolls_back_without_partial_batch_deadlock() {
+    let (address, _server) = echo_peer(XhttpVersion::H2, false).await;
+    let config = serde_json::from_value(serde_json::json!({
+        "pool":{"max_connections":2},"limits":{"max_requests_per_connection":1},
+        "protocol":{"type":"socks"}
+    }))
+    .unwrap();
+    let client = Arc::new(
+        Client::new(
+            config,
+            NetLocation::from_str("localhost:80", None).unwrap(),
+            "localhost".into(),
+            XhttpVersion::H2,
+            XhttpMode::StreamUp,
+            Security::Plain,
+        )
+        .unwrap(),
+    );
+    let dialer = Arc::new(Dialer {
+        address,
+        key: RouteKey(vec![1]),
+        opens: AtomicUsize::new(0),
+    });
+    let (first, second) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(client.open(dialer.clone()), client.open(dialer.clone()))
+    })
+    .await
+    .unwrap();
+    assert_ne!(first.is_ok(), second.is_ok());
+    assert_eq!(dialer.opens.load(Ordering::Relaxed), 2);
+    drop(first);
+    drop(second);
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    let next = client.open(dialer.clone()).await.unwrap();
+    assert_eq!(dialer.opens.load(Ordering::Relaxed), 2);
+    drop(next);
+}
+
+#[tokio::test]
+async fn stalled_route_dials_do_not_block_other_routes_or_leak_slots_on_cancel() {
+    #[derive(Debug)]
+    struct Stalled {
+        key: RouteKey,
+        opened: tokio::sync::Notify,
+    }
+    #[async_trait]
+    impl CarrierDialer for Stalled {
+        fn route_key(&self) -> &RouteKey {
+            &self.key
+        }
+        async fn open_stream(&self) -> io::Result<Box<dyn AsyncStream>> {
+            self.opened.notify_one();
+            std::future::pending().await
+        }
+    }
+    let (address, _server) = echo_peer(XhttpVersion::H2, false).await;
+    let config = serde_json::from_value(serde_json::json!({
+        "pool":{"max_connections":2},"protocol":{"type":"socks"}
+    }))
+    .unwrap();
+    let client = Arc::new(
+        Client::new(
+            config,
+            NetLocation::from_str("localhost:80", None).unwrap(),
+            "localhost".into(),
+            XhttpVersion::H2,
+            XhttpMode::StreamUp,
+            Security::Plain,
+        )
+        .unwrap(),
+    );
+    let stalled = Arc::new(Stalled {
+        key: RouteKey(vec![0]),
+        opened: tokio::sync::Notify::new(),
+    });
+    let bad = {
+        let client = client.clone();
+        let stalled = stalled.clone();
+        tokio::spawn(async move { client.open(stalled).await })
+    };
+    stalled.opened.notified().await;
+    let dialer = Arc::new(Dialer {
+        address,
+        key: RouteKey(vec![1]),
+        opens: AtomicUsize::new(0),
+    });
+    let good = tokio::time::timeout(Duration::from_secs(1), client.open(dialer))
+        .await
+        .unwrap()
+        .unwrap();
+    bad.abort();
+    let _ = bad.await;
+    let dialer = Arc::new(Dialer {
+        address,
+        key: RouteKey(vec![2]),
+        opens: AtomicUsize::new(0),
+    });
+    let next = tokio::time::timeout(Duration::from_secs(1), client.open(dialer))
+        .await
+        .unwrap()
+        .unwrap();
+    drop(good);
+    drop(next);
+}
+
+#[tokio::test]
+async fn h3_response_timeout_does_not_replay_the_request() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let (carrier, mut driver, _endpoint) = h3_peer(2).await;
+        let seen = Arc::new(AtomicUsize::new(0));
+        let received = seen.clone();
+        let peer = Tasks::new();
+        peer.spawn(async move {
+            let mut unanswered = None;
+            while let Ok(Some(resolver)) = driver.accept().await {
+                let (_, mut stream) = resolver.resolve_request().await.unwrap();
+                if received.fetch_add(1, Ordering::Relaxed) == 0 {
+                    unanswered = Some(stream);
+                } else {
+                    unanswered.take();
+                    stream.send_response(Response::new(())).await.unwrap();
+                    stream.finish().await.unwrap();
+                }
+            }
+        });
+        let memory = Memory::new(Arc::new(Budget::new(Some(1024))), 1024);
+        let tasks = Tasks::new();
+        let error = carrier
+            .request(
+                Request::post("https://localhost/packet/0")
+                    .body(Body::Empty)
+                    .unwrap(),
+                memory.clone(),
+                &tasks,
+                Duration::from_millis(100),
+            )
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(seen.load(Ordering::Relaxed), 1);
+        let mut response = carrier
+            .request(
+                Request::get("https://localhost/new")
+                    .body(Body::Empty)
+                    .unwrap(),
+                memory,
+                &tasks,
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap()
+            .into_body();
+        assert_eq!(response.read(&mut [0; 1]).await.unwrap(), 0);
+        assert_eq!(seen.load(Ordering::Relaxed), 2);
+    })
+    .await
+    .unwrap();
 }

@@ -659,7 +659,7 @@ impl XhttpServer {
     pub async fn serve_h3(&self, connection: quinn::Connection) -> io::Result<()> {
         let mut driver = h3::server::builder()
             .max_field_section_size(self.state.config.header_limit() as u64)
-            .build(h3_quinn::Connection::new(connection))
+            .build(super::h3::Connection::new(connection))
             .await
             .map_err(io::Error::other)?;
         let mut requests = tokio::task::JoinSet::new();

@@ -297,6 +297,9 @@ covering all three modes and HTTP versions. `type: splithttp` is an alias for
   padding, path/query handling, packet sizing/pacing, and stream-up keepalives
   follow modern Xray. `limits` bounds sessions, buffered bytes, requests and
   setup/header/packet deadlines; `pool` bounds connections and idle retention.
+  Split legs may use different carriers on the same selected route. H2/H3 admission
+  respects peer stream capacity; draining carriers retain their connection slots.
+  A full pool refuses new sessions rather than exceeding its configured cap.
 - Advanced placement/padding obfuscation, custom session IDs, separate downloads,
   full XMUX policy, and Vision over XHTTP are not supported. Unsupported options
   are rejected rather than silently ignored. Public CDN compatibility is not implied.

@@ -8,7 +8,7 @@ use tokio::{
 };
 
 use super::{
-    carrier::Carrier,
+    carrier::{Carrier, Reservation},
     connector::Security,
     stream::{Body, Event, Memory, Reader, Stream, Tasks, pipe},
     wire::{self, Path},
@@ -25,7 +25,68 @@ struct Slot {
     _dialer: Arc<dyn CarrierDialer>,
     carrier: OnceCell<Arc<Carrier>>,
     requests: Arc<Semaphore>,
+    limit: usize,
     last_used: parking_lot::Mutex<tokio::time::Instant>,
+}
+
+impl Slot {
+    fn active(&self) -> usize {
+        self.limit - self.requests.available_permits()
+    }
+
+    fn retain(&self, idle: Duration) -> bool {
+        self.active() != 0
+            || self.carrier.get().is_some_and(|carrier| !carrier.closed())
+                && self.last_used.lock().elapsed() < idle
+    }
+}
+
+struct SlotPermit {
+    _permit: OwnedSemaphorePermit,
+    slot: Option<Arc<Slot>>,
+}
+
+impl Drop for SlotPermit {
+    fn drop(&mut self) {
+        if let Some(slot) = &self.slot {
+            *slot.last_used.lock() = tokio::time::Instant::now();
+        }
+    }
+}
+
+struct Lease {
+    carrier: Arc<Carrier>,
+    reservation: Option<Reservation>,
+    _permit: SlotPermit,
+}
+
+impl Lease {
+    async fn request(
+        &mut self,
+        client: &Client,
+        request: Request<Body>,
+        memory: Memory,
+        tasks: &Tasks,
+    ) -> io::Result<http::Response<Reader>> {
+        let reservation = match self.reservation.take() {
+            Some(reservation) => reservation,
+            None => {
+                tokio::time::timeout(
+                    Duration::from_secs(client.config.limits.setup_timeout_secs),
+                    self.carrier.reserve(),
+                )
+                .await??
+            }
+        };
+        if self._permit.slot.as_ref().is_some_and(|slot| {
+            slot.active() > self.carrier.capacity(client.config.limits.request_limit())
+        }) {
+            return Err(crate::resources::exhausted());
+        }
+        self.carrier
+            .request_reserved(request, memory, tasks, client.header_timeout(), reservation)
+            .await
+    }
 }
 
 pub struct Client {
@@ -42,6 +103,10 @@ pub struct Client {
     reaper_started: std::sync::Once,
     slots: parking_lot::Mutex<Vec<Arc<Slot>>>,
     h1_slots: Arc<Semaphore>,
+    allocation: parking_lot::Mutex<
+        std::collections::HashMap<RouteKey, std::sync::Weak<tokio::sync::Mutex<()>>>,
+    >,
+    pending: Arc<Budget>,
 }
 
 impl std::fmt::Debug for Client {
@@ -55,7 +120,7 @@ impl std::fmt::Debug for Client {
 
 impl Client {
     pub fn new(
-        mut config: XhttpClientConfig,
+        config: XhttpClientConfig,
         endpoint: NetLocation,
         authority: String,
         version: XhttpVersion,
@@ -63,10 +128,11 @@ impl Client {
         security: Security,
     ) -> io::Result<Self> {
         let path = Path::new(&config.path)?;
-        config.limits.max_requests_per_connection = config.limits.request_limit();
         Ok(Self {
             memory: Arc::new(Budget::new(Some(config.limits.max_buffered_bytes))),
             admission: Arc::new(Budget::new(Some(config.limits.max_sessions))),
+            pending: Arc::new(Budget::new(Some(config.limits.max_pending_sessions))),
+            allocation: parking_lot::Mutex::new(std::collections::HashMap::new()),
             tasks: Tasks::new(),
             reaper_started: std::sync::Once::new(),
             h1_slots: Arc::new(Semaphore::new(config.pool.max_h1_connections)),
@@ -90,11 +156,7 @@ impl Client {
                     break;
                 };
                 let idle = Duration::from_secs(client.config.pool.idle_timeout_secs);
-                client.slots.lock().retain(|slot| {
-                    slot.requests.available_permits()
-                        != client.config.limits.max_requests_per_connection
-                        || slot.last_used.lock().elapsed() < idle
-                });
+                client.slots.lock().retain(|slot| slot.retain(idle));
             }
         });
     }
@@ -122,63 +184,93 @@ impl Client {
         .await?
     }
 
-    async fn lease(
-        &self,
-        dialer: &Arc<dyn CarrierDialer>,
-        count: u32,
-    ) -> io::Result<(Arc<Carrier>, OwnedSemaphorePermit)> {
+    async fn lease(&self, dialer: &Arc<dyn CarrierDialer>, allow_dial: bool) -> io::Result<Lease> {
         let (slot, permit) = {
             let mut slots = self.slots.lock();
             let idle = Duration::from_secs(self.config.pool.idle_timeout_secs);
-            slots.retain(|s| {
-                !s.carrier.get().is_some_and(|c| c.closed())
-                    && (s.requests.available_permits()
-                        != self.config.limits.max_requests_per_connection
-                        || s.last_used.lock().elapsed() <= idle)
-            });
-            if let Some(found) = slots
-                .iter()
-                .filter(|s| s.key == *dialer.route_key())
-                .find_map(|slot| {
-                    slot.requests
-                        .clone()
-                        .try_acquire_many_owned(count)
-                        .ok()
-                        .map(|permit| (slot.clone(), permit))
-                })
-            {
-                found
-            } else {
-                if slots.len() >= self.config.pool.max_connections
-                    || count as usize > self.config.limits.max_requests_per_connection
-                {
-                    return Err(crate::resources::exhausted());
+            slots.retain(|slot| slot.retain(idle));
+            for slot in slots.iter().filter(|slot| slot.key == *dialer.route_key()) {
+                let Some(carrier) = slot.carrier.get() else {
+                    continue;
+                };
+                if slot.active() >= carrier.capacity(self.config.limits.request_limit()) {
+                    continue;
                 }
-                let slot = Arc::new(Slot {
-                    key: dialer.route_key().clone(),
-                    _dialer: dialer.clone(),
-                    carrier: OnceCell::new(),
-                    requests: Arc::new(Semaphore::new(
-                        self.config.limits.max_requests_per_connection,
-                    )),
-                    last_used: parking_lot::Mutex::new(tokio::time::Instant::now()),
+                let Ok(Some(reservation)) = carrier.try_reserve() else {
+                    continue;
+                };
+                return Ok(Lease {
+                    carrier: carrier.clone(),
+                    reservation: Some(reservation),
+                    _permit: SlotPermit {
+                        _permit: slot
+                            .requests
+                            .clone()
+                            .try_acquire_owned()
+                            .map_err(|_| crate::resources::exhausted())?,
+                        slot: Some(slot.clone()),
+                    },
                 });
-                let permit = slot
+            }
+            if !allow_dial {
+                return Err(crate::resources::exhausted());
+            }
+            if slots.len() >= self.config.pool.max_connections
+                && let Some(oldest) = slots
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, slot)| slot.active() == 0)
+                    .min_by_key(|(_, slot)| *slot.last_used.lock())
+                    .map(|(index, _)| index)
+            {
+                slots.remove(oldest);
+            }
+            if slots.len() >= self.config.pool.max_connections {
+                return Err(crate::resources::exhausted());
+            }
+            let limit = self.config.limits.max_requests_per_connection;
+            let slot = Arc::new(Slot {
+                key: dialer.route_key().clone(),
+                _dialer: dialer.clone(),
+                carrier: OnceCell::new(),
+                requests: Arc::new(Semaphore::new(limit)),
+                limit,
+                last_used: parking_lot::Mutex::new(tokio::time::Instant::now()),
+            });
+            let permit = SlotPermit {
+                _permit: slot
                     .requests
                     .clone()
-                    .try_acquire_many_owned(count)
-                    .map_err(|_| crate::resources::exhausted())?;
-                slots.push(slot.clone());
-                (slot, permit)
-            }
+                    .try_acquire_owned()
+                    .map_err(|_| crate::resources::exhausted())?,
+                slot: Some(slot.clone()),
+            };
+            slots.push(slot.clone());
+            (slot, permit)
         };
-        let carrier = slot
-            .carrier
-            .get_or_try_init(|| self.dial(dialer))
-            .await?
-            .clone();
-        *slot.last_used.lock() = tokio::time::Instant::now();
-        Ok((carrier, permit))
+        let initialized = async {
+            let carrier = slot
+                .carrier
+                .get_or_try_init(|| self.dial(&slot._dialer))
+                .await?
+                .clone();
+            if carrier.capacity(self.config.limits.request_limit()) == 0 {
+                return Err(crate::resources::exhausted());
+            }
+            let reservation = carrier
+                .try_reserve()?
+                .ok_or_else(crate::resources::exhausted)?;
+            Ok(Lease {
+                carrier,
+                reservation: Some(reservation),
+                _permit: permit,
+            })
+        }
+        .await;
+        if initialized.is_err() {
+            self.slots.lock().retain(|entry| !Arc::ptr_eq(entry, &slot));
+        }
+        initialized
     }
 
     pub async fn open(self: &Arc<Self>, dialer: Arc<dyn CarrierDialer>) -> io::Result<Stream> {
@@ -188,31 +280,68 @@ impl Client {
             .admission
             .acquire(1)
             .ok_or_else(crate::resources::exhausted)?;
-        let request_count = match self.mode {
-            XhttpMode::StreamOne => 1,
-            XhttpMode::PacketUp => 1 + self.packet_concurrency() as u32,
-            _ => 2,
-        };
-        if self.mode != XhttpMode::StreamOne && request_count < 2 {
-            return Err(crate::resources::exhausted());
-        }
-        let (download, upload, permit) = if self.version == XhttpVersion::H1 {
-            let permit = self
-                .h1_slots
-                .clone()
-                .try_acquire_many_owned(request_count)
-                .map_err(|_| crate::resources::exhausted())?;
-            let download = self.dial(&dialer).await?;
-            let upload = if request_count == 1 {
-                download.clone()
-            } else {
-                self.dial(&dialer).await?
-            };
-            (download, upload, permit)
-        } else {
-            let (carrier, permit) = self.lease(&dialer, request_count).await?;
-            (carrier.clone(), carrier, permit)
-        };
+        let pending = self
+            .pending
+            .acquire(1)
+            .ok_or_else(crate::resources::exhausted)?;
+        let (download, upload) = tokio::time::timeout(
+            Duration::from_secs(self.config.limits.setup_timeout_secs),
+            async {
+                // Serialize same-route batches without blocking healthy routes on another route's dial.
+                let gate = if self.version != XhttpVersion::H1 {
+                    let mut gates = self.allocation.lock();
+                    gates.retain(|_, gate| gate.strong_count() != 0);
+                    let entry = gates.entry(dialer.route_key().clone()).or_default();
+                    let gate = entry
+                        .upgrade()
+                        .unwrap_or_else(|| Arc::new(tokio::sync::Mutex::new(())));
+                    *entry = Arc::downgrade(&gate);
+                    Some(gate)
+                } else {
+                    None
+                };
+                let _allocation = match gate {
+                    Some(gate) => Some(gate.lock_owned().await),
+                    None => None,
+                };
+                let count = if self.mode == XhttpMode::StreamOne {
+                    1
+                } else {
+                    2
+                };
+                let mut lanes = Vec::new();
+                if self.version == XhttpVersion::H1 {
+                    let mut permit = self
+                        .h1_slots
+                        .clone()
+                        .try_acquire_many_owned(count)
+                        .map_err(|_| crate::resources::exhausted())?;
+                    for _ in 0..count {
+                        lanes.push(Lease {
+                            carrier: self.dial(&dialer).await?,
+                            reservation: None,
+                            _permit: SlotPermit {
+                                _permit: permit.split(1).unwrap(),
+                                slot: None,
+                            },
+                        });
+                    }
+                } else {
+                    for _ in 0..count {
+                        lanes.push(self.lease(&dialer, true).await?);
+                    }
+                }
+                let download = lanes.remove(0);
+                if self.mode == XhttpMode::PacketUp {
+                    // Unsent QUIC stream IDs become visible when later requests open higher IDs.
+                    // Release the admission probe until a POST actually has data to send.
+                    lanes[0].reservation.take();
+                }
+                Ok::<_, io::Error>((download, lanes))
+            },
+        )
+        .await??;
+        drop(pending);
         let memory = Memory::new(
             self.memory.clone(),
             self.config.limits.max_session_buffered_bytes,
@@ -225,7 +354,6 @@ impl Client {
         // The stream owns cancellation; workers must not retain the task owner.
         tasks.spawn(async move {
             let _admission = admission;
-            let _permit = permit;
             let result = client
                 .run_session(
                     download,
@@ -250,8 +378,8 @@ impl Client {
 
     async fn run_session(
         self: &Arc<Self>,
-        download: Arc<Carrier>,
-        upload: Arc<Carrier>,
+        mut download: Lease,
+        upload: Vec<Lease>,
         dialer: Arc<dyn CarrierDialer>,
         upload_reader: Reader,
         download_writer: &mut super::stream::Writer,
@@ -298,7 +426,7 @@ impl Client {
             Some(error) = error_receiver.recv() => return Err(error),
             _ = local.cancel.cancelled() => return Err(io::ErrorKind::ConnectionAborted.into()),
             _ = &mut linger => return download_writer.shutdown().await,
-            result = download.request(request, memory, &local, self.header_timeout()) => result?,
+            result = download.request(self, request, memory, &local) => result?,
         };
         if response.status() != StatusCode::OK {
             return Err(io::Error::other(format!(
@@ -326,7 +454,7 @@ impl Client {
 
     async fn upload(
         &self,
-        carrier: Arc<Carrier>,
+        mut lanes: Vec<Lease>,
         dialer: Arc<dyn CarrierDialer>,
         reader: Reader,
         session: &str,
@@ -335,13 +463,12 @@ impl Client {
         let tasks = Tasks::new();
         if self.mode == XhttpMode::PacketUp {
             return self
-                .packets(carrier, dialer, reader, session, memory, &tasks)
+                .packets(lanes, dialer, reader, session, memory, &tasks)
                 .await;
         }
         let request = self.request(session, None, true, Body::stream(reader))?;
-        let response = carrier
-            .request(request, memory, &tasks, self.header_timeout())
-            .await?;
+        let mut upload = lanes.pop().unwrap();
+        let response = upload.request(self, request, memory, &tasks).await?;
         if response.status() != StatusCode::OK {
             return Err(io::Error::other(format!(
                 "XHTTP upload status {}",
@@ -360,18 +487,6 @@ impl Client {
 
     fn header_timeout(&self) -> Duration {
         Duration::from_secs(self.config.limits.response_header_timeout_secs)
-    }
-
-    fn packet_concurrency(&self) -> usize {
-        if self.version == XhttpVersion::H1 {
-            1
-        } else {
-            self.config
-                .limits
-                .max_requests_per_connection
-                .saturating_sub(1)
-                .min(4)
-        }
     }
 
     fn request(
@@ -401,7 +516,7 @@ impl Client {
 
     async fn packets(
         &self,
-        mut carrier: Arc<Carrier>,
+        mut lanes: Vec<Lease>,
         dialer: Arc<dyn CarrierDialer>,
         mut reader: Reader,
         session: &str,
@@ -413,14 +528,18 @@ impl Client {
                 .sc_max_each_post_bytes
                 .bounds((1_000_000, 1_000_000), false)?,
         ) as usize;
-        let concurrency = self.packet_concurrency();
+        let concurrency = if self.version == XhttpVersion::H1 {
+            1
+        } else {
+            4
+        };
         let mut inflight = futures::stream::FuturesUnordered::new();
         let mut pending = std::collections::VecDeque::new();
         let mut sequence = 0u64;
         let mut next_post_at = tokio::time::Instant::now();
         loop {
             while inflight.len() >= concurrency {
-                inflight.next().await.unwrap()?;
+                lanes.push(inflight.next().await.unwrap()?);
             }
             let event = if let Some(event) = pending.pop_front() {
                 Some(event)
@@ -428,7 +547,7 @@ impl Client {
                 tokio::select! {
                     event = reader.receiver.recv() => event,
                     done = inflight.next(), if !inflight.is_empty() => {
-                        done.unwrap()?;
+                        lanes.push(done.unwrap()?);
                         continue;
                     }
                 }
@@ -470,7 +589,7 @@ impl Client {
                                     biased;
                                     _ = tokio::time::sleep_until(next_post_at) => break None,
                                     done = inflight.next(), if !inflight.is_empty() => {
-                                        done.unwrap()?;
+                                        lanes.push(done.unwrap()?);
                                     }
                                     event = reader.receiver.recv() => break event,
                                 }
@@ -482,12 +601,19 @@ impl Client {
                         tokio::select! {
                             _ = tokio::time::sleep_until(next_post_at) => break,
                             done = inflight.next(), if !inflight.is_empty() => {
-                                done.unwrap()?;
+                                lanes.push(done.unwrap()?);
                             }
                         }
                     }
-                    if self.version == XhttpVersion::H1 && carrier.closed() {
-                        carrier = self.dial(&dialer).await?;
+                    let mut lane = if let Some(lane) = lanes.pop() {
+                        lane
+                    } else if let Ok(lane) = self.lease(&dialer, false).await {
+                        lane
+                    } else {
+                        inflight.next().await.unwrap()?
+                    };
+                    if self.version == XhttpVersion::H1 && lane.carrier.closed() {
+                        lane.carrier = self.dial(&dialer).await?;
                     }
                     let request =
                         self.request(session, Some(sequence), true, Body::Chunks(chunks.clone()))?;
@@ -497,16 +623,13 @@ impl Client {
                                 .sc_min_posts_interval_ms
                                 .bounds((30, 30), false)?,
                         ) as u64);
-                    let carrier = carrier.clone();
                     let memory = memory.clone();
                     inflight.push(async move {
                         let _retained_until_ack = chunks;
                         tokio::time::timeout(
                             Duration::from_secs(self.config.limits.packet_timeout_secs),
                             async {
-                                let response = carrier
-                                    .request(request, memory, tasks, self.header_timeout())
-                                    .await?;
+                                let response = lane.request(self, request, memory, tasks).await?;
                                 if response.status() != StatusCode::OK {
                                     return Err(io::Error::other(format!(
                                         "XHTTP packet status {}",
@@ -519,7 +642,7 @@ impl Client {
                                         "nonempty XHTTP packet acknowledgement",
                                     ));
                                 }
-                                Ok::<_, io::Error>(())
+                                Ok::<_, io::Error>(lane)
                             },
                         )
                         .await?
@@ -533,13 +656,13 @@ impl Client {
                 }
                 Event::Drain(ack) => {
                     while let Some(result) = inflight.next().await {
-                        result?;
+                        lanes.push(result?);
                     }
                     let _ = ack.send(());
                 }
                 Event::Finish => {
                     while let Some(result) = inflight.next().await {
-                        result?;
+                        lanes.push(result?);
                     }
                     return Ok(());
                 }

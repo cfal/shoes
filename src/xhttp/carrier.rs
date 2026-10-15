@@ -8,6 +8,7 @@ use std::{
 };
 
 use bytes::{Buf, Bytes};
+use h3::ConnectionState;
 use http::{Request, Response};
 use http_body_util::BodyExt;
 use hyper_util::rt::TokioIo;
@@ -18,12 +19,18 @@ use crate::{
     async_stream::AsyncStream, config::xhttp::XhttpVersion, tcp::carrier_dialer::QuicCarrier,
 };
 
-type H3Sender = h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>;
+type H3Sender = h3::client::SendRequest<super::h3::Opener, Bytes>;
+
+pub struct Reservation(Option<super::h3::Bidi>);
 
 enum Sender {
     H1(tokio::sync::Mutex<hyper::client::conn::http1::SendRequest<Body>>),
     H2(h2::client::SendRequest<Bytes>),
-    H3(H3Sender),
+    H3 {
+        sender: H3Sender,
+        opener: super::h3::Opener,
+        headers: tokio::sync::Mutex<()>,
+    },
 }
 
 pub struct Carrier {
@@ -53,18 +60,23 @@ impl Carrier {
             });
             Sender::H1(tokio::sync::Mutex::new(sender))
         } else {
-            let (sender, connection) = h2::client::Builder::new()
+            let (sender, mut connection) = h2::client::Builder::new()
                 .initial_window_size(256 * 1024)
                 .initial_connection_window_size(256 * 1024)
                 .max_header_list_size(header_limit as u32)
                 .handshake(stream)
                 .await
                 .map_err(io::Error::other)?;
+            let mut ping = connection.ping_pong().unwrap();
             tasks.spawn(async move {
                 if let Err(error) = connection.await {
                     log::debug!("XHTTP H2 carrier ended: {error}");
                 }
             });
+            // The handshake alone does not read peer SETTINGS. PONG follows their application.
+            ping.ping(h2::Ping::opaque())
+                .await
+                .map_err(io::Error::other)?;
             Sender::H2(sender)
         };
         Ok(Arc::new(Self {
@@ -76,9 +88,11 @@ impl Carrier {
     }
 
     pub async fn quic(carrier: QuicCarrier, header_limit: usize) -> io::Result<Arc<Self>> {
+        let connection = super::h3::Connection::new(carrier.connection.clone());
+        let opener = connection.opener();
         let (mut driver, sender) = h3::client::builder()
             .max_field_section_size(header_limit as u64)
-            .build(h3_quinn::Connection::new(carrier.connection.clone()))
+            .build(connection)
             .await
             .map_err(io::Error::other)?;
         let tasks = Tasks::new();
@@ -87,7 +101,11 @@ impl Carrier {
             log::debug!("XHTTP H3 carrier ended: {error}");
         });
         Ok(Arc::new(Self {
-            sender: Sender::H3(sender),
+            sender: Sender::H3 {
+                sender,
+                opener,
+                headers: tokio::sync::Mutex::new(()),
+            },
             retired: AtomicBool::new(false),
             _tasks: tasks,
             _quic: Some(carrier),
@@ -106,22 +124,82 @@ impl Carrier {
                     .poll_ready(&mut std::task::Context::from_waker(std::task::Waker::noop())),
                 std::task::Poll::Ready(Err(_))
             ),
-            Sender::H3(_) => self
-                ._quic
-                .as_ref()
-                .unwrap()
-                .connection
-                .close_reason()
-                .is_some(),
+            Sender::H3 { sender, .. } => {
+                sender.is_closing()
+                    || sender.get_conn_error().is_some()
+                    || self
+                        ._quic
+                        .as_ref()
+                        .unwrap()
+                        .connection
+                        .close_reason()
+                        .is_some()
+            }
         }
     }
 
+    pub fn capacity(&self, limit: usize) -> usize {
+        match &self.sender {
+            Sender::H1(_) => 1,
+            Sender::H2(sender) => limit.min(sender.current_max_send_streams()),
+            Sender::H3 { .. } => limit,
+        }
+    }
+
+    pub fn try_reserve(&self) -> io::Result<Option<Reservation>> {
+        if self.closed() {
+            return Ok(None);
+        }
+        let Sender::H3 { opener, .. } = &self.sender else {
+            return Ok(Some(Reservation(None)));
+        };
+        match opener
+            .clone()
+            .poll_reserve(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+        {
+            std::task::Poll::Ready(Ok(stream)) => Ok(Some(Reservation(Some(stream)))),
+            std::task::Poll::Ready(Err(error)) => {
+                self.retired.store(true, Ordering::Relaxed);
+                Err(io::Error::other(error))
+            }
+            std::task::Poll::Pending => Ok(None),
+        }
+    }
+
+    pub async fn reserve(&self) -> io::Result<Reservation> {
+        if self.closed() {
+            return Err(io::ErrorKind::ConnectionAborted.into());
+        }
+        let Sender::H3 { opener, .. } = &self.sender else {
+            return Ok(Reservation(None));
+        };
+        let mut opener = opener.clone();
+        futures::future::poll_fn(|cx| opener.poll_reserve(cx))
+            .await
+            .map(|stream| Reservation(Some(stream)))
+            .map_err(io::Error::other)
+    }
+
+    #[cfg(test)]
     pub async fn request(
+        self: &Arc<Self>,
+        request: Request<Body>,
+        memory: Memory,
+        tasks: &Tasks,
+        header_timeout: Duration,
+    ) -> io::Result<Response<Reader>> {
+        let reservation = tokio::time::timeout(header_timeout, self.reserve()).await??;
+        self.request_reserved(request, memory, tasks, header_timeout, reservation)
+            .await
+    }
+
+    pub async fn request_reserved(
         self: &Arc<Self>,
         mut request: Request<Body>,
         memory: Memory,
         tasks: &Tasks,
         header_timeout: Duration,
+        reservation: Reservation,
     ) -> io::Result<Response<Reader>> {
         let (writer, reader) = pipe(memory);
         let result = match &self.sender {
@@ -203,17 +281,24 @@ impl Carrier {
                 });
                 Response::from_parts(parts, reader)
             }
-            Sender::H3(sender) => {
+            Sender::H3 {
+                sender,
+                opener,
+                headers,
+            } => {
                 let (parts, mut body) = request.into_parts();
                 let mut sender = sender.clone();
-                let request = tokio::time::timeout(
-                    header_timeout,
-                    sender.send_request(Request::from_parts(parts, ())),
-                )
-                .await?
+                let request = tokio::time::timeout(header_timeout, async {
+                    let _lock = headers.lock().await;
+                    let _handoff = opener.install(reservation.0.unwrap());
+                    sender.send_request(Request::from_parts(parts, ())).await
+                })
+                .await
                 .map_err(|error| {
-                    // h3 exposes no readiness probe. Stop assigning requests after
-                    // an open failure without closing any already-active streams.
+                    self.retired.store(true, Ordering::Relaxed);
+                    io::Error::from(error)
+                })?
+                .map_err(|error| {
                     self.retired.store(true, Ordering::Relaxed);
                     io::Error::other(error)
                 })?;
@@ -223,7 +308,22 @@ impl Carrier {
                 tasks.spawn(async move {
                     let _carrier = carrier;
                     let result: io::Result<()> = async {
-                        while let Some(frame) = body.frame().await {
+                        loop {
+                            let frame =
+                                match tokio::time::timeout(Duration::from_secs(10), body.frame())
+                                    .await
+                                {
+                                    Ok(frame) => frame,
+                                    Err(_) => {
+                                        send.send_data(Bytes::new())
+                                            .await
+                                            .map_err(io::Error::other)?;
+                                        continue;
+                                    }
+                                };
+                            let Some(frame) = frame else {
+                                break;
+                            };
                             if let Ok(data) = frame?.into_data() {
                                 send.send_data(data).await.map_err(io::Error::other)?;
                             }

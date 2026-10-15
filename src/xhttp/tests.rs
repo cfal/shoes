@@ -56,14 +56,28 @@ async fn all_modes_and_carriers_exchange_data_before_upload_eof() {
             let _ = socket.read(&mut buffer).await;
         }
     });
-    for version in ["h1", "h2", "h3"] {
+    for (version, peer_limit, local_limit) in [
+        ("h1", 128, 128),
+        ("h2", 128, 128),
+        ("h3", 128, 128),
+        ("h2", 1, 128),
+        ("h3", 1, 128),
+        ("h2", 128, 1),
+        ("h3", 128, 1),
+    ] {
         for mode in ["packet-up", "stream-up", "stream-one"] {
-            eprintln!("testing {version} {mode}");
+            eprintln!(
+                "testing {version} {mode}, peer limit {peer_limit}, local limit {local_limit}"
+            );
             let reserved = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
             let port = reserved.local_addr().unwrap().port();
             let address = format!("127.0.0.1:{port}");
-            let server_protocol = json!({"type":"xhttp", "path":"/tunnel", "http_version":version, "protocol":{"type":"vless","user_id":"550e8400-e29b-41d4-a716-446655440000"}});
-            let client_protocol = json!({"type":"xhttp", "path":"/tunnel", "http_version":version, "mode":mode, "protocol":{"type":"vless","user_id":"550e8400-e29b-41d4-a716-446655440000"}});
+            let server_protocol = json!({"type":"xhttp", "path":"/tunnel", "http_version":version,
+                "limits":{"max_requests_per_connection":peer_limit},
+                "protocol":{"type":"vless","user_id":"550e8400-e29b-41d4-a716-446655440000"}});
+            let client_protocol = json!({"type":"xhttp", "path":"/tunnel", "http_version":version, "mode":mode,
+                "limits":{"max_requests_per_connection":local_limit}, "pool":{"max_connections":2},
+                "protocol":{"type":"vless","user_id":"550e8400-e29b-41d4-a716-446655440000"}});
             let (server_value, client_value) = if version == "h3" {
                 (
                     json!({"address":format!("0.0.0.0:{port}"), "transport":"quic", "quic_settings":{"cert":certificate.cert.pem(),"key":certificate.signing_key.serialize_pem()}, "protocol":server_protocol}),
@@ -158,11 +172,9 @@ async fn all_modes_and_carriers_exchange_data_before_upload_eof() {
                         assert_eq!(response, payload);
                     }
                     stream.shutdown().await.unwrap();
-                    if mode != "packet-up" {
-                        let mut tail = Vec::new();
-                        stream.read_to_end(&mut tail).await.unwrap();
-                        assert!(tail.is_empty());
-                    }
+                    let mut tail = Vec::new();
+                    stream.read_to_end(&mut tail).await.unwrap();
+                    assert!(tail.is_empty());
                 }
                 // H1 stream-one ends its connection with the response, not an independent FIN.
                 if mode != "packet-up" && !(mode == "stream-one" && version == "h1") {
