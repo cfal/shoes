@@ -191,7 +191,7 @@ mod tests {
                     .lock()
                     .unwrap()
                     .take()
-                    .expect("unexpected redundant dial"),
+                    .ok_or_else(|| std::io::Error::other("unexpected redundant dial"))?,
             ))
         }
         async fn connect_udp_bidirectional(
@@ -208,6 +208,15 @@ mod tests {
 
     #[tokio::test]
     async fn warm_naive_streams_share_one_socket_and_tls_handshake() {
+        check_warm_naive_reuse(false).await;
+    }
+
+    #[tokio::test]
+    async fn mixed_xhttp_pool_preserves_warm_naive_reuse() {
+        check_warm_naive_reuse(true).await;
+    }
+
+    async fn check_warm_naive_reuse(mixed: bool) {
         use crate::client_proxy_chain::{ClientProxyChain, InitialHopEntry};
         use crate::naiveproxy::NaiveProxyTcpClientHandler;
         use crate::tls_client_handler::TlsClientHandler;
@@ -269,18 +278,37 @@ mod tests {
                 Box::new(NaiveProxyTcpClientHandler::new("user", "pass", false)),
             )),
         };
-        let chain = ClientProxyChain::new(
-            vec![InitialHopEntry::Proxy {
+        let mut entries = vec![InitialHopEntry::Proxy {
+            socket: Arc::new(OneTransport {
+                stream: std::sync::Mutex::new(Some(client)),
+                connects: connects.clone(),
+            }),
+            proxy: Box::new(proxy),
+        }];
+        if mixed {
+            let config = serde_json::from_value(serde_json::json!({
+                "address": "localhost:443",
+                "protocol": {"type": "xhttp", "mode": "stream-one", "protocol": {"type": "socks"}}
+            }))
+            .unwrap();
+            entries.push(InitialHopEntry::Proxy {
                 socket: Arc::new(OneTransport {
-                    stream: std::sync::Mutex::new(Some(client)),
-                    connects: connects.clone(),
+                    stream: std::sync::Mutex::new(None),
+                    connects: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 }),
-                proxy: Box::new(proxy),
-            }],
-            vec![],
-        );
+                proxy: Box::new(
+                    ProxyConnectorImpl::from_config(config, mock_resolver())
+                        .unwrap()
+                        .unwrap(),
+                ),
+            });
+        }
+        let chain = ClientProxyChain::new(entries, vec![]);
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            for payload in [b"cold request".as_slice(), b"warm request"] {
+            for (index, payload) in [b"cold request".as_slice(), b"warm request"]
+                .into_iter()
+                .enumerate()
+            {
                 let target = NetLocation::from_str("example.com:443", None)
                     .unwrap()
                     .into();
@@ -294,6 +322,12 @@ mod tests {
                 let mut response = Vec::new();
                 stream.read_to_end(&mut response).await.unwrap();
                 assert_eq!(response, payload);
+                if mixed && index == 0 {
+                    let target = NetLocation::from_str("example.com:443", None)
+                        .unwrap()
+                        .into();
+                    assert!(chain.connect_tcp(target, &mock_resolver()).await.is_err());
+                }
             }
         })
         .await

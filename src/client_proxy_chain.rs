@@ -634,6 +634,12 @@ impl SelectedRoute {
     async fn connect(&self, target: ResolvedLocation) -> std::io::Result<TcpClientSetupResult> {
         match self.last_proxy() {
             Some(proxy) => {
+                if self.subsequent.is_empty()
+                    && !proxy.needs_carrier_dialer()
+                    && let Some(result) = proxy.try_reuse_tcp_stream(&target).await?
+                {
+                    return Ok(result);
+                }
                 proxy
                     .connect_tcp_with_dialer(self.prefix(proxy.proxy_location().into()), &target)
                     .await
