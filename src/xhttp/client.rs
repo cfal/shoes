@@ -623,14 +623,6 @@ impl Client {
                     if self.version == XhttpVersion::H1 && lane.carrier.closed() {
                         lane.carrier = self.dial(&dialer).await?;
                     }
-                    if self.version == XhttpVersion::H3 && lane.reservation.is_none() {
-                        if let Ok(Some(reservation)) = lane.carrier.try_reserve() {
-                            lane.reservation = Some(reservation);
-                        } else if let Ok(replacement) = self.lease(&dialer, true).await {
-                            // No request has been sent; another session may own this carrier's credit.
-                            lane = replacement;
-                        }
-                    }
                     let request =
                         self.request(session, Some(sequence), true, Body::Chunks(chunks.clone()))?;
                     next_post_at = tokio::time::Instant::now()
@@ -640,8 +632,17 @@ impl Client {
                                 .bounds((30, 30), false)?,
                         ) as u64);
                     let memory = memory.clone();
+                    let dialer = dialer.clone();
                     inflight.push(async move {
                         let _retained_until_ack = chunks;
+                        if self.version == XhttpVersion::H3 && lane.reservation.is_none() {
+                            if let Ok(Some(reservation)) = lane.carrier.try_reserve() {
+                                lane.reservation = Some(reservation);
+                            } else if let Ok(replacement) = self.lease(&dialer, true).await {
+                                // No request has been sent; another session may own this carrier's credit.
+                                lane = replacement;
+                            }
+                        }
                         tokio::time::timeout(
                             Duration::from_secs(self.config.limits.packet_timeout_secs),
                             async {

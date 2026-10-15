@@ -788,11 +788,11 @@ async fn split_requests_share_service_across_listener_addresses() {
     assert_eq!(greeting, [5, 0]);
 }
 
-async fn h3_peer(
+async fn quic_pair(
     limit: u32,
 ) -> (
-    Arc<super::carrier::Carrier>,
-    h3::server::Connection<h3_quinn::Connection, Bytes>,
+    crate::tcp::carrier_dialer::QuicCarrier,
+    quinn::Connection,
     quinn::Endpoint,
 ) {
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
@@ -821,20 +821,153 @@ async fn h3_peer(
     let (outgoing, incoming) = tokio::join!(client.connect(address, "localhost").unwrap(), async {
         server.accept().await.unwrap().await.unwrap()
     });
-    let carrier = super::carrier::Carrier::quic(
+    (
         crate::tcp::carrier_dialer::QuicCarrier {
             connection: outgoing.unwrap(),
             _endpoint: client,
         },
-        8192,
+        incoming,
+        server,
     )
-    .await
-    .unwrap();
+}
+
+async fn h3_peer(
+    limit: u32,
+) -> (
+    Arc<super::carrier::Carrier>,
+    h3::server::Connection<h3_quinn::Connection, Bytes>,
+    quinn::Endpoint,
+) {
+    let (outgoing, incoming, server) = quic_pair(limit).await;
+    let carrier = super::carrier::Carrier::quic(outgoing, 8192).await.unwrap();
     let driver = h3::server::builder()
         .build(h3_quinn::Connection::new(incoming))
         .await
         .unwrap();
     (carrier, driver, server)
+}
+
+#[tokio::test]
+async fn h3_stalled_packet_replacement_keeps_polling_other_acknowledgements() {
+    struct Stalled {
+        first: parking_lot::Mutex<Option<crate::tcp::carrier_dialer::QuicCarrier>>,
+        key: RouteKey,
+        opened: tokio::sync::Notify,
+    }
+    impl std::fmt::Debug for Stalled {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("Stalled").finish_non_exhaustive()
+        }
+    }
+    #[async_trait]
+    impl CarrierDialer for Stalled {
+        fn route_key(&self) -> &RouteKey {
+            &self.key
+        }
+        async fn open_stream(&self) -> io::Result<Box<dyn AsyncStream>> {
+            unreachable!()
+        }
+        async fn open_quic(&self) -> io::Result<crate::tcp::carrier_dialer::QuicCarrier> {
+            if let Some(first) = self.first.lock().take() {
+                return Ok(first);
+            }
+            self.opened.notify_one();
+            std::future::pending().await
+        }
+    }
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let (outgoing, incoming, _endpoint) = quic_pair(3).await;
+        let dialer = Arc::new(Stalled {
+            first: parking_lot::Mutex::new(Some(outgoing)),
+            key: RouteKey(vec![1]),
+            opened: tokio::sync::Notify::new(),
+        });
+        let acknowledge = tokio_util::sync::CancellationToken::new();
+        let reject = tokio_util::sync::CancellationToken::new();
+        let ack = acknowledge.clone();
+        let failure = reject.clone();
+        let (seen, mut requests) = tokio::sync::mpsc::channel(3);
+        let peer = Tasks::new();
+        peer.spawn(async move {
+            let mut driver: h3::server::Connection<_, Bytes> = h3::server::builder()
+                .build(h3_quinn::Connection::new(incoming))
+                .await
+                .unwrap();
+            let mut handlers = tokio::task::JoinSet::new();
+            while let Ok(Some(resolver)) = driver.accept().await {
+                let ack = ack.clone();
+                let failure = failure.clone();
+                let seen = seen.clone();
+                handlers.spawn(async move {
+                    let Ok((request, stream)) = resolver.resolve_request().await else {
+                        return;
+                    };
+                    let (mut send, receive) = stream.split();
+                    let status = if request.method() == http::Method::GET {
+                        seen.send(None).await.unwrap();
+                        http::StatusCode::OK
+                    } else {
+                        let sequence = request.uri().path().rsplit('/').next().unwrap();
+                        let sequence = sequence.parse::<u64>().unwrap();
+                        seen.send(Some(sequence)).await.unwrap();
+                        if sequence == 0 {
+                            ack.cancelled().await;
+                            http::StatusCode::OK
+                        } else {
+                            failure.cancelled().await;
+                            http::StatusCode::INTERNAL_SERVER_ERROR
+                        }
+                    };
+                    send.send_response(Response::builder().status(status).body(()).unwrap())
+                        .await
+                        .unwrap();
+                    if request.method() != http::Method::GET {
+                        send.finish().await.unwrap();
+                    }
+                    // Unread upload bodies keep the peer's three bidi streams occupied.
+                    let _receive = receive;
+                    let _send = send;
+                    std::future::pending::<()>().await;
+                });
+            }
+        });
+        let config = serde_json::from_value(serde_json::json!({
+            "sc_max_each_post_bytes":1,"pool":{"max_connections":2},
+            "protocol":{"type":"socks"}
+        }))
+        .unwrap();
+        let client = Arc::new(
+            Client::new(
+                config,
+                NetLocation::from_str("localhost:80", None).unwrap(),
+                "localhost".into(),
+                XhttpVersion::H3,
+                XhttpMode::PacketUp,
+                Security::Plain,
+            )
+            .unwrap(),
+        );
+        let mut stream = client.open(dialer.clone()).await.unwrap();
+        assert_eq!(requests.recv().await.unwrap(), None);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        stream.write_all(b"a").await.unwrap();
+        assert_eq!(requests.recv().await.unwrap(), Some(0));
+        stream.write_all(b"b").await.unwrap();
+        assert_eq!(requests.recv().await.unwrap(), Some(1));
+        acknowledge.cancel();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        stream.write_all(b"c").await.unwrap();
+        dialer.opened.notified().await;
+        reject.cancel();
+        let error = tokio::time::timeout(Duration::from_secs(1), stream.read(&mut [0; 1]))
+            .await
+            .expect("packet acknowledgement was blocked by an unrelated dial")
+            .unwrap_err();
+        assert!(error.to_string().contains("500"), "{error}");
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
