@@ -4,6 +4,7 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::{Context, Poll, ready},
+    time::Duration,
 };
 
 use bytes::{Buf, Bytes};
@@ -11,6 +12,7 @@ use hyper::body::{Body as HttpBody, Frame, SizeHint};
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     sync::{mpsc, oneshot},
+    time::Instant,
 };
 use tokio_util::{
     sync::{CancellationToken, PollSender},
@@ -24,6 +26,45 @@ use crate::{
 
 pub const CHUNK: usize = 16 * 1024;
 
+#[derive(Debug)]
+pub struct Activity(parking_lot::Mutex<Instant>);
+
+impl Activity {
+    pub fn new() -> Self {
+        Self(parking_lot::Mutex::new(Instant::now()))
+    }
+
+    pub fn touch(&self) {
+        *self.0.lock() = Instant::now();
+    }
+
+    pub async fn idle<T>(
+        &self,
+        since: Instant,
+        timeout: Duration,
+        work: impl Future<Output = T>,
+    ) -> io::Result<T> {
+        let expired = async {
+            loop {
+                let last = since.max(*self.0.lock());
+                let Some(deadline) = last.checked_add(timeout) else {
+                    return std::future::pending().await;
+                };
+                tokio::time::sleep_until(deadline).await;
+                // Activity never wakes waiters; only real progress can extend their deadlines.
+                if since.max(*self.0.lock()).checked_add(timeout) == Some(deadline) {
+                    return;
+                }
+            }
+        };
+        tokio::select! {
+            biased;
+            result = work => Ok(result),
+            _ = expired => Err(io::ErrorKind::TimedOut.into()),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Memory {
     global: Arc<Budget>,
@@ -34,6 +75,65 @@ pub struct Memory {
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test(start_paused = true)]
+    async fn inactivity_tracks_progress_not_total_lifetime() {
+        let activity = Activity::new();
+        let mut wait = Box::pin(activity.idle(
+            Instant::now(),
+            Duration::from_secs(10),
+            std::future::pending::<()>(),
+        ));
+        assert!(futures::poll!(&mut wait).is_pending());
+        for _ in 0..10 {
+            tokio::time::advance(Duration::from_secs(9)).await;
+            activity.touch();
+            assert!(futures::poll!(&mut wait).is_pending());
+        }
+        tokio::time::advance(Duration::from_millis(9999)).await;
+        assert!(futures::poll!(&mut wait).is_pending());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert_eq!(wait.await.unwrap_err().kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn inactivity_completion_and_progress_win_at_the_deadline() {
+        let activity = Activity::new();
+        let done = CancellationToken::new();
+        let mut wait =
+            Box::pin(activity.idle(Instant::now(), Duration::from_secs(10), done.cancelled()));
+        assert!(futures::poll!(&mut wait).is_pending());
+        tokio::time::advance(Duration::from_secs(10)).await;
+        activity.touch();
+        assert!(futures::poll!(&mut wait).is_pending());
+        tokio::time::advance(Duration::from_secs(10)).await;
+        done.cancel();
+        wait.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn inactivity_has_a_phase_floor_and_accepts_unrepresentable_deadlines() {
+        let activity = Activity::new();
+        tokio::time::advance(Duration::from_secs(20)).await;
+        let mut wait = Box::pin(activity.idle(
+            Instant::now(),
+            Duration::from_secs(10),
+            std::future::pending::<()>(),
+        ));
+        assert!(futures::poll!(&mut wait).is_pending());
+        tokio::time::advance(Duration::from_secs(9)).await;
+        assert!(futures::poll!(&mut wait).is_pending());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(wait.await.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert!(
+            futures::poll!(Box::pin(activity.idle(
+                Instant::now(),
+                Duration::MAX,
+                std::future::pending::<()>(),
+            )))
+            .is_pending()
+        );
+    }
 
     #[tokio::test]
     async fn partial_reads_explicit_eof_and_errors() {
@@ -300,6 +400,7 @@ pub struct Reader {
     current: Bytes,
     ended: bool,
     pub eof: CancellationToken,
+    pub activity: Option<Arc<Activity>>,
 }
 
 pub struct Writer {
@@ -329,6 +430,7 @@ pub fn pipe(memory: Memory) -> (Writer, Reader) {
             current: Bytes::new(),
             ended: false,
             eof: CancellationToken::new(),
+            activity: None,
         },
     )
 }
@@ -497,6 +599,9 @@ impl AsyncRead for Reader {
             if !self.current.is_empty() {
                 let len = self.current.len().min(buffer.remaining());
                 buffer.put_slice(&self.current[..len]);
+                if let Some(activity) = &self.activity {
+                    activity.touch();
+                }
                 self.current.advance(len);
                 if self.current.is_empty() {
                     self.current = Bytes::new();
