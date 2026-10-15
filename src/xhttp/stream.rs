@@ -108,6 +108,15 @@ struct Allocation {
     _global: BudgetPermit,
     _session: BudgetPermit,
 }
+struct Retained {
+    data: Bytes,
+    _session: BudgetPermit,
+}
+impl AsRef<[u8]> for Retained {
+    fn as_ref(&self) -> &[u8] {
+        &self.data
+    }
+}
 impl AsRef<[u8]> for Allocation {
     fn as_ref(&self) -> &[u8] {
         &self.data
@@ -138,6 +147,37 @@ impl Memory {
             // Never hold the global budget while waiting for this session to drain.
             drop(global);
             session_ready.await;
+        }
+    }
+
+    pub async fn copy_wait(&self, bytes: &[u8]) -> io::Result<Bytes> {
+        let (global, session) = self.reserve(bytes.len()).await?;
+        Ok(Bytes::from_owner(Allocation {
+            data: Bytes::copy_from_slice(bytes),
+            _global: global,
+            _session: session,
+        }))
+    }
+
+    pub async fn retain(&self, data: Bytes, wait: bool) -> io::Result<Bytes> {
+        if self.session.limit().is_some_and(|limit| data.len() > limit) {
+            return Err(crate::resources::exhausted());
+        }
+        loop {
+            let released = self.session.released();
+            tokio::pin!(released);
+            released.as_mut().enable();
+            if let Some(permit) = self.session.acquire(data.len()) {
+                // The incoming pipe already owns the global byte reservation.
+                return Ok(Bytes::from_owner(Retained {
+                    data,
+                    _session: permit,
+                }));
+            }
+            if !wait {
+                return Err(crate::resources::exhausted());
+            }
+            released.await;
         }
     }
 

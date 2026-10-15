@@ -38,6 +38,24 @@ async fn all_modes_and_carriers_exchange_data_before_upload_eof() {
             received.send(upload).await.unwrap();
         }
     });
+    let sink = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+    let sink_target = format!("127.0.0.1:{}", sink.local_addr().unwrap().port());
+    let (finished, mut transfers) = tokio::sync::mpsc::channel(1);
+    echo_tasks.spawn(async move {
+        while let Ok((mut socket, _)) = sink.accept().await {
+            let mut total = 0;
+            let mut buffer = [0; 16 * 1024];
+            while total < 8 * 1024 * 1024 {
+                let size = socket.read(&mut buffer).await.unwrap();
+                assert_ne!(size, 0, "packet upload was cut off after {total} bytes");
+                assert!(buffer[..size].iter().all(|byte| *byte == 83));
+                total += size;
+                tokio::time::sleep(Duration::from_millis(4)).await;
+            }
+            finished.send(total).await.unwrap();
+            let _ = socket.read(&mut buffer).await;
+        }
+    });
     for version in ["h1", "h2", "h3"] {
         for mode in ["packet-up", "stream-up", "stream-one"] {
             eprintln!("testing {version} {mode}");
@@ -163,6 +181,19 @@ async fn all_modes_and_carriers_exchange_data_before_upload_eof() {
                     stream.write_all(&payload).await.unwrap();
                     stream.shutdown().await.unwrap();
                     assert_eq!(uploads.recv().await.unwrap(), payload);
+                }
+                if mode == "packet-up" {
+                    let target = crate::address::NetLocation::from_str(&sink_target, None)
+                        .unwrap()
+                        .into();
+                    let mut stream = chain
+                        .connect_tcp(target, &resolver)
+                        .await
+                        .unwrap()
+                        .client_stream;
+                    stream.write_all(&vec![83; 8 * 1024 * 1024]).await.unwrap();
+                    stream.shutdown().await.unwrap();
+                    assert_eq!(transfers.recv().await.unwrap(), 8 * 1024 * 1024);
                 }
             })
             .await
