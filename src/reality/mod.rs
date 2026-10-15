@@ -10,6 +10,8 @@ mod reality_cipher_suite;
 mod reality_client_connection;
 mod reality_client_verify;
 mod reality_io_state;
+mod reality_key_exchange;
+mod reality_mldsa;
 mod reality_reader_writer;
 mod reality_records;
 mod reality_server_connection;
@@ -18,7 +20,17 @@ mod reality_tls13_keys;
 mod reality_tls13_messages;
 mod reality_util;
 
+#[cfg(test)]
+mod reality_pq_tests;
+#[cfg(test)]
+pub(crate) use reality_pq_tests::default_target_records;
+
 pub use reality_cipher_suite::{CipherSuite, DEFAULT_CIPHER_SUITES};
+#[allow(unused_imports)]
+pub use reality_mldsa::{
+    VerifyKey as Mldsa65VerifyKey, decode_mldsa65_seed, decode_mldsa65_verify,
+    generate_mldsa65_keypair, mldsa65_signing_key,
+};
 pub(crate) use reality_util::parse_server_name;
 // generate_keypair is used by binary, not by library's public API
 #[allow(unused_imports)]

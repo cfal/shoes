@@ -8,6 +8,42 @@ use subtle::ConstantTimeEq;
 use x509_parser::certificate::X509Certificate;
 use x509_parser::prelude::FromDer;
 
+pub fn verify_certificate_mldsa(
+    cert_der: &[u8],
+    auth_key: &[u8; 32],
+    hellos: &[u8],
+    verify_key: &super::reality_mldsa::VerifyKey,
+) -> io::Result<()> {
+    let (remaining, cert) = X509Certificate::from_der(cert_der)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid REALITY certificate"))?;
+    if !remaining.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Trailing certificate bytes",
+        ));
+    }
+    // OID 0.0 encodes as one zero byte; the parser displays it as "0".
+    let mut signatures = cert
+        .extensions()
+        .iter()
+        .filter(|ext| ext.oid.as_bytes() == [0]);
+    let ext = signatures.next().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "REALITY ML-DSA-65 signature required",
+        )
+    })?;
+    if signatures.next().is_some() || ext.critical {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Invalid REALITY ML-DSA-65 extension",
+        ));
+    }
+    let public = extract_ed25519_public_key(cert_der)?;
+    let message = super::reality_mldsa::certificate_message(auth_key, &public, &[hellos]);
+    super::reality_mldsa::verify(verify_key, &message, ext.value)
+}
+
 /// Extract the DER-encoded certificate from a TLS 1.3 Certificate message
 ///
 /// Certificate message structure:
@@ -107,7 +143,7 @@ pub fn verify_certificate_hmac(cert_der: &[u8], auth_key: &[u8; 32]) -> io::Resu
     );
 
     // Verify this is an Ed25519 public key (32 bytes)
-    if pubkey_data.len() != 32 {
+    if pubkey_data.len() != 32 || spki.algorithm.algorithm.to_id_string() != "1.3.101.112" {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
@@ -181,7 +217,7 @@ pub fn extract_ed25519_public_key(cert_der: &[u8]) -> io::Result<[u8; 32]> {
     let spki = cert.public_key();
     let pubkey_data: &[u8] = &spki.subject_public_key.data;
 
-    if pubkey_data.len() != 32 {
+    if pubkey_data.len() != 32 || spki.algorithm.algorithm.to_id_string() != "1.3.101.112" {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(

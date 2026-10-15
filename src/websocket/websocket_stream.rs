@@ -848,6 +848,7 @@ mod tests {
                     if pong { &[0x89, 0] } else { &[] },
                 );
                 let session = RealityServerConnection::new(RealityServerConfig {
+                    mldsa65_key: None,
                     private_key: [0; 32],
                     short_ids: vec![[0; 8]],
                     dest: NetLocation::new(Address::UNSPECIFIED, 443),

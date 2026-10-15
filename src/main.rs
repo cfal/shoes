@@ -107,6 +107,9 @@ fn print_usage_and_exit(arg0: String) {
     );
     eprintln!("    generate-shadowsocks-2022-password <cipher>    Generate a Shadowsocks password");
     eprintln!(
+        "    generate-reality-mldsa65-keypair                Generate optional REALITY ML-DSA-65 keys"
+    );
+    eprintln!(
         "    generate-vless-user-id                         Generate a random VLESS/VMESS user ID (UUID v4)"
     );
     std::process::exit(1);
@@ -185,6 +188,20 @@ fn main() {
     }
 
     logging::init_multi_logger(writers, directives);
+
+    if args.iter().any(|s| s == "generate-reality-mldsa65-keypair") {
+        match crate::reality::generate_mldsa65_keypair() {
+            Ok((seed, verify)) => {
+                println!("mldsa65_seed: {seed}");
+                println!("mldsa65_verify: {verify}");
+            }
+            Err(error) => {
+                eprintln!("ML-DSA-65 key generation failed: {error}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
 
     if args.iter().any(|s| s == "generate-reality-keypair") {
         let (private_key, public_key) = generate_keypair().unwrap();

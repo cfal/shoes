@@ -18,10 +18,12 @@ use crate::tcp::tcp_handler::{TcpClientSetupResult, TcpServerSetupResult};
 use crate::tls_server_handler::InnerProtocol;
 use crate::util::{allocate_vec, write_all};
 
+use super::reality_key_exchange::extract_server_key_share;
 use super::{RealityServerConfig, RealityServerConnection};
 
 #[derive(Debug)]
 pub struct RealityServerTarget {
+    pub mldsa65_key: Option<Arc<aws_lc_rs::signature::PqdsaKeyPair>>,
     pub private_key: [u8; 32],
     pub short_ids: Vec<[u8; 8]>,
     pub dest: NetLocation,
@@ -107,6 +109,7 @@ pub async fn setup_reality_server_stream(
     }
 
     let reality_config = RealityServerConfig {
+        mldsa65_key: target.mldsa65_key.clone(),
         private_key: target.private_key,
         short_ids: target.short_ids.clone(),
         dest: target.dest.clone(),
@@ -161,9 +164,14 @@ pub async fn setup_reality_server_stream(
         if dest_records.is_empty() && !new_records.is_empty() {
             match parse_server_hello(&new_records[0]) {
                 Ok(parsed) => {
-                    if !parsed.is_tls13 {
-                        log::error!(
-                            "REALITY: Dest {} is TLS 1.2, falling back to transparent forward",
+                    if !parsed.is_tls13 || extract_server_key_share(&new_records[0]).is_err() {
+                        log::log!(
+                            if auth_result.is_ok() {
+                                log::Level::Warn
+                            } else {
+                                log::Level::Debug
+                            },
+                            "REALITY: Dest {} has an unsupported TLS hello, forwarding transparently",
                             target.dest
                         );
                         return Ok(start_forward_to_dest(
@@ -177,7 +185,15 @@ pub async fn setup_reality_server_stream(
                     log::debug!("REALITY: Dest confirmed TLS 1.3");
                 }
                 Err(e) => {
-                    log::error!("REALITY: Failed to parse dest ServerHello: {}", e);
+                    log::log!(
+                        if auth_result.is_ok() {
+                            log::Level::Warn
+                        } else {
+                            log::Level::Debug
+                        },
+                        "REALITY: Failed to parse dest ServerHello: {}, forwarding transparently",
+                        e
+                    );
                     return Ok(start_forward_to_dest(
                         server_stream,
                         dest_stream,
@@ -242,7 +258,14 @@ pub async fn setup_reality_server_stream(
     // Branch based on auth result. We don't short circuit on permission denied before the
     // read loop above so that the timing is always the same.
     match auth_result {
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::PermissionDenied
+                    | std::io::ErrorKind::InvalidData
+                    | std::io::ErrorKind::UnexpectedEof
+            ) =>
+        {
             log::warn!(
                 "REALITY: Auth failed ({}), forwarding to dest transparently",
                 e
@@ -266,8 +289,16 @@ pub async fn setup_reality_server_stream(
 
     log::debug!("REALITY: Auth succeeded, building response matching dest structure");
 
+    if should_forward_to_dest(reality_conn.build_server_response(&dest_records))? {
+        return Ok(start_forward_to_dest(
+            server_stream,
+            dest_stream,
+            dest_records,
+            remaining_data,
+            client_pending,
+        ));
+    }
     drop(dest_stream);
-    reality_conn.build_server_response(dest_records)?;
 
     let connection = CryptoConnection::new_reality_server(reality_conn);
     let mode = match target.inner_protocol {
@@ -300,6 +331,18 @@ pub async fn setup_reality_server_stream(
             )
             .await
         }
+    }
+}
+
+fn should_forward_to_dest(response: std::io::Result<()>) -> std::io::Result<bool> {
+    match response {
+        Ok(()) => Ok(false),
+        // Only explicitly classified target incompatibilities permit fallback.
+        Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
+            log::warn!("REALITY: Cannot synthesize target handshake ({e}), forwarding");
+            Ok(true)
+        }
+        Err(e) => Err(e),
     }
 }
 
@@ -382,6 +425,252 @@ mod cleanup_tests {
     use std::task::{Context, Poll};
     use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
+    #[test]
+    fn synthesis_failures_only_forward_explicit_incompatibilities() {
+        use crate::reality::reality_key_exchange::{
+            ClientKeyShares, RealityGroup, server_exchange,
+        };
+
+        assert!(!should_forward_to_dest(Ok(())).unwrap());
+        assert!(should_forward_to_dest(Err(io::ErrorKind::Unsupported.into())).unwrap());
+        for kind in [
+            io::ErrorKind::InvalidData,
+            io::ErrorKind::UnexpectedEof,
+            io::ErrorKind::Other,
+        ] {
+            let error = io::Error::new(kind, "injected synthesis failure");
+            let propagated = should_forward_to_dest(Err(error)).unwrap_err();
+            assert_eq!(propagated.kind(), kind);
+            assert_eq!(propagated.to_string(), "injected synthesis failure");
+        }
+
+        // AWS-LC accepts the encoding but rejects this public key during encapsulation.
+        let shares = ClientKeyShares {
+            x25519: None,
+            hybrid: Some(Box::new([255; 1216])),
+        };
+        let result = server_exchange(RealityGroup::X25519MlKem768, &shares).map(|_| ());
+        let error = should_forward_to_dest(result).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(error.to_string(), "ML-KEM encapsulation failed");
+    }
+
+    fn client_key_share_offsets(hello: &[u8]) -> Vec<usize> {
+        use crate::buf_reader::BufReader;
+
+        let mut reader = BufReader::new(hello);
+        reader.skip(43).unwrap();
+        let session_len = reader.read_u8().unwrap() as usize;
+        reader.skip(session_len).unwrap();
+        let cipher_len = reader.read_u16_be().unwrap() as usize;
+        reader.skip(cipher_len).unwrap();
+        let compression_len = reader.read_u8().unwrap() as usize;
+        reader.skip(compression_len).unwrap();
+        let extensions_len = reader.read_u16_be().unwrap() as usize;
+        assert_eq!(extensions_len, reader.remaining());
+        while !reader.is_consumed() {
+            let id = reader.read_u16_be().unwrap();
+            let len = reader.read_u16_be().unwrap() as usize;
+            let start = reader.position();
+            let data = reader.read_slice(len).unwrap();
+            if id == 51 {
+                let mut shares = BufReader::new(data);
+                let len = shares.read_u16_be().unwrap() as usize;
+                assert_eq!(len, shares.remaining());
+                let mut offsets = Vec::new();
+                while !shares.is_consumed() {
+                    offsets.push(start + shares.position());
+                    shares.skip(2).unwrap();
+                    let len = shares.read_u16_be().unwrap() as usize;
+                    shares.skip(len).unwrap();
+                }
+                return offsets;
+            }
+        }
+        panic!("missing key_share extension");
+    }
+
+    #[tokio::test]
+    async fn incompatible_hellos_and_small_targets_forward_unchanged() {
+        use crate::client_proxy_chain::InitialHopEntry;
+        use crate::port_forward_handler::PortForwardServerHandler;
+        use crate::reality::reality_key_exchange::RealityGroup;
+        use crate::reality::reality_pq_tests::{configs, separate_target_records};
+        use crate::reality::{CipherSuite, RealityClientConnection, mldsa65_signing_key};
+        use crate::tcp::socket_connector_impl::SocketConnectorImpl;
+
+        for case in [
+            "small",
+            "small-separate",
+            "retry",
+            "unsupported",
+            "client-unknown-shares",
+            "client-truncated-share",
+        ] {
+            let (cc, mut sc) = configs(CipherSuite::AES_128_GCM_SHA256);
+            let (seed, _) = crate::reality::generate_mldsa65_keypair().unwrap();
+            sc.mldsa65_key = Some(mldsa65_signing_key(&seed).unwrap());
+            let mut client = RealityClientConnection::new(cc).unwrap();
+            let mut hello = Vec::new();
+            client.write_tls(&mut hello).unwrap();
+            let mut response = if matches!(case, "client-unknown-shares" | "client-truncated-share")
+            {
+                let offsets = client_key_share_offsets(&hello);
+                assert_eq!(offsets.len(), 2);
+                let expected_error = if case == "client-unknown-shares" {
+                    for (offset, group) in offsets.into_iter().zip([0xfe30u16, 0xfe31]) {
+                        hello[offset..offset + 2].copy_from_slice(&group.to_be_bytes());
+                    }
+                    io::ErrorKind::InvalidData
+                } else {
+                    // Keeps the TLS framing valid while overstating the last share's length.
+                    let offset = offsets[1] + 2;
+                    assert_eq!(&hello[offset..offset + 2], &[0, 32]);
+                    hello[offset..offset + 2].copy_from_slice(&33u16.to_be_bytes());
+                    io::ErrorKind::UnexpectedEof
+                };
+                let mut check = RealityServerConnection::new(sc.clone()).unwrap();
+                assert_eq!(
+                    check.validate_client_hello(&hello).unwrap_err().kind(),
+                    expected_error
+                );
+                // A valid target flight reaches the admission-error branch, not hello fallback.
+                crate::reality::default_target_records(&hello[44..76]).concat()
+            } else if matches!(case, "small" | "small-separate") {
+                let (mut records, small_record) = if case == "small" {
+                    (crate::reality::default_target_records(&hello[44..76]), 2)
+                } else {
+                    (
+                        separate_target_records(
+                            RealityGroup::X25519MlKem768,
+                            CipherSuite::AES_128_GCM_SHA256,
+                            &hello[44..76],
+                        ),
+                        3,
+                    )
+                };
+                let mut encrypted = vec![23, 3, 3, 2, 88];
+                encrypted.resize(605, 0);
+                records[small_record] = encrypted.into();
+                let mut check = RealityServerConnection::new(sc.clone()).unwrap();
+                check.validate_client_hello(&hello).unwrap();
+                assert!(
+                    check
+                        .build_server_response(&records)
+                        .unwrap_err()
+                        .to_string()
+                        .contains("insufficient capacity")
+                );
+                records.concat()
+            } else {
+                let mut message = vec![2, 0, 0, 0, 3, 3];
+                if case == "retry" {
+                    let retry_random =
+                        aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, b"HelloRetryRequest");
+                    message.extend_from_slice(retry_random.as_ref());
+                } else {
+                    message.extend_from_slice(&[3; 32]);
+                }
+                message.push(32);
+                message.extend_from_slice(&hello[44..76]);
+                message.extend_from_slice(&[0x13, 1, 0]);
+                let mut extensions = vec![0, 43, 0, 2, 3, 4];
+                if case == "retry" {
+                    extensions.extend_from_slice(&[0, 51, 0, 2, 0, 23]);
+                } else {
+                    extensions.extend_from_slice(&[0, 51, 0, 5, 0xfe, 0x30, 0, 1, 1]);
+                }
+                message.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+                message.extend_from_slice(&extensions);
+                let len = (message.len() - 4) as u32;
+                message[1..4].copy_from_slice(&len.to_be_bytes()[1..]);
+                let mut record = vec![22, 3, 3];
+                record.extend_from_slice(&(message.len() as u16).to_be_bytes());
+                record.extend_from_slice(&message);
+                record
+            };
+            // A partial trailing record exercises the deframer's retained bytes.
+            response.extend_from_slice(&[23, 3, 3]);
+
+            let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+            let dest = NetLocation::new(
+                crate::address::Address::Hostname("localhost".into()),
+                listener.local_addr().unwrap().port(),
+            );
+            let selector = Arc::new(ClientProxySelector::new(Vec::new()));
+            let target = RealityServerTarget {
+                mldsa65_key: sc.mldsa65_key,
+                private_key: sc.private_key,
+                short_ids: sc.short_ids,
+                dest: dest.clone(),
+                max_time_diff: None,
+                min_client_version: None,
+                max_client_version: None,
+                cipher_suites: sc.cipher_suites,
+                effective_selector: selector.clone(),
+                inner_protocol: InnerProtocol::Normal(Box::new(PortForwardServerHandler::new(
+                    vec![dest],
+                    selector,
+                ))),
+                dest_client_chain: ClientProxyChain::new(
+                    vec![InitialHopEntry::Direct(Box::new(
+                        SocketConnectorImpl::from_config(
+                            &crate::config::ClientConfig::default(),
+                            None,
+                        )
+                        .unwrap(),
+                    ))],
+                    Vec::new(),
+                ),
+            };
+            let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
+            let (io, mut peer) = tokio::io::duplex(65536);
+            let mut flight = hello.clone();
+            flight.extend_from_slice(b"pending");
+            peer.write_all(&flight).await.unwrap();
+            let mut io: Box<dyn AsyncStream> = Box::new(io);
+            let parsed = crate::shadow_tls::read_client_hello(&mut io).await.unwrap();
+            assert!(parsed.supports_tls13);
+            assert_eq!(parsed.client_reader.unparsed_data(), b"pending");
+            let decoy_io = async {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut forwarded = vec![0; hello.len()];
+                socket.read_exact(&mut forwarded).await.unwrap();
+                assert_eq!(forwarded, hello);
+                socket.write_all(&response).await.unwrap();
+                let mut upstream = Vec::new();
+                socket.read_to_end(&mut upstream).await.unwrap();
+                assert_eq!(upstream, b"pending-live");
+                socket.write_all(b"-reply").await.unwrap();
+                socket.shutdown().await.unwrap();
+            };
+            let handler = async {
+                let result = setup_reality_server_stream(io, &target, parsed, &resolver)
+                    .await
+                    .unwrap();
+                let TcpServerSetupResult::Session(session) = result else {
+                    panic!("expected transparent fallback for {case}");
+                };
+                session.await;
+            };
+            let peer_io = async {
+                let mut actual = vec![0; response.len()];
+                peer.read_exact(&mut actual).await.unwrap();
+                assert_eq!(actual, response, "{case}");
+                peer.write_all(b"-live").await.unwrap();
+                peer.shutdown().await.unwrap();
+                let mut reply = Vec::new();
+                peer.read_to_end(&mut reply).await.unwrap();
+                assert_eq!(reply, b"-reply");
+            };
+            tokio::time::timeout(Duration::from_secs(2), async {
+                tokio::join!(handler, decoy_io, peer_io);
+            })
+            .await
+            .unwrap_or_else(|_| panic!("transparent forwarding stalled for {case}"));
+        }
+    }
+
     #[tokio::test]
     async fn authenticated_non_vision_oversized_preread_returns_error_without_panicking() {
         use crate::client_proxy_chain::InitialHopEntry;
@@ -396,6 +685,7 @@ mod cleanup_tests {
             .compute_public_key()
             .unwrap();
         let mut client = RealityClientConnection::new(RealityClientConfig {
+            mldsa65_verify: None,
             public_key: public_key.as_ref().try_into().unwrap(),
             short_id: [0; 8],
             server_name: "localhost".into(),
@@ -435,6 +725,7 @@ mod cleanup_tests {
         decoy.write_tls(&mut response).unwrap();
         let selector = Arc::new(ClientProxySelector::new(Vec::new()));
         let target = RealityServerTarget {
+            mldsa65_key: None,
             private_key,
             short_ids: vec![[0; 8]],
             dest: dest.clone(),

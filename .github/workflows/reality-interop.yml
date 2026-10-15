@@ -1,0 +1,51 @@
+name: REALITY interoperability
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  xray:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: v26.10.10
+            revision: 701af60772cda123492f86e383e1fdba066614a9
+          - name: main-2026-10-14
+            revision: 0888beb38a9ba45440557175e71ce21cf8ba3b13
+    name: Xray ${{ matrix.name }}
+    env:
+      CARGO_BUILD_JOBS: 1
+      GOMAXPROCS: 1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.1'
+          cache: false
+      - uses: actions/checkout@v4
+        with:
+          repository: XTLS/Xray-core
+          ref: ${{ matrix.revision }}
+          path: reality-peer
+      - name: Cache Rust artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-reality-${{ hashFiles('**/Cargo.lock') }}
+      - name: Build pinned Xray
+        working-directory: reality-peer
+        run: go build -p 1 -o "$RUNNER_TEMP/xray" ./main
+      - name: Run local REALITY peer matrix
+        env:
+          XRAY_BINARY: ${{ runner.temp }}/xray
+        run: cargo test --locked --features optional-peer-tests --test reality_interop -- --test-threads=1

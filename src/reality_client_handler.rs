@@ -18,6 +18,7 @@ use crate::tcp::tcp_handler::{TcpClientHandler, TcpClientSetupResult};
 /// the buffered sans-I/O pattern with RealityClientConnection.
 #[derive(Debug)]
 pub struct RealityClientHandler {
+    mldsa65_verify: Option<crate::reality::Mldsa65VerifyKey>,
     public_key: [u8; 32],
     short_id: [u8; 8],
     server_name: rustls::pki_types::ServerName<'static>,
@@ -40,6 +41,7 @@ impl RealityClientHandler {
         handler: Box<dyn TcpClientHandler>,
     ) -> Self {
         Self {
+            mldsa65_verify: None,
             public_key,
             short_id,
             server_name,
@@ -56,6 +58,7 @@ impl RealityClientHandler {
         udp_enabled: bool,
     ) -> Self {
         Self {
+            mldsa65_verify: None,
             public_key,
             short_id,
             server_name,
@@ -65,6 +68,11 @@ impl RealityClientHandler {
                 udp_enabled,
             },
         }
+    }
+
+    pub fn with_mldsa65_verify(mut self, key: Option<crate::reality::Mldsa65VerifyKey>) -> Self {
+        self.mldsa65_verify = key;
+        self
     }
 
     async fn setup_client_stream_common(
@@ -90,6 +98,7 @@ impl RealityClientHandler {
 
         log::debug!("REALITY CLIENT: Creating buffered RealityClientConnection");
         let reality_config = RealityClientConfig {
+            mldsa65_verify: self.mldsa65_verify.clone(),
             public_key: self.public_key,
             short_id: self.short_id,
             server_name: server_name_str.to_string(),

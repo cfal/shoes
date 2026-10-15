@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- REALITY clients now offer `X25519MLKEM768` first, with X25519 fallback. Servers accept both groups and follow the camouflage target's choice. Upgrade Xray servers to v25.5.16 or newer: v25.4.30 and earlier reject hybrid-selected target handshakes, so hybrid-first clients fail when the target selects that group.
+- Added optional pinned ML-DSA-65 REALITY authentication through `mldsa65_seed` (server), `mldsa65_verify` (client), and `generate-reality-mldsa65-keypair`. Configured clients reject missing or invalid signatures; signing requires enough room in the camouflage target's certificate flight.
 - Hardened malformed protocol framing, credential comparisons, replay rejection, and secret-safe diagnostics.
 - Preserved handshake early data and response ordering in TCP, TUN, Hysteria2, and TUIC forwarding; bounded initial writes and flushes.
 - Added `check` and `version` aliases, nonzero validation failures, last-good configuration preparation, and explicit signal handling. SIGHUP reloads even with `--no-reload`; orderly signal shutdown exits with status 0.

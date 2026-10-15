@@ -611,6 +611,7 @@ mod tests {
 
     fn completed_reality_connection() -> RealityServerConnection {
         let config = RealityServerConfig {
+            mldsa65_key: None,
             private_key: [0; 32],
             short_ids: vec![[0; 8]],
             dest: NetLocation::new(Address::UNSPECIFIED, 443),

@@ -176,6 +176,7 @@ pub fn derive_traffic_keys(
 /// # Returns
 /// Handshake traffic secrets and master secret
 pub fn derive_handshake_keys(
+    group: super::reality_key_exchange::RealityGroup,
     cipher_suite: CipherSuite,
     shared_secret: &[u8],
     _client_hello_hash: &[u8], // Not used in TLS 1.3 key derivation - kept for API consistency
@@ -186,12 +187,13 @@ pub fn derive_handshake_keys(
     let digest_algorithm = cipher_suite.digest_algorithm();
 
     // Validate input lengths
-    if shared_secret.len() != 32 {
+    if shared_secret.len() != group.secret_len() {
         return Err(Error::new(
             ErrorKind::InvalidInput,
             format!(
-                "Invalid shared_secret length: {} (expected 32)",
-                shared_secret.len()
+                "Invalid shared_secret length: {} (expected {})",
+                shared_secret.len(),
+                group.secret_len()
             ),
         ));
     }

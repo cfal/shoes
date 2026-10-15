@@ -7,6 +7,7 @@ use super::common::{
     HANDSHAKE_TYPE_ENCRYPTED_EXTENSIONS, HANDSHAKE_TYPE_FINISHED, HANDSHAKE_TYPE_SERVER_HELLO,
     VERSION_TLS_1_2_MAJOR, VERSION_TLS_1_2_MINOR,
 };
+use super::reality_key_exchange::{KeyShareRef, RealityGroup};
 use aws_lc_rs::signature::Ed25519KeyPair;
 use std::io::Result;
 
@@ -16,13 +17,20 @@ use std::io::Result;
 /// * `server_random` - 32 bytes of server random
 /// * `session_id` - Session ID from ClientHello (for compatibility)
 /// * `cipher_suite` - Selected cipher suite (e.g., 0x1301)
-/// * `key_share_data` - Server's X25519 public key (32 bytes)
+/// * `key_share_data` - Encoded share for the selected group
 pub fn construct_server_hello(
     server_random: &[u8; 32],
     session_id: &[u8],
     cipher_suite: u16,
+    group: RealityGroup,
     key_share_data: &[u8],
 ) -> Result<Vec<u8>> {
+    if key_share_data.len() != group.share_len(false) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Invalid server key share size",
+        ));
+    }
     let mut server_hello = Vec::new();
 
     // ServerHello structure:
@@ -67,7 +75,7 @@ pub fn construct_server_hello(
     let key_share_length = 2 + 2 + key_share_data.len(); // group + length + data
     extensions.extend_from_slice(&[0x00, 0x33]); // type = 51
     extensions.extend_from_slice(&(key_share_length as u16).to_be_bytes());
-    extensions.extend_from_slice(&[0x00, 0x1d]); // group = X25519 (0x001d)
+    extensions.extend_from_slice(&(group as u16).to_be_bytes());
     extensions.extend_from_slice(&(key_share_data.len() as u16).to_be_bytes());
     extensions.extend_from_slice(key_share_data);
 
@@ -266,19 +274,30 @@ pub const DEFAULT_ALPN_PROTOCOLS: &[&str] = &["h2", "http/1.1"];
 /// # Arguments
 /// * `client_random` - 32 bytes client random
 /// * `session_id` - 32 bytes session ID
-/// * `client_public_key` - X25519 public key bytes
+/// * `key_shares` - Supported groups and shares in preference order
 /// * `server_name` - SNI hostname
 /// * `cipher_suites` - Cipher suite IDs to offer (e.g., &[0x1301, 0x1302, 0x1303])
 /// * `alpn_protocols` - ALPN protocols to offer (e.g., &["h2", "http/1.1"])
 pub fn construct_client_hello(
     client_random: &[u8; 32],
     session_id: &[u8; 32],
-    client_public_key: &[u8],
+    key_shares: &[KeyShareRef<'_>],
     server_name: &str,
     cipher_suites: &[u16],
     alpn_protocols: &[&str],
 ) -> Result<Vec<u8>> {
-    let mut hello = Vec::with_capacity(512);
+    if key_shares.is_empty()
+        || key_shares.len() > 2
+        || key_shares
+            .iter()
+            .any(|share| share.data.len() != share.group.share_len(true))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Invalid client key shares",
+        ));
+    }
+    let mut hello = Vec::with_capacity(1800);
 
     // Handshake message type: ClientHello (0x01)
     hello.push(0x01);
@@ -338,21 +357,24 @@ pub fn construct_client_hello(
     // supported_groups extension (type 10)
     {
         extensions.extend_from_slice(&[0x00, 0x0a]); // Extension type: supported_groups
-        extensions.extend_from_slice(&[0x00, 0x04]); // Extension length: 4
-        extensions.extend_from_slice(&[0x00, 0x02]); // Supported groups length: 2
-        extensions.extend_from_slice(&[0x00, 0x1d]); // x25519
+        extensions.extend_from_slice(&((2 + key_shares.len() * 2) as u16).to_be_bytes());
+        extensions.extend_from_slice(&((key_shares.len() * 2) as u16).to_be_bytes());
+        for share in key_shares {
+            extensions.extend_from_slice(&(share.group as u16).to_be_bytes());
+        }
     }
 
     // key_share extension (type 51)
     {
         extensions.extend_from_slice(&[0x00, 0x33]); // Extension type: key_share
-        let key_share_len = 2 + 4 + client_public_key.len();
-        extensions.extend_from_slice(&(key_share_len as u16).to_be_bytes()); // Extension length
-        let key_share_list_len = 4 + client_public_key.len();
-        extensions.extend_from_slice(&(key_share_list_len as u16).to_be_bytes()); // Key share list length
-        extensions.extend_from_slice(&[0x00, 0x1d]); // Group: x25519
-        extensions.extend_from_slice(&(client_public_key.len() as u16).to_be_bytes()); // Key length
-        extensions.extend_from_slice(client_public_key); // Public key
+        let list_len: usize = key_shares.iter().map(|s| 4 + s.data.len()).sum();
+        extensions.extend_from_slice(&((list_len + 2) as u16).to_be_bytes());
+        extensions.extend_from_slice(&(list_len as u16).to_be_bytes());
+        for share in key_shares {
+            extensions.extend_from_slice(&(share.group as u16).to_be_bytes());
+            extensions.extend_from_slice(&(share.data.len() as u16).to_be_bytes());
+            extensions.extend_from_slice(share.data);
+        }
     }
 
     // signature_algorithms extension (type 13)
@@ -438,7 +460,13 @@ mod tests {
         let cipher_suite = 0x1301; // TLS_AES_128_GCM_SHA256
         let key_share = vec![0xAAu8; 32];
 
-        let result = construct_server_hello(&server_random, &session_id, cipher_suite, &key_share);
+        let result = construct_server_hello(
+            &server_random,
+            &session_id,
+            cipher_suite,
+            RealityGroup::X25519,
+            &key_share,
+        );
 
         assert!(result.is_ok());
         let msg = result.unwrap();
@@ -457,7 +485,7 @@ mod tests {
     fn test_construct_certificate() {
         use crate::reality::reality_certificate::generate_hmac_certificate;
         let auth_key = [0x42u8; 32];
-        let (cert, _) = generate_hmac_certificate(&auth_key, "test.example.com").unwrap();
+        let (cert, _) = generate_hmac_certificate(&auth_key, "test.example.com", None).unwrap();
         let result = construct_certificate(cert);
         assert!(result.is_ok());
         let msg = result.unwrap();
@@ -493,7 +521,10 @@ mod tests {
         let hello = construct_client_hello(
             &client_random,
             &session_id,
-            &client_public_key,
+            &[KeyShareRef {
+                group: RealityGroup::X25519,
+                data: &client_public_key,
+            }],
             "example.com",
             &[0x1301],
             &["h2"],

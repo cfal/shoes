@@ -406,6 +406,8 @@ pub enum ClientProxyConfig {
         h2mux: Option<H2MuxConfig>,
     },
     Reality {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mldsa65_verify: Option<String>,
         public_key: String,
         #[serde(default = "default_reality_client_short_id")]
         short_id: String,
