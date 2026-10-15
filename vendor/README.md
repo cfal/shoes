@@ -24,4 +24,6 @@ CARGO_BUILD_JOBS=1 cargo test --locked --lib --features ffi h3_ -- --test-thread
 
 Remove this patch and directory after upgrading to an upstream version that
 passes the empty-DATA and idle-stream regressions. No fixed upstream version was
-available when this patch was added.
+available when this patch was added. Only then remove the root package's
+`publish = false` guard: Cargo strips `[patch.crates-io]` and nested packages when
+publishing, so a registry installation would otherwise lose this fix.

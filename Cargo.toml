@@ -1,6 +1,7 @@
 [package]
 name = "shoes"
 version = "0.3.2"
+publish = false # The local h3 patch must not be dropped by crates.io packaging.
 edition = "2024"
 autotests = false
 license = "MIT"

@@ -56,10 +56,18 @@ For advanced access control (IP allowlist/blocklists), see [tobaru](https://gith
 
 Precompiled binaries for x86_64 and Apple aarch64 are available on [Github Releases](https://github.com/cfal/shoes/releases).
 
-Or install with cargo:
+For the previously published release:
 
 ```bash
 cargo install shoes
+```
+
+This branch temporarily vendors an HTTP/3 correctness fix that Cargo excludes
+from crates.io packages. Publishing is disabled until an upstream release includes
+the fix. Build this branch from its checkout to retain the patch:
+
+```bash
+cargo install --path . --locked
 ```
 
 ## Usage
