@@ -642,6 +642,19 @@ fn validate_server_config(
     rule_groups: &HashMap<String, Vec<RuleConfig>>,
     named_pems: &HashMap<String, String>,
 ) -> std::io::Result<()> {
+    super::types::xhttp::validate_server_transport(
+        &server_config.protocol,
+        &server_config.transport,
+    )?;
+    if matches!(server_config.protocol, ServerProxyConfig::Xhttp(_))
+        && server_config.transport == Transport::Quic
+        && server_config.quic_settings.as_ref().is_some_and(|quic| {
+            !quic.alpn_protocols.is_unspecified()
+                && quic.alpn_protocols.clone().into_vec() != ["h3"]
+        })
+    {
+        return Err(super::types::xhttp::invalid("QUIC XHTTP ALPN must be h3"));
+    }
     if server_config.transport == Transport::Udp {
         return Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
@@ -897,6 +910,10 @@ fn validate_client_proxy_structure(config: &ClientProxyConfig) -> std::io::Resul
         }
         ClientProxyConfig::ShadowTls { protocol, .. } => Some(protocol.as_ref()),
         ClientProxyConfig::Websocket(ws_config) => Some(ws_config.protocol.as_ref()),
+        ClientProxyConfig::Xhttp(config) => {
+            config.validate()?;
+            Some(config.protocol.as_ref())
+        }
         _ => None,
     };
     if let Some(inner) = inner {
@@ -964,6 +981,13 @@ fn validate_client_config(
         named_pems,
         client_config.address.address().hostname(),
     )?;
+
+    if crate::xhttp::connector::contains(&client_config.protocol) {
+        crate::xhttp::connector::build(
+            client_config,
+            std::sync::Arc::new(crate::resolver::NativeResolver::new()),
+        )?;
+    }
 
     Ok(())
 }
@@ -1078,6 +1102,11 @@ fn validate_client_proxy_config(
 
         ClientProxyConfig::Websocket(ws_config) => {
             validate_client_proxy_config(&mut ws_config.protocol, named_pems, None)?;
+        }
+
+        ClientProxyConfig::Xhttp(config) => {
+            config.validate()?;
+            validate_client_proxy_config(&mut config.protocol, named_pems, None)?;
         }
 
         ClientProxyConfig::Anytls {
@@ -1240,6 +1269,16 @@ fn validate_server_proxy_config(
                 std::io::ErrorKind::InvalidInput,
                 format!("{server_proxy_config} requires a top-level QUIC listener"),
             ));
+        }
+        ServerProxyConfig::Xhttp(config) => {
+            config.validate()?;
+            validate_server_proxy_config(
+                &mut config.protocol,
+                client_groups,
+                rule_groups,
+                named_pems,
+                ServerProtocolContext::Stream,
+            )?;
         }
         ServerProxyConfig::Anytls {
             padding_scheme: Some(lines),
@@ -1660,6 +1699,20 @@ fn validate_direct_connector_positions(
         if hop_index == 0 {
             // Direct connectors are allowed at hop 0
             continue;
+        }
+
+        let unsupported_h3 = |selection: &ConfigSelection<ClientConfig>| {
+            matches!(selection, ConfigSelection::Config(config)
+                if config.transport == Transport::Quic && crate::xhttp::connector::contains(&config.protocol))
+        };
+        if match hop {
+            ClientChainHop::Single(selection) => unsupported_h3(selection),
+            ClientChainHop::Pool(selections) => selections.iter().any(unsupported_h3),
+        } {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "XHTTP H3 is only supported at hop 0",
+            ));
         }
 
         // For hop 1+, check if any connector is direct

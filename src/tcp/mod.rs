@@ -1,3 +1,4 @@
+pub mod carrier_dialer;
 pub mod chain_builder;
 pub mod proxy_connector;
 pub mod proxy_connector_impl;

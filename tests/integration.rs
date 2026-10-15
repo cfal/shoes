@@ -64,3 +64,5 @@ mod vless_xudp_true_multiplexing;
 mod vmess;
 #[path = "cases/integration/vmess_xudp_integration.rs"]
 mod vmess_xudp;
+#[path = "cases/integration/xhttp_integration.rs"]
+mod xhttp;

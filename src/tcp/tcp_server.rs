@@ -135,11 +135,26 @@ pub async fn process_stream<AS>(
 where
     AS: AsyncStream + 'static,
 {
-    let _permit = crate::resources::try_stream().ok_or_else(crate::resources::exhausted)?;
-    let setup_server_stream_future = timeout(
+    let permit = crate::resources::try_stream().ok_or_else(crate::resources::exhausted)?;
+    process_stream_with_permit(
+        stream,
+        server_handler,
+        resolver,
+        permit,
         Duration::from_secs(60),
-        setup_server_stream(stream, server_handler),
-    );
+    )
+    .await
+}
+
+pub(crate) async fn process_stream_with_permit<AS: AsyncStream + 'static>(
+    stream: AS,
+    server_handler: Arc<dyn TcpServerHandler>,
+    resolver: Arc<dyn Resolver>,
+    _permit: crate::resources::BudgetPermit,
+    setup_timeout: Duration,
+) -> std::io::Result<()> {
+    let setup_server_stream_future =
+        timeout(setup_timeout, setup_server_stream(stream, server_handler));
 
     let setup_result = match setup_server_stream_future.await {
         Ok(Ok(r)) => r,
@@ -167,7 +182,7 @@ where
             initial_remote_data,
         } => {
             let setup_client_stream_future = timeout(
-                Duration::from_secs(60),
+                setup_timeout,
                 setup_client_tcp_stream(proxy_selector, resolver, remote_location.clone()),
             );
 
@@ -431,6 +446,7 @@ async fn start_tcp_servers(
         BindLocation::Address(addresses) => {
             // Shares protocol state across ports without reusing an interface-specific UDP bind IP.
             let mut handlers: HashMap<IpAddr, Arc<dyn TcpServerHandler>> = HashMap::new();
+            let mut services = super::tcp_server_handler_factory::HandlerServices::default();
             let mut listeners = Vec::new();
             for address in addresses.into_vec() {
                 for socket_addr in address.to_socket_addrs()? {
@@ -438,11 +454,12 @@ async fn start_tcp_servers(
                     let tcp_handler = match handlers.entry(socket_addr.ip()) {
                         std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
                         std::collections::hash_map::Entry::Vacant(entry) => entry.insert(
-                            create_tcp_server_handler(
+                            super::tcp_server_handler_factory::create_tcp_server_handler_shared(
                                 protocol.clone(),
                                 &client_proxy_selector,
                                 &resolver,
                                 Some(socket_addr.ip()),
+                                &mut services,
                             )?
                             .into(),
                         ),
@@ -630,7 +647,7 @@ mod lifetime_tests {
                 flushes: request_flushes.clone(),
             };
             let chain = ClientProxyChain::new(
-                vec![InitialHopEntry::Direct(Box::new(ReadyConnector(
+                vec![InitialHopEntry::Direct(Arc::new(ReadyConnector(
                     std::sync::Mutex::new(Some(outbound)),
                 )))],
                 vec![],
@@ -855,7 +872,7 @@ mod lifetime_tests {
             let marker = Arc::new(());
             let shutdowns = Arc::new(AtomicUsize::new(0));
             let chain = ClientProxyChain::new(
-                vec![InitialHopEntry::Direct(Box::new(PendingConnector))],
+                vec![InitialHopEntry::Direct(Arc::new(PendingConnector))],
                 vec![],
             );
             let selector = Arc::new(ClientProxySelector::new(vec![ConnectRule::new(

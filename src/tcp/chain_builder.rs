@@ -82,7 +82,7 @@ fn build_client_proxy_chain_with_limits(
 
             let socket =
                 SocketConnectorImpl::from_config_with_limits(config, target_address, limits)
-                    .map(|s| Box::new(s) as Box<dyn SocketConnector>)?;
+                    .map(|s| Arc::new(s) as Arc<dyn SocketConnector>)?;
 
             if config.protocol.is_direct() {
                 // Direct: socket only, no proxy
@@ -111,6 +111,9 @@ fn build_client_proxy_chain_with_limits(
             hop_configs
                 .into_iter()
                 .map(|config| {
+                    if config.transport == crate::config::Transport::Quic && crate::xhttp::connector::contains(&config.protocol) {
+                        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "XHTTP H3 is only supported at hop 0"));
+                    }
                     // Subsequent hops MUST NOT have direct protocol
                     if config.protocol.is_direct() {
                         return Err(std::io::Error::new(

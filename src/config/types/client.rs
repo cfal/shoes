@@ -460,6 +460,8 @@ pub enum ClientProxyConfig {
     },
     #[serde(alias = "ws")]
     Websocket(WebsocketClientConfig),
+    #[serde(alias = "splithttp")]
+    Xhttp(super::xhttp::XhttpClientConfig),
     #[serde(alias = "noop")]
     PortForward,
     /// AnyTLS outbound protocol
@@ -507,6 +509,7 @@ impl ClientProxyConfig {
             ClientProxyConfig::ShadowTls { .. } => "ShadowTLS",
             ClientProxyConfig::Vmess { .. } => "VMess",
             ClientProxyConfig::Websocket(..) => "WebSocket",
+            ClientProxyConfig::Xhttp(..) => "XHTTP",
             ClientProxyConfig::PortForward => "PortForward",
             ClientProxyConfig::Anytls { .. } => "AnyTLS",
             ClientProxyConfig::Naiveproxy { .. } => "NaiveProxy",

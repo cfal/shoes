@@ -27,6 +27,7 @@ use log::debug;
 use crate::address::ResolvedLocation;
 use crate::async_stream::AsyncMessageStream;
 use crate::resolver::Resolver;
+use crate::tcp::carrier_dialer::{CarrierDialer, QuicCarrier, RouteKey};
 use crate::tcp::proxy_connector::ProxyConnector;
 use crate::tcp::socket_connector::SocketConnector;
 use crate::tcp::tcp_handler::TcpClientSetupResult;
@@ -38,12 +39,12 @@ use crate::tcp::tcp_handler::TcpClientSetupResult;
 pub enum InitialHopEntry {
     /// Direct connection - socket only, no protocol setup.
     /// Connects directly to the next hop's proxy or final destination.
-    Direct(Box<dyn SocketConnector>),
+    Direct(Arc<dyn SocketConnector>),
 
     /// Proxy connection - socket + protocol setup paired together.
     /// Socket connects to proxy_location, then protocol wraps the stream.
     Proxy {
-        socket: Box<dyn SocketConnector>,
+        socket: Arc<dyn SocketConnector>,
         proxy: Box<dyn ProxyConnector>,
     },
 }
@@ -79,13 +80,13 @@ impl InitialHopEntry {
 pub struct ClientProxyChain {
     /// Initial hop pool: each entry is either Direct or Proxy.
     /// Socket and proxy are paired and selected together.
-    initial_hop: Vec<InitialHopEntry>,
+    initial_hop: Vec<Arc<InitialHopEntry>>,
     /// Round-robin index for initial hop selection.
     initial_hop_next_index: AtomicU32,
 
     /// Protocol connectors for subsequent hops (hops 1+).
     /// Outer vec = hops, inner vec = round-robin pool per hop.
-    subsequent_hops: Vec<Vec<Box<dyn ProxyConnector>>>,
+    subsequent_hops: Vec<Vec<Arc<dyn ProxyConnector>>>,
     /// Round-robin indices for each subsequent hop's pool.
     subsequent_next_indices: Vec<AtomicU32>,
 
@@ -120,6 +121,50 @@ impl std::fmt::Debug for ClientProxyChain {
 }
 
 impl ClientProxyChain {
+    fn needs_carrier_dialer(&self) -> bool {
+        self.initial_hop.iter().any(|entry| matches!(entry.as_ref(), InitialHopEntry::Proxy { proxy, .. } if proxy.needs_carrier_dialer()))
+            || self.subsequent_hops.iter().flatten().any(|proxy| proxy.needs_carrier_dialer())
+    }
+
+    fn selected_route(&self, resolver: &Arc<dyn Resolver>, udp: bool) -> SelectedRoute {
+        let udp_index = || {
+            let index = self
+                .udp_final_hop_next_index
+                .fetch_add(1, Ordering::Relaxed) as usize;
+            self.udp_final_hop_indices[index % self.udp_final_hop_indices.len()]
+        };
+        let initial_index = if udp && self.udp_uses_initial_hop {
+            udp_index()
+        } else {
+            self.initial_hop_next_index.fetch_add(1, Ordering::Relaxed) as usize
+                % self.initial_hop.len()
+        };
+        let subsequent = self
+            .subsequent_hops
+            .iter()
+            .enumerate()
+            .map(|(i, hop)| {
+                let index = if udp && i + 1 == self.subsequent_hops.len() {
+                    udp_index()
+                } else {
+                    self.subsequent_next_indices[i].fetch_add(1, Ordering::Relaxed) as usize
+                        % hop.len()
+                };
+                hop[index].clone()
+            })
+            .collect();
+        SelectedRoute {
+            socket: match self.initial_hop[initial_index].as_ref() {
+                InitialHopEntry::Direct(socket) | InitialHopEntry::Proxy { socket, .. } => {
+                    socket.clone()
+                }
+            },
+            initial: Some(self.initial_hop[initial_index].clone()),
+            subsequent,
+            resolver: resolver.clone(),
+        }
+    }
+
     /// Create a new chain from initial hop entries and subsequent hop pools.
     ///
     /// # Arguments
@@ -165,9 +210,12 @@ impl ClientProxyChain {
         let subsequent_next_indices = subsequent_hops.iter().map(|_| AtomicU32::new(0)).collect();
 
         Self {
-            initial_hop,
+            initial_hop: initial_hop.into_iter().map(Arc::new).collect(),
             initial_hop_next_index: AtomicU32::new(0),
-            subsequent_hops,
+            subsequent_hops: subsequent_hops
+                .into_iter()
+                .map(|hop| hop.into_iter().map(Arc::from).collect())
+                .collect(),
             subsequent_next_indices,
             udp_final_hop_indices,
             udp_final_hop_next_index: AtomicU32::new(0),
@@ -195,7 +243,7 @@ impl ClientProxyChain {
         }
         self.initial_hop
             .iter()
-            .all(|entry| matches!(entry, InitialHopEntry::Direct(_)))
+            .all(|entry| matches!(entry.as_ref(), InitialHopEntry::Direct(_)))
     }
 
     /// Returns the bind_interface from a direct-only chain.
@@ -205,10 +253,12 @@ impl ClientProxyChain {
             return None;
         }
         // All entries should have the same bind_interface, return from the first.
-        self.initial_hop.first().and_then(|entry| match entry {
-            InitialHopEntry::Direct(socket) => socket.bind_interface(),
-            InitialHopEntry::Proxy { .. } => None,
-        })
+        self.initial_hop
+            .first()
+            .and_then(|entry| match entry.as_ref() {
+                InitialHopEntry::Direct(socket) => socket.bind_interface(),
+                InitialHopEntry::Proxy { .. } => None,
+            })
     }
 
     /// Select an initial hop entry (round-robin).
@@ -244,6 +294,12 @@ impl ClientProxyChain {
         remote_location: ResolvedLocation,
         resolver: &Arc<dyn Resolver>,
     ) -> std::io::Result<TcpClientSetupResult> {
+        if self.needs_carrier_dialer() {
+            return self
+                .selected_route(resolver, false)
+                .connect(remote_location)
+                .await;
+        }
         // Select initial hop entry (socket + optional proxy paired)
         let entry = self.select_initial_hop_entry();
 
@@ -356,6 +412,26 @@ impl ClientProxyChain {
             ));
         }
 
+        if self.needs_carrier_dialer() {
+            let route = self.selected_route(resolver, true);
+            return match route.last_proxy() {
+                Some(proxy) => {
+                    proxy
+                        .connect_udp_with_dialer(
+                            route.prefix(proxy.proxy_location().into()),
+                            target,
+                        )
+                        .await
+                }
+                None => {
+                    route
+                        .socket()
+                        .connect_udp_bidirectional(resolver, target)
+                        .await
+                }
+            };
+        }
+
         if self.udp_uses_initial_hop {
             // Case 1: No subsequent hops - initial hop IS the final hop
             // Select from UDP-capable initial hop entries
@@ -363,7 +439,7 @@ impl ClientProxyChain {
                 .udp_final_hop_next_index
                 .fetch_add(1, Ordering::Relaxed) as usize;
             let pool_idx = self.udp_final_hop_indices[idx % self.udp_final_hop_indices.len()];
-            let entry = &self.initial_hop[pool_idx];
+            let entry = self.initial_hop[pool_idx].as_ref();
 
             debug!(
                 "Chain UDP connect: 1 hop (initial IS final), target={}",
@@ -506,6 +582,267 @@ impl ClientProxyChain {
                 }
             }
         }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SelectedRoute {
+    socket: Arc<dyn SocketConnector>,
+    initial: Option<Arc<InitialHopEntry>>,
+    subsequent: Vec<Arc<dyn ProxyConnector>>,
+    resolver: Arc<dyn Resolver>,
+}
+
+impl SelectedRoute {
+    fn socket(&self) -> &dyn SocketConnector {
+        self.socket.as_ref()
+    }
+
+    fn last_proxy(&self) -> Option<&dyn ProxyConnector> {
+        self.subsequent
+            .last()
+            .map(|p| p.as_ref())
+            .or_else(|| match self.initial.as_deref() {
+                Some(InitialHopEntry::Proxy { proxy, .. }) => Some(proxy.as_ref()),
+                _ => None,
+            })
+    }
+
+    fn prefix(&self, target: ResolvedLocation) -> Arc<dyn CarrierDialer> {
+        let mut route = self.clone();
+        if route.subsequent.pop().is_none() {
+            // A pooled prefix must not retain the connector that owns its pool.
+            route.initial = None;
+        }
+        let mut identities = vec![Arc::as_ptr(&route.socket) as *const () as usize];
+        if let Some(initial) = &route.initial {
+            identities.push(Arc::as_ptr(initial) as usize);
+        }
+        identities.extend(
+            route
+                .subsequent
+                .iter()
+                .map(|p| Arc::as_ptr(p) as *const () as usize),
+        );
+        Arc::new(PrefixDialer {
+            route,
+            target,
+            key: RouteKey(identities),
+        })
+    }
+
+    async fn connect(&self, target: ResolvedLocation) -> std::io::Result<TcpClientSetupResult> {
+        match self.last_proxy() {
+            Some(proxy) => {
+                if self.subsequent.is_empty()
+                    && !proxy.needs_carrier_dialer()
+                    && let Some(result) = proxy.try_reuse_tcp_stream(&target).await?
+                {
+                    return Ok(result);
+                }
+                proxy
+                    .connect_tcp_with_dialer(self.prefix(proxy.proxy_location().into()), &target)
+                    .await
+            }
+            None => Ok(TcpClientSetupResult {
+                client_stream: self.socket().connect(&self.resolver, &target).await?,
+                early_data: None,
+            }),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PrefixDialer {
+    route: SelectedRoute,
+    target: ResolvedLocation,
+    key: RouteKey,
+}
+
+#[cfg(test)]
+mod carrier_tests {
+    use super::*;
+    use crate::address::NetLocation;
+    use crate::async_stream::AsyncStream;
+    use std::sync::Mutex;
+
+    #[derive(Debug)]
+    struct Socket(usize, Arc<Mutex<Vec<String>>>);
+    #[async_trait::async_trait]
+    impl SocketConnector for Socket {
+        async fn connect(
+            &self,
+            _: &Arc<dyn Resolver>,
+            target: &ResolvedLocation,
+        ) -> std::io::Result<Box<dyn AsyncStream>> {
+            self.1
+                .lock()
+                .unwrap()
+                .push(format!("socket {} -> {}", self.0, target));
+            Ok(Box::new(tokio::io::duplex(64).0))
+        }
+        async fn connect_udp_bidirectional(
+            &self,
+            _: &Arc<dyn Resolver>,
+            _: ResolvedLocation,
+        ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
+            unreachable!()
+        }
+        fn bind_interface(&self) -> Option<&str> {
+            None
+        }
+    }
+
+    #[derive(Debug)]
+    struct Proxy {
+        location: NetLocation,
+        lazy: bool,
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+    #[async_trait::async_trait]
+    impl ProxyConnector for Proxy {
+        fn proxy_location(&self) -> &NetLocation {
+            &self.location
+        }
+        fn supports_udp_over_tcp(&self) -> bool {
+            true
+        }
+        fn needs_carrier_dialer(&self) -> bool {
+            self.lazy
+        }
+        async fn setup_tcp_stream(
+            &self,
+            stream: Box<dyn AsyncStream>,
+            target: &ResolvedLocation,
+        ) -> std::io::Result<TcpClientSetupResult> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("{} -> {}", self.location, target));
+            Ok(TcpClientSetupResult {
+                client_stream: stream,
+                early_data: None,
+            })
+        }
+        async fn connect_tcp_with_dialer(
+            &self,
+            dialer: Arc<dyn CarrierDialer>,
+            target: &ResolvedLocation,
+        ) -> std::io::Result<TcpClientSetupResult> {
+            if self.lazy {
+                drop(dialer.open_stream().await?);
+            }
+            self.setup_tcp_stream(dialer.open_stream().await?, target)
+                .await
+        }
+        async fn setup_udp_bidirectional(
+            &self,
+            _: Box<dyn AsyncStream>,
+            _: ResolvedLocation,
+        ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
+            unreachable!()
+        }
+    }
+
+    #[tokio::test]
+    async fn redial_replays_exact_selected_prefix_without_round_robin_or_direct_bypass() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let location = |s| NetLocation::from_str(s, None).unwrap();
+        let proxy = |address, lazy| {
+            Box::new(Proxy {
+                location: location(address),
+                lazy,
+                calls: calls.clone(),
+            }) as Box<dyn ProxyConnector>
+        };
+        let chain = ClientProxyChain::new(
+            (0..2)
+                .map(|i| InitialHopEntry::Proxy {
+                    socket: Arc::new(Socket(i, calls.clone())),
+                    proxy: proxy("first.test:80", false),
+                })
+                .collect(),
+            vec![vec![proxy("xhttp.test:443", true)]],
+        );
+        let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
+        for index in 0..2 {
+            chain
+                .connect_tcp(location("target.test:80").into(), &resolver)
+                .await
+                .unwrap();
+            assert_eq!(
+                *calls.lock().unwrap(),
+                vec![
+                    format!("socket {index} -> first.test:80"),
+                    "first.test:80 -> xhttp.test:443".into(),
+                    format!("socket {index} -> first.test:80"),
+                    "first.test:80 -> xhttp.test:443".into(),
+                    "xhttp.test:443 -> target.test:80".into(),
+                ]
+            );
+            calls.lock().unwrap().clear();
+        }
+    }
+
+    #[test]
+    fn pooled_prefix_does_not_retain_its_own_proxy() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let chain = ClientProxyChain::new(
+            vec![InitialHopEntry::Proxy {
+                socket: Arc::new(Socket(0, calls.clone())),
+                proxy: Box::new(Proxy {
+                    location: NetLocation::from_str("xhttp.test:443", None).unwrap(),
+                    lazy: true,
+                    calls,
+                }),
+            }],
+            vec![],
+        );
+        let initial = Arc::downgrade(&chain.initial_hop[0]);
+        let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
+        let prefix = chain.selected_route(&resolver, false).prefix(
+            NetLocation::from_str("xhttp.test:443", None)
+                .unwrap()
+                .into(),
+        );
+        drop(chain);
+        assert!(initial.upgrade().is_none());
+        assert_eq!(prefix.route_key().0.len(), 1);
+    }
+}
+
+#[async_trait::async_trait]
+impl CarrierDialer for PrefixDialer {
+    fn route_key(&self) -> &RouteKey {
+        &self.key
+    }
+
+    async fn open_stream(&self) -> std::io::Result<Box<dyn crate::async_stream::AsyncStream>> {
+        let result = self.route.connect(self.target.clone()).await?;
+        if result
+            .early_data
+            .as_ref()
+            .is_some_and(|data| !data.is_empty())
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "unexpected early data from intermediate proxy",
+            ));
+        }
+        Ok(result.client_stream)
+    }
+
+    async fn open_quic(&self) -> std::io::Result<QuicCarrier> {
+        if self.route.last_proxy().is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "HTTP/3 requires a first-hop QUIC carrier",
+            ));
+        }
+        self.route
+            .socket()
+            .connect_quic(&self.route.resolver, &self.target)
+            .await
     }
 }
 
@@ -781,8 +1118,8 @@ mod tests {
         }
     }
 
-    fn mock_socket(_id: usize) -> Box<dyn SocketConnector> {
-        Box::new(MockSocketConnector)
+    fn mock_socket(_id: usize) -> Arc<dyn SocketConnector> {
+        Arc::new(MockSocketConnector)
     }
 
     fn mock_proxy(port: u16, supports_udp: bool) -> Box<dyn ProxyConnector> {
@@ -1048,7 +1385,7 @@ mod tests {
             let entry = &chain.initial_hop[pool_idx];
             let expected_udp_idx = iteration % 2; // 0 or 1 in udp_initial_hop_indices
 
-            match (expected_udp_idx, entry) {
+            match (expected_udp_idx, entry.as_ref()) {
                 (0, InitialHopEntry::Proxy { proxy, .. }) => {
                     // UDP index 0 -> initial_hop[1] -> port 1081
                     assert_eq!(

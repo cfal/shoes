@@ -1,0 +1,90 @@
+# Generate cert.pem/key.pem for localhost before running this example.
+# H1/H2 share the TCP service; H3 is a separate QUIC service.
+- address: "0.0.0.0:8443"
+  protocol:
+    type: tls
+    default_target:
+      cert: cert.pem
+      key: key.pem
+      protocol:
+        type: xhttp
+        path: /tunnel
+        mode: auto
+        protocol:
+          type: vless
+          user_id: "550e8400-e29b-41d4-a716-446655440000"
+
+- address: "0.0.0.0:8443"
+  transport: quic
+  quic_settings:
+    cert: cert.pem
+    key: key.pem
+  protocol:
+    type: xhttp
+    path: /tunnel
+    protocol:
+      type: vless
+      user_id: "550e8400-e29b-41d4-a716-446655440000"
+
+# TLS/H2 packet-up. Replace verify: false with certificate verification in production.
+- address: "0.0.0.0:1080"
+  protocol:
+    type: socks
+  rules:
+    - masks: "0.0.0.0/0"
+      client_chains:
+        - - address: "127.0.0.1:8443"
+            protocol:
+              type: tls
+              sni_hostname: localhost
+              verify: false
+              protocol:
+                type: xhttp
+                path: /tunnel
+                http_version: h2
+                mode: packet-up
+                protocol:
+                  type: vless
+                  user_id: "550e8400-e29b-41d4-a716-446655440000"
+
+# TLS/H1 stream-up uses separate upload and download connections.
+- address: "0.0.0.0:1081"
+  protocol:
+    type: socks
+  rules:
+    - masks: "0.0.0.0/0"
+      client_chains:
+        - - address: "127.0.0.1:8443"
+            protocol:
+              type: tls
+              sni_hostname: localhost
+              verify: false
+              protocol:
+                type: xhttp
+                path: /tunnel
+                http_version: h1
+                mode: stream-up
+                protocol:
+                  type: vless
+                  user_id: "550e8400-e29b-41d4-a716-446655440000"
+
+# HTTP/3 stream-one. QUIC XHTTP must be the first proxy hop.
+- address: "0.0.0.0:1082"
+  protocol:
+    type: socks
+  rules:
+    - masks: "0.0.0.0/0"
+      client_chains:
+        - - address: "127.0.0.1:8443"
+            transport: quic
+            quic_settings:
+              sni_hostname: localhost
+              verify: false
+            protocol:
+              type: xhttp
+              path: /tunnel
+              http_version: h3
+              mode: stream-one
+              protocol:
+                type: vless
+                user_id: "550e8400-e29b-41d4-a716-446655440000"

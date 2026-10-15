@@ -646,6 +646,8 @@ impl WebsocketPingType {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ServerProxyConfig {
+    #[serde(alias = "splithttp")]
+    Xhttp(super::xhttp::XhttpServerConfig),
     Http {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         username: Option<String>,
@@ -829,6 +831,7 @@ impl std::fmt::Display for ServerProxyConfig {
             }
             Self::Vmess { .. } => write!(f, "Vmess"),
             Self::Websocket { .. } => write!(f, "Websocket"),
+            Self::Xhttp(..) => write!(f, "XHTTP"),
             Self::PortForward { .. } => write!(f, "Portforward"),
             Self::Hysteria2 { .. } => write!(f, "Hysteria2"),
             Self::TuicV5 { .. } => write!(f, "TuicV5"),

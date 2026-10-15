@@ -32,19 +32,31 @@ struct BudgetState {
 }
 
 #[derive(Debug)]
-pub(crate) struct Budget(Mutex<BudgetState>);
+pub(crate) struct Budget(Mutex<BudgetState>, Arc<tokio::sync::Notify>);
 
 impl Budget {
     pub(crate) fn new(limit: Option<usize>) -> Self {
-        Self(Mutex::new(BudgetState {
-            limit,
-            ..Default::default()
-        }))
+        Self(
+            Mutex::new(BudgetState {
+                limit,
+                ..Default::default()
+            }),
+            Arc::new(tokio::sync::Notify::new()),
+        )
     }
 
     fn set_limit(&self, limit: Option<usize>) {
         // Keep outstanding reservations when a config reload changes admission policy.
         self.0.lock().limit = limit;
+        self.1.notify_waiters();
+    }
+
+    pub(crate) fn limit(&self) -> Option<usize> {
+        self.0.lock().limit
+    }
+
+    pub(crate) fn released(&self) -> tokio::sync::futures::OwnedNotified {
+        self.1.clone().notified_owned()
     }
 
     pub(crate) fn acquire(self: &Arc<Self>, count: usize) -> Option<BudgetPermit> {
@@ -87,9 +99,21 @@ pub(crate) struct BudgetPermit {
     count: usize,
 }
 
+impl BudgetPermit {
+    pub(crate) fn split(&mut self, count: usize) -> Self {
+        assert!(count <= self.count);
+        self.count -= count;
+        Self {
+            budget: self.budget.clone(),
+            count,
+        }
+    }
+}
+
 impl Drop for BudgetPermit {
     fn drop(&mut self) {
         self.budget.0.lock().active -= self.count;
+        self.budget.1.notify_waiters();
     }
 }
 

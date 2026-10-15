@@ -38,6 +38,27 @@ use crate::websocket::{WebsocketServerTarget, WebsocketTcpServerHandler};
 
 use super::tcp_client_handler_factory::create_tcp_client_proxy_selector;
 
+#[derive(Default)]
+pub(crate) struct HandlerServices {
+    xhttp: std::collections::HashMap<Vec<String>, crate::xhttp::XhttpServer>,
+}
+
+struct ServiceScope<'a> {
+    services: &'a mut HandlerServices,
+    path: Vec<String>,
+}
+
+impl ServiceScope<'_> {
+    fn child(&mut self, key: String) -> ServiceScope<'_> {
+        let mut path = self.path.clone();
+        path.push(key);
+        ServiceScope {
+            services: self.services,
+            path,
+        }
+    }
+}
+
 fn create_auth_credentials(
     username: Option<String>,
     password: Option<String>,
@@ -65,7 +86,51 @@ pub fn create_tcp_server_handler(
     resolver: &Arc<dyn Resolver>,
     bind_ip: Option<IpAddr>,
 ) -> std::io::Result<Box<dyn TcpServerHandler>> {
+    create_tcp_server_handler_shared(
+        server_proxy_config,
+        client_proxy_selector,
+        resolver,
+        bind_ip,
+        &mut HandlerServices::default(),
+    )
+}
+
+pub(crate) fn create_tcp_server_handler_shared(
+    config: ServerProxyConfig,
+    selector: &Arc<ClientProxySelector>,
+    resolver: &Arc<dyn Resolver>,
+    bind_ip: Option<IpAddr>,
+    services: &mut HandlerServices,
+) -> std::io::Result<Box<dyn TcpServerHandler>> {
+    create_handler(
+        config,
+        selector,
+        resolver,
+        bind_ip,
+        &mut ServiceScope {
+            services,
+            path: Vec::new(),
+        },
+    )
+}
+
+fn create_handler(
+    server_proxy_config: ServerProxyConfig,
+    client_proxy_selector: &Arc<ClientProxySelector>,
+    resolver: &Arc<dyn Resolver>,
+    bind_ip: Option<IpAddr>,
+    scope: &mut ServiceScope<'_>,
+) -> std::io::Result<Box<dyn TcpServerHandler>> {
     Ok(match server_proxy_config {
+        ServerProxyConfig::Xhttp(config) => {
+            let service = match scope.services.xhttp.entry(scope.path.clone()) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::hash_map::Entry::Vacant(entry) => entry.insert(
+                    crate::xhttp::XhttpServer::new(config, client_proxy_selector, resolver, None)?,
+                ),
+            };
+            Box::new(service.clone())
+        }
         ServerProxyConfig::Http { username, password } => Box::new(HttpTcpServerHandler::new(
             create_auth_credentials(username, password),
             client_proxy_selector.clone(),
@@ -165,26 +230,39 @@ pub fn create_tcp_server_handler(
                 .into_iter()
                 .map(|(sni, config)| {
                     Ok((
-                        sni,
-                        create_tls_server_target(config, client_proxy_selector, resolver, bind_ip)?,
+                        sni.clone(),
+                        create_tls_server_target(
+                            config,
+                            client_proxy_selector,
+                            resolver,
+                            bind_ip,
+                            &mut scope.child(format!("tls:{sni}")),
+                        )?,
                     ))
                 })
                 .collect::<std::io::Result<FxHashMap<String, TlsServerTarget>>>()?;
             let default_tls_target = default_tls_target
                 .map(|config| {
-                    create_tls_server_target(*config, client_proxy_selector, resolver, bind_ip)
+                    create_tls_server_target(
+                        *config,
+                        client_proxy_selector,
+                        resolver,
+                        bind_ip,
+                        &mut scope.child("default".into()),
+                    )
                 })
                 .transpose()?;
             let shadowtls_targets = shadowtls_targets
                 .into_iter()
                 .map(|(sni, config)| {
                     Ok((
-                        sni,
+                        sni.clone(),
                         create_shadow_tls_server_target(
                             config,
                             client_proxy_selector,
                             resolver,
                             bind_ip,
+                            &mut scope.child(format!("shadowtls:{sni}")),
                         )?,
                     ))
                 })
@@ -194,12 +272,13 @@ pub fn create_tcp_server_handler(
                 .into_iter()
                 .map(|(sni, config)| {
                     Ok((
-                        sni,
+                        sni.clone(),
                         create_reality_server_target(
                             config,
                             client_proxy_selector,
                             resolver,
                             bind_ip,
+                            &mut scope.child(format!("reality:{sni}")),
                         )?,
                     ))
                 })
@@ -227,8 +306,15 @@ pub fn create_tcp_server_handler(
             let server_targets: Vec<WebsocketServerTarget> = targets
                 .into_vec()
                 .into_iter()
-                .map(|config| {
-                    create_websocket_server_target(config, client_proxy_selector, resolver, bind_ip)
+                .enumerate()
+                .map(|(index, config)| {
+                    create_websocket_server_target(
+                        config,
+                        client_proxy_selector,
+                        resolver,
+                        bind_ip,
+                        &mut scope.child(format!("ws:{index}")),
+                    )
                 })
                 .collect::<std::io::Result<Vec<_>>>()?;
             Box::new(WebsocketTcpServerHandler::new(server_targets))
@@ -310,6 +396,7 @@ fn create_tls_server_target(
     client_proxy_selector: &Arc<ClientProxySelector>,
     resolver: &Arc<dyn Resolver>,
     bind_ip: Option<IpAddr>,
+    scope: &mut ServiceScope<'_>,
 ) -> std::io::Result<TlsServerTarget> {
     let TlsServerConfig {
         key_exchange_groups,
@@ -352,6 +439,8 @@ fn create_tls_server_target(
             );
         }
         naive_alpn
+    } else if let ServerProxyConfig::Xhttp(config) = &protocol {
+        config.tls_alpn(&alpn_protocols)?
     } else {
         alpn_protocols.into_vec()
     };
@@ -399,7 +488,7 @@ fn create_tls_server_target(
     } else if vision {
         InnerProtocol::VisionVless(create_vision_vless_config(&protocol)?)
     } else {
-        let handler = create_tcp_server_handler(protocol, &effective_selector, resolver, bind_ip)?;
+        let handler = create_handler(protocol, &effective_selector, resolver, bind_ip, scope)?;
         InnerProtocol::Normal(handler)
     };
 
@@ -415,6 +504,7 @@ fn create_shadow_tls_server_target(
     client_proxy_selector: &Arc<ClientProxySelector>,
     resolver: &Arc<dyn Resolver>,
     bind_ip: Option<IpAddr>,
+    scope: &mut ServiceScope<'_>,
 ) -> std::io::Result<TlsServerTarget> {
     let ShadowTlsServerConfig {
         password,
@@ -465,7 +555,7 @@ fn create_shadow_tls_server_target(
         client_proxy_selector.clone()
     };
 
-    let handler = create_tcp_server_handler(protocol, &effective_selector, resolver, bind_ip)?;
+    let handler = create_handler(protocol, &effective_selector, resolver, bind_ip, scope)?;
 
     Ok(TlsServerTarget::ShadowTls(ShadowTlsServerTarget::new(
         password,
@@ -479,6 +569,7 @@ fn create_reality_server_target(
     client_proxy_selector: &Arc<ClientProxySelector>,
     resolver: &Arc<dyn Resolver>,
     bind_ip: Option<IpAddr>,
+    scope: &mut ServiceScope<'_>,
 ) -> std::io::Result<TlsServerTarget> {
     let RealityServerConfig {
         mldsa65_seed,
@@ -547,7 +638,7 @@ fn create_reality_server_target(
     } else if vision {
         InnerProtocol::VisionVless(create_vision_vless_config(&protocol)?)
     } else {
-        let handler = create_tcp_server_handler(protocol, &effective_selector, resolver, bind_ip)?;
+        let handler = create_handler(protocol, &effective_selector, resolver, bind_ip, scope)?;
         InnerProtocol::Normal(handler)
     };
 
@@ -590,6 +681,7 @@ fn create_websocket_server_target(
     client_proxy_selector: &Arc<ClientProxySelector>,
     resolver: &Arc<dyn Resolver>,
     bind_ip: Option<IpAddr>,
+    scope: &mut ServiceScope<'_>,
 ) -> std::io::Result<WebsocketServerTarget> {
     let WebsocketServerConfig {
         matching_path,
@@ -618,7 +710,7 @@ fn create_websocket_server_target(
         client_proxy_selector.clone()
     };
 
-    let handler = create_tcp_server_handler(protocol, &effective_selector, resolver, bind_ip)?;
+    let handler = create_handler(protocol, &effective_selector, resolver, bind_ip, scope)?;
 
     Ok(WebsocketServerTarget {
         matching_path,

@@ -15,8 +15,10 @@
 //!
 //! `protocol: direct` does NOT create a ProxyConnector - it only creates a SocketConnector.
 
+use super::carrier_dialer::CarrierDialer;
 use async_trait::async_trait;
 use std::fmt::Debug;
+use std::sync::Arc;
 
 use crate::address::{NetLocation, ResolvedLocation};
 use crate::async_stream::{AsyncMessageStream, AsyncStream};
@@ -37,6 +39,28 @@ use crate::tcp::tcp_handler::TcpClientSetupResult;
     reason = "async-trait adds must_use to boxed futures"
 )]
 pub trait ProxyConnector: Send + Sync + Debug {
+    fn needs_carrier_dialer(&self) -> bool {
+        false
+    }
+
+    async fn connect_tcp_with_dialer(
+        &self,
+        dialer: Arc<dyn CarrierDialer>,
+        target: &ResolvedLocation,
+    ) -> std::io::Result<TcpClientSetupResult> {
+        self.setup_tcp_stream(dialer.open_stream().await?, target)
+            .await
+    }
+
+    async fn connect_udp_with_dialer(
+        &self,
+        dialer: Arc<dyn CarrierDialer>,
+        target: ResolvedLocation,
+    ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
+        self.setup_udp_bidirectional(dialer.open_stream().await?, target)
+            .await
+    }
+
     /// Returns the proxy server address.
     ///
     /// This is used to determine where the SocketConnector should connect to

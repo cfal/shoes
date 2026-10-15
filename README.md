@@ -25,6 +25,7 @@ All server protocols plus:
 - **ShadowTLS v3**
 - **TLS**
 - **WebSocket** (Shadowsocks SIP003)
+- **XHTTP / SplitHTTP** (packet-up, stream-up, stream-one over HTTP/1.1, HTTP/2, HTTP/3)
 - **XTLS Reality**
   - Hybrid-first X25519MLKEM768 key exchange and optional ML-DSA-65 server authentication
 - **XTLS Vision** (for VLESS)
@@ -55,10 +56,18 @@ For advanced access control (IP allowlist/blocklists), see [tobaru](https://gith
 
 Precompiled binaries for x86_64 and Apple aarch64 are available on [Github Releases](https://github.com/cfal/shoes/releases).
 
-Or install with cargo:
+For the previously published release:
 
 ```bash
 cargo install shoes
+```
+
+This branch temporarily vendors an HTTP/3 correctness fix that Cargo excludes
+from crates.io packages. Publishing is disabled until an upstream release includes
+the fix. Build this branch from its checkout to retain the patch:
+
+```bash
+cargo install --path . --locked
 ```
 
 ## Usage
@@ -272,6 +281,74 @@ the configured MTU and TCP buffer sizes are unchanged. Set
 Explicit enablement is not supported with `device_fd`, packet-information
 headers, or non-Linux devices. Automatic setup falls back to ordinary packets
 if offload initialization fails.
+
+### XHTTP / SplitHTTP
+
+See [examples/xhttp.yaml](examples/xhttp.yaml) for client/server configurations
+covering all three modes and HTTP versions. `type: splithttp` is an alias for
+`type: xhttp`; the inner `protocol` still handles authentication and destinations.
+
+- `http_version: auto`: H1 for plaintext TCP, H2 for TLS/REALITY, H3 for QUIC.
+  An explicit TLS ALPN of `http/1.1` selects H1. Explicit plaintext H2 uses h2c
+  prior knowledge, not HTTP Upgrade.
+- Client `mode: auto`: packet-up normally, stream-one under REALITY. Servers
+  default to accepting all modes. Stream-one uses one request; stream-up uses
+  separate streaming upload/download requests; packet-up uses bounded POSTs.
+- Packet-up cannot transmit upload EOF. Use a streaming mode when the target
+  must receive EOF before responding. After upload shutdown and packet acknowledgements,
+  the client allows a one-second download tail before closing the session.
+  Streaming bodies require unbuffered proxies. H1 stream-one closes the whole HTTP
+  connection when its response ends; use H2/H3 or stream-up for remote-first half-close.
+- H1/H2 preserve selected upstream proxy chains. H3 must be the first proxy hop;
+  it reuses the existing QUIC/H3 dependencies, not Hysteria2 framing.
+- `host` overrides HTTP authority independently of TLS SNI. Default Referer
+  padding, path/query handling, packet sizing/pacing, and stream-up keepalives
+  follow modern Xray. `limits` bounds sessions, buffered bytes, requests and
+  setup/header deadlines and packet inactivity; `pool` bounds connections and
+  idle retention.
+  Split legs may use different carriers on the same selected route. H2/H3 admission
+  respects peer stream capacity; draining carriers retain their connection slots.
+  A full pool refuses new sessions rather than exceeding its configured cap.
+- `packet_timeout_secs` defaults to 300 seconds and measures inactivity, not a
+  POST's total lifetime. On the server, each POST's body must keep receiving
+  nonempty bytes. Admission and forwarding-ACK waits stay alive while the inner
+  stream consumes upload bytes or the original receiver of the missing next
+  packet receives bytes. Duplicate bodies, empty packets, download traffic and
+  resource wakeups do not count as progress.
+  On the client, the timer covers only body transmission: H2/H3 transport
+  acceptance, or handoff into Hyper's bounded H1 write buffer. After the body is
+  sent, the forwarding ACK has no packet or response-header deadline. Healthy
+  slow destinations therefore need not forward a whole packet per timeout.
+  Carrier readiness and request headers retain `response_header_timeout_secs`;
+  other request types also retain it for response headers. `setup_timeout_secs`
+  is unchanged. A live peer that never ACKs can retain bounded client resources
+  until the stream is dropped or the transport fails.
+- Shoes H2/H3 packet-up clients can transmit four POST bodies concurrently.
+  Budget the server's `max_session_buffered_bytes` for at least four maximum
+  `sc_max_each_post_bytes` packets, plus room for duplex pipe buffers; the defaults
+  provide this. Smaller budgets remain valid for H1 or lower-concurrency clients,
+  but concurrent bodies can exhaust shared transport credit before their
+  predecessors finish. Byte caps do not provide per-session transport isolation:
+  stalled consumers or global byte-budget exhaustion can also block other sessions
+  on the same carrier. Server packet inactivity timeouts still bound stalled waits.
+  Slowly progressing sessions can hold global byte-budget capacity and shared
+  carrier flow-control credit indefinitely, so other sessions may time out.
+- The server bounds the initial TCP HTTP header/preface to four seconds after
+  transport setup (or the shorter configured setup timeout). H1 keep-alive idle
+  periods and subsequent partial headers have no deadline. For exposed listeners,
+  set `global_limits.max_connections` and `global_limits.max_connections_per_ip`.
+- Xray 26.10.10's H1 packet-up uploader can lose pipelined requests when Go GC
+  discards pooled connections with unread responses. Sustained uploads to slow
+  destinations can therefore fail despite bounded server backpressure. Prefer
+  H2/H3 or a streaming mode for these clients; disabling GC is not a production fix.
+- Advanced placement/padding obfuscation, custom session IDs, separate downloads,
+  full XMUX policy, and Vision over XHTTP are not supported. Unsupported options
+  are rejected rather than silently ignored. Public CDN compatibility is not implied.
+- REALITY XHTTP interoperates with Xray 26.10.10 in both directions over H2,
+  including all three modes and `auto`. REALITY prefers X25519MLKEM768 with
+  X25519 fallback according to the cover target. Optional `mldsa65_seed` and
+  `mldsa65_verify` apply to the outer REALITY configuration, independently of
+  XHTTP; see [CONFIG.md](CONFIG.md#reality-client).
 
 ## Similar Projects
 

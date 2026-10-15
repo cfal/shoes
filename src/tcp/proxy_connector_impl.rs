@@ -28,6 +28,7 @@ use crate::tcp::tcp_handler::{TcpClientHandler, TcpClientSetupResult};
 pub struct ProxyConnectorImpl {
     location: NetLocation,
     client_handler: Box<dyn TcpClientHandler>,
+    xhttp: Option<Arc<crate::xhttp::client::Client>>,
 }
 
 impl ProxyConnectorImpl {
@@ -42,9 +43,20 @@ impl ProxyConnectorImpl {
             return Ok(None);
         }
 
+        if let Some((xhttp, client_handler)) =
+            crate::xhttp::connector::build(&config, resolver.clone())?
+        {
+            return Ok(Some(Self {
+                location: config.address,
+                client_handler,
+                xhttp: Some(xhttp),
+            }));
+        }
+
         let default_sni_hostname = config.address.address().hostname().map(ToString::to_string);
 
         Ok(Some(Self {
+            xhttp: None,
             location: config.address,
             client_handler: create_tcp_client_handler(
                 config.protocol,
@@ -57,6 +69,38 @@ impl ProxyConnectorImpl {
 
 #[async_trait]
 impl ProxyConnector for ProxyConnectorImpl {
+    fn needs_carrier_dialer(&self) -> bool {
+        self.xhttp.is_some()
+    }
+
+    async fn connect_tcp_with_dialer(
+        &self,
+        dialer: Arc<dyn super::carrier_dialer::CarrierDialer>,
+        target: &ResolvedLocation,
+    ) -> std::io::Result<TcpClientSetupResult> {
+        let stream: Box<dyn AsyncStream> = match &self.xhttp {
+            Some(client) => Box::new(client.open(dialer).await?),
+            None => dialer.open_stream().await?,
+        };
+        self.client_handler
+            .setup_client_tcp_stream(stream, target.clone())
+            .await
+    }
+
+    async fn connect_udp_with_dialer(
+        &self,
+        dialer: Arc<dyn super::carrier_dialer::CarrierDialer>,
+        target: ResolvedLocation,
+    ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
+        let stream: Box<dyn AsyncStream> = match &self.xhttp {
+            Some(client) => Box::new(client.open(dialer).await?),
+            None => dialer.open_stream().await?,
+        };
+        self.client_handler
+            .setup_client_udp_bidirectional(stream, target)
+            .await
+    }
+
     fn proxy_location(&self) -> &NetLocation {
         &self.location
     }
@@ -69,6 +113,9 @@ impl ProxyConnector for ProxyConnectorImpl {
         &self,
         target: &ResolvedLocation,
     ) -> std::io::Result<Option<TcpClientSetupResult>> {
+        if self.xhttp.is_some() {
+            return Ok(None);
+        }
         self.client_handler.try_reuse_tcp_stream(target).await
     }
 
@@ -77,6 +124,12 @@ impl ProxyConnector for ProxyConnectorImpl {
         stream: Box<dyn AsyncStream>,
         target: &ResolvedLocation,
     ) -> std::io::Result<TcpClientSetupResult> {
+        if self.xhttp.is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "XHTTP requires a carrier dialer",
+            ));
+        }
         debug!(
             "[ProxyConnector] setup_tcp_stream: {} -> {}",
             self.location, target
@@ -91,6 +144,12 @@ impl ProxyConnector for ProxyConnectorImpl {
         stream: Box<dyn AsyncStream>,
         target: ResolvedLocation,
     ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
+        if self.xhttp.is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "XHTTP requires a carrier dialer",
+            ));
+        }
         debug!(
             "[ProxyConnector] setup_udp_bidirectional: {} -> {}",
             self.location, target
@@ -127,13 +186,9 @@ mod tests {
         ) -> std::io::Result<Box<dyn AsyncStream>> {
             self.connects
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            Ok(Box::new(
-                self.stream
-                    .lock()
-                    .unwrap()
-                    .take()
-                    .expect("unexpected redundant dial"),
-            ))
+            Ok(Box::new(self.stream.lock().unwrap().take().ok_or_else(
+                || std::io::Error::other("unexpected redundant dial"),
+            )?))
         }
         async fn connect_udp_bidirectional(
             &self,
@@ -149,6 +204,15 @@ mod tests {
 
     #[tokio::test]
     async fn warm_naive_streams_share_one_socket_and_tls_handshake() {
+        check_warm_naive_reuse(false).await;
+    }
+
+    #[tokio::test]
+    async fn mixed_xhttp_pool_preserves_warm_naive_reuse() {
+        check_warm_naive_reuse(true).await;
+    }
+
+    async fn check_warm_naive_reuse(mixed: bool) {
         use crate::client_proxy_chain::{ClientProxyChain, InitialHopEntry};
         use crate::naiveproxy::NaiveProxyTcpClientHandler;
         use crate::tls_client_handler::TlsClientHandler;
@@ -201,6 +265,7 @@ mod tests {
         });
         let connects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let proxy = ProxyConnectorImpl {
+            xhttp: None,
             location: NetLocation::from_str("localhost:443", None).unwrap(),
             client_handler: Box::new(TlsClientHandler::new(
                 client_config,
@@ -209,18 +274,37 @@ mod tests {
                 Box::new(NaiveProxyTcpClientHandler::new("user", "pass", false)),
             )),
         };
-        let chain = ClientProxyChain::new(
-            vec![InitialHopEntry::Proxy {
-                socket: Box::new(OneTransport {
-                    stream: std::sync::Mutex::new(Some(client)),
-                    connects: connects.clone(),
+        let mut entries = vec![InitialHopEntry::Proxy {
+            socket: Arc::new(OneTransport {
+                stream: std::sync::Mutex::new(Some(client)),
+                connects: connects.clone(),
+            }),
+            proxy: Box::new(proxy),
+        }];
+        if mixed {
+            let config = serde_json::from_value(serde_json::json!({
+                "address": "localhost:443",
+                "protocol": {"type": "xhttp", "mode": "stream-one", "protocol": {"type": "socks"}}
+            }))
+            .unwrap();
+            entries.push(InitialHopEntry::Proxy {
+                socket: Arc::new(OneTransport {
+                    stream: std::sync::Mutex::new(None),
+                    connects: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 }),
-                proxy: Box::new(proxy),
-            }],
-            vec![],
-        );
+                proxy: Box::new(
+                    ProxyConnectorImpl::from_config(config, mock_resolver())
+                        .unwrap()
+                        .unwrap(),
+                ),
+            });
+        }
+        let chain = ClientProxyChain::new(entries, vec![]);
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            for payload in [b"cold request".as_slice(), b"warm request"] {
+            for (index, payload) in [b"cold request".as_slice(), b"warm request"]
+                .into_iter()
+                .enumerate()
+            {
                 let target = NetLocation::from_str("example.com:443", None)
                     .unwrap()
                     .into();
@@ -234,6 +318,12 @@ mod tests {
                 let mut response = Vec::new();
                 stream.read_to_end(&mut response).await.unwrap();
                 assert_eq!(response, payload);
+                if mixed && index == 0 {
+                    let target = NetLocation::from_str("example.com:443", None)
+                        .unwrap()
+                        .into();
+                    assert!(chain.connect_tcp(target, &mock_resolver()).await.is_err());
+                }
             }
         })
         .await

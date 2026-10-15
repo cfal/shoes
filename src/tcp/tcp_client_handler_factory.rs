@@ -45,6 +45,12 @@ pub fn create_tcp_client_handler(
     resolver: Arc<dyn Resolver>,
 ) -> std::io::Result<Box<dyn TcpClientHandler>> {
     Ok(match client_proxy_config {
+        ClientProxyConfig::Xhttp(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "XHTTP requires a connector-level carrier dialer",
+            ));
+        }
         ClientProxyConfig::Direct => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,

@@ -221,10 +221,16 @@ impl SocketConnectorImpl {
                     (key_bytes, cert_bytes)
                 });
 
+                let is_xhttp = crate::xhttp::connector::contains(&config.protocol);
+                let alpn_protocols = if is_xhttp && alpn_protocols.is_unspecified() {
+                    vec!["h3".to_owned()]
+                } else {
+                    alpn_protocols.into_vec()
+                };
                 let rustls_client_config = try_create_client_config(
                     verify,
                     server_fingerprints.into_vec(),
-                    alpn_protocols.into_vec(),
+                    alpn_protocols,
                     sni_hostname.is_some(),
                     key_and_cert_bytes,
                     false, // tls13_only - QUIC enforces TLS 1.3 anyway
@@ -247,9 +253,14 @@ impl SocketConnectorImpl {
                 );
                 transport_config
                     .max_concurrent_bidi_streams(0_u32.into())
-                    .max_concurrent_uni_streams(0_u8.into())
+                    .max_concurrent_uni_streams(if is_xhttp { 16_u32 } else { 0 }.into())
                     .keep_alive_interval(Some(std::time::Duration::from_secs(15)))
                     .max_idle_timeout(Some(std::time::Duration::from_secs(30).try_into().unwrap()));
+                if is_xhttp {
+                    transport_config
+                        .datagram_receive_buffer_size(None)
+                        .datagram_send_buffer_size(0);
+                }
 
                 quinn_client_config.transport_config(Arc::new(transport_config));
 
@@ -293,22 +304,87 @@ impl SocketConnectorImpl {
             transport: TransportConfig::Tcp { no_delay },
         }
     }
+    async fn connect_quic_candidates<T>(
+        &self,
+        resolver: &Arc<dyn Resolver>,
+        address: &ResolvedLocation,
+        open: impl AsyncFn(super::carrier_dialer::QuicCarrier) -> std::io::Result<T>,
+    ) -> std::io::Result<T> {
+        let TransportConfig::Quic {
+            endpoints,
+            next_endpoint_index,
+            sni_hostname,
+        } = &self.transport
+        else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "not a QUIC socket connector",
+            ));
+        };
+        let mut addresses = match address.resolved_addr() {
+            Some(address) => vec![address],
+            None => resolve_addresses(resolver, address.location()).await?,
+        };
+        if address.address().hostname().is_some() {
+            addresses.sort_by_key(SocketAddr::is_ipv6);
+        }
+        let domain = sni_hostname
+            .as_deref()
+            .unwrap_or_else(|| address.address().hostname().unwrap_or("example.com"));
+        let mut last_error = std::io::Error::other("no resolved addresses succeeded");
+        for address in addresses {
+            let index =
+                next_endpoint_index.fetch_add(1, Ordering::Relaxed) as usize % endpoints.len();
+            let endpoint = endpoints[index].clone();
+            let result = match endpoint.connect(address, domain) {
+                Ok(connecting) => connecting.await.map_err(std::io::Error::other),
+                Err(error) => Err(std::io::Error::other(error)),
+            };
+            let result = match result {
+                Ok(connection) => {
+                    open(super::carrier_dialer::QuicCarrier {
+                        connection,
+                        _endpoint: endpoint,
+                    })
+                    .await
+                }
+                Err(error) => Err(error),
+            };
+            match result {
+                Ok(result) => return Ok(result),
+                Err(error) => {
+                    debug!("QUIC connection to {address} failed: {error}");
+                    last_error = error;
+                }
+            }
+        }
+        Err(last_error)
+    }
 }
 
 #[async_trait]
 impl SocketConnector for SocketConnectorImpl {
+    async fn connect_quic(
+        &self,
+        resolver: &Arc<dyn Resolver>,
+        address: &ResolvedLocation,
+    ) -> std::io::Result<super::carrier_dialer::QuicCarrier> {
+        self.connect_quic_candidates(resolver, address, async |carrier| Ok(carrier))
+            .await
+    }
+
     async fn connect(
         &self,
         resolver: &Arc<dyn Resolver>,
         address: &ResolvedLocation,
     ) -> std::io::Result<Box<dyn AsyncStream>> {
-        let mut target_addrs = match address.resolved_addr() {
-            Some(r) => vec![r],
-            None => resolve_addresses(resolver, address.location()).await?,
-        };
-
         match &self.transport {
             TransportConfig::Tcp { no_delay } => {
+                let target_addrs = match address.resolved_addr() {
+                    Some(r) => vec![r],
+                    None => resolve_addresses(resolver, address.location()).await?,
+                };
+
                 let stream = connect_tcp_candidates(target_addrs, |address| {
                     let socket = new_tcp_socket(self.bind_interface.clone(), address.is_ipv6())?;
                     Ok(socket.connect(address))
@@ -326,65 +402,16 @@ impl SocketConnector for SocketConnectorImpl {
                 }
                 Ok(Box::new(stream))
             }
-            TransportConfig::Quic {
-                endpoints,
-                next_endpoint_index,
-                sni_hostname,
-            } => {
-                // Preserve IPv4 preference for hostnames without excluding IPv6-only targets.
-                if address.address().hostname().is_some() {
-                    target_addrs.sort_by_key(SocketAddr::is_ipv6);
-                }
-                let domain = match sni_hostname {
-                    Some(s) => s.as_str(),
-                    None => address.address().hostname().unwrap_or("example.com"),
-                };
-
-                let mut last_err = None;
-                for (i, target_addr) in target_addrs.iter().enumerate() {
-                    let endpoint = if endpoints.len() == 1 {
-                        &endpoints[0]
-                    } else {
-                        let idx = next_endpoint_index.fetch_add(1, Ordering::Relaxed) as usize;
-                        &endpoints[idx % endpoints.len()]
-                    };
-
-                    match endpoint.connect(*target_addr, domain) {
-                        Ok(connecting) => match connecting.await {
-                            Ok(conn) => match conn.open_bi().await {
-                                Ok((send, recv)) => {
-                                    if i > 0 {
-                                        debug!(
-                                            "QUIC connect succeeded on address #{} ({}) after {} failures",
-                                            i, target_addr, i
-                                        );
-                                    }
-                                    return Ok(Box::new(QuicStream::from(send, recv)));
-                                }
-                                Err(e) => {
-                                    debug!("QUIC open_bi to {} failed: {}", target_addr, e);
-                                    last_err = Some(std::io::Error::other(format!(
-                                        "Failed to open QUIC stream: {e}"
-                                    )));
-                                }
-                            },
-                            Err(e) => {
-                                debug!("QUIC connection to {} failed: {}", target_addr, e);
-                                last_err = Some(std::io::Error::other(format!(
-                                    "QUIC connection failed: {e}"
-                                )));
-                            }
-                        },
-                        Err(e) => {
-                            debug!("QUIC connect to {} failed: {}", target_addr, e);
-                            last_err = Some(std::io::Error::other(format!(
-                                "Failed to connect to QUIC endpoint: {e}"
-                            )));
-                        }
-                    }
-                }
-                Err(last_err
-                    .unwrap_or_else(|| std::io::Error::other("no resolved addresses succeeded")))
+            TransportConfig::Quic { .. } => {
+                self.connect_quic_candidates(resolver, address, async |carrier| {
+                    let (send, recv) = carrier
+                        .connection
+                        .open_bi()
+                        .await
+                        .map_err(std::io::Error::other)?;
+                    Ok(Box::new(QuicStream::from(send, recv)) as Box<dyn AsyncStream>)
+                })
+                .await
             }
         }
     }

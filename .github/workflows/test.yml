@@ -15,6 +15,7 @@ env:
   MIHOMO_SHA256: 04cf9f09671704f839ddbee2e93069dc831a4123a75281e725d1d96ab9ac1afc
   XRAY_VERSION: 26.3.27
   XRAY_SHA256: 23cd9af937744d97776ee35ecad4972cf4b2109d1e0fe6be9930467608f7c8ae
+  XRAY_COMMIT: 701af60772cda123492f86e383e1fdba066614a9
 
 jobs:
   unit-tests:
@@ -184,6 +185,24 @@ jobs:
       run: >-
         cargo test -p shoes --locked --lib --features integration-tests
         h2mux::h2mux_server_session::singbox_interop_tests:: -- --test-threads=1
+
+    - name: Install Go for Xray peer
+      if: matrix.target == 'integration'
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.27.1'
+        cache: false
+
+    - name: Build pinned Xray test peer
+      if: matrix.target == 'integration'
+      run: |
+        source="$HOME/.cache/shoes-xray"
+        git clone --filter=blob:none --no-checkout https://github.com/XTLS/Xray-core.git "$source"
+        git -C "$source" checkout --detach "$XRAY_COMMIT"
+        test "$(git -C "$source" rev-parse HEAD)" = "$XRAY_COMMIT"
+        cd "$source"
+        GOMAXPROCS=1 go build -p 1 -o "$source/xray" ./main
+        echo "SHOES_TEST_XRAY_BIN=$source/xray" >> "$GITHUB_ENV"
 
     - name: Run integration tests
       env:
