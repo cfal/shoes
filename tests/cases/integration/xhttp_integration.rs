@@ -306,6 +306,15 @@ async fn xray_packet_upload_survives_a_slow_consumer() -> Result<(), Box<dyn std
         {"address":format!("0.0.0.0:{remote}"),"protocol":{"type":"xhttp","path":"/slow",
             "protocol":{"type":"vless","user_id":UUID}}}
     ]))?)?;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while tokio::net::TcpStream::connect(("127.0.0.1", remote))
+            .await
+            .is_err()
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await?;
     let _xray = xray::start(json!({
         "log":{"loglevel":"warning"},
         "inbounds":[{"listen":"0.0.0.0","port":socks_port,"protocol":"socks","settings":{"auth":"noauth"}}],
