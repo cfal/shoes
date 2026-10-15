@@ -77,6 +77,170 @@ mod tests {
         })
     }
 
+    #[derive(Debug)]
+    struct CloseDownload {
+        keep_upload: bool,
+    }
+    #[async_trait]
+    impl TcpServerHandler for CloseDownload {
+        async fn setup_server_stream(
+            &self,
+            mut stream: Box<dyn AsyncStream>,
+        ) -> io::Result<TcpServerSetupResult> {
+            let keep_upload = self.keep_upload;
+            Ok(TcpServerSetupResult::Session(Box::pin(async move {
+                if keep_upload {
+                    stream.write_all(b"bye").await.unwrap();
+                }
+                stream.shutdown().await.unwrap();
+                if keep_upload {
+                    let _ = stream.read_to_end(&mut Vec::new()).await;
+                }
+            })))
+        }
+    }
+
+    #[tokio::test]
+    async fn packet_download_eof_releases_the_session() {
+        let mut state = service();
+        Arc::get_mut(&mut state).unwrap().inner = Arc::new(CloseDownload { keep_upload: true });
+        for id in ["a", "b", "c"] {
+            assert_eq!(
+                request(&state, "POST", &format!("{id}/0"), b"hello")
+                    .await
+                    .status(),
+                StatusCode::OK
+            );
+            let response = request(&state, "GET", id, b"").await;
+            let data = response.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(data, b"bye".as_slice());
+            drop(data);
+            tokio::task::yield_now().await;
+            assert_eq!(state.admission.snapshot().active, 0);
+            assert_eq!(state.memory.snapshot().active, 0);
+        }
+    }
+
+    async fn streaming_carrier(
+        state: Arc<State>,
+        version: XhttpVersion,
+    ) -> (Arc<carrier::Carrier>, Tasks, Option<quinn::Endpoint>) {
+        let tasks = Tasks::new();
+        if version == XhttpVersion::H2 {
+            let (client, server) = tokio::io::duplex(8192);
+            tasks.spawn(async move {
+                let _ = state
+                    .serve_h2(
+                        Box::new(server),
+                        tokio::time::Instant::now() + Duration::from_secs(4),
+                    )
+                    .await;
+            });
+            let carrier = carrier::Carrier::tcp(Box::new(client), version, 8192)
+                .await
+                .unwrap();
+            return (carrier, tasks, None);
+        }
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert.cert.der().clone()).unwrap();
+        let mut config = quinn::ServerConfig::with_single_cert(
+            vec![cert.cert.der().clone()],
+            rustls::pki_types::PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()).into(),
+        )
+        .unwrap();
+        Arc::get_mut(&mut config.transport)
+            .unwrap()
+            .max_concurrent_bidi_streams(1u32.into());
+        let server = quinn::Endpoint::server(config, "0.0.0.0:0".parse().unwrap()).unwrap();
+        let mut client = crate::quic_endpoint::QuicEndpoint::new(
+            None,
+            std::net::UdpSocket::bind("0.0.0.0:0").unwrap(),
+            0,
+        )
+        .unwrap();
+        client.set_default_client_config(
+            quinn::ClientConfig::with_root_certificates(Arc::new(roots)).unwrap(),
+        );
+        let client = Arc::new(client);
+        let address = ([127, 0, 0, 1], server.local_addr().unwrap().port()).into();
+        let (outgoing, incoming) =
+            tokio::join!(client.connect(address, "localhost").unwrap(), async {
+                server.accept().await.unwrap().await.unwrap()
+            });
+        tasks.spawn(async move {
+            let _ = XhttpServer { state }.serve_h3(incoming).await;
+        });
+        let carrier = carrier::Carrier::quic(
+            crate::tcp::carrier_dialer::QuicCarrier {
+                connection: outgoing.unwrap(),
+                _endpoint: client,
+            },
+            8192,
+        )
+        .await
+        .unwrap();
+        (carrier, tasks, Some(server))
+    }
+
+    #[tokio::test]
+    async fn ended_streaming_sessions_release_idle_request_bodies() {
+        for version in [XhttpVersion::H2, XhttpVersion::H3] {
+            for suffix in ["", "idle"] {
+                let mut state = service();
+                let inner = Arc::get_mut(&mut state).unwrap();
+                inner.inner = Arc::new(CloseDownload { keep_upload: false });
+                inner.config.limits.max_requests_per_connection = 1;
+                inner.config.sc_stream_up_server_secs =
+                    crate::config::xhttp::XhttpRange::Number(-1);
+                let (carrier, _server, _endpoint) = streaming_carrier(state.clone(), version).await;
+                let memory = Memory::new(Arc::new(Budget::new(Some(1024))), 1024);
+                let (_writer, reader) = pipe(memory.clone());
+                let upload = Tasks::new();
+                let request = Request::post(format!("https://localhost/t/{suffix}"))
+                    .header("referer", format!("/?x_padding={}", "X".repeat(100)))
+                    .body(Body::stream(reader))
+                    .unwrap();
+                let mut response = carrier
+                    .request(request, memory.clone(), &upload, Duration::from_secs(1))
+                    .await
+                    .unwrap()
+                    .into_body();
+                if !suffix.is_empty() {
+                    state.close(suffix);
+                }
+                let mut data = Vec::new();
+                let _ =
+                    tokio::time::timeout(Duration::from_secs(1), response.read_to_end(&mut data))
+                        .await
+                        .unwrap();
+                assert!(data.is_empty());
+                // H3's idle sender observes STOP_SENDING on its ten-second probe.
+                tokio::time::timeout(Duration::from_secs(12), upload.cancel.cancelled())
+                    .await
+                    .unwrap();
+                let next = Tasks::new();
+                let response = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    carrier.request(
+                        Request::builder()
+                            .method("OPTIONS")
+                            .uri("https://localhost/t/")
+                            .body(Body::Empty)
+                            .unwrap(),
+                        memory,
+                        &next,
+                        Duration::from_secs(1),
+                    ),
+                )
+                .await
+                .unwrap()
+                .unwrap_or_else(|error| panic!("{version:?} {suffix}: {error}"));
+                assert_eq!(response.status(), StatusCode::OK, "{version:?} {suffix}");
+            }
+        }
+    }
+
     async fn request(
         state: &Arc<State>,
         method: &str,
@@ -639,13 +803,20 @@ struct Session {
 
 struct DownloadGuard {
     state: Weak<State>,
+    session: Option<Weak<Session>>,
     id: String,
     cancel: CancellationToken,
     eof: CancellationToken,
 }
 impl Drop for DownloadGuard {
     fn drop(&mut self) {
-        if self.eof.is_cancelled() {
+        if self.eof.is_cancelled()
+            && self.session.as_ref().is_none_or(|session| {
+                session
+                    .upgrade()
+                    .is_some_and(|session| session.state.lock().upload == Upload::Stream)
+            })
+        {
             return;
         }
         self.cancel.cancel();
@@ -730,6 +901,7 @@ impl XhttpServer {
                     state.config.limits.max_session_buffered_bytes,
                 );
                 let (mut writer, reader) = pipe(memory);
+                let upload_closed = writer.closed();
                 workers.spawn(async move {
                     let result: io::Result<()> = async {
                         while let Some(mut data) =
@@ -788,7 +960,10 @@ impl XhttpServer {
                 if result.is_err() {
                     send.stop_stream(h3::error::Code::H3_REQUEST_CANCELLED);
                 } else if keep_upload {
-                    workers.wait().await;
+                    tokio::select! {
+                        _ = workers.wait() => {},
+                        _ = upload_closed => {},
+                    }
                 }
             });
         }
@@ -841,6 +1016,13 @@ impl State {
         if let Some(Entry::Live(session)) = sessions.remove(id) {
             session.cancel.cancel();
             session.admission.lock().take();
+            {
+                let mut state = session.state.lock();
+                state.pending.clear();
+                state.permit.take();
+                state.writer.take();
+                state.reader.take();
+            }
             let closed = sessions
                 .values()
                 .filter(|entry| matches!(entry, Entry::Closed { .. }))
@@ -1019,6 +1201,7 @@ impl State {
                 });
                 let guard = DownloadGuard {
                     state: Weak::new(),
+                    session: None,
                     id: String::new(),
                     cancel: tasks.cancel.clone(),
                     eof: reader.eof.clone(),
@@ -1051,6 +1234,7 @@ impl State {
                 });
                 let guard = DownloadGuard {
                     state: Arc::downgrade(self),
+                    session: Some(Arc::downgrade(&session)),
                     id,
                     cancel: session.cancel.clone(),
                     eof: output.eof.clone(),
@@ -1473,6 +1657,7 @@ impl State {
                     state.config.limits.max_session_buffered_bytes,
                 ));
                 let tasks = Tasks::new();
+                let upload_closed = writer.closed();
                 tasks.spawn(carrier::receive_h2(body, writer));
                 let response = state.handle(request, reader).await;
                 let keep_upload = streaming_upload && response.status() == StatusCode::OK;
@@ -1481,7 +1666,10 @@ impl State {
                     && carrier::send_h2(body, send).await.is_ok()
                     && keep_upload
                 {
-                    tasks.wait().await;
+                    tokio::select! {
+                        _ = tasks.wait() => {},
+                        _ = upload_closed => {},
+                    }
                 }
             });
         }

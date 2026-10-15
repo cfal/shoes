@@ -303,6 +303,15 @@ pub fn pipe(memory: Memory) -> (Writer, Reader) {
 }
 
 impl Writer {
+    pub fn closed(&self) -> impl Future<Output = ()> + Send + 'static {
+        let sender = self.sender.lock().get_ref().cloned();
+        async move {
+            if let Some(sender) = sender {
+                sender.closed().await;
+            }
+        }
+    }
+
     pub async fn forward(&mut self, mut data: Bytes) -> io::Result<()> {
         let sender = self
             .sender
