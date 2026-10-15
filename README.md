@@ -25,6 +25,7 @@ All server protocols plus:
 - **ShadowTLS v3**
 - **TLS**
 - **WebSocket** (Shadowsocks SIP003)
+- **XHTTP / SplitHTTP** (packet-up, stream-up, stream-one over HTTP/1.1, HTTP/2, HTTP/3)
 - **XTLS Reality**
   - Hybrid-first X25519MLKEM768 key exchange and optional ML-DSA-65 server authentication
 - **XTLS Vision** (for VLESS)
@@ -272,6 +273,33 @@ the configured MTU and TCP buffer sizes are unchanged. Set
 Explicit enablement is not supported with `device_fd`, packet-information
 headers, or non-Linux devices. Automatic setup falls back to ordinary packets
 if offload initialization fails.
+
+### XHTTP / SplitHTTP
+
+See [examples/xhttp.yaml](examples/xhttp.yaml) for client/server configurations
+covering all three modes and HTTP versions. `type: splithttp` is an alias for
+`type: xhttp`; the inner `protocol` still handles authentication and destinations.
+
+- `http_version: auto`: H1 for plaintext TCP, H2 for TLS/REALITY, H3 for QUIC.
+  An explicit TLS ALPN of `http/1.1` selects H1. Explicit plaintext H2 uses h2c
+  prior knowledge, not HTTP Upgrade.
+- Client `mode: auto`: packet-up normally, stream-one under REALITY. Servers
+  default to accepting all modes. Stream-one uses one request; stream-up uses
+  separate streaming upload/download requests; packet-up uses bounded POSTs.
+- Packet-up cannot transmit upload EOF. Use a streaming mode when the target
+  must receive EOF before responding. Streaming bodies require unbuffered proxies.
+- H1/H2 preserve selected upstream proxy chains. H3 must be the first proxy hop;
+  it reuses the existing QUIC/H3 dependencies, not Hysteria2 framing.
+- `host` overrides HTTP authority independently of TLS SNI. Default Referer
+  padding, path/query handling, packet sizing/pacing, and stream-up keepalives
+  follow modern Xray. `limits` bounds sessions, buffered bytes, requests and
+  setup/header/packet deadlines; `pool` bounds connections and idle retention.
+- Advanced placement/padding obfuscation, custom session IDs, separate downloads,
+  full XMUX policy, and Vision over XHTTP are not supported. Unsupported options
+  are rejected rather than silently ignored. Public CDN compatibility is not implied.
+- Modern Xray clients work with Shoes REALITY servers. The existing Shoes REALITY
+  client does not yet offer X25519MLKEM768, which Xray 26.10.10 requires; use ordinary
+  TLS for Shoes-to-Xray XHTTP until that separate REALITY limitation is resolved.
 
 ## Similar Projects
 
