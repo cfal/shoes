@@ -190,7 +190,12 @@ mod tests {
         tokio::time::advance(Duration::from_secs(31)).await;
         state.reap();
         tokio::task::yield_now().await;
-        assert!(state.sessions.lock().is_empty());
+        assert_eq!(state.sessions.lock().len(), 2);
+        assert_eq!(
+            request(&state, "POST", "a/0", b"late").await.status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(state.admission.snapshot().active, 0);
         assert_eq!(
             request(&state, "GET", "c", b"").await.status(),
             StatusCode::OK
@@ -199,6 +204,23 @@ mod tests {
         state.reap();
         tokio::task::yield_now().await;
         assert!(state.sessions.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn closed_sessions_do_not_consume_live_admission() {
+        let state = service();
+        for index in 0..10 {
+            let response = request(&state, "GET", &format!("session-{index}"), b"").await;
+            assert_eq!(response.status(), StatusCode::OK);
+            drop(response);
+            tokio::task::yield_now().await;
+            assert_eq!(state.admission.snapshot().active, 0);
+            assert!(state.sessions.lock().len() <= state.config.limits.max_sessions);
+        }
+        assert_eq!(
+            request(&state, "GET", "session-9", b"").await.status(),
+            StatusCode::CONFLICT
+        );
     }
 
     #[tokio::test]
@@ -287,10 +309,7 @@ impl std::fmt::Debug for State {
 
 enum Entry {
     Live(Arc<Session>),
-    Closed {
-        when: tokio::time::Instant,
-        _permit: BudgetPermit,
-    },
+    Closed { when: tokio::time::Instant },
 }
 #[derive(Default, PartialEq)]
 enum Upload {
@@ -501,37 +520,63 @@ impl TcpServerHandler for XhttpServer {
 impl State {
     fn close(&self, id: &str) {
         let mut sessions = self.sessions.lock();
+        self.close_entry(&mut sessions, id);
+    }
+
+    fn close_entry(&self, sessions: &mut HashMap<String, Entry>, id: &str) {
         if !matches!(sessions.get(id), Some(Entry::Live(_))) {
             return;
         }
         if let Some(Entry::Live(session)) = sessions.remove(id) {
             session.cancel.cancel();
-            if let Some(permit) = session.admission.lock().take() {
-                sessions.insert(
-                    id.into(),
-                    Entry::Closed {
-                        when: tokio::time::Instant::now(),
-                        _permit: permit,
-                    },
-                );
+            session.admission.lock().take();
+            let closed = sessions
+                .values()
+                .filter(|entry| matches!(entry, Entry::Closed { .. }))
+                .count();
+            if closed >= self.config.limits.max_sessions {
+                let oldest = sessions
+                    .iter()
+                    .filter_map(|(id, entry)| match entry {
+                        Entry::Closed { when } => Some((id, when)),
+                        Entry::Live(_) => None,
+                    })
+                    .min_by_key(|(_, when)| *when)
+                    .map(|(id, _)| id.clone());
+                if let Some(oldest) = oldest {
+                    sessions.remove(&oldest);
+                }
             }
+            sessions.insert(
+                id.into(),
+                Entry::Closed {
+                    when: tokio::time::Instant::now(),
+                },
+            );
         }
     }
 
     fn reap(&self) {
-        self.sessions.lock().retain(|_, entry| match entry {
-            Entry::Closed { when, .. } => when.elapsed() < Duration::from_secs(30),
-            Entry::Live(session) => {
-                if !session.state.lock().downloaded
-                    && session.created.elapsed() >= Duration::from_secs(30)
-                {
-                    session.cancel.cancel();
-                    false
-                } else {
-                    true
-                }
-            }
+        let mut sessions = self.sessions.lock();
+        sessions.retain(|_, entry| match entry {
+            Entry::Closed { when } => when.elapsed() < Duration::from_secs(30),
+            Entry::Live(_) => true,
         });
+        let expired: Vec<_> = sessions
+            .iter()
+            .filter_map(|(id, entry)| match entry {
+                Entry::Live(session)
+                    if !session.state.lock().downloaded
+                        && session.created.elapsed() >= Duration::from_secs(30) =>
+                {
+                    Some(id.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        for id in expired {
+            self.close_entry(&mut sessions, &id);
+        }
     }
 
     fn session(&self, id: &str) -> Result<Arc<Session>, StatusCode> {
@@ -543,7 +588,11 @@ impl State {
                 Entry::Closed { .. } => Err(StatusCode::CONFLICT),
             };
         }
-        if sessions.len() >= self.config.limits.max_sessions
+        if sessions
+            .values()
+            .filter(|entry| matches!(entry, Entry::Live(_)))
+            .count()
+            >= self.config.limits.max_sessions
             || sessions
                 .values()
                 .filter(|entry| matches!(entry, Entry::Live(s) if !s.state.lock().downloaded))
