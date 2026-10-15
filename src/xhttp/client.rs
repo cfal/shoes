@@ -8,7 +8,7 @@ use tokio::{
 };
 
 use super::{
-    carrier::{Carrier, Reservation},
+    carrier::{Carrier, Reservation, Timeouts},
     connector::Security,
     stream::{Body, Event, Memory, Reader, Stream, Tasks, pipe},
     wire::{self, Path},
@@ -67,6 +67,7 @@ impl Lease {
         request: Request<Body>,
         memory: Memory,
         tasks: &Tasks,
+        packet: bool,
     ) -> io::Result<http::Response<Reader>> {
         let reservation = match self.reservation.take() {
             Some(reservation) => reservation,
@@ -83,8 +84,16 @@ impl Lease {
         }) {
             return Err(crate::resources::exhausted());
         }
+        let timeouts = if packet {
+            Timeouts::packet(
+                client.header_timeout(),
+                Duration::from_secs(client.config.limits.packet_timeout_secs),
+            )
+        } else {
+            Timeouts::headers(client.header_timeout())
+        };
         self.carrier
-            .request_reserved(request, memory, tasks, client.header_timeout(), reservation)
+            .request_reserved(request, memory, tasks, timeouts, reservation)
             .await
     }
 }
@@ -426,7 +435,7 @@ impl Client {
             Some(error) = error_receiver.recv() => return Err(error),
             _ = local.cancel.cancelled() => return Err(io::ErrorKind::ConnectionAborted.into()),
             _ = &mut linger => return download_writer.shutdown().await,
-            result = download.request(self, request, memory, &local) => result?,
+            result = download.request(self, request, memory, &local, false) => result?,
         };
         if response.status() != StatusCode::OK {
             return Err(io::Error::other(format!(
@@ -475,7 +484,7 @@ impl Client {
         }
         let request = self.request(session, None, true, Body::stream(reader))?;
         let mut upload = lanes.pop().unwrap();
-        let response = upload.request(self, request, memory, &tasks).await?;
+        let response = upload.request(self, request, memory, &tasks, false).await?;
         if response.status() != StatusCode::OK {
             return Err(io::Error::other(format!(
                 "XHTTP upload status {}",
@@ -643,26 +652,18 @@ impl Client {
                                 lane = replacement;
                             }
                         }
-                        tokio::time::timeout(
-                            Duration::from_secs(self.config.limits.packet_timeout_secs),
-                            async {
-                                let response = lane.request(self, request, memory, tasks).await?;
-                                if response.status() != StatusCode::OK {
-                                    return Err(io::Error::other(format!(
-                                        "XHTTP packet status {}",
-                                        response.status()
-                                    )));
-                                }
-                                let mut body = response.into_body();
-                                if body.read(&mut [0; 1]).await? != 0 {
-                                    return Err(io::Error::other(
-                                        "nonempty XHTTP packet acknowledgement",
-                                    ));
-                                }
-                                Ok::<_, io::Error>(lane)
-                            },
-                        )
-                        .await?
+                        let response = lane.request(self, request, memory, tasks, true).await?;
+                        if response.status() != StatusCode::OK {
+                            return Err(io::Error::other(format!(
+                                "XHTTP packet status {}",
+                                response.status()
+                            )));
+                        }
+                        let mut body = response.into_body();
+                        if body.read(&mut [0; 1]).await? != 0 {
+                            return Err(io::Error::other("nonempty XHTTP packet acknowledgement"));
+                        }
+                        Ok::<_, io::Error>(lane)
                     });
                     sequence = sequence
                         .checked_add(1)

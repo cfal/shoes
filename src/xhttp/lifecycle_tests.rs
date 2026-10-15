@@ -503,7 +503,7 @@ async fn packet_shutdown_waits_for_acknowledgement() {
             }
         });
         let config = serde_json::from_value(serde_json::json!({
-            "limits":{"max_sessions":1}, "protocol":{"type":"socks"}
+            "limits":{"max_sessions":1, "packet_timeout_secs":1, "response_header_timeout_secs":1}, "protocol":{"type":"socks"}
         }))
         .unwrap();
         let client = Arc::new(
@@ -531,6 +531,7 @@ async fn packet_shutdown_waits_for_acknowledgement() {
         let mut shutdown = Box::pin(stream.shutdown());
         assert!(futures::poll!(&mut shutdown).is_pending());
         assert_eq!(received.await.unwrap(), b"pending packet");
+        tokio::time::sleep(Duration::from_millis(1200)).await;
         assert!(futures::poll!(&mut shutdown).is_pending());
         release.send(()).unwrap();
         shutdown.as_mut().await.unwrap();
@@ -541,6 +542,262 @@ async fn packet_shutdown_waits_for_acknowledgement() {
     })
     .await
     .unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn h1_packet_upload_inactivity_and_deferred_ack() {
+    use super::carrier::{Carrier, Timeouts};
+
+    for stalled in [false, true] {
+        let (client, mut peer) = tokio::io::duplex(4096);
+        let carrier = Carrier::tcp(Box::new(client), XhttpVersion::H1, 8192)
+            .await
+            .unwrap();
+        let budget = Arc::new(Budget::new(Some(128 * 1024)));
+        let memory = Memory::new(budget.clone(), 128 * 1024);
+        let chunks = (0..64)
+            .map(|_| memory.copy(&[b'x'; 1024]).unwrap())
+            .collect();
+        let tasks = Arc::new(Tasks::new());
+        let request = Request::post("http://localhost/packet/0")
+            .body(Body::Chunks(chunks))
+            .unwrap();
+        let reservation = carrier.reserve().await.unwrap();
+        let post = tokio::spawn({
+            let carrier = carrier.clone();
+            let tasks = tasks.clone();
+            async move {
+                carrier
+                    .request_reserved(
+                        request,
+                        memory,
+                        &tasks,
+                        Timeouts::packet(Duration::from_millis(100), Duration::from_secs(1)),
+                        reservation,
+                    )
+                    .await
+            }
+        });
+        let mut headers = Vec::new();
+        while !headers.ends_with(b"\r\n\r\n") {
+            headers.push(peer.read_u8().await.unwrap());
+        }
+        assert!(
+            String::from_utf8(headers)
+                .unwrap()
+                .to_ascii_lowercase()
+                .contains("content-length: 65536")
+        );
+        if stalled {
+            peer.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+        }
+        let started = tokio::time::Instant::now();
+        for _ in 0..if stalled { 32 } else { 64 } {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let mut bytes = [0; 1024];
+            peer.read_exact(&mut bytes).await.unwrap();
+            assert!(bytes.iter().all(|byte| *byte == b'x'));
+            assert!(!post.is_finished());
+        }
+        if stalled {
+            let error = post.await.unwrap().err().unwrap();
+            assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+            assert!(started.elapsed() > Duration::from_secs(3));
+            assert!(carrier.closed());
+            let mut tail = Vec::new();
+            peer.read_to_end(&mut tail).await.unwrap();
+            assert!(
+                tail.iter().all(|byte| *byte == b'x'),
+                "request must not replay"
+            );
+        } else {
+            tokio::time::advance(Duration::from_secs(5)).await;
+            assert!(
+                !post.is_finished(),
+                "FIN disarms the packet timer, not just the header timer"
+            );
+            peer.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            let mut response = post.await.unwrap().unwrap().into_body();
+            assert_eq!(response.read(&mut [0; 1]).await.unwrap(), 0);
+        }
+        tokio::task::yield_now().await;
+        assert_eq!(budget.snapshot().active, 0);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn h1_abandoned_packet_fails_without_waiting_for_inactivity() {
+    use super::carrier::{Carrier, Timeouts};
+
+    for status in [200, 413] {
+        let (client, mut peer) = tokio::io::duplex(1024);
+        let carrier = Carrier::tcp(Box::new(client), XhttpVersion::H1, 8192)
+            .await
+            .unwrap();
+        let memory = Memory::new(Arc::new(Budget::new(Some(128 * 1024))), 128 * 1024);
+        let tasks = Arc::new(Tasks::new());
+        let chunks = (0..4)
+            .map(|_| memory.copy(&[0; 16 * 1024]).unwrap())
+            .collect();
+        let reservation = carrier.reserve().await.unwrap();
+        let post = tokio::spawn({
+            let tasks = tasks.clone();
+            let carrier = carrier.clone();
+            async move {
+                carrier
+                    .request_reserved(
+                        Request::post("http://localhost/packet/0")
+                            .body(Body::Chunks(chunks))
+                            .unwrap(),
+                        memory,
+                        &tasks,
+                        Timeouts::packet(Duration::from_secs(1), Duration::from_secs(300)),
+                        reservation,
+                    )
+                    .await
+            }
+        });
+        let mut headers = Vec::new();
+        while !headers.ends_with(b"\r\n\r\n") {
+            headers.push(peer.read_u8().await.unwrap());
+        }
+        peer.write_all(format!("HTTP/1.1 {status} Test\r\nContent-Length: 0\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        if status == 200 {
+            drop(peer);
+        }
+        let error = tokio::time::timeout(Duration::from_secs(1), post)
+            .await
+            .unwrap()
+            .unwrap()
+            .err()
+            .unwrap();
+        assert_ne!(error.kind(), io::ErrorKind::TimedOut);
+        if status == 413 {
+            assert!(error.to_string().contains("413"));
+        }
+        assert!(carrier.closed());
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn h2_packet_upload_inactivity_and_early_or_deferred_ack() {
+    use super::carrier::{Carrier, Timeouts};
+
+    for stalled in [false, true] {
+        let (client, peer) = tokio::io::duplex(4096);
+        let server_tasks = Tasks::new();
+        let (requests, mut received) = tokio::sync::mpsc::unbounded_channel();
+        server_tasks.spawn(async move {
+            let mut connection: h2::server::Connection<_, Bytes> = h2::server::Builder::new()
+                .initial_window_size(1024)
+                .handshake(peer)
+                .await
+                .unwrap();
+            while let Some(request) = connection.accept().await {
+                requests.send(request.unwrap()).unwrap();
+            }
+        });
+        let carrier = Carrier::tcp(Box::new(client), XhttpVersion::H2, 8192)
+            .await
+            .unwrap();
+        let tasks = Arc::new(Tasks::new());
+        let budget = Arc::new(Budget::new(Some(128 * 1024)));
+        let memory = Memory::new(budget.clone(), 128 * 1024);
+        let chunks = (0..4)
+            .map(|_| memory.copy(&[b'x'; 16 * 1024]).unwrap())
+            .collect();
+        let request = Request::post("https://localhost/packet/0")
+            .body(Body::Chunks(chunks))
+            .unwrap();
+        let reservation = carrier.reserve().await.unwrap();
+        let post = tokio::spawn({
+            let tasks = tasks.clone();
+            let carrier = carrier.clone();
+            async move {
+                carrier
+                    .request_reserved(
+                        request,
+                        memory,
+                        &tasks,
+                        Timeouts::packet(Duration::from_millis(100), Duration::from_secs(1)),
+                        reservation,
+                    )
+                    .await
+            }
+        });
+        let (request, mut respond) = received.recv().await.unwrap();
+        let mut body = request.into_body();
+        if stalled {
+            respond.send_response(Response::new(()), true).unwrap();
+        }
+        let started = tokio::time::Instant::now();
+        let mut total = 0;
+        while total < if stalled { 32 * 1024 } else { 64 * 1024 } {
+            let data = body.data().await.unwrap().unwrap();
+            assert!(data.iter().all(|byte| *byte == b'x'));
+            total += data.len();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            body.flow_control().release_capacity(data.len()).unwrap();
+            assert!(!post.is_finished());
+        }
+        if stalled {
+            let error = post.await.unwrap().err().unwrap();
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::TimedOut,
+                "early response must not disarm upload watchdog"
+            );
+            assert!(started.elapsed() > Duration::from_secs(3));
+            while let Some(data) = body.data().await {
+                if let Err(error) = data {
+                    assert_eq!(error.reason(), Some(h2::Reason::CANCEL));
+                    break;
+                }
+            }
+        } else {
+            while let Some(data) = body.data().await {
+                assert!(data.unwrap().is_empty());
+            }
+            tokio::time::advance(Duration::from_secs(5)).await;
+            assert!(!post.is_finished());
+            respond.send_response(Response::new(()), true).unwrap();
+            let mut response = post.await.unwrap().unwrap().into_body();
+            assert_eq!(response.read(&mut [0; 1]).await.unwrap(), 0);
+        }
+        tokio::task::yield_now().await;
+        assert!(received.try_recv().is_err(), "request must not replay");
+        assert_eq!(budget.snapshot().active, 0);
+        let fresh = Tasks::new();
+        let memory = Memory::new(budget.clone(), 128 * 1024);
+        let probe = carrier.request(
+            Request::get("https://localhost/probe")
+                .body(Body::Empty)
+                .unwrap(),
+            memory,
+            &fresh,
+            Duration::from_secs(1),
+        );
+        let reply = async {
+            let (_, mut respond) = received.recv().await.unwrap();
+            respond.send_response(Response::new(()), true).unwrap();
+        };
+        let (response, ()) = tokio::join!(probe, reply);
+        assert_eq!(
+            response
+                .unwrap()
+                .into_body()
+                .read(&mut [0; 1])
+                .await
+                .unwrap(),
+            0
+        );
+    }
 }
 
 #[tokio::test]
@@ -795,6 +1052,17 @@ async fn quic_pair(
     quinn::Connection,
     quinn::Endpoint,
 ) {
+    quic_pair_with_window(limit, None).await
+}
+
+async fn quic_pair_with_window(
+    limit: u32,
+    window: Option<u32>,
+) -> (
+    crate::tcp::carrier_dialer::QuicCarrier,
+    quinn::Connection,
+    quinn::Endpoint,
+) {
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     let mut roots = rustls::RootCertStore::empty();
     roots.add(cert.cert.der().clone()).unwrap();
@@ -806,6 +1074,11 @@ async fn quic_pair(
     Arc::get_mut(&mut server_config.transport)
         .unwrap()
         .max_concurrent_bidi_streams(limit.into());
+    if let Some(window) = window {
+        Arc::get_mut(&mut server_config.transport)
+            .unwrap()
+            .stream_receive_window(window.into());
+    }
     let server = quinn::Endpoint::server(server_config, "0.0.0.0:0".parse().unwrap()).unwrap();
     let mut client = crate::quic_endpoint::QuicEndpoint::new(
         None,
@@ -845,6 +1118,119 @@ async fn h3_peer(
         .await
         .unwrap();
     (carrier, driver, server)
+}
+
+#[tokio::test]
+async fn h3_packet_upload_inactivity_and_early_or_deferred_ack() {
+    use super::carrier::{Carrier, Timeouts};
+
+    tokio::time::timeout(Duration::from_secs(15), async {
+        for stalled in [false, true] {
+            let (outgoing, incoming, _endpoint) = quic_pair_with_window(2, Some(8192)).await;
+            let carrier = Carrier::quic(outgoing, 8192).await.unwrap();
+            let mut driver: h3::server::Connection<_, Bytes> = h3::server::builder()
+                .build(h3_quinn::Connection::new(incoming))
+                .await
+                .unwrap();
+            let server_tasks = Tasks::new();
+            let (requests, mut received) = tokio::sync::mpsc::unbounded_channel();
+            server_tasks.spawn(async move {
+                while let Ok(Some(resolver)) = driver.accept().await {
+                    requests
+                        .send(resolver.resolve_request().await.unwrap())
+                        .ok()
+                        .unwrap();
+                }
+            });
+            let tasks = Arc::new(Tasks::new());
+            let budget = Arc::new(Budget::new(Some(256 * 1024)));
+            let memory = Memory::new(budget.clone(), 256 * 1024);
+            let chunks = (0..8)
+                .map(|_| memory.copy(&[b'x'; 16 * 1024]).unwrap())
+                .collect();
+            let request = Request::post("https://localhost/packet/0")
+                .body(Body::Chunks(chunks))
+                .unwrap();
+            let reservation = carrier.reserve().await.unwrap();
+            let post = tokio::spawn({
+                let tasks = tasks.clone();
+                let carrier = carrier.clone();
+                async move {
+                    carrier
+                        .request_reserved(
+                            request,
+                            memory,
+                            &tasks,
+                            Timeouts::packet(
+                                Duration::from_millis(500),
+                                Duration::from_millis(500),
+                            ),
+                            reservation,
+                        )
+                        .await
+                }
+            });
+            let (_, mut stream) = received.recv().await.unwrap();
+            if stalled {
+                stream.send_response(Response::new(())).await.unwrap();
+                stream.finish().await.unwrap();
+            }
+            let started = tokio::time::Instant::now();
+            let mut total = 0;
+            while total < if stalled { 64 * 1024 } else { 128 * 1024 } {
+                use bytes::Buf;
+                let data = stream.recv_data().await.unwrap().unwrap();
+                assert!(data.chunk().iter().all(|byte| *byte == b'x'));
+                total += data.remaining();
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                assert!(!post.is_finished(), "stalled={stalled}, received={total}");
+            }
+            assert!(started.elapsed() > Duration::from_millis(500));
+            if stalled {
+                let error = post.await.unwrap().err().unwrap();
+                assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+                while stream.recv_data().await.is_ok_and(|data| data.is_some()) {}
+            } else {
+                assert!(stream.recv_data().await.unwrap().is_none());
+                tokio::time::sleep(Duration::from_millis(1100)).await;
+                assert!(!post.is_finished());
+                stream.send_response(Response::new(())).await.unwrap();
+                stream.finish().await.unwrap();
+                let mut response = post.await.unwrap().unwrap().into_body();
+                assert_eq!(response.read(&mut [0; 1]).await.unwrap(), 0);
+            }
+            tokio::task::yield_now().await;
+            assert!(received.try_recv().is_err(), "request must not replay");
+            assert_eq!(budget.snapshot().active, 0);
+            let fresh = Tasks::new();
+            let memory = Memory::new(budget.clone(), 256 * 1024);
+            let probe = carrier.request(
+                Request::get("https://localhost/probe")
+                    .body(Body::Empty)
+                    .unwrap(),
+                memory,
+                &fresh,
+                Duration::from_secs(1),
+            );
+            let reply = async {
+                let (_, mut stream) = received.recv().await.unwrap();
+                stream.send_response(Response::new(())).await.unwrap();
+                stream.finish().await.unwrap();
+            };
+            let (response, ()) = tokio::join!(probe, reply);
+            assert_eq!(
+                response
+                    .unwrap()
+                    .into_body()
+                    .read(&mut [0; 1])
+                    .await
+                    .unwrap(),
+                0
+            );
+        }
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
@@ -1002,7 +1388,7 @@ async fn h3_unused_stream_reservations_reset_without_transmitting_requests() {
                     .unwrap(),
                 memory,
                 &tasks,
-                Duration::from_secs(1),
+                super::carrier::Timeouts::headers(Duration::from_secs(1)),
                 reservation,
             )
             .await

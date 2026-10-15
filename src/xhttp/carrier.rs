@@ -13,8 +13,9 @@ use http::{Request, Response};
 use http_body_util::BodyExt;
 use hyper_util::rt::TokioIo;
 use tokio::io::AsyncWriteExt;
+use tokio_util::sync::CancellationToken;
 
-use super::stream::{Body, Memory, Reader, Tasks, Writer, pipe};
+use super::stream::{Body, Memory, Reader, Tasks, Upload, UploadWatch, Writer, pipe};
 use crate::{
     async_stream::AsyncStream, config::xhttp::XhttpVersion, tcp::carrier_dialer::QuicCarrier,
 };
@@ -22,6 +23,63 @@ use crate::{
 type H3Sender = h3::client::SendRequest<super::h3::Opener, Bytes>;
 
 pub struct Reservation(Option<super::h3::Bidi>);
+
+#[derive(Clone, Copy)]
+pub struct Timeouts {
+    headers: Duration,
+    response: Option<Duration>,
+    upload: Option<Duration>,
+}
+
+impl Timeouts {
+    pub fn headers(timeout: Duration) -> Self {
+        Self {
+            headers: timeout,
+            response: Some(timeout),
+            upload: None,
+        }
+    }
+
+    pub fn packet(headers: Duration, upload: Duration) -> Self {
+        Self {
+            headers,
+            response: None,
+            upload: Some(upload),
+        }
+    }
+
+    async fn response<B>(
+        self,
+        response: impl Future<Output = io::Result<Response<B>>>,
+        upload: Option<UploadWatch>,
+        cancel: &CancellationToken,
+    ) -> io::Result<Response<B>> {
+        let response = async {
+            let response = match self.response {
+                Some(timeout) => tokio::time::timeout(timeout, response).await?,
+                None => response.await,
+            }?;
+            if self.upload.is_some() && response.status() != http::StatusCode::OK {
+                return Err(io::Error::other(format!(
+                    "XHTTP packet status {}",
+                    response.status()
+                )));
+            }
+            Ok(response)
+        };
+        let uploaded = async {
+            if let Some((upload, timeout)) = upload.zip(self.upload) {
+                upload.wait(timeout).await?;
+            }
+            Ok::<_, io::Error>(())
+        };
+        tokio::select! {
+            biased;
+            result = async { tokio::try_join!(response, uploaded).map(|(response, ())| response) } => result,
+            _ = cancel.cancelled() => Err(io::ErrorKind::ConnectionAborted.into()),
+        }
+    }
+}
 
 enum Sender {
     H1(tokio::sync::Mutex<hyper::client::conn::http1::SendRequest<Body>>),
@@ -113,7 +171,7 @@ impl Carrier {
     }
 
     pub fn closed(&self) -> bool {
-        if self.retired.load(Ordering::Relaxed) {
+        if self.retired.load(Ordering::Relaxed) || self._tasks.cancel.is_cancelled() {
             return true;
         }
         match &self.sender {
@@ -189,8 +247,14 @@ impl Carrier {
         header_timeout: Duration,
     ) -> io::Result<Response<Reader>> {
         let reservation = tokio::time::timeout(header_timeout, self.reserve()).await??;
-        self.request_reserved(request, memory, tasks, header_timeout, reservation)
-            .await
+        self.request_reserved(
+            request,
+            memory,
+            tasks,
+            Timeouts::headers(header_timeout),
+            reservation,
+        )
+        .await
     }
 
     pub async fn request_reserved(
@@ -198,12 +262,22 @@ impl Carrier {
         mut request: Request<Body>,
         memory: Memory,
         tasks: &Tasks,
-        header_timeout: Duration,
+        timeouts: Timeouts,
         reservation: Reservation,
     ) -> io::Result<Response<Reader>> {
         let (writer, reader) = pipe(memory);
+        let (mut upload, watch) = match timeouts.upload {
+            Some(_) => {
+                let (upload, watch) = Upload::channel();
+                (Some(upload), Some(watch))
+            }
+            None => (None, None),
+        };
         let result = match &self.sender {
             Sender::H1(sender) => {
+                if let Some(upload) = upload.take() {
+                    request = request.map(|body| body.track_h1(upload));
+                }
                 let authority = request
                     .uri()
                     .authority()
@@ -219,15 +293,22 @@ impl Carrier {
                     .as_str()
                     .parse()
                     .map_err(io::Error::other)?;
-                let future = tokio::time::timeout(header_timeout, async {
+                let (future, guard) = tokio::time::timeout(timeouts.headers, async {
                     let mut sender = sender.lock().await;
                     sender.ready().await.map_err(io::Error::other)?;
-                    Ok::<_, io::Error>(sender.send_request(request))
+                    // A cancelled partial H1 request cannot leave a reusable connection behind.
+                    let guard = self._tasks.cancel.clone().drop_guard();
+                    Ok::<_, io::Error>((sender.send_request(request), guard))
                 })
                 .await??;
-                let response = tokio::time::timeout(header_timeout, future)
-                    .await?
-                    .map_err(io::Error::other)?;
+                let response = timeouts
+                    .response(
+                        async { future.await.map_err(io::Error::other) },
+                        watch,
+                        &tasks.cancel,
+                    )
+                    .await?;
+                guard.disarm();
                 if response
                     .headers()
                     .get_all(http::header::CONNECTION)
@@ -253,26 +334,41 @@ impl Carrier {
             Sender::H2(sender) => {
                 let (parts, body) = request.into_parts();
                 let empty = hyper::body::Body::is_end_stream(&body);
-                let mut sender = tokio::time::timeout(header_timeout, sender.clone().ready())
+                let mut sender = tokio::time::timeout(timeouts.headers, sender.clone().ready())
                     .await?
                     .map_err(io::Error::other)?;
-                let (response, send) = sender
+                let (response, mut send) = sender
                     .send_request(Request::from_parts(parts, ()), empty)
                     .map_err(io::Error::other)?;
+                let request_cancel = tasks.cancel.child_token();
+                let guard = request_cancel.clone().drop_guard();
                 if !empty {
                     let carrier = self.clone();
                     let cancel = tasks.cancel.clone();
                     tasks.spawn(async move {
                         let _carrier = carrier;
-                        if let Err(error) = send_h2(body, send).await {
+                        let result = tokio::select! {
+                            biased;
+                            _ = request_cancel.cancelled() => Err(io::ErrorKind::ConnectionAborted.into()),
+                            result = send_h2_tracked(body, &mut send, upload) => result,
+                        };
+                        if let Err(error) = result {
                             log::debug!("XHTTP H2 upload failed: {error}");
+                            send.send_reset(h2::Reason::CANCEL);
                             cancel.cancel();
                         }
                     });
+                } else if let Some(upload) = &mut upload {
+                    upload.finish();
                 }
-                let response = tokio::time::timeout(header_timeout, response)
-                    .await?
-                    .map_err(io::Error::other)?;
+                let response = timeouts
+                    .response(
+                        async { response.await.map_err(io::Error::other) },
+                        watch,
+                        &tasks.cancel,
+                    )
+                    .await?;
+                guard.disarm();
                 let (parts, incoming) = response.into_parts();
                 let carrier = self.clone();
                 tasks.spawn(async move {
@@ -288,7 +384,7 @@ impl Carrier {
             } => {
                 let (parts, mut body) = request.into_parts();
                 let mut sender = sender.clone();
-                let request = tokio::time::timeout(header_timeout, async {
+                let request = tokio::time::timeout(timeouts.headers, async {
                     let _lock = headers.lock().await;
                     let _handoff = opener.install(reservation.0.unwrap());
                     sender.send_request(Request::from_parts(parts, ())).await
@@ -305,9 +401,12 @@ impl Carrier {
                 let (mut send, mut receive) = request.split();
                 let carrier = self.clone();
                 let cancel = tasks.cancel.clone();
+                let request_cancel = tasks.cancel.child_token();
+                let guard = request_cancel.clone().drop_guard();
+                let mut sending = upload;
                 tasks.spawn(async move {
                     let _carrier = carrier;
-                    let result: io::Result<()> = async {
+                    let result = async {
                         loop {
                             let frame =
                                 match tokio::time::timeout(Duration::from_secs(10), body.frame())
@@ -325,21 +424,38 @@ impl Carrier {
                                 break;
                             };
                             if let Ok(data) = frame?.into_data() {
+                                let nonempty = !data.is_empty();
                                 send.send_data(data).await.map_err(io::Error::other)?;
+                                if nonempty && let Some(upload) = &sending {
+                                    upload.activity.touch();
+                                }
                             }
                         }
-                        send.finish().await.map_err(io::Error::other)
-                    }
-                    .await;
+                        send.finish().await.map_err(io::Error::other)?;
+                        if let Some(upload) = &mut sending {
+                            upload.finish();
+                        }
+                        Ok::<_, io::Error>(())
+                    };
+                    let result = tokio::select! {
+                        biased;
+                        _ = request_cancel.cancelled() => Err(io::ErrorKind::ConnectionAborted.into()),
+                        result = result => result,
+                    };
                     if let Err(error) = result {
                         log::debug!("XHTTP H3 upload failed: {error}");
                         send.stop_stream(h3::error::Code::H3_REQUEST_CANCELLED);
                         cancel.cancel();
                     }
                 });
-                let response = tokio::time::timeout(header_timeout, receive.recv_response())
-                    .await?
-                    .map_err(io::Error::other)?;
+                let response = timeouts
+                    .response(
+                        async { receive.recv_response().await.map_err(io::Error::other) },
+                        watch,
+                        &tasks.cancel,
+                    )
+                    .await?;
+                guard.disarm();
                 let carrier = self.clone();
                 tasks.spawn(async move {
                     let _carrier = carrier;
@@ -410,7 +526,15 @@ pub async fn receive_h2(mut body: h2::RecvStream, mut writer: Writer) {
     }
 }
 
-pub async fn send_h2(mut body: Body, mut send: h2::SendStream<Bytes>) -> io::Result<()> {
+pub async fn send_h2(body: Body, mut send: h2::SendStream<Bytes>) -> io::Result<()> {
+    send_h2_tracked(body, &mut send, None).await
+}
+
+async fn send_h2_tracked(
+    mut body: Body,
+    send: &mut h2::SendStream<Bytes>,
+    mut upload: Option<Upload>,
+) -> io::Result<()> {
     loop {
         let frame = tokio::select! {
             frame = body.frame() => frame,
@@ -432,8 +556,67 @@ pub async fn send_h2(mut body: Body, mut send: h2::SendStream<Bytes>) -> io::Res
             if len != 0 {
                 send.send_data(data.split_to(len), false)
                     .map_err(io::Error::other)?;
+                if let Some(upload) = &upload {
+                    upload.activity.touch();
+                }
             }
         }
     }
-    send.send_data(Bytes::new(), true).map_err(io::Error::other)
+    send.send_data(Bytes::new(), true)
+        .map_err(io::Error::other)?;
+    if let Some(upload) = &mut upload {
+        upload.finish();
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn packet_response_wait_requires_upload_completion_and_observes_cancellation() {
+        let timeouts = Timeouts::packet(Duration::from_secs(1), Duration::from_secs(10));
+        let (upload, watch) = Upload::channel();
+        let cancel = CancellationToken::new();
+        let mut response =
+            Box::pin(timeouts.response(async { Ok(Response::new(())) }, Some(watch), &cancel));
+        assert!(futures::poll!(&mut response).is_pending());
+        for _ in 0..5 {
+            tokio::time::advance(Duration::from_secs(9)).await;
+            upload.activity.touch();
+            assert!(futures::poll!(&mut response).is_pending());
+        }
+        tokio::time::advance(Duration::from_millis(9999)).await;
+        assert!(futures::poll!(&mut response).is_pending());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert_eq!(response.await.unwrap_err().kind(), io::ErrorKind::TimedOut);
+
+        let (mut upload, watch) = Upload::channel();
+        upload.finish();
+        let mut response = Box::pin(timeouts.response(
+            std::future::pending::<io::Result<Response<()>>>(),
+            Some(watch),
+            &cancel,
+        ));
+        assert!(futures::poll!(&mut response).is_pending());
+        tokio::time::advance(Duration::from_secs(1000)).await;
+        assert!(futures::poll!(&mut response).is_pending());
+        cancel.cancel();
+        assert_eq!(
+            response.await.unwrap_err().kind(),
+            io::ErrorKind::ConnectionAborted
+        );
+
+        let (_upload, watch) = Upload::channel();
+        let error = timeouts
+            .response(
+                async { Ok(Response::builder().status(413).body(()).unwrap()) },
+                Some(watch),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("413"));
+    }
 }

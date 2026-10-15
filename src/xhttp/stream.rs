@@ -135,6 +135,50 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn tracked_h1_body_preserves_framing_and_only_finishes_on_handoff() {
+        use http_body_util::BodyExt;
+
+        let (upload, watch) = Upload::channel();
+        let mut body = Body::Chunks([Bytes::from_static(b"a"), Bytes::from_static(b"bc")].into())
+            .track_h1(upload);
+        assert_eq!(body.size_hint().exact(), Some(3));
+        assert!(!body.is_end_stream());
+        let mut wait = Box::pin(watch.wait(Duration::from_secs(10)));
+        assert!(futures::poll!(&mut wait).is_pending());
+        tokio::time::advance(Duration::from_secs(9)).await;
+        assert_eq!(
+            body.frame().await.unwrap().unwrap().into_data().unwrap(),
+            "a"
+        );
+        assert_eq!(body.size_hint().exact(), Some(2));
+        tokio::time::advance(Duration::from_secs(9)).await;
+        assert!(futures::poll!(&mut wait).is_pending());
+        assert_eq!(
+            body.frame().await.unwrap().unwrap().into_data().unwrap(),
+            "bc"
+        );
+        assert!(body.is_end_stream());
+        assert_eq!(body.size_hint().exact(), Some(0));
+        drop(body);
+        wait.await.unwrap();
+
+        let (upload, watch) = Upload::channel();
+        let body = Body::Chunks([Bytes::from_static(b"unsent")].into()).track_h1(upload);
+        drop(body);
+        assert_eq!(
+            watch
+                .wait(Duration::from_secs(10))
+                .await
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        let (upload, watch) = Upload::channel();
+        drop(Body::Empty.track_h1(upload));
+        watch.wait(Duration::from_secs(10)).await.unwrap();
+    }
+
     #[tokio::test]
     async fn partial_reads_explicit_eof_and_errors() {
         let memory = Memory::new(Arc::new(Budget::new(Some(128))), 128);
@@ -671,15 +715,73 @@ impl AsyncPing for Stream {
 }
 impl AsyncStream for Stream {}
 
+pub struct Upload {
+    pub activity: Arc<Activity>,
+    done: Option<oneshot::Sender<()>>,
+}
+
+pub struct UploadWatch {
+    activity: Arc<Activity>,
+    done: oneshot::Receiver<()>,
+}
+
+impl Upload {
+    pub fn channel() -> (Self, UploadWatch) {
+        let activity = Arc::new(Activity::new());
+        let (send, done) = oneshot::channel();
+        (
+            Self {
+                activity: activity.clone(),
+                done: Some(send),
+            },
+            UploadWatch { activity, done },
+        )
+    }
+
+    pub fn finish(&mut self) {
+        if let Some(done) = self.done.take() {
+            let _ = done.send(());
+        }
+    }
+}
+
+impl UploadWatch {
+    pub async fn wait(self, timeout: Duration) -> io::Result<()> {
+        self.activity
+            .idle(Instant::now(), timeout, async {
+                self.done
+                    .await
+                    .map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))
+            })
+            .await?
+    }
+}
+
 pub enum Body {
     Empty,
     Chunks(VecDeque<Bytes>),
+    Packet {
+        chunks: VecDeque<Bytes>,
+        upload: Upload,
+    },
     Stream {
         reader: Reader,
         _guard: Option<Box<dyn Send + Sync>>,
     },
 }
 impl Body {
+    pub fn track_h1(self, mut upload: Upload) -> Self {
+        let chunks = match self {
+            Self::Chunks(chunks) => chunks,
+            Self::Empty => VecDeque::new(),
+            _ => unreachable!("only packet bodies have an upload watchdog"),
+        };
+        if chunks.is_empty() {
+            upload.finish();
+        }
+        Self::Packet { chunks, upload }
+    }
+
     pub fn stream(reader: Reader) -> Self {
         Self::Stream {
             reader,
@@ -707,6 +809,17 @@ impl HttpBody for Body {
             Self::Empty => Poll::Ready(None),
             Self::Chunks(chunks) => {
                 Poll::Ready(chunks.pop_front().map(|data| Ok(Frame::data(data))))
+            }
+            Self::Packet { chunks, upload } => {
+                let data = chunks.pop_front();
+                if data.as_ref().is_some_and(|data| !data.is_empty()) {
+                    upload.activity.touch();
+                }
+                // Hyper may skip the EOF poll. H1 completion means bounded-buffer handoff.
+                if chunks.is_empty() {
+                    upload.finish();
+                }
+                Poll::Ready(data.map(|data| Ok(Frame::data(data))))
             }
             Self::Stream { reader, .. } => {
                 if reader.ended {
@@ -739,12 +852,16 @@ impl HttpBody for Body {
     fn is_end_stream(&self) -> bool {
         matches!(self, Self::Empty)
             || matches!(self, Self::Chunks(chunks) if chunks.is_empty())
+            || matches!(self, Self::Packet { chunks, .. } if chunks.is_empty())
             || matches!(self, Self::Stream { reader, .. } if reader.ended)
     }
     fn size_hint(&self) -> SizeHint {
         match self {
             Self::Empty => SizeHint::with_exact(0),
             Self::Chunks(chunks) => {
+                SizeHint::with_exact(chunks.iter().map(|b| b.len() as u64).sum())
+            }
+            Self::Packet { chunks, .. } => {
                 SizeHint::with_exact(chunks.iter().map(|b| b.len() as u64).sum())
             }
             _ => SizeHint::default(),
