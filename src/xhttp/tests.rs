@@ -26,6 +26,18 @@ async fn all_modes_and_carriers_exchange_data_before_upload_eof() {
             }
         }
     });
+    let half_close = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+    let half_close_target = format!("127.0.0.1:{}", half_close.local_addr().unwrap().port());
+    let (received, mut uploads) = tokio::sync::mpsc::channel(1);
+    echo_tasks.spawn(async move {
+        while let Ok((mut socket, _)) = half_close.accept().await {
+            socket.write_all(b"fin").await.unwrap();
+            socket.shutdown().await.unwrap();
+            let mut upload = Vec::new();
+            socket.read_to_end(&mut upload).await.unwrap();
+            received.send(upload).await.unwrap();
+        }
+    });
     for version in ["h1", "h2", "h3"] {
         for mode in ["packet-up", "stream-up", "stream-one"] {
             eprintln!("testing {version} {mode}");
@@ -133,6 +145,24 @@ async fn all_modes_and_carriers_exchange_data_before_upload_eof() {
                         stream.read_to_end(&mut tail).await.unwrap();
                         assert!(tail.is_empty());
                     }
+                }
+                // H1 stream-one ends its connection with the response, not an independent FIN.
+                if mode != "packet-up" && !(mode == "stream-one" && version == "h1") {
+                    let target = crate::address::NetLocation::from_str(&half_close_target, None)
+                        .unwrap()
+                        .into();
+                    let mut stream = chain
+                        .connect_tcp(target, &resolver)
+                        .await
+                        .unwrap()
+                        .client_stream;
+                    let mut response = Vec::new();
+                    stream.read_to_end(&mut response).await.unwrap();
+                    assert_eq!(response, b"fin");
+                    let payload = vec![71; 2 * 1024 * 1024];
+                    stream.write_all(&payload).await.unwrap();
+                    stream.shutdown().await.unwrap();
+                    assert_eq!(uploads.recv().await.unwrap(), payload);
                 }
             })
             .await

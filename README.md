@@ -287,7 +287,10 @@ covering all three modes and HTTP versions. `type: splithttp` is an alias for
   default to accepting all modes. Stream-one uses one request; stream-up uses
   separate streaming upload/download requests; packet-up uses bounded POSTs.
 - Packet-up cannot transmit upload EOF. Use a streaming mode when the target
-  must receive EOF before responding. Streaming bodies require unbuffered proxies.
+  must receive EOF before responding. After upload shutdown and packet acknowledgements,
+  the client allows a one-second download tail before closing the session.
+  Streaming bodies require unbuffered proxies. H1 stream-one closes the whole HTTP
+  connection when its response ends; use H2/H3 or stream-up for remote-first half-close.
 - H1/H2 preserve selected upstream proxy chains. H3 must be the first proxy hop;
   it reuses the existing QUIC/H3 dependencies, not Hysteria2 framing.
 - `host` overrides HTTP authority independently of TLS SNI. Default Referer

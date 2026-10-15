@@ -373,6 +373,7 @@ mod tests {
             StatusCode::SERVICE_UNAVAILABLE
         );
         drop(first);
+        tokio::task::yield_now().await;
         assert_eq!(
             request(&state, "POST", "", b"third").await.status(),
             StatusCode::OK
@@ -438,9 +439,13 @@ struct DownloadGuard {
     state: Weak<State>,
     id: String,
     cancel: CancellationToken,
+    eof: CancellationToken,
 }
 impl Drop for DownloadGuard {
     fn drop(&mut self) {
+        if self.eof.is_cancelled() {
+            return;
+        }
         self.cancel.cancel();
         if let Some(state) = self.state.upgrade() {
             state.close(&self.id);
@@ -542,7 +547,12 @@ impl XhttpServer {
                         writer.fail(error).await;
                     }
                 });
+                let streaming_upload = matches!(
+                    wire::classify(&state.config, &state.path, &request),
+                    Ok(Kind::One | Kind::Upload(_))
+                );
                 let response = state.handle(request, reader).await;
+                let keep_upload = streaming_upload && response.status() == StatusCode::OK;
                 let (parts, mut body) = response.into_parts();
                 let result: io::Result<()> = async {
                     send.send_response(Response::from_parts(parts, ()))
@@ -575,6 +585,8 @@ impl XhttpServer {
                 .await;
                 if result.is_err() {
                     send.stop_stream(h3::error::Code::H3_REQUEST_CANCELLED);
+                } else if keep_upload {
+                    workers.wait().await;
                 }
             });
         }
@@ -749,7 +761,13 @@ impl State {
         response.body(body).unwrap()
     }
 
-    fn spawn_inner_session(&self, stream: Stream, permit: BudgetPermit, cancel: CancellationToken) {
+    fn spawn_inner_session(
+        &self,
+        stream: Stream,
+        permit: BudgetPermit,
+        cancel: CancellationToken,
+        finished: impl FnOnce() + Send + 'static,
+    ) {
         let inner = self.inner.clone();
         let resolver = self.resolver.clone();
         let timeout = Duration::from_secs(self.config.limits.setup_timeout_secs);
@@ -764,6 +782,7 @@ impl State {
                     }
                 }
             }
+            finished();
         });
     }
 
@@ -792,13 +811,16 @@ impl State {
                     write: writer,
                     _tasks: tasks.clone(),
                 };
-                // The response owns the guard. The session future owns only the
-                // token, not the task collection which would retain itself.
-                self.spawn_inner_session(stream, permit, tasks.cancel.clone());
-                Ok((
-                    Body::stream(reader).with_guard((tasks.cancel.clone().drop_guard(), admission)),
-                    true,
-                ))
+                self.spawn_inner_session(stream, permit, tasks.cancel.clone(), move || {
+                    drop(admission);
+                });
+                let guard = DownloadGuard {
+                    state: Weak::new(),
+                    id: String::new(),
+                    cancel: tasks.cancel.clone(),
+                    eof: reader.eof.clone(),
+                };
+                Ok((Body::stream(reader).with_guard(guard), true))
             }
             Kind::Download(id) => {
                 let session = self.session(&id)?;
@@ -817,11 +839,18 @@ impl State {
                     write: writer,
                     _tasks: tasks,
                 };
-                self.spawn_inner_session(stream, permit, session.cancel.clone());
+                let state = Arc::downgrade(self);
+                let session_id = id.clone();
+                self.spawn_inner_session(stream, permit, session.cancel.clone(), move || {
+                    if let Some(state) = state.upgrade() {
+                        state.close(&session_id);
+                    }
+                });
                 let guard = DownloadGuard {
                     state: Arc::downgrade(self),
                     id,
                     cancel: session.cancel.clone(),
+                    eof: output.eof.clone(),
                 };
                 Ok((Body::stream(output).with_guard(guard), true))
             }
@@ -1142,16 +1171,25 @@ impl State {
             let state = self.clone();
             requests.spawn(async move {
                 let (parts, body) = request.into_parts();
+                let request = Request::from_parts(parts, ());
+                let streaming_upload = matches!(
+                    wire::classify(&state.config, &state.path, &request),
+                    Ok(Kind::One | Kind::Upload(_))
+                );
                 let (writer, reader) = pipe(Memory::new(
                     state.memory.clone(),
                     state.config.limits.max_session_buffered_bytes,
                 ));
                 let tasks = Tasks::new();
                 tasks.spawn(carrier::receive_h2(body, writer));
-                let response = state.handle(Request::from_parts(parts, ()), reader).await;
+                let response = state.handle(request, reader).await;
+                let keep_upload = streaming_upload && response.status() == StatusCode::OK;
                 let (parts, body) = response.into_parts();
-                if let Ok(send) = respond.send_response(Response::from_parts(parts, ()), false) {
-                    let _ = carrier::send_h2(body, send).await;
+                if let Ok(send) = respond.send_response(Response::from_parts(parts, ()), false)
+                    && carrier::send_h2(body, send).await.is_ok()
+                    && keep_upload
+                {
+                    tasks.wait().await;
                 }
             });
         }

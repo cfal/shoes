@@ -318,8 +318,10 @@ async fn packet_shutdown_waits_for_acknowledgement() {
                 });
             }
         });
-        let config =
-            serde_json::from_value(serde_json::json!({"protocol":{"type":"socks"}})).unwrap();
+        let config = serde_json::from_value(serde_json::json!({
+            "limits":{"max_sessions":1}, "protocol":{"type":"socks"}
+        }))
+        .unwrap();
         let client = Arc::new(
             Client::new(
                 config,
@@ -331,14 +333,12 @@ async fn packet_shutdown_waits_for_acknowledgement() {
             )
             .unwrap(),
         );
-        let mut stream = client
-            .open(Arc::new(Dialer {
-                address,
-                key: RouteKey(vec![1]),
-                opens: AtomicUsize::new(0),
-            }))
-            .await
-            .unwrap();
+        let dialer = Arc::new(Dialer {
+            address,
+            key: RouteKey(vec![1]),
+            opens: AtomicUsize::new(0),
+        });
+        let mut stream = client.open(dialer.clone()).await.unwrap();
         stream.write_all(b"pending packet").await.unwrap();
         tokio::time::timeout(Duration::from_millis(100), stream.flush())
             .await
@@ -349,7 +349,11 @@ async fn packet_shutdown_waits_for_acknowledgement() {
         assert_eq!(received.await.unwrap(), b"pending packet");
         assert!(futures::poll!(&mut shutdown).is_pending());
         release.send(()).unwrap();
-        shutdown.await.unwrap();
+        shutdown.as_mut().await.unwrap();
+        drop(shutdown);
+        assert_eq!(stream.read(&mut [0; 1]).await.unwrap(), 0);
+        let next = client.open(dialer).await.unwrap();
+        drop(next);
     })
     .await
     .unwrap();

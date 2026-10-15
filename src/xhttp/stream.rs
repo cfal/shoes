@@ -182,6 +182,10 @@ impl Tasks {
             tokio::select! { biased; _ = cancel.cancelled() => {}, _ = future => {} }
         });
     }
+    pub async fn wait(&self) {
+        self.tracker.close();
+        self.tracker.wait().await;
+    }
 }
 impl Drop for Tasks {
     fn drop(&mut self) {
@@ -202,6 +206,7 @@ pub struct Reader {
     pub receiver: mpsc::Receiver<Event>,
     current: Bytes,
     ended: bool,
+    pub eof: CancellationToken,
 }
 
 pub struct Writer {
@@ -230,6 +235,7 @@ pub fn pipe(memory: Memory) -> (Writer, Reader) {
             receiver,
             current: Bytes::new(),
             ended: false,
+            eof: CancellationToken::new(),
         },
     )
 }
@@ -400,7 +406,10 @@ impl AsyncRead for Reader {
                 Some(Event::Flush(ack) | Event::Drain(ack)) => {
                     let _ = ack.send(());
                 }
-                Some(Event::Finish) => self.ended = true,
+                Some(Event::Finish) => {
+                    self.ended = true;
+                    self.eof.cancel();
+                }
                 Some(Event::Error(error)) => return Poll::Ready(Err(error)),
                 None => {
                     return Poll::Ready(Err(io::Error::new(
@@ -501,6 +510,7 @@ impl HttpBody for Body {
                         }
                         Some(Event::Finish) => {
                             reader.ended = true;
+                            reader.eof.cancel();
                             return Poll::Ready(None);
                         }
                         Some(Event::Error(error)) => {

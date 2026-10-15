@@ -264,6 +264,8 @@ impl Client {
             crate::uuid_util::generate_uuid()
         };
         let (errors, mut error_receiver) = tokio::sync::mpsc::channel(1);
+        let upload_finished = tokio_util::sync::CancellationToken::new();
+        let finished = upload_finished.clone();
         let body = if self.mode == XhttpMode::StreamOne {
             Body::stream(upload_reader)
         } else {
@@ -276,14 +278,26 @@ impl Client {
                     .await
                 {
                     let _ = errors.send(error).await;
+                } else {
+                    finished.cancel();
                 }
             });
             Body::Empty
         };
+        // Packet-up has no upload FIN on the wire. Bound its download-only tail.
+        let linger = async {
+            if self.mode != XhttpMode::PacketUp {
+                std::future::pending::<()>().await;
+            }
+            upload_finished.cancelled().await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        };
+        tokio::pin!(linger);
         let request = self.request(&session, None, self.mode == XhttpMode::StreamOne, body)?;
         let response = tokio::select! {
             Some(error) = error_receiver.recv() => return Err(error),
             _ = local.cancel.cancelled() => return Err(io::ErrorKind::ConnectionAborted.into()),
+            _ = &mut linger => return download_writer.shutdown().await,
             result = download.request(request, memory, &local, self.header_timeout()) => result?,
         };
         if response.status() != StatusCode::OK {
@@ -296,11 +310,18 @@ impl Client {
         tokio::select! {
             Some(error) = error_receiver.recv() => return Err(error),
             _ = local.cancel.cancelled() => return Err(io::ErrorKind::ConnectionAborted.into()),
+            _ = &mut linger => return download_writer.shutdown().await,
             result = tokio::io::copy(&mut body, download_writer) => {
                 result?;
             }
         }
-        download_writer.shutdown().await
+        download_writer.shutdown().await?;
+        tokio::select! {
+            biased;
+            Some(error) = error_receiver.recv() => Err(error),
+            _ = local.cancel.cancelled() => Err(io::ErrorKind::ConnectionAborted.into()),
+            _ = local.wait() => Ok(()),
+        }
     }
 
     async fn upload(
@@ -330,7 +351,11 @@ impl Client {
         let mut body = response.into_body();
         let mut buffer = [0; 4096];
         while body.read(&mut buffer).await? != 0 {}
-        Ok(())
+        tokio::select! {
+            biased;
+            _ = tasks.cancel.cancelled() => Err(io::ErrorKind::ConnectionAborted.into()),
+            _ = tasks.wait() => Ok(()),
+        }
     }
 
     fn header_timeout(&self) -> Duration {
