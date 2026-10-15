@@ -427,7 +427,9 @@ mod cleanup_tests {
 
     #[test]
     fn synthesis_failures_only_forward_explicit_incompatibilities() {
-        use crate::reality::reality_key_exchange::{ClientKeyShares, RealityGroup, server_exchange};
+        use crate::reality::reality_key_exchange::{
+            ClientKeyShares, RealityGroup, server_exchange,
+        };
 
         assert!(!should_forward_to_dest(Ok(())).unwrap());
         assert!(should_forward_to_dest(Err(io::ErrorKind::Unsupported.into())).unwrap());
@@ -453,8 +455,43 @@ mod cleanup_tests {
         assert_eq!(error.to_string(), "ML-KEM encapsulation failed");
     }
 
+    fn client_key_share_offsets(hello: &[u8]) -> Vec<usize> {
+        use crate::buf_reader::BufReader;
+
+        let mut reader = BufReader::new(hello);
+        reader.skip(43).unwrap();
+        let session_len = reader.read_u8().unwrap() as usize;
+        reader.skip(session_len).unwrap();
+        let cipher_len = reader.read_u16_be().unwrap() as usize;
+        reader.skip(cipher_len).unwrap();
+        let compression_len = reader.read_u8().unwrap() as usize;
+        reader.skip(compression_len).unwrap();
+        let extensions_len = reader.read_u16_be().unwrap() as usize;
+        assert_eq!(extensions_len, reader.remaining());
+        while !reader.is_consumed() {
+            let id = reader.read_u16_be().unwrap();
+            let len = reader.read_u16_be().unwrap() as usize;
+            let start = reader.position();
+            let data = reader.read_slice(len).unwrap();
+            if id == 51 {
+                let mut shares = BufReader::new(data);
+                let len = shares.read_u16_be().unwrap() as usize;
+                assert_eq!(len, shares.remaining());
+                let mut offsets = Vec::new();
+                while !shares.is_consumed() {
+                    offsets.push(start + shares.position());
+                    shares.skip(2).unwrap();
+                    let len = shares.read_u16_be().unwrap() as usize;
+                    shares.skip(len).unwrap();
+                }
+                return offsets;
+            }
+        }
+        panic!("missing key_share extension");
+    }
+
     #[tokio::test]
-    async fn unsupported_and_undersized_target_flights_forward_unchanged() {
+    async fn incompatible_hellos_and_small_targets_forward_unchanged() {
         use crate::client_proxy_chain::InitialHopEntry;
         use crate::port_forward_handler::PortForwardServerHandler;
         use crate::reality::reality_key_exchange::RealityGroup;
@@ -462,14 +499,44 @@ mod cleanup_tests {
         use crate::reality::{CipherSuite, RealityClientConnection, mldsa65_signing_key};
         use crate::tcp::socket_connector_impl::SocketConnectorImpl;
 
-        for case in ["small", "small-separate", "retry", "unsupported"] {
+        for case in [
+            "small",
+            "small-separate",
+            "retry",
+            "unsupported",
+            "client-unknown-shares",
+            "client-truncated-share",
+        ] {
             let (cc, mut sc) = configs(CipherSuite::AES_128_GCM_SHA256);
             let (seed, _) = crate::reality::generate_mldsa65_keypair().unwrap();
             sc.mldsa65_key = Some(mldsa65_signing_key(&seed).unwrap());
             let mut client = RealityClientConnection::new(cc).unwrap();
             let mut hello = Vec::new();
             client.write_tls(&mut hello).unwrap();
-            let mut response = if matches!(case, "small" | "small-separate") {
+            let mut response = if matches!(case, "client-unknown-shares" | "client-truncated-share")
+            {
+                let offsets = client_key_share_offsets(&hello);
+                assert_eq!(offsets.len(), 2);
+                let expected_error = if case == "client-unknown-shares" {
+                    for (offset, group) in offsets.into_iter().zip([0xfe30u16, 0xfe31]) {
+                        hello[offset..offset + 2].copy_from_slice(&group.to_be_bytes());
+                    }
+                    io::ErrorKind::InvalidData
+                } else {
+                    // Keeps the TLS framing valid while overstating the last share's length.
+                    let offset = offsets[1] + 2;
+                    assert_eq!(&hello[offset..offset + 2], &[0, 32]);
+                    hello[offset..offset + 2].copy_from_slice(&33u16.to_be_bytes());
+                    io::ErrorKind::UnexpectedEof
+                };
+                let mut check = RealityServerConnection::new(sc.clone()).unwrap();
+                assert_eq!(
+                    check.validate_client_hello(&hello).unwrap_err().kind(),
+                    expected_error
+                );
+                // A valid target flight reaches the admission-error branch, not hello fallback.
+                crate::reality::default_target_records(&hello[44..76]).concat()
+            } else if matches!(case, "small" | "small-separate") {
                 let (mut records, small_record) = if case == "small" {
                     (crate::reality::default_target_records(&hello[44..76]), 2)
                 } else {
@@ -563,6 +630,7 @@ mod cleanup_tests {
             peer.write_all(&flight).await.unwrap();
             let mut io: Box<dyn AsyncStream> = Box::new(io);
             let parsed = crate::shadow_tls::read_client_hello(&mut io).await.unwrap();
+            assert!(parsed.supports_tls13);
             assert_eq!(parsed.client_reader.unparsed_data(), b"pending");
             let decoy_io = async {
                 let (mut socket, _) = listener.accept().await.unwrap();
@@ -599,7 +667,7 @@ mod cleanup_tests {
                 tokio::join!(handler, decoy_io, peer_io);
             })
             .await
-            .expect("fallback must not wait for an encrypted flight after HRR");
+            .unwrap_or_else(|_| panic!("transparent forwarding stalled for {case}"));
         }
     }
 
