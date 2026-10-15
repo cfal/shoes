@@ -63,6 +63,10 @@ pub struct ProcessGuard {
 }
 
 impl ProcessGuard {
+    pub fn try_wait(&mut self) -> io::Result<Option<std::process::ExitStatus>> {
+        self.child_mut().try_wait()
+    }
+
     #[cfg(target_os = "linux")]
     pub fn process_group_id(&self) -> Option<i32> {
         match self.cleanup_target {
