@@ -646,6 +646,15 @@ fn validate_server_config(
         &server_config.protocol,
         &server_config.transport,
     )?;
+    if matches!(server_config.protocol, ServerProxyConfig::Xhttp(_))
+        && server_config.transport == Transport::Quic
+        && server_config.quic_settings.as_ref().is_some_and(|quic| {
+            !quic.alpn_protocols.is_unspecified()
+                && quic.alpn_protocols.clone().into_vec() != ["h3"]
+        })
+    {
+        return Err(super::types::xhttp::invalid("QUIC XHTTP ALPN must be h3"));
+    }
     if server_config.transport == Transport::Udp {
         return Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,

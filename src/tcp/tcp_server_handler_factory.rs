@@ -440,26 +440,7 @@ fn create_tls_server_target(
         }
         naive_alpn
     } else if let ServerProxyConfig::Xhttp(config) = &protocol {
-        use crate::config::xhttp::XhttpVersion;
-        let allowed: &[&str] = match config.http_version {
-            XhttpVersion::Auto => &["h2", "http/1.1"],
-            XhttpVersion::H1 => &["http/1.1"],
-            XhttpVersion::H2 => &["h2"],
-            XhttpVersion::H3 => return Err(std::io::Error::other("H3 requires QUIC transport")),
-        };
-        if alpn_protocols.is_unspecified() {
-            allowed.iter().map(|s| (*s).to_owned()).collect()
-        } else {
-            let protocols = alpn_protocols.into_vec();
-            if protocols.iter().any(|p| !allowed.contains(&p.as_str()))
-                || (protocols.is_empty() && config.http_version == XhttpVersion::H2)
-            {
-                return Err(std::io::Error::other(
-                    "XHTTP TLS ALPN conflicts with HTTP version",
-                ));
-            }
-            protocols
-        }
+        config.tls_alpn(&alpn_protocols)?
     } else {
         alpn_protocols.into_vec()
     };

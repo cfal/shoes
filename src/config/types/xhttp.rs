@@ -72,6 +72,15 @@ pub(crate) fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
 }
 
+fn validate_path_and_host(path: &str, host: Option<&str>) -> io::Result<()> {
+    crate::xhttp::wire::Path::new(path)?;
+    if let Some(host) = host.filter(|host| !host.is_empty()) {
+        host.parse::<http::uri::Authority>()
+            .map_err(io::Error::other)?;
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct XhttpLimits {
@@ -183,6 +192,7 @@ pub struct XhttpClientConfig {
 
 impl XhttpClientConfig {
     pub fn validate(&self) -> io::Result<()> {
+        validate_path_and_host(&self.path, self.host.as_deref())?;
         self.limits.validate()?;
         if self.x_padding_bytes.bounds((100, 1000), false)?.1 > 65536 {
             return Err(invalid("XHTTP padding must not exceed 65536 bytes"));
@@ -259,6 +269,7 @@ pub struct XhttpServerConfig {
 
 impl XhttpServerConfig {
     pub fn validate(&self) -> io::Result<()> {
+        validate_path_and_host(&self.path, self.host.as_deref())?;
         if contains_server(&self.protocol) {
             return Err(invalid("nested XHTTP is not supported"));
         }
@@ -276,6 +287,33 @@ impl XhttpServerConfig {
         }
         self.sc_stream_up_server_secs.bounds((20, 80), true)?;
         Ok(())
+    }
+
+    pub(crate) fn tls_alpn(
+        &self,
+        protocols: &crate::option_util::NoneOrSome<String>,
+    ) -> io::Result<Vec<String>> {
+        let allowed: &[&str] = match self.http_version {
+            XhttpVersion::Auto => &["h2", "http/1.1"],
+            XhttpVersion::H1 => &["http/1.1"],
+            XhttpVersion::H2 => &["h2"],
+            XhttpVersion::H3 => return Err(invalid("H3 requires QUIC transport")),
+        };
+        if protocols.is_unspecified() {
+            return Ok(allowed
+                .iter()
+                .map(|protocol| (*protocol).to_owned())
+                .collect());
+        }
+        let protocols = protocols.clone().into_vec();
+        if protocols
+            .iter()
+            .any(|protocol| !allowed.contains(&protocol.as_str()))
+            || (protocols.is_empty() && self.http_version == XhttpVersion::H2)
+        {
+            return Err(invalid("XHTTP TLS ALPN conflicts with HTTP version"));
+        }
+        Ok(protocols)
     }
     pub fn header_limit(&self) -> usize {
         if self.server_max_header_bytes == 0 {
@@ -347,15 +385,29 @@ pub(crate) fn validate_server_transport(
                 return Err(invalid("QUIC XHTTP must be a top-level protocol"));
             }
             for target in tls_targets.values() {
+                if let ServerProxyConfig::Xhttp(config) = &target.protocol {
+                    config.tls_alpn(&target.alpn_protocols)?;
+                }
                 validate_server_transport(&target.protocol, transport)?;
             }
             if let Some(target) = default_tls_target {
+                if let ServerProxyConfig::Xhttp(config) = &target.protocol {
+                    config.tls_alpn(&target.alpn_protocols)?;
+                }
                 validate_server_transport(&target.protocol, transport)?;
             }
             for target in shadowtls_targets.values() {
+                if contains_server(&target.protocol) {
+                    return Err(invalid("ShadowTLS cannot wrap XHTTP"));
+                }
                 validate_server_transport(&target.protocol, transport)?;
             }
             for target in reality_targets.values() {
+                if let ServerProxyConfig::Xhttp(config) = &target.protocol
+                    && !matches!(config.http_version, XhttpVersion::Auto | XhttpVersion::H2)
+                {
+                    return Err(invalid("REALITY XHTTP requires H2"));
+                }
                 validate_server_transport(&target.protocol, transport)?;
             }
         }
@@ -375,6 +427,39 @@ pub(crate) fn validate_server_transport(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn xhttp_rejects_invalid_wire_settings_before_startup() {
+        for (path, host) in [
+            ("/?bad=\n", "front.test"),
+            ("/", "https://front.test"),
+            ("/", "::1"),
+        ] {
+            let value =
+                serde_json::json!({"path": path, "host": host, "protocol": {"type": "socks"}});
+            assert!(
+                serde_json::from_value::<XhttpClientConfig>(value.clone())
+                    .unwrap()
+                    .validate()
+                    .is_err()
+            );
+            assert!(
+                serde_json::from_value::<XhttpServerConfig>(value)
+                    .unwrap()
+                    .validate()
+                    .is_err()
+            );
+        }
+        let xhttp = serde_json::json!({"type": "xhttp", "http_version": "h1", "protocol": {"type": "socks"}});
+        for protocol in [
+            serde_json::json!({"type": "tls", "default_target": {"cert": "unused", "key": "unused", "alpn_protocols": ["h2"], "protocol": xhttp}}),
+            serde_json::json!({"type": "tls", "shadowtls_targets": {"front.test": {"password": "unused", "handshake": {"address": "example.com:443"}, "protocol": xhttp}}}),
+            serde_json::json!({"type": "tls", "reality_targets": {"front.test": {"private_key": "unused", "dest": "example.com:443", "protocol": xhttp}}}),
+        ] {
+            let config = serde_json::from_value(protocol).unwrap();
+            assert!(validate_server_transport(&config, &super::super::Transport::Tcp).is_err());
+        }
+    }
     #[test]
     fn xhttp_range_defaults_and_sentinels() {
         assert_eq!(
