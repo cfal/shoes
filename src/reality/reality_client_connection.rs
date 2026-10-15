@@ -1148,6 +1148,114 @@ mod tests {
     }
 
     #[test]
+    fn single_share_and_distinct_auth_keys_complete_handshake() {
+        use super::super::RealityServerConnection;
+        use super::super::reality_pq_tests::{configs, target_records};
+
+        for (group, distinct_auth_key) in [
+            (RealityGroup::X25519, false),
+            (RealityGroup::X25519MlKem768, false),
+            (RealityGroup::X25519MlKem768, true),
+        ] {
+            let cipher = CipherSuite::AES_128_GCM_SHA256;
+            let (cc, sc) = configs(cipher);
+            let mut client = RealityClientConnection::new(cc.clone()).unwrap();
+            let HandshakeState::AwaitingServerHello {
+                client_hello_bytes,
+                client_private_key,
+                mlkem_private,
+                auth_key,
+            } = &mut client.handshake_state
+            else {
+                unreachable!();
+            };
+            let public =
+                agreement::PrivateKey::from_private_key(&agreement::X25519, client_private_key)
+                    .unwrap()
+                    .compute_public_key()
+                    .unwrap();
+            let mut hybrid = mlkem_private
+                .as_ref()
+                .unwrap()
+                .encapsulation_key()
+                .unwrap()
+                .key_bytes()
+                .unwrap()
+                .as_ref()
+                .to_vec();
+            hybrid.extend_from_slice(public.as_ref());
+            let auth_private = [8; 32];
+            let auth_public =
+                agreement::PrivateKey::from_private_key(&agreement::X25519, &auth_private)
+                    .unwrap()
+                    .compute_public_key()
+                    .unwrap();
+            let mut shares = vec![KeyShareRef {
+                group,
+                data: if group == RealityGroup::X25519 {
+                    public.as_ref()
+                } else {
+                    &hybrid
+                },
+            }];
+            let random: [u8; 32] = client_hello_bytes[6..38].try_into().unwrap();
+            if distinct_auth_key {
+                shares.push(KeyShareRef {
+                    group: RealityGroup::X25519,
+                    data: auth_public.as_ref(),
+                });
+                let shared = perform_ecdh(&auth_private, &cc.public_key).unwrap();
+                *auth_key = derive_auth_key(&shared, &random[..20], b"REALITY").unwrap();
+            }
+            let mut hello = construct_client_hello(
+                &random,
+                &[0; 32],
+                &shares,
+                &cc.server_name,
+                &[cipher.id()],
+                DEFAULT_ALPN_PROTOCOLS,
+            )
+            .unwrap();
+            let mut metadata = [0; 16];
+            metadata[..4].copy_from_slice(&[1, 8, 0, 0]);
+            metadata[8..].copy_from_slice(&cc.short_id);
+            let session = encrypt_session_id(&metadata, auth_key, &random[20..], &hello).unwrap();
+            hello[39..71].copy_from_slice(&session);
+            *client_hello_bytes = hello.clone();
+            client.ciphertext_write_buf =
+                write_record_header(CONTENT_TYPE_HANDSHAKE, hello.len() as u16);
+            client.ciphertext_write_buf.extend_from_slice(&hello);
+
+            let mut server = RealityServerConnection::new(sc).unwrap();
+            let mut wire = Vec::new();
+            client.write_tls(&mut wire).unwrap();
+            server.validate_client_hello(&wire).unwrap();
+            server
+                .build_server_response(&target_records(group, cipher, &session))
+                .unwrap();
+            wire.clear();
+            server.write_tls(&mut wire).unwrap();
+            client.read_tls(&mut wire.as_slice()).unwrap();
+            client.process_new_packets().unwrap();
+            wire.clear();
+            client.write_tls(&mut wire).unwrap();
+            server.read_tls(&mut wire.as_slice()).unwrap();
+            server.process_new_packets().unwrap();
+            assert_eq!(client.negotiated_group(), Some(group));
+            assert_eq!(server.negotiated_group(), Some(group));
+
+            client.writer().write_all(b"request").unwrap();
+            wire.clear();
+            client.write_tls(&mut wire).unwrap();
+            server.read_tls(&mut wire.as_slice()).unwrap();
+            server.process_new_packets().unwrap();
+            let mut request = [0; 7];
+            server.reader().read_exact(&mut request).unwrap();
+            assert_eq!(&request, b"request");
+        }
+    }
+
+    #[test]
     fn handshake_key_material_is_not_logged() {
         let private =
             agreement::PrivateKey::from_private_key(&agreement::X25519, &[1; 32]).unwrap();

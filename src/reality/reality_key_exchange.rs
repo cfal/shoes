@@ -113,7 +113,7 @@ fn key_share_extension(record: &[u8], client: bool) -> io::Result<&[u8]> {
     hello.skip(session_len)?;
     if client {
         let cipher_len = hello.read_u16_be()? as usize;
-        if cipher_len == 0 || cipher_len % 2 != 0 {
+        if cipher_len == 0 || !cipher_len.is_multiple_of(2) {
             return Err(invalid("Invalid cipher suite vector"));
         }
         hello.skip(cipher_len)?;

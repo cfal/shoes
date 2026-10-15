@@ -108,6 +108,53 @@ mod tests {
     use aws_lc_rs::signature::KeyPair;
 
     #[test]
+    fn malformed_mldsa_extensions_fail_even_with_valid_hmac() {
+        use super::super::reality_client_verify::{
+            verify_certificate_hmac, verify_certificate_mldsa,
+        };
+        use super::super::reality_mldsa;
+
+        let (seed, verify) = crate::reality::generate_mldsa65_keypair().unwrap();
+        let signer = crate::reality::mldsa65_signing_key(&seed).unwrap();
+        let verify = crate::reality::decode_mldsa65_verify(&verify).unwrap();
+        let auth = [42; 32];
+        let ed25519 = Ed25519KeyPair::generate().unwrap();
+        let public = ed25519.public_key().as_ref();
+        let key = HmacSigningKey {
+            hmac_key: hmac::Key::new(hmac::HMAC_SHA512, &auth),
+            public_key: public.try_into().unwrap(),
+        };
+        let message = reality_mldsa::certificate_message(&auth, public, &[b"clientserver"]);
+        let signature = reality_mldsa::sign(&signer, &message).unwrap();
+        for case in ["absent", "duplicate", "critical", "short", "corrupt"] {
+            let mut params = rcgen::CertificateParams::default();
+            let mut value = signature.clone();
+            if case == "short" {
+                value.pop();
+            } else if case == "corrupt" {
+                value[0] ^= 1;
+            }
+            let count = match case {
+                "absent" => 0,
+                "duplicate" => 2,
+                _ => 1,
+            };
+            for _ in 0..count {
+                let mut extension =
+                    rcgen::CustomExtension::from_oid_content(&[0, 0], value.clone());
+                extension.set_criticality(case == "critical");
+                params.custom_extensions.push(extension);
+            }
+            let cert = params.self_signed(&key).unwrap();
+            verify_certificate_hmac(cert.der(), &auth).unwrap();
+            assert!(
+                verify_certificate_mldsa(cert.der(), &auth, b"clientserver", &verify).is_err(),
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
     fn mldsa_extension_precedes_standard_extensions() {
         use x509_parser::prelude::FromDer;
         let (seed, verify) = crate::reality::generate_mldsa65_keypair().unwrap();

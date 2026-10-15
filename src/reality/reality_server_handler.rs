@@ -408,6 +408,144 @@ mod cleanup_tests {
     use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
     #[tokio::test]
+    async fn unsupported_and_undersized_target_flights_forward_unchanged() {
+        use crate::client_proxy_chain::InitialHopEntry;
+        use crate::port_forward_handler::PortForwardServerHandler;
+        use crate::reality::reality_pq_tests::configs;
+        use crate::reality::{CipherSuite, RealityClientConnection, mldsa65_signing_key};
+        use crate::tcp::socket_connector_impl::SocketConnectorImpl;
+
+        for case in ["small", "retry", "unsupported"] {
+            let (cc, mut sc) = configs(CipherSuite::AES_128_GCM_SHA256);
+            let (seed, _) = crate::reality::generate_mldsa65_keypair().unwrap();
+            sc.mldsa65_key = Some(mldsa65_signing_key(&seed).unwrap());
+            let mut client = RealityClientConnection::new(cc).unwrap();
+            let mut hello = Vec::new();
+            client.write_tls(&mut hello).unwrap();
+            let mut response = if case == "small" {
+                let mut records = crate::reality::default_target_records(&hello[44..76]);
+                let mut encrypted = vec![23, 3, 3, 2, 88];
+                encrypted.resize(605, 0);
+                records[2] = encrypted.into();
+                let mut check = RealityServerConnection::new(sc.clone()).unwrap();
+                check.validate_client_hello(&hello).unwrap();
+                assert!(
+                    check
+                        .build_server_response(&records)
+                        .unwrap_err()
+                        .to_string()
+                        .contains("insufficient capacity")
+                );
+                records.concat()
+            } else {
+                let mut message = vec![2, 0, 0, 0, 3, 3];
+                if case == "retry" {
+                    let retry_random =
+                        aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, b"HelloRetryRequest");
+                    message.extend_from_slice(retry_random.as_ref());
+                } else {
+                    message.extend_from_slice(&[3; 32]);
+                }
+                message.push(32);
+                message.extend_from_slice(&hello[44..76]);
+                message.extend_from_slice(&[0x13, 1, 0]);
+                let mut extensions = vec![0, 43, 0, 2, 3, 4];
+                if case == "retry" {
+                    extensions.extend_from_slice(&[0, 51, 0, 2, 0, 23]);
+                } else {
+                    extensions.extend_from_slice(&[0, 51, 0, 5, 0xfe, 0x30, 0, 1, 1]);
+                }
+                message.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+                message.extend_from_slice(&extensions);
+                let len = (message.len() - 4) as u32;
+                message[1..4].copy_from_slice(&len.to_be_bytes()[1..]);
+                let mut record = vec![22, 3, 3];
+                record.extend_from_slice(&(message.len() as u16).to_be_bytes());
+                record.extend_from_slice(&message);
+                record
+            };
+            // A partial trailing record exercises the deframer's retained bytes.
+            response.extend_from_slice(&[23, 3, 3]);
+
+            let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+            let dest = NetLocation::new(
+                crate::address::Address::Hostname("localhost".into()),
+                listener.local_addr().unwrap().port(),
+            );
+            let selector = Arc::new(ClientProxySelector::new(Vec::new()));
+            let target = RealityServerTarget {
+                mldsa65_key: sc.mldsa65_key,
+                private_key: sc.private_key,
+                short_ids: sc.short_ids,
+                dest: dest.clone(),
+                max_time_diff: None,
+                min_client_version: None,
+                max_client_version: None,
+                cipher_suites: sc.cipher_suites,
+                effective_selector: selector.clone(),
+                inner_protocol: InnerProtocol::Normal(Box::new(PortForwardServerHandler::new(
+                    vec![dest],
+                    selector,
+                ))),
+                dest_client_chain: ClientProxyChain::new(
+                    vec![InitialHopEntry::Direct(Box::new(
+                        SocketConnectorImpl::from_config(
+                            &crate::config::ClientConfig::default(),
+                            None,
+                        )
+                        .unwrap(),
+                    ))],
+                    Vec::new(),
+                ),
+            };
+            let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
+            let (io, mut peer) = tokio::io::duplex(65536);
+            let mut flight = hello.clone();
+            flight.extend_from_slice(b"pending");
+            peer.write_all(&flight).await.unwrap();
+            let mut io: Box<dyn AsyncStream> = Box::new(io);
+            let parsed = crate::shadow_tls::read_client_hello(&mut io).await.unwrap();
+            assert_eq!(parsed.client_reader.unparsed_data(), b"pending");
+            let decoy_io = async {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut forwarded = vec![0; hello.len()];
+                socket.read_exact(&mut forwarded).await.unwrap();
+                assert_eq!(forwarded, hello);
+                socket.write_all(&response).await.unwrap();
+                let mut upstream = Vec::new();
+                socket.read_to_end(&mut upstream).await.unwrap();
+                assert_eq!(upstream, b"pending-live");
+                socket.write_all(b"-reply").await.unwrap();
+                socket.shutdown().await.unwrap();
+            };
+            let handler = async {
+                let result = setup_reality_server_stream(io, &target, parsed, &resolver)
+                    .await
+                    .unwrap();
+                let TcpServerSetupResult::Session(session) = result else {
+                    panic!("expected transparent fallback for {case}");
+                };
+                session.await;
+            };
+            let peer_io = async {
+                let mut actual = vec![0; response.len()];
+                peer.read_exact(&mut actual).await.unwrap();
+                assert_eq!(actual, response, "{case}");
+                peer.write_all(b"-live").await.unwrap();
+                peer.shutdown().await.unwrap();
+                let mut reply = Vec::new();
+                peer.read_to_end(&mut reply).await.unwrap();
+                assert_eq!(reply, b"-reply");
+            };
+            tokio::time::timeout(Duration::from_secs(2), async {
+                tokio::join!(handler, decoy_io, peer_io);
+            })
+            .await
+            .expect("fallback must not wait for an encrypted flight after HRR");
+        }
+    }
+
+    #[tokio::test]
     async fn authenticated_non_vision_oversized_preread_returns_error_without_panicking() {
         use crate::client_proxy_chain::InitialHopEntry;
         use crate::port_forward_handler::PortForwardServerHandler;

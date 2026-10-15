@@ -40,7 +40,11 @@ pub(super) fn configs(cipher: CipherSuite) -> (RealityClientConfig, RealityServe
     )
 }
 
-fn target_records(group: RealityGroup, cipher: CipherSuite, session: &[u8]) -> Vec<Bytes> {
+pub(super) fn target_records(
+    group: RealityGroup,
+    cipher: CipherSuite,
+    session: &[u8],
+) -> Vec<Bytes> {
     let hello = construct_server_hello(
         &[3; 32],
         session,
