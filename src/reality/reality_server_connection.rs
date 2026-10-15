@@ -1169,6 +1169,7 @@ mod tests {
         use crate::reality::reality_client_connection::feed_reality_client_connection;
         use crate::reality::{RealityClientConfig, RealityClientConnection};
         use crate::shadow_tls::parse_server_hello;
+        use aws_lc_rs::agreement;
         use shoes_test_support::test_servers::reality_tls_template_config;
 
         let private_key = [1; 32];
@@ -1177,6 +1178,7 @@ mod tests {
             .compute_public_key()
             .unwrap();
         let mut client = RealityClientConnection::new(RealityClientConfig {
+            mldsa65_verify: None,
             public_key: public_key.as_ref().try_into().unwrap(),
             short_id: [2; 8],
             server_name: "localhost".into(),
@@ -1228,6 +1230,7 @@ mod tests {
         }
 
         let mut server = RealityServerConnection::new(RealityServerConfig {
+            mldsa65_key: None,
             private_key,
             short_ids: vec![[2; 8]],
             dest: NetLocation::new(Address::Hostname("localhost".into()), 443),
@@ -1238,7 +1241,7 @@ mod tests {
         })
         .unwrap();
         server.validate_client_hello(&client_hello).unwrap();
-        server.build_server_response(template_records).unwrap();
+        server.build_server_response(&template_records).unwrap();
         let mut server_flight = Vec::new();
         server.write_tls(&mut server_flight).unwrap();
         let server_records = complete_tls_records(&server_flight);
