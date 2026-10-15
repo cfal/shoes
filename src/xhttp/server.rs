@@ -669,7 +669,7 @@ mod tests {
             );
         }
         let mut requests = tokio::task::JoinSet::new();
-        for sequence in 4..8 {
+        for sequence in 4..11 {
             let state = state.clone();
             requests.spawn(async move {
                 request(&state, "POST", &format!("a/{sequence}"), b"abcdefgh")
@@ -684,13 +684,58 @@ mod tests {
             "full queues must backpressure, not reject"
         );
         tokio::time::timeout(Duration::from_secs(1), async {
-            reader.read_exact(&mut [0; 64]).await.unwrap();
+            reader.read_exact(&mut [0; 88]).await.unwrap();
             while let Some(response) = requests.join_next().await {
                 assert_eq!(response.unwrap(), StatusCode::OK);
             }
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn attached_duplicate_packets_wait_for_forwarding() {
+        let state = service();
+        let session = state.session("a").unwrap();
+        let mut reader = {
+            let mut state = session.state.lock();
+            state.downloaded = true;
+            state.reader.take().unwrap()
+        };
+        for sequence in 0..4 {
+            assert_eq!(
+                request(&state, "POST", &format!("a/{sequence}"), b"12345678")
+                    .await
+                    .status(),
+                StatusCode::OK
+            );
+        }
+        let mut later = Box::pin(request(&state, "POST", "a/5", b"BBBBBBBB"));
+        assert!(futures::poll!(&mut later).is_pending());
+        let mut duplicate_later = Box::pin(request(&state, "POST", "a/5", b"BBBBBBBB"));
+        assert!(futures::poll!(&mut duplicate_later).is_pending());
+        let mut next = Box::pin(request(&state, "POST", "a/4", b"AAAAAAAA"));
+        assert!(futures::poll!(&mut next).is_pending());
+        tokio::task::yield_now().await;
+        let mut duplicate_next = Box::pin(request(&state, "POST", "a/4", b"AAAAAAAA"));
+        assert!(futures::poll!(&mut duplicate_next).is_pending());
+        let mut bytes = [0; 48];
+        tokio::time::timeout(Duration::from_secs(1), async {
+            let (later, duplicate_later, next, duplicate_next, read) = tokio::join!(
+                later,
+                duplicate_later,
+                next,
+                duplicate_next,
+                reader.read_exact(&mut bytes)
+            );
+            read.unwrap();
+            for response in [later, duplicate_later, next, duplicate_next] {
+                assert_eq!(response.status(), StatusCode::OK);
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(&bytes[32..], b"AAAAAAAABBBBBBBB");
     }
 
     #[tokio::test]
@@ -783,9 +828,27 @@ struct SessionState {
     writer: Option<Writer>,
     reader: Option<Reader>,
     pending: BTreeMap<u64, Packet>,
+    receiving: BTreeMap<u64, usize>,
+    forwarding: Option<(u64, CancellationToken)>,
     next: u64,
     downloaded: bool,
     permit: Option<BudgetPermit>,
+}
+impl SessionState {
+    fn acknowledgement(&self, sequence: u64) -> Option<CancellationToken> {
+        if !self.downloaded {
+            return None;
+        }
+        self.forwarding
+            .as_ref()
+            .filter(|(number, _)| *number == sequence)
+            .map(|(_, forwarded)| forwarded.clone())
+            .or_else(|| {
+                self.pending
+                    .get(&sequence)
+                    .map(|packet| packet.forwarded.clone())
+            })
+    }
 }
 struct Packet {
     chunks: Vec<Bytes>,
@@ -799,6 +862,30 @@ struct Session {
     created: tokio::time::Instant,
     admission: parking_lot::Mutex<Option<BudgetPermit>>,
     progress: Notify,
+}
+
+struct PacketRequest {
+    session: Arc<Session>,
+    sequence: u64,
+}
+
+impl PacketRequest {
+    fn new(session: Arc<Session>, sequence: u64) -> Self {
+        *session.state.lock().receiving.entry(sequence).or_default() += 1;
+        Self { session, sequence }
+    }
+}
+
+impl Drop for PacketRequest {
+    fn drop(&mut self) {
+        let mut state = self.session.state.lock();
+        let count = state.receiving.get_mut(&self.sequence).unwrap();
+        *count -= 1;
+        if *count == 0 {
+            state.receiving.remove(&self.sequence);
+        }
+        self.session.progress.notify_waiters();
+    }
 }
 
 struct DownloadGuard {
@@ -1110,6 +1197,8 @@ impl State {
                 writer: Some(writer),
                 reader: Some(reader),
                 pending: BTreeMap::new(),
+                receiving: BTreeMap::new(),
+                forwarding: None,
                 next: 0,
                 downloaded: false,
                 permit: Some(permit),
@@ -1309,9 +1398,6 @@ impl State {
                     if state.upload == Upload::Stream {
                         return Err(StatusCode::CONFLICT);
                     }
-                    if sequence < state.next {
-                        return Ok((Body::Empty, false));
-                    }
                 }
                 let max = self
                     .config
@@ -1342,21 +1428,22 @@ impl State {
                 }
                 let deadline = tokio::time::Instant::now()
                     + Duration::from_secs(self.config.limits.packet_timeout_secs);
-                let work = async {
+                let _request = PacketRequest::new(session.clone(), sequence);
+                let ingest = async {
                     let mut memory = loop {
                         let released = session.memory.packet_space_released();
                         let progress = session.progress.notified();
                         tokio::pin!(released, progress);
                         released.as_mut().enable();
                         progress.as_mut().enable();
-                        let wait = {
+                        {
                             let mut state = session.state.lock();
                             if state.upload == Upload::Stream {
                                 return Err(StatusCode::CONFLICT);
                             }
                             state.upload = Upload::Packet;
                             if sequence < state.next {
-                                return Ok((Body::Empty, false));
+                                return Ok(state.acknowledgement(sequence));
                             }
                             let contiguous = state.downloaded
                                 && (state.next..sequence)
@@ -1364,10 +1451,14 @@ impl State {
                             if sequence.saturating_sub(state.next)
                                 >= self.config.buffered_posts() as u64
                             {
-                                if !contiguous {
+                                if !state.downloaded
+                                    || !(state.next..sequence).all(|number| {
+                                        state.pending.contains_key(&number)
+                                            || state.receiving.contains_key(&number)
+                                    })
+                                {
                                     return Err(StatusCode::SERVICE_UNAVAILABLE);
                                 }
-                                Some(state.pending[&state.next].forwarded.clone())
                             } else {
                                 // Out-of-order packets must leave space for their missing predecessor.
                                 let headroom = if contiguous || sequence == state.next {
@@ -1380,16 +1471,11 @@ impl State {
                                 {
                                     break memory;
                                 }
-                                None
                             }
-                        };
-                        if let Some(wait) = wait {
-                            wait.cancelled().await;
-                        } else {
-                            tokio::select! {
-                                _ = released => {},
-                                _ = progress => {},
-                            }
+                        }
+                        tokio::select! {
+                            _ = released => {},
+                            _ = progress => {},
                         }
                     };
                     let mut chunks = Vec::new();
@@ -1427,7 +1513,7 @@ impl State {
                     let writer = {
                         let mut state = session.state.lock();
                         if sequence < state.next {
-                            return Ok((Body::Empty, false));
+                            return Ok(state.acknowledgement(sequence));
                         }
                         if let Some(previous) = state.pending.get(&sequence) {
                             if previous
@@ -1436,7 +1522,7 @@ impl State {
                                 .flat_map(|b| b.iter())
                                 .eq(chunks.iter().flat_map(|b| b.iter()))
                             {
-                                return Ok((Body::Empty, false));
+                                return Ok(state.acknowledgement(sequence));
                             }
                             return Err(StatusCode::CONFLICT);
                         }
@@ -1463,7 +1549,9 @@ impl State {
                                         let mut state = session.state.lock();
                                         let next = state.next;
                                         let chunks = state.pending.remove(&next);
-                                        if chunks.is_some() {
+                                        if let Some(packet) = &chunks {
+                                            state.forwarding =
+                                                Some((next, packet.forwarded.clone()));
                                             state.next = next.checked_add(1).ok_or_else(|| {
                                                 io::Error::other("sequence exhausted")
                                             })?;
@@ -1476,6 +1564,7 @@ impl State {
                                             for chunk in packet.chunks {
                                                 writer.forward(chunk).await?;
                                             }
+                                            session.state.lock().forwarding = None;
                                             packet.forwarded.cancel();
                                         }
                                         None => session.ready.notified().await,
@@ -1491,8 +1580,10 @@ impl State {
                         });
                     }
                     session.ready.notify_one();
-                    let downloaded = session.state.lock().downloaded;
-                    if downloaded {
+                    Ok(session.state.lock().downloaded.then_some(forwarded))
+                };
+                let work = async {
+                    if let Some(forwarded) = ingest.await? {
                         forwarded.cancelled().await;
                     }
                     Ok((Body::Empty, false))
