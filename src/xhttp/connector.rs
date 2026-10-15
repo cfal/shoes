@@ -225,7 +225,13 @@ pub fn build(
         .clone()
         .filter(|host| !host.is_empty())
         .or(effective_sni)
-        .unwrap_or_else(|| config.address.to_string());
+        .unwrap_or_else(|| {
+            if config.address.address().is_ipv6() {
+                format!("[{}]:{}", config.address.address(), config.address.port())
+            } else {
+                config.address.to_string()
+            }
+        });
     let _: http::uri::Authority = authority.parse().map_err(io::Error::other)?;
     let mode = match xhttp.mode {
         XhttpMode::Auto if reality => XhttpMode::StreamOne,
@@ -254,6 +260,20 @@ pub fn build(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn ipv6_literal_endpoints_do_not_require_a_host_override() {
+        let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
+        for transport in ["tcp", "quic"] {
+            let config = serde_json::from_value(json!({
+                "address": "[::1]:443",
+                "transport": transport,
+                "protocol": {"type": "xhttp", "protocol": {"type": "socks"}}
+            }))
+            .unwrap();
+            assert!(build(&config, resolver.clone()).unwrap().is_some());
+        }
+    }
 
     #[test]
     fn xhttp_rejects_invalid_wrappers_carriers_and_headers() {

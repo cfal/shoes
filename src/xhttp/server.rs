@@ -99,6 +99,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unmatched_requests_do_not_disclose_xhttp_headers() {
+        let mut state = service();
+        Arc::get_mut(&mut state).unwrap().config.host = Some("front.test".into());
+        for uri in ["http://front.test/wrong", "http://wrong.test/t/session"] {
+            let request = Request::builder()
+                .method("OPTIONS")
+                .uri(uri)
+                .header("origin", "https://probe.test")
+                .body(())
+                .unwrap();
+            let (_, body) = pipe(Memory::new(state.memory.clone(), 1024));
+            let response = state.handle(request, body).await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            assert!(response.headers().is_empty());
+        }
+    }
+
+    #[tokio::test]
     async fn packet_reordering_duplicates_and_download_ownership() {
         let state = service();
         assert_eq!(
@@ -840,6 +858,12 @@ impl State {
         let result = self.dispatch(&request, body).await;
         let mut response = match result {
             Ok((body, downstream)) => self.response(StatusCode::OK, body, downstream),
+            Err(StatusCode::NOT_FOUND) => {
+                return Response::builder()
+                    .status(StatusCode::NOT_FOUND)
+                    .body(Body::Empty)
+                    .unwrap();
+            }
             Err(status) => {
                 if status != StatusCode::CONFLICT
                     && let Ok(Kind::Packet(id, _)) =

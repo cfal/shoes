@@ -83,11 +83,10 @@ pub fn request(
     }
     let padding =
         "X".repeat(sample(config.x_padding_bytes.bounds((100, 1000), false)?).max(1) as usize);
-    let base = path.request("", None);
-    let separator = if base.contains('?') { '&' } else { '?' };
+    let base = percent_encoding::utf8_percent_encode(&path.base, PATH_ESCAPE);
     request = request.header(
         "referer",
-        format!("{scheme}://{authority}{base}{separator}x_padding={padding}"),
+        format!("{scheme}://{authority}{base}?x_padding={padding}"),
     );
     let mut request = request.body(()).map_err(io::Error::other)?;
     if upload && sequence.is_none() && !config.no_grpc_header {
@@ -154,7 +153,7 @@ pub fn classify(
         Some(referer) => referer
             .to_str()
             .ok()
-            .and_then(|v| url::Url::parse(v).ok())
+            .and_then(|v| url::Url::parse("http://localhost/").ok()?.join(v).ok())
             .and_then(|u| query_padding(u.query().unwrap_or(""))),
         None => query_padding(request.uri().query().unwrap_or("")),
     }
@@ -320,6 +319,40 @@ mod tests {
             "/a%252Fb/session/12?q=a%2Bb"
         );
     }
+    #[test]
+    fn referer_padding_replaces_query_and_accepts_relative_references() {
+        let client: XhttpClientConfig = serde_json::from_value(serde_json::json!({
+            "path": "/t?q=a%2Bb&x_padding=short",
+            "x_padding_bytes": 100,
+            "protocol": {"type": "socks"}
+        }))
+        .unwrap();
+        let server: XhttpServerConfig = serde_json::from_value(serde_json::json!({
+            "path": client.path,
+            "protocol": {"type": "socks"}
+        }))
+        .unwrap();
+        let path = Path::new(&client.path).unwrap();
+        let mut request = request(&client, &path, "front.test", true, "id", None, false).unwrap();
+        assert_eq!(request.uri().query(), Some("q=a%2Bb&x_padding=short"));
+        assert_eq!(
+            request.headers()["referer"],
+            format!("https://front.test/t/?x_padding={}", "X".repeat(100))
+        );
+        for referer in [
+            format!("/t/?x_padding={}", "X".repeat(100)),
+            format!("?x_padding={}", "X".repeat(100)),
+        ] {
+            request
+                .headers_mut()
+                .insert("referer", referer.parse().unwrap());
+            assert_eq!(
+                classify(&server, &path, &request),
+                Ok(Kind::Download("id".into()))
+            );
+        }
+    }
+
     #[test]
     fn streaming_content_type_overrides_custom_header_unless_disabled() {
         let mut config: XhttpClientConfig = serde_json::from_value(serde_json::json!({
