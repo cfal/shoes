@@ -26,8 +26,8 @@ use tokio::{
 const USER: &str = "b85798ef-e9dc-46a4-9a87-8da4499d36d0";
 const SHORT_ID: &str = "0123456789abcdef";
 
-struct Task(JoinHandle<()>);
-impl Drop for Task {
+struct TaskGuard(JoinHandle<()>);
+impl Drop for TaskGuard {
     fn drop(&mut self) {
         self.0.abort();
     }
@@ -36,7 +36,7 @@ impl Drop for Task {
 struct Peer {
     _guard: ProcessGuard,
     _config: tempfile::NamedTempFile,
-    _log: tempfile::NamedTempFile,
+    log: tempfile::NamedTempFile,
 }
 
 async fn start_peer(xray: bool, port: u16, config: Value) -> Peer {
@@ -77,7 +77,7 @@ async fn start_peer(xray: bool, port: u16, config: Value) -> Peer {
             },
         ),
         _config: file,
-        _log: log,
+        log,
     };
     timeout(Duration::from_secs(10), async {
         loop {
@@ -91,7 +91,7 @@ async fn start_peer(xray: bool, port: u16, config: Value) -> Peer {
     .unwrap_or_else(|_| {
         panic!(
             "proxy listener did not become ready: {}",
-            std::fs::read_to_string(peer._log.path()).unwrap_or_default()
+            std::fs::read_to_string(peer.log.path()).unwrap_or_default()
         )
     });
     peer
@@ -106,7 +106,7 @@ async fn free_port() -> u16 {
         .port()
 }
 
-async fn target(hybrid: bool, padded: bool) -> (u16, Task) {
+async fn start_target(hybrid: bool, padded: bool) -> (u16, TaskGuard) {
     let key = rcgen::KeyPair::generate().unwrap();
     let mut params = rcgen::CertificateParams::new(vec!["cover.test".into()]).unwrap();
     if padded {
@@ -148,16 +148,18 @@ async fn target(hybrid: bool, padded: bool) -> (u16, Task) {
                 result = listener.accept() => {
                     let Ok((stream, _)) = result else { break };
                     let acceptor = acceptor.clone();
-                    children.spawn(async move { let _ = timeout(Duration::from_secs(5), acceptor.accept(stream)).await; });
+                    children.spawn(async move {
+                        let _ = timeout(Duration::from_secs(5), acceptor.accept(stream)).await;
+                    });
                 }
                 _ = children.join_next(), if !children.is_empty() => {}
             }
         }
     });
-    (port, Task(task))
+    (port, TaskGuard(task))
 }
 
-async fn record(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
+async fn read_tls_record(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
     let mut header = [0; 5];
     stream.read_exact(&mut header).await?;
     let len = u16::from_be_bytes([header[3], header[4]]) as usize;
@@ -167,45 +169,46 @@ async fn record(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn shares(record: &[u8], client: bool) -> Vec<(u16, usize)> {
-    let mut p = 43;
-    p += 1 + record[p] as usize;
+fn key_shares(record: &[u8], client: bool) -> Vec<(u16, usize)> {
+    let mut offset = 43;
+    offset += 1 + record[offset] as usize;
     if client {
-        let n = u16::from_be_bytes([record[p], record[p + 1]]) as usize;
-        p += 2 + n;
-        p += 1 + record[p] as usize;
+        let cipher_len = u16::from_be_bytes([record[offset], record[offset + 1]]) as usize;
+        offset += 2 + cipher_len;
+        offset += 1 + record[offset] as usize;
     } else {
-        p += 3;
+        offset += 3;
     }
-    let n = u16::from_be_bytes([record[p], record[p + 1]]) as usize;
-    p += 2;
-    let end = p + n;
-    while p < end {
-        let id = u16::from_be_bytes([record[p], record[p + 1]]);
-        let n = u16::from_be_bytes([record[p + 2], record[p + 3]]) as usize;
-        p += 4;
-        if id == 51 {
-            let end = p + n;
-            if client {
-                p += 2;
-            }
-            let mut result = Vec::new();
-            while p < end {
-                let group = u16::from_be_bytes([record[p], record[p + 1]]);
-                let n = u16::from_be_bytes([record[p + 2], record[p + 3]]) as usize;
-                result.push((group, n));
-                p += 4 + n;
-            }
-            return result;
+    let extensions_len = u16::from_be_bytes([record[offset], record[offset + 1]]) as usize;
+    offset += 2;
+    let extensions_end = offset + extensions_len;
+    while offset < extensions_end {
+        let id = u16::from_be_bytes([record[offset], record[offset + 1]]);
+        let extension_len = u16::from_be_bytes([record[offset + 2], record[offset + 3]]) as usize;
+        offset += 4;
+        if id != 51 {
+            offset += extension_len;
+            continue;
         }
-        p += n;
+        let shares_end = offset + extension_len;
+        if client {
+            offset += 2;
+        }
+        let mut shares = Vec::new();
+        while offset < shares_end {
+            let group = u16::from_be_bytes([record[offset], record[offset + 1]]);
+            let share_len = u16::from_be_bytes([record[offset + 2], record[offset + 3]]) as usize;
+            shares.push((group, share_len));
+            offset += 4 + share_len;
+        }
+        return shares;
     }
     panic!("key_share missing from captured hello");
 }
 
 type Capture = Arc<Mutex<Vec<(Vec<u8>, Vec<u8>)>>>;
 
-async fn tap(upstream: u16) -> (u16, Capture, Task) {
+async fn start_tap(upstream: u16) -> (u16, Capture, TaskGuard) {
     let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let captured: Capture = Arc::default();
@@ -219,10 +222,10 @@ async fn tap(upstream: u16) -> (u16, Capture, Task) {
                     let captured = captured.clone();
                     children.spawn(async move {
                         let _ = timeout(Duration::from_secs(15), async {
-                            let hello = record(&mut client).await?;
+                            let hello = read_tls_record(&mut client).await?;
                             let mut server = TcpStream::connect(("127.0.0.1", upstream)).await?;
                             server.write_all(&hello).await?;
-                            let response = record(&mut server).await?;
+                            let response = read_tls_record(&mut server).await?;
                             captured.lock().unwrap().push((hello, response.clone()));
                             client.write_all(&response).await?;
                             tokio::io::copy_bidirectional(&mut client, &mut server).await?;
@@ -234,7 +237,7 @@ async fn tap(upstream: u16) -> (u16, Capture, Task) {
             }
         }
     });
-    (port, output, Task(task))
+    (port, output, TaskGuard(task))
 }
 
 struct Case {
@@ -265,18 +268,141 @@ impl Default for Case {
     }
 }
 
+impl Case {
+    fn server_config(
+        &self,
+        port: u16,
+        target_port: u16,
+        private_key: &str,
+        signing_seed: &str,
+    ) -> Value {
+        let mut config = if self.server_xray {
+            let flow = if self.vision { "xtls-rprx-vision" } else { "" };
+            json!({
+                "log": { "loglevel": "warning" },
+                "inbounds": [{
+                    "listen": "0.0.0.0",
+                    "port": port,
+                    "protocol": "vless",
+                    "settings": {
+                        "clients": [{ "id": USER, "flow": flow }],
+                        "decryption": "none"
+                    },
+                    "streamSettings": {
+                        "network": "raw",
+                        "security": "reality",
+                        "realitySettings": {
+                            "target": format!("127.0.0.1:{target_port}"),
+                            "serverNames": ["cover.test"],
+                            "privateKey": private_key,
+                            "shortIds": [SHORT_ID]
+                        }
+                    }
+                }],
+                "outbounds": [{
+                    "protocol": "freedom",
+                    "settings": {
+                        "finalRules": [{ "ip": ["0.0.0.0/0", "::/0"], "action": "allow" }]
+                    }
+                }]
+            })
+        } else {
+            json!([{
+                "address": format!("0.0.0.0:{port}"),
+                "protocol": {
+                    "type": "tls",
+                    "reality_targets": {
+                        "cover.test": {
+                            "private_key": private_key,
+                            "short_ids": [SHORT_ID],
+                            "dest": format!("localhost:{target_port}"),
+                            "vision": self.vision,
+                            "protocol": { "type": "vless", "user_id": USER }
+                        }
+                    }
+                }
+            }])
+        };
+        if self.sign {
+            if self.server_xray {
+                config["inbounds"][0]["streamSettings"]["realitySettings"]["mldsa65Seed"] =
+                    json!(signing_seed);
+            } else {
+                config[0]["protocol"]["reality_targets"]["cover.test"]["mldsa65_seed"] =
+                    json!(signing_seed);
+            }
+        }
+        config
+    }
+
+    fn client_config(
+        &self,
+        port: u16,
+        server_port: u16,
+        public_key: &str,
+        verify_key: &str,
+    ) -> Value {
+        let mut config = if self.client_xray {
+            let flow = if self.vision { "xtls-rprx-vision" } else { "" };
+            json!({
+                "log": { "loglevel": "warning" },
+                "inbounds": [{ "listen": "0.0.0.0", "port": port, "protocol": "http" }],
+                "outbounds": [{
+                    "protocol": "vless",
+                    "settings": {
+                        "vnext": [{
+                            "address": "127.0.0.1",
+                            "port": server_port,
+                            "users": [{ "id": USER, "encryption": "none", "flow": flow }]
+                        }]
+                    },
+                    "streamSettings": {
+                        "network": "raw",
+                        "security": "reality",
+                        "realitySettings": {
+                            "serverName": "cover.test",
+                            "fingerprint": self.fingerprint,
+                            "publicKey": public_key,
+                            "shortId": SHORT_ID
+                        }
+                    }
+                }]
+            })
+        } else {
+            json!([{
+                "address": format!("0.0.0.0:{port}"),
+                "protocol": { "type": "http" },
+                "rules": [{
+                    "masks": "0.0.0.0/0",
+                    "action": "allow",
+                    "client_chain": {
+                        "address": format!("127.0.0.1:{server_port}"),
+                        "protocol": {
+                            "type": "reality",
+                            "public_key": public_key,
+                            "short_id": SHORT_ID,
+                            "sni_hostname": "cover.test",
+                            "vision": self.vision,
+                            "protocol": { "type": "vless", "user_id": USER }
+                        }
+                    }
+                }]
+            }])
+        };
+        if self.verify {
+            if self.client_xray {
+                config["outbounds"][0]["streamSettings"]["realitySettings"]["mldsa65Verify"] =
+                    json!(verify_key);
+            } else {
+                config[0]["rules"][0]["client_chain"]["protocol"]["mldsa65_verify"] =
+                    json!(verify_key);
+            }
+        }
+        config
+    }
+}
+
 async fn run_case(case: Case) {
-    let Case {
-        server_xray,
-        client_xray,
-        hybrid,
-        sign,
-        verify,
-        wrong_key,
-        padded,
-        vision,
-        fingerprint,
-    } = case;
     let private = [42; 32];
     let public = agreement::PrivateKey::from_private_key(&agreement::X25519, &private)
         .unwrap()
@@ -287,44 +413,33 @@ async fn run_case(case: Case) {
     let seed = [7; 32];
     let signing = signature::PqdsaKeyPair::from_seed(
         &signature::ML_DSA_65_SIGNING,
-        &if wrong_key { [8; 32] } else { seed },
+        &if case.wrong_key { [8; 32] } else { seed },
     )
     .unwrap();
     let verify_key = URL_SAFE_NO_PAD.encode(signing.public_key().as_ref());
-    let (target_port, _target) = target(hybrid, padded).await;
+    let (target_port, _target) = start_target(case.hybrid, case.padded).await;
     let app = start_local_http_server("0.0.0.0", 0).await.unwrap();
     let server_port = free_port().await;
-    let mut server_config = if server_xray {
-        json!({"log":{"loglevel":"warning"},"inbounds":[{"listen":"0.0.0.0","port":server_port,"protocol":"vless","settings":{"clients":[{"id":USER,"flow":if vision {"xtls-rprx-vision"} else {""}}],"decryption":"none"},"streamSettings":{"network":"raw","security":"reality","realitySettings":{"target":format!("127.0.0.1:{target_port}"),"serverNames":["cover.test"],"privateKey":private,"shortIds":[SHORT_ID]}}}],"outbounds":[{"protocol":"freedom","settings":{"finalRules":[{"ip":["0.0.0.0/0","::/0"],"action":"allow"}]}}]})
-    } else {
-        json!([{"address":format!("0.0.0.0:{server_port}"),"protocol":{"type":"tls","reality_targets":{"cover.test":{"private_key":private,"short_ids":[SHORT_ID],"dest":format!("localhost:{target_port}"),"vision":vision,"protocol":{"type":"vless","user_id":USER}}}}}])
-    };
-    if sign {
-        if server_xray {
-            server_config["inbounds"][0]["streamSettings"]["realitySettings"]["mldsa65Seed"] =
-                json!(URL_SAFE_NO_PAD.encode(seed));
-        } else {
-            server_config[0]["protocol"]["reality_targets"]["cover.test"]["mldsa65_seed"] =
-                json!(URL_SAFE_NO_PAD.encode(seed));
-        }
-    }
-    let _server = start_peer(server_xray, server_port, server_config).await;
-    let (tap_port, captured, _tap) = tap(server_port).await;
+    let server_config = case.server_config(
+        server_port,
+        target_port,
+        &private,
+        &URL_SAFE_NO_PAD.encode(seed),
+    );
+    let _server = start_peer(case.server_xray, server_port, server_config).await;
+    let (tap_port, captured, _tap) = start_tap(server_port).await;
     let client_port = free_port().await;
-    let mut client_config = if client_xray {
-        json!({"log":{"loglevel":"warning"},"inbounds":[{"listen":"0.0.0.0","port":client_port,"protocol":"http"}],"outbounds":[{"protocol":"vless","settings":{"vnext":[{"address":"127.0.0.1","port":tap_port,"users":[{"id":USER,"encryption":"none","flow":if vision {"xtls-rprx-vision"} else {""}}]}]},"streamSettings":{"network":"raw","security":"reality","realitySettings":{"serverName":"cover.test","fingerprint":fingerprint,"publicKey":public,"shortId":SHORT_ID}}}]})
-    } else {
-        json!([{"address":format!("0.0.0.0:{client_port}"),"protocol":{"type":"http"},"rules":[{"masks":"0.0.0.0/0","action":"allow","client_chain":{"address":format!("127.0.0.1:{tap_port}"),"protocol":{"type":"reality","public_key":public,"short_id":SHORT_ID,"sni_hostname":"cover.test","vision":vision,"protocol":{"type":"vless","user_id":USER}}}}]}])
-    };
-    if verify {
-        if client_xray {
-            client_config["outbounds"][0]["streamSettings"]["realitySettings"]["mldsa65Verify"] =
-                json!(verify_key);
-        } else {
-            client_config[0]["rules"][0]["client_chain"]["protocol"]["mldsa65_verify"] =
-                json!(verify_key);
-        }
-    }
+    let client_config = case.client_config(client_port, tap_port, &public, &verify_key);
+    let Case {
+        server_xray,
+        client_xray,
+        hybrid,
+        sign,
+        verify,
+        wrong_key,
+        padded,
+        ..
+    } = case;
     let _client = start_peer(client_xray, client_port, client_config).await;
     let start = std::time::Instant::now();
     let output = run_curl(
@@ -365,13 +480,13 @@ async fn run_case(case: Case) {
         let captured = captured.lock().unwrap();
         assert!(!captured.is_empty());
         for (hello, response) in captured.iter() {
-            let offered: Vec<_> = shares(hello, true)
+            let offered: Vec<_> = key_shares(hello, true)
                 .into_iter()
                 .filter(|(g, _)| *g == 0x11ec || *g == 0x001d)
                 .collect();
             assert_eq!(offered, [(0x11ec, 1216), (0x001d, 32)]);
             assert_eq!(
-                shares(response, false),
+                key_shares(response, false),
                 if hybrid {
                     vec![(0x11ec, 1120)]
                 } else {

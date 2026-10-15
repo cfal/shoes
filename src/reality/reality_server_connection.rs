@@ -1049,9 +1049,11 @@ impl RealityServerConnection {
     }
 
     pub fn negotiated_group(&self) -> Option<RealityGroup> {
-        (!self.is_handshaking())
-            .then_some(self.negotiated_group)
-            .flatten()
+        if self.is_handshaking() {
+            None
+        } else {
+            self.negotiated_group
+        }
     }
 
     /// Check if the connection wants to read more TLS data

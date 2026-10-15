@@ -95,7 +95,8 @@ fn key_share_extension(record: &[u8], client: bool) -> io::Result<&[u8]> {
     record_reader.skip(2)?;
     let record_len = record_reader.read_u16_be()? as usize;
     let mut hello = BufReader::new(record_reader.read_slice(record_len)?);
-    if !record_reader.is_consumed() || hello.read_u8()? != if client { 1 } else { 2 } {
+    let expected_message_type = if client { 1 } else { 2 };
+    if !record_reader.is_consumed() || hello.read_u8()? != expected_message_type {
         return Err(invalid("Invalid TLS hello framing"));
     }
     let length = hello.read_u24_be()? as usize;
@@ -136,14 +137,19 @@ fn key_share_extension(record: &[u8], client: bool) -> io::Result<&[u8]> {
         let id = extensions.read_u16_be()?;
         let len = extensions.read_u16_be()? as usize;
         let data = extensions.read_slice(len)?;
-        if id == 51 && share.replace(data).is_some() {
-            return Err(invalid("Duplicate key_share extension"));
-        }
-        if id == 43 && !client {
-            if tls13 || data != [3, 4] {
-                return Err(invalid("Invalid ServerHello supported_versions"));
+        match id {
+            51 => {
+                if share.replace(data).is_some() {
+                    return Err(invalid("Duplicate key_share extension"));
+                }
             }
-            tls13 = true;
+            43 if !client => {
+                if tls13 || data != [3, 4] {
+                    return Err(invalid("Invalid ServerHello supported_versions"));
+                }
+                tls13 = true;
+            }
+            _ => {}
         }
     }
     if !client && !tls13 {
@@ -215,21 +221,21 @@ pub fn complete_client_exchange(
     mlkem: &kem::DecapsulationKey,
     share: &KeyShareRef<'_>,
 ) -> io::Result<Vec<u8>> {
-    let offset = if share.group == RealityGroup::X25519MlKem768 {
+    let kem_ciphertext_len = if share.group == RealityGroup::X25519MlKem768 {
         MLKEM_CIPHERTEXT_LEN
     } else {
         0
     };
     let peer = share
         .data
-        .get(offset..)
+        .get(kem_ciphertext_len..)
         .and_then(|p| p.try_into().ok())
         .ok_or_else(|| invalid("Invalid server X25519 share"))?;
     let x25519 = perform_ecdh(private, peer).map_err(|_| invalid("Invalid server X25519 key"))?;
     let mut secret = Vec::with_capacity(share.group.secret_len());
-    if offset != 0 {
+    if share.group == RealityGroup::X25519MlKem768 {
         let kem_secret = mlkem
-            .decapsulate(kem::Ciphertext::from(&share.data[..offset]))
+            .decapsulate(kem::Ciphertext::from(&share.data[..kem_ciphertext_len]))
             .map_err(|_| invalid("ML-KEM decapsulation failed"))?;
         secret.extend_from_slice(kem_secret.as_ref());
     }
@@ -246,29 +252,29 @@ pub fn server_exchange(
     rand::rng().fill_bytes(&mut private_bytes);
     let private = agreement::PrivateKey::from_private_key(&agreement::X25519, &private_bytes)
         .map_err(|_| io::Error::other("X25519 key generation failed"))?;
-    let public = private
+    let x25519_public = private
         .compute_public_key()
         .map_err(|_| io::Error::other("X25519 public key failed"))?;
-    let offset = if group == RealityGroup::X25519MlKem768 {
+    let kem_public_len = if group == RealityGroup::X25519MlKem768 {
         MLKEM_PUBLIC_LEN
     } else {
         0
     };
-    let peer = client[offset..].try_into().unwrap();
+    let peer = client[kem_public_len..].try_into().unwrap();
     let x25519 =
         perform_ecdh(&private_bytes, peer).map_err(|_| invalid("Invalid client X25519 key"))?;
     let mut response = Vec::with_capacity(group.share_len(false));
     let mut secret = Vec::with_capacity(group.secret_len());
-    if offset != 0 {
-        let public = kem::EncapsulationKey::new(&kem::ML_KEM_768, &client[..offset])
+    if group == RealityGroup::X25519MlKem768 {
+        let kem_public = kem::EncapsulationKey::new(&kem::ML_KEM_768, &client[..kem_public_len])
             .map_err(|_| invalid("Invalid ML-KEM public key"))?;
-        let (ciphertext, kem_secret) = public
+        let (ciphertext, kem_secret) = kem_public
             .encapsulate()
             .map_err(|_| invalid("ML-KEM encapsulation failed"))?;
         response.extend_from_slice(ciphertext.as_ref());
         secret.extend_from_slice(kem_secret.as_ref());
     }
-    response.extend_from_slice(public.as_ref());
+    response.extend_from_slice(x25519_public.as_ref());
     secret.extend_from_slice(&x25519);
     Ok((response, secret))
 }

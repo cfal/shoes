@@ -40,16 +40,15 @@ use crate::util::allocate_vec;
 // Matches the maximum handshake size accepted by Xray's REALITY implementation.
 const MAX_HANDSHAKE_PLAINTEXT: usize = 4 * MAX_TLS_PLAINTEXT_LEN;
 
-fn append_handshake_plaintext(accumulated: &mut Vec<u8>, plaintext: &[u8]) -> io::Result<usize> {
-    let previous_len = accumulated.len();
-    if previous_len.saturating_add(plaintext.len()) > MAX_HANDSHAKE_PLAINTEXT {
+fn append_handshake_plaintext(accumulated: &mut Vec<u8>, plaintext: &[u8]) -> io::Result<()> {
+    if accumulated.len().saturating_add(plaintext.len()) > MAX_HANDSHAKE_PLAINTEXT {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "REALITY handshake exceeds maximum size",
         ));
     }
     accumulated.extend_from_slice(plaintext);
-    Ok(previous_len)
+    Ok(())
 }
 
 /// Configuration for REALITY client connections
@@ -995,9 +994,11 @@ impl RealityClientConnection {
     }
 
     pub fn negotiated_group(&self) -> Option<RealityGroup> {
-        (!self.is_handshaking())
-            .then_some(self.negotiated_group)
-            .flatten()
+        if self.is_handshaking() {
+            None
+        } else {
+            self.negotiated_group
+        }
     }
 
     /// Check if the connection wants to read more TLS data
