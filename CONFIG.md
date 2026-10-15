@@ -500,6 +500,8 @@ protocol:
 
 Reality offers `X25519MLKEM768` first, with X25519 fallback. Servers follow the camouflage target's selected group; choose a PQ-preferring TLS 1.3 target to negotiate hybrid key exchange. Legacy X25519 clients remain supported. Debug logs report the authenticated connection's `negotiated_group`.
 
+For Xray servers, use v25.5.16 or newer. Xray v25.4.30 and earlier cannot synthesize a hybrid-selected target handshake: when a PQ-capable target selects `X25519MLKEM768`, those servers forward to the real target and Shoes rejects its certificate. X25519 fallback does not prevent this failure because the target has already selected the hybrid group.
+
 `mldsa65_seed` enables optional server signing. Clients with `mldsa65_verify` require a matching signature and reject unsigned or incorrectly signed connections. These fields correspond to Xray's `mldsa65Seed` and `mldsa65Verify`; neither replaces the existing X25519 key. Omit the fields to disable this extra authentication; empty or incorrectly sized values are invalid.
 
 Enable server signing before distributing verification keys. The camouflage certificate flight must have room for the extra 3309-byte signature and DER overhead; insufficient capacity falls back to the real target instead of silently removing the signature. Removing signing later requires coordinating clients that already pin its key. Vision's direct mode relies on the inner TLS connection for payload encryption, not the outer Reality hybrid exchange.
