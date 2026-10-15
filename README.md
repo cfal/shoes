@@ -344,9 +344,11 @@ covering all three modes and HTTP versions. `type: splithttp` is an alias for
 - Advanced placement/padding obfuscation, custom session IDs, separate downloads,
   full XMUX policy, and Vision over XHTTP are not supported. Unsupported options
   are rejected rather than silently ignored. Public CDN compatibility is not implied.
-- Modern Xray clients work with Shoes REALITY servers. The existing Shoes REALITY
-  client does not yet offer X25519MLKEM768, which Xray 26.10.10 requires; use ordinary
-  TLS for Shoes-to-Xray XHTTP until that separate REALITY limitation is resolved.
+- REALITY XHTTP interoperates with Xray 26.10.10 in both directions over H2,
+  including all three modes and `auto`. REALITY prefers X25519MLKEM768 with
+  X25519 fallback according to the cover target. Optional `mldsa65_seed` and
+  `mldsa65_verify` apply to the outer REALITY configuration, independently of
+  XHTTP; see [CONFIG.md](CONFIG.md#reality-client).
 
 ## Similar Projects
 
