@@ -1,0 +1,147 @@
+use std::{sync::Arc, time::Duration};
+
+use serde_json::json;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+use crate::{
+    client_proxy_chain::{ClientProxyChain, InitialHopEntry},
+    config::{ClientConfig, Config},
+    resolver::{NativeResolver, Resolver},
+    tcp::{proxy_connector_impl::ProxyConnectorImpl, socket_connector_impl::SocketConnectorImpl},
+};
+
+#[tokio::test]
+async fn all_modes_and_carriers_exchange_data_before_upload_eof() {
+    let certificate = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+    let echo = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+    let target = format!("127.0.0.1:{}", echo.local_addr().unwrap().port());
+    let mut echo_tasks = tokio::task::JoinSet::new();
+    echo_tasks.spawn(async move {
+        let mut clients = tokio::task::JoinSet::new();
+        loop {
+            tokio::select! {
+                result = echo.accept() => { let (mut socket, _) = result.unwrap(); clients.spawn(async move { let (mut read, mut write) = socket.split(); let _ = tokio::io::copy(&mut read, &mut write).await; }); }
+                _ = clients.join_next(), if !clients.is_empty() => {}
+            }
+        }
+    });
+    for version in ["h1", "h2", "h3"] {
+        for mode in ["packet-up", "stream-up", "stream-one"] {
+            eprintln!("testing {version} {mode}");
+            let reserved = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+            let port = reserved.local_addr().unwrap().port();
+            let address = format!("127.0.0.1:{port}");
+            let server_protocol = json!({"type":"xhttp", "path":"/tunnel", "http_version":version, "protocol":{"type":"vless","user_id":"550e8400-e29b-41d4-a716-446655440000"}});
+            let client_protocol = json!({"type":"xhttp", "path":"/tunnel", "http_version":version, "mode":mode, "protocol":{"type":"vless","user_id":"550e8400-e29b-41d4-a716-446655440000"}});
+            let (server_value, client_value) = if version == "h3" {
+                (
+                    json!({"address":format!("0.0.0.0:{port}"), "transport":"quic", "quic_settings":{"cert":certificate.cert.pem(),"key":certificate.signing_key.serialize_pem()}, "protocol":server_protocol}),
+                    json!({"address":address,"transport":"quic","quic_settings":{"verify":false,"sni_hostname":"localhost"},"protocol":client_protocol}),
+                )
+            } else {
+                (
+                    json!({"address":format!("0.0.0.0:{port}"),"protocol":{"type":"tls","default_target":{"cert":certificate.cert.pem(),"key":certificate.signing_key.serialize_pem(),"protocol":server_protocol}}}),
+                    json!({"address":address,"protocol":{"type":"tls","verify":false,"sni_hostname":"localhost","protocol":client_protocol}}),
+                )
+            };
+            let configs: Vec<Config> = serde_json::from_value(json!([server_value])).unwrap();
+            let server = crate::config::create_server_configs(configs)
+                .unwrap()
+                .configs
+                .into_iter()
+                .next()
+                .unwrap();
+            drop(reserved);
+            let handles = crate::tcp::tcp_server::start_servers(server, resolver.clone())
+                .await
+                .unwrap();
+            let config: ClientConfig = serde_json::from_value(client_value.clone()).unwrap();
+            let socket = SocketConnectorImpl::from_config(&config, Some(&config.address)).unwrap();
+            let proxy = ProxyConnectorImpl::from_config(config, resolver.clone())
+                .unwrap()
+                .unwrap();
+            let chain = ClientProxyChain::new(
+                vec![InitialHopEntry::Proxy {
+                    socket: Arc::new(socket),
+                    proxy: Box::new(proxy),
+                }],
+                vec![],
+            );
+            let (chain, upstream_handles) = if version != "h3" {
+                let listener = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+                let port = listener.local_addr().unwrap().port();
+                let configs = serde_json::from_value(
+                    json!([{"address":format!("0.0.0.0:{port}"),"protocol":{"type":"socks"}}]),
+                )
+                .unwrap();
+                let server = crate::config::create_server_configs(configs)
+                    .unwrap()
+                    .configs
+                    .remove(0);
+                drop(listener);
+                let handles = crate::tcp::tcp_server::start_servers(server, resolver.clone())
+                    .await
+                    .unwrap();
+                let upstream: ClientConfig = serde_json::from_value(
+                    json!({"address":format!("127.0.0.1:{port}"),"protocol":{"type":"socks"}}),
+                )
+                .unwrap();
+                let socket =
+                    SocketConnectorImpl::from_config(&upstream, Some(&upstream.address)).unwrap();
+                let proxy = ProxyConnectorImpl::from_config(upstream, resolver.clone())
+                    .unwrap()
+                    .unwrap();
+                let config: ClientConfig = serde_json::from_value(client_value).unwrap();
+                let xhttp = ProxyConnectorImpl::from_config(config, resolver.clone())
+                    .unwrap()
+                    .unwrap();
+                (
+                    ClientProxyChain::new(
+                        vec![InitialHopEntry::Proxy {
+                            socket: Arc::new(socket),
+                            proxy: Box::new(proxy),
+                        }],
+                        vec![vec![Box::new(xhttp)]],
+                    ),
+                    handles,
+                )
+            } else {
+                (chain, vec![])
+            };
+            tokio::time::timeout(Duration::from_secs(15), async {
+                for _ in 0..2 {
+                    let target = crate::address::NetLocation::from_str(&target, None)
+                        .unwrap()
+                        .into();
+                    let mut stream = chain
+                        .connect_tcp(target, &resolver)
+                        .await
+                        .unwrap()
+                        .client_stream;
+                    for marker in [42, 43] {
+                        let payload = vec![marker; 32 * 1024];
+                        stream.write_all(&payload).await.unwrap();
+                        stream.flush().await.unwrap();
+                        let mut response = vec![0; payload.len()];
+                        stream.read_exact(&mut response).await.unwrap();
+                        assert_eq!(response, payload);
+                    }
+                    stream.shutdown().await.unwrap();
+                    if mode != "packet-up" {
+                        let mut tail = Vec::new();
+                        stream.read_to_end(&mut tail).await.unwrap();
+                        assert!(tail.is_empty());
+                    }
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("{version} {mode} stalled"));
+            drop(chain);
+            for handle in handles.into_iter().chain(upstream_handles) {
+                handle.abort();
+                let _ = handle.await;
+            }
+        }
+    }
+}

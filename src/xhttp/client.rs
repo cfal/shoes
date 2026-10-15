@@ -1,0 +1,511 @@
+use std::{io, sync::Arc, time::Duration};
+
+use futures::StreamExt;
+use http::{Request, StatusCode};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    sync::{OnceCell, OwnedSemaphorePermit, Semaphore},
+};
+
+use super::{
+    carrier::Carrier,
+    connector::Security,
+    stream::{Body, Event, Memory, Reader, Stream, Tasks, pipe},
+    wire::{self, Path},
+};
+use crate::{
+    address::NetLocation,
+    config::xhttp::{XhttpClientConfig, XhttpMode, XhttpVersion},
+    resources::Budget,
+    tcp::carrier_dialer::{CarrierDialer, RouteKey},
+};
+
+struct Slot {
+    key: RouteKey,
+    _dialer: Arc<dyn CarrierDialer>,
+    carrier: OnceCell<Arc<Carrier>>,
+    requests: Arc<Semaphore>,
+    last_used: parking_lot::Mutex<tokio::time::Instant>,
+}
+
+pub struct Client {
+    config: XhttpClientConfig,
+    endpoint: NetLocation,
+    authority: String,
+    path: Path,
+    version: XhttpVersion,
+    mode: XhttpMode,
+    security: Security,
+    memory: Arc<Budget>,
+    admission: Arc<Budget>,
+    tasks: Tasks,
+    reaper_started: std::sync::Once,
+    slots: parking_lot::Mutex<Vec<Arc<Slot>>>,
+    h1_slots: Arc<Semaphore>,
+}
+
+impl std::fmt::Debug for Client {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("XhttpClient")
+            .field("version", &self.version)
+            .field("mode", &self.mode)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Client {
+    pub fn new(
+        mut config: XhttpClientConfig,
+        endpoint: NetLocation,
+        authority: String,
+        version: XhttpVersion,
+        mode: XhttpMode,
+        security: Security,
+    ) -> io::Result<Self> {
+        let path = Path::new(&config.path)?;
+        config.limits.max_requests_per_connection = config.limits.request_limit();
+        Ok(Self {
+            memory: Arc::new(Budget::new(Some(config.limits.max_buffered_bytes))),
+            admission: Arc::new(Budget::new(Some(config.limits.max_sessions))),
+            tasks: Tasks::new(),
+            reaper_started: std::sync::Once::new(),
+            h1_slots: Arc::new(Semaphore::new(config.pool.max_h1_connections)),
+            config,
+            endpoint,
+            authority,
+            path,
+            version,
+            mode,
+            security,
+            slots: parking_lot::Mutex::new(Vec::new()),
+        })
+    }
+
+    pub fn start_reaper(self: &Arc<Self>) {
+        let weak = Arc::downgrade(self);
+        self.tasks.spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let Some(client) = weak.upgrade() else {
+                    break;
+                };
+                let idle = Duration::from_secs(client.config.pool.idle_timeout_secs);
+                client.slots.lock().retain(|slot| {
+                    slot.requests.available_permits()
+                        != client.config.limits.max_requests_per_connection
+                        || slot.last_used.lock().elapsed() < idle
+                });
+            }
+        });
+    }
+
+    async fn dial(&self, dialer: &Arc<dyn CarrierDialer>) -> io::Result<Arc<Carrier>> {
+        let header_limit =
+            8192 + self.config.x_padding_bytes.bounds((100, 1000), false)?.1 as usize;
+        tokio::time::timeout(
+            Duration::from_secs(self.config.limits.setup_timeout_secs),
+            async {
+                if self.version == XhttpVersion::H3 {
+                    Carrier::quic(dialer.open_quic().await?, header_limit).await
+                } else {
+                    Carrier::tcp(
+                        self.security
+                            .wrap(dialer.open_stream().await?, &self.endpoint, self.version)
+                            .await?,
+                        self.version,
+                        header_limit,
+                    )
+                    .await
+                }
+            },
+        )
+        .await?
+    }
+
+    async fn lease(
+        &self,
+        dialer: &Arc<dyn CarrierDialer>,
+        count: u32,
+    ) -> io::Result<(Arc<Carrier>, OwnedSemaphorePermit)> {
+        let (slot, permit) = {
+            let mut slots = self.slots.lock();
+            let idle = Duration::from_secs(self.config.pool.idle_timeout_secs);
+            slots.retain(|s| {
+                !s.carrier.get().is_some_and(|c| c.closed())
+                    && (s.requests.available_permits()
+                        != self.config.limits.max_requests_per_connection
+                        || s.last_used.lock().elapsed() <= idle)
+            });
+            if let Some(found) = slots
+                .iter()
+                .filter(|s| s.key == *dialer.route_key())
+                .find_map(|slot| {
+                    slot.requests
+                        .clone()
+                        .try_acquire_many_owned(count)
+                        .ok()
+                        .map(|permit| (slot.clone(), permit))
+                })
+            {
+                found
+            } else {
+                if slots.len() >= self.config.pool.max_connections
+                    || count as usize > self.config.limits.max_requests_per_connection
+                {
+                    return Err(crate::resources::exhausted());
+                }
+                let slot = Arc::new(Slot {
+                    key: dialer.route_key().clone(),
+                    _dialer: dialer.clone(),
+                    carrier: OnceCell::new(),
+                    requests: Arc::new(Semaphore::new(
+                        self.config.limits.max_requests_per_connection,
+                    )),
+                    last_used: parking_lot::Mutex::new(tokio::time::Instant::now()),
+                });
+                let permit = slot
+                    .requests
+                    .clone()
+                    .try_acquire_many_owned(count)
+                    .map_err(|_| crate::resources::exhausted())?;
+                slots.push(slot.clone());
+                (slot, permit)
+            }
+        };
+        let carrier = slot
+            .carrier
+            .get_or_try_init(|| self.dial(dialer))
+            .await?
+            .clone();
+        *slot.last_used.lock() = tokio::time::Instant::now();
+        Ok((carrier, permit))
+    }
+
+    pub async fn open(self: &Arc<Self>, dialer: Arc<dyn CarrierDialer>) -> io::Result<Stream> {
+        log::debug!("XHTTP opening {:?} over {:?}", self.mode, self.version);
+        self.reaper_started.call_once(|| self.start_reaper());
+        let admission = self
+            .admission
+            .acquire(1)
+            .ok_or_else(crate::resources::exhausted)?;
+        let count = if self.mode == XhttpMode::StreamOne {
+            1
+        } else if self.mode == XhttpMode::PacketUp && self.version != XhttpVersion::H1 {
+            1 + self
+                .config
+                .limits
+                .max_requests_per_connection
+                .saturating_sub(1)
+                .min(4) as u32
+        } else {
+            2
+        };
+        if self.mode != XhttpMode::StreamOne && count < 2 {
+            return Err(crate::resources::exhausted());
+        }
+        let (download, upload, permit) = if self.version == XhttpVersion::H1 {
+            let permit = self
+                .h1_slots
+                .clone()
+                .try_acquire_many_owned(count)
+                .map_err(|_| crate::resources::exhausted())?;
+            let down = self.dial(&dialer).await?;
+            let up = if count == 1 {
+                down.clone()
+            } else {
+                self.dial(&dialer).await?
+            };
+            (down, up, permit)
+        } else {
+            let (carrier, permit) = self.lease(&dialer, count).await?;
+            (carrier.clone(), carrier, permit)
+        };
+        let memory = Memory::new(
+            self.memory.clone(),
+            self.config.limits.max_session_buffered_bytes,
+        );
+        let tasks = Arc::new(Tasks::new());
+        let (mut write, upload_reader) = pipe(memory.clone());
+        write.flush_before_shutdown = self.mode == XhttpMode::PacketUp;
+        let (mut download_writer, read) = pipe(memory.clone());
+        let client = self.clone();
+        // The stream owns cancellation; workers must not retain the task owner.
+        tasks.spawn(async move {
+            let _admission = admission;
+            let _permit = permit;
+            let result = client
+                .run_session(
+                    download,
+                    upload,
+                    dialer,
+                    upload_reader,
+                    &mut download_writer,
+                    memory,
+                )
+                .await;
+            if let Err(error) = result {
+                log::debug!("XHTTP session failed: {error}");
+                download_writer.fail(error).await;
+            }
+        });
+        Ok(Stream {
+            read,
+            write,
+            _tasks: tasks,
+        })
+    }
+
+    async fn run_session(
+        self: &Arc<Self>,
+        download: Arc<Carrier>,
+        upload: Arc<Carrier>,
+        dialer: Arc<dyn CarrierDialer>,
+        upload_reader: Reader,
+        download_writer: &mut super::stream::Writer,
+        memory: Memory,
+    ) -> io::Result<()> {
+        let local = Tasks::new();
+        let session = if self.mode == XhttpMode::StreamOne {
+            String::new()
+        } else {
+            crate::uuid_util::generate_uuid()
+        };
+        let (errors, mut error_receiver) = tokio::sync::mpsc::channel(1);
+        let body = if self.mode == XhttpMode::StreamOne {
+            Body::stream(upload_reader)
+        } else {
+            let client = self.clone();
+            let session = session.clone();
+            let memory = memory.clone();
+            local.spawn(async move {
+                if let Err(error) = client
+                    .upload(upload, dialer, upload_reader, &session, memory)
+                    .await
+                {
+                    let _ = errors.send(error).await;
+                }
+            });
+            Body::Empty
+        };
+        let request = self.request(&session, None, self.mode == XhttpMode::StreamOne, body)?;
+        let response = tokio::select! {
+            Some(error) = error_receiver.recv() => return Err(error),
+            _ = local.cancel.cancelled() => return Err(io::ErrorKind::ConnectionAborted.into()),
+            result = download.request(request, memory, &local, self.header_timeout()) => result?,
+        };
+        if response.status() != StatusCode::OK {
+            return Err(io::Error::other(format!(
+                "XHTTP download status {}",
+                response.status()
+            )));
+        }
+        let mut body = response.into_body();
+        tokio::select! {
+            Some(error) = error_receiver.recv() => return Err(error),
+            _ = local.cancel.cancelled() => return Err(io::ErrorKind::ConnectionAborted.into()),
+            result = tokio::io::copy(&mut body, download_writer) => { result?; }
+        }
+        download_writer.shutdown().await
+    }
+
+    async fn upload(
+        &self,
+        carrier: Arc<Carrier>,
+        dialer: Arc<dyn CarrierDialer>,
+        reader: Reader,
+        session: &str,
+        memory: Memory,
+    ) -> io::Result<()> {
+        let tasks = Tasks::new();
+        if self.mode == XhttpMode::PacketUp {
+            return self
+                .packets(carrier, dialer, reader, session, memory, &tasks)
+                .await;
+        }
+        let request = self.request(session, None, true, Body::stream(reader))?;
+        let response = carrier
+            .request(request, memory, &tasks, self.header_timeout())
+            .await?;
+        if response.status() != StatusCode::OK {
+            return Err(io::Error::other(format!(
+                "XHTTP upload status {}",
+                response.status()
+            )));
+        }
+        let mut body = response.into_body();
+        let mut buffer = [0; 4096];
+        while body.read(&mut buffer).await? != 0 {}
+        Ok(())
+    }
+
+    fn header_timeout(&self) -> Duration {
+        Duration::from_secs(self.config.limits.response_header_timeout_secs)
+    }
+
+    fn request(
+        &self,
+        session: &str,
+        sequence: Option<u64>,
+        upload: bool,
+        body: Body,
+    ) -> io::Result<Request<Body>> {
+        let mut request = wire::request(
+            &self.config,
+            &self.path,
+            &self.authority,
+            self.version == XhttpVersion::H3 || !matches!(self.security, Security::Plain),
+            session,
+            sequence,
+            upload,
+        )?
+        .map(|_| body);
+        if self.version == XhttpVersion::H1 && sequence.is_none() {
+            request
+                .headers_mut()
+                .insert("connection", http::HeaderValue::from_static("close"));
+        }
+        Ok(request)
+    }
+
+    async fn packets(
+        &self,
+        mut carrier: Arc<Carrier>,
+        dialer: Arc<dyn CarrierDialer>,
+        mut reader: Reader,
+        session: &str,
+        memory: Memory,
+        tasks: &Tasks,
+    ) -> io::Result<()> {
+        let max = wire::sample(
+            self.config
+                .sc_max_each_post_bytes
+                .bounds((1_000_000, 1_000_000), false)?,
+        ) as usize;
+        let concurrency = if self.version == XhttpVersion::H1 {
+            1
+        } else {
+            self.config
+                .limits
+                .max_requests_per_connection
+                .saturating_sub(1)
+                .min(4)
+        };
+        let mut inflight = futures::stream::FuturesUnordered::new();
+        let mut pending = std::collections::VecDeque::new();
+        let mut sequence = 0u64;
+        let mut next = tokio::time::Instant::now();
+        loop {
+            while inflight.len() >= concurrency {
+                inflight.next().await.unwrap()?;
+            }
+            let event = if let Some(event) = pending.pop_front() {
+                Some(event)
+            } else {
+                tokio::select! {
+                    event = reader.receiver.recv() => event,
+                    done = inflight.next(), if !inflight.is_empty() => { done.unwrap()?; continue; }
+                }
+            };
+            let Some(event) = event else {
+                return Err(io::ErrorKind::BrokenPipe.into());
+            };
+            match event {
+                Event::Data(data) => {
+                    loop {
+                        tokio::select! {
+                            _ = tokio::time::sleep_until(next) => break,
+                            done = inflight.next(), if !inflight.is_empty() => { done.unwrap()?; }
+                        }
+                    }
+                    let mut chunks = Vec::new();
+                    let mut size = 0;
+                    let mut event = Some(Event::Data(data));
+                    while let Some(item) = event {
+                        match item {
+                            Event::Data(mut data) => {
+                                let len = data.len().min(max - size);
+                                chunks.push(data.split_to(len));
+                                size += len;
+                                if !data.is_empty() {
+                                    pending.push_front(Event::Data(data));
+                                    break;
+                                }
+                            }
+                            barrier => {
+                                pending.push_front(barrier);
+                                break;
+                            }
+                        }
+                        if size == max {
+                            break;
+                        }
+                        event = reader.receiver.try_recv().ok();
+                    }
+                    let packet = if chunks.len() == 1 {
+                        chunks.pop().unwrap()
+                    } else {
+                        memory.concat(&chunks)?
+                    };
+                    if self.version == XhttpVersion::H1 && carrier.closed() {
+                        carrier = self.dial(&dialer).await?;
+                    }
+                    let request = self.request(
+                        session,
+                        Some(sequence),
+                        true,
+                        Body::Full(Some(packet.clone())),
+                    )?;
+                    next = tokio::time::Instant::now()
+                        + Duration::from_millis(wire::sample(
+                            self.config
+                                .sc_min_posts_interval_ms
+                                .bounds((30, 30), false)?,
+                        ) as u64);
+                    let carrier = carrier.clone();
+                    let memory = memory.clone();
+                    inflight.push(async move {
+                        let _retained_until_ack = packet;
+                        tokio::time::timeout(
+                            Duration::from_secs(self.config.limits.packet_timeout_secs),
+                            async {
+                                let response = carrier
+                                    .request(request, memory, tasks, self.header_timeout())
+                                    .await?;
+                                if response.status() != StatusCode::OK {
+                                    return Err(io::Error::other(format!(
+                                        "XHTTP packet status {}",
+                                        response.status()
+                                    )));
+                                }
+                                let mut body = response.into_body();
+                                if body.read(&mut [0; 1]).await? != 0 {
+                                    return Err(io::Error::other(
+                                        "nonempty XHTTP packet acknowledgement",
+                                    ));
+                                }
+                                Ok::<_, io::Error>(())
+                            },
+                        )
+                        .await?
+                    });
+                    sequence = sequence
+                        .checked_add(1)
+                        .ok_or_else(|| io::Error::other("XHTTP sequence exhausted"))?;
+                }
+                Event::Flush(ack) => {
+                    while let Some(result) = inflight.next().await {
+                        result?;
+                    }
+                    let _ = ack.send(());
+                }
+                Event::Finish => {
+                    while let Some(result) = inflight.next().await {
+                        result?;
+                    }
+                    return Ok(());
+                }
+                Event::Error(error) => return Err(error),
+            }
+        }
+    }
+}

@@ -181,11 +181,17 @@ pub async fn start_quic_servers(
         processed_ca_certs.push(cert.as_bytes().to_vec());
     }
 
+    let alpn_protocols =
+        if matches!(protocol, ServerProxyConfig::Xhttp(_)) && alpn_protocols.is_unspecified() {
+            vec!["h3".to_owned()]
+        } else {
+            alpn_protocols.into_vec()
+        };
     let mut server_config = try_create_server_config(
         &cert_bytes,
         &key_bytes,
         processed_ca_certs,
-        &alpn_protocols.into_vec(),
+        &alpn_protocols,
         &client_fingerprints.into_vec(),
         &key_exchange_groups,
     )?;
@@ -209,6 +215,72 @@ pub async fn start_quic_servers(
     let mut handles = vec![];
 
     match protocol {
+        ServerProxyConfig::Xhttp(config) => {
+            if !matches!(
+                config.http_version,
+                crate::config::xhttp::XhttpVersion::Auto | crate::config::xhttp::XhttpVersion::H3
+            ) {
+                return Err(std::io::Error::other("QUIC XHTTP requires HTTP/3"));
+            }
+            if alpn_protocols != ["h3"] {
+                return Err(std::io::Error::other("QUIC XHTTP ALPN must be h3"));
+            }
+            let max_requests = config.limits.request_limit().min(u32::MAX as usize) as u32;
+            let service = Arc::new(crate::xhttp::XhttpServer::new(
+                config,
+                &client_proxy_selector,
+                &resolver,
+                None,
+            )?);
+            let mut endpoints = Vec::new();
+            for address in bind_addresses {
+                let mut config = quinn::ServerConfig::with_crypto(quic_server_config.clone());
+                let memory_bytes = crate::resources::configure_quic(&mut config, max_requests, 16);
+                let transport = Arc::get_mut(&mut config.transport).unwrap();
+                transport
+                    .max_concurrent_bidi_streams(max_requests.into())
+                    .max_concurrent_uni_streams(16u32.into())
+                    .datagram_receive_buffer_size(None)
+                    .datagram_send_buffer_size(0);
+                endpoints.extend(crate::listener_tasks::QuicListener::bind_all(
+                    address,
+                    config,
+                    num_endpoints,
+                    memory_bytes,
+                )?);
+            }
+            for endpoint in endpoints {
+                let service = service.clone();
+                handles.push(tokio::spawn(async move {
+                    let mut tasks = crate::listener_tasks::ListenerTasks::immediate();
+                    loop {
+                        let incoming = tokio::select! {
+                            incoming = endpoint.accept() => incoming,
+                            _ = tasks.join_next(), if !tasks.is_empty() => continue,
+                        };
+                        let Some(incoming) = incoming else {
+                            break;
+                        };
+                        let Some(permit) =
+                            crate::resources::try_connection(Some(incoming.remote_address().ip()))
+                        else {
+                            incoming.refuse();
+                            continue;
+                        };
+                        let service = service.clone();
+                        tasks.spawn(async move {
+                            let _permit = permit;
+                            if let Ok(connecting) = incoming.accept()
+                                && let Ok(connection) = connecting.await
+                                && let Err(error) = service.serve_h3(connection).await
+                            {
+                                log::debug!("XHTTP H3 carrier ended: {error}");
+                            }
+                        });
+                    }
+                }));
+            }
+        }
         ServerProxyConfig::Hysteria2 {
             password,
             udp_enabled,

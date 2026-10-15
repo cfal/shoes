@@ -28,6 +28,7 @@ use crate::tcp::tcp_handler::{TcpClientHandler, TcpClientSetupResult};
 pub struct ProxyConnectorImpl {
     location: NetLocation,
     client_handler: Box<dyn TcpClientHandler>,
+    xhttp: Option<Arc<crate::xhttp::client::Client>>,
 }
 
 impl ProxyConnectorImpl {
@@ -42,9 +43,20 @@ impl ProxyConnectorImpl {
             return Ok(None);
         }
 
+        if let Some((xhttp, client_handler)) =
+            crate::xhttp::connector::build(&config, resolver.clone())?
+        {
+            return Ok(Some(Self {
+                location: config.address,
+                client_handler,
+                xhttp: Some(xhttp),
+            }));
+        }
+
         let default_sni_hostname = config.address.address().hostname().map(ToString::to_string);
 
         Ok(Some(Self {
+            xhttp: None,
             location: config.address,
             client_handler: create_tcp_client_handler(
                 config.protocol,
@@ -57,6 +69,38 @@ impl ProxyConnectorImpl {
 
 #[async_trait]
 impl ProxyConnector for ProxyConnectorImpl {
+    fn needs_carrier_dialer(&self) -> bool {
+        self.xhttp.is_some()
+    }
+
+    async fn connect_tcp_with_dialer(
+        &self,
+        dialer: Arc<dyn super::carrier_dialer::CarrierDialer>,
+        target: &ResolvedLocation,
+    ) -> std::io::Result<TcpClientSetupResult> {
+        let stream: Box<dyn AsyncStream> = match &self.xhttp {
+            Some(client) => Box::new(client.open(dialer).await?),
+            None => dialer.open_stream().await?,
+        };
+        self.client_handler
+            .setup_client_tcp_stream(stream, target.clone())
+            .await
+    }
+
+    async fn connect_udp_with_dialer(
+        &self,
+        dialer: Arc<dyn super::carrier_dialer::CarrierDialer>,
+        target: ResolvedLocation,
+    ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
+        let stream: Box<dyn AsyncStream> = match &self.xhttp {
+            Some(client) => Box::new(client.open(dialer).await?),
+            None => dialer.open_stream().await?,
+        };
+        self.client_handler
+            .setup_client_udp_bidirectional(stream, target)
+            .await
+    }
+
     fn proxy_location(&self) -> &NetLocation {
         &self.location
     }
@@ -69,6 +113,9 @@ impl ProxyConnector for ProxyConnectorImpl {
         &self,
         target: &ResolvedLocation,
     ) -> std::io::Result<Option<TcpClientSetupResult>> {
+        if self.xhttp.is_some() {
+            return Ok(None);
+        }
         self.client_handler.try_reuse_tcp_stream(target).await
     }
 
@@ -77,6 +124,12 @@ impl ProxyConnector for ProxyConnectorImpl {
         stream: Box<dyn AsyncStream>,
         target: &ResolvedLocation,
     ) -> std::io::Result<TcpClientSetupResult> {
+        if self.xhttp.is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "XHTTP requires a carrier dialer",
+            ));
+        }
         debug!(
             "[ProxyConnector] setup_tcp_stream: {} -> {}",
             self.location, target
@@ -91,6 +144,12 @@ impl ProxyConnector for ProxyConnectorImpl {
         stream: Box<dyn AsyncStream>,
         target: ResolvedLocation,
     ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
+        if self.xhttp.is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "XHTTP requires a carrier dialer",
+            ));
+        }
         debug!(
             "[ProxyConnector] setup_udp_bidirectional: {} -> {}",
             self.location, target
@@ -201,6 +260,7 @@ mod tests {
         });
         let connects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let proxy = ProxyConnectorImpl {
+            xhttp: None,
             location: NetLocation::from_str("localhost:443", None).unwrap(),
             client_handler: Box::new(TlsClientHandler::new(
                 client_config,

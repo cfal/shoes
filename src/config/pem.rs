@@ -319,6 +319,13 @@ fn gather_pem_file_paths_from_server_proxy(
                 }
             }
         }
+        ServerProxyConfig::Xhttp(config) => {
+            gather_pem_file_paths_from_server_proxy(
+                &mut config.protocol,
+                known_pem_paths,
+                unknown_pem_paths,
+            )?;
+        }
         _ => {}
     }
     Ok(())
@@ -419,6 +426,13 @@ fn gather_pem_file_paths_from_client_proxy(
         ClientProxyConfig::Websocket(ws_config) => {
             gather_pem_file_paths_from_client_proxy(
                 &mut ws_config.protocol,
+                known_pem_paths,
+                unknown_pem_paths,
+            );
+        }
+        ClientProxyConfig::Xhttp(config) => {
+            gather_pem_file_paths_from_client_proxy(
+                &mut config.protocol,
                 known_pem_paths,
                 unknown_pem_paths,
             );

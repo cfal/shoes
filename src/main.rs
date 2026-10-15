@@ -57,6 +57,7 @@ mod uuid_util;
 mod vless;
 mod vmess;
 mod websocket;
+mod xhttp;
 mod xudp;
 
 #[cfg(not(any(target_env = "msvc", target_os = "ios", target_os = "android")))]

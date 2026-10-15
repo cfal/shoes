@@ -86,7 +86,7 @@ h3-quinn = "*"
 hickory-resolver = { version = "*", default-features = false, features = ["tokio", "tls-aws-lc-rs", "https-aws-lc-rs", "h3-aws-lc-rs"] }
 http = "*"
 http-body-util = "*"
-hyper = { version = "*", features = ["server", "http1", "http2"] }
+hyper = { version = "*", features = ["client", "server", "http1", "http2"] }
 hyper-util = { version = "*", features = ["tokio", "server"] }
 indexmap = "*"
 libc = "*"

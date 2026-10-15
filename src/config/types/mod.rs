@@ -25,6 +25,7 @@ pub mod shadowsocks;
 pub mod tls;
 pub mod transport;
 pub mod tun;
+pub mod xhttp;
 
 // Re-export all public types for convenience
 #[allow(unused_imports)]
