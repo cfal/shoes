@@ -362,6 +362,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn closing_an_idle_h1_download_releases_its_session() {
+        let state = service();
+        let (mut client, server) = tokio::io::duplex(8192);
+        let task = tokio::spawn(state.clone().serve_h1(
+            Box::new(server),
+            tokio::time::Instant::now() + Duration::from_secs(4),
+        ));
+        client
+            .write_all(
+                format!(
+                    "GET /t/a HTTP/1.1\r\nHost: localhost\r\nReferer: /?x_padding={}\r\n\r\n",
+                    "X".repeat(100),
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut header = [0; 4096];
+        assert!(client.read(&mut header).await.unwrap() > 0);
+        assert_eq!(state.admission.snapshot().active, 1);
+        drop(client);
+        let _ = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.admission.snapshot().active, 0);
+    }
+
+    #[tokio::test]
     async fn stream_one_admission_and_service_drop_release_resources() {
         let state = service();
         let first = request(&state, "POST", "", b"first").await;
@@ -1124,7 +1153,6 @@ impl State {
         });
         let mut builder = hyper::server::conn::http1::Builder::new();
         builder
-            .half_close(true)
             .max_buf_size(header_limit.max(8192))
             .timer(hyper_util::rt::TokioTimer::new())
             .header_read_timeout(header_timeout);
