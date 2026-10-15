@@ -585,58 +585,59 @@ impl State {
         response.body(body).unwrap()
     }
 
+    fn spawn_inner_session(&self, stream: Stream, permit: BudgetPermit, cancel: CancellationToken) {
+        let inner = self.inner.clone();
+        let resolver = self.resolver.clone();
+        let timeout = Duration::from_secs(self.config.limits.setup_timeout_secs);
+        self.tasks.spawn(async move {
+            tokio::select! {
+                _ = cancel.cancelled() => {},
+                result = crate::tcp::tcp_server::process_stream_with_permit(
+                    stream, inner, resolver, permit, timeout,
+                ) => {
+                    if let Err(error) = result {
+                        log::debug!("XHTTP inner session failed: {error}");
+                    }
+                }
+            }
+        });
+    }
+
     async fn dispatch(
         self: &Arc<Self>,
         request: &Request<()>,
         mut body: Reader,
     ) -> Result<(Body, bool), StatusCode> {
-        let kind = wire::classify(&self.config, &self.path, request)?;
-        if kind == Kind::Options {
-            return Ok((Body::Empty, false));
-        }
-        if kind == Kind::One {
-            let admission = self
-                .admission
-                .acquire(1)
-                .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-            let permit = crate::resources::try_stream().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-            let memory = Memory::new(
-                self.memory.clone(),
-                self.config.limits.max_session_buffered_bytes,
-            );
-            let (writer, reader) = pipe(memory);
-            let tasks = Arc::new(Tasks::new());
-            let stream = Stream {
-                read: body,
-                write: writer,
-                _tasks: tasks.clone(),
-            };
-            let inner = self.inner.clone();
-            let resolver = self.resolver.clone();
-            // The response owns the guard. The session future owns only the
-            // token, not the task collection which would retain itself.
-            let cancel = tasks.cancel.clone();
-            let timeout = Duration::from_secs(self.config.limits.setup_timeout_secs);
-            self.tasks.spawn(async move {
-                tokio::select! {
-                    _ = cancel.cancelled() => {},
-                    result = crate::tcp::tcp_server::process_stream_with_permit(stream, inner, resolver, permit, timeout) => {
-                        if let Err(error) = result { log::debug!("XHTTP inner session failed: {error}"); }
-                    }
-                }
-            });
-            return Ok((
-                Body::stream(reader).with_guard((tasks.cancel.clone().drop_guard(), admission)),
-                true,
-            ));
-        }
-        let id = match &kind {
-            Kind::Download(id) | Kind::Upload(id) | Kind::Packet(id, _) => id,
-            _ => unreachable!(),
-        };
-        let session = self.session(id)?;
-        match kind {
+        match wire::classify(&self.config, &self.path, request)? {
+            Kind::Options => Ok((Body::Empty, false)),
+            Kind::One => {
+                let admission = self
+                    .admission
+                    .acquire(1)
+                    .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+                let permit =
+                    crate::resources::try_stream().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+                let memory = Memory::new(
+                    self.memory.clone(),
+                    self.config.limits.max_session_buffered_bytes,
+                );
+                let (writer, reader) = pipe(memory);
+                let tasks = Arc::new(Tasks::new());
+                let stream = Stream {
+                    read: body,
+                    write: writer,
+                    _tasks: tasks.clone(),
+                };
+                // The response owns the guard. The session future owns only the
+                // token, not the task collection which would retain itself.
+                self.spawn_inner_session(stream, permit, tasks.cancel.clone());
+                Ok((
+                    Body::stream(reader).with_guard((tasks.cancel.clone().drop_guard(), admission)),
+                    true,
+                ))
+            }
             Kind::Download(id) => {
+                let session = self.session(&id)?;
                 let (reader, permit) = {
                     let mut state = session.state.lock();
                     if state.downloaded {
@@ -646,24 +647,13 @@ impl State {
                     (state.reader.take().unwrap(), state.permit.take().unwrap())
                 };
                 let (writer, output) = pipe(session.memory.clone());
-                let inner = self.inner.clone();
-                let resolver = self.resolver.clone();
-                let cancel = session.cancel.clone();
                 let tasks = Arc::new(Tasks::new());
                 let stream = Stream {
                     read: reader,
                     write: writer,
                     _tasks: tasks,
                 };
-                let timeout = Duration::from_secs(self.config.limits.setup_timeout_secs);
-                self.tasks.spawn(async move {
-                    tokio::select! {
-                        _ = cancel.cancelled() => {},
-                        result = crate::tcp::tcp_server::process_stream_with_permit(stream, inner, resolver, permit, timeout) => {
-                            if let Err(error) = result { log::debug!("XHTTP inner session failed: {error}"); }
-                        }
-                    }
-                });
+                self.spawn_inner_session(stream, permit, session.cancel.clone());
                 let guard = DownloadGuard {
                     state: Arc::downgrade(self),
                     id,
@@ -671,7 +661,8 @@ impl State {
                 };
                 Ok((Body::stream(output).with_guard(guard), true))
             }
-            Kind::Upload(_) => {
+            Kind::Upload(id) => {
+                let session = self.session(&id)?;
                 let mut writer = {
                     let mut state = session.state.lock();
                     if state.upload != Upload::Unclaimed {
@@ -731,7 +722,8 @@ impl State {
                 });
                 Ok((Body::stream(padding_reader), false))
             }
-            Kind::Packet(_, sequence) => {
+            Kind::Packet(id, sequence) => {
+                let session = self.session(&id)?;
                 let max = self
                     .config
                     .sc_max_each_post_bytes
@@ -841,7 +833,6 @@ impl State {
                 session.ready.notify_one();
                 Ok((Body::Empty, false))
             }
-            _ => unreachable!(),
         }
     }
 
@@ -937,7 +928,10 @@ impl State {
         .map_err(io::Error::other)?;
         let mut requests = tokio::task::JoinSet::new();
         loop {
-            let request = tokio::select! { request = connection.accept() => request, _ = requests.join_next(), if !requests.is_empty() => continue };
+            let request = tokio::select! {
+                request = connection.accept() => request,
+                _ = requests.join_next(), if !requests.is_empty() => continue,
+            };
             let Some(request) = request else {
                 return Ok(());
             };

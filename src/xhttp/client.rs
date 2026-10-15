@@ -188,36 +188,29 @@ impl Client {
             .admission
             .acquire(1)
             .ok_or_else(crate::resources::exhausted)?;
-        let count = if self.mode == XhttpMode::StreamOne {
-            1
-        } else if self.mode == XhttpMode::PacketUp && self.version != XhttpVersion::H1 {
-            1 + self
-                .config
-                .limits
-                .max_requests_per_connection
-                .saturating_sub(1)
-                .min(4) as u32
-        } else {
-            2
+        let request_count = match self.mode {
+            XhttpMode::StreamOne => 1,
+            XhttpMode::PacketUp => 1 + self.packet_concurrency() as u32,
+            _ => 2,
         };
-        if self.mode != XhttpMode::StreamOne && count < 2 {
+        if self.mode != XhttpMode::StreamOne && request_count < 2 {
             return Err(crate::resources::exhausted());
         }
         let (download, upload, permit) = if self.version == XhttpVersion::H1 {
             let permit = self
                 .h1_slots
                 .clone()
-                .try_acquire_many_owned(count)
+                .try_acquire_many_owned(request_count)
                 .map_err(|_| crate::resources::exhausted())?;
-            let down = self.dial(&dialer).await?;
-            let up = if count == 1 {
-                down.clone()
+            let download = self.dial(&dialer).await?;
+            let upload = if request_count == 1 {
+                download.clone()
             } else {
                 self.dial(&dialer).await?
             };
-            (down, up, permit)
+            (download, upload, permit)
         } else {
-            let (carrier, permit) = self.lease(&dialer, count).await?;
+            let (carrier, permit) = self.lease(&dialer, request_count).await?;
             (carrier.clone(), carrier, permit)
         };
         let memory = Memory::new(
@@ -303,7 +296,9 @@ impl Client {
         tokio::select! {
             Some(error) = error_receiver.recv() => return Err(error),
             _ = local.cancel.cancelled() => return Err(io::ErrorKind::ConnectionAborted.into()),
-            result = tokio::io::copy(&mut body, download_writer) => { result?; }
+            result = tokio::io::copy(&mut body, download_writer) => {
+                result?;
+            }
         }
         download_writer.shutdown().await
     }
@@ -342,6 +337,18 @@ impl Client {
         Duration::from_secs(self.config.limits.response_header_timeout_secs)
     }
 
+    fn packet_concurrency(&self) -> usize {
+        if self.version == XhttpVersion::H1 {
+            1
+        } else {
+            self.config
+                .limits
+                .max_requests_per_connection
+                .saturating_sub(1)
+                .min(4)
+        }
+    }
+
     fn request(
         &self,
         session: &str,
@@ -376,24 +383,16 @@ impl Client {
         memory: Memory,
         tasks: &Tasks,
     ) -> io::Result<()> {
-        let max = wire::sample(
+        let max_packet_bytes = wire::sample(
             self.config
                 .sc_max_each_post_bytes
                 .bounds((1_000_000, 1_000_000), false)?,
         ) as usize;
-        let concurrency = if self.version == XhttpVersion::H1 {
-            1
-        } else {
-            self.config
-                .limits
-                .max_requests_per_connection
-                .saturating_sub(1)
-                .min(4)
-        };
+        let concurrency = self.packet_concurrency();
         let mut inflight = futures::stream::FuturesUnordered::new();
         let mut pending = std::collections::VecDeque::new();
         let mut sequence = 0u64;
-        let mut next = tokio::time::Instant::now();
+        let mut next_post_at = tokio::time::Instant::now();
         loop {
             while inflight.len() >= concurrency {
                 inflight.next().await.unwrap()?;
@@ -403,7 +402,10 @@ impl Client {
             } else {
                 tokio::select! {
                     event = reader.receiver.recv() => event,
-                    done = inflight.next(), if !inflight.is_empty() => { done.unwrap()?; continue; }
+                    done = inflight.next(), if !inflight.is_empty() => {
+                        done.unwrap()?;
+                        continue;
+                    }
                 }
             };
             let Some(event) = event else {
@@ -413,8 +415,10 @@ impl Client {
                 Event::Data(data) => {
                     loop {
                         tokio::select! {
-                            _ = tokio::time::sleep_until(next) => break,
-                            done = inflight.next(), if !inflight.is_empty() => { done.unwrap()?; }
+                            _ = tokio::time::sleep_until(next_post_at) => break,
+                            done = inflight.next(), if !inflight.is_empty() => {
+                                done.unwrap()?;
+                            }
                         }
                     }
                     let mut chunks = Vec::new();
@@ -423,7 +427,7 @@ impl Client {
                     while let Some(item) = event {
                         match item {
                             Event::Data(mut data) => {
-                                let len = data.len().min(max - size);
+                                let len = data.len().min(max_packet_bytes - size);
                                 chunks.push(data.split_to(len));
                                 size += len;
                                 if !data.is_empty() {
@@ -436,7 +440,7 @@ impl Client {
                                 break;
                             }
                         }
-                        if size == max {
+                        if size == max_packet_bytes {
                             break;
                         }
                         event = reader.receiver.try_recv().ok();
@@ -455,7 +459,7 @@ impl Client {
                         true,
                         Body::Full(Some(packet.clone())),
                     )?;
-                    next = tokio::time::Instant::now()
+                    next_post_at = tokio::time::Instant::now()
                         + Duration::from_millis(wire::sample(
                             self.config
                                 .sc_min_posts_interval_ms

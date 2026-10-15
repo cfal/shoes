@@ -74,54 +74,82 @@ async fn echo_peer(version: XhttpVersion, drain: bool) -> (SocketAddr, Tasks) {
     tasks.spawn(async move {
         let mut connections = tokio::task::JoinSet::new();
         loop {
-            tokio::select! {
-                accepted = listener.accept() => {
-                    let (stream, _) = accepted.unwrap();
-                    connections.spawn(async move {
-                        if version == XhttpVersion::H1 {
-                            let service = hyper::service::service_fn(|request: Request<hyper::body::Incoming>| async {
-                                let mut incoming = request.into_body();
-                                // Headers deliberately wait for the client's inner handshake.
-                                let first = incoming.frame().await.unwrap().unwrap().into_data().unwrap();
-                                let memory = Memory::new(Arc::new(Budget::new(Some(1024*1024))), 1024*1024);
-                                let (mut write, read) = pipe(memory);
-                                let tasks = Arc::new(Tasks::new());
-                                tasks.spawn(async move {
-                                    write.write_all(&first).await.unwrap();
-                                    super::carrier::receive_hyper(incoming, write).await;
-                                });
-                                Ok::<_, io::Error>(Response::new(Body::stream(read).with_guard(tasks)))
+            let (stream, _) = tokio::select! {
+                accepted = listener.accept() => accepted.unwrap(),
+                _ = connections.join_next(), if !connections.is_empty() => continue,
+            };
+            connections.spawn(async move {
+                if version == XhttpVersion::H1 {
+                    let service = hyper::service::service_fn(
+                        |request: Request<hyper::body::Incoming>| async {
+                            let mut incoming = request.into_body();
+                            // Headers deliberately wait for the client's inner handshake.
+                            let first = incoming
+                                .frame()
+                                .await
+                                .unwrap()
+                                .unwrap()
+                                .into_data()
+                                .unwrap();
+                            let memory =
+                                Memory::new(Arc::new(Budget::new(Some(1024 * 1024))), 1024 * 1024);
+                            let (mut write, read) = pipe(memory);
+                            let tasks = Arc::new(Tasks::new());
+                            tasks.spawn(async move {
+                                write.write_all(&first).await.unwrap();
+                                super::carrier::receive_hyper(incoming, write).await;
                             });
-                            let _ = hyper::server::conn::http1::Builder::new().half_close(true).serve_connection(hyper_util::rt::TokioIo::new(stream), service).await;
-                        } else {
-                            let mut connection = h2::server::handshake(stream).await.unwrap();
-                            let mut requests = tokio::task::JoinSet::new();
-                            loop {
-                                tokio::select! {
-                                    request = connection.accept() => {
-                                        let Some(Ok((request, mut respond))) = request else { break; };
-                                        if drain { connection.graceful_shutdown(); }
-                                        requests.spawn(async move {
-                                            let mut incoming = request.into_body();
-                                            let Some(Ok(first)) = incoming.data().await else { return; };
-                                            incoming.flow_control().release_capacity(first.len()).unwrap();
-                                            let Ok(mut send) = respond.send_response(Response::new(()), false) else { return; };
-                                            if send.send_data(first, false).is_err() { return; }
-                                            while let Some(Ok(data)) = incoming.data().await {
-                                                incoming.flow_control().release_capacity(data.len()).unwrap();
-                                                if send.send_data(data, false).is_err() { return; }
-                                            }
-                                            let _ = send.send_data(Bytes::new(), true);
-                                        });
-                                    }
-                                    _ = requests.join_next(), if !requests.is_empty() => {}
+                            Ok::<_, io::Error>(Response::new(Body::stream(read).with_guard(tasks)))
+                        },
+                    );
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .half_close(true)
+                        .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                        .await;
+                } else {
+                    let mut connection = h2::server::handshake(stream).await.unwrap();
+                    let mut requests = tokio::task::JoinSet::new();
+                    loop {
+                        let request = tokio::select! {
+                            request = connection.accept() => request,
+                            _ = requests.join_next(), if !requests.is_empty() => continue,
+                        };
+                        let Some(Ok((request, mut respond))) = request else {
+                            break;
+                        };
+                        if drain {
+                            connection.graceful_shutdown();
+                        }
+                        requests.spawn(async move {
+                            let mut incoming = request.into_body();
+                            let Some(Ok(first)) = incoming.data().await else {
+                                return;
+                            };
+                            incoming
+                                .flow_control()
+                                .release_capacity(first.len())
+                                .unwrap();
+                            let Ok(mut send) = respond.send_response(Response::new(()), false)
+                            else {
+                                return;
+                            };
+                            if send.send_data(first, false).is_err() {
+                                return;
+                            }
+                            while let Some(Ok(data)) = incoming.data().await {
+                                incoming
+                                    .flow_control()
+                                    .release_capacity(data.len())
+                                    .unwrap();
+                                if send.send_data(data, false).is_err() {
+                                    return;
                                 }
                             }
-                        }
-                    });
+                            let _ = send.send_data(Bytes::new(), true);
+                        });
+                    }
                 }
-                _ = connections.join_next(), if !connections.is_empty() => {}
-            }
+            });
         }
     });
     (address, tasks)
@@ -334,44 +362,57 @@ async fn h1_packet_connection_close_redials_without_replaying_packets() {
         tasks.spawn(async move {
             let mut connections = tokio::task::JoinSet::new();
             loop {
-                tokio::select! {
-                    accepted = listener.accept() => {
-                        let (socket, _) = accepted.unwrap();
-                        let packets = packets.clone();
-                        connections.spawn(async move {
-                            let service = hyper::service::service_fn(move |request: Request<hyper::body::Incoming>| {
-                                let packets = packets.clone();
-                                async move {
-                                    if request.method() == http::Method::GET {
-                                        let memory = Memory::new(Arc::new(Budget::new(Some(1024))), 1024);
-                                        let (writer, reader) = pipe(memory);
-                                        return Ok::<_, io::Error>(Response::new(Body::stream(reader).with_guard(writer)));
-                                    }
-                                    let path = request.uri().path().to_owned();
-                                    let data = request.into_body().collect().await.unwrap().to_bytes();
-                                    packets.lock().push((path, data));
-                                    Ok(Response::builder().header("connection", "close").body(Body::Empty).unwrap())
+                let (socket, _) = tokio::select! {
+                    accepted = listener.accept() => accepted.unwrap(),
+                    _ = connections.join_next(), if !connections.is_empty() => continue,
+                };
+                let packets = packets.clone();
+                connections.spawn(async move {
+                    let service = hyper::service::service_fn(
+                        move |request: Request<hyper::body::Incoming>| {
+                            let packets = packets.clone();
+                            async move {
+                                if request.method() == http::Method::GET {
+                                    let memory =
+                                        Memory::new(Arc::new(Budget::new(Some(1024))), 1024);
+                                    let (writer, reader) = pipe(memory);
+                                    return Ok::<_, io::Error>(Response::new(
+                                        Body::stream(reader).with_guard(writer),
+                                    ));
                                 }
-                            });
-                            let _ = hyper::server::conn::http1::Builder::new()
-                                .serve_connection(hyper_util::rt::TokioIo::new(socket), service).await;
-                        });
-                    }
-                    _ = connections.join_next(), if !connections.is_empty() => {}
-                }
+                                let path = request.uri().path().to_owned();
+                                let data = request.into_body().collect().await.unwrap().to_bytes();
+                                packets.lock().push((path, data));
+                                Ok(Response::builder()
+                                    .header("connection", "close")
+                                    .body(Body::Empty)
+                                    .unwrap())
+                            }
+                        },
+                    );
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(hyper_util::rt::TokioIo::new(socket), service)
+                        .await;
+                });
             }
         });
-        let config = serde_json::from_value(serde_json::json!({"protocol":{"type":"socks"}})).unwrap();
-        let client = Arc::new(Client::new(
-            config,
-            NetLocation::from_str("localhost:80", None).unwrap(),
-            "localhost".into(),
-            XhttpVersion::H1,
-            XhttpMode::PacketUp,
-            Security::Plain,
-        ).unwrap());
+        let config =
+            serde_json::from_value(serde_json::json!({"protocol":{"type":"socks"}})).unwrap();
+        let client = Arc::new(
+            Client::new(
+                config,
+                NetLocation::from_str("localhost:80", None).unwrap(),
+                "localhost".into(),
+                XhttpVersion::H1,
+                XhttpMode::PacketUp,
+                Security::Plain,
+            )
+            .unwrap(),
+        );
         let dialer = Arc::new(Dialer {
-            address, key: RouteKey(vec![1]), opens: AtomicUsize::new(0),
+            address,
+            key: RouteKey(vec![1]),
+            opens: AtomicUsize::new(0),
         });
         let mut stream = client.open(dialer.clone()).await.unwrap();
         for byte in 0..3 {
@@ -386,7 +427,9 @@ async fn h1_packet_connection_close_redials_without_replaying_packets() {
             assert!(path.ends_with(&format!("/{sequence}")));
             assert_eq!(bytes.as_ref(), &[sequence as u8]);
         }
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
