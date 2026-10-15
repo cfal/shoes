@@ -186,13 +186,9 @@ mod tests {
         ) -> std::io::Result<Box<dyn AsyncStream>> {
             self.connects
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            Ok(Box::new(
-                self.stream
-                    .lock()
-                    .unwrap()
-                    .take()
-                    .ok_or_else(|| std::io::Error::other("unexpected redundant dial"))?,
-            ))
+            Ok(Box::new(self.stream.lock().unwrap().take().ok_or_else(
+                || std::io::Error::other("unexpected redundant dial"),
+            )?))
         }
         async fn connect_udp_bidirectional(
             &self,
