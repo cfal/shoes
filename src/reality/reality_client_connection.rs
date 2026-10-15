@@ -1085,7 +1085,10 @@ pub fn feed_reality_client_connection(
 mod tests {
     use super::*;
 
-    fn fragmented_server_flight(corrupt_finished: bool) -> io::Result<()> {
+    fn fragmented_server_flight(
+        mutate: impl FnOnce(&mut Vec<u8>),
+        record_fragment: usize,
+    ) -> io::Result<()> {
         use crate::reality::{
             RealityServerConnection, decode_mldsa65_verify, generate_mldsa65_keypair,
             mldsa65_signing_key,
@@ -1118,19 +1121,26 @@ mod tests {
         let encrypted = &flight[encrypted_start..];
         let len = u16::from_be_bytes([encrypted[3], encrypted[4]]);
         let mut plaintext = decrypt_handshake_message(cipher, &key, &iv, 0, &encrypted[5..], len)?;
-        if corrupt_finished {
-            *plaintext.last_mut().unwrap() ^= 1;
-        }
+        mutate(&mut plaintext);
         let aead = AeadKey::new(cipher, &key)?;
         let mut seq = 0;
         let mut encryptor = RecordEncryptor::new(&aead, &iv, &mut seq);
         let mut fragmented = Vec::new();
-        for chunk in plaintext.chunks(47) {
+        for chunk in plaintext.chunks(record_fragment) {
             encryptor.encrypt_handshake(chunk, &mut fragmented)?;
         }
         for chunk in fragmented.chunks(31) {
             client.read_tls(&mut &chunk[..])?;
-            client.process_new_packets()?;
+            if let Err(error) = client.process_new_packets() {
+                assert!(client.is_handshaking());
+                assert_eq!(client.negotiated_group(), None);
+                assert!(client.app_read_key.is_none());
+                assert!(client.app_write_key.is_none());
+                let mut output = Vec::new();
+                client.write_tls(&mut output).unwrap();
+                assert!(output.is_empty());
+                return Err(error);
+            }
         }
         assert!(!client.is_handshaking());
         Ok(())
@@ -1138,14 +1148,129 @@ mod tests {
 
     #[test]
     fn mldsa_certificate_across_tls_records() {
-        fragmented_server_flight(false).unwrap();
+        fragmented_server_flight(|_| {}, 47).unwrap();
     }
 
     #[test]
     fn server_finished_must_verify() {
-        let error = fragmented_server_flight(true).unwrap_err();
+        let error = fragmented_server_flight(|plaintext| *plaintext.last_mut().unwrap() ^= 1, 47)
+            .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
         assert!(error.to_string().contains("Finished"));
+    }
+
+    #[test]
+    fn out_of_order_server_handshake_messages_are_rejected() {
+        for message_index in 0..4 {
+            let error = fragmented_server_flight(
+                |plaintext| {
+                    let mut offset = 0;
+                    for _ in 0..message_index {
+                        let len = u32::from_be_bytes([
+                            0,
+                            plaintext[offset + 1],
+                            plaintext[offset + 2],
+                            plaintext[offset + 3],
+                        ]) as usize;
+                        offset += 4 + len;
+                    }
+                    plaintext[offset] = if message_index == 0 {
+                        HANDSHAKE_TYPE_CERTIFICATE
+                    } else {
+                        HANDSHAKE_TYPE_ENCRYPTED_EXTENSIONS
+                    };
+                },
+                47,
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(error.to_string(), "Unexpected REALITY handshake message");
+        }
+    }
+
+    #[test]
+    fn trailing_server_handshake_plaintext_is_rejected() {
+        let error =
+            fragmented_server_flight(|plaintext| plaintext.push(0), usize::MAX).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), "Trailing handshake plaintext");
+    }
+
+    #[test]
+    fn server_hello_must_echo_session_and_select_offered_cipher() {
+        use super::super::reality_pq_tests::{configs, target_records};
+
+        for mismatch_session in [false, true] {
+            let (cc, _) = configs(CipherSuite::AES_128_GCM_SHA256);
+            let mut client = RealityClientConnection::new(cc).unwrap();
+            let mut hello = Vec::new();
+            client.write_tls(&mut hello).unwrap();
+            let mut session = hello[44..76].to_vec();
+            let cipher = if mismatch_session {
+                session[0] ^= 1;
+                CipherSuite::AES_128_GCM_SHA256
+            } else {
+                CipherSuite::AES_256_GCM_SHA384
+            };
+            let records = target_records(RealityGroup::X25519MlKem768, cipher, &session);
+            client.read_tls(&mut records[0].as_ref()).unwrap();
+            let error = client.process_new_packets().unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(
+                error.to_string(),
+                if mismatch_session {
+                    "ServerHello session ID mismatch"
+                } else {
+                    "Server selected unoffered cipher suite"
+                }
+            );
+            assert!(client.is_handshaking());
+            assert_eq!(client.negotiated_group(), None);
+            assert!(client.app_read_key.is_none());
+            assert!(client.app_write_key.is_none());
+        }
+    }
+
+    #[test]
+    fn default_client_offers_hybrid_before_x25519() {
+        use crate::buf_reader::BufReader;
+
+        let (cc, _) = super::super::reality_pq_tests::configs(CipherSuite::AES_128_GCM_SHA256);
+        let mut client = RealityClientConnection::new(cc).unwrap();
+        let mut hello = Vec::new();
+        client.write_tls(&mut hello).unwrap();
+        let mut reader = BufReader::new(&hello);
+        reader.skip(43).unwrap();
+        let session_len = reader.read_u8().unwrap() as usize;
+        reader.skip(session_len).unwrap();
+        let cipher_len = reader.read_u16_be().unwrap() as usize;
+        reader.skip(cipher_len).unwrap();
+        let compression_len = reader.read_u8().unwrap() as usize;
+        reader.skip(compression_len).unwrap();
+        let extensions_len = reader.read_u16_be().unwrap() as usize;
+        assert_eq!(extensions_len, reader.remaining());
+        let mut groups = None;
+        let mut shares = None;
+        while !reader.is_consumed() {
+            let id = reader.read_u16_be().unwrap();
+            let len = reader.read_u16_be().unwrap() as usize;
+            let data = reader.read_slice(len).unwrap();
+            match id {
+                10 => groups = Some(data),
+                51 => shares = Some(data),
+                _ => {}
+            }
+        }
+        assert_eq!(groups.unwrap(), &[0, 4, 0x11, 0xec, 0, 0x1d]);
+        let mut shares = BufReader::new(shares.unwrap());
+        let len = shares.read_u16_be().unwrap() as usize;
+        assert_eq!(len, shares.remaining());
+        for (group, size) in [(0x11ec, 1216), (0x001d, 32)] {
+            assert_eq!(shares.read_u16_be().unwrap(), group);
+            assert_eq!(shares.read_u16_be().unwrap(), size);
+            shares.skip(size as usize).unwrap();
+        }
+        assert!(shares.is_consumed());
     }
 
     #[test]

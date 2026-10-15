@@ -427,6 +427,8 @@ mod cleanup_tests {
 
     #[test]
     fn synthesis_failures_only_forward_explicit_incompatibilities() {
+        use crate::reality::reality_key_exchange::{ClientKeyShares, RealityGroup, server_exchange};
+
         assert!(!should_forward_to_dest(Ok(())).unwrap());
         assert!(should_forward_to_dest(Err(io::ErrorKind::Unsupported.into())).unwrap());
         for kind in [
@@ -439,28 +441,50 @@ mod cleanup_tests {
             assert_eq!(propagated.kind(), kind);
             assert_eq!(propagated.to_string(), "injected synthesis failure");
         }
+
+        // AWS-LC accepts the encoding but rejects this public key during encapsulation.
+        let shares = ClientKeyShares {
+            x25519: None,
+            hybrid: Some(Box::new([255; 1216])),
+        };
+        let result = server_exchange(RealityGroup::X25519MlKem768, &shares).map(|_| ());
+        let error = should_forward_to_dest(result).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(error.to_string(), "ML-KEM encapsulation failed");
     }
 
     #[tokio::test]
     async fn unsupported_and_undersized_target_flights_forward_unchanged() {
         use crate::client_proxy_chain::InitialHopEntry;
         use crate::port_forward_handler::PortForwardServerHandler;
-        use crate::reality::reality_pq_tests::configs;
+        use crate::reality::reality_key_exchange::RealityGroup;
+        use crate::reality::reality_pq_tests::{configs, separate_target_records};
         use crate::reality::{CipherSuite, RealityClientConnection, mldsa65_signing_key};
         use crate::tcp::socket_connector_impl::SocketConnectorImpl;
 
-        for case in ["small", "retry", "unsupported"] {
+        for case in ["small", "small-separate", "retry", "unsupported"] {
             let (cc, mut sc) = configs(CipherSuite::AES_128_GCM_SHA256);
             let (seed, _) = crate::reality::generate_mldsa65_keypair().unwrap();
             sc.mldsa65_key = Some(mldsa65_signing_key(&seed).unwrap());
             let mut client = RealityClientConnection::new(cc).unwrap();
             let mut hello = Vec::new();
             client.write_tls(&mut hello).unwrap();
-            let mut response = if case == "small" {
-                let mut records = crate::reality::default_target_records(&hello[44..76]);
+            let mut response = if matches!(case, "small" | "small-separate") {
+                let (mut records, small_record) = if case == "small" {
+                    (crate::reality::default_target_records(&hello[44..76]), 2)
+                } else {
+                    (
+                        separate_target_records(
+                            RealityGroup::X25519MlKem768,
+                            CipherSuite::AES_128_GCM_SHA256,
+                            &hello[44..76],
+                        ),
+                        3,
+                    )
+                };
                 let mut encrypted = vec![23, 3, 3, 2, 88];
                 encrypted.resize(605, 0);
-                records[2] = encrypted.into();
+                records[small_record] = encrypted.into();
                 let mut check = RealityServerConnection::new(sc.clone()).unwrap();
                 check.validate_client_hello(&hello).unwrap();
                 assert!(

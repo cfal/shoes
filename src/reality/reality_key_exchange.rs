@@ -378,7 +378,18 @@ mod tests {
             x25519: Some([0; 32]),
             hybrid: None,
         };
-        assert!(server_exchange(RealityGroup::X25519, &zero).is_err());
+        assert_eq!(
+            server_exchange(RealityGroup::X25519, &zero)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Unsupported
+        );
+        assert_eq!(
+            server_exchange(RealityGroup::X25519MlKem768, &zero)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Unsupported
+        );
         let bad_kem = ClientKeyShares {
             x25519: None,
             hybrid: Some(Box::new([255; 1216])),

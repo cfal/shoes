@@ -72,10 +72,26 @@ pub(crate) fn default_target_records(session: &[u8]) -> Vec<Bytes> {
     )
 }
 
+pub(super) fn separate_target_records(
+    group: RealityGroup,
+    cipher: CipherSuite,
+    session: &[u8],
+) -> Vec<Bytes> {
+    let mut records = target_records(group, cipher, session);
+    records.truncate(2);
+    for payload_len in [32, 4096, 128, 96] {
+        let mut record = write_record_header(23, payload_len);
+        record.resize(5 + payload_len as usize, 0);
+        records.push(record.into());
+    }
+    records
+}
+
 fn handshake(
     client_config: RealityClientConfig,
     server_config: RealityServerConfig,
     group: RealityGroup,
+    make_target_records: fn(RealityGroup, CipherSuite, &[u8]) -> Vec<Bytes>,
     fragment: usize,
 ) -> (RealityClientConnection, RealityServerConnection) {
     let cipher = client_config.cipher_suites[0];
@@ -87,11 +103,17 @@ fn handshake(
     assert!(shares.hybrid.is_some());
     assert!(shares.x25519.is_some());
     server.validate_client_hello(&hello).unwrap();
-    server
-        .build_server_response(&target_records(group, cipher, &hello[44..76]))
-        .unwrap();
+    let target = make_target_records(group, cipher, &hello[44..76]);
+    server.build_server_response(&target).unwrap();
     let mut response = Vec::new();
     server.write_tls(&mut response).unwrap();
+    let mut deframer = crate::crypto::tls_deframer::TlsDeframer::new();
+    deframer.feed(&response);
+    let records = deframer.next_records().unwrap();
+    assert_eq!(records.len(), target.len());
+    for (actual, expected) in records.iter().zip(&target) {
+        assert_eq!(actual.len(), expected.len());
+    }
     for chunk in response.chunks(fragment) {
         client.read_tls(&mut &chunk[..]).unwrap();
         client.process_new_packets().unwrap();
@@ -114,7 +136,7 @@ fn reality_pq_handshake_and_data_all_suites() {
     for &cipher in DEFAULT_CIPHER_SUITES {
         for group in [RealityGroup::X25519MlKem768, RealityGroup::X25519] {
             let (cc, sc) = configs(cipher);
-            let (mut client, mut server) = handshake(cc, sc, group, 37);
+            let (mut client, mut server) = handshake(cc, sc, group, target_records, 37);
             let expected = vec![17; 200_000];
             let mut wire = Vec::new();
             for chunk in expected.chunks(8192) {
@@ -167,7 +189,8 @@ fn reality_pq_mldsa_optional_and_required() {
                 let (mut cc, mut sc) = configs(cipher);
                 sc.mldsa65_key = Some(signer.clone());
                 cc.mldsa65_verify = required.then(|| key.clone());
-                handshake(cc, sc, group, 19);
+                handshake(cc.clone(), sc.clone(), group, target_records, 19);
+                handshake(cc, sc, group, separate_target_records, 19);
             }
         }
     }
@@ -217,8 +240,41 @@ fn reality_pq_mldsa_small_target_does_not_emit_synthetic_bytes() {
     server.validate_client_hello(&hello).unwrap();
     let mut records = default_target_records(&hello[44..76]);
     records[2] = vec![0; 600].into();
-    assert!(server.build_server_response(&records).is_err());
+    assert_eq!(
+        server.build_server_response(&records).unwrap_err().kind(),
+        std::io::ErrorKind::Unsupported
+    );
     let mut output = Vec::new();
     server.write_tls(&mut output).unwrap();
     assert!(output.is_empty());
+}
+
+#[test]
+fn reality_pq_mldsa_separate_records_each_require_capacity() {
+    let (seed, _) = generate_mldsa65_keypair().unwrap();
+    let signer = mldsa65_signing_key(&seed).unwrap();
+    for &cipher in DEFAULT_CIPHER_SUITES {
+        for small_record in 2..6 {
+            let (cc, mut sc) = configs(cipher);
+            sc.mldsa65_key = Some(signer.clone());
+            let mut client = RealityClientConnection::new(cc).unwrap();
+            let mut server = RealityServerConnection::new(sc).unwrap();
+            let mut hello = Vec::new();
+            client.write_tls(&mut hello).unwrap();
+            server.validate_client_hello(&hello).unwrap();
+            let mut records =
+                separate_target_records(RealityGroup::X25519MlKem768, cipher, &hello[44..76]);
+            let mut small = write_record_header(23, 17);
+            small.resize(22, 0);
+            records[small_record] = small.into();
+            let error = server.build_server_response(&records).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+            assert!(error.to_string().contains("insufficient capacity"));
+            assert!(server.is_handshaking());
+            assert_eq!(server.negotiated_group(), None);
+            let mut output = Vec::new();
+            server.write_tls(&mut output).unwrap();
+            assert!(output.is_empty());
+        }
+    }
 }
