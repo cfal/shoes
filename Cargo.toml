@@ -13,7 +13,11 @@ categories = ["command-line-utilities", "network-programming"]
 
 [workspace]
 members = ["tests/support"]
+exclude = ["vendor/h3"]
 resolver = "3"
+
+[patch.crates-io]
+h3 = { path = "vendor/h3" }
 
 [lib]
 name = "shoes"

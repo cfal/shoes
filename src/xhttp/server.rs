@@ -184,6 +184,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn h3_idle_probes_preserve_stream_one_in_both_directions() {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let (carrier, _server, _endpoint) =
+                streaming_carrier(service(), XhttpVersion::H3).await;
+            let memory = Memory::new(Arc::new(Budget::new(Some(1024))), 1024);
+            let (mut writer, reader) = pipe(memory.clone());
+            let tasks = Tasks::new();
+            let request = Request::post("https://localhost/t/")
+                .header("referer", format!("/?x_padding={}", "X".repeat(100)))
+                .body(Body::stream(reader))
+                .unwrap();
+            let mut response = carrier
+                .request(request, memory, &tasks, Duration::from_secs(1))
+                .await
+                .unwrap()
+                .into_body();
+            writer.write_all(b"head").await.unwrap();
+            let mut echoed = [0; 4];
+            response.read_exact(&mut echoed).await.unwrap();
+            assert_eq!(&echoed, b"head");
+            tokio::time::sleep(Duration::from_secs(11)).await;
+            writer.write_all(b"tail").await.unwrap();
+            response.read_exact(&mut echoed).await.unwrap();
+            assert_eq!(&echoed, b"tail");
+            writer.shutdown().await.unwrap();
+            assert_eq!(response.read(&mut echoed).await.unwrap(), 0);
+            assert!(!carrier.closed());
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
     async fn ended_streaming_sessions_release_idle_request_bodies() {
         for version in [XhttpVersion::H2, XhttpVersion::H3] {
             for suffix in ["", "idle"] {

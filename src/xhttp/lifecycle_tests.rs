@@ -884,6 +884,74 @@ async fn h3_unused_stream_reservations_reset_without_transmitting_requests() {
 }
 
 #[tokio::test]
+async fn h3_empty_data_preserves_request_and_response_bodies() {
+    use bytes::Buf;
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        for payload in [b"".as_slice(), b"tail".as_slice()] {
+            for trailers in [false, true] {
+                let (carrier, mut driver, _endpoint) = h3_peer(1).await;
+                let tasks = Tasks::new();
+                let (received, receipt) = tokio::sync::oneshot::channel();
+                tasks.spawn(async move {
+                    let resolver = driver.accept().await.unwrap().unwrap();
+                    let (_, mut stream) = resolver.resolve_request().await.unwrap();
+                    let mut request_body = Vec::new();
+                    while let Some(mut data) = stream.recv_data().await.unwrap() {
+                        request_body.extend_from_slice(&data.copy_to_bytes(data.remaining()));
+                    }
+                    received.send(request_body).unwrap();
+                    stream.send_response(Response::new(())).await.unwrap();
+                    for data in [
+                        Bytes::new(),
+                        Bytes::new(),
+                        Bytes::from_static(payload),
+                        Bytes::new(),
+                    ] {
+                        stream.send_data(data).await.unwrap();
+                    }
+                    if trailers {
+                        let mut headers = http::HeaderMap::new();
+                        headers.insert("x-test", "done".parse().unwrap());
+                        stream.send_trailers(headers).await.unwrap();
+                    } else {
+                        stream.finish().await.unwrap();
+                    }
+                    let _ = driver.accept().await;
+                });
+                let memory = Memory::new(Arc::new(Budget::new(Some(1024))), 1024);
+                let mut response = carrier
+                    .request(
+                        Request::post("https://localhost/")
+                            .body(Body::Chunks(
+                                [
+                                    Bytes::new(),
+                                    Bytes::new(),
+                                    Bytes::from_static(payload),
+                                    Bytes::new(),
+                                ]
+                                .into(),
+                            ))
+                            .unwrap(),
+                        memory,
+                        &tasks,
+                        Duration::from_secs(1),
+                    )
+                    .await
+                    .unwrap()
+                    .into_body();
+                assert_eq!(receipt.await.unwrap(), payload);
+                let mut response_body = Vec::new();
+                response.read_to_end(&mut response_body).await.unwrap();
+                assert_eq!(response_body, payload);
+            }
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn h3_goaway_preserves_active_response_and_refuses_new_reservations() {
     tokio::time::timeout(Duration::from_secs(5), async {
         let (carrier, mut driver, _endpoint) = h3_peer(2).await;
