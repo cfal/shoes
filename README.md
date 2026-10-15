@@ -304,10 +304,25 @@ covering all three modes and HTTP versions. `type: splithttp` is an alias for
 - `host` overrides HTTP authority independently of TLS SNI. Default Referer
   padding, path/query handling, packet sizing/pacing, and stream-up keepalives
   follow modern Xray. `limits` bounds sessions, buffered bytes, requests and
-  setup/header/packet deadlines; `pool` bounds connections and idle retention.
+  setup/header deadlines and packet inactivity; `pool` bounds connections and
+  idle retention.
   Split legs may use different carriers on the same selected route. H2/H3 admission
   respects peer stream capacity; draining carriers retain their connection slots.
   A full pool refuses new sessions rather than exceeding its configured cap.
+- `packet_timeout_secs` defaults to 300 seconds and measures inactivity, not a
+  POST's total lifetime. On the server, each POST's body must keep receiving
+  nonempty bytes. Admission and forwarding-ACK waits stay alive while the inner
+  stream consumes upload bytes or the original receiver of the missing next
+  packet receives bytes. Duplicate bodies, empty packets, download traffic and
+  resource wakeups do not count as progress.
+  On the client, the timer covers only body transmission: H2/H3 transport
+  acceptance, or handoff into Hyper's bounded H1 write buffer. After the body is
+  sent, the forwarding ACK has no packet or response-header deadline. Healthy
+  slow destinations therefore need not forward a whole packet per timeout.
+  Carrier readiness and request headers retain `response_header_timeout_secs`;
+  other request types also retain it for response headers. `setup_timeout_secs`
+  is unchanged. A live peer that never ACKs can retain bounded client resources
+  until the stream is dropped or the transport fails.
 - Shoes H2/H3 packet-up clients can transmit four POST bodies concurrently.
   Budget the server's `max_session_buffered_bytes` for at least four maximum
   `sc_max_each_post_bytes` packets, plus room for duplex pipe buffers; the defaults
@@ -315,7 +330,9 @@ covering all three modes and HTTP versions. `type: splithttp` is an alias for
   but concurrent bodies can exhaust shared transport credit before their
   predecessors finish. Byte caps do not provide per-session transport isolation:
   stalled consumers or global byte-budget exhaustion can also block other sessions
-  on the same carrier. Packet deadlines still bound these waits.
+  on the same carrier. Server packet inactivity timeouts still bound stalled waits.
+  Slowly progressing sessions can hold global byte-budget capacity and shared
+  carrier flow-control credit indefinitely, so other sessions may time out.
 - The server bounds the initial TCP HTTP header/preface to four seconds after
   transport setup (or the shorter configured setup timeout). H1 keep-alive idle
   periods and subsequent partial headers have no deadline. For exposed listeners,

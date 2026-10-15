@@ -103,7 +103,7 @@ impl Default for XhttpLimits {
             max_session_buffered_bytes: 4 * 1024 * 1024,
             max_requests_per_connection: 128,
             setup_timeout_secs: 60,
-            packet_timeout_secs: 60,
+            packet_timeout_secs: 300,
             response_header_timeout_secs: 60,
         }
     }
@@ -467,6 +467,10 @@ mod tests {
     }
     #[test]
     fn xhttp_range_defaults_and_sentinels() {
+        let limits: XhttpLimits = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(limits.packet_timeout_secs, 300);
+        assert_eq!(limits.setup_timeout_secs, 60);
+        assert_eq!(limits.response_header_timeout_secs, 60);
         assert_eq!(
             XhttpRange::Number(0).bounds((100, 1000), false).unwrap(),
             (100, 1000)
