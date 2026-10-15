@@ -97,7 +97,7 @@ async fn echo_peer(version: XhttpVersion, drain: bool) -> (SocketAddr, Tasks) {
                             let tasks = Arc::new(Tasks::new());
                             tasks.spawn(async move {
                                 write.write_all(&first).await.unwrap();
-                                super::carrier::receive_hyper(incoming, write).await;
+                                super::carrier::receive_hyper(incoming, write, None).await;
                             });
                             Ok::<_, io::Error>(Response::new(Body::stream(read).with_guard(tasks)))
                         },

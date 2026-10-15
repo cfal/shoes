@@ -117,6 +117,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn h1_incomplete_rejected_bodies_close_the_connection() {
+        for (method, path, expected) in [
+            ("POST", "/t/id/0", "408"),
+            ("POST", "/wrong", "404"),
+            ("OPTIONS", "/t/", "200"),
+        ] {
+            let mut state = service();
+            Arc::get_mut(&mut state)
+                .unwrap()
+                .config
+                .limits
+                .packet_timeout_secs = 1;
+            let (mut client, server) = tokio::io::duplex(8192);
+            let task = tokio::spawn(state.serve_h1(
+                Box::new(server),
+                tokio::time::Instant::now() + Duration::from_secs(4),
+            ));
+            client.write_all(format!(
+                "{method} {path} HTTP/1.1\r\nHost: localhost\r\nReferer: /?x_padding={}\r\nContent-Length: 100\r\n\r\nx",
+                "X".repeat(100),
+            ).as_bytes()).await.unwrap();
+            let mut response = Vec::new();
+            tokio::time::timeout(Duration::from_secs(3), client.read_to_end(&mut response))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                String::from_utf8_lossy(&response).starts_with(&format!("HTTP/1.1 {expected}"))
+            );
+            task.await.unwrap().unwrap();
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tcp_header_deadline_includes_preface_detection() {
+        for prefix in [b"GET", b"PRI"] {
+            let server = XhttpServer { state: service() };
+            let (mut client, stream) = tokio::io::duplex(8192);
+            let setup = server.setup_server_stream(Box::new(stream));
+            tokio::pin!(setup);
+            assert!(futures::poll!(&mut setup).is_pending());
+            tokio::time::advance(Duration::from_secs(3)).await;
+            client.write_all(prefix).await.unwrap();
+            let TcpServerSetupResult::Session(run) = setup.await.unwrap() else {
+                panic!("expected HTTP session");
+            };
+            tokio::pin!(run);
+            assert!(futures::poll!(&mut run).is_pending());
+            tokio::time::advance(Duration::from_secs(1)).await;
+            run.await;
+            client.read_to_end(&mut Vec::new()).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn completed_h2_requests_do_not_consume_stream_admission() {
+        let mut state = service();
+        Arc::get_mut(&mut state)
+            .unwrap()
+            .config
+            .limits
+            .max_requests_per_connection = 1;
+        let (client, server) = tokio::io::duplex(8192);
+        let tasks = Tasks::new();
+        tasks.spawn(async move {
+            let _ = state
+                .serve_h2(
+                    Box::new(server),
+                    tokio::time::Instant::now() + Duration::from_secs(4),
+                )
+                .await;
+        });
+        let (mut sender, connection) = h2::client::handshake(client).await.unwrap();
+        tasks.spawn(async move {
+            let _ = connection.await;
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            for _ in 0..128 {
+                sender = sender.ready().await.unwrap();
+                let request = Request::builder()
+                    .method("OPTIONS")
+                    .uri("http://localhost/t/")
+                    .body(())
+                    .unwrap();
+                let (response, _) = sender.send_request(request, true).unwrap();
+                let response = response.await.unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let mut body = response.into_body();
+                while let Some(data) = body.data().await {
+                    assert!(data.unwrap().is_empty());
+                }
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
     async fn packet_reordering_duplicates_and_download_ownership() {
         let state = service();
         assert_eq!(
@@ -403,6 +501,7 @@ impl XhttpServer {
             let Some(resolver) = resolver else {
                 return Ok(());
             };
+            while requests.try_join_next().is_some() {}
             if requests.len() >= self.state.config.limits.request_limit() {
                 drop(resolver);
                 continue;
@@ -494,11 +593,9 @@ impl TcpServerHandler for XhttpServer {
             return Err(io::Error::other("H3 requires a QUIC listener"));
         }
         let mut prefix = [0; 3];
-        tokio::time::timeout(
-            Duration::from_secs(state.config.limits.setup_timeout_secs),
-            stream.read_exact(&mut prefix),
-        )
-        .await??;
+        let deadline = tokio::time::Instant::now()
+            + Duration::from_secs(state.config.limits.setup_timeout_secs.min(4));
+        tokio::time::timeout_at(deadline, stream.read_exact(&mut prefix)).await??;
         let h2 = &prefix == b"PRI";
         if (version == XhttpVersion::H1 && h2) || (version == XhttpVersion::H2 && !h2) {
             return Err(io::Error::other("unexpected XHTTP version"));
@@ -506,9 +603,9 @@ impl TcpServerHandler for XhttpServer {
         let stream = crate::prepend_stream::PrependStream::new(stream, Some(Box::new(prefix)));
         Ok(TcpServerSetupResult::Session(Box::pin(async move {
             let result = if h2 {
-                state.serve_h2(Box::new(stream)).await
+                state.serve_h2(Box::new(stream), deadline).await
             } else {
-                state.serve_h1(Box::new(stream)).await
+                state.serve_h1(Box::new(stream), deadline).await
             };
             if let Err(error) = result {
                 log::debug!("XHTTP carrier ended: {error}");
@@ -957,39 +1054,67 @@ impl State {
         response
     }
 
-    async fn serve_h1(self: Arc<Self>, stream: Box<dyn AsyncStream>) -> io::Result<()> {
+    async fn serve_h1(
+        self: Arc<Self>,
+        stream: Box<dyn AsyncStream>,
+        deadline: tokio::time::Instant,
+    ) -> io::Result<()> {
         let header_limit = self.config.header_limit();
-        let header_timeout = Duration::from_secs(self.config.limits.setup_timeout_secs);
-        let tasks = Arc::new(Tasks::new());
-        let owner = tasks.clone();
+        let header_timeout = Duration::from_secs(self.config.limits.setup_timeout_secs.min(4));
+        let first_header = Arc::new(Notify::new());
+        let received_header = first_header.clone();
         let service = hyper::service::service_fn(move |request: Request<hyper::body::Incoming>| {
+            received_header.notify_one();
             let state = self.clone();
-            let tasks = tasks.clone();
             async move {
                 let (parts, body) = request.into_parts();
+                let request = Request::from_parts(parts, ());
+                let streaming_upload = matches!(
+                    wire::classify(&state.config, &state.path, &request),
+                    Ok(Kind::One | Kind::Upload(_))
+                );
                 let (writer, reader) = pipe(Memory::new(
                     state.memory.clone(),
                     state.config.limits.max_session_buffered_bytes,
                 ));
-                tasks.spawn(carrier::receive_hyper(body, writer));
-                Ok::<_, io::Error>(state.handle(Request::from_parts(parts, ()), reader).await)
+                let tasks = Arc::new(Tasks::new());
+                let eof = CancellationToken::new();
+                tasks.spawn(carrier::receive_hyper(body, writer, Some(eof.clone())));
+                let response = state.handle(request, reader).await;
+                if streaming_upload && response.status() == StatusCode::OK {
+                    return Ok::<_, io::Error>(response.map(|body| body.with_guard(tasks)));
+                }
+                let mut response = response;
+                if !eof.is_cancelled() {
+                    response
+                        .headers_mut()
+                        .insert("connection", http::HeaderValue::from_static("close"));
+                }
+                Ok(response)
             }
         });
-        let result = hyper::server::conn::http1::Builder::new()
+        let mut builder = hyper::server::conn::http1::Builder::new();
+        builder
             .half_close(true)
             .max_buf_size(header_limit.max(8192))
             .timer(hyper_util::rt::TokioTimer::new())
-            .header_read_timeout(header_timeout)
-            .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
-            .await
-            .map_err(io::Error::other);
-        drop(owner);
-        result
+            .header_read_timeout(header_timeout);
+        let connection = builder.serve_connection(hyper_util::rt::TokioIo::new(stream), service);
+        tokio::pin!(connection);
+        tokio::select! {
+            result = &mut connection => return result.map_err(io::Error::other),
+            result = tokio::time::timeout_at(deadline, first_header.notified()) => { result?; }
+        }
+        connection.await.map_err(io::Error::other)
     }
 
-    async fn serve_h2(self: Arc<Self>, stream: Box<dyn AsyncStream>) -> io::Result<()> {
-        let mut connection = tokio::time::timeout(
-            Duration::from_secs(self.config.limits.setup_timeout_secs),
+    async fn serve_h2(
+        self: Arc<Self>,
+        stream: Box<dyn AsyncStream>,
+        deadline: tokio::time::Instant,
+    ) -> io::Result<()> {
+        let mut connection = tokio::time::timeout_at(
+            deadline,
             h2::server::Builder::new()
                 .max_header_list_size(self.config.header_limit().min(u32::MAX as usize) as u32)
                 .max_concurrent_streams(self.config.limits.request_limit() as u32)
@@ -1009,6 +1134,7 @@ impl State {
                 return Ok(());
             };
             let (request, mut respond) = request.map_err(io::Error::other)?;
+            while requests.try_join_next().is_some() {}
             if requests.len() >= self.config.limits.request_limit() {
                 respond.send_reset(h2::Reason::REFUSED_STREAM);
                 continue;

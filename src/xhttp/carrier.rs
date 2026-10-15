@@ -168,7 +168,7 @@ impl Carrier {
                 let carrier = self.clone();
                 tasks.spawn(async move {
                     let _carrier = carrier;
-                    receive_hyper(incoming, writer).await;
+                    receive_hyper(incoming, writer, None).await;
                 });
                 Response::from_parts(parts, reader)
             }
@@ -269,12 +269,19 @@ impl Carrier {
     }
 }
 
-pub async fn receive_hyper(mut body: hyper::body::Incoming, mut writer: Writer) {
+pub async fn receive_hyper(
+    mut body: hyper::body::Incoming,
+    mut writer: Writer,
+    eof: Option<tokio_util::sync::CancellationToken>,
+) {
     let result: io::Result<()> = async {
         while let Some(frame) = body.frame().await {
             if let Ok(data) = frame.map_err(io::Error::other)?.into_data() {
                 writer.write_all(&data).await?;
             }
+        }
+        if let Some(eof) = eof {
+            eof.cancel();
         }
         writer.shutdown().await
     }

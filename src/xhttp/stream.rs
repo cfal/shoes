@@ -384,9 +384,9 @@ impl Body {
     }
     pub fn with_guard(self, guard: impl Send + Sync + 'static) -> Self {
         match self {
-            Self::Stream { reader, .. } => Self::Stream {
+            Self::Stream { reader, _guard } => Self::Stream {
                 reader,
-                _guard: Some(Box::new(guard)),
+                _guard: Some(Box::new((_guard, guard))),
             },
             other => other,
         }
