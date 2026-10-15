@@ -689,3 +689,50 @@ impl Client {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustls::NamedGroup;
+    use serde_json::json;
+
+    #[test]
+    fn tls_connector_preserves_key_exchange_policy() {
+        let resolver = Arc::new(crate::resolver::NativeResolver::new());
+        for (groups, expected) in [
+            (json!(["X25519"]), vec![NamedGroup::X25519]),
+            (json!(["X25519MLKEM768"]), vec![NamedGroup::X25519MLKEM768]),
+            (
+                json!(["SecP256r1MLKEM768", "X25519"]),
+                vec![NamedGroup::secp256r1MLKEM768, NamedGroup::X25519],
+            ),
+        ] {
+            for (version, alpn) in [("h1", b"http/1.1".as_slice()), ("h2", b"h2")] {
+                let config = serde_json::from_value(json!({
+                    "address":"localhost:443", "protocol":{
+                        "type":"tls", "verify":false, "key_exchange_groups":groups,
+                        "protocol":{"type":"xhttp", "http_version":version,
+                            "protocol":{"type":"socks"}}
+                    }
+                }))
+                .unwrap();
+                let (client, _) = super::super::connector::build(&config, resolver.clone())
+                    .unwrap()
+                    .unwrap();
+                let Security::Tls { config, .. } = &client.security else {
+                    panic!("expected TLS carrier");
+                };
+                assert_eq!(
+                    config
+                        .crypto_provider()
+                        .kx_groups
+                        .iter()
+                        .map(|g| g.name())
+                        .collect::<Vec<_>>(),
+                    expected
+                );
+                assert_eq!(config.alpn_protocols, [alpn]);
+            }
+        }
+    }
+}
