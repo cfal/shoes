@@ -385,6 +385,90 @@ async fn rejected_and_delayed_response_errors_reach_reader() {
 }
 
 #[tokio::test]
+async fn packet_bursts_release_opportunistic_request_lanes() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let address = ([127, 0, 0, 1], listener.local_addr().unwrap().port()).into();
+        let tasks = Tasks::new();
+        let (seen, mut received) = tokio::sync::mpsc::channel(3);
+        let release = tokio_util::sync::CancellationToken::new();
+        let released = release.clone();
+        tasks.spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut connection = h2::server::Builder::new()
+                .max_concurrent_streams(4)
+                .handshake::<_, Bytes>(stream)
+                .await
+                .unwrap();
+            let mut downloads = Vec::new();
+            let mut uploads = tokio::task::JoinSet::new();
+            while let Some(Ok((request, mut respond))) = connection.accept().await {
+                if request.method() == http::Method::GET {
+                    downloads.push(
+                        respond
+                            .send_response(Response::<()>::new(()), false)
+                            .unwrap(),
+                    );
+                    continue;
+                }
+                let seen = seen.clone();
+                let released = released.clone();
+                uploads.spawn(async move {
+                    let mut body = request.into_body();
+                    while let Some(chunk) = body.data().await {
+                        body.flow_control()
+                            .release_capacity(chunk.unwrap().len())
+                            .unwrap();
+                    }
+                    seen.send(()).await.unwrap();
+                    released.cancelled().await;
+                    respond.send_response(Response::new(()), true).unwrap();
+                });
+            }
+        });
+        let config = serde_json::from_value(serde_json::json!({
+            "sc_max_each_post_bytes":16384, "sc_min_posts_interval_ms":1,
+            "limits":{"max_requests_per_connection":4},
+            "pool":{"max_connections":1}, "protocol":{"type":"socks"}
+        }))
+        .unwrap();
+        let client = Arc::new(
+            Client::new(
+                config,
+                NetLocation::from_str("localhost:80", None).unwrap(),
+                "localhost".into(),
+                XhttpVersion::H2,
+                XhttpMode::PacketUp,
+                Security::Plain,
+            )
+            .unwrap(),
+        );
+        let dialer = Arc::new(Dialer {
+            address,
+            key: RouteKey(vec![1]),
+            opens: AtomicUsize::new(0),
+        });
+        let mut first = client.open(dialer.clone()).await.unwrap();
+        first.write_all(&[42; 3 * 16384]).await.unwrap();
+        for _ in 0..3 {
+            received.recv().await.unwrap();
+        }
+        assert!(client.open(dialer.clone()).await.is_err());
+        release.cancel();
+        let second = loop {
+            if let Ok(stream) = client.open(dialer.clone()).await {
+                break stream;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        };
+        assert_eq!(dialer.opens.load(Ordering::Relaxed), 1);
+        drop((first, second));
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn packet_shutdown_waits_for_acknowledgement() {
     tokio::time::timeout(Duration::from_secs(5), async {
         let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();

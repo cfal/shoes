@@ -75,8 +75,10 @@ async fn all_modes_and_carriers_exchange_data_before_upload_eof() {
             let server_protocol = json!({"type":"xhttp", "path":"/tunnel", "http_version":version,
                 "limits":{"max_requests_per_connection":peer_limit},
                 "protocol":{"type":"vless","user_id":"550e8400-e29b-41d4-a716-446655440000"}});
+            let concurrent_packets =
+                version == "h3" && peer_limit == 1 && local_limit == 128 && mode == "packet-up";
             let client_protocol = json!({"type":"xhttp", "path":"/tunnel", "http_version":version, "mode":mode,
-                "limits":{"max_requests_per_connection":local_limit}, "pool":{"max_connections":2},
+                "limits":{"max_requests_per_connection":local_limit}, "pool":{"max_connections":if concurrent_packets { 3 } else { 2 }},
                 "protocol":{"type":"vless","user_id":"550e8400-e29b-41d4-a716-446655440000"}});
             let (server_value, client_value) = if version == "h3" {
                 (
@@ -175,6 +177,38 @@ async fn all_modes_and_carriers_exchange_data_before_upload_eof() {
                     let mut tail = Vec::new();
                     stream.read_to_end(&mut tail).await.unwrap();
                     assert!(tail.is_empty());
+                }
+                if concurrent_packets {
+                    let destination = crate::address::NetLocation::from_str(&target, None).unwrap();
+                    let mut first = chain
+                        .connect_tcp(destination.clone().into(), &resolver)
+                        .await
+                        .unwrap()
+                        .client_stream;
+                    first.write_all(b"a").await.unwrap();
+                    assert_eq!(first.read_u8().await.unwrap(), b'a');
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    let mut second = chain
+                        .connect_tcp(destination.into(), &resolver)
+                        .await
+                        .unwrap()
+                        .client_stream;
+                    second.write_all(b"b").await.unwrap();
+                    assert_eq!(second.read_u8().await.unwrap(), b'b');
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    first.write_all(b"c").await.unwrap();
+                    assert_eq!(first.read_u8().await.unwrap(), b'c');
+                    second.write_all(b"d").await.unwrap();
+                    assert_eq!(second.read_u8().await.unwrap(), b'd');
+                    tokio::try_join!(first.shutdown(), second.shutdown()).unwrap();
+                    let (mut first_tail, mut second_tail) = (Vec::new(), Vec::new());
+                    tokio::try_join!(
+                        first.read_to_end(&mut first_tail),
+                        second.read_to_end(&mut second_tail),
+                    )
+                    .unwrap();
+                    assert!(first_tail.is_empty() && second_tail.is_empty());
+                    tokio::time::sleep(Duration::from_millis(100)).await;
                 }
                 // H1 stream-one ends its connection with the response, not an independent FIN.
                 if mode != "packet-up" && !(mode == "stream-one" && version == "h1") {

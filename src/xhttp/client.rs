@@ -463,7 +463,14 @@ impl Client {
         let tasks = Tasks::new();
         if self.mode == XhttpMode::PacketUp {
             return self
-                .packets(lanes, dialer, reader, session, memory, &tasks)
+                .packets(
+                    lanes.pop().unwrap(),
+                    dialer,
+                    reader,
+                    session,
+                    memory,
+                    &tasks,
+                )
                 .await;
         }
         let request = self.request(session, None, true, Body::stream(reader))?;
@@ -516,7 +523,7 @@ impl Client {
 
     async fn packets(
         &self,
-        mut lanes: Vec<Lease>,
+        lane: Lease,
         dialer: Arc<dyn CarrierDialer>,
         mut reader: Reader,
         session: &str,
@@ -534,12 +541,13 @@ impl Client {
             4
         };
         let mut inflight = futures::stream::FuturesUnordered::new();
+        let mut idle_lane = Some(lane);
         let mut pending = std::collections::VecDeque::new();
         let mut sequence = 0u64;
         let mut next_post_at = tokio::time::Instant::now();
         loop {
             while inflight.len() >= concurrency {
-                lanes.push(inflight.next().await.unwrap()?);
+                idle_lane.get_or_insert(inflight.next().await.unwrap()?);
             }
             let event = if let Some(event) = pending.pop_front() {
                 Some(event)
@@ -547,7 +555,7 @@ impl Client {
                 tokio::select! {
                     event = reader.receiver.recv() => event,
                     done = inflight.next(), if !inflight.is_empty() => {
-                        lanes.push(done.unwrap()?);
+                        idle_lane.get_or_insert(done.unwrap()?);
                         continue;
                     }
                 }
@@ -589,7 +597,7 @@ impl Client {
                                     biased;
                                     _ = tokio::time::sleep_until(next_post_at) => break None,
                                     done = inflight.next(), if !inflight.is_empty() => {
-                                        lanes.push(done.unwrap()?);
+                                        idle_lane.get_or_insert(done.unwrap()?);
                                     }
                                     event = reader.receiver.recv() => break event,
                                 }
@@ -601,11 +609,11 @@ impl Client {
                         tokio::select! {
                             _ = tokio::time::sleep_until(next_post_at) => break,
                             done = inflight.next(), if !inflight.is_empty() => {
-                                lanes.push(done.unwrap()?);
+                                idle_lane.get_or_insert(done.unwrap()?);
                             }
                         }
                     }
-                    let mut lane = if let Some(lane) = lanes.pop() {
+                    let mut lane = if let Some(lane) = idle_lane.take() {
                         lane
                     } else if let Ok(lane) = self.lease(&dialer, false).await {
                         lane
@@ -614,6 +622,14 @@ impl Client {
                     };
                     if self.version == XhttpVersion::H1 && lane.carrier.closed() {
                         lane.carrier = self.dial(&dialer).await?;
+                    }
+                    if self.version == XhttpVersion::H3 && lane.reservation.is_none() {
+                        if let Ok(Some(reservation)) = lane.carrier.try_reserve() {
+                            lane.reservation = Some(reservation);
+                        } else if let Ok(replacement) = self.lease(&dialer, true).await {
+                            // No request has been sent; another session may own this carrier's credit.
+                            lane = replacement;
+                        }
                     }
                     let request =
                         self.request(session, Some(sequence), true, Body::Chunks(chunks.clone()))?;
@@ -656,13 +672,13 @@ impl Client {
                 }
                 Event::Drain(ack) => {
                     while let Some(result) = inflight.next().await {
-                        lanes.push(result?);
+                        idle_lane.get_or_insert(result?);
                     }
                     let _ = ack.send(());
                 }
                 Event::Finish => {
                     while let Some(result) = inflight.next().await {
-                        lanes.push(result?);
+                        result?;
                     }
                     return Ok(());
                 }
