@@ -75,6 +75,31 @@ mod tests {
         flush.await.unwrap();
         assert!(memory.copy(b"more").is_ok());
     }
+
+    #[tokio::test]
+    async fn byte_budget_backpressures_other_sessions_and_wakes_on_release() {
+        let budget = Arc::new(Budget::new(Some(8)));
+        let (mut first, mut first_reader) = pipe(Memory::new(budget.clone(), 8));
+        let (mut second, mut second_reader) = pipe(Memory::new(budget.clone(), 8));
+        first.write_all(b"12345678").await.unwrap();
+        let mut blocked = Box::pin(second.write_all(b"next"));
+        assert!(futures::poll!(&mut blocked).is_pending());
+        assert_eq!(budget.snapshot().active, 8);
+        first_reader.read_exact(&mut [0; 8]).await.unwrap();
+        blocked.await.unwrap();
+        let mut bytes = [0; 4];
+        second_reader.read_exact(&mut bytes).await.unwrap();
+        assert_eq!(&bytes, b"next");
+        assert_eq!(budget.snapshot().active, 0);
+
+        first.write_all(b"12345678").await.unwrap();
+        let mut blocked = Box::pin(second.write_all(b"cancel"));
+        assert!(futures::poll!(&mut blocked).is_pending());
+        drop(second_reader);
+        assert_eq!(blocked.await.unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+        drop(first_reader);
+        assert_eq!(budget.snapshot().active, 0);
+    }
 }
 
 struct Allocation {
@@ -89,6 +114,32 @@ impl AsRef<[u8]> for Allocation {
 }
 
 impl Memory {
+    async fn reserve(&self, size: usize) -> io::Result<(BudgetPermit, BudgetPermit)> {
+        if self.global.limit().is_some_and(|limit| size > limit)
+            || self.session.limit().is_some_and(|limit| size > limit)
+        {
+            return Err(crate::resources::exhausted());
+        }
+        loop {
+            let global_ready = self.global.released();
+            tokio::pin!(global_ready);
+            global_ready.as_mut().enable();
+            let Some(global) = self.global.acquire(size) else {
+                global_ready.await;
+                continue;
+            };
+            let session_ready = self.session.released();
+            tokio::pin!(session_ready);
+            session_ready.as_mut().enable();
+            if let Some(session) = self.session.acquire(size) {
+                return Ok((global, session));
+            }
+            // Never hold the global budget while waiting for this session to drain.
+            drop(global);
+            session_ready.await;
+        }
+    }
+
     pub fn concat(&self, chunks: &[Bytes]) -> io::Result<Bytes> {
         let size = chunks
             .iter()
@@ -180,8 +231,11 @@ pub struct Writer {
     memory: Memory,
     flush: Option<oneshot::Receiver<()>>,
     finished: bool,
+    allocation: parking_lot::Mutex<Option<(usize, Reservation)>>,
     pub flush_before_shutdown: bool,
 }
+
+type Reservation = Pin<Box<dyn Future<Output = io::Result<(BudgetPermit, BudgetPermit)>> + Send>>;
 
 pub fn pipe(memory: Memory) -> (Writer, Reader) {
     let (sender, receiver) = mpsc::channel(4);
@@ -191,6 +245,7 @@ pub fn pipe(memory: Memory) -> (Writer, Reader) {
             memory,
             flush: None,
             finished: false,
+            allocation: parking_lot::Mutex::new(None),
             flush_before_shutdown: false,
         },
         Reader {
@@ -253,12 +308,48 @@ impl AsyncWrite for Writer {
         if self.flush.is_some() {
             ready!(self.as_mut().poll_flush(cx))?;
         }
-        let len = data.len().min(CHUNK);
+        let len = data
+            .len()
+            .min(CHUNK)
+            .min(self.memory.global.limit().unwrap_or(CHUNK))
+            .min(self.memory.session.limit().unwrap_or(CHUNK));
         if len == 0 {
             return Poll::Ready(Ok(0));
         }
-        let memory = self.memory.clone();
-        ready!(self.event(cx, || Ok(Event::Data(memory.copy(&data[..len])?))))?;
+        let this = &mut *self;
+        ready!(this.sender.get_mut().poll_reserve(cx))
+            .map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))?;
+        let allocation = this.allocation.get_mut();
+        if allocation.as_ref().is_none_or(|(size, _)| *size != len) {
+            let memory = this.memory.clone();
+            let sender = this
+                .sender
+                .get_mut()
+                .get_ref()
+                .cloned()
+                .ok_or(io::ErrorKind::BrokenPipe)?;
+            *allocation = Some((
+                len,
+                Box::pin(async move {
+                    tokio::select! {
+                        result = memory.reserve(len) => result,
+                        _ = sender.closed() => Err(io::ErrorKind::BrokenPipe.into()),
+                    }
+                }),
+            ));
+        }
+        let result = ready!(allocation.as_mut().unwrap().1.as_mut().poll(cx));
+        *allocation = None;
+        let (global, session) = result?;
+        let bytes = Bytes::from_owner(Allocation {
+            data: Bytes::copy_from_slice(&data[..len]),
+            _global: global,
+            _session: session,
+        });
+        this.sender
+            .get_mut()
+            .send_item(Event::Data(bytes))
+            .map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))?;
         Poll::Ready(Ok(len))
     }
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
