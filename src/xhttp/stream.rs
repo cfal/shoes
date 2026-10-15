@@ -78,6 +78,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dropped_barrier_ack_keeps_subsequent_operations_fallible() {
+        for drain in [false, true] {
+            let memory = Memory::new(Arc::new(Budget::new(Some(128))), 128);
+            let (mut writer, reader) = pipe(memory);
+            writer.drain_before_shutdown = drain;
+            let mut barrier = Box::pin(async {
+                if drain {
+                    writer.shutdown().await
+                } else {
+                    writer.flush().await
+                }
+            });
+            assert!(futures::poll!(&mut barrier).is_pending());
+            drop(reader);
+            assert_eq!(barrier.await.unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+            assert_eq!(
+                writer.flush().await.unwrap_err().kind(),
+                io::ErrorKind::BrokenPipe
+            );
+            assert_eq!(
+                writer.shutdown().await.unwrap_err().kind(),
+                io::ErrorKind::BrokenPipe
+            );
+            assert_eq!(
+                writer.write_all(b"x").await.unwrap_err().kind(),
+                io::ErrorKind::BrokenPipe
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn byte_budget_backpressures_other_sessions_and_wakes_on_release() {
         let budget = Arc::new(Budget::new(Some(8)));
         let (mut first, mut first_reader) = pipe(Memory::new(budget.clone(), 8));
@@ -364,10 +395,13 @@ impl Writer {
                 self.flush = Some((drain, recv));
             }
             let (was_drain, recv) = self.flush.as_mut().unwrap();
-            ready!(Pin::new(recv).poll(cx))
-                .map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))?;
+            let result = ready!(Pin::new(recv).poll(cx));
             let complete = !drain || *was_drain;
             self.flush = None;
+            if result.is_err() {
+                self.sender.get_mut().close();
+                return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
+            }
             if complete {
                 return Poll::Ready(Ok(()));
             }
