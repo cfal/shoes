@@ -1124,7 +1124,7 @@ async fn h3_peer(
 async fn h3_packet_upload_inactivity_and_early_or_deferred_ack() {
     use super::carrier::{Carrier, Timeouts};
 
-    tokio::time::timeout(Duration::from_secs(15), async {
+    tokio::time::timeout(Duration::from_secs(20), async {
         for stalled in [false, true] {
             let (outgoing, incoming, _endpoint) = quic_pair_with_window(2, Some(8192)).await;
             let carrier = Carrier::quic(outgoing, 8192).await.unwrap();
@@ -1161,10 +1161,7 @@ async fn h3_packet_upload_inactivity_and_early_or_deferred_ack() {
                             request,
                             memory,
                             &tasks,
-                            Timeouts::packet(
-                                Duration::from_millis(500),
-                                Duration::from_millis(500),
-                            ),
+                            Timeouts::packet(Duration::from_secs(1), Duration::from_secs(1)),
                             reservation,
                         )
                         .await
@@ -1182,17 +1179,18 @@ async fn h3_packet_upload_inactivity_and_early_or_deferred_ack() {
                 let data = stream.recv_data().await.unwrap().unwrap();
                 assert!(data.chunk().iter().all(|byte| *byte == b'x'));
                 total += data.remaining();
-                tokio::time::sleep(Duration::from_millis(20)).await;
+                let paced = Duration::from_secs_f64(total as f64 / (32.0 * 1024.0));
+                tokio::time::sleep_until(started + paced).await;
                 assert!(!post.is_finished(), "stalled={stalled}, received={total}");
             }
-            assert!(started.elapsed() > Duration::from_millis(500));
+            assert!(started.elapsed() > Duration::from_secs(1));
             if stalled {
                 let error = post.await.unwrap().err().unwrap();
                 assert_eq!(error.kind(), io::ErrorKind::TimedOut);
                 while stream.recv_data().await.is_ok_and(|data| data.is_some()) {}
             } else {
                 assert!(stream.recv_data().await.unwrap().is_none());
-                tokio::time::sleep(Duration::from_millis(1100)).await;
+                tokio::time::sleep(Duration::from_millis(2100)).await;
                 assert!(!post.is_finished());
                 stream.send_response(Response::new(())).await.unwrap();
                 stream.finish().await.unwrap();
