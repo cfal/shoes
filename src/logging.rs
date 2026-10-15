@@ -46,6 +46,21 @@ pub struct FileLogWriter {
     file: parking_lot::Mutex<File>,
 }
 
+fn escaped_file_record(formatted: &str) -> String {
+    let mut line = String::with_capacity(formatted.len() + 1);
+    for c in formatted.chars() {
+        if c.is_control()
+            || matches!(c, '\u{061c}' | '\u{200e}'..='\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+        {
+            line.extend(c.escape_default());
+        } else {
+            line.push(c);
+        }
+    }
+    line.push('\n');
+    line
+}
+
 impl FileLogWriter {
     pub fn new(path: &str) -> std::io::Result<Self> {
         let file = OpenOptions::new().create(true).append(true).open(path)?;
@@ -57,9 +72,8 @@ impl FileLogWriter {
 
 impl LogWriter for FileLogWriter {
     fn write_log(&self, _record: &Record, formatted: &str) {
+        let line = escaped_file_record(formatted);
         let mut guard = self.file.lock();
-        let mut line = formatted.to_string();
-        line.push('\n');
         let _ = guard.write_all(line.as_bytes());
     }
 
@@ -89,8 +103,7 @@ impl LogWriter for DynamicFileLogWriter {
         if let Some(mutex) = self.file.get() {
             let mut guard = mutex.lock();
             if let Some(ref mut file) = *guard {
-                let mut line = formatted.to_string();
-                line.push('\n');
+                let line = escaped_file_record(formatted);
                 let _ = file.write_all(line.as_bytes());
             }
         }
@@ -276,6 +289,52 @@ pub fn resolve_directives() -> Vec<Directive> {
 mod tests {
     use super::*;
     use log::Level;
+
+    fn check_file_records(writer: &dyn LogWriter, path: &std::path::Path) {
+        let record = Record::builder().args(format_args!("unused")).build();
+        writer.write_log(
+            &record,
+            "peer\r\nforged\t\u{1b}[31m\u{0}\u{7}\u{7f}\u{85}\u{2028}\u{2029}\u{202e}\u{2066} caf\u{e9} \u{65e5}\u{672c}",
+        );
+        writer.write_log(&record, "next record");
+        writer.flush();
+        let contents = std::fs::read_to_string(path).unwrap();
+        assert_eq!(
+            contents,
+            "peer\\r\\nforged\\t\\u{1b}[31m\\u{0}\\u{7}\\u{7f}\\u{85}\\u{2028}\\u{2029}\\u{202e}\\u{2066} caf\u{e9} \u{65e5}\u{672c}\nnext record\n"
+        );
+        assert_eq!(contents.lines().count(), 2);
+        assert!(contents.chars().all(|c| !c.is_control() || c == '\n'));
+    }
+
+    #[test]
+    fn file_writer_escapes_controls_and_preserves_unicode() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("log");
+        let writer = FileLogWriter::new(path.to_str().unwrap()).unwrap();
+        check_file_records(&writer, &path);
+    }
+
+    #[test]
+    fn dynamic_file_writer_escapes_records_after_installation() {
+        static FILE: std::sync::OnceLock<parking_lot::Mutex<Option<File>>> =
+            std::sync::OnceLock::new();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("log");
+        let writer = DynamicFileLogWriter::new(&FILE);
+        let record = Record::builder().args(format_args!("unused")).build();
+        writer.write_log(&record, "before initialization");
+        writer.flush();
+        let file = FILE.get_or_init(|| parking_lot::Mutex::new(None));
+        writer.write_log(&record, "before installation");
+        writer.flush();
+        *file.lock() = Some(File::create(&path).unwrap());
+        check_file_records(&writer, &path);
+        *file.lock() = None;
+        writer.write_log(&record, "after removal");
+        writer.flush();
+        assert_eq!(std::fs::read_to_string(path).unwrap().lines().count(), 2);
+    }
 
     /// Builds a MultiLogger (no writers) from directives for testing matches().
     fn logger_from(mut directives: Vec<Directive>) -> MultiLogger {

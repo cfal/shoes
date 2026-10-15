@@ -1,0 +1,41 @@
+name: Kernel TUN
+
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: 1
+  RUST_BACKTRACE: 1
+
+jobs:
+  kernel-tun:
+    name: Linux kernel TUN
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Check kernel test prerequisites
+      run: |
+        sudo -n true
+        test -c /dev/net/tun
+        command -v ip
+        ip -j -6 address show dev lo | jq --exit-status 'any(.[].addr_info[]; .local == "::1")'
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache Rust build
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-tun-kernel-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Run kernel TUN tests
+      run: >-
+        cargo test -p shoes --locked --features privileged-tests
+        --test privileged tun_kernel:: --verbose -- --test-threads=1

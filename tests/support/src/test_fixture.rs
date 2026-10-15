@@ -1927,48 +1927,27 @@ impl ProxyTestFixture {
     }
 
     /// Add a shoes REALITY+VLESS server
-    pub fn with_shoes_reality_vless_server(mut self) -> Self {
-        let (ip, port) = self.ports.get_listener_port();
-        let (private_key, public_key) = generate_reality_keypair();
-
-        let config = RealityConfig {
-            private_key,
-            public_key,
-            server_name: "www.cloudflare.com".to_string(),
-            short_id: "0123456789abcdef".to_string(),
-            dest: "www.cloudflare.com:443".to_string(),
-            inner_protocol: RealityInnerProtocol::Vless,
-        };
-
-        let role = if self.proxies.is_empty() {
-            ProxyRole::Entry
-        } else {
-            ProxyRole::Intermediate
-        };
-
-        self.proxies.push(ProxyConfig {
-            ip,
-            proxy_type: ProxyType::ShoesRealityServer { config },
-            port,
-            role,
-        });
-        self
+    pub fn with_shoes_reality_vless_server(self) -> Self {
+        self.with_shoes_reality_vless_server_for_dest(
+            "www.cloudflare.com",
+            "www.cloudflare.com:443",
+        )
     }
 
-    /// Add a shoes REALITY+VLESS server using a SEPARATE mode dest server
-    ///
-    /// Uses www.debian.org:443 which sends 4 encrypted records (first one <= 512 bytes)
-    /// rather than 1 combined record. This tests the 512-byte heuristic for mode detection.
-    pub fn with_shoes_reality_vless_server_separate_mode(mut self) -> Self {
+    pub fn with_shoes_reality_vless_server_for_dest(
+        mut self,
+        server_name: &str,
+        dest: &str,
+    ) -> Self {
         let (ip, port) = self.ports.get_listener_port();
         let (private_key, public_key) = generate_reality_keypair();
 
         let config = RealityConfig {
             private_key,
             public_key,
-            server_name: "www.debian.org".to_string(),
+            server_name: server_name.to_string(),
             short_id: "0123456789abcdef".to_string(),
-            dest: "www.debian.org:443".to_string(),
+            dest: dest.to_string(),
             inner_protocol: RealityInnerProtocol::Vless,
         };
 

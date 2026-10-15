@@ -25,6 +25,27 @@ pub const FLAG_ADDR: u16 = 0x0002; // Per-packet addressing for UDP
 pub const STATUS_SUCCESS: u8 = 0;
 pub const STATUS_ERROR: u8 = 1;
 
+pub const MAX_ERROR_MESSAGE_LEN: usize = 4096;
+pub const MAX_ERROR_RESPONSE_LEN: usize = 1 + 2 + MAX_ERROR_MESSAGE_LEN;
+
+pub fn decode_error_length(data: &[u8]) -> io::Result<Option<(usize, usize)>> {
+    let mut len = 0;
+    // A bounded error length fits in two varint bytes on every target.
+    for (index, &byte) in data.iter().take(2).enumerate() {
+        len |= usize::from(byte & 0x7f) << (index * 7);
+        if len > MAX_ERROR_MESSAGE_LEN || (index == 1 && byte & 0x80 != 0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "h2mux error message length exceeds limit",
+            ));
+        }
+        if byte & 0x80 == 0 {
+            return Ok(Some((len, index + 1)));
+        }
+    }
+    Ok(None)
+}
+
 // Padding constants
 pub const MIN_PADDING: u16 = 256;
 pub const MAX_PADDING: u16 = 767;
@@ -212,18 +233,18 @@ impl StreamResponse {
         buf.put_u8(self.status);
 
         if self.status == STATUS_ERROR {
-            if let Some(ref msg) = self.message {
-                let len = msg.len();
-                if len < 128 {
-                    buf.put_u8(len as u8);
-                } else {
-                    buf.put_u8((len & 0x7F) as u8 | 0x80);
-                    buf.put_u8((len >> 7) as u8);
-                }
-                buf.put_slice(msg.as_bytes());
-            } else {
-                buf.put_u8(0);
+            let message = self.message.as_deref().unwrap_or_default();
+            let mut len = message.len().min(MAX_ERROR_MESSAGE_LEN);
+            while !message.is_char_boundary(len) {
+                len -= 1;
             }
+            if len < 128 {
+                buf.put_u8(len as u8);
+            } else {
+                buf.put_u8((len & 0x7F) as u8 | 0x80);
+                buf.put_u8((len >> 7) as u8);
+            }
+            buf.put_slice(&message.as_bytes()[..len]);
         }
         buf
     }
@@ -233,7 +254,7 @@ impl StreamResponse {
         let status = reader.read_u8().await?;
 
         let message = if status == STATUS_ERROR {
-            let len = read_varint(reader).await?;
+            let len = read_error_length(reader).await?;
             if len > 0 {
                 let mut msg_buf = vec![0u8; len];
                 reader.read_exact(&mut msg_buf).await?;
@@ -396,34 +417,88 @@ pub async fn decode_socks_address_async<R: AsyncRead + Unpin>(
     Ok(NetLocation::new(address, port))
 }
 
-/// Read a varint from reader.
-/// Used by StreamResponse::decode.
 #[allow(dead_code)]
-async fn read_varint<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<usize> {
-    let mut result: usize = 0;
-    let mut shift = 0;
-
-    loop {
-        let byte = reader.read_u8().await?;
-        result |= ((byte & 0x7F) as usize) << shift;
-        if byte & 0x80 == 0 {
-            break;
-        }
-        shift += 7;
-        if shift >= 64 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "varint too long",
-            ));
+async fn read_error_length<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<usize> {
+    let mut prefix = [0; 2];
+    for end in 1..=prefix.len() {
+        prefix[end - 1] = reader.read_u8().await?;
+        if let Some((len, _)) = decode_error_length(&prefix[..end])? {
+            return Ok(len);
         }
     }
-
-    Ok(result)
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        "invalid h2mux error length",
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn absent_and_empty_error_messages_have_identical_encoding() {
+        for message in [None, Some(String::new())] {
+            let response = StreamResponse {
+                status: STATUS_ERROR,
+                message,
+            };
+            assert_eq!(response.encode().as_ref(), &[STATUS_ERROR, 0]);
+        }
+    }
+
+    #[tokio::test]
+    async fn error_lengths_are_bounded_before_reading_bodies() {
+        for prefix in [
+            vec![0x81, 0x20], // 4097
+            vec![0x80, 0x80, 0],
+            vec![0xff, 0xff, 0xff, 0xff, 0x0f], // u32::MAX
+            vec![0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 1],
+        ] {
+            assert_eq!(
+                decode_error_length(&prefix).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+            let mut response = vec![STATUS_ERROR];
+            response.extend(prefix);
+            assert_eq!(
+                StreamResponse::decode(&mut response.as_slice())
+                    .await
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+        assert_eq!(decode_error_length(&[]).unwrap(), None);
+        assert_eq!(decode_error_length(&[0x80]).unwrap(), None);
+        assert_eq!(decode_error_length(&[0x80, 0x20]).unwrap(), Some((4096, 2)));
+        assert_eq!(decode_error_length(&[0]).unwrap(), Some((0, 1)));
+        for bytes in [vec![STATUS_ERROR, 0x80], vec![STATUS_ERROR, 1]] {
+            assert_eq!(
+                StreamResponse::decode(&mut bytes.as_slice())
+                    .await
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::UnexpectedEof
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn encoded_errors_truncate_at_a_utf8_boundary() {
+        for message in [
+            "x".repeat(4096),
+            "x".repeat(4097),
+            format!("{}\u{20ac}", "x".repeat(4095)),
+        ] {
+            let encoded = StreamResponse::error(&message).encode();
+            assert!(encoded.len() <= MAX_ERROR_RESPONSE_LEN);
+            let response = StreamResponse::decode(&mut encoded.as_ref()).await.unwrap();
+            let decoded = response.message.unwrap();
+            assert!(decoded.len() <= MAX_ERROR_MESSAGE_LEN);
+            assert!(message.starts_with(&decoded));
+        }
+    }
 
     #[test]
     fn test_session_request_encode_decode_v0() {

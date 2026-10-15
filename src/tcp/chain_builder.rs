@@ -66,6 +66,12 @@ fn build_client_proxy_chain_with_limits(
         ));
     }
 
+    for (index, configs) in hops.iter().enumerate() {
+        for config in configs {
+            config.validate_quic_key_exchange(index == 0)?;
+        }
+    }
+
     // Build initial hop entries from hop 0.
     // Each entry pairs socket + optional proxy together to ensure atomic selection.
     let initial_hop: Vec<InitialHopEntry> = hops[0]
@@ -232,6 +238,50 @@ mod tests {
 
     fn direct_config() -> ClientConfig {
         ClientConfig::default()
+    }
+
+    #[test]
+    fn quic_allowlists_fail_before_ignored_transport_construction() {
+        for groups in [None, Some("X25519MLKEM768"), Some("X25519")] {
+            let field = groups
+                .map(|g| format!("key_exchange_groups: [{g}]"))
+                .unwrap_or_default();
+            let direct: ClientConfig = serde_yaml::from_str(&format!(
+                "protocol: {{type: direct}}\ntransport: quic\nquic_settings: {{{field}}}\n"
+            ))
+            .unwrap();
+            assert_eq!(
+                SocketConnectorImpl::from_config(&direct, None).is_err(),
+                groups.is_some()
+            );
+            let direct_chain =
+                OneOrSome::One(ClientChainHop::Single(ConfigSelection::Config(direct)));
+            assert_eq!(
+                try_build_client_proxy_chain(direct_chain, mock_resolver()).is_err(),
+                groups.is_some()
+            );
+
+            let proxy: ClientConfig = serde_yaml::from_str(&format!(
+                "address: '127.0.0.1:443'\nprotocol: {{type: socks}}\ntransport: quic\nquic_settings: {{{field}}}\n"
+            )).unwrap();
+            for hop in [
+                ClientChainHop::Single(ConfigSelection::Config(proxy.clone())),
+                ClientChainHop::Pool(OneOrSome::Some(vec![
+                    ConfigSelection::Config(socks_config(1080)),
+                    ConfigSelection::Config(proxy),
+                ])),
+            ] {
+                let chain = OneOrSome::Some(vec![
+                    ClientChainHop::Single(ConfigSelection::Config(direct_config())),
+                    hop,
+                ]);
+                let result = try_build_client_proxy_chain(chain, mock_resolver());
+                assert_eq!(result.is_err(), groups.is_some());
+                if let Err(error) = result {
+                    assert!(error.to_string().contains("QUIC key_exchange_groups"));
+                }
+            }
+        }
     }
 
     #[test]

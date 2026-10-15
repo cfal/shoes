@@ -576,11 +576,128 @@ async fn handle_h2mux_udp_packet_addr(
     result
 }
 
+#[cfg(all(test, feature = "integration-tests"))]
+#[path = "singbox_interop_tests.rs"]
+mod singbox_interop_tests;
+
+#[cfg(test)]
+#[path = "test_io.rs"]
+mod test_io;
+
 #[cfg(test)]
 mod tests {
+    use super::test_io::H2Writes;
     use super::*;
     use crate::h2mux::{H2MuxClientSession, H2MuxOptions};
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_goaway_allows_existing_stream_to_finish() {
+        timeout(Duration::from_secs(30), exercise_idle_shutdown(true))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_goaway_bounds_stalled_stream_drain() {
+        timeout(Duration::from_secs(30), exercise_idle_shutdown(false))
+            .await
+            .unwrap();
+    }
+
+    async fn exercise_idle_shutdown(finish_stream: bool) {
+        let (client_io, server_io) = tokio::io::duplex(65536);
+        let writes = H2Writes::default();
+        let (client, server) = tokio::join!(
+            h2::client::handshake(client_io),
+            h2::server::handshake(writes.wrap(server_io)),
+        );
+        let (mut sender, client) = client.unwrap();
+        let mut server = server.unwrap();
+        let mut ping = server.ping_pong().unwrap();
+        let (inbound_tx, mut inbound_rx) = mpsc::channel(8);
+        let closed = Arc::new(AtomicBool::new(false));
+        let mut drivers = JoinSet::new();
+        let closed_flag = closed.clone();
+        drivers.spawn(async move {
+            // Synthetic inactivity isolates the idle branch from control-frame
+            // activity; the real-peer test covers normal PING keepalive.
+            H2MuxServerSession::accept_loop(
+                server,
+                inbound_tx,
+                closed_flag,
+                ActivityTracker::already_idle(),
+            )
+            .await;
+        });
+        drivers.spawn(async move { client.await.unwrap() });
+
+        let location = crate::address::NetLocation::from_str("echo.test:1234", None).unwrap();
+        let (response, mut body) = sender
+            .send_request(
+                http::Request::builder()
+                    .uri("https://localhost/")
+                    .body(())
+                    .unwrap(),
+                false,
+            )
+            .unwrap();
+        body.send_data(
+            StreamRequest::tcp(location).encode().unwrap().freeze(),
+            false,
+        )
+        .unwrap();
+        let mut inbound = inbound_rx.recv().await.unwrap();
+        let mut stream = H2MuxStream::new(body, response.await.unwrap().into_body());
+        inbound.stream.write_all(b"before").await.unwrap();
+        let mut before = [0; 7];
+        stream.read_exact(&mut before).await.unwrap();
+        assert_eq!(&before, b"\0before");
+
+        tokio::time::advance(IDLE_TIMEOUT / 6).await;
+        writes.wait_for_goaway().await;
+        let drain_started = tokio::time::Instant::now();
+        // The ACK follows GOAWAY processing in the peer's read loop.
+        ping.ping(h2::Ping::opaque()).await.unwrap();
+        let error = sender.ready().await.unwrap_err();
+        assert!(error.is_go_away());
+        assert_eq!(error.reason(), Some(h2::Reason::NO_ERROR));
+        assert!(!closed.load(Ordering::Relaxed));
+
+        if finish_stream {
+            stream.write_all(b"after").await.unwrap();
+            let mut received = [0; 5];
+            inbound.stream.read_exact(&mut received).await.unwrap();
+            assert_eq!(&received, b"after");
+            inbound.stream.write_all(&received).await.unwrap();
+            stream.read_exact(&mut received).await.unwrap();
+            assert_eq!(&received, b"after");
+            stream.shutdown().await.unwrap();
+            assert_eq!(inbound.stream.read(&mut [0]).await.unwrap(), 0);
+            inbound.stream.shutdown().await.unwrap();
+            assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
+            drop(stream);
+            drop(inbound);
+        } else {
+            let before_deadline = SHUTDOWN_DRAIN_TIMEOUT - Duration::from_millis(1);
+            tokio::time::advance(before_deadline).await;
+            assert!(!closed.load(Ordering::Relaxed));
+            let mut byte = [0];
+            let read = inbound.stream.read(&mut byte);
+            tokio::pin!(read);
+            assert!(futures::poll!(&mut read).is_pending());
+            assert_eq!(drain_started.elapsed(), before_deadline);
+
+            tokio::time::advance(Duration::from_millis(1)).await;
+            assert!(read.await.is_err());
+            assert_eq!(drain_started.elapsed(), SHUTDOWN_DRAIN_TIMEOUT);
+        }
+        while let Some(result) = drivers.join_next().await {
+            result.unwrap();
+        }
+        assert!(closed.load(Ordering::Relaxed));
+        writes.assert_graceful_goaway();
+    }
 
     #[tokio::test]
     async fn dropping_server_closes_driver_and_waiting_streams() {

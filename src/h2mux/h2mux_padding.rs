@@ -218,7 +218,6 @@ impl<S: AsyncRead + Unpin> AsyncRead for H2MuxPaddingStream<S> {
 
                     // Padding complete, transition to next state
                     if this.read_count >= FIRST_PADDINGS {
-                        let _ = mem::take(&mut this.write_buffer);
                         this.read_state = ReadState::Passthrough;
                     } else {
                         this.read_state = ReadState::Header { pos: 0 };
@@ -423,6 +422,97 @@ impl<S: AsyncStream> AsyncStream for H2MuxPaddingStream<S> {}
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
+    use tokio::time::{Duration, timeout};
+
+    #[derive(Clone, Copy, Debug)]
+    enum ResumeWrite {
+        Pending,
+        Partial,
+        Flush,
+        Shutdown,
+    }
+
+    async fn read_transition_preserves_outbound_frame(resume: ResumeWrite) {
+        timeout(Duration::from_secs(5), async {
+            let (mut inbound, reader) = duplex(16 * 1024);
+            let (mut writer, mut outbound) = duplex(8);
+            let initially_pending = matches!(resume, ResumeWrite::Pending);
+            if initially_pending {
+                writer.write_all(&[0xff; 8]).await.unwrap();
+            }
+            let mut stream = H2MuxPaddingStream::new(tokio::io::join(reader, writer));
+            let payload = b"outbound data held behind backpressure";
+
+            if initially_pending {
+                assert!(futures::poll!(std::pin::pin!(stream.write(payload))).is_pending());
+                assert!(matches!(stream.write_state, WriteState::Pending { .. }));
+            } else {
+                assert_eq!(stream.write(payload).await.unwrap(), payload.len());
+                assert!(matches!(stream.write_state, WriteState::Partial { .. }));
+            }
+            let expected_wire = stream.write_buffer.to_vec();
+            assert!(futures::poll!(std::pin::pin!(stream.flush())).is_pending());
+
+            for i in 0..FIRST_PADDINGS {
+                inbound.write_all(&[0, 1, 1, 0]).await.unwrap();
+                inbound.write_all(&[i as u8]).await.unwrap();
+                inbound.write_all(&[0; 256]).await.unwrap();
+            }
+            inbound.write_all(b"raw inbound tail").await.unwrap();
+            inbound.shutdown().await.unwrap();
+            let mut received = Vec::new();
+            stream.read_to_end(&mut received).await.unwrap();
+            let mut expected = (0..FIRST_PADDINGS as u8).collect::<Vec<_>>();
+            expected.extend_from_slice(b"raw inbound tail");
+            assert_eq!(received, expected);
+            assert!(matches!(stream.read_state, ReadState::Passthrough));
+            assert_eq!(stream.write_count, 0);
+
+            let finish_write = async {
+                match resume {
+                    ResumeWrite::Pending => {
+                        assert_eq!(stream.write(payload).await.unwrap(), payload.len());
+                    }
+                    ResumeWrite::Partial => {
+                        assert_eq!(stream.write(&[]).await.unwrap(), 0);
+                    }
+                    ResumeWrite::Flush => stream.flush().await.unwrap(),
+                    ResumeWrite::Shutdown => {}
+                }
+                stream.shutdown().await.unwrap();
+            };
+            let receive_wire = async {
+                if initially_pending {
+                    let mut prefix = [0; 8];
+                    outbound.read_exact(&mut prefix).await.unwrap();
+                    assert_eq!(prefix, [0xff; 8]);
+                }
+                let mut wire = Vec::new();
+                outbound.read_to_end(&mut wire).await.unwrap();
+                wire
+            };
+            let ((), wire) = tokio::join!(finish_write, receive_wire);
+            assert_eq!(wire, expected_wire, "resume via {resume:?}");
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_padding_transition_preserves_pending_write() {
+        read_transition_preserves_outbound_frame(ResumeWrite::Pending).await;
+    }
+
+    #[tokio::test]
+    async fn read_padding_transition_preserves_partial_write() {
+        for resume in [
+            ResumeWrite::Partial,
+            ResumeWrite::Flush,
+            ResumeWrite::Shutdown,
+        ] {
+            read_transition_preserves_outbound_frame(resume).await;
+        }
+    }
 
     #[tokio::test]
     async fn test_padding_write_read_roundtrip() {

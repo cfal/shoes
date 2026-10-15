@@ -156,21 +156,187 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_bad_indices_and_caps_packet_and_total_bytes() {
+    async fn packet_budget_is_independent_and_completion_releases_capacity() {
         let mut cache = UdpFragments::new();
-        assert!(cache.push(1, 0, 0, Some(address()), b"x").is_err());
-        assert!(cache.push(1, 2, 2, Some(address()), b"x").is_err());
+        for key in 0..MAX_PACKETS {
+            assert!(
+                cache
+                    .push(key, 2, 0, Some(address()), b"x")
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert_eq!(cache.packets.len(), MAX_PACKETS);
+        assert_eq!(cache.bytes, MAX_PACKETS);
+        assert_eq!(
+            cache
+                .push(MAX_PACKETS, 2, 0, None, b"x")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(
+            cache.push(0, 2, 1, None, b"y").unwrap().unwrap().1.as_ref(),
+            b"xy"
+        );
+        assert_eq!(cache.packets.len(), MAX_PACKETS - 1);
+        assert_eq!(cache.bytes, MAX_PACKETS - 1);
+        assert!(cache.push(MAX_PACKETS, 2, 0, None, b"z").unwrap().is_none());
+        assert_eq!(cache.packets.len(), MAX_PACKETS);
+        assert_eq!(cache.bytes, MAX_PACKETS);
+    }
+
+    #[tokio::test]
+    async fn byte_budget_is_exact_and_rejection_releases_affected_packet() {
+        let mut cache = UdpFragments::new();
+        let payload = vec![0; MAX_UDP_PAYLOAD];
+        let full_packets = MAX_BYTES / MAX_UDP_PAYLOAD;
+        for key in 0..full_packets {
+            cache.push(key, 2, 0, Some(address()), &payload).unwrap();
+        }
+        let remainder = MAX_BYTES % MAX_UDP_PAYLOAD;
+        cache
+            .push(full_packets, 2, 0, Some(address()), &payload[..remainder])
+            .unwrap();
+        assert_eq!(cache.bytes, MAX_BYTES);
+        assert_eq!(cache.packets.len(), full_packets + 1);
+        assert!(cache.packets.len() < MAX_PACKETS);
+        assert_eq!(
+            cache
+                .push(full_packets + 1, 2, 0, None, b"x")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(cache.bytes, MAX_BYTES);
+        assert_eq!(
+            cache
+                .push(full_packets, 2, 1, None, b"x")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(cache.bytes, MAX_BYTES - remainder);
+        assert_eq!(cache.packets.len(), full_packets);
+        cache
+            .push(full_packets, 2, 0, Some(address()), &payload[..remainder])
+            .unwrap();
+        assert_eq!(cache.bytes, MAX_BYTES);
+    }
+
+    #[tokio::test]
+    async fn invalid_fragments_clean_only_the_affected_packet_and_allow_reuse() {
+        let oversized = vec![0; MAX_UDP_PAYLOAD];
+        let other_address = NetLocation::from_str("127.0.0.2:53", None).unwrap();
+        for (count, index, location, data) in [
+            (0, 0, None, &b"x"[..]),
+            (2, 2, None, &b"x"[..]),
+            (2, 0, None, &b"duplicate"[..]),
+            (3, 2, None, &b"changed count"[..]),
+            (2, 1, Some(other_address), &b"conflict"[..]),
+            (2, 1, None, oversized.as_slice()),
+        ] {
+            let mut cache = UdpFragments::new();
+            cache.push(1, 2, 0, Some(address()), b"head").unwrap();
+            cache.push(2, 2, 0, Some(address()), b"other").unwrap();
+            assert_eq!(
+                cache
+                    .push(1, count, index, location, data)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidData
+            );
+            assert!(!cache.packets.contains_key(&1));
+            assert_eq!(cache.packets.len(), 1);
+            assert_eq!(cache.bytes, 5);
+            cache.push(1, 2, 1, None, b"tail").unwrap();
+            assert_eq!(
+                cache
+                    .push(1, 2, 0, Some(address()), b"head")
+                    .unwrap()
+                    .unwrap()
+                    .1
+                    .as_ref(),
+                b"headtail"
+            );
+            assert_eq!(cache.packets.len(), 1);
+            assert_eq!(cache.bytes, 5);
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_payload_limit_and_missing_address_release_state() {
+        let mut cache = UdpFragments::new();
+        let payload = vec![7; MAX_UDP_PAYLOAD - 1];
+        cache.push(1, 2, 0, Some(address()), &payload).unwrap();
+        let (location, result) = cache.push(1, 2, 1, None, &[7]).unwrap().unwrap();
+        assert_eq!(location, address());
+        assert_eq!(result.as_ref(), vec![7; MAX_UDP_PAYLOAD]);
+        assert_eq!(cache.bytes, 0);
+        assert!(cache.packets.is_empty());
+        cache.push(1, 2, 0, Some(address()), &payload).unwrap();
+        assert_eq!(
+            cache.push(1, 2, 1, None, &[7, 7]).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(cache.bytes, 0);
+        assert!(cache.packets.is_empty());
+        cache.push(1, 2, 0, None, b"head").unwrap();
+        assert_eq!(
+            cache.push(1, 2, 1, None, b"tail").unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(cache.bytes, 0);
+        assert!(cache.packets.is_empty());
+        cache.push(1, 2, 0, Some(address()), b"old").unwrap();
+        assert_eq!(
+            cache
+                .push(1, 1, 0, Some(address()), b"new")
+                .unwrap()
+                .unwrap()
+                .1
+                .as_ref(),
+            b"new"
+        );
+        assert_eq!(cache.bytes, 0);
+        assert!(cache.packets.is_empty());
+        cache.push(1, 2, 0, None, b"old").unwrap();
+        assert_eq!(
+            cache.push(1, 1, 0, None, b"new").unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(cache.bytes, 0);
+        assert!(cache.packets.is_empty());
         assert!(
             cache
-                .push(1, 2, 0, Some(address()), &vec![0; MAX_UDP_PAYLOAD])
+                .push(1, 2, 0, Some(address()), b"reused")
                 .unwrap()
                 .is_none()
         );
-        assert!(cache.push(1, 2, 1, None, b"x").is_err());
-        for key in 2..1000 {
-            let _ = cache.push(key, 255, 0, Some(address()), &vec![0; 60000]);
-        }
-        assert!(cache.bytes <= MAX_BYTES);
-        assert!(cache.packets.len() <= MAX_PACKETS);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn later_fragments_do_not_extend_creation_deadline() {
+        let mut cache = UdpFragments::new();
+        cache.push(1, 3, 0, Some(address()), b"first").unwrap();
+        tokio::time::advance(Duration::from_secs(4)).await;
+        cache.push(1, 3, 1, None, b"second").unwrap();
+        assert_eq!(cache.bytes, 11);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        cache.expire();
+        assert!(cache.packets.is_empty());
+        assert_eq!(cache.bytes, 0);
+        cache.push(1, 2, 0, Some(address()), b"new").unwrap();
+        assert_eq!(
+            cache
+                .push(1, 2, 1, None, b"tail")
+                .unwrap()
+                .unwrap()
+                .1
+                .as_ref(),
+            b"newtail"
+        );
+        assert!(cache.packets.is_empty());
+        assert_eq!(cache.bytes, 0);
     }
 }

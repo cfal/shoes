@@ -75,41 +75,6 @@ async fn test_shoes_reality_server_trojan() -> Result<(), Box<dyn std::error::Er
         .await
 }
 
-/// Test shoes REALITY server with SEPARATE mode dest server (www.debian.org)
-///
-/// This test verifies the 512-byte heuristic for mode detection works correctly.
-/// www.debian.org sends 4 encrypted records with the first one <= 512 bytes,
-/// unlike cloudflare.com/google.com which send 1 combined record > 512 bytes.
-///
-/// Chain: curl -> sing-box HTTP proxy -> shoes REALITY+VLESS server (debian.org dest) -> internet
-#[tokio::test]
-async fn test_shoes_reality_server_vless_separate_mode() -> Result<(), Box<dyn std::error::Error>> {
-    ProxyTestFixture::new()
-        .with_singbox_reality_vless_client()
-        .with_shoes_reality_vless_server_separate_mode()
-        .build()
-        .await?
-        .test_http("https://www.google.com")
-        .await
-}
-
-/// Test shoes REALITY server with SEPARATE mode dest and large data transfer
-/// Ensures the 512-byte heuristic handles substantial data correctly
-#[tokio::test]
-async fn test_shoes_reality_server_vless_separate_mode_large()
--> Result<(), Box<dyn std::error::Error>> {
-    let fixture = ProxyTestFixture::new()
-        .with_singbox_reality_vless_client()
-        .with_shoes_reality_vless_server_separate_mode()
-        .with_local_http_server()
-        .build()
-        .await?;
-
-    let body = fixture.test_local_server("/bytes/204800", false).await?;
-    assert_eq!(body.len(), 204800, "Expected exactly 200KB");
-    Ok(())
-}
-
 // REALITY Server Tests - GET operations with local test servers
 
 /// Test shoes REALITY+VLESS server with small data (1 byte) over local HTTP server

@@ -367,7 +367,10 @@ pub async fn start_servers(
             "TUN server is not supported on this platform",
         )),
         Config::Server(server_config) => start_tcp_or_quic_servers(server_config, resolver).await,
-        _ => unreachable!("create_server_configs only returns Server and TunServer"),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Expected a server configuration",
+        )),
     }
 }
 
@@ -379,7 +382,12 @@ async fn start_tcp_or_quic_servers(
     let join_handles = match config.transport {
         Transport::Tcp => start_tcp_servers(config, resolver).await?,
         Transport::Quic => start_quic_servers(config, resolver).await?,
-        Transport::Udp => todo!(),
+        Transport::Udp => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "UDP listener transport is not supported",
+            ));
+        }
     };
 
     if join_handles.is_empty() {
