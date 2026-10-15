@@ -213,6 +213,62 @@ async fn trojan_transport_independence() -> Result<(), Box<dyn std::error::Error
 }
 
 #[tokio::test]
+async fn shoes_reality_client_and_udp_through_a_tcp_prefix()
+-> Result<(), Box<dyn std::error::Error>> {
+    let echo_port = port();
+    let _echo = start_tcp_stream_echo_server("0.0.0.0", echo_port).await?;
+    let _udp = start_udp_echo_server_with_suffix("0.0.0.0", echo_port, b"").await?;
+    let target: SocketAddr = ([127, 0, 0, 1], echo_port).into();
+    let names: Vec<String> = std::iter::once("localhost".into())
+        .chain((0..40).map(|i| format!("fixture-{i}.local.test")))
+        .collect();
+    let certificate = rcgen::generate_simple_self_signed(names)?;
+    let (private_key, public_key) = generate_reality_keypair();
+    for mode in ["auto", "stream-one", "stream-up", "packet-up"] {
+        let destination = port();
+        let remote = port();
+        let prefix = port();
+        let socks = port();
+        let inner = json!({"type":"vless","user_id":UUID,"udp_enabled":true});
+        let xhttp = json!({"type":"xhttp","path":"/reality","mode":mode,"protocol":inner});
+        let config = json!([
+            {"address":format!("0.0.0.0:{destination}"),"protocol":{"type":"tls","default_target":{
+                "cert":certificate.cert.pem(),"key":certificate.signing_key.serialize_pem(),
+                "alpn_protocols":["h2","http/1.1"],"protocol":{"type":"http"}
+            }}},
+            {"address":format!("0.0.0.0:{remote}"),"protocol":{"type":"tls","reality_targets":{"localhost":{
+                "private_key":private_key,"short_ids":["0123456789abcdef"],
+                "dest":format!("localhost:{destination}"),"protocol":xhttp
+            }}}},
+            {"address":format!("0.0.0.0:{prefix}"),"protocol":{"type":"socks"}},
+            {"address":format!("0.0.0.0:{socks}"),"protocol":{"type":"socks","udp_enabled":true},
+                "rules":[{"masks":"0.0.0.0/0","client_chains":[[
+                    {"address":format!("127.0.0.1:{prefix}"),"protocol":{"type":"socks"}},
+                    {"address":format!("127.0.0.1:{remote}"),"protocol":{"type":"reality",
+                        "public_key":public_key,"short_id":"0123456789abcdef",
+                        "sni_hostname":"localhost","protocol":xhttp}}
+                ]]}]}
+        ]);
+        let _server = start_shoes_server(&serde_yaml::to_string(&config)?)?;
+        let address: SocketAddr = ([127, 0, 0, 1], socks).into();
+        xray::wait_socks(address).await?;
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let mut stream = xray::connect(address, target).await?;
+            let payload = vec![71; 300_000];
+            let mut response = vec![0; payload.len()];
+            let (mut read, mut write) = stream.split();
+            tokio::try_join!(write.write_all(&payload), read.read_exact(&mut response))?;
+            assert_eq!(response, payload);
+            let udp = Socks5UdpAssociation::connect("127.0.0.1", socks).await?;
+            assert_eq!(udp.send_to(target, b"prefix\0\xff").await?, b"prefix\0\xff");
+            Ok::<_, std::io::Error>(())
+        })
+        .await??;
+    }
+    Ok(())
+}
+
+#[tokio::test]
 #[ignore = "Existing Shoes REALITY client lacks the X25519MLKEM768 key share required by Xray 26.10.10"]
 async fn shoes_client_xray_reality_server() -> Result<(), Box<dyn std::error::Error>> {
     matrix(true, "vless", &["reality"]).await
