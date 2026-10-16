@@ -10,37 +10,41 @@ use crate::address::NetLocation;
 async fn existing_settings_and_idle_policy_are_unchanged() {
     let (client, mut peer) = tokio::io::duplex(8192);
     let session = NaiveClientSession::new(Box::new(client)).await.unwrap();
-    let mut preface = [0; 24];
-    peer.read_exact(&mut preface).await.unwrap();
-    assert_eq!(&preface, b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
-    peer.write_all(&[0, 0, 0, 4, 0, 0, 0, 0, 0]).await.unwrap();
-
     let mut settings = BTreeMap::new();
     let mut connection_window = 65_535;
     let mut acknowledged = false;
-    while !acknowledged || connection_window == 65_535 {
-        let mut header = [0; 9];
-        peer.read_exact(&mut header).await.unwrap();
-        let length = u32::from_be_bytes([0, header[0], header[1], header[2]]) as usize;
-        let mut payload = vec![0; length];
-        peer.read_exact(&mut payload).await.unwrap();
-        match header[3] {
-            4 if header[4] == 1 => acknowledged = true,
-            4 => {
-                for setting in payload.as_chunks::<6>().0 {
-                    settings.insert(
-                        u16::from_be_bytes(setting[..2].try_into().unwrap()),
-                        u32::from_be_bytes(setting[2..].try_into().unwrap()),
-                    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut preface = [0; 24];
+        peer.read_exact(&mut preface).await.unwrap();
+        assert_eq!(&preface, b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+        peer.write_all(&[0, 0, 0, 4, 0, 0, 0, 0, 0]).await.unwrap();
+
+        while !acknowledged || connection_window == 65_535 {
+            let mut header = [0; 9];
+            peer.read_exact(&mut header).await.unwrap();
+            let length = u32::from_be_bytes([0, header[0], header[1], header[2]]) as usize;
+            let mut payload = vec![0; length];
+            peer.read_exact(&mut payload).await.unwrap();
+            match header[3] {
+                4 if header[4] == 1 => acknowledged = true,
+                4 => {
+                    for setting in payload.as_chunks::<6>().0 {
+                        settings.insert(
+                            u16::from_be_bytes(setting[..2].try_into().unwrap()),
+                            u32::from_be_bytes(setting[2..].try_into().unwrap()),
+                        );
+                    }
                 }
+                8 => {
+                    assert_eq!(&header[5..], &[0; 4]);
+                    connection_window += u32::from_be_bytes(payload.try_into().unwrap());
+                }
+                frame_type => panic!("unexpected frame type {frame_type}"),
             }
-            8 => {
-                assert_eq!(&header[5..], &[0; 4]);
-                connection_window += u32::from_be_bytes(payload.try_into().unwrap());
-            }
-            frame_type => panic!("unexpected frame type {frame_type}"),
         }
-    }
+    })
+    .await
+    .expect("Naive handshake did not advertise its connection window");
     assert_eq!(connection_window, 256 * 1024);
     assert_eq!(settings.get(&4), Some(&(256 * 1024)));
     assert_eq!(settings.get(&5), Some(&(16 * 1024)));
@@ -137,10 +141,13 @@ async fn peer_stream_limit_queues_without_dropping_existing_tunnel() {
     });
     let mut session = NaiveClientSession::new(Box::new(client)).await.unwrap();
     let target = NetLocation::from_str("example.com:443", None).unwrap();
-    let mut first = session
-        .open_stream(&target, "Basic dTpw", false)
-        .await
-        .unwrap();
+    let mut first = tokio::time::timeout(
+        Duration::from_secs(5),
+        session.open_stream(&target, "Basic dTpw", false),
+    )
+    .await
+    .expect("first tunnel did not open")
+    .unwrap();
     let mut second_session = session.clone();
     let second = second_session.open_stream(&target, "Basic dTpw", false);
     tokio::pin!(second);
@@ -150,10 +157,14 @@ async fn peer_stream_limit_queues_without_dropping_existing_tunnel() {
             .is_err()
     );
     assert_eq!(count.load(Ordering::SeqCst), 1);
-    first.write_all(b"first").await.unwrap();
-    first.shutdown().await.unwrap();
     let mut response = Vec::new();
-    first.read_to_end(&mut response).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        first.write_all(b"first").await.unwrap();
+        first.shutdown().await.unwrap();
+        first.read_to_end(&mut response).await.unwrap();
+    })
+    .await
+    .expect("first tunnel did not finish while the second was queued");
     assert_eq!(response, b"first");
     drop(first);
     let mut second = tokio::time::timeout(Duration::from_secs(1), second)
@@ -161,10 +172,14 @@ async fn peer_stream_limit_queues_without_dropping_existing_tunnel() {
         .unwrap()
         .unwrap();
     assert_eq!(count.load(Ordering::SeqCst), 2);
-    second.write_all(b"second").await.unwrap();
-    second.shutdown().await.unwrap();
     response.clear();
-    second.read_to_end(&mut response).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        second.write_all(b"second").await.unwrap();
+        second.shutdown().await.unwrap();
+        second.read_to_end(&mut response).await.unwrap();
+    })
+    .await
+    .expect("second tunnel did not finish after receiving a stream slot");
     assert_eq!(response, b"second");
     server.abort();
     let _ = server.await;
