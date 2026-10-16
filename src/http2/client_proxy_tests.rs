@@ -101,6 +101,7 @@ async fn warm_tunnels_share_a_carrier_and_rejection_does_not_replay_or_truncate(
         });
         let handler = HttpTcpClientHandler::new(Some(("user".into(), "pass".into())), None, HttpVersion::H2);
         let target: ResolvedLocation = NetLocation::from_str("example.com:443", None).unwrap().into();
+        assert!(handler.try_reuse_tcp_stream(&target).await.unwrap().is_none());
         let mut first = handler.setup_client_tcp_stream(Box::new(client), target.clone()).await.unwrap().client_stream;
         let mut second = handler.try_reuse_tcp_stream(&target).await.unwrap().unwrap().client_stream;
         let rejected = NetLocation::from_str("reject.test:443", None).unwrap().into();
@@ -215,6 +216,29 @@ async fn cold_opens_always_use_the_supplied_route() {
 }
 
 #[tokio::test]
+async fn cold_only_handler_releases_the_carrier_after_its_tunnel() {
+    let handler = HttpTcpClientHandler::new(None, None, HttpVersion::H2);
+    let target = NetLocation::from_str("example.com:443", None)
+        .unwrap()
+        .into();
+    let (client, server) = marker_carrier(10, b'A', false);
+    let mut stream = handler
+        .setup_client_tcp_stream(Box::new(client), target)
+        .await
+        .unwrap()
+        .client_stream;
+    assert_eq!(stream.read_u8().await.unwrap(), b'A');
+    stream.shutdown().await.unwrap();
+    assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
+    drop(stream);
+    tokio::time::timeout(Duration::from_secs(1), server)
+        .await
+        .expect("a non-reusable carrier must not retain its prefix tunnel")
+        .unwrap();
+    drop(handler);
+}
+
+#[tokio::test]
 async fn every_success_status_establishes_cold_and_warm_connect_tunnels() {
     for host in ["created.test", "no-content.test", "other-success.test"] {
         let (client, server) = marker_carrier(10, b'A', false);
@@ -222,6 +246,13 @@ async fn every_success_status_establishes_cold_and_warm_connect_tunnels() {
         let target: ResolvedLocation = NetLocation::from_str(&format!("{host}:443"), None)
             .unwrap()
             .into();
+        assert!(
+            handler
+                .try_reuse_tcp_stream(&target)
+                .await
+                .unwrap()
+                .is_none()
+        );
         let mut cold = handler
             .setup_client_tcp_stream(Box::new(client), target.clone())
             .await
@@ -250,6 +281,13 @@ async fn refused_stream_does_not_retire_or_replay_the_carrier() {
     let target: ResolvedLocation = NetLocation::from_str("example.com:443", None)
         .unwrap()
         .into();
+    assert!(
+        handler
+            .try_reuse_tcp_stream(&target)
+            .await
+            .unwrap()
+            .is_none()
+    );
     let first = handler
         .setup_client_tcp_stream(Box::new(client), target.clone())
         .await
@@ -286,6 +324,13 @@ async fn a_carrier_failure_before_submission_is_a_warm_miss() {
     let target: ResolvedLocation = NetLocation::from_str("example.com:443", None)
         .unwrap()
         .into();
+    assert!(
+        handler
+            .try_reuse_tcp_stream(&target)
+            .await
+            .unwrap()
+            .is_none()
+    );
     let first = handler
         .setup_client_tcp_stream(Box::new(client), target.clone())
         .await
@@ -320,6 +365,13 @@ async fn full_and_draining_carriers_are_warm_misses_without_breaking_existing_tu
         let target: ResolvedLocation = NetLocation::from_str("example.com:443", None)
             .unwrap()
             .into();
+        assert!(
+            handler
+                .try_reuse_tcp_stream(&target)
+                .await
+                .unwrap()
+                .is_none()
+        );
         let mut first = handler
             .setup_client_tcp_stream(Box::new(client), target.clone())
             .await

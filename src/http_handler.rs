@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -546,6 +547,7 @@ pub struct HttpTcpClientHandler {
     resolver: Option<Arc<dyn Resolver>>,
     version: HttpVersion,
     session: parking_lot::Mutex<Option<H2ClientSession>>,
+    reuse_enabled: AtomicBool,
 }
 
 impl std::fmt::Debug for HttpTcpClientHandler {
@@ -575,6 +577,7 @@ impl HttpTcpClientHandler {
             resolver,
             version,
             session: parking_lot::Mutex::new(None),
+            reuse_enabled: AtomicBool::new(false),
         }
     }
 
@@ -694,6 +697,7 @@ impl TcpClientHandler for HttpTcpClientHandler {
         if self.version != HttpVersion::H2 {
             return Ok(None);
         }
+        self.reuse_enabled.store(true, Ordering::Relaxed);
         let session = self.session.lock().clone();
         let Some(session) = session else {
             return Ok(None);
@@ -714,7 +718,10 @@ impl TcpClientHandler for HttpTcpClientHandler {
             // The supplied carrier already embodies the selected route and wrappers.
             let session = H2ClientSession::new(client_stream).await?;
             let reservation = session.reserve();
-            *self.session.lock() = Some(session.clone());
+            // Only eligible first-hop routes probe reuse before building a carrier.
+            if self.reuse_enabled.load(Ordering::Relaxed) {
+                *self.session.lock() = Some(session.clone());
+            }
             return self
                 .open_h2(session, reservation, remote_location, false)
                 .await
