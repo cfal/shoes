@@ -15,7 +15,7 @@ use hyper_util::rt::TokioIo;
 use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
 
-use super::stream::{Body, Memory, Reader, Tasks, Upload, UploadWatch, Writer, pipe};
+use super::stream::{Body, Memory, Reader, Tasks, Upload, UploadSignal, UploadWatch, Writer, pipe};
 use crate::{
     async_stream::AsyncStream, config::xhttp::XhttpVersion, tcp::carrier_dialer::QuicCarrier,
 };
@@ -27,24 +27,21 @@ pub struct Reservation(Option<super::h3::Bidi>);
 #[derive(Clone, Copy)]
 pub struct Timeouts {
     headers: Duration,
-    response: Option<Duration>,
-    upload: Option<Duration>,
+    upload_idle: Option<Duration>,
 }
 
 impl Timeouts {
     pub fn headers(timeout: Duration) -> Self {
         Self {
             headers: timeout,
-            response: Some(timeout),
-            upload: None,
+            upload_idle: None,
         }
     }
 
     pub fn packet(headers: Duration, upload: Duration) -> Self {
         Self {
             headers,
-            response: None,
-            upload: Some(upload),
+            upload_idle: Some(upload),
         }
     }
 
@@ -55,11 +52,11 @@ impl Timeouts {
         cancel: &CancellationToken,
     ) -> io::Result<Response<B>> {
         let response = async {
-            let response = match self.response {
-                Some(timeout) => tokio::time::timeout(timeout, response).await?,
-                None => response.await,
+            let response = match self.upload_idle {
+                None => tokio::time::timeout(self.headers, response).await?,
+                Some(_) => response.await,
             }?;
-            if self.upload.is_some() && response.status() != http::StatusCode::OK {
+            if self.upload_idle.is_some() && response.status() != http::StatusCode::OK {
                 return Err(io::Error::other(format!(
                     "XHTTP packet status {}",
                     response.status()
@@ -68,7 +65,7 @@ impl Timeouts {
             Ok(response)
         };
         let uploaded = async {
-            if let Some((upload, timeout)) = upload.zip(self.upload) {
+            if let Some((upload, timeout)) = upload.zip(self.upload_idle) {
                 upload.wait(timeout).await?;
             }
             Ok::<_, io::Error>(())
@@ -99,10 +96,26 @@ pub struct Carrier {
 }
 
 impl Carrier {
+    #[cfg(test)]
     pub async fn tcp(
         stream: Box<dyn AsyncStream>,
         version: XhttpVersion,
         header_limit: usize,
+    ) -> io::Result<Arc<Self>> {
+        Self::tcp_with_windows(
+            stream,
+            version,
+            header_limit,
+            crate::config::xhttp::XhttpLimits::default().h2_windows(),
+        )
+        .await
+    }
+
+    pub async fn tcp_with_windows(
+        stream: Box<dyn AsyncStream>,
+        version: XhttpVersion,
+        header_limit: usize,
+        (stream_window, connection_window): (u32, u32),
     ) -> io::Result<Arc<Self>> {
         let tasks = Tasks::new();
         let sender = if version == XhttpVersion::H1 {
@@ -119,8 +132,8 @@ impl Carrier {
             Sender::H1(tokio::sync::Mutex::new(sender))
         } else {
             let (sender, mut connection) = h2::client::Builder::new()
-                .initial_window_size(256 * 1024)
-                .initial_connection_window_size(256 * 1024)
+                .initial_window_size(stream_window)
+                .initial_connection_window_size(connection_window)
                 .max_header_list_size(header_limit as u32)
                 .handshake(stream)
                 .await
@@ -150,6 +163,8 @@ impl Carrier {
         let opener = connection.opener();
         let (mut driver, sender) = h3::client::builder()
             .max_field_section_size(header_limit as u64)
+            // Known-length peers can stop receiving before finish() writes its optional GREASE frame.
+            .send_grease(false)
             .build(connection)
             .await
             .map_err(io::Error::other)?;
@@ -266,9 +281,10 @@ impl Carrier {
         reservation: Reservation,
     ) -> io::Result<Response<Reader>> {
         let (writer, reader) = pipe(memory);
-        let (mut upload, watch) = match timeouts.upload {
+        let (mut upload, watch) = match timeouts.upload_idle {
             Some(_) => {
-                let (upload, watch) = Upload::channel();
+                let (mut upload, watch) = Upload::channel();
+                upload.written = request.extensions_mut().remove::<UploadSignal>();
                 (Some(upload), Some(watch))
             }
             None => (None, None),
@@ -367,7 +383,13 @@ impl Carrier {
                         watch,
                         &tasks.cancel,
                     )
-                    .await?;
+                    .await
+                    .inspect_err(|error| {
+                        if timeouts.upload_idle.is_none() && error.kind() == io::ErrorKind::TimedOut
+                        {
+                            self.retired.store(true, Ordering::Relaxed);
+                        }
+                    })?;
                 guard.disarm();
                 let (parts, incoming) = response.into_parts();
                 let carrier = self.clone();
@@ -406,41 +428,10 @@ impl Carrier {
                 let mut sending = upload;
                 tasks.spawn(async move {
                     let _carrier = carrier;
-                    let result = async {
-                        loop {
-                            let frame =
-                                match tokio::time::timeout(Duration::from_secs(10), body.frame())
-                                    .await
-                                {
-                                    Ok(frame) => frame,
-                                    Err(_) => {
-                                        send.send_data(Bytes::new())
-                                            .await
-                                            .map_err(io::Error::other)?;
-                                        continue;
-                                    }
-                                };
-                            let Some(frame) = frame else {
-                                break;
-                            };
-                            if let Ok(data) = frame?.into_data() {
-                                let nonempty = !data.is_empty();
-                                send.send_data(data).await.map_err(io::Error::other)?;
-                                if nonempty && let Some(upload) = &sending {
-                                    upload.activity.touch();
-                                }
-                            }
-                        }
-                        send.finish().await.map_err(io::Error::other)?;
-                        if let Some(upload) = &mut sending {
-                            upload.finish();
-                        }
-                        Ok::<_, io::Error>(())
-                    };
                     let result = tokio::select! {
                         biased;
                         _ = request_cancel.cancelled() => Err(io::ErrorKind::ConnectionAborted.into()),
-                        result = result => result,
+                        result = send_h3(&mut body, &mut send, &mut sending) => result,
                     };
                     if let Err(error) = result {
                         log::debug!("XHTTP H3 upload failed: {error}");
@@ -483,6 +474,39 @@ impl Carrier {
         };
         Ok(result)
     }
+}
+
+async fn send_h3(
+    body: &mut Body,
+    send: &mut h3::client::RequestStream<super::h3::Send, Bytes>,
+    upload: &mut Option<Upload>,
+) -> io::Result<()> {
+    loop {
+        let frame = match tokio::time::timeout(Duration::from_secs(10), body.frame()).await {
+            Ok(frame) => frame,
+            Err(_) => {
+                send.send_data(Bytes::new())
+                    .await
+                    .map_err(io::Error::other)?;
+                continue;
+            }
+        };
+        let Some(frame) = frame else {
+            break;
+        };
+        if let Ok(data) = frame?.into_data() {
+            let nonempty = !data.is_empty();
+            send.send_data(data).await.map_err(io::Error::other)?;
+            if nonempty && let Some(upload) = upload.as_ref() {
+                upload.activity.touch();
+            }
+        }
+    }
+    send.finish().await.map_err(io::Error::other)?;
+    if let Some(upload) = upload {
+        upload.finish();
+    }
+    Ok(())
 }
 
 pub async fn receive_hyper(
@@ -535,12 +559,14 @@ async fn send_h2_tracked(
     send: &mut h2::SendStream<Bytes>,
     mut upload: Option<Upload>,
 ) -> io::Result<()> {
-    loop {
+    'frames: loop {
         let frame = tokio::select! {
             frame = body.frame() => frame,
             reset = futures::future::poll_fn(|cx| send.poll_reset(cx)) => return Err(io::Error::other(format!("XHTTP H2 stream reset: {reset:?}"))),
         };
         let Some(frame) = frame else {
+            send.send_data(Bytes::new(), true)
+                .map_err(io::Error::other)?;
             break;
         };
         let Ok(mut data) = frame?.into_data() else {
@@ -553,17 +579,21 @@ async fn send_h2_tracked(
                 .ok_or_else(|| io::Error::from(io::ErrorKind::BrokenPipe))?
                 .map_err(io::Error::other)?;
             let len = capacity.min(data.len());
-            if len != 0 {
-                send.send_data(data.split_to(len), false)
-                    .map_err(io::Error::other)?;
-                if let Some(upload) = &upload {
-                    upload.activity.touch();
-                }
+            if len == 0 {
+                continue;
+            }
+            // Known-length peers may respond and reset immediately after the final bytes.
+            let end = len == data.len() && hyper::body::Body::is_end_stream(&body);
+            send.send_data(data.split_to(len), end)
+                .map_err(io::Error::other)?;
+            if let Some(upload) = &upload {
+                upload.activity.touch();
+            }
+            if end {
+                break 'frames;
             }
         }
     }
-    send.send_data(Bytes::new(), true)
-        .map_err(io::Error::other)?;
     if let Some(upload) = &mut upload {
         upload.finish();
     }

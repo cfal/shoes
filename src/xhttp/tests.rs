@@ -21,7 +21,13 @@ async fn all_modes_and_carriers_exchange_data_before_upload_eof() {
         let mut clients = tokio::task::JoinSet::new();
         loop {
             tokio::select! {
-                result = echo.accept() => { let (mut socket, _) = result.unwrap(); clients.spawn(async move { let (mut read, mut write) = socket.split(); let _ = tokio::io::copy(&mut read, &mut write).await; }); }
+                result = echo.accept() => {
+                    let (mut socket, _) = result.unwrap();
+                    clients.spawn(async move {
+                        let (mut read, mut write) = socket.split();
+                        let _ = tokio::io::copy(&mut read, &mut write).await;
+                    });
+                }
                 _ = clients.join_next(), if !clients.is_empty() => {}
             }
         }
@@ -156,15 +162,23 @@ async fn all_modes_and_carriers_exchange_data_before_upload_eof() {
                 (chain, vec![])
             };
             tokio::time::timeout(Duration::from_secs(15), async {
+                let connect = async |target: crate::address::ResolvedLocation| {
+                    loop {
+                        match chain.connect_tcp(target.clone(), &resolver).await {
+                            Ok(connection) => break connection.client_stream,
+                            Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
+                                // Stream drop cancels workers asynchronously, including pool leases.
+                                tokio::time::sleep(Duration::from_millis(1)).await;
+                            }
+                            Err(error) => panic!("{error}"),
+                        }
+                    }
+                };
                 for _ in 0..2 {
                     let target = crate::address::NetLocation::from_str(&target, None)
                         .unwrap()
                         .into();
-                    let mut stream = chain
-                        .connect_tcp(target, &resolver)
-                        .await
-                        .unwrap()
-                        .client_stream;
+                    let mut stream = connect(target).await;
                     for marker in [42, 43] {
                         let payload = vec![marker; 32 * 1024];
                         stream.write_all(&payload).await.unwrap();
@@ -175,7 +189,18 @@ async fn all_modes_and_carriers_exchange_data_before_upload_eof() {
                     }
                     stream.shutdown().await.unwrap();
                     let mut tail = Vec::new();
-                    stream.read_to_end(&mut tail).await.unwrap();
+                    if mode == "packet-up" {
+                        assert!(
+                            tokio::time::timeout(
+                                Duration::from_millis(50),
+                                stream.read_to_end(&mut tail)
+                            )
+                            .await
+                            .is_err()
+                        );
+                    } else {
+                        stream.read_to_end(&mut tail).await.unwrap();
+                    }
                     assert!(tail.is_empty());
                 }
                 if concurrent_packets {
@@ -202,12 +227,18 @@ async fn all_modes_and_carriers_exchange_data_before_upload_eof() {
                     assert_eq!(second.read_u8().await.unwrap(), b'd');
                     tokio::try_join!(first.shutdown(), second.shutdown()).unwrap();
                     let (mut first_tail, mut second_tail) = (Vec::new(), Vec::new());
-                    tokio::try_join!(
-                        first.read_to_end(&mut first_tail),
-                        second.read_to_end(&mut second_tail),
-                    )
-                    .unwrap();
+                    assert!(
+                        tokio::time::timeout(Duration::from_millis(50), async {
+                            tokio::try_join!(
+                                first.read_to_end(&mut first_tail),
+                                second.read_to_end(&mut second_tail),
+                            )
+                        })
+                        .await
+                        .is_err()
+                    );
                     assert!(first_tail.is_empty() && second_tail.is_empty());
+                    drop((first, second));
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
                 // H1 stream-one ends its connection with the response, not an independent FIN.
@@ -215,11 +246,7 @@ async fn all_modes_and_carriers_exchange_data_before_upload_eof() {
                     let target = crate::address::NetLocation::from_str(&half_close_target, None)
                         .unwrap()
                         .into();
-                    let mut stream = chain
-                        .connect_tcp(target, &resolver)
-                        .await
-                        .unwrap()
-                        .client_stream;
+                    let mut stream = connect(target).await;
                     let mut response = Vec::new();
                     stream.read_to_end(&mut response).await.unwrap();
                     assert_eq!(response, b"fin");
@@ -232,11 +259,7 @@ async fn all_modes_and_carriers_exchange_data_before_upload_eof() {
                     let target = crate::address::NetLocation::from_str(&sink_target, None)
                         .unwrap()
                         .into();
-                    let mut stream = chain
-                        .connect_tcp(target, &resolver)
-                        .await
-                        .unwrap()
-                        .client_stream;
+                    let mut stream = connect(target).await;
                     stream.write_all(&vec![83; 8 * 1024 * 1024]).await.unwrap();
                     stream.shutdown().await.unwrap();
                     assert_eq!(transfers.recv().await.unwrap(), 8 * 1024 * 1024);

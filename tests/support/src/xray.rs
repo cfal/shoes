@@ -18,6 +18,12 @@ pub struct Peer {
     _files: tempfile::TempDir,
 }
 
+impl Peer {
+    pub fn id(&self) -> u32 {
+        self._process.id()
+    }
+}
+
 pub fn binary() -> io::Result<PathBuf> {
     let path = std::env::var_os("SHOES_TEST_XRAY_BIN")
         .map(PathBuf::from)

@@ -7,7 +7,7 @@ use std::{
     time::Duration,
 };
 
-use bytes::{Buf, Bytes};
+use bytes::{Buf, Bytes, BytesMut};
 use hyper::body::{Body as HttpBody, Frame, SizeHint};
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
@@ -180,6 +180,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn packet_coalescing_transfers_permits_without_double_reserving() {
+        for fragment_size in [1, 13, CHUNK] {
+            let size = 2 * CHUNK + 17;
+            let budget = Arc::new(Budget::new(Some(size)));
+            let source = Memory::new(budget.clone(), size);
+            let target = Memory::new(budget.clone(), size);
+            let mut packet = target.reserve_packet(size, 0).unwrap();
+            let (mut writer, mut reader) = pipe(source.clone());
+            let expected: Vec<_> = (0..size).map(|index| (index % 251) as u8).collect();
+            let mut chunks = Vec::new();
+            for fragment in expected.chunks(fragment_size) {
+                writer.write_all(fragment).await.unwrap();
+                let Some(Event::Allocated(data)) = reader.receiver.recv().await else {
+                    panic!("expected an owned allocation");
+                };
+                packet.retain(data, &mut chunks).unwrap();
+                assert_eq!(source.session.snapshot().active, 0);
+            }
+            assert!(chunks.len() <= 2 * size.div_ceil(CHUNK));
+            assert_eq!(budget.snapshot().active, size);
+            assert_eq!(budget.snapshot().peak, size);
+            assert_eq!(target.session.snapshot().active, size);
+            let actual: Vec<_> = chunks
+                .iter()
+                .flat_map(|chunk| chunk.as_ref())
+                .copied()
+                .collect();
+            assert_eq!(actual, expected);
+            drop(packet);
+            assert_eq!(target.session.snapshot().active, size);
+            drop(chunks);
+            assert_eq!(target.session.snapshot().active, 0);
+            assert_eq!(budget.snapshot().active, 0);
+        }
+    }
+
+    #[tokio::test]
     async fn partial_reads_explicit_eof_and_errors() {
         let memory = Memory::new(Arc::new(Budget::new(Some(128))), 128);
         let (mut writer, mut reader) = pipe(memory.clone());
@@ -253,6 +290,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn forwarding_preserves_buffered_bytes_barriers_fin_and_errors() {
+        for failure in [false, true] {
+            let budget = Arc::new(Budget::new(Some(8)));
+            let memory = Memory::new(budget.clone(), 8);
+            let (mut source, mut incoming) = pipe(memory.clone());
+            let (mut destination, mut outgoing) = pipe(memory);
+            source.write_all(b"12345678").await.unwrap();
+            assert_eq!(incoming.read_u8().await.unwrap(), b'1');
+            let eof = incoming.eof.clone();
+            tokio::time::timeout(Duration::from_secs(1), async {
+                let ((), result, bytes) = tokio::join!(
+                    async {
+                        source.flush().await.unwrap();
+                        if failure {
+                            source.fail(io::ErrorKind::ConnectionReset.into()).await;
+                        } else {
+                            source.shutdown().await.unwrap();
+                        }
+                    },
+                    async {
+                        let result = incoming.forward_to(&mut destination).await;
+                        destination.shutdown().await.unwrap();
+                        result
+                    },
+                    async {
+                        let mut bytes = Vec::new();
+                        outgoing.read_to_end(&mut bytes).await.unwrap();
+                        bytes
+                    }
+                );
+                assert_eq!(bytes, b"2345678");
+                if failure {
+                    assert_eq!(result.unwrap_err().kind(), io::ErrorKind::ConnectionReset);
+                    assert!(!eof.is_cancelled());
+                } else {
+                    result.unwrap();
+                    assert!(eof.is_cancelled());
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(budget.snapshot().active, 0);
+        }
+        let memory = Memory::new(Arc::new(Budget::new(Some(8))), 8);
+        let (source, mut incoming) = pipe(memory.clone());
+        let (mut destination, _outgoing) = pipe(memory);
+        drop(source);
+        assert_eq!(
+            incoming
+                .forward_to(&mut destination)
+                .await
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+    }
+
+    #[tokio::test]
     async fn byte_budget_backpressures_other_sessions_and_wakes_on_release() {
         let budget = Arc::new(Budget::new(Some(8)));
         let (mut first, mut first_reader) = pipe(Memory::new(budget.clone(), 8));
@@ -278,14 +373,41 @@ mod tests {
     }
 }
 
-struct Allocation {
-    data: Bytes,
+pub struct Allocation {
+    data: BytesMut,
     _global: BudgetPermit,
     _session: BudgetPermit,
 }
-struct Retained {
-    data: Bytes,
-    _session: BudgetPermit,
+
+impl Allocation {
+    pub fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    pub fn into_bytes(self) -> Bytes {
+        Bytes::from_owner(self)
+    }
+
+    pub fn split_to(&mut self, len: usize) -> Self {
+        Self {
+            data: self.data.split_to(len),
+            _global: self._global.split(len),
+            _session: self._session.split(len),
+        }
+    }
+
+    pub fn retain(self, chunks: &mut Vec<Self>) {
+        // Transfers permits rather than reserving a second copy against a full budget.
+        if let Some(last) = chunks.last_mut()
+            && last.len() + self.len() <= CHUNK
+        {
+            last.data.extend_from_slice(&self.data);
+            last._global.merge(self._global);
+            last._session.merge(self._session);
+        } else {
+            chunks.push(self);
+        }
+    }
 }
 
 pub struct PacketMemory {
@@ -295,18 +417,17 @@ pub struct PacketMemory {
 }
 
 impl PacketMemory {
-    pub fn retain(&mut self, data: Bytes) -> io::Result<Bytes> {
+    pub fn retain(&mut self, mut data: Allocation, chunks: &mut Vec<Allocation>) -> io::Result<()> {
         if data.len() > self.remaining {
             return Err(crate::resources::exhausted());
         }
         self.remaining -= data.len();
-        Ok(Bytes::from_owner(Retained {
-            _session: self.session.split(data.len()),
-            data,
-        }))
+        data._session = self.session.split(data.len());
+        data.retain(chunks);
+        Ok(())
     }
 
-    pub async fn copy(&mut self, bytes: &[u8]) -> io::Result<Bytes> {
+    pub async fn copy(&mut self, bytes: &[u8]) -> io::Result<Allocation> {
         if bytes.len() > self.remaining {
             return Err(crate::resources::exhausted());
         }
@@ -316,19 +437,14 @@ impl PacketMemory {
             released.as_mut().enable();
             if let Some(global) = self.global.acquire(bytes.len()) {
                 self.remaining -= bytes.len();
-                return Ok(Bytes::from_owner(Allocation {
-                    data: Bytes::copy_from_slice(bytes),
+                return Ok(Allocation {
+                    data: BytesMut::from(bytes),
                     _global: global,
                     _session: self.session.split(bytes.len()),
-                }));
+                });
             }
             released.await;
         }
-    }
-}
-impl AsRef<[u8]> for Retained {
-    fn as_ref(&self) -> &[u8] {
-        &self.data
     }
 }
 impl AsRef<[u8]> for Allocation {
@@ -394,7 +510,7 @@ impl Memory {
             .acquire(bytes.len())
             .ok_or_else(crate::resources::exhausted)?;
         Ok(Bytes::from_owner(Allocation {
-            data: Bytes::copy_from_slice(bytes),
+            data: BytesMut::from(bytes),
             _global: global,
             _session: session,
         }))
@@ -433,6 +549,7 @@ impl Drop for Tasks {
 
 pub enum Event {
     Data(Bytes),
+    Allocated(Allocation),
     Flush(oneshot::Sender<()>),
     Drain(oneshot::Sender<()>),
     Finish,
@@ -445,6 +562,54 @@ pub struct Reader {
     ended: bool,
     pub eof: CancellationToken,
     pub activity: Option<Arc<Activity>>,
+    start: Option<oneshot::Sender<()>>,
+}
+
+impl Reader {
+    pub fn defer(&mut self) -> oneshot::Receiver<()> {
+        let (start, ready) = oneshot::channel();
+        self.start = Some(start);
+        ready
+    }
+
+    pub fn start(&mut self) {
+        if let Some(start) = self.start.take() {
+            let _ = start.send(());
+        }
+    }
+
+    pub async fn forward_to(&mut self, writer: &mut Writer) -> io::Result<()> {
+        self.start();
+        loop {
+            if !self.current.is_empty() {
+                writer.forward(std::mem::take(&mut self.current)).await?;
+                if let Some(activity) = &self.activity {
+                    activity.touch();
+                }
+            }
+            if self.ended {
+                return Ok(());
+            }
+            match self.receiver.recv().await {
+                Some(Event::Data(data)) => self.current = data,
+                Some(Event::Allocated(data)) => self.current = data.into_bytes(),
+                Some(Event::Flush(ack) | Event::Drain(ack)) => {
+                    let _ = ack.send(());
+                }
+                Some(Event::Finish) => {
+                    self.ended = true;
+                    self.eof.cancel();
+                }
+                Some(Event::Error(error)) => return Err(error),
+                None => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "XHTTP body terminated without FIN",
+                    ));
+                }
+            }
+        }
+    }
 }
 
 pub struct Writer {
@@ -475,6 +640,7 @@ pub fn pipe(memory: Memory) -> (Writer, Reader) {
             ended: false,
             eof: CancellationToken::new(),
             activity: None,
+            start: None,
         },
     )
 }
@@ -600,14 +766,14 @@ impl AsyncWrite for Writer {
         let result = ready!(allocation.as_mut().unwrap().1.as_mut().poll(cx));
         *allocation = None;
         let (global, session) = result?;
-        let bytes = Bytes::from_owner(Allocation {
-            data: Bytes::copy_from_slice(&data[..len]),
+        let bytes = Allocation {
+            data: BytesMut::from(&data[..len]),
             _global: global,
             _session: session,
-        });
+        };
         this.sender
             .get_mut()
-            .send_item(Event::Data(bytes))
+            .send_item(Event::Allocated(bytes))
             .map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))?;
         Poll::Ready(Ok(len))
     }
@@ -639,6 +805,7 @@ impl AsyncRead for Reader {
         if buffer.remaining() == 0 {
             return Poll::Ready(Ok(()));
         }
+        self.start();
         loop {
             if !self.current.is_empty() {
                 let len = self.current.len().min(buffer.remaining());
@@ -657,6 +824,7 @@ impl AsyncRead for Reader {
             }
             match ready!(self.receiver.poll_recv(cx)) {
                 Some(Event::Data(data)) => self.current = data,
+                Some(Event::Allocated(data)) => self.current = data.into_bytes(),
                 Some(Event::Flush(ack) | Event::Drain(ack)) => {
                     let _ = ack.send(());
                 }
@@ -718,6 +886,17 @@ impl AsyncStream for Stream {}
 pub struct Upload {
     pub activity: Arc<Activity>,
     done: Option<oneshot::Sender<()>>,
+    pub written: Option<UploadSignal>,
+}
+
+#[derive(Clone)]
+pub struct UploadSignal(Arc<parking_lot::Mutex<Option<oneshot::Sender<()>>>>);
+
+impl UploadSignal {
+    pub fn channel() -> (Self, oneshot::Receiver<()>) {
+        let (send, receive) = oneshot::channel();
+        (Self(Arc::new(parking_lot::Mutex::new(Some(send)))), receive)
+    }
 }
 
 pub struct UploadWatch {
@@ -733,6 +912,7 @@ impl Upload {
             Self {
                 activity: activity.clone(),
                 done: Some(send),
+                written: None,
             },
             UploadWatch { activity, done },
         )
@@ -741,6 +921,11 @@ impl Upload {
     pub fn finish(&mut self) {
         if let Some(done) = self.done.take() {
             let _ = done.send(());
+        }
+        if let Some(written) = self.written.take()
+            && let Some(send) = written.0.lock().take()
+        {
+            let _ = send.send(());
         }
     }
 }
@@ -822,12 +1007,16 @@ impl HttpBody for Body {
                 Poll::Ready(data.map(|data| Ok(Frame::data(data))))
             }
             Self::Stream { reader, .. } => {
+                reader.start();
                 if reader.ended {
                     return Poll::Ready(None);
                 }
                 loop {
                     match ready!(reader.receiver.poll_recv(cx)) {
                         Some(Event::Data(data)) => return Poll::Ready(Some(Ok(Frame::data(data)))),
+                        Some(Event::Allocated(data)) => {
+                            return Poll::Ready(Some(Ok(Frame::data(data.into_bytes()))));
+                        }
                         Some(Event::Flush(ack) | Event::Drain(ack)) => {
                             let _ = ack.send(());
                         }
@@ -850,21 +1039,19 @@ impl HttpBody for Body {
         }
     }
     fn is_end_stream(&self) -> bool {
-        matches!(self, Self::Empty)
-            || matches!(self, Self::Chunks(chunks) if chunks.is_empty())
-            || matches!(self, Self::Packet { chunks, .. } if chunks.is_empty())
-            || matches!(self, Self::Stream { reader, .. } if reader.ended)
+        match self {
+            Self::Empty => true,
+            Self::Chunks(chunks) | Self::Packet { chunks, .. } => chunks.is_empty(),
+            Self::Stream { reader, .. } => reader.ended,
+        }
     }
     fn size_hint(&self) -> SizeHint {
         match self {
             Self::Empty => SizeHint::with_exact(0),
-            Self::Chunks(chunks) => {
+            Self::Chunks(chunks) | Self::Packet { chunks, .. } => {
                 SizeHint::with_exact(chunks.iter().map(|b| b.len() as u64).sum())
             }
-            Self::Packet { chunks, .. } => {
-                SizeHint::with_exact(chunks.iter().map(|b| b.len() as u64).sum())
-            }
-            _ => SizeHint::default(),
+            Self::Stream { .. } => SizeHint::default(),
         }
     }
 }

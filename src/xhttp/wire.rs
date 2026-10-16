@@ -118,15 +118,6 @@ pub fn classify(
     path: &Path,
     request: &Request<()>,
 ) -> Result<Kind, StatusCode> {
-    if request
-        .headers()
-        .iter()
-        .map(|(k, v)| k.as_str().len() + v.len() + 4)
-        .sum::<usize>()
-        > config.header_limit()
-    {
-        return Err(StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE);
-    }
     if let Some(host) = config.host.as_ref().filter(|host| !host.is_empty()) {
         let actual = request
             .uri()
@@ -142,10 +133,19 @@ pub fn classify(
     }
     let decoded_path = percent_encoding::percent_decode_str(request.uri().path())
         .decode_utf8()
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
+        .map_err(|_| StatusCode::NOT_FOUND)?;
     let suffix = decoded_path
         .strip_prefix(&path.base)
         .ok_or(StatusCode::NOT_FOUND)?;
+    if request
+        .headers()
+        .iter()
+        .map(|(k, v)| k.as_str().len() + v.len() + 4)
+        .sum::<usize>()
+        > config.header_limit()
+    {
+        return Err(StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE);
+    }
     if request.method() == Method::OPTIONS {
         return Ok(Kind::Options);
     }
@@ -250,6 +250,39 @@ pub fn header_payload(headers: &HeaderMap) -> io::Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn padding_acceptance_range_does_not_override_request_header_limit() {
+        let mut server: XhttpServerConfig = serde_json::from_value(serde_json::json!({
+            "host": "front.test", "path": "/upload", "x_padding_bytes": "100-20000",
+            "protocol": {"type": "socks"}
+        }))
+        .unwrap();
+        server.validate().unwrap();
+        let path = Path::new(&server.path).unwrap();
+        for padding in [100, 20000] {
+            let client: XhttpClientConfig = serde_json::from_value(serde_json::json!({
+                "x_padding_bytes": padding, "protocol": {"type": "socks"}
+            }))
+            .unwrap();
+            let request = request(&client, &path, "front.test", true, "id", None, false).unwrap();
+            server.server_max_header_bytes = 0;
+            assert_eq!(
+                classify(&server, &path, &request),
+                if padding == 100 {
+                    Ok(Kind::Download("id".into()))
+                } else {
+                    Err(StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE)
+                }
+            );
+            server.server_max_header_bytes = 32768;
+            assert_eq!(
+                classify(&server, &path, &request),
+                Ok(Kind::Download("id".into()))
+            );
+        }
+    }
+
     #[test]
     fn default_wire_classification_and_rejections() {
         let config: XhttpServerConfig = serde_json::from_value(serde_json::json!({"path":"/a%2Fb?q=x", "host":"front.test", "protocol":{"type":"socks"}})).unwrap();

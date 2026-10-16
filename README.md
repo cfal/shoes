@@ -296,9 +296,16 @@ covering all three modes and HTTP versions. `type: splithttp` is an alias for
   separate streaming upload/download requests; packet-up uses bounded POSTs.
 - Packet-up cannot transmit upload EOF. Use a streaming mode when the target
   must receive EOF before responding. After upload shutdown and packet acknowledgements,
-  the client allows a one-second download tail before closing the session.
+  client `download_idle_timeout_secs` bounds the download-only tail (900 seconds,
+  or 15 minutes, by default; must be positive). Download forwarding and successful
+  local reads reset this timer. Expiry reports a timeout, not a successful EOF.
+  Peer EOF or dropping the stream closes it immediately. An idle timeout cannot
+  prove delivery of queued uploads; allow for the destination's expected stalls.
   Streaming bodies require unbuffered proxies. H1 stream-one closes the whole HTTP
   connection when its response ends; use H2/H3 or stream-up for remote-first half-close.
+  In stream-up/auto server mode, normal download EOF allows an unclaimed streaming
+  upload 30 seconds to attach; an absent upload is then reaped. Packet uploads do
+  not receive this grace period.
 - H1/H2 preserve selected upstream proxy chains. H3 must be the first proxy hop;
   it reuses the existing QUIC/H3 dependencies, not Hysteria2 framing.
 - `host` overrides HTTP authority independently of TLS SNI. Default Referer
@@ -309,30 +316,98 @@ covering all three modes and HTTP versions. `type: splithttp` is an alias for
   Split legs may use different carriers on the same selected route. H2/H3 admission
   respects peer stream capacity; draining carriers retain their connection slots.
   A full pool refuses new sessions rather than exceeding its configured cap.
+  Split modes require at least two effective request lanes: two H1 connections,
+  or `pool.max_connections * effective_requests_per_connection >= 2` for H2/H3.
+  The effective per-connection limit is the smaller of
+  `limits.max_requests_per_connection` and `global_limits.max_streams_per_connection`
+  when the latter is configured. Peer stream limits can reduce runtime capacity further.
+  Stream-one needs only one lane, including REALITY's automatic mode.
+- Server `x_padding_bytes` is an acceptance range, independent of
+  `server_max_header_bytes` (8192 by default). A wide range can accept clients
+  using smaller padding without raising the header cap. To use larger Referer
+  padding, raise the cap to fit the padding plus the URL, other headers, and
+  HTTP-version framing overhead. Padding within the range is still rejected
+  when the request exceeds that cap.
 - `packet_timeout_secs` defaults to 300 seconds and measures inactivity, not a
   POST's total lifetime. On the server, each POST's body must keep receiving
-  nonempty bytes. Admission and forwarding-ACK waits stay alive while the inner
+  nonempty bytes. Admission waits stay alive while the inner
   stream consumes upload bytes or the original receiver of the missing next
   packet receives bytes. Duplicate bodies, empty packets, download traffic and
   resource wakeups do not count as progress.
   On the client, the timer covers only body transmission: H2/H3 transport
   acceptance, or handoff into Hyper's bounded H1 write buffer. After the body is
-  sent, the forwarding ACK has no packet or response-header deadline. Healthy
-  slow destinations therefore need not forward a whole packet per timeout.
+  sent, the ACK has no packet or response-header deadline. HTTP 200 acknowledges
+  acceptance into the server's bounded packet queue, as in Xray, not delivery to
+  the destination. Queued bytes retain their budget permits until consumed.
   Carrier readiness and request headers retain `response_header_timeout_secs`;
   other request types also retain it for response headers. `setup_timeout_secs`
   is unchanged. A live peer that never ACKs can retain bounded client resources
   until the stream is dropped or the transport fails.
-- Shoes H2/H3 packet-up clients can transmit four POST bodies concurrently.
-  Budget the server's `max_session_buffered_bytes` for at least four maximum
-  `sc_max_each_post_bytes` packets, plus room for duplex pipe buffers; the defaults
-  provide this. Smaller budgets remain valid for H1 or lower-concurrency clients,
+- H2/H3 packet-up follows Xray's paced, write-gated pipeline: the next POST may start
+  after the preceding body is transmitted, without waiting for its ACK. Client
+  `packet_pipeline_depth` defaults to 30 (minimum 1), matching the reference peers'
+  default reorder depth. The window advances only through consecutive ACKs, so
+  later ACKs cannot accumulate an unbounded sequence gap at a stalled peer.
+  Larger depths require a correspondingly larger peer reorder queue. Client
+  and Shoes server request limits must also agree: allow at least the effective
+  client POST depth plus one reserved head slot in server
+  `limits.max_requests_per_session` (31 for the default H2/H3 client depth).
+  Lower the client depth when using a smaller server cap; Shoes does not replay
+  refused POSTs. Pool, byte and client request limits may reduce the effective depth.
+  Each H2/H3 packet-up session can hold up to the effective POST depth plus one
+  download slot in the shared pool (31 slots at the default depth). Delayed ACKs
+  retain those slots; several stalled or high-latency sessions can fill the pool
+  and refuse new sessions, including sessions to healthy destinations.
+  Client `limits.max_requests_per_session` is an additional ceiling (128, minimum 2): one
+  slot is for the download leg. `limits.max_requests`
+  bounds outstanding POSTs across a client instance (4096 by default). Reaching
+  either client bound backpressures the local writer. Pool limits may constrain
+  concurrency further. H1 keeps one ACK-gated POST on a reusable upload connection,
+  plus the download connection; it does not open opportunistic upload connections
+  or use raw HTTP/1 pipelining. Use H2/H3 for high-latency packet-up throughput.
+  Unsent bytes remain subject to the byte budgets;
+  successfully transmitted bodies are not retained while awaiting ACKs.
+  Outstanding POST payload sizes also count against a separate logical credit
+  limit equal to `max_session_buffered_bytes`, bounding peer-side backlog without
+  keeping sent allocations or consuming the download's memory allowance.
+  Tiny writes are coalesced into allocations of at most 16 KiB while transferring
+  their existing byte permits, avoiding per-write metadata and small-DATA-frame
+  amplification without throttling datagram-sized writes.
+  On the server, `limits.max_requests_per_session` bounds live packet requests
+  across carriers, including empty bodies, duplicates and admission waiters.
+  One slot is reserved for a missing head packet. `limits.max_requests` additionally
+  bounds all active HTTP request handlers across the service, including waiters
+  and streaming requests, and must be at least 2 for split server modes.
+  Body pumps start only after packet byte/reorder admission;
+  waiting packets do not each absorb an extra four-slot application pipe.
+  H2 rejects never-admitted excess POSTs with `REFUSED_STREAM`, preserving the
+  existing session. The pinned Xray transport can replay these requests with bounded
+  backoff; HTTP 503 cannot provide that recovery. Refusal is not an unlimited-stall
+  guarantee or a universal retry mechanism: Shoes does not replay submitted POSTs,
+  and Mihomo does not provide Xray's replayable body. H1/H3 per-session overflow
+  still terminates the session. Hard limits and inactivity expiry remain backstops,
+  not promises of lossless operation under arbitrary overload.
+  Attached sessions wait for late predecessors beyond the default 30-packet reorder
+  window, subject to this request cap and packet inactivity timeout. Unattached
+  sessions still reject out-of-window packets.
+  Budget `max_session_buffered_bytes` for the desired bandwidth-delay product
+  and packet queue, not a fixed POST concurrency multiplier. Server download
+  pipes have an independent allowance of the same size, so a full packet queue
+  cannot block a write-before-read handshake locally. All pipes still share the
+  global byte budget. Smaller budgets remain valid,
   but concurrent bodies can exhaust shared transport credit before their
   predecessors finish. Byte caps do not provide per-session transport isolation:
   stalled consumers or global byte-budget exhaustion can also block other sessions
   on the same carrier. Server packet inactivity timeouts still bound stalled waits.
   Slowly progressing sessions can hold global byte-budget capacity and shared
   carrier flow-control credit indefinitely, so other sessions may time out.
+- H2 receive windows default to 4 MiB per stream and 8 MiB per connection through
+  `limits.h2_stream_window_bytes` and `limits.h2_connection_window_bytes`. The
+  stream window is capped by session/global byte limits; the connection window
+  is capped by the global limit, with HTTP/2's mandatory 65535-byte minimum.
+  Increase both the window and byte limits for higher bandwidth-delay products.
+  Transport buffers are additional to application-accounted bytes: window limits
+  apply per carrier, not to total RSS. Exposed servers also need connection limits.
 - The server bounds the initial TCP HTTP header/preface to four seconds after
   transport setup (or the shorter configured setup timeout). H1 keep-alive idle
   periods and subsequent partial headers have no deadline. For exposed listeners,

@@ -71,6 +71,7 @@ mod tests {
             resolver: Arc::new(crate::resolver::NativeResolver::new()),
             memory: Arc::new(Budget::new(Some(1024))),
             admission: Arc::new(Budget::new(Some(2))),
+            requests: Arc::new(Budget::new(Some(config.limits.max_requests))),
             sessions: parking_lot::Mutex::new(HashMap::new()),
             tasks: Tasks::new(),
             config,
@@ -121,20 +122,143 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn download_pipe_can_write_before_reading_a_full_packet() {
+        let mut state = inactivity_service(16);
+        Arc::get_mut(&mut state).unwrap().inner = Arc::new(CloseDownload { keep_upload: true });
+        assert_eq!(
+            request(&state, "POST", "a/0", b"0123456789abcdef")
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        let response = request(&state, "GET", "a", b"").await;
+        let data = tokio::time::timeout(Duration::from_secs(1), response.into_body().collect())
+            .await
+            .expect("download must not wait for packet memory")
+            .unwrap()
+            .to_bytes();
+        assert_eq!(data, b"bye".as_slice());
+        drop(data);
+        tokio::task::yield_now().await;
+        assert_eq!(state.admission.snapshot().active, 0);
+        assert_eq!(state.memory.snapshot().active, 0);
+    }
+
+    #[derive(Debug)]
+    struct DrainUpload;
+
+    #[async_trait]
+    impl TcpServerHandler for DrainUpload {
+        async fn setup_server_stream(
+            &self,
+            mut stream: Box<dyn AsyncStream>,
+        ) -> io::Result<TcpServerSetupResult> {
+            Ok(TcpServerSetupResult::Session(Box::pin(async move {
+                let mut data = Vec::new();
+                stream.read_to_end(&mut data).await.unwrap();
+                assert_eq!(data, vec![42; 16384]);
+                stream.write_all(b"ok").await.unwrap();
+                stream.shutdown().await.unwrap();
+            })))
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_upload_forwards_without_reserving_global_bytes_twice() {
+        let mut state = inactivity_service(16384);
+        let inner = Arc::get_mut(&mut state).unwrap();
+        inner.inner = Arc::new(DrainUpload);
+        inner.memory = Arc::new(Budget::new(Some(16384)));
+        inner.config.limits.max_buffered_bytes = 16384;
+        inner.config.sc_stream_up_server_secs = crate::config::xhttp::XhttpRange::Number(-1);
+        let (mut writer, body) = pipe(state.new_memory());
+        writer.write_all(&[42; 16384]).await.unwrap();
+        writer.shutdown().await.unwrap();
+        assert_eq!(state.memory.snapshot().active, 16384);
+        let upload = Request::post("http://localhost/t/a")
+            .header("referer", format!("/?x_padding={}", "X".repeat(100)))
+            .body(())
+            .unwrap();
+        let upload = state.handle(upload, body).await;
+        assert_eq!(upload.status(), StatusCode::OK);
+        let download = request(&state, "GET", "a", b"").await;
+        let data = tokio::time::timeout(Duration::from_secs(1), download.into_body().collect())
+            .await
+            .expect("stream upload must transfer its existing byte permits")
+            .unwrap()
+            .to_bytes();
+        assert_eq!(data, b"ok".as_slice());
+        drop(data);
+        upload.into_body().collect().await.unwrap();
+        tokio::task::yield_now().await;
+        assert_eq!(state.admission.snapshot().active, 0);
+        assert_eq!(state.memory.snapshot().active, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn download_eof_allows_bounded_late_stream_upload_attachment() {
+        use crate::config::xhttp::{XhttpMode, XhttpRange};
+
+        for mode in [XhttpMode::Auto, XhttpMode::StreamUp] {
+            for attach in [false, true] {
+                let mut state = service();
+                let inner = Arc::get_mut(&mut state).unwrap();
+                inner.inner = Arc::new(CloseDownload { keep_upload: true });
+                inner.config.mode = mode;
+                inner.config.sc_stream_up_server_secs = XhttpRange::Number(-1);
+                let session = state.session("a").unwrap();
+                let response = request(&state, "GET", "a", b"").await;
+                let data = response.into_body().collect().await.unwrap().to_bytes();
+                assert_eq!(data, b"bye".as_slice());
+                drop(data);
+                assert!(!session.cancel.is_cancelled());
+                assert_eq!(state.admission.snapshot().active, 1);
+                assert_eq!(
+                    request(&state, "POST", "a/0", b"").await.status(),
+                    if mode == XhttpMode::Auto {
+                        StatusCode::CONFLICT
+                    } else {
+                        StatusCode::BAD_REQUEST
+                    }
+                );
+                tokio::time::advance(Duration::from_secs(29)).await;
+                state.reap();
+                assert!(!session.cancel.is_cancelled());
+                if attach {
+                    let response = request(&state, "POST", "a", b"tail").await;
+                    assert_eq!(response.status(), StatusCode::OK);
+                    response.into_body().collect().await.unwrap();
+                    tokio::task::yield_now().await;
+                } else {
+                    tokio::time::advance(Duration::from_secs(1)).await;
+                    assert!(matches!(
+                        session.claim_stream_upload(),
+                        Err(StatusCode::CONFLICT)
+                    ));
+                    state.reap();
+                }
+                assert!(session.cancel.is_cancelled());
+                assert_eq!(state.admission.snapshot().active, 0);
+                assert_eq!(state.memory.snapshot().active, 0);
+            }
+        }
+    }
+
     async fn streaming_carrier(
         state: Arc<State>,
         version: XhttpVersion,
     ) -> (Arc<carrier::Carrier>, Tasks, Option<quinn::Endpoint>) {
         let tasks = Tasks::new();
-        if version == XhttpVersion::H2 {
+        if version != XhttpVersion::H3 {
             let (client, server) = tokio::io::duplex(8192);
             tasks.spawn(async move {
-                let _ = state
-                    .serve_h2(
-                        Box::new(server),
-                        tokio::time::Instant::now() + Duration::from_secs(4),
-                    )
-                    .await;
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+                let _ = if version == XhttpVersion::H1 {
+                    state.serve_h1(Box::new(server), deadline).await
+                } else {
+                    state.serve_h2(Box::new(server), deadline).await
+                };
             });
             let carrier = carrier::Carrier::tcp(Box::new(client), version, 8192)
                 .await
@@ -387,10 +511,10 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn forwarding_wait_tracks_consumption_not_packet_handoffs() {
+    async fn queued_packets_ack_before_forwarding_and_full_queue_waits_for_consumption() {
         let state = inactivity_service(64);
         let mut reader = attached_reader(&state, "a");
-        for sequence in 0..4 {
+        for sequence in 0..8 {
             assert_eq!(
                 request(&state, "POST", &format!("a/{sequence}"), b"12345678")
                     .await
@@ -398,14 +522,14 @@ mod tests {
                 StatusCode::OK
             );
         }
-        let (mut fifth, fifth_post) = open_post(&state, "a/4");
+        let (mut fifth, fifth_post) = open_post(&state, "a/8");
         fifth.write_all(b"fifth").await.unwrap();
         fifth.shutdown().await.unwrap();
-        let (mut sixth, sixth_post) = open_post(&state, "a/5");
+        let (mut sixth, sixth_post) = open_post(&state, "a/9");
         sixth.write_all(b"sixth").await.unwrap();
         sixth.shutdown().await.unwrap();
         tokio::task::yield_now().await;
-        for _ in 0..8 {
+        for _ in 0..16 {
             tokio::time::advance(Duration::from_secs(9)).await;
             reader.read_u8().await.unwrap();
             tokio::task::yield_now().await;
@@ -464,18 +588,45 @@ mod tests {
     async fn unmatched_requests_do_not_disclose_xhttp_headers() {
         let mut state = service();
         Arc::get_mut(&mut state).unwrap().config.host = Some("front.test".into());
-        for uri in ["http://front.test/wrong", "http://wrong.test/t/session"] {
-            let request = Request::builder()
-                .method("OPTIONS")
-                .uri(uri)
-                .header("origin", "https://probe.test")
-                .body(())
-                .unwrap();
-            let (_, body) = pipe(Memory::new(state.memory.clone(), 1024));
-            let response = state.handle(request, body).await;
-            assert_eq!(response.status(), StatusCode::NOT_FOUND);
-            assert!(response.headers().is_empty());
+        Arc::get_mut(&mut state)
+            .unwrap()
+            .config
+            .server_max_header_bytes = 256;
+        for uri in [
+            "http://front.test/wrong",
+            "http://wrong.test/t/session",
+            "http://front.test/wrong/%FF",
+            "http://front.test/%FF",
+        ] {
+            for oversized in [false, true] {
+                let request = Request::builder()
+                    .method("OPTIONS")
+                    .uri(uri)
+                    .header("origin", "https://probe.test")
+                    .header("x-extra", "X".repeat(if oversized { 512 } else { 1 }))
+                    .body(())
+                    .unwrap();
+                let (_, body) = pipe(Memory::new(state.memory.clone(), 1024));
+                let response = state.handle(request, body).await;
+                assert_eq!(
+                    response.status(),
+                    StatusCode::NOT_FOUND,
+                    "{uri}, {oversized}"
+                );
+                assert!(response.headers().is_empty());
+            }
         }
+        let request = Request::builder()
+            .method("OPTIONS")
+            .uri("http://front.test/t/session")
+            .header("x-extra", "X".repeat(512))
+            .body(())
+            .unwrap();
+        let (_, body) = pipe(state.new_memory());
+        assert_eq!(
+            state.handle(request, body).await.status(),
+            StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -607,6 +758,39 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn h1_bodiless_requests_keep_the_connection_alive() {
+        let (client, server) = tokio::io::duplex(8192);
+        let tasks = Tasks::new();
+        tasks.spawn(async move {
+            service()
+                .serve_h1(
+                    Box::new(server),
+                    tokio::time::Instant::now() + Duration::from_secs(4),
+                )
+                .await
+                .unwrap();
+        });
+        let (mut sender, connection) =
+            hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(client))
+                .await
+                .unwrap();
+        tasks.spawn(async move { connection.await.unwrap() });
+        for method in ["OPTIONS", "GET"] {
+            let request = Request::builder()
+                .method(method)
+                .uri("/wrong")
+                .header("host", "localhost")
+                .body(Body::Empty)
+                .unwrap();
+            let response = sender.send_request(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            assert!(!response.headers().contains_key("connection"));
+            response.into_body().collect().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn h1_packet_connection_survives_idle_between_requests() {
         let (mut client, server) = tokio::io::duplex(8192);
         let task = tokio::spawn(service().serve_h1(
@@ -665,6 +849,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reset_parked_h2_packet_releases_admission_without_closing_session() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let state = service();
+            let _reader = attached_reader(&state, "a");
+            let session = state.session("a").unwrap();
+            let (client, server) = tokio::io::duplex(8192);
+            let tasks = Tasks::new();
+            let serving = state.clone();
+            tasks.spawn(async move {
+                let _ = serving
+                    .serve_h2(
+                        Box::new(server),
+                        tokio::time::Instant::now() + Duration::from_secs(4),
+                    )
+                    .await;
+            });
+            let (sender, connection) = h2::client::handshake(client).await.unwrap();
+            tasks.spawn(async move {
+                let _ = connection.await;
+            });
+            let mut sender = sender.ready().await.unwrap();
+            let packet = Request::post("http://localhost/t/a/100")
+                .header("referer", format!("/?x_padding={}", "X".repeat(100)))
+                .header("content-length", 8)
+                .body(())
+                .unwrap();
+            let (_response, mut body) = sender.send_request(packet, false).unwrap();
+            body.send_data(Bytes::from_static(b"buffered"), false)
+                .unwrap();
+            while session.packet_requests.snapshot().active == 0 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(state.memory.snapshot().active, 0);
+            body.send_reset(h2::Reason::CANCEL);
+            while state.requests.snapshot().active != 0 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(session.packet_requests.snapshot().active, 0);
+            assert!(session.state.lock().receiving.is_empty());
+            assert!(!session.cancel.is_cancelled());
+            assert_eq!(
+                request(&state, "POST", "a/0", b"head").await.status(),
+                StatusCode::OK
+            );
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
     async fn completed_h2_requests_do_not_consume_stream_admission() {
         let mut state = service();
         Arc::get_mut(&mut state)
@@ -705,6 +939,319 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn fragmented_packets_retain_bounded_chunks_and_release_on_close() {
+        let mut state = service();
+        let size = super::super::stream::CHUNK + 7;
+        let inner = Arc::get_mut(&mut state).unwrap();
+        inner.config.sc_max_each_post_bytes = crate::config::xhttp::XhttpRange::Number(size as i64);
+        inner.memory = Arc::new(Budget::new(Some(size)));
+        let session = state.session("a").unwrap();
+        let (mut writer, post) = open_post(&state, "a/1");
+        for index in 0..size {
+            writer.write_all(&[(index % 251) as u8]).await.unwrap();
+        }
+        writer.shutdown().await.unwrap();
+        assert_eq!(post.await.unwrap(), StatusCode::OK);
+        {
+            let inner = session.state.lock();
+            let packet = inner.pending.get(&1).unwrap();
+            assert_eq!(packet.len(), 2);
+            assert!(
+                packet
+                    .iter()
+                    .flat_map(|chunk| chunk.iter())
+                    .copied()
+                    .eq((0..size).map(|index| (index % 251) as u8))
+            );
+            assert!(inner.receiving.is_empty());
+            assert!(inner.reserved.is_empty());
+        }
+        assert_eq!(state.memory.snapshot().active, size);
+        state.close("a");
+        assert_eq!(state.memory.snapshot().active, 0);
+        assert_eq!(session.packet_requests.snapshot().active, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn attached_default_window_waits_for_late_predecessors() {
+        let mut state = service();
+        Arc::get_mut(&mut state)
+            .unwrap()
+            .config
+            .sc_max_buffered_posts = 0;
+        let mut reader = attached_reader(&state, "a");
+        let mut posts = Vec::new();
+        for sequence in (0..=30).rev() {
+            let state = state.clone();
+            posts.push(tokio::spawn(async move {
+                request(&state, "POST", &format!("a/{sequence}"), &[sequence])
+                    .await
+                    .status()
+            }));
+            tokio::task::yield_now().await;
+            if sequence == 30 {
+                assert!(!posts[0].is_finished());
+            }
+        }
+        let mut data = [0; 31];
+        tokio::time::timeout(Duration::from_secs(1), reader.read_exact(&mut data))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(data, std::array::from_fn(|index| index as u8));
+        for post in posts {
+            assert_eq!(post.await.unwrap(), StatusCode::OK);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn far_packet_waiters_expire_without_reserving_bytes() {
+        let state = inactivity_service(64);
+        let _reader = attached_reader(&state, "a");
+        let session = state.session("a").unwrap();
+        let mut post = Box::pin(request(&state, "POST", "a/18446744073709551615", b""));
+        assert!(futures::poll!(&mut post).is_pending());
+        assert!(session.state.lock().reserved.is_empty());
+        assert!(session.memory.reserve_packet(64, 0).is_some());
+        tokio::time::advance(Duration::from_secs(10)).await;
+        assert_eq!(post.await.status(), StatusCode::REQUEST_TIMEOUT);
+        assert!(session.state.lock().receiving.is_empty());
+        assert_eq!(session.packet_requests.snapshot().active, 0);
+    }
+
+    #[tokio::test]
+    async fn duplicate_receivers_keep_request_permits_and_leave_head_capacity() {
+        let mut state = service();
+        Arc::get_mut(&mut state)
+            .unwrap()
+            .config
+            .limits
+            .max_requests_per_session = 4;
+        let _reader = attached_reader(&state, "a");
+        let session = state.session("a").unwrap();
+        let mut duplicates = Vec::new();
+        for _ in 0..3 {
+            duplicates.push(PacketRequest::new(session.clone(), 100).unwrap());
+        }
+        assert_eq!(session.state.lock().receiving[&100], 3);
+        assert_eq!(session.packet_requests.snapshot().active, 3);
+        assert!(matches!(
+            PacketRequest::new(session.clone(), 1),
+            Err(Rejection::Full)
+        ));
+        assert!(matches!(
+            PacketRequest::new(session.clone(), 100),
+            Err(Rejection::Full)
+        ));
+        let head = PacketRequest::new(session.clone(), 0).unwrap();
+        assert_eq!(session.head_request.snapshot().active, 1);
+        drop(head);
+        drop(duplicates);
+        assert_eq!(session.packet_requests.snapshot().active, 0);
+        assert_eq!(session.head_request.snapshot().active, 0);
+    }
+
+    #[tokio::test]
+    async fn aggregate_request_limit_refuses_before_creating_another_session() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut state = service();
+            Arc::get_mut(&mut state).unwrap().requests = Arc::new(Budget::new(Some(1)));
+            let (carrier, _server, _endpoint) =
+                streaming_carrier(state.clone(), XhttpVersion::H2).await;
+            let tasks = Tasks::new();
+            let memory = Memory::new(Arc::new(Budget::new(Some(1024))), 1024);
+            let make = |path: &str| {
+                Request::get(format!("https://localhost/t/{path}"))
+                    .header("referer", format!("/?x_padding={}", "X".repeat(100)))
+                    .body(Body::Empty)
+                    .unwrap()
+            };
+            let first = carrier
+                .request(make("a"), memory.clone(), &tasks, Duration::from_secs(2))
+                .await
+                .unwrap();
+            assert_eq!(first.status(), StatusCode::OK);
+            assert_eq!(state.requests.snapshot().active, 1);
+            let error = carrier
+                .request(make("b"), memory.clone(), &tasks, Duration::from_secs(2))
+                .await
+                .err()
+                .unwrap();
+            assert_eq!(
+                error
+                    .get_ref()
+                    .and_then(|error| error.downcast_ref::<h2::Error>())
+                    .unwrap()
+                    .reason(),
+                Some(h2::Reason::REFUSED_STREAM)
+            );
+            assert!(!state.sessions.lock().contains_key("b"));
+            assert!(!state.session("a").unwrap().cancel.is_cancelled());
+            state.close("a");
+            while state.requests.snapshot().active != 0 {
+                tokio::task::yield_now().await;
+            }
+            let second = carrier
+                .request(make("b"), memory, &tasks, Duration::from_secs(2))
+                .await
+                .unwrap();
+            assert_eq!(second.status(), StatusCode::OK);
+            assert_eq!(state.requests.snapshot().peak, 1);
+            state.close("b");
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn packet_admission_precedes_body_buffering_and_cancellation_releases_waiters() {
+        let state = inactivity_service(64);
+        let _inner = attached_reader(&state, "a");
+        let session = state.session("a").unwrap();
+        let held = session.memory.reserve_packet(64, 0).unwrap();
+        let (mut writer, mut reader) = pipe(state.new_memory());
+        let ready = reader.defer();
+        let pumping = tokio::spawn(async move {
+            if ready.await.is_ok() {
+                writer.write_all(b"not admitted").await.unwrap();
+                true
+            } else {
+                false
+            }
+        });
+        let req = Request::post("http://localhost/t/a/0")
+            .header("referer", format!("/?x_padding={}", "X".repeat(100)))
+            .header("content-length", 12)
+            .body(())
+            .unwrap();
+        let mut post = Box::pin(state.handle(req, reader));
+        assert!(futures::poll!(&mut post).is_pending());
+        tokio::task::yield_now().await;
+        assert!(!pumping.is_finished());
+        assert_eq!(state.memory.snapshot().active, 0);
+        assert_eq!(session.packet_requests.snapshot().active, 1);
+        drop(post);
+        assert!(!pumping.await.unwrap());
+        assert_eq!(session.packet_requests.snapshot().active, 0);
+        assert!(session.state.lock().receiving.is_empty());
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn live_packet_request_limit_applies_across_carriers() {
+        for version in [XhttpVersion::H1, XhttpVersion::H2, XhttpVersion::H3] {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let mut state = service();
+                Arc::get_mut(&mut state)
+                    .unwrap()
+                    .config
+                    .limits
+                    .max_requests_per_session = 4;
+                let _reader = attached_reader(&state, "a");
+                let session = state.session("a").unwrap();
+                let mut servers = Vec::new();
+                let mut posts = Vec::new();
+                for count in 1..=4 {
+                    let (carrier, tasks, endpoint) =
+                        streaming_carrier(state.clone(), version).await;
+                    servers.push((tasks, endpoint));
+                    posts.push(tokio::spawn(async move {
+                        let tasks = Tasks::new();
+                        let request = Request::post("https://localhost/t/a/100")
+                            .header("referer", format!("/?x_padding={}", "X".repeat(100)))
+                            .header("content-length", 0)
+                            .body(Body::Empty)
+                            .unwrap();
+                        carrier
+                            .request(
+                                request,
+                                Memory::new(Arc::new(Budget::new(Some(1024))), 1024),
+                                &tasks,
+                                Duration::from_secs(4),
+                            )
+                            .await
+                            .map(|response| response.status())
+                    }));
+                    if count < 4 {
+                        while session.packet_requests.snapshot().active != count {
+                            tokio::task::yield_now().await;
+                        }
+                    }
+                }
+                let rejected = posts.pop().unwrap().await.unwrap();
+                if version == XhttpVersion::H2 {
+                    let error = rejected.unwrap_err();
+                    assert_eq!(
+                        error
+                            .get_ref()
+                            .and_then(|error| error.downcast_ref::<h2::Error>())
+                            .unwrap()
+                            .reason(),
+                        Some(h2::Reason::REFUSED_STREAM)
+                    );
+                    assert!(!session.cancel.is_cancelled());
+                    assert!(posts.iter().all(|post| !post.is_finished()));
+                    state.close("a");
+                } else {
+                    assert_eq!(rejected.unwrap(), StatusCode::SERVICE_UNAVAILABLE);
+                }
+                for post in posts {
+                    assert_eq!(
+                        post.await.unwrap().unwrap(),
+                        StatusCode::SERVICE_UNAVAILABLE
+                    );
+                }
+                assert_eq!(session.packet_requests.snapshot().active, 0);
+                assert_eq!(session.head_request.snapshot().active, 0);
+                assert!(session.state.lock().receiving.is_empty());
+                assert!(session.state.lock().reserved.is_empty());
+                assert_eq!(state.memory.snapshot().active, 0);
+                assert_eq!(state.admission.snapshot().active, 0);
+            })
+            .await
+            .unwrap_or_else(|error| panic!("{version:?}: {error}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn far_packet_timeout_releases_a_single_stream_carrier() {
+        for version in [XhttpVersion::H1, XhttpVersion::H2, XhttpVersion::H3] {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let mut state = service();
+                let limits = &mut Arc::get_mut(&mut state).unwrap().config.limits;
+                limits.packet_timeout_secs = 1;
+                limits.max_requests_per_connection = 1;
+                let _reader = attached_reader(&state, "a");
+                let (carrier, _server, _endpoint) = streaming_carrier(state, version).await;
+                let tasks = Tasks::new();
+                for (suffix, status) in [
+                    ("a/30", StatusCode::REQUEST_TIMEOUT),
+                    ("b/0", StatusCode::OK),
+                ] {
+                    let request = Request::post(format!("https://localhost/t/{suffix}"))
+                        .header("referer", format!("/?x_padding={}", "X".repeat(100)))
+                        .header("content-length", 0)
+                        .body(Body::Empty)
+                        .unwrap();
+                    let response = carrier
+                        .request(
+                            request,
+                            Memory::new(Arc::new(Budget::new(Some(1024))), 1024),
+                            &tasks,
+                            Duration::from_secs(3),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(response.status(), status);
+                    assert_eq!(response.into_body().read(&mut [0]).await.unwrap(), 0);
+                }
+            })
+            .await
+            .unwrap_or_else(|error| panic!("{version:?}: {error}"));
+        }
     }
 
     #[tokio::test]
@@ -812,6 +1359,88 @@ mod tests {
             request(&state, "GET", "session-9", b"").await.status(),
             StatusCode::CONFLICT
         );
+    }
+
+    #[tokio::test]
+    async fn session_close_between_lookup_and_claim_rejects_both_stream_handles() {
+        for close in [false, true] {
+            let state = service();
+            let session = state.session("a").unwrap();
+            if close {
+                state.close("a");
+            } else {
+                session.cancel.cancel();
+            }
+
+            assert!(matches!(
+                session.claim_download(),
+                Err(StatusCode::CONFLICT)
+            ));
+            assert!(matches!(
+                session.claim_stream_upload(),
+                Err(StatusCode::CONFLICT)
+            ));
+            let inner = session.state.lock();
+            assert!(!inner.downloaded);
+            assert!(inner.upload == Upload::Unclaimed);
+            assert_eq!(inner.reader.is_some(), !close);
+            assert_eq!(inner.writer.is_some(), !close);
+            assert_eq!(inner.permit.is_some(), !close);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn old_download_guard_does_not_close_a_replacement_session() {
+        for expire in [false, true] {
+            let state = service();
+            let response = request(&state, "GET", "a", b"").await;
+            assert_eq!(response.status(), StatusCode::OK);
+            state.close("a");
+            if expire {
+                tokio::time::advance(Duration::from_secs(31)).await;
+                state.reap();
+            } else {
+                for id in ["b", "c"] {
+                    tokio::time::advance(Duration::from_secs(1)).await;
+                    state.session(id).unwrap();
+                    state.close(id);
+                }
+            }
+            let replacement = state.session("a").unwrap();
+            drop(response);
+            tokio::task::yield_now().await;
+            assert!(!replacement.cancel.is_cancelled());
+            assert!(Arc::ptr_eq(&state.session("a").unwrap(), &replacement));
+            assert_eq!(state.admission.snapshot().active, 1);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn closed_packet_cannot_commit_or_close_a_replacement_session() {
+        let state = service();
+        let old = state.session("a").unwrap();
+        let request = Request::post("http://localhost/t/a/1").body(()).unwrap();
+        let (mut writer, mut reader) = pipe(state.new_memory());
+        writer.write_all(b"partial").await.unwrap();
+        let admission = PacketRequest::new(old.clone(), 1).unwrap();
+        let mut packet = Box::pin(state.packet_body(&request, &mut reader, &old, 1, admission));
+        assert!(futures::poll!(&mut packet).is_pending());
+        state.close("a");
+        writer.shutdown().await.unwrap();
+        assert!(matches!(packet.await, Err(StatusCode::SERVICE_UNAVAILABLE)));
+        assert!(old.state.lock().pending.is_empty());
+        assert!(old.state.lock().receiving.is_empty());
+        assert!(old.state.lock().reserved.is_empty());
+        assert_eq!(old.packet_requests.snapshot().active, 0);
+        for id in ["b", "c"] {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            state.session(id).unwrap();
+            state.close(id);
+        }
+        let replacement = state.session("a").unwrap();
+        state.close_session("a", &old);
+        assert!(!replacement.cancel.is_cancelled());
+        assert!(Arc::ptr_eq(&state.session("a").unwrap(), &replacement));
     }
 
     #[tokio::test]
@@ -970,8 +1599,11 @@ mod tests {
             tokio::task::yield_now().await;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
+        while let Some(result) = requests.try_join_next() {
+            assert_eq!(result.unwrap(), StatusCode::OK);
+        }
         assert!(
-            requests.try_join_next().is_none(),
+            !requests.is_empty(),
             "full queues must backpressure, not reject"
         );
         tokio::time::timeout(Duration::from_secs(1), async {
@@ -1228,7 +1860,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn attached_duplicate_packets_wait_for_forwarding() {
+    async fn attached_duplicate_packets_are_queued_only_once() {
         let state = service();
         let session = state.session("a").unwrap();
         let mut reader = {
@@ -1244,15 +1876,11 @@ mod tests {
                 StatusCode::OK
             );
         }
-        let mut later = Box::pin(request(&state, "POST", "a/5", b"BBBBBBBB"));
-        assert!(futures::poll!(&mut later).is_pending());
-        let mut duplicate_later = Box::pin(request(&state, "POST", "a/5", b"BBBBBBBB"));
-        assert!(futures::poll!(&mut duplicate_later).is_pending());
-        let mut next = Box::pin(request(&state, "POST", "a/4", b"AAAAAAAA"));
-        assert!(futures::poll!(&mut next).is_pending());
+        let later = request(&state, "POST", "a/5", b"BBBBBBBB");
+        let duplicate_later = request(&state, "POST", "a/5", b"BBBBBBBB");
+        let next = request(&state, "POST", "a/4", b"AAAAAAAA");
         tokio::task::yield_now().await;
-        let mut duplicate_next = Box::pin(request(&state, "POST", "a/4", b"AAAAAAAA"));
-        assert!(futures::poll!(&mut duplicate_next).is_pending());
+        let duplicate_next = request(&state, "POST", "a/4", b"AAAAAAAA");
         let mut bytes = [0; 48];
         tokio::time::timeout(Duration::from_secs(1), async {
             let (later, duplicate_later, next, duplicate_next, read) = tokio::join!(
@@ -1337,6 +1965,7 @@ struct State {
     resolver: Arc<dyn Resolver>,
     memory: Arc<Budget>,
     admission: Arc<Budget>,
+    requests: Arc<Budget>,
     sessions: parking_lot::Mutex<HashMap<String, Entry>>,
     tasks: Tasks,
 }
@@ -1361,33 +1990,21 @@ struct SessionState {
     upload: Upload,
     writer: Option<Writer>,
     reader: Option<Reader>,
-    pending: BTreeMap<u64, Packet>,
+    pending: BTreeMap<u64, Vec<Bytes>>,
     receiving: BTreeMap<u64, usize>,
     reserved: BTreeMap<u64, usize>,
-    forwarding: Option<(u64, CancellationToken)>,
     next: u64,
     downloaded: bool,
+    upload_deadline: Option<tokio::time::Instant>,
     permit: Option<BudgetPermit>,
 }
 impl SessionState {
-    fn acknowledgement(&self, sequence: u64) -> Option<CancellationToken> {
-        if !self.downloaded {
-            return None;
-        }
-        self.forwarding
-            .as_ref()
-            .filter(|(number, _)| *number == sequence)
-            .map(|(_, forwarded)| forwarded.clone())
-            .or_else(|| {
-                self.pending
-                    .get(&sequence)
-                    .map(|packet| packet.forwarded.clone())
+    fn predecessors_available(&self, sequence: u64, in_progress: &BTreeMap<u64, usize>) -> bool {
+        self.downloaded
+            && (self.next..sequence).all(|number| {
+                self.pending.contains_key(&number) || in_progress.contains_key(&number)
             })
     }
-}
-struct Packet {
-    chunks: Vec<Bytes>,
-    forwarded: CancellationToken,
 }
 struct Session {
     state: parking_lot::Mutex<SessionState>,
@@ -1398,6 +2015,35 @@ struct Session {
     admission: parking_lot::Mutex<Option<BudgetPermit>>,
     progress: Notify,
     activity: Arc<Activity>,
+    packet_requests: Arc<Budget>,
+    head_request: Arc<Budget>,
+}
+
+impl Session {
+    fn claim_download(&self) -> Result<(Reader, BudgetPermit), StatusCode> {
+        let mut state = self.state.lock();
+        // close_entry cancels before taking this lock and removing the handles.
+        if self.cancel.is_cancelled() || state.downloaded {
+            return Err(StatusCode::CONFLICT);
+        }
+        state.downloaded = true;
+        Ok((state.reader.take().unwrap(), state.permit.take().unwrap()))
+    }
+
+    fn claim_stream_upload(&self) -> Result<Writer, StatusCode> {
+        let mut state = self.state.lock();
+        if self.cancel.is_cancelled()
+            || state.upload != Upload::Unclaimed
+            || state
+                .upload_deadline
+                .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+        {
+            return Err(StatusCode::CONFLICT);
+        }
+        state.upload = Upload::Stream;
+        state.upload_deadline = None;
+        Ok(state.writer.take().unwrap())
+    }
 }
 
 struct PacketRequest {
@@ -1407,20 +2053,59 @@ struct PacketRequest {
     primary: bool,
 }
 
+#[derive(Debug, PartialEq)]
+enum Rejection {
+    Status(StatusCode),
+    Full,
+}
+
+impl From<StatusCode> for Rejection {
+    fn from(status: StatusCode) -> Self {
+        Self::Status(status)
+    }
+}
+
+#[derive(Clone)]
+struct Refused;
+
+#[derive(Clone)]
+struct RequestReset(CancellationToken);
+
 impl PacketRequest {
-    fn new(session: Arc<Session>, sequence: u64) -> Self {
-        let primary = {
+    fn new(session: Arc<Session>, sequence: u64) -> Result<(Self, BudgetPermit), Rejection> {
+        let (primary, permit) = {
             let mut state = session.state.lock();
+            if session.cancel.is_cancelled() {
+                return Err(StatusCode::SERVICE_UNAVAILABLE.into());
+            }
+            if state.upload == Upload::Stream || state.upload_deadline.is_some() {
+                return Err(StatusCode::CONFLICT.into());
+            }
+            let permit = session
+                .packet_requests
+                .acquire(1)
+                .or_else(|| {
+                    // Far requests and duplicates cannot consume the missing head's last slot.
+                    if sequence == state.next && !state.receiving.contains_key(&sequence) {
+                        session.head_request.acquire(1)
+                    } else {
+                        None
+                    }
+                })
+                .ok_or(Rejection::Full)?;
             let count = state.receiving.entry(sequence).or_default();
             *count += 1;
-            *count == 1
+            (*count == 1, permit)
         };
-        Self {
-            session,
-            sequence,
-            reserved: false,
-            primary,
-        }
+        Ok((
+            Self {
+                session,
+                sequence,
+                reserved: false,
+                primary,
+            },
+            permit,
+        ))
     }
 
     fn touch(&self) {
@@ -1462,18 +2147,37 @@ struct DownloadGuard {
 }
 impl Drop for DownloadGuard {
     fn drop(&mut self) {
-        if self.eof.is_cancelled()
-            && self.session.as_ref().is_none_or(|session| {
-                session
-                    .upgrade()
-                    .is_some_and(|session| session.state.lock().upload == Upload::Stream)
-            })
-        {
-            return;
+        if self.eof.is_cancelled() {
+            let Some(session) = &self.session else {
+                return;
+            };
+            if let Some(session) = session.upgrade() {
+                let mut state = session.state.lock();
+                if state.upload == Upload::Stream {
+                    return;
+                }
+                if !session.cancel.is_cancelled()
+                    && state.upload == Upload::Unclaimed
+                    && state.receiving.is_empty()
+                    && self.state.upgrade().is_some_and(|service| {
+                        matches!(
+                            service.config.mode,
+                            crate::config::xhttp::XhttpMode::Auto
+                                | crate::config::xhttp::XhttpMode::StreamUp
+                        )
+                    })
+                {
+                    state.upload_deadline =
+                        Some(tokio::time::Instant::now() + Duration::from_secs(30));
+                    return;
+                }
+            }
         }
         self.cancel.cancel();
-        if let Some(state) = self.state.upgrade() {
-            state.close(&self.id);
+        if let Some(state) = self.state.upgrade()
+            && let Some(session) = self.session.as_ref().and_then(Weak::upgrade)
+        {
+            state.close_session(&self.id, &session);
         }
     }
 }
@@ -1499,6 +2203,7 @@ impl XhttpServer {
             resolver: resolver.clone(),
             memory: Arc::new(Budget::new(Some(config.limits.max_buffered_bytes))),
             admission: Arc::new(Budget::new(Some(config.limits.max_sessions))),
+            requests: Arc::new(Budget::new(Some(config.limits.max_requests))),
             sessions: parking_lot::Mutex::new(HashMap::new()),
             tasks: Tasks::new(),
             config,
@@ -1511,6 +2216,11 @@ impl XhttpServer {
                     break;
                 };
                 state.reap();
+                log::debug!(
+                    "XHTTP server resources: requests={:?} bytes={:?}",
+                    state.requests.snapshot(),
+                    state.memory.snapshot()
+                );
             }
         });
         Ok(Self { state })
@@ -1536,8 +2246,13 @@ impl XhttpServer {
                 drop(resolver);
                 continue;
             }
+            let Some(request_permit) = self.state.requests.acquire(1) else {
+                drop(resolver);
+                continue;
+            };
             let state = self.state.clone();
             requests.spawn(async move {
+                let _request_permit = request_permit;
                 let Ok(Ok((request, stream))) = tokio::time::timeout(
                     Duration::from_secs(state.config.limits.setup_timeout_secs),
                     resolver.resolve_request(),
@@ -1548,13 +2263,14 @@ impl XhttpServer {
                 };
                 let (mut send, mut receive) = stream.split();
                 let workers = Tasks::new();
-                let memory = Memory::new(
-                    state.memory.clone(),
-                    state.config.limits.max_session_buffered_bytes,
-                );
-                let (mut writer, reader) = pipe(memory);
+                let memory = state.new_memory();
+                let (mut writer, mut reader) = pipe(memory);
+                let ready = reader.defer();
                 let upload_closed = writer.closed();
                 workers.spawn(async move {
+                    if ready.await.is_err() {
+                        return;
+                    }
                     let result: io::Result<()> = async {
                         while let Some(mut data) =
                             receive.recv_data().await.map_err(io::Error::other)?
@@ -1656,9 +2372,24 @@ impl TcpServerHandler for XhttpServer {
 }
 
 impl State {
+    fn new_memory(&self) -> Memory {
+        Memory::new(
+            self.memory.clone(),
+            self.config.limits.max_session_buffered_bytes,
+        )
+    }
+
+    #[cfg(test)]
     fn close(&self, id: &str) {
         let mut sessions = self.sessions.lock();
         self.close_entry(&mut sessions, id);
+    }
+
+    fn close_session(&self, id: &str, session: &Arc<Session>) {
+        let mut sessions = self.sessions.lock();
+        if matches!(sessions.get(id), Some(Entry::Live(current)) if Arc::ptr_eq(current, session)) {
+            self.close_entry(&mut sessions, id);
+        }
     }
 
     fn close_entry(&self, sessions: &mut HashMap<String, Entry>, id: &str) {
@@ -1710,11 +2441,13 @@ impl State {
         let expired: Vec<_> = sessions
             .iter()
             .filter_map(|(id, entry)| match entry {
-                Entry::Live(session)
-                    if !session.state.lock().downloaded
-                        && session.created.elapsed() >= Duration::from_secs(30) =>
-                {
-                    Some(id.clone())
+                Entry::Live(session) => {
+                    let state = session.state.lock();
+                    ((!state.downloaded && session.created.elapsed() >= Duration::from_secs(30))
+                        || state
+                            .upload_deadline
+                            .is_some_and(|deadline| tokio::time::Instant::now() >= deadline))
+                    .then(|| id.clone())
                 }
                 _ => None,
             })
@@ -1751,10 +2484,7 @@ impl State {
             .admission
             .acquire(1)
             .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-        let memory = Memory::new(
-            self.memory.clone(),
-            self.config.limits.max_session_buffered_bytes,
-        );
+        let memory = self.new_memory();
         let (writer, mut reader) = pipe(memory.clone());
         let activity = Arc::new(Activity::new());
         reader.activity = Some(activity.clone());
@@ -1766,9 +2496,9 @@ impl State {
                 pending: BTreeMap::new(),
                 receiving: BTreeMap::new(),
                 reserved: BTreeMap::new(),
-                forwarding: None,
                 next: 0,
                 downloaded: false,
+                upload_deadline: None,
                 permit: Some(permit),
             }),
             memory,
@@ -1778,6 +2508,10 @@ impl State {
             admission: parking_lot::Mutex::new(Some(admission)),
             activity,
             progress: Notify::new(),
+            packet_requests: Arc::new(Budget::new(Some(
+                self.config.limits.max_requests_per_session - 1,
+            ))),
+            head_request: Arc::new(Budget::new(Some(1))),
         });
         sessions.insert(id.into(), Entry::Live(session.clone()));
         Ok(session)
@@ -1832,400 +2566,437 @@ impl State {
     async fn dispatch(
         self: &Arc<Self>,
         request: &Request<()>,
-        mut body: Reader,
-    ) -> Result<(Body, bool), StatusCode> {
+        body: Reader,
+    ) -> Result<(Body, bool), Rejection> {
         match wire::classify(&self.config, &self.path, request)? {
             Kind::Options => Ok((Body::Empty, false)),
-            Kind::One => {
-                let admission = self
-                    .admission
-                    .acquire(1)
-                    .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-                let permit =
-                    crate::resources::try_stream().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-                let memory = Memory::new(
-                    self.memory.clone(),
-                    self.config.limits.max_session_buffered_bytes,
-                );
-                let (writer, reader) = pipe(memory);
-                let tasks = Arc::new(Tasks::new());
-                let stream = Stream {
-                    read: body,
-                    write: writer,
-                    _tasks: tasks.clone(),
-                };
-                self.spawn_inner_session(stream, permit, tasks.cancel.clone(), move || {
-                    drop(admission);
-                });
-                let guard = DownloadGuard {
-                    state: Weak::new(),
-                    session: None,
-                    id: String::new(),
-                    cancel: tasks.cancel.clone(),
-                    eof: reader.eof.clone(),
-                };
-                Ok((Body::stream(reader).with_guard(guard), true))
-            }
-            Kind::Download(id) => {
-                let session = self.session(&id)?;
-                let (reader, permit) = {
-                    let mut state = session.state.lock();
-                    if state.downloaded {
-                        return Err(StatusCode::CONFLICT);
-                    }
-                    state.downloaded = true;
-                    (state.reader.take().unwrap(), state.permit.take().unwrap())
-                };
-                session.progress.notify_waiters();
-                let (writer, output) = pipe(session.memory.clone());
-                let tasks = Arc::new(Tasks::new());
-                let stream = Stream {
-                    read: reader,
-                    write: writer,
-                    _tasks: tasks,
-                };
-                let state = Arc::downgrade(self);
-                let session_id = id.clone();
-                self.spawn_inner_session(stream, permit, session.cancel.clone(), move || {
-                    if let Some(state) = state.upgrade() {
-                        state.close(&session_id);
-                    }
-                });
-                let guard = DownloadGuard {
-                    state: Arc::downgrade(self),
-                    session: Some(Arc::downgrade(&session)),
-                    id,
-                    cancel: session.cancel.clone(),
-                    eof: output.eof.clone(),
-                };
-                Ok((Body::stream(output).with_guard(guard), true))
-            }
-            Kind::Upload(id) => {
-                let session = self.session(&id)?;
-                let mut writer = {
-                    let mut state = session.state.lock();
-                    if state.upload != Upload::Unclaimed {
-                        return Err(StatusCode::CONFLICT);
-                    }
-                    state.upload = Upload::Stream;
-                    state.writer.take().unwrap()
-                };
-                let (mut padding_writer, padding_reader) = pipe(session.memory.clone());
-                let interval = if request
-                    .headers()
-                    .get("referer")
-                    .is_some_and(|v| !v.is_empty())
-                {
-                    self.config
-                        .sc_stream_up_server_secs
-                        .bounds((20, 80), true)
-                        .unwrap()
-                } else {
-                    (0, 0)
-                };
-                let padding = self
-                    .config
-                    .x_padding_bytes
-                    .bounds((100, 1000), false)
-                    .unwrap();
-                let cancel = session.cancel.clone();
-                self.tasks.spawn(async move {
-                    let upload = async {
-                        tokio::io::copy(&mut body, &mut writer).await?;
-                        writer.shutdown().await
-                    };
-                    let padding = async {
-                        if interval.1 == 0 {
-                            std::future::pending::<()>().await;
-                        }
-                        loop {
-                            padding_writer
-                                .write_all(&vec![b'X'; wire::sample(padding) as usize])
-                                .await?;
-                            tokio::time::sleep(Duration::from_secs(wire::sample(interval) as u64))
-                                .await;
-                        }
-                        #[allow(unreachable_code)]
-                        Ok::<_, io::Error>(())
-                    };
-                    tokio::select! {
-                        _ = cancel.cancelled() => {},
-                        result = upload => {
-                            if result.is_err() {
-                                cancel.cancel();
-                            }
-                        },
-                        _ = padding => { cancel.cancel(); }
-                    }
-                    let _ = padding_writer.shutdown().await;
-                });
-                Ok((Body::stream(padding_reader), false))
-            }
-            Kind::Packet(id, sequence) => {
-                use std::ops::ControlFlow;
+            Kind::One => self.stream_one(body).map_err(Into::into),
+            Kind::Download(id) => self.download(id).map_err(Into::into),
+            Kind::Upload(id) => self.stream_upload(request, body, id).map_err(Into::into),
+            Kind::Packet(id, sequence) => self.packet(request, body, id, sequence).await,
+        }
+    }
 
-                let session = self.session(&id)?;
-                {
-                    let state = session.state.lock();
-                    if state.upload == Upload::Stream {
-                        return Err(StatusCode::CONFLICT);
+    fn stream_one(self: &Arc<Self>, body: Reader) -> Result<(Body, bool), StatusCode> {
+        let admission = self
+            .admission
+            .acquire(1)
+            .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+        let permit = crate::resources::try_stream().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+        let memory = self.new_memory();
+        let (writer, reader) = pipe(memory);
+        let tasks = Arc::new(Tasks::new());
+        let stream = Stream {
+            read: body,
+            write: writer,
+            _tasks: tasks.clone(),
+        };
+        self.spawn_inner_session(stream, permit, tasks.cancel.clone(), move || {
+            drop(admission);
+        });
+        let guard = DownloadGuard {
+            state: Weak::new(),
+            session: None,
+            id: String::new(),
+            cancel: tasks.cancel.clone(),
+            eof: reader.eof.clone(),
+        };
+        Ok((Body::stream(reader).with_guard(guard), true))
+    }
+
+    fn download(self: &Arc<Self>, id: String) -> Result<(Body, bool), StatusCode> {
+        let session = self.session(&id)?;
+        let (reader, permit) = session.claim_download()?;
+        session.progress.notify_waiters();
+        let (writer, output) = pipe(self.new_memory());
+        let tasks = Arc::new(Tasks::new());
+        let stream = Stream {
+            read: reader,
+            write: writer,
+            _tasks: tasks,
+        };
+        let state = Arc::downgrade(self);
+        let session_id = id.clone();
+        let completed = Arc::downgrade(&session);
+        self.spawn_inner_session(stream, permit, session.cancel.clone(), move || {
+            if let Some(state) = state.upgrade()
+                && let Some(session) = completed.upgrade()
+            {
+                state.close_session(&session_id, &session);
+            }
+        });
+        let guard = DownloadGuard {
+            state: Arc::downgrade(self),
+            session: Some(Arc::downgrade(&session)),
+            id,
+            cancel: session.cancel.clone(),
+            eof: output.eof.clone(),
+        };
+        Ok((Body::stream(output).with_guard(guard), true))
+    }
+
+    fn stream_upload(
+        self: &Arc<Self>,
+        request: &Request<()>,
+        mut body: Reader,
+        id: String,
+    ) -> Result<(Body, bool), StatusCode> {
+        let session = self.session(&id)?;
+        let mut writer = session.claim_stream_upload()?;
+        let (mut padding_writer, padding_reader) = pipe(session.memory.clone());
+        let interval = if request
+            .headers()
+            .get("referer")
+            .is_some_and(|v| !v.is_empty())
+        {
+            self.config
+                .sc_stream_up_server_secs
+                .bounds((20, 80), true)
+                .unwrap()
+        } else {
+            (0, 0)
+        };
+        let padding = self
+            .config
+            .x_padding_bytes
+            .bounds((100, 1000), false)
+            .unwrap();
+        let cancel = session.cancel.clone();
+        self.tasks.spawn(async move {
+            let upload = async {
+                body.forward_to(&mut writer).await?;
+                writer.shutdown().await
+            };
+            let padding = async {
+                if interval.1 == 0 {
+                    std::future::pending::<()>().await;
+                }
+                loop {
+                    padding_writer
+                        .write_all(&vec![b'X'; wire::sample(padding) as usize])
+                        .await?;
+                    tokio::time::sleep(Duration::from_secs(wire::sample(interval) as u64)).await;
+                }
+                #[allow(unreachable_code)]
+                Ok::<_, io::Error>(())
+            };
+            tokio::select! {
+                _ = cancel.cancelled() => {},
+                result = upload => {
+                    if result.is_err() {
+                        cancel.cancel();
                     }
+                },
+                _ = padding => { cancel.cancel(); }
+            }
+            let _ = padding_writer.shutdown().await;
+        });
+        Ok((Body::stream(padding_reader), false))
+    }
+
+    async fn packet(
+        self: &Arc<Self>,
+        request: &Request<()>,
+        mut body: Reader,
+        id: String,
+        sequence: u64,
+    ) -> Result<(Body, bool), Rejection> {
+        let session = self.session(&id)?;
+        let admission = match PacketRequest::new(session.clone(), sequence) {
+            Ok(admission) => admission,
+            Err(Rejection::Full) if request.version() == http::Version::HTTP_2 => {
+                log::debug!(
+                    "XHTTP session {id} request limit reached; refusing unaccepted packet {sequence}"
+                );
+                return Err(Rejection::Full);
+            }
+            Err(error) => {
+                if error != Rejection::Status(StatusCode::CONFLICT) {
+                    self.close_session(&id, &session);
                 }
-                let max = self
-                    .config
-                    .sc_max_each_post_bytes
-                    .bounds((1_000_000, 1_000_000), false)
-                    .unwrap()
-                    .1 as usize;
-                let initial =
-                    wire::header_payload(request.headers()).map_err(|_| StatusCode::BAD_REQUEST)?;
-                let mut size = initial.len();
-                let mut reservation = max.min(self.config.limits.max_session_buffered_bytes);
-                if let Some(length) = request.headers().get(http::header::CONTENT_LENGTH) {
-                    let length = length
-                        .to_str()
-                        .ok()
-                        .and_then(|v| v.parse::<u64>().ok())
-                        .ok_or(StatusCode::BAD_REQUEST)?;
-                    if length > max.saturating_sub(size) as u64 {
-                        return Err(StatusCode::PAYLOAD_TOO_LARGE);
-                    }
-                    reservation = size + length as usize;
-                }
-                if size > max {
-                    return Err(StatusCode::PAYLOAD_TOO_LARGE);
-                }
-                if reservation > self.config.limits.max_session_buffered_bytes {
-                    return Err(StatusCode::SERVICE_UNAVAILABLE);
-                }
-                let arrived = tokio::time::Instant::now();
-                let timeout = Duration::from_secs(self.config.limits.packet_timeout_secs);
-                let ingest = async {
-                    let mut packet_request = PacketRequest::new(session.clone(), sequence);
-                    let admission = async {
-                        loop {
-                            let released = session.memory.packet_space_released();
-                            let progress = session.progress.notified();
-                            tokio::pin!(released, progress);
-                            released.as_mut().enable();
-                            progress.as_mut().enable();
-                            {
-                                let mut state = session.state.lock();
-                                if state.upload == Upload::Stream {
-                                    return Err(StatusCode::CONFLICT);
-                                }
-                                state.upload = Upload::Packet;
-                                if sequence < state.next {
-                                    return Ok(ControlFlow::Break(state.acknowledgement(sequence)));
-                                }
-                                let contiguous = state.downloaded
-                                    && (state.next..sequence).all(|number| {
-                                        state.pending.contains_key(&number)
-                                            || state.reserved.contains_key(&number)
-                                    });
-                                if sequence.saturating_sub(state.next)
-                                    >= self.config.buffered_posts() as u64
-                                {
-                                    if !state.downloaded
-                                        || !(state.next..sequence).all(|number| {
-                                            state.pending.contains_key(&number)
-                                                || state.receiving.contains_key(&number)
-                                        })
-                                    {
-                                        return Err(StatusCode::SERVICE_UNAVAILABLE);
-                                    }
-                                } else {
-                                    // Out-of-order packets must leave space for their missing predecessor.
-                                    let headroom = if contiguous || sequence == state.next {
-                                        0
-                                    } else {
-                                        max.min(self.config.limits.max_session_buffered_bytes)
-                                    };
-                                    if let Some(memory) =
-                                        session.memory.reserve_packet(reservation, headroom)
-                                    {
-                                        *state.reserved.entry(sequence).or_default() += 1;
-                                        packet_request.reserved = true;
-                                        session.progress.notify_waiters();
-                                        break Ok(ControlFlow::Continue(memory));
-                                    }
-                                }
-                            }
-                            tokio::select! {
-                                _ = released => {},
-                                _ = progress => {},
-                            }
-                        }
-                    };
-                    let mut memory = match session
-                        .activity
-                        .idle(arrived, timeout, admission)
-                        .await
-                        .map_err(|_| StatusCode::REQUEST_TIMEOUT)??
-                    {
-                        ControlFlow::Break(ack) => return Ok(ack),
-                        ControlFlow::Continue(memory) => memory,
-                    };
-                    let mut chunks = Vec::new();
-                    // On cancellation, remove admission markers before releasing byte permits.
-                    let body_request = packet_request;
-                    let body_activity = Activity::new();
-                    let intake = async {
-                        if !initial.is_empty() {
-                            chunks.push(
-                                memory
-                                    .copy(&initial)
-                                    .await
-                                    .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?,
-                            );
-                            body_activity.touch();
-                            body_request.touch();
-                        }
-                        loop {
-                            let data = match body.receiver.recv().await {
-                                Some(Event::Data(data)) => data,
-                                Some(Event::Flush(ack) | Event::Drain(ack)) => {
-                                    let _ = ack.send(());
-                                    continue;
-                                }
-                                Some(Event::Finish) => break,
-                                Some(Event::Error(_)) | None => {
-                                    return Err(StatusCode::BAD_REQUEST);
-                                }
-                            };
-                            size = size
-                                .checked_add(data.len())
-                                .ok_or(StatusCode::PAYLOAD_TOO_LARGE)?;
-                            if size > max {
-                                return Err(StatusCode::PAYLOAD_TOO_LARGE);
-                            }
-                            if data.is_empty() {
-                                continue;
-                            }
-                            chunks.push(
-                                memory
-                                    .retain(data)
-                                    .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?,
-                            );
-                            body_activity.touch();
-                            body_request.touch();
-                        }
-                        Ok::<_, StatusCode>(())
-                    };
-                    body_activity
-                        .idle(tokio::time::Instant::now(), timeout, intake)
-                        .await
-                        .map_err(|_| StatusCode::REQUEST_TIMEOUT)??;
-                    let forwarded = CancellationToken::new();
-                    let writer = {
-                        let mut state = session.state.lock();
-                        if sequence < state.next {
-                            return Ok(state.acknowledgement(sequence));
-                        }
-                        if let Some(previous) = state.pending.get(&sequence) {
-                            if previous
-                                .chunks
-                                .iter()
-                                .flat_map(|b| b.iter())
-                                .eq(chunks.iter().flat_map(|b| b.iter()))
-                            {
-                                return Ok(state.acknowledgement(sequence));
-                            }
-                            return Err(StatusCode::CONFLICT);
-                        }
-                        if state.pending.len() >= self.config.buffered_posts() {
-                            session.cancel.cancel();
-                            return Err(StatusCode::SERVICE_UNAVAILABLE);
-                        }
-                        state.pending.insert(
-                            sequence,
-                            Packet {
-                                chunks,
-                                forwarded: forwarded.clone(),
-                            },
-                        );
-                        state.writer.take()
-                    };
-                    drop(memory);
-                    if let Some(mut writer) = writer {
-                        let session = session.clone();
-                        self.tasks.spawn(async move {
-                            let work = async {
-                                loop {
-                                    let chunks = {
-                                        let mut state = session.state.lock();
-                                        let next = state.next;
-                                        let chunks = state.pending.remove(&next);
-                                        if let Some(packet) = &chunks {
-                                            state.forwarding =
-                                                Some((next, packet.forwarded.clone()));
-                                            state.next = next.checked_add(1).ok_or_else(|| {
-                                                io::Error::other("sequence exhausted")
-                                            })?;
-                                            session.progress.notify_waiters();
-                                        }
-                                        chunks
-                                    };
-                                    match chunks {
-                                        Some(packet) => {
-                                            for chunk in packet.chunks {
-                                                writer.forward(chunk).await?;
-                                            }
-                                            session.state.lock().forwarding = None;
-                                            packet.forwarded.cancel();
-                                        }
-                                        None => session.ready.notified().await,
-                                    }
-                                }
-                                #[allow(unreachable_code)]
-                                Ok::<_, io::Error>(())
-                            };
-                            tokio::select! {
-                                _ = session.cancel.cancelled() => {},
-                                _ = work => { session.cancel.cancel(); }
-                            }
-                        });
-                    }
-                    session.ready.notify_one();
-                    let downloaded = session.state.lock().downloaded;
-                    Ok(downloaded.then_some(forwarded))
-                };
-                let work = async {
-                    if let Some(forwarded) = ingest.await? {
-                        session
-                            .activity
-                            .idle(tokio::time::Instant::now(), timeout, forwarded.cancelled())
-                            .await
-                            .map_err(|_| StatusCode::REQUEST_TIMEOUT)?;
-                    }
-                    Ok((Body::Empty, false))
-                };
-                tokio::select! {
-                    result = work => result,
-                    _ = session.cancel.cancelled() => Err(StatusCode::SERVICE_UNAVAILABLE),
-                }
+                return Err(match error {
+                    Rejection::Full => StatusCode::SERVICE_UNAVAILABLE.into(),
+                    error => error,
+                });
+            }
+        };
+        let result = self
+            .packet_body(request, &mut body, &session, sequence, admission)
+            .await;
+        if matches!(result, Err(status) if status != StatusCode::CONFLICT) {
+            self.close_session(&id, &session);
+        }
+        result.map_err(Into::into)
+    }
+
+    async fn packet_body(
+        self: &Arc<Self>,
+        request: &Request<()>,
+        body: &mut Reader,
+        session: &Arc<Session>,
+        sequence: u64,
+        (mut packet_request, _request_permit): (PacketRequest, BudgetPermit),
+    ) -> Result<(Body, bool), StatusCode> {
+        use std::ops::ControlFlow;
+
+        {
+            let state = session.state.lock();
+            if session.cancel.is_cancelled() {
+                return Err(StatusCode::SERVICE_UNAVAILABLE);
+            }
+            if state.upload == Upload::Stream {
+                return Err(StatusCode::CONFLICT);
             }
         }
+        let max = self
+            .config
+            .sc_max_each_post_bytes
+            .bounds((1_000_000, 1_000_000), false)
+            .unwrap()
+            .1 as usize;
+        let initial =
+            wire::header_payload(request.headers()).map_err(|_| StatusCode::BAD_REQUEST)?;
+        let mut size = initial.len();
+        let mut reservation = max.min(self.config.limits.max_session_buffered_bytes);
+        if let Some(length) = request.headers().get(http::header::CONTENT_LENGTH) {
+            let length = length
+                .to_str()
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .ok_or(StatusCode::BAD_REQUEST)?;
+            if length > max.saturating_sub(size) as u64 {
+                return Err(StatusCode::PAYLOAD_TOO_LARGE);
+            }
+            reservation = size + length as usize;
+        }
+        if size > max {
+            return Err(StatusCode::PAYLOAD_TOO_LARGE);
+        }
+        if reservation > self.config.limits.max_session_buffered_bytes {
+            return Err(StatusCode::SERVICE_UNAVAILABLE);
+        }
+        let arrived = tokio::time::Instant::now();
+        let timeout = Duration::from_secs(self.config.limits.packet_timeout_secs);
+        let ingest = async {
+            let admission = async {
+                loop {
+                    let released = session.memory.packet_space_released();
+                    let progress = session.progress.notified();
+                    tokio::pin!(released, progress);
+                    released.as_mut().enable();
+                    progress.as_mut().enable();
+                    {
+                        let mut state = session.state.lock();
+                        if session.cancel.is_cancelled() {
+                            return Err(StatusCode::SERVICE_UNAVAILABLE);
+                        }
+                        if state.upload == Upload::Stream {
+                            return Err(StatusCode::CONFLICT);
+                        }
+                        state.upload = Upload::Packet;
+                        if sequence < state.next {
+                            return Ok(ControlFlow::Break(()));
+                        }
+                        if sequence.saturating_sub(state.next)
+                            >= self.config.buffered_posts() as u64
+                        {
+                            if !state.downloaded {
+                                return Err(StatusCode::SERVICE_UNAVAILABLE);
+                            }
+                        } else {
+                            let contiguous =
+                                state.predecessors_available(sequence, &state.reserved);
+                            // Out-of-order packets must leave space for their missing predecessor.
+                            let headroom = if contiguous || sequence == state.next {
+                                0
+                            } else {
+                                max.min(self.config.limits.max_session_buffered_bytes)
+                            };
+                            if let Some(memory) =
+                                session.memory.reserve_packet(reservation, headroom)
+                            {
+                                *state.reserved.entry(sequence).or_default() += 1;
+                                packet_request.reserved = true;
+                                session.progress.notify_waiters();
+                                break Ok(ControlFlow::Continue(memory));
+                            }
+                        }
+                    }
+                    tokio::select! {
+                        _ = released => {},
+                        _ = progress => {},
+                    }
+                }
+            };
+            let cancelled = async {
+                match request.extensions().get::<RequestReset>() {
+                    Some(reset) => reset.0.cancelled().await,
+                    None => std::future::pending().await,
+                }
+            };
+            let admitted = tokio::select! {
+                biased;
+                // A reset before body admission withdraws only this request, not the session.
+                _ = cancelled => return Err(StatusCode::CONFLICT),
+                result = session.activity.idle(arrived, timeout, admission) => {
+                    result.map_err(|_| StatusCode::REQUEST_TIMEOUT)??
+                }
+            };
+            let mut memory = match admitted {
+                ControlFlow::Break(()) => return Ok(()),
+                ControlFlow::Continue(memory) => memory,
+            };
+            body.start();
+            let mut chunks = Vec::new();
+            // On cancellation, remove admission markers before releasing byte permits.
+            let body_request = packet_request;
+            let body_activity = Activity::new();
+            let intake = async {
+                if !initial.is_empty() {
+                    chunks.push(
+                        memory
+                            .copy(&initial)
+                            .await
+                            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?,
+                    );
+                    body_activity.touch();
+                    body_request.touch();
+                }
+                loop {
+                    let data = match body.receiver.recv().await {
+                        Some(Event::Allocated(data)) => data,
+                        Some(Event::Flush(ack) | Event::Drain(ack)) => {
+                            let _ = ack.send(());
+                            continue;
+                        }
+                        Some(Event::Finish) => break,
+                        Some(Event::Data(_) | Event::Error(_)) | None => {
+                            return Err(StatusCode::BAD_REQUEST);
+                        }
+                    };
+                    size = size
+                        .checked_add(data.len())
+                        .ok_or(StatusCode::PAYLOAD_TOO_LARGE)?;
+                    if size > max {
+                        return Err(StatusCode::PAYLOAD_TOO_LARGE);
+                    }
+                    if data.len() == 0 {
+                        continue;
+                    }
+                    memory
+                        .retain(data, &mut chunks)
+                        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+                    body_activity.touch();
+                    body_request.touch();
+                }
+                Ok::<_, StatusCode>(())
+            };
+            body_activity
+                .idle(tokio::time::Instant::now(), timeout, intake)
+                .await
+                .map_err(|_| StatusCode::REQUEST_TIMEOUT)??;
+            let writer = {
+                let mut state = session.state.lock();
+                if session.cancel.is_cancelled() {
+                    return Err(StatusCode::SERVICE_UNAVAILABLE);
+                }
+                if sequence < state.next {
+                    return Ok(());
+                }
+                if let Some(previous) = state.pending.get(&sequence) {
+                    if previous
+                        .iter()
+                        .flat_map(|b| b.iter())
+                        .eq(chunks.iter().flat_map(|b| b.as_ref().iter()))
+                    {
+                        return Ok(());
+                    }
+                    return Err(StatusCode::CONFLICT);
+                }
+                if state.pending.len() >= self.config.buffered_posts() {
+                    session.cancel.cancel();
+                    return Err(StatusCode::SERVICE_UNAVAILABLE);
+                }
+                state.pending.insert(
+                    sequence,
+                    chunks.into_iter().map(|chunk| chunk.into_bytes()).collect(),
+                );
+                state.writer.take()
+            };
+            drop(memory);
+            if let Some(writer) = writer {
+                self.spawn_packet_forwarder(session.clone(), writer);
+            }
+            session.ready.notify_one();
+            Ok(())
+        };
+        let work = async {
+            ingest.await?;
+            if session.cancel.is_cancelled() {
+                Err(StatusCode::SERVICE_UNAVAILABLE)
+            } else {
+                Ok((Body::Empty, false))
+            }
+        };
+        tokio::select! {
+            result = work => result,
+            _ = session.cancel.cancelled() => Err(StatusCode::SERVICE_UNAVAILABLE),
+        }
+    }
+
+    fn spawn_packet_forwarder(&self, session: Arc<Session>, mut writer: Writer) {
+        self.tasks.spawn(async move {
+            let work = async {
+                loop {
+                    let packet = {
+                        let mut state = session.state.lock();
+                        let next = state.next;
+                        let packet = state.pending.remove(&next);
+                        if packet.is_some() {
+                            state.next = next
+                                .checked_add(1)
+                                .ok_or_else(|| io::Error::other("sequence exhausted"))?;
+                            session.progress.notify_waiters();
+                        }
+                        packet
+                    };
+                    match packet {
+                        Some(packet) => {
+                            for chunk in packet {
+                                writer.forward(chunk).await?;
+                            }
+                        }
+                        None => session.ready.notified().await,
+                    }
+                }
+                #[allow(unreachable_code)]
+                Ok::<_, io::Error>(())
+            };
+            tokio::select! {
+                _ = session.cancel.cancelled() => {},
+                _ = work => { session.cancel.cancel(); }
+            }
+        });
     }
 
     async fn handle(self: &Arc<Self>, request: Request<()>, body: Reader) -> Response<Body> {
         let result = self.dispatch(&request, body).await;
         let mut response = match result {
             Ok((body, downstream)) => self.response(StatusCode::OK, body, downstream),
-            Err(StatusCode::NOT_FOUND) => {
+            Err(Rejection::Full) => {
+                let mut response =
+                    self.response(StatusCode::SERVICE_UNAVAILABLE, Body::Empty, false);
+                response.extensions_mut().insert(Refused);
+                return response;
+            }
+            Err(Rejection::Status(StatusCode::NOT_FOUND)) => {
                 return Response::builder()
                     .status(StatusCode::NOT_FOUND)
                     .body(Body::Empty)
                     .unwrap();
             }
-            Err(status) => {
+            Err(Rejection::Status(status)) => {
                 log::debug!("XHTTP request {} rejected: {status}", request.uri().path());
-                if status != StatusCode::CONFLICT
-                    && let Ok(Kind::Packet(id, _)) =
-                        wire::classify(&self.config, &self.path, &request)
-                {
-                    self.close(&id);
-                }
                 self.response(status, Body::Empty, false)
             }
         };
@@ -2275,24 +3046,40 @@ impl State {
             received_header.notify_one();
             let state = self.clone();
             async move {
+                let Some(request_permit) = state.requests.acquire(1) else {
+                    let mut response =
+                        state.response(StatusCode::SERVICE_UNAVAILABLE, Body::Empty, false);
+                    response
+                        .headers_mut()
+                        .insert("connection", http::HeaderValue::from_static("close"));
+                    return Ok::<_, io::Error>(response);
+                };
                 let (parts, body) = request.into_parts();
                 let request = Request::from_parts(parts, ());
                 let streaming_upload = matches!(
                     wire::classify(&state.config, &state.path, &request),
                     Ok(Kind::One | Kind::Upload(_))
                 );
-                let (writer, reader) = pipe(Memory::new(
-                    state.memory.clone(),
-                    state.config.limits.max_session_buffered_bytes,
-                ));
+                let (writer, mut reader) = pipe(state.new_memory());
+                let ready = reader.defer();
                 let tasks = Arc::new(Tasks::new());
                 let eof = CancellationToken::new();
-                tasks.spawn(carrier::receive_hyper(body, writer, Some(eof.clone())));
-                let response = state.handle(request, reader).await;
+                if hyper::body::Body::is_end_stream(&body) {
+                    eof.cancel();
+                }
+                let received = eof.clone();
+                tasks.spawn(async move {
+                    if ready.await.is_ok() {
+                        carrier::receive_hyper(body, writer, Some(received)).await;
+                    }
+                });
+                let mut response = state
+                    .handle(request, reader)
+                    .await
+                    .map(|body| body.with_guard(request_permit));
                 if streaming_upload && response.status() == StatusCode::OK {
                     return Ok::<_, io::Error>(response.map(|body| body.with_guard(tasks)));
                 }
-                let mut response = response;
                 if !eof.is_cancelled() {
                     response
                         .headers_mut()
@@ -2321,13 +3108,14 @@ impl State {
         stream: Box<dyn AsyncStream>,
         deadline: tokio::time::Instant,
     ) -> io::Result<()> {
+        let (stream_window, connection_window) = self.config.limits.h2_windows();
         let mut connection = tokio::time::timeout_at(
             deadline,
             h2::server::Builder::new()
                 .max_header_list_size(self.config.header_limit().min(u32::MAX as usize) as u32)
                 .max_concurrent_streams(self.config.limits.request_limit() as u32)
-                .initial_window_size(256 * 1024)
-                .initial_connection_window_size(256 * 1024)
+                .initial_window_size(stream_window)
+                .initial_connection_window_size(connection_window)
                 .handshake(stream),
         )
         .await?
@@ -2347,22 +3135,44 @@ impl State {
                 respond.send_reset(h2::Reason::REFUSED_STREAM);
                 continue;
             }
+            let Some(request_permit) = self.requests.acquire(1) else {
+                respond.send_reset(h2::Reason::REFUSED_STREAM);
+                continue;
+            };
             let state = self.clone();
             requests.spawn(async move {
+                let _request_permit = request_permit;
                 let (parts, body) = request.into_parts();
-                let request = Request::from_parts(parts, ());
+                let mut request = Request::from_parts(parts, ());
+                let reset = CancellationToken::new();
+                request.extensions_mut().insert(RequestReset(reset.clone()));
                 let streaming_upload = matches!(
                     wire::classify(&state.config, &state.path, &request),
                     Ok(Kind::One | Kind::Upload(_))
                 );
-                let (writer, reader) = pipe(Memory::new(
-                    state.memory.clone(),
-                    state.config.limits.max_session_buffered_bytes,
-                ));
+                let (writer, mut reader) = pipe(state.new_memory());
+                let ready = reader.defer();
                 let tasks = Tasks::new();
                 let upload_closed = writer.closed();
-                tasks.spawn(carrier::receive_h2(body, writer));
-                let response = state.handle(request, reader).await;
+                tasks.spawn(async move {
+                    if ready.await.is_ok() {
+                        carrier::receive_h2(body, writer).await;
+                    }
+                });
+                let handle = state.handle(request, reader);
+                tokio::pin!(handle);
+                let response = tokio::select! {
+                    response = &mut handle => response,
+                    _ = futures::future::poll_fn(|cx| respond.poll_reset(cx)) => {
+                        reset.cancel();
+                        let _ = handle.await;
+                        return;
+                    }
+                };
+                if response.extensions().get::<Refused>().is_some() {
+                    respond.send_reset(h2::Reason::REFUSED_STREAM);
+                    return;
+                }
                 let keep_upload = streaming_upload && response.status() == StatusCode::OK;
                 let (parts, body) = response.into_parts();
                 if let Ok(send) = respond.send_response(Response::from_parts(parts, ()), false)
