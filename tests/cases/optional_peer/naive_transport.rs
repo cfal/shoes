@@ -93,21 +93,21 @@ async fn transport_compatibility(peer: Peer) -> Result<(), Box<dyn std::error::E
         let mut first = support::connect(entry, &target).await?;
         assert_eq!(count.load(Ordering::SeqCst), 1);
 
-        // Exceed the shared H2 watchdog's former 30 s + 5 s interval, but not
-        // Caddy 2.11.7's independent 60 s request-body idle timeout.
+        // Exceed the standard HTTP/2 proxy's 30 s + 5 s PING watchdog, which
+        // Naive must not inherit, but stay below Caddy 2.11.7's 60 s body timeout.
         tokio::time::sleep(Duration::from_secs(40)).await;
         first.write_all(b"quiet").await?;
         let mut response = [0; 5];
         first.read_exact(&mut response).await?;
         assert_eq!(&response, b"quiet");
-        let (second, third) = tokio::try_join!(
-            support::connect(entry, &target), support::connect(entry, &target),
-        )?;
+        // Concurrent preflight contention may legitimately dial a spare carrier.
+        let second = support::connect(entry, &target).await?;
+        let third = support::connect(entry, &target).await?;
         assert_eq!(count.load(Ordering::SeqCst), 1);
-        tokio::try_join!(large_exchange(first), large_exchange(second), large_exchange(third))?;
+        tokio::try_join!(large_exchange(first, peer), large_exchange(second, peer), large_exchange(third, peer))?;
 
         tokio::time::sleep(Duration::from_secs(40)).await;
-        support::exchange(support::connect(entry, &target).await?).await?;
+        large_exchange(support::connect(entry, &target).await?, peer).await?;
         assert_eq!(count.load(Ordering::SeqCst), 1, "idle carrier was not reused");
         Ok::<_, Box<dyn std::error::Error>>(())
     }).await?
@@ -137,20 +137,30 @@ async fn forward_carriers(
     }
 }
 
-async fn large_exchange(mut stream: TcpStream) -> io::Result<()> {
+async fn large_exchange(mut stream: TcpStream, peer: Peer) -> io::Result<()> {
     let payload: Vec<_> = (0..4 * 1024 * 1024 + 1).map(|i| (i % 251) as u8).collect();
     let (mut read, mut write) = stream.split();
     let upload = async {
         write.write_all(&payload).await?;
-        write.shutdown().await
+        if matches!(peer, Peer::Caddy) {
+            write.shutdown().await?;
+        }
+        Ok::<_, io::Error>(())
     };
     let download = async {
         tokio::time::sleep(Duration::from_millis(200)).await;
-        let mut received = Vec::new();
-        read.read_to_end(&mut received).await?;
-        assert_eq!(received, payload);
+        let mut received = vec![0; payload.len()];
+        read.read_exact(&mut received).await?;
+        assert!(received == payload, "echo payload differs");
         Ok::<_, io::Error>(())
     };
     tokio::try_join!(upload, download)?;
+    // sing-box 1.14.1 fully closes upstream TCP on upload EOF. Receive the
+    // complete echo first; Caddy above still exercises early half-close draining.
+    if matches!(peer, Peer::SingBox) {
+        write.shutdown().await?;
+    }
+    let mut trailing = [0; 1];
+    assert_eq!(read.read(&mut trailing).await?, 0, "unexpected echo tail");
     Ok(())
 }
