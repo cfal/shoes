@@ -410,8 +410,10 @@ protocol:
   resolve_hostname: false      # Resolve destinations locally before CONNECT
 ```
 
-Both versions establish TCP CONNECT tunnels. H2 reuses a connection for multiple
-concurrent tunnels; H1 retains its existing one-tunnel-per-connection behavior.
+Both versions establish TCP CONNECT tunnels. When the H2 proxy is the first and
+only hop, eligible routes reuse a connection for multiple concurrent tunnels.
+Chained H2 hops use the carrier established through the selected prefix rather
+than sharing tunnels across routes. H1 retains its existing one-tunnel-per-connection behavior.
 There is no automatic version fallback or replay after a failed CONNECT.
 
 For H2 over TLS, set `http_version: h2` here and `alpn_protocols: [h2]` on

@@ -5,6 +5,7 @@ use shoes_test_support::{
     port_helper::PortHelper, test_fixture::start_shoes_server,
     test_servers::start_tcp_stream_echo_server,
 };
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[path = "../http_proxy_support.rs"]
 mod support;
@@ -123,6 +124,58 @@ async fn named_tls_target_routing_and_h2_proxy_chaining() -> io::Result<()> {
         for _ in 0..2 {
             support::exchange(support::connect(entry, "localhost:1").await?).await?;
         }
+        Ok::<_, io::Error>(())
+    }).await?
+}
+
+#[tokio::test]
+async fn pooled_prefixes_do_not_share_a_subsequent_h2_carrier() -> io::Result<()> {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let mut markers = Vec::new();
+        let mut tasks = tokio::task::JoinSet::new();
+        for marker in b"AB" {
+            let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await?;
+            markers.push(listener.local_addr()?.port());
+            let marker = *marker;
+            tasks.spawn(async move {
+                for _ in 0..2 {
+                    let (mut stream, _) = listener.accept().await?;
+                    stream.write_all(&[marker]).await?;
+                    stream.read_to_end(&mut Vec::new()).await?;
+                }
+                Ok::<_, io::Error>(())
+            });
+        }
+        let mut ports = PortHelper::new();
+        let (_, h2_a) = ports.get_localhost_listener_port();
+        let (_, h2_b) = ports.get_localhost_listener_port();
+        let (_, prefix_a) = ports.get_localhost_listener_port();
+        let (_, prefix_b) = ports.get_localhost_listener_port();
+        let (_, entry) = ports.get_localhost_listener_port();
+        let listener = |port, target| json!({
+            "address": format!("0.0.0.0:{port}"), "protocol": {"type": "http"},
+            "rules": [{"mask": "0.0.0.0/0", "action": "allow", "override_address": format!("127.0.0.1:{target}")}]
+        });
+        let hop = |port, version| json!({
+            "address": format!("127.0.0.1:{port}"), "protocol": {"type": "http", "http_version": version}
+        });
+        let config = json!([
+            listener(h2_a, markers[0]), listener(h2_b, markers[1]),
+            listener(prefix_a, h2_a), listener(prefix_b, h2_b),
+            {"address": format!("0.0.0.0:{entry}"), "protocol": {"type": "http"},
+                "rules": [{"mask": "0.0.0.0/0", "action": "allow", "client_chain": [
+                    [hop(prefix_a, "h1"), hop(prefix_b, "h1")], hop(h2_a, "h2")
+                ]}]}
+        ]);
+        let _shoes = start_shoes_server(&serde_yaml::to_string(&config).unwrap())?;
+        ports.wait_for_all_ports().await?;
+        for expected in b"ABAB" {
+            let mut stream = support::connect(entry, "example.test:443").await?;
+            assert_eq!(stream.read_u8().await?, *expected);
+            stream.shutdown().await?;
+            stream.read_to_end(&mut Vec::new()).await?;
+        }
+        while let Some(task) = tasks.join_next().await { task.unwrap()?; }
         Ok::<_, io::Error>(())
     }).await?
 }

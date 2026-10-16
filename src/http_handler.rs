@@ -10,7 +10,7 @@ use crate::address::{Address, NetLocation, ResolvedLocation};
 use crate::async_stream::AsyncStream;
 use crate::client_proxy_selector::ClientProxySelector;
 use crate::config::HttpVersion;
-use crate::http2::client::{H2ClientSession, format_authority};
+use crate::http2::client::{H2ClientSession, StreamReservation, format_authority};
 use crate::resolver::{Resolver, resolve_single_address};
 use crate::stream_reader::StreamReader;
 use crate::tcp::tcp_handler::{
@@ -545,7 +545,7 @@ pub struct HttpTcpClientHandler {
     auth_header: Option<String>,
     resolver: Option<Arc<dyn Resolver>>,
     version: HttpVersion,
-    session: tokio::sync::Mutex<Option<H2ClientSession>>,
+    session: parking_lot::Mutex<Option<H2ClientSession>>,
 }
 
 impl std::fmt::Debug for HttpTcpClientHandler {
@@ -574,7 +574,7 @@ impl HttpTcpClientHandler {
             auth_header,
             resolver,
             version,
-            session: tokio::sync::Mutex::new(None),
+            session: parking_lot::Mutex::new(None),
         }
     }
 
@@ -621,9 +621,11 @@ impl HttpTcpClientHandler {
 
     async fn open_h2(
         &self,
-        mut session: H2ClientSession,
+        session: H2ClientSession,
+        reservation: StreamReservation,
         target: ResolvedLocation,
-    ) -> std::io::Result<TcpClientSetupResult> {
+        warm: bool,
+    ) -> std::io::Result<Option<TcpClientSetupResult>> {
         let location = self.connect_location(target).await?;
         let mut request = http::Request::builder()
             .method(http::Method::CONNECT)
@@ -634,20 +636,25 @@ impl HttpTcpClientHandler {
             value.set_sensitive(true);
             request = request.header(http::header::PROXY_AUTHORIZATION, value);
         }
-        let result = session
+        let result = reservation
             .open(request.body(()).map_err(std::io::Error::other)?)
             .await;
         let (response, stream) = match result {
             Ok(result) => result,
             Err(error) => {
-                let mut slot = self.session.lock().await;
-                if slot
-                    .as_ref()
-                    .is_some_and(|current| current.same_generation(&session))
+                let mut slot = self.session.lock();
+                if !error.error.is_reset()
+                    && slot
+                        .as_ref()
+                        .is_some_and(|current| current.same_generation(&session))
                 {
                     *slot = None;
                 }
-                return Err(error);
+                // A pre-send miss is safe to redial, but submitted CONNECTs are never replayed.
+                if warm && !error.sent {
+                    return Ok(None);
+                }
+                return Err(error.into());
             }
         };
         if response.status != http::StatusCode::OK {
@@ -656,10 +663,10 @@ impl HttpTcpClientHandler {
                 response.status
             )));
         }
-        Ok(TcpClientSetupResult {
+        Ok(Some(TcpClientSetupResult {
             client_stream: Box::new(stream),
             early_data: None,
-        })
+        }))
     }
 }
 
@@ -687,16 +694,15 @@ impl TcpClientHandler for HttpTcpClientHandler {
         if self.version != HttpVersion::H2 {
             return Ok(None);
         }
-        let session = {
-            let Ok(slot) = self.session.try_lock() else {
-                return Ok(None);
-            };
-            slot.as_ref().filter(|session| session.is_ready()).cloned()
+        let session = self.session.lock().clone();
+        let Some(session) = session else {
+            return Ok(None);
         };
-        match session {
-            Some(session) => self.open_h2(session, target.clone()).await.map(Some),
-            None => Ok(None),
-        }
+        let Some(reservation) = session.try_reserve() else {
+            return Ok(None);
+        };
+        self.open_h2(session, reservation, target.clone(), true)
+            .await
     }
 
     async fn setup_client_tcp_stream(
@@ -705,17 +711,14 @@ impl TcpClientHandler for HttpTcpClientHandler {
         remote_location: ResolvedLocation,
     ) -> std::io::Result<TcpClientSetupResult> {
         if self.version == HttpVersion::H2 {
-            let session = {
-                let mut slot = self.session.lock().await;
-                if let Some(session) = slot.as_ref().filter(|session| session.is_ready()) {
-                    session.clone()
-                } else {
-                    let session = H2ClientSession::new(client_stream).await?;
-                    *slot = Some(session.clone());
-                    session
-                }
-            };
-            return self.open_h2(session, remote_location).await;
+            // The supplied carrier already embodies the selected route and wrappers.
+            let session = H2ClientSession::new(client_stream).await?;
+            let reservation = session.reserve();
+            *self.session.lock() = Some(session.clone());
+            return self
+                .open_h2(session, reservation, remote_location, false)
+                .await
+                .map(|result| result.expect("cold CONNECT cannot be a reuse miss"));
         }
         let connect_location = self.connect_location(remote_location).await?;
 

@@ -19,7 +19,7 @@ pub struct H2MultiStream {
     recv_buf: Bytes,
     /// Whether we've sent END_STREAM
     shutdown_sent: bool,
-    session_owner: Option<super::client::H2ClientSession>,
+    reservation: Option<super::client::StreamReservation>,
 }
 
 impl H2MultiStream {
@@ -29,12 +29,12 @@ impl H2MultiStream {
             recv,
             recv_buf: Bytes::new(),
             shutdown_sent: false,
-            session_owner: None,
+            reservation: None,
         }
     }
 
-    pub fn set_session_owner(&mut self, session: super::client::H2ClientSession) {
-        self.session_owner = Some(session);
+    pub fn set_reservation(&mut self, reservation: super::client::StreamReservation) {
+        self.reservation = Some(reservation);
     }
 
     // A relay blocked on its upstream must still observe a peer reset.

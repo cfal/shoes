@@ -1,5 +1,8 @@
 use std::io;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::{Context, Poll, Waker};
+use std::time::Duration;
 
 use bytes::Bytes;
 use http::Request;
@@ -20,16 +23,37 @@ pub struct H2ClientSession {
 struct DriverHandle {
     driver: tokio::task::AbortHandle,
     _drain: oneshot::Sender<()>,
+    active: AtomicUsize,
+}
+
+pub(crate) struct StreamReservation(H2ClientSession);
+
+impl Drop for StreamReservation {
+    fn drop(&mut self) {
+        self.0.driver_handle.active.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct OpenError {
+    pub error: h2::Error,
+    pub sent: bool,
+}
+
+impl From<OpenError> for io::Error {
+    fn from(error: OpenError) -> Self {
+        io::Error::other(error.error)
+    }
 }
 
 impl H2ClientSession {
     pub async fn new(stream: Box<dyn AsyncStream>) -> io::Result<Self> {
-        const WINDOW_SIZE: u32 = 256 * 1024;
         const MAX_FRAME_SIZE: u32 = 16 * 1024;
 
         let (send_request, mut connection) = h2::client::Builder::new()
-            .initial_window_size(WINDOW_SIZE)
-            .initial_connection_window_size(WINDOW_SIZE)
+            .initial_window_size(super::STREAM_WINDOW)
+            .initial_connection_window_size(super::CONNECTION_WINDOW)
+            .enable_push(false)
             .max_frame_size(MAX_FRAME_SIZE)
             .max_header_list_size(16 * 1024)
             .max_concurrent_streams(1024)
@@ -37,12 +61,15 @@ impl H2ClientSession {
             .await
             .map_err(|e| io::Error::other(format!("H2 client handshake failed: {}", e)))?;
 
+        let ping = connection.ping_pong().unwrap();
         let (drain_tx, drain_rx) = oneshot::channel();
         let abort_handle = tokio::spawn(async move {
             // Retired sessions must flush queued DATA and END_STREAM before teardown.
             let result = tokio::select! {
-                result = &mut connection => Some(result),
-                _ = drain_rx => tokio::time::timeout(crate::util::SHUTDOWN_TIMEOUT, connection).await.ok(),
+                result = &mut connection => Some(result.map_err(io::Error::other)),
+                _ = drain_rx => tokio::time::timeout(crate::util::SHUTDOWN_TIMEOUT, connection)
+                    .await.ok().map(|result| result.map_err(io::Error::other)),
+                result = keep_alive(ping) => Some(result),
             };
             if let Some(Err(e)) = result {
                 debug!("HTTP/2 client connection ended: {}", e);
@@ -57,6 +84,7 @@ impl H2ClientSession {
             driver_handle: Arc::new(DriverHandle {
                 driver: abort_handle,
                 _drain: drain_tx,
+                active: AtomicUsize::new(0),
             }),
         })
     }
@@ -64,6 +92,40 @@ impl H2ClientSession {
     /// Check if this session is still usable for new streams.
     pub fn is_ready(&self) -> bool {
         !self.driver_handle.driver.is_finished()
+            && matches!(
+                self.send_request
+                    .clone()
+                    .poll_ready(&mut Context::from_waker(Waker::noop())),
+                Poll::Ready(Ok(()))
+            )
+    }
+
+    pub fn try_reserve(&self) -> Option<StreamReservation> {
+        if !self.is_ready() {
+            return None;
+        }
+        let limit = self.send_request.current_max_send_streams();
+        let mut active = self.driver_handle.active.load(Ordering::Relaxed);
+        loop {
+            if active >= limit {
+                return None;
+            }
+            match self.driver_handle.active.compare_exchange_weak(
+                active,
+                active + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(current) => active = current,
+            }
+        }
+        Some(StreamReservation(self.clone()))
+    }
+
+    pub fn reserve(&self) -> StreamReservation {
+        self.driver_handle.active.fetch_add(1, Ordering::Relaxed);
+        StreamReservation(self.clone())
     }
 
     pub fn same_generation(&self, other: &Self) -> bool {
@@ -73,18 +135,40 @@ impl H2ClientSession {
     pub async fn open(
         &mut self,
         request: Request<()>,
-    ) -> io::Result<(http::response::Parts, H2MultiStream)> {
-        std::future::poll_fn(|cx| self.send_request.poll_ready(cx))
+    ) -> Result<(http::response::Parts, H2MultiStream), OpenError> {
+        self.reserve().open(request).await
+    }
+}
+
+async fn keep_alive(mut ping: h2::PingPong) -> io::Result<()> {
+    loop {
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        tokio::time::timeout(Duration::from_secs(5), ping.ping(h2::Ping::opaque()))
             .await
+            .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))?
             .map_err(io::Error::other)?;
+    }
+}
+
+impl StreamReservation {
+    pub async fn open(
+        mut self,
+        request: Request<()>,
+    ) -> Result<(http::response::Parts, H2MultiStream), OpenError> {
+        std::future::poll_fn(|cx| self.0.send_request.poll_ready(cx))
+            .await
+            .map_err(|error| OpenError { error, sent: false })?;
         let (response, send) = self
+            .0
             .send_request
             .send_request(request, false)
-            .map_err(io::Error::other)?;
-        let response = response.await.map_err(io::Error::other)?;
+            .map_err(|error| OpenError { error, sent: false })?;
+        let response = response
+            .await
+            .map_err(|error| OpenError { error, sent: true })?;
         let (parts, recv) = response.into_parts();
         let mut stream = H2MultiStream::new(send, recv);
-        stream.set_session_owner(self.clone());
+        stream.set_reservation(self);
         Ok((parts, stream))
     }
 }
@@ -102,6 +186,84 @@ pub(crate) fn format_authority(location: &NetLocation) -> String {
 mod tests {
     use super::*;
     use http::Method;
+
+    #[tokio::test(start_paused = true)]
+    async fn keepalive_retires_blackholed_but_not_responsive_carriers() {
+        for responsive in [false, true] {
+            let (client, peer) = tokio::io::duplex(8192);
+            let (ready_tx, ready_rx) = oneshot::channel();
+            let server = tokio::spawn(async move {
+                let mut connection = h2::server::handshake(peer).await.unwrap();
+                ready_tx.send(()).unwrap();
+                if responsive {
+                    while connection.accept().await.is_some() {}
+                } else {
+                    // Keep the transport open without processing PINGs.
+                    std::future::pending::<()>().await;
+                    drop(connection);
+                }
+            });
+            let session = H2ClientSession::new(Box::new(client)).await.unwrap();
+            ready_rx.await.unwrap();
+            tokio::time::sleep(Duration::from_secs(36)).await;
+            assert_eq!(session.is_ready(), responsive);
+            server.abort();
+            let _ = server.await;
+        }
+    }
+
+    #[tokio::test]
+    async fn unread_download_does_not_block_another_tunnel() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (client, peer) = tokio::io::duplex(8192);
+        let (filled_tx, filled_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut connection = h2::server::handshake(peer).await.unwrap();
+            let mut filled = Some(filled_tx);
+            let mut tasks = tokio::task::JoinSet::new();
+            loop {
+                tokio::select! {
+                    incoming = connection.accept() => {
+                        let Some(Ok((request, mut respond))) = incoming else { break };
+                        let send = respond.send_response(http::Response::new(()), false).unwrap();
+                        let signal = filled.take();
+                        tasks.spawn(async move {
+                            let mut stream = H2MultiStream::new(send, request.into_body());
+                            if let Some(signal) = signal {
+                                stream.write_all(&vec![0; super::super::STREAM_WINDOW as usize]).await.unwrap();
+                                signal.send(()).unwrap();
+                                let _ = stream.read(&mut [0]).await;
+                            } else {
+                                stream.write_all(b"ok").await.unwrap();
+                                stream.shutdown().await.unwrap();
+                            }
+                        });
+                    }
+                    _ = tasks.join_next(), if !tasks.is_empty() => {}
+                }
+            }
+        });
+        let mut session = H2ClientSession::new(Box::new(client)).await.unwrap();
+        let request = || {
+            Request::builder()
+                .method("CONNECT")
+                .uri("example.com:443")
+                .body(())
+                .unwrap()
+        };
+        let (_, unread) = session.open(request()).await.unwrap();
+        filled_rx.await.unwrap();
+        let (_, mut second) = session.open(request()).await.unwrap();
+        let mut data = Vec::new();
+        tokio::time::timeout(Duration::from_secs(1), second.read_to_end(&mut data))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(data, b"ok");
+        drop(unread);
+        server.abort();
+        let _ = server.await;
+    }
 
     #[tokio::test(start_paused = true)]
     async fn last_owner_drain_is_bounded_when_peer_stalls() {
