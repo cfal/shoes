@@ -323,6 +323,11 @@ impl XhttpServerConfig {
             return Err(invalid("nested XHTTP is not supported"));
         }
         self.limits.validate()?;
+        if self.mode != XhttpMode::StreamOne && self.limits.max_requests < 2 {
+            return Err(invalid(
+                "XHTTP split server modes require at least two aggregate requests",
+            ));
+        }
         if self.x_padding_bytes.bounds((100, 1000), false)?.1 > MAX_PADDING_BYTES {
             return Err(invalid("XHTTP padding must not exceed 65536 bytes"));
         }
@@ -558,6 +563,25 @@ mod tests {
             }))
             .unwrap();
             assert_eq!(config.validate().is_ok(), limit >= 2);
+        }
+    }
+
+    #[test]
+    fn server_aggregate_requests_must_fit_the_mode() {
+        for mode in ["auto", "packet-up", "stream-up", "stream-one"] {
+            for limit in [0, 1, 2, 4096] {
+                let config: XhttpServerConfig = serde_json::from_value(serde_json::json!({
+                    "mode": mode,
+                    "limits": {"max_requests": limit},
+                    "protocol": {"type": "socks"}
+                }))
+                .unwrap();
+                assert_eq!(
+                    config.validate().is_ok(),
+                    limit >= 2 || (mode == "stream-one" && limit == 1),
+                    "mode={mode}, max_requests={limit}"
+                );
+            }
         }
     }
 
