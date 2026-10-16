@@ -75,6 +75,180 @@ fn raw_frame(kind: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
     frame
 }
 
+async fn read_raw_frame(client: &mut tokio::io::DuplexStream) -> (u8, u8, u32, Vec<u8>) {
+    let mut header = [0; 9];
+    client.read_exact(&mut header).await.unwrap();
+    let len = u32::from_be_bytes([0, header[0], header[1], header[2]]) as usize;
+    let mut payload = vec![0; len];
+    client.read_exact(&mut payload).await.unwrap();
+    (
+        header[3],
+        header[4],
+        u32::from_be_bytes(header[5..9].try_into().unwrap()),
+        payload,
+    )
+}
+
+fn connect_block(target: &str, auth: Option<&[u8]>) -> Vec<u8> {
+    let mut headers = b"\x02\x07CONNECT\x01".to_vec();
+    headers.push(target.len() as u8);
+    headers.extend_from_slice(target.as_bytes());
+    if let Some(auth) = auth {
+        headers.extend_from_slice(b"\x0f\x22"); // Literal proxy-authorization (static index 49).
+        headers.push(auth.len() as u8);
+        headers.extend_from_slice(auth);
+    }
+    headers
+}
+
+async fn accepted_tunnel_survives_graceful_shutdown(auth: bool) {
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+    let target = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let upstream = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let (mut read, mut write) = stream.split();
+        tokio::io::copy(&mut read, &mut write).await.unwrap();
+    });
+    let (mut client, transport) = tokio::io::duplex(8192);
+    let resolver = Arc::new(NativeResolver::new());
+    let selector = Arc::new(
+        create_tcp_client_proxy_selector(
+            vec![crate::config::RuleConfig::default()],
+            resolver.clone(),
+        )
+        .unwrap(),
+    );
+    let server = tokio::spawn(serve(
+        Box::new(transport),
+        auth.then(|| "dXNlcjpwYXNz".into()),
+        selector,
+        resolver,
+    ));
+    client
+        .write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+        .await
+        .unwrap();
+    client.write_all(&raw_frame(4, 0, 0, &[])).await.unwrap();
+    loop {
+        let (kind, flags, _, _) = read_raw_frame(&mut client).await;
+        if kind == 4 && flags & 1 == 0 {
+            client.write_all(&raw_frame(4, 1, 0, &[])).await.unwrap();
+            break;
+        }
+    }
+    if auth {
+        client
+            .write_all(&raw_frame(
+                1,
+                4,
+                1,
+                &connect_block(&target, Some(b"Basic dXNlcjpwYXNz")),
+            ))
+            .await
+            .unwrap();
+    } else {
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(60)).await;
+        tokio::time::resume();
+    }
+    let mut connected = false;
+    let mut final_goaway = false;
+    while !connected || !final_goaway {
+        let (kind, flags, stream, payload) = read_raw_frame(&mut client).await;
+        match kind {
+            1 if stream == 1 => {
+                assert_eq!(payload[0], 0x88); // Static HPACK :status 200.
+                connected = true;
+                if auth {
+                    client
+                        .write_all(&raw_frame(
+                            1,
+                            4,
+                            3,
+                            &connect_block(&target, Some(b"Basic wrong")),
+                        ))
+                        .await
+                        .unwrap();
+                }
+            }
+            6 if flags & 1 == 0 => {
+                if !auth {
+                    // This in-flight CONNECT precedes the shutdown PING ACK.
+                    client
+                        .write_all(&raw_frame(1, 4, 1, &connect_block(&target, None)))
+                        .await
+                        .unwrap();
+                }
+                client
+                    .write_all(&raw_frame(6, 1, 0, &payload))
+                    .await
+                    .unwrap();
+            }
+            7 => {
+                let last = u32::from_be_bytes(payload[..4].try_into().unwrap());
+                if last != 0x7fffffff {
+                    assert!(last >= 1);
+                    final_goaway = true;
+                }
+            }
+            3 if stream == 1 => panic!("accepted tunnel was reset"),
+            _ => {}
+        }
+    }
+    tokio::time::pause();
+    tokio::time::advance(crate::util::SHUTDOWN_TIMEOUT + Duration::from_secs(1)).await;
+    tokio::time::resume();
+    client
+        .write_all(&raw_frame(0, 0, 1, b"after"))
+        .await
+        .unwrap();
+    loop {
+        let (kind, _, stream, payload) = read_raw_frame(&mut client).await;
+        if kind == 0 && stream == 1 {
+            assert_eq!(payload, b"after");
+            break;
+        }
+    }
+    assert!(!server.is_finished());
+    client
+        .write_all(&raw_frame(0, 1, 1, b"tail"))
+        .await
+        .unwrap();
+    let mut tail = Vec::new();
+    loop {
+        let (kind, flags, stream, payload) = read_raw_frame(&mut client).await;
+        if kind == 0 && stream == 1 {
+            tail.extend(payload);
+            if flags & 1 != 0 {
+                break;
+            }
+        }
+    }
+    assert_eq!(tail, b"tail");
+    upstream.await.unwrap();
+    server.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn connect_racing_idle_goaway_is_not_cut_off_by_the_shutdown_deadline() {
+    tokio::time::timeout(
+        Duration::from_secs(70),
+        accepted_tunnel_survives_graceful_shutdown(false),
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn authenticated_tunnel_survives_another_streams_wrong_credentials() {
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        accepted_tunnel_survives_graceful_shutdown(true),
+    )
+    .await
+    .unwrap();
+}
+
 #[tokio::test]
 async fn final_upload_data_survives_graceful_goaway() {
     tokio::time::timeout(Duration::from_secs(3), async {

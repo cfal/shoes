@@ -45,7 +45,7 @@ pub(crate) async fn serve(
     loop {
         tokio::select! {
             _ = tokio::time::sleep_until(shutdown_deadline.unwrap_or(idle_deadline)),
-                if shutdown_deadline.is_some() || tasks.is_empty() => {
+                if tasks.is_empty() => {
                 if shutdown_deadline.is_some() {
                     return Ok(());
                 }
@@ -89,13 +89,15 @@ pub(crate) async fn serve(
             _ = tasks.join_next(), if !tasks.is_empty() => {
                 if tasks.is_empty() {
                     idle_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+                    if shutdown_deadline.is_some() {
+                        shutdown_deadline = Some(tokio::time::Instant::now() + crate::util::SHUTDOWN_TIMEOUT);
+                    }
                 }
             }
         }
     }
     // Clean H2 completion may precede consumption of the final buffered DATA.
-    let deadline = shutdown_deadline
-        .unwrap_or_else(|| tokio::time::Instant::now() + crate::util::SHUTDOWN_TIMEOUT);
+    let deadline = tokio::time::Instant::now() + crate::util::SHUTDOWN_TIMEOUT;
     let _ = tokio::time::timeout_at(deadline, async {
         while tasks.join_next().await.is_some() {}
     })
