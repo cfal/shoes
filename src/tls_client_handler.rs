@@ -92,6 +92,7 @@ impl TcpClientHandler for TlsClientHandler {
 
         match &self.handler {
             TlsInnerClientHandler::Default(handler) => {
+                handler.validate_alpn(tls_stream.alpn_protocol())?;
                 handler
                     .setup_client_tcp_stream(Box::new(tls_stream), remote_location)
                     .await

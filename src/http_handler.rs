@@ -9,6 +9,8 @@ use tokio::io::AsyncWriteExt;
 use crate::address::{Address, NetLocation, ResolvedLocation};
 use crate::async_stream::AsyncStream;
 use crate::client_proxy_selector::ClientProxySelector;
+use crate::config::HttpVersion;
+use crate::http2::client::{H2ClientSession, format_authority};
 use crate::resolver::{Resolver, resolve_single_address};
 use crate::stream_reader::StreamReader;
 use crate::tcp::tcp_handler::{
@@ -18,6 +20,10 @@ use crate::tcp::tcp_handler::{
 const PROXY_AUTH_HEADER_PREFIX: &str = "proxy-authorization: basic ";
 const CONNECTION_HEADER_PREFIX: &str = "connection: ";
 const PROXY_CONNECTION_HEADER_PREFIX: &str = "proxy-connection: ";
+
+#[cfg(test)]
+#[path = "http2/client_proxy_tests.rs"]
+mod h2_tests;
 
 #[cfg(test)]
 mod request_tests {
@@ -155,7 +161,7 @@ mod request_tests {
             .await
             .unwrap();
         server.shutdown().await.unwrap();
-        let result = HttpTcpClientHandler::new(None, None)
+        let result = HttpTcpClientHandler::new(None, None, HttpVersion::H1)
             .setup_client_tcp_stream(
                 Box::new(client),
                 NetLocation::from_str("example.com:443", None)
@@ -535,16 +541,11 @@ pub async fn setup_http_server_stream_inner(
     })
 }
 
-fn create_http_auth_header_line(username: &str, password: &str) -> String {
-    format!(
-        "Proxy-Authorization: Basic {}\r\n",
-        create_http_auth_token(username, password)
-    )
-}
-
 pub struct HttpTcpClientHandler {
     auth_header: Option<String>,
     resolver: Option<Arc<dyn Resolver>>,
+    version: HttpVersion,
+    session: tokio::sync::Mutex<Option<H2ClientSession>>,
 }
 
 impl std::fmt::Debug for HttpTcpClientHandler {
@@ -555,6 +556,7 @@ impl std::fmt::Debug for HttpTcpClientHandler {
                 &self.auth_header.as_ref().map(|_| "[redacted]"),
             )
             .field("resolver", &self.resolver.is_some())
+            .field("version", &self.version)
             .finish()
     }
 }
@@ -563,27 +565,27 @@ impl HttpTcpClientHandler {
     pub fn new(
         auth_credentials: Option<(String, String)>,
         resolver: Option<Arc<dyn Resolver>>,
+        version: HttpVersion,
     ) -> Self {
-        let auth_header = auth_credentials
-            .map(|(username, password)| create_http_auth_header_line(&username, &password));
+        let auth_header = auth_credentials.map(|(username, password)| {
+            format!("Basic {}", create_http_auth_token(&username, &password))
+        });
         Self {
             auth_header,
             resolver,
+            version,
+            session: tokio::sync::Mutex::new(None),
         }
     }
-}
 
-#[async_trait]
-impl TcpClientHandler for HttpTcpClientHandler {
-    async fn setup_client_tcp_stream(
+    async fn connect_location(
         &self,
-        mut client_stream: Box<dyn AsyncStream>,
         remote_location: ResolvedLocation,
-    ) -> std::io::Result<TcpClientSetupResult> {
+    ) -> std::io::Result<NetLocation> {
         // Resolve hostname to IP if resolver is configured.
         // Bypasses DNS issues when the upstream proxy has DNS problems.
         // Uses pre-resolved address if available, otherwise resolves here.
-        let connect_location = if let Some(ref resolver) = self.resolver {
+        Ok(if let Some(ref resolver) = self.resolver {
             if let Some(resolved_addr) = remote_location.resolved_addr() {
                 // Use pre-resolved address
                 debug!(
@@ -614,7 +616,108 @@ impl TcpClientHandler for HttpTcpClientHandler {
             }
         } else {
             remote_location.into_location()
+        })
+    }
+
+    async fn open_h2(
+        &self,
+        mut session: H2ClientSession,
+        target: ResolvedLocation,
+    ) -> std::io::Result<TcpClientSetupResult> {
+        let location = self.connect_location(target).await?;
+        let mut request = http::Request::builder()
+            .method(http::Method::CONNECT)
+            .version(http::Version::HTTP_2)
+            .uri(format_authority(&location));
+        if let Some(auth) = &self.auth_header {
+            let mut value = http::HeaderValue::from_str(auth).map_err(std::io::Error::other)?;
+            value.set_sensitive(true);
+            request = request.header(http::header::PROXY_AUTHORIZATION, value);
+        }
+        let result = session
+            .open(request.body(()).map_err(std::io::Error::other)?)
+            .await;
+        let (response, stream) = match result {
+            Ok(result) => result,
+            Err(error) => {
+                let mut slot = self.session.lock().await;
+                if slot
+                    .as_ref()
+                    .is_some_and(|current| current.same_generation(&session))
+                {
+                    *slot = None;
+                }
+                return Err(error);
+            }
         };
+        if response.status != http::StatusCode::OK {
+            return Err(std::io::Error::other(format!(
+                "HTTP CONNECT failed: {}",
+                response.status
+            )));
+        }
+        Ok(TcpClientSetupResult {
+            client_stream: Box::new(stream),
+            early_data: None,
+        })
+    }
+}
+
+#[async_trait]
+impl TcpClientHandler for HttpTcpClientHandler {
+    fn validate_alpn(&self, alpn: Option<&[u8]>) -> std::io::Result<()> {
+        let valid = match self.version {
+            HttpVersion::H1 => alpn.is_none() || alpn == Some(b"http/1.1"),
+            HttpVersion::H2 => alpn == Some(b"h2"),
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "HTTP proxy version does not match negotiated TLS ALPN",
+            ))
+        }
+    }
+
+    async fn try_reuse_tcp_stream(
+        &self,
+        target: &ResolvedLocation,
+    ) -> std::io::Result<Option<TcpClientSetupResult>> {
+        if self.version != HttpVersion::H2 {
+            return Ok(None);
+        }
+        let session = {
+            let Ok(slot) = self.session.try_lock() else {
+                return Ok(None);
+            };
+            slot.as_ref().filter(|session| session.is_ready()).cloned()
+        };
+        match session {
+            Some(session) => self.open_h2(session, target.clone()).await.map(Some),
+            None => Ok(None),
+        }
+    }
+
+    async fn setup_client_tcp_stream(
+        &self,
+        mut client_stream: Box<dyn AsyncStream>,
+        remote_location: ResolvedLocation,
+    ) -> std::io::Result<TcpClientSetupResult> {
+        if self.version == HttpVersion::H2 {
+            let session = {
+                let mut slot = self.session.lock().await;
+                if let Some(session) = slot.as_ref().filter(|session| session.is_ready()) {
+                    session.clone()
+                } else {
+                    let session = H2ClientSession::new(client_stream).await?;
+                    *slot = Some(session.clone());
+                    session
+                }
+            };
+            return self.open_h2(session, remote_location).await;
+        }
+        let connect_location = self.connect_location(remote_location).await?;
 
         let mut connect_str = match connect_location.address() {
             Address::Ipv6(addr) => {
@@ -633,7 +736,9 @@ impl TcpClientHandler for HttpTcpClientHandler {
         };
 
         if let Some(ref header) = self.auth_header {
+            connect_str.push_str("Proxy-Authorization: ");
             connect_str.push_str(header);
+            connect_str.push_str("\r\n");
         }
         connect_str.push_str("\r\n");
         client_stream.write_all(&connect_str.into_bytes()).await?;

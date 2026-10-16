@@ -61,6 +61,7 @@ pub fn create_tcp_client_handler(
             username,
             password,
             resolve_hostname,
+            http_version,
         } => {
             let http_resolver = if resolve_hostname {
                 Some(resolver.clone())
@@ -70,6 +71,7 @@ pub fn create_tcp_client_handler(
             Box::new(HttpTcpClientHandler::new(
                 create_auth_credentials(username, password),
                 http_resolver,
+                http_version,
             ))
         }
         ClientProxyConfig::Socks { username, password } => Box::new(SocksTcpClientHandler::new(
