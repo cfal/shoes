@@ -1,4 +1,7 @@
-use std::{collections::BTreeMap, io};
+use std::{
+    collections::{BTreeMap, HashSet},
+    io,
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -81,6 +84,22 @@ fn validate_path_and_host(path: &str, host: Option<&str>) -> io::Result<()> {
             .map_err(io::Error::other)?;
     }
     Ok(())
+}
+
+fn conflicts_with_framing(name: &http::HeaderName) -> bool {
+    matches!(
+        name.as_str(),
+        "host"
+            | "keep-alive"
+            | "proxy-connection"
+            | "content-length"
+            | "transfer-encoding"
+            | "connection"
+            | "upgrade"
+            | "te"
+            | "trailer"
+            | "referer"
+    )
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -271,19 +290,7 @@ impl XhttpClientConfig {
         for (name, value) in &self.headers {
             let name = http::HeaderName::try_from(name).map_err(io::Error::other)?;
             http::HeaderValue::try_from(value).map_err(io::Error::other)?;
-            if matches!(
-                name.as_str(),
-                "host"
-                    | "keep-alive"
-                    | "proxy-connection"
-                    | "content-length"
-                    | "transfer-encoding"
-                    | "connection"
-                    | "upgrade"
-                    | "te"
-                    | "trailer"
-                    | "referer"
-            ) {
+            if conflicts_with_framing(&name) {
                 return Err(invalid(
                     "XHTTP custom header conflicts with transport framing",
                 ));
@@ -299,7 +306,11 @@ pub struct XhttpServerConfig {
     #[serde(default)]
     pub path: String,
     #[serde(default)]
+    pub close_on_error: bool,
+    #[serde(default)]
     pub host: Option<String>,
+    #[serde(default)]
+    pub matching_headers: BTreeMap<String, String>,
     #[serde(default)]
     pub mode: XhttpMode,
     #[serde(default)]
@@ -324,6 +335,31 @@ pub struct XhttpServerConfig {
 impl XhttpServerConfig {
     pub fn validate(&self) -> io::Result<()> {
         validate_path_and_host(&self.path, self.host.as_deref())?;
+        let mut names = HashSet::new();
+        for (name, value) in &self.matching_headers {
+            let name = http::HeaderName::try_from(name).map_err(io::Error::other)?;
+            http::HeaderValue::try_from(value).map_err(io::Error::other)?;
+            if name == http::header::HOST {
+                return Err(invalid(
+                    "XHTTP matching_headers cannot include Host; use host instead",
+                ));
+            }
+            if conflicts_with_framing(&name) {
+                return Err(invalid(
+                    "XHTTP matching header conflicts with transport framing",
+                ));
+            }
+            if value.starts_with([' ', '\t']) || value.ends_with([' ', '\t']) {
+                return Err(invalid(
+                    "XHTTP matching header values cannot start or end with whitespace",
+                ));
+            }
+            if !names.insert(name) {
+                return Err(invalid(
+                    "XHTTP matching_headers contains duplicate header names",
+                ));
+            }
+        }
         if contains_server(&self.protocol) {
             return Err(invalid("nested XHTTP is not supported"));
         }
@@ -496,6 +532,60 @@ pub(crate) fn validate_server_transport(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn server_request_filters_defaults_and_round_trip() {
+        let mut config: XhttpServerConfig = serde_json::from_value(serde_json::json!({
+            "protocol": {"type": "socks"}
+        }))
+        .unwrap();
+        assert!(config.matching_headers.is_empty());
+        assert!(!config.close_on_error);
+        config.close_on_error = true;
+        config
+            .matching_headers
+            .insert("X-Token".into(), "Secret".into());
+        config
+            .matching_headers
+            .insert("X-Empty".into(), String::new());
+        config.validate().unwrap();
+        let decoded: XhttpServerConfig =
+            serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
+        assert_eq!(decoded.matching_headers, config.matching_headers);
+        assert!(decoded.close_on_error);
+        decoded.validate().unwrap();
+    }
+
+    #[test]
+    fn server_rejects_invalid_matching_headers() {
+        for headers in [
+            serde_json::json!({"bad name": "value"}),
+            serde_json::json!({"": "value"}),
+            serde_json::json!({":authority": "front.test"}),
+            serde_json::json!({"x-token": "secret\r\nx-injected: value"}),
+            serde_json::json!({"X-Token": "secret", "x-token": "secret"}),
+            serde_json::json!({"Host": "front.test"}),
+            serde_json::json!({"connection": "keep-alive"}),
+            serde_json::json!({"Keep-Alive": "timeout=60"}),
+            serde_json::json!({"proxy-connection": "keep-alive"}),
+            serde_json::json!({"content-length": "16"}),
+            serde_json::json!({"transfer-encoding": "chunked"}),
+            serde_json::json!({"upgrade": "websocket"}),
+            serde_json::json!({"te": "trailers"}),
+            serde_json::json!({"trailer": "x-token"}),
+            serde_json::json!({"referer": "https://front.test/"}),
+            serde_json::json!({"x-token": " secret"}),
+            serde_json::json!({"x-token": "secret "}),
+            serde_json::json!({"x-token": "\tsecret"}),
+            serde_json::json!({"x-token": "secret\t"}),
+        ] {
+            let config: XhttpServerConfig = serde_json::from_value(serde_json::json!({
+                "matching_headers": headers, "protocol": {"type": "socks"}
+            }))
+            .unwrap();
+            assert!(config.validate().is_err(), "{headers}");
+        }
+    }
 
     #[test]
     fn xhttp_rejects_invalid_wire_settings_before_startup() {
