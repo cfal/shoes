@@ -9,8 +9,7 @@ use shoes_test_support::{
     test_servers::start_tcp_stream_echo_server,
 };
 
-#[path = "../http_proxy_support.rs"]
-mod support;
+use crate::http_proxy_support as support;
 
 #[tokio::test]
 #[ignore = "Requires sing-box >=1.15.0-alpha.7; set SHOES_TEST_HTTP2_SING_BOX_BIN"]

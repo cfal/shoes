@@ -22,8 +22,7 @@ use tokio::{
     task::JoinSet,
 };
 
-#[path = "../http_proxy_support.rs"]
-mod support;
+use crate::http_proxy_support as support;
 
 #[derive(Clone, Copy)]
 enum Peer {

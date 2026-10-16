@@ -27,7 +27,7 @@ async fn existing_settings_and_idle_policy_are_unchanged() {
         match header[3] {
             4 if header[4] == 1 => acknowledged = true,
             4 => {
-                for setting in payload.chunks_exact(6) {
+                for setting in payload.as_chunks::<6>().0 {
                     settings.insert(
                         u16::from_be_bytes(setting[..2].try_into().unwrap()),
                         u32::from_be_bytes(setting[2..].try_into().unwrap()),
