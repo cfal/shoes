@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## v0.3.3
+
+- Added XHTTP/SplitHTTP client and server transports with packet-up, stream-up, and stream-one modes over HTTP/1.1, HTTP/2, and HTTP/3. See the README for supported configurations and interoperability limitations.
+- Added ordered `key_exchange_groups` allowlists for TLS and QUIC (`quic_settings`), including native hybrid key exchange. Omitting the field preserves current defaults.
 - REALITY clients now offer `X25519MLKEM768` first, with X25519 fallback. Servers accept both groups and follow the camouflage target's choice. Upgrade Xray servers to v25.5.16 or newer: v25.4.30 and earlier reject hybrid-selected target handshakes, so hybrid-first clients fail when the target selects that group.
 - Added optional pinned ML-DSA-65 REALITY authentication through `mldsa65_seed` (server), `mldsa65_verify` (client), and `generate-reality-mldsa65-keypair`. Configured clients reject missing or invalid signatures; signing requires enough room in the camouflage target's certificate flight.
 - Hardened malformed protocol framing, credential comparisons, replay rejection, and secret-safe diagnostics.
@@ -10,7 +14,14 @@
 - Corrected Snell salts to 16 bytes for all ciphers. ChaCha20 and AES-256 connections to older Shoes versions using 32-byte salts are not wire-compatible; upgrade both ends together.
 - Hysteria2 now reports actual connection outcomes, emits bracketed IPv6 addresses, and advertises `Hysteria-CC-RX: auto`. Compatible clients select automatic congestion control (BBR in sing-box), even when a client bandwidth is configured.
 - Unsupported VMess cipher names, including `auto`, are rejected during validation instead of panicking at startup. Use `any` for automatic cipher selection.
+- Stricter server validation rejects empty authentication passwords, invalid SOCKS/mixed credential lengths, wrong-length Shadowsocks 2022 keys, Vision with non-VLESS inner protocols, and misplaced Hysteria2/TUIC/NaiveProxy layers (including NaiveProxy inside ShadowTLS). Some configurations accepted by v0.3.2 now fail `check` or startup.
 - Improved QUIC socket portability, SOCKS UDP compatibility with NAT clients, and synchronous mobile lifecycle safety.
+- Fixed h2mux data loss under backpressure.
+- Fixed premature HTTP/3 body EOF on empty DATA frames through a pinned h3 fork, preserving XHTTP idle streams and covering direct and transitive h3 dependencies.
+- Reduced Linux TCP relay overhead with splice, including drained Vision DIRECT connections, and added TCPv4 segmentation offload for created Linux TUN devices. Offload is automatic when available; set `segmentation_offload: false` to disable it.
+- Reduced TCP and UDP relay copies, allocations, and polling overhead.
+
+This release is available on GitHub only. Crates.io publishing remains disabled while the h3 fork patches are required; `cargo install shoes` still installs the previously published release.
 
 ## v0.3.2
 
