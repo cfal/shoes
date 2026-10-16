@@ -675,21 +675,31 @@ mod tests {
 
     #[tokio::test]
     async fn rejection_closes_sibling_downloads_and_releases_server_resources() {
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum Case {
+            MissingHeader,
+            UnmatchedPath,
+            MissingPadding,
+            DuplicateDownload,
+            RequestLimit,
+            PacketLimit,
+        }
+
         tokio::time::timeout(Duration::from_secs(10), async {
             for version in [XhttpVersion::H2, XhttpVersion::H3] {
-                for rejection in [
-                    "headers",
-                    "path",
-                    "padding",
-                    "conflict",
-                    "overload",
-                    "packet_overload",
+                for case in [
+                    Case::MissingHeader,
+                    Case::UnmatchedPath,
+                    Case::MissingPadding,
+                    Case::DuplicateDownload,
+                    Case::RequestLimit,
+                    Case::PacketLimit,
                 ] {
                     let mut state = service();
                     let service = Arc::get_mut(&mut state).unwrap();
-                    service.config.close_on_error = rejection != "headers";
+                    service.config.close_on_error = case != Case::MissingHeader;
                     service.config.matching_headers = [("x-token".into(), "secret".into())].into();
-                    if rejection == "overload" {
+                    if case == Case::RequestLimit {
                         service.requests = Arc::new(Budget::new(Some(1)));
                     }
                     service.config.limits.max_requests_per_session = 2;
@@ -733,7 +743,7 @@ mod tests {
                     assert_eq!(state.admission.snapshot().active, 1);
                     assert_eq!(state.memory.snapshot().active, 4);
 
-                    let packet_permit = if rejection == "packet_overload" {
+                    let packet_permit = if case == Case::PacketLimit {
                         Some(
                             state
                                 .session("session")
@@ -745,15 +755,14 @@ mod tests {
                     } else {
                         None
                     };
-                    let invalid = match rejection {
-                        "headers" => Request::get("https://localhost/t/session/0"),
-                        "path" => make("GET", "/wrong"),
-                        "padding" => Request::get("https://localhost/t/session/0")
+                    let invalid = match case {
+                        Case::MissingHeader => Request::get("https://localhost/t/session/0"),
+                        Case::UnmatchedPath => make("GET", "/wrong"),
+                        Case::MissingPadding => Request::get("https://localhost/t/session/0")
                             .header("x-token", "secret"),
-                        "conflict" => make("GET", "/t/session"),
-                        "overload" => make("GET", "/t/other"),
-                        "packet_overload" => make("POST", "/t/session/2"),
-                        _ => unreachable!(),
+                        Case::DuplicateDownload => make("GET", "/t/session"),
+                        Case::RequestLimit => make("GET", "/t/other"),
+                        Case::PacketLimit => make("POST", "/t/session/2"),
                     };
                     assert!(
                         carrier
@@ -3658,17 +3667,16 @@ impl State {
                 response.extensions_mut().insert(Refused);
                 return response;
             }
-            Err(Rejection::Status(status @ (StatusCode::NOT_FOUND | StatusCode::BAD_REQUEST))) => {
-                if status == StatusCode::BAD_REQUEST {
+            Err(Rejection::Status(status)) => {
+                if status != StatusCode::NOT_FOUND {
                     log::debug!("XHTTP request {} rejected: {status}", request.uri().path());
                 }
-                return Response::builder()
-                    .status(status)
-                    .body(Body::Empty)
-                    .unwrap();
-            }
-            Err(Rejection::Status(status)) => {
-                log::debug!("XHTTP request {} rejected: {status}", request.uri().path());
+                if matches!(status, StatusCode::NOT_FOUND | StatusCode::BAD_REQUEST) {
+                    return Response::builder()
+                        .status(status)
+                        .body(Body::Empty)
+                        .unwrap();
+                }
                 self.response(status, Body::Empty, false)
             }
         };

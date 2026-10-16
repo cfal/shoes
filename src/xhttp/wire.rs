@@ -111,11 +111,11 @@ pub enum Kind {
 pub fn check_matching_headers(config: &XhttpServerConfig, headers: &HeaderMap) -> io::Result<()> {
     for (name, expected) in &config.matching_headers {
         let mut values = headers.get_all(name.as_str()).iter();
-        if !values
+        let matches = values
             .next()
             .is_some_and(|value| bool::from(value.as_bytes().ct_eq(expected.as_bytes())))
-            || values.next().is_some()
-        {
+            && values.next().is_none();
+        if !matches {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "XHTTP request headers do not match",
