@@ -316,8 +316,11 @@ covering all three modes and HTTP versions. `type: splithttp` is an alias for
   Split legs may use different carriers on the same selected route. H2/H3 admission
   respects peer stream capacity; draining carriers retain their connection slots.
   A full pool refuses new sessions rather than exceeding its configured cap.
-  Split modes require at least two configured request lanes: two H1 connections,
-  or `pool.max_connections * limits.max_requests_per_connection >= 2` for H2/H3.
+  Split modes require at least two effective request lanes: two H1 connections,
+  or `pool.max_connections * effective_requests_per_connection >= 2` for H2/H3.
+  The effective per-connection limit is the smaller of
+  `limits.max_requests_per_connection` and `global_limits.max_streams_per_connection`
+  when the latter is configured. Peer stream limits can reduce runtime capacity further.
   Stream-one needs only one lane, including REALITY's automatic mode.
 - Server `x_padding_bytes` is an acceptance range, independent of
   `server_max_header_bytes` (8192 by default). A wide range can accept clients
@@ -351,6 +354,10 @@ covering all three modes and HTTP versions. `type: splithttp` is an alias for
   `limits.max_requests_per_session` (31 for the default H2/H3 client depth).
   Lower the client depth when using a smaller server cap; Shoes does not replay
   refused POSTs. Pool, byte and client request limits may reduce the effective depth.
+  Each H2/H3 packet-up session can hold up to the effective POST depth plus one
+  download slot in the shared pool (31 slots at the default depth). Delayed ACKs
+  retain those slots; several stalled or high-latency sessions can fill the pool
+  and refuse new sessions, including sessions to healthy destinations.
   Client `limits.max_requests_per_session` is an additional ceiling (128, minimum 2): one
   slot is for the download leg. `limits.max_requests`
   bounds outstanding POSTs across a client instance (4096 by default). Reaching

@@ -139,13 +139,15 @@ pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Valida
         }
     }
 
+    let global_limits = global_limits.unwrap_or_default();
+
     // Resolve client groups using topological sort
     let mut client_groups = resolve_client_groups_topologically(raw_client_groups)?;
 
     // Embed PEMs into all client configs in groups before they're used
     for configs in client_groups.values_mut() {
         for config in configs.iter_mut() {
-            validate_client_config(config, &named_pems)?;
+            validate_client_config(config, &named_pems, global_limits)?;
         }
     }
 
@@ -173,7 +175,13 @@ pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Valida
 
     for name in dns_group_order {
         let specs = expanded_dns_groups.get(&name).unwrap();
-        let expanded_specs = expand_dns_specs(specs, &client_groups, &named_pems, &group_names)?;
+        let expanded_specs = expand_dns_specs(
+            specs,
+            &client_groups,
+            &named_pems,
+            &group_names,
+            global_limits,
+        )?;
         final_dns_groups.push(ExpandedDnsGroup {
             name,
             specs: expanded_specs,
@@ -182,13 +190,19 @@ pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Valida
 
     // Validate server configs (DNS is now just a group reference).
     for config in server_configs.iter_mut() {
-        validate_server_config(config, &client_groups, &rule_groups, &named_pems)?;
+        validate_server_config(
+            config,
+            &client_groups,
+            &rule_groups,
+            &named_pems,
+            global_limits,
+        )?;
         validate_dns_group_ref(&config.dns, &group_names)?;
     }
 
     // Validate TUN configs.
     for config in tun_configs.iter_mut() {
-        validate_tun_config(config, &client_groups, &rule_groups)?;
+        validate_tun_config(config, &client_groups, &rule_groups, global_limits)?;
         validate_dns_group_ref(&config.dns, &group_names)?;
     }
 
@@ -197,7 +211,7 @@ pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Valida
     result.extend(tun_configs.into_iter().map(Config::TunServer));
 
     Ok(ValidatedConfigs {
-        global_limits: global_limits.unwrap_or_default(),
+        global_limits,
         configs: result,
         dns_groups: final_dns_groups,
     })
@@ -518,6 +532,7 @@ fn expand_dns_specs(
     client_groups: &HashMap<String, Vec<ClientConfig>>,
     named_pems: &HashMap<String, String>,
     dns_group_names: &HashSet<&str>,
+    global_limits: GlobalLimits,
 ) -> std::io::Result<Vec<ExpandedDnsSpec>> {
     let mut result = Vec::new();
 
@@ -544,7 +559,7 @@ fn expand_dns_specs(
             };
             // Validate inline client configs before expanding
             for hop in chain.hops.iter_mut() {
-                validate_client_chain_hop(hop, client_groups, named_pems)?;
+                validate_client_chain_hop(hop, client_groups, named_pems, global_limits)?;
             }
             expand_client_chain(&mut chain.hops, client_groups)?;
             expanded_chains.push(chain);
@@ -641,6 +656,7 @@ fn validate_server_config(
     client_groups: &HashMap<String, Vec<ClientConfig>>,
     rule_groups: &HashMap<String, Vec<RuleConfig>>,
     named_pems: &HashMap<String, String>,
+    global_limits: GlobalLimits,
 ) -> std::io::Result<()> {
     super::types::xhttp::validate_server_transport(
         &server_config.protocol,
@@ -736,6 +752,7 @@ fn validate_server_config(
             rule_config_selection.unwrap_config_mut(),
             client_groups,
             named_pems,
+            global_limits,
         )?;
     }
 
@@ -749,6 +766,7 @@ fn validate_server_config(
         } else {
             ServerProtocolContext::Stream
         },
+        global_limits,
     )?;
 
     Ok(())
@@ -931,6 +949,7 @@ fn validate_client_proxy_structure(config: &ClientProxyConfig) -> std::io::Resul
 fn validate_client_config(
     client_config: &mut ClientConfig,
     named_pems: &HashMap<String, String>,
+    global_limits: GlobalLimits,
 ) -> std::io::Result<()> {
     client_config.validate_quic_key_exchange(true)?;
     if client_config.transport != Transport::Tcp && client_config.tcp_settings.is_some() {
@@ -983,9 +1002,10 @@ fn validate_client_config(
     )?;
 
     if crate::xhttp::connector::contains(&client_config.protocol) {
-        crate::xhttp::connector::build(
+        crate::xhttp::connector::build_with_limits(
             client_config,
             std::sync::Arc::new(crate::resolver::NativeResolver::new()),
+            global_limits,
         )?;
     }
 
@@ -1259,6 +1279,7 @@ fn validate_server_proxy_config(
     rule_groups: &HashMap<String, Vec<RuleConfig>>,
     named_pems: &HashMap<String, String>,
     context: ServerProtocolContext,
+    global_limits: GlobalLimits,
 ) -> std::io::Result<()> {
     validate_server_auth(server_proxy_config)?;
     match server_proxy_config {
@@ -1278,6 +1299,7 @@ fn validate_server_proxy_config(
                 rule_groups,
                 named_pems,
                 ServerProtocolContext::Stream,
+                global_limits,
             )?;
         }
         ServerProxyConfig::Anytls {
@@ -1351,6 +1373,7 @@ fn validate_server_proxy_config(
                     rule_groups,
                     named_pems,
                     ServerProtocolContext::Tls,
+                    global_limits,
                 )?;
 
                 ConfigSelection::replace_none_or_some_groups(override_rules, rule_groups)?;
@@ -1360,6 +1383,7 @@ fn validate_server_proxy_config(
                         rule_config_selection.unwrap_config_mut(),
                         client_groups,
                         named_pems,
+                        global_limits,
                     )?;
                 }
             }
@@ -1391,6 +1415,7 @@ fn validate_server_proxy_config(
                     rule_groups,
                     named_pems,
                     ServerProtocolContext::Tls,
+                    global_limits,
                 )?;
 
                 ConfigSelection::replace_none_or_some_groups(override_rules, rule_groups)?;
@@ -1400,6 +1425,7 @@ fn validate_server_proxy_config(
                         rule_config_selection.unwrap_config_mut(),
                         client_groups,
                         named_pems,
+                        global_limits,
                     )?;
                 }
             }
@@ -1438,6 +1464,7 @@ fn validate_server_proxy_config(
                         0,
                         client_groups,
                         named_pems,
+                        global_limits,
                     )?;
                 }
 
@@ -1447,6 +1474,7 @@ fn validate_server_proxy_config(
                     rule_groups,
                     named_pems,
                     ServerProtocolContext::Stream,
+                    global_limits,
                 )?;
 
                 ConfigSelection::replace_none_or_some_groups(override_rules, rule_groups)?;
@@ -1456,6 +1484,7 @@ fn validate_server_proxy_config(
                         rule_config_selection.unwrap_config_mut(),
                         client_groups,
                         named_pems,
+                        global_limits,
                     )?;
                 }
             }
@@ -1489,7 +1518,7 @@ fn validate_server_proxy_config(
                     let mut hops = OneOrSome::Some(
                         std::mem::take(&mut reality_config.dest_client_chain).into_vec(),
                     );
-                    validate_client_chain(&mut hops, 0, client_groups, named_pems)?;
+                    validate_client_chain(&mut hops, 0, client_groups, named_pems, global_limits)?;
                     reality_config.dest_client_chain = NoneOrSome::Some(hops.into_vec());
                 }
 
@@ -1499,6 +1528,7 @@ fn validate_server_proxy_config(
                     rule_groups,
                     named_pems,
                     ServerProtocolContext::Tls,
+                    global_limits,
                 )?;
 
                 ConfigSelection::replace_none_or_some_groups(
@@ -1511,6 +1541,7 @@ fn validate_server_proxy_config(
                         rule_config_selection.unwrap_config_mut(),
                         client_groups,
                         named_pems,
+                        global_limits,
                     )?;
                 }
             }
@@ -1537,6 +1568,7 @@ fn validate_server_proxy_config(
                     rule_groups,
                     named_pems,
                     ServerProtocolContext::Stream,
+                    global_limits,
                 )?;
 
                 ConfigSelection::replace_none_or_some_groups(override_rules, rule_groups)?;
@@ -1546,6 +1578,7 @@ fn validate_server_proxy_config(
                         rule_config_selection.unwrap_config_mut(),
                         client_groups,
                         named_pems,
+                        global_limits,
                     )?;
                 }
             }
@@ -1580,6 +1613,7 @@ fn validate_tun_config(
     config: &mut TunConfig,
     client_groups: &HashMap<String, Vec<ClientConfig>>,
     rule_groups: &HashMap<String, Vec<RuleConfig>>,
+    global_limits: GlobalLimits,
 ) -> std::io::Result<()> {
     config.resource_limits.validate()?;
     if config.segmentation_offload == Some(true)
@@ -1636,7 +1670,7 @@ fn validate_tun_config(
     // Validate rules
     for rule in config.rules.iter_mut() {
         let rule = rule.unwrap_config_mut();
-        validate_rule_config(rule, client_groups, &HashMap::new())?;
+        validate_rule_config(rule, client_groups, &HashMap::new(), global_limits)?;
     }
 
     Ok(())
@@ -1646,6 +1680,7 @@ fn validate_rule_config(
     rule_config: &mut RuleConfig,
     client_groups: &HashMap<String, Vec<ClientConfig>>,
     named_pems: &HashMap<String, String>,
+    global_limits: GlobalLimits,
 ) -> std::io::Result<()> {
     if let RuleActionConfig::Allow {
         ref mut client_chains,
@@ -1666,7 +1701,13 @@ fn validate_rule_config(
         }
 
         for (chain_index, chain) in client_chains.iter_mut().enumerate() {
-            validate_client_chain(&mut chain.hops, chain_index, client_groups, named_pems)?;
+            validate_client_chain(
+                &mut chain.hops,
+                chain_index,
+                client_groups,
+                named_pems,
+                global_limits,
+            )?;
         }
     }
 
@@ -1678,9 +1719,10 @@ fn validate_client_chain(
     chain_index: usize,
     client_groups: &HashMap<String, Vec<ClientConfig>>,
     named_pems: &HashMap<String, String>,
+    global_limits: GlobalLimits,
 ) -> std::io::Result<()> {
     for hop in hops.iter_mut() {
-        validate_client_chain_hop(hop, client_groups, named_pems)?;
+        validate_client_chain_hop(hop, client_groups, named_pems, global_limits)?;
     }
     expand_client_chain(hops, client_groups)?;
     validate_direct_connector_positions(hops, chain_index)
@@ -1753,14 +1795,15 @@ fn validate_client_chain_hop(
     hop: &mut ClientChainHop,
     client_groups: &HashMap<String, Vec<ClientConfig>>,
     named_pems: &HashMap<String, String>,
+    global_limits: GlobalLimits,
 ) -> std::io::Result<()> {
     match hop {
         ClientChainHop::Single(selection) => {
-            validate_and_expand_selection(selection, client_groups, named_pems)?;
+            validate_and_expand_selection(selection, client_groups, named_pems, global_limits)?;
         }
         ClientChainHop::Pool(selections) => {
             for selection in selections.iter_mut() {
-                validate_and_expand_selection(selection, client_groups, named_pems)?;
+                validate_and_expand_selection(selection, client_groups, named_pems, global_limits)?;
             }
         }
     }
@@ -1772,10 +1815,11 @@ fn validate_and_expand_selection(
     selection: &mut ConfigSelection<ClientConfig>,
     client_groups: &HashMap<String, Vec<ClientConfig>>,
     named_pems: &HashMap<String, String>,
+    global_limits: GlobalLimits,
 ) -> std::io::Result<()> {
     match selection {
         ConfigSelection::Config(client_config) => {
-            validate_client_config(client_config, named_pems)?;
+            validate_client_config(client_config, named_pems, global_limits)?;
         }
         ConfigSelection::GroupName(group_name) => {
             let group_configs = client_groups.get(group_name).ok_or_else(|| {
@@ -1786,7 +1830,7 @@ fn validate_and_expand_selection(
             })?;
             // Validate all configs in the group; expansion happens in expand_client_chain
             for mut config in group_configs.clone() {
-                validate_client_config(&mut config, named_pems)?;
+                validate_client_config(&mut config, named_pems, global_limits)?;
             }
         }
     }
@@ -2027,6 +2071,7 @@ mod tests {
                     &HashMap::new(),
                     &HashMap::new(),
                     context,
+                    GlobalLimits::default(),
                 );
                 assert_eq!(result.is_ok(), context == valid_context);
                 if let Err(error) = result {
@@ -2059,7 +2104,8 @@ mod tests {
             }
         }))
         .unwrap();
-        let error = validate_client_config(&mut config, &HashMap::new()).unwrap_err();
+        let error = validate_client_config(&mut config, &HashMap::new(), GlobalLimits::default())
+            .unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
         assert_eq!(
             error.to_string(),
@@ -2111,7 +2157,8 @@ mod tests {
             }))
             .unwrap();
             assert_eq!(
-                validate_client_config(&mut config, &HashMap::new()).is_ok(),
+                validate_client_config(&mut config, &HashMap::new(), GlobalLimits::default())
+                    .is_ok(),
                 valid
             );
         }
@@ -2138,7 +2185,8 @@ mod tests {
             }
             let mut config: ClientConfig = serde_json::from_value(value).unwrap();
             assert_eq!(
-                validate_client_config(&mut config, &HashMap::new()).is_ok(),
+                validate_client_config(&mut config, &HashMap::new(), GlobalLimits::default())
+                    .is_ok(),
                 expected
             );
         }
@@ -2175,6 +2223,60 @@ mod tests {
     }
 
     #[test]
+    fn xhttp_split_capacity_uses_candidate_global_stream_limit() {
+        use serde_json::json;
+
+        for version in ["h1", "h2", "h3"] {
+            for mode in ["auto", "packet-up", "stream-up", "stream-one"] {
+                for connections in [1, 2] {
+                    for stream_limit in [None, Some(1), Some(2)] {
+                        let client = json!({
+                            "address": "127.0.0.1:443",
+                            "transport": if version == "h3" { "quic" } else { "tcp" },
+                            "protocol": {
+                                "type": "xhttp", "http_version": version, "mode": mode,
+                                "pool": {"max_connections": connections, "max_h1_connections": 2},
+                                "limits": {"max_requests_per_connection": 2},
+                                "protocol": {"type": "socks"}
+                            }
+                        });
+                        let rules = json!([{"masks": "0.0.0.0/0", "action": "allow", "client_chain": client}]);
+                        let entries = [
+                            json!({"client_group": "proxy", "client_proxies": client}),
+                            json!({"address": "0.0.0.0:1080", "protocol": {"type": "socks"}, "rules": rules}),
+                            json!({"dns_group": "dns", "dns_servers": [{"url": "https://1.1.1.1/dns-query", "client_chain": client}]}),
+                            json!({"device_fd": 1, "rules": rules}),
+                            json!({"address": "0.0.0.0:1080", "protocol": {"type": "websocket", "targets": [{"protocol": {"type": "socks"}, "override_rules": rules}]}}),
+                        ];
+                        for entry in entries {
+                            let configs = serde_json::from_value(json!([
+                                entry,
+                                {"global_limits": {"max_streams_per_connection": stream_limit}}
+                            ]))
+                            .unwrap();
+                            let result = create_server_configs(configs);
+                            let valid = version == "h1"
+                                || mode == "stream-one"
+                                || connections == 2
+                                || stream_limit != Some(1);
+                            assert_eq!(
+                                result.is_ok(),
+                                valid,
+                                "version={version}, mode={mode}, connections={connections}, stream_limit={stream_limit:?}, entry={entry}: {:?}",
+                                result.as_ref().err()
+                            );
+                            if let Err(error) = result {
+                                assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+                                assert!(error.to_string().contains("at least two request lanes"));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn hybrid_only_rejects_vision_and_tuic_early_handshakes() {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let tls_target = serde_json::json!({
@@ -2193,6 +2295,7 @@ mod tests {
                 &HashMap::new(),
                 &HashMap::new(),
                 ServerProtocolContext::Stream,
+                GlobalLimits::default(),
             )
             .unwrap_err();
             assert!(error.to_string().contains("hybrid-only"), "{error}");
@@ -2218,7 +2321,8 @@ mod tests {
                 &mut server,
                 &HashMap::new(),
                 &HashMap::new(),
-                &HashMap::new()
+                &HashMap::new(),
+                GlobalLimits::default(),
             )
             .unwrap_err()
             .to_string()
@@ -2240,7 +2344,8 @@ mod tests {
             }
             let direct = json!({"protocol": {"type": "direct"}, "transport": "quic", "quic_settings": settings});
             let mut config: ClientConfig = serde_json::from_value(direct).unwrap();
-            let result = validate_client_config(&mut config, &HashMap::new());
+            let result =
+                validate_client_config(&mut config, &HashMap::new(), GlobalLimits::default());
             assert_eq!(result.is_err(), groups.is_some());
 
             let proxy = json!({"address": "127.0.0.1:443", "protocol": {"type": "socks"}, "transport": "quic", "quic_settings": settings});
@@ -2258,8 +2363,13 @@ mod tests {
                     let later_hop = chain.as_array().unwrap().len() > 1;
                     let mut parsed: super::super::types::ClientChain =
                         serde_json::from_value(chain.clone()).unwrap();
-                    let result =
-                        validate_client_chain(&mut parsed.hops, 0, &group_configs, &HashMap::new());
+                    let result = validate_client_chain(
+                        &mut parsed.hops,
+                        0,
+                        &group_configs,
+                        &HashMap::new(),
+                        GlobalLimits::default(),
+                    );
                     assert_eq!(result.is_err(), later_hop && groups.is_some(), "{chain}");
                     if let Err(error) = result {
                         assert!(error.to_string().contains("QUIC key_exchange_groups"));
@@ -2268,8 +2378,13 @@ mod tests {
                         "url": "https://1.1.1.1/dns-query", "client_chain": {"chain": chain}
                     }))
                     .unwrap();
-                    let result =
-                        expand_dns_specs(&[spec], &group_configs, &HashMap::new(), &HashSet::new());
+                    let result = expand_dns_specs(
+                        &[spec],
+                        &group_configs,
+                        &HashMap::new(),
+                        &HashSet::new(),
+                        GlobalLimits::default(),
+                    );
                     assert_eq!(result.is_err(), later_hop && groups.is_some());
                     if let Err(error) = result {
                         assert!(error.to_string().contains("QUIC key_exchange_groups"));

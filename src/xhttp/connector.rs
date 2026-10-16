@@ -5,7 +5,7 @@ use crate::{
     address::NetLocation,
     async_stream::AsyncStream,
     config::xhttp::{XhttpMode, XhttpVersion, invalid},
-    config::{ClientConfig, ClientProxyConfig, Transport},
+    config::{ClientConfig, ClientProxyConfig, GlobalLimits, Transport},
     crypto::{CryptoConnection, CryptoTlsStream, TlsReadMode},
     resolver::Resolver,
     tcp::tcp_handler::TcpClientHandler,
@@ -86,6 +86,16 @@ type ClientTransport = (Arc<Client>, Box<dyn TcpClientHandler>);
 pub fn build(
     config: &ClientConfig,
     resolver: Arc<dyn Resolver>,
+) -> io::Result<Option<ClientTransport>> {
+    // DNS preparation can build connectors before candidate limits replace the live policy.
+    // Candidate capacity is checked separately during full-config validation.
+    build_with_limits(config, resolver, GlobalLimits::default())
+}
+
+pub(crate) fn build_with_limits(
+    config: &ClientConfig,
+    resolver: Arc<dyn Resolver>,
+    global_limits: GlobalLimits,
 ) -> io::Result<Option<ClientTransport>> {
     if !contains(&config.protocol) {
         return Ok(None);
@@ -233,14 +243,13 @@ pub fn build(
         XhttpMode::Auto => XhttpMode::PacketUp,
         mode => mode,
     };
-    // Config validation precedes installation of candidate global limits.
     let capacity = if version == XhttpVersion::H1 {
         xhttp.pool.max_h1_connections
     } else {
         xhttp
             .pool
             .max_connections
-            .saturating_mul(xhttp.limits.max_requests_per_connection)
+            .saturating_mul(xhttp.limits.request_limit_with(global_limits))
     };
     if mode != XhttpMode::StreamOne && capacity < 2 {
         return Err(invalid(
@@ -285,7 +294,7 @@ mod tests {
     }
 
     #[test]
-    fn split_modes_require_two_configured_lanes_after_auto_resolution() {
+    fn split_modes_require_two_effective_lanes_after_auto_resolution() {
         let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
         let public_key =
             base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, [1; 32]);
@@ -329,20 +338,26 @@ mod tests {
                     }))
                     .unwrap();
                     let single = mode == "stream-one" || (mode == "auto" && carrier == "reality");
-                    let capacity = if matches!(carrier, "plain-auto" | "h1" | "tls-h1") {
-                        h1_connections
-                    } else {
-                        connections * requests
-                    };
-                    let result = build(&config, resolver.clone());
-                    assert_eq!(
-                        result.is_ok(),
-                        single || capacity >= 2,
-                        "carrier={carrier}, mode={mode}, pool=({connections}, {h1_connections}, {requests}): {result:?}"
-                    );
-                    if let Err(error) = result {
-                        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
-                        assert!(error.to_string().contains("at least two request lanes"));
+                    for stream_limit in [None, Some(1), Some(2)] {
+                        let global_limits = GlobalLimits {
+                            max_streams_per_connection: stream_limit,
+                            ..Default::default()
+                        };
+                        let capacity = if matches!(carrier, "plain-auto" | "h1" | "tls-h1") {
+                            h1_connections
+                        } else {
+                            connections * requests.min(stream_limit.unwrap_or(requests))
+                        };
+                        let result = build_with_limits(&config, resolver.clone(), global_limits);
+                        assert_eq!(
+                            result.is_ok(),
+                            single || capacity >= 2,
+                            "carrier={carrier}, mode={mode}, pool=({connections}, {h1_connections}, {requests}), stream_limit={stream_limit:?}: {result:?}"
+                        );
+                        if let Err(error) = result {
+                            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+                            assert!(error.to_string().contains("at least two request lanes"));
+                        }
                     }
                 }
             }

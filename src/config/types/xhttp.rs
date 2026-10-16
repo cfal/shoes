@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, io};
 
 use serde::{Deserialize, Serialize};
 
-use super::{ClientProxyConfig, ServerProxyConfig};
+use super::{ClientProxyConfig, GlobalLimits, ServerProxyConfig};
 
 pub(crate) const MAX_PADDING_BYTES: u32 = 65536;
 
@@ -134,7 +134,11 @@ impl XhttpLimits {
     }
 
     pub(crate) fn request_limit(&self) -> usize {
-        crate::resources::limits()
+        self.request_limit_with(crate::resources::limits())
+    }
+
+    pub(crate) fn request_limit_with(&self, global_limits: GlobalLimits) -> usize {
+        global_limits
             .max_streams_per_connection
             .map_or(self.max_requests_per_connection, |limit| {
                 self.max_requests_per_connection.min(limit)
