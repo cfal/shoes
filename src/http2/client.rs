@@ -86,21 +86,25 @@ impl H2ClientSession {
         let active = Arc::new(ActiveStreams::default());
         let driver_active = active.clone();
         let abort_handle = tokio::spawn(async move {
-            // Retired sessions must flush queued DATA and END_STREAM before teardown.
-            let result = tokio::select! {
-                result = &mut connection => Some(result.map_err(io::Error::other)),
-                _ = &mut drain_rx => tokio::time::timeout(crate::util::SHUTDOWN_TIMEOUT, connection)
-                    .await.ok().map(|result| result.map_err(io::Error::other)),
+            let completed = tokio::select! {
+                result = &mut connection => Some(result),
+                _ = &mut drain_rx => None,
                 result = keep_alive(ping) => {
                     debug!("HTTP/2 client session retired after keepalive failure: {result:?}");
                     driver_retired.store(true, Ordering::SeqCst);
                     // A delayed PONG stops reuse, not already-established tunnels.
                     tokio::select! {
-                        result = &mut connection => Some(result.map_err(io::Error::other)),
-                        _ = driver_active.wait_idle() => tokio::time::timeout(crate::util::SHUTDOWN_TIMEOUT, connection)
-                            .await.ok().map(|result| result.map_err(io::Error::other)),
+                        result = &mut connection => Some(result),
+                        _ = driver_active.wait_idle() => None,
                     }
                 },
+            };
+            // Retired sessions must flush queued DATA and END_STREAM before teardown.
+            let result = match completed {
+                Some(result) => Some(result),
+                None => tokio::time::timeout(crate::util::SHUTDOWN_TIMEOUT, connection)
+                    .await
+                    .ok(),
             };
             if let Some(Err(e)) = result {
                 debug!("HTTP/2 client connection ended: {}", e);
@@ -304,20 +308,16 @@ mod tests {
         assert!(!session.is_ready());
         assert!(!session.driver_handle.driver.is_finished());
         for reservation in [reserved, session.reserve()] {
-            let error = tokio::time::timeout(
-                Duration::from_secs(1),
-                reservation.open(
-                    Request::builder()
-                        .method("CONNECT")
-                        .uri("example.com:443")
-                        .body(())
-                        .unwrap(),
-                ),
-            )
-            .await
-            .expect("retired carriers must reject pending opens without sending")
-            .err()
-            .expect("a retired carrier accepted a new request");
+            let request = Request::builder()
+                .method("CONNECT")
+                .uri("example.com:443")
+                .body(())
+                .unwrap();
+            let error = tokio::time::timeout(Duration::from_secs(1), reservation.open(request))
+                .await
+                .expect("retired carriers must reject pending opens without sending")
+                .err()
+                .expect("a retired carrier accepted a new request");
             assert!(!error.sent);
             assert_eq!(error.error.reason(), Some(h2::Reason::REFUSED_STREAM));
         }
