@@ -9,3 +9,6 @@ mod tls_hybrid;
 
 #[path = "cases/optional_peer/http2_proxy.rs"]
 mod http2_proxy;
+
+#[path = "cases/optional_peer/naive_transport.rs"]
+mod naive_transport;

@@ -100,3 +100,72 @@ async fn response_headers_larger_than_16_kib_remain_accepted() {
     let _ = server.await;
     result.unwrap().unwrap();
 }
+
+#[tokio::test]
+async fn peer_stream_limit_queues_without_dropping_existing_tunnel() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use super::h2_multi_stream::H2MultiStream;
+
+    let (client, peer) = tokio::io::duplex(8192);
+    let count = Arc::new(AtomicUsize::new(0));
+    let accepted = count.clone();
+    let server = tokio::spawn(async move {
+        let mut connection = h2::server::Builder::new()
+            .max_concurrent_streams(1)
+            .handshake(peer)
+            .await
+            .unwrap();
+        let mut streams = tokio::task::JoinSet::new();
+        while let Some(incoming) = connection.accept().await {
+            let (request, mut respond) = incoming.unwrap();
+            accepted.fetch_add(1, Ordering::SeqCst);
+            let send = respond
+                .send_response(http::Response::new(()), false)
+                .unwrap();
+            streams.spawn(async move {
+                let mut stream = H2MultiStream::new(send, request.into_body());
+                let mut data = Vec::new();
+                stream.read_to_end(&mut data).await.unwrap();
+                stream.write_all(&data).await.unwrap();
+                stream.shutdown().await.unwrap();
+            });
+        }
+    });
+    let mut session = NaiveClientSession::new(Box::new(client)).await.unwrap();
+    let target = NetLocation::from_str("example.com:443", None).unwrap();
+    let mut first = session
+        .open_stream(&target, "Basic dTpw", false)
+        .await
+        .unwrap();
+    let mut second_session = session.clone();
+    let second = second_session.open_stream(&target, "Basic dTpw", false);
+    tokio::pin!(second);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut second)
+            .await
+            .is_err()
+    );
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+    first.write_all(b"first").await.unwrap();
+    first.shutdown().await.unwrap();
+    let mut response = Vec::new();
+    first.read_to_end(&mut response).await.unwrap();
+    assert_eq!(response, b"first");
+    drop(first);
+    let mut second = tokio::time::timeout(Duration::from_secs(1), second)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(count.load(Ordering::SeqCst), 2);
+    second.write_all(b"second").await.unwrap();
+    second.shutdown().await.unwrap();
+    response.clear();
+    second.read_to_end(&mut response).await.unwrap();
+    assert_eq!(response, b"second");
+    server.abort();
+    let _ = server.await;
+}

@@ -30,11 +30,8 @@ fn require_naive_client() -> std::io::Result<()> {
 
 // Shoes Client -> Native NaiveProxy Server (Caddy) Tests
 //
-// Note: These tests may have authentication issues due to differences
-// in how forwardproxy handles JSON config vs Caddyfile config.
-
 #[tokio::test]
-#[ignore = "Requires native naive caddy binary - may have auth config issues"]
+#[ignore = "Requires native naive Caddy binary; no root or system CA needed"]
 async fn test_shoes_client_to_naive_caddy_server() -> Result<(), Box<dyn std::error::Error>> {
     let fixture = ProxyTestFixture::new()
         .with_shoes_naiveproxy_client()
@@ -49,7 +46,7 @@ async fn test_shoes_client_to_naive_caddy_server() -> Result<(), Box<dyn std::er
 }
 
 #[tokio::test]
-#[ignore = "Requires native naive caddy binary - may have auth config issues"]
+#[ignore = "Requires native naive Caddy binary; no root or system CA needed"]
 async fn test_shoes_client_to_naive_caddy_server_large() -> Result<(), Box<dyn std::error::Error>> {
     let fixture = ProxyTestFixture::new()
         .with_shoes_naiveproxy_client()
