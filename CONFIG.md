@@ -634,6 +634,13 @@ protocol:
   padding: true                # Default: true (enables padding protocol)
 ```
 
+NaiveProxy retains its own HTTP/2 client transport policies, independent of
+`http_version: h2` on standard HTTP proxies: 256 KiB stream and connection
+receive windows, the H2 library's 16 MiB response-header decoding limit, and no periodic
+HTTP/2 PING watchdog. Peer stream limits and timeouts still apply. In particular,
+Caddy v2.11.7 defaults to a one-minute request-body idle timeout, which can end a
+quiet CONNECT tunnel; connection-level PINGs do not reset that timeout.
+
 ## Rules System
 
 Rules determine how incoming connections are routed.

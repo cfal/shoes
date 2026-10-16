@@ -172,6 +172,7 @@ impl H2ClientSession {
         Arc::ptr_eq(&self.driver_handle, &other.driver_handle)
     }
 
+    #[cfg(test)]
     pub async fn open(
         &mut self,
         request: Request<()>,

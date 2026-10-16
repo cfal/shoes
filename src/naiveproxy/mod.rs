@@ -1,3 +1,6 @@
+#[cfg(test)]
+mod client_compat_tests;
+mod h2_multi_stream;
 mod naive_client_handler;
 mod naive_client_session;
 mod naive_hyper_service;
