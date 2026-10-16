@@ -66,6 +66,11 @@ async fn chacha20_tcp() -> Result<(), Box<dyn Error>> {
 }
 
 #[tokio::test]
+async fn aes128_v2_single_request() -> Result<(), Box<dyn Error>> {
+    roundtrip(2, "aes-128-gcm").await
+}
+
+#[tokio::test]
 async fn aes128_tcp_and_udp() -> Result<(), Box<dyn Error>> {
     roundtrip(3, "aes-128-gcm").await
 }

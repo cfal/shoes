@@ -39,6 +39,14 @@ All server protocols plus:
 - **Shadowsocks**: `aes-128-gcm`, `aes-256-gcm`, `chacha20-ietf-poly1305`, `2022-blake3-aes-128-gcm`, `2022-blake3-aes-256-gcm`, `2022-blake3-chacha20-ietf-poly1305`
 - **Snell v3**: `aes-128-gcm`, `aes-256-gcm`, `chacha20-ietf-poly1305`
 
+For Clash.Meta/Mihomo legacy Snell clients, use `chacha20-ietf-poly1305` with v1
+or `aes-128-gcm` with v3. Run Shoes v0.3.3 or newer for the corrected 16-byte
+Snell salts. These clients do not offer an AES-256 option. Do not use v2:
+Shoes does not implement Snell v2 connection reuse or its half-close markers.
+Older Clash.Meta clients fail requests on reused v2 connections.
+Shoes-to-Shoes connections can also use `aes-256-gcm`; both ends must use the
+same cipher and run v0.3.3 or newer for AES-256 or ChaCha20.
+
 ## Features
 
 - **Multi-transport**: TCP or QUIC for all protocols
@@ -324,6 +332,42 @@ covering all three modes and HTTP versions. `type: splithttp` is an alias for
   not receive this grace period.
 - H1/H2 preserve selected upstream proxy chains. H3 must be the first proxy hop;
   it reuses the existing QUIC/H3 dependencies, not Hysteria2 framing.
+- Server `matching_headers` requires every configured header on every request,
+  including OPTIONS. Names are case-insensitive; values must match exactly and
+  occur only once. Missing, wrong, or repeated values close the entire carrier
+  without an HTTP response, before session admission or body processing. On
+  H2/H3 this also terminates other requests sharing the connection. Configure
+  the client's `headers` with the same values, for example
+  `matching_headers: { X-Tunnel-Key: "replace-me" }` on the server and
+  `headers: { X-Tunnel-Key: "replace-me" }` on the client. An empty map (default)
+  adds no requirements; an empty value requires a present, empty header.
+  Use `host`, not `matching_headers`, to match Host/`:authority` across versions.
+  Transport-managed headers and values with leading/trailing spaces or tabs
+  are rejected at startup. With multiplexing reverse proxies or CDNs, closing
+  a shared upstream connection can also interrupt other clients.
+  Browser preflights without the required headers are also rejected.
+  On H3, exhausting request admission closes the connection when header
+  requirements are configured: the server cannot validate more headers within
+  its request budget. This also affects valid clients, regardless of `close_on_error`.
+- Server `close_on_error: true` closes the carrier instead of sending any
+  XHTTP-generated 4xx/5xx response, including invalid requests, unmatched paths
+  or hosts, conflicts, timeouts, oversized bodies, and resource exhaustion.
+  Admission failures also close instead of refusing an individual stream.
+  On H2/H3, other requests sharing that connection are terminated too.
+  With a CDN or reverse proxy, this can interrupt other clients sharing its
+  upstream connection. Late packets, routine session teardown, or request slots
+  awaiting cancellation cleanup can also trigger strict closure; this option
+  trades shared-connection resilience for silent rejection.
+  The default is `false`, preserving HTTP errors and stream refusals; 400 and
+  404 responses omit XHTTP-specific and CORS headers. Required-header mismatches
+  always close once checked, regardless of this option. Observed peer stream
+  resets stay stream-local, as do H2 library resets for malformed request bodies
+  (for example, Content-Length or flow-control violations). H3 may not observe
+  cancellation while a request is awaiting admission or the peer only stops
+  reading; a later timeout or other rejection still closes the carrier.
+  HTTP-library parsing/protocol errors before
+  XHTTP receives a request, and body failures after a successful response has
+  started, retain their existing handling.
 - `host` overrides HTTP authority independently of TLS SNI. Default Referer
   padding, path/query handling, packet sizing/pacing, and stream-up keepalives
   follow modern Xray. `limits` bounds sessions, buffered bytes, requests and

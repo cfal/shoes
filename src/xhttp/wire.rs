@@ -2,6 +2,7 @@ use std::io;
 
 use base64::Engine;
 use http::{HeaderMap, Method, Request, StatusCode};
+use subtle::ConstantTimeEq;
 
 use crate::config::xhttp::{XhttpClientConfig, XhttpMode, XhttpServerConfig};
 
@@ -105,6 +106,23 @@ pub enum Kind {
     Download(String),
     Upload(String),
     Packet(String, u64),
+}
+
+pub fn check_matching_headers(config: &XhttpServerConfig, headers: &HeaderMap) -> io::Result<()> {
+    for (name, expected) in &config.matching_headers {
+        let mut values = headers.get_all(name.as_str()).iter();
+        let matches = values
+            .next()
+            .is_some_and(|value| bool::from(value.as_bytes().ct_eq(expected.as_bytes())))
+            && values.next().is_none();
+        if !matches {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "XHTTP request headers do not match",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn query_padding(query: &str) -> Option<String> {
@@ -250,6 +268,83 @@ pub fn header_payload(headers: &HeaderMap) -> io::Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classification_uses_decoded_paths() {
+        let config: XhttpServerConfig = serde_json::from_value(serde_json::json!({
+            "path": "/t", "host": "front.test", "protocol": {"type": "socks"}
+        }))
+        .unwrap();
+        let path = Path::new(&config.path).unwrap();
+        for (uri, matched) in [
+            ("/wrong", false),
+            ("/t", false),
+            ("/tother/", false),
+            ("/t/%FF", false),
+            ("/t/", true),
+            ("/t/session", true),
+            ("/%74/session", true),
+            ("/t/?next=/wrong", true),
+        ] {
+            let request = Request::builder()
+                .method("OPTIONS")
+                .uri(format!("http://front.test{uri}"))
+                .body(())
+                .unwrap();
+            assert_eq!(classify(&config, &path, &request).is_ok(), matched);
+        }
+        for (uri, status) in [
+            ("http://front.test/t/session", StatusCode::BAD_REQUEST),
+            ("http://wrong.test/t/session", StatusCode::NOT_FOUND),
+        ] {
+            let request = Request::get(uri).body(()).unwrap();
+            assert_eq!(classify(&config, &path, &request), Err(status));
+        }
+    }
+
+    #[test]
+    fn matching_headers_require_one_exact_value_per_name() {
+        let mut config: XhttpServerConfig = serde_json::from_value(serde_json::json!({
+            "protocol": {"type": "socks"}
+        }))
+        .unwrap();
+        assert!(check_matching_headers(&config, &HeaderMap::new()).is_ok());
+        config
+            .matching_headers
+            .insert("X-Token".into(), "Secret".into());
+        config
+            .matching_headers
+            .insert("X-Empty".into(), String::new());
+        config.validate().unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-token", "Secret".parse().unwrap());
+        assert!(check_matching_headers(&config, &headers).is_err());
+        headers.insert("x-empty", "".parse().unwrap());
+        headers.insert("x-extra", "allowed".parse().unwrap());
+        assert!(check_matching_headers(&config, &headers).is_ok());
+        for values in [
+            vec![],
+            vec![""],
+            vec!["secret"],
+            vec!["Secret "],
+            vec!["Secret, Secret"],
+            vec!["Secret", "Secret"],
+            vec!["Secret", "wrong"],
+            vec!["wrong", "Secret"],
+        ] {
+            headers.remove("x-token");
+            for value in values {
+                headers.append("x-token", value.parse().unwrap());
+            }
+            assert_eq!(
+                check_matching_headers(&config, &headers)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::PermissionDenied
+            );
+        }
+    }
 
     #[test]
     fn padding_acceptance_range_does_not_override_request_header_limit() {
