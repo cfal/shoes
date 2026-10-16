@@ -66,6 +66,169 @@ fn connect(target: &str) -> Request<()> {
         .unwrap()
 }
 
+fn raw_frame(kind: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(9 + payload.len());
+    frame.extend_from_slice(&(payload.len() as u32).to_be_bytes()[1..]);
+    frame.extend_from_slice(&[kind, flags]);
+    frame.extend_from_slice(&stream.to_be_bytes());
+    frame.extend_from_slice(payload);
+    frame
+}
+
+#[tokio::test]
+async fn final_upload_data_survives_graceful_goaway() {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let target = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let upstream = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.shutdown().await.unwrap();
+            let mut data = Vec::new();
+            stream.read_to_end(&mut data).await.unwrap();
+            data
+        });
+        let (mut client, transport) = tokio::io::duplex(8192);
+        let resolver = Arc::new(NativeResolver::new());
+        let selector = Arc::new(
+            create_tcp_client_proxy_selector(
+                vec![crate::config::RuleConfig::default()],
+                resolver.clone(),
+            )
+            .unwrap(),
+        );
+        let server = tokio::spawn(serve(Box::new(transport), None, selector, resolver));
+        // Literal HPACK :method CONNECT and :authority, followed by END_HEADERS.
+        let mut headers = b"\x02\x07CONNECT\x01".to_vec();
+        headers.push(target.len() as u8);
+        headers.extend_from_slice(target.as_bytes());
+        client
+            .write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+            .await
+            .unwrap();
+        client.write_all(&raw_frame(4, 0, 0, &[])).await.unwrap();
+        client
+            .write_all(&raw_frame(1, 4, 1, &headers))
+            .await
+            .unwrap();
+        loop {
+            let mut header = [0; 9];
+            client.read_exact(&mut header).await.unwrap();
+            let len = u32::from_be_bytes([0, header[0], header[1], header[2]]) as usize;
+            let mut payload = vec![0; len];
+            client.read_exact(&mut payload).await.unwrap();
+            if header[3] == 4 && header[4] & 1 == 0 {
+                client.write_all(&raw_frame(4, 1, 0, &[])).await.unwrap();
+            }
+            if matches!(header[3], 0 | 1) && header[4] & 1 != 0 {
+                break;
+            }
+        }
+        let mut end = raw_frame(0, 1, 1, b"tail");
+        end.extend(raw_frame(7, 0, 0, &[0; 8]));
+        client.write_all(&end).await.unwrap();
+        assert_eq!(upstream.await.unwrap(), b"tail");
+        server.await.unwrap().unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn reset_cancels_a_relay_blocked_on_upstream() {
+    let (client, transport) = tokio::io::duplex(8192);
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let mut connection = h2::server::handshake(transport).await.unwrap();
+        let (request, mut respond) = connection.accept().await.unwrap().unwrap();
+        let send = respond.send_response(Response::new(()), false).unwrap();
+        tx.send(H2MultiStream::new(send, request.into_body()))
+            .ok()
+            .unwrap();
+        while connection.accept().await.is_some() {}
+    });
+    let mut session = H2ClientSession::new(Box::new(client)).await.unwrap();
+    let (_, mut client) = session.open(connect("example.com:443")).await.unwrap();
+    let (upstream, _stalled) = tokio::io::duplex(1);
+    let relay = tokio::spawn(relay(
+        rx.await.unwrap(),
+        crate::tcp::tcp_handler::TcpClientSetupResult {
+            client_stream: Box::new(upstream),
+            early_data: None,
+        },
+    ));
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(20),
+            client.write_all(&vec![0; 1024 * 1024])
+        )
+        .await
+        .is_err()
+    );
+    drop(client);
+    tokio::time::timeout(Duration::from_secs(1), relay)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(session.is_ready());
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn unread_upload_does_not_exhaust_connection_credit() {
+    let resolver = Arc::new(PendingResolver {
+        started: Arc::new(tokio::sync::Notify::new()),
+        dropped: Arc::new(tokio::sync::Notify::new()),
+    });
+    let selector = Arc::new(
+        create_tcp_client_proxy_selector(
+            vec![crate::config::RuleConfig::default()],
+            resolver.clone(),
+        )
+        .unwrap(),
+    );
+    let (client, transport) = tokio::io::duplex(8192);
+    let server = tokio::spawn(serve(Box::new(transport), None, selector, resolver.clone()));
+    let (mut sender, connection) = h2::client::handshake(client).await.unwrap();
+    let driver = tokio::spawn(connection);
+    let (first_response, first_send) = sender
+        .send_request(connect("pending.test:443"), false)
+        .unwrap();
+    resolver.started.notified().await;
+    // Consume one full stream window without reading it on the server.
+    async fn write(send: &mut h2::SendStream<Bytes>, mut bytes: usize) {
+        while bytes > 0 {
+            send.reserve_capacity(bytes);
+            let count = std::future::poll_fn(|cx| send.poll_capacity(cx))
+                .await
+                .unwrap()
+                .unwrap()
+                .min(bytes);
+            send.send_data(Bytes::from(vec![0; count]), false).unwrap();
+            bytes -= count;
+        }
+    }
+    let mut first_send = first_send;
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        write(&mut first_send, super::super::STREAM_WINDOW as usize),
+    )
+    .await
+    .unwrap();
+    sender = sender.ready().await.unwrap();
+    let (second_response, mut second_send) = sender
+        .send_request(connect("pending.test:443"), false)
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), write(&mut second_send, 1))
+        .await
+        .unwrap();
+    drop((first_response, first_send, second_response, second_send));
+    server.abort();
+    driver.abort();
+    let _ = tokio::join!(server, driver);
+}
+
 #[tokio::test]
 async fn h1_method_sharing_preface_prefix_remains_h1() {
     let (mut client, server) = tokio::io::duplex(256);
@@ -92,23 +255,11 @@ async fn h1_method_sharing_preface_prefix_remains_h1() {
 }
 
 #[tokio::test]
-async fn authentication_is_checked_on_every_stream_and_errors_are_isolated() {
+async fn missing_auth_can_be_retried_but_every_stream_must_authenticate() {
     let mut peer = peer(true, false, Arc::new(NativeResolver::new()), true).await;
-    for headers in [
-        vec![],
-        vec!["Basic wrong"],
-        vec!["Basic dXNlcjpwYXNz", "Basic dXNlcjpwYXNz"],
-    ] {
-        let mut request = connect("example.com:443");
-        for value in headers {
-            request
-                .headers_mut()
-                .append(header::PROXY_AUTHORIZATION, value.parse().unwrap());
-        }
-        let (response, _) = peer.session.open(request).await.unwrap();
-        assert_eq!(response.status, StatusCode::PROXY_AUTHENTICATION_REQUIRED);
-        assert!(response.headers.contains_key(header::PROXY_AUTHENTICATE));
-    }
+    let (response, _) = peer.session.open(connect("example.com:443")).await.unwrap();
+    assert_eq!(response.status, StatusCode::PROXY_AUTHENTICATION_REQUIRED);
+    assert!(response.headers.contains_key(header::PROXY_AUTHENTICATE));
     let mut request = connect("example.com:443");
     request.headers_mut().insert(
         header::PROXY_AUTHORIZATION,
@@ -118,6 +269,55 @@ async fn authentication_is_checked_on_every_stream_and_errors_are_isolated() {
     assert_eq!(response.status, StatusCode::FORBIDDEN);
     let (response, _) = peer.session.open(connect("example.com:443")).await.unwrap();
     assert_eq!(response.status, StatusCode::PROXY_AUTHENTICATION_REQUIRED);
+}
+
+#[tokio::test]
+async fn wrong_or_duplicate_credentials_close_the_carrier() {
+    for headers in [
+        vec!["Basic wrong"],
+        vec!["Basic dXNlcjpwYXNz", "Basic dXNlcjpwYXNz"],
+    ] {
+        let mut peer = peer(true, false, Arc::new(NativeResolver::new()), true).await;
+        let mut request = connect("example.com:443");
+        for value in headers {
+            request
+                .headers_mut()
+                .append(header::PROXY_AUTHORIZATION, value.parse().unwrap());
+        }
+        let (response, stream) = peer.session.open(request).await.unwrap();
+        assert_eq!(response.status, StatusCode::PROXY_AUTHENTICATION_REQUIRED);
+        drop(stream);
+        let mut request = connect("example.com:443");
+        request.headers_mut().insert(
+            header::PROXY_AUTHORIZATION,
+            "Basic dXNlcjpwYXNz".parse().unwrap(),
+        );
+        if let Ok((response, stream)) = peer.session.open(request).await {
+            assert_eq!(response.status, StatusCode::PROXY_AUTHENTICATION_REQUIRED);
+            drop(stream);
+        }
+        tokio::time::timeout(Duration::from_secs(1), &mut peer.server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn idle_timeout_ignores_pings_and_rejected_requests() {
+    let mut peer = peer(true, false, Arc::new(NativeResolver::new()), true).await;
+    // Complete SETTINGS and establish the idle clock.
+    drop(peer.session.open(connect("example.com:443")).await.unwrap());
+    let start = tokio::time::Instant::now();
+    tokio::time::sleep(Duration::from_secs(59)).await;
+    drop(peer.session.open(connect("example.com:443")).await.unwrap());
+    // The shared client sends PINGs at 30 s, which must not keep this carrier alive.
+    tokio::time::timeout(Duration::from_secs(7), &mut peer.server)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(start.elapsed() >= Duration::from_secs(60));
+    assert!(start.elapsed() <= Duration::from_secs(65));
 }
 
 #[test]

@@ -1,4 +1,4 @@
-use std::{io, sync::Arc};
+use std::{io, sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use http::{Method, Request, Response, StatusCode, header};
@@ -28,8 +28,8 @@ pub(crate) async fn serve(
     let budget = Arc::new(Budget::new(limit));
     let mut connection = crate::util::timeout_stream_setup(async {
         h2::server::Builder::new()
-            .initial_window_size(256 * 1024)
-            .initial_connection_window_size(256 * 1024)
+            .initial_window_size(super::STREAM_WINDOW)
+            .initial_connection_window_size(super::CONNECTION_WINDOW)
             .max_frame_size(16 * 1024)
             .max_header_list_size(16 * 1024)
             .max_concurrent_streams(limit.unwrap_or(1024).min(u32::MAX as usize) as u32)
@@ -39,21 +39,43 @@ pub(crate) async fn serve(
     })
     .await?;
     let mut tasks = JoinSet::new();
+    let mut idle_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let mut shutdown_deadline = None;
+    let mut auth_failed = false;
     loop {
         tokio::select! {
+            _ = tokio::time::sleep_until(shutdown_deadline.unwrap_or(idle_deadline)),
+                if shutdown_deadline.is_some() || tasks.is_empty() => {
+                if shutdown_deadline.is_some() {
+                    return Ok(());
+                }
+                connection.graceful_shutdown();
+                shutdown_deadline = Some(tokio::time::Instant::now() + crate::util::SHUTDOWN_TIMEOUT);
+            }
             accepted = connection.accept() => {
                 let Some(accepted) = accepted else { break };
                 let (request, mut respond) = accepted.map_err(io::Error::other)?;
-                let (Some(local), Some(global)) = (budget.acquire(1), resources::try_stream()) else {
-                    respond.send_reset(h2::Reason::REFUSED_STREAM);
+                if auth_failed {
+                    let _ = reject(&mut respond, StatusCode::PROXY_AUTHENTICATION_REQUIRED);
                     continue;
-                };
+                }
                 let target = match validate(&request, auth_token.as_deref()) {
                     Ok(target) => target,
                     Err(status) => {
                         let _ = reject(&mut respond, status);
+                        if status == StatusCode::PROXY_AUTHENTICATION_REQUIRED
+                            && request.headers().contains_key(header::PROXY_AUTHORIZATION)
+                        {
+                            auth_failed = true;
+                            connection.graceful_shutdown();
+                            shutdown_deadline = Some(tokio::time::Instant::now() + crate::util::SHUTDOWN_TIMEOUT);
+                        }
                         continue;
                     }
+                };
+                let (Some(local), Some(global)) = (budget.acquire(1), resources::try_stream()) else {
+                    respond.send_reset(h2::Reason::REFUSED_STREAM);
+                    continue;
                 };
                 let selector = selector.clone();
                 let resolver = resolver.clone();
@@ -64,10 +86,20 @@ pub(crate) async fn serve(
                     }
                 });
             }
-            _ = tasks.join_next(), if !tasks.is_empty() => {}
+            _ = tasks.join_next(), if !tasks.is_empty() => {
+                if tasks.is_empty() {
+                    idle_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+                }
+            }
         }
     }
-    // JoinSet drops abort pending dials and relays when the carrier closes.
+    // Clean H2 completion may precede consumption of the final buffered DATA.
+    let deadline = shutdown_deadline
+        .unwrap_or_else(|| tokio::time::Instant::now() + crate::util::SHUTDOWN_TIMEOUT);
+    let _ = tokio::time::timeout_at(deadline, async {
+        while tasks.join_next().await.is_some() {}
+    })
+    .await;
     Ok(())
 }
 
@@ -139,7 +171,7 @@ async fn tunnel(
             setup_client_tcp_stream(selector, resolver, target),
         ) => result,
     };
-    let mut upstream = match result {
+    let upstream = match result {
         Ok(Some(upstream)) => upstream,
         Ok(None) => return reject(&mut respond, StatusCode::FORBIDDEN),
         Err(error) => {
@@ -154,22 +186,34 @@ async fn tunnel(
     let send = respond
         .send_response(Response::new(()), false)
         .map_err(io::Error::other)?;
-    let mut stream = H2MultiStream::new(send, request.into_body());
-    if let Some(data) = upstream.early_data.take() {
-        stream.write_all(&data).await?;
+    relay(H2MultiStream::new(send, request.into_body()), upstream).await
+}
+
+async fn relay(
+    mut stream: H2MultiStream,
+    mut upstream: crate::tcp::tcp_handler::TcpClientSetupResult,
+) -> io::Result<()> {
+    let reset = stream.reset();
+    tokio::select! {
+        biased;
+        _ = reset => Ok(()),
+        result = async {
+            if let Some(data) = upstream.early_data.take() {
+                stream.write_all(&data).await?;
+            }
+            let result = crate::copy_bidirectional::copy_bidirectional(
+                &mut stream,
+                &mut upstream.client_stream,
+                false,
+                false,
+            ).await;
+            if result.is_ok() {
+                tokio::join!(
+                    crate::util::shutdown_stream(&mut stream),
+                    crate::util::shutdown_stream(&mut upstream.client_stream),
+                );
+            }
+            result.map(|_| ())
+        } => result,
     }
-    let result = crate::copy_bidirectional::copy_bidirectional(
-        &mut stream,
-        &mut upstream.client_stream,
-        false,
-        false,
-    )
-    .await;
-    if result.is_ok() {
-        tokio::join!(
-            crate::util::shutdown_stream(&mut stream),
-            crate::util::shutdown_stream(&mut upstream.client_stream),
-        );
-    }
-    result.map(|_| ())
 }

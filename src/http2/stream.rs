@@ -2,6 +2,7 @@
 
 use std::io;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use bytes::Bytes;
@@ -12,7 +13,7 @@ use crate::async_stream::{AsyncPing, AsyncStream};
 /// H2 stream for multiplexed connections.
 /// Client streams retain the connection driver independently of the session slot.
 pub struct H2MultiStream {
-    send: h2::SendStream<Bytes>,
+    send: Arc<parking_lot::Mutex<h2::SendStream<Bytes>>>,
     recv: h2::RecvStream,
     /// Buffered received data
     recv_buf: Bytes,
@@ -24,7 +25,7 @@ pub struct H2MultiStream {
 impl H2MultiStream {
     pub fn new(send: h2::SendStream<Bytes>, recv: h2::RecvStream) -> Self {
         Self {
-            send,
+            send: Arc::new(parking_lot::Mutex::new(send)),
             recv,
             recv_buf: Bytes::new(),
             shutdown_sent: false,
@@ -34,6 +35,12 @@ impl H2MultiStream {
 
     pub fn set_session_owner(&mut self, session: super::client::H2ClientSession) {
         self.session_owner = Some(session);
+    }
+
+    // A relay blocked on its upstream must still observe a peer reset.
+    pub fn reset(&self) -> impl Future<Output = Result<h2::Reason, h2::Error>> + use<> {
+        let send = self.send.clone();
+        std::future::poll_fn(move |cx| send.lock().poll_reset(cx))
     }
 }
 
@@ -70,7 +77,7 @@ impl AsyncRead for H2MultiStream {
 
 impl AsyncWrite for H2MultiStream {
     fn poll_write(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
@@ -81,17 +88,17 @@ impl AsyncWrite for H2MultiStream {
             return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
         }
         let wanted = buf.len().min(16 * 1024);
-        self.send.reserve_capacity(wanted);
+        let mut send = self.send.lock();
+        send.reserve_capacity(wanted);
         loop {
-            let capacity = self.send.capacity();
+            let capacity = send.capacity();
             if capacity != 0 {
                 let count = wanted.min(capacity);
-                self.send
-                    .send_data(Bytes::copy_from_slice(&buf[..count]), false)
+                send.send_data(Bytes::copy_from_slice(&buf[..count]), false)
                     .map_err(io::Error::other)?;
                 return Poll::Ready(Ok(count));
             }
-            match std::task::ready!(self.send.poll_capacity(cx)) {
+            match std::task::ready!(send.poll_capacity(cx)) {
                 Some(Ok(_)) => continue,
                 Some(Err(e)) => return Poll::Ready(Err(io::Error::other(e))),
                 None => return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into())),
@@ -106,7 +113,8 @@ impl AsyncWrite for H2MultiStream {
 
     fn poll_shutdown(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         if !self.shutdown_sent {
-            match self.send.send_data(Bytes::new(), true) {
+            let result = self.send.lock().send_data(Bytes::new(), true);
+            match result {
                 Ok(()) => self.shutdown_sent = true,
                 Err(e) => {
                     return Poll::Ready(Err(io::Error::other(format!(
@@ -176,10 +184,11 @@ mod tests {
         assert_eq!(client.write(&[]).await.unwrap(), 0);
         assert_eq!(client.read(&mut []).await.unwrap(), 0);
         for _ in 0..64 {
-            server.send.send_data(Bytes::new(), false).unwrap();
+            server.send.lock().send_data(Bytes::new(), false).unwrap();
         }
         server
             .send
+            .lock()
             .send_data(Bytes::from_static(b"hello"), true)
             .unwrap();
         let mut first = [0; 1];
@@ -242,15 +251,12 @@ mod tests {
 
     #[tokio::test]
     async fn abandoned_stream_resets_peer() {
-        let (client, mut server, driver) = pair().await;
+        let (client, server, driver) = pair().await;
         drop(client);
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            std::future::poll_fn(|cx| server.send.poll_reset(cx)),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), server.reset())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(result, h2::Reason::CANCEL);
         driver.abort();
         let _ = driver.await;

@@ -104,6 +104,11 @@ cleartext H2 requires prior knowledge, not HTTP Upgrade. Authentication applies
 independently to every H2 stream. A successful CONNECT response is sent only
 after the destination connects.
 
+H2 connections with no active tunnels close after 60 seconds; PINGs and rejected
+authentication attempts do not extend that interval. Missing credentials receive
+a 407 challenge. Incorrect credentials also begin connection shutdown, preventing
+repeated password guesses on one carrier.
+
 For HTTPS proxying, wrap HTTP in a TLS server and explicitly configure
 `alpn_protocols: [h2, http/1.1]` on its TLS target. HTTP does not change the
 parent layer's ALPN defaults. H2 GET/POST forwarding, extended CONNECT,
