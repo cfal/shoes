@@ -51,7 +51,7 @@ local-only coverage without external peers.
 - Mihomo server recovery is also checked with the default Shoes client byte limits.
   The client sequence window prevents ACKs for later packets from advancing past
   a stalled earlier packet and overflowing the peer's reorder queue.
-  H1 client pipelines undergo the same stall/resume checks against both peers.
+  H1's single-POST client path undergoes the same stall/resume checks against both peers.
 - Raw H1 requests exercise reordering, matching/conflicting duplicates, exclusive
   download ownership, wrong host/path, missing padding, oversized packets,
   reorder-window rejection, and recovery after rejected requests.

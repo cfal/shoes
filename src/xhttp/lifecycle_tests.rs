@@ -583,6 +583,75 @@ async fn packet_upload_pipelines_written_requests_before_acknowledgement() {
 }
 
 #[tokio::test]
+async fn client_aggregate_packet_limit_releases_capacity_after_session_cancellation() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let address = ([127, 0, 0, 1], listener.local_addr().unwrap().port()).into();
+        let tasks = Tasks::new();
+        let (seen, mut received) = tokio::sync::mpsc::channel(8);
+        let release = tokio_util::sync::CancellationToken::new();
+        let released = release.clone();
+        tasks.spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut connection = h2::server::handshake(socket).await.unwrap();
+            let mut uploads = tokio::task::JoinSet::new();
+            let mut downloads = Vec::new();
+            while let Some(Ok((request, mut respond))) = connection.accept().await {
+                if request.method() == http::Method::GET {
+                    downloads.push(respond.send_response(Response::new(()), false).unwrap());
+                    continue;
+                }
+                let seen = seen.clone();
+                let released = released.clone();
+                uploads.spawn(async move {
+                    let mut body = request.into_body();
+                    let mut bytes = Vec::new();
+                    while let Some(chunk) = body.data().await {
+                        let chunk = chunk.unwrap();
+                        body.flow_control().release_capacity(chunk.len()).unwrap();
+                        bytes.extend_from_slice(&chunk);
+                    }
+                    seen.send(bytes).await.unwrap();
+                    released.cancelled().await;
+                    let _ = respond.send_response(Response::new(()), true);
+                });
+            }
+        });
+        let config = serde_json::from_value(serde_json::json!({
+            "sc_max_each_post_bytes": 1024,
+            "sc_min_posts_interval_ms": 1,
+            "limits": {"max_requests": 2},
+            "pool": {"max_connections": 1},
+            "protocol": {"type": "socks"}
+        }))
+        .unwrap();
+        let client = configured_client(config, XhttpVersion::H2, XhttpMode::PacketUp);
+        let dialer = Arc::new(Dialer {
+            address,
+            key: RouteKey(vec![1]),
+            opens: AtomicUsize::new(0),
+        });
+        let mut first = client.open(dialer.clone()).await.unwrap();
+        let mut second = client.open(dialer).await.unwrap();
+        first.write_all(&[1; 1024]).await.unwrap();
+        assert_eq!(received.recv().await.unwrap(), [1; 1024]);
+        second.write_all(&[2; 2048]).await.unwrap();
+        assert_eq!(received.recv().await.unwrap(), [2; 1024]);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), received.recv())
+                .await
+                .is_err()
+        );
+        drop(first);
+        assert_eq!(received.recv().await.unwrap(), [2; 1024]);
+        release.cancel();
+        second.shutdown().await.unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn packet_lanes_reacquire_after_h2_goaway() {
     for sessions in [1, 4] {
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -1369,6 +1438,85 @@ async fn h2_packet_upload_inactivity_and_early_or_deferred_ack() {
 }
 
 #[tokio::test]
+async fn h1_waiting_packet_ack_does_not_consume_another_sessions_connections() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let address = ([127, 0, 0, 1], listener.local_addr().unwrap().port()).into();
+        let tasks = Tasks::new();
+        let (seen, mut received) = tokio::sync::mpsc::channel(8);
+        let release = tokio_util::sync::CancellationToken::new();
+        let released = release.clone();
+        tasks.spawn(async move {
+            let mut connections = tokio::task::JoinSet::new();
+            loop {
+                let (socket, _) = listener.accept().await.unwrap();
+                let seen = seen.clone();
+                let released = released.clone();
+                connections.spawn(async move {
+                    let service = hyper::service::service_fn(
+                        move |request: Request<hyper::body::Incoming>| {
+                            let seen = seen.clone();
+                            let released = released.clone();
+                            async move {
+                                if request.method() == http::Method::GET {
+                                    let memory =
+                                        Memory::new(Arc::new(Budget::new(Some(1024))), 1024);
+                                    let (writer, reader) = pipe(memory);
+                                    return Ok::<_, io::Error>(Response::new(
+                                        Body::stream(reader).with_guard(writer),
+                                    ));
+                                }
+                                let data = request.into_body().collect().await.unwrap().to_bytes();
+                                seen.send(data).await.unwrap();
+                                released.cancelled().await;
+                                Ok(Response::new(Body::Empty))
+                            }
+                        },
+                    );
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(hyper_util::rt::TokioIo::new(socket), service)
+                        .await;
+                });
+            }
+        });
+        let config = serde_json::from_value(serde_json::json!({
+            "sc_max_each_post_bytes": 1024,
+            "sc_min_posts_interval_ms": 1,
+            "pool": {"max_h1_connections": 4},
+            "protocol": {"type": "socks"}
+        }))
+        .unwrap();
+        let client = configured_client(config, XhttpVersion::H1, XhttpMode::PacketUp);
+        let dialer = Arc::new(Dialer {
+            address,
+            key: RouteKey(vec![1]),
+            opens: AtomicUsize::new(0),
+        });
+        let mut first = client.open(dialer.clone()).await.unwrap();
+        first.write_all(&[1; 3072]).await.unwrap();
+        assert_eq!(received.recv().await.unwrap().as_ref(), &[1; 1024]);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), received.recv())
+                .await
+                .is_err()
+        );
+        assert_eq!(dialer.opens.load(Ordering::Relaxed), 2);
+        let mut second = client.open(dialer.clone()).await.unwrap();
+        second.write_all(&[2; 1024]).await.unwrap();
+        assert_eq!(received.recv().await.unwrap().as_ref(), &[2; 1024]);
+        assert_eq!(dialer.opens.load(Ordering::Relaxed), 4);
+        release.cancel();
+        tokio::try_join!(first.shutdown(), second.shutdown()).unwrap();
+        for _ in 0..2 {
+            assert_eq!(received.recv().await.unwrap().as_ref(), &[1; 1024]);
+        }
+        assert_eq!(dialer.opens.load(Ordering::Relaxed), 4);
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn h1_packet_connection_close_redials_without_replaying_packets() {
     tokio::time::timeout(Duration::from_secs(5), async {
         let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
@@ -1400,6 +1548,7 @@ async fn h1_packet_connection_close_redials_without_replaying_packets() {
                                 let path = request.uri().path().to_owned();
                                 let data = request.into_body().collect().await.unwrap().to_bytes();
                                 packets.lock().push((path, data));
+                                tokio::time::sleep(Duration::from_millis(100)).await;
                                 Ok(Response::builder()
                                     .header("connection", "close")
                                     .body(Body::Empty)

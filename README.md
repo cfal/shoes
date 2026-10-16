@@ -340,18 +340,25 @@ covering all three modes and HTTP versions. `type: splithttp` is an alias for
   other request types also retain it for response headers. `setup_timeout_secs`
   is unchanged. A live peer that never ACKs can retain bounded client resources
   until the stream is dropped or the transport fails.
-- Packet-up follows Xray's paced, write-gated pipeline: the next POST may start
+- H2/H3 packet-up follows Xray's paced, write-gated pipeline: the next POST may start
   after the preceding body is transmitted, without waiting for its ACK. Client
   `packet_pipeline_depth` defaults to 30 (minimum 1), matching the reference peers'
   default reorder depth. The window advances only through consecutive ACKs, so
   later ACKs cannot accumulate an unbounded sequence gap at a stalled peer.
   Larger depths require a correspondingly larger peer reorder queue. Client
-  `limits.max_requests_per_session` is an additional ceiling (128, minimum 2): one
+  and Shoes server request limits must also agree: allow at least the effective
+  client POST depth plus one reserved head slot in server
+  `limits.max_requests_per_session` (31 for the default H2/H3 client depth).
+  Lower the client depth when using a smaller server cap; Shoes does not replay
+  refused POSTs. Pool, byte and client request limits may reduce the effective depth.
+  Client `limits.max_requests_per_session` is an additional ceiling (128, minimum 2): one
   slot is for the download leg. `limits.max_requests`
   bounds outstanding POSTs across a client instance (4096 by default). Reaching
   either client bound backpressures the local writer. Pool limits may constrain
-  concurrency further. H1 uses separate bounded connections for overlapping POSTs,
-  not raw HTTP/1 pipelining. Unsent bytes remain subject to the byte budgets;
+  concurrency further. H1 keeps one ACK-gated POST on a reusable upload connection,
+  plus the download connection; it does not open opportunistic upload connections
+  or use raw HTTP/1 pipelining. Use H2/H3 for high-latency packet-up throughput.
+  Unsent bytes remain subject to the byte budgets;
   successfully transmitted bodies are not retained while awaiting ACKs.
   Outstanding POST payload sizes also count against a separate logical credit
   limit equal to `max_session_buffered_bytes`, bounding peer-side backlog without
@@ -363,7 +370,8 @@ covering all three modes and HTTP versions. `type: splithttp` is an alias for
   across carriers, including empty bodies, duplicates and admission waiters.
   One slot is reserved for a missing head packet. `limits.max_requests` additionally
   bounds all active HTTP request handlers across the service, including waiters
-  and streaming requests. Body pumps start only after packet byte/reorder admission;
+  and streaming requests, and must be at least 2 for split server modes.
+  Body pumps start only after packet byte/reorder admission;
   waiting packets do not each absorb an extra four-slot application pipe.
   H2 rejects never-admitted excess POSTs with `REFUSED_STREAM`, preserving the
   existing session. The pinned Xray transport can replay these requests with bounded

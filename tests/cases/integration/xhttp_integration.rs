@@ -657,7 +657,7 @@ async fn mihomo_server_stall_recovery_with_default_client_limits() -> fixture::R
 }
 
 #[tokio::test]
-async fn h1_packet_pipeline_survives_peer_stalls() -> fixture::Result {
+async fn h1_packet_upload_survives_peer_stalls() -> fixture::Result {
     for peer in [Peer::Xray, Peer::Mihomo] {
         pressure_with_limits(peer, true, "h1", false).await?;
     }

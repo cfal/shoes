@@ -573,8 +573,12 @@ impl Client {
                 .sc_max_each_post_bytes
                 .bounds((1_000_000, 1_000_000), false)?,
         ) as usize;
-        // The download leg retains one request slot for the logical session.
-        let concurrency = self.config.limits.max_requests_per_session - 1;
+        let concurrency = if self.version == XhttpVersion::H1 {
+            1
+        } else {
+            // The download leg retains one request slot for the logical session.
+            self.config.limits.max_requests_per_session - 1
+        };
         let mut window = PacketWindow::default();
         let unacknowledged = Arc::new(Budget::new(Some(
             self.config.limits.max_session_buffered_bytes,
@@ -687,9 +691,6 @@ impl Client {
                             done = inflight.next(), if !inflight.is_empty() => window.acknowledge(done.unwrap()?),
                         }
                     };
-                    if self.version == XhttpVersion::H1 && lane.carrier.closed() {
-                        lane.carrier = self.dial(&dialer).await?;
-                    }
                     let mut request = self.request(
                         session,
                         Some(sequence),
@@ -712,6 +713,9 @@ impl Client {
                     inflight.push(async move {
                         let _request_permit = request_permit;
                         let _byte_permit = byte_permit;
+                        if self.version == XhttpVersion::H1 && lane.carrier.closed() {
+                            lane.carrier = self.dial(&dialer).await?;
+                        }
                         if self.version != XhttpVersion::H1
                             && (lane.reservation.is_none() || lane.carrier.closed())
                         {
@@ -773,21 +777,6 @@ impl Client {
     }
 
     async fn packet_lane(&self, dialer: &Arc<dyn CarrierDialer>) -> io::Result<Lease> {
-        if self.version == XhttpVersion::H1 {
-            let permit = self
-                .h1_slots
-                .clone()
-                .try_acquire_owned()
-                .map_err(|_| crate::resources::exhausted())?;
-            return Ok(Lease {
-                carrier: self.dial(dialer).await?,
-                reservation: None,
-                _permit: SlotPermit {
-                    _permit: permit,
-                    slot: None,
-                },
-            });
-        }
         let gate = self.route_gate(dialer.route_key());
         let _allocation = gate.lock().await;
         self.lease(dialer, true).await
