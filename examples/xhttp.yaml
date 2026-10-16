@@ -43,6 +43,7 @@
                 path: /tunnel
                 http_version: h2
                 mode: packet-up
+                download_idle_timeout_secs: 900
                 protocol:
                   type: vless
                   user_id: "550e8400-e29b-41d4-a716-446655440000"

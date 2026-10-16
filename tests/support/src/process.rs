@@ -63,6 +63,10 @@ pub struct ProcessGuard {
 }
 
 impl ProcessGuard {
+    pub fn id(&self) -> u32 {
+        self.process.as_ref().unwrap().id()
+    }
+
     pub fn try_wait(&mut self) -> io::Result<Option<std::process::ExitStatus>> {
         self.child_mut().try_wait()
     }

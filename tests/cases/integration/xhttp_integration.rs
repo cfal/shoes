@@ -338,12 +338,21 @@ async fn pause_with_exchange(
 }
 
 async fn pressure(peer: Peer, shoes_client: bool, version: &str) -> fixture::Result {
+    pressure_with_limits(peer, shoes_client, version, true).await
+}
+
+async fn pressure_with_limits(
+    peer: Peer,
+    shoes_client: bool,
+    version: &str,
+    tight: bool,
+) -> fixture::Result {
     use std::sync::Arc;
     use tokio::sync::{Notify, oneshot};
 
     let mut fixture = Fixture::new(peer)?;
     // Small byte budgets force backpressure while retaining the default request-count limits.
-    fixture.pressure = true;
+    fixture.pressure = tight;
     let pair = fixture
         .start(peer, shoes_client, "vless", version, "packet-up")
         .await?;
@@ -491,8 +500,9 @@ async fn xray_backpressure_cancellation_and_churn() -> fixture::Result {
 }
 
 #[tokio::test]
-async fn xray_h2_default_budgets_bound_non_ack_waiting_uploads() -> fixture::Result {
-    let fixture = Fixture::new(Peer::Xray)?;
+async fn xray_h2_packet_inactivity_bounds_permanent_stalls() -> fixture::Result {
+    let mut fixture = Fixture::new(Peer::Xray)?;
+    fixture.server_packet_timeout_secs = Some(2);
     let pair = fixture.start_with_client_patch(fixture::Case {
         peer: Peer::Xray, shoes_client: false, protocol: "vless", version: "h2", mode: "packet-up",
     }, |config| {
@@ -518,7 +528,7 @@ async fn xray_h2_default_budgets_bound_non_ack_waiting_uploads() -> fixture::Res
         )
     })
     .await
-    .expect("unacknowledged POSTs must not accumulate indefinitely");
+    .expect("stalled POST admission must expire without unbounded accumulation");
     let error = result.unwrap_err();
     assert!(
         matches!(
@@ -543,8 +553,16 @@ async fn xray_h2_default_budgets_bound_non_ack_waiting_uploads() -> fixture::Res
 }
 
 #[tokio::test]
+async fn xray_h2_default_byte_budgets_stalled_upload() -> fixture::Result {
+    xray_default_byte_budgets_stalled_upload("h2").await
+}
+
+#[tokio::test]
 async fn xray_h3_default_byte_budgets_stalled_upload() -> fixture::Result {
-    let version = "h3";
+    xray_default_byte_budgets_stalled_upload("h3").await
+}
+
+async fn xray_default_byte_budgets_stalled_upload(version: &str) -> fixture::Result {
     let fixture = Fixture::new(Peer::Xray)?;
     let pair = fixture.start_with_client_patch(fixture::Case {
             peer: Peer::Xray, shoes_client: false, protocol: "vless", version, mode: "packet-up",
@@ -564,18 +582,50 @@ async fn xray_h3_default_byte_budgets_stalled_upload() -> fixture::Result {
                 let mut data = vec![0; size];
                 socket.read_exact(&mut data[..1]).await?;
                 accepted.send(()).unwrap();
-                resume.notified().await;
-                socket.read_exact(&mut data[1..]).await?;
-                assert_eq!(data, payload(size, 77));
-                socket.write_all(b"received").await?;
+                let (mut read, mut write) = socket.into_split();
+                let done = tokio_util::sync::CancellationToken::new();
+                tokio::try_join!(
+                    async {
+                        resume.notified().await;
+                        read.read_exact(&mut data[1..]).await?;
+                        assert_eq!(data, payload(size, 77));
+                        done.cancel();
+                        Ok::<_, std::io::Error>(())
+                    },
+                    async {
+                        loop {
+                            write.write_all(b"progress").await?;
+                            tokio::select! {
+                                _ = done.cancelled() => break,
+                                _ = tokio::time::sleep(Duration::from_millis(200)) => {},
+                            }
+                        }
+                        write.write_all(b"received").await
+                    }
+                )?;
                 Ok::<_, std::io::Error>(())
             },
             async {
-                let mut stream = xray::connect(pair.socks, target).await?;
-                stream.write_all(&payload(size, 77)).await?;
-                let mut response = [0; 8];
-                stream.read_exact(&mut response).await?;
-                assert_eq!(&response, b"received");
+                let stream = xray::connect(pair.socks, target).await?;
+                let (mut read, mut write) = tokio::io::split(stream);
+                tokio::try_join!(async { write.write_all(&payload(size, 77)).await }, async {
+                    let mut progress = 0;
+                    loop {
+                        let mut response = [0; 8];
+                        tokio::time::timeout(
+                            Duration::from_secs(3),
+                            read.read_exact(&mut response),
+                        )
+                        .await??;
+                        if &response == b"received" {
+                            assert!(progress >= 10);
+                            break;
+                        }
+                        assert_eq!(&response, b"progress");
+                        progress += 1;
+                    }
+                    Ok::<_, std::io::Error>(())
+                })?;
                 Ok::<_, std::io::Error>(())
             },
             async {
@@ -597,6 +647,182 @@ async fn mihomo_backpressure_cancellation_and_churn() -> fixture::Result {
     pressure(Peer::Mihomo, true, "h2").await?;
     for version in ["h2", "h3"] {
         pressure(Peer::Mihomo, false, version).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn mihomo_server_stall_recovery_with_default_client_limits() -> fixture::Result {
+    pressure_with_limits(Peer::Mihomo, true, "h2", false).await
+}
+
+#[tokio::test]
+async fn h1_packet_pipeline_survives_peer_stalls() -> fixture::Result {
+    for peer in [Peer::Xray, Peer::Mihomo] {
+        pressure_with_limits(peer, true, "h1", false).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "real-peer throughput and stall qualification; configure XHTTP_BENCH_* sweeps"]
+async fn packet_up_throughput_and_stall_qualification() -> fixture::Result {
+    fn values(name: &str, default: &str) -> Vec<u64> {
+        std::env::var(name)
+            .unwrap_or_else(|_| default.into())
+            .split(',')
+            .map(|value| value.parse().unwrap())
+            .collect()
+    }
+    let directions = std::env::var("XHTTP_BENCH_DIRECTIONS")
+        .unwrap_or_else(|_| "xray-xray,xray-shoes,shoes-xray".into());
+    for rtt in values("XHTTP_BENCH_RTT_MS", "0,150") {
+        for pause in values("XHTTP_BENCH_PAUSE_SECS", "0") {
+            for post in values("XHTTP_BENCH_POST_BYTES", "32768,1000000") {
+                for cap in values("XHTTP_BENCH_REQUEST_CAP", "128") {
+                    for sessions in values("XHTTP_BENCH_SESSIONS", "1") {
+                        for direction in directions.split(',') {
+                            assert!(matches!(
+                                direction,
+                                "xray-xray" | "xray-shoes" | "shoes-xray"
+                            ));
+                            let mut fixture = Fixture::new(Peer::Xray)?;
+                            fixture.post_bytes = post as usize;
+                            fixture.post_interval_ms = 30;
+                            fixture.latency_ms = rtt;
+                            fixture.server_request_limit = Some(cap as usize);
+                            fixture.h2_window_bytes = std::env::var("XHTTP_BENCH_H2_WINDOW_BYTES")
+                                .ok()
+                                .map(|value| value.parse().unwrap());
+                            let pair = if direction == "xray-xray" {
+                                fixture.start_xray_reference().await?
+                            } else {
+                                fixture
+                                    .start(
+                                        Peer::Xray,
+                                        direction == "shoes-xray",
+                                        "vless",
+                                        "h2",
+                                        "packet-up",
+                                    )
+                                    .await?
+                            };
+                            let pids = pair.pids();
+                            let peak_rss =
+                                std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+                            let peak = peak_rss.clone();
+                            let stop = tokio_util::sync::CancellationToken::new();
+                            let stopped = stop.clone();
+                            let sampler = tokio::spawn(async move {
+                                loop {
+                                    let rss: u64 = pids
+                                        .iter()
+                                        .filter_map(|pid| {
+                                            let status = std::fs::read_to_string(format!(
+                                                "/proc/{pid}/status"
+                                            ))
+                                            .ok()?;
+                                            status.lines().find_map(|line| {
+                                                line.strip_prefix("VmRSS:")?
+                                                    .split_whitespace()
+                                                    .next()?
+                                                    .parse::<u64>()
+                                                    .ok()
+                                            })
+                                        })
+                                        .sum();
+                                    peak.fetch_max(rss, std::sync::atomic::Ordering::Relaxed);
+                                    tokio::select! {
+                                        _ = stopped.cancelled() => break,
+                                        _ = tokio::time::sleep(Duration::from_millis(50)) => {},
+                                    }
+                                }
+                            });
+                            let started = std::time::Instant::now();
+                            let mut transfers = tokio::task::JoinSet::new();
+                            let size = 16 * 1024 * 1024;
+                            for session in 0..sessions {
+                                let socks = pair.socks;
+                                transfers.spawn(async move {
+                                    let listener =
+                                        tokio::net::TcpListener::bind("0.0.0.0:0").await?;
+                                    socket2::SockRef::from(&listener)
+                                        .set_recv_buffer_size(65536)?;
+                                    let target =
+                                        ([127, 0, 0, 1], listener.local_addr()?.port()).into();
+                                    tokio::try_join!(
+                                        async {
+                                            let (socket, _) = listener.accept().await?;
+                                            let (mut read, mut write) = socket.into_split();
+                                            tokio::try_join!(
+                                                async {
+                                                    let mut bytes = vec![0; size];
+                                                    read.read_exact(&mut bytes[..1]).await?;
+                                                    tokio::time::sleep(Duration::from_secs(pause))
+                                                        .await;
+                                                    read.read_exact(&mut bytes[1..]).await?;
+                                                    assert_eq!(
+                                                        bytes,
+                                                        payload(size, session as usize)
+                                                    );
+                                                    Ok::<_, std::io::Error>(())
+                                                },
+                                                async { write.write_all(&payload(size, 97)).await }
+                                            )?;
+                                            write.write_all(b"!").await?;
+                                            Ok::<_, std::io::Error>(())
+                                        },
+                                        async {
+                                            let socket = xray::connect(socks, target).await?;
+                                            let (mut read, mut write) = tokio::io::split(socket);
+                                            tokio::try_join!(
+                                                async {
+                                                    write
+                                                        .write_all(&payload(size, session as usize))
+                                                        .await
+                                                },
+                                                async {
+                                                    let mut bytes = vec![0; size];
+                                                    read.read_exact(&mut bytes).await?;
+                                                    assert_eq!(bytes, payload(size, 97));
+                                                    Ok::<_, std::io::Error>(())
+                                                }
+                                            )?;
+                                            assert_eq!(read.read_u8().await?, b'!');
+                                            Ok::<_, std::io::Error>(())
+                                        }
+                                    )?;
+                                    Ok::<_, std::io::Error>(())
+                                });
+                            }
+                            let result =
+                                tokio::time::timeout(Duration::from_secs(pause + 180), async {
+                                    while let Some(result) = transfers.join_next().await {
+                                        result??;
+                                    }
+                                    Ok::<_, Box<dyn std::error::Error>>(())
+                                })
+                                .await;
+                            stop.cancel();
+                            sampler.await?;
+                            let elapsed = started.elapsed().as_secs_f64();
+                            eprintln!(
+                                "XHTTP_QUALIFICATION {}",
+                                json!({
+                                    "direction":direction,"rtt_ms":rtt,"pause_secs":pause,
+                                    "post_bytes":post,"server_request_cap":cap,"sessions":sessions,
+                                "shoes_window_override":fixture.h2_window_bytes,
+                                    "seconds":elapsed,"duplex_mib_per_sec":32.0 * sessions as f64 / elapsed,
+                                    "peer_peak_rss_kib":peak_rss.load(std::sync::atomic::Ordering::Relaxed),
+                                    "success":matches!(&result, Ok(Ok(())))
+                                })
+                            );
+                            result??;
+                        }
+                    }
+                }
+            }
+        }
     }
     Ok(())
 }

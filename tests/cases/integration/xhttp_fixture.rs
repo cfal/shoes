@@ -6,6 +6,7 @@ use shoes_test_support::{
     test_fixture::{generate_reality_keypair, start_shoes_server},
     xray,
 };
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 pub const UUID: &str = "550e8400-e29b-41d4-a716-446655440000";
 pub const POST_BYTES: usize = 32 * 1024;
@@ -61,6 +62,11 @@ pub fn port() -> u16 {
 
 pub struct Fixture {
     pub post_bytes: usize,
+    pub post_interval_ms: u64,
+    pub latency_ms: u64,
+    pub server_request_limit: Option<usize>,
+    pub server_packet_timeout_secs: Option<u64>,
+    pub h2_window_bytes: Option<usize>,
     pub pressure: bool,
     cert: PathBuf,
     key: PathBuf,
@@ -75,9 +81,98 @@ pub struct Fixture {
 
 pub struct Pair {
     pub socks: SocketAddr,
-    _shoes: (ProcessGuard, tempfile::NamedTempFile),
+    _shoes: Option<(ProcessGuard, tempfile::NamedTempFile)>,
     _xray: Option<xray::Peer>,
     _mihomo: Option<(ProcessGuard, tempfile::NamedTempFile)>,
+    _reference: Option<xray::Peer>,
+    _relay: Option<LatencyRelay>,
+}
+
+impl Pair {
+    pub fn pids(&self) -> Vec<u32> {
+        self._shoes
+            .iter()
+            .map(|process| process.0.id())
+            .chain(self._xray.iter().map(xray::Peer::id))
+            .chain(self._reference.iter().map(xray::Peer::id))
+            .chain(self._mihomo.iter().map(|process| process.0.id()))
+            .collect()
+    }
+}
+
+struct LatencyRelay(tokio::task::JoinHandle<()>);
+
+impl Drop for LatencyRelay {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+impl LatencyRelay {
+    async fn start(remote: u16, latency_ms: u64) -> io::Result<(u16, Option<Self>)> {
+        if latency_ms == 0 {
+            return Ok((remote, None));
+        }
+        let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await?;
+        let port = listener.local_addr()?.port();
+        let delay = std::time::Duration::from_micros(latency_ms * 500);
+        let task = tokio::spawn(async move {
+            let mut connections = tokio::task::JoinSet::new();
+            loop {
+                let accepted = tokio::select! {
+                    accepted = listener.accept() => accepted,
+                    _ = connections.join_next(), if !connections.is_empty() => continue,
+                };
+                let Ok((incoming, _)) = accepted else { break };
+                connections.spawn(async move {
+                    let outgoing =
+                        tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, remote))
+                            .await?;
+                    let (read_client, write_client) = incoming.into_split();
+                    let (read_server, write_server) = outgoing.into_split();
+                    tokio::try_join!(
+                        delayed_copy(read_client, write_server, delay),
+                        delayed_copy(read_server, write_client, delay),
+                    )?;
+                    Ok::<_, io::Error>(())
+                });
+            }
+        });
+        Ok((port, Some(Self(task))))
+    }
+}
+
+async fn delayed_copy(
+    mut read: tokio::net::tcp::OwnedReadHalf,
+    mut write: tokio::net::tcp::OwnedWriteHalf,
+    delay: std::time::Duration,
+) -> io::Result<()> {
+    let (send, mut receive) = tokio::sync::mpsc::channel::<(tokio::time::Instant, Vec<u8>)>(512);
+    tokio::try_join!(
+        async {
+            loop {
+                let mut data = vec![0; 16384];
+                let size = read.read(&mut data).await?;
+                if size == 0 {
+                    break;
+                }
+                data.truncate(size);
+                send.send((tokio::time::Instant::now() + delay, data))
+                    .await
+                    .map_err(|_| io::ErrorKind::BrokenPipe)?;
+            }
+            drop(send);
+            Ok::<_, io::Error>(())
+        },
+        async {
+            while let Some((ready, data)) = receive.recv().await {
+                tokio::time::sleep_until(ready).await;
+                write.write_all(&data).await?;
+            }
+            write.shutdown().await
+        }
+    )?;
+    Ok(())
 }
 
 impl Fixture {
@@ -114,6 +209,11 @@ impl Fixture {
         ]))?)?;
         Ok(Self {
             post_bytes: POST_BYTES,
+            post_interval_ms: 1,
+            latency_ms: 0,
+            server_request_limit: None,
+            server_packet_timeout_secs: None,
+            h2_window_bytes: None,
             pressure: false,
             cert,
             key,
@@ -139,6 +239,16 @@ impl Fixture {
                 "max_buffered_bytes":1024 * 1024,
                 "max_session_buffered_bytes":256 * 1024,
             });
+        }
+        if !client && let Some(limit) = self.server_request_limit {
+            xhttp["limits"]["max_requests_per_session"] = json!(limit);
+        }
+        if !client && let Some(timeout) = self.server_packet_timeout_secs {
+            xhttp["limits"]["packet_timeout_secs"] = json!(timeout);
+        }
+        if let Some(window) = self.h2_window_bytes {
+            xhttp["limits"]["h2_stream_window_bytes"] = json!(window);
+            xhttp["limits"]["h2_connection_window_bytes"] = json!(window);
         }
         let host = if client { "127.0.0.1" } else { "0.0.0.0" };
         let mut endpoint = json!({"address":format!("{host}:{remote}"),"protocol":xhttp});
@@ -216,7 +326,8 @@ impl Fixture {
         let mut shoes_endpoint = self.shoes_endpoint(shoes_client, remote, version, xhttp.clone());
         // Pacing is a client-only setting.
         if shoes_client {
-            shoes_xhttp(&mut shoes_endpoint)["sc_min_posts_interval_ms"] = json!(1);
+            shoes_xhttp(&mut shoes_endpoint)["sc_min_posts_interval_ms"] =
+                json!(self.post_interval_ms);
         }
         let mut shoes_config = if shoes_client {
             json!([{"address":format!("0.0.0.0:{socks_port}"),"protocol":{"type":"socks","udp_enabled":true},
@@ -250,7 +361,7 @@ impl Fixture {
                 "path":path,
                 "host":if shoes_client {"front.test"} else {"front.test:8443"},
                 "mode":mode,
-                "extra":{"scMaxEachPostBytes":self.post_bytes,"scMinPostsIntervalMs":1}
+                "extra":{"scMaxEachPostBytes":self.post_bytes,"scMinPostsIntervalMs":self.post_interval_ms}
             },
             "security":"tls",
             "tlsSettings":{
@@ -339,7 +450,7 @@ impl Fixture {
                 "uuid":UUID,"udp":true,"tls":!matches!(version,"plain"|"h2c"),
                 "servername":"localhost","skip-cert-verify":true,"network":"xhttp","alpn":[alpn],
                 "xhttp-opts":{"path":path,"host":"front.test:8443","mode":mode,
-                    "sc-max-each-post-bytes":self.post_bytes.to_string(),"sc-min-posts-interval-ms":"1"}});
+                    "sc-max-each-post-bytes":self.post_bytes.to_string(),"sc-min-posts-interval-ms":self.post_interval_ms.to_string()}});
             if version == "reality" {
                 proxy["client-fingerprint"] = json!("chrome");
                 proxy["reality-opts"] =
@@ -368,14 +479,36 @@ impl Fixture {
         assert!(peer != Peer::Mihomo || protocol == "vless");
         assert!(peer != Peer::Mihomo || !shoes_client || version != "h3");
         let remote = port();
+        assert!(
+            version != "h3" || self.latency_ms == 0,
+            "latency relay is TCP-only"
+        );
+        assert!(
+            peer != Peer::Shoes || self.latency_ms == 0,
+            "latency qualification requires a separate peer process"
+        );
+        let (client_remote, relay) = LatencyRelay::start(remote, self.latency_ms).await?;
         let socks_port = port();
         let readiness = port();
         let socks = ([127, 0, 0, 1], socks_port).into();
-        let mut shoes_config = self.shoes_config(&case, remote, socks_port, readiness);
+        let mut shoes_config = self.shoes_config(
+            &case,
+            if shoes_client { client_remote } else { remote },
+            socks_port,
+            readiness,
+        );
         let mut peer_config = match peer {
             Peer::Shoes => Value::Null,
-            Peer::Xray => self.xray_config(&case, remote, socks_port),
-            Peer::Mihomo => self.mihomo_config(&case, remote, socks_port)?,
+            Peer::Xray => self.xray_config(
+                &case,
+                if shoes_client { remote } else { client_remote },
+                socks_port,
+            ),
+            Peer::Mihomo => self.mihomo_config(
+                &case,
+                if shoes_client { remote } else { client_remote },
+                socks_port,
+            )?,
         };
         if shoes_client {
             let index = usize::from(peer == Peer::Shoes);
@@ -400,9 +533,11 @@ impl Fixture {
         .await?;
         let mut pair = Pair {
             socks,
-            _shoes: shoes,
+            _shoes: Some(shoes),
             _xray: None,
             _mihomo: None,
+            _reference: None,
+            _relay: relay,
         };
         match peer {
             Peer::Shoes => {}
@@ -416,6 +551,32 @@ impl Fixture {
             .await
             .map_err(|error| io::Error::other(format!("{peer:?} {version} {mode}: {error}")))?;
         Ok(pair)
+    }
+
+    pub async fn start_xray_reference(&self) -> Result<Pair> {
+        let remote = port();
+        let socks_port = port();
+        let (client_remote, relay) = LatencyRelay::start(remote, self.latency_ms).await?;
+        let mut case = Case {
+            peer: Peer::Xray,
+            shoes_client: true,
+            protocol: "vless",
+            version: "h2",
+            mode: "packet-up",
+        };
+        let server = xray::start(self.xray_config(&case, remote, socks_port)).await?;
+        case.shoes_client = false;
+        let client = xray::start(self.xray_config(&case, client_remote, socks_port)).await?;
+        let socks = ([127, 0, 0, 1], socks_port).into();
+        xray::wait_socks(socks).await?;
+        Ok(Pair {
+            socks,
+            _shoes: None,
+            _xray: Some(client),
+            _mihomo: None,
+            _reference: Some(server),
+            _relay: relay,
+        })
     }
 }
 
