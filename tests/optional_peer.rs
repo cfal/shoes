@@ -6,3 +6,6 @@ mod snell_mihomo;
 
 #[path = "cases/optional_peer/tls_hybrid.rs"]
 mod tls_hybrid;
+
+#[path = "cases/optional_peer/http2_proxy.rs"]
+mod http2_proxy;

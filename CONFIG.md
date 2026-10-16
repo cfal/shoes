@@ -98,6 +98,18 @@ protocol:
   password: string?
 ```
 
+Accepts HTTP/1.0 and HTTP/1.1 CONNECT and absolute-form forwarding, plus
+multiplexed TCP CONNECT over HTTP/2. H2 is detected from its connection preface;
+cleartext H2 requires prior knowledge, not HTTP Upgrade. Authentication applies
+independently to every H2 stream. A successful CONNECT response is sent only
+after the destination connects.
+
+For HTTPS proxying, wrap HTTP in a TLS server and explicitly configure
+`alpn_protocols: [h2, http/1.1]` on its TLS target. HTTP does not change the
+parent layer's ALPN defaults. H2 GET/POST forwarding, extended CONNECT,
+CONNECT-UDP, and HTTP/3 are not supported. This is standard HTTP proxying, not
+NaiveProxy or XHTTP.
+
 ### SOCKS5
 ```yaml
 protocol:
@@ -116,7 +128,7 @@ protocol:
   udp_enabled: true            # Default: true (enables UDP ASSOCIATE for SOCKS5)
 ```
 
-Auto-detects HTTP or SOCKS5 protocol from the first byte of the connection.
+Auto-detects HTTP (including H2 CONNECT) or SOCKS5.
 
 ### Shadowsocks
 ```yaml
@@ -389,7 +401,18 @@ protocol:
   type: http
   username: string?
   password: string?
+  http_version: h1             # h1 (default) or h2
+  resolve_hostname: false      # Resolve destinations locally before CONNECT
 ```
+
+Both versions establish TCP CONNECT tunnels. H2 reuses a connection for multiple
+concurrent tunnels; H1 retains its existing one-tunnel-per-connection behavior.
+There is no automatic version fallback or replay after a failed CONNECT.
+
+For H2 over TLS, set `http_version: h2` here and `alpn_protocols: [h2]` on
+the enclosing TLS client. The handshake must negotiate `h2`. H1 accepts no
+ALPN or `http/1.1`, and rejects other negotiated protocols. Cleartext H2 uses
+prior knowledge. See [examples/http2-proxy.yaml](examples/http2-proxy.yaml).
 
 ### SOCKS5
 ```yaml

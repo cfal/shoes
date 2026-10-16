@@ -1,0 +1,33 @@
+# HTTPS proxy listener accepting H2 CONNECT and legacy HTTP/1 clients.
+- address: "0.0.0.0:8443"
+  protocol:
+    type: tls
+    default_tls_target:
+      cert: cert.pem
+      key: key.pem
+      alpn_protocols: [h2, http/1.1]
+      protocol:
+        type: http
+        username: user
+        password: replace-me
+
+# Local HTTP entry point forwarding through an H2 HTTPS proxy.
+- address: "0.0.0.0:8080"
+  protocol:
+    type: http
+    username: local-user
+    password: replace-local-password
+  rules:
+    - mask: "0.0.0.0/0"
+      action: allow
+      client_chain:
+        - address: "proxy.example.com:8443"
+          protocol:
+            type: tls
+            sni_hostname: proxy.example.com
+            alpn_protocols: [h2]
+            protocol:
+              type: http
+              http_version: h2
+              username: user
+              password: replace-me

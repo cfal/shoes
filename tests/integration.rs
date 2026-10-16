@@ -8,6 +8,8 @@ mod h2mux;
 mod h2mux_backpressure;
 #[path = "cases/integration/h2mux_singbox.rs"]
 mod h2mux_singbox;
+#[path = "cases/integration/http2_proxy.rs"]
+mod http2_proxy;
 #[path = "cases/integration/hysteria2_integration.rs"]
 mod hysteria2;
 #[path = "cases/integration/hysteria2_udp_integration.rs"]
