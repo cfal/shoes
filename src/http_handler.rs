@@ -36,6 +36,7 @@ mod request_tests {
         let handler = HttpTcpServerHandler::new(
             Some(("user".into(), "password".into())),
             Arc::new(ClientProxySelector::new(vec![])),
+            Arc::new(crate::resolver::NativeResolver::new()),
         );
         (handler.setup_server_stream(Box::new(server)).await, client)
     }
@@ -206,6 +207,7 @@ mod request_tests {
             let handler = HttpTcpServerHandler::new(
                 Some(("user".into(), "password".into())),
                 Arc::new(ClientProxySelector::new(vec![])),
+                Arc::new(crate::resolver::NativeResolver::new()),
             );
             let error = handler
                 .setup_server_stream(Box::new(server))
@@ -233,6 +235,7 @@ mod request_tests {
         let handler = HttpTcpServerHandler::new(
             Some(("user".into(), "password".into())),
             Arc::new(ClientProxySelector::new(vec![])),
+            Arc::new(crate::resolver::NativeResolver::new()),
         );
         assert!(handler.setup_server_stream(Box::new(server)).await.is_err());
     }
@@ -246,18 +249,21 @@ fn create_http_auth_token(username: &str, password: &str) -> String {
 pub struct HttpTcpServerHandler {
     auth_token: Option<String>,
     proxy_selector: Arc<ClientProxySelector>,
+    resolver: Arc<dyn Resolver>,
 }
 
 impl HttpTcpServerHandler {
     pub fn new(
         auth_credentials: Option<(String, String)>,
         proxy_selector: Arc<ClientProxySelector>,
+        resolver: Arc<dyn Resolver>,
     ) -> Self {
         let auth_token = auth_credentials
             .map(|(username, password)| create_http_auth_token(&username, &password));
         Self {
             auth_token,
             proxy_selector,
+            resolver,
         }
     }
 }
@@ -274,6 +280,7 @@ impl TcpServerHandler for HttpTcpServerHandler {
             server_stream,
             stream_reader,
             self.proxy_selector.clone(),
+            self.resolver.clone(),
         )
         .await
     }
@@ -288,7 +295,30 @@ pub async fn setup_http_server_stream_inner(
     mut server_stream: Box<dyn AsyncStream>,
     mut stream_reader: StreamReader,
     proxy_selector: Arc<ClientProxySelector>,
+    resolver: Arc<dyn Resolver>,
 ) -> std::io::Result<TcpServerSetupResult> {
+    const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+    let mut is_h2 = true;
+    for length in 1..=H2_PREFACE.len() {
+        if stream_reader.peek_slice(&mut server_stream, length).await? != &H2_PREFACE[..length] {
+            is_h2 = false;
+            break;
+        }
+    }
+    if is_h2 {
+        let stream = Box::new(crate::prepend_stream::PrependStream::new(
+            server_stream,
+            stream_reader.unparsed_data_owned(),
+        ));
+        let auth = auth_token.map(str::to_owned);
+        return Ok(TcpServerSetupResult::Session(Box::pin(async move {
+            if let Err(error) =
+                crate::http2::server::serve(stream, auth, proxy_selector, resolver).await
+            {
+                debug!("HTTP/2 proxy connection ended: {error}");
+            }
+        })));
+    }
     let line = stream_reader.read_line(&mut server_stream).await?;
     if !line.ends_with(" HTTP/1.0") && !line.ends_with(" HTTP/1.1") {
         return Err(std::io::Error::new(

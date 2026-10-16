@@ -134,6 +134,7 @@ fn create_handler(
         ServerProxyConfig::Http { username, password } => Box::new(HttpTcpServerHandler::new(
             create_auth_credentials(username, password),
             client_proxy_selector.clone(),
+            resolver.clone(),
         )),
         ServerProxyConfig::Socks {
             username,
