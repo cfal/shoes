@@ -296,9 +296,13 @@ covering all three modes and HTTP versions. `type: splithttp` is an alias for
   separate streaming upload/download requests; packet-up uses bounded POSTs.
 - Packet-up cannot transmit upload EOF. Use a streaming mode when the target
   must receive EOF before responding. After upload shutdown and packet acknowledgements,
-  the client allows a one-second download tail before closing the session.
+  the client closes the download-only tail after one second of inactivity,
+  not while download forwarding or local reads continue to progress.
   Streaming bodies require unbuffered proxies. H1 stream-one closes the whole HTTP
   connection when its response ends; use H2/H3 or stream-up for remote-first half-close.
+  In stream-up/auto server mode, normal download EOF allows an unclaimed streaming
+  upload 30 seconds to attach; an absent upload is then reaped. Packet uploads do
+  not receive this grace period.
 - H1/H2 preserve selected upstream proxy chains. H3 must be the first proxy hop;
   it reuses the existing QUIC/H3 dependencies, not Hysteria2 framing.
 - `host` overrides HTTP authority independently of TLS SNI. Default Referer
@@ -309,6 +313,15 @@ covering all three modes and HTTP versions. `type: splithttp` is an alias for
   Split legs may use different carriers on the same selected route. H2/H3 admission
   respects peer stream capacity; draining carriers retain their connection slots.
   A full pool refuses new sessions rather than exceeding its configured cap.
+  Split modes require at least two configured request lanes: two H1 connections,
+  or `pool.max_connections * limits.max_requests_per_connection >= 2` for H2/H3.
+  Stream-one needs only one lane, including REALITY's automatic mode.
+- Server `x_padding_bytes` is an acceptance range, independent of
+  `server_max_header_bytes` (8192 by default). A wide range can accept clients
+  using smaller padding without raising the header cap. To use larger Referer
+  padding, raise the cap to fit the padding plus the URL, other headers, and
+  HTTP-version framing overhead. Padding within the range is still rejected
+  when the request exceeds that cap.
 - `packet_timeout_secs` defaults to 300 seconds and measures inactivity, not a
   POST's total lifetime. On the server, each POST's body must keep receiving
   nonempty bytes. Admission and forwarding-ACK waits stay alive while the inner
@@ -324,9 +337,27 @@ covering all three modes and HTTP versions. `type: splithttp` is an alias for
   is unchanged. A live peer that never ACKs can retain bounded client resources
   until the stream is dropped or the transport fails.
 - Shoes H2/H3 packet-up clients can transmit four POST bodies concurrently.
+  Each client POST retains at most 64 fragments shorter than 256 bytes; larger
+  fragments remain bounded by packet size and byte budgets. Tiny writes produce
+  smaller paced POSTs rather than unbounded fragment bookkeeping.
+  Server `limits.max_requests_per_session` defaults to 128 (minimum 2), counting
+  live packet requests across all carriers through forwarding acknowledgement,
+  including empty bodies and duplicates. One slot is reserved for a missing head
+  packet. Excess requests fail the session rather than accumulate unbounded waiters.
+  Shoes H2/H3 clients need at least five slots (four ordinary plus the reserved
+  head slot). Smaller caps are for H1 or clients with lower POST concurrency.
+  Clients such as Xray/H2 that send further POSTs without waiting for ACKs can
+  reach the live-request cap during a stalled upload even when byte budgets have
+  space. The session then closes. Use a streaming mode, or explicitly raise the
+  cap after budgeting for the additional live-request metadata.
+  Attached sessions wait for late predecessors beyond the default 30-packet reorder
+  window, subject to this request cap and packet inactivity timeout. Unattached
+  sessions still reject out-of-window packets.
   Budget the server's `max_session_buffered_bytes` for at least four maximum
-  `sc_max_each_post_bytes` packets, plus room for duplex pipe buffers; the defaults
-  provide this. Smaller budgets remain valid for H1 or lower-concurrency clients,
+  `sc_max_each_post_bytes` packets; the defaults provide this. Server download
+  pipes have an independent allowance of the same size, so a full packet queue
+  cannot block a write-before-read handshake locally. All pipes still share the
+  global byte budget. Smaller budgets remain valid for H1 or lower-concurrency clients,
   but concurrent bodies can exhaust shared transport credit before their
   predecessors finish. Byte caps do not provide per-session transport isolation:
   stalled consumers or global byte-budget exhaustion can also block other sessions
