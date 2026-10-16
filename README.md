@@ -80,6 +80,12 @@ revision from its checkout:
 cargo install --path . --locked
 ```
 
+After updating the H3 pins, run the empty-DATA and idle-stream regressions:
+
+```sh
+CARGO_BUILD_JOBS=1 cargo test --locked --lib --features ffi h3_ -- --test-threads=1
+```
+
 ## Usage
 
 ```
