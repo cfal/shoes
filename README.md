@@ -324,6 +324,25 @@ covering all three modes and HTTP versions. `type: splithttp` is an alias for
   not receive this grace period.
 - H1/H2 preserve selected upstream proxy chains. H3 must be the first proxy hop;
   it reuses the existing QUIC/H3 dependencies, not Hysteria2 framing.
+- Server `matching_headers` requires every configured header on every request,
+  including OPTIONS. Names are case-insensitive; values must match exactly and
+  occur only once. Missing, wrong, or repeated values close the entire carrier
+  without an HTTP response, before session admission or body processing. On
+  H2/H3 this also terminates other requests sharing the connection. Configure
+  the client's `headers` with the same values, for example
+  `matching_headers: { X-Tunnel-Key: "replace-me" }` on the server and
+  `headers: { X-Tunnel-Key: "replace-me" }` on the client. An empty map (default)
+  adds no requirements; an empty value requires a present, empty header.
+  Use `host`, not `matching_headers`, to match Host/`:authority` across versions.
+  Transport-managed headers and values with leading/trailing spaces or tabs
+  are rejected at startup. With multiplexing reverse proxies or CDNs, closing
+  a shared upstream connection can also interrupt other clients.
+  Browser preflights without the required headers are also rejected.
+- Server `close_on_unmatched_path: true` closes the carrier without an HTTP
+  response when the decoded request path does not match the configured path prefix.
+  The default is `false` (return 404). This option only changes path matching.
+  Both 400 and 404 responses omit XHTTP-specific and CORS headers; 400 responses
+  are not turned into connection-only rejections.
 - `host` overrides HTTP authority independently of TLS SNI. Default Referer
   padding, path/query handling, packet sizing/pacing, and stream-up keepalives
   follow modern Xray. `limits` bounds sessions, buffered bytes, requests and
