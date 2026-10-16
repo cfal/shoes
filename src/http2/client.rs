@@ -7,7 +7,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use http::Request;
 use log::debug;
-use tokio::sync::oneshot;
+use tokio::sync::{Notify, oneshot};
 
 use crate::address::{Address, NetLocation};
 use crate::async_stream::AsyncStream;
@@ -23,15 +23,32 @@ pub struct H2ClientSession {
 struct DriverHandle {
     driver: tokio::task::AbortHandle,
     _drain: oneshot::Sender<()>,
-    active: AtomicUsize,
+    active: Arc<ActiveStreams>,
     retired: Arc<AtomicBool>,
+}
+
+#[derive(Default)]
+struct ActiveStreams {
+    count: AtomicUsize,
+    idle: Notify,
+}
+
+impl ActiveStreams {
+    async fn wait_idle(&self) {
+        while self.count.load(Ordering::SeqCst) != 0 {
+            self.idle.notified().await;
+        }
+    }
 }
 
 pub(crate) struct StreamReservation(H2ClientSession);
 
 impl Drop for StreamReservation {
     fn drop(&mut self) {
-        self.0.driver_handle.active.fetch_sub(1, Ordering::Relaxed);
+        let active = &self.0.driver_handle.active;
+        if active.count.fetch_sub(1, Ordering::SeqCst) == 1 {
+            active.idle.notify_one();
+        }
     }
 }
 
@@ -66,6 +83,8 @@ impl H2ClientSession {
         let (drain_tx, mut drain_rx) = oneshot::channel();
         let retired = Arc::new(AtomicBool::new(false));
         let driver_retired = retired.clone();
+        let active = Arc::new(ActiveStreams::default());
+        let driver_active = active.clone();
         let abort_handle = tokio::spawn(async move {
             // Retired sessions must flush queued DATA and END_STREAM before teardown.
             let result = tokio::select! {
@@ -74,11 +93,11 @@ impl H2ClientSession {
                     .await.ok().map(|result| result.map_err(io::Error::other)),
                 result = keep_alive(ping) => {
                     debug!("HTTP/2 client session retired after keepalive failure: {result:?}");
-                    driver_retired.store(true, Ordering::Relaxed);
+                    driver_retired.store(true, Ordering::SeqCst);
                     // A delayed PONG stops reuse, not already-established tunnels.
                     tokio::select! {
                         result = &mut connection => Some(result.map_err(io::Error::other)),
-                        _ = drain_rx => tokio::time::timeout(crate::util::SHUTDOWN_TIMEOUT, connection)
+                        _ = driver_active.wait_idle() => tokio::time::timeout(crate::util::SHUTDOWN_TIMEOUT, connection)
                             .await.ok().map(|result| result.map_err(io::Error::other)),
                     }
                 },
@@ -96,7 +115,7 @@ impl H2ClientSession {
             driver_handle: Arc::new(DriverHandle {
                 driver: abort_handle,
                 _drain: drain_tx,
-                active: AtomicUsize::new(0),
+                active,
                 retired,
             }),
         })
@@ -104,7 +123,7 @@ impl H2ClientSession {
 
     /// Check if this session is still usable for new streams.
     pub fn is_ready(&self) -> bool {
-        !self.driver_handle.retired.load(Ordering::Relaxed)
+        !self.driver_handle.retired.load(Ordering::SeqCst)
             && !self.driver_handle.driver.is_finished()
             && matches!(
                 self.send_request
@@ -119,16 +138,16 @@ impl H2ClientSession {
             return None;
         }
         let limit = self.send_request.current_max_send_streams();
-        let mut active = self.driver_handle.active.load(Ordering::Relaxed);
+        let mut active = self.driver_handle.active.count.load(Ordering::SeqCst);
         loop {
             if active >= limit {
                 return None;
             }
-            match self.driver_handle.active.compare_exchange_weak(
+            match self.driver_handle.active.count.compare_exchange_weak(
                 active,
                 active + 1,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
             ) {
                 Ok(_) => break,
                 Err(current) => active = current,
@@ -138,7 +157,10 @@ impl H2ClientSession {
     }
 
     pub fn reserve(&self) -> StreamReservation {
-        self.driver_handle.active.fetch_add(1, Ordering::Relaxed);
+        self.driver_handle
+            .active
+            .count
+            .fetch_add(1, Ordering::SeqCst);
         StreamReservation(self.clone())
     }
 
@@ -172,6 +194,13 @@ impl StreamReservation {
         std::future::poll_fn(|cx| self.0.send_request.poll_ready(cx))
             .await
             .map_err(|error| OpenError { error, sent: false })?;
+        // A reservation may predate keepalive retirement; it must not restart idle draining.
+        if self.0.driver_handle.retired.load(Ordering::SeqCst) {
+            return Err(OpenError {
+                error: h2::Reason::REFUSED_STREAM.into(),
+                sent: false,
+            });
+        }
         let (response, send) = self
             .0
             .send_request
@@ -221,6 +250,8 @@ mod tests {
             ready_rx.await.unwrap();
             tokio::time::sleep(Duration::from_secs(36)).await;
             assert_eq!(session.is_ready(), responsive);
+            tokio::time::sleep(crate::util::SHUTDOWN_TIMEOUT + Duration::from_secs(1)).await;
+            assert_eq!(session.driver_handle.driver.is_finished(), !responsive);
             server.abort();
             let _ = server.await;
         }
@@ -266,11 +297,30 @@ mod tests {
             )
             .await
             .unwrap();
+        let reserved = session.try_reserve().unwrap();
         pause_tx.send(()).unwrap();
         paused_rx.await.unwrap();
         tokio::time::sleep(Duration::from_secs(36)).await;
         assert!(!session.is_ready());
         assert!(!session.driver_handle.driver.is_finished());
+        for reservation in [reserved, session.reserve()] {
+            let error = tokio::time::timeout(
+                Duration::from_secs(1),
+                reservation.open(
+                    Request::builder()
+                        .method("CONNECT")
+                        .uri("example.com:443")
+                        .body(())
+                        .unwrap(),
+                ),
+            )
+            .await
+            .expect("retired carriers must reject pending opens without sending")
+            .err()
+            .expect("a retired carrier accepted a new request");
+            assert!(!error.sent);
+            assert_eq!(error.error.reason(), Some(h2::Reason::REFUSED_STREAM));
+        }
         resume_tx.send(()).unwrap();
         stream.write_all(b"tail").await.unwrap();
         stream.shutdown().await.unwrap();
@@ -278,6 +328,9 @@ mod tests {
         stream.read_to_end(&mut data).await.unwrap();
         assert_eq!(data, b"tail");
         assert!(!session.is_ready());
+        drop(stream);
+        tokio::time::sleep(crate::util::SHUTDOWN_TIMEOUT + Duration::from_secs(1)).await;
+        assert!(session.driver_handle.driver.is_finished());
         server.abort();
         let _ = server.await;
     }
