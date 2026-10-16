@@ -115,7 +115,7 @@ impl Carrier {
         stream: Box<dyn AsyncStream>,
         version: XhttpVersion,
         header_limit: usize,
-        windows: (u32, u32),
+        (stream_window, connection_window): (u32, u32),
     ) -> io::Result<Arc<Self>> {
         let tasks = Tasks::new();
         let sender = if version == XhttpVersion::H1 {
@@ -132,8 +132,8 @@ impl Carrier {
             Sender::H1(tokio::sync::Mutex::new(sender))
         } else {
             let (sender, mut connection) = h2::client::Builder::new()
-                .initial_window_size(windows.0)
-                .initial_connection_window_size(windows.1)
+                .initial_window_size(stream_window)
+                .initial_connection_window_size(connection_window)
                 .max_header_list_size(header_limit as u32)
                 .handshake(stream)
                 .await
@@ -579,17 +579,18 @@ async fn send_h2_tracked(
                 .ok_or_else(|| io::Error::from(io::ErrorKind::BrokenPipe))?
                 .map_err(io::Error::other)?;
             let len = capacity.min(data.len());
-            if len != 0 {
-                // Known-length peers may respond and reset immediately after the final bytes.
-                let end = len == data.len() && hyper::body::Body::is_end_stream(&body);
-                send.send_data(data.split_to(len), end)
-                    .map_err(io::Error::other)?;
-                if let Some(upload) = &upload {
-                    upload.activity.touch();
-                }
-                if end {
-                    break 'frames;
-                }
+            if len == 0 {
+                continue;
+            }
+            // Known-length peers may respond and reset immediately after the final bytes.
+            let end = len == data.len() && hyper::body::Body::is_end_stream(&body);
+            send.send_data(data.split_to(len), end)
+                .map_err(io::Error::other)?;
+            if let Some(upload) = &upload {
+                upload.activity.touch();
+            }
+            if end {
+                break 'frames;
             }
         }
     }

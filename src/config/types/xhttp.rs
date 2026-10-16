@@ -121,15 +121,16 @@ impl Default for XhttpLimits {
 
 impl XhttpLimits {
     pub(crate) fn h2_windows(&self) -> (u32, u32) {
-        (
-            self.h2_stream_window_bytes
-                .min(self.max_session_buffered_bytes)
-                .min(self.max_buffered_bytes) as u32,
-            // HTTP/2 starts every connection with at least 65535 bytes of credit.
-            self.h2_connection_window_bytes
-                .min(self.max_buffered_bytes)
-                .max(65535) as u32,
-        )
+        let stream_window = self
+            .h2_stream_window_bytes
+            .min(self.max_session_buffered_bytes)
+            .min(self.max_buffered_bytes) as u32;
+        // HTTP/2 starts every connection with at least 65535 bytes of credit.
+        let connection_window = self
+            .h2_connection_window_bytes
+            .min(self.max_buffered_bytes)
+            .max(65535) as u32;
+        (stream_window, connection_window)
     }
 
     pub(crate) fn request_limit(&self) -> usize {

@@ -958,10 +958,9 @@ mod tests {
         {
             let inner = session.state.lock();
             let packet = inner.pending.get(&1).unwrap();
-            assert_eq!(packet.chunks.len(), 2);
+            assert_eq!(packet.len(), 2);
             assert!(
                 packet
-                    .chunks
                     .iter()
                     .flat_map(|chunk| chunk.iter())
                     .copied()
@@ -1991,7 +1990,7 @@ struct SessionState {
     upload: Upload,
     writer: Option<Writer>,
     reader: Option<Reader>,
-    pending: BTreeMap<u64, Packet>,
+    pending: BTreeMap<u64, Vec<Bytes>>,
     receiving: BTreeMap<u64, usize>,
     reserved: BTreeMap<u64, usize>,
     next: u64,
@@ -2006,9 +2005,6 @@ impl SessionState {
                 self.pending.contains_key(&number) || in_progress.contains_key(&number)
             })
     }
-}
-struct Packet {
-    chunks: Vec<Bytes>,
 }
 struct Session {
     state: parking_lot::Mutex<SessionState>,
@@ -2909,7 +2905,6 @@ impl State {
                 }
                 if let Some(previous) = state.pending.get(&sequence) {
                     if previous
-                        .chunks
                         .iter()
                         .flat_map(|b| b.iter())
                         .eq(chunks.iter().flat_map(|b| b.as_ref().iter()))
@@ -2924,9 +2919,7 @@ impl State {
                 }
                 state.pending.insert(
                     sequence,
-                    Packet {
-                        chunks: chunks.into_iter().map(|chunk| chunk.into_bytes()).collect(),
-                    },
+                    chunks.into_iter().map(|chunk| chunk.into_bytes()).collect(),
                 );
                 state.writer.take()
             };
@@ -2969,7 +2962,7 @@ impl State {
                     };
                     match packet {
                         Some(packet) => {
-                            for chunk in packet.chunks {
+                            for chunk in packet {
                                 writer.forward(chunk).await?;
                             }
                         }
@@ -3080,12 +3073,13 @@ impl State {
                         carrier::receive_hyper(body, writer, Some(received)).await;
                     }
                 });
-                let response = state.handle(request, reader).await;
-                let response = response.map(|body| body.with_guard(request_permit));
+                let mut response = state
+                    .handle(request, reader)
+                    .await
+                    .map(|body| body.with_guard(request_permit));
                 if streaming_upload && response.status() == StatusCode::OK {
                     return Ok::<_, io::Error>(response.map(|body| body.with_guard(tasks)));
                 }
-                let mut response = response;
                 if !eof.is_cancelled() {
                     response
                         .headers_mut()
@@ -3114,14 +3108,14 @@ impl State {
         stream: Box<dyn AsyncStream>,
         deadline: tokio::time::Instant,
     ) -> io::Result<()> {
-        let windows = self.config.limits.h2_windows();
+        let (stream_window, connection_window) = self.config.limits.h2_windows();
         let mut connection = tokio::time::timeout_at(
             deadline,
             h2::server::Builder::new()
                 .max_header_list_size(self.config.header_limit().min(u32::MAX as usize) as u32)
                 .max_concurrent_streams(self.config.limits.request_limit() as u32)
-                .initial_window_size(windows.0)
-                .initial_connection_window_size(windows.1)
+                .initial_window_size(stream_window)
+                .initial_connection_window_size(connection_window)
                 .handshake(stream),
         )
         .await?
