@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 
 use super::{ClientProxyConfig, ServerProxyConfig};
 
+pub(crate) const MAX_PADDING_BYTES: u32 = 65536;
+
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum XhttpMode {
@@ -89,6 +91,7 @@ pub struct XhttpLimits {
     pub max_buffered_bytes: usize,
     pub max_session_buffered_bytes: usize,
     pub max_requests_per_connection: usize,
+    pub max_requests_per_session: usize,
     pub setup_timeout_secs: u64,
     pub packet_timeout_secs: u64,
     pub response_header_timeout_secs: u64,
@@ -102,6 +105,7 @@ impl Default for XhttpLimits {
             max_buffered_bytes: 64 * 1024 * 1024,
             max_session_buffered_bytes: 4 * 1024 * 1024,
             max_requests_per_connection: 128,
+            max_requests_per_session: 128,
             setup_timeout_secs: 60,
             packet_timeout_secs: 300,
             response_header_timeout_secs: 60,
@@ -119,6 +123,9 @@ impl XhttpLimits {
     }
 
     pub fn validate(&self) -> io::Result<()> {
+        if self.max_requests_per_session < 2 {
+            return Err(invalid("XHTTP session request limit must be at least 2"));
+        }
         if [
             self.max_sessions,
             self.max_pending_sessions,
@@ -194,7 +201,10 @@ impl XhttpClientConfig {
     pub fn validate(&self) -> io::Result<()> {
         validate_path_and_host(&self.path, self.host.as_deref())?;
         self.limits.validate()?;
-        if self.x_padding_bytes.bounds((100, 1000), false)?.1 > 65536 {
+        if self.limits.max_requests_per_session != XhttpLimits::default().max_requests_per_session {
+            return Err(invalid("XHTTP max_requests_per_session is server-only"));
+        }
+        if self.x_padding_bytes.bounds((100, 1000), false)?.1 > MAX_PADDING_BYTES {
             return Err(invalid("XHTTP padding must not exceed 65536 bytes"));
         }
         let (min, _) = self
@@ -274,7 +284,7 @@ impl XhttpServerConfig {
             return Err(invalid("nested XHTTP is not supported"));
         }
         self.limits.validate()?;
-        if self.x_padding_bytes.bounds((100, 1000), false)?.1 > 65536 {
+        if self.x_padding_bytes.bounds((100, 1000), false)?.1 > MAX_PADDING_BYTES {
             return Err(invalid("XHTTP padding must not exceed 65536 bytes"));
         }
         let (min, max) = self
@@ -283,12 +293,17 @@ impl XhttpServerConfig {
         if min == 0 {
             return Err(invalid("XHTTP packet size must be positive"));
         }
-        if matches!(self.mode, XhttpMode::Auto | XhttpMode::PacketUp)
-            && max as usize > self.limits.max_session_buffered_bytes
-        {
-            return Err(invalid(
-                "XHTTP maximum packet size exceeds the session byte budget",
-            ));
+        if matches!(self.mode, XhttpMode::Auto | XhttpMode::PacketUp) {
+            if max as usize > self.limits.max_session_buffered_bytes {
+                return Err(invalid(
+                    "XHTTP maximum packet size exceeds the session byte budget",
+                ));
+            }
+            if max as usize > self.limits.max_buffered_bytes {
+                return Err(invalid(
+                    "XHTTP maximum packet size exceeds the global byte budget",
+                ));
+            }
         }
         self.sc_stream_up_server_secs.bounds((20, 80), true)?;
         Ok(())
@@ -471,6 +486,14 @@ mod tests {
         assert_eq!(limits.packet_timeout_secs, 300);
         assert_eq!(limits.setup_timeout_secs, 60);
         assert_eq!(limits.response_header_timeout_secs, 60);
+        assert_eq!(limits.max_requests_per_session, 128);
+        for limit in [0, 1, 2] {
+            let limits = XhttpLimits {
+                max_requests_per_session: limit,
+                ..limits.clone()
+            };
+            assert_eq!(limits.validate().is_ok(), limit >= 2);
+        }
         assert_eq!(
             XhttpRange::Number(0).bounds((100, 1000), false).unwrap(),
             (100, 1000)
@@ -487,6 +510,18 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn client_rejects_server_only_session_request_limits() {
+        for limit in [2, 5, 128, 129] {
+            let config: XhttpClientConfig = serde_json::from_value(serde_json::json!({
+                "limits": {"max_requests_per_session": limit},
+                "protocol": {"type": "socks"}
+            }))
+            .unwrap();
+            assert_eq!(config.validate().is_ok(), limit == 128);
+        }
+    }
+
     #[test]
     fn xhttp_alias_and_strict_fields() {
         for mode in ["auto", "packet-up", "stream-up", "stream-one"] {
@@ -508,7 +543,7 @@ mod tests {
     }
 }
 #[test]
-fn server_packet_size_must_fit_the_session_budget() {
+fn server_packet_size_must_fit_both_byte_budgets() {
     for mode in ["auto", "packet-up", "stream-up", "stream-one"] {
         for (packet, fits) in [
             (serde_json::json!(32), true),
@@ -517,16 +552,22 @@ fn server_packet_size_must_fit_the_session_budget() {
             (serde_json::json!("16-33"), false),
             (serde_json::json!(0), false),
         ] {
-            let config: XhttpServerConfig = serde_json::from_value(serde_json::json!({
-                "mode": mode, "sc_max_each_post_bytes": packet,
-                "limits": {"max_session_buffered_bytes": 32},
-                "protocol": {"type": "socks"}
-            }))
-            .unwrap();
-            assert_eq!(
-                config.validate().is_ok(),
-                fits || mode.starts_with("stream-")
-            );
+            for (session, global) in [(32, 64), (64, 32), (32, 32)] {
+                let config: XhttpServerConfig = serde_json::from_value(serde_json::json!({
+                    "mode": mode, "sc_max_each_post_bytes": packet,
+                    "limits": {
+                        "max_session_buffered_bytes": session,
+                        "max_buffered_bytes": global
+                    },
+                    "protocol": {"type": "socks"}
+                }))
+                .unwrap();
+                assert_eq!(
+                    config.validate().is_ok(),
+                    fits || mode.starts_with("stream-"),
+                    "mode={mode}, packet={packet}, session={session}, global={global}"
+                );
+            }
         }
     }
 }

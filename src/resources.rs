@@ -100,6 +100,12 @@ pub(crate) struct BudgetPermit {
 }
 
 impl BudgetPermit {
+    pub(crate) fn merge(&mut self, mut other: Self) {
+        assert!(Arc::ptr_eq(&self.budget, &other.budget));
+        self.count += other.count;
+        other.count = 0;
+    }
+
     pub(crate) fn split(&mut self, count: usize) -> Self {
         assert!(count <= self.count);
         self.count -= count;
@@ -112,8 +118,10 @@ impl BudgetPermit {
 
 impl Drop for BudgetPermit {
     fn drop(&mut self) {
-        self.budget.0.lock().active -= self.count;
-        self.budget.1.notify_waiters();
+        if self.count != 0 {
+            self.budget.0.lock().active -= self.count;
+            self.budget.1.notify_waiters();
+        }
     }
 }
 
@@ -444,6 +452,25 @@ mod tests {
         budget.set_limit(None);
         let third = budget.acquire(1024).unwrap();
         drop((second, third));
+        assert_eq!(budget.snapshot().active, 0);
+    }
+
+    #[tokio::test]
+    async fn merging_permits_preserves_accounting_without_release_notifications() {
+        let budget = Arc::new(Budget::new(Some(2)));
+        let mut first = budget.acquire(1).unwrap();
+        let second = budget.acquire(1).unwrap();
+        let released = budget.released();
+        tokio::pin!(released);
+        assert!(futures::poll!(&mut released).is_pending());
+        first.merge(second);
+        drop(budget.acquire(0).unwrap());
+        assert_eq!(budget.snapshot().active, 2);
+        assert!(futures::poll!(&mut released).is_pending());
+        drop(first.split(1));
+        assert!(futures::poll!(&mut released).is_ready());
+        assert_eq!(budget.snapshot().active, 1);
+        drop(first);
         assert_eq!(budget.snapshot().active, 0);
     }
 

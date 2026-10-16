@@ -572,13 +572,13 @@ impl Client {
             let Some(event) = event else {
                 return Err(io::ErrorKind::BrokenPipe.into());
             };
-            match event {
+            match event.into_shared() {
                 Event::Data(data) => {
                     let mut chunks = std::collections::VecDeque::new();
                     let mut size = 0;
                     let mut event = Some(Event::Data(data));
                     while let Some(item) = event {
-                        match item {
+                        match item.into_shared() {
                             Event::Data(mut data) => {
                                 let len = data.len().min(max_packet_bytes - size);
                                 chunks.push_back(data.split_to(len));
@@ -685,6 +685,7 @@ impl Client {
                     return Ok(());
                 }
                 Event::Error(error) => return Err(error),
+                Event::Allocated(_) => unreachable!(),
             }
         }
     }
