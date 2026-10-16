@@ -163,6 +163,8 @@ impl Carrier {
         let opener = connection.opener();
         let (mut driver, sender) = h3::client::builder()
             .max_field_section_size(header_limit as u64)
+            // Known-length peers can stop receiving before finish() writes its optional GREASE frame.
+            .send_grease(false)
             .build(connection)
             .await
             .map_err(io::Error::other)?;

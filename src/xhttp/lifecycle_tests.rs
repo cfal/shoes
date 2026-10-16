@@ -1898,6 +1898,58 @@ async fn h3_peer(
 }
 
 #[tokio::test]
+async fn h3_packet_fin_does_not_write_frames_after_the_payload() {
+    async fn varint(stream: &mut quinn::RecvStream) -> u64 {
+        let first = stream.read_u8().await.unwrap();
+        let mut value = u64::from(first & 0x3f);
+        for _ in 1..(1 << (first >> 6)) {
+            value = (value << 8) | u64::from(stream.read_u8().await.unwrap());
+        }
+        value
+    }
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let (outgoing, incoming, _endpoint) = quic_pair(1).await;
+        let carrier = super::carrier::Carrier::quic(outgoing, 8192).await.unwrap();
+        let tasks = Arc::new(Tasks::new());
+        let memory = Memory::new(Arc::new(Budget::new(Some(4096))), 4096);
+        let reservation = carrier.reserve().await.unwrap();
+        let workers = tasks.clone();
+        tasks.spawn(async move {
+            let _ = carrier
+                .request_reserved(
+                    Request::post("https://localhost/packet/0")
+                        .header("content-length", 1024)
+                        .body(Body::Chunks([Bytes::from(vec![42; 1024])].into()))
+                        .unwrap(),
+                    memory,
+                    &workers,
+                    super::carrier::Timeouts::packet(
+                        Duration::from_secs(1),
+                        Duration::from_secs(1),
+                    ),
+                    reservation,
+                )
+                .await;
+        });
+        let (_response, mut request) = incoming.accept_bi().await.unwrap();
+        assert_eq!(varint(&mut request).await, 1, "HEADERS");
+        let mut headers = vec![0; varint(&mut request).await as usize];
+        request.read_exact(&mut headers).await.unwrap();
+        assert_eq!(varint(&mut request).await, 0, "DATA");
+        assert_eq!(varint(&mut request).await, 1024);
+        let mut payload = [0; 1024];
+        request.read_exact(&mut payload).await.unwrap();
+        assert_eq!(payload, [42; 1024]);
+        let tail = request.read_to_end(1024).await.unwrap();
+        assert!(tail.is_empty(), "post-payload HTTP/3 frames: {tail:?}");
+        tasks.cancel.cancel();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn h3_packet_upload_inactivity_and_early_or_deferred_ack() {
     use super::carrier::{Carrier, Timeouts};
 
