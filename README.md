@@ -39,6 +39,14 @@ All server protocols plus:
 - **Shadowsocks**: `aes-128-gcm`, `aes-256-gcm`, `chacha20-ietf-poly1305`, `2022-blake3-aes-128-gcm`, `2022-blake3-aes-256-gcm`, `2022-blake3-chacha20-ietf-poly1305`
 - **Snell v3**: `aes-128-gcm`, `aes-256-gcm`, `chacha20-ietf-poly1305`
 
+For Clash.Meta/Mihomo legacy Snell clients, use `chacha20-ietf-poly1305` with v1
+or `aes-128-gcm` with v3. Run Shoes v0.3.3 or newer for the corrected 16-byte
+Snell salts. These clients do not offer an AES-256 option. Do not use v2:
+Shoes does not implement Snell v2 connection reuse or its half-close markers.
+Older Clash.Meta clients fail requests on reused v2 connections.
+Shoes-to-Shoes connections can also use `aes-256-gcm`; both ends must use the
+same cipher and run v0.3.3 or newer for AES-256 or ChaCha20.
+
 ## Features
 
 - **Multi-transport**: TCP or QUIC for all protocols
