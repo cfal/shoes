@@ -16,6 +16,7 @@ env:
   XRAY_VERSION: 26.3.27
   XRAY_SHA256: 23cd9af937744d97776ee35ecad4972cf4b2109d1e0fe6be9930467608f7c8ae
   XRAY_COMMIT: 701af60772cda123492f86e383e1fdba066614a9
+  MIHOMO_ALPHA_COMMIT: 94b13aed49b8dc41973e4bb3f721c5fa2c5c5c1f
 
 jobs:
   unit-tests:
@@ -101,6 +102,11 @@ jobs:
           target: optional_peer
           filters: ""
           peer: mihomo
+        - name: XHTTP interoperability
+          features: integration-tests
+          target: xhttp_interop
+          filters: ""
+          peer: xhttp
         - name: external DNS
           features: external-network-tests
           target: external_network
@@ -186,15 +192,25 @@ jobs:
         cargo test -p shoes --locked --lib --features integration-tests
         h2mux::h2mux_server_session::singbox_interop_tests:: -- --test-threads=1
 
-    - name: Install Go for Xray peer
-      if: matrix.target == 'integration'
+    - name: Restore pinned XHTTP peers
+      if: matrix.target == 'xhttp_interop'
+      id: xhttp-peers
+      uses: actions/cache/restore@v4
+      with:
+        path: |
+          ~/.cache/shoes-xray/xray
+          ~/.cache/shoes-mihomo/mihomo
+        key: ${{ runner.os }}-xhttp-peers-go1.27.1-${{ env.XRAY_COMMIT }}-${{ env.MIHOMO_ALPHA_COMMIT }}
+
+    - name: Install Go for XHTTP peers
+      if: matrix.target == 'xhttp_interop' && steps.xhttp-peers.outputs.cache-hit != 'true'
       uses: actions/setup-go@v5
       with:
         go-version: '1.27.1'
         cache: false
 
     - name: Build pinned Xray test peer
-      if: matrix.target == 'integration'
+      if: matrix.target == 'xhttp_interop' && steps.xhttp-peers.outputs.cache-hit != 'true'
       run: |
         source="$HOME/.cache/shoes-xray"
         git clone --filter=blob:none --no-checkout https://github.com/XTLS/Xray-core.git "$source"
@@ -202,7 +218,35 @@ jobs:
         test "$(git -C "$source" rev-parse HEAD)" = "$XRAY_COMMIT"
         cd "$source"
         GOMAXPROCS=1 go build -p 1 -o "$source/xray" ./main
-        echo "SHOES_TEST_XRAY_BIN=$source/xray" >> "$GITHUB_ENV"
+
+    - name: Build pinned Mihomo Alpha test peer
+      if: matrix.target == 'xhttp_interop' && steps.xhttp-peers.outputs.cache-hit != 'true'
+      run: |
+        source="$HOME/.cache/shoes-mihomo"
+        git clone --filter=blob:none --no-checkout https://github.com/MetaCubeX/mihomo.git "$source"
+        git -C "$source" checkout --detach "$MIHOMO_ALPHA_COMMIT"
+        test "$(git -C "$source" rev-parse HEAD)" = "$MIHOMO_ALPHA_COMMIT"
+        cd "$source"
+        GOMAXPROCS=1 CGO_ENABLED=0 go build -p 1 \
+          -ldflags "-X github.com/metacubex/mihomo/constant.Version=alpha-${MIHOMO_ALPHA_COMMIT:0:8}" \
+          -o "$source/mihomo" .
+
+    - name: Save pinned XHTTP peers
+      if: matrix.target == 'xhttp_interop' && steps.xhttp-peers.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: |
+          ~/.cache/shoes-xray/xray
+          ~/.cache/shoes-mihomo/mihomo
+        key: ${{ steps.xhttp-peers.outputs.cache-primary-key }}
+
+    - name: Select XHTTP peers
+      if: matrix.target == 'xhttp_interop'
+      run: |
+        echo "SHOES_TEST_XRAY_BIN=$HOME/.cache/shoes-xray/xray" >> "$GITHUB_ENV"
+        echo "SHOES_TEST_MIHOMO_BIN=$HOME/.cache/shoes-mihomo/mihomo" >> "$GITHUB_ENV"
+        "$HOME/.cache/shoes-xray/xray" version
+        "$HOME/.cache/shoes-mihomo/mihomo" -v
 
     - name: Run integration tests
       env:

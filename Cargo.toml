@@ -60,6 +60,11 @@ path = "tests/optional_peer.rs"
 required-features = ["optional-peer-tests"]
 
 [[test]]
+name = "xhttp_interop"
+path = "tests/xhttp_interop.rs"
+required-features = ["integration-tests"]
+
+[[test]]
 name = "reality_interop"
 path = "tests/reality_interop.rs"
 required-features = ["optional-peer-tests"]
