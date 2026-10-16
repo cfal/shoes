@@ -1,7 +1,7 @@
 [package]
 name = "shoes"
 version = "0.3.2"
-publish = false # The local h3 patch must not be dropped by crates.io packaging.
+publish = false # Cargo strips fork patches from crates.io packages.
 edition = "2024"
 autotests = false
 license = "MIT"
@@ -14,11 +14,11 @@ categories = ["command-line-utilities", "network-programming"]
 
 [workspace]
 members = ["tests/support"]
-exclude = ["vendor/h3"]
 resolver = "3"
 
 [patch.crates-io]
-h3 = { path = "vendor/h3" }
+h3 = { git = "https://github.com/cfal/h3", rev = "a0a7a53a143798d71884df36cfac4dd36cd087e6" }
+h3-quinn = { git = "https://github.com/cfal/h3", rev = "a0a7a53a143798d71884df36cfac4dd36cd087e6" }
 
 [lib]
 name = "shoes"

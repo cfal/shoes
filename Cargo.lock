@@ -750,6 +750,7 @@ dependencies = [
 [[package]]
 name = "h3"
 version = "0.0.8"
+source = "git+https://github.com/cfal/h3?rev=a0a7a53a143798d71884df36cfac4dd36cd087e6#a0a7a53a143798d71884df36cfac4dd36cd087e6"
 dependencies = [
  "bytes",
  "fastrand",
@@ -762,14 +763,12 @@ dependencies = [
 [[package]]
 name = "h3-quinn"
 version = "0.0.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b2e732c8d91a74731663ac8479ab505042fbf547b9a207213ab7fbcbfc4f8b4"
+source = "git+https://github.com/cfal/h3?rev=a0a7a53a143798d71884df36cfac4dd36cd087e6#a0a7a53a143798d71884df36cfac4dd36cd087e6"
 dependencies = [
  "bytes",
- "futures",
+ "futures-util",
  "h3",
  "quinn",
- "tokio",
  "tokio-util",
 ]
 

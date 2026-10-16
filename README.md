@@ -62,9 +62,19 @@ For the previously published release:
 cargo install shoes
 ```
 
-This branch temporarily vendors an HTTP/3 correctness fix that Cargo excludes
-from crates.io packages. Publishing is disabled until an upstream release includes
-the fix. Build this branch from its checkout to retain the patch:
+GitHub release builds pin `h3` and `h3-quinn` to the
+[`cfal/h3` fork](https://github.com/cfal/h3/tree/a0a7a53a143798d71884df36cfac4dd36cd087e6),
+including the [empty-DATA fix](https://github.com/hyperium/h3/pull/373).
+Empty HTTP/3 DATA frames must not be treated as body EOF; XHTTP uses them for
+idle cancellation probes. The workspace patches cover direct and transitive
+dependencies, including DNS over HTTP/3. The experimental zero-copy change in
+[h3 #368](https://github.com/hyperium/h3/pull/368) is not included.
+
+GitHub releases and checkout builds retain these patches. Crates.io publishing
+remains disabled because Cargo removes workspace patches from published packages.
+Remove the patches and publishing guard only after adopting fixed registry
+versions that pass the H3 empty-DATA and idle-stream regressions. To install this
+revision from its checkout:
 
 ```bash
 cargo install --path . --locked
