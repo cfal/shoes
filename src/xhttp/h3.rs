@@ -189,7 +189,7 @@ impl RecvStream for Recv {
         result
     }
     fn stop_sending(&mut self, code: u64) {
-        // h3-quinn moves its stream into a pending read future; stop_sending would panic there.
+        // h3-quinn defers STOP until a pending read completes; dropping it cancels immediately.
         if self.pending {
             self.inner.take();
         } else if let Some(inner) = &mut self.inner {
