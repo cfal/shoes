@@ -112,12 +112,12 @@ async fn named_tls_target_routing_and_h2_proxy_chaining() -> io::Result<()> {
                 }}}},
             {"address": format!("0.0.0.0:{middle}"), "protocol": {"type": "http"}},
             {"address": format!("0.0.0.0:{entry}"), "protocol": {"type": "http"},
-                "rules": [{"mask": "0.0.0.0/0", "action": "allow", "client_chain": [
+                "rules": [{"mask": "0.0.0.0/0", "action": "allow", "client_chain": {"chain": [
                     {"address": format!("127.0.0.1:{middle}"), "protocol": {"type": "http", "http_version": "h2"}},
                     {"address": format!("127.0.0.1:{server}"), "protocol": {"type": "tls", "verify": false,
                         "sni_hostname": "localhost", "alpn_protocols": ["h2"],
                         "protocol": {"type": "http", "http_version": "h2", "resolve_hostname": true}}}
-                ]}]}
+                ]}}]}
         ]);
         let _shoes = start_shoes_server(&serde_yaml::to_string(&config).unwrap())?;
         ports.wait_for_all_ports().await?;
@@ -163,9 +163,9 @@ async fn pooled_prefixes_do_not_share_a_subsequent_h2_carrier() -> io::Result<()
             listener(h2_a, markers[0]), listener(h2_b, markers[1]),
             listener(prefix_a, h2_a), listener(prefix_b, h2_b),
             {"address": format!("0.0.0.0:{entry}"), "protocol": {"type": "http"},
-                "rules": [{"mask": "0.0.0.0/0", "action": "allow", "client_chain": [
-                    [hop(prefix_a, "h1"), hop(prefix_b, "h1")], hop(h2_a, "h2")
-                ]}]}
+                "rules": [{"mask": "0.0.0.0/0", "action": "allow", "client_chain": {"chain": [
+                    {"pool": [hop(prefix_a, "h1"), hop(prefix_b, "h1")]}, hop(h2_a, "h2")
+                ]}}]}
         ]);
         let _shoes = start_shoes_server(&serde_yaml::to_string(&config).unwrap())?;
         ports.wait_for_all_ports().await?;
