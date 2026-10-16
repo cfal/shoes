@@ -21,7 +21,13 @@ async fn all_modes_and_carriers_exchange_data_before_upload_eof() {
         let mut clients = tokio::task::JoinSet::new();
         loop {
             tokio::select! {
-                result = echo.accept() => { let (mut socket, _) = result.unwrap(); clients.spawn(async move { let (mut read, mut write) = socket.split(); let _ = tokio::io::copy(&mut read, &mut write).await; }); }
+                result = echo.accept() => {
+                    let (mut socket, _) = result.unwrap();
+                    clients.spawn(async move {
+                        let (mut read, mut write) = socket.split();
+                        let _ = tokio::io::copy(&mut read, &mut write).await;
+                    });
+                }
                 _ = clients.join_next(), if !clients.is_empty() => {}
             }
         }

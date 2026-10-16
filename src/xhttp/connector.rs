@@ -121,13 +121,8 @@ pub fn build(
             };
             let explicit_alpn = tls.alpn_protocols.clone().into_vec();
             let version = match xhttp.http_version {
-                XhttpVersion::Auto => {
-                    if explicit_alpn == ["http/1.1"] {
-                        XhttpVersion::H1
-                    } else {
-                        XhttpVersion::H2
-                    }
-                }
+                XhttpVersion::Auto if explicit_alpn == ["http/1.1"] => XhttpVersion::H1,
+                XhttpVersion::Auto => XhttpVersion::H2,
                 v => v,
             };
             let alpn = match version {
@@ -184,7 +179,7 @@ pub fn build(
             let sni = sni_hostname.clone().or(default_sni.clone());
             **protocol = ClientProxyConfig::PortForward;
             let handler = crate::tcp::tcp_client_handler_factory::create_tcp_client_handler(
-                outer.clone(),
+                outer,
                 default_sni,
                 resolver.clone(),
             )?;
@@ -238,6 +233,20 @@ pub fn build(
         XhttpMode::Auto => XhttpMode::PacketUp,
         mode => mode,
     };
+    // Config validation precedes installation of candidate global limits.
+    let capacity = if version == XhttpVersion::H1 {
+        xhttp.pool.max_h1_connections
+    } else {
+        xhttp
+            .pool
+            .max_connections
+            .saturating_mul(xhttp.limits.max_requests_per_connection)
+    };
+    if mode != XhttpMode::StreamOne && capacity < 2 {
+        return Err(invalid(
+            "XHTTP split modes require at least two request lanes",
+        ));
+    }
     let inner = crate::tcp::tcp_client_handler_factory::create_tcp_client_handler(
         *xhttp.protocol.clone(),
         None,
@@ -272,6 +281,71 @@ mod tests {
             }))
             .unwrap();
             assert!(build(&config, resolver.clone()).unwrap().is_some());
+        }
+    }
+
+    #[test]
+    fn split_modes_require_two_configured_lanes_after_auto_resolution() {
+        let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
+        let public_key =
+            base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, [1; 32]);
+        for carrier in [
+            "plain-auto",
+            "h1",
+            "h2",
+            "h3",
+            "tls-auto",
+            "tls-h1",
+            "reality",
+        ] {
+            for mode in ["auto", "packet-up", "stream-up", "stream-one"] {
+                for (connections, h1_connections, requests) in
+                    [(1, 1, 1), (2, 1, 1), (1, 2, 1), (1, 1, 2)]
+                {
+                    let version = match carrier {
+                        "h1" | "h2" | "h3" => carrier,
+                        _ => "auto",
+                    };
+                    let mut protocol = json!({
+                        "type": "xhttp", "mode": mode, "http_version": version,
+                        "pool": {"max_connections": connections, "max_h1_connections": h1_connections},
+                        "limits": {"max_requests_per_connection": requests},
+                        "protocol": {"type": "socks"}
+                    });
+                    protocol = match carrier {
+                        "tls-auto" => json!({"type": "tls", "protocol": protocol}),
+                        "tls-h1" => {
+                            json!({"type": "tls", "alpn_protocols": ["http/1.1"], "protocol": protocol})
+                        }
+                        "reality" => {
+                            json!({"type": "reality", "public_key": public_key, "protocol": protocol})
+                        }
+                        _ => protocol,
+                    };
+                    let config = serde_json::from_value(json!({
+                        "address": "localhost:443",
+                        "transport": if carrier == "h3" { "quic" } else { "tcp" },
+                        "protocol": protocol
+                    }))
+                    .unwrap();
+                    let single = mode == "stream-one" || (mode == "auto" && carrier == "reality");
+                    let capacity = if matches!(carrier, "plain-auto" | "h1" | "tls-h1") {
+                        h1_connections
+                    } else {
+                        connections * requests
+                    };
+                    let result = build(&config, resolver.clone());
+                    assert_eq!(
+                        result.is_ok(),
+                        single || capacity >= 2,
+                        "carrier={carrier}, mode={mode}, pool=({connections}, {h1_connections}, {requests}): {result:?}"
+                    );
+                    if let Err(error) = result {
+                        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+                        assert!(error.to_string().contains("at least two request lanes"));
+                    }
+                }
+            }
         }
     }
 

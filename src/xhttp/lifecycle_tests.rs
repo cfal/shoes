@@ -54,13 +54,21 @@ fn client(version: XhttpVersion) -> Arc<Client> {
         "protocol":{"type":"socks"}
     }))
     .unwrap();
+    configured_client(config, version, XhttpMode::StreamOne)
+}
+
+fn configured_client(
+    config: XhttpClientConfig,
+    version: XhttpVersion,
+    mode: XhttpMode,
+) -> Arc<Client> {
     Arc::new(
         Client::new(
             config,
             NetLocation::from_str("localhost:80", None).unwrap(),
             "localhost".into(),
             version,
-            XhttpMode::StreamOne,
+            mode,
             Security::Plain,
         )
         .unwrap(),
@@ -265,17 +273,7 @@ async fn draining_carriers_keep_their_physical_pool_slots_until_tails_finish() {
         "pool":{"max_connections":1},"protocol":{"type":"socks"}
     }))
     .unwrap();
-    let client = Arc::new(
-        Client::new(
-            config,
-            NetLocation::from_str("localhost:80", None).unwrap(),
-            "localhost".into(),
-            XhttpVersion::H2,
-            XhttpMode::StreamOne,
-            Security::Plain,
-        )
-        .unwrap(),
-    );
+    let client = configured_client(config, XhttpVersion::H2, XhttpMode::StreamOne);
     let dialer = Arc::new(Dialer {
         address,
         key: RouteKey(vec![1]),
@@ -385,6 +383,297 @@ async fn rejected_and_delayed_response_errors_reach_reader() {
 }
 
 #[tokio::test]
+async fn client_download_does_not_reserve_the_same_bytes_twice() {
+    for global_limit in [16384, 65536] {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+            let address = ([127, 0, 0, 1], listener.local_addr().unwrap().port()).into();
+            let tasks = Tasks::new();
+            tasks.spawn(async move {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut connection = h2::server::handshake(socket).await.unwrap();
+                while let Some(Ok((_, mut respond))) = connection.accept().await {
+                    let mut send = respond.send_response(Response::new(()), false).unwrap();
+                    send.send_data(Bytes::from(vec![42; 16384]), true).unwrap();
+                }
+            });
+            let config = serde_json::from_value(serde_json::json!({
+                "limits":{"max_buffered_bytes":global_limit,
+                    "max_session_buffered_bytes": if global_limit == 16384 {65536} else {16384}},
+                "protocol":{"type":"socks"}
+            }))
+            .unwrap();
+            let client = configured_client(config, XhttpVersion::H2, XhttpMode::StreamOne);
+            let mut stream = client
+                .open(Arc::new(Dialer {
+                    address,
+                    key: RouteKey(vec![1]),
+                    opens: AtomicUsize::new(0),
+                }))
+                .await
+                .unwrap();
+            stream.shutdown().await.unwrap();
+            let mut bytes = Vec::new();
+            stream.read_to_end(&mut bytes).await.unwrap();
+            assert_eq!(bytes, vec![42; 16384]);
+        })
+        .await
+        .expect("download must progress at an exact one-frame byte budget");
+    }
+}
+
+#[tokio::test]
+async fn sent_packet_releases_bytes_before_acknowledgement() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let address = ([127, 0, 0, 1], listener.local_addr().unwrap().port()).into();
+        let tasks = Tasks::new();
+        tasks.spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut connection = h2::server::handshake(socket).await.unwrap();
+            let (download, mut downloads) = tokio::sync::mpsc::channel(1);
+            let mut uploads = tokio::task::JoinSet::new();
+            while let Some(Ok((request, mut respond))) = connection.accept().await {
+                if request.method() == http::Method::GET {
+                    download
+                        .send(respond.send_response(Response::new(()), false).unwrap())
+                        .await
+                        .unwrap();
+                    continue;
+                }
+                let send = downloads.recv().await.unwrap();
+                uploads.spawn(async move {
+                    let mut body = request.into_body();
+                    let mut size = 0;
+                    while let Some(data) = body.data().await {
+                        let data = data.unwrap();
+                        size += data.len();
+                        body.flow_control().release_capacity(data.len()).unwrap();
+                    }
+                    assert_eq!(size, 16384);
+                    super::carrier::send_h2(
+                        Body::Chunks([Bytes::from(vec![7; 512 * 1024])].into()),
+                        send,
+                    )
+                    .await
+                    .unwrap();
+                    respond.send_response(Response::new(()), true).unwrap();
+                });
+            }
+        });
+        let config = serde_json::from_value(serde_json::json!({
+            "sc_max_each_post_bytes":16384,
+            "limits":{"max_buffered_bytes":16384,"max_session_buffered_bytes":16384},
+            "protocol":{"type":"socks"}
+        }))
+        .unwrap();
+        let client = configured_client(config, XhttpVersion::H2, XhttpMode::PacketUp);
+        let stream = client
+            .open(Arc::new(Dialer {
+                address,
+                key: RouteKey(vec![1]),
+                opens: AtomicUsize::new(0),
+            }))
+            .await
+            .unwrap();
+        let (mut read, mut write) = tokio::io::split(stream);
+        let ((), bytes) = tokio::join!(
+            async {
+                write.write_all(&[42; 16384]).await.unwrap();
+                write.shutdown().await.unwrap();
+            },
+            async {
+                let mut bytes = Vec::new();
+                read.read_to_end(&mut bytes).await.unwrap();
+                bytes
+            }
+        );
+        assert_eq!(bytes, vec![7; 512 * 1024]);
+    })
+    .await
+    .expect("download before the POST acknowledgement must not deadlock");
+}
+
+#[tokio::test]
+async fn packet_lanes_reacquire_after_h2_goaway() {
+    for sessions in [1, 4] {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+            let address = ([127, 0, 0, 1], listener.local_addr().unwrap().port()).into();
+            let tasks = Tasks::new();
+            let (seen, mut received) = tokio::sync::mpsc::channel(8);
+            let retire = tokio_util::sync::CancellationToken::new();
+            let retired = retire.clone();
+            tasks.spawn(async move {
+                let mut connections = tokio::task::JoinSet::new();
+                let mut index = 0;
+                loop {
+                    let (socket, _) = listener.accept().await.unwrap();
+                    let index = {
+                        let current = index;
+                        index += 1;
+                        current
+                    };
+                    let seen = seen.clone();
+                    let retired = retired.clone();
+                    connections.spawn(async move {
+                        let mut connection = h2::server::handshake(socket).await.unwrap();
+                        let mut downloads = Vec::new();
+                        let mut uploads = tokio::task::JoinSet::new();
+                        let mut draining = false;
+                        loop {
+                            let request = tokio::select! {
+                                _ = retired.cancelled(), if index == 0 && !draining => {
+                                    connection.graceful_shutdown();
+                                    draining = true;
+                                    continue;
+                                },
+                                request = connection.accept() => request,
+                            };
+                            let Some(Ok((request, mut respond))) = request else {
+                                break;
+                            };
+                            if request.method() == http::Method::GET {
+                                downloads
+                                    .push(respond.send_response(Response::new(()), false).unwrap());
+                                continue;
+                            }
+                            let seen = seen.clone();
+                            uploads.spawn(async move {
+                                let path = request.uri().path().to_owned();
+                                let mut body = request.into_body();
+                                let mut bytes = Vec::new();
+                                while let Some(data) = body.data().await {
+                                    let data = data.unwrap();
+                                    bytes.extend_from_slice(&data);
+                                    body.flow_control().release_capacity(data.len()).unwrap();
+                                }
+                                respond.send_response(Response::new(()), true).unwrap();
+                                seen.send((index, path, bytes)).await.unwrap();
+                            });
+                        }
+                    });
+                }
+            });
+            let config = serde_json::from_value(serde_json::json!({
+                "sc_max_each_post_bytes":1,"sc_min_posts_interval_ms":1,
+                "pool":{"max_connections":2},"protocol":{"type":"socks"}
+            }))
+            .unwrap();
+            let client = configured_client(config, XhttpVersion::H2, XhttpMode::PacketUp);
+            let dialer = Arc::new(Dialer {
+                address,
+                key: RouteKey(vec![1]),
+                opens: AtomicUsize::new(0),
+            });
+            let mut streams = Vec::new();
+            for _ in 0..sessions {
+                let mut stream = client.open(dialer.clone()).await.unwrap();
+                stream.write_all(b"a").await.unwrap();
+                streams.push(stream);
+            }
+            let mut paths = std::collections::BTreeSet::new();
+            for _ in 0..sessions {
+                let (index, path, bytes) = received.recv().await.unwrap();
+                assert_eq!(index, 0);
+                assert_eq!(bytes, b"a");
+                paths.insert(path.strip_suffix("/0").unwrap().to_owned());
+            }
+            retire.cancel();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            for stream in &mut streams {
+                stream.write_all(b"b").await.unwrap();
+            }
+            for _ in 0..sessions {
+                let (index, path, bytes) = received.recv().await.unwrap();
+                assert_eq!(index, 1);
+                assert_eq!(bytes, b"b");
+                assert!(paths.remove(path.strip_suffix("/1").unwrap()));
+            }
+            assert!(paths.is_empty());
+            assert_eq!(dialer.opens.load(Ordering::Relaxed), 2);
+        })
+        .await
+        .expect("retired packet lanes must reuse one exact-route replacement");
+    }
+}
+
+#[tokio::test]
+async fn h2_header_timeout_retires_the_carrier() {
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+    let address = ([127, 0, 0, 1], listener.local_addr().unwrap().port()).into();
+    let tasks = Tasks::new();
+    tasks.spawn(async move {
+        let mut connections = tokio::task::JoinSet::new();
+        loop {
+            let (socket, _) = listener.accept().await.unwrap();
+            connections.spawn(async move {
+                let mut connection = h2::server::handshake(socket).await.unwrap();
+                let mut pending = Vec::new();
+                while let Some(Ok(request)) = connection.accept().await {
+                    pending.push(request);
+                }
+            });
+        }
+    });
+    let client = client(XhttpVersion::H2);
+    let dialer = Arc::new(Dialer {
+        address,
+        key: RouteKey(vec![1]),
+        opens: AtomicUsize::new(0),
+    });
+    for _ in 0..2 {
+        let mut stream = client.open(dialer.clone()).await.unwrap();
+        stream.shutdown().await.unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(3), stream.read(&mut [0; 1]))
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+    assert_eq!(dialer.opens.load(Ordering::Relaxed), 2);
+}
+
+#[tokio::test]
+async fn client_accepts_server_padding_wider_than_its_own_range() {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let address = ([127, 0, 0, 1], listener.local_addr().unwrap().port()).into();
+        let tasks = Tasks::new();
+        tasks.spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let service = hyper::service::service_fn(|_: Request<hyper::body::Incoming>| async {
+                Ok::<_, io::Error>(
+                    Response::builder()
+                        .header("x-padding", "X".repeat(20000))
+                        .body(Body::Chunks([Bytes::from_static(b"ok")].into()))
+                        .unwrap(),
+                )
+            });
+            let _ = hyper::server::conn::http1::Builder::new()
+                .half_close(true)
+                .serve_connection(hyper_util::rt::TokioIo::new(socket), service)
+                .await;
+        });
+        let client = client(XhttpVersion::H1);
+        let mut stream = client
+            .open(Arc::new(Dialer {
+                address,
+                key: RouteKey(vec![1]),
+                opens: AtomicUsize::new(0),
+            }))
+            .await
+            .unwrap();
+        stream.shutdown().await.unwrap();
+        let mut bytes = Vec::new();
+        stream.read_to_end(&mut bytes).await.unwrap();
+        assert_eq!(bytes, b"ok");
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn packet_bursts_release_opportunistic_request_lanes() {
     tokio::time::timeout(Duration::from_secs(5), async {
         let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
@@ -432,17 +721,7 @@ async fn packet_bursts_release_opportunistic_request_lanes() {
             "pool":{"max_connections":1}, "protocol":{"type":"socks"}
         }))
         .unwrap();
-        let client = Arc::new(
-            Client::new(
-                config,
-                NetLocation::from_str("localhost:80", None).unwrap(),
-                "localhost".into(),
-                XhttpVersion::H2,
-                XhttpMode::PacketUp,
-                Security::Plain,
-            )
-            .unwrap(),
-        );
+        let client = configured_client(config, XhttpVersion::H2, XhttpMode::PacketUp);
         let dialer = Arc::new(Dialer {
             address,
             key: RouteKey(vec![1]),
@@ -463,6 +742,90 @@ async fn packet_bursts_release_opportunistic_request_lanes() {
         };
         assert_eq!(dialer.opens.load(Ordering::Relaxed), 1);
         drop((first, second));
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn packet_shutdown_preserves_an_active_download_tail() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        for slow_reader in [false, true] {
+            let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+            let address = ([127, 0, 0, 1], listener.local_addr().unwrap().port()).into();
+            let tasks = Tasks::new();
+            let uploaded = tokio_util::sync::CancellationToken::new();
+            tasks.spawn(async move {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut connection = h2::server::handshake(socket).await.unwrap();
+                let mut requests = tokio::task::JoinSet::new();
+                while let Some(Ok((request, mut respond))) = connection.accept().await {
+                    let uploaded = uploaded.clone();
+                    requests.spawn(async move {
+                        if request.method() == http::Method::GET {
+                            let mut send = respond.send_response(Response::new(()), false).unwrap();
+                            uploaded.cancelled().await;
+                            if slow_reader {
+                                send.send_data(Bytes::from(vec![42; 96 * 1024]), true)
+                                    .unwrap();
+                                return;
+                            }
+                            for index in 0..8 {
+                                tokio::time::sleep(Duration::from_millis(300)).await;
+                                if send
+                                    .send_data(Bytes::from(vec![index; 1024]), index == 7)
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                        } else {
+                            let mut body = request.into_body();
+                            while let Some(data) = body.data().await {
+                                body.flow_control()
+                                    .release_capacity(data.unwrap().len())
+                                    .unwrap();
+                            }
+                            respond.send_response(Response::new(()), true).unwrap();
+                            uploaded.cancel();
+                        }
+                    });
+                }
+            });
+            let config =
+                serde_json::from_value(serde_json::json!({"protocol":{"type":"socks"}})).unwrap();
+            let client = configured_client(config, XhttpVersion::H2, XhttpMode::PacketUp);
+            let mut stream = client
+                .open(Arc::new(Dialer {
+                    address,
+                    key: RouteKey(vec![1]),
+                    opens: AtomicUsize::new(0),
+                }))
+                .await
+                .unwrap();
+            stream.write_all(b"request").await.unwrap();
+            stream.shutdown().await.unwrap();
+            let mut bytes = Vec::new();
+            if slow_reader {
+                let mut buffer = [0; 4096];
+                loop {
+                    let size = stream.read(&mut buffer).await.unwrap();
+                    if size == 0 {
+                        break;
+                    }
+                    bytes.extend_from_slice(&buffer[..size]);
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                }
+                assert_eq!(bytes.len(), 96 * 1024);
+                assert!(bytes.iter().all(|byte| *byte == 42));
+            } else {
+                stream.read_to_end(&mut bytes).await.unwrap();
+                assert_eq!(bytes.len(), 8192);
+                for (index, chunk) in bytes.chunks(1024).enumerate() {
+                    assert!(chunk.iter().all(|byte| *byte == index as u8));
+                }
+            }
+        }
     })
     .await
     .unwrap();
@@ -506,17 +869,7 @@ async fn packet_shutdown_waits_for_acknowledgement() {
             "limits":{"max_sessions":1, "packet_timeout_secs":1, "response_header_timeout_secs":1}, "protocol":{"type":"socks"}
         }))
         .unwrap();
-        let client = Arc::new(
-            Client::new(
-                config,
-                NetLocation::from_str("localhost:80", None).unwrap(),
-                "localhost".into(),
-                XhttpVersion::H2,
-                XhttpMode::PacketUp,
-                Security::Plain,
-            )
-            .unwrap(),
-        );
+        let client = configured_client(config, XhttpVersion::H2, XhttpMode::PacketUp);
         let dialer = Arc::new(Dialer {
             address,
             key: RouteKey(vec![1]),
@@ -847,17 +1200,7 @@ async fn h1_packet_connection_close_redials_without_replaying_packets() {
         });
         let config =
             serde_json::from_value(serde_json::json!({"protocol":{"type":"socks"}})).unwrap();
-        let client = Arc::new(
-            Client::new(
-                config,
-                NetLocation::from_str("localhost:80", None).unwrap(),
-                "localhost".into(),
-                XhttpVersion::H1,
-                XhttpMode::PacketUp,
-                Security::Plain,
-            )
-            .unwrap(),
-        );
+        let client = configured_client(config, XhttpVersion::H1, XhttpMode::PacketUp);
         let dialer = Arc::new(Dialer {
             address,
             key: RouteKey(vec![1]),
@@ -885,56 +1228,55 @@ async fn h1_packet_connection_close_redials_without_replaying_packets() {
 }
 
 #[tokio::test]
-async fn packet_pacing_stages_more_than_one_pipe_without_serializing_flushes() {
+async fn tiny_writes_bound_packet_fragments_without_losing_bytes() {
     tokio::time::timeout(Duration::from_secs(5), async {
         let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
         let address = ([127, 0, 0, 1], listener.local_addr().unwrap().port()).into();
-        let packets = Arc::new(parking_lot::Mutex::new(Vec::new()));
-        let received = packets.clone();
         let tasks = Tasks::new();
+        let packets = Arc::new(parking_lot::Mutex::new(std::collections::BTreeMap::new()));
+        let received = packets.clone();
         tasks.spawn(async move {
             let (socket, _) = listener.accept().await.unwrap();
             let mut connection = h2::server::handshake(socket).await.unwrap();
             let mut downloads = Vec::new();
-            let mut requests = tokio::task::JoinSet::new();
+            let mut uploads = tokio::task::JoinSet::new();
             while let Some(Ok((request, mut respond))) = connection.accept().await {
                 if request.method() == http::Method::GET {
                     downloads.push(respond.send_response(Response::new(()), false).unwrap());
                     continue;
                 }
+                let sequence: usize = request
+                    .uri()
+                    .path()
+                    .rsplit('/')
+                    .next()
+                    .unwrap()
+                    .parse()
+                    .unwrap();
                 let received = received.clone();
-                requests.spawn(async move {
+                uploads.spawn(async move {
                     let mut body = request.into_body();
-                    let mut size = 0;
+                    let mut bytes = Vec::new();
                     while let Some(data) = body.data().await {
                         let data = data.unwrap();
-                        assert!(data.iter().all(|byte| *byte == 42));
-                        size += data.len();
+                        bytes.extend_from_slice(&data);
                         body.flow_control().release_capacity(data.len()).unwrap();
                     }
-                    received.lock().push(size);
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    assert!(
+                        bytes.len() <= 64,
+                        "one-byte fragment count: {}",
+                        bytes.len()
+                    );
+                    received.lock().insert(sequence, bytes);
                     respond.send_response(Response::new(()), true).unwrap();
                 });
             }
         });
         let config = serde_json::from_value(serde_json::json!({
-            "sc_min_posts_interval_ms":100,
-            "limits":{"max_session_buffered_bytes": 1200000},
-            "protocol":{"type":"socks"}
+            "sc_min_posts_interval_ms":100, "protocol":{"type":"socks"}
         }))
         .unwrap();
-        let client = Arc::new(
-            Client::new(
-                config,
-                NetLocation::from_str("localhost:80", None).unwrap(),
-                "localhost".into(),
-                XhttpVersion::H2,
-                XhttpMode::PacketUp,
-                Security::Plain,
-            )
-            .unwrap(),
-        );
+        let client = configured_client(config, XhttpVersion::H2, XhttpMode::PacketUp);
         let mut stream = client
             .open(Arc::new(Dialer {
                 address,
@@ -943,15 +1285,86 @@ async fn packet_pacing_stages_more_than_one_pipe_without_serializing_flushes() {
             }))
             .await
             .unwrap();
-        for _ in 0..64 {
-            stream.write_all(&[42; 16 * 1024]).await.unwrap();
-            stream.flush().await.unwrap();
+        let payload: Vec<u8> = (0..2048).map(|index| (index % 251) as u8).collect();
+        let started = tokio::time::Instant::now();
+        for byte in &payload {
+            stream.write_u8(*byte).await.unwrap();
         }
+        assert!(started.elapsed() >= Duration::from_secs(1));
         stream.shutdown().await.unwrap();
         let packets = packets.lock();
-        assert_eq!(packets.iter().sum::<usize>(), 1024 * 1024);
-        assert!(packets.iter().any(|size| *size > 64 * 1024), "{packets:?}");
-        assert!(packets.len() < 10, "{packets:?}");
+        assert!(packets.values().any(|packet| packet.len() == 64));
+        assert_eq!(
+            packets.values().flatten().copied().collect::<Vec<_>>(),
+            payload
+        );
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn packet_pacing_stages_more_than_one_pipe_without_serializing_flushes() {
+    tokio::time::timeout(Duration::from_secs(8), async {
+        for (size, count) in [(16 * 1024, 64), (1200, 256)] {
+            let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+            let address = ([127, 0, 0, 1], listener.local_addr().unwrap().port()).into();
+            let packets = Arc::new(parking_lot::Mutex::new(Vec::new()));
+            let received = packets.clone();
+            let tasks = Tasks::new();
+            tasks.spawn(async move {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut connection = h2::server::handshake(socket).await.unwrap();
+                let mut downloads = Vec::new();
+                let mut requests = tokio::task::JoinSet::new();
+                while let Some(Ok((request, mut respond))) = connection.accept().await {
+                    if request.method() == http::Method::GET {
+                        downloads.push(respond.send_response(Response::new(()), false).unwrap());
+                        continue;
+                    }
+                    let received = received.clone();
+                    requests.spawn(async move {
+                        let mut body = request.into_body();
+                        let mut size = 0;
+                        while let Some(data) = body.data().await {
+                            let data = data.unwrap();
+                            assert!(data.iter().all(|byte| *byte == 42));
+                            size += data.len();
+                            body.flow_control().release_capacity(data.len()).unwrap();
+                        }
+                        received.lock().push(size);
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        respond.send_response(Response::new(()), true).unwrap();
+                    });
+                }
+            });
+            let config = serde_json::from_value(serde_json::json!({
+                "sc_min_posts_interval_ms":if size == 1200 { 1000 } else { 100 },
+                "limits":{"max_session_buffered_bytes": 1200000},
+                "protocol":{"type":"socks"}
+            }))
+            .unwrap();
+            let client = configured_client(config, XhttpVersion::H2, XhttpMode::PacketUp);
+            let mut stream = client
+                .open(Arc::new(Dialer {
+                    address,
+                    key: RouteKey(vec![1]),
+                    opens: AtomicUsize::new(0),
+                }))
+                .await
+                .unwrap();
+            let data = vec![42; size];
+            for _ in 0..count {
+                stream.write_all(&data).await.unwrap();
+                stream.flush().await.unwrap();
+            }
+            stream.shutdown().await.unwrap();
+            let packets = packets.lock();
+            assert_eq!(packets.iter().sum::<usize>(), size * count);
+            let threshold = if size == 1200 { 64 * size } else { 64 * 1024 };
+            assert!(packets.iter().any(|size| *size > threshold), "{packets:?}");
+            assert!(packets.len() < 10, "{packets:?}");
+        }
     })
     .await
     .unwrap();
@@ -1045,7 +1458,7 @@ async fn split_requests_share_service_across_listener_addresses() {
     assert_eq!(greeting, [5, 0]);
 }
 
-async fn quic_pair(
+pub(super) async fn quic_pair(
     limit: u32,
 ) -> (
     crate::tcp::carrier_dialer::QuicCarrier,
@@ -1321,17 +1734,7 @@ async fn h3_stalled_packet_replacement_keeps_polling_other_acknowledgements() {
             "protocol":{"type":"socks"}
         }))
         .unwrap();
-        let client = Arc::new(
-            Client::new(
-                config,
-                NetLocation::from_str("localhost:80", None).unwrap(),
-                "localhost".into(),
-                XhttpVersion::H3,
-                XhttpMode::PacketUp,
-                Security::Plain,
-            )
-            .unwrap(),
-        );
+        let client = configured_client(config, XhttpVersion::H3, XhttpMode::PacketUp);
         let mut stream = client.open(dialer.clone()).await.unwrap();
         assert_eq!(requests.recv().await.unwrap(), None);
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1559,17 +1962,7 @@ async fn split_allocation_rolls_back_without_partial_batch_deadlock() {
         "protocol":{"type":"socks"}
     }))
     .unwrap();
-    let client = Arc::new(
-        Client::new(
-            config,
-            NetLocation::from_str("localhost:80", None).unwrap(),
-            "localhost".into(),
-            XhttpVersion::H2,
-            XhttpMode::StreamUp,
-            Security::Plain,
-        )
-        .unwrap(),
-    );
+    let client = configured_client(config, XhttpVersion::H2, XhttpMode::StreamUp);
     let dialer = Arc::new(Dialer {
         address,
         key: RouteKey(vec![1]),
@@ -1612,17 +2005,7 @@ async fn stalled_route_dials_do_not_block_other_routes_or_leak_slots_on_cancel()
         "pool":{"max_connections":2},"protocol":{"type":"socks"}
     }))
     .unwrap();
-    let client = Arc::new(
-        Client::new(
-            config,
-            NetLocation::from_str("localhost:80", None).unwrap(),
-            "localhost".into(),
-            XhttpVersion::H2,
-            XhttpMode::StreamUp,
-            Security::Plain,
-        )
-        .unwrap(),
-    );
+    let client = configured_client(config, XhttpVersion::H2, XhttpMode::StreamUp);
     let stalled = Arc::new(Stalled {
         key: RouteKey(vec![0]),
         opened: tokio::sync::Notify::new(),

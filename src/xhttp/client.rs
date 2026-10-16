@@ -10,15 +10,19 @@ use tokio::{
 use super::{
     carrier::{Carrier, Reservation, Timeouts},
     connector::Security,
-    stream::{Body, Event, Memory, Reader, Stream, Tasks, pipe},
+    stream::{Activity, Body, Event, Memory, Reader, Stream, Tasks, pipe},
     wire::{self, Path},
 };
 use crate::{
     address::NetLocation,
-    config::xhttp::{XhttpClientConfig, XhttpMode, XhttpVersion},
+    config::xhttp::{MAX_PADDING_BYTES, XhttpClientConfig, XhttpMode, XhttpVersion},
     resources::Budget,
     tcp::carrier_dialer::{CarrierDialer, RouteKey},
 };
+
+const MAX_SMALL_PACKET_FRAGMENTS: usize = 64;
+// Matches h2's small DATA-frame accounting threshold.
+const SMALL_FRAGMENT_BYTES: usize = 256;
 
 struct Slot {
     key: RouteKey,
@@ -171,8 +175,7 @@ impl Client {
     }
 
     async fn dial(&self, dialer: &Arc<dyn CarrierDialer>) -> io::Result<Arc<Carrier>> {
-        let header_limit =
-            8192 + self.config.x_padding_bytes.bounds((100, 1000), false)?.1 as usize;
+        let header_limit = 8192 + MAX_PADDING_BYTES as usize;
         tokio::time::timeout(
             Duration::from_secs(self.config.limits.setup_timeout_secs),
             async {
@@ -258,17 +261,15 @@ impl Client {
             (slot, permit)
         };
         let initialized = async {
-            let carrier = slot
-                .carrier
-                .get_or_try_init(|| self.dial(&slot._dialer))
-                .await?
-                .clone();
+            let carrier = self.dial(&slot._dialer).await?;
             if carrier.capacity(self.config.limits.request_limit()) == 0 {
                 return Err(crate::resources::exhausted());
             }
             let reservation = carrier
                 .try_reserve()?
                 .ok_or_else(crate::resources::exhausted)?;
+            // Publish only after the initializer owns its stream credit.
+            assert!(slot.carrier.set(carrier.clone()).is_ok());
             Ok(Lease {
                 carrier,
                 reservation: Some(reservation),
@@ -282,6 +283,17 @@ impl Client {
         initialized
     }
 
+    fn route_gate(&self, key: &RouteKey) -> Arc<tokio::sync::Mutex<()>> {
+        let mut gates = self.allocation.lock();
+        gates.retain(|_, gate| gate.strong_count() != 0);
+        let entry = gates.entry(key.clone()).or_default();
+        let gate = entry
+            .upgrade()
+            .unwrap_or_else(|| Arc::new(tokio::sync::Mutex::new(())));
+        *entry = Arc::downgrade(&gate);
+        gate
+    }
+
     pub async fn open(self: &Arc<Self>, dialer: Arc<dyn CarrierDialer>) -> io::Result<Stream> {
         log::debug!("XHTTP opening {:?} over {:?}", self.mode, self.version);
         self.reaper_started.call_once(|| self.start_reaper());
@@ -293,19 +305,12 @@ impl Client {
             .pending
             .acquire(1)
             .ok_or_else(crate::resources::exhausted)?;
-        let (download, upload) = tokio::time::timeout(
+        let lanes = tokio::time::timeout(
             Duration::from_secs(self.config.limits.setup_timeout_secs),
             async {
                 // Serialize same-route batches without blocking healthy routes on another route's dial.
                 let gate = if self.version != XhttpVersion::H1 {
-                    let mut gates = self.allocation.lock();
-                    gates.retain(|_, gate| gate.strong_count() != 0);
-                    let entry = gates.entry(dialer.route_key().clone()).or_default();
-                    let gate = entry
-                        .upgrade()
-                        .unwrap_or_else(|| Arc::new(tokio::sync::Mutex::new(())));
-                    *entry = Arc::downgrade(&gate);
-                    Some(gate)
+                    Some(self.route_gate(dialer.route_key()))
                 } else {
                     None
                 };
@@ -341,12 +346,13 @@ impl Client {
                     }
                 }
                 let download = lanes.remove(0);
+                let mut upload = lanes.pop();
                 if self.mode == XhttpMode::PacketUp {
                     // Unsent QUIC stream IDs become visible when later requests open higher IDs.
                     // Release the admission probe until a POST actually has data to send.
-                    lanes[0].reservation.take();
+                    upload.as_mut().unwrap().reservation.take();
                 }
-                Ok::<_, io::Error>((download, lanes))
+                Ok::<_, io::Error>((download, upload))
             },
         )
         .await??;
@@ -358,19 +364,21 @@ impl Client {
         let tasks = Arc::new(Tasks::new());
         let (mut write, upload_reader) = pipe(memory.clone());
         write.drain_before_shutdown = self.mode == XhttpMode::PacketUp;
-        let (mut download_writer, read) = pipe(memory.clone());
+        let (mut download_writer, mut read) = pipe(memory.clone());
+        let download_activity = Arc::new(Activity::new());
+        read.activity = Some(download_activity.clone());
         let client = self.clone();
         // The stream owns cancellation; workers must not retain the task owner.
         tasks.spawn(async move {
             let _admission = admission;
             let result = client
                 .run_session(
-                    download,
-                    upload,
+                    lanes,
                     dialer,
                     upload_reader,
                     &mut download_writer,
                     memory,
+                    download_activity,
                 )
                 .await;
             if let Err(error) = result {
@@ -387,13 +395,14 @@ impl Client {
 
     async fn run_session(
         self: &Arc<Self>,
-        mut download: Lease,
-        upload: Vec<Lease>,
+        lanes: (Lease, Option<Lease>),
         dialer: Arc<dyn CarrierDialer>,
         upload_reader: Reader,
         download_writer: &mut super::stream::Writer,
         memory: Memory,
+        download_activity: Arc<Activity>,
     ) -> io::Result<()> {
+        let (mut download, upload) = lanes;
         let local = Tasks::new();
         let session = if self.mode == XhttpMode::StreamOne {
             String::new()
@@ -411,7 +420,7 @@ impl Client {
             let memory = memory.clone();
             local.spawn(async move {
                 if let Err(error) = client
-                    .upload(upload, dialer, upload_reader, &session, memory)
+                    .upload(upload.unwrap(), dialer, upload_reader, &session, memory)
                     .await
                 {
                     let _ = errors.send(error).await;
@@ -421,13 +430,19 @@ impl Client {
             });
             Body::Empty
         };
-        // Packet-up has no upload FIN on the wire. Bound its download-only tail.
+        // Packet-up has no upload FIN on the wire. Bound its idle download-only tail.
         let linger = async {
             if self.mode != XhttpMode::PacketUp {
                 std::future::pending::<()>().await;
             }
             upload_finished.cancelled().await;
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            let _ = download_activity
+                .idle(
+                    tokio::time::Instant::now(),
+                    Duration::from_secs(1),
+                    std::future::pending::<()>(),
+                )
+                .await;
         };
         tokio::pin!(linger);
         let request = self.request(&session, None, self.mode == XhttpMode::StreamOne, body)?;
@@ -444,11 +459,12 @@ impl Client {
             )));
         }
         let mut body = response.into_body();
+        body.activity = Some(download_activity.clone());
         tokio::select! {
             Some(error) = error_receiver.recv() => return Err(error),
             _ = local.cancel.cancelled() => return Err(io::ErrorKind::ConnectionAborted.into()),
             _ = &mut linger => return download_writer.shutdown().await,
-            result = tokio::io::copy(&mut body, download_writer) => {
+            result = body.forward_to(download_writer) => {
                 result?;
             }
         }
@@ -463,7 +479,7 @@ impl Client {
 
     async fn upload(
         &self,
-        mut lanes: Vec<Lease>,
+        lane: Lease,
         dialer: Arc<dyn CarrierDialer>,
         reader: Reader,
         session: &str,
@@ -472,18 +488,11 @@ impl Client {
         let tasks = Tasks::new();
         if self.mode == XhttpMode::PacketUp {
             return self
-                .packets(
-                    lanes.pop().unwrap(),
-                    dialer,
-                    reader,
-                    session,
-                    memory,
-                    &tasks,
-                )
+                .packets(lane, dialer, reader, session, memory, &tasks)
                 .await;
         }
         let request = self.request(session, None, true, Body::stream(reader))?;
-        let mut upload = lanes.pop().unwrap();
+        let mut upload = lane;
         let response = upload.request(self, request, memory, &tasks, false).await?;
         if response.status() != StatusCode::OK {
             return Err(io::Error::other(format!(
@@ -576,6 +585,7 @@ impl Client {
                 Event::Data(data) => {
                     let mut chunks = std::collections::VecDeque::new();
                     let mut size = 0;
+                    let mut small_fragments = 0;
                     let mut event = Some(Event::Data(data));
                     while let Some(item) = event {
                         match item.into_shared() {
@@ -583,6 +593,9 @@ impl Client {
                                 let len = data.len().min(max_packet_bytes - size);
                                 chunks.push_back(data.split_to(len));
                                 size += len;
+                                if len < SMALL_FRAGMENT_BYTES {
+                                    small_fragments += 1;
+                                }
                                 if !data.is_empty() {
                                     pending.push_front(Event::Data(data));
                                     break;
@@ -596,7 +609,8 @@ impl Client {
                                 break;
                             }
                         }
-                        if size == max_packet_bytes {
+                        if size == max_packet_bytes || small_fragments == MAX_SMALL_PACKET_FRAGMENTS
+                        {
                             break;
                         }
                         event = match reader.receiver.try_recv() {
@@ -633,7 +647,7 @@ impl Client {
                         lane.carrier = self.dial(&dialer).await?;
                     }
                     let request =
-                        self.request(session, Some(sequence), true, Body::Chunks(chunks.clone()))?;
+                        self.request(session, Some(sequence), true, Body::Chunks(chunks))?;
                     next_post_at = tokio::time::Instant::now()
                         + Duration::from_millis(wire::sample(
                             self.config
@@ -643,22 +657,24 @@ impl Client {
                     let memory = memory.clone();
                     let dialer = dialer.clone();
                     inflight.push(async move {
-                        let _retained_until_ack = chunks;
-                        if self.version == XhttpVersion::H3 && lane.reservation.is_none() {
+                        if self.version != XhttpVersion::H1
+                            && (lane.reservation.is_none() || lane.carrier.closed())
+                        {
                             if let Ok(Some(reservation)) = lane.carrier.try_reserve() {
                                 lane.reservation = Some(reservation);
-                            } else if let Ok(replacement) = self.lease(&dialer, true).await {
-                                // No request has been sent; another session may own this carrier's credit.
-                                lane = replacement;
+                            } else {
+                                let gate = self.route_gate(dialer.route_key());
+                                let _allocation = gate.lock().await;
+                                if lane.carrier.closed() {
+                                    drop(lane);
+                                    lane = self.lease(&dialer, true).await?;
+                                } else if let Ok(replacement) = self.lease(&dialer, true).await {
+                                    // No request has been sent; another session may own this carrier's credit.
+                                    lane = replacement;
+                                }
                             }
                         }
                         let response = lane.request(self, request, memory, tasks, true).await?;
-                        if response.status() != StatusCode::OK {
-                            return Err(io::Error::other(format!(
-                                "XHTTP packet status {}",
-                                response.status()
-                            )));
-                        }
                         let mut body = response.into_body();
                         if body.read(&mut [0; 1]).await? != 0 {
                             return Err(io::Error::other("nonempty XHTTP packet acknowledgement"));
@@ -696,6 +712,186 @@ mod tests {
     use super::*;
     use rustls::NamedGroup;
     use serde_json::json;
+
+    struct QuicDialer {
+        carriers:
+            parking_lot::Mutex<std::collections::VecDeque<crate::tcp::carrier_dialer::QuicCarrier>>,
+        key: RouteKey,
+        opens: std::sync::atomic::AtomicUsize,
+    }
+    impl std::fmt::Debug for QuicDialer {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("QuicDialer").finish_non_exhaustive()
+        }
+    }
+    #[async_trait::async_trait]
+    impl CarrierDialer for QuicDialer {
+        fn route_key(&self) -> &RouteKey {
+            &self.key
+        }
+        async fn open_stream(&self) -> io::Result<Box<dyn crate::async_stream::AsyncStream>> {
+            unreachable!()
+        }
+        async fn open_quic(&self) -> io::Result<crate::tcp::carrier_dialer::QuicCarrier> {
+            self.opens
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(self
+                .carriers
+                .lock()
+                .pop_front()
+                .expect("unexpected additional dial"))
+        }
+    }
+
+    #[tokio::test]
+    async fn h3_initial_reservation_is_counted_before_pool_reuse() {
+        for exhausted in [false, true] {
+            let (outgoing, incoming, _endpoint) = super::super::lifecycle_tests::quic_pair(1).await;
+            let occupied = if exhausted {
+                Some(outgoing.connection.open_bi().await.unwrap())
+            } else {
+                None
+            };
+            let peer = Tasks::new();
+            peer.spawn(async move {
+                let mut driver: h3::server::Connection<_, bytes::Bytes> = h3::server::builder()
+                    .build(h3_quinn::Connection::new(incoming))
+                    .await
+                    .unwrap();
+                while let Ok(Some(_)) = driver.accept().await {}
+            });
+            let config = serde_json::from_value(json!({
+                "pool":{"max_connections":1},"protocol":{"type":"socks"}
+            }))
+            .unwrap();
+            let client = Client::new(
+                config,
+                NetLocation::from_str("localhost:443", None).unwrap(),
+                "localhost".into(),
+                XhttpVersion::H3,
+                XhttpMode::StreamOne,
+                Security::Plain,
+            )
+            .unwrap();
+            let dialer: Arc<dyn CarrierDialer> = Arc::new(QuicDialer {
+                carriers: parking_lot::Mutex::new([outgoing].into()),
+                key: RouteKey(vec![1]),
+                opens: std::sync::atomic::AtomicUsize::new(0),
+            });
+            let initialized = client.lease(&dialer, true).await;
+            if exhausted {
+                assert!(initialized.is_err());
+                assert!(client.slots.lock().is_empty());
+            } else {
+                let lane = initialized.unwrap();
+                assert!(lane.reservation.is_some());
+                assert!(client.lease(&dialer, true).await.is_err());
+                let slots = client.slots.lock();
+                assert_eq!(slots.len(), 1);
+                assert_eq!(slots[0].active(), 1);
+                assert!(Arc::ptr_eq(slots[0].carrier.get().unwrap(), &lane.carrier));
+            }
+            drop(occupied);
+        }
+    }
+
+    #[tokio::test]
+    async fn h3_retired_packet_lane_releases_its_slot_before_replacement() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut endpoints = Vec::new();
+            let mut carriers = std::collections::VecDeque::new();
+            let peer = Tasks::new();
+            let (seen, mut received) = tokio::sync::mpsc::channel(2);
+            for index in 0..3 {
+                let (outgoing, incoming, endpoint) =
+                    super::super::lifecycle_tests::quic_pair(1).await;
+                carriers.push_back(outgoing);
+                endpoints.push(endpoint);
+                let seen = seen.clone();
+                peer.spawn(async move {
+                    let mut driver: h3::server::Connection<_, bytes::Bytes> = h3::server::builder()
+                        .build(h3_quinn::Connection::new(incoming))
+                        .await
+                        .unwrap();
+                    while let Ok(Some(resolver)) = driver.accept().await {
+                        let (request, mut stream) = resolver.resolve_request().await.unwrap();
+                        let mut body = Vec::new();
+                        while let Some(mut data) = stream.recv_data().await.unwrap() {
+                            use bytes::Buf;
+                            while data.has_remaining() {
+                                body.extend_from_slice(data.chunk());
+                                let len = data.chunk().len();
+                                data.advance(len);
+                            }
+                        }
+                        stream.send_response(http::Response::new(())).await.unwrap();
+                        stream.finish().await.unwrap();
+                        drop(stream);
+                        seen.send((index, request.uri().path().to_owned(), body))
+                            .await
+                            .unwrap();
+                        if index == 1 {
+                            driver.shutdown(0).await.unwrap();
+                        }
+                    }
+                    std::future::pending::<()>().await;
+                });
+            }
+            let dialer = Arc::new(QuicDialer {
+                carriers: parking_lot::Mutex::new(carriers),
+                key: RouteKey(vec![1]),
+                opens: std::sync::atomic::AtomicUsize::new(0),
+            });
+            let route: Arc<dyn CarrierDialer> = dialer.clone();
+            let config = serde_json::from_value(json!({
+                "sc_max_each_post_bytes":1,"sc_min_posts_interval_ms":1,
+                "pool":{"max_connections":2},"protocol":{"type":"socks"}
+            }))
+            .unwrap();
+            let client = Arc::new(
+                Client::new(
+                    config,
+                    NetLocation::from_str("localhost:443", None).unwrap(),
+                    "localhost".into(),
+                    XhttpVersion::H3,
+                    XhttpMode::PacketUp,
+                    Security::Plain,
+                )
+                .unwrap(),
+            );
+            let download = client.lease(&route, true).await.unwrap();
+            let upload = client.lease(&route, true).await.unwrap();
+            let retired = Arc::downgrade(&upload.carrier);
+            let memory = Memory::new(client.memory.clone(), 65536);
+            let (mut writer, reader) = pipe(memory.clone());
+            let tasks = Tasks::new();
+            let (result, ()) = tokio::join!(
+                client.packets(upload, route, reader, "session", memory, &tasks),
+                async {
+                    writer.write_all(b"a").await.unwrap();
+                    assert_eq!(
+                        received.recv().await.unwrap(),
+                        (1, "/session/0".into(), b"a".to_vec())
+                    );
+                    while retired.upgrade().is_some_and(|carrier| !carrier.closed()) {
+                        tokio::task::yield_now().await;
+                    }
+                    writer.write_all(b"b").await.unwrap();
+                    writer.shutdown().await.unwrap();
+                    assert_eq!(
+                        received.recv().await.unwrap(),
+                        (2, "/session/1".into(), b"b".to_vec())
+                    );
+                }
+            );
+            result.unwrap();
+            assert_eq!(dialer.opens.load(std::sync::atomic::Ordering::Relaxed), 3);
+            assert_eq!(client.slots.lock().len(), 2);
+            assert!(!download.carrier.closed());
+        })
+        .await
+        .unwrap();
+    }
 
     #[test]
     fn tls_connector_preserves_key_exchange_policy() {
