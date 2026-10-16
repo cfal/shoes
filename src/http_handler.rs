@@ -657,7 +657,7 @@ impl HttpTcpClientHandler {
                 return Err(error.into());
             }
         };
-        if response.status != http::StatusCode::OK {
+        if !response.status.is_success() {
             return Err(std::io::Error::other(format!(
                 "HTTP CONNECT failed: {}",
                 response.status

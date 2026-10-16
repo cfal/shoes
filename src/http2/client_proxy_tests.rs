@@ -167,7 +167,13 @@ fn marker_carrier(
                         respond.send_reset(h2::Reason::REFUSED_STREAM);
                         continue;
                     }
-                    let send = respond.send_response(http::Response::new(()), false).unwrap();
+                    let status = match request.uri().host().unwrap() {
+                        "created.test" => 201,
+                        "no-content.test" => 204,
+                        "other-success.test" => 299,
+                        _ => 200,
+                    };
+                    let send = respond.send_response(http::Response::builder().status(status).body(()).unwrap(), false).unwrap();
                     tasks.spawn(async move {
                         let mut stream = crate::http2::stream::H2MultiStream::new(send, request.into_body());
                         stream.write_all(&[marker]).await.unwrap();
@@ -203,6 +209,35 @@ async fn cold_opens_always_use_the_supplied_route() {
         servers.push(server);
     }
     for server in servers {
+        server.abort();
+        let _ = server.await;
+    }
+}
+
+#[tokio::test]
+async fn every_success_status_establishes_cold_and_warm_connect_tunnels() {
+    for host in ["created.test", "no-content.test", "other-success.test"] {
+        let (client, server) = marker_carrier(10, b'A', false);
+        let handler = HttpTcpClientHandler::new(None, None, HttpVersion::H2);
+        let target: ResolvedLocation = NetLocation::from_str(&format!("{host}:443"), None)
+            .unwrap()
+            .into();
+        let mut cold = handler
+            .setup_client_tcp_stream(Box::new(client), target.clone())
+            .await
+            .unwrap()
+            .client_stream;
+        let mut warm = handler
+            .try_reuse_tcp_stream(&target)
+            .await
+            .unwrap()
+            .unwrap()
+            .client_stream;
+        for stream in [&mut cold, &mut warm] {
+            assert_eq!(stream.read_u8().await.unwrap(), b'A');
+            stream.shutdown().await.unwrap();
+            assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
+        }
         server.abort();
         let _ = server.await;
     }
