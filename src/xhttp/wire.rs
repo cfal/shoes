@@ -108,27 +108,7 @@ pub enum Kind {
     Packet(String, u64),
 }
 
-pub fn check_request<B>(
-    config: &XhttpServerConfig,
-    path: &Path,
-    request: &Request<B>,
-) -> io::Result<()> {
-    check_matching_headers(config, request.headers())?;
-    if config.close_on_unmatched_path {
-        let matches = percent_encoding::percent_decode_str(request.uri().path())
-            .decode_utf8()
-            .is_ok_and(|decoded| decoded.starts_with(&path.base));
-        if !matches {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "XHTTP request path does not match",
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn check_matching_headers(config: &XhttpServerConfig, headers: &HeaderMap) -> io::Result<()> {
+pub fn check_matching_headers(config: &XhttpServerConfig, headers: &HeaderMap) -> io::Result<()> {
     for (name, expected) in &config.matching_headers {
         let mut values = headers.get_all(name.as_str()).iter();
         if !values
@@ -290,42 +270,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn closing_unmatched_paths_is_optional_and_uses_decoded_paths() {
-        let mut config: XhttpServerConfig = serde_json::from_value(serde_json::json!({
+    fn classification_uses_decoded_paths() {
+        let config: XhttpServerConfig = serde_json::from_value(serde_json::json!({
             "path": "/t", "host": "front.test", "protocol": {"type": "socks"}
         }))
         .unwrap();
         let path = Path::new(&config.path).unwrap();
-        for close in [false, true] {
-            config.close_on_unmatched_path = close;
-            for (uri, matched) in [
-                ("/wrong", false),
-                ("/t", false),
-                ("/tother/", false),
-                ("/t/%FF", false),
-                ("/t/", true),
-                ("/t/session", true),
-                ("/%74/session", true),
-                ("/t/?next=/wrong", true),
-            ] {
-                let request = Request::builder()
-                    .method("OPTIONS")
-                    .uri(format!("http://front.test{uri}"))
-                    .body(())
-                    .unwrap();
-                assert_eq!(
-                    check_request(&config, &path, &request).is_ok(),
-                    !close || matched
-                );
-                assert_eq!(classify(&config, &path, &request).is_ok(), matched);
-            }
+        for (uri, matched) in [
+            ("/wrong", false),
+            ("/t", false),
+            ("/tother/", false),
+            ("/t/%FF", false),
+            ("/t/", true),
+            ("/t/session", true),
+            ("/%74/session", true),
+            ("/t/?next=/wrong", true),
+        ] {
+            let request = Request::builder()
+                .method("OPTIONS")
+                .uri(format!("http://front.test{uri}"))
+                .body(())
+                .unwrap();
+            assert_eq!(classify(&config, &path, &request).is_ok(), matched);
         }
         for (uri, status) in [
             ("http://front.test/t/session", StatusCode::BAD_REQUEST),
             ("http://wrong.test/t/session", StatusCode::NOT_FOUND),
         ] {
             let request = Request::get(uri).body(()).unwrap();
-            check_request(&config, &path, &request).unwrap();
             assert_eq!(classify(&config, &path, &request), Err(status));
         }
     }

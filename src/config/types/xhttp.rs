@@ -306,7 +306,7 @@ pub struct XhttpServerConfig {
     #[serde(default)]
     pub path: String,
     #[serde(default)]
-    pub close_on_unmatched_path: bool,
+    pub close_on_error: bool,
     #[serde(default)]
     pub host: Option<String>,
     #[serde(default)]
@@ -540,8 +540,8 @@ mod tests {
         }))
         .unwrap();
         assert!(config.matching_headers.is_empty());
-        assert!(!config.close_on_unmatched_path);
-        config.close_on_unmatched_path = true;
+        assert!(!config.close_on_error);
+        config.close_on_error = true;
         config
             .matching_headers
             .insert("X-Token".into(), "Secret".into());
@@ -552,7 +552,7 @@ mod tests {
         let decoded: XhttpServerConfig =
             serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
         assert_eq!(decoded.matching_headers, config.matching_headers);
-        assert!(decoded.close_on_unmatched_path);
+        assert!(decoded.close_on_error);
         decoded.validate().unwrap();
     }
 

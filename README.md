@@ -338,11 +338,28 @@ covering all three modes and HTTP versions. `type: splithttp` is an alias for
   are rejected at startup. With multiplexing reverse proxies or CDNs, closing
   a shared upstream connection can also interrupt other clients.
   Browser preflights without the required headers are also rejected.
-- Server `close_on_unmatched_path: true` closes the carrier without an HTTP
-  response when the decoded request path does not match the configured path prefix.
-  The default is `false` (return 404). This option only changes path matching.
-  Both 400 and 404 responses omit XHTTP-specific and CORS headers; 400 responses
-  are not turned into connection-only rejections.
+  On H3, exhausting request admission closes the connection when header
+  requirements are configured: the server cannot validate more headers within
+  its request budget. This also affects valid clients, regardless of `close_on_error`.
+- Server `close_on_error: true` closes the carrier instead of sending any
+  XHTTP-generated 4xx/5xx response, including invalid requests, unmatched paths
+  or hosts, conflicts, timeouts, oversized bodies, and resource exhaustion.
+  Admission failures also close instead of refusing an individual stream.
+  On H2/H3, other requests sharing that connection are terminated too.
+  With a CDN or reverse proxy, this can interrupt other clients sharing its
+  upstream connection. Late packets, routine session teardown, or request slots
+  awaiting cancellation cleanup can also trigger strict closure; this option
+  trades shared-connection resilience for silent rejection.
+  The default is `false`, preserving HTTP errors and stream refusals; 400 and
+  404 responses omit XHTTP-specific and CORS headers. Required-header mismatches
+  always close once checked, regardless of this option. Observed peer stream
+  resets stay stream-local, as do H2 library resets for malformed request bodies
+  (for example, Content-Length or flow-control violations). H3 may not observe
+  cancellation while a request is awaiting admission or the peer only stops
+  reading; a later timeout or other rejection still closes the carrier.
+  HTTP-library parsing/protocol errors before
+  XHTTP receives a request, and body failures after a successful response has
+  started, retain their existing handling.
 - `host` overrides HTTP authority independently of TLS SNI. Default Referer
   padding, path/query handling, packet sizing/pacing, and stream-up keepalives
   follow modern Xray. `limits` bounds sessions, buffered bytes, requests and
