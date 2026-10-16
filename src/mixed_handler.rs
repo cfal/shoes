@@ -114,6 +114,7 @@ impl TcpServerHandler for MixedTcpServerHandler {
                 server_stream,
                 stream_reader,
                 self.proxy_selector.clone(),
+                self.resolver.clone(),
             )
             .await
         }

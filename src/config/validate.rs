@@ -2709,6 +2709,7 @@ mod tests {
             username: None,
             password: None,
             resolve_hostname: false,
+            http_version: Default::default(),
         }
     }
 

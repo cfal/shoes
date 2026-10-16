@@ -98,6 +98,23 @@ protocol:
   password: string?
 ```
 
+Accepts HTTP/1.0 and HTTP/1.1 CONNECT and absolute-form forwarding, plus
+multiplexed TCP CONNECT over HTTP/2. H2 is detected from its connection preface;
+cleartext H2 requires prior knowledge, not HTTP Upgrade. Authentication applies
+independently to every H2 stream. A successful CONNECT response is sent only
+after the destination connects.
+
+H2 connections with no active tunnels close after 60 seconds; PINGs and rejected
+authentication attempts do not extend that interval. Missing credentials receive
+a 407 challenge. Incorrect credentials also begin connection shutdown, preventing
+repeated password guesses on one carrier.
+
+For HTTPS proxying, wrap HTTP in a TLS server and explicitly configure
+`alpn_protocols: [h2, http/1.1]` on its TLS target. HTTP does not change the
+parent layer's ALPN defaults. H2 GET/POST forwarding, extended CONNECT,
+CONNECT-UDP, and HTTP/3 are not supported. This is standard HTTP proxying, not
+NaiveProxy or XHTTP.
+
 ### SOCKS5
 ```yaml
 protocol:
@@ -116,7 +133,7 @@ protocol:
   udp_enabled: true            # Default: true (enables UDP ASSOCIATE for SOCKS5)
 ```
 
-Auto-detects HTTP or SOCKS5 protocol from the first byte of the connection.
+Auto-detects HTTP (including H2 CONNECT) or SOCKS5.
 
 ### Shadowsocks
 ```yaml
@@ -389,7 +406,22 @@ protocol:
   type: http
   username: string?
   password: string?
+  http_version: h1             # h1 (default) or h2
+  resolve_hostname: false      # Resolve destinations locally before CONNECT
 ```
+
+Both versions establish TCP CONNECT tunnels. When the H2 proxy is the first and
+only hop, eligible routes reuse a connection for multiple concurrent tunnels.
+Chained H2 hops use the carrier established through the selected prefix rather
+than sharing tunnels across routes. H1 retains its existing one-tunnel-per-connection behavior.
+There is no automatic version fallback or replay after a failed CONNECT.
+
+For H2 over TLS, set `http_version: h2` here and `alpn_protocols: [h2]` on
+the enclosing TLS client. The handshake must negotiate `h2`. Omitted or explicit
+`http_version: h1` preserves legacy behavior: it sends HTTP/1.1 without checking
+the negotiated ALPN. Set `alpn_protocols: [http/1.1]` on the enclosing TLS client
+when the peer requires ALPN to match the HTTP version. Cleartext H2 uses prior
+knowledge. See [examples/http2-proxy.yaml](examples/http2-proxy.yaml).
 
 ### SOCKS5
 ```yaml
@@ -601,6 +633,13 @@ protocol:
   password: string             # Basic Auth password
   padding: true                # Default: true (enables padding protocol)
 ```
+
+NaiveProxy retains its own HTTP/2 client transport policies, independent of
+`http_version: h2` on standard HTTP proxies: 256 KiB stream and connection
+receive windows, the H2 library's 16 MiB response-header decoding limit, and no periodic
+HTTP/2 PING watchdog. Peer stream limits and timeouts still apply. In particular,
+Caddy v2.11.7 defaults to a one-minute request-body idle timeout, which can end a
+quiet CONNECT tunnel; connection-level PINGs do not reset that timeout.
 
 ## Rules System
 

@@ -96,6 +96,11 @@ pub struct TcpClientSetupResult {
     reason = "async-trait adds must_use to boxed futures"
 )]
 pub trait TcpClientHandler: Send + Sync + Debug {
+    /// Validates the immediately enclosing TLS layer before any protocol bytes are sent.
+    fn validate_alpn(&self, _alpn: Option<&[u8]>) -> std::io::Result<()> {
+        Ok(())
+    }
+
     /// Opens a logical stream on an existing session without acquiring a new transport.
     /// Only a miss permits cold setup; an open error must not retry the request.
     async fn try_reuse_tcp_stream(

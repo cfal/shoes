@@ -17,6 +17,8 @@ env:
   XRAY_SHA256: 23cd9af937744d97776ee35ecad4972cf4b2109d1e0fe6be9930467608f7c8ae
   XRAY_COMMIT: 701af60772cda123492f86e383e1fdba066614a9
   MIHOMO_ALPHA_COMMIT: 94b13aed49b8dc41973e4bb3f721c5fa2c5c5c1f
+  NAIVE_CADDY_VERSION: 2.11.7-naive
+  NAIVE_CADDY_SHA256: ac97057c925bb098eb575e7b0cb8bd547d4c5f845b09a3dedfbe34444aa7ae88
 
 jobs:
   unit-tests:
@@ -185,6 +187,19 @@ jobs:
         binary="$RUNNER_TEMP/xray-peer/xray"
         chmod +x "$binary"
         echo "SHOES_TEST_XRAY_BIN=$binary" >> "$GITHUB_ENV"
+
+    - name: Install native Naive Caddy test peer
+      if: matrix.target == 'optional_peer'
+      run: |
+        archive="$RUNNER_TEMP/caddy-forwardproxy-naive.tar.xz"
+        curl --fail --location --retry 3 \
+          --output "$archive" \
+          "https://github.com/klzgrad/forwardproxy/releases/download/v${NAIVE_CADDY_VERSION}/caddy-forwardproxy-naive.tar.xz"
+        echo "${NAIVE_CADDY_SHA256}  ${archive}" | sha256sum --check --strict
+        tar --extract --xz --file "$archive" --directory "$RUNNER_TEMP"
+        binary="$RUNNER_TEMP/caddy-forwardproxy-naive/caddy"
+        chmod +x "$binary"
+        echo "SHOES_TEST_NAIVE_CADDY_BIN=$binary" >> "$GITHUB_ENV"
 
     - name: Run sing-box mux lifecycle tests
       if: matrix.name == 'local protocols'

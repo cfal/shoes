@@ -351,6 +351,14 @@ impl ClientConfig {
     }
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HttpVersion {
+    #[default]
+    H1,
+    H2,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ClientProxyConfig {
@@ -364,6 +372,8 @@ pub enum ClientProxyConfig {
         /// Used when the upstream proxy blocks by hostname.
         #[serde(default, skip_serializing_if = "is_false")]
         resolve_hostname: bool,
+        #[serde(default)]
+        http_version: HttpVersion,
     },
     #[serde(alias = "socks5")]
     Socks {

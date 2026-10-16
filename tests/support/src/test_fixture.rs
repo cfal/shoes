@@ -205,6 +205,9 @@ pub fn find_naive_binary() -> Option<String> {
 
 /// Find caddy binary (with forwardproxy for NaiveProxy server) in common locations
 pub fn find_naive_caddy_binary() -> Option<String> {
+    if let Ok(binary) = std::env::var("SHOES_TEST_NAIVE_CADDY_BIN") {
+        return Some(binary);
+    }
     let locations = vec![
         format!("{}/naive/caddy", std::env::var("HOME").unwrap_or_default()),
         "/usr/local/bin/caddy-naive".to_string(),
@@ -5400,6 +5403,7 @@ impl ProxyTestFixture {
       "servers": {{
         "naive": {{
           "listen": ["{}:{}"],
+          "automatic_https": {{"disable_redirects": true}},
           "routes": [{{
             "handle": [{{
               "handler": "forward_proxy",
