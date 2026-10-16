@@ -62,11 +62,11 @@ async fn h2_and_h1_through_http_and_mixed_with_optional_auth_and_tls() -> io::Re
 }
 
 #[tokio::test]
-async fn tls_alpn_mismatch_fails_instead_of_falling_back() -> io::Result<()> {
+async fn h2_tls_alpn_mismatch_fails_instead_of_falling_back() -> io::Result<()> {
     tokio::time::timeout(Duration::from_secs(15), async {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let echo = start_tcp_stream_echo_server("0.0.0.0", 0).await?;
-        for (version, alpn) in [("h2", vec!["http/1.1"]), ("h2", vec![]), ("h1", vec!["h2"])] {
+        for alpn in [vec!["http/1.1"], vec![], vec!["custom"]] {
             let mut ports = PortHelper::new();
             let (_, server) = ports.get_localhost_listener_port();
             let (_, entry) = ports.get_localhost_listener_port();
@@ -77,7 +77,7 @@ async fn tls_alpn_mismatch_fails_instead_of_falling_back() -> io::Result<()> {
                 }}},
                 support::relay_config(entry, server, json!({
                     "type": "tls", "sni_hostname": "localhost", "verify": false,
-                    "alpn_protocols": alpn, "protocol": {"type": "http", "http_version": version}
+                    "alpn_protocols": alpn, "protocol": {"type": "http", "http_version": "h2"}
                 }))
             ]);
             let _shoes = start_shoes_server(&serde_yaml::to_string(&config).unwrap())?;
@@ -85,7 +85,42 @@ async fn tls_alpn_mismatch_fails_instead_of_falling_back() -> io::Result<()> {
             let result = tokio::time::timeout(Duration::from_secs(2),
                 support::connect(entry, &format!("127.0.0.1:{}", echo.local_addr().port())),
             ).await.expect("ALPN mismatch must fail promptly");
-            assert!(result.is_err(), "version {version} accepted ALPN {alpn:?}");
+            assert!(result.is_err(), "H2 accepted ALPN {alpn:?}");
+        }
+        Ok::<_, io::Error>(())
+    }).await?
+}
+
+#[tokio::test]
+async fn default_and_explicit_h1_preserve_permissive_tls_alpn() -> io::Result<()> {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let echo = start_tcp_stream_echo_server("0.0.0.0", 0).await?;
+        for explicit_h1 in [false, true] {
+            for alpn in [vec![], vec!["http/1.1"], vec!["h2"], vec!["custom"]] {
+                let mut ports = PortHelper::new();
+                let (_, server) = ports.get_localhost_listener_port();
+                let (_, entry) = ports.get_localhost_listener_port();
+                let mut outbound = json!({"type": "http"});
+                if explicit_h1 {
+                    outbound["http_version"] = json!("h1");
+                }
+                let config = json!([
+                    {"address": format!("0.0.0.0:{server}"), "protocol": {"type": "tls", "default_tls_target": {
+                        "cert": cert.cert.pem(), "key": cert.signing_key.serialize_pem(),
+                        "alpn_protocols": alpn, "protocol": {"type": "http"}
+                    }}},
+                    support::relay_config(entry, server, json!({
+                        "type": "tls", "sni_hostname": "localhost", "verify": false,
+                        "alpn_protocols": alpn, "protocol": outbound
+                    }))
+                ]);
+                let _shoes = start_shoes_server(&serde_yaml::to_string(&config).unwrap())?;
+                ports.wait_for_all_ports().await?;
+                support::exchange(support::connect(entry,
+                    &format!("127.0.0.1:{}", echo.local_addr().port()),
+                ).await?).await?;
+            }
         }
         Ok::<_, io::Error>(())
     }).await?

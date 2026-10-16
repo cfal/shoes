@@ -6,6 +6,7 @@ use tokio::io::AsyncReadExt;
 fn version_defaults_and_alpn_are_explicit() {
     for (json, expected) in [
         (r#"{"type":"http"}"#, HttpVersion::H1),
+        (r#"{"type":"http","http_version":"h1"}"#, HttpVersion::H1),
         (r#"{"type":"http","http_version":"h2"}"#, HttpVersion::H2),
     ] {
         let crate::config::ClientProxyConfig::Http { http_version, .. } =
@@ -32,7 +33,7 @@ fn version_defaults_and_alpn_are_explicit() {
             assert_eq!(
                 handler.validate_alpn(alpn).is_ok(),
                 match version {
-                    HttpVersion::H1 => alpn.is_none() || alpn == Some(b"http/1.1"),
+                    HttpVersion::H1 => true,
                     HttpVersion::H2 => alpn == Some(b"h2"),
                 }
             );

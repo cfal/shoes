@@ -417,9 +417,11 @@ than sharing tunnels across routes. H1 retains its existing one-tunnel-per-conne
 There is no automatic version fallback or replay after a failed CONNECT.
 
 For H2 over TLS, set `http_version: h2` here and `alpn_protocols: [h2]` on
-the enclosing TLS client. The handshake must negotiate `h2`. H1 accepts no
-ALPN or `http/1.1`, and rejects other negotiated protocols. Cleartext H2 uses
-prior knowledge. See [examples/http2-proxy.yaml](examples/http2-proxy.yaml).
+the enclosing TLS client. The handshake must negotiate `h2`. Omitted or explicit
+`http_version: h1` preserves legacy behavior: it sends HTTP/1.1 without checking
+the negotiated ALPN. Set `alpn_protocols: [http/1.1]` on the enclosing TLS client
+when the peer requires ALPN to match the HTTP version. Cleartext H2 uses prior
+knowledge. See [examples/http2-proxy.yaml](examples/http2-proxy.yaml).
 
 ### SOCKS5
 ```yaml

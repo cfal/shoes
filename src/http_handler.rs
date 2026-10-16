@@ -677,7 +677,7 @@ impl HttpTcpClientHandler {
 impl TcpClientHandler for HttpTcpClientHandler {
     fn validate_alpn(&self, alpn: Option<&[u8]>) -> std::io::Result<()> {
         let valid = match self.version {
-            HttpVersion::H1 => alpn.is_none() || alpn == Some(b"http/1.1"),
+            HttpVersion::H1 => true,
             HttpVersion::H2 => alpn == Some(b"h2"),
         };
         if valid {
