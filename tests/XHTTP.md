@@ -33,13 +33,15 @@ local-only coverage without external peers.
   check integrity and routing, not just successful handshakes. Dedicated UDP
   cases use 1 KiB POST limits and concurrent associations so 4 KiB datagrams cross
   POST boundaries without exceeding the external peers' UDP buffer limits.
-- H2/H3 packet-up transfers pause upload/download consumers with 16 MiB in flight,
+- H2/H3 packet-up transfers pause consumers with 16 MiB uploads and 64 MiB downloads,
   for at least twice the measured unpaused transfer duration (minimum one second),
   then resume and verify exact bytes and continued session progress. Shoes uses
   256 KiB per-session and 1 MiB global byte budgets, with the default 30-packet
   reorder window and 128 live requests per session. Test-owned sending and
   receiving sockets use 64 KiB buffers
   to keep kernel autotuning from absorbing the entire paused transfer.
+  Downloads exceed the combined peer transport windows and intermediate TCP buffers;
+  a 16 MiB download can fit in those buffers without backpressuring the source.
   Cancellation and connection churn use the same processes.
 - Separate Xray cases use the default 64 MiB global and 4 MiB session byte
   budgets with 32 KiB POSTs and 30 ms pacing. H2's non-ACK-waiting uploader

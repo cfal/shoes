@@ -418,24 +418,26 @@ async fn pressure_with_limits(
         writers.join_next().await.unwrap().unwrap()?;
         tasks.join_next().await.unwrap().unwrap()?;
 
+        // The peer's transport windows and both TCP hops can collectively retain 16 MiB.
+        let download_size = 64 * 1024 * 1024;
         let source = tokio::net::TcpListener::bind("0.0.0.0:0").await?;
         let target = ([127, 0, 0, 1], source.local_addr()?.port()).into();
         tasks.spawn(async move {
             let (mut socket, _) = source.accept().await?;
             socket2::SockRef::from(&socket).set_send_buffer_size(65536)?;
             socket.read_exact(&mut [0]).await?;
-            socket.write_all(&payload(size, 72)).await?;
+            socket.write_all(&payload(download_size, 72)).await?;
             socket.read_exact(&mut [0]).await?;
-            socket.write_all(&payload(size, 73)).await?;
+            socket.write_all(&payload(download_size, 73)).await?;
             Ok::<_, std::io::Error>(())
         });
         let mut download = xray::connect(pair.socks, target).await?;
         socket2::SockRef::from(&download).set_recv_buffer_size(65536)?;
         let start = tokio::time::Instant::now();
         download.write_all(b"c").await?;
-        let mut control = vec![0; size];
+        let mut control = vec![0; download_size];
         download.read_exact(&mut control).await?;
-        assert_eq!(control, payload(size, 72), "invalid download control");
+        assert_eq!(control, payload(download_size, 72), "invalid download control");
         let download_pause = (2 * start.elapsed()).max(Duration::from_secs(1));
         download.write_all(b"p").await?;
         let mut first = [0];
@@ -444,18 +446,19 @@ async fn pressure_with_limits(
         let other = exchange(pair.socks, echo_address, 74);
         tokio::pin!(other);
         let completed = pause_with_exchange(download_pause, &mut other).await?;
+        let source_result = tasks.try_join_next();
         assert!(
-            tasks.try_join_next().is_none(),
-            "{peer:?}, shoes_client={shoes_client}, {version}: stalled download was entirely buffered or failed after {download_pause:?}"
+            source_result.is_none(),
+            "{peer:?}, shoes_client={shoes_client}, {version}: stalled download completed after {download_pause:?}: {source_result:?}"
         );
-        let mut rest = vec![0; size - 1];
+        let mut rest = vec![0; download_size - 1];
         tokio::try_join!(download.read_exact(&mut rest), async {
             if !completed {
                 other.await?;
             }
             Ok::<_, std::io::Error>(())
         })?;
-        assert_eq!(rest, payload(size, 73)[1..]);
+        assert_eq!(rest, payload(download_size, 73)[1..]);
         tasks.join_next().await.unwrap().unwrap()?;
 
         // Cancel a live transfer, not just an idle SOCKS connection.
