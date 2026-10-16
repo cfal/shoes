@@ -387,6 +387,27 @@ impl Allocation {
     pub fn into_bytes(self) -> Bytes {
         Bytes::from_owner(self)
     }
+
+    pub fn split_to(&mut self, len: usize) -> Self {
+        Self {
+            data: self.data.split_to(len),
+            _global: self._global.split(len),
+            _session: self._session.split(len),
+        }
+    }
+
+    pub fn retain(self, chunks: &mut Vec<Self>) {
+        // Transfers permits rather than reserving a second copy against a full budget.
+        if let Some(last) = chunks.last_mut()
+            && last.len() + self.len() <= CHUNK
+        {
+            last.data.extend_from_slice(&self.data);
+            last._global.merge(self._global);
+            last._session.merge(self._session);
+        } else {
+            chunks.push(self);
+        }
+    }
 }
 
 pub struct PacketMemory {
@@ -402,16 +423,7 @@ impl PacketMemory {
         }
         self.remaining -= data.len();
         data._session = self.session.split(data.len());
-        // Transfer the existing permits; reserving the copied bytes again can deadlock a full budget.
-        if let Some(last) = chunks.last_mut()
-            && last.len() + data.len() <= CHUNK
-        {
-            last.data.extend_from_slice(&data.data);
-            last._global.merge(data._global);
-            last._session.merge(data._session);
-        } else {
-            chunks.push(data);
-        }
+        data.retain(chunks);
         Ok(())
     }
 
@@ -544,25 +556,30 @@ pub enum Event {
     Error(io::Error),
 }
 
-impl Event {
-    pub fn into_shared(self) -> Self {
-        match self {
-            Self::Allocated(data) => Self::Data(data.into_bytes()),
-            event => event,
-        }
-    }
-}
-
 pub struct Reader {
     pub receiver: mpsc::Receiver<Event>,
     current: Bytes,
     ended: bool,
     pub eof: CancellationToken,
     pub activity: Option<Arc<Activity>>,
+    start: Option<oneshot::Sender<()>>,
 }
 
 impl Reader {
+    pub fn defer(&mut self) -> oneshot::Receiver<()> {
+        let (start, ready) = oneshot::channel();
+        self.start = Some(start);
+        ready
+    }
+
+    pub fn start(&mut self) {
+        if let Some(start) = self.start.take() {
+            let _ = start.send(());
+        }
+    }
+
     pub async fn forward_to(&mut self, writer: &mut Writer) -> io::Result<()> {
+        self.start();
         loop {
             if !self.current.is_empty() {
                 writer.forward(std::mem::take(&mut self.current)).await?;
@@ -623,6 +640,7 @@ pub fn pipe(memory: Memory) -> (Writer, Reader) {
             ended: false,
             eof: CancellationToken::new(),
             activity: None,
+            start: None,
         },
     )
 }
@@ -787,6 +805,7 @@ impl AsyncRead for Reader {
         if buffer.remaining() == 0 {
             return Poll::Ready(Ok(()));
         }
+        self.start();
         loop {
             if !self.current.is_empty() {
                 let len = self.current.len().min(buffer.remaining());
@@ -867,6 +886,17 @@ impl AsyncStream for Stream {}
 pub struct Upload {
     pub activity: Arc<Activity>,
     done: Option<oneshot::Sender<()>>,
+    pub written: Option<UploadSignal>,
+}
+
+#[derive(Clone)]
+pub struct UploadSignal(Arc<parking_lot::Mutex<Option<oneshot::Sender<()>>>>);
+
+impl UploadSignal {
+    pub fn channel() -> (Self, oneshot::Receiver<()>) {
+        let (send, receive) = oneshot::channel();
+        (Self(Arc::new(parking_lot::Mutex::new(Some(send)))), receive)
+    }
 }
 
 pub struct UploadWatch {
@@ -882,6 +912,7 @@ impl Upload {
             Self {
                 activity: activity.clone(),
                 done: Some(send),
+                written: None,
             },
             UploadWatch { activity, done },
         )
@@ -890,6 +921,11 @@ impl Upload {
     pub fn finish(&mut self) {
         if let Some(done) = self.done.take() {
             let _ = done.send(());
+        }
+        if let Some(written) = self.written.take()
+            && let Some(send) = written.0.lock().take()
+        {
+            let _ = send.send(());
         }
     }
 }
@@ -971,6 +1007,7 @@ impl HttpBody for Body {
                 Poll::Ready(data.map(|data| Ok(Frame::data(data))))
             }
             Self::Stream { reader, .. } => {
+                reader.start();
                 if reader.ended {
                     return Poll::Ready(None);
                 }

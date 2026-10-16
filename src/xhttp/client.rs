@@ -10,7 +10,7 @@ use tokio::{
 use super::{
     carrier::{Carrier, Reservation, Timeouts},
     connector::Security,
-    stream::{Activity, Body, Event, Memory, Reader, Stream, Tasks, pipe},
+    stream::{Activity, Body, Event, Memory, Reader, Stream, Tasks, UploadSignal, pipe},
     wire::{self, Path},
 };
 use crate::{
@@ -19,10 +19,6 @@ use crate::{
     resources::Budget,
     tcp::carrier_dialer::{CarrierDialer, RouteKey},
 };
-
-const MAX_SMALL_PACKET_FRAGMENTS: usize = 64;
-// Matches h2's small DATA-frame accounting threshold.
-const SMALL_FRAGMENT_BYTES: usize = 256;
 
 struct Slot {
     key: RouteKey,
@@ -62,6 +58,22 @@ struct Lease {
     carrier: Arc<Carrier>,
     reservation: Option<Reservation>,
     _permit: SlotPermit,
+}
+
+#[derive(Default)]
+struct PacketWindow {
+    next: u64,
+    completed: std::collections::BTreeSet<u64>,
+}
+
+impl PacketWindow {
+    fn acknowledge(&mut self, (lane, sequence): (Lease, u64)) -> Lease {
+        self.completed.insert(sequence);
+        while self.completed.remove(&self.next) {
+            self.next += 1;
+        }
+        lane
+    }
 }
 
 impl Lease {
@@ -120,6 +132,7 @@ pub struct Client {
         std::collections::HashMap<RouteKey, std::sync::Weak<tokio::sync::Mutex<()>>>,
     >,
     pending: Arc<Budget>,
+    requests: Arc<Budget>,
 }
 
 impl std::fmt::Debug for Client {
@@ -145,6 +158,7 @@ impl Client {
             memory: Arc::new(Budget::new(Some(config.limits.max_buffered_bytes))),
             admission: Arc::new(Budget::new(Some(config.limits.max_sessions))),
             pending: Arc::new(Budget::new(Some(config.limits.max_pending_sessions))),
+            requests: Arc::new(Budget::new(Some(config.limits.max_requests))),
             allocation: parking_lot::Mutex::new(std::collections::HashMap::new()),
             tasks: Tasks::new(),
             reaper_started: std::sync::Once::new(),
@@ -170,6 +184,11 @@ impl Client {
                 };
                 let idle = Duration::from_secs(client.config.pool.idle_timeout_secs);
                 client.slots.lock().retain(|slot| slot.retain(idle));
+                log::debug!(
+                    "XHTTP client resources: posts={:?} bytes={:?}",
+                    client.requests.snapshot(),
+                    client.memory.snapshot()
+                );
             }
         });
     }
@@ -182,12 +201,13 @@ impl Client {
                 if self.version == XhttpVersion::H3 {
                     Carrier::quic(dialer.open_quic().await?, header_limit).await
                 } else {
-                    Carrier::tcp(
+                    Carrier::tcp_with_windows(
                         self.security
                             .wrap(dialer.open_stream().await?, &self.endpoint, self.version)
                             .await?,
                         self.version,
                         header_limit,
+                        self.config.limits.h2_windows(),
                     )
                     .await
                 }
@@ -436,20 +456,20 @@ impl Client {
                 std::future::pending::<()>().await;
             }
             upload_finished.cancelled().await;
-            let _ = download_activity
+            download_activity
                 .idle(
                     tokio::time::Instant::now(),
-                    Duration::from_secs(1),
+                    Duration::from_secs(self.config.download_idle_timeout_secs),
                     std::future::pending::<()>(),
                 )
-                .await;
+                .await
         };
         tokio::pin!(linger);
         let request = self.request(&session, None, self.mode == XhttpMode::StreamOne, body)?;
         let response = tokio::select! {
             Some(error) = error_receiver.recv() => return Err(error),
             _ = local.cancel.cancelled() => return Err(io::ErrorKind::ConnectionAborted.into()),
-            _ = &mut linger => return download_writer.shutdown().await,
+            result = &mut linger => return result,
             result = download.request(self, request, memory, &local, false) => result?,
         };
         if response.status() != StatusCode::OK {
@@ -463,7 +483,7 @@ impl Client {
         tokio::select! {
             Some(error) = error_receiver.recv() => return Err(error),
             _ = local.cancel.cancelled() => return Err(io::ErrorKind::ConnectionAborted.into()),
-            _ = &mut linger => return download_writer.shutdown().await,
+            result = &mut linger => return result,
             result = body.forward_to(download_writer) => {
                 result?;
             }
@@ -553,19 +573,22 @@ impl Client {
                 .sc_max_each_post_bytes
                 .bounds((1_000_000, 1_000_000), false)?,
         ) as usize;
-        let concurrency = if self.version == XhttpVersion::H1 {
-            1
-        } else {
-            4
-        };
+        // The download leg retains one request slot for the logical session.
+        let concurrency = self.config.limits.max_requests_per_session - 1;
+        let mut window = PacketWindow::default();
+        let unacknowledged = Arc::new(Budget::new(Some(
+            self.config.limits.max_session_buffered_bytes,
+        )));
         let mut inflight = futures::stream::FuturesUnordered::new();
         let mut idle_lane = Some(lane);
         let mut pending = std::collections::VecDeque::new();
         let mut sequence = 0u64;
         let mut next_post_at = tokio::time::Instant::now();
         loop {
-            while inflight.len() >= concurrency {
-                idle_lane.get_or_insert(inflight.next().await.unwrap()?);
+            while inflight.len() >= concurrency
+                || sequence - window.next >= self.config.packet_pipeline_depth as u64
+            {
+                idle_lane.get_or_insert(window.acknowledge(inflight.next().await.unwrap()?));
             }
             let event = if let Some(event) = pending.pop_front() {
                 Some(event)
@@ -573,7 +596,7 @@ impl Client {
                 tokio::select! {
                     event = reader.receiver.recv() => event,
                     done = inflight.next(), if !inflight.is_empty() => {
-                        idle_lane.get_or_insert(done.unwrap()?);
+                        idle_lane.get_or_insert(window.acknowledge(done.unwrap()?));
                         continue;
                     }
                 }
@@ -581,23 +604,19 @@ impl Client {
             let Some(event) = event else {
                 return Err(io::ErrorKind::BrokenPipe.into());
             };
-            match event.into_shared() {
-                Event::Data(data) => {
-                    let mut chunks = std::collections::VecDeque::new();
+            match event {
+                Event::Allocated(data) => {
+                    let mut chunks = Vec::new();
                     let mut size = 0;
-                    let mut small_fragments = 0;
-                    let mut event = Some(Event::Data(data));
+                    let mut event = Some(Event::Allocated(data));
                     while let Some(item) = event {
-                        match item.into_shared() {
-                            Event::Data(mut data) => {
+                        match item {
+                            Event::Allocated(mut data) => {
                                 let len = data.len().min(max_packet_bytes - size);
-                                chunks.push_back(data.split_to(len));
+                                data.split_to(len).retain(&mut chunks);
                                 size += len;
-                                if len < SMALL_FRAGMENT_BYTES {
-                                    small_fragments += 1;
-                                }
-                                if !data.is_empty() {
-                                    pending.push_front(Event::Data(data));
+                                if data.len() != 0 {
+                                    pending.push_front(Event::Allocated(data));
                                     break;
                                 }
                             }
@@ -609,8 +628,7 @@ impl Client {
                                 break;
                             }
                         }
-                        if size == max_packet_bytes || small_fragments == MAX_SMALL_PACKET_FRAGMENTS
-                        {
+                        if size == max_packet_bytes {
                             break;
                         }
                         event = match reader.receiver.try_recv() {
@@ -620,7 +638,7 @@ impl Client {
                                     biased;
                                     _ = tokio::time::sleep_until(next_post_at) => break None,
                                     done = inflight.next(), if !inflight.is_empty() => {
-                                        idle_lane.get_or_insert(done.unwrap()?);
+                                        idle_lane.get_or_insert(window.acknowledge(done.unwrap()?));
                                     }
                                     event = reader.receiver.recv() => break event,
                                 }
@@ -632,22 +650,57 @@ impl Client {
                         tokio::select! {
                             _ = tokio::time::sleep_until(next_post_at) => break,
                             done = inflight.next(), if !inflight.is_empty() => {
-                                idle_lane.get_or_insert(done.unwrap()?);
+                                idle_lane.get_or_insert(window.acknowledge(done.unwrap()?));
                             }
                         }
                     }
+                    let request_permit = loop {
+                        let released = self.requests.released();
+                        tokio::pin!(released);
+                        released.as_mut().enable();
+                        if let Some(permit) = self.requests.acquire(1) {
+                            break permit;
+                        }
+                        tokio::select! {
+                            _ = released => {},
+                            done = inflight.next(), if !inflight.is_empty() => {
+                                idle_lane.get_or_insert(window.acknowledge(done.unwrap()?));
+                            }
+                        }
+                    };
+                    // Logical credits bound peer-side backlog without retaining sent allocations.
+                    let byte_permit = loop {
+                        if let Some(permit) = unacknowledged.acquire(size) {
+                            break permit;
+                        }
+                        idle_lane
+                            .get_or_insert(window.acknowledge(inflight.next().await.unwrap()?));
+                    };
                     let mut lane = if let Some(lane) = idle_lane.take() {
                         lane
-                    } else if let Ok(lane) = self.lease(&dialer, false).await {
-                        lane
                     } else {
-                        inflight.next().await.unwrap()?
+                        tokio::select! {
+                            result = self.packet_lane(&dialer) => match result {
+                                Ok(lane) => lane,
+                                Err(_) => window.acknowledge(inflight.next().await.unwrap()?),
+                            },
+                            done = inflight.next(), if !inflight.is_empty() => window.acknowledge(done.unwrap()?),
+                        }
                     };
                     if self.version == XhttpVersion::H1 && lane.carrier.closed() {
                         lane.carrier = self.dial(&dialer).await?;
                     }
-                    let request =
-                        self.request(session, Some(sequence), true, Body::Chunks(chunks))?;
+                    let mut request = self.request(
+                        session,
+                        Some(sequence),
+                        true,
+                        Body::Chunks(chunks.into_iter().map(|chunk| chunk.into_bytes()).collect()),
+                    )?;
+                    request
+                        .headers_mut()
+                        .insert(http::header::CONTENT_LENGTH, size.into());
+                    let (written, mut uploaded) = UploadSignal::channel();
+                    request.extensions_mut().insert(written);
                     next_post_at = tokio::time::Instant::now()
                         + Duration::from_millis(wire::sample(
                             self.config
@@ -657,6 +710,8 @@ impl Client {
                     let memory = memory.clone();
                     let dialer = dialer.clone();
                     inflight.push(async move {
+                        let _request_permit = request_permit;
+                        let _byte_permit = byte_permit;
                         if self.version != XhttpVersion::H1
                             && (lane.reservation.is_none() || lane.carrier.closed())
                         {
@@ -679,8 +734,19 @@ impl Client {
                         if body.read(&mut [0; 1]).await? != 0 {
                             return Err(io::Error::other("nonempty XHTTP packet acknowledgement"));
                         }
-                        Ok::<_, io::Error>(lane)
+                        Ok::<_, io::Error>((lane, sequence))
                     });
+                    loop {
+                        tokio::select! {
+                            result = &mut uploaded => {
+                                result.map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))?;
+                                break;
+                            },
+                            done = inflight.next(), if !inflight.is_empty() => {
+                                idle_lane.get_or_insert(window.acknowledge(done.unwrap()?));
+                            }
+                        }
+                    }
                     sequence = sequence
                         .checked_add(1)
                         .ok_or_else(|| io::Error::other("XHTTP sequence exhausted"))?;
@@ -690,7 +756,7 @@ impl Client {
                 }
                 Event::Drain(ack) => {
                     while let Some(result) = inflight.next().await {
-                        idle_lane.get_or_insert(result?);
+                        idle_lane.get_or_insert(window.acknowledge(result?));
                     }
                     let _ = ack.send(());
                 }
@@ -701,9 +767,30 @@ impl Client {
                     return Ok(());
                 }
                 Event::Error(error) => return Err(error),
-                Event::Allocated(_) => unreachable!(),
+                Event::Data(_) => unreachable!("the public upload writer emits owned allocations"),
             }
         }
+    }
+
+    async fn packet_lane(&self, dialer: &Arc<dyn CarrierDialer>) -> io::Result<Lease> {
+        if self.version == XhttpVersion::H1 {
+            let permit = self
+                .h1_slots
+                .clone()
+                .try_acquire_owned()
+                .map_err(|_| crate::resources::exhausted())?;
+            return Ok(Lease {
+                carrier: self.dial(dialer).await?,
+                reservation: None,
+                _permit: SlotPermit {
+                    _permit: permit,
+                    slot: None,
+                },
+            });
+        }
+        let gate = self.route_gate(dialer.route_key());
+        let _allocation = gate.lock().await;
+        self.lease(dialer, true).await
     }
 }
 

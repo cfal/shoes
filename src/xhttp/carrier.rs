@@ -15,7 +15,7 @@ use hyper_util::rt::TokioIo;
 use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
 
-use super::stream::{Body, Memory, Reader, Tasks, Upload, UploadWatch, Writer, pipe};
+use super::stream::{Body, Memory, Reader, Tasks, Upload, UploadSignal, UploadWatch, Writer, pipe};
 use crate::{
     async_stream::AsyncStream, config::xhttp::XhttpVersion, tcp::carrier_dialer::QuicCarrier,
 };
@@ -96,10 +96,26 @@ pub struct Carrier {
 }
 
 impl Carrier {
+    #[cfg(test)]
     pub async fn tcp(
         stream: Box<dyn AsyncStream>,
         version: XhttpVersion,
         header_limit: usize,
+    ) -> io::Result<Arc<Self>> {
+        Self::tcp_with_windows(
+            stream,
+            version,
+            header_limit,
+            crate::config::xhttp::XhttpLimits::default().h2_windows(),
+        )
+        .await
+    }
+
+    pub async fn tcp_with_windows(
+        stream: Box<dyn AsyncStream>,
+        version: XhttpVersion,
+        header_limit: usize,
+        windows: (u32, u32),
     ) -> io::Result<Arc<Self>> {
         let tasks = Tasks::new();
         let sender = if version == XhttpVersion::H1 {
@@ -116,8 +132,8 @@ impl Carrier {
             Sender::H1(tokio::sync::Mutex::new(sender))
         } else {
             let (sender, mut connection) = h2::client::Builder::new()
-                .initial_window_size(256 * 1024)
-                .initial_connection_window_size(256 * 1024)
+                .initial_window_size(windows.0)
+                .initial_connection_window_size(windows.1)
                 .max_header_list_size(header_limit as u32)
                 .handshake(stream)
                 .await
@@ -265,7 +281,8 @@ impl Carrier {
         let (writer, reader) = pipe(memory);
         let (mut upload, watch) = match timeouts.upload_idle {
             Some(_) => {
-                let (upload, watch) = Upload::channel();
+                let (mut upload, watch) = Upload::channel();
+                upload.written = request.extensions_mut().remove::<UploadSignal>();
                 (Some(upload), Some(watch))
             }
             None => (None, None),
@@ -540,12 +557,14 @@ async fn send_h2_tracked(
     send: &mut h2::SendStream<Bytes>,
     mut upload: Option<Upload>,
 ) -> io::Result<()> {
-    loop {
+    'frames: loop {
         let frame = tokio::select! {
             frame = body.frame() => frame,
             reset = futures::future::poll_fn(|cx| send.poll_reset(cx)) => return Err(io::Error::other(format!("XHTTP H2 stream reset: {reset:?}"))),
         };
         let Some(frame) = frame else {
+            send.send_data(Bytes::new(), true)
+                .map_err(io::Error::other)?;
             break;
         };
         let Ok(mut data) = frame?.into_data() else {
@@ -559,16 +578,19 @@ async fn send_h2_tracked(
                 .map_err(io::Error::other)?;
             let len = capacity.min(data.len());
             if len != 0 {
-                send.send_data(data.split_to(len), false)
+                // Known-length peers may respond and reset immediately after the final bytes.
+                let end = len == data.len() && hyper::body::Body::is_end_stream(&body);
+                send.send_data(data.split_to(len), end)
                     .map_err(io::Error::other)?;
                 if let Some(upload) = &upload {
                     upload.activity.touch();
                 }
+                if end {
+                    break 'frames;
+                }
             }
         }
     }
-    send.send_data(Bytes::new(), true)
-        .map_err(io::Error::other)?;
     if let Some(upload) = &mut upload {
         upload.finish();
     }

@@ -495,6 +495,94 @@ async fn sent_packet_releases_bytes_before_acknowledgement() {
 }
 
 #[tokio::test]
+async fn packet_upload_pipelines_written_requests_before_acknowledgement() {
+    for (request_limit, byte_limit, depth, hold_head_only) in [
+        (9, 4 * 1024 * 1024, 30, false),
+        (128, 8 * 1024, 30, false),
+        (128, 4 * 1024 * 1024, 8, true),
+    ] {
+        tokio::time::timeout(Duration::from_secs(5), async {
+        let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let address = ([127, 0, 0, 1], listener.local_addr().unwrap().port()).into();
+        let tasks = Tasks::new();
+        let (seen, mut received) = tokio::sync::mpsc::channel(16);
+        let release = tokio_util::sync::CancellationToken::new();
+        let released = release.clone();
+        tasks.spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut connection = h2::server::handshake(socket).await.unwrap();
+            let mut uploads = tokio::task::JoinSet::new();
+            let mut downloads = Vec::new();
+            while let Some(Ok((request, mut respond))) = connection.accept().await {
+                if request.method() == http::Method::GET {
+                    downloads.push(respond.send_response(Response::new(()), false).unwrap());
+                    continue;
+                }
+                let seen = seen.clone();
+                let released = released.clone();
+                uploads.spawn(async move {
+                    assert_eq!(request.headers()[http::header::CONTENT_LENGTH], "1024");
+                    let sequence: usize = request
+                        .uri()
+                        .path()
+                        .rsplit('/')
+                        .next()
+                        .unwrap()
+                        .parse()
+                        .unwrap();
+                    let mut body = request.into_body();
+                    let mut bytes = Vec::new();
+                    while let Some(chunk) = body.data().await {
+                        let chunk = chunk.unwrap();
+                        body.flow_control().release_capacity(chunk.len()).unwrap();
+                        bytes.extend_from_slice(&chunk);
+                    }
+                    assert_eq!(bytes, vec![sequence as u8; 1024]);
+                    seen.send(sequence).await.unwrap();
+                        if !hold_head_only || sequence == 0 {
+                            released.cancelled().await;
+                        }
+                    respond.send_response(Response::new(()), true).unwrap();
+                });
+            }
+        });
+        let config = serde_json::from_value(serde_json::json!({
+            "sc_max_each_post_bytes":1024, "sc_min_posts_interval_ms":1,
+                "packet_pipeline_depth":depth,
+            "limits":{"max_requests_per_session":request_limit, "max_session_buffered_bytes":byte_limit},
+            "pool":{"max_connections":1}, "protocol":{"type":"socks"}
+        }))
+        .unwrap();
+        let client = configured_client(config, XhttpVersion::H2, XhttpMode::PacketUp);
+        let mut stream = client
+            .open(Arc::new(Dialer {
+                address,
+                key: RouteKey(vec![1]),
+                opens: AtomicUsize::new(0),
+            }))
+            .await
+            .unwrap();
+        for sequence in 0..9 {
+            stream.write_all(&[sequence; 1024]).await.unwrap();
+        }
+        for sequence in 0..8 {
+            assert_eq!(received.recv().await.unwrap(), sequence);
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), received.recv())
+                .await
+                .is_err()
+        );
+        release.cancel();
+        assert_eq!(received.recv().await.unwrap(), 8);
+        stream.shutdown().await.unwrap();
+    })
+    .await
+    .expect("packet sending must pipeline until its explicit request or byte bound");
+    }
+}
+
+#[tokio::test]
 async fn packet_lanes_reacquire_after_h2_goaway() {
     for sessions in [1, 4] {
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -792,8 +880,11 @@ async fn packet_shutdown_preserves_an_active_download_tail() {
                     });
                 }
             });
-            let config =
-                serde_json::from_value(serde_json::json!({"protocol":{"type":"socks"}})).unwrap();
+            let config = serde_json::from_value(serde_json::json!({
+                "download_idle_timeout_secs": 1,
+                "protocol":{"type":"socks"}
+            }))
+            .unwrap();
             let client = configured_client(config, XhttpVersion::H2, XhttpMode::PacketUp);
             let mut stream = client
                 .open(Arc::new(Dialer {
@@ -826,6 +917,71 @@ async fn packet_shutdown_preserves_an_active_download_tail() {
                 }
             }
         }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn packet_download_idle_timeout_starts_after_upload_and_resets_on_progress() {
+    tokio::time::timeout(Duration::from_secs(6), async {
+        let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let address = ([127, 0, 0, 1], listener.local_addr().unwrap().port()).into();
+        let tasks = Tasks::new();
+        let (download, ready) = tokio::sync::oneshot::channel();
+        tasks.spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut connection = h2::server::handshake(socket).await.unwrap();
+            let mut download = Some(download);
+            while let Some(Ok((request, mut respond))) = connection.accept().await {
+                assert_eq!(request.method(), http::Method::GET);
+                download
+                    .take()
+                    .unwrap()
+                    .send(respond.send_response(Response::new(()), false).unwrap())
+                    .unwrap();
+            }
+        });
+        let config = serde_json::from_value(serde_json::json!({
+            "download_idle_timeout_secs": 1,
+            "protocol": {"type": "socks"}
+        }))
+        .unwrap();
+        let client = configured_client(config, XhttpVersion::H2, XhttpMode::PacketUp);
+        let mut stream = client
+            .open(Arc::new(Dialer {
+                address,
+                key: RouteKey(vec![1]),
+                opens: AtomicUsize::new(0),
+            }))
+            .await
+            .unwrap();
+        let mut download = ready.await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1200), stream.read_u8())
+                .await
+                .is_err(),
+            "an open upload must not start the tail timer"
+        );
+        stream.shutdown().await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(600), stream.read_u8())
+                .await
+                .is_err()
+        );
+        download.send_data(Bytes::from_static(b"x"), false).unwrap();
+        assert_eq!(stream.read_u8().await.unwrap(), b'x');
+        assert!(
+            tokio::time::timeout(Duration::from_millis(600), stream.read_u8())
+                .await
+                .is_err(),
+            "download progress must extend the deadline"
+        );
+        assert_eq!(
+            stream.read_u8().await.unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+        drop(stream);
     })
     .await
     .unwrap();
@@ -889,8 +1045,16 @@ async fn packet_shutdown_waits_for_acknowledgement() {
         release.send(()).unwrap();
         shutdown.as_mut().await.unwrap();
         drop(shutdown);
-        assert_eq!(stream.read(&mut [0; 1]).await.unwrap(), 0);
-        let next = client.open(dialer).await.unwrap();
+        assert!(tokio::time::timeout(Duration::from_millis(1200), stream.read(&mut [0; 1]))
+            .await
+            .is_err());
+        drop(stream);
+        let next = loop {
+            if let Ok(stream) = client.open(dialer.clone()).await {
+                break stream;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        };
         drop(next);
     })
     .await
@@ -1036,6 +1200,57 @@ async fn h1_abandoned_packet_fails_without_waiting_for_inactivity() {
         }
         assert!(carrier.closed());
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn h2_packet_fin_is_on_the_last_payload_frame() {
+    let (client, mut peer) = tokio::io::duplex(4096);
+    let tasks = Tasks::new();
+    let (mut sender, connection) = h2::client::handshake(client).await.unwrap();
+    tasks.spawn(async move {
+        connection.await.unwrap();
+    });
+    peer.write_all(&[0, 0, 0, 4, 0, 0, 0, 0, 0]).await.unwrap();
+    let mut preface = [0; 24];
+    peer.read_exact(&mut preface).await.unwrap();
+    assert_eq!(&preface, b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+    let (_response, send) = sender
+        .send_request(
+            Request::post("https://localhost/packet/0")
+                .header("content-length", 2048)
+                .body(())
+                .unwrap(),
+            false,
+        )
+        .unwrap();
+    tasks.spawn(async move {
+        super::carrier::send_h2(
+            Body::Chunks(vec![Bytes::from(vec![42; 1024]), Bytes::from(vec![42; 1024])].into()),
+            send,
+        )
+        .await
+        .unwrap();
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        let mut received = 0;
+        loop {
+            let mut header = [0; 9];
+            peer.read_exact(&mut header).await.unwrap();
+            let length = u32::from_be_bytes([0, header[0], header[1], header[2]]) as usize;
+            let mut payload = vec![0; length];
+            peer.read_exact(&mut payload).await.unwrap();
+            if header[3] == 0 {
+                assert!(payload.iter().all(|byte| *byte == 42));
+                received += length;
+                if received == 2048 {
+                    assert_ne!(header[4] & 1, 0, "final DATA must carry END_STREAM");
+                    break;
+                }
+            }
+        }
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test(start_paused = true)]
@@ -1257,14 +1472,16 @@ async fn tiny_writes_bound_packet_fragments_without_losing_bytes() {
                 uploads.spawn(async move {
                     let mut body = request.into_body();
                     let mut bytes = Vec::new();
+                    let mut fragments = 0;
                     while let Some(data) = body.data().await {
                         let data = data.unwrap();
+                        fragments += 1;
                         bytes.extend_from_slice(&data);
                         body.flow_control().release_capacity(data.len()).unwrap();
                     }
                     assert!(
-                        bytes.len() <= 64,
-                        "one-byte fragment count: {}",
+                        fragments <= 2 * bytes.len().div_ceil(super::stream::CHUNK),
+                        "uncoalesced packet: {fragments} fragments for {} bytes",
                         bytes.len()
                     );
                     received.lock().insert(sequence, bytes);
@@ -1286,14 +1503,12 @@ async fn tiny_writes_bound_packet_fragments_without_losing_bytes() {
             .await
             .unwrap();
         let payload: Vec<u8> = (0..2048).map(|index| (index % 251) as u8).collect();
-        let started = tokio::time::Instant::now();
         for byte in &payload {
             stream.write_u8(*byte).await.unwrap();
         }
-        assert!(started.elapsed() >= Duration::from_secs(1));
         stream.shutdown().await.unwrap();
         let packets = packets.lock();
-        assert!(packets.values().any(|packet| packet.len() == 64));
+        assert!(packets.values().any(|packet| packet.len() > 64));
         assert_eq!(
             packets.values().flatten().copied().collect::<Vec<_>>(),
             payload

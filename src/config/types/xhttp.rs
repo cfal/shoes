@@ -92,6 +92,9 @@ pub struct XhttpLimits {
     pub max_session_buffered_bytes: usize,
     pub max_requests_per_connection: usize,
     pub max_requests_per_session: usize,
+    pub max_requests: usize,
+    pub h2_stream_window_bytes: usize,
+    pub h2_connection_window_bytes: usize,
     pub setup_timeout_secs: u64,
     pub packet_timeout_secs: u64,
     pub response_header_timeout_secs: u64,
@@ -106,6 +109,9 @@ impl Default for XhttpLimits {
             max_session_buffered_bytes: 4 * 1024 * 1024,
             max_requests_per_connection: 128,
             max_requests_per_session: 128,
+            max_requests: 4096,
+            h2_stream_window_bytes: 4 * 1024 * 1024,
+            h2_connection_window_bytes: 8 * 1024 * 1024,
             setup_timeout_secs: 60,
             packet_timeout_secs: 300,
             response_header_timeout_secs: 60,
@@ -114,6 +120,18 @@ impl Default for XhttpLimits {
 }
 
 impl XhttpLimits {
+    pub(crate) fn h2_windows(&self) -> (u32, u32) {
+        (
+            self.h2_stream_window_bytes
+                .min(self.max_session_buffered_bytes)
+                .min(self.max_buffered_bytes) as u32,
+            // HTTP/2 starts every connection with at least 65535 bytes of credit.
+            self.h2_connection_window_bytes
+                .min(self.max_buffered_bytes)
+                .max(65535) as u32,
+        )
+    }
+
     pub(crate) fn request_limit(&self) -> usize {
         crate::resources::limits()
             .max_streams_per_connection
@@ -132,6 +150,9 @@ impl XhttpLimits {
             self.max_buffered_bytes,
             self.max_session_buffered_bytes,
             self.max_requests_per_connection,
+            self.max_requests,
+            self.h2_stream_window_bytes,
+            self.h2_connection_window_bytes,
         ]
         .contains(&0)
             || [
@@ -142,6 +163,9 @@ impl XhttpLimits {
             .contains(&0)
             || self.max_requests_per_connection > u32::MAX as usize
             || self.max_requests_per_connection > tokio::sync::Semaphore::MAX_PERMITS
+            || self.h2_stream_window_bytes > i32::MAX as usize
+            || self.h2_connection_window_bytes > i32::MAX as usize
+            || self.h2_connection_window_bytes < 65535
         {
             return Err(invalid(
                 "XHTTP limits must be positive and request count must fit u32",
@@ -188,6 +212,10 @@ pub struct XhttpClientConfig {
     pub sc_min_posts_interval_ms: XhttpRange,
     #[serde(default)]
     pub no_grpc_header: bool,
+    #[serde(default = "default_download_idle_timeout_secs")]
+    pub download_idle_timeout_secs: u64,
+    #[serde(default = "default_packet_pipeline_depth")]
+    pub packet_pipeline_depth: usize,
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
     #[serde(default)]
@@ -197,12 +225,23 @@ pub struct XhttpClientConfig {
     pub protocol: Box<ClientProxyConfig>,
 }
 
+fn default_download_idle_timeout_secs() -> u64 {
+    15 * 60
+}
+
+fn default_packet_pipeline_depth() -> usize {
+    30
+}
+
 impl XhttpClientConfig {
     pub fn validate(&self) -> io::Result<()> {
         validate_path_and_host(&self.path, self.host.as_deref())?;
         self.limits.validate()?;
-        if self.limits.max_requests_per_session != XhttpLimits::default().max_requests_per_session {
-            return Err(invalid("XHTTP max_requests_per_session is server-only"));
+        if self.download_idle_timeout_secs == 0 {
+            return Err(invalid("XHTTP download idle timeout must be positive"));
+        }
+        if self.packet_pipeline_depth == 0 {
+            return Err(invalid("XHTTP packet pipeline depth must be positive"));
         }
         if self.x_padding_bytes.bounds((100, 1000), false)?.1 > MAX_PADDING_BYTES {
             return Err(invalid("XHTTP padding must not exceed 65536 bytes"));
@@ -511,15 +550,48 @@ mod tests {
         }
     }
     #[test]
-    fn client_rejects_server_only_session_request_limits() {
-        for limit in [2, 5, 128, 129] {
+    fn client_validates_session_request_limits() {
+        for limit in [0, 1, 2, 5, 128, 129] {
             let config: XhttpClientConfig = serde_json::from_value(serde_json::json!({
                 "limits": {"max_requests_per_session": limit},
                 "protocol": {"type": "socks"}
             }))
             .unwrap();
-            assert_eq!(config.validate().is_ok(), limit == 128);
+            assert_eq!(config.validate().is_ok(), limit >= 2);
         }
+    }
+
+    #[test]
+    fn client_download_idle_timeout_defaults_and_validation() {
+        let mut config: XhttpClientConfig = serde_json::from_value(serde_json::json!({
+            "protocol": {"type": "socks"}
+        }))
+        .unwrap();
+        assert_eq!(config.download_idle_timeout_secs, 900);
+        assert_eq!(config.packet_pipeline_depth, 30);
+        config.packet_pipeline_depth = 0;
+        assert!(config.validate().is_err());
+        config.packet_pipeline_depth = 30;
+        for seconds in [0, 1, 900, 1800] {
+            config.download_idle_timeout_secs = seconds;
+            let decoded: XhttpClientConfig =
+                serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
+            assert_eq!(decoded.download_idle_timeout_secs, seconds);
+            assert_eq!(decoded.validate().is_ok(), seconds > 0);
+        }
+    }
+
+    #[test]
+    fn h2_windows_follow_byte_limits_and_protocol_bounds() {
+        let mut limits = XhttpLimits::default();
+        assert_eq!(limits.h2_windows(), (4 * 1024 * 1024, 8 * 1024 * 1024));
+        limits.max_session_buffered_bytes = 16384;
+        limits.max_buffered_bytes = 32768;
+        assert_eq!(limits.h2_windows(), (16384, 65535));
+        limits.h2_stream_window_bytes = 8192;
+        assert_eq!(limits.h2_windows().0, 8192);
+        limits.h2_connection_window_bytes = i32::MAX as usize + 1;
+        assert!(limits.validate().is_err());
     }
 
     #[test]
