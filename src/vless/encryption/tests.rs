@@ -10,14 +10,14 @@ use super::{
 mod lifecycle;
 mod transports;
 
-fn fixtures() -> Value {
+pub(super) fn fixtures() -> Value {
     serde_json::from_str(include_str!(
         "../../../tests/fixtures/vless_encryption/vectors.json"
     ))
     .unwrap()
 }
 
-fn bytes(value: &Value, field: &str) -> Vec<u8> {
+pub(super) fn bytes(value: &Value, field: &str) -> Vec<u8> {
     let hex = value[field].as_str().unwrap();
     assert!(hex.len().is_multiple_of(2));
     (0..hex.len())
@@ -58,12 +58,23 @@ fn export_rust_encapsulations() {
     let output =
         std::env::var_os("VLESS_RUST_VECTORS").expect("set VLESS_RUST_VECTORS to the output path");
     let hex = |data: &[u8]| data.iter().map(|b| format!("{b:02x}")).collect::<String>();
-    let vectors: Vec<_> = fixtures()["seeds"].as_array().unwrap().iter().map(|v| {
-        let seed = bytes(v, "seed");
-        let key = ServerKey::new(&seed).unwrap();
-        let (ciphertext, secret) = super::keys::ClientKey::new(&key.public).unwrap().exchange().unwrap();
-        serde_json::json!({"seed": hex(&seed), "public": hex(&key.public), "ciphertext": hex(&ciphertext), "secret": hex(secret.as_ref())})
-    }).collect();
+    let vectors: Vec<_> = fixtures()["seeds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|vector| {
+            let seed = bytes(vector, "seed");
+            let key = ServerKey::new(&seed).unwrap();
+            let client = super::keys::ClientKey::new(&key.public).unwrap();
+            let (ciphertext, secret) = client.exchange().unwrap();
+            serde_json::json!({
+                "seed": hex(&seed),
+                "public": hex(&key.public),
+                "ciphertext": hex(&ciphertext),
+                "secret": hex(secret.as_ref()),
+            })
+        })
+        .collect();
     std::fs::write(output, serde_json::to_vec_pretty(&vectors).unwrap()).unwrap();
 }
 
@@ -153,9 +164,20 @@ pub(super) fn fixture_settings(mode: &str, resume: bool, keys: &[usize]) -> (Str
     )
 }
 
+pub(super) fn fixture_pair(
+    mode: &str,
+    resume: bool,
+    keys: &[usize],
+) -> (super::ClientEncryption, super::ServerEncryption) {
+    let (encryption, decryption) = fixture_settings(mode, resume, keys);
+    (
+        super::ClientEncryption::new(&encryption).unwrap(),
+        super::ServerEncryption::new(&decryption, Default::default()).unwrap(),
+    )
+}
+
 #[tokio::test]
 async fn fresh_and_resumed_handshakes_over_tiny_streams() {
-    use super::{ClientEncryption, ServerEncryption};
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -163,9 +185,7 @@ async fn fresh_and_resumed_handshakes_over_tiny_streams() {
         for keys in [&[32][..], &[64], &[32, 64], &[64, 32, 32], &[64, 64]] {
             for cipher in [Cipher::Aes256Gcm, Cipher::ChaCha20Poly1305] {
                 for capacity in [1, 5, 32] {
-                    let (client, server) = fixture_settings(mode, true, keys);
-                    let client = ClientEncryption::new(&client).unwrap();
-                    let server = ServerEncryption::new(&server, Default::default()).unwrap();
+                    let (client, server) = fixture_pair(mode, true, keys);
                     for resumed in [false, true] {
                         let (left, right) = tokio::io::duplex(capacity);
                         let request = vec![0x5a; 100];

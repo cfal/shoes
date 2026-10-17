@@ -11,7 +11,7 @@ use tokio::io::{
 };
 use tokio::time::Instant;
 
-use super::fixture_settings;
+use super::{fixture_pair, fixture_settings};
 use crate::async_stream::{AsyncPing, AsyncStream};
 use crate::vless::encryption::{ClientEncryption, ServerEncryption};
 
@@ -109,9 +109,8 @@ async fn check_ticket_during_padding(lifetime: &str, published: bool) {
 #[tokio::test]
 async fn concurrent_cold_and_warm_connections_transfer_full_duplex_and_half_close() {
     for mode in ["native", "xorpub", "random"] {
-        let (c, s) = fixture_settings(mode, true, &[64]);
-        let client = Arc::new(ClientEncryption::new(&c).unwrap());
-        let server = Arc::new(ServerEncryption::new(&s, Default::default()).unwrap());
+        let (client, server) = fixture_pair(mode, true, &[64]);
+        let (client, server) = (Arc::new(client), Arc::new(server));
         for warm in [false, true] {
             let mut tasks = tokio::task::JoinSet::new();
             for _ in 0..16 {

@@ -251,18 +251,9 @@ mod tests {
 
     #[test]
     fn wrapped_nonce_records_match_go() {
-        let fixtures: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../tests/fixtures/vless_encryption/vectors.json"
-        ))
-        .unwrap();
-        let bytes = |v: &serde_json::Value, field: &str| {
-            let text = v[field].as_str().unwrap();
-            (0..text.len())
-                .step_by(2)
-                .map(|i| u8::from_str_radix(&text[i..i + 2], 16).unwrap())
-                .collect::<Vec<_>>()
-        };
-        for v in fixtures["rekey"].as_array().unwrap() {
+        use super::super::tests::{bytes, fixtures};
+
+        for v in fixtures()["rekey"].as_array().unwrap() {
             let cipher = if v["aes"].as_bool().unwrap() {
                 Cipher::Aes256Gcm
             } else {

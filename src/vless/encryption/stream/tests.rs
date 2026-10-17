@@ -116,10 +116,17 @@ fn stream<S: AsyncStream>(inner: S, client: bool, masked: bool) -> EncryptionStr
 }
 
 fn pending_padding<S: AsyncStream>(inner: S) -> (EncryptionStream<S>, Vec<u8>, Vec<u8>) {
+    pending_padding_with_response(inner, b"response")
+}
+
+fn pending_padding_with_response<S: AsyncStream>(
+    inner: S,
+    response: &[u8],
+) -> (EncryptionStream<S>, Vec<u8>, Vec<u8>) {
     let mut stream = stream(inner, true, false);
     let mut peer = Aead::new(b"context", &[7; 96], Cipher::Aes256Gcm).unwrap();
     let padding = peer.seal(&[0; 48], &[]).unwrap();
-    let record = peer.seal_record(b"response", &[7; 96]).unwrap();
+    let record = peer.seal_record(response, &[7; 96]).unwrap();
     stream.initial = InitialRead::Fresh(FreshPadding::new(
         vec![0; padding.len()],
         0,

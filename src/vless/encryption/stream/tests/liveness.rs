@@ -9,13 +9,10 @@ fn pending_vision(
     VisionStream<EncryptionStream<tokio::io::DuplexStream>>,
     Vec<u8>,
 ) {
-    let (stream, padding, _) = pending_padding(io);
-    let mut peer = Aead::new(b"context", &[7; 96], Cipher::Aes256Gcm).unwrap();
-    peer.seal(&[0; 48], &[]).unwrap();
     let mut response = vec![0, 0];
     response.extend_from_slice(&[9; 16]);
     response.extend_from_slice(b"\x02\x00\x08\x00\x00response");
-    let record = peer.seal_record(&response, &[7; 96]).unwrap();
+    let (stream, padding, record) = pending_padding_with_response(io, &response);
     let stream = VisionStream::new_client(stream, [9; 16])
         .unwrap()
         .with_write_error_policy(VisionWriteErrorPolicy::AcknowledgeAccepted);

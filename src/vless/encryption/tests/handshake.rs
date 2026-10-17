@@ -1,6 +1,6 @@
 use super::*;
 use crate::async_stream::AsyncPing;
-use crate::vless::encryption::tests::fixture_settings;
+use crate::vless::encryption::tests::fixture_pair;
 use std::{
     pin::Pin,
     task::{Context, Poll},
@@ -100,9 +100,7 @@ async fn every_fresh_control_field_is_authenticated_before_use() {
         } else {
             CLIENT_FIELDS
         } {
-            let (c, s) = fixture_settings("native", true, &[32]);
-            let client = ClientEncryption::new(&c).unwrap();
-            let server = ServerEncryption::new(&s, Default::default()).unwrap();
+            let (client, server) = fixture_pair("native", true, &[32]);
             let (left, right) = tokio::io::duplex(8192);
             let (mut left, mut right) = (FaultRead::new(left), FaultRead::new(right));
             if client_receives {
@@ -141,9 +139,7 @@ async fn every_fresh_control_field_is_authenticated_before_use() {
 #[tokio::test]
 async fn invalid_chain_link_and_wrong_private_key_reject_before_server_flight() {
     for wrong_key in [false, true] {
-        let (c, s) = fixture_settings("xorpub", true, &[32, 32]);
-        let client = ClientEncryption::new(&c).unwrap();
-        let mut server = ServerEncryption::new(&s, Default::default()).unwrap();
+        let (client, mut server) = fixture_pair("xorpub", true, &[32, 32]);
         if wrong_key {
             server.keys[0] = super::super::keys::ServerKey::new(&[71; 32]).unwrap();
         }
@@ -172,9 +168,7 @@ async fn cancellation_before_authenticating_server_flight_never_publishes_a_tick
             &CLIENT_FIELDS[..2]
         };
         for &field in fields {
-            let (c, s) = fixture_settings("native", true, &[32]);
-            let client = ClientEncryption::new(&c).unwrap();
-            let server = ServerEncryption::new(&s, Default::default()).unwrap();
+            let (client, server) = fixture_pair("native", true, &[32]);
             let (left, right) = tokio::io::duplex(8192);
             let notify = Arc::new(Notify::new());
             let (mut left, mut right) = (FaultRead::new(left), FaultRead::new(right));
@@ -212,9 +206,7 @@ async fn cancelling_server_padding_read_preserves_authenticated_client_ticket() 
     // The server issues its ticket before consuming client padding. Cancelling
     // that read cannot revoke a reply the client has already authenticated.
     for &field in &CLIENT_FIELDS[2..] {
-        let (c, s) = fixture_settings("native", true, &[32]);
-        let client = ClientEncryption::new(&c).unwrap();
-        let server = ServerEncryption::new(&s, Default::default()).unwrap();
+        let (client, server) = fixture_pair("native", true, &[32]);
         let (left, right) = tokio::io::duplex(8192);
         let (client_stopped, server_stopped) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
         let (mut left, mut right) = (FaultRead::new(left), FaultRead::new(right));
@@ -271,9 +263,7 @@ async fn cancelling_server_padding_read_preserves_authenticated_client_ticket() 
 #[tokio::test]
 async fn extended_ephemeral_offer_authenticates_but_only_standard_keys_derive_records() {
     for cipher in [Cipher::Aes256Gcm, Cipher::ChaCha20Poly1305] {
-        let (c, s) = fixture_settings("native", true, &[32]);
-        let client = ClientEncryption::new(&c).unwrap();
-        let server = ServerEncryption::new(&s, Default::default()).unwrap();
+        let (client, server) = fixture_pair("native", true, &[32]);
         let (mut left, right) = tokio::io::duplex(8192);
         let iv = [3; 16];
         let (relay, nfs) = client.keys[0].exchange().unwrap();

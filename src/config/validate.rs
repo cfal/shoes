@@ -1989,9 +1989,12 @@ fn expand_selection(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::config::pem::convert_cert_paths;
+    use crate::dns::IpStrategy;
+
     #[test]
     fn native_vless_configuration_rejects_ambiguous_vision_and_secrets() {
-        use super::*;
         use serde_json::json;
 
         const KEY: &str = "CQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
@@ -2072,10 +2075,6 @@ mod tests {
             validate_server_vision(true, &validate_server(config).unwrap()).unwrap();
         }
     }
-
-    use super::*;
-    use crate::config::pem::convert_cert_paths;
-    use crate::dns::IpStrategy;
 
     #[test]
     fn server_secrets_must_be_nonempty() {

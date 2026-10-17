@@ -1408,6 +1408,7 @@ mod tests {
         use crate::client_proxy_selector::ClientProxySelector;
         use crate::resolver::{NativeResolver, Resolver};
         use crate::tcp::tcp_handler::TcpServerSetupResult;
+        use crate::vless::vless_server_handler::setup_custom_tls_vision_vless_server_stream;
 
         for backend in BACKENDS {
             for addon in [b"".as_slice(), b"\x0a\x10xtls-rprx-vision".as_slice()] {
@@ -1428,8 +1429,7 @@ mod tests {
                 };
                 let tls = CryptoTlsStream::new(io, server, Some(TlsDeframer::new()));
                 let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
-                let result =
-                super::super::vless_server_handler::setup_custom_tls_vision_vless_server_stream(
+                let result = setup_custom_tls_vision_vless_server_stream(
                     tls,
                     &uuid,
                     true,
