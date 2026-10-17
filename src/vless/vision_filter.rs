@@ -7,9 +7,6 @@ const TLS_CONTENT_TYPE_HANDSHAKE: u8 = 0x16;
 const TLS_HANDSHAKE_TYPE_CLIENT_HELLO: u8 = 0x01;
 const TLS_HANDSHAKE_TYPE_SERVER_HELLO: u8 = 0x02;
 
-// TLS ciphers
-const TLS13_CIPHER_AES_128_CCM_8_SHA256: u16 = 0x1305;
-
 /// VISION protocol filter state
 ///
 /// This structure maintains only the state needed for TLS record filtering
@@ -126,18 +123,16 @@ impl VisionFilter {
                     if parsed.is_tls13 {
                         log::debug!("VISION: Detected TLS 1.3 via supported_versions extension");
 
-                        // Check if cipher is supported for XTLS
-                        // Following Xray-core: all TLS 1.3 ciphers EXCEPT 0x1305 support XTLS
-                        if parsed.cipher_suite == TLS13_CIPHER_AES_128_CCM_8_SHA256 {
-                            log::warn!(
-                                "VISION: TLS 1.3 detected but cipher 0x{:04x} (TLS_AES_128_CCM_8_SHA256) not supported for XTLS",
-                                parsed.cipher_suite
-                            );
-                        } else {
-                            // Assume all other TLS 1.3 ciphers support XTLS
+                        // Xray and Mihomo allow GCM, ChaCha20 and CCM, but not CCM_8 or unknown suites.
+                        if matches!(parsed.cipher_suite, 0x1301..=0x1304) {
                             self.supports_xtls = true;
                             log::debug!(
                                 "VISION: TLS 1.3 with supported cipher 0x{:04x} - XTLS enabled",
+                                parsed.cipher_suite
+                            );
+                        } else {
+                            log::warn!(
+                                "VISION: TLS 1.3 detected but cipher 0x{:04x} not supported for XTLS",
                                 parsed.cipher_suite
                             );
                         }

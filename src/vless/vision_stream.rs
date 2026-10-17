@@ -606,8 +606,8 @@ where
                             assert!(
                                 self.inner_write_deframer.pending_bytes() == unprocessed_buf_len
                             );
-                            // clear since the user will re-feed
-                            self.inner_write_deframer.clear();
+                            // Discard the unaccepted tail, but keep TLS recognition for resubmission.
+                            self.inner_write_deframer.discard_buffered();
                             return Poll::Ready(Ok(processed_len - existing_inner_len));
                         }
                         Poll::Ready(Ok(())) => {
@@ -857,6 +857,7 @@ impl<S: VisionTransport> AsyncStream for VisionStream<S> {
 
 #[cfg(test)]
 mod tests {
+    mod decisions;
     mod native_errors;
     #[cfg(target_os = "linux")]
     mod splice;
@@ -997,7 +998,7 @@ mod tests {
 
     impl AsyncStream for GatedIo {}
 
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, Debug)]
     enum Backend {
         Tls12,
         Tls13,
