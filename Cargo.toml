@@ -21,6 +21,8 @@ resolver = "3"
 blake3 = { git = "https://github.com/cfal/BLAKE3", rev = "0fef7d31c337697da030754b70de2991c4fa9aba" }
 h3 = { git = "https://github.com/cfal/h3", rev = "a0a7a53a143798d71884df36cfac4dd36cd087e6" }
 h3-quinn = { git = "https://github.com/cfal/h3", rev = "a0a7a53a143798d71884df36cfac4dd36cd087e6" }
+# Backports nix-rust/nix#2821 to 0.31.3 for iOS socket feature compatibility.
+nix = { git = "https://github.com/cfal/nix", rev = "ca73cf95233e0c6f61ad871feb925081b000c5e3" }
 
 [lib]
 name = "shoes"
