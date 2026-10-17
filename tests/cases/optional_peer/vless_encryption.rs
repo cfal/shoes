@@ -23,10 +23,14 @@ const LIMIT: Duration = Duration::from_secs(10);
 
 #[path = "vless_encryption/benchmarks.rs"]
 mod benchmarks;
+#[path = "vless_encryption/chained.rs"]
+mod chained;
 #[path = "vless_encryption/composition.rs"]
 mod composition;
 #[path = "vless_encryption/legacy.rs"]
 mod legacy;
+#[path = "vless_encryption/lifecycle.rs"]
+mod lifecycle;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
