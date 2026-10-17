@@ -104,6 +104,9 @@ destination share an association. No native WireGuard UDP listener is opened.
 Configure physical interface binding on the first outer client, not the endpoint.
 `inbound.rules` still handles authenticated connections received over established
 associations, but cannot accept unsolicited public peers through a proxy detour.
+Inbound-only detours require a nonzero `persistent_keepalive` on every peer:
+Shoes must initiate a handshake to establish the proxy's UDP return mapping.
+Without keepalive, an outbound inner flow must initiate that handshake first.
 
 Detoured destinations are fixed for the configuration generation. Their message
 streams do not expose source addresses, so arbitrary peer address roaming is not
@@ -159,6 +162,15 @@ UDP forwarding and outbound associations have separate bounded pools.
 Missing or null limit fields use WireGuard defaults rather than the unlimited
 TUN defaults. Packet and command queues are bounded at 64. These budgets
 cover modeled Shoes-owned state, not total process RSS or all GotaTun state.
+
+The TCP buffers bound the advertised receive window and in-flight data across
+the tunnel. A 32 KiB window limits a single flow to roughly 5 Mbit/s at 50 ms RTT
+or 2.6 Mbit/s at 100 ms RTT, before other bottlenecks. For higher-bandwidth,
+higher-latency links, set `resource_limits.tcp_buffer_size` to, for example,
+262144 (256 KiB). Four buffers are budgeted per flow, so retaining 256 connections
+at that size also requires `tcp_memory_bytes: 268435456` (256 MiB); the default
+32 MiB budget would admit only 32 connections. Tune against measured RTT,
+throughput, and available memory rather than increasing buffers unconditionally.
 
 Periodic logs report endpoint flow/drop counts and each peer's public key,
 handshake age, and byte counters. Private keys and PSKs are redacted.
