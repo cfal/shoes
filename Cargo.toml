@@ -71,6 +71,11 @@ path = "tests/reality_interop.rs"
 required-features = ["optional-peer-tests"]
 
 [[test]]
+name = "vless_encryption_interop"
+path = "tests/vless_encryption_interop.rs"
+required-features = ["optional-peer-tests"]
+
+[[test]]
 name = "privileged"
 path = "tests/privileged.rs"
 required-features = ["privileged-tests"]
