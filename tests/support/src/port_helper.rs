@@ -52,16 +52,23 @@ impl PortHelper {
     ///
     /// Returns ("127.0.0.1", port).
     pub fn get_localhost_listener_port(&mut self) -> (String, u16) {
-        let listener =
-            TcpListener::bind("127.0.0.1:0").expect("failed to allocate a localhost test port");
-        let port = listener
-            .local_addr()
-            .expect("failed to read allocated localhost test port")
-            .port();
-        let addr = ("127.0.0.1".to_string(), port);
-        self.listener_addrs
-            .push(format!("{}:{}", addr.0, addr.1).parse().unwrap());
-        addr
+        loop {
+            let listener =
+                TcpListener::bind("127.0.0.1:0").expect("failed to allocate a localhost test port");
+            let address = listener
+                .local_addr()
+                .expect("failed to read allocated localhost test port");
+            // Released reservations can be reissued before the fixture starts its listeners.
+            if self
+                .listener_addrs
+                .iter()
+                .any(|pending| pending.port() == address.port())
+            {
+                continue;
+            }
+            self.listener_addrs.push(address);
+            return (address.ip().to_string(), address.port());
+        }
     }
 
     pub fn get_ipv6_listener_port(&mut self) -> (String, u16) {
@@ -166,6 +173,16 @@ async fn wait_for_addr(addr: SocketAddr, wait_timeout: Duration) -> std::io::Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_localhost_listeners_have_distinct_ports() {
+        let mut helper = PortHelper::new();
+        let ports: std::collections::HashSet<_> = (0..128)
+            .map(|_| helper.get_localhost_listener_port().1)
+            .collect();
+        assert_eq!(ports.len(), 128);
+        assert_eq!(helper.listener_addrs.len(), 128);
+    }
 
     #[tokio::test]
     async fn readiness_only_waits_for_pending_listeners() {
