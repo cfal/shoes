@@ -22,10 +22,14 @@ async fn load_validated(paths: &[String]) -> io::Result<ValidatedConfigs> {
 struct PreparedServers {
     validated: ValidatedConfigs,
     dns: DnsRegistry,
+    #[cfg(unix)]
+    wireguard: crate::wireguard::Prepared,
 }
 
 async fn prepare(paths: &[String]) -> io::Result<PreparedServers> {
     let mut validated = load_validated(paths).await?;
+    #[cfg(unix)]
+    let wireguard = crate::wireguard::Prepared::new(&mut validated).await?;
     for config in &mut validated.configs {
         let Config::Server(server) = config else {
             continue;
@@ -79,7 +83,12 @@ async fn prepare(paths: &[String]) -> io::Result<PreparedServers> {
             ))
         }
     })?;
-    Ok(PreparedServers { validated, dns })
+    Ok(PreparedServers {
+        validated,
+        dns,
+        #[cfg(unix)]
+        wireguard,
+    })
 }
 
 #[derive(Default)]
@@ -87,6 +96,8 @@ struct RunningServers {
     listeners: Vec<JoinHandle<()>>,
     reporter: Option<resources::ResourceReporter>,
     quic_retirements: crate::listener_tasks::QuicRetirements,
+    #[cfg(unix)]
+    wireguard: crate::wireguard::Running,
 }
 
 impl RunningServers {
@@ -97,12 +108,23 @@ impl RunningServers {
         for task in self.listeners.drain(..) {
             let _ = task.await;
         }
+        #[cfg(unix)]
+        self.wireguard.stop().await;
         self.reporter = None;
     }
 
     async fn start(&mut self, prepared: &mut PreparedServers) -> io::Result<()> {
         resources::configure(prepared.validated.global_limits)?;
         self.reporter = Some(resources::ResourceReporter::start());
+        #[cfg(unix)]
+        if let Err(error) = prepared
+            .wireguard
+            .start(&mut prepared.dns, &mut self.wireguard)
+            .await
+        {
+            self.stop().await;
+            return Err(error);
+        }
         for config in &prepared.validated.configs {
             let dns_ref = match config {
                 Config::Server(server) => server.dns.as_ref(),

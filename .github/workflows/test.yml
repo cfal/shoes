@@ -21,6 +21,85 @@ env:
   NAIVE_CADDY_SHA256: ac97057c925bb098eb575e7b0cb8bd547d4c5f845b09a3dedfbe34444aa7ae88
 
 jobs:
+  dependency-notices:
+    name: Dependency notices
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@stable
+    - uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-about@0.9.2
+    - name: Verify generated dependency licenses and artifact checks
+      run: |
+        python3 scripts/generate-release-notices.py
+        git diff --exit-code -- licenses/dependencies.txt
+        cargo fetch --locked
+        python3 scripts/test-release-notices.py
+
+  wireguard-interop:
+    name: WireGuard interoperability
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      GOMAXPROCS: 1
+      WG_SING_BOX_COMMIT: 7054cac5124465ffdb145870d7c01885566711b1
+      WG_XRAY_COMMIT: 0888beb38a9ba45440557175e71ce21cf8ba3b13
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@stable
+    - name: Restore pinned WireGuard peers
+      id: wireguard-peers
+      uses: actions/cache/restore@v4
+      with:
+        path: ~/.cache/shoes-wireguard
+        key: ${{ runner.os }}-${{ runner.arch }}-wireguard-peers-go1.27.1-${{ env.WG_SING_BOX_COMMIT }}-${{ env.WG_XRAY_COMMIT }}
+    - uses: actions/setup-go@v5
+      if: steps.wireguard-peers.outputs.cache-hit != 'true'
+      with:
+        go-version: '1.27.1'
+        cache: false
+    - uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+          ~/go/pkg/mod
+          ~/.cache/go-build
+        key: ${{ runner.os }}-wireguard-${{ hashFiles('**/Cargo.lock') }}-${{ env.WG_SING_BOX_COMMIT }}-${{ env.WG_XRAY_COMMIT }}
+    - name: Build pinned independent WireGuard peers
+      if: steps.wireguard-peers.outputs.cache-hit != 'true'
+      run: |
+        mkdir -p "$HOME/.cache/shoes-wireguard"
+        git clone --filter=blob:none --no-checkout https://github.com/SagerNet/sing-box.git "$HOME/wg-sing-box"
+        git -C "$HOME/wg-sing-box" checkout --detach "$WG_SING_BOX_COMMIT"
+        test "$(git -C "$HOME/wg-sing-box" rev-parse HEAD)" = "$WG_SING_BOX_COMMIT"
+        git clone --filter=blob:none --no-checkout https://github.com/XTLS/Xray-core.git "$HOME/wg-xray"
+        git -C "$HOME/wg-xray" checkout --detach "$WG_XRAY_COMMIT"
+        test "$(git -C "$HOME/wg-xray" rev-parse HEAD)" = "$WG_XRAY_COMMIT"
+        cd "$HOME/wg-sing-box"
+        go build -mod=readonly -p 1 -tags with_gvisor,with_wireguard -o "$HOME/.cache/shoes-wireguard/sing-box" ./cmd/sing-box
+        cd "$HOME/wg-xray"
+        go build -mod=readonly -p 1 -o "$HOME/.cache/shoes-wireguard/xray" ./main
+    - name: Save pinned WireGuard peers
+      if: steps.wireguard-peers.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: ~/.cache/shoes-wireguard
+        key: ${{ steps.wireguard-peers.outputs.cache-primary-key }}
+    - name: Select WireGuard peers
+      run: |
+        echo "SHOES_TEST_SING_BOX_BIN=$HOME/.cache/shoes-wireguard/sing-box" >> "$GITHUB_ENV"
+        echo "SHOES_TEST_XRAY_BIN=$HOME/.cache/shoes-wireguard/xray" >> "$GITHUB_ENV"
+        "$HOME/.cache/shoes-wireguard/sing-box" version
+        "$HOME/.cache/shoes-wireguard/xray" version
+    - name: Test both roles, inner address families, and real rekey
+      run: >-
+        cargo test -p shoes --locked --features optional-peer-tests
+        --test optional_peer wireguard -- --ignored --test-threads=1
+
   unit-tests:
     name: Unit tests
     runs-on: ubuntu-latest
@@ -124,6 +203,11 @@ jobs:
           target: external_network
           filters: reality
           peer: sing-box
+        - name: kernel WireGuard
+          features: privileged-tests
+          target: privileged
+          filters: wireguard_kernel
+          peer: kernel-wireguard
 
     steps:
     - uses: actions/checkout@v4
@@ -148,6 +232,14 @@ jobs:
       with:
         path: target
         key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Install kernel WireGuard test tools
+      if: matrix.peer == 'kernel-wireguard'
+      run: |
+        sudo apt-get update
+        sudo apt-get install --yes --no-install-recommends wireguard-tools iproute2
+        uname -r
+        wg --version
 
     - name: Install sing-box test peer
       if: matrix.peer == 'sing-box' || matrix.target == 'optional_peer'

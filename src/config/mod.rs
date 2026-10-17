@@ -13,6 +13,7 @@
 //! - [`create_server_configs`]: Validate and create final server configs
 //! - [`singbox::convert_singbox_config`]: Convert sing-box configs to shoes format
 
+mod client_visit;
 mod pem;
 mod types;
 mod validate;

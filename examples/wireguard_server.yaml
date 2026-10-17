@@ -1,0 +1,14 @@
+# Demonstration keys only. Generate new keys before deployment and exchange public keys.
+- wireguard: wg-in
+  private_key: "KSkpKSkpKSkpKSkpKSkpKSkpKSkpKSkpKSkpKSkpKSk="
+  addresses: ["10.77.0.1/32", "fd77::1/128"]
+  listen: "0.0.0.0:51820"
+  peers:
+    - public_key: "B6r/Pp/BZydVRPTDpqF82Dfy7G54zYpXsePfs8wDWnY="
+      allowed_ips: ["10.77.0.2/32", "fd77::2/128"]
+  inbound:
+    rules:
+      - masks: ["127.0.0.0/8", "::1/128", "169.254.0.0/16", "fe80::/10"]
+        action: block
+      - masks: ["0.0.0.0/0", "::/0"]
+        action: allow

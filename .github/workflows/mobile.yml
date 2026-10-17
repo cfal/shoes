@@ -102,6 +102,9 @@ jobs:
         working-directory: android
         run: gradle assembleRelease --no-daemon
 
+      - name: Verify AAR dependency notices
+        run: python3 scripts/check-release-notices.py android/build/outputs/aar/shoes-release.aar
+
       - name: Upload AAR
         uses: actions/upload-artifact@v4
         with:

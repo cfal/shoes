@@ -115,6 +115,10 @@ impl Drop for Session {
 }
 
 impl TunUdpManager {
+    pub(crate) fn destination_counter(&self) -> Arc<Budget> {
+        self.destination_slots.clone()
+    }
+
     /// Create a new TUN UDP manager.
     pub fn new(
         reader: UdpReader,

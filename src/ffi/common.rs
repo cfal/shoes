@@ -201,11 +201,15 @@ pub async fn start_from_config(
         info!("Loaded {} PEM files", pem_count);
     }
 
+    let mut validated = create_server_configs(configs)?;
+    #[cfg(unix)]
+    let wireguard = crate::wireguard::Prepared::new(&mut validated).await?;
     let crate::config::ValidatedConfigs {
         configs: validated_configs,
         dns_groups,
         global_limits,
-    } = create_server_configs(configs)?;
+        ..
+    } = validated;
     crate::resources::configure(global_limits)?;
     let _resource_reporter = crate::resources::ResourceReporter::start();
 
@@ -252,14 +256,30 @@ pub async fn start_from_config(
         std::io::Error::new(std::io::ErrorKind::InvalidData, "No TUN config found")
     })?;
 
+    #[cfg(unix)]
+    let mut wireguard_running = crate::wireguard::Running::default();
+    #[cfg(unix)]
+    if let Err(error) = wireguard
+        .start(&mut dns_registry, &mut wireguard_running)
+        .await
+    {
+        wireguard_running.stop().await;
+        return Err(error);
+    }
+
     // Start TCP servers (like mixed)
     let mut join_handles = ServerTasks(Vec::new());
 
     for server_config in server_configs {
         let resolver = dns_registry.get_for_server(server_config.dns.as_ref());
-        join_handles
-            .0
-            .extend(start_servers(Config::Server(server_config), resolver).await?);
+        match start_servers(Config::Server(server_config), resolver).await {
+            Ok(tasks) => join_handles.0.extend(tasks),
+            Err(error) => {
+                #[cfg(unix)]
+                wireguard_running.stop().await;
+                return Err(error);
+            }
+        }
     }
 
     // Run TUN server (blocks until shutdown). close_fd_on_drop = false because mobile owns the FD
@@ -276,6 +296,8 @@ pub async fn start_from_config(
 
     // Cleanup any servers when TUN stops
     drop(join_handles);
+    #[cfg(unix)]
+    wireguard_running.stop().await;
 
     result
 }

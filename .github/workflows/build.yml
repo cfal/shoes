@@ -133,8 +133,11 @@ jobs:
           fi
           
           # Create tarball
+          cp THIRD_PARTY_NOTICES.md artifacts/
+          cp -R licenses artifacts/
           cd artifacts
-          tar -czf ${{ github.event.repository.name }}-${{ matrix.target }}.tar.gz "${{ matrix.binary_name }}"
+          tar -czf ${{ github.event.repository.name }}-${{ matrix.target }}.tar.gz "${{ matrix.binary_name }}" THIRD_PARTY_NOTICES.md licenses
+          python3 ../scripts/check-release-notices.py ${{ github.event.repository.name }}-${{ matrix.target }}.tar.gz
           
           # Debug: show what files were created
           echo "Contents of artifacts directory:"

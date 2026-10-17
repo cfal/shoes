@@ -26,6 +26,7 @@ pub mod tls;
 pub mod transport;
 pub mod tun;
 pub mod vless;
+pub mod wireguard;
 pub mod xhttp;
 
 // Re-export all public types for convenience

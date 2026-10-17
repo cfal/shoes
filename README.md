@@ -31,6 +31,7 @@ All server protocols plus:
 - **XTLS Vision** (for VLESS)
 
 ### TUN/VPN Mode
+- **WireGuard endpoints** - Userspace TCP/UDP server and client using GotaTun, without root, an OS TUN, or host route changes (Unix only). See [WireGuard configuration](CONFIG.md#wireguard-endpoints).
 - **TUN device support** - Layer 3 VPN for transparent proxying
 - Supported platforms: Linux, Android, iOS
 
@@ -62,6 +63,10 @@ For advanced access control (IP allowlist/blocklists), see [tobaru](https://gith
 
 ## Installation
 
+Building Shoes requires Rust 1.95 or newer. Unix WireGuard builds include
+MPL-2.0-covered GotaTun code; binary and library distributors must retain
+[the dependency notices and corresponding source information](THIRD_PARTY_NOTICES.md).
+
 Precompiled binaries for x86_64 and Apple aarch64 are available on [Github Releases](https://github.com/cfal/shoes/releases).
 
 For the previously published release:
@@ -78,11 +83,16 @@ idle cancellation probes. The workspace patches cover direct and transitive
 dependencies, including DNS over HTTP/3. The experimental zero-copy change in
 [h3 #368](https://github.com/hyperium/h3/pull/368) is not included.
 
+The `nix` patch pins an [upstream commit](https://github.com/nix-rust/nix/commit/3eae6d68ec6382fef7b38cd58f97458e59a71af9)
+containing [nix #2821](https://github.com/nix-rust/nix/pull/2821) for iOS socket
+compatibility. Retain it until adopting a registry release containing that fix.
+
 GitHub releases and checkout builds retain these patches. Crates.io publishing
 remains disabled because Cargo removes workspace patches from published packages.
-Remove the patches and publishing guard only after adopting fixed registry
-versions that pass the H3 empty-DATA and idle-stream regressions. To install this
-revision from its checkout:
+Remove the H3 patches only after adopting fixed registry versions that pass the
+H3 empty-DATA and idle-stream regressions. Remove the publishing guard only when
+all workspace patches have been replaced with registry dependencies. To install
+this revision from its checkout:
 
 ```bash
 cargo install --path . --locked
@@ -92,6 +102,25 @@ After updating the H3 pins, run the empty-DATA and idle-stream regressions:
 
 ```sh
 CARGO_BUILD_JOBS=1 cargo test --locked --lib --features ffi h3_ -- --test-threads=1
+```
+
+### WireGuard Kernel Interoperability
+
+Linux kernel peer tests require kernel WireGuard support, network/PID namespaces,
+passwordless sudo, `ip`, `wg`, `unshare`, and `timeout`. They run both Shoes roles
+inside isolated namespaces without changing host routes. Coverage includes
+inner IPv4/IPv6 TCP and UDP, TCP half-close, PSK/no-PSK, MTUs 1280/1408, and VLESS
+chaining in both directions. Kernel handshake and byte counters verify that
+payloads actually cross WireGuard. Outer-chain cases require SOCKS -> VLESS before
+WireGuard, optionally with VLESS after it, and use an unreachable destination that
+only the outer proxy can translate, including IPv6 outer destinations. The 64-case
+matrix is supplemented by carrier outage/recovery, a real two-minute rekey with
+the same TCP flow, concurrent kernel peers, cross-peer source spoofing rejection,
+and wrong-PSK rejection/recovery. Missing prerequisites fail rather than skip.
+Set `SHOES_TEST_WG_BIN` to an absolute path to override `wg`.
+
+```sh
+CARGO_BUILD_JOBS=1 cargo test --locked --features privileged-tests --test privileged wireguard_kernel:: -- --test-threads=1
 ```
 
 ## Usage

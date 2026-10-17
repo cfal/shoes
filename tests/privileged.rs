@@ -7,3 +7,9 @@ mod tun;
 #[cfg(target_os = "linux")]
 #[path = "cases/privileged/tun_kernel.rs"]
 mod tun_kernel;
+#[cfg(target_os = "linux")]
+#[path = "cases/privileged/wireguard_kernel.rs"]
+mod wireguard_kernel;
+#[cfg(target_os = "linux")]
+#[path = "cases/wireguard_support.rs"]
+mod wireguard_support;

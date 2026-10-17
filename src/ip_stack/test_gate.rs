@@ -1,12 +1,12 @@
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::time::Duration;
 
-pub(super) struct TestGate {
+pub(crate) struct TestGate {
     entered: SyncSender<()>,
     resume: Receiver<()>,
 }
 
-pub(super) struct GateControl {
+pub(crate) struct GateControl {
     entered: Receiver<()>,
     resume: SyncSender<()>,
 }

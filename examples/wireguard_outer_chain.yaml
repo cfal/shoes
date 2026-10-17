@@ -1,0 +1,26 @@
+# Demonstration keys and credentials only. Replace them and both remote addresses.
+- wireguard: wg-out
+  private_key: "KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKio="
+  addresses: ["10.77.0.2/32", "fd77::2/128"]
+  mtu: 1280
+  outer_client_chain:
+    - address: "relay.example:443"
+      protocol:
+        type: tls
+        protocol:
+          type: vless
+          user_id: "b85798ef-e9dc-46a4-9a87-8da4499d36d0"
+          udp_enabled: true
+  peers:
+    - public_key: "F9firNML9eGdhhroCYjRf66PZi9dgLAFP2zHPNqx0mQ="
+      endpoint: "vpn.example:51820"
+      allowed_ips: ["0.0.0.0/0", "::/0"]
+      persistent_keepalive: 25
+
+- address: "0.0.0.0:1080"
+  protocol: {type: socks}
+  rules:
+    - masks: ["0.0.0.0/0", "::/0"]
+      action: allow
+      client_chain:
+        - protocol: {type: wireguard, endpoint: wg-out}

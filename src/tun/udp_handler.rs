@@ -220,17 +220,13 @@ pub fn build_udp_packet(
             PacketBuilder::ipv4(
                 src.ip().octets(),
                 dst.ip().octets(),
-                20, // TTL
+                64, // TTL matches the TCP stack for traffic routed beyond a tunnel peer.
             )
             .udp(src.port(), dst.port())
         }
         (SocketAddr::V6(src), SocketAddr::V6(dst)) => {
-            PacketBuilder::ipv6(
-                src.ip().octets(),
-                dst.ip().octets(),
-                20, // Hop limit
-            )
-            .udp(src.port(), dst.port())
+            PacketBuilder::ipv6(src.ip().octets(), dst.ip().octets(), 64)
+                .udp(src.port(), dst.port())
         }
         _ => {
             return Err(io::Error::new(
@@ -251,6 +247,24 @@ pub fn build_udp_packet(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn udp_packets_allow_routed_internet_paths() {
+        for (source, target) in [
+            ("10.77.0.2:1234", "198.18.0.1:53"),
+            ("[fd77::2]:1234", "[fd77::1]:53"),
+        ] {
+            let packet =
+                build_udp_packet(b"data", source.parse().unwrap(), target.parse().unwrap())
+                    .unwrap();
+            let hop_limit = if packet[0] >> 4 == 4 {
+                Ipv4Packet::new_checked(&*packet).unwrap().hop_limit()
+            } else {
+                Ipv6Packet::new_checked(&*packet).unwrap().hop_limit()
+            };
+            assert_eq!(hop_limit, 64);
+        }
+    }
 
     #[test]
     fn reader_skips_invalid_packets_before_pending_delivery_and_eof() {
