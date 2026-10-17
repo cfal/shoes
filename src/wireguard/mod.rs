@@ -73,6 +73,10 @@ impl Connector {
         };
         let addresses: Vec<_> = addresses
             .into_iter()
+            .map(|mut address| {
+                address.set_ip(address.ip().to_canonical());
+                address
+            })
             .filter(|address| self.reachable(*address))
             .collect();
         if addresses.is_empty() {

@@ -147,6 +147,79 @@ async fn wireguard_tcp_udp_both_families_empty_outer_and_reload_rebind() {
 }
 
 #[tokio::test]
+async fn wireguard_mapped_ipv4_destinations_use_the_ipv4_tunnel() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let reservation = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+        let mut configs = validate(&pair_config(reservation.local_addr().unwrap().port())).unwrap();
+        configs.wireguard_endpoints[1].addresses = vec!["10.77.0.2/32".into()];
+        configs.wireguard_endpoints[1].peers[0].allowed_ips = vec!["0.0.0.0/0".into()];
+        let prepared = Prepared::new(&mut configs).await.unwrap();
+        drop(reservation);
+        let mut running = Running::default();
+        prepared
+            .start(&mut DnsRegistry::new(), &mut running)
+            .await
+            .unwrap();
+        let (tcp, udp, _echoes) = echo_servers(false).await;
+        let mapped = |address: SocketAddr| {
+            SocketAddr::new("::ffff:127.0.0.1".parse().unwrap(), address.port())
+        };
+        check_echo(
+            prepared.endpoints[1].connector.as_ref(),
+            mapped(tcp),
+            mapped(udp),
+        )
+        .await;
+        running.stop().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wireguard_concurrent_tcp_transfers_preserve_all_data() {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let reservation = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+        let mut configs = validate(&pair_config(reservation.local_addr().unwrap().port())).unwrap();
+        let prepared = Prepared::new(&mut configs).await.unwrap();
+        drop(reservation);
+        let mut running = Running::default();
+        prepared
+            .start(&mut DnsRegistry::new(), &mut running)
+            .await
+            .unwrap();
+        let (tcp, _, _echoes) = echo_servers(false).await;
+        let mut flows = JoinSet::new();
+        for id in 0..16u8 {
+            let connector = prepared.endpoints[1].connector.clone();
+            flows.spawn(async move {
+                let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+                let target = NetLocation::from_ip_addr(tcp.ip(), tcp.port()).into();
+                let stream = connector.connect(&resolver, &target).await.unwrap();
+                let (mut read, mut write) = tokio::io::split(stream);
+                let payload = vec![id; 256 * 1024];
+                let mut response = vec![0; payload.len()];
+                let send = async {
+                    write.write_all(&payload).await.unwrap();
+                    write.shutdown().await.unwrap();
+                };
+                let receive = async {
+                    read.read_exact(&mut response).await.unwrap();
+                };
+                tokio::join!(send, receive);
+                assert_eq!(response, payload);
+            });
+        }
+        while let Some(result) = flows.join_next().await {
+            result.unwrap();
+        }
+        running.stop().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn wireguard_ipv6_outer_transport() {
     tokio::time::timeout(Duration::from_secs(10), async {
         let reservation = std::net::UdpSocket::bind("[::]:0").unwrap();

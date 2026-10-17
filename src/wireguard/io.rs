@@ -27,15 +27,11 @@ impl IpSend for IpSink {
             self.drops.fetch_add(1, Ordering::Relaxed);
             return Ok(());
         }
-        match self.sender.try_send(PacketBuffer::copy_from_slice(&packet)) {
-            Ok(()) => self.wake.notify(),
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                self.drops.fetch_add(1, Ordering::Relaxed);
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                return Err(io::ErrorKind::BrokenPipe.into());
-            }
-        }
+        self.sender
+            .send(PacketBuffer::copy_from_slice(&packet))
+            .await
+            .map_err(|_| io::ErrorKind::BrokenPipe)?;
+        self.wake.notify();
         Ok(())
     }
 }
@@ -237,6 +233,46 @@ impl UdpRecv for Udp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn decrypted_packets_wait_for_capacity_and_fail_only_when_closed() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let (wake, _wake_rx) = Wake::new().unwrap();
+        let drops = Arc::default();
+        let mut sink = IpSink {
+            sender,
+            wake,
+            mtu: 1408,
+            drops: Arc::clone(&drops),
+        };
+        let bytes = crate::tun::udp_handler::build_udp_packet(
+            b"packet",
+            "10.77.0.1:1".parse().unwrap(),
+            "10.77.0.2:2".parse().unwrap(),
+        )
+        .unwrap();
+        let pool: PacketBufPool = PacketBufPool::new(4);
+        sink.sender
+            .send(PacketBuffer::copy_from_slice(b"full"))
+            .await
+            .unwrap();
+        let packet = pool.get().overwrite_with(&*bytes).try_into_ip().unwrap();
+        {
+            let send = sink.send(packet);
+            tokio::pin!(send);
+            assert!(futures::poll!(&mut send).is_pending());
+            assert_eq!(&*receiver.recv().await.unwrap(), b"full");
+            send.await.unwrap();
+        }
+        assert_eq!(&*receiver.recv().await.unwrap(), &*bytes);
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
+        drop(receiver);
+        let packet = pool.get().overwrite_with(&*bytes).try_into_ip().unwrap();
+        assert_eq!(
+            sink.send(packet).await.unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
+    }
 
     #[tokio::test]
     async fn ipv4_fallback_rejects_ipv6_peers_before_activation() {
