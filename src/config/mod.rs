@@ -20,6 +20,7 @@ mod validate;
 pub use pem::convert_cert_paths;
 pub use types::*;
 pub use validate::{ValidatedConfigs, create_server_configs};
+pub(crate) use validate::{validate_client_vision_protocol, validate_server_vision};
 
 /// Loads configuration files from the provided paths.
 ///

@@ -25,6 +25,12 @@ const COMMAND_CONTINUE: u8 = 0x00;
 const COMMAND_END: u8 = 0x01;
 const COMMAND_DIRECT: u8 = 0x02;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VisionWriteErrorPolicy {
+    Legacy,
+    AcknowledgeAccepted,
+}
+
 /// Current operating mode of the VISION stream
 #[derive(Debug, PartialEq)]
 enum VisionMode {
@@ -48,6 +54,8 @@ impl std::fmt::Display for VisionMode {
 
 pub struct VisionStream<S> {
     tls: S,
+    write_error_policy: VisionWriteErrorPolicy,
+    write_error: Option<(io::ErrorKind, String)>,
 
     /// Current READ operating mode (independent from write mode)
     read_mode: VisionMode,
@@ -136,6 +144,31 @@ where
         Ok(Self::new_common(tls, user_uuid, true, false))
     }
 
+    pub(crate) fn with_write_error_policy(mut self, policy: VisionWriteErrorPolicy) -> Self {
+        self.write_error_policy = policy;
+        self
+    }
+
+    fn output_status(&self) -> io::Result<()> {
+        match &self.write_error {
+            Some((kind, message)) => Err(io::Error::new(*kind, message.clone())),
+            None => Ok(()),
+        }
+    }
+
+    fn fail_padded_write(&mut self, error: io::Error, accepted: usize) -> Poll<io::Result<usize>> {
+        if self.write_error_policy == VisionWriteErrorPolicy::Legacy {
+            return Poll::Ready(Err(error));
+        }
+        self.write_error = Some((error.kind(), error.to_string()));
+        self.inner_write_deframer.clear();
+        if accepted == 0 {
+            Poll::Ready(Err(error))
+        } else {
+            Poll::Ready(Ok(accepted))
+        }
+    }
+
     fn new_common(
         tls: S,
         user_uuid: [u8; 16],
@@ -144,6 +177,8 @@ where
     ) -> Self {
         Self {
             tls,
+            write_error_policy: VisionWriteErrorPolicy::Legacy,
+            write_error: None,
             read_mode: VisionMode::PaddingTls,
             write_mode: VisionMode::PaddingTls,
             inner_read_deframer: FuzzyTlsDeframer::new(),
@@ -508,8 +543,15 @@ where
                         };
 
                         self.queue_padded_write(&final_padded_packet);
-                        if command == COMMAND_DIRECT {
-                            self.switch_write_to_direct_mode()?;
+                        if command == COMMAND_DIRECT
+                            && let Err(error) = self.switch_write_to_direct_mode()
+                        {
+                            return self.fail_padded_write(
+                                error,
+                                processed_len
+                                    .saturating_sub(existing_inner_len)
+                                    .min(buf.len()),
+                            );
                         }
 
                         // this must be true because else we would have a successful next_record call on previous iteration
@@ -520,7 +562,14 @@ where
                             Poll::Ready(Ok(())) => {
                                 // Fully drained, continue
                             }
-                            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                            Poll::Ready(Err(e)) => {
+                                return self.fail_padded_write(
+                                    e,
+                                    processed_len
+                                        .saturating_sub(existing_inner_len)
+                                        .min(buf.len()),
+                                );
+                            }
                             Poll::Pending => {
                                 // Still draining
                             }
@@ -572,7 +621,14 @@ where
                         Poll::Ready(Ok(())) => {
                             // continue since it drained
                         }
-                        Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                        Poll::Ready(Err(e)) => {
+                            return self.fail_padded_write(
+                                e,
+                                processed_len
+                                    .saturating_sub(existing_inner_len)
+                                    .min(buf.len()),
+                            );
+                        }
                     }
                 }
                 Ok(DeframeResult::NeedData) => {
@@ -617,7 +673,14 @@ where
                         match self.drain_all_writes_padding(cx) {
                             Poll::Pending => {}
                             Poll::Ready(Ok(())) => {}
-                            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                            Poll::Ready(Err(e)) => {
+                                return self.fail_padded_write(
+                                    e,
+                                    processed_len
+                                        .saturating_sub(existing_inner_len)
+                                        .min(buf.len()),
+                                );
+                            }
                         }
 
                         // Continue processing
@@ -651,7 +714,14 @@ where
                             Poll::Ready(Ok(())) => {
                                 // Fully drained
                             }
-                            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                            Poll::Ready(Err(e)) => {
+                                return self.fail_padded_write(
+                                    e,
+                                    processed_len
+                                        .saturating_sub(existing_inner_len)
+                                        .min(buf.len()),
+                                );
+                            }
                             Poll::Pending => {
                                 // Still draining
                             }
@@ -701,7 +771,8 @@ where
                     match self.drain_all_writes_padding(cx) {
                         Poll::Pending => {}
                         Poll::Ready(Ok(())) => {}
-                        Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                        // The final END packet includes the entire unprocessed tail.
+                        Poll::Ready(Err(e)) => return self.fail_padded_write(e, buf.len()),
                     }
 
                     self.inner_write_deframer.clear();
@@ -753,6 +824,7 @@ impl<S: VisionTransport> AsyncWrite for VisionStream<S> {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
+        this.output_status()?;
         match this.write_mode {
             VisionMode::PaddingTls => this.poll_write_padding_tls(cx, buf),
             VisionMode::Tls | VisionMode::Direct => Pin::new(&mut this.tls).poll_write(cx, buf),
@@ -761,6 +833,7 @@ impl<S: VisionTransport> AsyncWrite for VisionStream<S> {
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
+        this.output_status()?;
         if this.write_mode == VisionMode::PaddingTls {
             ready!(this.drain_all_writes_padding(cx))?;
         }
@@ -779,7 +852,9 @@ impl<S: VisionTransport> crate::async_stream::AsyncPing for VisionStream<S> {
     }
 
     fn poll_write_ping(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
-        Pin::new(&mut self.get_mut().tls).poll_write_ping(cx)
+        let this = self.get_mut();
+        this.output_status()?;
+        Pin::new(&mut this.tls).poll_write_ping(cx)
     }
 }
 
@@ -787,6 +862,7 @@ impl<S: VisionTransport> AsyncStream for VisionStream<S> {
     #[cfg(target_os = "linux")]
     fn plain_tcp(&self) -> Option<&tokio::net::TcpStream> {
         if self.read_mode != VisionMode::Direct
+            || self.write_error.is_some()
             || self.write_mode != VisionMode::Direct
             || !self.pending_read.is_empty()
             || self.vless_response_pending
@@ -804,6 +880,7 @@ impl<S: VisionTransport> AsyncStream for VisionStream<S> {
 
 #[cfg(test)]
 mod tests {
+    mod native_errors;
     #[cfg(target_os = "linux")]
     mod splice;
 
@@ -1356,22 +1433,25 @@ mod tests {
         use crate::tcp::tcp_handler::TcpServerSetupResult;
 
         for backend in BACKENDS {
-            let (mut client, server) = connection_pair(backend);
-            let uuid = [7; 16];
-            let mut request = vec![0];
-            request.extend_from_slice(&uuid);
-            request.extend_from_slice(&[0, 2, 0, 53, 1, 127, 0, 0, 1]);
-            request.extend_from_slice(&1000u16.to_be_bytes());
-            request.extend_from_slice(&[42; 1000]);
-            let mut first = encrypt(&mut client, &request);
-            let second = encrypt(&mut client, b"\x00\x03two");
-            first.extend_from_slice(&second[..3]);
-            let io = ScriptedIo {
-                reads: VecDeque::from([first.into(), second[3..].to_vec().into()]),
-            };
-            let tls = CryptoTlsStream::new(io, server, Some(TlsDeframer::new()));
-            let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
-            let result =
+            for addon in [b"".as_slice(), b"\x0a\x10xtls-rprx-vision".as_slice()] {
+                let (mut client, server) = connection_pair(backend);
+                let uuid = [7; 16];
+                let mut request = vec![0];
+                request.extend_from_slice(&uuid);
+                request.push(addon.len() as u8);
+                request.extend_from_slice(addon);
+                request.extend_from_slice(&[2, 0, 53, 1, 127, 0, 0, 1]);
+                request.extend_from_slice(&1000u16.to_be_bytes());
+                request.extend_from_slice(&[42; 1000]);
+                let mut first = encrypt(&mut client, &request);
+                let second = encrypt(&mut client, b"\x00\x03two");
+                first.extend_from_slice(&second[..3]);
+                let io = ScriptedIo {
+                    reads: VecDeque::from([first.into(), second[3..].to_vec().into()]),
+                };
+                let tls = CryptoTlsStream::new(io, server, Some(TlsDeframer::new()));
+                let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+                let result =
                 super::super::vless_server_handler::setup_custom_tls_vision_vless_server_stream(
                     tls,
                     &uuid,
@@ -1382,18 +1462,25 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            let TcpServerSetupResult::BidirectionalUdp { mut stream, .. } = result else {
-                panic!("expected ordinary UDP on the Vision-enabled target");
-            };
-            for expected in [vec![42; 1000], b"two".to_vec()] {
-                let mut bytes = [0; 1024];
-                let mut buf = ReadBuf::new(&mut bytes);
-                futures::future::poll_fn(|cx| {
-                    Pin::new(&mut *stream).poll_read_message(cx, &mut buf)
-                })
-                .await
-                .unwrap();
-                assert_eq!(buf.filled(), expected);
+                let TcpServerSetupResult::BidirectionalUdp {
+                    mut stream,
+                    need_initial_flush,
+                    ..
+                } = result
+                else {
+                    panic!("expected ordinary UDP on the Vision-enabled target");
+                };
+                assert!(!need_initial_flush);
+                for expected in [vec![42; 1000], b"two".to_vec()] {
+                    let mut bytes = [0; 1024];
+                    let mut buf = ReadBuf::new(&mut bytes);
+                    futures::future::poll_fn(|cx| {
+                        Pin::new(&mut *stream).poll_read_message(cx, &mut buf)
+                    })
+                    .await
+                    .unwrap();
+                    assert_eq!(buf.filled(), expected);
+                }
             }
         }
     }

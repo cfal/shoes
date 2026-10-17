@@ -401,6 +401,20 @@ pub enum ClientProxyConfig {
     },
     Vless {
         user_id: String,
+        #[serde(
+            default,
+            skip_serializing_if = "super::vless::VlessEncryptionSetting::is_disabled"
+        )]
+        encryption: super::vless::VlessEncryptionSetting,
+        #[serde(
+            default,
+            rename = "decryption",
+            skip_serializing,
+            deserialize_with = "super::vless::reject_client_decryption"
+        )]
+        _invalid_decryption: (),
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        vision: bool,
         #[serde(default = "default_true", skip_serializing_if = "is_true")]
         udp_enabled: bool,
         /// H2MUX multiplexing configuration

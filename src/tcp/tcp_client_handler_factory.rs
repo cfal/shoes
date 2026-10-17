@@ -104,9 +104,29 @@ pub fn create_tcp_client_handler(
             user_id,
             udp_enabled,
             h2mux,
+            encryption,
+            vision,
+            ..
         } => {
-            let handler: Box<dyn TcpClientHandler> =
-                Box::new(VlessTcpClientHandler::new(&user_id, udp_enabled));
+            if vision && h2mux.is_some() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Native VLESS Vision does not support H2MUX",
+                ));
+            }
+            let encryption = if encryption.is_disabled() {
+                None
+            } else {
+                Some(crate::vless::encryption::ClientEncryption::new(
+                    encryption.as_str(),
+                )?)
+            };
+            let handler: Box<dyn TcpClientHandler> = Box::new(VlessTcpClientHandler::new(
+                &user_id,
+                udp_enabled,
+                encryption,
+                vision,
+            )?);
             if let Some(h2mux_config) = h2mux {
                 Box::new(H2MuxClientHandler::new(
                     Arc::from(handler),
@@ -146,6 +166,7 @@ pub fn create_tcp_client_handler(
                 vision,
             } = tls_client_config;
             key_exchange_groups.validate_vision(vision)?;
+            crate::config::validate_client_vision_protocol(vision, &protocol, "TLS")?;
 
             let sni_hostname = if sni_hostname.is_unspecified() {
                 if let Some(ref hostname) = default_sni_hostname {
@@ -190,7 +211,7 @@ pub fn create_tcp_client_handler(
                 let ClientProxyConfig::Vless {
                     user_id,
                     udp_enabled,
-                    h2mux: _, // h2mux not supported with vision
+                    ..
                 } = protocol.as_ref()
                 else {
                     // Validated when loading config
@@ -226,6 +247,7 @@ pub fn create_tcp_client_handler(
             vision,
             protocol,
         } => {
+            crate::config::validate_client_vision_protocol(vision, &protocol, "REALITY")?;
             let public_key_bytes =
                 crate::reality::decode_public_key(&public_key).map_err(std::io::Error::other)?;
             let mldsa65_verify = mldsa65_verify
@@ -248,7 +270,7 @@ pub fn create_tcp_client_handler(
                 let ClientProxyConfig::Vless {
                     user_id,
                     udp_enabled,
-                    h2mux: _, // h2mux not supported with vision
+                    ..
                 } = protocol.as_ref()
                 else {
                     unreachable!("Vision requires VLESS (should be validated during config load)")

@@ -886,7 +886,7 @@ fn validate_reality_server_short_ids(
 }
 
 /// Validates that Vision is only enabled when the inner protocol is VLESS (client-side)
-fn validate_client_vision_protocol(
+pub(crate) fn validate_client_vision_protocol(
     vision_enabled: bool,
     protocol: &ClientProxyConfig,
     config_type: &str,
@@ -896,6 +896,12 @@ fn validate_client_vision_protocol(
     }
 
     match protocol {
+        ClientProxyConfig::Vless { encryption, .. } if !encryption.is_disabled() => {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Native VLESS encryption requires outer TLS/REALITY vision: false; set vision: true on VLESS instead",
+            ))
+        }
         ClientProxyConfig::Vless { .. } => Ok(()),
         other_protocol => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -1042,8 +1048,30 @@ fn validate_client_proxy_config(
             parse_uuid(user_id)?;
             validate_vmess_cipher(cipher)?;
         }
-        ClientProxyConfig::Vless { user_id, .. } => {
+        ClientProxyConfig::Vless {
+            user_id,
+            encryption,
+            vision,
+            h2mux,
+            ..
+        } => {
             parse_uuid(user_id)?;
+            if encryption.is_disabled() {
+                if *vision {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "VLESS-level vision: true requires native encryption; for legacy Vision move vision: true to TLS/REALITY (older versions ignored it on VLESS)",
+                    ));
+                }
+            } else {
+                if *vision && h2mux.is_some() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "Native VLESS Vision does not support H2MUX",
+                    ));
+                }
+                crate::vless::encryption::ClientEncryption::new(encryption.as_str())?;
+            }
         }
         ClientProxyConfig::Snell {
             config: super::types::ShadowsocksConfig::Aead2022 { .. },
@@ -1192,7 +1220,18 @@ enum ServerProtocolContext {
     Quic,
 }
 
-fn validate_server_vision(vision: bool, protocol: &ServerProxyConfig) -> std::io::Result<()> {
+pub(crate) fn validate_server_vision(
+    vision: bool,
+    protocol: &ServerProxyConfig,
+) -> std::io::Result<()> {
+    if vision
+        && matches!(protocol, ServerProxyConfig::Vless { decryption, .. } if !decryption.is_disabled())
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Native VLESS decryption requires outer TLS/REALITY vision: false; set vision: true on VLESS instead",
+        ));
+    }
     if vision && !matches!(protocol, ServerProxyConfig::Vless { .. }) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -1316,8 +1355,34 @@ fn validate_server_proxy_config(
                  Configure it as the inner protocol of tls: or reality: targets.",
             ));
         }
-        ServerProxyConfig::Vless { user_id, .. } => {
+        ServerProxyConfig::Vless {
+            user_id,
+            decryption,
+            vision,
+            encryption_limits,
+            fallback,
+            ..
+        } => {
             parse_uuid(user_id)?;
+            if decryption.is_disabled() {
+                if *vision || encryption_limits.is_some() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "VLESS-level vision and encryption_limits require native decryption; for legacy Vision move vision: true to TLS/REALITY (older versions ignored it on VLESS)",
+                    ));
+                }
+            } else {
+                if fallback.is_some() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "Native VLESS decryption does not support fallback",
+                    ));
+                }
+                crate::vless::encryption::ServerEncryption::new(
+                    decryption.as_str(),
+                    encryption_limits.unwrap_or_default(),
+                )?;
+            }
         }
         ServerProxyConfig::Vmess {
             user_id, cipher, ..
@@ -1924,6 +1989,90 @@ fn expand_selection(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_vless_configuration_rejects_ambiguous_vision_and_secrets() {
+        use super::*;
+        use serde_json::json;
+
+        const KEY: &str = "CQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let client = json!({
+            "type": "vless", "user_id": "550e8400-e29b-41d4-a716-446655440000",
+            "encryption": format!("mlkem768x25519plus.native.0rtt.{KEY}"), "vision": true,
+        });
+        let server = json!({
+            "type": "vless", "user_id": "550e8400-e29b-41d4-a716-446655440000",
+            "decryption": format!("mlkem768x25519plus.native.600s.{KEY}"), "vision": true,
+        });
+        let mut client_config = serde_json::from_value(client.clone()).unwrap();
+        validate_client_proxy_config(&mut client_config, &HashMap::new(), None).unwrap();
+        for outer in ["TLS", "REALITY"] {
+            let error = validate_client_vision_protocol(true, &client_config, outer).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("outer TLS/REALITY vision: false")
+            );
+            assert!(!error.to_string().contains(KEY));
+            validate_client_vision_protocol(false, &client_config, outer).unwrap();
+        }
+        let validate_server = |value: serde_json::Value| {
+            let mut config = serde_json::from_value(value).unwrap();
+            validate_server_proxy_config(
+                &mut config,
+                &HashMap::new(),
+                &HashMap::new(),
+                &HashMap::new(),
+                ServerProtocolContext::Stream,
+                GlobalLimits::default(),
+            )?;
+            Ok::<_, std::io::Error>(config)
+        };
+        let server_config = validate_server(server.clone()).unwrap();
+        assert!(
+            validate_server_vision(true, &server_config)
+                .unwrap_err()
+                .to_string()
+                .contains("outer TLS/REALITY vision: false")
+        );
+        validate_server_vision(false, &server_config).unwrap();
+        for (key, value) in [
+            ("encryption", json!("none")),
+            ("encryption", json!("invalid-secret-do-not-log")),
+            ("h2mux", json!({})),
+        ] {
+            let mut value_config = client.clone();
+            value_config[key] = value;
+            let mut config = serde_json::from_value(value_config).unwrap();
+            let error =
+                validate_client_proxy_config(&mut config, &HashMap::new(), None).unwrap_err();
+            assert!(!error.to_string().contains("do-not-log"));
+            assert!(!format!("{config:?}").contains("do-not-log"));
+        }
+        for (key, value) in [
+            ("decryption", json!("none")),
+            ("decryption", json!("invalid-secret-do-not-log")),
+            ("fallback", json!("127.0.0.1:80")),
+            ("encryption_limits", json!({"max_replays": 0})),
+        ] {
+            let mut config = server.clone();
+            config[key] = value;
+            let error = validate_server(config).unwrap_err();
+            assert!(!error.to_string().contains("do-not-log"));
+        }
+        for disabled in ["", "none"] {
+            let mut config = client.clone();
+            config["encryption"] = json!(disabled);
+            config["vision"] = json!(false);
+            let mut config = serde_json::from_value(config).unwrap();
+            validate_client_proxy_config(&mut config, &HashMap::new(), None).unwrap();
+            validate_client_vision_protocol(true, &config, "TLS").unwrap();
+            let mut config = server.clone();
+            config["decryption"] = json!(disabled);
+            config["vision"] = json!(false);
+            validate_server_vision(true, &validate_server(config).unwrap()).unwrap();
+        }
+    }
+
     use super::*;
     use crate::config::pem::convert_cert_paths;
     use crate::dns::IpStrategy;
