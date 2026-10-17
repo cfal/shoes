@@ -231,9 +231,9 @@ async fn wireguard_mapped_ipv4_outer_endpoint_uses_ipv4_transport() {
             let reservation = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
             let port = reservation.local_addr().unwrap().port();
             let mut configs = validate(&pair_config(port)).unwrap();
-            configs.wireguard_endpoints[1].listen = listen.map(|address| address.parse().unwrap());
-            configs.wireguard_endpoints[1].peers[0].endpoint =
-                Some(format!("[::ffff:127.0.0.1]:{port}"));
+            let client = &mut configs.wireguard_endpoints[1];
+            client.listen = listen.map(|address| address.parse().unwrap());
+            client.peers[0].endpoint = Some(format!("[::ffff:127.0.0.1]:{port}"));
             let prepared = Prepared::new(&mut configs).await.unwrap();
             assert_eq!(
                 prepared.endpoints[1].peers[0].endpoint,
@@ -332,30 +332,39 @@ async fn wireguard_dual_stack_connect_falls_back_without_waiting_for_blackholed_
 }
 
 #[tokio::test]
-async fn wireguard_ipv4_bind_selects_a_compatible_hostname_address() {
+async fn wireguard_bind_selects_a_compatible_hostname_address() {
     let mut configs = validate(&pair_config(51820)).unwrap();
-    configs.wireguard_endpoints[1].listen = Some("0.0.0.0:0".parse().unwrap());
     configs.wireguard_endpoints[1].peers[0].endpoint = Some("localhost:51820".into());
-    let prepared = Prepared::new(&mut configs).await.unwrap();
-    assert!(prepared.endpoints[1].peers[0].endpoint.unwrap().is_ipv4());
-    configs.wireguard_endpoints[1].peers[0].endpoint = Some("[::1]:51820".into());
-    assert!(configs.wireguard_endpoints[1].validate().is_err());
-    configs.wireguard_endpoints[1].listen = Some("[::1]:0".parse().unwrap());
-    configs.wireguard_endpoints[1].peers[0].endpoint = Some("localhost:51820".into());
-    let prepared = Prepared::new(&mut configs).await.unwrap();
-    assert!(prepared.endpoints[1].peers[0].endpoint.unwrap().is_ipv6());
-    configs.wireguard_endpoints[1].peers[0].endpoint = Some("127.0.0.1:51820".into());
-    assert!(configs.wireguard_endpoints[1].validate().is_err());
-    configs.wireguard_endpoints[1].peers[0].endpoint = Some("[::ffff:127.0.0.1]:51820".into());
-    assert!(configs.wireguard_endpoints[1].validate().is_err());
-    configs.wireguard_endpoints[1].listen = Some("[::ffff:127.0.0.1]:0".parse().unwrap());
-    assert!(configs.wireguard_endpoints[1].validate().is_ok());
-    configs.wireguard_endpoints[1].peers[0].endpoint = Some("[::1]:51820".into());
-    assert!(configs.wireguard_endpoints[1].validate().is_err());
-    configs.wireguard_endpoints[1].listen = Some("[::]:0".parse().unwrap());
-    assert!(configs.wireguard_endpoints[1].validate().is_ok());
-    configs.wireguard_endpoints[1].peers[0].endpoint = Some("127.0.0.1:51820".into());
-    assert!(configs.wireguard_endpoints[1].validate().is_ok());
+    for listen in ["0.0.0.0:0", "[::1]:0"] {
+        let listen: SocketAddr = listen.parse().unwrap();
+        configs.wireguard_endpoints[1].listen = Some(listen);
+        let prepared = Prepared::new(&mut configs).await.unwrap();
+        let endpoint = prepared.endpoints[1].peers[0].endpoint.unwrap();
+        assert_eq!(endpoint.is_ipv4(), listen.is_ipv4(), "listen: {listen}");
+    }
+}
+
+#[test]
+fn wireguard_bind_validates_peer_address_families() {
+    let mut configs = validate(&pair_config(51820)).unwrap();
+    let client = &mut configs.wireguard_endpoints[1];
+    for (listen, endpoint, compatible) in [
+        ("0.0.0.0:0", "[::1]:51820", false),
+        ("[::1]:0", "127.0.0.1:51820", false),
+        ("[::1]:0", "[::ffff:127.0.0.1]:51820", false),
+        ("[::ffff:127.0.0.1]:0", "[::ffff:127.0.0.1]:51820", true),
+        ("[::ffff:127.0.0.1]:0", "[::1]:51820", false),
+        ("[::]:0", "[::1]:51820", true),
+        ("[::]:0", "127.0.0.1:51820", true),
+    ] {
+        client.listen = Some(listen.parse().unwrap());
+        client.peers[0].endpoint = Some(endpoint.into());
+        assert_eq!(
+            client.validate().is_ok(),
+            compatible,
+            "listen: {listen}, endpoint: {endpoint}"
+        );
+    }
 }
 
 #[tokio::test]

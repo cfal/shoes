@@ -150,18 +150,18 @@ impl Prepared {
                     .then_some(peer_config.persistent_keepalive);
                 if let Some(endpoint) = &peer_config.endpoint {
                     let address = NetLocation::from_str(endpoint, None)?;
-                    peer.endpoint = Some(
-                        tokio::time::timeout(
-                            std::time::Duration::from_secs(10),
-                            resolve_addresses(&resolver, &address),
+                    let addresses = tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        resolve_addresses(&resolver, &address),
+                    )
+                    .await
+                    .map_err(|_| {
+                        stdio::Error::new(
+                            stdio::ErrorKind::TimedOut,
+                            "WireGuard endpoint DNS timed out",
                         )
-                        .await
-                        .map_err(|_| {
-                            stdio::Error::new(
-                                stdio::ErrorKind::TimedOut,
-                                "WireGuard endpoint DNS timed out",
-                            )
-                        })??
+                    })??;
+                    let selected_endpoint = addresses
                         .into_iter()
                         .map(|mut address| {
                             address.set_ip(address.ip().to_canonical());
@@ -173,8 +173,8 @@ impl Prepared {
                                 stdio::ErrorKind::AddrNotAvailable,
                                 "WireGuard peer has no endpoint compatible with the listen address",
                             )
-                        })?,
-                    );
+                        })?;
+                    peer.endpoint = Some(selected_endpoint);
                 }
                 peers.push(peer);
             }
