@@ -201,7 +201,6 @@ impl UdpRecv for Udp {
     type RecvManyBuf = ();
     async fn recv_from(&mut self, pool: &mut PacketBufPool) -> io::Result<(Packet, SocketAddr)> {
         let mut packet = pool.get();
-        packet.buf_mut().resize(65536, 0);
         let (len, mut source) = self
             .0
             .socket
