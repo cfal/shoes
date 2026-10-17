@@ -215,7 +215,9 @@ lifetime plus the 120-second retention grace.
 At 75% session/replay occupancy, new connections receive zero-lifetime tickets
 and remain usable through fresh handshakes. At the hard replay limit, the whole
 requesting ticket is invalidated; that resumption fails, and the next independent
-connection refreshes its ticket. Duplicate resumes never repeat destination I/O.
+connection performs a fresh handshake. New resumable tickets are issued only
+once both session and replay occupancy fall below 75%. Duplicate resumes never
+repeat destination I/O.
 Ticket state is shared across addresses of one logical listener, not across
 different protocol targets. Reloads reset ticket state; existing streams retain
 their cryptographic state. TLS/REALITY/QUIC resumption is independent.

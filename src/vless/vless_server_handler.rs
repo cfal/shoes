@@ -198,9 +198,14 @@ impl TcpServerHandler for VlessTcpServerHandler {
 
         let addon_length = stream_reader.read_u8(&mut server_stream).await?;
         if addon_length > 0 {
+            let message = if self.encryption.is_some() {
+                "VLESS addons not supported in current configuration, set vision: true on this VLESS server for VISION support"
+            } else {
+                "VLESS addons not supported in current configuration, use TLS protocol config for VISION support"
+            };
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "VLESS addons not supported in current configuration, use TLS protocol config for VISION support",
+                message,
             ));
         }
 

@@ -71,6 +71,61 @@ fn request(port: u16, command: u8, flow: bool) -> Vec<u8> {
 }
 
 #[tokio::test]
+async fn non_vision_server_rejects_flow_with_backend_specific_guidance() {
+    use crate::{
+        async_stream::AsyncStream,
+        client_proxy_selector::ClientProxySelector,
+        tcp::tcp_handler::TcpServerHandler,
+        vless::{encryption::ServerEncryption, vless_server_handler::VlessTcpServerHandler},
+    };
+
+    for native in [false, true] {
+        let (encryption, decryption) = fixture_settings("native", false, &[32]);
+        let server_encryption = native
+            .then(|| Arc::new(ServerEncryption::new(&decryption, Default::default()).unwrap()));
+        let handler = VlessTcpServerHandler::new(
+            UUID,
+            true,
+            Arc::new(ClientProxySelector::new(Vec::new())),
+            Arc::new(NativeResolver::new()),
+            None,
+            server_encryption,
+            false,
+        )
+        .unwrap();
+        let (client, server) = tokio::io::duplex(8192);
+        let (result, _client) = timeout(LIMIT, async {
+            tokio::join!(handler.setup_server_stream(Box::new(server)), async {
+                let mut client: Box<dyn AsyncStream> = if native {
+                    Box::new(
+                        ClientEncryption::new(&encryption)
+                            .unwrap()
+                            .handshake(client)
+                            .await
+                            .unwrap(),
+                    )
+                } else {
+                    Box::new(client)
+                };
+                client.write_all(&request(443, 1, true)).await.unwrap();
+                client.flush().await.unwrap();
+                client
+            })
+        })
+        .await
+        .unwrap();
+        let error = result.err().expect("non-Vision server accepted a flow");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        let guidance = if native {
+            "set vision: true on this VLESS server"
+        } else {
+            "use TLS protocol config"
+        };
+        assert!(error.to_string().contains(guidance), "{error}");
+    }
+}
+
+#[tokio::test]
 async fn raw_quic_bind_addresses_share_tickets_and_capacity() {
     let (encryption, decryption) = fixture_settings("random", true, &[32]);
     let client = ClientEncryption::new(&encryption).unwrap();
