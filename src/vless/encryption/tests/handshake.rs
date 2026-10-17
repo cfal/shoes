@@ -166,11 +166,12 @@ async fn invalid_chain_link_and_wrong_private_key_reject_before_server_flight() 
 #[tokio::test]
 async fn cancellation_before_authenticating_server_flight_never_publishes_a_ticket() {
     for cancel_client in [false, true] {
-        for &field in if cancel_client {
+        let fields = if cancel_client {
             &SERVER_FIELDS[..]
         } else {
             &CLIENT_FIELDS[..2]
-        } {
+        };
+        for &field in fields {
             let (c, s) = fixture_settings("native", true, &[32]);
             let client = ClientEncryption::new(&c).unwrap();
             let server = ServerEncryption::new(&s, Default::default()).unwrap();
@@ -188,11 +189,16 @@ async fn cancellation_before_authenticating_server_flight_never_publishes_a_tick
                     stream.read_u8().await
                 };
                 let server_run = server.handshake(right);
+                let exchange = async {
+                    let _ = tokio::join!(client_run, server_run);
+                };
                 tokio::select! {
                     _ = notify.notified() => {},
-                    _ = async { let _ = tokio::join!(client_run, server_run); } => panic!("exchange unexpectedly completed"),
+                    _ = exchange => panic!("exchange unexpectedly completed"),
                 }
-            }).await.unwrap();
+            })
+            .await
+            .unwrap();
             assert!(
                 client.cache.snapshot(Instant::now()).is_none(),
                 "cancel_client={cancel_client}, field={field}"
@@ -220,14 +226,20 @@ async fn cancelling_server_padding_read_preserves_authenticated_client_ticket() 
                 stream.read_u8().await
             };
             let server_run = server.handshake(right);
+            let exchange = async {
+                let _ = tokio::join!(client_run, server_run);
+            };
+            let both_stopped = async {
+                client_stopped.notified().await;
+                server_stopped.notified().await;
+            };
             tokio::select! {
-                _ = async {
-                    client_stopped.notified().await;
-                    server_stopped.notified().await;
-                } => {},
-                _ = async { let _ = tokio::join!(client_run, server_run); } => panic!("exchange unexpectedly completed"),
+                _ = both_stopped => {},
+                _ = exchange => panic!("exchange unexpectedly completed"),
             }
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
         assert!(
             client.cache.snapshot(Instant::now()).is_some(),
             "field={field}"
