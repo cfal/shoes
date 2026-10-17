@@ -27,6 +27,7 @@ impl Serialize for WireguardKey {
 
 impl<'de> Deserialize<'de> for WireguardKey {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // Parses through Value to keep rejected key material out of deserialization errors.
         let value = serde_yaml::Value::deserialize(deserializer)?;
         let bytes = value.as_str().and_then(|text| STANDARD.decode(text).ok());
         bytes

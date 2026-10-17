@@ -268,17 +268,16 @@ pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Valida
         dns_groups: final_dns_groups,
         wireguard_endpoints,
     };
-    let mut check_reference = |client: &mut ClientConfig| {
-        if let ClientProxyConfig::Wireguard(reference) = &client.protocol
-            && !endpoint_names.contains(&reference.endpoint)
-        {
-            return Err(super::types::wireguard::invalid(format!(
-                "unknown WireGuard endpoint: {}",
-                reference.endpoint
-            )));
-        }
-        Ok(())
-    };
+    validate_wireguard_references(&mut validated, &mut client_groups, &endpoint_names)?;
+    order_wireguard_endpoints(&mut validated.wireguard_endpoints)?;
+    Ok(validated)
+}
+
+fn validate_wireguard_references(
+    validated: &mut ValidatedConfigs,
+    client_groups: &mut HashMap<String, Vec<ClientConfig>>,
+    endpoint_names: &HashSet<String>,
+) -> std::io::Result<()> {
     let tunnel_dns: HashSet<_> = validated
         .dns_groups
         .iter()
@@ -303,14 +302,23 @@ pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Valida
             }
         }
     }
+    let mut check_reference = |client: &mut ClientConfig| {
+        if let ClientProxyConfig::Wireguard(reference) = &client.protocol
+            && !endpoint_names.contains(&reference.endpoint)
+        {
+            return Err(super::types::wireguard::invalid(format!(
+                "unknown WireGuard endpoint: {}",
+                reference.endpoint
+            )));
+        }
+        Ok(())
+    };
     for group in client_groups.values_mut() {
         for client in group {
             check_reference(client)?;
         }
     }
-    validated.visit_clients(&mut check_reference)?;
-    order_wireguard_endpoints(&mut validated.wireguard_endpoints)?;
-    Ok(validated)
+    validated.visit_clients(&mut check_reference)
 }
 
 fn order_wireguard_endpoints(
@@ -1109,14 +1117,16 @@ fn validate_client_proxy_structure(config: &ClientProxyConfig) -> std::io::Resul
         _ => None,
     };
     if let Some(inner) = inner {
-        if inner.is_direct() || inner.is_wireguard() {
+        if inner.is_direct() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                if inner.is_direct() {
-                    "direct cannot be used as an inner proxy protocol"
-                } else {
-                    "WireGuard cannot be used as an inner proxy protocol"
-                },
+                "direct cannot be used as an inner proxy protocol",
+            ));
+        }
+        if inner.is_wireguard() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "WireGuard cannot be used as an inner proxy protocol",
             ));
         }
         validate_client_proxy_structure(inner)?;
