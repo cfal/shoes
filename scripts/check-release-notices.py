@@ -11,11 +11,11 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def expected_notices():
-    paths = [ROOT / name for name in (
+    names = (
         "THIRD_PARTY_NOTICES.md", "licenses/dependencies.txt",
         "licenses/MPL-2.0.txt", "licenses/gotatun-CLOUDFLARE.txt",
-    )]
-    return {path.relative_to(ROOT).as_posix(): path.read_bytes() for path in paths}
+    )
+    return {name: (ROOT / name).read_bytes() for name in names}
 
 
 def check(artifact):
