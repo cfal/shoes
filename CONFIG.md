@@ -45,8 +45,9 @@ Each peer requires `public_key` and nonempty `allowed_ips`. Optional fields
 are `pre_shared_key`, `endpoint: "host:port"`, and
 `persistent_keepalive` in seconds (zero disables it). Omit `endpoint` for a
 peer that initiates toward this server. Hostnames are resolved through native
-bootstrap DNS during preparation and refreshed on reload. Authenticated
-WireGuard roaming can update the active peer address without a reload in direct mode.
+bootstrap DNS during preparation and refreshed on reload. Direct mode selects
+the first resolved address compatible with the bound socket at startup.
+Authenticated WireGuard roaming can update the active peer address without a reload in direct mode.
 Overlapping allowed prefixes between different peers, duplicate keys, and
 self-peering are rejected. Assign each client distinct tunnel addresses.
 

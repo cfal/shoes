@@ -118,9 +118,14 @@ impl SocketConnector for Connector {
     }
 }
 
+struct PreparedPeer {
+    config: Peer,
+    endpoints: Vec<SocketAddr>,
+}
+
 struct PreparedEndpoint {
     config: WireguardConfig,
-    peers: Vec<Peer>,
+    peers: Vec<PreparedPeer>,
     connector: Arc<Connector>,
     global_limits: crate::config::GlobalLimits,
 }
@@ -148,6 +153,7 @@ impl Prepared {
                 peer.preshared_key = peer_config.pre_shared_key.as_ref().map(|key| key.0);
                 peer.keepalive = (peer_config.persistent_keepalive != 0)
                     .then_some(peer_config.persistent_keepalive);
+                let mut endpoints = Vec::new();
                 if let Some(endpoint) = &peer_config.endpoint {
                     let address = NetLocation::from_str(endpoint, None)?;
                     let addresses = tokio::time::timeout(
@@ -161,22 +167,25 @@ impl Prepared {
                             "WireGuard endpoint DNS timed out",
                         )
                     })??;
-                    let selected_endpoint = addresses
+                    endpoints = addresses
                         .into_iter()
                         .map(|mut address| {
                             address.set_ip(address.ip().to_canonical());
                             address
                         })
-                        .find(|address| config.can_reach_endpoint(*address))
-                        .ok_or_else(|| {
-                            stdio::Error::new(
-                                stdio::ErrorKind::AddrNotAvailable,
-                                "WireGuard peer has no endpoint compatible with the listen address",
-                            )
-                        })?;
-                    peer.endpoint = Some(selected_endpoint);
+                        .filter(|address| config.can_reach_endpoint(*address))
+                        .collect();
+                    if endpoints.is_empty() {
+                        return Err(stdio::Error::new(
+                            stdio::ErrorKind::AddrNotAvailable,
+                            "WireGuard peer has no endpoint compatible with the listen address",
+                        ));
+                    }
                 }
-                peers.push(peer);
+                peers.push(PreparedPeer {
+                    config: peer,
+                    endpoints,
+                });
             }
             let addresses = config
                 .addresses
@@ -194,7 +203,7 @@ impl Prepared {
                 addresses,
                 routes: peers
                     .iter()
-                    .flat_map(|peer| peer.allowed_ips.iter().copied())
+                    .flat_map(|peer| peer.config.allowed_ips.iter().copied())
                     .collect(),
             });
             connectors.insert(config.wireguard.clone(), connector.clone());
@@ -262,6 +271,33 @@ impl Running {
 }
 
 impl PreparedEndpoint {
+    fn peers_for_socket(&self, local: Option<SocketAddr>) -> stdio::Result<Vec<Peer>> {
+        self.peers
+            .iter()
+            .map(|prepared| {
+                let mut peer = prepared.config.clone();
+                if !prepared.endpoints.is_empty() {
+                    // Candidates match the configured bind, but the socket may fall back to IPv4.
+                    let endpoint = prepared
+                        .endpoints
+                        .iter()
+                        .copied()
+                        .find(|address| {
+                            local.is_none_or(|local| local.is_ipv6() || address.is_ipv4())
+                        })
+                        .ok_or_else(|| {
+                            stdio::Error::new(
+                                stdio::ErrorKind::AddrNotAvailable,
+                                "WireGuard peer has no endpoint compatible with the bound socket",
+                            )
+                        })?;
+                    peer.endpoint = Some(endpoint);
+                }
+                Ok(peer)
+            })
+            .collect()
+    }
+
     fn build_outer_chain(
         &self,
         resolver: &Arc<dyn Resolver>,
@@ -311,35 +347,34 @@ impl PreparedEndpoint {
         )?;
         let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
         // Rebuilding after preflight gives each start fresh pool indices and handler lifetimes.
-        let (udp, released) = if let Some(chain) = self.build_outer_chain(&resolver)? {
+        let (udp, released, peers) = if let Some(chain) = self.build_outer_chain(&resolver)? {
+            let peers = self.peers_for_socket(None)?;
             let (sender, receiver, released) = detour::start(
                 config.wireguard.clone(),
                 chain,
                 resolver,
-                self.peers.iter().map(|peer| peer.endpoint.unwrap()),
+                peers.iter().map(|peer| peer.endpoint.unwrap()),
                 stack.drops.clone(),
             );
             log::info!(
                 "WireGuard endpoint {} using outer_client_chain",
                 config.wireguard
             );
-            (io::Factory::detour(sender, receiver), released)
+            (io::Factory::detour(sender, receiver), released, peers)
         } else {
-            let (udp, released, local) = io::Factory::new(
-                config.listen,
-                config.bind_interface.clone(),
-                self.peers.iter().filter_map(|peer| peer.endpoint),
-            )?;
+            let (udp, released, local) =
+                io::Factory::new(config.listen, config.bind_interface.clone())?;
+            let peers = self.peers_for_socket(Some(local))?;
             log::info!(
                 "WireGuard endpoint {} listening on {local}",
                 config.wireguard
             );
-            (udp, released)
+            (udp, released, peers)
         };
         let mut device = DeviceBuilder::new()
             .with_udp(udp)
             .with_private_key(StaticSecret::from(config.private_key.0))
-            .with_peers(self.peers.clone())
+            .with_peers(peers)
             .with_ip_pair(
                 io::IpSink {
                     sender: stack.input.clone(),

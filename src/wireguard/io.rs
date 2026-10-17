@@ -93,7 +93,6 @@ impl Factory {
     pub fn new(
         listen: Option<SocketAddr>,
         interface: Option<String>,
-        endpoints: impl Iterator<Item = SocketAddr>,
     ) -> io::Result<(Self, oneshot::Receiver<()>, SocketAddr)> {
         let socket = if let Some(listen) = listen {
             let socket = crate::socket_util::new_outbound_socket2_udp_socket(
@@ -105,22 +104,7 @@ impl Factory {
         } else {
             crate::socket_util::new_hostname_udp_socket(interface)?
         };
-        Self::from_socket(socket, endpoints)
-    }
-
-    fn from_socket(
-        socket: tokio::net::UdpSocket,
-        endpoints: impl Iterator<Item = SocketAddr>,
-    ) -> io::Result<(Self, oneshot::Receiver<()>, SocketAddr)> {
         let local = socket.local_addr()?;
-        for endpoint in endpoints {
-            if local.is_ipv4() && endpoint.is_ipv6() {
-                return Err(io::Error::new(
-                    io::ErrorKind::AddrNotAvailable,
-                    format!("WireGuard IPv4 socket cannot reach peer endpoint {endpoint}"),
-                ));
-            }
-        }
         let (closed, released) = oneshot::channel();
         let udp = Udp(Arc::new(Socket {
             socket: Some(socket),
@@ -272,21 +256,5 @@ mod tests {
             sink.send(packet).await.unwrap_err().kind(),
             io::ErrorKind::BrokenPipe
         );
-    }
-
-    #[tokio::test]
-    async fn ipv4_fallback_rejects_ipv6_peers_before_activation() {
-        for (peer, compatible) in [("127.0.0.1:51820", true), ("[::1]:51820", false)] {
-            let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await.unwrap();
-            let result = Factory::from_socket(socket, std::iter::once(peer.parse().unwrap()));
-            if compatible {
-                assert!(result.is_ok());
-            } else {
-                assert_eq!(
-                    result.err().unwrap().kind(),
-                    io::ErrorKind::AddrNotAvailable
-                );
-            }
-        }
     }
 }

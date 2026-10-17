@@ -236,8 +236,8 @@ async fn wireguard_mapped_ipv4_outer_endpoint_uses_ipv4_transport() {
             client.peers[0].endpoint = Some(format!("[::ffff:127.0.0.1]:{port}"));
             let prepared = Prepared::new(&mut configs).await.unwrap();
             assert_eq!(
-                prepared.endpoints[1].peers[0].endpoint,
-                Some(SocketAddr::from(([127, 0, 0, 1], port)))
+                prepared.endpoints[1].peers[0].endpoints,
+                vec![SocketAddr::from(([127, 0, 0, 1], port))]
             );
             drop(reservation);
             let mut running = Running::default();
@@ -339,9 +339,45 @@ async fn wireguard_bind_selects_a_compatible_hostname_address() {
         let listen: SocketAddr = listen.parse().unwrap();
         configs.wireguard_endpoints[1].listen = Some(listen);
         let prepared = Prepared::new(&mut configs).await.unwrap();
-        let endpoint = prepared.endpoints[1].peers[0].endpoint.unwrap();
-        assert_eq!(endpoint.is_ipv4(), listen.is_ipv4(), "listen: {listen}");
+        for endpoint in &prepared.endpoints[1].peers[0].endpoints {
+            assert_eq!(endpoint.is_ipv4(), listen.is_ipv4(), "listen: {listen}");
+        }
     }
+}
+
+#[tokio::test]
+async fn wireguard_ipv4_fallback_selects_a_compatible_resolved_peer() {
+    let mut configs = validate(&pair_config(51820)).unwrap();
+    let mut prepared = Prepared::new(&mut configs).await.unwrap();
+    let (udp, released, local) =
+        io::Factory::new(Some("0.0.0.0:0".parse().unwrap()), None).unwrap();
+    assert!(local.is_ipv4());
+    let ipv6: SocketAddr = "[::1]:51820".parse().unwrap();
+    let ipv4: SocketAddr = "127.0.0.1:51820".parse().unwrap();
+    let client = &mut prepared.endpoints[1];
+    assert!(client.config.listen.is_none());
+    client.peers[0].endpoints = vec![ipv6, ipv4];
+    assert_eq!(
+        client.peers_for_socket(None).unwrap()[0].endpoint,
+        Some(ipv6)
+    );
+    assert_eq!(
+        client.peers_for_socket(Some(local)).unwrap()[0].endpoint,
+        Some(ipv4)
+    );
+    assert_eq!(client.peers[0].endpoints, vec![ipv6, ipv4]);
+    client.peers[0].endpoints = vec![ipv6];
+    assert_eq!(
+        client.peers_for_socket(Some(local)).unwrap_err().kind(),
+        stdio::ErrorKind::AddrNotAvailable,
+    );
+    assert!(
+        prepared.endpoints[0].peers_for_socket(Some(local)).unwrap()[0]
+            .endpoint
+            .is_none()
+    );
+    drop(udp);
+    released.await.unwrap();
 }
 
 #[test]
