@@ -9,7 +9,10 @@ tasks.register<Sync>("dependencyNotices") {
     into(layout.buildDirectory.dir("generated/notices/META-INF/shoes"))
 }
 
-android.sourceSets.getByName("main").resources.srcDir(layout.buildDirectory.dir("generated/notices"))
+// AGP 9 rejects Provider values in SourceSet configuration.
+android.sourceSets.getByName("main").resources.srcDir(
+    layout.buildDirectory.dir("generated/notices").get().asFile,
+)
 tasks.named("preBuild").configure { dependsOn("dependencyNotices") }
 
 android {
