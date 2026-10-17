@@ -51,6 +51,12 @@ pub fn create_tcp_client_handler(
                 "XHTTP requires a connector-level carrier dialer",
             ));
         }
+        ClientProxyConfig::Wireguard(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "WireGuard is a network connector and is only supported at hop 0",
+            ));
+        }
         ClientProxyConfig::Direct => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,

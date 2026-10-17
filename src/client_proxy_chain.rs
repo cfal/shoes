@@ -40,6 +40,7 @@ pub enum InitialHopEntry {
     /// Direct connection - socket only, no protocol setup.
     /// Connects directly to the next hop's proxy or final destination.
     Direct(Arc<dyn SocketConnector>),
+    Wireguard(Arc<dyn SocketConnector>),
 
     /// Proxy connection - socket + protocol setup paired together.
     /// Socket connects to proxy_location, then protocol wraps the stream.
@@ -53,6 +54,7 @@ impl std::fmt::Debug for InitialHopEntry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             InitialHopEntry::Direct(socket) => f.debug_tuple("Direct").field(socket).finish(),
+            InitialHopEntry::Wireguard(socket) => f.debug_tuple("Wireguard").field(socket).finish(),
             InitialHopEntry::Proxy { socket, proxy } => f
                 .debug_struct("Proxy")
                 .field("socket", socket)
@@ -66,7 +68,7 @@ impl InitialHopEntry {
     /// Returns true if this entry supports UDP.
     pub fn supports_udp(&self) -> bool {
         match self {
-            InitialHopEntry::Direct(_) => true, // Direct always supports UDP
+            InitialHopEntry::Direct(_) | InitialHopEntry::Wireguard(_) => true,
             InitialHopEntry::Proxy { proxy, .. } => proxy.supports_udp_over_tcp(),
         }
     }
@@ -155,9 +157,9 @@ impl ClientProxyChain {
             .collect();
         SelectedRoute {
             socket: match self.initial_hop[initial_index].as_ref() {
-                InitialHopEntry::Direct(socket) | InitialHopEntry::Proxy { socket, .. } => {
-                    socket.clone()
-                }
+                InitialHopEntry::Direct(socket)
+                | InitialHopEntry::Wireguard(socket)
+                | InitialHopEntry::Proxy { socket, .. } => socket.clone(),
             },
             initial: Some(self.initial_hop[initial_index].clone()),
             subsequent,
@@ -257,7 +259,7 @@ impl ClientProxyChain {
             .first()
             .and_then(|entry| match entry.as_ref() {
                 InitialHopEntry::Direct(socket) => socket.bind_interface(),
-                InitialHopEntry::Proxy { .. } => None,
+                InitialHopEntry::Proxy { .. } | InitialHopEntry::Wireguard(_) => None,
             })
     }
 
@@ -320,10 +322,10 @@ impl ClientProxyChain {
 
         // Connect based on initial hop type
         let mut result = match entry {
-            InitialHopEntry::Direct(socket) => {
+            InitialHopEntry::Direct(socket) | InitialHopEntry::Wireguard(socket) => {
                 // Socket connects to first subsequent proxy (or final target)
                 debug!(
-                    "Initial hop: Direct -> {}",
+                    "Initial hop: {entry:?} -> {}",
                     first_subsequent_target.location()
                 );
                 let stream = socket.connect(resolver, &first_subsequent_target).await?;
@@ -447,8 +449,8 @@ impl ClientProxyChain {
             );
 
             match entry {
-                InitialHopEntry::Direct(socket) => {
-                    debug!("Chain UDP: Direct connection (native UDP)");
+                InitialHopEntry::Direct(socket) | InitialHopEntry::Wireguard(socket) => {
+                    debug!("Chain UDP: {entry:?}");
                     socket.connect_udp_bidirectional(resolver, target).await
                 }
                 InitialHopEntry::Proxy { socket, proxy } => {
@@ -501,7 +503,7 @@ impl ClientProxyChain {
 
             // Build the chain: initial -> intermediates -> final (UDP)
             match entry {
-                InitialHopEntry::Direct(socket) => {
+                InitialHopEntry::Direct(socket) | InitialHopEntry::Wireguard(socket) => {
                     // Determine first target after initial hop
                     let first_target: ResolvedLocation =
                         if let Some(first) = intermediate_proxies.first() {

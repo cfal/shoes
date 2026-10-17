@@ -123,6 +123,8 @@ pub mod tun;
 
 #[cfg(unix)]
 pub(crate) mod ip_stack;
+#[cfg(unix)]
+pub(crate) mod wireguard;
 
 /// FFI bindings for mobile platforms.
 #[cfg(any(target_os = "android", target_os = "ios", feature = "ffi"))]

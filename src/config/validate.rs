@@ -28,6 +28,7 @@ pub struct ValidatedConfigs {
     pub configs: Vec<Config>,
     /// Expanded DNS groups in topological order (bootstrap deps first).
     pub dns_groups: Vec<ExpandedDnsGroup>,
+    pub wireguard_endpoints: Vec<super::types::wireguard::WireguardConfig>,
 }
 
 /// Validates configs and returns startable server configs with expanded DNS groups.
@@ -70,6 +71,8 @@ pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Valida
 
     let mut server_configs: Vec<ServerConfig> = vec![];
     let mut tun_configs: Vec<TunConfig> = vec![];
+    let mut wireguard_endpoints = Vec::new();
+    let mut endpoint_names = HashSet::new();
     let mut named_pems: HashMap<String, String> = HashMap::new();
     let mut dns_groups: HashMap<String, DnsConfigGroup> = HashMap::new();
 
@@ -111,6 +114,15 @@ pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Valida
             }
             Config::TunServer(tun_config) => {
                 tun_configs.push(tun_config);
+            }
+            Config::Wireguard(endpoint) => {
+                endpoint.validate()?;
+                if !endpoint_names.insert(endpoint.wireguard.clone()) {
+                    return Err(super::types::wireguard::invalid(
+                        "duplicate WireGuard endpoint name",
+                    ));
+                }
+                wireguard_endpoints.push(endpoint);
             }
             Config::NamedPem(pem) => {
                 let pem_data = match pem.source {
@@ -160,6 +172,11 @@ pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Valida
     for config in tun_configs.iter_mut() {
         extract_inline_dns(&mut config.dns, &mut dns_groups, &mut inline_dns_counter)?;
     }
+    for endpoint in &mut wireguard_endpoints {
+        if let Some(inbound) = &mut endpoint.inbound {
+            extract_inline_dns(&mut inbound.dns, &mut dns_groups, &mut inline_dns_counter)?;
+        }
+    }
 
     // Expand DNS group composition references for ALL groups (named + inline).
     let expanded_dns_groups = expand_dns_groups_composition(dns_groups)?;
@@ -206,15 +223,86 @@ pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Valida
         validate_dns_group_ref(&config.dns, &group_names)?;
     }
 
+    for endpoint in &mut wireguard_endpoints {
+        if let Some(inbound) = &mut endpoint.inbound {
+            ConfigSelection::replace_none_or_some_groups(&mut inbound.rules, &rule_groups)?;
+            if inbound.rules.is_empty() {
+                return Err(super::types::wireguard::invalid(
+                    "WireGuard inbound requires nonempty rules",
+                ));
+            }
+            for rule in inbound.rules.iter_mut() {
+                validate_rule_config(
+                    rule.unwrap_config_mut(),
+                    &client_groups,
+                    &named_pems,
+                    global_limits,
+                )?;
+            }
+            validate_dns_group_ref(&inbound.dns, &group_names)?;
+        }
+    }
+
     // Combine into Config list (only Server and TunServer variants)
     let mut result: Vec<Config> = server_configs.into_iter().map(Config::Server).collect();
     result.extend(tun_configs.into_iter().map(Config::TunServer));
 
-    Ok(ValidatedConfigs {
+    let mut validated = ValidatedConfigs {
         global_limits,
         configs: result,
         dns_groups: final_dns_groups,
-    })
+        wireguard_endpoints,
+    };
+    let mut check_reference = |client: &mut ClientConfig| {
+        if let ClientProxyConfig::Wireguard(reference) = &client.protocol
+            && !endpoint_names.contains(&reference.endpoint)
+        {
+            return Err(super::types::wireguard::invalid(format!(
+                "unknown WireGuard endpoint: {}",
+                reference.endpoint
+            )));
+        }
+        Ok(())
+    };
+    let tunnel_dns: HashSet<_> = validated
+        .dns_groups
+        .iter()
+        .filter(|group| {
+            group.specs.iter().any(|spec| {
+                spec.client_chains.iter().any(|chain| {
+                    chain.hops.iter().any(|hop| match hop {
+                        ClientChainHop::Single(selection) => {
+                            selection.clone().unwrap_config().protocol.is_wireguard()
+                        }
+                        ClientChainHop::Pool(selections) => selections.iter().any(|selection| {
+                            selection.clone().unwrap_config().protocol.is_wireguard()
+                        }),
+                    })
+                })
+            })
+        })
+        .map(|group| group.name.as_str())
+        .collect();
+    for group in &validated.dns_groups {
+        for spec in &group.specs {
+            if spec
+                .bootstrap_url
+                .as_deref()
+                .is_some_and(|name| tunnel_dns.contains(name))
+            {
+                return Err(super::types::wireguard::invalid(
+                    "DNS bootstrap cannot depend on a WireGuard-routed group",
+                ));
+            }
+        }
+    }
+    for group in client_groups.values_mut() {
+        for client in group {
+            check_reference(client)?;
+        }
+    }
+    validated.visit_clients(&mut check_reference)?;
+    Ok(validated)
 }
 
 /// Resolves client group references using topological sort.
@@ -562,6 +650,7 @@ fn expand_dns_specs(
                 validate_client_chain_hop(hop, client_groups, named_pems, global_limits)?;
             }
             expand_client_chain(&mut chain.hops, client_groups)?;
+            validate_direct_connector_positions(&chain.hops, 0)?;
             expanded_chains.push(chain);
         }
 
@@ -592,6 +681,22 @@ fn expand_dns_specs(
                     _ => {}
                 }
             }
+        }
+
+        let uses_wireguard = expanded_chains.iter().any(|chain| {
+            chain.hops.iter().any(|hop| match hop {
+                ClientChainHop::Single(selection) => {
+                    selection.clone().unwrap_config().protocol.is_wireguard()
+                }
+                ClientChainHop::Pool(selections) => selections
+                    .iter()
+                    .any(|selection| selection.clone().unwrap_config().protocol.is_wireguard()),
+            })
+        });
+        if uses_wireguard && (parsed_url.has_hostname() || spec.bootstrap_url().is_some()) {
+            return Err(super::types::wireguard::invalid(
+                "WireGuard DNS requires a literal upstream IP and no bootstrap_url",
+            ));
         }
 
         // Validate bootstrap_url
@@ -941,10 +1046,14 @@ fn validate_client_proxy_structure(config: &ClientProxyConfig) -> std::io::Resul
         _ => None,
     };
     if let Some(inner) = inner {
-        if inner.is_direct() {
+        if inner.is_direct() || inner.is_wireguard() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "direct cannot be used as an inner proxy protocol",
+                if inner.is_direct() {
+                    "direct cannot be used as an inner proxy protocol"
+                } else {
+                    "WireGuard cannot be used as an inner proxy protocol"
+                },
             ));
         }
         validate_client_proxy_structure(inner)?;
@@ -958,6 +1067,17 @@ fn validate_client_config(
     global_limits: GlobalLimits,
 ) -> std::io::Result<()> {
     client_config.validate_quic_key_exchange(true)?;
+    if client_config.protocol.is_wireguard()
+        && (client_config.address != ClientConfig::default().address
+            || client_config.bind_interface.is_one()
+            || client_config.transport != Transport::Tcp
+            || client_config.tcp_settings.is_some()
+            || client_config.quic_settings.is_some())
+    {
+        return Err(super::types::wireguard::invalid(
+            "WireGuard references cannot set address, bind_interface, transport, or socket settings",
+        ));
+    }
     if client_config.transport != Transport::Tcp && client_config.tcp_settings.is_some() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -1806,6 +1926,19 @@ fn validate_direct_connector_positions(
         if hop_index == 0 {
             // Direct connectors are allowed at hop 0
             continue;
+        }
+
+        let wireguard = |selection: &ConfigSelection<ClientConfig>| {
+            matches!(selection,
+            ConfigSelection::Config(config) if config.protocol.is_wireguard())
+        };
+        if match hop {
+            ClientChainHop::Single(selection) => wireguard(selection),
+            ClientChainHop::Pool(selections) => selections.iter().any(wireguard),
+        } {
+            return Err(super::types::wireguard::invalid(
+                "WireGuard is only supported at hop 0",
+            ));
         }
 
         let unsupported_h3 = |selection: &ConfigSelection<ClientConfig>| {

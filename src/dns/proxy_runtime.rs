@@ -146,8 +146,15 @@ impl RuntimeProvider for ProxyRuntimeProvider {
         _server_addr: SocketAddr,
     ) -> Pin<Box<dyn Send + Future<Output = Result<Self::Udp, io::Error>>>> {
         let bind_interface = self.bind_interface.clone();
+        let direct = self.chain_group.is_direct_only();
 
         Box::pin(async move {
+            if !direct {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "UDP DNS requires a direct chain",
+                ));
+            }
             let socket = crate::socket_util::new_outbound_socket2_udp_socket(
                 local_addr.is_ipv6(),
                 bind_interface,
@@ -158,7 +165,9 @@ impl RuntimeProvider for ProxyRuntimeProvider {
     }
 
     fn quic_binder(&self) -> Option<&dyn QuicSocketBinder> {
-        Some(&self.quic_binder)
+        self.chain_group
+            .is_direct_only()
+            .then_some(&self.quic_binder as &dyn QuicSocketBinder)
     }
 }
 

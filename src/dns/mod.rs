@@ -19,3 +19,5 @@ mod proxy_runtime;
 #[allow(unused_imports)]
 pub use builder::{DnsRegistry, build_dns_registry, build_dns_registry_with_limits};
 pub use parsed::{IpStrategy, ParsedDnsUrl};
+#[cfg(all(test, unix))]
+pub(crate) use proxy_runtime::ProxyRuntimeProvider;

@@ -31,9 +31,9 @@ pub(crate) struct UdpControl {
 }
 
 impl UdpControl {
-    pub fn receive(&mut self, packet: PacketBuffer) {
+    pub fn receive(&mut self, packet: PacketBuffer) -> bool {
         if self.closed || self.incoming.len() == 8 {
-            return;
+            return false;
         }
         if let Some(permit) = self.budget.acquire(packet.len()) {
             self.incoming.push_back(Datagram {
@@ -43,7 +43,9 @@ impl UdpControl {
             if let Some(waker) = self.reader.take() {
                 waker.wake();
             }
+            return true;
         }
+        false
     }
     pub fn close(&mut self) {
         self.closed = true;

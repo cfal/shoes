@@ -3,6 +3,7 @@ name = "shoes"
 version = "0.3.3"
 publish = false # Cargo strips fork patches from crates.io packages.
 edition = "2024"
+rust-version = "1.95"
 autotests = false
 license = "MIT"
 description = "A multi-protocol proxy server."
@@ -153,6 +154,10 @@ serde_json = "*"
 shoes-test-support = { path = "tests/support" }
 tempfile = "*"
 tokio-rustls = "*"
+
+[target.'cfg(unix)'.dependencies]
+gotatun = { version = "=0.10.1", default-features = false, features = ["device", "aws-lc-rs"] }
+ipnetwork = "0.21"
 
 # jemalloc for better memory performance (not supported on Windows MSVC, iOS, or Android)
 [target.'cfg(not(any(target_env = "msvc", target_os = "ios", target_os = "android")))'.dependencies]

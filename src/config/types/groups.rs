@@ -155,6 +155,7 @@ pub enum Config {
     /// TUN device server - accepts IP packets from a TUN device.
     /// This is separate from Server because TUN doesn't use bind_location or transport.
     TunServer(TunConfig),
+    Wireguard(super::wireguard::WireguardConfig),
     ClientConfigGroup(ClientConfigGroup),
     RuleConfigGroup(RuleConfigGroup),
     DnsConfigGroup(DnsConfigGroup),
@@ -194,7 +195,11 @@ impl<'de> serde::de::Deserialize<'de> for Config {
         let is_tun_config = has_device_name || has_device_fd;
 
         // Try to determine which variant based on fields
-        if map.contains_key(Value::String("global_limits".to_string())) {
+        if map.contains_key(Value::String("wireguard".to_string())) {
+            serde_yaml::from_value(value)
+                .map(Config::Wireguard)
+                .map_err(|e| Error::custom(format!("invalid WireGuard endpoint: {e}")))
+        } else if map.contains_key(Value::String("global_limits".to_string())) {
             #[derive(Deserialize)]
             #[serde(deny_unknown_fields)]
             struct GlobalLimitsEntry {
@@ -266,6 +271,7 @@ impl serde::ser::Serialize for Config {
             }
             Config::Server(server) => server.serialize(serializer),
             Config::TunServer(tun) => tun.serialize(serializer),
+            Config::Wireguard(endpoint) => endpoint.serialize(serializer),
             Config::ClientConfigGroup(group) => group.serialize(serializer),
             Config::RuleConfigGroup(group) => group.serialize(serializer),
             Config::DnsConfigGroup(group) => group.serialize(serializer),

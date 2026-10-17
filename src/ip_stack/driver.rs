@@ -19,7 +19,7 @@ use std::{
     net::{IpAddr, SocketAddr},
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     thread,
     time::Duration,
@@ -94,6 +94,13 @@ pub(crate) struct PacketStack {
     pub replies: mpsc::Sender<PacketBuffer>,
     pub done: oneshot::Receiver<()>,
     pub drops: Arc<AtomicU64>,
+    pub counts: Arc<FlowCounts>,
+}
+
+#[derive(Default)]
+pub(crate) struct FlowCounts {
+    pub tcp: AtomicUsize,
+    pub outbound_udp: AtomicUsize,
 }
 
 impl Drop for PacketStack {
@@ -103,6 +110,8 @@ impl Drop for PacketStack {
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+        self.counts.tcp.store(0, Ordering::Relaxed);
+        self.counts.outbound_udp.store(0, Ordering::Relaxed);
     }
 }
 
@@ -117,6 +126,7 @@ impl PacketStack {
         let (wake, wake_rx) = Wake::new()?;
         let running = Arc::new(AtomicBool::new(true));
         let drops = Arc::new(AtomicU64::new(0));
+        let counts = Arc::new(FlowCounts::default());
         let (input, input_rx) = mpsc::channel(QUEUE_CAPACITY);
         let (output_tx, output) = mpsc::channel(QUEUE_CAPACITY);
         let (tcp_tx, tcp) = mpsc::channel(QUEUE_CAPACITY);
@@ -135,6 +145,7 @@ impl PacketStack {
             mtu: mtu as usize,
             drops: drops.clone(),
         };
+        let worker_counts = counts.clone();
         let thread = thread::Builder::new()
             .name("shoes-wireguard-stack".into())
             .spawn(move || {
@@ -146,8 +157,19 @@ impl PacketStack {
                 }
                 let _stop = Stop(running.clone());
                 run(
-                    device, addresses, inbound, limits, running, wake, wake_rx, input_rx,
-                    replies_rx, command_rx, tcp_tx, udp_tx,
+                    device,
+                    addresses,
+                    inbound,
+                    limits,
+                    running,
+                    wake,
+                    wake_rx,
+                    input_rx,
+                    replies_rx,
+                    command_rx,
+                    tcp_tx,
+                    udp_tx,
+                    worker_counts,
                 );
                 let _ = done_tx.send(());
             })?;
@@ -161,6 +183,7 @@ impl PacketStack {
             replies,
             done,
             drops,
+            counts,
         })
     }
 }
@@ -310,6 +333,7 @@ fn run(
     mut commands: mpsc::Receiver<Command>,
     accepted: mpsc::Sender<AcceptedTcp>,
     inbound_udp: mpsc::Sender<PacketBuffer>,
+    counts: Arc<FlowCounts>,
 ) {
     let mut config = Config::new(HardwareAddress::Ip);
     config.random_seed = rand::random();
@@ -476,10 +500,12 @@ fn run(
                             40
                         };
                         packet.retain_range(offset + 8..length);
-                        control.receive(packet);
+                        if !control.receive(packet) {
+                            device.drops.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
-                } else if inbound {
-                    let _ = inbound_udp.try_send(packet);
+                } else if inbound && inbound_udp.try_send(packet).is_err() {
+                    device.drops.fetch_add(1, Ordering::Relaxed);
                 }
                 continue;
             }
@@ -591,6 +617,8 @@ fn run(
                 || socket.state() != State::Closed && entry.control.is_abandoned();
             true
         });
+        counts.tcp.store(tcp.len(), Ordering::Relaxed);
+        counts.outbound_udp.store(udp.len(), Ordering::Relaxed);
         if !running.load(Ordering::Acquire) {
             break;
         }

@@ -183,6 +183,45 @@ fn shutdown_during_wake_acknowledgment_never_parks_the_worker() {
 }
 
 #[tokio::test]
+async fn udp_receive_saturation_is_bounded_and_counted() {
+    use std::sync::atomic::Ordering;
+
+    tokio::time::timeout(Duration::from_secs(3), async {
+        let stack = stack(false, "10.77.0.2");
+        let remote = "10.77.0.1:53".parse().unwrap();
+        let mut stream = stack.handle.open_udp(remote).await.unwrap();
+        let local = stream.control.lock().local;
+        for byte in 0..32 {
+            stack
+                .input
+                .send(crate::tun::udp_handler::build_udp_packet(&[byte], remote, local).unwrap())
+                .await
+                .unwrap();
+            stack.handle.wake.notify();
+        }
+        while stack.drops.load(Ordering::Relaxed) != 24
+            || stack.counts.outbound_udp.load(Ordering::Relaxed) != 1
+        {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(stack.counts.outbound_udp.load(Ordering::Relaxed), 1);
+        for byte in 0..8 {
+            assert_eq!(read_udp(&mut stream).await.unwrap(), [byte]);
+        }
+        drop(stream);
+        while stack.counts.outbound_udp.load(Ordering::Relaxed) != 0 {
+            tokio::task::yield_now().await;
+        }
+        let counts = stack.counts.clone();
+        drop(stack);
+        assert_eq!(counts.tcp.load(Ordering::Relaxed), 0);
+        assert_eq!(counts.outbound_udp.load(Ordering::Relaxed), 0);
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn udp_admission_and_remote_tuple_isolation() {
     tokio::time::timeout(Duration::from_secs(3), async {
         let mut stack = stack(false, "10.77.0.2");

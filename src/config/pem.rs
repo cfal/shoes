@@ -78,6 +78,16 @@ pub async fn convert_cert_paths(all_configs: Vec<Config>) -> std::io::Result<(Ve
         );
     }
 
+    for config in &mut other_configs {
+        if let Config::Wireguard(endpoint) = config
+            && let Some(inbound) = &mut endpoint.inbound
+        {
+            for rule in inbound.rules.iter_mut() {
+                gather_pem_file_paths_from_rule(rule, &path_pem_configs, &mut unknown_pem_paths);
+            }
+        }
+    }
+
     let mut updated_configs = vec![];
 
     updated_configs.append(&mut data_configs);

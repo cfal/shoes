@@ -77,6 +77,15 @@ fn build_client_proxy_chain_with_limits(
     let initial_hop: Vec<InitialHopEntry> = hops[0]
         .iter()
         .map(|config| {
+            if let crate::config::ClientProxyConfig::Wireguard(reference) = &config.protocol {
+                let connector = reference.connector.clone().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::NotConnected,
+                        "WireGuard endpoint registry has not been prepared",
+                    )
+                })?;
+                return Ok(InitialHopEntry::Wireguard(connector));
+            }
             // Find the first proxy address for QUIC socket configuration
             let target_address = find_first_proxy_address(&hops, config);
 

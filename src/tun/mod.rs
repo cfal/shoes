@@ -33,7 +33,7 @@ use crate::ip_stack::{packet, tcp_conn, wake};
 mod tcp_stack_direct;
 mod tun_server;
 pub(crate) mod udp_handler;
-mod udp_manager;
+pub(crate) mod udp_manager;
 
 #[cfg(test)]
 use crate::ip_stack::test_gate;

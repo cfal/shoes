@@ -61,6 +61,8 @@ mod uuid_util;
 mod vless;
 mod vmess;
 mod websocket;
+#[cfg(unix)]
+mod wireguard;
 mod xhttp;
 mod xudp;
 
