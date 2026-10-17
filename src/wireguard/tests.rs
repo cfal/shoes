@@ -483,6 +483,7 @@ fn wireguard_validation_rejects_unsafe_or_ambiguous_configs() {
         base.replace("wireguard: client", "wireguard: server"),
         base.replace("['10.77.0.1/32', 'fd77::1/128']", "[]"),
         base.replace("10.77.0.1/32", "255.255.255.255/32"),
+        base.replace("fd77::1/128", "::ffff:10.77.0.9/128"),
         base.replace(
             "allowed_ips: ['10.77.0.2/32', 'fd77::2/128']",
             "allowed_ips: []",

@@ -163,6 +163,11 @@ impl WireguardConfig {
                 let network: IpNetwork = address
                     .parse()
                     .map_err(|_| invalid("invalid WireGuard local CIDR"))?;
+                if network.ip().to_canonical() != network.ip() {
+                    return Err(invalid(
+                        "WireGuard local addresses must not be IPv4-mapped IPv6",
+                    ));
+                }
                 if !families.insert(network.is_ipv4())
                     || !smoltcp::wire::IpAddress::from(network.ip()).is_unicast()
                 {
