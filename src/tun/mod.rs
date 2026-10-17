@@ -337,7 +337,7 @@ pub(crate) async fn handle_tcp_connection(
 /// - Keys sessions by local (app) address, not by destination
 /// - Stores the return address in each session
 /// - Routes responses using the stored address (no NAT table lookup)
-pub(crate) async fn handle_udp_packets(
+async fn handle_udp_packets(
     from_stack_rx: mpsc::Receiver<PacketBuffer>,
     to_stack_tx: mpsc::Sender<PacketBuffer>,
     proxy_selector: Arc<ClientProxySelector>,

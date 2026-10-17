@@ -5,6 +5,7 @@ use std::{
 };
 
 const BUFFER_POOL_MAX_SIZE: usize = 64;
+// Leaves room for TUN framing and offload headers alongside the IP packet.
 const BUFFER_POOL_MAX_CAPACITY: usize = 65_535 + 16;
 static BUFFER_POOL: LazyLock<Mutex<Vec<Vec<u8>>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 

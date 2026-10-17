@@ -257,8 +257,17 @@ fn now() -> Instant {
     std::time::Instant::now().into()
 }
 
+struct PacketInfo {
+    protocol: IpProtocol,
+    source: SocketAddr,
+    target: SocketAddr,
+    syn: bool,
+    transport_offset: usize,
+    length: usize,
+}
+
 /// Rejects fragments and extensions before interpreting any transport header.
-fn packet_info(packet: &[u8]) -> Option<(IpProtocol, SocketAddr, SocketAddr, bool, usize)> {
+fn packet_info(packet: &[u8]) -> Option<PacketInfo> {
     let (protocol, src, dst, payload, offset) = match packet.first()? >> 4 {
         4 => {
             let ip = Ipv4Packet::new_checked(packet).ok()?;
@@ -310,13 +319,14 @@ fn packet_info(packet: &[u8]) -> Option<(IpProtocol, SocketAddr, SocketAddr, boo
         }
         _ => return None,
     };
-    Some((
+    Some(PacketInfo {
         protocol,
-        SocketAddr::new(src, sport),
-        SocketAddr::new(dst, dport),
+        source: SocketAddr::new(src, sport),
+        target: SocketAddr::new(dst, dport),
         syn,
-        offset + length,
-    ))
+        transport_offset: offset,
+        length: offset + length,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -481,7 +491,7 @@ fn run(
                 break;
             };
             work += 1;
-            let Some((protocol, src, dst, syn, length)) = packet_info(&packet) else {
+            let Some(info) = packet_info(&packet) else {
                 device.drops.fetch_add(1, Ordering::Relaxed);
                 continue;
             };
@@ -489,17 +499,12 @@ fn run(
                 device.drops.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
-            packet.retain_range(0..length);
-            if protocol == IpProtocol::Udp {
-                if let Some(entry) = udp.get(&dst) {
+            packet.retain_range(0..info.length);
+            if info.protocol == IpProtocol::Udp {
+                if let Some(entry) = udp.get(&info.target) {
                     let mut control = entry.0.lock();
-                    if control.remote == src {
-                        let offset = if src.is_ipv4() {
-                            (packet[0] as usize & 15) * 4
-                        } else {
-                            40
-                        };
-                        packet.retain_range(offset + 8..length);
+                    if control.remote == info.source {
+                        packet.retain_range(info.transport_offset + 8..info.length);
                         if !control.receive(packet) {
                             device.drops.fetch_add(1, Ordering::Relaxed);
                         }
@@ -511,13 +516,13 @@ fn run(
             }
             let known = tcp
                 .values()
-                .any(|entry| entry.remote == src && entry.local == dst);
+                .any(|entry| entry.remote == info.source && entry.local == info.target);
             if !known {
                 if !inbound
-                    || !syn
+                    || !info.syn
                     || tcp
                         .values()
-                        .any(|entry| entry.outbound && entry.local == dst)
+                        .any(|entry| entry.outbound && entry.local == info.target)
                 {
                     continue;
                 }
@@ -528,7 +533,7 @@ fn run(
                     continue;
                 }
                 let mut socket = super::tcp_socket(limits.tcp_buffer_size);
-                if socket.listen(dst).is_err() {
+                if socket.listen(info.target).is_err() {
                     continue;
                 }
                 let control = Arc::new(TcpConnectionControl::new(
@@ -539,8 +544,8 @@ fn run(
                 if accepted
                     .try_send(AcceptedTcp {
                         connection,
-                        source: src,
-                        target: dst,
+                        source: info.source,
+                        target: info.target,
                     })
                     .is_err()
                 {
@@ -550,8 +555,8 @@ fn run(
                     sockets.add(socket),
                     TcpEntry {
                         control,
-                        remote: src,
-                        local: dst,
+                        remote: info.source,
+                        local: info.target,
                         outbound: false,
                         pending: None,
                     },
@@ -568,7 +573,7 @@ fn run(
                     socket.abort();
                 } else if socket.state() == State::Established || socket.state() == State::CloseWait
                 {
-                    socket.set_timeout(Some(smoltcp::time::Duration::from_secs(7200)));
+                    socket.set_timeout(Some(super::TCP_PEER_SILENCE_TIMEOUT));
                     let (result, connection) = entry.pending.take().unwrap();
                     let _ = result.send(Ok(connection));
                 } else if socket.state() == State::Closed {
@@ -636,6 +641,42 @@ fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classification_tracks_transport_offset_and_length() {
+        for (source, target, offset) in [
+            ("10.0.0.1:1", "10.0.0.2:2", 20),
+            ("[fd77::1]:1", "[fd77::2]:2", 40),
+        ] {
+            let source = source.parse().unwrap();
+            let target = target.parse().unwrap();
+            let packet =
+                crate::tun::udp_handler::build_udp_packet(b"data", source, target).unwrap();
+            let info = packet_info(&packet).unwrap();
+            assert_eq!(info.protocol, IpProtocol::Udp);
+            assert_eq!(info.source, source);
+            assert_eq!(info.target, target);
+            assert!(!info.syn);
+            assert_eq!(info.transport_offset, offset);
+            assert_eq!(info.length, packet.len());
+            assert_eq!(&packet[info.transport_offset + 8..info.length], b"data");
+
+            if source.is_ipv4() {
+                let mut options = packet[..offset].to_vec();
+                options.extend_from_slice(&[0; 4]);
+                options.extend_from_slice(&packet[offset..]);
+                let length = options.len();
+                let mut ip = Ipv4Packet::new_unchecked(&mut options);
+                ip.set_header_len(24);
+                ip.set_total_len(length as u16);
+                ip.fill_checksum();
+                let info = packet_info(&options).unwrap();
+                assert_eq!(info.transport_offset, 24);
+                assert_eq!(info.length, length);
+                assert_eq!(&options[info.transport_offset + 8..info.length], b"data");
+            }
+        }
+    }
 
     #[test]
     fn classification_rejects_fragments_extensions_and_bad_checksums() {

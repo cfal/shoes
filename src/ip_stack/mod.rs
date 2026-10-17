@@ -16,14 +16,18 @@ mod tests;
 pub(crate) mod udp;
 pub(crate) mod wake;
 
+// Matches Linux tcp_keepalive_time and shadowsocks-rust.
+const TCP_PEER_SILENCE_TIMEOUT: SmolDuration = SmolDuration::from_secs(7200);
+
 pub(crate) fn tcp_socket(buffer_size: usize) -> TcpSocket<'static> {
     let mut socket = TcpSocket::new(
         SocketBuffer::new(vec![0; buffer_size]),
         SocketBuffer::new(vec![0; buffer_size]),
     );
+    // Matches netstack-smoltcp's congestion and keepalive settings.
     socket.set_congestion_control(CongestionControl::Cubic);
     socket.set_keep_alive(Some(SmolDuration::from_secs(28)));
-    socket.set_timeout(Some(SmolDuration::from_secs(7200)));
+    socket.set_timeout(Some(TCP_PEER_SILENCE_TIMEOUT));
     socket.set_nagle_enabled(false);
     socket.set_ack_delay(None);
     socket
