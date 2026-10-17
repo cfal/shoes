@@ -434,6 +434,17 @@ async fn run_case(
         let payload_len = payload_sizes[sequence % payload_sizes.len()];
         let payload = vec![sequence as u8; payload_len];
         if let Some(association) = &association {
+            if !chain && sequence == 1 {
+                let error = association
+                    .send_to_with_timeout(
+                        shoes_test_support::socks5::SocksDestination::Ip(udp_target),
+                        &vec![0xff; usize::from(mtu)],
+                        Duration::from_millis(100),
+                    )
+                    .await
+                    .unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+            }
             assert_eq!(association.send_to(udp_target, &payload).await?, payload);
         } else {
             assert_eq!(socket.send_to(&payload, udp_target).await?, payload.len());

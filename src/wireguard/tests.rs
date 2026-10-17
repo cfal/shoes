@@ -95,6 +95,9 @@ async fn check_echo(connector: &dyn SocketConnector, tcp: SocketAddr, udp: Socke
         .unwrap();
     assert!(!stream.read_message_eof_on_empty());
     for bytes in [&b"WireGuard UDP"[..], &b""[..], &b"after empty"[..]] {
+        futures::future::poll_fn(|cx| Pin::new(&mut stream).poll_write_message(cx, &[0; 1408]))
+            .await
+            .unwrap();
         futures::future::poll_fn(|cx| Pin::new(&mut stream).poll_write_message(cx, bytes))
             .await
             .unwrap();
@@ -105,11 +108,6 @@ async fn check_echo(connector: &dyn SocketConnector, tcp: SocketAddr, udp: Socke
             .unwrap();
         assert_eq!(buf.filled(), bytes);
     }
-    assert!(
-        futures::future::poll_fn(|cx| Pin::new(&mut stream).poll_write_message(cx, &[0; 1408]))
-            .await
-            .is_err()
-    );
 }
 
 #[tokio::test]

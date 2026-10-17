@@ -54,7 +54,10 @@ impl StackHandle {
         }
         self.commands
             .try_send(command)
-            .map_err(|_| crate::resources::exhausted())?;
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => crate::resources::exhausted(),
+                mpsc::error::TrySendError::Closed(_) => io::ErrorKind::NotConnected.into(),
+            })?;
         self.wake.notify();
         Ok(())
     }
@@ -478,6 +481,7 @@ fn run(
                         control: control.clone(),
                         wake: wake.clone(),
                         mtu: device.mtu,
+                        drops: device.drops.clone(),
                     };
                     udp.insert(local, UdpEntry(control));
                     let _ = result.send(Ok(connection));
@@ -536,6 +540,14 @@ fn run(
                 if socket.listen(info.target).is_err() {
                     continue;
                 }
+                let handle = sockets.add(socket);
+                device.packet = Some(packet);
+                iface.poll_ingress_single(now(), &mut device, &mut sockets);
+                // Admission follows smoltcp validation, not just the packet's SYN flag.
+                if sockets.get::<TcpSocket>(handle).state() != State::SynReceived {
+                    sockets.remove(handle);
+                    continue;
+                }
                 let control = Arc::new(TcpConnectionControl::new(
                     limits.tcp_buffer_size,
                     limits.tcp_buffer_size,
@@ -549,10 +561,11 @@ fn run(
                     })
                     .is_err()
                 {
+                    sockets.remove(handle);
                     continue;
                 }
                 tcp.insert(
-                    sockets.add(socket),
+                    handle,
                     TcpEntry {
                         control,
                         remote: info.source,
@@ -561,6 +574,7 @@ fn run(
                         pending: None,
                     },
                 );
+                continue;
             }
             device.packet = Some(packet);
             iface.poll_ingress_single(now(), &mut device, &mut sockets);
@@ -641,6 +655,94 @@ fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_channel_distinguishes_full_from_closed() {
+        let (commands, receiver) = mpsc::channel(1);
+        let (wake, _wake_rx) = Wake::new().unwrap();
+        let handle = StackHandle {
+            commands,
+            wake,
+            running: Arc::new(AtomicBool::new(true)),
+        };
+        let command = || Command::Udp("10.77.0.1:53".parse().unwrap(), oneshot::channel().0);
+        handle.send(command()).unwrap();
+        assert_eq!(
+            handle.send(command()).unwrap_err().kind(),
+            crate::resources::exhausted().kind()
+        );
+        drop(receiver);
+        assert_eq!(
+            handle.send(command()).unwrap_err().kind(),
+            io::ErrorKind::NotConnected
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_syns_do_not_admit_flows_or_capture_later_peers() {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let mut stack = PacketStack::new(
+                vec!["10.77.0.1".parse().unwrap()],
+                1408,
+                true,
+                TunResourceLimits {
+                    max_tcp_connections: Some(1),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let mut accepted = stack.tcp.take().unwrap();
+            for malformed in 0..5 {
+                let source = if malformed < 4 {
+                    "10.77.0.2"
+                } else {
+                    "10.77.0.3"
+                }
+                .parse()
+                .unwrap();
+                let target = "198.18.0.1".parse().unwrap();
+                let mut packet = PacketBuffer::with_capacity(44);
+                packet.resize(44);
+                let mut ip = Ipv4Packet::new_unchecked(&mut *packet);
+                smoltcp::wire::Ipv4Repr {
+                    src_addr: source,
+                    dst_addr: target,
+                    next_header: IpProtocol::Tcp,
+                    payload_len: 24,
+                    hop_limit: 64,
+                }
+                .emit(&mut ip, &Default::default());
+                let mut tcp = TcpPacket::new_unchecked(ip.payload_mut());
+                tcp.set_header_len(24);
+                tcp.set_src_port(if malformed == 2 { 0 } else { 40000 });
+                tcp.set_dst_port(443);
+                tcp.set_seq_number(smoltcp::wire::TcpSeqNumber(1000));
+                tcp.set_syn(true);
+                tcp.set_fin(malformed == 0);
+                tcp.set_rst(malformed == 1);
+                tcp.set_window_len(65535);
+                if malformed == 3 {
+                    tcp.options_mut().copy_from_slice(&[2, 1, 0, 0]);
+                }
+                tcp.fill_checksum(&source.into(), &target.into());
+                stack.input.send(packet).await.unwrap();
+                stack.handle.wake.notify();
+            }
+            let flow = accepted.recv().await.unwrap();
+            assert_eq!(flow.source, "10.77.0.3:40000".parse().unwrap());
+            assert_eq!(flow.target, "198.18.0.1:443".parse().unwrap());
+            // A command is processed after the packet batch, making the count assertion deterministic.
+            let _barrier = stack
+                .handle
+                .open_udp("10.77.0.2:53".parse().unwrap())
+                .await
+                .unwrap();
+            assert_eq!(stack.counts.tcp.load(Ordering::Relaxed), 1);
+            assert!(accepted.try_recv().is_err());
+        })
+        .await
+        .unwrap();
+    }
 
     #[test]
     fn classification_tracks_transport_offset_and_length() {

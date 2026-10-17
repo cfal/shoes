@@ -107,13 +107,16 @@ async fn udp_empty_datagrams_boundaries_mtu_and_shutdown() {
                 write_udp(&mut reverse, data).await.unwrap();
                 assert_eq!(read_udp(&mut outbound).await.unwrap(), data);
             }
-            assert_eq!(
-                write_udp(&mut outbound, &[0; 1408])
-                    .await
-                    .unwrap_err()
-                    .kind(),
-                io::ErrorKind::InvalidInput
-            );
+            write_udp(&mut outbound, &[0; 1408]).await.unwrap();
+            assert_eq!(client.drops.load(std::sync::atomic::Ordering::Relaxed), 1);
+            write_udp(&mut outbound, b"after oversize").await.unwrap();
+            assert_eq!(read_udp(&mut reverse).await.unwrap(), b"after oversize");
+            let permit = outbound.control.lock().budget.acquire(65535).unwrap();
+            write_udp(&mut outbound, b"over budget").await.unwrap();
+            assert_eq!(client.drops.load(std::sync::atomic::Ordering::Relaxed), 2);
+            drop(permit);
+            write_udp(&mut outbound, b"after budget").await.unwrap();
+            assert_eq!(read_udp(&mut reverse).await.unwrap(), b"after budget");
             drop(client);
             assert!(read_udp(&mut outbound).await.is_err());
             assert!(write_udp(&mut outbound, b"closed").await.is_err());

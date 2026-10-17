@@ -145,8 +145,9 @@ wg-quick import are not implemented.
 
 Fragmented input and unsupported IPv6 extension chains are dropped before
 transport parsing. TCP advertises an MSS derived from the MTU. Outbound UDP
-writes larger than MTU minus 28 bytes (IPv4) or 48 bytes (IPv6) return errors;
-they are never truncated. At MTU 1408 these payload limits are 1380 and 1360
+writes larger than MTU minus 28 bytes (IPv4) or 48 bytes (IPv6) are dropped and
+counted without closing the flow; they are never truncated. UDP queue-budget
+exhaustion also drops individual writes. At MTU 1408 the payload limits are 1380 and 1360
 bytes. Oversized UDP responses on inbound forwarding are dropped. Large DNS
 replies should use TCP-based transports. Reduce MTU for constrained underlays;
 automatic path-MTU discovery is not provided.

@@ -9,7 +9,10 @@ use std::{
     io,
     net::SocketAddr,
     pin::Pin,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     task::{Context, Poll, Waker},
 };
 use tokio::io::ReadBuf;
@@ -64,6 +67,7 @@ pub(crate) struct UdpConnection {
     pub control: Arc<Mutex<UdpControl>>,
     pub wake: Wake,
     pub mtu: usize,
+    pub drops: Arc<AtomicU64>,
 }
 
 impl Drop for UdpConnection {
@@ -112,19 +116,17 @@ impl AsyncWriteMessage for UdpConnection {
         }
         let overhead = if control.local.is_ipv4() { 28 } else { 48 };
         if data.len() > self.mtu - overhead {
-            return Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "UDP payload exceeds WireGuard MTU",
-            )));
+            self.drops.fetch_add(1, Ordering::Relaxed);
+            return Poll::Ready(Ok(()));
         }
         if control.outgoing.len() == 8 {
             control.writer = Some(cx.waker().clone());
             return Poll::Pending;
         }
-        let permit = control
-            .budget
-            .acquire(data.len() + overhead)
-            .ok_or_else(crate::resources::exhausted)?;
+        let Some(permit) = control.budget.acquire(data.len() + overhead) else {
+            self.drops.fetch_add(1, Ordering::Relaxed);
+            return Poll::Ready(Ok(()));
+        };
         let packet =
             crate::tun::udp_handler::build_udp_packet(data, control.local, control.remote)?;
         control.outgoing.push_back(Datagram {
