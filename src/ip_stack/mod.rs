@@ -39,7 +39,13 @@ pub(crate) fn pump_tcp(
     control: &TcpConnectionControl,
 ) {
     if control.is_abandoned() {
-        socket.abort();
+        // A completed write shutdown must finish its FIN exchange, unless unread data is discarded.
+        if control.should_abort() || socket.can_recv() {
+            socket.abort();
+        } else {
+            socket.close();
+        }
+        return;
     }
 
     if socket.state() == TcpState::Closed {

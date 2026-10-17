@@ -27,6 +27,13 @@ use std::{
 use tokio::sync::{mpsc, oneshot};
 
 pub(crate) const QUEUE_CAPACITY: usize = 64;
+const TCP_HANDSHAKE_TIMEOUT: smoltcp::time::Duration = smoltcp::time::Duration::from_secs(30);
+
+fn tcp_socket(buffer_size: usize) -> TcpSocket<'static> {
+    let mut socket = super::tcp_socket(buffer_size);
+    socket.set_timeout(Some(TCP_HANDSHAKE_TIMEOUT));
+    socket
+}
 
 enum Command {
     Tcp(SocketAddr, oneshot::Sender<io::Result<TcpConnection>>),
@@ -242,7 +249,29 @@ struct TcpEntry {
     remote: SocketAddr,
     local: SocketAddr,
     outbound: bool,
+    established: bool,
     pending: Option<(oneshot::Sender<io::Result<TcpConnection>>, TcpConnection)>,
+}
+impl TcpEntry {
+    fn pump(&mut self, handle: SocketHandle, socket: &mut TcpSocket<'_>) {
+        if !self.established && matches!(socket.state(), State::Established | State::CloseWait) {
+            self.established = true;
+            socket.set_timeout(Some(super::TCP_PEER_SILENCE_TIMEOUT));
+        }
+        if let Some((result, _)) = &self.pending {
+            if result.is_closed() {
+                self.pending = None;
+                socket.abort();
+            } else if self.established {
+                let (result, connection) = self.pending.take().unwrap();
+                let _ = result.send(Ok(connection));
+            } else if socket.state() == State::Closed {
+                let (result, _) = self.pending.take().unwrap();
+                let _ = result.send(Err(io::ErrorKind::ConnectionRefused.into()));
+            }
+        }
+        super::pump_tcp(handle, socket, &self.control);
+    }
 }
 impl Drop for TcpEntry {
     fn drop(&mut self) {
@@ -426,8 +455,7 @@ fn run(
                         let _ = result.send(Err(crate::resources::exhausted()));
                         continue;
                     }
-                    let mut socket = super::tcp_socket(limits.tcp_buffer_size);
-                    socket.set_timeout(Some(smoltcp::time::Duration::from_secs(30)));
+                    let mut socket = tcp_socket(limits.tcp_buffer_size);
                     if socket.connect(iface.context(), target, local).is_err() {
                         let _ = result.send(Err(io::ErrorKind::InvalidInput.into()));
                         continue;
@@ -444,6 +472,7 @@ fn run(
                             remote: target,
                             local,
                             outbound: true,
+                            established: false,
                             pending: Some((result, connection)),
                         },
                     );
@@ -518,10 +547,10 @@ fn run(
                 }
                 continue;
             }
-            let known = tcp
-                .values()
-                .any(|entry| entry.remote == info.source && entry.local == info.target);
-            if !known {
+            let known = tcp.iter().find_map(|(handle, entry)| {
+                (entry.remote == info.source && entry.local == info.target).then_some(*handle)
+            });
+            if known.is_none() {
                 if !inbound
                     || !info.syn
                     || tcp
@@ -536,7 +565,7 @@ fn run(
                 {
                     continue;
                 }
-                let mut socket = super::tcp_socket(limits.tcp_buffer_size);
+                let mut socket = tcp_socket(limits.tcp_buffer_size);
                 if socket.listen(info.target).is_err() {
                     continue;
                 }
@@ -571,6 +600,7 @@ fn run(
                         remote: info.source,
                         local: info.target,
                         outbound: false,
+                        established: false,
                         pending: None,
                     },
                 );
@@ -578,24 +608,17 @@ fn run(
             }
             device.packet = Some(packet);
             iface.poll_ingress_single(now(), &mut device, &mut sockets);
+            // A reset passive open returns to Listen and must not capture the next peer's SYN.
+            if let Some(handle) = known
+                && sockets.get::<TcpSocket>(handle).state() == State::Listen
+            {
+                sockets.remove(handle);
+                tcp.remove(&handle);
+            }
         }
         for (handle, entry) in &mut tcp {
             let socket = sockets.get_mut::<TcpSocket>(*handle);
-            if let Some((result, _)) = &entry.pending {
-                if result.is_closed() {
-                    entry.pending = None;
-                    socket.abort();
-                } else if socket.state() == State::Established || socket.state() == State::CloseWait
-                {
-                    socket.set_timeout(Some(super::TCP_PEER_SILENCE_TIMEOUT));
-                    let (result, connection) = entry.pending.take().unwrap();
-                    let _ = result.send(Ok(connection));
-                } else if socket.state() == State::Closed {
-                    let (result, _) = entry.pending.take().unwrap();
-                    let _ = result.send(Err(io::ErrorKind::ConnectionRefused.into()));
-                }
-            }
-            super::pump_tcp(*handle, socket, &entry.control);
+            entry.pump(*handle, socket);
         }
         udp.retain(|_, entry| {
             let mut control = entry.0.lock();
@@ -633,7 +656,7 @@ fn run(
             }
             local_work |= socket.can_recv() && !entry.control.recv_buffer_full()
                 || socket.can_send() && !entry.control.send_buffer_empty()
-                || socket.state() != State::Closed && entry.control.is_abandoned();
+                || socket.state() != State::Closed && entry.control.should_abort();
             true
         });
         counts.tcp.store(tcp.len(), Ordering::Relaxed);
@@ -655,6 +678,232 @@ fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use smoltcp::wire::TcpControl;
+
+    fn tcp_segment(
+        source: SocketAddr,
+        target: SocketAddr,
+        sequence: u32,
+        control: TcpControl,
+        ack: Option<u32>,
+    ) -> PacketBuffer {
+        let (IpAddr::V4(source_ip), IpAddr::V4(target_ip)) = (source.ip(), target.ip()) else {
+            unreachable!()
+        };
+        let mut tcp = etherparse::TcpHeader::new(source.port(), target.port(), sequence, 65535);
+        tcp.syn = control == TcpControl::Syn;
+        tcp.rst = control == TcpControl::Rst;
+        tcp.fin = control == TcpControl::Fin;
+        tcp.ack = ack.is_some();
+        tcp.acknowledgment_number = ack.unwrap_or(0);
+        let builder = etherparse::PacketBuilder::ipv4(source_ip.octets(), target_ip.octets(), 64)
+            .tcp_header(tcp);
+        let mut packet = PacketBuffer::with_capacity(builder.size(0));
+        packet.resize(builder.size(0));
+        builder.write(&mut &mut packet[..], &[]).unwrap();
+        packet
+    }
+
+    #[tokio::test]
+    async fn reset_half_open_releases_admission_before_the_next_peer() {
+        use tokio::io::AsyncReadExt;
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let mut stack = PacketStack::new(
+                vec!["10.77.0.1".parse().unwrap()],
+                1408,
+                true,
+                TunResourceLimits {
+                    max_tcp_connections: Some(1),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let mut accepted = stack.tcp.take().unwrap();
+            let mut output = stack.output.take().unwrap();
+            let target = "198.18.0.1:443".parse().unwrap();
+            let first = "10.77.0.2:40000".parse().unwrap();
+            let second = "10.77.0.3:50000".parse().unwrap();
+            stack
+                .input
+                .send(tcp_segment(first, target, 1000, TcpControl::Syn, None))
+                .await
+                .unwrap();
+            stack.handle.wake.notify();
+            let mut flow = accepted.recv().await.unwrap();
+            assert_eq!(flow.source, first);
+            let reply = output.recv().await.unwrap();
+            let ip = Ipv4Packet::new_checked(&*reply).unwrap();
+            let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+            assert!(tcp.syn() && tcp.ack());
+            assert_eq!(tcp.ack_number().0, 1001);
+
+            // An abandoned connect responds to SYN-ACK with RST and no ACK flag.
+            stack
+                .input
+                .try_send(tcp_segment(first, target, 1001, TcpControl::Rst, None))
+                .unwrap();
+            stack
+                .input
+                .try_send(tcp_segment(second, target, 5000, TcpControl::Syn, None))
+                .unwrap();
+            stack.handle.wake.notify();
+            assert_eq!(flow.connection.read(&mut [0; 1]).await.unwrap(), 0);
+            let next = accepted.recv().await.unwrap();
+            assert_eq!(next.source, second);
+            assert_eq!(next.target, target);
+            for port in [53, 54] {
+                let _barrier = stack
+                    .handle
+                    .open_udp(SocketAddr::new(target.ip(), port))
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(stack.counts.tcp.load(Ordering::Relaxed), 1);
+            assert!(accepted.try_recv().is_err());
+        })
+        .await
+        .unwrap();
+    }
+
+    #[test]
+    fn inbound_handshake_timeout_is_lifted_only_after_establishment() {
+        for complete in [false, true] {
+            let (output, mut packets) = mpsc::channel(QUEUE_CAPACITY);
+            let mut device = QueueDevice {
+                packet: None,
+                output,
+                mtu: 1408,
+                drops: Arc::default(),
+            };
+            let start = Instant::from_secs(1);
+            let mut iface = Interface::new(Config::new(HardwareAddress::Ip), &mut device, start);
+            let source: SocketAddr = "10.77.0.2:40000".parse().unwrap();
+            let target: SocketAddr = "10.77.0.1:443".parse().unwrap();
+            iface.update_ip_addrs(|ips| ips.push(IpCidr::new(target.ip().into(), 24)).unwrap());
+            let mut socket = tcp_socket(4096);
+            socket.listen(target).unwrap();
+            let mut sockets = SocketSet::new(vec![]);
+            let handle = sockets.add(socket);
+            let mut entry = TcpEntry {
+                control: Arc::new(TcpConnectionControl::new(4096, 4096)),
+                remote: source,
+                local: target,
+                outbound: false,
+                established: false,
+                pending: None,
+            };
+            device.packet = Some(tcp_segment(source, target, 1000, TcpControl::Syn, None));
+            iface.poll(start, &mut device, &mut sockets);
+            let socket = sockets.get_mut::<TcpSocket>(handle);
+            entry.pump(handle, socket);
+            assert_eq!(socket.state(), State::SynReceived);
+            assert_eq!(socket.timeout(), Some(TCP_HANDSHAKE_TIMEOUT));
+            if complete {
+                let reply = packets.try_recv().unwrap();
+                let ip = Ipv4Packet::new_checked(&*reply).unwrap();
+                let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+                let ack = (tcp.seq_number() + 1).0 as u32;
+                device.packet = Some(tcp_segment(
+                    source,
+                    target,
+                    1001,
+                    TcpControl::None,
+                    Some(ack),
+                ));
+                iface.poll(start, &mut device, &mut sockets);
+                let socket = sockets.get_mut::<TcpSocket>(handle);
+                entry.pump(handle, socket);
+                assert!(entry.established);
+                assert_eq!(
+                    socket.timeout(),
+                    Some(super::super::TCP_PEER_SILENCE_TIMEOUT)
+                );
+            }
+            iface.poll(
+                start + TCP_HANDSHAKE_TIMEOUT + smoltcp::time::Duration::from_secs(1),
+                &mut device,
+                &mut sockets,
+            );
+            assert_eq!(
+                sockets.get::<TcpSocket>(handle).state(),
+                if complete {
+                    State::Established
+                } else {
+                    State::Closed
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_after_write_shutdown_finishes_the_fin_exchange_without_reset() {
+        use tokio::io::AsyncWriteExt;
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let mut stack = PacketStack::new(
+                vec!["10.77.0.1".parse().unwrap()],
+                1408,
+                true,
+                TunResourceLimits::default(),
+            )
+            .unwrap();
+            let mut accepted = stack.tcp.take().unwrap();
+            let mut output = stack.output.take().unwrap();
+            let target = "198.18.0.1:443".parse().unwrap();
+            let source = "10.77.0.2:40000".parse().unwrap();
+            stack
+                .input
+                .send(tcp_segment(source, target, 1000, TcpControl::Syn, None))
+                .await
+                .unwrap();
+            stack.handle.wake.notify();
+            let mut flow = accepted.recv().await.unwrap();
+            let synack = output.recv().await.unwrap();
+            let ip = Ipv4Packet::new_checked(&*synack).unwrap();
+            let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+            let ack = (tcp.seq_number() + 1).0 as u32;
+            stack
+                .input
+                .send(tcp_segment(
+                    source,
+                    target,
+                    1001,
+                    TcpControl::None,
+                    Some(ack),
+                ))
+                .await
+                .unwrap();
+            stack.handle.wake.notify();
+            flow.connection.shutdown().await.unwrap();
+            drop(flow);
+
+            let fin = output.recv().await.unwrap();
+            let ip = Ipv4Packet::new_checked(&*fin).unwrap();
+            let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+            assert!(tcp.fin() && !tcp.rst());
+            let ack = (tcp.seq_number() + 1).0 as u32;
+            stack
+                .input
+                .send(tcp_segment(
+                    source,
+                    target,
+                    1001,
+                    TcpControl::Fin,
+                    Some(ack),
+                ))
+                .await
+                .unwrap();
+            stack.handle.wake.notify();
+            let reply = output.recv().await.unwrap();
+            let ip = Ipv4Packet::new_checked(&*reply).unwrap();
+            let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+            assert!(tcp.ack() && !tcp.rst());
+            assert_eq!(tcp.ack_number().0, 1002);
+        })
+        .await
+        .unwrap();
+    }
 
     #[test]
     fn command_channel_distinguishes_full_from_closed() {

@@ -468,6 +468,76 @@ fn kernel_client_to_shoes_server() -> io::Result<()> {
 }
 
 #[test]
+fn kernel_reset_half_open_does_not_capture_the_next_connection() -> io::Result<()> {
+    isolated_test(
+        "wireguard_kernel::kernel_reset_half_open_does_not_capture_the_next_connection",
+        async {
+            timeout(Duration::from_secs(15), async {
+                let reservation = std::net::UdpSocket::bind("0.0.0.0:0")?;
+                let port = reservation.local_addr()?.port();
+                let kernel = KernelPeer::start(true, 1408, true, port)?;
+                let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await?;
+                let target =
+                    SocketAddr::new("10.88.0.1".parse().unwrap(), listener.local_addr()?.port());
+                let mut ports = PortHelper::new();
+                let (_, entry) = ports.get_localhost_listener_port();
+                let mut endpoint = config::server(port);
+                endpoint["resource_limits"] = json!({"max_tcp_connections": 1});
+                drop(reservation);
+                let _shoes = start_shoes_server(
+                    &serde_yaml::to_string(&json!([endpoint, config::socks(entry)])).unwrap(),
+                )?;
+                ports.wait_for_all_ports().await?;
+                let source_port = {
+                    let reservation = std::net::TcpListener::bind("10.77.0.2:0")?;
+                    reservation.local_addr()?.port()
+                };
+                let before = kernel.counters()?;
+                let probe = tokio::task::spawn_blocking(move || -> io::Result<()> {
+                    use socket2::{Domain, Protocol, Socket, Type};
+                    use std::io::Read;
+
+                    let mut raw = Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::TCP))?;
+                    raw.bind(&SocketAddr::from(([10, 77, 0, 2], 0)).into())?;
+                    raw.set_header_included_v4(true)?;
+                    raw.set_read_timeout(Some(Duration::from_secs(5)))?;
+                    let mut syn = Vec::new();
+                    etherparse::PacketBuilder::ipv4([10, 77, 0, 2], [10, 88, 0, 1], 64)
+                        .tcp(source_port, target.port(), 1000, 65535)
+                        .syn()
+                        .write(&mut syn, &[])
+                        .map_err(io::Error::other)?;
+                    raw.send_to(&syn, &target.into())?;
+                    let mut bytes = [0; 1500];
+                    let len = raw.read(&mut bytes)?;
+                    let ip = smoltcp::wire::Ipv4Packet::new_checked(&bytes[..len])
+                        .map_err(io::Error::other)?;
+                    let tcp = smoltcp::wire::TcpPacket::new_checked(ip.payload())
+                        .map_err(io::Error::other)?;
+                    assert_eq!(tcp.dst_port(), source_port);
+                    assert!(tcp.syn() && tcp.ack());
+                    // No kernel TCP socket owns the raw SYN, so Linux resets the received SYN-ACK.
+                    Ok(())
+                });
+                let (mut abandoned, _) = listener.accept().await?;
+                probe.await.map_err(io::Error::other)??;
+                assert_eq!(abandoned.read(&mut [0; 1]).await?, 0);
+                let mut stream = TcpStream::connect(target).await?;
+                let (mut upstream, _) = listener.accept().await?;
+                stream.write_all(b"after reset").await?;
+                let mut data = [0; 11];
+                upstream.read_exact(&mut data).await?;
+                upstream.write_all(&data).await?;
+                stream.read_exact(&mut data).await?;
+                assert_eq!(&data, b"after reset");
+                kernel.assert_transfer(before, data.len())
+            })
+            .await?
+        },
+    )
+}
+
+#[test]
 fn shoes_client_to_kernel_server() -> io::Result<()> {
     isolated_test(
         "wireguard_kernel::shoes_client_to_kernel_server",

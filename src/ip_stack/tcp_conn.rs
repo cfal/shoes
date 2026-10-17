@@ -79,6 +79,15 @@ impl TcpConnectionControl {
         self.inner.lock().abandoned
     }
 
+    pub fn should_abort(&self) -> bool {
+        let inner = self.inner.lock();
+        inner.abandoned
+            && (!matches!(
+                inner.send_state,
+                TcpSocketState::Closing | TcpSocketState::Closed
+            ) || !inner.recv_buffer.is_empty())
+    }
+
     /// Check if recv buffer is full.
     pub fn recv_buffer_full(&self) -> bool {
         self.inner.lock().recv_buffer.is_full()

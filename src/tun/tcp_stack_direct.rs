@@ -708,7 +708,7 @@ fn reconcile_sockets(
             return false;
         }
         let control = &info.control;
-        has_local_work |= (!is_closed && control.is_abandoned())
+        has_local_work |= (!is_closed && control.should_abort())
             || (socket.can_recv() && !control.recv_buffer_full())
             || (socket.can_send() && !control.send_buffer_empty())
             || (!is_closed
@@ -1343,6 +1343,18 @@ mod tests {
             false,
         );
         socket_set.get_mut::<TcpSocket>(handle).close();
+        control.set_send_state(TcpSocketState::Closing);
+        drop(connection);
+        crate::ip_stack::pump_tcp(handle, socket_set.get_mut::<TcpSocket>(handle), &control);
+        assert_eq!(
+            socket_set.get::<TcpSocket>(handle).state(),
+            TcpState::FinWait1
+        );
+        assert!(!reconcile_sockets(
+            &mut sockets,
+            &mut socket_set,
+            &mut active
+        ));
         iface.poll_egress(SmolInstant::from_millis(1), &mut device, &mut socket_set);
         ingress(
             &mut iface,
