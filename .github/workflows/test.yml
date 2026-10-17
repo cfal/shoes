@@ -35,6 +35,7 @@ jobs:
       run: |
         cargo about generate --locked --all-features --fail scripts/licenses.hbs -o licenses/dependencies.txt
         git diff --exit-code -- licenses/dependencies.txt
+        cargo fetch --locked
         python3 scripts/test-release-notices.py
 
   wireguard-interop:
