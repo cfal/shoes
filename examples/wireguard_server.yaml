@@ -8,5 +8,7 @@
       allowed_ips: ["10.77.0.2/32", "fd77::2/128"]
   inbound:
     rules:
+      - masks: ["127.0.0.0/8", "::1/128", "169.254.0.0/16", "fe80::/10"]
+        action: block
       - masks: ["0.0.0.0/0", "::/0"]
         action: allow

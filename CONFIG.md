@@ -59,6 +59,9 @@ Rules use the normal destination masks, overrides, and client chains. There
 is no implicit allow-all fallback for an empty inbound block. Outbound socket
 replies remain enabled when `inbound` is omitted. Per-peer authorization
 beyond cryptokey source validation is not supplied by destination rules.
+Authenticated peers can reach the gateway's local services unless rules block
+them. The server example blocks loopback and link-local destinations; restrict
+private networks too when peers should not access the gateway's LAN.
 
 Reference an endpoint from the first hop:
 
@@ -154,6 +157,9 @@ exhaustion also drops individual writes. At MTU 1408 the payload limits are 1380
 bytes. Oversized UDP responses on inbound forwarding are dropped. Large DNS
 replies should use TCP-based transports. Reduce MTU for constrained underlays;
 automatic path-MTU discovery is not provided.
+Packets received from a peer above the local MTU are also dropped. Configure
+matching MTUs on both sides, including peers whose default is 1420 rather than
+Shoes' 1408; TCP MSS negotiation does not protect UDP traffic.
 
 Default admission limits are 256 TCP connections, 32 KiB TCP buffers, a
 32 MiB TCP buffer budget, 1024 UDP sessions, 4096 UDP destinations, 64
