@@ -48,7 +48,10 @@ used only by the legacy TLS/REALITY regression suites.
 
 The ignored `legacy_baseline_matches_backpressure_and_half_close` test compares
 both Shoes roles against Xray over TLS, including slow reads and half-close
-after DIRECT. Set `SHOES_BASELINE_BINARY` to a binary built from
+after DIRECT. It verifies payload integrity, observes remote EOF within five
+seconds, and checks both read and write DIRECT transitions in the Shoes logs.
+Both Shoes binaries must be debug builds; release builds omit the DIRECT logs.
+Set `SHOES_BASELINE_BINARY` to a debug binary built from
 `001495285ac16e2121a539682d1a1f6a7c07c5ed` and run that named test with `--ignored`.
 The pinned-peer CI job builds that baseline and runs the comparison explicitly.
 
