@@ -153,6 +153,16 @@ async fn wireguard_singbox_both_roles_tcp_udp_ipv4_ipv6() -> io::Result<()> {
 #[tokio::test]
 #[ignore = "Requires sing-box and a real WireGuard rekey (about two minutes)"]
 async fn wireguard_singbox_tcp_survives_real_rekey_without_psk() -> io::Result<()> {
+    run_rekey(false).await
+}
+
+#[tokio::test]
+#[ignore = "Requires sing-box and a real WireGuard rekey (about two minutes)"]
+async fn wireguard_singbox_detoured_tcp_survives_real_rekey_without_psk() -> io::Result<()> {
+    run_rekey(true).await
+}
+
+async fn run_rekey(detour: bool) -> io::Result<()> {
     tokio::time::timeout(Duration::from_secs(180), async {
         let binary = PathBuf::from(
             std::env::var_os("SHOES_TEST_SING_BOX_BIN").expect("set SHOES_TEST_SING_BOX_BIN"),
@@ -194,12 +204,24 @@ async fn wireguard_singbox_tcp_survives_real_rekey_without_psk() -> io::Result<(
         let mut client = config::client(relay_port);
         client["mtu"] = json!(1280);
         client["peers"][0].as_object_mut().unwrap().remove("pre_shared_key");
+        let mut shoes_config = Vec::new();
+        if detour {
+            let (_, outer_port) = ports.get_localhost_listener_port();
+            let protocol = json!({"type": "vless", "user_id": "b85798ef-e9dc-46a4-9a87-8da4499d36d0", "udp_enabled": true});
+            client["peers"][0]["endpoint"] = json!(format!("192.0.2.200:{relay_port}"));
+            client["outer_client_chain"] = json!([{"address": format!("127.0.0.1:{outer_port}"), "protocol": protocol}]);
+            shoes_config.push(json!({
+                "address": format!("0.0.0.0:{outer_port}"), "protocol": protocol,
+                "rules": [{"masks": "192.0.2.200/32", "action": "allow", "override_address": "127.0.0.1:0"}],
+            }));
+        }
+        shoes_config.extend([client, config::socks(entry)]);
         let mut peer = singbox_server(peer_port);
         peer["endpoints"][0]["mtu"] = json!(1280);
         peer["endpoints"][0]["peers"][0].as_object_mut().unwrap().remove("pre_shared_key");
         drop(reservation);
         let _peer = start_singbox_server_with_binary(&peer.to_string(), &binary, &[("GOMAXPROCS", "1")])?;
-        let _shoes = start_shoes_server(&serde_yaml::to_string(&json!([client, config::socks(entry)])).unwrap())?;
+        let _shoes = start_shoes_server(&serde_yaml::to_string(&shoes_config).unwrap())?;
         ports.wait_for_all_ports().await?;
         let echoes = EchoTargets::new(false).await?;
         let mut target = echoes.tcp();

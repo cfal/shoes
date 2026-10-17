@@ -20,6 +20,17 @@ mod wireguard_support;
 #[cfg(unix)]
 #[tokio::test]
 async fn wireguard_reload_retains_invalid_candidates_rebinds_and_releases_on_exit() {
+    wireguard_reload(false).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn wireguard_outer_chain_reload_retains_invalid_candidates_and_releases_on_exit() {
+    wireguard_reload(true).await;
+}
+
+#[cfg(unix)]
+async fn wireguard_reload(detour: bool) {
     use serde_json::json;
     let directory = tempfile::tempdir().unwrap();
     let server_path = directory.path().join("server.yaml");
@@ -27,12 +38,22 @@ async fn wireguard_reload_retains_invalid_candidates_rebinds_and_releases_on_exi
     let socket = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
     let port = socket.local_addr().unwrap().port();
     let entry = available_address().port();
-    let server_config = serde_yaml::to_string(&json!([wireguard_support::server(port)])).unwrap();
-    let client_config = serde_yaml::to_string(&json!([
-        wireguard_support::client(port),
-        wireguard_support::socks(entry)
-    ]))
-    .unwrap();
+    let mut servers = vec![wireguard_support::server(port)];
+    let mut endpoint = wireguard_support::client(port);
+    if detour {
+        let outer_port = available_address().port();
+        let protocol = json!({"type": "vless", "user_id": "b85798ef-e9dc-46a4-9a87-8da4499d36d0", "udp_enabled": true});
+        endpoint["peers"][0]["endpoint"] = json!(format!("192.0.2.200:{port}"));
+        endpoint["outer_client_chain"] =
+            json!([{"address": format!("127.0.0.1:{outer_port}"), "protocol": protocol}]);
+        servers.push(json!({
+            "address": format!("0.0.0.0:{outer_port}"), "protocol": protocol,
+            "rules": [{"masks": "192.0.2.200/32", "action": "allow", "override_address": "127.0.0.1:0"}],
+        }));
+    }
+    let server_config = serde_yaml::to_string(&servers).unwrap();
+    let mut client_configs = json!([endpoint, wireguard_support::socks(entry)]);
+    let client_config = serde_yaml::to_string(&client_configs).unwrap();
     std::fs::write(&server_path, &server_config).unwrap();
     std::fs::write(&client_path, &client_config).unwrap();
     drop(socket);
@@ -47,11 +68,14 @@ async fn wireguard_reload_retains_invalid_candidates_rebinds_and_releases_on_exi
         .await
         .unwrap();
     roundtrip(&mut active).await;
-    std::fs::write(
-        &client_path,
-        client_config.replace("endpoint: wg", "endpoint: missing"),
-    )
-    .unwrap();
+    if detour {
+        client_configs[0]["outer_client_chain"][0]["protocol"]["udp_enabled"] = json!(false);
+    } else {
+        client_configs[1]["rules"][0]["client_chain"][0]["protocol"]["endpoint"] = json!("missing");
+    }
+    let invalid = serde_yaml::to_string(&client_configs).unwrap();
+    assert_ne!(invalid, client_config);
+    std::fs::write(&client_path, invalid).unwrap();
     client.signal(libc::SIGHUP);
     client.wait_for("Reload rejected").await;
     roundtrip(&mut active).await;
