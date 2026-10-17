@@ -69,6 +69,7 @@ jobs:
         env:
           XRAY_BINARY: ${{ runner.temp }}/xray
           MIHOMO_BINARY: ${{ runner.temp }}/mihomo
+          SHOES_TEST_SING_BOX_BIN: ${{ runner.temp }}/sing-box
         run: cargo test --locked --features optional-peer-tests --test vless_encryption_interop -- --test-threads=1
       - name: Cross-language cryptography vectors
         run: |
