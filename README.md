@@ -83,9 +83,9 @@ idle cancellation probes. The workspace patches cover direct and transitive
 dependencies, including DNS over HTTP/3. The experimental zero-copy change in
 [h3 #368](https://github.com/hyperium/h3/pull/368) is not included.
 
-The `nix` patch backports [nix #2821](https://github.com/nix-rust/nix/pull/2821)
-to 0.31.3 for iOS socket compatibility. Retain it until adopting a registry
-release containing that fix.
+The `nix` patch pins an [upstream commit](https://github.com/nix-rust/nix/commit/3eae6d68ec6382fef7b38cd58f97458e59a71af9)
+containing [nix #2821](https://github.com/nix-rust/nix/pull/2821) for iOS socket
+compatibility. Retain it until adopting a registry release containing that fix.
 
 GitHub releases and checkout builds retain these patches. Crates.io publishing
 remains disabled because Cargo removes workspace patches from published packages.
