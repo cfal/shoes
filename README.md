@@ -106,7 +106,12 @@ passwordless sudo, `ip`, `wg`, `unshare`, and `timeout`. They run both Shoes rol
 inside isolated namespaces without changing host routes. Coverage includes
 inner IPv4/IPv6 TCP and UDP, TCP half-close, PSK/no-PSK, MTUs 1280/1408, and VLESS
 chaining in both directions. Kernel handshake and byte counters verify that
-payloads actually cross WireGuard. Missing prerequisites fail rather than skip.
+payloads actually cross WireGuard. Outer-chain cases require SOCKS -> VLESS before
+WireGuard, optionally with VLESS after it, and use an unreachable destination that
+only the outer proxy can translate, including IPv6 outer destinations. The 64-case
+matrix is supplemented by carrier outage/recovery, a real two-minute rekey with
+the same TCP flow, concurrent kernel peers, cross-peer source spoofing rejection,
+and wrong-PSK rejection/recovery. Missing prerequisites fail rather than skip.
 Set `SHOES_TEST_WG_BIN` to an absolute path to override `wg`.
 
 ```sh
