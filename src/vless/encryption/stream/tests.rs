@@ -11,6 +11,8 @@ mod resumption;
 struct Scripted {
     input: VecDeque<u8>,
     output: Vec<u8>,
+    write_sizes: Vec<usize>,
+    writable_bytes: Option<usize>,
     block_write: bool,
     fail_write: bool,
     fail_read: bool,
@@ -59,8 +61,18 @@ impl AsyncWrite for Scripted {
         if this.block_write {
             return Poll::Pending;
         }
-        this.output.extend_from_slice(buf);
-        Poll::Ready(Ok(buf.len()))
+        let n = this
+            .writable_bytes
+            .map_or(buf.len(), |limit| buf.len().min(limit));
+        if n == 0 && !buf.is_empty() {
+            return Poll::Pending;
+        }
+        if let Some(remaining) = &mut this.writable_bytes {
+            *remaining -= n;
+        }
+        this.write_sizes.push(n);
+        this.output.extend_from_slice(&buf[..n]);
+        Poll::Ready(Ok(n))
     }
     fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();

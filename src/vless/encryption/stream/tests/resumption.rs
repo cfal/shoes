@@ -1,4 +1,5 @@
 use super::*;
+use crate::vless::encryption::crypto::TAG_LEN;
 
 fn ticket(number: u8) -> Arc<ClientSession> {
     Arc::new(ClientSession {
@@ -93,12 +94,151 @@ async fn resumed_authentication_disarms_guard_and_drop_does_not_invalidate() {
 }
 
 #[tokio::test]
+async fn resumed_prefix_shares_first_scalar_or_vectored_record_write() {
+    for masked in [false, true] {
+        for vectored in [false, true] {
+            let (mut client, _) = resumed(Scripted::default());
+            let prefix = client.output.to_vec();
+            if masked {
+                client.write_mask = Some(HeaderMask::new(&[7; 96], &[8; 16], 0).unwrap());
+            }
+            let n = if vectored {
+                client
+                    .write_vectored(&[io::IoSlice::new(b""), io::IoSlice::new(b"first")])
+                    .await
+            } else {
+                client.write(b"first").await
+            };
+            assert_eq!(n.unwrap(), 5);
+            assert_eq!(
+                client.inner.write_sizes,
+                [prefix.len() + HEADER_LEN + 5 + TAG_LEN]
+            );
+            client.write_all(b"second").await.unwrap();
+            client.flush().await.unwrap();
+            assert_eq!(client.inner.write_sizes.len(), 2);
+            assert_eq!(&client.inner.output[..prefix.len()], &prefix);
+            let mut peer = stream(
+                Scripted {
+                    input: client.inner.output[prefix.len()..].to_vec().into(),
+                    eof: true,
+                    ..Default::default()
+                },
+                false,
+                masked,
+            );
+            let mut plaintext = Vec::new();
+            peer.read_to_end(&mut plaintext).await.unwrap();
+            assert_eq!(plaintext, b"firstsecond");
+        }
+    }
+}
+
+#[tokio::test]
+async fn resumed_prefix_accepts_only_one_record_while_output_is_blocked() {
+    for writable_bytes in [0, 3, b"resume prefix".len() + 2] {
+        let (mut client, _) = resumed(Scripted {
+            writable_bytes: Some(writable_bytes),
+            ..Default::default()
+        });
+        let prefix_len = client.output.len();
+        let mut cx = Context::from_waker(noop_waker_ref());
+        let first = vec![42; WRITE_PLAINTEXT_MAX];
+        assert!(matches!(
+            Pin::new(&mut client).poll_write(&mut cx, &first),
+            Poll::Ready(Ok(WRITE_PLAINTEXT_MAX))
+        ));
+        let queued = client.output.clone();
+        assert_eq!(
+            queued.len(),
+            prefix_len + HEADER_LEN + first.len() + TAG_LEN - writable_bytes
+        );
+        assert!(
+            Pin::new(&mut client)
+                .poll_write(&mut cx, b"cancelled")
+                .is_pending()
+        );
+        assert_eq!(client.output, queued);
+        client.inner.writable_bytes = None;
+        client.write_all(b"replacement").await.unwrap();
+        client.flush().await.unwrap();
+        let mut peer = stream_from_wire(client.inner.output[prefix_len..].to_vec());
+        let mut plaintext = Vec::new();
+        peer.read_to_end(&mut plaintext).await.unwrap();
+        assert_eq!(plaintext, [first.as_slice(), b"replacement"].concat());
+    }
+}
+
+#[tokio::test]
+async fn resumed_prefix_drain_failure_acknowledges_first_record_and_latches_error() {
+    let (mut client, cache) = resumed(Scripted {
+        fail_write: true,
+        ..Default::default()
+    });
+    assert_eq!(client.write(b"first").await.unwrap(), 5);
+    let queued = client.output.clone();
+    assert_eq!(
+        client.write(b"second").await.unwrap_err().kind(),
+        io::ErrorKind::BrokenPipe
+    );
+    assert_eq!(
+        client.flush().await.unwrap_err().kind(),
+        io::ErrorKind::BrokenPipe
+    );
+    assert_eq!(client.output, queued);
+    assert!(client.inner.output.is_empty());
+    assert!(cache.snapshot(Instant::now()).is_none());
+}
+
+#[tokio::test]
+async fn explicit_prefix_drain_and_direct_record_preserve_output_order() {
+    for direct in [false, true] {
+        let (mut client, _) = resumed(Scripted {
+            writable_bytes: Some(3),
+            ..Default::default()
+        });
+        let prefix_len = client.output.len();
+        let mut cx = Context::from_waker(noop_waker_ref());
+        if direct {
+            client.start_raw_write(b"final").unwrap();
+        } else {
+            assert!(Pin::new(&mut client).poll_flush(&mut cx).is_pending());
+        }
+        assert!(
+            Pin::new(&mut client)
+                .poll_write(&mut cx, b"later")
+                .is_pending()
+        );
+        client.inner.writable_bytes = None;
+        client.write_all(b"later").await.unwrap();
+        client.flush().await.unwrap();
+        assert_eq!(&client.inner.output[..prefix_len], b"resume prefix");
+        let mut peer = stream_from_wire(client.inner.output[prefix_len..].to_vec());
+        if direct {
+            let mut final_record = [0; 5];
+            peer.read_exact(&mut final_record).await.unwrap();
+            assert_eq!(&final_record, b"final");
+            peer.start_raw_read().unwrap();
+        }
+        let mut plaintext = Vec::new();
+        peer.read_to_end(&mut plaintext).await.unwrap();
+        assert_eq!(plaintext, b"later");
+    }
+}
+
+#[tokio::test]
 async fn client_flush_sends_prefix_but_server_flush_waits_for_a_record() {
     let (mut client, _) = resumed(Scripted::default());
     client.flush().await.unwrap();
     assert_eq!(client.inner.output, b"resume prefix");
     client.flush().await.unwrap();
     assert_eq!(client.inner.output, b"resume prefix");
+    assert_eq!(client.inner.write_sizes, [b"resume prefix".len()]);
+    client.write_all(b"request").await.unwrap();
+    assert_eq!(
+        client.inner.write_sizes,
+        [b"resume prefix".len(), HEADER_LEN + 7 + TAG_LEN]
+    );
     let mut server = stream(Scripted::default(), false, false);
     server.set_server_random([9; 16]);
     server.flush().await.unwrap();

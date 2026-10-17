@@ -105,6 +105,7 @@ pub(crate) struct EncryptionStream<S> {
     resume: Option<ResumeGuard>,
     server_random: Option<[u8; 16]>,
     output: BytesMut,
+    prefix_unattached: bool,
     header: [u8; HEADER_LEN],
     header_filled: usize,
     body: Vec<u8>,
@@ -147,6 +148,7 @@ impl<S: AsyncStream> EncryptionStream<S> {
             resume: None,
             server_random: None,
             output: BytesMut::new(),
+            prefix_unattached: false,
             header: [0; HEADER_LEN],
             header_filled: 0,
             body: Vec::new(),
@@ -171,6 +173,7 @@ impl<S: AsyncStream> EncryptionStream<S> {
             mask.apply(&mut prefix, true)?;
         }
         self.output.extend_from_slice(&prefix);
+        self.prefix_unattached = true;
         self.resume = Some(guard);
         self.need_flush = true;
         Ok(())
@@ -345,6 +348,8 @@ impl<S: AsyncStream> EncryptionStream<S> {
     }
 
     fn poll_drain(&mut self, cx: &mut Context<'_>, budget: &mut usize) -> Poll<io::Result<()>> {
+        // An explicit drain commits an unattached prefix even if the write stalls.
+        self.prefix_unattached = false;
         self.poll_output(cx, budget, |this, cx| {
             while !this.output.is_empty() {
                 let written = ready!(Pin::new(&mut this.inner).poll_write(cx, &this.output))?;
@@ -370,6 +375,7 @@ impl<S: AsyncStream> EncryptionStream<S> {
             mask.apply(&mut output, true)?;
         }
         self.output.extend_from_slice(&output);
+        self.prefix_unattached = false;
         self.need_flush = true;
         Ok(())
     }
@@ -520,7 +526,10 @@ impl<S: AsyncStream> AsyncWrite for EncryptionStream<S> {
         if this.write_closed {
             return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
         }
-        ready!(this.poll_drain(cx, &mut budget))?;
+        // Attach the first record before submitting a resumed prefix to the transport.
+        if !this.prefix_unattached {
+            ready!(this.poll_drain(cx, &mut budget))?;
+        }
         let n = buf.len().min(WRITE_PLAINTEXT_MAX);
         if this.write_raw {
             let mut output = buf[..n].to_vec();
