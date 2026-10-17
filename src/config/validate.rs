@@ -232,6 +232,12 @@ pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Valida
                 &named_pems,
                 global_limits,
             )?;
+            if !crate::tcp::chain_builder::supports_udp_offline(chain)? {
+                return Err(super::types::wireguard::invalid(format!(
+                    "WireGuard endpoint {} outer_client_chain does not support UDP",
+                    endpoint.wireguard,
+                )));
+            }
         }
         if let Some(inbound) = &mut endpoint.inbound {
             ConfigSelection::replace_none_or_some_groups(&mut inbound.rules, &rule_groups)?;

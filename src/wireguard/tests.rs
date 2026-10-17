@@ -176,6 +176,14 @@ async fn wireguard_ipv4_bind_selects_a_compatible_hostname_address() {
     assert!(prepared.endpoints[1].peers[0].endpoint.unwrap().is_ipv4());
     configs.wireguard_endpoints[1].peers[0].endpoint = Some("[::1]:51820".into());
     assert!(configs.wireguard_endpoints[1].validate().is_err());
+    configs.wireguard_endpoints[1].listen = Some("[::1]:0".parse().unwrap());
+    configs.wireguard_endpoints[1].peers[0].endpoint = Some("localhost:51820".into());
+    let prepared = Prepared::new(&mut configs).await.unwrap();
+    assert!(prepared.endpoints[1].peers[0].endpoint.unwrap().is_ipv6());
+    configs.wireguard_endpoints[1].peers[0].endpoint = Some("127.0.0.1:51820".into());
+    assert!(configs.wireguard_endpoints[1].validate().is_err());
+    configs.wireguard_endpoints[1].listen = Some("[::]:0".parse().unwrap());
+    assert!(configs.wireguard_endpoints[1].validate().is_ok());
 }
 
 #[tokio::test]
@@ -217,6 +225,7 @@ fn wireguard_validation_rejects_unsafe_or_ambiguous_configs() {
         base.replace("  listen:", "  mtu: 9000\n  listen:"),
         base.replace("wireguard: client", "wireguard: server"),
         base.replace("['10.77.0.1/32', 'fd77::1/128']", "[]"),
+        base.replace("10.77.0.1/32", "255.255.255.255/32"),
         base.replace(
             "allowed_ips: ['10.77.0.2/32', 'fd77::2/128']",
             "allowed_ips: []",
@@ -249,6 +258,26 @@ fn wireguard_validation_rejects_unsafe_or_ambiguous_configs() {
         )
         .contains(&key(41))
     );
+}
+
+#[test]
+fn wireguard_rejects_non_contributory_peer_keys() {
+    let mut low_order = [0; 32];
+    low_order[0] = 1;
+    let mut minus_one = [0xff; 32];
+    minus_one[0] = 0xec;
+    minus_one[31] = 0x7f;
+    for bytes in [[0; 32], low_order, minus_one] {
+        let mut configs = validate(&pair_config(51820)).unwrap();
+        let endpoint = &mut configs.wireguard_endpoints[1];
+        endpoint.peers[0].public_key = crate::config::wireguard::WireguardKey(bytes);
+        for psk in [Some(crate::config::wireguard::WireguardKey([7; 32])), None] {
+            endpoint.peers[0].pre_shared_key = psk;
+            let error = endpoint.validate().unwrap_err().to_string();
+            assert!(error.contains("non-contributory"));
+            assert!(!error.contains(&STANDARD.encode(bytes)));
+        }
+    }
 }
 
 #[test]
@@ -361,7 +390,7 @@ fn wireguard_outer_chain_validation_and_roundtrip() {
     let cycle_chain = |endpoint| {
         json!([
             {"protocol": {"type": "wireguard", "endpoint": endpoint}},
-            {"address": "127.0.0.1:443", "protocol": {"type": "socks"}},
+            {"address": "127.0.0.1:443", "protocol": {"type": "vless", "user_id": "b85798ef-e9dc-46a4-9a87-8da4499d36d0"}},
         ])
     };
     let mut cyclic = valid.clone();
@@ -393,6 +422,15 @@ async fn wireguard_outer_chain_requires_udp_before_starting() {
         "{type: trojan, password: test}",
         "{type: vless, user_id: b85798ef-e9dc-46a4-9a87-8da4499d36d0, udp_enabled: false}",
     ] {
+        let mut raw: serde_json::Value = serde_yaml::from_str(&pair_config(51820)).unwrap();
+        raw[1]["outer_client_chain"] = serde_yaml::from_str(&format!(
+            "[{{address: 'unresolvable.invalid:9', protocol: {protocol}}}]"
+        ))
+        .unwrap();
+        let error = validate(&serde_yaml::to_string(&raw).unwrap())
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("does not support UDP"));
         let mut configs = validate(&pair_config(51820)).unwrap();
         configs.wireguard_endpoints[1].outer_client_chain = Some(
             serde_yaml::from_str(&format!(
@@ -521,7 +559,7 @@ async fn wireguard_chains_load_client_certificate_paths_before_validation() {
     std::fs::write(&key_path, cert.signing_key.serialize_pem()).unwrap();
     let mut config: serde_json::Value = serde_yaml::from_str(&pair_config(10001)).unwrap();
     let chain = serde_json::json!([{
-        "address":"127.0.0.1:443", "protocol": {"type":"tls", "cert":cert_path, "key":key_path, "protocol":{"type":"socks"}}
+        "address":"127.0.0.1:443", "protocol": {"type":"tls", "cert":cert_path, "key":key_path, "protocol":{"type":"vless", "user_id":"b85798ef-e9dc-46a4-9a87-8da4499d36d0"}}
     }]);
     for outer in [false, true] {
         if outer {

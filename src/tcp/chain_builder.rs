@@ -11,6 +11,32 @@ use crate::tcp::proxy_connector_impl::ProxyConnectorImpl;
 use crate::tcp::socket_connector::SocketConnector;
 use crate::tcp::socket_connector_impl::SocketConnectorImpl;
 
+/// Checks the final hop without creating sockets or resolving addresses.
+pub(crate) fn supports_udp_offline(chain: &crate::config::ClientChain) -> std::io::Result<bool> {
+    let Some(hop) = chain.hops.iter().last() else {
+        return Ok(false);
+    };
+    let selections: Box<dyn Iterator<Item = &ConfigSelection<ClientConfig>>> = match hop {
+        ClientChainHop::Single(selection) => Box::new(std::iter::once(selection)),
+        ClientChainHop::Pool(selections) => selections.iter(),
+    };
+    let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
+    let mut supports_udp = false;
+    for selection in selections {
+        let ConfigSelection::Config(config) = selection else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Client chain groups must be expanded before checking UDP capability",
+            ));
+        };
+        supports_udp |= config.protocol.is_direct()
+            || config.protocol.is_wireguard()
+            || ProxyConnectorImpl::from_config(config.clone(), resolver.clone())?
+                .is_some_and(|proxy| proxy.supports_udp_over_tcp());
+    }
+    Ok(supports_udp)
+}
+
 /// Build a ClientProxyChain from a client_chain configuration.
 ///
 /// Creates InitialHopEntry (socket + optional proxy paired) from hop 0.
@@ -250,6 +276,45 @@ mod tests {
 
     fn direct_config() -> ClientConfig {
         ClientConfig::default()
+    }
+
+    #[test]
+    fn offline_udp_capability_matches_wrappers_pools_and_runtime_handlers() {
+        for (protocol, expected) in [
+            ("{type: direct}", true),
+            ("{type: socks}", false),
+            ("{type: trojan, password: test}", false),
+            ("{type: trojan, password: test, h2mux: {}}", true),
+            (
+                "{type: vless, user_id: b85798ef-e9dc-46a4-9a87-8da4499d36d0, udp_enabled: false}",
+                false,
+            ),
+            (
+                "{type: websocket, protocol: {type: vless, user_id: b85798ef-e9dc-46a4-9a87-8da4499d36d0}}",
+                true,
+            ),
+        ] {
+            let config: ClientConfig = serde_yaml::from_str(&format!(
+                "{{address: 'unresolvable.invalid:443', protocol: {protocol}}}"
+            ))
+            .unwrap();
+            let chain = ClientChain {
+                hops: OneOrSome::One(ClientChainHop::Single(ConfigSelection::Config(
+                    config.clone(),
+                ))),
+            };
+            assert_eq!(supports_udp_offline(&chain).unwrap(), expected);
+            let runtime =
+                try_build_client_proxy_chain(chain.hops.clone(), mock_resolver()).unwrap();
+            assert_eq!(runtime.supports_udp(), expected);
+            let pool = ClientChain {
+                hops: OneOrSome::One(ClientChainHop::Pool(OneOrSome::Some(vec![
+                    ConfigSelection::Config(socks_config(1080)),
+                    ConfigSelection::Config(config),
+                ]))),
+            };
+            assert_eq!(supports_udp_offline(&pool).unwrap(), expected);
+        }
     }
 
     #[test]

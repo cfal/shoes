@@ -129,7 +129,7 @@ pub(crate) struct Prepared {
 
 impl Prepared {
     pub async fn new(validated: &mut ValidatedConfigs) -> stdio::Result<Self> {
-        let mut endpoints = Vec::new();
+        let mut pending = Vec::new();
         let mut connectors = HashMap::new();
         let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
         for config in &validated.wireguard_endpoints {
@@ -160,10 +160,7 @@ impl Prepared {
                             )
                         })??
                         .into_iter()
-                        .find(|address| {
-                            !config.listen.is_some_and(|listen| listen.is_ipv4())
-                                || address.is_ipv4()
-                        })
+                        .find(|address| config.can_reach_endpoint(*address))
                         .ok_or_else(|| {
                             stdio::Error::new(
                                 stdio::ErrorKind::AddrNotAvailable,
@@ -194,12 +191,7 @@ impl Prepared {
                     .collect(),
             });
             connectors.insert(config.wireguard.clone(), connector.clone());
-            endpoints.push(PreparedEndpoint {
-                config: config.clone(),
-                peers,
-                connector,
-                global_limits: validated.global_limits,
-            });
+            pending.push((peers, connector));
         }
         validated.visit_clients(&mut |client| {
             if let ClientProxyConfig::Wireguard(reference) = &mut client.protocol {
@@ -213,9 +205,17 @@ impl Prepared {
             Ok(())
         })?;
         // Endpoint chains share the prepared handles used by ordinary listeners and DNS.
-        for (endpoint, config) in endpoints.iter_mut().zip(&validated.wireguard_endpoints) {
-            endpoint.config = config.clone();
+        let mut endpoints = Vec::with_capacity(pending.len());
+        for ((peers, connector), config) in pending.into_iter().zip(&validated.wireguard_endpoints)
+        {
+            let endpoint = PreparedEndpoint {
+                config: config.clone(),
+                peers,
+                connector,
+                global_limits: validated.global_limits,
+            };
             endpoint.build_outer_chain(&resolver)?;
+            endpoints.push(endpoint);
         }
         Ok(Self { endpoints })
     }

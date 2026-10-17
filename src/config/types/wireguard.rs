@@ -89,6 +89,14 @@ pub(crate) fn invalid(message: impl Into<String>) -> io::Error {
 }
 
 impl WireguardConfig {
+    #[cfg(unix)]
+    pub(crate) fn can_reach_endpoint(&self, endpoint: SocketAddr) -> bool {
+        self.listen.is_none_or(|listen| {
+            listen.is_ipv4() == endpoint.is_ipv4()
+                || listen.is_ipv6() && listen.ip().is_unspecified()
+        })
+    }
+
     pub fn limits(&self) -> TunResourceLimits {
         let mut limits = self.resource_limits.clone();
         limits.tcp_memory_bytes.get_or_insert(32 * 1024 * 1024);
@@ -153,18 +161,24 @@ impl WireguardConfig {
                     .parse()
                     .map_err(|_| invalid("invalid WireGuard local CIDR"))?;
                 if !families.insert(network.is_ipv4())
-                    || network.ip().is_unspecified()
-                    || network.ip().is_multicast()
+                    || !smoltcp::wire::IpAddress::from(network.ip()).is_unicast()
                 {
                     return Err(invalid(
                         "WireGuard requires at most one unicast local address per family",
                     ));
                 }
             }
-            let own_key = PublicKey::from(&StaticSecret::from(self.private_key.0));
+            let secret = StaticSecret::from(self.private_key.0);
+            let own_key = PublicKey::from(&secret);
             let mut keys = HashSet::new();
             let mut ranges: Vec<(usize, IpNetwork)> = Vec::new();
             for (index, peer) in self.peers.iter().enumerate() {
+                if !secret
+                    .diffie_hellman(&PublicKey::from(peer.public_key.0))
+                    .was_contributory()
+                {
+                    return Err(invalid("WireGuard peer key is non-contributory"));
+                }
                 if peer.public_key.0 == *own_key.as_bytes() || !keys.insert(peer.public_key.0) {
                     return Err(invalid(
                         "WireGuard peer key is duplicated or equals the local public key",
@@ -179,13 +193,12 @@ impl WireguardConfig {
                     if location.port() == 0 {
                         return Err(invalid("WireGuard peer endpoint requires a nonzero port"));
                     }
-                    if self.listen.is_some_and(|listen| listen.is_ipv4())
-                        && location
-                            .to_socket_addr_nonblocking()
-                            .is_some_and(|address| address.is_ipv6())
+                    if location
+                        .to_socket_addr_nonblocking()
+                        .is_some_and(|address| !self.can_reach_endpoint(address))
                     {
                         return Err(invalid(
-                            "WireGuard IPv4 listen address cannot reach an IPv6 peer endpoint",
+                            "WireGuard peer endpoint is incompatible with the listen address",
                         ));
                     }
                 }
