@@ -113,10 +113,10 @@ This extended sweep is opt-in; normal CI runs the focused recovery/containment c
 
 ### Local Stall Qualification
 
-On 2026-10-16, the pinned Xray client completed all six 16 MiB duplex cases against
-Shoes with 32 KiB POSTs, 30 ms pacing, no added RTT, and destination pauses of
-10/30/60 seconds. These correctness runs used a debug Shoes binary; their rates
-are not production throughput measurements.
+On 2026-10-16, the then-pinned Xray 26.10.10 (`701af607`) client completed all six
+16 MiB duplex cases against Shoes with 32 KiB POSTs, 30 ms pacing, no added RTT,
+and destination pauses of 10/30/60 seconds. These correctness runs used a debug
+Shoes binary; their rates are not production throughput measurements.
 
 | Server request cap | Total duration, 10/30/60 s pause | Peak service handlers | Peak application bytes | Combined peer RSS range |
 | --- | --- | --- | --- | --- |
@@ -137,8 +137,9 @@ for Shoes-to-Xray. Each session resumed with exact upload and download bytes.
 
 ### Local Throughput Qualification
 
-The release Shoes binary passed all 24 combinations of 0/50/150/300 ms added RTT,
-32 KiB/1,000,000-byte POST limits, and the three peer directions. All used 30 ms
+Using the then-pinned Xray 26.10.10 (`701af607`), the release Shoes binary passed
+all 24 combinations of 0/50/150/300 ms added RTT, 32 KiB/1,000,000-byte POST limits,
+and the three peer directions. All used 30 ms
 pacing and exact 16 MiB transfers each way; Shoes used its default client pipeline
 depth of 30. Representative aggregate duplex rates for 1,000,000-byte POSTs:
 
