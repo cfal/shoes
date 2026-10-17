@@ -590,8 +590,13 @@ fn run(
                 (entry.remote == info.source && entry.local == info.target).then_some(*handle)
             });
             let Some(handle) = known else {
+                if !info.syn {
+                    // Lets smoltcp reset stale flows without answering RSTs or admitting new flows.
+                    device.packet = Some(packet);
+                    iface.poll_ingress_single(now(), &mut device, &mut sockets);
+                    continue;
+                }
                 if !inbound
-                    || !info.syn
                     || tcp
                         .values()
                         .any(|entry| entry.outbound && entry.local == info.target)
@@ -822,6 +827,65 @@ mod tests {
         packet.resize(builder.size(0));
         builder.write(&mut &mut packet[..], &[]).unwrap();
         packet
+    }
+
+    #[tokio::test]
+    async fn unknown_tcp_segments_receive_resets_without_admitting_flows() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            for inbound in [false, true] {
+                for (local, source, transparent) in [
+                    ("10.77.0.1", "10.77.0.2:40000", "198.18.0.1"),
+                    ("fd77::1", "[fd77::2]:40000", "2001:db8::1"),
+                ] {
+                    let mut stack = PacketStack::new(
+                        vec![local.parse().unwrap()],
+                        1408,
+                        inbound,
+                        TunResourceLimits::default(),
+                    )
+                    .unwrap();
+                    let source = source.parse().unwrap();
+                    let target = SocketAddr::new(
+                        if inbound { transparent } else { local }.parse().unwrap(),
+                        49152,
+                    );
+                    let mut output = stack.output.take().unwrap();
+                    let mut accepted = stack.tcp.take().unwrap();
+                    stack
+                        .input
+                        .send(tcp_segment(source, target, 5000, TcpControl::Rst, None))
+                        .await
+                        .unwrap();
+                    for control in [TcpControl::None, TcpControl::Fin, TcpControl::Syn] {
+                        stack
+                            .input
+                            .send(tcp_segment(source, target, 5000, control, Some(7000)))
+                            .await
+                            .unwrap();
+                        stack.handle.wake.notify();
+                        let packet = output.recv().await.unwrap();
+                        let info = packet_info(&packet).unwrap();
+                        assert_eq!(info.source, target);
+                        assert_eq!(info.target, source);
+                        let tcp = TcpPacket::new_checked(&packet[info.transport_offset..]).unwrap();
+                        assert!(tcp.rst());
+                        assert_eq!(tcp.seq_number().0, 7000);
+                        assert!(!tcp.ack());
+                        assert!(matches!(
+                            accepted.try_recv(),
+                            Err(mpsc::error::TryRecvError::Empty)
+                        ));
+                    }
+                    // FIFO processing makes the ACK reply a barrier for the preceding RST.
+                    assert!(matches!(
+                        output.try_recv(),
+                        Err(mpsc::error::TryRecvError::Empty)
+                    ));
+                }
+            }
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
