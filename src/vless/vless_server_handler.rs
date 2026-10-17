@@ -55,7 +55,7 @@ impl VlessTcpServerHandler {
         encryption: Option<Arc<ServerEncryption>>,
         vision: bool,
     ) -> std::io::Result<Self> {
-        if vision && encryption.is_none() || encryption.is_some() && fallback.is_some() {
+        if (vision && encryption.is_none()) || (encryption.is_some() && fallback.is_some()) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "Native VLESS Vision requires encryption; native encryption does not support fallback",
@@ -358,6 +358,7 @@ async fn setup_vision_vless_server_stream<S: VisionTransport + 'static>(
     fallback: Option<NetLocation>,
     policy: VisionWriteErrorPolicy,
 ) -> std::io::Result<TcpServerSetupResult> {
+    let native_encryption = policy == VisionWriteErrorPolicy::AcknowledgeAccepted;
     tls_stream.require_record_framing()?;
     let mut stream_reader = StreamReader::new_with_buffer_size(800);
 
@@ -412,7 +413,7 @@ async fn setup_vision_vless_server_stream<S: VisionTransport + 'static>(
             debug!("Parsing remote location...");
             let remote_location =
                 parse_remote_location_from_reader(&mut stream_reader, &mut tls_stream).await?;
-            if policy == VisionWriteErrorPolicy::AcknowledgeAccepted
+            if native_encryption
                 && matches!(remote_location.address(), Address::Hostname(host) if host == MUX_DESTINATION_HOST)
                 && remote_location.port() == MUX_DESTINATION_PORT
             {
@@ -438,7 +439,7 @@ async fn setup_vision_vless_server_stream<S: VisionTransport + 'static>(
             })
         }
         COMMAND_UDP => {
-            if policy == VisionWriteErrorPolicy::AcknowledgeAccepted && !flow.is_empty() {
+            if native_encryption && !flow.is_empty() {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     "VLESS command-2 UDP requires an empty flow with native encryption",
@@ -467,7 +468,7 @@ async fn setup_vision_vless_server_stream<S: VisionTransport + 'static>(
             Ok(TcpServerSetupResult::BidirectionalUdp {
                 remote_location,
                 stream: Box::new(vless_stream),
-                need_initial_flush: policy == VisionWriteErrorPolicy::AcknowledgeAccepted,
+                need_initial_flush: native_encryption,
                 proxy_selector: proxy_selector.clone(),
             })
         }
@@ -516,7 +517,7 @@ async fn setup_vision_vless_server_stream<S: VisionTransport + 'static>(
 
                 Ok(TcpServerSetupResult::SessionBasedUdp {
                     stream: Box::new(xudp_stream),
-                    need_initial_flush: policy == VisionWriteErrorPolicy::AcknowledgeAccepted,
+                    need_initial_flush: native_encryption,
                     proxy_selector,
                 })
             }

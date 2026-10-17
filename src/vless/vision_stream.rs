@@ -490,6 +490,8 @@ where
         // Feed write buffer to inner deframer and check for ApplicationData
         let existing_inner_len = self.inner_write_deframer.pending_bytes();
         self.inner_write_deframer.feed(buf);
+        let accepted_prefix =
+            |processed: usize| processed.saturating_sub(existing_inner_len).min(buf.len());
 
         // Process all complete TLS records in the buffer
         let mut processed_len = 0;
@@ -546,12 +548,7 @@ where
                         if command == COMMAND_DIRECT
                             && let Err(error) = self.switch_write_to_direct_mode()
                         {
-                            return self.fail_padded_write(
-                                error,
-                                processed_len
-                                    .saturating_sub(existing_inner_len)
-                                    .min(buf.len()),
-                            );
+                            return self.fail_padded_write(error, accepted_prefix(processed_len));
                         }
 
                         // this must be true because else we would have a successful next_record call on previous iteration
@@ -563,12 +560,7 @@ where
                                 // Fully drained, continue
                             }
                             Poll::Ready(Err(e)) => {
-                                return self.fail_padded_write(
-                                    e,
-                                    processed_len
-                                        .saturating_sub(existing_inner_len)
-                                        .min(buf.len()),
-                                );
+                                return self.fail_padded_write(e, accepted_prefix(processed_len));
                             }
                             Poll::Pending => {
                                 // Still draining
@@ -622,12 +614,7 @@ where
                             // continue since it drained
                         }
                         Poll::Ready(Err(e)) => {
-                            return self.fail_padded_write(
-                                e,
-                                processed_len
-                                    .saturating_sub(existing_inner_len)
-                                    .min(buf.len()),
-                            );
+                            return self.fail_padded_write(e, accepted_prefix(processed_len));
                         }
                     }
                 }
@@ -674,12 +661,7 @@ where
                             Poll::Pending => {}
                             Poll::Ready(Ok(())) => {}
                             Poll::Ready(Err(e)) => {
-                                return self.fail_padded_write(
-                                    e,
-                                    processed_len
-                                        .saturating_sub(existing_inner_len)
-                                        .min(buf.len()),
-                                );
+                                return self.fail_padded_write(e, accepted_prefix(processed_len));
                             }
                         }
 
@@ -715,12 +697,7 @@ where
                                 // Fully drained
                             }
                             Poll::Ready(Err(e)) => {
-                                return self.fail_padded_write(
-                                    e,
-                                    processed_len
-                                        .saturating_sub(existing_inner_len)
-                                        .min(buf.len()),
-                                );
+                                return self.fail_padded_write(e, accepted_prefix(processed_len));
                             }
                             Poll::Pending => {
                                 // Still draining
