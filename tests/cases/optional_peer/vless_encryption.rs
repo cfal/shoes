@@ -52,7 +52,12 @@ impl Kind {
             Self::Mihomo => std::env::var_os("MIHOMO_BINARY")
                 .expect("MIHOMO_BINARY must name the pinned Mihomo binary; no silent skips")
                 .into(),
-            Self::SingBox => shoes_test_support::process::find_singbox_binary().unwrap(),
+            Self::SingBox => {
+                std::env::var_os("SHOES_TEST_SING_BOX_BIN").expect(
+                    "SHOES_TEST_SING_BOX_BIN must name the pinned sing-box binary; no silent skips",
+                );
+                shoes_test_support::process::find_singbox_binary().unwrap()
+            }
         }
     }
 }
