@@ -797,6 +797,8 @@ mod tests {
                 upload.closed().await;
                 assert!(response.read(&mut [0; 1]).await.is_err());
                 tasks.wait().await;
+                let quiet = matches!(failure, Failure::Reset(h2::Reason::NO_ERROR));
+                assert_eq!(tasks.cancel.is_cancelled(), !quiet);
             }
         })
         .await
@@ -926,6 +928,7 @@ mod tests {
             assert!(response.is_err());
             assert!(written.await.is_err());
             tasks.wait().await;
+            assert!(tasks.cancel.is_cancelled());
             assert_eq!(budget.snapshot().active, 0);
         })
         .await

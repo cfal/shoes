@@ -218,7 +218,7 @@ async fn h2_streaming_early_responses_preserve_download_tails() {
             let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
             let address = ([127, 0, 0, 1], listener.local_addr().unwrap().port()).into();
             let tasks = Tasks::new();
-            let expected: Vec<_> = (0..48 * 1024).map(|i| (i % 251) as u8).collect();
+            let expected: Vec<_> = (0..96 * 1024).map(|i| (i % 251) as u8).collect();
             let response_bytes = expected.clone();
             tasks.spawn(async move {
                 let (socket, _) = listener.accept().await.unwrap();
@@ -265,6 +265,7 @@ async fn h2_streaming_early_responses_preserve_download_tails() {
             });
             let mut stream = client.open(dialer.clone()).await.unwrap();
             stream.write_all(&[7; 2048]).await.unwrap();
+            stream.write.closed().await;
             let mut actual = Vec::new();
             stream.read_to_end(&mut actual).await.unwrap();
             assert_eq!(actual, expected);
