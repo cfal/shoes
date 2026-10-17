@@ -277,18 +277,10 @@ pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Valida
         .dns_groups
         .iter()
         .filter(|group| {
-            group.specs.iter().any(|spec| {
-                spec.client_chains.iter().any(|chain| {
-                    chain.hops.iter().any(|hop| match hop {
-                        ClientChainHop::Single(selection) => {
-                            selection.clone().unwrap_config().protocol.is_wireguard()
-                        }
-                        ClientChainHop::Pool(selections) => selections.iter().any(|selection| {
-                            selection.clone().unwrap_config().protocol.is_wireguard()
-                        }),
-                    })
-                })
-            })
+            group
+                .specs
+                .iter()
+                .any(|spec| spec.client_chains.iter().any(chain_uses_wireguard))
         })
         .map(|group| group.name.as_str())
         .collect();
@@ -709,12 +701,7 @@ fn expand_dns_specs(
                     ))),
                 },
             };
-            // Validate inline client configs before expanding
-            for hop in chain.hops.iter_mut() {
-                validate_client_chain_hop(hop, client_groups, named_pems, global_limits)?;
-            }
-            expand_client_chain(&mut chain.hops, client_groups)?;
-            validate_direct_connector_positions(&chain.hops, 0)?;
+            validate_client_chain(&mut chain.hops, 0, client_groups, named_pems, global_limits)?;
             expanded_chains.push(chain);
         }
 
@@ -747,16 +734,7 @@ fn expand_dns_specs(
             }
         }
 
-        let uses_wireguard = expanded_chains.iter().any(|chain| {
-            chain.hops.iter().any(|hop| match hop {
-                ClientChainHop::Single(selection) => {
-                    selection.clone().unwrap_config().protocol.is_wireguard()
-                }
-                ClientChainHop::Pool(selections) => selections
-                    .iter()
-                    .any(|selection| selection.clone().unwrap_config().protocol.is_wireguard()),
-            })
-        });
+        let uses_wireguard = expanded_chains.iter().any(chain_uses_wireguard);
         if uses_wireguard && (parsed_url.has_hostname() || spec.bootstrap_url().is_some()) {
             return Err(super::types::wireguard::invalid(
                 "WireGuard DNS requires a literal upstream IP and no bootstrap_url",
@@ -798,7 +776,22 @@ fn expand_dns_specs(
     Ok(result)
 }
 
-/// Check if a client chain is direct-only (single hop with all direct protocol configs).
+fn hop_uses_wireguard(hop: &ClientChainHop) -> bool {
+    let uses_wireguard = |selection: &ConfigSelection<ClientConfig>| match selection {
+        ConfigSelection::Config(config) => config.protocol.is_wireguard(),
+        ConfigSelection::GroupName(_) => false,
+    };
+    match hop {
+        ClientChainHop::Single(selection) => uses_wireguard(selection),
+        ClientChainHop::Pool(selections) => selections.iter().any(uses_wireguard),
+    }
+}
+
+fn chain_uses_wireguard(chain: &ClientChain) -> bool {
+    chain.hops.iter().any(hop_uses_wireguard)
+}
+
+/// Checks if a client chain is direct-only (single hop with all direct protocol configs).
 fn is_chain_direct_only(chain: &ClientChain) -> bool {
     // Must have exactly one hop (OneOrSome::One variant)
     let hop = match &chain.hops {
@@ -1974,15 +1967,11 @@ fn validate_client_chain(
         validate_client_chain_hop(hop, client_groups, named_pems, global_limits)?;
     }
     expand_client_chain(hops, client_groups)?;
-    validate_direct_connector_positions(hops, chain_index)
+    validate_connector_positions(hops, chain_index)
 }
 
-/// Validates that direct connectors only appear at hop 0.
-///
-/// Direct connectors can only be used as the first hop in a chain because they
-/// create the TCP connection. At hop 1+, the TCP connection already exists, so
-/// "direct" makes no sense there.
-fn validate_direct_connector_positions(
+/// Rejects connector protocols that cannot wrap an existing stream at later hops.
+fn validate_connector_positions(
     hops: &OneOrSome<ClientChainHop>,
     chain_index: usize,
 ) -> std::io::Result<()> {
@@ -1992,14 +1981,7 @@ fn validate_direct_connector_positions(
             continue;
         }
 
-        let wireguard = |selection: &ConfigSelection<ClientConfig>| {
-            matches!(selection,
-            ConfigSelection::Config(config) if config.protocol.is_wireguard())
-        };
-        if match hop {
-            ClientChainHop::Single(selection) => wireguard(selection),
-            ClientChainHop::Pool(selections) => selections.iter().any(wireguard),
-        } {
+        if hop_uses_wireguard(hop) {
             return Err(super::types::wireguard::invalid(
                 "WireGuard is only supported at hop 0; configure outer_client_chain on the endpoint for preceding proxies",
             ));
@@ -3046,7 +3028,7 @@ mod tests {
             ClientConfig::default(), // default is direct
         )));
 
-        assert!(validate_direct_connector_positions(&hops, 0).is_ok());
+        assert!(validate_connector_positions(&hops, 0).is_ok());
     }
 
     fn http_proxy_config() -> ClientProxyConfig {
@@ -3076,7 +3058,7 @@ mod tests {
             })),
         ]);
 
-        assert!(validate_direct_connector_positions(&hops, 0).is_ok());
+        assert!(validate_connector_positions(&hops, 0).is_ok());
     }
 
     #[test]
@@ -3093,7 +3075,7 @@ mod tests {
             })),
         ]);
 
-        assert!(validate_direct_connector_positions(&hops, 0).is_ok());
+        assert!(validate_connector_positions(&hops, 0).is_ok());
     }
 
     #[test]
@@ -3107,7 +3089,7 @@ mod tests {
             ClientChainHop::Single(ConfigSelection::Config(ClientConfig::default())), // direct
         ]);
 
-        let result = validate_direct_connector_positions(&hops, 0);
+        let result = validate_connector_positions(&hops, 0);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.to_string().contains("hop 1"));
@@ -3128,7 +3110,7 @@ mod tests {
             })),
         ]);
 
-        let result = validate_direct_connector_positions(&hops, 0);
+        let result = validate_connector_positions(&hops, 0);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.to_string().contains("hop 1"));
@@ -3145,7 +3127,7 @@ mod tests {
             }),
         ])));
 
-        assert!(validate_direct_connector_positions(&hops, 0).is_ok());
+        assert!(validate_connector_positions(&hops, 0).is_ok());
     }
 
     #[test]
@@ -3165,7 +3147,7 @@ mod tests {
             ])),
         ]);
 
-        let result = validate_direct_connector_positions(&hops, 0);
+        let result = validate_connector_positions(&hops, 0);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.to_string().contains("hop 1"));
@@ -3186,7 +3168,7 @@ mod tests {
             })),
         ]);
 
-        assert!(validate_direct_connector_positions(&hops, 0).is_ok());
+        assert!(validate_connector_positions(&hops, 0).is_ok());
     }
 
     #[tokio::test]

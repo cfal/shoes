@@ -20,7 +20,7 @@ pub(crate) fn visit_hop(hop: &mut ClientChainHop, visitor: &mut Visitor<'_>) -> 
     }
 }
 
-fn rules(
+fn visit_rules(
     rules: &mut NoneOrSome<ConfigSelection<RuleConfig>>,
     visitor: &mut Visitor<'_>,
 ) -> io::Result<()> {
@@ -37,7 +37,7 @@ fn rules(
     Ok(())
 }
 
-fn protocol(protocol: &mut ServerProxyConfig, visitor: &mut Visitor<'_>) -> io::Result<()> {
+fn visit_protocol(protocol: &mut ServerProxyConfig, visitor: &mut Visitor<'_>) -> io::Result<()> {
     match protocol {
         ServerProxyConfig::Tls {
             tls_targets,
@@ -50,12 +50,12 @@ fn protocol(protocol: &mut ServerProxyConfig, visitor: &mut Visitor<'_>) -> io::
                 .values_mut()
                 .chain(default_tls_target.iter_mut().map(|target| target.as_mut()))
             {
-                rules(&mut target.override_rules, visitor)?;
-                self::protocol(&mut target.protocol, visitor)?;
+                visit_rules(&mut target.override_rules, visitor)?;
+                visit_protocol(&mut target.protocol, visitor)?;
             }
             for target in shadowtls_targets.values_mut() {
-                rules(&mut target.override_rules, visitor)?;
-                self::protocol(&mut target.protocol, visitor)?;
+                visit_rules(&mut target.override_rules, visitor)?;
+                visit_protocol(&mut target.protocol, visitor)?;
                 if let ShadowTlsServerHandshakeConfig::Remote(remote) = &mut target.handshake {
                     for hop in remote.client_chain.iter_mut() {
                         visit_hop(hop, visitor)?;
@@ -63,8 +63,8 @@ fn protocol(protocol: &mut ServerProxyConfig, visitor: &mut Visitor<'_>) -> io::
                 }
             }
             for target in reality_targets.values_mut() {
-                rules(&mut target.override_rules, visitor)?;
-                self::protocol(&mut target.protocol, visitor)?;
+                visit_rules(&mut target.override_rules, visitor)?;
+                visit_protocol(&mut target.protocol, visitor)?;
                 for hop in target.dest_client_chain.iter_mut() {
                     visit_hop(hop, visitor)?;
                 }
@@ -72,11 +72,11 @@ fn protocol(protocol: &mut ServerProxyConfig, visitor: &mut Visitor<'_>) -> io::
         }
         ServerProxyConfig::Websocket { targets } => {
             for target in targets.iter_mut() {
-                rules(&mut target.override_rules, visitor)?;
-                self::protocol(&mut target.protocol, visitor)?;
+                visit_rules(&mut target.override_rules, visitor)?;
+                visit_protocol(&mut target.protocol, visitor)?;
             }
         }
-        ServerProxyConfig::Xhttp(config) => self::protocol(&mut config.protocol, visitor)?,
+        ServerProxyConfig::Xhttp(config) => visit_protocol(&mut config.protocol, visitor)?,
         _ => {}
     }
     Ok(())
@@ -87,10 +87,10 @@ impl ValidatedConfigs {
         for config in &mut self.configs {
             match config {
                 Config::Server(server) => {
-                    rules(&mut server.rules, visitor)?;
-                    protocol(&mut server.protocol, visitor)?;
+                    visit_rules(&mut server.rules, visitor)?;
+                    visit_protocol(&mut server.protocol, visitor)?;
                 }
-                Config::TunServer(tun) => rules(&mut tun.rules, visitor)?,
+                Config::TunServer(tun) => visit_rules(&mut tun.rules, visitor)?,
                 _ => {}
             }
         }
@@ -101,7 +101,7 @@ impl ValidatedConfigs {
                 }
             }
             if let Some(inbound) = &mut endpoint.inbound {
-                rules(&mut inbound.rules, visitor)?;
+                visit_rules(&mut inbound.rules, visitor)?;
             }
         }
         for group in &mut self.dns_groups {
