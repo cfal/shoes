@@ -264,14 +264,37 @@ async fn udp_admission_and_remote_tuple_isolation() {
         assert_eq!(read_udp(&mut streams[0]).await.unwrap(), b"valid");
         assert!(stack.udp.as_mut().unwrap().try_recv().is_err());
         drop(streams);
-        let connection = loop {
-            match stack.handle.open_udp(remote).await {
-                Ok(connection) => break connection,
-                Err(_) => tokio::task::yield_now().await,
-            }
-        };
+        let connection = stack.handle.open_udp(remote).await.unwrap();
         drop(connection);
         drop(stack);
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn udp_drop_releases_each_admission_limit_without_retrying() {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        for (sessions, destinations) in [(Some(1), None), (None, Some(1)), (Some(1), Some(1))] {
+            let stack = PacketStack::new(
+                vec!["10.77.0.2".parse().unwrap()],
+                1408,
+                false,
+                TunResourceLimits {
+                    max_udp_sessions: sessions,
+                    max_udp_destinations: destinations,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let remote = "10.77.0.1:53".parse().unwrap();
+            let connection = stack.handle.open_udp(remote).await.unwrap();
+            assert!(stack.handle.open_udp(remote).await.is_err());
+            drop(connection);
+            for _ in 0..128 {
+                drop(stack.handle.open_udp(remote).await.unwrap());
+            }
+        }
     })
     .await
     .unwrap();

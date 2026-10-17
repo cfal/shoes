@@ -472,6 +472,8 @@ fn run(
             let target = match &command {
                 Command::Tcp(target, _) | Command::Udp(target, _) => *target,
             };
+            // Releases dropped UDP flows before replacement opens can hit stale limits.
+            udp.retain(|_, entry| !entry.0.lock().closed);
             let local = allocate_local(&addresses, target, &mut next_port, &tcp, &udp);
             match command {
                 Command::Tcp(target, result) => {
