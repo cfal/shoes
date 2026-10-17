@@ -25,6 +25,13 @@ use tokio::{
 
 const TCP_BYTES: usize = 512_007;
 const PARENT_NETNS: &str = "SHOES_TEST_WG_PARENT_NETNS";
+const PARENT_MOUNTNS: &str = "SHOES_TEST_WG_PARENT_MOUNTNS";
+
+#[path = "wireguard_kernel/network.rs"]
+mod network;
+
+#[path = "wireguard_kernel/resolution.rs"]
+mod resolution;
 
 fn run(program: impl AsRef<OsStr>, args: &[&str]) -> io::Result<String> {
     let output = Command::new(program.as_ref()).args(args).output()?;
@@ -67,9 +74,23 @@ fn isolated_test(name: &str, cases: impl Future<Output = io::Result<()>>) -> io:
     let output = Command::new("sudo")
         .args(["-n", "-E", "--"])
         .args(["timeout", "--kill-after=5s", "210s"])
-        .args(["unshare", "--net", "--pid", "--fork", "--kill-child", "--"])
+        .args([
+            "unshare",
+            "--net",
+            "--mount",
+            "--propagation",
+            "private",
+            "--pid",
+            "--fork",
+            "--kill-child",
+            "--",
+        ])
         .arg("env")
         .arg(format!("{PARENT_NETNS}={}", namespace.display()))
+        .arg(format!(
+            "{PARENT_MOUNTNS}={}",
+            std::fs::read_link("/proc/self/ns/mnt")?.display()
+        ))
         .arg(std::env::current_exe()?)
         .args(["--exact", name, "--nocapture", "--test-threads=1"])
         .output()?;
