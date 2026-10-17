@@ -155,6 +155,7 @@ impl ClientEncryption {
                     used,
                 },
             )?;
+            log::debug!("VLESS encryption client: resumed handshake");
             return Ok(stream);
         }
         let mlkem = kem::DecapsulationKey::generate(&kem::ML_KEM_768)
@@ -276,6 +277,7 @@ impl ClientEncryption {
                 .map_err(|_| {
                     io::Error::new(io::ErrorKind::TimedOut, "VLESS fresh handshake timed out")
                 })??;
+        log::debug!("VLESS encryption client: fresh handshake");
         Ok(EncryptionStream::new(io, true, keys, initial))
     }
 
@@ -319,6 +321,14 @@ impl ServerEncryption {
         if let Some(random) = random_prefix {
             stream.set_server_random(random);
         }
+        log::debug!(
+            "VLESS encryption server: {} handshake",
+            if random_prefix.is_some() {
+                "resumed"
+            } else {
+                "fresh"
+            }
+        );
         Ok(stream)
     }
 
@@ -345,6 +355,7 @@ impl ServerEncryption {
         };
         let length = u16::from_be_bytes(plain.try_into().unwrap()) as usize;
         let cipher = nfs_aead.cipher;
+        log::debug!("VLESS encryption server cipher: {cipher:?}");
         let random_mode = self.mode == Mode::Random;
         if length == 32 {
             let mut encrypted_ticket = [0; 32];
