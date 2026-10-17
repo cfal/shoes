@@ -35,11 +35,7 @@ impl Tasks {
 }
 
 pub(super) async fn echo() -> (u16, Tasks) {
-    echo_at("0.0.0.0").await
-}
-
-async fn echo_at(ip: &str) -> (u16, Tasks) {
-    let listener = TcpListener::bind((ip, 0)).await.unwrap();
+    let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let task = tokio::spawn(async move {
         let mut tasks = JoinSet::new();
@@ -117,22 +113,37 @@ async fn native_vision_rejects_h2mux_before_opening_a_stream() {
 async fn legacy_and_native_address_forms_and_empty_udp_responses() {
     use crate::async_stream::AsyncStream;
     use shoes_test_support::{
-        test_servers::start_udp_response_server,
+        test_servers::{start_tcp_stream_echo_server, start_udp_response_server},
         vless::{
             VlessDestination, VlessUdpClient, XUDP_OPTION_DATA, XUDP_STATUS_NEW, XudpClient,
             XudpFrame, encode_vless_udp_request, parse_uuid,
         },
     };
-    let udp = start_udp_response_server("::", 0, |payload, _| {
+
+    let udp_response = |payload: &[u8], _| {
         if payload == b"empty reply" {
             vec![]
         } else {
             payload.to_vec()
         }
-    })
-    .await
-    .unwrap();
-    let (tcp_port, mut target) = echo_at("::").await;
+    };
+    let udp = start_udp_response_server("0.0.0.0", 0, udp_response)
+        .await
+        .unwrap();
+    let (tcp_port, mut target) = echo().await;
+    // Separate listeners serve either localhost address without requiring dual-stack sockets.
+    let ipv6_targets = match TcpListener::bind("[::1]:0").await {
+        Ok(_probe) => Some((
+            start_tcp_stream_echo_server("::1", tcp_port).await.unwrap(),
+            start_udp_response_server("::1", udp.local_addr().port(), udp_response)
+                .await
+                .unwrap(),
+        )),
+        Err(error) => {
+            eprintln!("IPv6 loopback unavailable; skipping IPv6 cases: {error}");
+            None
+        }
+    };
     for (native, vision) in [(false, false), (true, false), (true, true)] {
         let (encryption, decryption) = fixture_settings("random", true, &[32]);
         let client = ClientEncryption::new(&encryption).unwrap();
@@ -166,16 +177,22 @@ async fn legacy_and_native_address_forms_and_empty_udp_responses() {
             stream
         };
         timeout(LIMIT, async {
-            let destinations = |port| {
-                [
+            let destinations = |port, ipv6: Option<SocketAddr>| {
+                let mut destinations = vec![
                     VlessDestination::Ip(SocketAddr::from(([127, 0, 0, 1], port))),
-                    VlessDestination::Ip(SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, port))),
                     VlessDestination::Domain("localhost".into(), port),
-                ]
+                ];
+                if let Some(address) = ipv6 {
+                    destinations.push(VlessDestination::Ip(address));
+                }
+                destinations
             };
             for _ in 0..2 {
                 if !vision {
-                    for destination in destinations(tcp_port) {
+                    for destination in destinations(
+                        tcp_port,
+                        ipv6_targets.as_ref().map(|(tcp, _)| tcp.local_addr()),
+                    ) {
                         let mut stream = connect().await;
                         let mut request =
                             encode_vless_udp_request(parse_uuid(UUID).unwrap(), &destination)
@@ -190,7 +207,10 @@ async fn legacy_and_native_address_forms_and_empty_udp_responses() {
                         assert_eq!(&reply[2..], b"address roundtrip");
                     }
                 }
-                for destination in destinations(udp.local_addr().port()) {
+                for destination in destinations(
+                    udp.local_addr().port(),
+                    ipv6_targets.as_ref().map(|(_, udp)| udp.local_addr()),
+                ) {
                     let stream = connect().await;
                     let mut udp = VlessUdpClient::connect(
                         stream,
