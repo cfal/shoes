@@ -16,11 +16,15 @@ struct Process {
 #[test]
 fn vless_encryption_generator_prints_only_matched_yaml_credentials() {
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-    for args in [
-        vec![],
-        vec![
-            "--auth", "x25519", "--auth", "mlkem768", "--auth", "mlkem768",
-        ],
+    for (args, expected_public_lengths, expected_private_lengths) in [
+        (vec![], vec![1184], vec![64]),
+        (
+            vec![
+                "--auth", "x25519", "--auth", "mlkem768", "--auth", "mlkem768",
+            ],
+            vec![32, 1184, 1184],
+            vec![32, 64, 64],
+        ),
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_shoes"))
             .arg("generate-vless-encryption")
@@ -49,22 +53,8 @@ fn vless_encryption_generator_prints_only_matched_yaml_credentials() {
             .skip(3)
             .map(|s| URL_SAFE_NO_PAD.decode(s).unwrap().len())
             .collect();
-        assert_eq!(
-            public_lengths,
-            if args.is_empty() {
-                vec![1184]
-            } else {
-                vec![32, 1184, 1184]
-            }
-        );
-        assert_eq!(
-            private_lengths,
-            if args.is_empty() {
-                vec![64]
-            } else {
-                vec![32, 64, 64]
-            }
-        );
+        assert_eq!(public_lengths, expected_public_lengths);
+        assert_eq!(private_lengths, expected_private_lengths);
     }
     for args in [
         vec!["--auth", "bad"],

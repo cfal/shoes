@@ -72,6 +72,18 @@ impl Peer {
     }
 }
 
+fn pair_logs(client: &Peer, server: &Peer) -> String {
+    format!("client: {}\nserver: {}", client.logs(), server.logs())
+}
+
+fn peer_roles(peer: Kind, peer_is_client: bool) -> (Kind, Kind) {
+    if peer_is_client {
+        (Kind::Shoes, peer)
+    } else {
+        (peer, Kind::Shoes)
+    }
+}
+
 async fn start(kind: Kind, port: u16, config: Value) -> Peer {
     start_binary(kind, port, config, kind.binary()).await
 }
@@ -375,8 +387,7 @@ async fn run_case(peer: Kind, peer_client: bool, mode: &str, auth: &[&str], visi
         "case: {peer:?}, peer_client={peer_client}, mode={mode}, auth={auth:?}, vision={vision}"
     );
     let (encryption, decryption, fresh_min) = credentials(mode, auth);
-    let server_kind = if peer_client { Kind::Shoes } else { peer };
-    let client_kind = if peer_client { peer } else { Kind::Shoes };
+    let (server_kind, client_kind) = peer_roles(peer, peer_client);
     let (target, connections, mut target_task) = echo().await;
     let server_port = free_port().await;
     let server = start(
@@ -396,13 +407,7 @@ async fn run_case(peer: Kind, peer_client: bool, mode: &str, auth: &[&str], visi
     for resumed in [false, true] {
         exchange(client_port, target, b"native VLESS encryption interop")
             .await
-            .unwrap_or_else(|error| {
-                panic!(
-                    "{error}\nclient: {}\nserver: {}",
-                    client.logs(),
-                    server.logs()
-                )
-            });
+            .unwrap_or_else(|error| panic!("{error}\n{}", pair_logs(&client, &server)));
         let lengths: Vec<_> = captures.lock().unwrap().iter().map(Vec::len).collect();
         assert_eq!(lengths.len(), if resumed { 2 } else { 1 });
         assert_eq!(
@@ -434,13 +439,7 @@ async fn run_case(peer: Kind, peer_client: bool, mode: &str, auth: &[&str], visi
     let data: Vec<_> = (0..131072).map(|n| (n % 251) as u8).collect();
     exchange(client_port, target, &data)
         .await
-        .unwrap_or_else(|error| {
-            panic!(
-                "{error}\nclient: {}\nserver: {}",
-                client.logs(),
-                server.logs()
-            )
-        });
+        .unwrap_or_else(|error| panic!("{error}\n{}", pair_logs(&client, &server)));
     assert_eq!(connections.load(Ordering::SeqCst), 3);
     drop((client, server));
     tap_task.stop().await;
@@ -462,8 +461,7 @@ async fn default_and_gapped_padding_preserve_payloads() {
                         ""
                     },
                 );
-                let server_kind = if peer_client { Kind::Shoes } else { peer };
-                let client_kind = if peer_client { peer } else { Kind::Shoes };
+                let (server_kind, client_kind) = peer_roles(peer, peer_client);
                 let (target, connections, mut target_task) = echo().await;
                 let server_port = free_port().await;
                 let server = start(
@@ -481,9 +479,14 @@ async fn default_and_gapped_padding_preserve_payloads() {
                 .await;
                 let payload: Vec<_> = (0..131072).map(|n| (n % 251) as u8).collect();
                 for _ in 0..3 {
-                    exchange(client_port, target, &payload).await.unwrap_or_else(|error| {
-                        panic!("{peer:?} client={peer_client} gap={gap}: {error}\nclient: {}\nserver: {}", client.logs(), server.logs())
-                    });
+                    exchange(client_port, target, &payload)
+                        .await
+                        .unwrap_or_else(|error| {
+                            panic!(
+                                "{peer:?} client={peer_client} gap={gap}: {error}\n{}",
+                                pair_logs(&client, &server)
+                            )
+                        });
                 }
                 assert_eq!(connections.load(Ordering::SeqCst), 3);
                 drop((client, server));
@@ -597,6 +600,22 @@ enum Transport {
     Reality,
 }
 
+fn shoes_protocol_mut(config: &mut Value, server: bool) -> &mut Value {
+    if server {
+        &mut config[0]["protocol"]
+    } else {
+        &mut config[0]["rules"][0]["client_chain"]["protocol"]
+    }
+}
+
+fn xray_endpoint_mut(config: &mut Value, server: bool) -> &mut Value {
+    if server {
+        &mut config["inbounds"][0]
+    } else {
+        &mut config["outbounds"][0]
+    }
+}
+
 fn wrap(
     kind: Kind,
     mut config: Value,
@@ -609,11 +628,7 @@ fn wrap(
     match (kind, transport) {
         (_, Transport::Raw) => {}
         (Kind::Shoes, Transport::Tls) => {
-            let field = if server {
-                &mut config[0]["protocol"]
-            } else {
-                &mut config[0]["rules"][0]["client_chain"]["protocol"]
-            };
+            let field = shoes_protocol_mut(&mut config, server);
             let inner = field.take();
             *field = if server {
                 json!({"type": "tls", "default_target": {"cert": cert, "key": key, "protocol": inner}})
@@ -622,11 +637,7 @@ fn wrap(
             };
         }
         (Kind::Shoes, Transport::Websocket) => {
-            let field = if server {
-                &mut config[0]["protocol"]
-            } else {
-                &mut config[0]["rules"][0]["client_chain"]["protocol"]
-            };
+            let field = shoes_protocol_mut(&mut config, server);
             let inner = field.take();
             *field = if server {
                 json!({"type": "websocket", "targets": [{"matching_path": "/native", "protocol": inner}]})
@@ -644,11 +655,7 @@ fn wrap(
                 .iter()
                 .map(|byte| format!("{byte:02x}"))
                 .collect();
-            let field = if server {
-                &mut config["inbounds"][0]
-            } else {
-                &mut config["outbounds"][0]
-            };
+            let field = xray_endpoint_mut(&mut config, server);
             field["streamSettings"] = if server {
                 json!({"network": "raw", "security": "tls", "tlsSettings": {"certificates": [{"certificate": cert.lines().collect::<Vec<_>>(), "key": key.lines().collect::<Vec<_>>() }]}})
             } else {
@@ -656,11 +663,7 @@ fn wrap(
             };
         }
         (Kind::Xray, Transport::Websocket) => {
-            let field = if server {
-                &mut config["inbounds"][0]
-            } else {
-                &mut config["outbounds"][0]
-            };
+            let field = xray_endpoint_mut(&mut config, server);
             field["streamSettings"] = json!({"network": "ws", "wsSettings": {"path": "/native"}});
         }
         (Kind::Mihomo, Transport::Tls) => {
@@ -682,20 +685,12 @@ fn wrap(
             }
         }
         (Kind::Shoes, Transport::Xhttp) => {
-            let field = if server {
-                &mut config[0]["protocol"]
-            } else {
-                &mut config[0]["rules"][0]["client_chain"]["protocol"]
-            };
+            let field = shoes_protocol_mut(&mut config, server);
             let inner = field.take();
             *field = json!({"type": "xhttp", "path": "/native", "host": "localhost", "mode": "packet-up", "http_version": "h1", "protocol": inner});
         }
         (Kind::Xray, Transport::Xhttp) => {
-            let field = if server {
-                &mut config["inbounds"][0]
-            } else {
-                &mut config["outbounds"][0]
-            };
+            let field = xray_endpoint_mut(&mut config, server);
             field["streamSettings"] = json!({"network": "xhttp", "security": "none", "xhttpSettings": {"path": "/native", "host": "localhost", "mode": "packet-up"}});
         }
         (Kind::Shoes | Kind::Xray, Transport::Reality) => {
@@ -711,11 +706,7 @@ fn wrap(
             let public = URL_SAFE_NO_PAD.encode(public.as_ref());
             let private = URL_SAFE_NO_PAD.encode(private);
             if kind == Kind::Shoes {
-                let field = if server {
-                    &mut config[0]["protocol"]
-                } else {
-                    &mut config[0]["rules"][0]["client_chain"]["protocol"]
-                };
+                let field = shoes_protocol_mut(&mut config, server);
                 let inner = field.take();
                 *field = if server {
                     json!({"type": "tls", "reality_targets": {"localhost": {"private_key": private, "short_ids": ["0123456789abcdef"], "dest": format!("localhost:{cover_port}"), "protocol": inner}}})
@@ -723,11 +714,7 @@ fn wrap(
                     json!({"type": "reality", "public_key": public, "short_id": "0123456789abcdef", "sni_hostname": "localhost", "protocol": inner})
                 };
             } else {
-                let field = if server {
-                    &mut config["inbounds"][0]
-                } else {
-                    &mut config["outbounds"][0]
-                };
+                let field = xray_endpoint_mut(&mut config, server);
                 let reality = if server {
                     json!({"target": format!("127.0.0.1:{cover_port}"), "serverNames": ["localhost"], "privateKey": private, "shortIds": ["0123456789abcdef"]})
                 } else {
@@ -749,8 +736,7 @@ async fn direct_case(peer: Kind, peer_client: bool, transport: Transport, mode: 
         "inner TLS: {peer:?}, peer_client={peer_client}, {transport:?}, {mode}, tls12={tls12}"
     );
     let (encryption, decryption, _) = credentials(mode, &["mlkem768"]);
-    let server_kind = if peer_client { Kind::Shoes } else { peer };
-    let client_kind = if peer_client { peer } else { Kind::Shoes };
+    let (server_kind, client_kind) = peer_roles(peer, peer_client);
     let (target, connector, mut target_task) = tls_echo(tls12).await;
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     let (cert, key) = (cert.cert.pem(), cert.signing_key.serialize_pem());
@@ -806,9 +792,8 @@ async fn direct_case(peer: Kind, peer_client: bool, transport: Transport, mode: 
                     assert_eq!(
                         after - before,
                         data.len() + 22,
-                        "DIRECT must remove native records, including in random mode\nclient: {}\nserver: {}",
-                        client.logs(),
-                        server.logs()
+                        "DIRECT must remove native records, including in random mode\n{}",
+                        pair_logs(&client, &server)
                     );
                 }
             }
@@ -817,11 +802,7 @@ async fn direct_case(peer: Kind, peer_client: bool, transport: Transport, mode: 
     })
     .await;
     if !matches!(result, Ok(Ok(()))) {
-        panic!(
-            "{result:?}\nclient: {}\nserver: {}",
-            client.logs(),
-            server.logs()
-        );
+        panic!("{result:?}\n{}", pair_logs(&client, &server));
     }
     let shoes = if peer_client { &server } else { &client };
     assert_eq!(
@@ -932,8 +913,7 @@ async fn fresh_only_and_zero_lifetime_never_resume() {
                 } else {
                     encryption = encryption.replacen(".0rtt.", ".1rtt.", 1);
                 }
-                let server_kind = if peer_client { Kind::Shoes } else { peer };
-                let client_kind = if peer_client { peer } else { Kind::Shoes };
+                let (server_kind, client_kind) = peer_roles(peer, peer_client);
                 let (target, _, mut target_task) = echo().await;
                 let server_port = free_port().await;
                 let server = start(
@@ -992,13 +972,9 @@ async fn native_h2mux_preserves_concurrent_connections() {
         }
         timeout(LIMIT, async {
             while let Some(result) = tasks.join_next().await {
-                result.unwrap().unwrap_or_else(|error| {
-                    panic!(
-                        "{error}\nclient: {}\nserver: {}",
-                        client.logs(),
-                        server.logs()
-                    )
-                });
+                result
+                    .unwrap()
+                    .unwrap_or_else(|error| panic!("{error}\n{}", pair_logs(&client, &server)));
             }
         })
         .await
@@ -1018,8 +994,7 @@ async fn wrong_uuid_and_key_order_have_no_destination_side_effects() {
         for peer_client in [false, true] {
             for wrong_uuid in [false, true] {
                 let (encryption, decryption, _) = credentials("native", &["x25519", "x25519"]);
-                let server_kind = if peer_client { Kind::Shoes } else { peer };
-                let client_kind = if peer_client { peer } else { Kind::Shoes };
+                let (server_kind, client_kind) = peer_roles(peer, peer_client);
                 let (target, connections, mut target_task) = echo().await;
                 let server_port = free_port().await;
                 let server = start(
@@ -1032,10 +1007,15 @@ async fn wrong_uuid_and_key_order_have_no_destination_side_effects() {
                 let mut config =
                     client_config(client_kind, client_port, server_port, &encryption, false);
                 if wrong_uuid {
-                    let changed = serde_json::to_string(&config)
-                        .unwrap()
-                        .replace(USER, "c85798ef-e9dc-46a4-9a87-8da4499d36d0");
-                    config = serde_json::from_str(&changed).unwrap();
+                    let user = match client_kind {
+                        Kind::Shoes => &mut shoes_protocol_mut(&mut config, false)["user_id"],
+                        Kind::Xray => {
+                            &mut xray_endpoint_mut(&mut config, false)["settings"]["vnext"][0]["users"]
+                                [0]["id"]
+                        }
+                        Kind::Mihomo => &mut config["proxies"][0]["uuid"],
+                    };
+                    *user = json!("c85798ef-e9dc-46a4-9a87-8da4499d36d0");
                 } else {
                     let mut fields: Vec<_> = encryption.split('.').collect();
                     fields.swap(4, 5);
@@ -1070,8 +1050,7 @@ async fn encrypted_command_two_and_xudp_roundtrip_multiple_destinations() {
         for peer_client in [false, true] {
             for vision in [false, true] {
                 let (encryption, decryption, _) = credentials("random", &["mlkem768"]);
-                let server_kind = if peer_client { Kind::Shoes } else { peer };
-                let client_kind = if peer_client { peer } else { Kind::Shoes };
+                let (server_kind, client_kind) = peer_roles(peer, peer_client);
                 let a = start_udp_echo_server_with_suffix("0.0.0.0", 0, b"")
                     .await
                     .unwrap();
@@ -1101,7 +1080,12 @@ async fn encrypted_command_two_and_xudp_roundtrip_multiple_destinations() {
                             (std::net::Ipv4Addr::LOCALHOST, target.local_addr().port()).into();
                         // Xray's XUDP writer reserves 666 of its 8192-byte buffer.
                         for payload in [b"UDP over encrypted VLESS".as_slice(), &[42; 7526][..]] {
-                            let response = association.send_to(target, payload).await.unwrap_or_else(|error| panic!("{error}: {peer:?}, peer_client={peer_client}, vision={vision}\nclient: {}\nserver: {}", client.logs(), server.logs()));
+                            let response = association.send_to(target, payload).await.unwrap_or_else(|error| {
+                                panic!(
+                                    "{error}: {peer:?}, peer_client={peer_client}, vision={vision}\n{}",
+                                    pair_logs(&client, &server)
+                                )
+                            });
                             assert_eq!(response, payload);
                         }
                     }
