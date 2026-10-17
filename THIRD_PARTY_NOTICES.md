@@ -9,9 +9,15 @@ XCFramework include this bundle and the additional GotaTun notices below.
 Regenerate the bundle after changing Cargo.lock, using cargo-about 0.9.2:
 
 ```sh
-cargo about generate --locked --all-features --fail scripts/licenses.hbs -o licenses/dependencies.txt
+cargo install --locked cargo-about@0.9.2
+python3 scripts/generate-release-notices.py
+cargo fetch --locked
 python3 scripts/test-release-notices.py
 ```
+
+Generation requires network access for the checksummed upstream blake2b_simd
+license clarification. The generator rejects warnings, including failed
+clarifications, without replacing the existing bundle.
 
 `about.toml` records the license choices and verified clarifications. CI checks
 that regeneration is clean and that every production/build dependency appears.

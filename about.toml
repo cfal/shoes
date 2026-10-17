@@ -65,6 +65,10 @@ checksum = "f025ccfb7dfb6bdfedc75ca0f67acc69e6fb4998143d834f7c2f38a29989680f"
 path = "src/polyfill/once_cell/LICENSE-MIT"
 license = "MIT"
 checksum = "6ee2ed6c77710de911761acd5fc1ad1da00f476beb1a7ef27e78c2d1858deafc"
+[[ring.clarify.files]]
+path = "third_party/fiat/LICENSE"
+license = "Apache-2.0"
+checksum = "9eacbcb81be660840c714a560a9d65ba07913db98dd4baf969f78dd499fdd60f"
 
 # The native library's consolidated license retains all component attributions.
 [aws-lc-sys.clarify]

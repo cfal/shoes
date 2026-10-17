@@ -9,6 +9,7 @@ import subprocess
 import tarfile
 import tempfile
 import unittest
+from unittest import mock
 import zipfile
 
 SPEC = importlib.util.spec_from_file_location(
@@ -17,8 +18,44 @@ SPEC = importlib.util.spec_from_file_location(
 NOTICES = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(NOTICES)
 
+GENERATOR_SPEC = importlib.util.spec_from_file_location(
+    "generate_notices", Path(__file__).with_name("generate-release-notices.py")
+)
+GENERATOR = importlib.util.module_from_spec(GENERATOR_SPEC)
+GENERATOR_SPEC.loader.exec_module(GENERATOR)
+
 
 class ReleaseNoticesTests(unittest.TestCase):
+    def test_generation_preserves_bundle_on_warning_or_failure(self):
+        for status, stderr in [(0, ""), (0, "WARN checksum mismatch"), (1, ""), (1, "failed")]:
+            with self.subTest(status=status, stderr=stderr), tempfile.TemporaryDirectory() as tmp:
+                output = Path(tmp) / "dependencies.txt"
+                output.write_text("original")
+
+                def run(command, **kwargs):
+                    Path(command[-1]).write_text("generated")
+                    return subprocess.CompletedProcess(command, status, stderr=stderr)
+
+                with mock.patch.object(GENERATOR.subprocess, "run", side_effect=run):
+                    if status or stderr:
+                        with self.assertRaises(RuntimeError):
+                            GENERATOR.generate(output)
+                        self.assertEqual(output.read_text(), "original")
+                    else:
+                        GENERATOR.generate(output)
+                        self.assertEqual(output.read_text(), "generated")
+
+    def test_bundle_has_no_placeholder_attributions(self):
+        bundle = (NOTICES.ROOT / "licenses/dependencies.txt").read_text()
+        for block in bundle.split("\nLicense: ")[1:]:
+            heading = block.splitlines()[0]
+            if heading.endswith(("(MIT)", "(BSD-2-Clause)", "(BSD-3-Clause)", "(ISC)", "(0BSD)")):
+                with self.subTest(license=heading):
+                    text = block.partition("\n\n")[2]
+                    self.assertNotRegex(
+                        text, r"(?i)<(?:year|copyright holders?|owner)>|YEAR by AUTHOR EMAIL"
+                    )
+
     def test_bundle_covers_production_dependency_graph(self):
         cargo_options = [
             "--locked", "--offline", "--all-features",
@@ -35,10 +72,15 @@ class ReleaseNoticesTests(unittest.TestCase):
         ]))
         bundle = (NOTICES.ROOT / "licenses/dependencies.txt").read_text()
         original_notices = {
-            "curve25519-dalek": "LICENSE", "x25519-dalek": "LICENSE",
-            "ip_network": "LICENSE", "ip_network_table": "LICENSE",
-            "aws-lc-sys": "LICENSE", "aws-lc-rs": "LICENSE",
-            "tikv-jemalloc-sys": "jemalloc/COPYING", "moka": "NOTICE",
+            "curve25519-dalek": ["LICENSE"], "x25519-dalek": ["LICENSE"],
+            "ip_network": ["LICENSE"], "ip_network_table": ["LICENSE"],
+            "aws-lc-sys": ["LICENSE"], "aws-lc-rs": ["LICENSE"],
+            "tikv-jemalloc-sys": ["jemalloc/COPYING"], "moka": ["NOTICE"],
+            "ring": [
+                "LICENSE-BoringSSL", "LICENSE-other-bits",
+                "src/polyfill/once_cell/LICENSE-MIT", "third_party/fiat/LICENSE",
+            ],
+            "h3": ["../LICENSE"], "h3-quinn": ["../LICENSE"],
         }
         for package in metadata["packages"]:
             if (package["name"], "v" + package["version"]) not in production:
@@ -46,13 +88,11 @@ class ReleaseNoticesTests(unittest.TestCase):
             if package["source"] is not None:
                 entry = f"Package: {package['name']} {package['version']}\n"
                 self.assertTrue(entry in bundle, f"Missing {entry.strip()}")
-            if package["name"] in original_notices:
-                source_license = (
-                    Path(package["manifest_path"]).parent / original_notices[package["name"]]
-                )
+            for notice in original_notices.get(package["name"], []):
+                source_license = Path(package["manifest_path"]).parent / notice
                 self.assertTrue(
                     source_license.read_text().strip() in bundle,
-                    f"Missing original license for {package['name']}",
+                    f"Missing original {notice} for {package['name']}",
                 )
 
     def test_artifacts_reject_missing_and_modified_notices(self):
