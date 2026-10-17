@@ -57,34 +57,32 @@ impl Drop for WakeOnDrop {
 }
 
 impl StackHandle {
-    fn send(&self, command: Command) -> io::Result<()> {
+    async fn send(&self, command: Command) -> io::Result<()> {
         if !self.running.load(Ordering::Acquire) {
             return Err(io::ErrorKind::NotConnected.into());
         }
         self.commands
-            .try_send(command)
-            .map_err(|error| match error {
-                mpsc::error::TrySendError::Full(_) => crate::resources::exhausted(),
-                mpsc::error::TrySendError::Closed(_) => io::ErrorKind::NotConnected.into(),
-            })?;
+            .send(command)
+            .await
+            .map_err(|_| io::Error::from(io::ErrorKind::NotConnected))?;
         self.wake.notify();
         Ok(())
     }
     pub async fn connect(&self, target: SocketAddr) -> io::Result<TcpConnection> {
         let (tx, rx) = oneshot::channel();
         let _cancel = WakeOnDrop(self.wake.clone());
-        self.send(Command::Tcp(target, tx))?;
-        tokio::time::timeout(Duration::from_secs(30), rx)
-            .await
-            .map_err(|_| {
-                io::Error::new(io::ErrorKind::TimedOut, "WireGuard TCP connect timed out")
-            })?
-            .map_err(|_| io::Error::from(io::ErrorKind::NotConnected))?
+        tokio::time::timeout(Duration::from_secs(30), async {
+            self.send(Command::Tcp(target, tx)).await?;
+            rx.await
+                .map_err(|_| io::Error::from(io::ErrorKind::NotConnected))?
+        })
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "WireGuard TCP connect timed out"))?
     }
     pub async fn open_udp(&self, target: SocketAddr) -> io::Result<UdpConnection> {
         let (tx, rx) = oneshot::channel();
         let _cancel = WakeOnDrop(self.wake.clone());
-        self.send(Command::Udp(target, tx))?;
+        self.send(Command::Udp(target, tx)).await?;
         rx.await
             .map_err(|_| io::Error::from(io::ErrorKind::NotConnected))?
     }
@@ -786,10 +784,10 @@ mod tests {
             let target = "10.77.0.2:443".parse().unwrap();
             let (tcp, canceled) = oneshot::channel();
             drop(canceled);
-            stack.handle.send(Command::Tcp(target, tcp)).unwrap();
+            stack.handle.send(Command::Tcp(target, tcp)).await.unwrap();
             let (udp, canceled) = oneshot::channel();
             drop(canceled);
-            stack.handle.send(Command::Udp(target, udp)).unwrap();
+            stack.handle.send(Command::Udp(target, udp)).await.unwrap();
             let connection = stack.handle.open_udp(target).await.unwrap();
             assert_eq!(
                 connection.control.lock().local.port(),
@@ -1331,26 +1329,98 @@ mod tests {
         .unwrap();
     }
 
-    #[test]
-    fn command_channel_distinguishes_full_from_closed() {
-        let (commands, receiver) = mpsc::channel(1);
+    #[tokio::test]
+    async fn command_channel_waits_for_capacity_and_rejects_closed_stack() {
+        let (commands, mut receiver) = mpsc::channel(1);
         let (wake, _wake_rx) = Wake::new().unwrap();
         let handle = StackHandle {
             commands,
             wake,
             running: Arc::new(AtomicBool::new(true)),
         };
-        let command = || Command::Udp("10.77.0.1:53".parse().unwrap(), oneshot::channel().0);
-        handle.send(command()).unwrap();
+        let target = "10.77.0.1:53".parse().unwrap();
+        let command = || Command::Udp(target, oneshot::channel().0);
+        handle.commands.try_send(command()).unwrap();
+        let mut opening = Box::pin(handle.open_udp(target));
+        assert!(futures::poll!(&mut opening).is_pending());
+        receiver.try_recv().unwrap();
+        assert!(futures::poll!(&mut opening).is_pending());
+        let Command::Udp(_, result) = receiver.try_recv().unwrap() else {
+            panic!("expected UDP open");
+        };
+        let _ = result.send(Err(io::ErrorKind::AddrNotAvailable.into()));
         assert_eq!(
-            handle.send(command()).unwrap_err().kind(),
-            crate::resources::exhausted().kind()
+            opening.await.err().unwrap().kind(),
+            io::ErrorKind::AddrNotAvailable
         );
+        handle.commands.try_send(command()).unwrap();
+        let mut opening = Box::pin(handle.open_udp(target));
+        assert!(futures::poll!(&mut opening).is_pending());
         drop(receiver);
         assert_eq!(
-            handle.send(command()).unwrap_err().kind(),
+            opening.await.err().unwrap().kind(),
             io::ErrorKind::NotConnected
         );
+        assert_eq!(
+            handle.open_udp(target).await.err().unwrap().kind(),
+            io::ErrorKind::NotConnected
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tcp_connect_timeout_includes_waiting_for_command_capacity() {
+        let (commands, mut receiver) = mpsc::channel(1);
+        let (wake, _wake_rx) = Wake::new().unwrap();
+        let handle = StackHandle {
+            commands,
+            wake,
+            running: Arc::new(AtomicBool::new(true)),
+        };
+        let target = "10.77.0.1:443".parse().unwrap();
+        handle
+            .commands
+            .try_send(Command::Tcp(target, oneshot::channel().0))
+            .unwrap();
+        let error = handle.connect(target).await.err().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(error.to_string(), "WireGuard TCP connect timed out");
+        receiver.try_recv().unwrap();
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn udp_open_bursts_respect_flow_limits_not_queue_capacity() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let limit = QUEUE_CAPACITY * 4;
+            let stack = PacketStack::new(
+                vec!["10.77.0.1".parse().unwrap()],
+                1408,
+                false,
+                TunResourceLimits {
+                    max_udp_sessions: Some(limit),
+                    max_udp_destinations: Some(limit),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let target = "10.77.0.2:53".parse().unwrap();
+            let connections =
+                futures::future::join_all((0..limit).map(|_| stack.handle.open_udp(target)))
+                    .await
+                    .into_iter()
+                    .collect::<io::Result<Vec<_>>>()
+                    .unwrap();
+            assert_eq!(connections.len(), limit);
+            assert_eq!(
+                stack.handle.open_udp(target).await.err().unwrap().kind(),
+                crate::resources::exhausted().kind()
+            );
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
