@@ -9,21 +9,13 @@ pub(super) fn wrap_singbox(
     cover: u16,
 ) -> Value {
     let tls = if matches!(transport, Transport::Reality) {
-        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-        let private = [42; 32];
-        let public = aws_lc_rs::agreement::PrivateKey::from_private_key(
-            &aws_lc_rs::agreement::X25519,
-            &private,
-        )
-        .unwrap()
-        .compute_public_key()
-        .unwrap();
+        let (private, public) = reality_keys();
         if server {
             json!({"enabled":true,"server_name":"localhost","reality":{"enabled":true,
-                "handshake":{"server":"localhost","server_port":cover},"private_key":URL_SAFE_NO_PAD.encode(private),"short_id":["0123456789abcdef"]}})
+                "handshake":{"server":"localhost","server_port":cover},"private_key":private,"short_id":["0123456789abcdef"]}})
         } else {
             json!({"enabled":true,"server_name":"localhost","utls":{"enabled":true,"fingerprint":"chrome"},
-                "reality":{"enabled":true,"public_key":URL_SAFE_NO_PAD.encode(public.as_ref()),"short_id":"0123456789abcdef"}})
+                "reality":{"enabled":true,"public_key":public,"short_id":"0123456789abcdef"}})
         }
     } else {
         assert!(matches!(transport, Transport::Tls));
@@ -109,14 +101,14 @@ async fn legacy_peers_assert_direct_end_and_eof_over_tls_and_reality() {
     for peer in [Kind::Xray, Kind::Mihomo, Kind::SingBox] {
         for peer_client in [false, true] {
             for transport in [Transport::Tls, Transport::Reality] {
-                for inner_tls in [None, Some(true), Some(false)] {
+                for inner_tls12 in [None, Some(true), Some(false)] {
                     // sing-box's Vision wrapper has no CloseWrite; upload EOF closes both sides.
                     let half_close_before_reply = peer != Kind::SingBox || !peer_client;
                     decision_case(
                         peer,
                         peer_client,
                         transport,
-                        inner_tls,
+                        inner_tls12,
                         half_close_before_reply,
                     )
                     .await;
@@ -136,15 +128,15 @@ async fn decision_case(
     peer: Kind,
     peer_client: bool,
     transport: Transport,
-    inner_tls: Option<bool>,
+    inner_tls12: Option<bool>,
     half_close_before_reply: bool,
 ) {
     eprintln!(
-        "legacy decisions: {peer:?} client={peer_client} {transport:?} inner_tls12={inner_tls:?}"
+        "legacy decisions: {peer:?} client={peer_client} {transport:?} inner_tls12={inner_tls12:?}"
     );
     let (server_kind, client_kind) = peer_roles(peer, peer_client);
     let (cover, _, mut cover_task) = tls_echo(false).await;
-    let (target, connector, mut target_task) = if let Some(tls12) = inner_tls {
+    let (target, connector, mut target_task) = if let Some(tls12) = inner_tls12 {
         let (port, connector, task) = tls_echo(tls12).await;
         (port, Some(connector), task)
     } else {
@@ -155,7 +147,7 @@ async fn decision_case(
     let (cert, key) = (cert.cert.pem(), cert.signing_key.serialize_pem());
     let server_port = free_port().await;
     let client_port = free_port().await;
-    let mut sc = wrap(
+    let mut server_settings = wrap(
         server_kind,
         server_config(server_kind, server_port, "none", server_kind != Kind::Shoes),
         true,
@@ -164,7 +156,7 @@ async fn decision_case(
         &key,
         cover,
     );
-    let mut cc = wrap(
+    let mut client_settings = wrap(
         client_kind,
         client_config(
             client_kind,
@@ -180,12 +172,12 @@ async fn decision_case(
         cover,
     );
     if server_kind == Kind::Shoes {
-        enable_legacy_vision(&mut sc, true, transport);
+        enable_legacy_vision(&mut server_settings, true, transport);
     } else {
-        enable_legacy_vision(&mut cc, false, transport);
+        enable_legacy_vision(&mut client_settings, false, transport);
     }
-    let server = start(server_kind, server_port, sc).await;
-    let client = start(client_kind, client_port, cc).await;
+    let server = start(server_kind, server_port, server_settings).await;
+    let client = start(client_kind, client_port, client_settings).await;
     timeout(Duration::from_secs(20), async {
         let socket = socks_connect(client_port, target).await?;
         if let Some(connector) = connector {
@@ -214,7 +206,7 @@ async fn decision_case(
     .unwrap_or_else(|e| panic!("{e}\n{}", pair_logs(&client, &server)))
     .unwrap_or_else(|e| panic!("{e}\n{}", pair_logs(&client, &server)));
     let shoes = if peer_client { &server } else { &client };
-    let direct = inner_tls == Some(false);
+    let direct = inner_tls12 == Some(false);
     for direction in ["READ", "WRITE"] {
         let logs = shoes.logs();
         assert_eq!(

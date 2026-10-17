@@ -28,24 +28,25 @@ async fn tls_and_anytls_consumers_survive_backpressure_and_cancelled_streams() {
                 } else {
                     json!({"type":"socks"})
                 };
-                let hop = start(Kind::Shoes, hop_port, json!([{
+                let hop_config = json!([{
                     "address":format!("0.0.0.0:{hop_port}"),
                     "protocol":{"type":"tls","default_target":{
                         "cert":cert.cert.pem(),"key":cert.signing_key.serialize_pem(),"protocol":hop_protocol
                     }}
-                }])).await;
+                }]);
+                let hop = start(Kind::Shoes, hop_port, hop_config).await;
                 let proxy = free_port().await;
                 let mut config =
                     client_config(Kind::Shoes, proxy, carrier_port, &encryption, vision);
-                let first = config[0]["rules"][0]["client_chain"].take();
-                let protocol = if anytls {
+                let vless_hop = config[0]["rules"][0]["client_chain"].take();
+                let hop_client_protocol = if anytls {
                     json!({"type":"anytls","password":"test-password"})
                 } else {
                     json!({"type":"socks"})
                 };
-                config[0]["rules"][0]["client_chain"] = json!([first, {
+                config[0]["rules"][0]["client_chain"] = json!([vless_hop, {
                     "address":format!("127.0.0.1:{hop_port}"),
-                    "protocol":{"type":"tls","sni_hostname":"localhost","verify":false,"protocol":protocol}
+                    "protocol":{"type":"tls","sni_hostname":"localhost","verify":false,"protocol":hop_client_protocol}
                 }]);
                 let client = start(Kind::Shoes, proxy, config).await;
                 let (target, _, mut target_task) = echo().await;

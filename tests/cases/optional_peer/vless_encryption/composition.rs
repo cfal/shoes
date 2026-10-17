@@ -12,13 +12,14 @@ pub(super) fn wrap_xhttp(
     key: &str,
     cover: u16,
 ) -> Value {
-    if version == "reality" {
-        config = wrap(kind, config, server, Transport::Reality, cert, key, cover);
-    } else if !matches!(version, "plain" | "h2c" | "h3") || (kind != Kind::Shoes && version == "h3")
-    {
-        config = wrap(kind, config, server, Transport::Tls, cert, key, cover);
-    } else if version == "h3" {
-        config = wrap(kind, config, server, Transport::Quic, cert, key, cover);
+    let carrier = match (version, kind) {
+        ("reality", _) => Some(Transport::Reality),
+        ("plain" | "h2c", _) => None,
+        ("h3", Kind::Shoes) => Some(Transport::Quic),
+        _ => Some(Transport::Tls),
+    };
+    if let Some(carrier) = carrier {
+        config = wrap(kind, config, server, carrier, cert, key, cover);
     }
     let alpn = match version {
         "plain" | "h1" => "http/1.1",
@@ -41,8 +42,14 @@ pub(super) fn wrap_xhttp(
                 protocol = &mut protocol["protocol"];
             }
             let inner = protocol.take();
+            let http_version = match version {
+                "plain" => "h1",
+                "h2c" => "h2",
+                "reality" => "auto",
+                other => other,
+            };
             *protocol = json!({"type":"xhttp", "path":"/native", "host":"localhost", "mode":mode,
-                "http_version":match version { "plain" => "h1", "h2c" => "h2", "reality" => "auto", other => other },
+                "http_version":http_version,
                 "sc_max_each_post_bytes":1024, "protocol":inner});
         }
         Kind::Xray => {
@@ -93,8 +100,8 @@ async fn wrapped_case(
         "composition: {peer:?} client={peer_client} {transport:?} encrypted={encrypted} vision={vision}"
     );
     let (encryption, decryption) = if encrypted {
-        let (c, s, _) = credentials("random", &["mlkem768"]);
-        (c, s)
+        let (encryption, decryption, _) = credentials("random", &["mlkem768"]);
+        (encryption, decryption)
     } else {
         ("none".into(), "none".into())
     };

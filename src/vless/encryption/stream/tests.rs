@@ -16,9 +16,13 @@ async fn maximum_native_record_keeps_direct_command_in_second_vision_read_and_ra
             let second = vec![42; 7596];
             let mut plain = vec![0, 0];
             plain.extend_from_slice(&[7; 16]);
-            plain.extend_from_slice(&[0, 0x23, 0x28, 0, 0]);
+            plain.push(0);
+            plain.extend_from_slice(&(first.len() as u16).to_be_bytes());
+            plain.extend_from_slice(&[0, 0]);
             plain.extend_from_slice(&first);
-            plain.extend_from_slice(&[2, 0x1d, 0xac, 0, 0]);
+            plain.push(2);
+            plain.extend_from_slice(&(second.len() as u16).to_be_bytes());
+            plain.extend_from_slice(&[0, 0]);
             plain.extend_from_slice(&second);
             assert_eq!(plain.len(), 16624);
             let mut peer = Aead::new(b"context", &[7; 96], cipher).unwrap();

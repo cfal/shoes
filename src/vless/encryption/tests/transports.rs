@@ -219,17 +219,16 @@ async fn legacy_and_native_address_forms_and_empty_udp_responses() {
                     )
                     .await
                     .unwrap();
-                    for payload in [b"empty reply".as_slice(), b"nonempty after empty"] {
+                    for (payload, expected) in [
+                        (b"empty reply".as_slice(), b"".as_slice()),
+                        (
+                            b"nonempty after empty".as_slice(),
+                            b"nonempty after empty".as_slice(),
+                        ),
+                    ] {
                         udp.send_packet(payload).await.unwrap();
                         let reply = udp.recv_packet(LIMIT).await.unwrap();
-                        assert_eq!(
-                            reply,
-                            if payload == b"empty reply" {
-                                b""
-                            } else {
-                                payload
-                            }
-                        );
+                        assert_eq!(reply, expected);
                     }
                     let mut xudp = XudpClient::connect(connect().await, parse_uuid(UUID).unwrap())
                         .await

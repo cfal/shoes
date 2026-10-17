@@ -63,9 +63,11 @@ async fn native_direct_splices_only_unmasked_tcp_and_preserves_half_close() {
                             },
                             server.handshake(wrap(b))
                         );
-                        let c = VisionStream::new_client(a, [7; 16]).unwrap()
+                        let c = VisionStream::new_client(a, [7; 16])
+                            .unwrap()
                             .with_write_error_policy(VisionWriteErrorPolicy::AcknowledgeAccepted);
-                        let s = VisionStream::new_server(b.unwrap(), [7; 16], b"").unwrap()
+                        let s = VisionStream::new_server(b.unwrap(), [7; 16], b"")
+                            .unwrap()
                             .with_write_error_policy(VisionWriteErrorPolicy::AcknowledgeAccepted);
                         let (mut peer, mut relay_io) = if server_relay { (c, s) } else { (s, c) };
                         let (mut remote, mut target) = tcp_pair().await;
@@ -73,7 +75,11 @@ async fn native_direct_splices_only_unmasked_tcp_and_preserves_half_close() {
                             copy_bidirectional(&mut relay_io, &mut remote, false, false).await
                         });
                         let hello = client_hello();
-                        let flight = [server_hello(0x1301, 32, TLS13_VERSION), APPLICATION.to_vec()].concat();
+                        let flight = [
+                            server_hello(0x1301, 32, TLS13_VERSION),
+                            APPLICATION.to_vec(),
+                        ]
+                        .concat();
                         if server_relay {
                             transfer(&mut peer, &mut target, &hello).await;
                             transfer(&mut target, &mut peer, &flight).await;
@@ -85,9 +91,10 @@ async fn native_direct_splices_only_unmasked_tcp_and_preserves_half_close() {
                             assert!(peer.plain_tcp().is_none());
                             transfer(&mut target, &mut peer, APPLICATION).await;
                         }
-                        let splice = mode != "random" && !hide_tcp;
-                        assert_eq!(peer.plain_tcp().is_some(), splice);
-                        let payload: Vec<_> = (0..1024 * 1024 + 37).map(|n| (n % 251) as u8).collect();
+                        let expect_splice = mode != "random" && !hide_tcp;
+                        assert_eq!(peer.plain_tcp().is_some(), expect_splice);
+                        let payload: Vec<_> =
+                            (0..1024 * 1024 + 37).map(|n| (n % 251) as u8).collect();
                         for upload in [true, false] {
                             let before = crate::splice::TEST_SPLICED_BYTES.get();
                             if upload {
@@ -98,7 +105,7 @@ async fn native_direct_splices_only_unmasked_tcp_and_preserves_half_close() {
                             let copied = crate::splice::TEST_SPLICED_BYTES.get() - before;
                             assert_eq!(
                                 copied > 0,
-                                splice,
+                                expect_splice,
                                 "{mode}, server={server_relay}, hidden={hide_tcp}, resumed={resumed}, upload={upload}"
                             );
                         }
@@ -112,5 +119,7 @@ async fn native_direct_splices_only_unmasked_tcp_and_preserves_half_close() {
                 }
             }
         }
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
 }

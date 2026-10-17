@@ -689,6 +689,21 @@ fn xray_endpoint_mut(config: &mut Value, server: bool) -> &mut Value {
     }
 }
 
+fn reality_keys() -> (String, String) {
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+
+    let private = [42; 32];
+    let public =
+        aws_lc_rs::agreement::PrivateKey::from_private_key(&aws_lc_rs::agreement::X25519, &private)
+            .unwrap()
+            .compute_public_key()
+            .unwrap();
+    (
+        URL_SAFE_NO_PAD.encode(private),
+        URL_SAFE_NO_PAD.encode(public.as_ref()),
+    )
+}
+
 fn wrap(
     kind: Kind,
     mut config: Value,
@@ -825,17 +840,7 @@ fn wrap(
             field["streamSettings"] = json!({"network": "xhttp", "security": "none", "xhttpSettings": {"path": "/native", "host": "localhost", "mode": "packet-up"}});
         }
         (Kind::Shoes | Kind::Xray, Transport::Reality) => {
-            use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-            let private = [42; 32];
-            let public = aws_lc_rs::agreement::PrivateKey::from_private_key(
-                &aws_lc_rs::agreement::X25519,
-                &private,
-            )
-            .unwrap()
-            .compute_public_key()
-            .unwrap();
-            let public = URL_SAFE_NO_PAD.encode(public.as_ref());
-            let private = URL_SAFE_NO_PAD.encode(private);
+            let (private, public) = reality_keys();
             if kind == Kind::Shoes {
                 let field = shoes_protocol_mut(&mut config, server);
                 let inner = field.take();
@@ -867,26 +872,18 @@ fn wrap(
             );
         }
         (Kind::Mihomo, Transport::Reality) => {
-            use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-            let private = [42; 32];
-            let public = aws_lc_rs::agreement::PrivateKey::from_private_key(
-                &aws_lc_rs::agreement::X25519,
-                &private,
-            )
-            .unwrap()
-            .compute_public_key()
-            .unwrap();
+            let (private, public) = reality_keys();
             if server {
                 config["listeners"][0]["reality-config"] = json!({
                     "dest":format!("localhost:{cover_port}"), "server-names":["localhost"],
-                    "private-key":URL_SAFE_NO_PAD.encode(private), "short-id":["0123456789abcdef"]
+                    "private-key":private, "short-id":["0123456789abcdef"]
                 });
             } else {
                 let proxy = &mut config["proxies"][0];
                 proxy["tls"] = json!(true);
                 proxy["servername"] = json!("localhost");
                 proxy["client-fingerprint"] = json!("chrome");
-                proxy["reality-opts"] = json!({"public-key":URL_SAFE_NO_PAD.encode(public.as_ref()), "short-id":"0123456789abcdef"});
+                proxy["reality-opts"] = json!({"public-key":public, "short-id":"0123456789abcdef"});
             }
         }
     }
