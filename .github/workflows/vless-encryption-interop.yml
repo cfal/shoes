@@ -1,0 +1,101 @@
+name: VLESS encryption interoperability
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  pinned-peers:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      CARGO_BUILD_JOBS: 1
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+      GOMAXPROCS: 1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.1'
+          cache: false
+      - uses: actions/checkout@v4
+        with:
+          repository: XTLS/Xray-core
+          ref: 0f3d884786f9ec73d3be8899cb6b9e1e6dd3c41e
+          path: peers/xray
+      - uses: actions/checkout@v4
+        with:
+          repository: MetaCubeX/mihomo
+          ref: 94b13aed49b8dc41973e4bb3f721c5fa2c5c5c1f
+          path: peers/mihomo
+      - uses: actions/checkout@v4
+        with:
+          repository: SagerNet/sing-box
+          ref: dfb80349bf5779ec0a3f834c9ec2794345bff8f0
+          path: peers/sing-box
+      - uses: actions/checkout@v4
+        with:
+          repository: cfal/shoes
+          ref: 001495285ac16e2121a539682d1a1f6a7c07c5ed
+          path: peers/shoes-baseline
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-vless-encryption-${{ hashFiles('Cargo.lock') }}
+      - name: Build frozen Shoes baseline
+        working-directory: peers/shoes-baseline
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+        run: |
+          cargo build --locked --bin shoes
+          cp "$CARGO_TARGET_DIR/debug/shoes" "$RUNNER_TEMP/shoes-baseline"
+      - name: Build pinned Xray
+        working-directory: peers/xray
+        run: go build -p 1 -o "$RUNNER_TEMP/xray" ./main
+      - name: Build pinned Mihomo
+        working-directory: peers/mihomo
+        run: go build -p 1 -ldflags '-X github.com/metacubex/mihomo/constant.Version=alpha-94b13aed' -o "$RUNNER_TEMP/mihomo" .
+      - name: Build legacy sing-box peer
+        working-directory: peers/sing-box
+        run: go build -p 1 -tags with_utls,with_quic -o "$RUNNER_TEMP/sing-box" ./cmd/sing-box
+      - name: Native VLESS peer matrix
+        env:
+          XRAY_BINARY: ${{ runner.temp }}/xray
+          MIHOMO_BINARY: ${{ runner.temp }}/mihomo
+        run: cargo test --locked --features optional-peer-tests --test vless_encryption_interop -- --test-threads=1
+      - name: Cross-language cryptography vectors
+        run: |
+          cargo test --locked --lib vless::encryption:: -- --test-threads=1
+          VLESS_RUST_VECTORS="$RUNNER_TEMP/vless-rust.json" cargo test --locked --lib export_rust_encapsulations -- --ignored
+          cd peers/xray
+          go run -p 1 ../../tests/fixtures/vless_encryption/generate.go --verify-rust "$RUNNER_TEMP/vless-rust.json"
+      - name: Bounded native VLESS stress
+        run: cargo test --locked --features stress-tests --test stress vless_encryption -- --test-threads=1
+      - name: Legacy baseline comparison
+        env:
+          XRAY_BINARY: ${{ runner.temp }}/xray
+          SHOES_BASELINE_BINARY: ${{ runner.temp }}/shoes-baseline
+        run: cargo test --locked --features optional-peer-tests --test vless_encryption_interop legacy_baseline_matches_backpressure_and_half_close -- --ignored --test-threads=1
+      - name: Legacy VLESS regression
+        env:
+          SHOES_TEST_SING_BOX_BIN: ${{ runner.temp }}/sing-box
+        run: cargo test --locked --features integration-tests --test integration vless -- --test-threads=1
+      - name: Legacy REALITY regression
+        env:
+          XRAY_BINARY: ${{ runner.temp }}/xray
+        run: cargo test --locked --features optional-peer-tests --test reality_interop -- --test-threads=1
+      - name: XHTTP transport regression
+        env:
+          SHOES_TEST_XRAY_BIN: ${{ runner.temp }}/xray
+          SHOES_TEST_MIHOMO_BIN: ${{ runner.temp }}/mihomo
+        run: |
+          cargo test --locked --features integration-tests --test xhttp_interop shoes_to_shoes_modes_and_transports -- --test-threads=1
+          cargo test --locked --features integration-tests --test xhttp_interop all_modes_and_versions -- --test-threads=1
+          cargo test --locked --features integration-tests --test xhttp_interop mihomo_alpha -- --test-threads=1

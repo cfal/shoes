@@ -14,6 +14,160 @@ struct Process {
 }
 
 #[test]
+fn vless_encryption_generator_prints_only_matched_yaml_credentials() {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    for (args, expected_public_lengths, expected_private_lengths) in [
+        (vec![], vec![1184], vec![64]),
+        (
+            vec![
+                "--auth", "x25519", "--auth", "mlkem768", "--auth", "mlkem768",
+            ],
+            vec![32, 1184, 1184],
+            vec![32, 64, 64],
+        ),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_shoes"))
+            .arg("generate-vless-encryption")
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let values: serde_yaml::Value = serde_yaml::from_slice(&output.stdout).unwrap();
+        assert_eq!(values.as_mapping().unwrap().len(), 2);
+        let encryption = values["encryption"].as_str().unwrap();
+        let decryption = values["decryption"].as_str().unwrap();
+        assert!(!String::from_utf8_lossy(&output.stderr).contains(decryption));
+        assert!(encryption.starts_with("mlkem768x25519plus.native.0rtt."));
+        assert!(decryption.starts_with("mlkem768x25519plus.native.600s."));
+        let public_lengths: Vec<_> = encryption
+            .split('.')
+            .skip(3)
+            .map(|s| URL_SAFE_NO_PAD.decode(s).unwrap().len())
+            .collect();
+        let private_lengths: Vec<_> = decryption
+            .split('.')
+            .skip(3)
+            .map(|s| URL_SAFE_NO_PAD.decode(s).unwrap().len())
+            .collect();
+        assert_eq!(public_lengths, expected_public_lengths);
+        assert_eq!(private_lengths, expected_private_lengths);
+    }
+    for args in [
+        vec!["--auth", "bad"],
+        vec!["--rtt", "1rtt"],
+        vec!["--lifetime", "0s"],
+        vec!["--mode"],
+        vec!["--mode", "random", "--mode", "native"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_shoes"))
+            .arg("generate-vless-encryption")
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+    }
+}
+
+#[test]
+fn vless_encryption_rejects_invalid_startup_without_credentials_in_diagnostics() {
+    use serde_json::json;
+    let directory = tempfile::Builder::new()
+        .prefix("vless-invalid-")
+        .tempdir_in(std::env::var_os("HOME").unwrap())
+        .unwrap();
+    let credential = "mlkem768x25519plus.native.600s.private-key-must-not-appear";
+    for protocol in [
+        json!({"type": "vless", "user_id": "550e8400-e29b-41d4-a716-446655440000", "decryption": credential}),
+        json!({"type": "vless", "user_id": "550e8400-e29b-41d4-a716-446655440000", "vision": true}),
+        json!({"type": "vless", "user_id": "550e8400-e29b-41d4-a716-446655440000", "encryption_limits": {"max_sessions": 0}}),
+    ] {
+        let address = available_address();
+        let config = directory.path().join("invalid.json");
+        std::fs::write(
+            &config,
+            serde_json::to_vec(&json!([{"address": address, "protocol": protocol}])).unwrap(),
+        )
+        .unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_shoes"))
+            .arg("--no-reload")
+            .arg(&config)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let diagnostic = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !diagnostic.contains("private-key-must-not-appear"),
+            "{diagnostic}"
+        );
+        assert!(!diagnostic.contains("Servers ready"), "{diagnostic}");
+        assert!(std::net::TcpListener::bind(address).is_ok());
+    }
+}
+
+#[test]
+fn vless_wrong_side_credentials_fail_check_and_startup() {
+    use serde_json::json;
+    let directory = tempfile::Builder::new()
+        .prefix("vless-wrong-side-")
+        .tempdir_in(std::env::var_os("HOME").unwrap())
+        .unwrap();
+    for server in [false, true] {
+        let address = available_address();
+        let mut protocol = json!({
+            "type": "vless", "user_id": "550e8400-e29b-41d4-a716-446655440000",
+        });
+        protocol[if server { "encryption" } else { "decryption" }] =
+            json!("private-key-must-not-appear");
+        let config = if server {
+            json!([{"address": address, "protocol": protocol}])
+        } else {
+            json!([{"address": address, "protocol": {"type": "socks"},
+                "rules": [{"masks": "0.0.0.0/0", "action": "allow", "client_chain": {
+                    "address": "127.0.0.1:443", "protocol": protocol,
+                }}],
+            }])
+        };
+        let path = directory.path().join("invalid.json");
+        std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+        for operation in ["check", "--no-reload"] {
+            let output = Command::new(env!("CARGO_BIN_EXE_shoes"))
+                .arg(operation)
+                .arg(&path)
+                .output()
+                .unwrap();
+            assert!(!output.status.success());
+            let diagnostic = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                diagnostic.contains("Could not parse config file"),
+                "{diagnostic}"
+            );
+            if server {
+                assert!(diagnostic.contains("VLESS server uses decryption, not encryption"));
+            }
+            assert!(
+                !diagnostic.contains("private-key-must-not-appear"),
+                "{diagnostic}"
+            );
+            assert!(!diagnostic.contains("Servers ready"));
+            assert!(std::net::TcpListener::bind(address).is_ok());
+        }
+    }
+}
+
+#[test]
 fn reality_mldsa_keygen_outputs_interoperable_seed_and_key() {
     use aws_lc_rs::signature::{self, KeyPair};
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};

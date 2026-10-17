@@ -683,6 +683,22 @@ pub enum ServerProxyConfig {
     },
     Vless {
         user_id: String,
+        #[serde(
+            default,
+            skip_serializing_if = "super::vless::VlessEncryptionSetting::is_disabled"
+        )]
+        decryption: super::vless::VlessEncryptionSetting,
+        #[serde(
+            default,
+            rename = "encryption",
+            skip_serializing,
+            deserialize_with = "super::vless::reject_server_encryption"
+        )]
+        _invalid_encryption: (),
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        vision: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        encryption_limits: Option<super::vless::VlessEncryptionLimits>,
         #[serde(default = "default_true")]
         udp_enabled: bool,
         /// Fallback destination for failed authentication (optional)
@@ -908,6 +924,10 @@ mod tests {
             .into(),
             protocol: ServerProxyConfig::Vless {
                 user_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+                decryption: Default::default(),
+                _invalid_encryption: (),
+                vision: false,
+                encryption_limits: None,
                 udp_enabled: true,
                 fallback: None,
             },

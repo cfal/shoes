@@ -41,6 +41,7 @@ use super::tcp_client_handler_factory::create_tcp_client_proxy_selector;
 #[derive(Default)]
 pub(crate) struct HandlerServices {
     xhttp: std::collections::HashMap<Vec<String>, crate::xhttp::XhttpServer>,
+    vless: std::collections::HashMap<Vec<String>, Arc<crate::vless::encryption::ServerEncryption>>,
 }
 
 struct ServiceScope<'a> {
@@ -204,13 +205,41 @@ fn create_handler(
             user_id,
             udp_enabled,
             fallback,
-        } => Box::new(VlessTcpServerHandler::new(
-            &user_id,
-            udp_enabled,
-            client_proxy_selector.clone(),
-            resolver.clone(),
-            fallback,
-        )),
+            decryption,
+            vision,
+            encryption_limits,
+            ..
+        } => {
+            let encryption = if decryption.is_disabled() {
+                if encryption_limits.is_some() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "VLESS encryption_limits requires native decryption",
+                    ));
+                }
+                None
+            } else {
+                let service = match scope.services.vless.entry(scope.path.clone()) {
+                    std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(Arc::new(crate::vless::encryption::ServerEncryption::new(
+                            decryption.as_str(),
+                            encryption_limits.unwrap_or_default(),
+                        )?))
+                    }
+                };
+                Some(service.clone())
+            };
+            Box::new(VlessTcpServerHandler::new(
+                &user_id,
+                udp_enabled,
+                client_proxy_selector.clone(),
+                resolver.clone(),
+                fallback,
+                encryption,
+                vision,
+            )?)
+        }
         ServerProxyConfig::Trojan {
             password,
             shadowsocks,
@@ -373,10 +402,12 @@ fn create_handler(
 }
 
 fn create_vision_vless_config(protocol: &ServerProxyConfig) -> std::io::Result<VisionVlessConfig> {
+    crate::config::validate_server_vision(true, protocol)?;
     let ServerProxyConfig::Vless {
         user_id,
         udp_enabled,
         fallback,
+        ..
     } = protocol
     else {
         return Err(std::io::Error::new(
@@ -726,6 +757,64 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::io::ErrorKind;
+
+    #[test]
+    fn native_vless_services_share_only_within_one_generation_and_protocol_path() {
+        let selector = Arc::new(ClientProxySelector::new(vec![]));
+        let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
+        let config: ServerProxyConfig = serde_json::from_value(json!({
+            "type": "vless", "user_id": "550e8400-e29b-41d4-a716-446655440000",
+            "decryption": "mlkem768x25519plus.native.600s.CQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        })).unwrap();
+        let mut services = HandlerServices::default();
+        let first = create_tcp_server_handler_shared(
+            config.clone(),
+            &selector,
+            &resolver,
+            Some("127.0.0.1".parse().unwrap()),
+            &mut services,
+        )
+        .unwrap();
+        let session = services.vless[&Vec::new()].clone();
+        let second = create_tcp_server_handler_shared(
+            config.clone(),
+            &selector,
+            &resolver,
+            Some("127.0.0.2".parse().unwrap()),
+            &mut services,
+        )
+        .unwrap();
+        assert_eq!(services.vless.len(), 1);
+        assert!(Arc::ptr_eq(&session, &services.vless[&Vec::new()]));
+        assert_eq!(Arc::strong_count(&session), 4);
+        let scoped = create_handler(
+            config.clone(),
+            &selector,
+            &resolver,
+            None,
+            &mut ServiceScope {
+                services: &mut services,
+                path: vec!["other-target".into()],
+            },
+        )
+        .unwrap();
+        assert!(!Arc::ptr_eq(
+            &session,
+            &services.vless[&vec!["other-target".into()]]
+        ));
+        let mut next_generation = HandlerServices::default();
+        let next = create_tcp_server_handler_shared(
+            config,
+            &selector,
+            &resolver,
+            None,
+            &mut next_generation,
+        )
+        .unwrap();
+        assert!(!Arc::ptr_eq(&session, &next_generation.vless[&Vec::new()]));
+        drop((first, second, scoped, next, services, next_generation));
+        assert_eq!(Arc::strong_count(&session), 1);
+    }
 
     #[test]
     fn unsupported_protocols_return_errors_without_credentials() {

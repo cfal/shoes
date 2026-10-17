@@ -13,7 +13,7 @@ use crate::resolver::Resolver;
 use crate::rustls_config_util::try_create_server_config;
 use crate::tcp::tcp_client_handler_factory::create_tcp_client_proxy_selector;
 use crate::tcp::tcp_handler::TcpServerHandler;
-use crate::tcp::tcp_server_handler_factory::create_tcp_server_handler;
+use crate::tcp::tcp_server_handler_factory::{HandlerServices, create_tcp_server_handler_shared};
 use crate::uuid_util::parse_uuid;
 
 async fn start_quic_server(
@@ -333,17 +333,19 @@ pub async fn start_quic_servers(
         tcp_protocol => {
             // Shares protocol state across ports without reusing an interface-specific UDP bind IP.
             let mut handlers: HashMap<IpAddr, Arc<dyn TcpServerHandler>> = HashMap::new();
+            let mut services = HandlerServices::default();
             // Construct every handler before spawning listeners so errors cannot detach tasks.
             for bind_address in &bind_addresses {
                 if let std::collections::hash_map::Entry::Vacant(entry) =
                     handlers.entry(bind_address.ip())
                 {
                     entry.insert(
-                        create_tcp_server_handler(
+                        create_tcp_server_handler_shared(
                             tcp_protocol.clone(),
                             &client_proxy_selector,
                             &resolver,
                             Some(bind_address.ip()),
+                            &mut services,
                         )?
                         .into(),
                     );

@@ -3,6 +3,7 @@ use tokio::io::AsyncWriteExt;
 use crate::async_stream::AsyncShutdownMessageExt;
 
 pub(crate) const SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+pub(crate) const STREAM_SETUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 pub(crate) async fn shutdown_stream<T: AsyncWriteExt + Unpin + ?Sized>(stream: &mut T) {
     let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, stream.shutdown()).await;
@@ -17,7 +18,7 @@ pub(crate) async fn shutdown_message_stream<T: AsyncShutdownMessageExt + Unpin +
 pub(crate) async fn timeout_stream_setup<T>(
     future: impl std::future::Future<Output = std::io::Result<T>>,
 ) -> std::io::Result<T> {
-    tokio::time::timeout(std::time::Duration::from_secs(60), future)
+    tokio::time::timeout(STREAM_SETUP_TIMEOUT, future)
         .await
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "stream setup timed out"))?
 }

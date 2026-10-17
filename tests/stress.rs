@@ -4,5 +4,7 @@ mod anytls;
 mod benchmarks;
 #[path = "cases/stress/tls_throughput_benchmark.rs"]
 mod tls_throughput;
+#[path = "cases/stress/vless_encryption.rs"]
+mod vless_encryption;
 #[path = "cases/stress/vless_xudp_long_lived.rs"]
 mod vless_xudp_long_lived;
