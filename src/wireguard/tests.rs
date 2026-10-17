@@ -220,6 +220,41 @@ async fn wireguard_concurrent_tcp_transfers_preserve_all_data() {
 }
 
 #[tokio::test]
+async fn wireguard_mapped_ipv4_outer_endpoint_uses_ipv4_transport() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        for listen in [
+            None,
+            Some("0.0.0.0:0"),
+            Some("[::]:0"),
+            Some("[::ffff:127.0.0.1]:0"),
+        ] {
+            let reservation = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+            let port = reservation.local_addr().unwrap().port();
+            let mut configs = validate(&pair_config(port)).unwrap();
+            configs.wireguard_endpoints[1].listen = listen.map(|address| address.parse().unwrap());
+            configs.wireguard_endpoints[1].peers[0].endpoint =
+                Some(format!("[::ffff:127.0.0.1]:{port}"));
+            let prepared = Prepared::new(&mut configs).await.unwrap();
+            assert_eq!(
+                prepared.endpoints[1].peers[0].endpoint,
+                Some(SocketAddr::from(([127, 0, 0, 1], port)))
+            );
+            drop(reservation);
+            let mut running = Running::default();
+            prepared
+                .start(&mut DnsRegistry::new(), &mut running)
+                .await
+                .unwrap();
+            let (tcp, udp, _echoes) = echo_servers(false).await;
+            check_echo(prepared.endpoints[1].connector.as_ref(), tcp, udp).await;
+            running.stop().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn wireguard_ipv6_outer_transport() {
     tokio::time::timeout(Duration::from_secs(10), async {
         let reservation = std::net::UdpSocket::bind("[::]:0").unwrap();
@@ -311,7 +346,15 @@ async fn wireguard_ipv4_bind_selects_a_compatible_hostname_address() {
     assert!(prepared.endpoints[1].peers[0].endpoint.unwrap().is_ipv6());
     configs.wireguard_endpoints[1].peers[0].endpoint = Some("127.0.0.1:51820".into());
     assert!(configs.wireguard_endpoints[1].validate().is_err());
+    configs.wireguard_endpoints[1].peers[0].endpoint = Some("[::ffff:127.0.0.1]:51820".into());
+    assert!(configs.wireguard_endpoints[1].validate().is_err());
+    configs.wireguard_endpoints[1].listen = Some("[::ffff:127.0.0.1]:0".parse().unwrap());
+    assert!(configs.wireguard_endpoints[1].validate().is_ok());
+    configs.wireguard_endpoints[1].peers[0].endpoint = Some("[::1]:51820".into());
+    assert!(configs.wireguard_endpoints[1].validate().is_err());
     configs.wireguard_endpoints[1].listen = Some("[::]:0".parse().unwrap());
+    assert!(configs.wireguard_endpoints[1].validate().is_ok());
+    configs.wireguard_endpoints[1].peers[0].endpoint = Some("127.0.0.1:51820".into());
     assert!(configs.wireguard_endpoints[1].validate().is_ok());
 }
 

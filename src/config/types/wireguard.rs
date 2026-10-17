@@ -92,8 +92,9 @@ impl WireguardConfig {
     #[cfg(unix)]
     pub(crate) fn can_reach_endpoint(&self, endpoint: SocketAddr) -> bool {
         self.listen.is_none_or(|listen| {
-            listen.is_ipv4() == endpoint.is_ipv4()
-                || listen.is_ipv6() && listen.ip().is_unspecified()
+            let listen = listen.ip().to_canonical();
+            listen.is_ipv4() == endpoint.ip().to_canonical().is_ipv4()
+                || listen.is_ipv6() && listen.is_unspecified()
         })
     }
 

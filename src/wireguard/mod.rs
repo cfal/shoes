@@ -163,6 +163,10 @@ impl Prepared {
                             )
                         })??
                         .into_iter()
+                        .map(|mut address| {
+                            address.set_ip(address.ip().to_canonical());
+                            address
+                        })
                         .find(|address| config.can_reach_endpoint(*address))
                         .ok_or_else(|| {
                             stdio::Error::new(
