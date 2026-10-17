@@ -498,36 +498,26 @@ async fn monitor_tcp_close(stream: &mut Box<dyn AsyncStream>) -> std::io::Result
 
 #[derive(Debug)]
 pub struct SocksTcpClientHandler {
-    prefix_data: Vec<u8>,
-    has_auth: bool,
+    auth_data: Option<Vec<u8>>,
+    auth_method: u8,
 }
 
 impl SocksTcpClientHandler {
     pub fn new(auth_info: Option<(String, String)>) -> Self {
-        let mut data = vec![
-            VER_SOCKS5,
-            1, // number of methods,
-            if auth_info.is_some() {
-                METHOD_USERNAME
-            } else {
-                METHOD_NONE
-            },
-        ];
-        if let Some((username, password)) = auth_info.as_ref() {
-            data.extend(&[VER_AUTH, username.len() as u8]);
-            data.extend_from_slice(username.as_bytes());
-            data.push(password.len() as u8);
-            data.extend_from_slice(password.as_bytes());
-        }
-        data.extend(&[
-            VER_SOCKS5,
-            CMD_CONNECT,
-            0x0, // reserved
-        ]);
+        let (auth_method, auth_data) = match auth_info {
+            Some((username, password)) => {
+                let mut data = vec![VER_AUTH, username.len() as u8];
+                data.extend_from_slice(username.as_bytes());
+                data.push(password.len() as u8);
+                data.extend_from_slice(password.as_bytes());
+                (METHOD_USERNAME, Some(data))
+            }
+            None => (METHOD_NONE, None),
+        };
 
         Self {
-            prefix_data: data,
-            has_auth: auth_info.is_some(),
+            auth_data,
+            auth_method,
         }
     }
 }
@@ -539,12 +529,10 @@ impl TcpClientHandler for SocksTcpClientHandler {
         mut client_stream: Box<dyn AsyncStream>,
         remote_location: ResolvedLocation,
     ) -> std::io::Result<TcpClientSetupResult> {
-        write_all(&mut client_stream, &self.prefix_data).await?;
-        let location_bytes = write_location_to_vec(remote_location.location());
-        write_all(&mut client_stream, &location_bytes).await?;
-        client_stream.flush().await?;
-
         let mut stream_reader = StreamReader::new_with_buffer_size(400);
+
+        write_all(&mut client_stream, &[VER_SOCKS5, 1, self.auth_method]).await?;
+        client_stream.flush().await?;
 
         let socks_version = stream_reader.read_u8(&mut client_stream).await?;
         if socks_version != VER_SOCKS5 {
@@ -555,14 +543,21 @@ impl TcpClientHandler for SocksTcpClientHandler {
         }
 
         let auth_method = stream_reader.read_u8(&mut client_stream).await?;
-        if auth_method == METHOD_INVALID {
+        if auth_method != self.auth_method {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "SOCKS server rejected auth method",
+                if auth_method == METHOD_INVALID {
+                    "SOCKS server rejected auth method"
+                } else {
+                    "SOCKS server selected an unsupported auth method"
+                },
             ));
         }
 
-        if self.has_auth {
+        if let Some(auth_data) = &self.auth_data {
+            write_all(&mut client_stream, auth_data).await?;
+            client_stream.flush().await?;
+
             let auth_version = stream_reader.read_u8(&mut client_stream).await?;
             if auth_version != VER_AUTH {
                 return Err(std::io::Error::new(
@@ -579,6 +574,11 @@ impl TcpClientHandler for SocksTcpClientHandler {
                 ));
             }
         }
+
+        let mut connect_request = vec![VER_SOCKS5, CMD_CONNECT, 0x0];
+        connect_request.extend(write_location_to_vec(remote_location.location()));
+        write_all(&mut client_stream, &connect_request).await?;
+        client_stream.flush().await?;
 
         let socks_version = stream_reader.read_u8(&mut client_stream).await?;
         if socks_version != VER_SOCKS5 {
@@ -618,6 +618,116 @@ impl TcpClientHandler for SocksTcpClientHandler {
             client_stream,
             early_data,
         })
+    }
+}
+
+#[cfg(test)]
+mod client_handshake_tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn client_waits_for_method_selection_before_auth_or_connect() {
+        for with_auth in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut greeting = [0; 3];
+                stream.read_exact(&mut greeting).await.unwrap();
+                assert_eq!(
+                    greeting,
+                    [
+                        VER_SOCKS5,
+                        1,
+                        if with_auth {
+                            METHOD_USERNAME
+                        } else {
+                            METHOD_NONE
+                        }
+                    ]
+                );
+
+                let mut unexpected = [0; 1];
+                assert!(
+                    tokio::time::timeout(
+                        Duration::from_millis(50),
+                        stream.read_exact(&mut unexpected),
+                    )
+                    .await
+                    .is_err()
+                );
+
+                let method = if with_auth {
+                    METHOD_USERNAME
+                } else {
+                    METHOD_NONE
+                };
+                stream.write_all(&[VER_SOCKS5, method]).await.unwrap();
+
+                if with_auth {
+                    let mut auth = [0; 11];
+                    stream.read_exact(&mut auth).await.unwrap();
+                    assert_eq!(
+                        &auth,
+                        &[
+                            VER_AUTH, 4, b'u', b's', b'e', b'r', 4, b'p', b'a', b's', b's'
+                        ]
+                    );
+                    stream.write_all(&[VER_AUTH, RESULT_SUCCESS]).await.unwrap();
+                }
+
+                let expected_connect = [
+                    VER_SOCKS5,
+                    CMD_CONNECT,
+                    0,
+                    ADDR_TYPE_DOMAIN_NAME,
+                    11,
+                    b'e',
+                    b'x',
+                    b'a',
+                    b'm',
+                    b'p',
+                    b'l',
+                    b'e',
+                    b'.',
+                    b'c',
+                    b'o',
+                    b'm',
+                    1,
+                    187,
+                ];
+                let mut connect = [0; 18];
+                stream.read_exact(&mut connect).await.unwrap();
+                assert_eq!(connect, expected_connect);
+                stream
+                    .write_all(&[
+                        VER_SOCKS5,
+                        RESULT_SUCCESS,
+                        0,
+                        ADDR_TYPE_IPV4,
+                        127,
+                        0,
+                        0,
+                        1,
+                        0,
+                        0,
+                    ])
+                    .await
+                    .unwrap();
+            });
+
+            let client = tokio::net::TcpStream::connect(address).await.unwrap();
+            let auth_info = with_auth.then(|| ("user".to_string(), "pass".to_string()));
+            let handler = SocksTcpClientHandler::new(auth_info);
+            let destination = NetLocation::from_str("example.com:443", None).unwrap();
+            handler
+                .setup_client_tcp_stream(Box::new(client), destination.into())
+                .await
+                .unwrap();
+            server.await.unwrap();
+        }
     }
 }
 
