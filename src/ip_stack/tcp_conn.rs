@@ -54,7 +54,7 @@ struct TcpConnectionInner {
     recv_state: TcpSocketState,
     /// Send side state
     send_state: TcpSocketState,
-    abandoned: bool,
+    abandoned_at: Option<smoltcp::time::Instant>,
 }
 
 impl TcpConnectionControl {
@@ -68,20 +68,23 @@ impl TcpConnectionControl {
                 recv_waker: None,
                 recv_state: TcpSocketState::Normal,
                 send_state: TcpSocketState::Normal,
-                abandoned: false,
+                abandoned_at: None,
             }),
         }
     }
 
     // --- Methods called by stack thread ---
 
-    pub fn is_abandoned(&self) -> bool {
-        self.inner.lock().abandoned
+    pub fn orphan_deadline(&self) -> Option<smoltcp::time::Instant> {
+        self.inner
+            .lock()
+            .abandoned_at
+            .map(|at| at + super::TCP_ORPHAN_TIMEOUT)
     }
 
     pub fn should_abort(&self) -> bool {
         let inner = self.inner.lock();
-        inner.abandoned
+        inner.abandoned_at.is_some()
             && (!matches!(
                 inner.send_state,
                 TcpSocketState::Closing | TcpSocketState::Closed
@@ -198,7 +201,7 @@ impl TcpConnection {
 impl Drop for TcpConnection {
     fn drop(&mut self) {
         let mut inner = self.control.inner.lock();
-        inner.abandoned = true;
+        inner.abandoned_at = Some(std::time::Instant::now().into());
         drop(inner);
         self.notify();
     }

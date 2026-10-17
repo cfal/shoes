@@ -2,7 +2,7 @@ use log::{error, trace};
 use smoltcp::{
     iface::SocketHandle,
     socket::tcp::{CongestionControl, Socket as TcpSocket, SocketBuffer, State as TcpState},
-    time::Duration as SmolDuration,
+    time::{Duration as SmolDuration, Instant as SmolInstant},
 };
 use tcp_conn::{TcpConnectionControl, TcpSocketState};
 
@@ -18,6 +18,20 @@ pub(crate) mod wake;
 
 // Matches Linux tcp_keepalive_time and shadowsocks-rust.
 const TCP_PEER_SILENCE_TIMEOUT: SmolDuration = SmolDuration::from_secs(7200);
+// Bounds orphaned FIN exchanges independently of traffic refreshing smoltcp's silence timer.
+const TCP_ORPHAN_TIMEOUT: SmolDuration = SmolDuration::from_secs(60);
+
+pub(crate) fn tcp_poll_delay<'a>(
+    now: SmolInstant,
+    stack_delay: Option<SmolDuration>,
+    controls: impl Iterator<Item = &'a TcpConnectionControl>,
+) -> Option<SmolDuration> {
+    controls
+        .filter_map(TcpConnectionControl::orphan_deadline)
+        .map(|deadline| deadline.max(now) - now)
+        .chain(stack_delay)
+        .min()
+}
 
 pub(crate) fn tcp_socket(buffer_size: usize) -> TcpSocket<'static> {
     let mut socket = TcpSocket::new(
@@ -37,12 +51,14 @@ pub(crate) fn pump_tcp(
     handle: SocketHandle,
     socket: &mut TcpSocket<'_>,
     control: &TcpConnectionControl,
+    now: SmolInstant,
 ) {
-    if control.is_abandoned() {
+    if let Some(deadline) = control.orphan_deadline() {
         // A completed write shutdown must finish its FIN exchange, unless unread data is discarded.
-        if control.should_abort() || socket.can_recv() {
+        if now >= deadline || control.should_abort() || socket.can_recv() {
             socket.abort();
         } else {
+            socket.set_keep_alive(None);
             socket.close();
         }
         return;

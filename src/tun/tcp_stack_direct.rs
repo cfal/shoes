@@ -615,7 +615,7 @@ fn run_direct_stack_thread(
             let control = &socket_info.control;
             let socket = socket_set.get_mut::<TcpSocket>(handle);
 
-            crate::ip_stack::pump_tcp(handle, socket, control);
+            crate::ip_stack::pump_tcp(handle, socket, control, stack_now());
         }
 
         // Amortizes loop overhead without starving later sockets or draining indefinitely.
@@ -646,7 +646,12 @@ fn run_direct_stack_thread(
             continue;
         }
 
-        let delay = iface.poll_delay(stack_now(), &socket_set);
+        let now = stack_now();
+        let delay = crate::ip_stack::tcp_poll_delay(
+            now,
+            iface.poll_delay(now, &socket_set),
+            sockets.values().map(|info| &*info.control),
+        );
         #[cfg(test)]
         if let Some(gate) = wake_rx.before_wait.take() {
             assert!(delay.is_none(), "idle test must not rely on a timer wakeup");
@@ -1192,7 +1197,7 @@ mod tests {
         );
         let connection = receiver.try_recv().unwrap();
         assert_eq!(connection.remote_addr, address);
-        assert!(!control.is_abandoned());
+        assert!(control.orphan_deadline().is_none());
         assert!(snapshot.is_some());
         assert!(state.lock().unwrap().new_conn_tx.is_none());
     }
@@ -1345,7 +1350,12 @@ mod tests {
         socket_set.get_mut::<TcpSocket>(handle).close();
         control.set_send_state(TcpSocketState::Closing);
         drop(connection);
-        crate::ip_stack::pump_tcp(handle, socket_set.get_mut::<TcpSocket>(handle), &control);
+        crate::ip_stack::pump_tcp(
+            handle,
+            socket_set.get_mut::<TcpSocket>(handle),
+            &control,
+            stack_now(),
+        );
         assert_eq!(
             socket_set.get::<TcpSocket>(handle).state(),
             TcpState::FinWait1
@@ -1697,7 +1707,7 @@ mod tests {
         );
         assert!(Pin::new(&mut conn).poll_write(&mut cx, b"b").is_ready());
         drop(conn);
-        assert!(control.is_abandoned());
+        assert!(control.orphan_deadline().is_some());
     }
 
     #[test]

@@ -253,7 +253,7 @@ struct TcpEntry {
     pending: Option<(oneshot::Sender<io::Result<TcpConnection>>, TcpConnection)>,
 }
 impl TcpEntry {
-    fn pump(&mut self, handle: SocketHandle, socket: &mut TcpSocket<'_>) {
+    fn pump(&mut self, handle: SocketHandle, socket: &mut TcpSocket<'_>, now: Instant) {
         if !self.established && matches!(socket.state(), State::Established | State::CloseWait) {
             self.established = true;
             socket.set_timeout(Some(super::TCP_PEER_SILENCE_TIMEOUT));
@@ -270,7 +270,7 @@ impl TcpEntry {
                 let _ = result.send(Err(io::ErrorKind::ConnectionRefused.into()));
             }
         }
-        super::pump_tcp(handle, socket, &self.control);
+        super::pump_tcp(handle, socket, &self.control, now);
     }
 }
 impl Drop for TcpEntry {
@@ -287,6 +287,27 @@ impl Drop for UdpEntry {
 
 fn now() -> Instant {
     std::time::Instant::now().into()
+}
+
+fn reconcile_tcp(
+    tcp: &mut HashMap<SocketHandle, TcpEntry>,
+    sockets: &mut SocketSet<'_>,
+    counts: &FlowCounts,
+) -> bool {
+    let mut local_work = false;
+    tcp.retain(|handle, entry| {
+        let socket = sockets.get::<TcpSocket>(*handle);
+        if socket.state() == State::Closed && socket.remote_endpoint().is_none() {
+            sockets.remove(*handle);
+            return false;
+        }
+        local_work |= socket.can_recv() && !entry.control.recv_buffer_full()
+            || socket.can_send() && !entry.control.send_buffer_empty()
+            || socket.state() != State::Closed && entry.control.should_abort();
+        true
+    });
+    counts.tcp.store(tcp.len(), Ordering::Relaxed);
+    local_work
 }
 
 struct PacketInfo {
@@ -565,6 +586,9 @@ fn run(
                 {
                     continue;
                 }
+                let Ok(permit) = accepted.try_reserve() else {
+                    continue;
+                };
                 let mut socket = tcp_socket(limits.tcp_buffer_size);
                 if socket.listen(info.target).is_err() {
                     continue;
@@ -582,17 +606,11 @@ fn run(
                     limits.tcp_buffer_size,
                 ));
                 let connection = TcpConnection::new(control.clone(), wake.clone());
-                if accepted
-                    .try_send(AcceptedTcp {
-                        connection,
-                        source: info.source,
-                        target: info.target,
-                    })
-                    .is_err()
-                {
-                    sockets.remove(handle);
-                    continue;
-                }
+                permit.send(AcceptedTcp {
+                    connection,
+                    source: info.source,
+                    target: info.target,
+                });
                 tcp.insert(
                     handle,
                     TcpEntry {
@@ -618,7 +636,7 @@ fn run(
         }
         for (handle, entry) in &mut tcp {
             let socket = sockets.get_mut::<TcpSocket>(*handle);
-            entry.pump(*handle, socket);
+            entry.pump(*handle, socket, now());
         }
         udp.retain(|_, entry| {
             let mut control = entry.0.lock();
@@ -647,19 +665,7 @@ fn run(
                 break;
             }
         }
-        let mut local_work = false;
-        tcp.retain(|handle, entry| {
-            let socket = sockets.get::<TcpSocket>(*handle);
-            if socket.state() == State::Closed && socket.remote_endpoint().is_none() {
-                sockets.remove(*handle);
-                return false;
-            }
-            local_work |= socket.can_recv() && !entry.control.recv_buffer_full()
-                || socket.can_send() && !entry.control.send_buffer_empty()
-                || socket.state() != State::Closed && entry.control.should_abort();
-            true
-        });
-        counts.tcp.store(tcp.len(), Ordering::Relaxed);
+        let local_work = reconcile_tcp(&mut tcp, &mut sockets, &counts);
         counts.outbound_udp.store(udp.len(), Ordering::Relaxed);
         if !running.load(Ordering::Acquire) {
             break;
@@ -667,7 +673,13 @@ fn run(
         if work >= QUEUE_CAPACITY || !commands.is_empty() || local_work {
             continue;
         }
-        if let Err(error) = wake_rx.wait(-1, iface.poll_delay(now(), &sockets).map(Into::into))
+        let timestamp = now();
+        let delay = super::tcp_poll_delay(
+            timestamp,
+            iface.poll_delay(timestamp, &sockets),
+            tcp.values().map(|entry| &*entry.control),
+        );
+        if let Err(error) = wake_rx.wait(-1, delay.map(Into::into))
             && error.kind() != io::ErrorKind::Interrupted
         {
             break;
@@ -702,6 +714,191 @@ mod tests {
         packet.resize(builder.size(0));
         builder.write(&mut &mut packet[..], &[]).unwrap();
         packet
+    }
+
+    #[tokio::test]
+    async fn full_accept_queue_drops_syn_before_sending_synack() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut stack = PacketStack::new(
+                vec!["10.77.0.1".parse().unwrap()],
+                1408,
+                true,
+                TunResourceLimits::default(),
+            )
+            .unwrap();
+            let mut accepted = stack.tcp.take().unwrap();
+            let mut output = stack.output.take().unwrap();
+            let mut inbound_udp = stack.udp.take().unwrap();
+            let target = "198.18.0.1:443".parse().unwrap();
+            for port in 40000..40000 + QUEUE_CAPACITY as u16 {
+                let source = SocketAddr::new("10.77.0.2".parse().unwrap(), port);
+                stack
+                    .input
+                    .send(tcp_segment(source, target, 1000, TcpControl::Syn, None))
+                    .await
+                    .unwrap();
+                stack.handle.wake.notify();
+                output.recv().await.unwrap();
+            }
+            assert_eq!(accepted.len(), QUEUE_CAPACITY);
+            let overflow = "10.77.0.2:50000".parse().unwrap();
+            stack
+                .input
+                .send(tcp_segment(overflow, target, 1000, TcpControl::Syn, None))
+                .await
+                .unwrap();
+            // The UDP sentinel is delivered only after the preceding SYN has been processed.
+            stack
+                .input
+                .send(
+                    crate::tun::udp_handler::build_udp_packet(b"barrier", overflow, target)
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            stack.handle.wake.notify();
+            inbound_udp.recv().await.unwrap();
+            while let Ok(packet) = output.try_recv() {
+                let ip = Ipv4Packet::new_checked(&*packet).unwrap();
+                assert_ne!(
+                    TcpPacket::new_checked(ip.payload()).unwrap().dst_port(),
+                    overflow.port()
+                );
+            }
+            let _first = accepted.recv().await.unwrap();
+            stack
+                .input
+                .send(tcp_segment(overflow, target, 1000, TcpControl::Syn, None))
+                .await
+                .unwrap();
+            stack.handle.wake.notify();
+            loop {
+                let packet = output.recv().await.unwrap();
+                let ip = Ipv4Packet::new_checked(&*packet).unwrap();
+                let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+                if tcp.dst_port() == overflow.port() {
+                    assert!(tcp.syn() && tcp.ack());
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[test]
+    fn orphaned_fin_wait_releases_admission_even_when_peer_keeps_sending_acks() {
+        use super::super::{TCP_ORPHAN_TIMEOUT, tcp_conn::TcpSocketState, tcp_poll_delay};
+        use smoltcp::time::Duration as SmolDuration;
+
+        for live_peer in [false, true] {
+            let (output, mut packets) = mpsc::channel(QUEUE_CAPACITY);
+            let mut device = QueueDevice {
+                packet: None,
+                output,
+                mtu: 1408,
+                drops: Arc::default(),
+            };
+            let start = now();
+            let mut iface = Interface::new(Config::new(HardwareAddress::Ip), &mut device, start);
+            let source: SocketAddr = "10.77.0.2:40000".parse().unwrap();
+            let target: SocketAddr = "10.77.0.1:443".parse().unwrap();
+            iface.update_ip_addrs(|ips| ips.push(IpCidr::new(target.ip().into(), 24)).unwrap());
+            let mut socket = tcp_socket(4096);
+            socket.listen(target).unwrap();
+            let mut sockets = SocketSet::new(vec![]);
+            let handle = sockets.add(socket);
+            let control = Arc::new(TcpConnectionControl::new(4096, 4096));
+            let connection = TcpConnection::new(control.clone(), Wake::new().unwrap().0);
+            let mut entries = HashMap::from([(
+                handle,
+                TcpEntry {
+                    control: control.clone(),
+                    remote: source,
+                    local: target,
+                    outbound: false,
+                    established: false,
+                    pending: None,
+                },
+            )]);
+            let counts = FlowCounts::default();
+            device.packet = Some(tcp_segment(source, target, 1000, TcpControl::Syn, None));
+            iface.poll(start, &mut device, &mut sockets);
+            let synack = packets.try_recv().unwrap();
+            let ip = Ipv4Packet::new_checked(&*synack).unwrap();
+            let ack = (TcpPacket::new_checked(ip.payload()).unwrap().seq_number() + 1).0 as u32;
+            device.packet = Some(tcp_segment(
+                source,
+                target,
+                1001,
+                TcpControl::None,
+                Some(ack),
+            ));
+            iface.poll(start, &mut device, &mut sockets);
+            entries.get_mut(&handle).unwrap().pump(
+                handle,
+                sockets.get_mut::<TcpSocket>(handle),
+                start,
+            );
+            sockets.get_mut::<TcpSocket>(handle).close();
+            control.set_send_state(TcpSocketState::Closing);
+            drop(connection);
+            let deadline = control.orphan_deadline().unwrap();
+            let abandoned = deadline - TCP_ORPHAN_TIMEOUT;
+            entries.get_mut(&handle).unwrap().pump(
+                handle,
+                sockets.get_mut::<TcpSocket>(handle),
+                abandoned,
+            );
+            iface.poll_egress(abandoned, &mut device, &mut sockets);
+            let fin = packets.try_recv().unwrap();
+            let ip = Ipv4Packet::new_checked(&*fin).unwrap();
+            assert!(TcpPacket::new_checked(ip.payload()).unwrap().fin());
+            let ack = ack.wrapping_add(1);
+            device.packet = Some(tcp_segment(
+                source,
+                target,
+                1001,
+                TcpControl::None,
+                Some(ack),
+            ));
+            iface.poll(abandoned, &mut device, &mut sockets);
+            assert_eq!(sockets.get::<TcpSocket>(handle).state(), State::FinWait2);
+            assert_eq!(sockets.get::<TcpSocket>(handle).keep_alive(), None);
+            assert!(!reconcile_tcp(&mut entries, &mut sockets, &counts));
+            assert_eq!(counts.tcp.load(Ordering::Relaxed), 1);
+
+            for seconds in [1, 29, 59, 60] {
+                let timestamp = abandoned + SmolDuration::from_secs(seconds);
+                if live_peer {
+                    device.packet = Some(tcp_segment(
+                        source,
+                        target,
+                        1001,
+                        TcpControl::None,
+                        Some(ack),
+                    ));
+                    iface.poll_ingress_single(timestamp, &mut device, &mut sockets);
+                }
+                assert_eq!(
+                    tcp_poll_delay(timestamp, None, std::iter::once(&*control)),
+                    Some(SmolDuration::from_secs(60 - seconds)),
+                );
+                entries.get_mut(&handle).unwrap().pump(
+                    handle,
+                    sockets.get_mut::<TcpSocket>(handle),
+                    timestamp,
+                );
+                iface.poll_egress(timestamp, &mut device, &mut sockets);
+                assert!(!reconcile_tcp(&mut entries, &mut sockets, &counts));
+                assert_eq!(
+                    counts.tcp.load(Ordering::Relaxed),
+                    usize::from(seconds < 60)
+                );
+            }
+            assert!(entries.is_empty());
+            assert_eq!(control.recv_state(), TcpSocketState::Closed);
+        }
     }
 
     #[tokio::test]
@@ -796,7 +993,7 @@ mod tests {
             device.packet = Some(tcp_segment(source, target, 1000, TcpControl::Syn, None));
             iface.poll(start, &mut device, &mut sockets);
             let socket = sockets.get_mut::<TcpSocket>(handle);
-            entry.pump(handle, socket);
+            entry.pump(handle, socket, start);
             assert_eq!(socket.state(), State::SynReceived);
             assert_eq!(socket.timeout(), Some(TCP_HANDSHAKE_TIMEOUT));
             if complete {
@@ -813,7 +1010,7 @@ mod tests {
                 ));
                 iface.poll(start, &mut device, &mut sockets);
                 let socket = sockets.get_mut::<TcpSocket>(handle);
-                entry.pump(handle, socket);
+                entry.pump(handle, socket, start);
                 assert!(entry.established);
                 assert_eq!(
                     socket.timeout(),
