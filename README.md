@@ -99,6 +99,20 @@ After updating the H3 pins, run the empty-DATA and idle-stream regressions:
 CARGO_BUILD_JOBS=1 cargo test --locked --lib --features ffi h3_ -- --test-threads=1
 ```
 
+### WireGuard Kernel Interoperability
+
+Linux kernel peer tests require kernel WireGuard support, network/PID namespaces,
+passwordless sudo, `ip`, `wg`, `unshare`, and `timeout`. They run both Shoes roles
+inside isolated namespaces without changing host routes. Coverage includes
+inner IPv4/IPv6 TCP and UDP, TCP half-close, PSK/no-PSK, MTUs 1280/1408, and VLESS
+chaining in both directions. Kernel handshake and byte counters verify that
+payloads actually cross WireGuard. Missing prerequisites fail rather than skip.
+Set `SHOES_TEST_WG_BIN` to an absolute path to override `wg`.
+
+```sh
+CARGO_BUILD_JOBS=1 cargo test --locked --features privileged-tests --test privileged wireguard_kernel:: -- --test-threads=1
+```
+
 ## Usage
 
 ```

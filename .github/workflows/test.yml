@@ -166,6 +166,11 @@ jobs:
           target: external_network
           filters: reality
           peer: sing-box
+        - name: kernel WireGuard
+          features: privileged-tests
+          target: privileged
+          filters: wireguard_kernel
+          peer: kernel-wireguard
 
     steps:
     - uses: actions/checkout@v4
@@ -190,6 +195,14 @@ jobs:
       with:
         path: target
         key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Install kernel WireGuard test tools
+      if: matrix.peer == 'kernel-wireguard'
+      run: |
+        sudo apt-get update
+        sudo apt-get install --yes --no-install-recommends wireguard-tools iproute2
+        uname -r
+        wg --version
 
     - name: Install sing-box test peer
       if: matrix.peer == 'sing-box' || matrix.target == 'optional_peer'
@@ -307,6 +320,7 @@ jobs:
 
     - name: Run integration tests
       env:
+        CARGO_BUILD_JOBS: 1
         TEST_FILTERS: ${{ matrix.filters }}
       run: |
         if [ -z "$TEST_FILTERS" ]; then
