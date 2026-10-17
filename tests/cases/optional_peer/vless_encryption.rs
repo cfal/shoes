@@ -969,7 +969,7 @@ async fn fresh_only_and_zero_lifetime_never_resume() {
 }
 
 #[tokio::test]
-async fn native_h2mux_preserves_concurrent_streams() {
+async fn native_h2mux_preserves_concurrent_connections() {
     for mode in ["native", "xorpub", "random"] {
         let (encryption, decryption, _) = credentials(mode, &["mlkem768"]);
         let (target, connections, mut target_task) = echo().await;

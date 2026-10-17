@@ -126,6 +126,107 @@ async fn non_vision_server_rejects_flow_with_backend_specific_guidance() {
 }
 
 #[tokio::test]
+async fn h2mux_multiplexes_concurrent_streams_over_one_encrypted_connection() {
+    use crate::{
+        address::{Address, NetLocation, ResolvedLocation},
+        h2mux::{H2MuxClientSession, H2MuxOptions, MUX_DESTINATION_HOST, MUX_DESTINATION_PORT},
+        tcp::tcp_handler::TcpClientHandler,
+        vless::vless_client_handler::VlessTcpClientHandler,
+    };
+
+    for mode in ["native", "xorpub", "random"] {
+        let (encryption, decryption) = fixture_settings(mode, true, &[64]);
+        let client = VlessTcpClientHandler::new(
+            UUID,
+            true,
+            Some(ClientEncryption::new(&encryption).unwrap()),
+            false,
+        )
+        .unwrap();
+        let port = TcpListener::bind("0.0.0.0:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let config: ServerConfig = serde_json::from_value(json!({
+            "address": format!("0.0.0.0:{port}"),
+            "protocol": {"type": "vless", "user_id": UUID, "decryption": decryption},
+        }))
+        .unwrap();
+        let mut listeners = Tasks(
+            crate::tcp::tcp_server::start_servers(
+                crate::config::Config::Server(config),
+                Arc::new(NativeResolver::new()),
+            )
+            .await
+            .unwrap(),
+        );
+        let (target, mut target_task) = echo().await;
+        let target = NetLocation::new(Address::Ipv4(std::net::Ipv4Addr::LOCALHOST), target);
+        for padding in [false, true] {
+            timeout(LIMIT, async {
+                let socket = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+                let carrier = client
+                    .setup_client_tcp_stream(
+                        Box::new(socket),
+                        ResolvedLocation::new(NetLocation::new(
+                            Address::Hostname(MUX_DESTINATION_HOST.into()),
+                            MUX_DESTINATION_PORT,
+                        )),
+                    )
+                    .await
+                    .unwrap()
+                    .client_stream;
+                let mut session = H2MuxClientSession::new(
+                    carrier,
+                    &H2MuxOptions {
+                        padding,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+                let mut streams = Vec::new();
+                for _ in 0..16 {
+                    streams.push(session.open_tcp(&target).await.unwrap());
+                }
+                assert_eq!(session.active_streams(), 16);
+                let mut tasks = JoinSet::new();
+                for (id, mut stream) in streams.into_iter().enumerate() {
+                    tasks.spawn(async move {
+                        let data: Vec<_> = (0..131072).map(|n| ((n + id) % 251) as u8).collect();
+                        let (mut read, mut write) = tokio::io::split(&mut stream);
+                        let mut reply = vec![0; data.len()];
+                        let ((), ()) = tokio::join!(
+                            async {
+                                for chunk in data.chunks(8192) {
+                                    write.write_all(chunk).await.unwrap();
+                                }
+                                write.flush().await.unwrap();
+                            },
+                            async {
+                                read.read_exact(&mut reply).await.unwrap();
+                            },
+                        );
+                        assert_eq!(reply, data);
+                        stream.shutdown().await.unwrap();
+                    });
+                }
+                while let Some(result) = tasks.join_next().await {
+                    result.unwrap();
+                }
+                assert_eq!(session.active_streams(), 0);
+            })
+            .await
+            .unwrap_or_else(|error| panic!("{mode}, padding={padding}: {error}"));
+        }
+        listeners.stop().await;
+        target_task.stop().await;
+    }
+}
+
+#[tokio::test]
 async fn raw_quic_bind_addresses_share_tickets_and_capacity() {
     let (encryption, decryption) = fixture_settings("random", true, &[32]);
     let client = ClientEncryption::new(&encryption).unwrap();
