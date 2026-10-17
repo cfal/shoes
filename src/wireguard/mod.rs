@@ -30,16 +30,9 @@ use crate::{
     tcp::socket_connector::SocketConnector,
 };
 
-enum State {
-    Prepared,
-    Active(StackHandle),
-    Stopped,
-    Failed,
-}
-
 struct Connector {
     name: String,
-    state: Mutex<State>,
+    active: Mutex<Option<StackHandle>>,
     addresses: Vec<IpAddr>,
     routes: Vec<IpNetwork>,
 }
@@ -52,13 +45,12 @@ impl fmt::Debug for Connector {
 }
 impl Connector {
     fn handle(&self) -> stdio::Result<StackHandle> {
-        match &*self.state.lock() {
-            State::Active(handle) => Ok(handle.clone()),
-            _ => Err(stdio::Error::new(
+        self.active.lock().clone().ok_or_else(|| {
+            stdio::Error::new(
                 stdio::ErrorKind::NotConnected,
                 format!("WireGuard endpoint {} is not active", self.name),
-            )),
-        }
+            )
+        })
     }
     fn reachable(&self, address: SocketAddr) -> bool {
         self.addresses
@@ -194,7 +186,7 @@ impl Prepared {
                 .collect::<stdio::Result<_>>()?;
             let connector = Arc::new(Connector {
                 name: config.wireguard.clone(),
-                state: Mutex::new(State::Prepared),
+                active: Mutex::new(None),
                 addresses,
                 routes: peers
                     .iter()
@@ -223,7 +215,7 @@ impl Prepared {
         // Endpoint chains share the prepared handles used by ordinary listeners and DNS.
         for (endpoint, config) in endpoints.iter_mut().zip(&validated.wireguard_endpoints) {
             endpoint.config = config.clone();
-            endpoint.outer_chain(&resolver)?;
+            endpoint.build_outer_chain(&resolver)?;
         }
         Ok(Self { endpoints })
     }
@@ -239,7 +231,7 @@ impl Prepared {
 
 struct EndpointRuntime {
     cancel: CancellationToken,
-    task: Option<JoinHandle<()>>,
+    task: JoinHandle<()>,
 }
 impl Drop for EndpointRuntime {
     fn drop(&mut self) {
@@ -257,15 +249,13 @@ impl Running {
             endpoint.cancel.cancel();
         }
         for mut endpoint in self.endpoints.drain(..) {
-            if let Some(task) = endpoint.task.take() {
-                let _ = task.await;
-            }
+            let _ = (&mut endpoint.task).await;
         }
     }
 }
 
 impl PreparedEndpoint {
-    fn outer_chain(
+    fn build_outer_chain(
         &self,
         resolver: &Arc<dyn Resolver>,
     ) -> stdio::Result<Option<Arc<crate::client_proxy_chain::ClientProxyChain>>> {
@@ -305,14 +295,16 @@ impl PreparedEndpoint {
         } else {
             None
         };
+        let limits = config.limits();
         let mut stack = PacketStack::new(
             self.connector.addresses.clone(),
             config.mtu,
             inbound.is_some(),
-            config.limits(),
+            limits.clone(),
         )?;
         let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
-        let (udp, released) = if let Some(chain) = self.outer_chain(&resolver)? {
+        // Rebuilding after preflight gives each start fresh pool indices and handler lifetimes.
+        let (udp, released) = if let Some(chain) = self.build_outer_chain(&resolver)? {
             let (sender, receiver, released) = detour::start(
                 config.wireguard.clone(),
                 chain,
@@ -355,12 +347,11 @@ impl PreparedEndpoint {
             .map_err(|error| {
                 stdio::Error::other(format!("WireGuard device startup failed: {error}"))
             })?;
-        *self.connector.state.lock() = State::Active(stack.handle.clone());
+        *self.connector.active.lock() = Some(stack.handle.clone());
         let connector = self.connector.clone();
         let name = config.wireguard.clone();
         let cancel = CancellationToken::new();
         let shutdown = cancel.clone();
-        let limits = config.limits();
         let task = tokio::spawn(async move {
             let mut tasks = JoinSet::new();
             let mut inbound_udp_count = None;
@@ -437,11 +428,7 @@ impl PreparedEndpoint {
                     }
                 }
             };
-            *connector.state.lock() = if failed {
-                State::Failed
-            } else {
-                State::Stopped
-            };
+            *connector.active.lock() = None;
             if failed {
                 log::error!("WireGuard endpoint {name} stopped unexpectedly; routes remain closed");
             }
@@ -455,9 +442,6 @@ impl PreparedEndpoint {
             );
             drop(stack);
         });
-        Ok(EndpointRuntime {
-            cancel,
-            task: Some(task),
-        })
+        Ok(EndpointRuntime { cancel, task })
     }
 }

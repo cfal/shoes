@@ -33,6 +33,8 @@ const MAX_DATAGRAM: usize = 2048;
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
 const MIN_BACKOFF: Duration = Duration::from_millis(250);
 const MAX_BACKOFF: Duration = Duration::from_secs(10);
+const STABLE_ASSOCIATION: Duration = Duration::from_secs(10);
+const PING_INTERVAL: Duration = Duration::from_secs(30);
 
 struct Destination {
     outgoing: mpsc::Sender<Vec<u8>>,
@@ -179,7 +181,7 @@ impl Worker {
                     let started = Instant::now();
                     let result = self.relay(stream.as_mut()).await;
                     self.connected.store(false, Ordering::Release);
-                    if started.elapsed() >= MAX_BACKOFF {
+                    if started.elapsed() >= STABLE_ASSOCIATION {
                         backoff = MIN_BACKOFF;
                     }
                     result.unwrap_err()
@@ -211,9 +213,10 @@ impl Worker {
             Flush,
         }
         let mut scratch = vec![0; 65536];
+        // Flushes protocol setup buffered while opening the association.
         let mut pending = Some(Write::Flush);
         let mut deadline = Box::pin(sleep(IO_TIMEOUT));
-        let mut ping = tokio::time::interval(Duration::from_secs(30));
+        let mut ping = tokio::time::interval(PING_INTERVAL);
         ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::task::consume_budget().await;
