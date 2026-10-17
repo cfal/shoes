@@ -4,12 +4,12 @@ use tokio::io::AsyncWriteExt;
 use crate::address::{Address, NetLocation, ResolvedLocation};
 use crate::async_stream::AsyncMessageStream;
 use crate::async_stream::AsyncStream;
-use crate::crypto::CryptoTlsStream;
 use crate::tcp::tcp_handler::{TcpClientHandler, TcpClientSetupResult};
 use crate::util::{allocate_vec, write_all};
 use crate::uuid_util::parse_uuid;
 
 use super::vision_stream::VisionStream;
+use super::vision_transport::VisionTransport;
 use super::vless_message_stream::VlessMessageStream;
 use super::vless_response_stream::VlessResponseStream;
 use super::vless_util::{COMMAND_TCP, COMMAND_UDP, vision_flow_addon_data};
@@ -79,13 +79,13 @@ impl TcpClientHandler for VlessTcpClientHandler {
 
 /// Helper function for setup_client_udp_bidirectional that can be called from TlsClientHandler
 /// for Vision VLESS or regular VLESS over TLS.
-pub async fn setup_vless_udp_bidirectional<IO>(
-    mut stream: CryptoTlsStream<IO>,
+pub async fn setup_vless_udp_bidirectional<S>(
+    mut stream: S,
     user_id: &[u8],
     target: NetLocation,
 ) -> std::io::Result<Box<dyn AsyncMessageStream>>
 where
-    IO: crate::async_stream::AsyncStream + 'static,
+    S: AsyncStream + 'static,
 {
     write_vless_udp_header(&mut stream, user_id, &target).await?;
     stream.flush().await?;
@@ -94,13 +94,13 @@ where
     Ok(Box::new(message_stream))
 }
 
-pub async fn setup_custom_tls_vision_vless_client_stream<IO>(
-    mut tls_stream: CryptoTlsStream<IO>,
+pub(crate) async fn setup_custom_tls_vision_vless_client_stream<S>(
+    mut tls_stream: S,
     user_id: &[u8],
     remote_location: &NetLocation,
 ) -> std::io::Result<TcpClientSetupResult>
 where
-    IO: crate::async_stream::AsyncStream + 'static,
+    S: VisionTransport + 'static,
 {
     tls_stream.require_record_framing()?;
     write_vless_header(

@@ -7,7 +7,6 @@
 
 use bytes::{Buf, BytesMut};
 
-use crate::crypto::CryptoTlsStream;
 use futures::ready;
 use std::io;
 use std::pin::Pin;
@@ -18,6 +17,7 @@ use crate::async_stream::AsyncStream;
 
 use super::tls_fuzzy_deframer::{DeframeResult, FuzzyTlsDeframer};
 use super::vision_filter::VisionFilter;
+use super::vision_transport::VisionTransport;
 use super::vision_unpad::{UnpadCommand, UnpadResult, VisionUnpadder};
 
 // TODO: consider combining with UnpadCommand
@@ -46,8 +46,8 @@ impl std::fmt::Display for VisionMode {
     }
 }
 
-pub struct VisionStream<IO> {
-    tls: CryptoTlsStream<IO>,
+pub struct VisionStream<S> {
+    tls: S,
 
     /// Current READ operating mode (independent from write mode)
     read_mode: VisionMode,
@@ -107,16 +107,12 @@ pub struct VisionStream<IO> {
     pending_plain_writes: BytesMut,
 }
 
-impl<IO> VisionStream<IO>
+impl<S> VisionStream<S>
 where
-    IO: AsyncStream,
+    S: VisionTransport,
 {
     /// Create a new VisionStream for server-side (inbound) connections with VLESS response writing
-    pub fn new_server(
-        tls: CryptoTlsStream<IO>,
-        user_uuid: [u8; 16],
-        initial_read_data: &[u8],
-    ) -> io::Result<Self> {
+    pub fn new_server(tls: S, user_uuid: [u8; 16], initial_read_data: &[u8]) -> io::Result<Self> {
         tls.require_record_framing()?;
         if !tls.is_server() {
             return Err(io::Error::new(
@@ -129,7 +125,7 @@ where
         Ok(stream)
     }
 
-    pub fn new_client(tls: CryptoTlsStream<IO>, user_uuid: [u8; 16]) -> io::Result<Self> {
+    pub fn new_client(tls: S, user_uuid: [u8; 16]) -> io::Result<Self> {
         tls.require_record_framing()?;
         if !tls.is_client() {
             return Err(io::Error::new(
@@ -141,7 +137,7 @@ where
     }
 
     fn new_common(
-        tls: CryptoTlsStream<IO>,
+        tls: S,
         user_uuid: [u8; 16],
         vless_response_pending: bool,
         vless_response_to_send: bool,
@@ -291,7 +287,7 @@ where
             }
             self.pending_plain_writes.advance(written);
         }
-        self.tls.poll_drain_tls(cx)
+        self.tls.poll_drain_encrypted(cx)
     }
 
     /// Read the VLESS response header and addons, returning any following plaintext.
@@ -720,7 +716,7 @@ where
     }
 }
 
-impl<IO: AsyncStream> AsyncRead for VisionStream<IO> {
+impl<S: VisionTransport> AsyncRead for VisionStream<S> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -750,7 +746,7 @@ impl<IO: AsyncStream> AsyncRead for VisionStream<IO> {
     }
 }
 
-impl<IO: AsyncStream> AsyncWrite for VisionStream<IO> {
+impl<S: VisionTransport> AsyncWrite for VisionStream<S> {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -777,7 +773,7 @@ impl<IO: AsyncStream> AsyncWrite for VisionStream<IO> {
     }
 }
 
-impl<IO: AsyncStream> crate::async_stream::AsyncPing for VisionStream<IO> {
+impl<S: VisionTransport> crate::async_stream::AsyncPing for VisionStream<S> {
     fn supports_ping(&self) -> bool {
         self.tls.supports_ping()
     }
@@ -787,7 +783,7 @@ impl<IO: AsyncStream> crate::async_stream::AsyncPing for VisionStream<IO> {
     }
 }
 
-impl<IO: AsyncStream> AsyncStream for VisionStream<IO> {
+impl<S: VisionTransport> AsyncStream for VisionStream<S> {
     #[cfg(target_os = "linux")]
     fn plain_tcp(&self) -> Option<&tokio::net::TcpStream> {
         if self.read_mode != VisionMode::Direct
@@ -815,7 +811,7 @@ mod tests {
     use crate::address::{Address, NetLocation};
     use crate::async_stream::AsyncPing;
     use crate::crypto::tls_deframer::TlsDeframer;
-    use crate::crypto::{CryptoConnection, TlsReadMode, feed_crypto_connection};
+    use crate::crypto::{CryptoConnection, CryptoTlsStream, TlsReadMode, feed_crypto_connection};
     use crate::reality::{
         RealityClientConfig, RealityClientConnection, RealityServerConfig, RealityServerConnection,
     };

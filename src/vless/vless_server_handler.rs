@@ -8,7 +8,6 @@ use tokio::io::AsyncWriteExt;
 use crate::address::{Address, NetLocation};
 use crate::async_stream::AsyncStream;
 use crate::client_proxy_selector::ClientProxySelector;
-use crate::crypto::CryptoTlsStream;
 use crate::h2mux::{MUX_DESTINATION_HOST, MUX_DESTINATION_PORT, handle_h2mux_session};
 use crate::resolver::Resolver;
 use crate::stream_reader::StreamReader;
@@ -18,6 +17,7 @@ use crate::uuid_util::parse_uuid;
 use crate::xudp::XudpMessageStream;
 
 use super::vision_stream::VisionStream;
+use super::vision_transport::VisionTransport;
 use super::vless_message_stream::VlessMessageStream;
 use super::vless_util::{
     COMMAND_MUX, COMMAND_TCP, COMMAND_UDP, XTLS_VISION_FLOW, parse_addons_from_reader,
@@ -289,8 +289,8 @@ impl TcpServerHandler for VlessTcpServerHandler {
 }
 
 /// Setup a VISION+VLESS stream from a CryptoTlsStream (for REALITY+Vision support)
-pub async fn setup_custom_tls_vision_vless_server_stream<IO>(
-    mut tls_stream: CryptoTlsStream<IO>,
+pub(crate) async fn setup_custom_tls_vision_vless_server_stream<S>(
+    mut tls_stream: S,
     user_id: &[u8],
     udp_enabled: bool,
     proxy_selector: Arc<ClientProxySelector>,
@@ -298,7 +298,7 @@ pub async fn setup_custom_tls_vision_vless_server_stream<IO>(
     fallback: Option<NetLocation>,
 ) -> std::io::Result<TcpServerSetupResult>
 where
-    IO: AsyncStream + 'static,
+    S: VisionTransport + 'static,
 {
     tls_stream.require_record_framing()?;
     let mut stream_reader = StreamReader::new_with_buffer_size(800);

@@ -11,7 +11,7 @@ use tokio::time::timeout;
 
 const DEADLINE: Duration = Duration::from_secs(20);
 const APPLICATION_DATA: &[u8] = b"\x17\x03\x03\x00\x04data";
-type Vision = VisionStream<Box<dyn AsyncStream>>;
+type Vision = VisionStream<CryptoTlsStream<Box<dyn AsyncStream>>>;
 
 #[derive(Clone, Copy)]
 enum RelayMode {
