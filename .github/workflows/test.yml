@@ -45,7 +45,7 @@ jobs:
     env:
       GOMAXPROCS: 1
       WG_SING_BOX_COMMIT: 7054cac5124465ffdb145870d7c01885566711b1
-      WG_XRAY_COMMIT: 0888beb38a9ba45440557175e71ce21cf8ba3b13
+      WG_XRAY_COMMIT: 92ccc939aaf4f8965f369cf0b142e005aeaa11d5
     steps:
     - uses: actions/checkout@v4
     - uses: dtolnay/rust-toolchain@stable
