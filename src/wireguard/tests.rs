@@ -62,13 +62,18 @@ async fn echo_servers(v6: bool) -> (SocketAddr, SocketAddr, JoinSet<()>) {
     let mut tasks = JoinSet::new();
     tasks.spawn(async move {
         let mut flows = JoinSet::new();
-        loop { tokio::select! {
-            connection = listener.accept() => {
-                let (mut stream,_) = connection.unwrap();
-                flows.spawn(async move { let (mut read,mut write) = stream.split(); let _ = tokio::io::copy(&mut read,&mut write).await; });
+        loop {
+            tokio::select! {
+                connection = listener.accept() => {
+                    let (mut stream, _) = connection.unwrap();
+                    flows.spawn(async move {
+                        let (mut read, mut write) = stream.split();
+                        let _ = tokio::io::copy(&mut read, &mut write).await;
+                    });
+                }
+                _ = flows.join_next(), if !flows.is_empty() => {}
             }
-            _ = flows.join_next(), if !flows.is_empty() => {}
-        }}
+        }
     });
     tasks.spawn(async move {
         let mut data = [0; 65536];
@@ -162,6 +167,57 @@ async fn wireguard_ipv6_outer_transport() {
         }
         running.stop().await;
         std::net::UdpSocket::bind(("::", port)).unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn wireguard_dual_stack_connect_falls_back_without_waiting_for_blackholed_ipv6() {
+    #[derive(Debug)]
+    struct DualStackResolver(Vec<SocketAddr>);
+    impl Resolver for DualStackResolver {
+        fn resolve_location(
+            &self,
+            _: &NetLocation,
+        ) -> Pin<Box<dyn std::future::Future<Output = stdio::Result<Vec<SocketAddr>>> + Send>>
+        {
+            let addresses = self.0.clone();
+            Box::pin(async move { Ok(addresses) })
+        }
+    }
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let reservation = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+        let mut configs = validate(&pair_config(reservation.local_addr().unwrap().port())).unwrap();
+        // Authenticated IPv6 packets are dropped by the remote peer's allowed_ips check.
+        configs.wireguard_endpoints[0].peers[0].allowed_ips = vec!["10.77.0.2/32".into()];
+        let prepared = Prepared::new(&mut configs).await.unwrap();
+        drop(reservation);
+        let mut running = Running::default();
+        prepared
+            .start(&mut DnsRegistry::new(), &mut running)
+            .await
+            .unwrap();
+        let (tcp, _, _echoes) = echo_servers(false).await;
+        let resolver: Arc<dyn Resolver> = Arc::new(DualStackResolver(vec![
+            SocketAddr::new("::1".parse().unwrap(), tcp.port()),
+            tcp,
+        ]));
+        let target = NetLocation::from_str(&format!("dual.test:{}", tcp.port()), None)
+            .unwrap()
+            .into();
+        let mut stream = prepared.endpoints[1]
+            .connector
+            .connect(&resolver, &target)
+            .await
+            .unwrap();
+        stream.write_all(b"fallback").await.unwrap();
+        let mut response = [0; 8];
+        stream.read_exact(&mut response).await.unwrap();
+        assert_eq!(&response, b"fallback");
+        drop(stream);
+        running.stop().await;
     })
     .await
     .unwrap();

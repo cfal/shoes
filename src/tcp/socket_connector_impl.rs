@@ -52,7 +52,7 @@ fn interleave_tcp_addresses(addresses: Vec<SocketAddr>) -> Vec<SocketAddr> {
     ordered
 }
 
-async fn connect_tcp_candidates<T, F>(
+pub(crate) async fn connect_tcp_candidates<T, F>(
     addresses: Vec<SocketAddr>,
     mut connect: impl FnMut(SocketAddr) -> std::io::Result<F>,
 ) -> std::io::Result<T>

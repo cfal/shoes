@@ -92,14 +92,13 @@ impl SocketConnector for Connector {
         target: &ResolvedLocation,
     ) -> stdio::Result<Box<dyn AsyncStream>> {
         let handle = self.handle()?;
-        let mut last_error = stdio::Error::from(stdio::ErrorKind::NotConnected);
-        for address in self.destinations(resolver, target).await? {
-            match handle.connect(address).await {
-                Ok(stream) => return Ok(Box::new(stream)),
-                Err(error) => last_error = error,
-            }
-        }
-        Err(last_error)
+        let addresses = self.destinations(resolver, target).await?;
+        let stream =
+            crate::tcp::socket_connector_impl::connect_tcp_candidates(addresses, |address| {
+                Ok(handle.connect(address))
+            })
+            .await?;
+        Ok(Box::new(stream))
     }
     async fn connect_udp_bidirectional(
         &self,
@@ -318,8 +317,11 @@ impl PreparedEndpoint {
             );
             (io::Factory::detour(sender, receiver), released)
         } else {
-            let (udp, released, local) =
-                io::Factory::new(config.listen, config.bind_interface.clone())?;
+            let (udp, released, local) = io::Factory::new(
+                config.listen,
+                config.bind_interface.clone(),
+                self.peers.iter().filter_map(|peer| peer.endpoint),
+            )?;
             log::info!(
                 "WireGuard endpoint {} listening on {local}",
                 config.wireguard
