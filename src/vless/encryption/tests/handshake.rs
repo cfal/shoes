@@ -164,12 +164,12 @@ async fn invalid_chain_link_and_wrong_private_key_reject_before_server_flight() 
 }
 
 #[tokio::test]
-async fn cancellation_at_each_flight_field_never_publishes_a_client_ticket() {
+async fn cancellation_before_authenticating_server_flight_never_publishes_a_ticket() {
     for cancel_client in [false, true] {
-        for field in if cancel_client {
-            SERVER_FIELDS
+        for &field in if cancel_client {
+            &SERVER_FIELDS[..]
         } else {
-            CLIENT_FIELDS
+            &CLIENT_FIELDS[..2]
         } {
             let (c, s) = fixture_settings("native", true, &[32]);
             let client = ClientEncryption::new(&c).unwrap();
@@ -193,8 +193,66 @@ async fn cancellation_at_each_flight_field_never_publishes_a_client_ticket() {
                     _ = async { let _ = tokio::join!(client_run, server_run); } => panic!("exchange unexpectedly completed"),
                 }
             }).await.unwrap();
-            assert!(client.cache.snapshot(Instant::now()).is_none());
+            assert!(
+                client.cache.snapshot(Instant::now()).is_none(),
+                "cancel_client={cancel_client}, field={field}"
+            );
         }
+    }
+}
+
+#[tokio::test]
+async fn cancelling_server_padding_read_preserves_authenticated_client_ticket() {
+    // The server issues its ticket before consuming client padding. Cancelling
+    // that read cannot revoke a reply the client has already authenticated.
+    for &field in &CLIENT_FIELDS[2..] {
+        let (c, s) = fixture_settings("native", true, &[32]);
+        let client = ClientEncryption::new(&c).unwrap();
+        let server = ServerEncryption::new(&s, Default::default()).unwrap();
+        let (left, right) = tokio::io::duplex(8192);
+        let (client_stopped, server_stopped) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+        let (mut left, mut right) = (FaultRead::new(left), FaultRead::new(right));
+        left.stop = Some((SERVER_FIELDS[3] + 1, client_stopped.clone()));
+        right.stop = Some((field, server_stopped.clone()));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let client_run = async {
+                let mut stream = client.handshake(left).await?;
+                stream.read_u8().await
+            };
+            let server_run = server.handshake(right);
+            tokio::select! {
+                _ = async {
+                    client_stopped.notified().await;
+                    server_stopped.notified().await;
+                } => {},
+                _ = async { let _ = tokio::join!(client_run, server_run); } => panic!("exchange unexpectedly completed"),
+            }
+        }).await.unwrap();
+        assert!(
+            client.cache.snapshot(Instant::now()).is_some(),
+            "field={field}"
+        );
+
+        let (left, right) = tokio::io::duplex(8192);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(
+                async {
+                    let mut stream = client.handshake(left).await.unwrap();
+                    assert!(stream.is_resumed(), "field={field}");
+                    stream.write_all(b"c").await.unwrap();
+                    stream.flush().await.unwrap();
+                    assert_eq!(stream.read_u8().await.unwrap(), b's');
+                },
+                async {
+                    let mut stream = server.handshake(right).await.unwrap();
+                    assert_eq!(stream.read_u8().await.unwrap(), b'c');
+                    stream.write_all(b"s").await.unwrap();
+                    stream.flush().await.unwrap();
+                }
+            );
+        })
+        .await
+        .unwrap();
     }
 }
 
