@@ -5,6 +5,7 @@ import importlib.util
 import io
 import json
 from pathlib import Path
+import re
 import subprocess
 import tarfile
 import tempfile
@@ -23,6 +24,13 @@ GENERATOR_SPEC = importlib.util.spec_from_file_location(
 )
 GENERATOR = importlib.util.module_from_spec(GENERATOR_SPEC)
 GENERATOR_SPEC.loader.exec_module(GENERATOR)
+
+# SPDX's ISC fallback names its publisher rather than the dependency's authors.
+PLACEHOLDER_ATTRIBUTION = re.compile(
+    r"<(?:year|copyright holders?|owner)>|YEAR by AUTHOR EMAIL"
+    r"|Copyright \(c\) 2004-2010 by Internet Systems Consortium, Inc\.",
+    re.IGNORECASE,
+)
 
 
 class ReleaseNoticesTests(unittest.TestCase):
@@ -52,9 +60,18 @@ class ReleaseNoticesTests(unittest.TestCase):
             if heading.endswith(("(MIT)", "(BSD-2-Clause)", "(BSD-3-Clause)", "(ISC)", "(0BSD)")):
                 with self.subTest(license=heading):
                     text = block.partition("\n\n")[2]
-                    self.assertNotRegex(
-                        text, r"(?i)<(?:year|copyright holders?|owner)>|YEAR by AUTHOR EMAIL"
-                    )
+                    self.assertNotRegex(text, PLACEHOLDER_ATTRIBUTION)
+
+    def test_placeholder_detection_includes_spdx_isc_publisher(self):
+        for text in [
+            "Copyright (c) <year> <copyright holders>",
+            "Copyright (c) <year> <owner>",
+            "Copyright (C) YEAR by AUTHOR EMAIL",
+            'Copyright (c) 2004-2010 by Internet Systems Consortium, Inc. ("ISC")\n'
+            "Copyright (c) 1995-2003 by Internet Software Consortium",
+        ]:
+            with self.subTest(text=text):
+                self.assertRegex(text, PLACEHOLDER_ATTRIBUTION)
 
     def test_bundle_covers_production_dependency_graph(self):
         cargo_options = [
