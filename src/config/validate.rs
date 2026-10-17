@@ -224,6 +224,15 @@ pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Valida
     }
 
     for endpoint in &mut wireguard_endpoints {
+        if let Some(chain) = &mut endpoint.outer_client_chain {
+            validate_client_chain(
+                &mut chain.hops,
+                0,
+                &client_groups,
+                &named_pems,
+                global_limits,
+            )?;
+        }
         if let Some(inbound) = &mut endpoint.inbound {
             ConfigSelection::replace_none_or_some_groups(&mut inbound.rules, &rule_groups)?;
             if inbound.rules.is_empty() {
@@ -302,7 +311,62 @@ pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Valida
         }
     }
     validated.visit_clients(&mut check_reference)?;
+    order_wireguard_endpoints(&mut validated.wireguard_endpoints)?;
     Ok(validated)
+}
+
+fn order_wireguard_endpoints(
+    endpoints: &mut Vec<super::types::wireguard::WireguardConfig>,
+) -> std::io::Result<()> {
+    use super::types::wireguard::invalid;
+    let mtus: HashMap<_, _> = endpoints
+        .iter()
+        .map(|endpoint| (endpoint.wireguard.clone(), endpoint.mtu))
+        .collect();
+    let mut dependencies = HashMap::new();
+    for endpoint in endpoints.iter_mut() {
+        let mut names = HashSet::new();
+        if let Some(chain) = &mut endpoint.outer_client_chain {
+            let datagram_carrier = chain.hops.iter().count() == 1;
+            for hop in chain.hops.iter_mut() {
+                super::client_visit::visit_hop(hop, &mut |client| {
+                    if let ClientProxyConfig::Wireguard(reference) = &client.protocol {
+                        let carrier_mtu = mtus.get(&reference.endpoint).ok_or_else(|| {
+                            invalid(format!(
+                                "unknown WireGuard endpoint: {}",
+                                reference.endpoint
+                            ))
+                        })?;
+                        // IPv6 UDP plus WireGuard header, tag and worst-case padding.
+                        let required_mtu = endpoint.mtu.next_multiple_of(16) + 80;
+                        if datagram_carrier && required_mtu > *carrier_mtu {
+                            return Err(invalid(format!(
+                                "WireGuard endpoint {} requires carrier {} MTU >= {required_mtu}",
+                                endpoint.wireguard, reference.endpoint,
+                            )));
+                        }
+                        names.insert(reference.endpoint.clone());
+                    }
+                    Ok(())
+                })?;
+            }
+        }
+        dependencies.insert(endpoint.wireguard.clone(), names);
+    }
+    let mut pending = std::mem::take(endpoints);
+    let mut ready = HashSet::new();
+    while !pending.is_empty() {
+        let Some(index) = pending
+            .iter()
+            .position(|endpoint| dependencies[&endpoint.wireguard].is_subset(&ready))
+        else {
+            return Err(invalid("WireGuard outer_client_chain dependency cycle"));
+        };
+        let endpoint = pending.remove(index);
+        ready.insert(endpoint.wireguard.clone());
+        endpoints.push(endpoint);
+    }
+    Ok(())
 }
 
 /// Resolves client group references using topological sort.
@@ -1937,7 +2001,7 @@ fn validate_direct_connector_positions(
             ClientChainHop::Pool(selections) => selections.iter().any(wireguard),
         } {
             return Err(super::types::wireguard::invalid(
-                "WireGuard is only supported at hop 0",
+                "WireGuard is only supported at hop 0; configure outer_client_chain on the endpoint for preceding proxies",
             ));
         }
 

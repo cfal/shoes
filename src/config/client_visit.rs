@@ -95,6 +95,11 @@ impl ValidatedConfigs {
             }
         }
         for endpoint in &mut self.wireguard_endpoints {
+            if let Some(chain) = &mut endpoint.outer_client_chain {
+                for hop in chain.hops.iter_mut() {
+                    visit_hop(hop, visitor)?;
+                }
+            }
             if let Some(inbound) = &mut endpoint.inbound {
                 rules(&mut inbound.rules, visitor)?;
             }

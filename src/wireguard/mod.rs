@@ -1,3 +1,4 @@
+mod detour;
 mod io;
 #[cfg(test)]
 mod tests;
@@ -126,6 +127,7 @@ struct PreparedEndpoint {
     config: WireguardConfig,
     peers: Vec<Peer>,
     connector: Arc<Connector>,
+    global_limits: crate::config::GlobalLimits,
 }
 
 #[derive(Default)]
@@ -204,6 +206,7 @@ impl Prepared {
                 config: config.clone(),
                 peers,
                 connector,
+                global_limits: validated.global_limits,
             });
         }
         validated.visit_clients(&mut |client| {
@@ -217,14 +220,10 @@ impl Prepared {
             }
             Ok(())
         })?;
-        // Inbound chains must use the same prepared handles as ordinary listeners and DNS.
-        for endpoint in &mut endpoints {
-            endpoint.config = validated
-                .wireguard_endpoints
-                .iter()
-                .find(|config| config.wireguard == endpoint.config.wireguard)
-                .unwrap()
-                .clone();
+        // Endpoint chains share the prepared handles used by ordinary listeners and DNS.
+        for (endpoint, config) in endpoints.iter_mut().zip(&validated.wireguard_endpoints) {
+            endpoint.config = config.clone();
+            endpoint.outer_chain(&resolver)?;
         }
         Ok(Self { endpoints })
     }
@@ -266,6 +265,27 @@ impl Running {
 }
 
 impl PreparedEndpoint {
+    fn outer_chain(
+        &self,
+        resolver: &Arc<dyn Resolver>,
+    ) -> stdio::Result<Option<Arc<crate::client_proxy_chain::ClientProxyChain>>> {
+        let Some(config) = &self.config.outer_client_chain else {
+            return Ok(None);
+        };
+        let chain = crate::tcp::chain_builder::build_client_proxy_chain_with_limits(
+            config.hops.clone(),
+            resolver.clone(),
+            self.global_limits,
+        )?;
+        if !chain.supports_udp() {
+            return Err(crate::config::wireguard::invalid(format!(
+                "WireGuard endpoint {} outer_client_chain does not support UDP",
+                self.config.wireguard,
+            )));
+        }
+        Ok(Some(Arc::new(chain)))
+    }
+
     async fn start(&self, dns: &mut DnsRegistry) -> stdio::Result<EndpointRuntime> {
         let config = &self.config;
         let inbound = if let Some(inbound) = &config.inbound {
@@ -291,8 +311,29 @@ impl PreparedEndpoint {
             inbound.is_some(),
             config.limits(),
         )?;
-        let (udp, released, local) =
-            io::Factory::new(config.listen, config.bind_interface.clone())?;
+        let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+        let (udp, released) = if let Some(chain) = self.outer_chain(&resolver)? {
+            let (sender, receiver, released) = detour::start(
+                config.wireguard.clone(),
+                chain,
+                resolver,
+                self.peers.iter().map(|peer| peer.endpoint.unwrap()),
+                stack.drops.clone(),
+            );
+            log::info!(
+                "WireGuard endpoint {} using outer_client_chain",
+                config.wireguard
+            );
+            (io::Factory::detour(sender, receiver), released)
+        } else {
+            let (udp, released, local) =
+                io::Factory::new(config.listen, config.bind_interface.clone())?;
+            log::info!(
+                "WireGuard endpoint {} listening on {local}",
+                config.wireguard
+            );
+            (udp, released)
+        };
         let mut device = DeviceBuilder::new()
             .with_udp(udp)
             .with_private_key(StaticSecret::from(config.private_key.0))
@@ -320,7 +361,6 @@ impl PreparedEndpoint {
         let cancel = CancellationToken::new();
         let shutdown = cancel.clone();
         let limits = config.limits();
-        log::info!("WireGuard endpoint {name} listening on {local}");
         let task = tokio::spawn(async move {
             let mut tasks = JoinSet::new();
             let mut inbound_udp_count = None;

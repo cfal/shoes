@@ -296,6 +296,7 @@ fn wireguard_dns_and_chain_constraints() {
     for example in [
         include_str!("../../examples/wireguard_client.yaml"),
         include_str!("../../examples/wireguard_server.yaml"),
+        include_str!("../../examples/wireguard_outer_chain.yaml"),
     ] {
         validate(example).unwrap();
     }
@@ -315,8 +316,205 @@ fn wireguard_rejects_duplicate_peers_and_cross_peer_route_overlaps() {
     server.validate().unwrap();
 }
 
+#[test]
+fn wireguard_outer_chain_validation_and_roundtrip() {
+    use serde_json::json;
+    let base: serde_json::Value = serde_yaml::from_str(&pair_config(51820)).unwrap();
+    let direct = json!({"protocol": {"type": "direct"}});
+    let check = |value: &serde_json::Value| validate(&serde_yaml::to_string(value).unwrap());
+    let mut valid = base.clone();
+    valid[1]["outer_client_chain"] = json!([direct]);
+    check(&valid).unwrap();
+    let raw: Vec<crate::config::Config> =
+        serde_yaml::from_str(&serde_yaml::to_string(&valid).unwrap()).unwrap();
+    validate(&serde_yaml::to_string(&raw).unwrap()).unwrap();
+    for (field, value) in [
+        ("listen", json!("0.0.0.0:0")),
+        ("bind_interface", json!("lo")),
+        ("outer_client_chain", json!([])),
+        ("outer_client_chain", json!("missing-group")),
+        (
+            "outer_client_chain",
+            json!([{"protocol": {"type": "wireguard", "endpoint": "missing"}}]),
+        ),
+    ] {
+        let mut invalid = valid.clone();
+        invalid[1][field] = value;
+        assert!(check(&invalid).is_err(), "accepted {field}");
+    }
+    let mut missing_peer = valid.clone();
+    missing_peer[1]["peers"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("endpoint");
+    assert!(check(&missing_peer).is_err());
+
+    let mut nested = base.clone();
+    nested[1]["mtu"] = json!(1280);
+    nested[1]["outer_client_chain"] =
+        json!([{"protocol": {"type": "wireguard", "endpoint": "server"}}]);
+    nested.as_array_mut().unwrap().reverse();
+    let sorted = check(&nested).unwrap();
+    assert_eq!(sorted.wireguard_endpoints[0].wireguard, "server");
+    nested[0]["mtu"] = json!(1408);
+    assert!(check(&nested).err().unwrap().to_string().contains("MTU"));
+
+    // A TCP proxy after the carrier segments datagrams, so MTU alone cannot detect cycles.
+    let cycle_chain = |endpoint| {
+        json!([
+            {"protocol": {"type": "wireguard", "endpoint": endpoint}},
+            {"address": "127.0.0.1:443", "protocol": {"type": "socks"}},
+        ])
+    };
+    let mut cyclic = valid.clone();
+    cyclic[1]["outer_client_chain"] = cycle_chain("client");
+    assert!(check(&cyclic).err().unwrap().to_string().contains("cycle"));
+    cyclic[1]["outer_client_chain"] = cycle_chain("server");
+    cyclic[0].as_object_mut().unwrap().remove("listen");
+    cyclic[0]["peers"][0]["endpoint"] = json!("127.0.0.1:51820");
+    cyclic[0]["outer_client_chain"] = cycle_chain("client");
+    assert!(check(&cyclic).err().unwrap().to_string().contains("cycle"));
+    cyclic[1]["outer_client_chain"][0] = json!({"pool": [
+        direct,
+        {"protocol": {"type": "wireguard", "endpoint": "server"}},
+    ]});
+    assert!(check(&cyclic).err().unwrap().to_string().contains("cycle"));
+
+    valid[1]["outer_client_chain"] = json!("outer");
+    valid
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"client_group": "outer", "client_proxies": [direct]}));
+    check(&valid).unwrap();
+}
+
 #[tokio::test]
-async fn wireguard_inbound_loads_client_certificate_paths_before_validation() {
+async fn wireguard_outer_chain_requires_udp_before_starting() {
+    for protocol in [
+        "{type: socks}",
+        "{type: trojan, password: test}",
+        "{type: vless, user_id: b85798ef-e9dc-46a4-9a87-8da4499d36d0, udp_enabled: false}",
+    ] {
+        let mut configs = validate(&pair_config(51820)).unwrap();
+        configs.wireguard_endpoints[1].outer_client_chain = Some(
+            serde_yaml::from_str(&format!(
+                "[{{address: '127.0.0.1:9', protocol: {protocol}}}]"
+            ))
+            .unwrap(),
+        );
+        let error = Prepared::new(&mut configs).await.err().unwrap();
+        assert!(error.to_string().contains("does not support UDP"));
+    }
+    let mut configs = validate(&pair_config(51820)).unwrap();
+    configs.wireguard_endpoints[1].outer_client_chain = Some(
+        serde_yaml::from_str(
+            r#"
+      - address: '127.0.0.1:9'
+        protocol: {type: socks}
+      - pool:
+          - address: '127.0.0.1:10'
+            protocol: {type: socks}
+          - address: '127.0.0.1:11'
+            protocol: {type: vless, user_id: b85798ef-e9dc-46a4-9a87-8da4499d36d0}
+    "#,
+        )
+        .unwrap(),
+    );
+    Prepared::new(&mut configs).await.unwrap();
+}
+
+#[tokio::test]
+async fn wireguard_nested_outer_chain_and_reload() {
+    use serde_json::{Value, json};
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let carrier_port = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+        let inner_port = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+        let mut carrier: Vec<Value> =
+            serde_yaml::from_str(&pair_config(carrier_port.local_addr().unwrap().port())).unwrap();
+        carrier[0]["wireguard"] = json!("carrier-server");
+        carrier[1]["wireguard"] = json!("carrier-client");
+        let mut inner: Vec<Value> =
+            serde_yaml::from_str(&pair_config(inner_port.local_addr().unwrap().port())).unwrap();
+        inner[1]["mtu"] = json!(1280);
+        inner[1]["outer_client_chain"] =
+            json!([{"protocol": {"type": "wireguard", "endpoint": "carrier-client"}}]);
+        inner.extend(carrier);
+        let mut configs = validate(&serde_yaml::to_string(&inner).unwrap()).unwrap();
+        let prepared = Prepared::new(&mut configs).await.unwrap();
+        let find = |name| {
+            prepared
+                .endpoints
+                .iter()
+                .find(|endpoint| endpoint.config.wireguard == name)
+                .unwrap()
+        };
+        let client = find("client");
+        let carrier = find("carrier-client");
+        assert!(Arc::strong_count(&carrier.connector) > 1);
+        drop((carrier_port, inner_port));
+        let mut running = Running::default();
+        for _ in 0..2 {
+            prepared
+                .start(&mut DnsRegistry::new(), &mut running)
+                .await
+                .unwrap();
+            for ipv6 in [false, true] {
+                let (tcp, udp, _servers) = echo_servers(ipv6).await;
+                check_echo(client.connector.as_ref(), tcp, udp).await;
+            }
+            running.stop().await;
+            assert!(client.connector.handle().is_err());
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn wireguard_detoured_endpoint_keeps_encrypted_peers_separate() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let first = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+        let second = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+        let mut configs = validate(&pair_config(first.local_addr().unwrap().port())).unwrap();
+        let mut other_server = configs.wireguard_endpoints[0].clone();
+        other_server.wireguard = "other-server".into();
+        other_server.private_key = crate::config::wireguard::WireguardKey([44; 32]);
+        other_server.listen = Some(second.local_addr().unwrap());
+        let client = &mut configs.wireguard_endpoints[1];
+        client.outer_client_chain = Some(crate::config::ClientChain::default());
+        client.peers[0].allowed_ips = vec!["127.0.0.1/32".into()];
+        let mut other_peer = client.peers[0].clone();
+        other_peer.public_key = serde_yaml::from_str(&public(44)).unwrap();
+        other_peer.endpoint = Some(format!("127.0.0.1:{}", second.local_addr().unwrap().port()));
+        other_peer.allowed_ips = vec!["127.0.0.2/32".into()];
+        client.peers.push(other_peer);
+        configs.wireguard_endpoints.push(other_server);
+        let prepared = Prepared::new(&mut configs).await.unwrap();
+        drop((first, second));
+        let mut running = Running::default();
+        prepared
+            .start(&mut DnsRegistry::new(), &mut running)
+            .await
+            .unwrap();
+        let (tcp, udp, _servers) = echo_servers(false).await;
+        let second_ip = "127.0.0.2".parse().unwrap();
+        let connector = prepared.endpoints[1].connector.as_ref();
+        tokio::join!(
+            check_echo(connector, tcp, udp),
+            check_echo(
+                connector,
+                SocketAddr::new(second_ip, tcp.port()),
+                SocketAddr::new(second_ip, udp.port())
+            ),
+        );
+        running.stop().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn wireguard_chains_load_client_certificate_paths_before_validation() {
     let directory = tempfile::tempdir().unwrap();
     let cert_path = directory.path().join("client.crt");
     let key_path = directory.path().join("client.key");
@@ -324,13 +522,21 @@ async fn wireguard_inbound_loads_client_certificate_paths_before_validation() {
     std::fs::write(&cert_path, cert.cert.pem()).unwrap();
     std::fs::write(&key_path, cert.signing_key.serialize_pem()).unwrap();
     let mut config: serde_json::Value = serde_yaml::from_str(&pair_config(10001)).unwrap();
-    config[0]["inbound"]["rules"][0]["client_chain"] = serde_json::json!([{
+    let chain = serde_json::json!([{
         "address":"127.0.0.1:443", "protocol": {"type":"tls", "cert":cert_path, "key":key_path, "protocol":{"type":"socks"}}
     }]);
-    let configs = serde_yaml::from_str(&serde_yaml::to_string(&config).unwrap()).unwrap();
-    let (configs, count) = crate::config::convert_cert_paths(configs).await.unwrap();
-    assert_eq!(count, 2);
-    crate::config::create_server_configs(configs).unwrap();
+    for outer in [false, true] {
+        if outer {
+            config[1]["outer_client_chain"] = chain.clone();
+        } else {
+            config[0]["inbound"]["rules"][0]["client_chain"] = chain.clone();
+        }
+        let configs = serde_yaml::from_str(&serde_yaml::to_string(&config).unwrap()).unwrap();
+        let (configs, count) = crate::config::convert_cert_paths(configs).await.unwrap();
+        assert_eq!(count, 2);
+        crate::config::create_server_configs(configs).unwrap();
+        config = serde_yaml::from_str(&pair_config(10001)).unwrap();
+    }
 }
 
 #[tokio::test]

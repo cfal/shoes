@@ -80,7 +80,18 @@ impl Drop for Socket {
 }
 #[derive(Clone)]
 pub(super) struct Udp(Arc<Socket>);
-pub(super) struct Factory(Option<Udp>);
+pub(super) struct Factory(Option<(UdpSender, UdpReceiver)>);
+
+#[derive(Clone)]
+pub(super) enum UdpSender {
+    Direct(Udp),
+    Detour(super::detour::Sender),
+}
+
+pub(super) enum UdpReceiver {
+    Direct(Udp),
+    Detour(super::detour::Receiver),
+}
 
 impl Factory {
     pub fn new(
@@ -99,28 +110,67 @@ impl Factory {
         };
         let local = socket.local_addr()?;
         let (closed, released) = oneshot::channel();
+        let udp = Udp(Arc::new(Socket {
+            socket: Some(socket),
+            closed: Some(closed),
+            ipv6: local.is_ipv6(),
+        }));
         Ok((
-            Self(Some(Udp(Arc::new(Socket {
-                socket: Some(socket),
-                closed: Some(closed),
-                ipv6: local.is_ipv6(),
-            })))),
+            Self(Some((
+                UdpSender::Direct(udp.clone()),
+                UdpReceiver::Direct(udp),
+            ))),
             released,
             local,
         ))
     }
+
+    pub fn detour(sender: super::detour::Sender, receiver: super::detour::Receiver) -> Self {
+        Self(Some((
+            UdpSender::Detour(sender),
+            UdpReceiver::Detour(receiver),
+        )))
+    }
 }
 impl UdpTransportFactory for Factory {
-    type Send = Udp;
-    type Recv = Udp;
-    async fn bind(&mut self, _: &UdpTransportFactoryParams) -> io::Result<(Udp, Udp)> {
-        let socket = self.0.take().ok_or_else(|| {
+    type Send = UdpSender;
+    type Recv = UdpReceiver;
+    async fn bind(
+        &mut self,
+        _: &UdpTransportFactoryParams,
+    ) -> io::Result<(UdpSender, UdpReceiver)> {
+        self.0.take().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::Unsupported,
                 "WireGuard socket reconfiguration requires reload",
             )
-        })?;
-        Ok((socket.clone(), socket))
+        })
+    }
+}
+
+impl UdpSend for UdpSender {
+    type SendManyBuf = ();
+    async fn send_to(&self, packet: Packet, target: SocketAddr) -> io::Result<()> {
+        match self {
+            Self::Direct(socket) => socket.send_to(packet, target).await,
+            Self::Detour(sender) => sender.send_to(packet, target),
+        }
+    }
+    fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
+        match self {
+            Self::Direct(socket) => socket.local_addr(),
+            Self::Detour(_) => Ok(None),
+        }
+    }
+}
+
+impl UdpRecv for UdpReceiver {
+    type RecvManyBuf = ();
+    async fn recv_from(&mut self, pool: &mut PacketBufPool) -> io::Result<(Packet, SocketAddr)> {
+        match self {
+            Self::Direct(socket) => socket.recv_from(pool).await,
+            Self::Detour(receiver) => receiver.recv_from(pool).await,
+        }
     }
 }
 impl UdpSend for Udp {

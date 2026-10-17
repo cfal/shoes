@@ -33,8 +33,9 @@ and derive its public key with `wg pubkey`. Never share the private key.
 | `wireguard` | Unique, nonempty endpoint name |
 | `private_key` | Base64-encoded 32-byte private key |
 | `addresses` | Nonempty local tunnel CIDRs; at most one address per family |
-| `listen` | Optional literal UDP socket address; omission chooses an ephemeral dual-stack wildcard, with IPv4 fallback when IPv6 is unavailable |
+| `listen` | Optional literal UDP socket address in direct mode; omission chooses an ephemeral dual-stack wildcard, with IPv4 fallback when IPv6 is unavailable |
 | `bind_interface` | Optional outer UDP interface, supported on Linux/Android |
+| `outer_client_chain` | Optional client chain carrying encrypted UDP to the peers; conflicts with `listen` and endpoint `bind_interface` |
 | `mtu` | Inner IP MTU, default 1408; supported range 1280-1420 |
 | `peers` | Nonempty static peer list |
 | `inbound` | Optional forwarding policy; omitted disables unsolicited inbound flows |
@@ -45,7 +46,7 @@ are `pre_shared_key`, `endpoint: "host:port"`, and
 `persistent_keepalive` in seconds (zero disables it). Omit `endpoint` for a
 peer that initiates toward this server. Hostnames are resolved through native
 bootstrap DNS during preparation and refreshed on reload. Authenticated
-WireGuard roaming can update the active peer address without a reload.
+WireGuard roaming can update the active peer address without a reload in direct mode.
 Overlapping allowed prefixes between different peers, duplicate keys, and
 self-peering are rejected. Assign each client distinct tunnel addresses.
 
@@ -73,6 +74,60 @@ The second hop is optional. A WireGuard reference must not specify `address`,
 inside TLS/WebSocket or at later hops. A missing route, address family, failed
 endpoint, or unavailable peer never causes direct fallback.
 
+To put proxies **before** WireGuard, configure `outer_client_chain` on the endpoint:
+
+```yaml
+outer_client_chain:
+  - address: "relay.example:443"
+    protocol:
+      type: tls
+      protocol:
+        type: vless
+        user_id: "b85798ef-e9dc-46a4-9a87-8da4499d36d0"
+        udp_enabled: true
+```
+
+The effective path is `Shoes -> outer proxy chain -> WireGuard peer -> optional
+inner proxy chain -> destination`. The routing rule still references WireGuard
+at hop zero. See [the complete detour example](examples/wireguard_outer_chain.yaml).
+
+Outer chains use the normal inline, named-group and pool syntax. Their final hop
+must support UDP; earlier hops may be TCP-only. VLESS, VMess and compatible
+Shadowsocks/AnyTLS UDP-over-TCP configurations work. Shoes' SOCKS outbound only
+implements CONNECT, and Trojan outbound UDP is not implemented, so neither can
+be the final UDP hop. Pools select UDP-capable final members. Selection remains
+fixed for the life of an association; reconnection may select another member.
+
+Every detoured peer must specify `endpoint`. One persistent association is shared
+by all inner flows to each resolved peer destination; peers with the same resolved
+destination share an association. No native WireGuard UDP listener is opened.
+Configure physical interface binding on the first outer client, not the endpoint.
+`inbound.rules` still handles authenticated connections received over established
+associations, but cannot accept unsolicited public peers through a proxy detour.
+
+Detoured destinations are fixed for the configuration generation. Their message
+streams do not expose source addresses, so arbitrary peer address roaming is not
+supported. Peer hostname changes require reload. Peer and outer-proxy bootstrap
+use native DNS independently of routed DNS and `inbound.dns`. Ensure host DNS and
+host routes do not themselves require the tunnel being established.
+
+Outer connect and blocked-write attempts time out after 10 seconds. Failed streams
+retry with backoff from 250 ms to 10 seconds, never falling back to direct UDP.
+Offline/overflow packets are dropped rather than indefinitely buffered; WireGuard
+and inner TCP perform their normal retries. Use `persistent_keepalive` to maintain
+idle proxy UDP mappings. Silent blackholes without stream errors remain UDP loss.
+Queues hold at most 64 packets per destination and 64 aggregate received packets,
+with a 2048-byte outer datagram limit, above the supported inner MTU plus WireGuard
+overhead. Shutdown waits for workers to release their associations.
+
+An outer chain can itself start with another named WireGuard endpoint. Dependencies
+start first, regardless of declaration order; self-dependencies and indirect cycles
+(including pool alternatives) are rejected. A direct WireGuard-in-WireGuard carrier
+requires `round_up(inner_mtu, 16) + 80 <= carrier_mtu`, conservatively accounting for
+IPv6, UDP and WireGuard overhead. For example, inner MTU 1280 fits carrier MTU 1408.
+A TCP proxy after the carrier segments packets instead. External path MTU still
+needs operator tuning; UDP-over-TCP can introduce head-of-line blocking.
+
 DNS remains independently configured. Merely defining a WireGuard endpoint
 does not tunnel the application's default native DNS. Explicit TCP DNS,
 DoT, and DoH client chains may use WireGuard with a literal upstream IP.
@@ -85,7 +140,7 @@ This is TCP/UDP proxying, not arbitrary IP routing. Remote destinations see
 the gateway's outgoing proxy connection, not the original client's source
 address. A non-Shoes gateway must provide the required routes and forwarding
 or NAT for destinations behind it. ICMP forwarding, IP fragment reassembly,
-peer-to-peer IP forwarding, WARP reserved bytes, outer proxy detours, and
+peer-to-peer IP forwarding, WARP reserved bytes, and
 wg-quick import are not implemented.
 
 Fragmented input and unsupported IPv6 extension chains are dropped before

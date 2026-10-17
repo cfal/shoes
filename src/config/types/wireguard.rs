@@ -5,7 +5,9 @@ use std::{fmt, io, net::SocketAddr};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 
-use super::{DnsConfig, RuleConfig, selection::ConfigSelection, tun::TunResourceLimits};
+use super::{
+    ClientChain, DnsConfig, RuleConfig, selection::ConfigSelection, tun::TunResourceLimits,
+};
 use crate::option_util::NoneOrSome;
 
 #[derive(Clone)]
@@ -68,6 +70,8 @@ pub struct WireguardConfig {
     pub listen: Option<SocketAddr>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bind_interface: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outer_client_chain: Option<ClientChain>,
     #[serde(default = "default_mtu")]
     pub mtu: u16,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -112,6 +116,18 @@ impl WireguardConfig {
             return Err(invalid("WireGuard MTU must be between 1280 and 1420"));
         }
         self.limits().validate()?;
+        if self.outer_client_chain.is_some() {
+            if self.listen.is_some() || self.bind_interface.is_some() {
+                return Err(invalid(
+                    "WireGuard outer_client_chain conflicts with listen and bind_interface",
+                ));
+            }
+            if self.peers.iter().any(|peer| peer.endpoint.is_none()) {
+                return Err(invalid(
+                    "WireGuard outer_client_chain requires an endpoint for every peer",
+                ));
+            }
+        }
         if self
             .inbound
             .as_ref()

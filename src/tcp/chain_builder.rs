@@ -31,7 +31,7 @@ pub fn try_build_client_proxy_chain(
     build_client_proxy_chain_with_limits(client_chain, resolver, crate::resources::limits())
 }
 
-fn build_client_proxy_chain_with_limits(
+pub(crate) fn build_client_proxy_chain_with_limits(
     client_chain: crate::option_util::OneOrSome<ClientChainHop>,
     resolver: Arc<dyn Resolver>,
     limits: crate::config::GlobalLimits,
