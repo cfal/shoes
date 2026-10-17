@@ -11,11 +11,7 @@ async fn wireguard_server_client_tcp_udp_and_stream_chain() -> std::io::Result<(
         let port = reservation.local_addr()?.port();
         let mut ports = PortHelper::new();
         let (_, proxy) = ports.get_localhost_listener_port();
-        let protocol = json!({
-            "type": "vless",
-            "user_id": "b85798ef-e9dc-46a4-9a87-8da4499d36d0",
-            "udp_enabled": true,
-        });
+        let protocol = config::vless_protocol();
         let server = json!([
             config::server(port),
             {"address": format!("0.0.0.0:{proxy}"), "protocol": protocol}

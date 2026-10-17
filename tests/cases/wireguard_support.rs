@@ -1,6 +1,11 @@
 use base64::{Engine, engine::general_purpose::STANDARD};
 use gotatun::x25519::{PublicKey, StaticSecret};
 use serde_json::{Value, json};
+use shoes_test_support::test_fixture::TEST_UUID;
+
+pub fn vless_protocol() -> Value {
+    json!({"type": "vless", "user_id": TEST_UUID, "udp_enabled": true})
+}
 
 pub fn key(n: u8) -> String {
     STANDARD.encode([n; 32])

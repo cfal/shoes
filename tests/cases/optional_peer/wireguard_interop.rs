@@ -207,7 +207,7 @@ async fn run_rekey(detour: bool) -> io::Result<()> {
         let mut shoes_config = Vec::new();
         if detour {
             let (_, outer_port) = ports.get_localhost_listener_port();
-            let protocol = json!({"type": "vless", "user_id": "b85798ef-e9dc-46a4-9a87-8da4499d36d0", "udp_enabled": true});
+            let protocol = config::vless_protocol();
             client["peers"][0]["endpoint"] = json!(format!("192.0.2.200:{relay_port}"));
             client["outer_client_chain"] = json!([{"address": format!("127.0.0.1:{outer_port}"), "protocol": protocol}]);
             shoes_config.push(json!({

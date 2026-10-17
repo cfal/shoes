@@ -42,7 +42,7 @@ async fn wireguard_reload(detour: bool) {
     let mut endpoint = wireguard_support::client(port);
     if detour {
         let outer_port = available_address().port();
-        let protocol = json!({"type": "vless", "user_id": "b85798ef-e9dc-46a4-9a87-8da4499d36d0", "udp_enabled": true});
+        let protocol = wireguard_support::vless_protocol();
         endpoint["peers"][0]["endpoint"] = json!(format!("192.0.2.200:{port}"));
         endpoint["outer_client_chain"] =
             json!([{"address": format!("127.0.0.1:{outer_port}"), "protocol": protocol}]);

@@ -9,6 +9,8 @@ use std::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+pub const ECHO_TCP_BYTES: usize = 256_000;
+
 pub struct EchoTargets {
     tcp: TestServer,
     udp: TestServer,
@@ -38,7 +40,7 @@ impl EchoTargets {
                 udp.set_ip(ip);
             }
             let mut stream = connect(entry, tcp).await?;
-            let payload: Vec<_> = (0..256_000).map(|i| (i ^ (i >> 8)) as u8).collect();
+            let payload: Vec<_> = (0..ECHO_TCP_BYTES).map(|i| (i ^ (i >> 8)) as u8).collect();
             let (mut read, mut write) = stream.split();
             let send = async {
                 write.write_all(&payload).await?;

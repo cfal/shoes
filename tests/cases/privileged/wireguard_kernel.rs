@@ -7,7 +7,7 @@ use shoes_test_support::{
     port_helper::PortHelper,
     socks5::Socks5UdpAssociation,
     test_fixture::start_shoes_server,
-    wireguard::{EchoTargets, connect},
+    wireguard::{ECHO_TCP_BYTES, EchoTargets, connect},
 };
 use std::{
     ffi::OsStr,
@@ -43,14 +43,6 @@ fn wg(args: &[&str]) -> io::Result<String> {
         std::env::var_os("SHOES_TEST_WG_BIN").unwrap_or_else(|| "wg".into()),
         args,
     )
-}
-
-fn vless_protocol() -> Value {
-    json!({
-        "type": "vless",
-        "user_id": "b85798ef-e9dc-46a4-9a87-8da4499d36d0",
-        "udp_enabled": true,
-    })
 }
 
 fn isolated_test(name: &str, cases: impl Future<Output = io::Result<()>>) -> io::Result<()> {
@@ -333,7 +325,7 @@ async fn run_case(
     let chained_target_ip: IpAddr = if ipv6 { "2001:db8::77" } else { "192.0.2.77" }
         .parse()
         .unwrap();
-    let vless_protocol = vless_protocol();
+    let vless_protocol = config::vless_protocol();
     // The SOCKS listener also provides readiness for inbound-only exchanges.
     let mut socks = config::socks(socks_port);
     if chain {
@@ -494,7 +486,7 @@ fn detoured_client_configs(
     outer_port: u16,
     peer_host: &str,
 ) -> io::Result<(String, String)> {
-    let protocol = vless_protocol();
+    let protocol = config::vless_protocol();
     let outer_config = serde_yaml::to_string(&json!([{
         "address": format!("0.0.0.0:{outer_port}"), "protocol": protocol,
         "rules": [{"masks": format!("{peer_host}/32"), "action": "allow", "override_address": "127.0.0.1:0"}],
@@ -673,7 +665,7 @@ async fn run_multi_peer_case() -> io::Result<()> {
     assert!(run("ip", &["route", "get", "192.0.2.200"]).is_err());
     let mut ports = PortHelper::new();
     let (_, outer_port) = ports.get_localhost_listener_port();
-    let protocol = vless_protocol();
+    let protocol = config::vless_protocol();
     let mut endpoint = config::server(0);
     endpoint.as_object_mut().unwrap().remove("listen");
     endpoint["mtu"] = json!(1280);
@@ -782,7 +774,7 @@ async fn run_psk_rejection_case() -> io::Result<()> {
     kernel.wait_for_handshake().await?;
     let before = kernel.counters()?;
     echo.check(socks_port, Some(target.ip())).await?;
-    kernel.assert_transfer(before, 256_000)?;
+    kernel.assert_transfer(before, ECHO_TCP_BYTES)?;
     Ok(())
 }
 
