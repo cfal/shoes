@@ -262,12 +262,10 @@ impl Worker {
                     };
                     if let Poll::Ready(result) = result {
                         result?;
-                        pending = if matches!(write, Write::Flush { .. }) {
-                            None
-                        } else {
-                            Some(Write::Flush {
-                                packet: matches!(write, Write::Packet(_)),
-                            })
+                        pending = match write {
+                            Write::Packet(_) => Some(Write::Flush { packet: true }),
+                            Write::Ping => Some(Write::Flush { packet: false }),
+                            Write::Flush { .. } => None,
                         };
                         progress = true;
                     }

@@ -68,8 +68,7 @@ pub(crate) fn pump_tcp(
         return;
     }
 
-    // Handle SHUT_WR: Close -> Closing transition
-    // Must check send_queue() to ensure smoltcp has transmitted all data
+    // Waits for both send queues to drain before scheduling FIN.
     if control.send_state() == TcpSocketState::Close
         && socket.send_queue() == 0
         && control.send_buffer_empty()
@@ -84,7 +83,6 @@ pub(crate) fn pump_tcp(
         control.wake_sender();
     }
 
-    // Receive data from smoltcp into our buffer
     let mut wake_receiver = false;
     while socket.can_recv() && !control.recv_buffer_full() {
         match socket.recv(|data| {
@@ -112,8 +110,6 @@ pub(crate) fn pump_tcp(
         }
     }
 
-    // Detect recv half close using negative state matching.
-    // If socket can't receive and is not in an active receiving state, mark recv closed.
     if control.recv_state() == TcpSocketState::Normal
         && !socket.may_recv()
         && !matches!(
@@ -139,7 +135,6 @@ pub(crate) fn pump_tcp(
         control.wake_receiver();
     }
 
-    // Send data from our buffer to smoltcp
     let mut wake_sender = false;
     while socket.can_send() && !control.send_buffer_empty() {
         match socket.send(|buf| {

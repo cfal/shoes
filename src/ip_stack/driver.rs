@@ -28,6 +28,8 @@ use tokio::sync::{mpsc, oneshot};
 
 pub(crate) const QUEUE_CAPACITY: usize = 64;
 const TCP_HANDSHAKE_TIMEOUT: smoltcp::time::Duration = smoltcp::time::Duration::from_secs(30);
+const FIRST_EPHEMERAL_PORT: u16 = 49152;
+const LAST_EPHEMERAL_PORT: u16 = 65535;
 
 fn tcp_socket(buffer_size: usize) -> TcpSocket<'static> {
     let mut socket = super::tcp_socket(buffer_size);
@@ -387,6 +389,41 @@ fn packet_info(packet: &[u8]) -> Option<PacketInfo> {
     })
 }
 
+fn allocate_local(
+    addresses: &[IpAddr],
+    target: SocketAddr,
+    next_port: &mut u16,
+    tcp: &HashMap<SocketHandle, TcpEntry>,
+    udp: &HashMap<SocketAddr, UdpEntry>,
+) -> io::Result<SocketAddr> {
+    let ip = addresses
+        .iter()
+        .find(|ip| ip.is_ipv4() == target.is_ipv4())
+        .copied()
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                "WireGuard endpoint has no local address for this family",
+            )
+        })?;
+    for _ in FIRST_EPHEMERAL_PORT..=LAST_EPHEMERAL_PORT {
+        let port = *next_port;
+        *next_port = if port == LAST_EPHEMERAL_PORT {
+            FIRST_EPHEMERAL_PORT
+        } else {
+            port + 1
+        };
+        let local = SocketAddr::new(ip, port);
+        if !udp.contains_key(&local) && !tcp.values().any(|entry| entry.local == local) {
+            return Ok(local);
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AddrNotAvailable,
+        "WireGuard ephemeral ports exhausted",
+    ))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run(
     mut device: QueueDevice,
@@ -425,7 +462,7 @@ fn run(
     let mut tcp: HashMap<SocketHandle, TcpEntry> = HashMap::new();
     let mut udp: HashMap<SocketAddr, UdpEntry> = HashMap::new();
     let budget = Arc::new(Budget::new(limits.max_udp_queued_bytes));
-    let mut next_port = 49152u16;
+    let mut next_port = FIRST_EPHEMERAL_PORT;
     while running.load(Ordering::Acquire) {
         if wake_rx.drain().is_err() {
             break;
@@ -437,31 +474,7 @@ fn run(
             let target = match &command {
                 Command::Tcp(target, _) | Command::Udp(target, _) => *target,
             };
-            let local = addresses
-                .iter()
-                .find(|ip| ip.is_ipv4() == target.is_ipv4())
-                .copied()
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::AddrNotAvailable,
-                        "WireGuard endpoint has no local address for this family",
-                    )
-                });
-            let local = local.and_then(|ip| {
-                for _ in 49152..=65535 {
-                    let port = next_port;
-                    next_port = if port == 65535 { 49152 } else { port + 1 };
-                    let local = SocketAddr::new(ip, port);
-                    if !udp.contains_key(&local) && !tcp.values().any(|entry| entry.local == local)
-                    {
-                        return Ok(local);
-                    }
-                }
-                Err(io::Error::new(
-                    io::ErrorKind::AddrNotAvailable,
-                    "WireGuard ephemeral ports exhausted",
-                ))
-            });
+            let local = allocate_local(&addresses, target, &mut next_port, &tcp, &udp);
             match command {
                 Command::Tcp(target, result) => {
                     if result.is_closed() {
@@ -576,7 +589,7 @@ fn run(
             let known = tcp.iter().find_map(|(handle, entry)| {
                 (entry.remote == info.source && entry.local == info.target).then_some(*handle)
             });
-            if known.is_none() {
+            let Some(handle) = known else {
                 if !inbound
                     || !info.syn
                     || tcp
@@ -628,13 +641,11 @@ fn run(
                     },
                 );
                 continue;
-            }
+            };
             device.packet = Some(packet);
             iface.poll_ingress_single(now(), &mut device, &mut sockets);
             // A reset passive open returns to Listen and must not capture the next peer's SYN.
-            if let Some(handle) = known
-                && sockets.get::<TcpSocket>(handle).state() == State::Listen
-            {
+            if sockets.get::<TcpSocket>(handle).state() == State::Listen {
                 sockets.remove(handle);
                 tcp.remove(&handle);
             }
@@ -696,6 +707,93 @@ fn run(
 mod tests {
     use super::*;
     use smoltcp::wire::TcpControl;
+
+    #[test]
+    fn local_allocation_preserves_family_order_wraps_and_skips_both_flow_types() {
+        let ipv4 = "10.77.0.1".parse().unwrap();
+        let ipv6 = "fd77::1".parse().unwrap();
+        let addresses = [ipv6, ipv4, "10.77.0.3".parse().unwrap()];
+        let target = "10.77.0.2:443".parse().unwrap();
+        let mut sockets = SocketSet::new(vec![]);
+        let tcp = HashMap::from([(
+            sockets.add(tcp_socket(4096)),
+            TcpEntry {
+                control: Arc::new(TcpConnectionControl::new(4096, 4096)),
+                remote: target,
+                local: SocketAddr::new(ipv4, LAST_EPHEMERAL_PORT),
+                outbound: true,
+                established: false,
+                pending: None,
+            },
+        )]);
+        let local = SocketAddr::new(ipv4, FIRST_EPHEMERAL_PORT);
+        let udp = HashMap::from([(
+            local,
+            UdpEntry(Arc::new(Mutex::new(UdpControl {
+                local,
+                remote: target,
+                incoming: Default::default(),
+                outgoing: Default::default(),
+                reader: None,
+                writer: None,
+                closed: false,
+                budget: Arc::new(Budget::new(None)),
+            }))),
+        )]);
+        let mut next_port = LAST_EPHEMERAL_PORT;
+        assert_eq!(
+            allocate_local(&addresses, target, &mut next_port, &tcp, &udp).unwrap(),
+            SocketAddr::new(ipv4, FIRST_EPHEMERAL_PORT + 1),
+        );
+        assert_eq!(next_port, FIRST_EPHEMERAL_PORT + 2);
+        let error = allocate_local(&[ipv6], target, &mut next_port, &tcp, &udp).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AddrNotAvailable);
+        assert_eq!(
+            error.to_string(),
+            "WireGuard endpoint has no local address for this family",
+        );
+        assert_eq!(next_port, FIRST_EPHEMERAL_PORT + 2);
+        next_port = LAST_EPHEMERAL_PORT;
+        assert_eq!(
+            allocate_local(
+                &addresses,
+                "[fd77::2]:443".parse().unwrap(),
+                &mut next_port,
+                &tcp,
+                &udp,
+            )
+            .unwrap(),
+            SocketAddr::new(ipv6, LAST_EPHEMERAL_PORT),
+        );
+        assert_eq!(next_port, FIRST_EPHEMERAL_PORT);
+    }
+
+    #[tokio::test]
+    async fn canceled_commands_still_advance_the_local_port_cursor() {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let stack = PacketStack::new(
+                vec!["10.77.0.1".parse().unwrap()],
+                1408,
+                false,
+                TunResourceLimits::default(),
+            )
+            .unwrap();
+            let target = "10.77.0.2:443".parse().unwrap();
+            let (tcp, canceled) = oneshot::channel();
+            drop(canceled);
+            stack.handle.send(Command::Tcp(target, tcp)).unwrap();
+            let (udp, canceled) = oneshot::channel();
+            drop(canceled);
+            stack.handle.send(Command::Udp(target, udp)).unwrap();
+            let connection = stack.handle.open_udp(target).await.unwrap();
+            assert_eq!(
+                connection.control.lock().local.port(),
+                FIRST_EPHEMERAL_PORT + 2
+            );
+        })
+        .await
+        .unwrap();
+    }
 
     fn tcp_segment(
         source: SocketAddr,

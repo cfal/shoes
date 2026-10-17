@@ -17,6 +17,8 @@ use std::{
 };
 use tokio::io::ReadBuf;
 
+const FLOW_QUEUE_CAPACITY: usize = 8;
+
 pub(crate) struct Datagram {
     pub packet: PacketBuffer,
     _permit: BudgetPermit,
@@ -35,20 +37,20 @@ pub(crate) struct UdpControl {
 
 impl UdpControl {
     pub fn receive(&mut self, packet: PacketBuffer) -> bool {
-        if self.closed || self.incoming.len() == 8 {
+        if self.closed || self.incoming.len() == FLOW_QUEUE_CAPACITY {
             return false;
         }
-        if let Some(permit) = self.budget.acquire(packet.len()) {
-            self.incoming.push_back(Datagram {
-                packet: packet.into_payload(true),
-                _permit: permit,
-            });
-            if let Some(waker) = self.reader.take() {
-                waker.wake();
-            }
-            return true;
+        let Some(permit) = self.budget.acquire(packet.len()) else {
+            return false;
+        };
+        self.incoming.push_back(Datagram {
+            packet: packet.into_payload(true),
+            _permit: permit,
+        });
+        if let Some(waker) = self.reader.take() {
+            waker.wake();
         }
-        false
+        true
     }
     pub fn close(&mut self) {
         self.closed = true;
@@ -119,7 +121,7 @@ impl AsyncWriteMessage for UdpConnection {
             self.drops.fetch_add(1, Ordering::Relaxed);
             return Poll::Ready(Ok(()));
         }
-        if control.outgoing.len() == 8 {
+        if control.outgoing.len() == FLOW_QUEUE_CAPACITY {
             control.writer = Some(cx.waker().clone());
             return Poll::Pending;
         }

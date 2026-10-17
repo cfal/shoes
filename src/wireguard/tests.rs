@@ -115,6 +115,54 @@ async fn check_echo(connector: &dyn SocketConnector, tcp: SocketAddr, udp: Socke
     }
 }
 
+async fn start_prepared(prepared: &Prepared) -> Running {
+    let mut running = Running::default();
+    prepared
+        .start(&mut DnsRegistry::new(), &mut running)
+        .await
+        .unwrap();
+    running
+}
+
+fn dns_answer(bytes: &[u8]) -> Vec<u8> {
+    use hickory_resolver::proto::{
+        op::{Message, MessageType},
+        rr::{RData, Record, rdata::A},
+    };
+    let mut response = Message::from_vec(bytes).unwrap();
+    response.metadata.message_type = MessageType::Response;
+    response.add_answer(Record::from_rdata(
+        response.queries[0].name().clone(),
+        0,
+        RData::A(A::new(192, 0, 2, 42)),
+    ));
+    response.to_vec().unwrap()
+}
+
+#[test]
+fn canonical_socket_addresses_preserve_native_ipv6_metadata() {
+    for text in [
+        "127.0.0.1:443",
+        "[::]:443",
+        "[::192.0.2.1]:443",
+        "[fe80::1%3]:443",
+    ] {
+        let address: SocketAddr = text.parse().unwrap();
+        assert_eq!(canonical_socket_addr(address), address);
+    }
+    let scoped = SocketAddr::V6(std::net::SocketAddrV6::new(
+        "fe80::1".parse().unwrap(),
+        443,
+        123,
+        3,
+    ));
+    assert_eq!(canonical_socket_addr(scoped), scoped);
+    assert_eq!(
+        canonical_socket_addr("[::ffff:192.0.2.1]:443".parse().unwrap()),
+        "192.0.2.1:443".parse().unwrap(),
+    );
+}
+
 #[tokio::test]
 async fn wireguard_tcp_udp_both_families_empty_outer_and_reload_rebind() {
     tokio::time::timeout(Duration::from_secs(20), async {
@@ -155,11 +203,7 @@ async fn wireguard_mapped_ipv4_destinations_use_the_ipv4_tunnel() {
         configs.wireguard_endpoints[1].peers[0].allowed_ips = vec!["0.0.0.0/0".into()];
         let prepared = Prepared::new(&mut configs).await.unwrap();
         drop(reservation);
-        let mut running = Running::default();
-        prepared
-            .start(&mut DnsRegistry::new(), &mut running)
-            .await
-            .unwrap();
+        let mut running = start_prepared(&prepared).await;
         let (tcp, udp, _echoes) = echo_servers(false).await;
         let mapped = |address: SocketAddr| {
             SocketAddr::new("::ffff:127.0.0.1".parse().unwrap(), address.port())
@@ -183,11 +227,7 @@ async fn wireguard_concurrent_tcp_transfers_preserve_all_data() {
         let mut configs = validate(&pair_config(reservation.local_addr().unwrap().port())).unwrap();
         let prepared = Prepared::new(&mut configs).await.unwrap();
         drop(reservation);
-        let mut running = Running::default();
-        prepared
-            .start(&mut DnsRegistry::new(), &mut running)
-            .await
-            .unwrap();
+        let mut running = start_prepared(&prepared).await;
         let (tcp, _, _echoes) = echo_servers(false).await;
         let mut flows = JoinSet::new();
         for id in 0..16u8 {
@@ -240,11 +280,7 @@ async fn wireguard_mapped_ipv4_outer_endpoint_uses_ipv4_transport() {
                 vec![SocketAddr::from(([127, 0, 0, 1], port))]
             );
             drop(reservation);
-            let mut running = Running::default();
-            prepared
-                .start(&mut DnsRegistry::new(), &mut running)
-                .await
-                .unwrap();
+            let mut running = start_prepared(&prepared).await;
             let (tcp, udp, _echoes) = echo_servers(false).await;
             check_echo(prepared.endpoints[1].connector.as_ref(), tcp, udp).await;
             running.stop().await;
@@ -264,11 +300,7 @@ async fn wireguard_ipv6_outer_transport() {
         configs.wireguard_endpoints[1].peers[0].endpoint = Some(format!("[::1]:{port}"));
         let prepared = Prepared::new(&mut configs).await.unwrap();
         drop(reservation);
-        let mut running = Running::default();
-        prepared
-            .start(&mut DnsRegistry::new(), &mut running)
-            .await
-            .unwrap();
+        let mut running = start_prepared(&prepared).await;
         for v6 in [false, true] {
             let (tcp, udp, _echoes) = echo_servers(v6).await;
             check_echo(prepared.endpoints[1].connector.as_ref(), tcp, udp).await;
@@ -302,11 +334,7 @@ async fn wireguard_dual_stack_connect_falls_back_without_waiting_for_blackholed_
         configs.wireguard_endpoints[0].peers[0].allowed_ips = vec!["10.77.0.2/32".into()];
         let prepared = Prepared::new(&mut configs).await.unwrap();
         drop(reservation);
-        let mut running = Running::default();
-        prepared
-            .start(&mut DnsRegistry::new(), &mut running)
-            .await
-            .unwrap();
+        let mut running = start_prepared(&prepared).await;
         let (tcp, _, _echoes) = echo_servers(false).await;
         let resolver: Arc<dyn Resolver> = Arc::new(DualStackResolver(vec![
             SocketAddr::new("::1".parse().unwrap(), tcp.port()),
@@ -405,7 +433,19 @@ fn wireguard_bind_validates_peer_address_families() {
 
 #[tokio::test]
 async fn wireguard_references_share_a_connector_and_are_not_direct() {
-    let mut configs = validate(&format!("{}\n- address: '0.0.0.0:1080'\n  protocol: {{type: socks}}\n  rules:\n    - masks: '0.0.0.0/0'\n      action: allow\n      client_chain:\n        - protocol: {{type: wireguard, endpoint: client}}\n",pair_config(10001))).unwrap();
+    let mut configs = validate(&format!(
+        r#"{}
+- address: '0.0.0.0:1080'
+  protocol: {{type: socks}}
+  rules:
+    - masks: '0.0.0.0/0'
+      action: allow
+      client_chain:
+        - protocol: {{type: wireguard, endpoint: client}}
+"#,
+        pair_config(10001)
+    ))
+    .unwrap();
     configs.configs.push(configs.configs[0].clone());
     let prepared = Prepared::new(&mut configs).await.unwrap();
     let expected: Arc<dyn SocketConnector> = prepared.endpoints[1].connector.clone();
@@ -744,11 +784,7 @@ async fn wireguard_detoured_endpoint_keeps_encrypted_peers_separate() {
         configs.wireguard_endpoints.push(other_server);
         let prepared = Prepared::new(&mut configs).await.unwrap();
         drop((first, second));
-        let mut running = Running::default();
-        prepared
-            .start(&mut DnsRegistry::new(), &mut running)
-            .await
-            .unwrap();
+        let mut running = start_prepared(&prepared).await;
         let (tcp, udp, _servers) = echo_servers(false).await;
         let second_ip = "127.0.0.2".parse().unwrap();
         let connector = prepared.endpoints[1].connector.as_ref();
@@ -836,11 +872,7 @@ async fn wireguard_replay_corruption_and_authenticated_endpoint_roaming() {
         }
         let prepared = Prepared::new(&mut configs).await.unwrap();
         drop(reservation);
-        let mut running = Running::default();
-        prepared
-            .start(&mut DnsRegistry::new(), &mut running)
-            .await
-            .unwrap();
+        let mut running = start_prepared(&prepared).await;
         let target = UdpSocket::bind("0.0.0.0:0").await.unwrap();
         let target_addr = SocketAddr::new(
             "127.0.0.1".parse().unwrap(),
@@ -938,11 +970,7 @@ async fn wireguard_rejects_wrong_psk_spoofed_sources_and_unsolicited_flows() {
             }
             let prepared = Prepared::new(&mut configs).await.unwrap();
             drop(reservation);
-            let mut running = Running::default();
-            prepared
-                .start(&mut DnsRegistry::new(), &mut running)
-                .await
-                .unwrap();
+            let mut running = start_prepared(&prepared).await;
             let target = UdpSocket::bind("0.0.0.0:0").await.unwrap();
             let address = SocketAddr::new(
                 "127.0.0.1".parse().unwrap(),
@@ -992,11 +1020,7 @@ async fn wireguard_multiple_peers_share_a_bind_without_cross_delivering_replies(
         configs.wireguard_endpoints.push(client);
         let prepared = Prepared::new(&mut configs).await.unwrap();
         drop(reservation);
-        let mut running = Running::default();
-        prepared
-            .start(&mut DnsRegistry::new(), &mut running)
-            .await
-            .unwrap();
+        let mut running = start_prepared(&prepared).await;
         for v6 in [false, true] {
             let (tcp, udp, _echoes) = echo_servers(v6).await;
             tokio::join!(
@@ -1016,23 +1040,10 @@ async fn wireguard_dns_tcp_dot_doh_use_the_tunnel_and_fail_closed_after_stop() {
     use hickory_resolver::{
         config::{ConnectionConfig, NameServerConfig, ResolverConfig},
         net::runtime::RuntimeProvider,
-        proto::{
-            op::{Message, MessageType},
-            rr::{RData, Record, rdata::A},
-        },
+        proto::rr::{RData, rdata::A},
     };
     trait TestIo: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
     impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> TestIo for T {}
-    fn answer(bytes: &[u8]) -> Vec<u8> {
-        let mut response = Message::from_vec(bytes).unwrap();
-        response.metadata.message_type = MessageType::Response;
-        response.add_answer(Record::from_rdata(
-            response.queries[0].name().clone(),
-            0,
-            RData::A(A::new(192, 0, 2, 42)),
-        ));
-        response.to_vec().unwrap()
-    }
     tokio::time::timeout(Duration::from_secs(20), async {
         let reservation = std::net::UdpSocket::bind("[::]:0").unwrap();
         let port = reservation.local_addr().unwrap().port();
@@ -1103,7 +1114,7 @@ async fn wireguard_dns_tcp_dot_doh_use_the_tunnel_and_fail_closed_after_stop() {
                             body.flow_control().release_capacity(data.len()).unwrap();
                             query.extend_from_slice(&data);
                         }
-                        let bytes = answer(&query);
+                        let bytes = dns_answer(&query);
                         let mut send = response
                             .send_response(
                                 http::Response::builder()
@@ -1122,7 +1133,7 @@ async fn wireguard_dns_tcp_dot_doh_use_the_tunnel_and_fail_closed_after_stop() {
                     let length = stream.read_u16().await.unwrap() as usize;
                     let mut query = vec![0; length];
                     stream.read_exact(&mut query).await.unwrap();
-                    let bytes = answer(&query);
+                    let bytes = dns_answer(&query);
                     stream.write_u16(bytes.len() as u16).await.unwrap();
                     stream.write_all(&bytes).await.unwrap();
                     stream.flush().await.unwrap();
@@ -1167,31 +1178,40 @@ async fn wireguard_dns_tcp_dot_doh_use_the_tunnel_and_fail_closed_after_stop() {
 
 #[tokio::test]
 async fn wireguard_dns_registry_prepares_inactive_generation_handles() {
-    use hickory_resolver::proto::{
-        op::{Message, MessageType},
-        rr::{RData, Record, rdata::A},
-    };
     tokio::time::timeout(Duration::from_secs(10), async {
         let reservation = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
         let port = reservation.local_addr().unwrap().port();
         let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
         let dns_port = listener.local_addr().unwrap().port();
-        let yaml = format!("{}\n- dns_group: tunnel\n  dns_servers:\n    - url: tcp://127.0.0.1:{dns_port}\n      ip_strategy: ipv4_only\n      client_chain:\n        - protocol: {{type: wireguard, endpoint: client}}\n", pair_config(port));
+        let yaml = format!(
+            r#"{}
+- dns_group: tunnel
+  dns_servers:
+    - url: tcp://127.0.0.1:{dns_port}
+      ip_strategy: ipv4_only
+      client_chain:
+        - protocol: {{type: wireguard, endpoint: client}}
+"#,
+            pair_config(port)
+        );
         let mut configs = validate(&yaml).unwrap();
         let prepared = Prepared::new(&mut configs).await.unwrap();
-        let mut dns = crate::dns::build_dns_registry(configs.dns_groups.clone()).await.unwrap();
-        assert!(tokio::time::timeout(Duration::from_millis(20), listener.accept()).await.is_err());
+        let mut dns = crate::dns::build_dns_registry(configs.dns_groups.clone())
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), listener.accept())
+                .await
+                .is_err()
+        );
         let mut servers = JoinSet::new();
         servers.spawn(async move {
             loop {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let length = stream.read_u16().await.unwrap() as usize;
-                let mut bytes = vec![0;length];
+                let mut bytes = vec![0; length];
                 stream.read_exact(&mut bytes).await.unwrap();
-                let mut reply = Message::from_vec(&bytes).unwrap();
-                reply.metadata.message_type = MessageType::Response;
-                reply.add_answer(Record::from_rdata(reply.queries[0].name().clone(), 0, RData::A(A::new(192,0,2,42))));
-                let bytes = reply.to_vec().unwrap();
+                let bytes = dns_answer(&bytes);
                 stream.write_u16(bytes.len() as u16).await.unwrap();
                 stream.write_all(&bytes).await.unwrap();
                 stream.shutdown().await.unwrap();
@@ -1200,13 +1220,31 @@ async fn wireguard_dns_registry_prepares_inactive_generation_handles() {
         drop(reservation);
         let mut running = Running::default();
         prepared.start(&mut dns, &mut running).await.unwrap();
-        for registry in [dns, crate::dns::build_dns_registry(configs.dns_groups.clone()).await.unwrap()] {
+        for registry in [
+            dns,
+            crate::dns::build_dns_registry(configs.dns_groups.clone())
+                .await
+                .unwrap(),
+        ] {
             let resolver = registry.get_by_name("tunnel").unwrap();
-            let answer = resolver.resolve_location(&NetLocation::from_str("registry.test:443", None).unwrap()).await.unwrap();
+            let answer = resolver
+                .resolve_location(&NetLocation::from_str("registry.test:443", None).unwrap())
+                .await
+                .unwrap();
             assert_eq!(answer[0], "192.0.2.42:443".parse().unwrap());
         }
         running.stop().await;
-        let dns = crate::dns::build_dns_registry(configs.dns_groups).await.unwrap();
-        assert!(dns.get_by_name("tunnel").unwrap().resolve_location(&NetLocation::from_str("after-stop.test:443",None).unwrap()).await.is_err());
-    }).await.unwrap();
+        let dns = crate::dns::build_dns_registry(configs.dns_groups)
+            .await
+            .unwrap();
+        assert!(
+            dns.get_by_name("tunnel")
+                .unwrap()
+                .resolve_location(&NetLocation::from_str("after-stop.test:443", None).unwrap())
+                .await
+                .is_err()
+        );
+    })
+    .await
+    .unwrap();
 }

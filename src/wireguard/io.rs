@@ -68,6 +68,7 @@ struct Socket {
 }
 impl Drop for Socket {
     fn drop(&mut self) {
+        // Releases the bind before notifying shutdown waiters.
         drop(self.socket.take());
         if let Some(closed) = self.closed.take() {
             let _ = closed.send(());
@@ -197,7 +198,7 @@ impl UdpRecv for Udp {
     type RecvManyBuf = ();
     async fn recv_from(&mut self, pool: &mut PacketBufPool) -> io::Result<(Packet, SocketAddr)> {
         let mut packet = pool.get();
-        let (len, mut source) = self
+        let (len, source) = self
             .0
             .socket
             .as_ref()
@@ -205,12 +206,7 @@ impl UdpRecv for Udp {
             .recv_from(packet.buf_mut())
             .await?;
         packet.truncate(len);
-        if let std::net::IpAddr::V6(ip) = source.ip()
-            && let Some(ip) = ip.to_ipv4_mapped()
-        {
-            source.set_ip(ip.into());
-        }
-        Ok((packet, source))
+        Ok((packet, super::canonical_socket_addr(source)))
     }
 }
 

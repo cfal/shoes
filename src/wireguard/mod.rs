@@ -15,7 +15,7 @@ use std::{
     collections::HashMap,
     fmt, io as stdio,
     net::{IpAddr, SocketAddr},
-    sync::Arc,
+    sync::{Arc, atomic::Ordering},
 };
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
@@ -23,12 +23,21 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     address::{NetLocation, ResolvedLocation},
     async_stream::{AsyncMessageStream, AsyncStream},
-    config::{ClientProxyConfig, ValidatedConfigs, wireguard::WireguardConfig},
+    client_proxy_selector::ClientProxySelector,
+    config::{
+        ClientProxyConfig, ValidatedConfigs,
+        wireguard::{WireguardConfig, WireguardPeer},
+    },
     dns::DnsRegistry,
     ip_stack::driver::{PacketStack, StackHandle},
     resolver::{NativeResolver, Resolver, resolve_addresses},
     tcp::socket_connector::SocketConnector,
 };
+
+fn canonical_socket_addr(mut address: SocketAddr) -> SocketAddr {
+    address.set_ip(address.ip().to_canonical());
+    address
+}
 
 struct Connector {
     name: String,
@@ -73,10 +82,7 @@ impl Connector {
         };
         let addresses: Vec<_> = addresses
             .into_iter()
-            .map(|mut address| {
-                address.set_ip(address.ip().to_canonical());
-                address
-            })
+            .map(canonical_socket_addr)
             .filter(|address| self.reachable(*address))
             .collect();
         if addresses.is_empty() {
@@ -123,6 +129,56 @@ struct PreparedPeer {
     endpoints: Vec<SocketAddr>,
 }
 
+impl PreparedPeer {
+    async fn resolve(
+        config: &WireguardConfig,
+        peer_config: &WireguardPeer,
+        resolver: &Arc<dyn Resolver>,
+    ) -> stdio::Result<Self> {
+        let mut peer = Peer::new(PublicKey::from(peer_config.public_key.0));
+        peer.allowed_ips = peer_config
+            .allowed_ips
+            .iter()
+            .map(|prefix| prefix.parse().map_err(stdio::Error::other))
+            .collect::<stdio::Result<_>>()?;
+        peer.preshared_key = peer_config.pre_shared_key.as_ref().map(|key| key.0);
+        peer.keepalive =
+            (peer_config.persistent_keepalive != 0).then_some(peer_config.persistent_keepalive);
+        let endpoints = if let Some(endpoint) = &peer_config.endpoint {
+            let address = NetLocation::from_str(endpoint, None)?;
+            let addresses = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                resolve_addresses(resolver, &address),
+            )
+            .await
+            .map_err(|_| {
+                stdio::Error::new(
+                    stdio::ErrorKind::TimedOut,
+                    "WireGuard endpoint DNS timed out",
+                )
+            })??;
+            let endpoints: Vec<_> = addresses
+                .into_iter()
+                .map(canonical_socket_addr)
+                .filter(|address| config.can_reach_endpoint(*address))
+                .collect();
+            if endpoints.is_empty() {
+                return Err(stdio::Error::new(
+                    stdio::ErrorKind::AddrNotAvailable,
+                    "WireGuard peer has no endpoint compatible with the listen address",
+                ));
+            }
+            endpoints
+        } else {
+            Vec::new()
+        };
+        Ok(Self {
+            config: peer,
+            endpoints,
+        })
+    }
+}
+
 struct PreparedEndpoint {
     config: WireguardConfig,
     peers: Vec<PreparedPeer>,
@@ -144,48 +200,7 @@ impl Prepared {
             config.validate()?;
             let mut peers = Vec::new();
             for peer_config in &config.peers {
-                let mut peer = Peer::new(PublicKey::from(peer_config.public_key.0));
-                peer.allowed_ips = peer_config
-                    .allowed_ips
-                    .iter()
-                    .map(|prefix| prefix.parse().map_err(stdio::Error::other))
-                    .collect::<stdio::Result<_>>()?;
-                peer.preshared_key = peer_config.pre_shared_key.as_ref().map(|key| key.0);
-                peer.keepalive = (peer_config.persistent_keepalive != 0)
-                    .then_some(peer_config.persistent_keepalive);
-                let mut endpoints = Vec::new();
-                if let Some(endpoint) = &peer_config.endpoint {
-                    let address = NetLocation::from_str(endpoint, None)?;
-                    let addresses = tokio::time::timeout(
-                        std::time::Duration::from_secs(10),
-                        resolve_addresses(&resolver, &address),
-                    )
-                    .await
-                    .map_err(|_| {
-                        stdio::Error::new(
-                            stdio::ErrorKind::TimedOut,
-                            "WireGuard endpoint DNS timed out",
-                        )
-                    })??;
-                    endpoints = addresses
-                        .into_iter()
-                        .map(|mut address| {
-                            address.set_ip(address.ip().to_canonical());
-                            address
-                        })
-                        .filter(|address| config.can_reach_endpoint(*address))
-                        .collect();
-                    if endpoints.is_empty() {
-                        return Err(stdio::Error::new(
-                            stdio::ErrorKind::AddrNotAvailable,
-                            "WireGuard peer has no endpoint compatible with the listen address",
-                        ));
-                    }
-                }
-                peers.push(PreparedPeer {
-                    config: peer,
-                    endpoints,
-                });
+                peers.push(PreparedPeer::resolve(config, peer_config, &resolver).await?);
             }
             let addresses = config
                 .addresses
@@ -401,49 +416,9 @@ impl PreparedEndpoint {
             let mut tasks = JoinSet::new();
             let mut inbound_udp_count = None;
             if let Some((selector, resolver)) = inbound {
-                let udp = stack.udp.take().unwrap();
-                let (reader, writer) = crate::tun::udp_handler::UdpHandler::new(
-                    udp,
-                    stack.replies.clone(),
-                    stack.handle.wake.clone(),
-                )
-                .split();
-                let manager = crate::tun::udp_manager::TunUdpManager::new(
-                    reader,
-                    writer,
-                    selector.clone(),
-                    resolver.clone(),
-                    limits,
-                );
-                inbound_udp_count = Some(manager.destination_counter());
-                tasks.spawn(async move {
-                    if let Err(error) = manager.run().await {
-                        log::warn!("WireGuard UDP forwarding stopped: {error}");
-                    }
-                });
-                let mut tcp = stack.tcp.take().unwrap();
-                tasks.spawn(async move {
-                    let mut flows = JoinSet::new();
-                    loop {
-                        tokio::select! {
-                            connection = tcp.recv() => {
-                                let Some(connection) = connection else { break; };
-                                let selector = selector.clone();
-                                let resolver = resolver.clone();
-                                flows.spawn(async move {
-                                    log::debug!("WireGuard TCP {} -> {}", connection.source, connection.target);
-                                    let target = NetLocation::from_ip_addr(
-                                        connection.target.ip(), connection.target.port(),
-                                    );
-                                    let _ = crate::tun::handle_tcp_connection(
-                                        connection.connection, target, selector, resolver,
-                                    ).await;
-                                });
-                            }
-                            _ = flows.join_next(), if !flows.is_empty() => {}
-                        }
-                    }
-                });
+                inbound_udp_count = Some(spawn_inbound(
+                    &mut tasks, &mut stack, selector, resolver, limits,
+                ));
             }
             let mut report = tokio::time::interval(std::time::Duration::from_secs(60));
             report.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -456,10 +431,10 @@ impl PreparedEndpoint {
                     _ = report.tick() => {
                         log::info!(
                             "WireGuard endpoint {name} tcp_flows={} outbound_udp_flows={} inbound_udp_destinations={} packet_drops={}",
-                            stack.counts.tcp.load(std::sync::atomic::Ordering::Relaxed),
-                            stack.counts.outbound_udp.load(std::sync::atomic::Ordering::Relaxed),
+                            stack.counts.tcp.load(Ordering::Relaxed),
+                            stack.counts.outbound_udp.load(Ordering::Relaxed),
                             inbound_udp_count.as_ref().map_or(0, |count| count.snapshot().active),
-                            stack.drops.load(std::sync::atomic::Ordering::Relaxed),
+                            stack.drops.load(Ordering::Relaxed),
                         );
                         for peer in device.peers().await {
                             log::info!(
@@ -483,10 +458,71 @@ impl PreparedEndpoint {
             let _ = released.await;
             log::info!(
                 "WireGuard endpoint {name} stopped; packet drops={}",
-                stack.drops.load(std::sync::atomic::Ordering::Relaxed)
+                stack.drops.load(Ordering::Relaxed)
             );
             drop(stack);
         });
         Ok(EndpointRuntime { cancel, task })
     }
+}
+
+fn spawn_inbound(
+    tasks: &mut JoinSet<()>,
+    stack: &mut PacketStack,
+    selector: Arc<ClientProxySelector>,
+    resolver: Arc<dyn Resolver>,
+    limits: crate::config::tun::TunResourceLimits,
+) -> Arc<crate::resources::Budget> {
+    let udp = stack.udp.take().unwrap();
+    let (reader, writer) = crate::tun::udp_handler::UdpHandler::new(
+        udp,
+        stack.replies.clone(),
+        stack.handle.wake.clone(),
+    )
+    .split();
+    let manager = crate::tun::udp_manager::TunUdpManager::new(
+        reader,
+        writer,
+        selector.clone(),
+        resolver.clone(),
+        limits,
+    );
+    let udp_count = manager.destination_counter();
+    tasks.spawn(async move {
+        if let Err(error) = manager.run().await {
+            log::warn!("WireGuard UDP forwarding stopped: {error}");
+        }
+    });
+    let mut tcp = stack.tcp.take().unwrap();
+    tasks.spawn(async move {
+        let mut flows = JoinSet::new();
+        loop {
+            let connection = tokio::select! {
+                connection = tcp.recv() => match connection {
+                    Some(connection) => connection,
+                    None => break,
+                },
+                _ = flows.join_next(), if !flows.is_empty() => continue,
+            };
+            let selector = selector.clone();
+            let resolver = resolver.clone();
+            flows.spawn(async move {
+                log::debug!(
+                    "WireGuard TCP {} -> {}",
+                    connection.source,
+                    connection.target
+                );
+                let target =
+                    NetLocation::from_ip_addr(connection.target.ip(), connection.target.port());
+                let _ = crate::tun::handle_tcp_connection(
+                    connection.connection,
+                    target,
+                    selector,
+                    resolver,
+                )
+                .await;
+            });
+        }
+    });
+    udp_count
 }
