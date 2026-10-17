@@ -1,5 +1,6 @@
 mod config;
 mod crypto;
+pub(crate) mod generator;
 mod handshake;
 mod keys;
 mod mask;

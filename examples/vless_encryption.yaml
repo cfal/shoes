@@ -1,0 +1,27 @@
+# Runnable loopback pair. These public demonstration credentials are not secrets.
+# Replace both strings using `shoes generate-vless-encryption` before deployment.
+# Native Vision belongs on VLESS; any outer TLS/REALITY vision flag stays false.
+- address: 0.0.0.0:18443
+  protocol:
+    type: vless
+    user_id: b85798ef-e9dc-46a4-9a87-8da4499d36d0
+    decryption: mlkem768x25519plus.native.600s.rzk6eW5Hwh0VCNry0pr0NmZNUS57gSjGW_OTx_02HdI
+    vision: true
+    encryption_limits:
+      max_sessions: 4096
+      max_replays: 262144
+      max_replays_per_session: 65536
+
+- address: 0.0.0.0:11080
+  protocol:
+    type: socks
+  rules:
+    - masks: 0.0.0.0/0
+      action: allow
+      client_chain:
+        address: 127.0.0.1:18443
+        protocol:
+          type: vless
+          user_id: b85798ef-e9dc-46a4-9a87-8da4499d36d0
+          encryption: mlkem768x25519plus.native.0rtt.KjMKlkHxbs2nFyfvxcVAilQmTR3aD7jHjp5E6Rwa80I
+          vision: true
