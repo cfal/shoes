@@ -1,4 +1,25 @@
-# WireGuard Dependency Notices
+# Dependency Notices
+
+`licenses/dependencies.txt` reproduces the license texts and attributions for
+Shoes' production and build dependencies, including transitive dependencies
+across all target platforms. A given binary may link only a subset of them.
+The release tarballs, Android AAR (`classes.jar/META-INF/shoes`) and iOS
+XCFramework include this bundle and the additional GotaTun notices below.
+
+Regenerate the bundle after changing Cargo.lock, using cargo-about 0.9.2:
+
+```sh
+cargo about generate --locked --all-features --fail scripts/licenses.hbs -o licenses/dependencies.txt
+python3 scripts/test-release-notices.py
+```
+
+`about.toml` records the license choices and verified clarifications. CI checks
+that regeneration is clean and that every production/build dependency appears.
+`scripts/check-release-notices.py <artifact>` checks the exact notice bytes in
+a release tarball, AAR, or XCFramework directory; release scripts invoke it
+before distributing artifacts. Do not remove the bundle when redistributing.
+
+## WireGuard Source
 
 Unix builds, including Android and iOS libraries, link GotaTun 0.10.1, an
 implementation of the WireGuard protocol. GotaTun is copyright Mullvad VPN AB
@@ -17,5 +38,4 @@ its existing MIT license. Distributors of modified GotaTun builds must also
 provide the corresponding modified covered source and retain these notices.
 Embedding a Shoes static or dynamic library does not remove these obligations.
 
-This notice supplements, rather than replaces, the licenses and notices of
-other dependencies recorded in Cargo.lock and their source distributions.
+These source-availability details supplement the reproduced dependency licenses.

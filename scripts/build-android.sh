@@ -9,6 +9,7 @@
 #   - cargo-ndk: installed automatically if missing
 #   - Gradle 8.6+ available as `gradle` in PATH, or ./gradlew in android/
 #   - Java 17+
+#   - Python 3 for dependency-notice verification
 #
 set -euo pipefail
 
@@ -90,6 +91,7 @@ if [ -z "$AAR" ]; then
     exit 1
 fi
 cp "$AAR" "$OUTPUT_DIR/shoes-release.aar"
+python3 "$SCRIPT_DIR/check-release-notices.py" "$OUTPUT_DIR/shoes-release.aar"
 
 echo ""
 echo "Done: $OUTPUT_DIR/shoes-release.aar"
