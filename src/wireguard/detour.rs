@@ -6,7 +6,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering},
     },
     task::Poll,
     time::Duration,
@@ -14,6 +14,7 @@ use std::{
 
 use futures::future::poll_fn;
 use gotatun::packet::{Packet, PacketBufPool};
+use parking_lot::Mutex;
 use tokio::{
     io::ReadBuf,
     sync::{mpsc, oneshot},
@@ -36,10 +37,7 @@ const MAX_BACKOFF: Duration = Duration::from_secs(10);
 const STABLE_ASSOCIATION: Duration = Duration::from_secs(10);
 const PING_INTERVAL: Duration = Duration::from_secs(30);
 
-struct Destination {
-    outgoing: mpsc::Sender<Vec<u8>>,
-    connected: Arc<AtomicBool>,
-}
+type Destination = Arc<Mutex<Option<mpsc::Sender<Vec<u8>>>>>;
 
 #[derive(Clone)]
 pub(super) struct Sender {
@@ -60,10 +58,12 @@ impl Sender {
                 "WireGuard detour target is not configured",
             )
         })?;
-        if packet.len() > MAX_DATAGRAM
-            || !destination.connected.load(Ordering::Acquire)
-            || destination.outgoing.try_send(packet.to_vec()).is_err()
-        {
+        let outgoing = destination.lock();
+        let sent = packet.len() <= MAX_DATAGRAM
+            && outgoing
+                .as_ref()
+                .is_some_and(|queue| queue.try_send(packet.to_vec()).is_ok());
+        if !sent {
             self.drops.fetch_add(1, Ordering::Relaxed);
         }
         Ok(())
@@ -100,34 +100,24 @@ pub(super) fn start(
         let Entry::Vacant(entry) = destinations.entry(target) else {
             continue;
         };
-        let (outgoing, queued) = mpsc::channel(QUEUE_CAPACITY);
-        let connected = Arc::new(AtomicBool::new(false));
-        entry.insert(Destination {
-            outgoing,
-            connected: connected.clone(),
-        });
+        let destination = Arc::new(Mutex::new(None));
+        entry.insert(destination.clone());
         let worker = Worker {
             name: name.clone(),
             target,
             chain: chain.clone(),
             resolver: resolver.clone(),
-            outgoing: queued,
+            destination,
             incoming: incoming.clone(),
-            connected,
             drops: drops.clone(),
         };
-        let shutdown = cancel.clone();
-        workers.spawn(async move {
-            tokio::select! {
-                _ = shutdown.cancelled() => {},
-                _ = worker.run() => {},
-            }
-        });
+        workers.spawn(worker.run());
     }
     drop(incoming);
     let shutdown = cancel.clone();
     tokio::spawn(async move {
         tokio::select! {
+            biased;
             _ = shutdown.cancelled() => {},
             result = workers.join_next() => {
                 log::error!("WireGuard endpoint {name} outer worker stopped unexpectedly: {result:?}");
@@ -154,14 +144,13 @@ struct Worker {
     target: SocketAddr,
     chain: Arc<ClientProxyChain>,
     resolver: Arc<dyn Resolver>,
-    outgoing: mpsc::Receiver<Vec<u8>>,
+    destination: Destination,
     incoming: mpsc::Sender<(Vec<u8>, SocketAddr)>,
-    connected: Arc<AtomicBool>,
     drops: Arc<AtomicU64>,
 }
 
 impl Worker {
-    async fn run(mut self) {
+    async fn run(self) {
         let mut backoff = MIN_BACKOFF;
         loop {
             let target = NetLocation::from_ip_addr(self.target.ip(), self.target.port()).into();
@@ -177,14 +166,17 @@ impl Worker {
                         self.name,
                         self.target
                     );
-                    self.connected.store(true, Ordering::Release);
+                    let (outgoing, mut queued) = mpsc::channel(QUEUE_CAPACITY);
+                    *self.destination.lock() = Some(outgoing);
                     let started = Instant::now();
-                    let result = self.relay(stream.as_mut()).await;
-                    self.connected.store(false, Ordering::Release);
+                    let error = self.relay(stream.as_mut(), &mut queued).await;
+                    // Removing the sender under the enqueue lock isolates failed associations.
+                    self.destination.lock().take();
+                    self.drops.fetch_add(queued.len() as u64, Ordering::Relaxed);
                     if started.elapsed() >= STABLE_ASSOCIATION {
                         backoff = MIN_BACKOFF;
                     }
-                    result.unwrap_err()
+                    error
                 }
                 Ok(Err(error)) => error,
                 Err(_) => io::Error::new(
@@ -197,30 +189,30 @@ impl Worker {
                 self.name,
                 self.target
             );
-            // Old ciphertext must not accumulate across a failed association.
-            while self.outgoing.try_recv().is_ok() {
-                self.drops.fetch_add(1, Ordering::Relaxed);
-            }
             sleep(backoff).await;
             backoff = (backoff * 2).min(MAX_BACKOFF);
         }
     }
 
-    async fn relay(&mut self, stream: &mut dyn AsyncMessageStream) -> io::Result<()> {
+    async fn relay(
+        &self,
+        stream: &mut dyn AsyncMessageStream,
+        outgoing: &mut mpsc::Receiver<Vec<u8>>,
+    ) -> io::Error {
         enum Write {
             Packet(Vec<u8>),
             Ping,
-            Flush,
+            Flush { packet: bool },
         }
         let mut scratch = vec![0; 65536];
         // Flushes protocol setup buffered while opening the association.
-        let mut pending = Some(Write::Flush);
+        let mut pending = Some(Write::Flush { packet: false });
         let mut deadline = Box::pin(sleep(IO_TIMEOUT));
         let mut ping = tokio::time::interval(PING_INTERVAL);
         ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::task::consume_budget().await;
-            poll_fn(|cx| {
+            let result: io::Result<()> = poll_fn(|cx| {
                 let mut progress = false;
                 let mut buffer = ReadBuf::new(&mut scratch);
                 if let Poll::Ready(result) =
@@ -243,7 +235,7 @@ impl Worker {
                     progress = true;
                 }
                 if pending.is_none() {
-                    match self.outgoing.poll_recv(cx) {
+                    match outgoing.poll_recv(cx) {
                         Poll::Ready(Some(packet)) => pending = Some(Write::Packet(packet)),
                         Poll::Ready(None) => {
                             return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
@@ -266,14 +258,16 @@ impl Worker {
                         Write::Ping => Pin::new(&mut *stream)
                             .poll_write_ping(cx)
                             .map(|result| result.map(|_| ())),
-                        Write::Flush => Pin::new(&mut *stream).poll_flush_message(cx),
+                        Write::Flush { .. } => Pin::new(&mut *stream).poll_flush_message(cx),
                     };
                     if let Poll::Ready(result) = result {
                         result?;
-                        pending = if matches!(write, Write::Flush) {
+                        pending = if matches!(write, Write::Flush { .. }) {
                             None
                         } else {
-                            Some(Write::Flush)
+                            Some(Write::Flush {
+                                packet: matches!(write, Write::Packet(_)),
+                            })
                         };
                         progress = true;
                     }
@@ -290,7 +284,16 @@ impl Worker {
                     Poll::Pending
                 }
             })
-            .await?;
+            .await;
+            if let Err(error) = result {
+                if matches!(
+                    pending,
+                    Some(Write::Packet(_) | Write::Flush { packet: true })
+                ) {
+                    self.drops.fetch_add(1, Ordering::Relaxed);
+                }
+                return error;
+            }
         }
     }
 }
@@ -361,23 +364,17 @@ mod tests {
     async fn bounded_queues_drop_offline_oversize_and_unknown_targets() {
         let target = "127.0.0.1:51820".parse().unwrap();
         let (outgoing, mut queue) = mpsc::channel(QUEUE_CAPACITY);
-        let connected = Arc::new(AtomicBool::new(false));
+        let destination = Arc::new(Mutex::new(None));
         let drops = Arc::new(AtomicU64::new(0));
         let sender = Sender {
-            destinations: Arc::new(HashMap::from([(
-                target,
-                Destination {
-                    outgoing,
-                    connected: connected.clone(),
-                },
-            )])),
+            destinations: Arc::new(HashMap::from([(target, destination.clone())])),
             drops: drops.clone(),
         };
         sender
             .send_to(Packet::copy_from(b"offline"), target)
             .unwrap();
         assert!(queue.try_recv().is_err());
-        connected.store(true, Ordering::Release);
+        *destination.lock() = Some(outgoing);
         sender
             .send_to(Packet::copy_from(&[0; MAX_DATAGRAM + 1]), target)
             .unwrap();
@@ -396,6 +393,43 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn disconnected_queue_cannot_receive_or_replay_packets() {
+        let target = "127.0.0.1:51820".parse().unwrap();
+        let (old_sender, mut old_queue) = mpsc::channel(QUEUE_CAPACITY);
+        let destination = Arc::new(Mutex::new(Some(old_sender)));
+        let drops = Arc::new(AtomicU64::new(0));
+        let sender = Sender {
+            destinations: Arc::new(HashMap::from([(target, destination.clone())])),
+            drops: drops.clone(),
+        };
+        sender.send_to(Packet::copy_from(b"old"), target).unwrap();
+        let mut slot = destination.lock();
+        let (started, ready) = std::sync::mpsc::channel();
+        let concurrent_sender = sender.clone();
+        let send = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            concurrent_sender
+                .send_to(Packet::copy_from(b"offline"), target)
+                .unwrap();
+        });
+        ready.recv().unwrap();
+        slot.take();
+        drop(slot);
+        send.join().unwrap();
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+        assert_eq!(old_queue.try_recv().unwrap(), b"old");
+        assert!(matches!(
+            old_queue.try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected)
+        ));
+        let (fresh_sender, mut fresh_queue) = mpsc::channel(QUEUE_CAPACITY);
+        *destination.lock() = Some(fresh_sender);
+        sender.send_to(Packet::copy_from(b"fresh"), target).unwrap();
+        assert_eq!(fresh_queue.try_recv().unwrap(), b"fresh");
+        assert!(fresh_queue.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -486,12 +520,12 @@ mod tests {
             drop(receiver);
             released.await.unwrap();
             // Sender clones cannot keep carriers alive after the GotaTun receiver is dropped.
-            assert!(
-                sender
-                    .destinations
-                    .values()
-                    .all(|destination| destination.outgoing.is_closed())
-            );
+            assert!(sender.destinations.values().all(|destination| {
+                destination
+                    .lock()
+                    .as_ref()
+                    .is_none_or(|queue| queue.is_closed())
+            }));
             assert!(
                 read(&mut peers.get_mut(&targets[0]).unwrap().1)
                     .await
@@ -525,11 +559,7 @@ mod tests {
         tokio::time::advance(IO_TIMEOUT + MIN_BACKOFF).await;
         assert_eq!(first.read(&mut [0]).await.unwrap(), 0);
         let (_, _, mut second) = connections.recv().await.unwrap();
-        assert!(
-            !sender.destinations[&target]
-                .connected
-                .load(Ordering::Acquire)
-        );
+        assert!(sender.destinations[&target].lock().is_none());
         drop(receiver);
         released.await.unwrap();
         assert_eq!(second.read(&mut [0]).await.unwrap(), 0);
@@ -565,7 +595,7 @@ mod tests {
         tokio::time::advance(IO_TIMEOUT + MIN_BACKOFF).await;
         let (_, _, stream) = connections.recv().await.unwrap();
         let mut peer = VlessMessageStream::new(stream);
-        assert_eq!(drops.load(Ordering::Relaxed), 2);
+        assert_eq!(drops.load(Ordering::Relaxed), 3);
         sender.send_to(Packet::copy_from(b"fresh"), target).unwrap();
         assert_eq!(read(&mut peer).await, b"fresh");
         drop(receiver);
