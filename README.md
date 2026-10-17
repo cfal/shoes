@@ -83,11 +83,16 @@ idle cancellation probes. The workspace patches cover direct and transitive
 dependencies, including DNS over HTTP/3. The experimental zero-copy change in
 [h3 #368](https://github.com/hyperium/h3/pull/368) is not included.
 
+The `nix` patch backports [nix #2821](https://github.com/nix-rust/nix/pull/2821)
+to 0.31.3 for iOS socket compatibility. Retain it until adopting a registry
+release containing that fix.
+
 GitHub releases and checkout builds retain these patches. Crates.io publishing
 remains disabled because Cargo removes workspace patches from published packages.
-Remove the patches and publishing guard only after adopting fixed registry
-versions that pass the H3 empty-DATA and idle-stream regressions. To install this
-revision from its checkout:
+Remove the H3 patches only after adopting fixed registry versions that pass the
+H3 empty-DATA and idle-stream regressions. Remove the publishing guard only when
+all workspace patches have been replaced with registry dependencies. To install
+this revision from its checkout:
 
 ```bash
 cargo install --path . --locked
