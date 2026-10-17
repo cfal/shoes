@@ -66,3 +66,9 @@ mod vless_xudp_true_multiplexing;
 mod vmess;
 #[path = "cases/integration/vmess_xudp_integration.rs"]
 mod vmess_xudp;
+#[cfg(unix)]
+#[path = "cases/integration/wireguard_integration.rs"]
+mod wireguard;
+#[cfg(unix)]
+#[path = "cases/wireguard_support.rs"]
+mod wireguard_support;

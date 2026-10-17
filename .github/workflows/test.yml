@@ -21,6 +21,48 @@ env:
   NAIVE_CADDY_SHA256: ac97057c925bb098eb575e7b0cb8bd547d4c5f845b09a3dedfbe34444aa7ae88
 
 jobs:
+  wireguard-interop:
+    name: WireGuard interoperability
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_BUILD_JOBS: 1
+      GOMAXPROCS: 1
+      WG_SING_BOX_COMMIT: 7054cac5124465ffdb145870d7c01885566711b1
+      WG_XRAY_COMMIT: 0888beb38a9ba45440557175e71ce21cf8ba3b13
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@stable
+    - uses: actions/setup-go@v5
+      with:
+        go-version: '1.27.1'
+        cache: false
+    - uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+          ~/go/pkg/mod
+          ~/.cache/go-build
+        key: ${{ runner.os }}-wireguard-${{ hashFiles('**/Cargo.lock') }}-${{ env.WG_SING_BOX_COMMIT }}-${{ env.WG_XRAY_COMMIT }}
+    - name: Build pinned independent WireGuard peers
+      run: |
+        git clone --filter=blob:none --no-checkout https://github.com/SagerNet/sing-box.git "$HOME/wg-sing-box"
+        git -C "$HOME/wg-sing-box" checkout --detach "$WG_SING_BOX_COMMIT"
+        git clone --filter=blob:none --no-checkout https://github.com/XTLS/Xray-core.git "$HOME/wg-xray"
+        git -C "$HOME/wg-xray" checkout --detach "$WG_XRAY_COMMIT"
+        cd "$HOME/wg-sing-box"
+        go build -mod=readonly -p 1 -tags with_gvisor,with_wireguard -o "$HOME/sing-box-wireguard" ./cmd/sing-box
+        cd "$HOME/wg-xray"
+        go build -mod=readonly -p 1 -o "$HOME/xray-wireguard" ./main
+        echo "SHOES_TEST_SING_BOX_BIN=$HOME/sing-box-wireguard" >> "$GITHUB_ENV"
+        echo "SHOES_TEST_XRAY_BIN=$HOME/xray-wireguard" >> "$GITHUB_ENV"
+    - name: Test both roles, inner address families, and real rekey
+      run: >-
+        cargo test -p shoes --locked --features optional-peer-tests
+        --test optional_peer wireguard -- --ignored --test-threads=1
+
   unit-tests:
     name: Unit tests
     runs-on: ubuntu-latest

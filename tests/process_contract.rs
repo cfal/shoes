@@ -13,6 +13,91 @@ struct Process {
     lines: tokio::sync::mpsc::UnboundedReceiver<String>,
 }
 
+#[cfg(unix)]
+#[path = "cases/wireguard_support.rs"]
+mod wireguard_support;
+
+#[cfg(unix)]
+#[tokio::test]
+async fn wireguard_reload_retains_invalid_candidates_rebinds_and_releases_on_exit() {
+    use serde_json::json;
+    let directory = tempfile::tempdir().unwrap();
+    let server_path = directory.path().join("server.yaml");
+    let client_path = directory.path().join("client.yaml");
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+    let port = socket.local_addr().unwrap().port();
+    let entry = available_address().port();
+    let server_config = serde_yaml::to_string(&json!([wireguard_support::server(port)])).unwrap();
+    let client_config = serde_yaml::to_string(&json!([
+        wireguard_support::client(port),
+        wireguard_support::socks(entry)
+    ]))
+    .unwrap();
+    std::fs::write(&server_path, &server_config).unwrap();
+    std::fs::write(&client_path, &client_config).unwrap();
+    drop(socket);
+    let mut server = Process::start(&server_path, &["--no-reload"]);
+    let mut client = Process::start(&client_path, &["--no-reload"]);
+    server.wait_for("Servers ready").await;
+    client.wait_for("Servers ready").await;
+    let echo = shoes_test_support::wireguard::EchoTargets::new(false)
+        .await
+        .unwrap();
+    let mut active = shoes_test_support::wireguard::connect(entry, echo.tcp())
+        .await
+        .unwrap();
+    roundtrip(&mut active).await;
+    std::fs::write(
+        &client_path,
+        client_config.replace("endpoint: wg", "endpoint: missing"),
+    )
+    .unwrap();
+    client.signal(libc::SIGHUP);
+    client.wait_for("Reload rejected").await;
+    roundtrip(&mut active).await;
+    std::fs::write(&client_path, &client_config).unwrap();
+    client.signal(libc::SIGHUP);
+    client.wait_for("Servers ready").await;
+    let mut byte = [0; 1];
+    assert!(!matches!(
+        timeout(Duration::from_secs(3), active.read(&mut byte)).await,
+        Ok(Ok(1)) | Err(_)
+    ));
+    server.signal(libc::SIGHUP);
+    server.wait_for("Servers ready").await;
+    // A fresh client generation has no stale handshake state from the retired server.
+    client.signal(libc::SIGHUP);
+    client.wait_for("Servers ready").await;
+    echo.check(entry, None).await.unwrap();
+    client.signal(libc::SIGTERM);
+    server.signal(libc::SIGTERM);
+    assert!(client.exit().await.success());
+    assert!(server.exit().await.success());
+    std::net::UdpSocket::bind(("0.0.0.0", port)).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn wireguard_partial_startup_releases_previously_started_endpoint() {
+    use serde_json::json;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.yaml");
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+    let port = socket.local_addr().unwrap().port();
+    let occupied = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+    let mut second = wireguard_support::server(occupied.local_addr().unwrap().port());
+    second["wireguard"] = json!("second");
+    std::fs::write(
+        &path,
+        serde_yaml::to_string(&json!([wireguard_support::server(port), second])).unwrap(),
+    )
+    .unwrap();
+    drop(socket);
+    let mut child = Process::start(&path, &["--no-reload"]);
+    assert_eq!(child.exit().await.code(), Some(1));
+    std::net::UdpSocket::bind(("0.0.0.0", port)).unwrap();
+}
+
 #[test]
 fn vless_encryption_generator_prints_only_matched_yaml_credentials() {
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
