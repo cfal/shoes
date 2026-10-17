@@ -768,7 +768,7 @@ mod tests {
             let _first = accepted.recv().await.unwrap();
             stack
                 .input
-                .send(tcp_segment(overflow, target, 1000, TcpControl::Syn, None))
+                .send(tcp_segment(overflow, target, 2000, TcpControl::Syn, None))
                 .await
                 .unwrap();
             stack.handle.wake.notify();
@@ -778,6 +778,7 @@ mod tests {
                 let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
                 if tcp.dst_port() == overflow.port() {
                     assert!(tcp.syn() && tcp.ack());
+                    assert_eq!(tcp.ack_number().0, 2001);
                     break;
                 }
             }
