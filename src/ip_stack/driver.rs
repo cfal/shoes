@@ -337,6 +337,11 @@ fn packet_info(packet: &[u8]) -> Option<PacketInfo> {
         }
         6 => {
             let ip = Ipv6Packet::new_checked(packet).ok()?;
+            // Mapped addresses can bypass the checks below and become loopback targets in socket APIs.
+            if ip.src_addr().to_ipv4_mapped().is_some() || ip.dst_addr().to_ipv4_mapped().is_some()
+            {
+                return None;
+            }
             (
                 ip.next_header(),
                 IpAddr::V6(ip.src_addr()),
@@ -699,21 +704,82 @@ mod tests {
         control: TcpControl,
         ack: Option<u32>,
     ) -> PacketBuffer {
-        let (IpAddr::V4(source_ip), IpAddr::V4(target_ip)) = (source.ip(), target.ip()) else {
-            unreachable!()
-        };
         let mut tcp = etherparse::TcpHeader::new(source.port(), target.port(), sequence, 65535);
         tcp.syn = control == TcpControl::Syn;
         tcp.rst = control == TcpControl::Rst;
         tcp.fin = control == TcpControl::Fin;
         tcp.ack = ack.is_some();
         tcp.acknowledgment_number = ack.unwrap_or(0);
-        let builder = etherparse::PacketBuilder::ipv4(source_ip.octets(), target_ip.octets(), 64)
-            .tcp_header(tcp);
+        let builder = match (source.ip(), target.ip()) {
+            (IpAddr::V4(source), IpAddr::V4(target)) => {
+                etherparse::PacketBuilder::ipv4(source.octets(), target.octets(), 64)
+            }
+            (IpAddr::V6(source), IpAddr::V6(target)) => {
+                etherparse::PacketBuilder::ipv6(source.octets(), target.octets(), 64)
+            }
+            _ => unreachable!(),
+        }
+        .tcp_header(tcp);
         let mut packet = PacketBuffer::with_capacity(builder.size(0));
         packet.resize(builder.size(0));
         builder.write(&mut &mut packet[..], &[]).unwrap();
         packet
+    }
+
+    #[tokio::test]
+    async fn inbound_rejects_mapped_ipv4_packet_addresses() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut stack = PacketStack::new(
+                vec!["fd77::1".parse().unwrap()],
+                1408,
+                true,
+                TunResourceLimits::default(),
+            )
+            .unwrap();
+            let mut accepted = stack.tcp.take().unwrap();
+            let mut inbound_udp = stack.udp.take().unwrap();
+            let source: SocketAddr = "[fd77::2]:40000".parse().unwrap();
+            let target: SocketAddr = "[2001:db8::1]:443".parse().unwrap();
+            let barrier =
+                crate::tun::udp_handler::build_udp_packet(b"barrier", source, target).unwrap();
+
+            for mapped in ["::ffff:0.0.0.0", "::ffff:224.0.0.251", "::ffff:127.0.0.1"] {
+                let mapped = mapped.parse().unwrap();
+                for (source, target) in [
+                    (source, SocketAddr::new(mapped, target.port())),
+                    (SocketAddr::new(mapped, source.port()), target),
+                ] {
+                    stack
+                        .input
+                        .send(tcp_segment(source, target, 1000, TcpControl::Syn, None))
+                        .await
+                        .unwrap();
+                    stack
+                        .input
+                        .send(
+                            crate::tun::udp_handler::build_udp_packet(b"rejected", source, target)
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    stack
+                        .input
+                        .send(PacketBuffer::copy_from_slice(&barrier))
+                        .await
+                        .unwrap();
+                    stack.handle.wake.notify();
+                    // Receiving the sentinel proves both preceding packets were processed.
+                    assert_eq!(&*inbound_udp.recv().await.unwrap(), &*barrier);
+                    assert!(matches!(
+                        accepted.try_recv(),
+                        Err(mpsc::error::TryRecvError::Empty)
+                    ));
+                }
+            }
+            assert_eq!(stack.drops.load(Ordering::Relaxed), 12);
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
