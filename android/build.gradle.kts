@@ -3,6 +3,15 @@ plugins {
     // kotlin-android removed: AGP 9.0 has built-in Kotlin support
 }
 
+tasks.register<Copy>("dependencyNotices") {
+    from("../THIRD_PARTY_NOTICES.md")
+    from("../licenses") { into("licenses") }
+    into(layout.buildDirectory.dir("generated/notices/META-INF/shoes"))
+}
+
+android.sourceSets.getByName("main").resources.srcDir(layout.buildDirectory.dir("generated/notices"))
+tasks.named("preBuild").configure { dependsOn("dependencyNotices") }
+
 android {
     namespace = "com.shoesproxy"
     compileSdk = 35

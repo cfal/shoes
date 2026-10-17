@@ -31,6 +31,7 @@ All server protocols plus:
 - **XTLS Vision** (for VLESS)
 
 ### TUN/VPN Mode
+- **WireGuard endpoints** - Userspace TCP/UDP server and client using GotaTun, without root, an OS TUN, or host route changes (Unix only). See [WireGuard configuration](CONFIG.md#wireguard-endpoints).
 - **TUN device support** - Layer 3 VPN for transparent proxying
 - Supported platforms: Linux, Android, iOS
 
@@ -61,6 +62,10 @@ same cipher and run v0.3.3 or newer for AES-256 or ChaCha20.
 For advanced access control (IP allowlist/blocklists), see [tobaru](https://github.com/cfal/tobaru).
 
 ## Installation
+
+Building Unix targets requires Rust 1.95 or newer. WireGuard builds include
+MPL-2.0-covered GotaTun code; binary and library distributors must retain
+[the dependency notices and corresponding source information](THIRD_PARTY_NOTICES.md).
 
 Precompiled binaries for x86_64 and Apple aarch64 are available on [Github Releases](https://github.com/cfal/shoes/releases).
 

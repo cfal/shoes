@@ -7,6 +7,7 @@ shoes uses YAML configuration files. Multiple configuration types can be combine
 - [Server Config](#server-config)
 - [Server Protocols](#server-protocols)
 - [TUN Config](#tun-config)
+- [WireGuard Endpoints](#wireguard-endpoints)
 - [Client Config](#client-config)
 - [Client Protocols](#client-protocols)
 - [Rules System](#rules-system)
@@ -15,12 +16,110 @@ shoes uses YAML configuration files. Multiple configuration types can be combine
 - [Advanced Features](#advanced-features)
 - [Command Line](#command-line)
 
+## WireGuard Endpoints
+
+WireGuard is a named top-level endpoint, not a TCP server protocol or a stream
+wrapper. Each configuration generation owns one GotaTun device and one smoltcp
+stack per endpoint name. All references share that endpoint. Unix builds
+support this mode; Windows rejects WireGuard configuration.
+
+See [server](examples/wireguard_server.yaml) and
+[client](examples/wireguard_client.yaml) examples. Their demonstration keys
+must be replaced before deployment. Generate a private key with `wg genkey`
+and derive its public key with `wg pubkey`. Never share the private key.
+
+| Field | Meaning |
+| --- | --- |
+| `wireguard` | Unique, nonempty endpoint name |
+| `private_key` | Base64-encoded 32-byte private key |
+| `addresses` | Nonempty local tunnel CIDRs; at most one address per family |
+| `listen` | Optional literal UDP socket address; omission chooses an ephemeral dual-stack wildcard, with IPv4 fallback when IPv6 is unavailable |
+| `bind_interface` | Optional outer UDP interface, supported on Linux/Android |
+| `mtu` | Inner IP MTU, default 1408; supported range 1280-1420 |
+| `peers` | Nonempty static peer list |
+| `inbound` | Optional forwarding policy; omitted disables unsolicited inbound flows |
+| `resource_limits` | Same fields as TUN, with bounded WireGuard defaults |
+
+Each peer requires `public_key` and nonempty `allowed_ips`. Optional fields
+are `pre_shared_key`, `endpoint: "host:port"`, and
+`persistent_keepalive` in seconds (zero disables it). Omit `endpoint` for a
+peer that initiates toward this server. Hostnames are resolved through native
+bootstrap DNS during preparation and refreshed on reload. Authenticated
+WireGuard roaming can update the active peer address without a reload.
+Overlapping allowed prefixes between different peers, duplicate keys, and
+self-peering are rejected. Assign each client distinct tunnel addresses.
+
+`0.0.0.0:51820` listens only on IPv4; `[::]:51820` uses a dual-stack socket
+where supported. Outer sockets retain mobile socket protection and interface
+binding. No OS interface, route, firewall rule, or NAT rule is created.
+
+An explicit `inbound` requires nonempty `rules` and may specify `dns`.
+Rules use the normal destination masks, overrides, and client chains. There
+is no implicit allow-all fallback for an empty inbound block. Outbound socket
+replies remain enabled when `inbound` is omitted. Per-peer authorization
+beyond cryptokey source validation is not supplied by destination rules.
+
+Reference an endpoint from the first hop:
+
+```yaml
+client_chain:
+  - protocol: {type: wireguard, endpoint: wg-out}
+  - address: "10.77.0.10:1080"
+    protocol: {type: socks}
+```
+
+The second hop is optional. A WireGuard reference must not specify `address`,
+`bind_interface`, QUIC, or TCP/QUIC socket settings. WireGuard cannot appear
+inside TLS/WebSocket or at later hops. A missing route, address family, failed
+endpoint, or unavailable peer never causes direct fallback.
+
+DNS remains independently configured. Merely defining a WireGuard endpoint
+does not tunnel the application's default native DNS. Explicit TCP DNS,
+DoT, and DoH client chains may use WireGuard with a literal upstream IP.
+Use `server_name` for TLS authentication where needed. UDP DNS, HTTP/3 DNS,
+hostname upstreams on WireGuard chains, and bootstrap dependencies on
+WireGuard-routed DNS groups are rejected. Endpoint bootstrap itself is native
+DNS, not DNS through the not-yet-active tunnel.
+
+This is TCP/UDP proxying, not arbitrary IP routing. Remote destinations see
+the gateway's outgoing proxy connection, not the original client's source
+address. A non-Shoes gateway must provide the required routes and forwarding
+or NAT for destinations behind it. ICMP forwarding, IP fragment reassembly,
+peer-to-peer IP forwarding, WARP reserved bytes, outer proxy detours, and
+wg-quick import are not implemented.
+
+Fragmented input and unsupported IPv6 extension chains are dropped before
+transport parsing. TCP advertises an MSS derived from the MTU. Outbound UDP
+writes larger than MTU minus 28 bytes (IPv4) or 48 bytes (IPv6) return errors;
+they are never truncated. At MTU 1408 these payload limits are 1380 and 1360
+bytes. Oversized UDP responses on inbound forwarding are dropped. Large DNS
+replies should use TCP-based transports. Reduce MTU for constrained underlays;
+automatic path-MTU discovery is not provided.
+
+Default admission limits are 256 TCP connections, 32 KiB TCP buffers, a
+32 MiB TCP buffer budget, 1024 UDP sessions, 4096 UDP destinations, 64
+destinations per inbound UDP session, and 8 MiB queued UDP payloads.
+UDP forwarding and outbound associations have separate bounded pools.
+Missing or null limit fields use WireGuard defaults rather than the unlimited
+TUN defaults. Packet and command queues are bounded at 64. These budgets
+cover modeled Shoes-owned state, not total process RSS or all GotaTun state.
+
+Periodic logs report endpoint flow/drop counts and each peer's public key,
+handshake age, and byte counters. Private keys and PSKs are redacted.
+
+Preparation failures retain the old configuration. Successful reloads
+disconnect existing tunnel flows and rebuild endpoints; sessions are not
+migrated. Bind failures during activation can still terminate the process
+after the old generation has stopped. Shutdown waits for buffered UDP tasks
+to release their sockets before rebind. No host route cleanup is necessary.
+
 ## Configuration Structure
 
 A configuration file is a YAML array containing one or more configuration entries. Each entry can be:
 
 - **Server Config** - Defines a proxy server instance
 - **TUN Config** - Defines a TUN/VPN device for transparent proxying
+- **WireGuard Endpoint** - Defines a shared userspace WireGuard server/client
 - **Client Config Group** - Defines reusable upstream proxy configurations
 - **Rule Config Group** - Defines reusable routing rules
 - **Named PEM** - Defines reusable certificate/key data

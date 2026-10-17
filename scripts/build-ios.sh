@@ -56,6 +56,9 @@ xcodebuild -create-xcframework \
     -headers "$ROOT_DIR/include" \
     -output "$OUTPUT_DIR/$XCFRAMEWORK_NAME.xcframework"
 
+cp "$ROOT_DIR/THIRD_PARTY_NOTICES.md" "$OUTPUT_DIR/$XCFRAMEWORK_NAME.xcframework/"
+cp -R "$ROOT_DIR/licenses" "$OUTPUT_DIR/$XCFRAMEWORK_NAME.xcframework/"
+
 echo ""
 echo "Done: $OUTPUT_DIR/$XCFRAMEWORK_NAME.xcframework"
 echo ""

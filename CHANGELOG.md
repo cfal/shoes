@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Added named, userspace WireGuard endpoints using GotaTun 0.10.1. Endpoints support inbound TCP/UDP forwarding, outbound proxy chains, IPv4/IPv6, multiple static peers, PSKs, keepalives, and authenticated roaming on Unix.
+- WireGuard references are supported only at the first chain hop. TCP DNS transports can use them; unsupported UDP/H3 DNS routes and tunnel-dependent bootstrap configurations are rejected instead of bypassing the tunnel.
+- WireGuard reloads disconnect existing flows and explicitly release endpoint sockets before rebinding. Initial limitations include no IP fragmentation/reassembly, ICMP forwarding, OS route management, or later-hop WireGuard.
+- Shared smoltcp TCP streams complete write-half shutdown after queuing FIN, without waiting for the remote read half to close.
+
 ## v0.3.3
 
 - Added XHTTP/SplitHTTP client and server transports with packet-up, stream-up, and stream-one modes over HTTP/1.1, HTTP/2, and HTTP/3. See the README for supported configurations and interoperability limitations.
