@@ -59,26 +59,15 @@ fn isolated_test(name: &str, shoes_server: bool) -> io::Result<()> {
         return tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?
-            .block_on(async { timeout(Duration::from_secs(120), exercise(shoes_server)).await? });
+            .block_on(async { timeout(Duration::from_secs(120), run_cases(shoes_server)).await? });
     }
 
     // PID namespace teardown also kills Shoes if the test aborts or exceeds the deadline.
     let output = Command::new("sudo")
-        .args([
-            "-n",
-            "-E",
-            "--",
-            "timeout",
-            "--kill-after=5s",
-            "150s",
-            "unshare",
-            "--net",
-            "--pid",
-            "--fork",
-            "--kill-child",
-            "--",
-            "env",
-        ])
+        .args(["-n", "-E", "--"])
+        .args(["timeout", "--kill-after=5s", "150s"])
+        .args(["unshare", "--net", "--pid", "--fork", "--kill-child", "--"])
+        .arg("env")
         .arg(format!("{PARENT_NETNS}={}", namespace.display()))
         .arg(std::env::current_exe()?)
         .args(["--exact", name, "--nocapture", "--test-threads=1"])
@@ -99,7 +88,7 @@ impl KernelPeer {
     fn start(shoes_server: bool, mtu: u16, psk: bool, shoes_port: u16) -> io::Result<Self> {
         run("ip", &["link", "add", "wg0", "type", "wireguard"])?;
         let peer = Self;
-        let (private, public, addresses, routes) = if shoes_server {
+        let (local_key_seed, peer_key_seed, addresses, routes) = if shoes_server {
             (
                 42,
                 41,
@@ -118,8 +107,8 @@ impl KernelPeer {
         writeln!(
             file,
             "[Interface]\nPrivateKey={}\n[Peer]\nPublicKey={}\nAllowedIPs={}",
-            config::key(private),
-            config::public(public),
+            config::key(local_key_seed),
+            config::public(peer_key_seed),
             routes.join(",")
         )?;
         if psk {
@@ -180,17 +169,9 @@ impl KernelPeer {
                 "payload bypassed WireGuard: {before} -> {after}, expected {bytes} bytes"
             );
         }
-        let handshake = wg(&["show", "wg0", "latest-handshakes"])?;
-        assert!(
-            handshake
-                .split_whitespace()
-                .nth(1)
-                .unwrap()
-                .parse::<u64>()
-                .unwrap()
-                > 0,
-            "no authenticated kernel handshake"
-        );
+        let output = wg(&["show", "wg0", "latest-handshakes"])?;
+        let latest_handshake: u64 = output.split_whitespace().nth(1).unwrap().parse().unwrap();
+        assert!(latest_handshake > 0, "no authenticated kernel handshake");
         Ok(())
     }
 }
@@ -226,7 +207,7 @@ async fn bulk_echo(mut stream: TcpStream) -> io::Result<()> {
     Ok(())
 }
 
-async fn exercise(shoes_server: bool) -> io::Result<()> {
+async fn run_cases(shoes_server: bool) -> io::Result<()> {
     for mtu in [1280, 1408] {
         for psk in [false, true] {
             for chain in [false, true] {
@@ -236,7 +217,7 @@ async fn exercise(shoes_server: bool) -> io::Result<()> {
                     );
                     timeout(
                         Duration::from_secs(20),
-                        exchange(shoes_server, mtu, psk, chain, ipv6),
+                        run_case(shoes_server, mtu, psk, chain, ipv6),
                     )
                     .await??;
                 }
@@ -246,7 +227,7 @@ async fn exercise(shoes_server: bool) -> io::Result<()> {
     Ok(())
 }
 
-async fn exchange(
+async fn run_case(
     shoes_server: bool,
     mtu: u16,
     psk: bool,
@@ -255,8 +236,8 @@ async fn exchange(
 ) -> io::Result<()> {
     let echo = EchoTargets::new(ipv6).await?;
     let mut ports = PortHelper::new();
-    let (_, entry) = ports.get_localhost_listener_port();
-    let (_, proxy) = ports.get_localhost_listener_port();
+    let (_, socks_port) = ports.get_localhost_listener_port();
+    let (_, vless_port) = ports.get_localhost_listener_port();
     let reservation = std::net::UdpSocket::bind("0.0.0.0:0")?;
     let shoes_port = reservation.local_addr()?.port();
     let kernel = KernelPeer::start(shoes_server, mtu, psk, shoes_port)?;
@@ -272,26 +253,32 @@ async fn exchange(
             .unwrap()
             .remove("pre_shared_key");
     }
-    let kernel_ip: IpAddr = if ipv6 { "fd77::1" } else { "10.77.0.1" }.parse().unwrap();
+    let kernel_server_ip: IpAddr = if ipv6 { "fd77::1" } else { "10.77.0.1" }.parse().unwrap();
     // Only the VLESS server can translate this unroutable destination to the echo target.
-    let chained_target: IpAddr = if ipv6 { "2001:db8::77" } else { "192.0.2.77" }
+    let chained_target_ip: IpAddr = if ipv6 { "2001:db8::77" } else { "192.0.2.77" }
         .parse()
         .unwrap();
-    let protocol = json!({"type":"vless", "user_id":"b85798ef-e9dc-46a4-9a87-8da4499d36d0", "udp_enabled":true});
+    let vless_protocol = json!({
+        "type": "vless",
+        "user_id": "b85798ef-e9dc-46a4-9a87-8da4499d36d0",
+        "udp_enabled": true,
+    });
     // The SOCKS listener also provides readiness for inbound-only exchanges.
-    let mut socks = config::socks(entry);
+    let mut socks = config::socks(socks_port);
     if chain {
         let proxy_ip = if shoes_server {
             echo.tcp().ip()
         } else {
-            kernel_ip
+            kernel_server_ip
         };
-        let hop =
-            json!({"address":SocketAddr::new(proxy_ip, proxy).to_string(), "protocol":protocol});
+        let hop = json!({
+            "address": SocketAddr::new(proxy_ip, vless_port).to_string(),
+            "protocol": vless_protocol,
+        });
         if shoes_server {
             for rule in endpoint["inbound"]["rules"].as_array_mut().unwrap() {
                 rule["client_chain"] = json!([hop]);
-                rule["override_address"] = json!(SocketAddr::new(chained_target, 0).to_string());
+                rule["override_address"] = json!(SocketAddr::new(chained_target_ip, 0).to_string());
             }
         } else {
             socks["rules"][0]["client_chain"]
@@ -300,22 +287,28 @@ async fn exchange(
                 .push(hop);
         }
     }
-    let settings = json!([
-        endpoint, socks,
-        {"address":format!("[::]:{proxy}"), "protocol":protocol,
-         "rules":[{"masks":[format!("{chained_target}/{}", if ipv6 { 128 } else { 32 })],
-                   "action":"allow", "override_address":SocketAddr::new(echo.tcp().ip(), 0).to_string()}]}
-    ]);
+    let prefix_length = if ipv6 { 128 } else { 32 };
+    let vless_server = json!({
+        "address": format!("[::]:{vless_port}"),
+        "protocol": vless_protocol,
+        "rules": [{
+            "masks": [format!("{chained_target_ip}/{prefix_length}")],
+            "action": "allow",
+            "override_address": SocketAddr::new(echo.tcp().ip(), 0).to_string(),
+        }],
+    });
+    let shoes_config = json!([endpoint, socks, vless_server]);
     drop(reservation);
-    let _shoes = start_shoes_server(&serde_yaml::to_string(&settings).unwrap())?;
+    let _shoes = start_shoes_server(&serde_yaml::to_string(&shoes_config).unwrap())?;
     ports.wait_for_all_ports().await?;
 
+    let inbound_target_ip: IpAddr = if ipv6 { "fd88::1" } else { "10.88.0.1" }.parse().unwrap();
     let target_ip = if shoes_server {
-        if ipv6 { "fd88::1" } else { "10.88.0.1" }.parse().unwrap()
+        inbound_target_ip
     } else if chain {
-        chained_target
+        chained_target_ip
     } else {
-        kernel_ip
+        kernel_server_ip
     };
     let tcp_target = SocketAddr::new(target_ip, echo.tcp().port());
     let before = kernel.counters()?;
@@ -327,36 +320,38 @@ async fn exchange(
         };
         socket.connect(tcp_target).await?
     } else {
-        connect(entry, tcp_target).await?
+        connect(socks_port, tcp_target).await?
     };
     bulk_echo(stream).await?;
     kernel.assert_transfer(before, TCP_BYTES)?;
 
-    let target = SocketAddr::new(target_ip, echo.udp().port());
+    let udp_target = SocketAddr::new(target_ip, echo.udp().port());
     let before = kernel.counters()?;
-    let mut bytes = 0;
+    let mut udp_bytes = 0;
     let socket = UdpSocket::bind(if ipv6 { "[::]:0" } else { "0.0.0.0:0" }).await?;
     let association = if shoes_server {
         None
     } else {
-        Some(Socks5UdpAssociation::connect("127.0.0.1", entry).await?)
+        Some(Socks5UdpAssociation::connect("127.0.0.1", socks_port).await?)
     };
+    let ip_udp_overhead = if ipv6 { 48 } else { 28 };
+    let payload_sizes = [1, 64, 1200, usize::from(mtu) - ip_udp_overhead];
     for sequence in 0..12 {
-        let length = [1, 64, 1200, mtu as usize - if ipv6 { 48 } else { 28 }][sequence % 4];
-        let payload = vec![sequence as u8; length];
+        let payload_len = payload_sizes[sequence % payload_sizes.len()];
+        let payload = vec![sequence as u8; payload_len];
         if let Some(association) = &association {
-            assert_eq!(association.send_to(target, &payload).await?, payload);
+            assert_eq!(association.send_to(udp_target, &payload).await?, payload);
         } else {
-            assert_eq!(socket.send_to(&payload, target).await?, payload.len());
-            let mut response = vec![0; length + 1];
-            let (length, source) =
+            assert_eq!(socket.send_to(&payload, udp_target).await?, payload.len());
+            let mut response = vec![0; payload_len + 1];
+            let (received_len, source) =
                 timeout(Duration::from_secs(5), socket.recv_from(&mut response)).await??;
-            assert_eq!(source, target);
-            assert_eq!(&response[..length], payload);
+            assert_eq!(source, udp_target);
+            assert_eq!(&response[..received_len], payload);
         }
-        bytes += length;
+        udp_bytes += payload_len;
     }
-    kernel.assert_transfer(before, bytes)
+    kernel.assert_transfer(before, udp_bytes)
 }
 
 #[test]
