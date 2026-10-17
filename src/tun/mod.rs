@@ -29,16 +29,14 @@
 //!   directly, or `false` if using the readPackets/writePackets API.
 
 mod offload;
-mod packet;
-mod tcp_conn;
+use crate::ip_stack::{packet, tcp_conn, wake};
 mod tcp_stack_direct;
 mod tun_server;
-mod udp_handler;
+pub(crate) mod udp_handler;
 mod udp_manager;
-mod wake;
 
 #[cfg(test)]
-mod test_gate;
+use crate::ip_stack::test_gate;
 #[cfg(test)]
 mod udp_tests;
 
@@ -255,7 +253,7 @@ fn socket_addr_to_net_location(addr: SocketAddr) -> NetLocation {
 }
 
 /// Handle a TCP connection by forwarding it through the proxy chain.
-async fn handle_tcp_connection(
+pub(crate) async fn handle_tcp_connection(
     mut connection: tcp_conn::TcpConnection,
     target: NetLocation,
     proxy_selector: Arc<ClientProxySelector>,
@@ -339,7 +337,7 @@ async fn handle_tcp_connection(
 /// - Keys sessions by local (app) address, not by destination
 /// - Stores the return address in each session
 /// - Routes responses using the stored address (no NAT table lookup)
-async fn handle_udp_packets(
+pub(crate) async fn handle_udp_packets(
     from_stack_rx: mpsc::Receiver<PacketBuffer>,
     to_stack_tx: mpsc::Sender<PacketBuffer>,
     proxy_selector: Arc<ClientProxySelector>,

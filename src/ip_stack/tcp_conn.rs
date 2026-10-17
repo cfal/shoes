@@ -279,8 +279,11 @@ impl AsyncWrite for TcpConnection {
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let mut inner = self.control.inner.lock();
 
-        // Already fully closed
-        if matches!(inner.send_state, TcpSocketState::Closed) {
+        // Write-half shutdown completes once FIN is queued, independently of peer closure.
+        if matches!(
+            inner.send_state,
+            TcpSocketState::Closing | TcpSocketState::Closed
+        ) {
             return Poll::Ready(Ok(()));
         }
 
@@ -289,7 +292,7 @@ impl AsyncWrite for TcpConnection {
             inner.send_state = TcpSocketState::Close;
         }
 
-        // Register waker to be notified when Closed
+        // FIN scheduling wakes the writer.
         if let Some(ref old_waker) = inner.send_waker {
             if !old_waker.will_wake(cx.waker()) {
                 inner.send_waker = Some(cx.waker().clone());
@@ -304,6 +307,17 @@ impl AsyncWrite for TcpConnection {
         Poll::Pending
     }
 }
+
+impl crate::async_stream::AsyncPing for TcpConnection {
+    fn supports_ping(&self) -> bool {
+        false
+    }
+    fn poll_write_ping(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<bool>> {
+        Poll::Ready(Ok(false))
+    }
+}
+
+impl crate::async_stream::AsyncStream for TcpConnection {}
 
 #[cfg(test)]
 mod tests {

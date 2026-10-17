@@ -12,14 +12,14 @@ use std::{
 };
 
 #[derive(Clone)]
-pub(super) struct Wake(Arc<WakeInner>);
+pub(crate) struct Wake(Arc<WakeInner>);
 
 struct WakeInner {
     writer: UnixStream,
     pending: AtomicBool,
 }
 
-pub(super) struct WakeReceiver {
+pub(crate) struct WakeReceiver {
     reader: UnixStream,
     wake: Wake,
     #[cfg(test)]

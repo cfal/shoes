@@ -21,10 +21,8 @@ use log::{debug, error, info, trace, warn};
 use smoltcp::{
     iface::{Config as InterfaceConfig, Interface, SocketHandle, SocketSet},
     phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken},
-    socket::tcp::{
-        CongestionControl, Socket as TcpSocket, SocketBuffer as TcpSocketBuffer, State as TcpState,
-    },
-    time::{Duration as SmolDuration, Instant as SmolInstant},
+    socket::tcp::{Socket as TcpSocket, State as TcpState},
+    time::Instant as SmolInstant,
     wire::{
         HardwareAddress, IpAddress, IpCidr, IpProtocol, Ipv4Address, Ipv4Packet, Ipv6Address,
         Ipv6Packet, TcpPacket,
@@ -617,114 +615,7 @@ fn run_direct_stack_thread(
             let control = &socket_info.control;
             let socket = socket_set.get_mut::<TcpSocket>(handle);
 
-            if control.is_abandoned() {
-                socket.abort();
-            }
-
-            if socket.state() == TcpState::Closed {
-                continue;
-            }
-
-            // Handle SHUT_WR: Close -> Closing transition
-            // Must check send_queue() to ensure smoltcp has transmitted all data
-            if control.send_state() == TcpSocketState::Close
-                && socket.send_queue() == 0
-                && control.send_buffer_empty()
-            {
-                trace!(
-                    "socket {:?}: closing write half, state={:?}",
-                    handle,
-                    socket.state()
-                );
-                socket.close();
-                control.set_send_state(TcpSocketState::Closing);
-            }
-
-            // Receive data from smoltcp into our buffer
-            let mut wake_receiver = false;
-            while socket.can_recv() && !control.recv_buffer_full() {
-                match socket.recv(|data| {
-                    let n = control.enqueue_recv_data(data);
-                    (n, n)
-                }) {
-                    Ok(n) if n > 0 => {
-                        wake_receiver = true;
-                    }
-                    Ok(_) => break,
-                    Err(e) => {
-                        error!(
-                            "socket {:?} recv error: {:?}, state={:?}",
-                            handle,
-                            e,
-                            socket.state()
-                        );
-                        socket.abort();
-                        if control.recv_state() == TcpSocketState::Normal {
-                            control.set_recv_state(TcpSocketState::Closed);
-                        }
-                        wake_receiver = true;
-                        break;
-                    }
-                }
-            }
-
-            // Detect recv half close using negative state matching.
-            // If socket can't receive and is not in an active receiving state, mark recv closed.
-            if control.recv_state() == TcpSocketState::Normal
-                && !socket.may_recv()
-                && !matches!(
-                    socket.state(),
-                    TcpState::Listen
-                        | TcpState::SynReceived
-                        | TcpState::Established
-                        | TcpState::FinWait1
-                        | TcpState::FinWait2
-                )
-            {
-                trace!(
-                    "socket {:?}: recv half closed, state={:?}",
-                    handle,
-                    socket.state()
-                );
-                control.set_recv_state(TcpSocketState::Closed);
-                wake_receiver = true;
-            }
-
-            if wake_receiver {
-                control.wake_receiver();
-            }
-
-            // Send data from our buffer to smoltcp
-            let mut wake_sender = false;
-            while socket.can_send() && !control.send_buffer_empty() {
-                match socket.send(|buf| {
-                    let n = control.dequeue_send_data(buf);
-                    (n, n)
-                }) {
-                    Ok(n) if n > 0 => {
-                        wake_sender = true;
-                    }
-                    Ok(_) => break,
-                    Err(e) => {
-                        error!(
-                            "socket {:?} send error: {:?}, state={:?}",
-                            handle,
-                            e,
-                            socket.state()
-                        );
-                        socket.abort();
-                        if control.send_state() == TcpSocketState::Normal {
-                            control.set_send_state(TcpSocketState::Closed);
-                        }
-                        wake_sender = true;
-                        break;
-                    }
-                }
-            }
-
-            if wake_sender {
-                control.wake_sender();
-            }
+            crate::ip_stack::pump_tcp(handle, socket, control);
         }
 
         // Amortizes loop overhead without starving later sockets or draining indefinitely.
@@ -843,18 +734,7 @@ fn create_tcp_connection(
     wake: &Wake,
     buffer_size: usize,
 ) -> Option<(CreateConnectionResult, Arc<TcpConnectionControl>)> {
-    let mut socket = TcpSocket::new(
-        TcpSocketBuffer::new(vec![0u8; buffer_size]),
-        TcpSocketBuffer::new(vec![0u8; buffer_size]),
-    );
-
-    // Matched to netstack-smoltcp settings for optimal performance
-    socket.set_congestion_control(CongestionControl::Cubic);
-    socket.set_keep_alive(Some(SmolDuration::from_secs(28)));
-    // 7200s matches Linux default (tcp_keepalive_time) and shadowsocks-rust
-    socket.set_timeout(Some(SmolDuration::from_secs(7200)));
-    socket.set_nagle_enabled(false);
-    socket.set_ack_delay(None);
+    let mut socket = crate::ip_stack::tcp_socket(buffer_size);
 
     if let Err(e) = socket.listen(dst_addr) {
         warn!("Failed to listen on socket for {}: {:?}", dst_addr, e);
@@ -1152,6 +1032,7 @@ fn write_framed_packet_with(
 mod tests {
     use super::super::test_gate::{GateControl, TestGate};
     use super::*;
+    use smoltcp::socket::tcp::SocketBuffer as TcpSocketBuffer;
     use std::os::unix::io::IntoRawFd;
     use std::os::unix::net::{UnixDatagram, UnixStream};
 

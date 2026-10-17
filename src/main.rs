@@ -50,6 +50,9 @@ mod trojan_handler;
 mod tuic_server;
 #[cfg(unix)]
 mod tun;
+
+#[cfg(unix)]
+mod ip_stack;
 mod udp_fragments;
 mod udp_message_stream;
 mod uot;
