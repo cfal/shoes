@@ -615,13 +615,11 @@ async fn run_recovery_case() -> io::Result<()> {
             .is_err()
         );
     }
-    drop(udp);
     let _outer = start_shoes_server(&outer_config)?;
     let before = kernel.counters()?;
     // TCP retransmission and a fresh outer association recover the existing inner flow.
     timeout(Duration::from_secs(20), bulk_echo(stream)).await??;
     kernel.assert_transfer(before, TCP_BYTES)?;
-    let udp = Socks5UdpAssociation::connect("127.0.0.1", socks_port).await?;
     assert_eq!(
         udp.send_to(udp_target, b"after recovery").await?,
         b"after recovery"
@@ -652,6 +650,12 @@ async fn run_rekey_case() -> io::Result<()> {
     let mut stream = connect(socks_port, target).await?;
     kernel.wait_for_handshake().await?;
     let first_handshake = kernel.handshake()?;
+    let udp = Socks5UdpAssociation::connect("127.0.0.1", socks_port).await?;
+    let udp_target = SocketAddr::new(target.ip(), echo.udp().port());
+    assert_eq!(
+        udp.send_to(udp_target, b"before rekey").await?,
+        b"before rekey"
+    );
     let started = tokio::time::Instant::now();
     timeout(Duration::from_secs(150), async {
         let mut tick = tokio::time::interval(Duration::from_secs(1));
@@ -663,6 +667,7 @@ async fn run_rekey_case() -> io::Result<()> {
             let mut response = [0; 8];
             stream.read_exact(&mut response).await?;
             assert_eq!(response, payload);
+            assert_eq!(udp.send_to(udp_target, &payload).await?, payload);
             if kernel.handshake()? > first_handshake {
                 assert!(
                     started.elapsed() >= Duration::from_secs(100),
@@ -677,9 +682,10 @@ async fn run_rekey_case() -> io::Result<()> {
     let before = kernel.counters()?;
     timeout(Duration::from_secs(20), bulk_echo(stream)).await??;
     kernel.assert_transfer(before, TCP_BYTES)?;
-    let udp = Socks5UdpAssociation::connect("127.0.0.1", socks_port).await?;
-    let target = SocketAddr::new(target.ip(), echo.udp().port());
-    assert_eq!(udp.send_to(target, b"after rekey").await?, b"after rekey");
+    assert_eq!(
+        udp.send_to(udp_target, b"after rekey").await?,
+        b"after rekey"
+    );
     Ok(())
 }
 
