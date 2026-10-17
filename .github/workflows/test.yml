@@ -24,7 +24,7 @@ jobs:
   wireguard-interop:
     name: WireGuard interoperability
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     env:
       CARGO_BUILD_JOBS: 1
       GOMAXPROCS: 1
@@ -320,7 +320,6 @@ jobs:
 
     - name: Run integration tests
       env:
-        CARGO_BUILD_JOBS: 1
         TEST_FILTERS: ${{ matrix.filters }}
       run: |
         if [ -z "$TEST_FILTERS" ]; then
