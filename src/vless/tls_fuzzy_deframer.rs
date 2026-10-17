@@ -197,10 +197,15 @@ impl FuzzyTlsDeframer {
         }
     }
 
-    /// Clear all buffered data and reset to searching state
-    pub fn clear(&mut self) {
+    /// Discards buffered bytes for resubmission without forgetting recognized TLS framing.
+    pub fn discard_buffered(&mut self) {
         self.search_buffer.clear();
         self.inner.clear();
+    }
+
+    /// Clear all buffered data and reset to searching state
+    pub fn clear(&mut self) {
+        self.discard_buffered();
         self.state = FuzzyState::Searching;
         self.total_prefix_bytes = 0;
     }
@@ -512,6 +517,57 @@ mod tests {
         deframer.clear();
         assert_eq!(deframer.pending_bytes(), 0);
         assert_eq!(deframer.state, FuzzyState::Searching);
+    }
+
+    #[test]
+    fn discard_buffered_preserves_tls_framing_at_a_record_boundary() {
+        let hello = make_tls_record(0x16, b"hello");
+        let application = make_tls_record(0x17, b"application");
+        for tail_len in 0..=application.len() {
+            let mut deframer = FuzzyTlsDeframer::new();
+            deframer.feed(&hello);
+            assert!(matches!(
+                deframer.next_record().unwrap(),
+                DeframeResult::TlsRecord(_)
+            ));
+            deframer.feed(&application[..tail_len]);
+            if tail_len < application.len() {
+                assert!(matches!(
+                    deframer.next_record().unwrap(),
+                    DeframeResult::NeedData
+                ));
+            }
+            deframer.discard_buffered();
+            assert_eq!(deframer.pending_bytes(), 0);
+            deframer.feed(&application);
+            match deframer.next_record().unwrap() {
+                DeframeResult::TlsRecord(bytes) => assert_eq!(bytes.as_ref(), application),
+                result => panic!("lost TLS framing: {result:?}"),
+            }
+            assert_eq!(deframer.pending_bytes(), 0);
+            assert!(matches!(
+                deframer.next_record().unwrap(),
+                DeframeResult::NeedData
+            ));
+        }
+    }
+
+    #[test]
+    fn discard_buffered_does_not_promote_searching_to_tls() {
+        let mut deframer = FuzzyTlsDeframer::new();
+        deframer.feed(&[0x16, 3]);
+        assert!(matches!(
+            deframer.next_record().unwrap(),
+            DeframeResult::NeedData
+        ));
+        deframer.discard_buffered();
+        assert_eq!(deframer.pending_bytes(), 0);
+        let application = make_tls_record(0x17, b"application");
+        deframer.feed(&application);
+        match deframer.next_record().unwrap() {
+            DeframeResult::UnknownPrefix(bytes) => assert_eq!(bytes.as_ref(), application),
+            result => panic!("unexpected TLS recognition: {result:?}"),
+        }
     }
 
     #[test]
