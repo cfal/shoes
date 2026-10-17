@@ -116,8 +116,8 @@ fn permissive_header_masks_match_go_at_every_split() {
         for split in 0..expected.len() {
             let mut mask = HeaderMask::new(&bytes(vector, "material"), &iv, 0).unwrap();
             let mut actual = bytes(vector, "plaintext");
-            mask.apply(&mut actual[..split], true).unwrap();
-            mask.apply(&mut actual[split..], true).unwrap();
+            mask.apply_write(&mut actual[..split]).unwrap();
+            mask.apply_write(&mut actual[split..]).unwrap();
             assert_eq!(actual, expected);
         }
     }

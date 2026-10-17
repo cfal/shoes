@@ -20,7 +20,15 @@ impl HeaderMask {
         })
     }
 
-    pub(crate) fn apply(&mut self, mut bytes: &mut [u8], writing: bool) -> io::Result<()> {
+    pub(crate) fn apply_write(&mut self, bytes: &mut [u8]) -> io::Result<()> {
+        self.apply(bytes, true)
+    }
+
+    pub(crate) fn apply_read(&mut self, bytes: &mut [u8]) -> io::Result<()> {
+        self.apply(bytes, false)
+    }
+
+    fn apply(&mut self, mut bytes: &mut [u8], writing: bool) -> io::Result<()> {
         while !bytes.is_empty() {
             if self.skip != 0 {
                 let n = self.skip.min(bytes.len());
@@ -68,18 +76,18 @@ mod tests {
         let mut expected = plaintext.clone();
         HeaderMask::new(&[1; 96], &[2; 16], 16)
             .unwrap()
-            .apply(&mut expected, true)
+            .apply_write(&mut expected)
             .unwrap();
         assert_eq!(&expected[..16], &plaintext[..16]);
         for split in 0..plaintext.len() {
             let mut actual = plaintext.clone();
             let mut writer = HeaderMask::new(&[1; 96], &[2; 16], 16).unwrap();
-            writer.apply(&mut actual[..split], true).unwrap();
-            writer.apply(&mut actual[split..], true).unwrap();
+            writer.apply_write(&mut actual[..split]).unwrap();
+            writer.apply_write(&mut actual[split..]).unwrap();
             assert_eq!(actual, expected);
             let mut reader = HeaderMask::new(&[1; 96], &[2; 16], 16).unwrap();
             for chunk in actual.chunks_mut(1) {
-                reader.apply(chunk, false).unwrap();
+                reader.apply_read(chunk).unwrap();
             }
             assert_eq!(actual, plaintext);
         }
@@ -97,11 +105,11 @@ mod tests {
             for split in 0..expected.len() {
                 let mut wire = expected.clone();
                 let mut writer = HeaderMask::new(&[4; 96], &[5; 16], 0).unwrap();
-                writer.apply(&mut wire[..split], true).unwrap();
-                writer.apply(&mut wire[split..], true).unwrap();
+                writer.apply_write(&mut wire[..split]).unwrap();
+                writer.apply_write(&mut wire[split..]).unwrap();
                 let mut reader = HeaderMask::new(&[4; 96], &[5; 16], 0).unwrap();
                 for chunk in wire.chunks_mut(3) {
-                    reader.apply(chunk, false).unwrap();
+                    reader.apply_read(chunk).unwrap();
                 }
                 assert_eq!(wire, expected);
             }

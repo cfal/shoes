@@ -115,26 +115,7 @@ impl ClientEncryption {
         let deadline = Instant::now() + STREAM_SETUP_TIMEOUT;
         let iv = random::<16>()?;
         let mut flight = iv.to_vec();
-        let mut previous: Option<Ctr> = None;
-        let mut nfs = Zeroizing::new([0; 32]);
-        for (index, key) in self.keys.iter().enumerate() {
-            let (mut relay, secret) = key.exchange()?;
-            nfs = secret;
-            if self.mode != Mode::Native {
-                Ctr::new(&key.public, &iv)?.apply(&mut relay)?;
-            }
-            if let Some(ctr) = &mut previous {
-                ctr.apply(&mut relay[..32])?;
-            }
-            flight.extend_from_slice(&relay);
-            if let Some(next) = self.keys.get(index + 1) {
-                let mut ctr = Ctr::new(nfs.as_ref(), &iv)?;
-                let mut hash = next.hash;
-                ctr.apply(&mut hash)?;
-                flight.extend_from_slice(&hash);
-                previous = Some(ctr);
-            }
-        }
+        let nfs = self.encode_relays(&iv, &mut flight)?;
         let mut nfs_aead = Aead::new(&iv, nfs.as_ref(), cipher)?;
         if self.resume
             && let Some(used) = self.cache.snapshot(Instant::now())
@@ -297,6 +278,30 @@ impl ClientEncryption {
                 })??;
         Ok(EncryptionStream::new(io, true, keys, initial))
     }
+
+    fn encode_relays(&self, iv: &[u8; 16], flight: &mut Vec<u8>) -> io::Result<Secret> {
+        let mut previous: Option<Ctr> = None;
+        let mut nfs = Zeroizing::new([0; 32]);
+        for (index, key) in self.keys.iter().enumerate() {
+            let (mut relay, secret) = key.exchange()?;
+            nfs = secret;
+            if self.mode != Mode::Native {
+                Ctr::new(&key.public, iv)?.apply(&mut relay)?;
+            }
+            if let Some(ctr) = &mut previous {
+                ctr.apply(&mut relay[..32])?;
+            }
+            flight.extend_from_slice(&relay);
+            if let Some(next) = self.keys.get(index + 1) {
+                let mut ctr = Ctr::new(nfs.as_ref(), iv)?;
+                let mut hash = next.hash;
+                ctr.apply(&mut hash)?;
+                flight.extend_from_slice(&hash);
+                previous = Some(ctr);
+            }
+        }
+        Ok(nfs)
+    }
 }
 
 impl ServerEncryption {
@@ -329,15 +334,16 @@ impl ServerEncryption {
         let mut encrypted_length = [0; 18];
         io.read_exact(&mut encrypted_length).await?;
         let mut nfs_aead = Aead::new(&iv, nfs.as_ref(), Cipher::Aes256Gcm)?;
+        // A failed open may overwrite its input; preserve the ChaCha trial's ciphertext.
         let mut trial = encrypted_length;
-        let length = match nfs_aead.open(&mut trial, &[]) {
-            Ok(plain) => u16::from_be_bytes(plain.try_into().unwrap()) as usize,
+        let plain = match nfs_aead.open(&mut trial, &[]) {
+            Ok(plain) => plain,
             Err(_) => {
                 nfs_aead = Aead::new(&iv, nfs.as_ref(), Cipher::ChaCha20Poly1305)?;
-                let plain = nfs_aead.open(&mut encrypted_length, &[])?;
-                u16::from_be_bytes(plain.try_into().unwrap()) as usize
+                nfs_aead.open(&mut encrypted_length, &[])?
             }
         };
+        let length = u16::from_be_bytes(plain.try_into().unwrap()) as usize;
         let cipher = nfs_aead.cipher;
         let random_mode = self.mode == Mode::Random;
         if length == 32 {

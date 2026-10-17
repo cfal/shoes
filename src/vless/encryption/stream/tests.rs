@@ -340,7 +340,7 @@ async fn resumed_server_rejects_empty_direct_flight_without_losing_random() {
         if masked {
             HeaderMask::new(&[7; 96], &[8; 16], 0)
                 .unwrap()
-                .apply(&mut record, false)
+                .apply_read(&mut record)
                 .unwrap();
         }
         let mut peer = stream_from_wire(record);

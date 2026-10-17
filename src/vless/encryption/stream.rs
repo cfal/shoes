@@ -170,7 +170,7 @@ impl<S: AsyncStream> EncryptionStream<S> {
         guard: ResumeGuard,
     ) -> io::Result<()> {
         if let Some(mask) = &mut self.write_mask {
-            mask.apply(&mut prefix, true)?;
+            mask.apply_write(&mut prefix)?;
         }
         self.output.extend_from_slice(&prefix);
         self.prefix_unattached = true;
@@ -372,7 +372,7 @@ impl<S: AsyncStream> EncryptionStream<S> {
         }
         output.extend_from_slice(&record);
         if let Some(mask) = &mut self.write_mask {
-            mask.apply(&mut output, true)?;
+            mask.apply_write(&mut output)?;
         }
         self.output.extend_from_slice(&output);
         self.prefix_unattached = false;
@@ -412,7 +412,7 @@ impl<S: AsyncStream> EncryptionStream<S> {
                         ));
                     }
                     if let Some(mask) = &mut self.read_mask
-                        && let Err(error) = mask.apply(input.filled_mut(), false)
+                        && let Err(error) = mask.apply_read(input.filled_mut())
                     {
                         return Poll::Ready(Err(self.fail_shared(error)));
                     }
@@ -471,7 +471,7 @@ fn poll_field<S: AsyncStream>(
         return Poll::Ready(Err(io::ErrorKind::UnexpectedEof.into()));
     }
     if let Some(mask) = mask {
-        mask.apply(buf.filled_mut(), false)?;
+        mask.apply_read(buf.filled_mut())?;
     }
     *filled += buf.filled().len();
     Poll::Ready(Ok(*filled == bytes.len()))
@@ -503,7 +503,7 @@ impl<S: AsyncStream> AsyncRead for EncryptionStream<S> {
         ready!(Pin::new(&mut this.inner).poll_read(cx, buf))
             .map_err(|error| this.fail_shared(error))?;
         if let Some(mask) = &mut this.read_mask {
-            mask.apply(&mut buf.filled_mut()[before..], false)
+            mask.apply_read(&mut buf.filled_mut()[before..])
                 .map_err(|error| this.fail_shared(error))?;
         }
         this.read_eof = before == buf.filled().len();
@@ -534,7 +534,7 @@ impl<S: AsyncStream> AsyncWrite for EncryptionStream<S> {
         if this.write_raw {
             let mut output = buf[..n].to_vec();
             if let Some(mask) = &mut this.write_mask {
-                mask.apply(&mut output, true)
+                mask.apply_write(&mut output)
                     .map_err(|error| this.fail_shared(error))?;
             }
             this.output.extend_from_slice(&output);

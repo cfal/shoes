@@ -67,6 +67,7 @@ impl ClientKey {
     pub(crate) fn new(raw: &[u8]) -> io::Result<Self> {
         let key = match raw.len() {
             32 => {
+                // A fixed private key suffices to reject noncontributory public keys.
                 let probe = agreement::PrivateKey::from_private_key(&agreement::X25519, &[9; 32])
                     .map_err(|_| invalid())?;
                 x25519_agree(&probe, raw)?;
