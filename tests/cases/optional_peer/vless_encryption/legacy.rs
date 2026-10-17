@@ -102,8 +102,11 @@ async fn legacy_peers_assert_direct_end_and_eof_over_tls_and_reality() {
         for peer_client in [false, true] {
             for transport in [Transport::Tls, Transport::Reality] {
                 for inner_tls12 in [None, Some(true), Some(false)] {
-                    // sing-box's Vision wrapper has no CloseWrite; upload EOF closes both sides.
-                    let half_close_before_reply = peer != Kind::SingBox || !peer_client;
+                    // sing-box's Vision wrapper has no CloseWrite. Clients close both sides on
+                    // upload EOF; servers can reset TLS 1.2 replies when the target closes first.
+                    // Upstream fix: https://github.com/SagerNet/sing-vmess/pull/16
+                    let half_close_before_reply =
+                        peer != Kind::SingBox || (!peer_client && inner_tls12 != Some(true));
                     decision_case(
                         peer,
                         peer_client,
@@ -122,6 +125,14 @@ async fn legacy_peers_assert_direct_end_and_eof_over_tls_and_reality() {
 #[ignore = "pinned sing-box Vision client closes both directions on upload EOF"]
 async fn singbox_vision_client_half_close_preserves_pending_reply() {
     decision_case(Kind::SingBox, true, Transport::Tls, None, true).await;
+}
+
+#[tokio::test]
+#[ignore = "pinned sing-box Vision server can reset TLS 1.2 replies during upload half-close"]
+async fn singbox_vision_server_half_close_preserves_tls12_reply() {
+    for transport in [Transport::Tls, Transport::Reality] {
+        decision_case(Kind::SingBox, false, transport, Some(true), true).await;
+    }
 }
 
 async fn decision_case(

@@ -59,11 +59,21 @@ The enabled matrix covers:
 - Legacy plain VLESS over WS/WSS and Mihomo raw/TLS/REALITY. Legacy Vision uses
   Xray, Mihomo, and sing-box in both roles, asserting DIRECT for inner TLS 1.3,
   END for plain/TLS 1.2 traffic, exact payloads under slow reads, and remote EOF.
-  Xray/Mihomo and Shoes clients half-close before receiving the full reply.
+  Clients half-close before receiving the full reply except in the sing-box cases
+  below.
   The pinned sing-box Vision client closes both directions on upload EOF, so its
   enabled cases finish receiving before closing. The ignored
   `singbox_vision_client_half_close_preserves_pending_reply` retains that failing
-  peer reproducer. All native-Vision peer cases close inner TLS gracefully without
+  peer reproducer. The sing-box Vision server can also reset inner TLS 1.2 replies
+  when the target closes before upload EOF arrives. Only those server cases, over
+  TLS and REALITY, receive the full payload before sending inner `close_notify`
+  and requiring clean EOF. The ignored
+  `singbox_vision_server_half_close_preserves_tls12_reply` retains the intermittent
+  server reproducer. Remove this server workaround when the pinned peer includes
+  the Vision half-close fix in
+  [SagerNet/sing-vmess#16](https://github.com/SagerNet/sing-vmess/pull/16).
+  Plain and TLS 1.3 server cases still assert early half-close.
+  All native-Vision peer cases close inner TLS gracefully without
   requiring transport-level half-close support: WebSocket and Mihomo's masked
   native wrapper can close both transport halves. Native TCP half-close and a
   delayed reverse reply are asserted separately in the library/splice tests.
