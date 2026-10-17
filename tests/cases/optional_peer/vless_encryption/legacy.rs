@@ -73,6 +73,7 @@ async fn checked_transfer<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpi
         async {
             let mut output = Vec::new();
             let mut buf = [0; 8192];
+            let mut next_pause = 65536;
             while output.len() < data.len() {
                 let n = r.read(&mut buf).await?;
                 if n == 0 {
@@ -80,7 +81,8 @@ async fn checked_transfer<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpi
                 }
                 output.extend_from_slice(&buf[..n]);
                 assert!(output.len() <= data.len(), "duplicate data before EOF");
-                if output.len() % 65536 == 0 {
+                if output.len() >= next_pause {
+                    next_pause += 65536;
                     tokio::time::sleep(Duration::from_millis(1)).await;
                 }
             }

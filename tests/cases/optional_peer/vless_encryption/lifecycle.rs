@@ -100,7 +100,7 @@ async fn expired_tickets_use_a_fresh_handshake_without_losing_the_request() {
         for peer_client in [false, true] {
             let (server_kind, client_kind) = peer_roles(peer, peer_client);
             let (encryption, decryption, _) = credentials("random", &["x25519"]);
-            let decryption = decryption.replace(".600s.", ".2-2s.");
+            let decryption = decryption.replace(".600s.", ".5-5s.");
             let (target, count, mut task) = echo().await;
             let port = free_port().await;
             let server = start(
@@ -123,7 +123,7 @@ async fn expired_tickets_use_a_fresh_handshake_without_losing_the_request() {
             }
             let shoes = if peer_client { &server } else { &client };
             shoes.assert_handshakes(&["fresh", "resumed"]);
-            tokio::time::sleep(Duration::from_millis(2200)).await;
+            tokio::time::sleep(Duration::from_millis(5200)).await;
             exchange(proxy, target, b"fresh after expiry")
                 .await
                 .unwrap();

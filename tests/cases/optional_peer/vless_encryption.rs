@@ -211,17 +211,33 @@ async fn start_options(
 }
 
 async fn free_port() -> u16 {
+    static ALLOCATED: Mutex<Vec<u16>> = Mutex::new(Vec::new());
     for _ in 0..100 {
         let tcp = TcpListener::bind("0.0.0.0:0").await.unwrap();
         let port = tcp.local_addr().unwrap().port();
         // SOCKS and QUIC peers also bind UDP on this port.
         match tokio::net::UdpSocket::bind(("0.0.0.0", port)).await {
-            Ok(_) => return port,
+            Ok(_udp) => {
+                let mut allocated = ALLOCATED.lock().unwrap();
+                if allocated.contains(&port) {
+                    continue;
+                }
+                allocated.push(port);
+                return port;
+            }
             Err(error) if error.kind() == io::ErrorKind::AddrInUse => continue,
             Err(error) => panic!("reserve UDP port: {error}"),
         }
     }
     panic!("could not find a free TCP/UDP port");
+}
+
+#[tokio::test]
+async fn allocated_peer_ports_are_not_reused_before_listeners_start() {
+    let mut ports = std::collections::HashSet::new();
+    for _ in 0..512 {
+        assert!(ports.insert(free_port().await));
+    }
 }
 
 fn credentials(mode: &str, auth: &[&str]) -> (String, String, usize) {
@@ -943,7 +959,7 @@ async fn direct_case(peer: Kind, peer_client: bool, transport: Transport, mode: 
                     );
                 }
             }
-            // Some peer wrappers close both halves when their upload transport reaches EOF.
+            // WebSocket and Mihomo's masked native wrapper can close both transport halves.
             tls.get_mut().1.send_close_notify();
             tls.flush().await?;
             assert_eq!(tls.read(&mut [0]).await?, 0, "data after TLS close");

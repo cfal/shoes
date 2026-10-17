@@ -2,13 +2,18 @@ use super::*;
 
 #[tokio::test]
 async fn tls_and_anytls_consumers_survive_backpressure_and_cancelled_streams() {
+    let with_padding_gap = |setting: String| {
+        let gapped = setting.replace(".100-35-35.", ".100-35-35.100-25-25.100-35-35.");
+        assert_ne!(gapped, setting, "fixture padding token was not found");
+        gapped
+    };
     for mode in ["native", "xorpub", "random"] {
         for vision in [false, true] {
             for anytls in [false, true] {
                 eprintln!("chained: {mode}, vision={vision}, anytls={anytls}");
                 let (encryption, decryption, _) = credentials(mode, &["x25519"]);
-                let encryption = encryption.replace("100-0-0", "100-25-25");
-                let decryption = decryption.replace("100-0-0", "100-25-25");
+                let encryption = with_padding_gap(encryption);
+                let decryption = with_padding_gap(decryption);
                 let carrier_port = free_port().await;
                 let carrier = start(
                     Kind::Shoes,
