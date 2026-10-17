@@ -15,3 +15,9 @@ mod http2_proxy;
 
 #[path = "cases/optional_peer/naive_transport.rs"]
 mod naive_transport;
+#[cfg(unix)]
+#[path = "cases/optional_peer/wireguard_interop.rs"]
+mod wireguard;
+#[cfg(unix)]
+#[path = "cases/wireguard_support.rs"]
+mod wireguard_support;

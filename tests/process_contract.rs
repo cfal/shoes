@@ -13,6 +13,167 @@ struct Process {
     lines: tokio::sync::mpsc::UnboundedReceiver<String>,
 }
 
+#[cfg(unix)]
+#[path = "cases/wireguard_support.rs"]
+mod wireguard_support;
+
+#[cfg(unix)]
+#[tokio::test]
+async fn wireguard_reload_retains_invalid_candidates_rebinds_and_releases_on_exit() {
+    wireguard_reload(false).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn wireguard_outer_chain_reload_retains_invalid_candidates_and_releases_on_exit() {
+    wireguard_reload(true).await;
+}
+
+#[cfg(unix)]
+#[test]
+fn wireguard_check_validates_outer_udp_without_dns_or_listeners() {
+    use serde_json::json;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.yaml");
+    let occupied = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+    let mut server = wireguard_support::server(occupied.local_addr().unwrap().port());
+    server["wireguard"] = json!("occupied-listener");
+    let mut endpoint = wireguard_support::client(51820);
+    endpoint["peers"][0]["endpoint"] = json!("unresolvable.invalid:51820");
+    for mode in ["check", "--dry-run"] {
+        for (protocol, valid) in [
+            (json!({"type": "socks"}), false),
+            (json!({"type": "trojan", "password": "test"}), false),
+            (
+                json!({"type": "vless", "user_id": shoes_test_support::test_fixture::TEST_UUID, "udp_enabled": false}),
+                false,
+            ),
+            (wireguard_support::vless_protocol(), true),
+        ] {
+            endpoint["outer_client_chain"] = json!([{
+                "address": "unresolvable.invalid:443", "protocol": protocol,
+                "transport": "quic", "bind_interface": "shoes-missing-interface",
+            }]);
+            let config = json!([server, endpoint]);
+            std::fs::write(&path, serde_yaml::to_string(&config).unwrap()).unwrap();
+            let output = Command::new(env!("CARGO_BIN_EXE_shoes"))
+                .args([mode, "-t", "1"])
+                .arg(&path)
+                .output()
+                .unwrap();
+            let error = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(output.status.success(), valid, "{error}");
+            if !valid {
+                assert!(error.contains("does not support UDP"), "{error}");
+            }
+        }
+        let mut invalid = wireguard_support::server(51820);
+        invalid["addresses"] = json!(["255.255.255.255/32"]);
+        std::fs::write(&path, serde_yaml::to_string(&json!([invalid])).unwrap()).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_shoes"))
+            .args([mode, "-t", "1"])
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("unicast local address"));
+    }
+}
+
+#[cfg(unix)]
+async fn wireguard_reload(detour: bool) {
+    use serde_json::json;
+    let directory = tempfile::tempdir().unwrap();
+    let server_path = directory.path().join("server.yaml");
+    let client_path = directory.path().join("client.yaml");
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+    let port = socket.local_addr().unwrap().port();
+    let mut ports = shoes_test_support::port_helper::PortHelper::new();
+    let (_, entry) = ports.get_localhost_listener_port();
+    let mut servers = vec![wireguard_support::server(port)];
+    let mut endpoint = wireguard_support::client(port);
+    if detour {
+        let (_, outer_port) = ports.get_localhost_listener_port();
+        let protocol = wireguard_support::vless_protocol();
+        endpoint["peers"][0]["endpoint"] = json!(format!("192.0.2.200:{port}"));
+        endpoint["outer_client_chain"] =
+            json!([{"address": format!("127.0.0.1:{outer_port}"), "protocol": protocol}]);
+        servers.push(json!({
+            "address": format!("0.0.0.0:{outer_port}"), "protocol": protocol,
+            "rules": [{"masks": "192.0.2.200/32", "action": "allow", "override_address": "127.0.0.1:0"}],
+        }));
+    }
+    let server_config = serde_yaml::to_string(&servers).unwrap();
+    let mut client_configs = json!([endpoint, wireguard_support::socks(entry)]);
+    let client_config = serde_yaml::to_string(&client_configs).unwrap();
+    std::fs::write(&server_path, &server_config).unwrap();
+    std::fs::write(&client_path, &client_config).unwrap();
+    drop(socket);
+    let mut server = Process::start(&server_path, &["--no-reload"]);
+    let mut client = Process::start(&client_path, &["--no-reload"]);
+    server.wait_for("Servers ready").await;
+    client.wait_for("Servers ready").await;
+    let echo = shoes_test_support::wireguard::EchoTargets::new(false)
+        .await
+        .unwrap();
+    let mut active = shoes_test_support::wireguard::connect(entry, echo.tcp())
+        .await
+        .unwrap();
+    roundtrip(&mut active).await;
+    if detour {
+        client_configs[0]["outer_client_chain"][0]["protocol"]["udp_enabled"] = json!(false);
+    } else {
+        client_configs[1]["rules"][0]["client_chain"][0]["protocol"]["endpoint"] = json!("missing");
+    }
+    let invalid = serde_yaml::to_string(&client_configs).unwrap();
+    assert_ne!(invalid, client_config);
+    std::fs::write(&client_path, invalid).unwrap();
+    client.signal(libc::SIGHUP);
+    client.wait_for("Reload rejected").await;
+    roundtrip(&mut active).await;
+    std::fs::write(&client_path, &client_config).unwrap();
+    client.signal(libc::SIGHUP);
+    client.wait_for("Servers ready").await;
+    let mut byte = [0; 1];
+    assert!(!matches!(
+        timeout(Duration::from_secs(3), active.read(&mut byte)).await,
+        Ok(Ok(1)) | Err(_)
+    ));
+    server.signal(libc::SIGHUP);
+    server.wait_for("Servers ready").await;
+    // A fresh client generation has no stale handshake state from the retired server.
+    client.signal(libc::SIGHUP);
+    client.wait_for("Servers ready").await;
+    echo.check(entry, None).await.unwrap();
+    client.signal(libc::SIGTERM);
+    server.signal(libc::SIGTERM);
+    assert!(client.exit().await.success());
+    assert!(server.exit().await.success());
+    std::net::UdpSocket::bind(("0.0.0.0", port)).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn wireguard_partial_startup_releases_previously_started_endpoint() {
+    use serde_json::json;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.yaml");
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+    let port = socket.local_addr().unwrap().port();
+    let occupied = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+    let mut second = wireguard_support::server(occupied.local_addr().unwrap().port());
+    second["wireguard"] = json!("second");
+    std::fs::write(
+        &path,
+        serde_yaml::to_string(&json!([wireguard_support::server(port), second])).unwrap(),
+    )
+    .unwrap();
+    drop(socket);
+    let mut child = Process::start(&path, &["--no-reload"]);
+    assert_eq!(child.exit().await.code(), Some(1));
+    std::net::UdpSocket::bind(("0.0.0.0", port)).unwrap();
+}
+
 #[test]
 fn vless_encryption_generator_prints_only_matched_yaml_credentials() {
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};

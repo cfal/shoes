@@ -50,6 +50,9 @@ mod trojan_handler;
 mod tuic_server;
 #[cfg(unix)]
 mod tun;
+
+#[cfg(unix)]
+mod ip_stack;
 mod udp_fragments;
 mod udp_message_stream;
 mod uot;
@@ -58,6 +61,8 @@ mod uuid_util;
 mod vless;
 mod vmess;
 mod websocket;
+#[cfg(unix)]
+mod wireguard;
 mod xhttp;
 mod xudp;
 

@@ -7,6 +7,7 @@
 # Requirements:
 #   - macOS with Xcode installed (xcodebuild)
 #   - Rust with rustup (targets added automatically)
+#   - Python 3 for dependency-notice verification
 #
 set -euo pipefail
 
@@ -55,6 +56,10 @@ xcodebuild -create-xcframework \
     -library "$OUTPUT_DIR/sim/$LIB_NAME" \
     -headers "$ROOT_DIR/include" \
     -output "$OUTPUT_DIR/$XCFRAMEWORK_NAME.xcframework"
+
+cp "$ROOT_DIR/THIRD_PARTY_NOTICES.md" "$OUTPUT_DIR/$XCFRAMEWORK_NAME.xcframework/"
+cp -R "$ROOT_DIR/licenses" "$OUTPUT_DIR/$XCFRAMEWORK_NAME.xcframework/"
+python3 "$SCRIPT_DIR/check-release-notices.py" "$OUTPUT_DIR/$XCFRAMEWORK_NAME.xcframework"
 
 echo ""
 echo "Done: $OUTPUT_DIR/$XCFRAMEWORK_NAME.xcframework"

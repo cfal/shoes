@@ -8,4 +8,5 @@ pub mod socks5;
 pub mod test_fixture;
 pub mod test_servers;
 pub mod vless;
+pub mod wireguard;
 pub mod xray;

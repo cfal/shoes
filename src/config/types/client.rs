@@ -363,6 +363,7 @@ pub enum HttpVersion {
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ClientProxyConfig {
     Direct,
+    Wireguard(super::wireguard::WireguardReference),
     Http {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         username: Option<String>,
@@ -514,6 +515,10 @@ pub enum ClientProxyConfig {
 }
 
 impl ClientProxyConfig {
+    pub fn is_wireguard(&self) -> bool {
+        matches!(self, Self::Wireguard(_))
+    }
+
     pub fn is_direct(&self) -> bool {
         matches!(self, ClientProxyConfig::Direct)
     }
@@ -522,6 +527,7 @@ impl ClientProxyConfig {
     pub fn protocol_name(&self) -> &str {
         match self {
             ClientProxyConfig::Direct => "Direct",
+            ClientProxyConfig::Wireguard(_) => "WireGuard",
             ClientProxyConfig::Http { .. } => "HTTP",
             ClientProxyConfig::Socks { .. } => "SOCKS5",
             ClientProxyConfig::Shadowsocks { .. } => "Shadowsocks",

@@ -1,0 +1,91 @@
+accepted = [
+    "Apache-2.0", "MIT", "BSD-3-Clause", "BSD-2-Clause", "ISC", "MPL-2.0",
+    "Unicode-3.0", "Zlib", "CC0-1.0", "OpenSSL", "CDLA-Permissive-2.0", "Unlicense",
+    "0BSD", "WTFPL",
+]
+ignore-dev-dependencies = true
+ignore-build-dependencies = false
+ignore-transitive-dependencies = false
+private = { ignore = true }
+# Crate-level licenses are supplemented by explicit, checksummed exceptions below.
+max-depth = 1
+workarounds = ["chrono", "rustls", "cocoa"]
+
+[moka.clarify]
+license = "Apache-2.0"
+[[moka.clarify.files]]
+path = "LICENSE-APACHE"
+checksum = "021f4a01e58372b826203064fac216e15d51e07f7739b8ca33d4b746ec8abb3b"
+[[moka.clarify.files]]
+path = "NOTICE"
+checksum = "f6d3f84b39d597c19748c6b50a04abe1634edb3c0b15392daa217ec44119f652"
+
+# The allocator's BSD license is separate from its Rust bindings.
+[tikv-jemalloc-sys.clarify]
+license = "Apache-2.0 AND BSD-2-Clause"
+[[tikv-jemalloc-sys.clarify.files]]
+path = "LICENSE-APACHE"
+license = "Apache-2.0"
+checksum = "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
+[[tikv-jemalloc-sys.clarify.files]]
+path = "jemalloc/COPYING"
+license = "BSD-2-Clause"
+checksum = "94aa2caa98c25d942f58b956c71dba6a99ff98fc3a31cbc669fe2a4cd0268b53"
+
+[blake2b_simd.clarify]
+license = "MIT"
+[[blake2b_simd.clarify.git]]
+path = "LICENSE"
+checksum = "27e0387973d6b8507cb15f825f6f26e0278d4d5857082c1f56b49a7b39a90183"
+
+[aws-lc-rs.clarify]
+license = "ISC AND (Apache-2.0 OR ISC)"
+[[aws-lc-rs.clarify.files]]
+path = "LICENSE"
+checksum = "b50b376e7d24a0598488b730c3034ffcd0b58dd36c0913a24b9903a3cfd04bf7"
+
+# Both BSD notices share one file, which automatic license detection misidentifies.
+[curve25519-dalek.clarify]
+license = "BSD-3-Clause"
+[[curve25519-dalek.clarify.files]]
+path = "LICENSE"
+checksum = "cca0bd3c4fcdba74145ef9d49c62337e2c9fbf9368288f11d0547f1b0273219f"
+
+[ring.clarify]
+license = "Apache-2.0 AND ISC AND MIT"
+[[ring.clarify.files]]
+path = "LICENSE-BoringSSL"
+license = "Apache-2.0"
+checksum = "005fc765ddc5115da796cca915baa9557abae13ff35e0a47c47affc56f6c414d"
+[[ring.clarify.files]]
+path = "LICENSE-other-bits"
+license = "ISC"
+checksum = "f025ccfb7dfb6bdfedc75ca0f67acc69e6fb4998143d834f7c2f38a29989680f"
+[[ring.clarify.files]]
+path = "src/polyfill/once_cell/LICENSE-MIT"
+license = "MIT"
+checksum = "6ee2ed6c77710de911761acd5fc1ad1da00f476beb1a7ef27e78c2d1858deafc"
+[[ring.clarify.files]]
+path = "third_party/fiat/LICENSE"
+license = "Apache-2.0"
+checksum = "9eacbcb81be660840c714a560a9d65ba07913db98dd4baf969f78dd499fdd60f"
+
+# The native library's consolidated license retains all component attributions.
+[aws-lc-sys.clarify]
+license = "ISC AND (Apache-2.0 OR ISC) AND Apache-2.0 AND MIT AND BSD-3-Clause AND (Apache-2.0 OR ISC OR MIT) AND (Apache-2.0 OR ISC OR MIT-0)"
+[[aws-lc-sys.clarify.files]]
+path = "LICENSE"
+checksum = "728536b4160e051f86d7c9c388f704866b3d512cd7df97ac3516c65279523c4e"
+
+# Both patched crates use the license at their repository root.
+[h3.clarify]
+license = "MIT"
+[[h3.clarify.files]]
+path = "../LICENSE"
+checksum = "a0d039cdafe68f363893abddb5e4d50dbe6f8b56611e2650aaab4237103285f1"
+
+[h3-quinn.clarify]
+license = "MIT"
+[[h3-quinn.clarify.files]]
+path = "../LICENSE"
+checksum = "a0d039cdafe68f363893abddb5e4d50dbe6f8b56611e2650aaab4237103285f1"

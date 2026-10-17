@@ -3,6 +3,7 @@ name = "shoes"
 version = "0.3.3"
 publish = false # Cargo strips fork patches from crates.io packages.
 edition = "2024"
+rust-version = "1.95"
 autotests = false
 license = "MIT"
 description = "A multi-protocol proxy server."
@@ -20,6 +21,8 @@ resolver = "3"
 blake3 = { git = "https://github.com/cfal/BLAKE3", rev = "0fef7d31c337697da030754b70de2991c4fa9aba" }
 h3 = { git = "https://github.com/cfal/h3", rev = "a0a7a53a143798d71884df36cfac4dd36cd087e6" }
 h3-quinn = { git = "https://github.com/cfal/h3", rev = "a0a7a53a143798d71884df36cfac4dd36cd087e6" }
+# Includes nix-rust/nix#2821 for iOS socket feature compatibility.
+nix = { git = "https://github.com/nix-rust/nix", rev = "3eae6d68ec6382fef7b38cd58f97458e59a71af9" }
 
 [lib]
 name = "shoes"
@@ -153,6 +156,10 @@ serde_json = "*"
 shoes-test-support = { path = "tests/support" }
 tempfile = "*"
 tokio-rustls = "*"
+
+[target.'cfg(unix)'.dependencies]
+gotatun = { version = "=0.10.1", default-features = false, features = ["device", "aws-lc-rs"] }
+ipnetwork = "0.21"
 
 # jemalloc for better memory performance (not supported on Windows MSVC, iOS, or Android)
 [target.'cfg(not(any(target_env = "msvc", target_os = "ios", target_os = "android")))'.dependencies]

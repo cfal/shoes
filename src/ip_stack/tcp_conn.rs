@@ -54,7 +54,7 @@ struct TcpConnectionInner {
     recv_state: TcpSocketState,
     /// Send side state
     send_state: TcpSocketState,
-    abandoned: bool,
+    abandoned_at: Option<smoltcp::time::Instant>,
 }
 
 impl TcpConnectionControl {
@@ -68,15 +68,27 @@ impl TcpConnectionControl {
                 recv_waker: None,
                 recv_state: TcpSocketState::Normal,
                 send_state: TcpSocketState::Normal,
-                abandoned: false,
+                abandoned_at: None,
             }),
         }
     }
 
     // --- Methods called by stack thread ---
 
-    pub fn is_abandoned(&self) -> bool {
-        self.inner.lock().abandoned
+    pub fn orphan_deadline(&self) -> Option<smoltcp::time::Instant> {
+        self.inner
+            .lock()
+            .abandoned_at
+            .map(|at| at + super::TCP_ORPHAN_TIMEOUT)
+    }
+
+    pub fn should_abort(&self) -> bool {
+        let inner = self.inner.lock();
+        inner.abandoned_at.is_some()
+            && (!matches!(
+                inner.send_state,
+                TcpSocketState::Closing | TcpSocketState::Closed
+            ) || !inner.recv_buffer.is_empty())
     }
 
     /// Check if recv buffer is full.
@@ -189,7 +201,7 @@ impl TcpConnection {
 impl Drop for TcpConnection {
     fn drop(&mut self) {
         let mut inner = self.control.inner.lock();
-        inner.abandoned = true;
+        inner.abandoned_at = Some(std::time::Instant::now().into());
         drop(inner);
         self.notify();
     }
@@ -279,8 +291,11 @@ impl AsyncWrite for TcpConnection {
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let mut inner = self.control.inner.lock();
 
-        // Already fully closed
-        if matches!(inner.send_state, TcpSocketState::Closed) {
+        // Write-half shutdown completes once FIN is queued, independently of peer closure.
+        if matches!(
+            inner.send_state,
+            TcpSocketState::Closing | TcpSocketState::Closed
+        ) {
             return Poll::Ready(Ok(()));
         }
 
@@ -289,7 +304,7 @@ impl AsyncWrite for TcpConnection {
             inner.send_state = TcpSocketState::Close;
         }
 
-        // Register waker to be notified when Closed
+        // FIN scheduling wakes the writer.
         if let Some(ref old_waker) = inner.send_waker {
             if !old_waker.will_wake(cx.waker()) {
                 inner.send_waker = Some(cx.waker().clone());
@@ -304,6 +319,17 @@ impl AsyncWrite for TcpConnection {
         Poll::Pending
     }
 }
+
+impl crate::async_stream::AsyncPing for TcpConnection {
+    fn supports_ping(&self) -> bool {
+        false
+    }
+    fn poll_write_ping(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<bool>> {
+        Poll::Ready(Ok(false))
+    }
+}
+
+impl crate::async_stream::AsyncStream for TcpConnection {}
 
 #[cfg(test)]
 mod tests {
