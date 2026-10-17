@@ -63,7 +63,7 @@ The enabled matrix covers:
   The pinned sing-box Vision client closes both directions on upload EOF, so its
   enabled cases finish receiving before closing. The ignored
   `singbox_vision_client_half_close_preserves_pending_reply` retains that failing
-  peer reproducer. Native peer compositions close inner TLS gracefully without
+  peer reproducer. All native-Vision peer cases close inner TLS gracefully without
   requiring transport-level half-close support: WebSocket and Mihomo's masked
   native wrapper can close both transport halves. Native TCP half-close and a
   delayed reverse reply are asserted separately in the library/splice tests.
@@ -78,7 +78,9 @@ Vision decisions, fragmented and malformed records, the maximum native record
 across Vision's 8 KiB buffer, real Linux splice transfers and masked/wrapped
 negative controls, concurrent duplicate flights across bind IPs, SNI/WS ticket
 isolation, IPv4/IPv6/domain destinations, empty UDP replies, and native-Vision
-H2MUX rejection. These tests also run without optional peer binaries.
+H2MUX rejection. IPv6 address cases run when IPv6 loopback is available;
+IPv4 and domain cases always run without relying on dual-stack sockets.
+These tests also run without optional peer binaries.
 
 The ignored `legacy_baseline_matches_backpressure_and_half_close` test compares
 both Shoes roles against Xray over TLS, including slow reads and half-close
