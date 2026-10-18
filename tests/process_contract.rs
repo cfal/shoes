@@ -92,6 +92,54 @@ fn wireguard_check_validates_outer_udp_without_dns_or_listeners() {
 }
 
 #[cfg(unix)]
+#[tokio::test]
+async fn wireguard_conflicting_shared_client_reload_retains_live_flows() {
+    use serde_json::json;
+    use shoes_test_support::socks5::Socks5UdpAssociation;
+    use shoes_test_support::wireguard::{EchoTargets, connect};
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.yaml");
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+    let port = socket.local_addr().unwrap().port();
+    let mut ports = shoes_test_support::port_helper::PortHelper::new();
+    let (_, entry) = ports.get_localhost_listener_port();
+    let first = wireguard_support::client(port);
+    let mut second = first.clone();
+    second["client_group"] = json!("copy");
+    let mut socks = wireguard_support::socks(entry);
+    socks["rules"][0]["client_chain"] = json!([{"pool": ["wg", "copy"]}]);
+    let mut configs = json!([wireguard_support::server(port), first, second, socks]);
+    std::fs::write(&path, serde_yaml::to_string(&configs).unwrap()).unwrap();
+    drop(socket);
+    let mut process = Process::start(&path, &["--no-reload"]);
+    process.wait_for("Servers ready").await;
+    let echo = EchoTargets::new(false).await.unwrap();
+    let mut tcp = connect(entry, echo.tcp()).await.unwrap();
+    let udp = Socks5UdpAssociation::connect("127.0.0.1", entry)
+        .await
+        .unwrap();
+    roundtrip(&mut tcp).await;
+    assert_eq!(udp.send_to(echo.udp(), b"before").await.unwrap(), b"before");
+
+    configs[2]["client_proxies"][0]["protocol"]["pre_shared_key"] =
+        json!(wireguard_support::key(44));
+    std::fs::write(&path, serde_yaml::to_string(&configs).unwrap()).unwrap();
+    process.signal(libc::SIGHUP);
+    process
+        .wait_for("conflicting WireGuard client settings")
+        .await;
+    roundtrip(&mut tcp).await;
+    assert_eq!(udp.send_to(echo.udp(), b"after").await.unwrap(), b"after");
+    echo.check(entry, None).await.unwrap();
+
+    process.signal(libc::SIGTERM);
+    assert!(process.exit().await.success());
+    std::net::UdpSocket::bind(("0.0.0.0", port)).unwrap();
+    std::net::TcpListener::bind(("0.0.0.0", entry)).unwrap();
+}
+
+#[cfg(unix)]
 async fn wireguard_reload(detour: bool) {
     use serde_json::json;
     let directory = tempfile::tempdir().unwrap();
