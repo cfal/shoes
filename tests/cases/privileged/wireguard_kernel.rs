@@ -94,11 +94,12 @@ fn isolated_test(name: &str, cases: impl Future<Output = io::Result<()>>) -> io:
         .arg(std::env::current_exe()?)
         .args(["--exact", name, "--nocapture", "--test-threads=1"])
         .output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        output.status.success(),
+        output.status.success() && stdout.contains("test result: ok. 1 passed;"),
         "isolated kernel WireGuard test failed: {}\n{}\n{}",
         output.status,
-        String::from_utf8_lossy(&output.stdout),
+        stdout,
         String::from_utf8_lossy(&output.stderr),
     );
     Ok(())
@@ -623,9 +624,13 @@ async fn run_recovery_case() -> io::Result<()> {
     stream.read_exact(&mut bytes).await?;
     assert_eq!(&bytes, b"before outage");
 
-    drop(outer);
     let udp_target = SocketAddr::new("10.77.0.1".parse().unwrap(), echo.udp().port());
     let udp = Socks5UdpAssociation::connect("127.0.0.1", socks_port).await?;
+    assert_eq!(
+        udp.send_to(udp_target, b"before outage").await?,
+        b"before outage"
+    );
+    drop(outer);
     for _ in 0..8 {
         assert!(
             timeout(
@@ -649,9 +654,9 @@ async fn run_recovery_case() -> io::Result<()> {
 }
 
 #[test]
-fn kernel_detour_recovers_existing_tcp_without_direct_fallback() -> io::Result<()> {
+fn kernel_detour_recovers_existing_tcp_and_udp_without_direct_fallback() -> io::Result<()> {
     isolated_test(
-        "wireguard_kernel::kernel_detour_recovers_existing_tcp_without_direct_fallback",
+        "wireguard_kernel::kernel_detour_recovers_existing_tcp_and_udp_without_direct_fallback",
         run_recovery_case(),
     )
 }
