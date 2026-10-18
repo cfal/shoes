@@ -423,7 +423,7 @@ fn ipv6_to_u128(ip: Ipv6Addr) -> u128 {
 }
 
 #[inline]
-fn matches_domain(base_domain: &str, hostname: &str) -> bool {
+pub(crate) fn matches_domain(base_domain: &str, hostname: &str) -> bool {
     let base_domain = base_domain.strip_suffix('.').unwrap_or(base_domain);
     let hostname = hostname.strip_suffix('.').unwrap_or(hostname);
     if hostname.len() >= base_domain.len()
