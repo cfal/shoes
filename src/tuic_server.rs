@@ -387,26 +387,6 @@ fn serialize_address(location: &NetLocation) -> Vec<u8> {
     address_bytes
 }
 
-fn serialize_socket_addr(addr: &SocketAddr) -> Vec<u8> {
-    let mut res = match addr {
-        SocketAddr::V4(addr_v4) => {
-            let mut res = Vec::with_capacity(1 + 4 + 2);
-            res.push(0x01); // address type for IPv4
-            res.extend_from_slice(&addr_v4.ip().octets());
-            res
-        }
-        SocketAddr::V6(addr_v6) => {
-            let mut res = Vec::with_capacity(1 + 16 + 2);
-            res.push(0x02); // address type for IPv6
-            res.extend_from_slice(&addr_v6.ip().octets());
-            res
-        }
-    };
-
-    res.extend_from_slice(&addr.port().to_be_bytes());
-    res
-}
-
 async fn process_tcp_stream(
     client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
@@ -654,7 +634,7 @@ async fn run_udp_remote_to_local_stream_loop(
 
         let address_bytes = match original_address_bytes {
             Some(ref a) => a.clone(),
-            None => serialize_socket_addr(&src_addr).into(),
+            None => serialize_address(&src_addr).into(),
         };
 
         let mut frame = BytesMut::with_capacity(MAX_HEADER_LEN + payload_len);
@@ -708,7 +688,7 @@ async fn run_udp_remote_to_local_datagram_loop(
 
         let address_bytes: Bytes = match &original_address_bytes {
             Some(a) => a.clone(),
-            None => serialize_socket_addr(&src_addr).into(),
+            None => serialize_address(&src_addr).into(),
         };
         let address_bytes_len = address_bytes.len();
 
@@ -1004,33 +984,38 @@ async fn process_udp_packet(
                         "TUIC UDP session limit reached",
                     )
                 })?;
-                let action = client_proxy_selector
-                    .judge(remote_location.clone().into(), resolver)
-                    .await;
-
-                let (_chain_group, updated_location) = match action {
-                    Ok(ConnectDecision::Allow {
-                        chain_group,
-                        remote_location,
-                    }) => (chain_group, remote_location),
-                    Ok(ConnectDecision::Block) => {
-                        return Err(std::io::Error::other(format!(
-                            "Blocked UDP forward to {remote_location}"
-                        )));
-                    }
-                    Err(e) => {
-                        return Err(std::io::Error::other(format!(
-                            "Failed to judge UDP forward to {remote_location}: {e}"
-                        )));
-                    }
-                };
-
-                let pinned_location = if remote_location.address().hostname().is_some()
-                    || updated_location.location() != &remote_location
-                {
-                    Some(remote_location.clone())
-                } else {
+                let pinned_location = if client_proxy_selector.fake_dns_enabled() {
+                    // The shared router prepares and routes each destination once.
                     None
+                } else {
+                    let action = client_proxy_selector
+                        .judge(remote_location.clone().into(), resolver)
+                        .await;
+
+                    let (_chain_group, updated_location) = match action {
+                        Ok(ConnectDecision::Allow {
+                            chain_group,
+                            remote_location,
+                        }) => (chain_group, remote_location),
+                        Ok(ConnectDecision::Block) => {
+                            return Err(std::io::Error::other(format!(
+                                "Blocked UDP forward to {remote_location}"
+                            )));
+                        }
+                        Err(e) => {
+                            return Err(std::io::Error::other(format!(
+                                "Failed to judge UDP forward to {remote_location}: {e}"
+                            )));
+                        }
+                    };
+
+                    if remote_location.address().hostname().is_some()
+                        || updated_location.location() != &remote_location
+                    {
+                        Some(remote_location.clone())
+                    } else {
+                        None
+                    }
                 };
                 let client_socket = UdpRelay::new(client_proxy_selector.clone(), resolver.clone())?;
 

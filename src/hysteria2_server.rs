@@ -343,8 +343,7 @@ async fn run_udp_remote_to_local_loop(
         let (address_bytes, address_len_bytes) = match original_address_bytes {
             Some((ref a, ref b)) => (a.clone(), b.clone()),
             None => {
-                let address_bytes: Bytes = src_addr.to_string().into_bytes().into();
-                // no need to do a length check since this is a socket address and an IP.
+                let address_bytes: Bytes = wire_address(&src_addr).into_bytes().into();
                 let address_len = address_bytes.len();
                 let address_len_bytes = encode_varint(address_len as u64)?.into();
                 (address_bytes, address_len_bytes)
@@ -498,31 +497,36 @@ async fn run_udp_local_to_remote_loop(
         let mut session_entry = sessions.entry(session_id);
         let session = match session_entry {
             Entry::Vacant(entry) => {
-                let action = client_proxy_selector
-                    .judge(remote_location.clone().into(), &resolver)
-                    .await;
-
-                let (_chain_group, updated_location) = match action {
-                    Ok(ConnectDecision::Allow {
-                        chain_group,
-                        remote_location,
-                    }) => (chain_group, remote_location),
-                    Ok(ConnectDecision::Block) => {
-                        warn!("Blocked UDP forward to {remote_location}");
-                        continue;
-                    }
-                    Err(e) => {
-                        error!("Failed to judge UDP forward to {remote_location}: {e}");
-                        continue;
-                    }
-                };
-
-                let pinned_location = if remote_location.address().hostname().is_some()
-                    || updated_location.location() != &remote_location
-                {
-                    Some(remote_location.clone())
-                } else {
+                let pinned_location = if client_proxy_selector.fake_dns_enabled() {
+                    // The shared router prepares and routes each destination once.
                     None
+                } else {
+                    let action = client_proxy_selector
+                        .judge(remote_location.clone().into(), &resolver)
+                        .await;
+
+                    let (_chain_group, updated_location) = match action {
+                        Ok(ConnectDecision::Allow {
+                            chain_group,
+                            remote_location,
+                        }) => (chain_group, remote_location),
+                        Ok(ConnectDecision::Block) => {
+                            warn!("Blocked UDP forward to {remote_location}");
+                            continue;
+                        }
+                        Err(e) => {
+                            error!("Failed to judge UDP forward to {remote_location}: {e}");
+                            continue;
+                        }
+                    };
+
+                    if remote_location.address().hostname().is_some()
+                        || updated_location.location() != &remote_location
+                    {
+                        Some(remote_location.clone())
+                    } else {
+                        None
+                    }
                 };
                 let Ok(client_socket) =
                     UdpRelay::new(client_proxy_selector.clone(), resolver.clone())

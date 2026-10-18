@@ -5,18 +5,15 @@
 use bytes::{Buf, BufMut, BytesMut};
 use futures::ready;
 use std::collections::{HashMap, VecDeque};
-use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use crate::address::{Address, NetLocation};
+use crate::address::NetLocation;
 use crate::async_stream::{
     AsyncFlushMessage, AsyncPing, AsyncReadSessionMessage, AsyncSessionMessageStream,
     AsyncShutdownMessage, AsyncStream, AsyncWriteSessionMessage, MessageSessionId,
 };
-use crate::resolver::{NativeResolver, ResolverCache};
 
 use super::frame::{FrameMetadata, FrameOption, SessionStatus, TargetNetwork};
 
@@ -43,11 +40,7 @@ pub struct XudpMessageStream {
     /// Route identities whose protocol session has ended.
     closed_routes: VecDeque<MessageSessionId>,
 
-    /// Resolver cache for hostname resolution
-    /// Resolves hostnames to IPs before storing in session maps
-    resolver_cache: ResolverCache,
-
-    /// Buffered incoming message waiting for destination resolution.
+    /// Buffered incoming message that did not fit the caller's buffer.
     incoming_message: Option<(Vec<u8>, NetLocation, u16)>,
 
     /// EOF flag
@@ -66,13 +59,6 @@ struct RoutedSession {
 
 impl XudpMessageStream {
     pub fn new(inner_stream: Box<dyn AsyncStream>) -> Self {
-        Self::new_with_resolver(inner_stream, Arc::new(NativeResolver::new()))
-    }
-
-    pub(crate) fn new_with_resolver(
-        inner_stream: Box<dyn AsyncStream>,
-        resolver: Arc<dyn crate::resolver::Resolver>,
-    ) -> Self {
         Self {
             inner_stream,
             read_buffer: BytesMut::with_capacity(65536),
@@ -81,7 +67,6 @@ impl XudpMessageStream {
             wire_sessions: HashMap::new(),
             routes: HashMap::new(),
             closed_routes: VecDeque::new(),
-            resolver_cache: ResolverCache::new(resolver),
             incoming_message: None,
             is_eof: false,
         }
@@ -360,7 +345,7 @@ impl AsyncReadSessionMessage for XudpMessageStream {
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<(MessageSessionId, SocketAddr)>> {
+    ) -> Poll<std::io::Result<(MessageSessionId, NetLocation)>> {
         let this = self.get_mut();
 
         // Return buffered message if available
@@ -376,19 +361,8 @@ impl AsyncReadSessionMessage for XudpMessageStream {
             if let Some(session_id) =
                 this.get_or_create_route(wire_session_id, &original_destination)?
             {
-                let socket_addr = match this
-                    .resolver_cache
-                    .poll_resolve_location(cx, &original_destination)
-                {
-                    Poll::Ready(result) => result?,
-                    Poll::Pending => {
-                        this.incoming_message = Some((data, original_destination, wire_session_id));
-                        return Poll::Pending;
-                    }
-                };
-
                 buf.put_slice(&data);
-                return Poll::Ready(Ok((session_id, socket_addr)));
+                return Poll::Ready(Ok((session_id, original_destination)));
             }
         }
 
@@ -413,44 +387,9 @@ impl AsyncReadSessionMessage for XudpMessageStream {
                         continue;
                     };
 
-                    // Resolve hostname to IP if needed
-                    log::debug!("[XUDP SESSION READ] Resolving destination: {}", destination);
-                    let socket_addr =
-                        match this.resolver_cache.poll_resolve_location(cx, &destination) {
-                            Poll::Ready(Ok(addr)) => addr,
-                            Poll::Ready(Err(e)) => {
-                                return Poll::Ready(Err(e));
-                            }
-                            Poll::Pending => {
-                                // DNS resolution pending - buffer the frame and wait
-                                this.incoming_message = Some((data, destination, wire_session_id));
-                                return Poll::Pending;
-                            }
-                        };
-
-                    let resolved_destination = match socket_addr {
-                        SocketAddr::V4(addr) => {
-                            NetLocation::new(Address::Ipv4(*addr.ip()), addr.port())
-                        }
-                        SocketAddr::V6(addr) => {
-                            NetLocation::new(Address::Ipv6(*addr.ip()), addr.port())
-                        }
-                    };
-                    log::debug!(
-                        "[XUDP SESSION READ] Resolved {} -> {}",
-                        destination,
-                        resolved_destination
-                    );
-
-                    log::debug!(
-                        "[XUDP SESSION READ] Session {} mapped to {}",
-                        session_id,
-                        resolved_destination
-                    );
-
                     // Successfully decoded a frame
                     if data.len() > buf.remaining() {
-                        // Buffer it with resolved destination for next read
+                        // Keep the logical destination for the next read
                         this.incoming_message = Some((data, destination, wire_session_id));
                         return Poll::Ready(Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
@@ -463,9 +402,9 @@ impl AsyncReadSessionMessage for XudpMessageStream {
                         "[XUDP SESSION READ] Returning {} bytes for session {} to {}",
                         data.len(),
                         session_id,
-                        socket_addr
+                        destination
                     );
-                    return Poll::Ready(Ok((session_id, socket_addr)));
+                    return Poll::Ready(Ok((session_id, destination)));
                 }
                 None => {
                     // Buffer doesn't have a complete frame, need to read more data
@@ -524,7 +463,7 @@ impl AsyncWriteSessionMessage for XudpMessageStream {
         cx: &mut Context<'_>,
         session_id: MessageSessionId,
         buf: &[u8],
-        target: &SocketAddr,
+        target: &NetLocation,
     ) -> Poll<std::io::Result<()>> {
         // This is the reverse direction: UDP response from internet → XUDP client
         // Use original destination (may be hostname) in response frame, NOT resolved IP
@@ -592,10 +531,11 @@ impl AsyncSessionMessageStream for XudpMessageStream {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::address::Address;
     use futures::task::noop_waker;
     use std::collections::HashSet;
     use std::io;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     struct PendingOnceWriter {
         output: Arc<Mutex<Vec<u8>>>,
@@ -649,6 +589,38 @@ mod tests {
     impl AsyncStream for PendingOnceWriter {}
 
     #[test]
+    fn hostname_destination_reaches_router_without_native_resolution() {
+        let destination = NetLocation::from_str("unresolvable.invalid:53", None).unwrap();
+        let mut encoded = BytesMut::new();
+        FrameMetadata {
+            session_id: 8,
+            status: SessionStatus::New,
+            option: FrameOption::new().with_data(),
+            target: Some(destination.clone()),
+            network: Some(TargetNetwork::Udp),
+        }
+        .encode(&mut encoded)
+        .unwrap();
+        encoded.put_u16(1);
+        encoded.extend_from_slice(b"x");
+        let mut stream = XudpMessageStream::new(Box::new(PendingOnceWriter {
+            output: Arc::new(Mutex::new(Vec::new())),
+            pending: false,
+        }));
+        stream.feed_initial_read_data(&encoded).unwrap();
+        let mut storage = [0; 8];
+        let mut buffer = ReadBuf::new(&mut storage);
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let Poll::Ready(Ok((_, target))) =
+            Pin::new(&mut stream).poll_read_session_message(&mut cx, &mut buffer)
+        else {
+            panic!("hostname must reach preparation synchronously");
+        };
+        assert_eq!(target, destination);
+        assert_eq!(buffer.filled(), b"x");
+    }
+
+    #[test]
     fn buffered_response_is_accepted_once_when_output_blocks() {
         let output = Arc::new(Mutex::new(Vec::new()));
         let inner = PendingOnceWriter {
@@ -662,7 +634,7 @@ mod tests {
             .get_or_create_route(10, &destination)
             .unwrap()
             .unwrap();
-        let source = "127.0.0.1:53".parse().unwrap();
+        let source = NetLocation::from_str("127.0.0.1:53", None).unwrap();
         let waker = noop_waker();
         let mut cx = Context::from_waker(&waker);
 
@@ -702,7 +674,7 @@ mod tests {
         assert_eq!(stream.take_closed_session(), Some(old_route));
         assert_eq!(stream.take_closed_session(), None);
 
-        let source = "127.0.0.1:53".parse().unwrap();
+        let source = NetLocation::from_str("127.0.0.1:53", None).unwrap();
         let waker = noop_waker();
         let mut cx = Context::from_waker(&waker);
         assert!(matches!(

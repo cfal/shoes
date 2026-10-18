@@ -10,7 +10,6 @@
 //! - UoT V1 and V2 non-connect use sing `AddrParser`
 //! - h2mux `packet_addr` uses SOCKS-style `SocksaddrSerializer`
 
-use std::net::SocketAddr;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -34,7 +33,7 @@ type ParseFn = fn(&[u8]) -> std::io::Result<Option<(NetLocation, usize)>>;
 
 struct AddressCodec {
     parse: ParseFn,
-    write: fn(&mut [u8], &SocketAddr) -> usize,
+    write: fn(&mut [u8], &NetLocation) -> std::io::Result<usize>,
 }
 
 const UOT_ADDR_CODEC: AddressCodec = AddressCodec {
@@ -218,7 +217,7 @@ impl<S: AsyncStream> AsyncWriteSourcedMessage for PacketAddrStream<S> {
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
-        source: &SocketAddr,
+        source: &NetLocation,
     ) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
 
@@ -239,20 +238,15 @@ impl<S: AsyncStream> AsyncWriteSourcedMessage for PacketAddrStream<S> {
         this.write_buf_sent = 0;
 
         // Calculate required space: address + length(2) + payload
-        let addr_len = match source {
-            SocketAddr::V4(_) => 7,  // ATYP + IPv4(4) + Port(2)
-            SocketAddr::V6(_) => 19, // ATYP + IPv6(16) + Port(2)
-        };
-        let total_len = addr_len + 2 + buf.len();
+        let offset = (this.codec.write)(&mut this.write_buf, source)?;
+        let total_len = offset + 2 + buf.len();
 
-        if total_len > this.write_buf.len() {
+        if buf.len() > u16::MAX as usize || total_len > this.write_buf.len() {
             return Poll::Ready(Err(std::io::Error::other(format!(
                 "packet-address frame too large: {total_len} > {}",
                 this.write_buf.len()
             ))));
         }
-
-        let offset = (this.codec.write)(&mut this.write_buf, source);
 
         // Write length prefix (u16be)
         let len_bytes = (buf.len() as u16).to_be_bytes();
@@ -320,7 +314,7 @@ pub type SocksPacketAddrStream<S> = PacketAddrStream<S>;
 #[cfg(test)]
 mod tests {
     use std::future::poll_fn;
-    use std::net::{Ipv4Addr, SocketAddr};
+    use std::net::Ipv4Addr;
     use std::pin::Pin;
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadBuf};
@@ -351,7 +345,7 @@ mod tests {
     async fn write_packet<S: AsyncStream>(
         stream: &mut PacketAddrStream<S>,
         payload: &[u8],
-        source: &SocketAddr,
+        source: &NetLocation,
     ) -> std::io::Result<()> {
         poll_fn(|cx| Pin::new(&mut *stream).poll_write_sourced_message(cx, payload, source))
             .await?;
@@ -359,12 +353,12 @@ mod tests {
     }
 
     fn encode_packet(
-        write_addr: fn(&mut [u8], &SocketAddr) -> usize,
-        addr: &SocketAddr,
+        write_addr: fn(&mut [u8], &NetLocation) -> std::io::Result<usize>,
+        addr: &NetLocation,
         payload: &[u8],
     ) -> Vec<u8> {
         let mut frame = vec![0u8; 64 + payload.len()];
-        let addr_len = write_addr(&mut frame, addr);
+        let addr_len = write_addr(&mut frame, addr).unwrap();
         frame[addr_len..addr_len + 2].copy_from_slice(&(payload.len() as u16).to_be_bytes());
         frame[addr_len + 2..addr_len + 2 + payload.len()].copy_from_slice(payload);
         frame.truncate(addr_len + 2 + payload.len());
@@ -373,7 +367,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_new_uot_reads_uot_packets() {
-        let source = SocketAddr::from((Ipv4Addr::new(198, 51, 100, 10), 4444));
+        let source = NetLocation::from_ip_addr(Ipv4Addr::new(198, 51, 100, 10).into(), 4444);
         let payload = b"uot payload";
         let frame = encode_packet(write_uot_address, &source, payload);
 
@@ -387,13 +381,13 @@ mod tests {
         let (location, read_payload) = read_packet(&mut stream).await.unwrap();
         writer.await.unwrap();
 
-        assert_eq!(location.to_socket_addr_nonblocking(), Some(source));
+        assert_eq!(location, source);
         assert_eq!(read_payload, payload);
     }
 
     #[tokio::test]
     async fn test_new_socks_reads_socks_packets() {
-        let source = SocketAddr::from((Ipv4Addr::new(203, 0, 113, 20), 5353));
+        let source = NetLocation::from_ip_addr(Ipv4Addr::new(203, 0, 113, 20).into(), 5353);
         let payload = b"socks payload";
         let frame = encode_packet(write_socks_packet_address, &source, payload);
 
@@ -407,7 +401,7 @@ mod tests {
         let (location, read_payload) = read_packet(&mut stream).await.unwrap();
         writer.await.unwrap();
 
-        assert_eq!(location.to_socket_addr_nonblocking(), Some(source));
+        assert_eq!(location, source);
         assert_eq!(read_payload, payload);
     }
 
@@ -436,7 +430,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_new_socks_rejects_uot_packets() {
-        let source = SocketAddr::from((Ipv4Addr::new(198, 51, 100, 11), 7001));
+        let source = NetLocation::from_ip_addr(Ipv4Addr::new(198, 51, 100, 11).into(), 7001);
         let frame = encode_packet(write_uot_address, &source, b"wrong codec");
 
         let (client, mut server) = tcp_pair().await.unwrap();
@@ -454,7 +448,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_new_socks_writes_socks_packets() {
-        let source = SocketAddr::from((Ipv4Addr::new(203, 0, 113, 22), 9000));
+        let source = NetLocation::from_ip_addr(Ipv4Addr::new(203, 0, 113, 22).into(), 9000);
         let payload = b"write socks";
         let expected = encode_packet(write_socks_packet_address, &source, payload);
 
@@ -470,7 +464,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_new_uot_writes_uot_packets() {
-        let source = SocketAddr::from((Ipv4Addr::new(198, 51, 100, 12), 9001));
+        let source = NetLocation::from_ip_addr(Ipv4Addr::new(198, 51, 100, 12).into(), 9001);
         let payload = b"write uot";
         let expected = encode_packet(write_uot_address, &source, payload);
 

@@ -130,11 +130,15 @@ impl AsyncReadTargetedMessage for SnellUdpStream {
 }
 
 impl AsyncWriteSourcedMessage for SnellUdpStream {
+    fn supports_hostname_source(&self) -> bool {
+        false
+    }
+
     fn poll_write_sourced_message(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
-        source: &SocketAddr,
+        source: &NetLocation,
     ) -> Poll<std::io::Result<()>> {
         let mut this = self.get_mut();
 
@@ -154,6 +158,12 @@ impl AsyncWriteSourcedMessage for SnellUdpStream {
             panic!("single message is larger than our write buf: {buf_len}");
         }
 
+        let source = source.to_socket_addr_nonblocking().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "Snell UDP replies require an IP address",
+            )
+        })?;
         let offset = match source {
             SocketAddr::V4(socket_addr) => {
                 this.write_buf[0] = 4;

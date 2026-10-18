@@ -9,7 +9,7 @@
 //! - 0x01: IPv6 (16 bytes)
 //! - 0x02: Domain (1 byte length + domain string)
 
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{Ipv4Addr, Ipv6Addr};
 
 use crate::address::{Address, NetLocation};
 
@@ -71,29 +71,66 @@ pub fn parse_uot_address(data: &[u8]) -> std::io::Result<Option<(NetLocation, us
     }
 }
 
-/// Write a UoT AddrParser address (ATYP + address + port) from SocketAddr.
-/// Returns number of bytes written
+/// Write a packet address, including hostname reply identities.
 #[inline]
-pub fn write_uot_address(buf: &mut [u8], addr: &SocketAddr) -> usize {
-    match addr {
-        SocketAddr::V4(v4) => {
-            buf[0] = ATYP_IPV4;
-            buf[1..5].copy_from_slice(&v4.ip().octets());
-            buf[5..7].copy_from_slice(&v4.port().to_be_bytes());
-            7
+pub fn write_uot_address(buf: &mut [u8], addr: &NetLocation) -> std::io::Result<usize> {
+    let len = match addr.address() {
+        Address::Ipv4(_) => 7,
+        Address::Ipv6(_) => 19,
+        Address::Hostname(name) if !name.is_empty() && name.len() <= 255 => 4 + name.len(),
+        Address::Hostname(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid packet hostname length",
+            ));
         }
-        SocketAddr::V6(v6) => {
+    };
+    if buf.len() < len {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "packet address buffer too short",
+        ));
+    }
+    match addr.address() {
+        Address::Ipv4(ip) => {
+            buf[0] = ATYP_IPV4;
+            buf[1..5].copy_from_slice(&ip.octets());
+        }
+        Address::Ipv6(ip) => {
             buf[0] = ATYP_IPV6;
-            buf[1..17].copy_from_slice(&v6.ip().octets());
-            buf[17..19].copy_from_slice(&v6.port().to_be_bytes());
-            19
+            buf[1..17].copy_from_slice(&ip.octets());
+        }
+        Address::Hostname(name) => {
+            buf[0] = ATYP_DOMAIN;
+            buf[1] = name.len() as u8;
+            buf[2..len - 2].copy_from_slice(name.as_bytes());
         }
     }
+    buf[len - 2..len].copy_from_slice(&addr.port().to_be_bytes());
+    Ok(len)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hostname_replies_round_trip_and_validate_lengths() {
+        let location = NetLocation::from_str("unresolvable.invalid:53", None).unwrap();
+        let mut bytes = [0; 300];
+        let len = write_uot_address(&mut bytes, &location).unwrap();
+        assert_eq!(
+            parse_uot_address(&bytes[..len]).unwrap(),
+            Some((location.clone(), len))
+        );
+        assert!(write_uot_address(&mut bytes[..len - 1], &location).is_err());
+        for name in [String::new(), "x".repeat(256)] {
+            assert!(
+                write_uot_address(&mut bytes, &NetLocation::new(Address::Hostname(name), 53))
+                    .is_err()
+            );
+        }
+    }
 
     #[test]
     fn test_parse_uot_ipv4_address() {
@@ -171,9 +208,9 @@ mod tests {
 
     #[test]
     fn test_write_uot_ipv4_address() {
-        let addr: SocketAddr = "192.168.1.1:8080".parse().unwrap();
+        let addr = NetLocation::from_str("192.168.1.1:8080", None).unwrap();
         let mut buf = [0u8; 32];
-        let len = write_uot_address(&mut buf, &addr);
+        let len = write_uot_address(&mut buf, &addr).unwrap();
         assert_eq!(len, 7);
         assert_eq!(buf[0], ATYP_IPV4);
         assert_eq!(&buf[1..5], &[192, 168, 1, 1]);
@@ -182,9 +219,9 @@ mod tests {
 
     #[test]
     fn test_write_uot_ipv6_address() {
-        let addr: SocketAddr = "[::1]:443".parse().unwrap();
+        let addr = NetLocation::from_str("[::1]:443", None).unwrap();
         let mut buf = [0u8; 32];
-        let len = write_uot_address(&mut buf, &addr);
+        let len = write_uot_address(&mut buf, &addr).unwrap();
         assert_eq!(len, 19);
         assert_eq!(buf[0], ATYP_IPV6);
         assert_eq!(&buf[1..17], &Ipv6Addr::LOCALHOST.octets());

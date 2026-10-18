@@ -419,6 +419,10 @@ impl ClientProxySelector {
         self.sniff_enabled && self.has_hostname_rules && target.sniffable_real_ip().is_some()
     }
 
+    pub(crate) fn fake_dns_enabled(&self) -> bool {
+        self.fake_dns.is_some()
+    }
+
     pub(crate) async fn judge_prepared<'a>(
         &'a self,
         target: PreparedDestination,
