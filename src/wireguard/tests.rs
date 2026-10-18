@@ -202,6 +202,98 @@ async fn wireguard_mapped_ipv4_destinations_use_the_ipv4_tunnel() {
     .unwrap();
 }
 
+#[tokio::test]
+async fn wireguard_fake_dns_restores_tcp_and_udp_in_both_families() {
+    use hickory_resolver::proto::{
+        op::{Message, Query},
+        rr::{Name, RData, RecordType},
+    };
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let reservation = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+        let mut documents: Vec<serde_yaml::Value> =
+            serde_yaml::from_str(&pair_config(reservation.local_addr().unwrap().port())).unwrap();
+        documents[0]["inbound"] = serde_yaml::from_str(
+            r#"
+dns:
+  servers: udp://127.0.0.1:9
+  fake_ip:
+    ipv6_range: fd18::/64
+rules:
+  - mask: wireguard.example
+    action: allow
+    override_address: '127.0.0.1:0'
+  - masks: ['0.0.0.0/0', '::/0']
+    action: block
+"#,
+        )
+        .unwrap();
+        let mut configs = validate(&serde_yaml::to_string(&documents).unwrap()).unwrap();
+        let prepared = Prepared::new(&mut configs).await.unwrap();
+        let mut dns = crate::dns::build_dns_registry(configs.dns_groups.clone())
+            .await
+            .unwrap();
+        drop(reservation);
+        let mut running = Running::default();
+        prepared.start(&mut dns, &mut running).await.unwrap();
+        let connector = prepared.endpoints[1].connector.as_ref();
+        let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+        let (tcp, udp, _echoes) = echo_servers(false).await;
+        for (target, kind) in [
+            ("198.18.0.1:53", RecordType::A),
+            ("[fd18::1]:53", RecordType::AAAA),
+        ] {
+            let location = NetLocation::from_str(target, None).unwrap().into();
+            let mut query = Message::query();
+            query.metadata.id = 73;
+            query.add_query(Query::query(
+                Name::from_ascii("wireguard.example.").unwrap(),
+                kind,
+            ));
+            let query = query.to_vec().unwrap();
+            let response = if kind == RecordType::A {
+                let mut stream = connector
+                    .connect_udp_bidirectional(&resolver, location)
+                    .await
+                    .unwrap();
+                futures::future::poll_fn(|cx| Pin::new(&mut stream).poll_write_message(cx, &query))
+                    .await
+                    .unwrap();
+                let mut bytes = [0; 512];
+                let mut buf = ReadBuf::new(&mut bytes);
+                futures::future::poll_fn(|cx| {
+                    Pin::new(&mut stream).poll_read_message(cx, &mut buf)
+                })
+                .await
+                .unwrap();
+                Message::from_vec(buf.filled()).unwrap()
+            } else {
+                let mut stream = connector.connect(&resolver, &location).await.unwrap();
+                stream.write_u16(query.len() as u16).await.unwrap();
+                stream.write_all(&query).await.unwrap();
+                let length = stream.read_u16().await.unwrap();
+                let mut bytes = vec![0; length as usize];
+                stream.read_exact(&mut bytes).await.unwrap();
+                Message::from_vec(&bytes).unwrap()
+            };
+            assert_eq!(response.metadata.id, 73);
+            let ip = match response.answers[0].data {
+                RData::A(ip) => IpAddr::V4(ip.0),
+                RData::AAAA(ip) => IpAddr::V6(ip.0),
+                _ => panic!("missing synthetic address"),
+            };
+            check_echo(
+                connector,
+                SocketAddr::new(ip, tcp.port()),
+                SocketAddr::new(ip, udp.port()),
+            )
+            .await;
+        }
+        running.stop().await;
+    })
+    .await
+    .unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wireguard_concurrent_tcp_transfers_preserve_all_data() {
     tokio::time::timeout(Duration::from_secs(20), async {
