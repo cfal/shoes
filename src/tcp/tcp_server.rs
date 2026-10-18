@@ -272,7 +272,7 @@ pub(crate) async fn process_stream_with_permit<AS: AsyncStream + 'static>(
                 crate::routing::ingress::connect_udp(&proxy_selector, remote_location, &resolver)
                     .await
                     .map_err(|error| {
-                        if error.kind() == std::io::ErrorKind::PermissionDenied {
+                        if crate::routing::ingress::is_policy_block(&error) {
                             std::io::Error::new(
                                 std::io::ErrorKind::ConnectionRefused,
                                 "Blocked bidirectional udp forward",
@@ -1053,6 +1053,75 @@ mod lifetime_tests {
         }
         fn bind_interface(&self) -> Option<&str> {
             None
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fixed_udp_preserves_transport_permission_denials() {
+        #[derive(Debug)]
+        struct DeniedConnector;
+
+        #[async_trait]
+        impl SocketConnector for DeniedConnector {
+            async fn connect(
+                &self,
+                _: &Arc<dyn Resolver>,
+                _: &crate::address::ResolvedLocation,
+            ) -> io::Result<Box<dyn AsyncStream>> {
+                unreachable!()
+            }
+
+            async fn connect_udp_bidirectional(
+                &self,
+                _: &Arc<dyn Resolver>,
+                _: crate::address::ResolvedLocation,
+            ) -> io::Result<Box<dyn AsyncMessageStream>> {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "transport denied",
+                ))
+            }
+
+            fn bind_interface(&self) -> Option<&str> {
+                None
+            }
+        }
+
+        for blocked in [true, false] {
+            let action = if blocked {
+                ConnectAction::Block
+            } else {
+                ConnectAction::new_allow(
+                    None,
+                    ClientChainGroup::new(vec![ClientProxyChain::new(
+                        vec![InitialHopEntry::Direct(Arc::new(DeniedConnector))],
+                        vec![],
+                    )]),
+                )
+            };
+            let handler = Arc::new(UdpHandler {
+                remote: NetLocation::from_str("192.0.2.1:443", None).unwrap(),
+                selector: Arc::new(ClientProxySelector::new(vec![ConnectRule::new(
+                    vec![crate::address::NetLocationMask::ANY],
+                    action,
+                )])),
+                marker: Arc::new(()),
+                shutdowns: Arc::new(AtomicUsize::new(0)),
+            });
+            let (stream, _peer) = tokio::io::duplex(64);
+            let error = process_stream(stream, handler, Arc::new(PendingResolver))
+                .await
+                .unwrap_err();
+            let (kind, message) = if blocked {
+                (
+                    io::ErrorKind::ConnectionRefused,
+                    "Blocked bidirectional udp forward",
+                )
+            } else {
+                (io::ErrorKind::PermissionDenied, "transport denied")
+            };
+            assert_eq!(error.kind(), kind);
+            assert_eq!(error.to_string(), message);
         }
     }
 
