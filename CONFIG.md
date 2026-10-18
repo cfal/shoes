@@ -897,8 +897,11 @@ A/AAAA synthesis creates scoped mappings. Later connections to those addresses
 restore the hostname before routing or SNI sniffing. A restored hostname is
 resolved normally when a rule or direct connection needs a real IP; a proxy can
 receive the hostname instead. Sniffed SNI cannot replace a restored name.
-Unknown/evicted synthetic addresses fail closed, including addresses learned
-through a different DNS context. Established flows keep their chosen target.
+Synthetic addresses absent from the receiving context fail closed. Independent
+contexts with overlapping ranges cannot distinguish cross-use: an address may
+already map to an unrelated hostname in the receiving context. Use one shared
+named DNS group or non-overlapping ranges for inbounds serving the same clients.
+Established flows keep their chosen target.
 
 `false` disables the feature. An options object enables it with these defaults:
 
