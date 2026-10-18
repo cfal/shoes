@@ -1604,10 +1604,16 @@ mod tests {
         let source = PacketSource::default();
         let mut server = ServerStream::Targeted(Box::new(source.clone()));
         let mut router = UdpRouter::new(&mut server, selector, resolver, false);
-        let wire = NetLocation::from_str("198.18.0.2:443", None).unwrap();
+        let wire = NetLocation::from_ip_addr(context.allocate("old.example", false).unwrap(), 443);
+        context.allocate("eviction.example", false).unwrap();
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         for name in [None, Some("blocked.example")] {
             if let Some(name) = name {
+                for n in 0..3 {
+                    context
+                        .allocate(&format!("before-block{n}.example"), false)
+                        .unwrap();
+                }
                 assert_eq!(
                     context.allocate(name, false).unwrap(),
                     wire.to_socket_addr_nonblocking().unwrap().ip()
