@@ -628,12 +628,7 @@ fn extract_inline_dns(
     }
 
     // Generate unique name and extract specs into a new group
-    let generated_name = if config
-        .fake_ip
-        .as_ref()
-        .and_then(|config| config.options())
-        .is_some()
-    {
+    let generated_name = if config.fake_ip.is_some() {
         format!("__inline_fake_dns:{identity}")
     } else {
         format!("__inline_dns_{}", *counter)
