@@ -75,7 +75,8 @@ impl RawDnsExchange {
             .options
             .timeout
             .saturating_mul(self.context.options.attempts.max(1).min(u32::MAX as usize) as u32);
-        let result = tokio::time::timeout(deadline, self.exchange_inner(bytes))
+        let setups = parking_lot::Mutex::new(Vec::new());
+        let result = tokio::time::timeout(deadline, self.exchange_inner(bytes, &setups))
             .await
             .unwrap_or_else(|_| {
                 Err(io::Error::new(
@@ -86,12 +87,7 @@ impl RawDnsExchange {
         if result
             .as_ref()
             .is_err_and(|error| error.kind() == io::ErrorKind::TimedOut)
-            && self.upstreams.iter().any(|upstream| {
-                upstream
-                    .connection
-                    .try_lock()
-                    .is_ok_and(|cached| cached.as_ref().is_some_and(|setup| setup.peek().is_none()))
-            })
+            && setups.lock().iter().any(|setup| setup.peek().is_none())
         {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
@@ -101,7 +97,11 @@ impl RawDnsExchange {
         result
     }
 
-    async fn exchange_inner(&self, bytes: Vec<u8>) -> io::Result<Vec<u8>> {
+    async fn exchange_inner(
+        &self,
+        bytes: Vec<u8>,
+        setups: &parking_lot::Mutex<Vec<Connection>>,
+    ) -> io::Result<Vec<u8>> {
         let mut request = super::message::decode(&bytes)?;
         if request.metadata.message_type != MessageType::Query
             || request.metadata.op_code != OpCode::Query
@@ -140,8 +140,9 @@ impl RawDnsExchange {
             let concurrency = self.context.options.num_concurrent_reqs.max(1);
             let waves = upstreams.len().div_ceil(concurrency).max(1);
             let slot_timeout = self.context.options.timeout / waves.min(u32::MAX as usize) as u32;
-            let jobs = futures::stream::iter(upstreams)
-                .map(|index| self.upstream_job(&self.upstreams[index], &request, slot_timeout));
+            let jobs = futures::stream::iter(upstreams).map(|index| {
+                self.upstream_job(&self.upstreams[index], &request, slot_timeout, setups)
+            });
             let mut answers = jobs.buffer_unordered(concurrency);
             while let Some(result) = answers.next().await {
                 match result {
@@ -172,9 +173,10 @@ impl RawDnsExchange {
         upstream: &'a Upstream,
         request: &'a Message,
         timeout: std::time::Duration,
+        setups: &'a parking_lot::Mutex<Vec<Connection>>,
     ) -> BoxFuture<'a, io::Result<Message>> {
         Box::pin(async move {
-            tokio::time::timeout(timeout, self.send(upstream, request.clone()))
+            tokio::time::timeout(timeout, self.send(upstream, request.clone(), setups))
                 .await
                 .unwrap_or_else(|_| {
                     Err(io::Error::new(
@@ -185,8 +187,15 @@ impl RawDnsExchange {
         })
     }
 
-    async fn send(&self, upstream: &Upstream, message: Message) -> io::Result<Message> {
-        let answer = self.send_upstream(upstream, message.clone()).await?;
+    async fn send(
+        &self,
+        upstream: &Upstream,
+        message: Message,
+        setups: &parking_lot::Mutex<Vec<Connection>>,
+    ) -> io::Result<Message> {
+        let answer = self
+            .send_upstream(upstream, message.clone(), setups)
+            .await?;
         if answer.metadata.truncation && matches!(upstream.config.protocol, ProtocolConfig::Udp) {
             // Only use explicitly configured TCP, including system-discovered UDP+TCP pairs.
             if let Some(tcp) = self.upstreams.iter().find(|candidate| {
@@ -195,13 +204,18 @@ impl RawDnsExchange {
                     && candidate.config.bind_addr == upstream.config.bind_addr
                     && matches!(candidate.config.protocol, ProtocolConfig::Tcp)
             }) {
-                return self.send_upstream(tcp, message).await;
+                return self.send_upstream(tcp, message, setups).await;
             }
         }
         Ok(answer)
     }
 
-    async fn send_upstream(&self, upstream: &Upstream, message: Message) -> io::Result<Message> {
+    async fn send_upstream(
+        &self,
+        upstream: &Upstream,
+        message: Message,
+        setups: &parking_lot::Mutex<Vec<Connection>>,
+    ) -> io::Result<Message> {
         for reconnect in 0..2 {
             let (setup, reused) = {
                 let mut cached = upstream.connection.lock().await;
@@ -216,6 +230,13 @@ impl RawDnsExchange {
                 }
                 (cached.as_ref().unwrap().clone(), reused)
             };
+            // Retain only this query's setup identities, including canceled slot waits.
+            {
+                let mut setups = setups.lock();
+                if !setups.iter().any(|current| current.ptr_eq(&setup)) {
+                    setups.push(setup.clone());
+                }
+            }
             let result = match setup.clone().await {
                 Ok(connection) => send_message(&connection, message.clone()).await,
                 Err(error) => Err(io::Error::new(error.kind(), error.to_string())),
@@ -497,6 +518,42 @@ mod tests {
             let answer = raw.exchange(request().to_vec().unwrap()).await.unwrap();
             assert_eq!(Message::from_vec(&answer).unwrap().metadata.id, 17);
             server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn unused_tcp_fallback_does_not_mark_udp_timeout_as_setup_pending() {
+        for completed in [false, true] {
+            let silent = tokio::net::UdpSocket::bind("0.0.0.0:0").await.unwrap();
+            let mut address = silent.local_addr().unwrap();
+            address.set_ip("127.0.0.1".parse().unwrap());
+            let mut raw = exchange(address, false);
+            raw.context.options.timeout = Duration::from_millis(30);
+            let mut config = ConnectionConfig::tcp();
+            config.port = address.port();
+            let (finished, done) = tokio::sync::oneshot::channel();
+            let setup = connection_setup(
+                Box::pin(async move {
+                    if !completed {
+                        futures::future::pending::<()>().await;
+                    }
+                    let _ = finished.send(());
+                    Err(NetError::Timeout)
+                }),
+                tokio::time::Instant::now() + Duration::from_secs(1),
+            );
+            if completed {
+                done.await.unwrap();
+            }
+            assert!(setup.peek().is_none());
+            raw.upstreams.push(Upstream {
+                ip: address.ip(),
+                config,
+                connection: Mutex::new(Some(setup)),
+            });
+            let error = raw.exchange(request().to_vec().unwrap()).await.unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+            assert!(!crate::resolver::dns_setup_pending(&error));
         }
     }
 

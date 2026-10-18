@@ -256,15 +256,16 @@ impl RefreshingResolver {
 
             let current_generation = refresh_state.lock().generation;
             let current = inner.read().await.clone();
-            match operation(current.clone()).await {
+            let mut result = operation(current.clone()).await;
+            let retried_setup =
+                policy.retry_once_after_refresh && result.as_ref().is_err_and(dns_setup_pending);
+            if retried_setup {
+                result = operation(current).await;
+            }
+            match result {
                 Ok(addrs) => {
                     refresh_state.lock().last_activity_at = Some(Instant::now());
                     Ok(addrs)
-                }
-                Err(err) if policy.retry_once_after_refresh && dns_setup_pending(&err) => {
-                    let result = operation(current).await?;
-                    refresh_state.lock().last_activity_at = Some(Instant::now());
-                    Ok(result)
                 }
                 Err(err)
                     if policy.retry_once_after_refresh
@@ -272,6 +273,9 @@ impl RefreshingResolver {
                 {
                     let _guard = refresh_lock.lock().await;
                     if refresh_state.lock().generation != current_generation {
+                        if retried_setup {
+                            return Err(err);
+                        }
                         let current = inner.read().await.clone();
                         let addrs = operation(current).await?;
                         refresh_state.lock().last_activity_at = Some(Instant::now());
@@ -288,6 +292,10 @@ impl RefreshingResolver {
                             {
                                 let mut state = refresh_state.lock();
                                 state.generation = state.generation.wrapping_add(1);
+                            }
+                            // A retained setup gets one retry, then refreshes only for future calls.
+                            if retried_setup {
+                                return Err(err);
                             }
                             let addrs = operation(fresh).await?;
                             refresh_state.lock().last_activity_at = Some(Instant::now());
@@ -740,6 +748,90 @@ mod tests {
 
     fn test_addrs() -> Vec<SocketAddr> {
         vec!["127.0.0.1:80".parse().unwrap()]
+    }
+
+    #[tokio::test]
+    async fn failed_setup_retry_refreshes_only_for_future_requests() {
+        #[derive(Debug)]
+        struct SetupFailureResolver {
+            calls: AtomicUsize,
+            second_error: Option<std::io::ErrorKind>,
+        }
+        impl Resolver for SetupFailureResolver {
+            fn resolve_location(&self, _: &NetLocation) -> ResolveFuture {
+                unreachable!()
+            }
+
+            fn exchange(&self, _: Vec<u8>) -> DnsExchangeFuture {
+                let call = self.calls.fetch_add(1, Ordering::Relaxed);
+                let second_error = self.second_error;
+                Box::pin(async move {
+                    if call > 0
+                        && let Some(kind) = second_error
+                    {
+                        return Err(std::io::Error::new(kind, "retry failure"));
+                    }
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        DnsSetupPending,
+                    ))
+                })
+            }
+        }
+
+        for (second_error, factory_fails) in [
+            (None, false),
+            (Some(std::io::ErrorKind::TimedOut), false),
+            (Some(std::io::ErrorKind::InvalidData), false),
+            (None, true),
+        ] {
+            let initial = Arc::new(SetupFailureResolver {
+                calls: AtomicUsize::new(0),
+                second_error,
+            });
+            let builds = Arc::new(AtomicUsize::new(0));
+            let factory: ResolverFactory = {
+                let initial = initial.clone();
+                let builds = builds.clone();
+                Arc::new(move || {
+                    let generation = builds.fetch_add(1, Ordering::Relaxed);
+                    let initial = initial.clone();
+                    Box::pin(async move {
+                        if generation == 0 {
+                            Ok(initial as Arc<dyn Resolver>)
+                        } else if factory_fails {
+                            Err(std::io::Error::other("factory failed"))
+                        } else {
+                            Ok(Arc::new(MockResolver::with_addrs(vec![])) as Arc<dyn Resolver>)
+                        }
+                    })
+                })
+            };
+            let resolver = RefreshingResolver::new(
+                factory,
+                RefreshPolicy {
+                    max_idle: Duration::from_secs(60),
+                    retry_once_after_refresh: true,
+                },
+                "failed retained setup".into(),
+            )
+            .await
+            .unwrap();
+            let error = resolver.exchange(vec![]).await.unwrap_err();
+            assert_eq!(initial.calls.load(Ordering::Relaxed), 2);
+            assert_eq!(dns_setup_pending(&error), second_error.is_none());
+            assert_eq!(
+                error.kind(),
+                second_error.unwrap_or(std::io::ErrorKind::TimedOut)
+            );
+            let refreshable = RefreshingResolver::should_refresh_for_error(&error);
+            assert_eq!(builds.load(Ordering::Relaxed), 1 + usize::from(refreshable));
+            if refreshable && !factory_fails {
+                assert_eq!(resolver.exchange(vec![3]).await.unwrap(), vec![3]);
+                assert_eq!(initial.calls.load(Ordering::Relaxed), 2);
+                assert_eq!(builds.load(Ordering::Relaxed), 2);
+            }
+        }
     }
 
     fn unique_location(index: usize) -> NetLocation {
