@@ -131,6 +131,7 @@ pub async fn start_quic_servers(
         quic_settings,
         protocol,
         rules,
+        sniff,
         ..
     } = config;
 
@@ -210,10 +211,9 @@ pub async fn start_quic_servers(
 
     let quic_server_config = Arc::new(quic_server_config);
 
-    let client_proxy_selector = Arc::new(create_tcp_client_proxy_selector(
-        rules.clone(),
-        resolver.clone(),
-    )?);
+    let client_proxy_selector = Arc::new(
+        create_tcp_client_proxy_selector(rules.clone(), resolver.clone())?.with_sniff(sniff),
+    );
 
     let mut handles = vec![];
 
@@ -412,6 +412,7 @@ mod tests {
         let occupied_addr = occupied.local_addr().unwrap();
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let config = ServerConfig {
+            sniff: false,
             bind_location: BindLocation::Address(OneOrSome::Some(
                 [first_addr, occupied_addr]
                     .into_iter()

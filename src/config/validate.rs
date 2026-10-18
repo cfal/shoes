@@ -3359,6 +3359,7 @@ mod tests {
     async fn test_tun_icmp_requires_tcp() {
         // ICMP requires TCP to be enabled
         let tun_config = TunConfig {
+            sniff: false,
             segmentation_offload: None,
             resource_limits: Default::default(),
             packet_information: None,
@@ -3842,6 +3843,7 @@ mod tests {
                 dns_servers: NoneOrSome::One(DnsServerSpec::Simple("udp://8.8.8.8".to_string())),
             }),
             Config::Server(ServerConfig {
+                sniff: false,
                 bind_location: BindLocation::Address(OneOrSome::One(
                     NetLocationPortRange::new(
                         crate::address::Address::Ipv4(std::net::Ipv4Addr::LOCALHOST),
@@ -3892,6 +3894,7 @@ mod tests {
                 dns_servers: NoneOrSome::One(DnsServerSpec::Simple("udp://8.8.8.8".to_string())),
             }),
             Config::Server(ServerConfig {
+                sniff: false,
                 bind_location: BindLocation::Address(OneOrSome::One(
                     NetLocationPortRange::new(
                         crate::address::Address::Ipv4(std::net::Ipv4Addr::LOCALHOST),
@@ -3955,6 +3958,7 @@ mod tests {
                 dns_servers: NoneOrSome::One(DnsServerSpec::Simple("tcp://1.1.1.1".to_string())),
             }),
             Config::Server(ServerConfig {
+                sniff: false,
                 bind_location: BindLocation::Address(OneOrSome::One(
                     NetLocationPortRange::new(
                         crate::address::Address::Ipv4(std::net::Ipv4Addr::LOCALHOST),
@@ -4007,6 +4011,7 @@ mod tests {
 
         // Server config references non-existent dns_group
         let configs = vec![Config::Server(ServerConfig {
+            sniff: false,
             bind_location: BindLocation::Address(OneOrSome::One(
                 NetLocationPortRange::new(
                     crate::address::Address::Ipv4(std::net::Ipv4Addr::LOCALHOST),

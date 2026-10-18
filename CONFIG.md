@@ -880,6 +880,31 @@ quiet CONNECT tunnel; connection-level PINGs do not reset that timeout.
 
 Rules determine how incoming connections are routed.
 
+### TLS SNI Routing
+
+Set `sniff: true` on a server, TUN configuration, or WireGuard `inbound` to use
+visible TLS ClientHello SNI for hostname rules. The default is `false`. The option
+applies to logical TCP streams, including multiplexed and QUIC-carried TCP, not
+UDP/QUIC Initial packets, HTTP Host headers, or the outer TLS carrier handshake.
+Nested `override_rules` inherit the setting.
+
+Sniffing applies only to literal real-IP targets when hostname rules exist.
+Supplied hostnames and restored Fake DNS names take precedence. SNI is routing
+metadata only: IP/CIDR masks and the outbound destination retain the original
+IP/port, including through proxy chains. Sniffing does not resolve the SNI name.
+An explicit rule `override_address` can still change the destination.
+
+Capture is best-effort, limited to 300 ms and 64 KiB of wire data. Unknown,
+malformed, oversized, or incomplete TLS falls back to ordinary routing; captured
+bytes are replayed unchanged. Transport errors still terminate the connection.
+Server-first applications can incur the full delay. When more client bytes are
+needed, response-gated protocols send success before routing/dialing; a later
+failure closes or resets the stream rather than sending another status.
+
+SNI is client-controlled, not authenticated identity or a domain firewall. Put
+mandatory IP deny rules before hostname allows. With ECH, only the visible outer
+name is available, not the encrypted inner hostname.
+
 ### Rule Config
 ```yaml
 rules:

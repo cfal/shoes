@@ -350,7 +350,8 @@ impl PreparedEndpoint {
                 crate::tcp::tcp_client_handler_factory::create_tcp_client_proxy_selector(
                     rules,
                     resolver.clone(),
-                )?,
+                )?
+                .with_sniff(inbound.sniff),
             );
             Some((selector, resolver))
         } else {

@@ -54,6 +54,8 @@ pub struct WireguardPeer {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct WireguardInbound {
+    #[serde(default, skip_serializing_if = "super::common::is_false")]
+    pub sniff: bool,
     pub rules: NoneOrSome<ConfigSelection<RuleConfig>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dns: Option<DnsConfig>,
