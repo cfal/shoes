@@ -155,17 +155,16 @@ impl WireguardServerConfig {
     pub(crate) fn device(&self, server: &super::ServerConfig) -> io::Result<WireguardDeviceConfig> {
         let listen = match &server.bind_location {
             super::BindLocation::Unspecified {} if self.peer_client_chain.is_some() => None,
-            super::BindLocation::Address(addresses) if addresses.iter().count() == 1 => Some(
-                addresses
-                    .iter()
-                    .next()
-                    .unwrap()
+            super::BindLocation::Address(addresses) if addresses.iter().count() == 1 => {
+                let address = addresses.iter().next().unwrap();
+                let listen = address
                     .literal_socket_addr()
                     .filter(|address| address.port() != 0)
                     .ok_or_else(|| {
                         invalid("WireGuard server requires one nonzero literal UDP listen address")
-                    })?,
-            ),
+                    })?;
+                Some(listen)
+            }
             _ => {
                 return Err(invalid(
                     "WireGuard server requires one literal UDP listen address, or peer_client_chain without an address",

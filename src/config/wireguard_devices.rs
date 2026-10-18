@@ -22,13 +22,13 @@ struct ClientIdentity {
 }
 
 #[derive(Default)]
-struct Clients {
+struct ClientRegistry {
     identities: HashMap<ClientIdentity, usize>,
     devices: Vec<WireguardDeviceConfig>,
     settings: Vec<serde_yaml::Value>,
 }
 
-impl Clients {
+impl ClientRegistry {
     fn register(&mut self, client: &mut ClientConfig) -> io::Result<()> {
         normalize_client(client)?;
         if !client.protocol.is_wireguard() {
@@ -45,8 +45,6 @@ impl Clients {
             local_key: PublicKey::from(&StaticSecret::from(config.private_key.0)).to_bytes(),
             remote_key: config.public_key.0,
         };
-        let mut device =
-            config.device(&client.address, client.bind_interface.clone().into_option());
         if let Some(&index) = self.identities.get(&identity) {
             if settings != self.settings[index] {
                 return Err(invalid(format!(
@@ -55,15 +53,18 @@ impl Clients {
                 )));
             }
             config.endpoint_id = self.devices[index].id.clone();
-        } else {
-            validate_carrier_mtu(&device)?;
-            let index = self.devices.len();
-            config.endpoint_id = format!("client-{index}");
-            device.id = config.endpoint_id.clone();
-            self.identities.insert(identity, index);
-            self.devices.push(device);
-            self.settings.push(settings);
+            return Ok(());
         }
+
+        let mut device =
+            config.device(&client.address, client.bind_interface.clone().into_option());
+        validate_carrier_mtu(&device)?;
+        let index = self.devices.len();
+        config.endpoint_id = format!("client-{index}");
+        device.id = config.endpoint_id.clone();
+        self.identities.insert(identity, index);
+        self.devices.push(device);
+        self.settings.push(settings);
         Ok(())
     }
 }
@@ -72,10 +73,9 @@ fn normalize_client(client: &mut ClientConfig) -> io::Result<()> {
     let ClientProxyConfig::Wireguard(config) = &mut client.protocol else {
         return Ok(());
     };
-    client.bind_interface = match client.bind_interface.clone().into_option() {
-        Some(interface) => NoneOrOne::One(interface),
-        None => NoneOrOne::None,
-    };
+    if client.bind_interface.is_unspecified() {
+        client.bind_interface = NoneOrOne::None;
+    }
     if let Address::Hostname(host) = client.address.address()
         && host.starts_with('[')
     {
@@ -178,12 +178,12 @@ pub(super) fn collect_devices(
     validated: &mut ValidatedConfigs,
     groups: &mut HashMap<String, Vec<ClientConfig>>,
 ) -> io::Result<()> {
-    let mut clients = Clients::default();
+    let mut clients = ClientRegistry::default();
     // Unused groups are validated for conflicts but do not start devices.
-    let mut names: Vec<_> = groups.keys().cloned().collect();
-    names.sort();
-    for name in names {
-        for client in groups.get_mut(&name).unwrap() {
+    let mut sorted_groups: Vec<_> = groups.iter_mut().collect();
+    sorted_groups.sort_by_key(|(name, _)| *name);
+    for (_, group) in sorted_groups {
+        for client in group {
             visit_client(client, &mut |client| clients.register(client))?;
         }
     }
