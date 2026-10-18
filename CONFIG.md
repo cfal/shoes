@@ -10,6 +10,7 @@ shoes uses YAML configuration files. Multiple configuration types can be combine
 - [WireGuard](#wireguard)
 - [Client Config](#client-config)
 - [Client Protocols](#client-protocols)
+- [Fake DNS](#fake-dns)
 - [Rules System](#rules-system)
 - [Named Groups](#named-groups)
 - [Named PEMs](#named-pems)
@@ -875,6 +876,103 @@ receive windows, the H2 library's 16 MiB response-header decoding limit, and no 
 HTTP/2 PING watchdog. Peer stream limits and timeouts still apply. In particular,
 Caddy v2.11.7 defaults to a one-minute request-body idle timeout, which can end a
 quiet CONNECT tunnel; connection-level PINGs do not reset that timeout.
+
+## Fake DNS
+
+Fake DNS is opt-in on a server, TUN configuration, or WireGuard `inbound`:
+
+```yaml
+dns:
+  servers: "tls://1.1.1.1"
+  fake_ip: true
+```
+
+It intercepts logical TCP and UDP destinations on port 53 after inbound
+authentication/admission, before destination rules. It does not open a DNS
+listener or intercept encrypted DNS. Intercepted DNS is answered locally or
+forwarded through `dns.servers`, never to the application's requested resolver.
+An explicit rule override to port 53 is ordinary forwarding, not interception.
+
+A/AAAA synthesis creates scoped mappings. Later connections to those addresses
+restore the hostname before routing or SNI sniffing. A restored hostname is
+resolved normally when a rule or direct connection needs a real IP; a proxy can
+receive the hostname instead. Sniffed SNI cannot replace a restored name.
+Unknown/evicted synthetic addresses fail closed, including addresses learned
+through a different DNS context. Established flows keep their chosen target.
+
+`false` disables the feature. An options object enables it with these defaults:
+
+```yaml
+fake_ip:
+  ipv4_range: "198.18.0.0/15"
+  ipv6_range: null
+  max_entries: 65536
+  bypass_domains: []
+  missing_family: forward
+  https_records: forward
+  state_file: null
+```
+
+- Pools must be CIDRs with usable addresses; reserve non-conflicting ranges
+  and route them through the same ingress. The base and base+1 addresses are
+  reserved, as is IPv4 broadcast. Real upstream, bootstrap, proxy, and literal
+  rule-override addresses cannot be inside active fake ranges.
+- `max_entries` bounds retained domain mappings, not the allocation range.
+  Least-recently-used domains are evicted; sequential allocation traverses the
+  entire range before reuse. Synthetic answers have a 60-second TTL. This is
+  not a guarantee that a mapping remains valid for 60 seconds under pressure.
+- `bypass_domains` uses the normal hostname-mask suffix matching, including
+  subdomains. Excluded names and IP-shaped questions are forwarded.
+- `missing_family: forward` forwards queries for a disabled family;
+  `nodata` returns an empty successful answer instead.
+- `https_records: forward` preserves HTTPS/SVCB answers; `suppress` returns
+  empty successful answers for both types. Forwarded address hints and ECH can
+  bypass hostname-based routing; suppression trades away those capabilities.
+- Other record types use real upstream exchange. Valid negative/error answers
+  are retained. Multi-question queries receive FORMERR; TSIG/SIG(0), zone
+  transfers, and non-query operations are refused. Synthesized answers are
+  unsigned and do not claim DNSSEC authentication.
+
+Named DNS groups share one pool across every referencing inbound:
+
+```yaml
+- dns_group: shared-fake
+  dns_servers: ["tls://1.1.1.1"]
+  fake_ip: true
+- address: "0.0.0.0:1080"
+  protocol: {type: socks}
+  dns: {servers: shared-fake}
+```
+
+Inline `fake_ip` creates a private context, even when `servers` references a
+named group. Omit the inline override to share the group's mappings. Combining
+fake-enabled groups requires an explicit policy on the composed group.
+
+Compatible reloads retain mappings, including explicit disable/re-enable under
+the same group/inline identity. Pool ranges, capacity, or state-file ownership
+changes require restart. Without `state_file`, restart loses the mappings.
+With a state file, snapshots are private, atomically replaced, locked against
+multiple writers, and checked for compatibility. Create its parent directory
+before startup; protect it because the file records queried domains. Cursor
+reservations are persisted before issuance; a crash can lose recent mappings,
+which then fail closed rather than restoring an obsolete owner. Back up or
+explicitly remove incompatible state before changing its pool configuration.
+
+Omitted `servers` uses system DNS. Desktop discovery is a periodically refreshed
+endpoint snapshot, not the OS's complete split/scoped DNS policy. Keep discovered
+resolvers and any loopback stub's own upstream traffic outside TUN capture to
+avoid recursive interception. Android/iOS hosts must supply underlying real
+`dns.servers` explicitly; automatic VPN system discovery is not supported.
+Missing/unusable upstreams produce DNS failure, not a public-provider fallback.
+UDP and HTTP/3 upstreams remain direct-only; TCP/TLS/HTTPS can use client chains.
+UDP truncation retries TCP only when that transport is explicitly configured.
+
+SOCKS, UoT, H2MUX, XUDP, Hysteria2, and TUIC preserve the original logical reply
+address. Snell's reply format supports only IP addresses: hostname-addressed
+DNS requires a real lookup for its reply identity and fails if that lookup
+fails. Literal-address DNS interception remains fully local on Snell.
+
+See [the shared-pool example](examples/fake_dns.yaml).
 
 ## Rules System
 
