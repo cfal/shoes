@@ -80,3 +80,34 @@ async fn fake_dns_reload_shutdown_and_crash_preserve_safe_mapping_state() {
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn fake_dns_reload_checkpoint_failure_keeps_the_service_available() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.yaml");
+        let state = directory.path().join("fake.json");
+        let port = available_address().port();
+        let config = json!([
+            {"dns_group":"shared", "dns_servers":"udp://127.0.0.1:9",
+             "fake_ip":{"state_file":state,"max_entries":16}},
+            {"address":format!("0.0.0.0:{port}"),"protocol":{"type":"socks","udp_enabled":true},
+             "dns":{"servers":"shared"}}
+        ]);
+        std::fs::write(&path, config.to_string()).unwrap();
+        let mut process = Process::start(&path, &["--no-reload"]);
+        process.wait_for("Servers ready").await;
+        let stable = query(port, "stable.example.").await;
+        std::fs::remove_file(&state).unwrap();
+        std::fs::create_dir(&state).unwrap();
+        process.signal(libc::SIGHUP);
+        process.wait_for("Servers ready").await;
+        assert_eq!(query(port, "stable.example.").await, stable);
+        std::fs::remove_dir(&state).unwrap();
+        process.signal(libc::SIGTERM);
+        assert!(process.exit().await.success());
+        assert!(state.is_file());
+    })
+    .await
+    .unwrap();
+}

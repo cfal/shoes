@@ -117,6 +117,20 @@ struct RunningServers {
 }
 
 impl RunningServers {
+    async fn shutdown(&mut self, registries: &[&DnsRegistry]) -> io::Result<()> {
+        self.stop().await;
+        let mut result = Ok(());
+        for registry in registries {
+            if let Err(error) = registry.shutdown_checkpoint().await {
+                log::warn!("Final Fake DNS checkpoint failed: {error}");
+                if result.is_ok() {
+                    result = Err(error);
+                }
+            }
+        }
+        result
+    }
+
     async fn stop(&mut self) {
         for task in &self.listeners {
             task.abort();
@@ -389,20 +403,23 @@ pub async fn run(paths: Vec<String>, dry_run: bool, no_reload: bool) -> io::Resu
     let mut running = RunningServers::default();
     tokio::select! {
         biased;
-        _ = shutdown.recv() => { running.stop().await; prepared.dns.checkpoint().await?; return Ok(()); }
-        result = running.start(&mut prepared) => result?,
+        _ = shutdown.recv() => return running.shutdown(&[&prepared.dns]).await,
+        result = running.start(&mut prepared) => if let Err(error) = result {
+            let _ = running.shutdown(&[&prepared.dns]).await;
+            return Err(error);
+        },
     }
     loop {
         let debounce = tokio::select! {
             biased;
-            _ = shutdown.recv() => { running.stop().await; prepared.dns.checkpoint().await?; return Ok(()); }
+            _ = shutdown.recv() => return running.shutdown(&[&prepared.dns]).await,
             _ = reload.recv() => false,
             _ = changes.recv() => true,
         };
         if debounce {
             tokio::select! {
                 biased;
-                _ = shutdown.recv() => { running.stop().await; prepared.dns.checkpoint().await?; return Ok(()); }
+                _ = shutdown.recv() => return running.shutdown(&[&prepared.dns]).await,
                 _ = reload.recv() => {}
                 _ = tokio::time::sleep(Duration::from_secs(3)) => {}
             }
@@ -417,7 +434,7 @@ pub async fn run(paths: Vec<String>, dry_run: bool, no_reload: bool) -> io::Resu
         }
         let candidate = tokio::select! {
             biased;
-            _ = shutdown.recv() => { running.stop().await; prepared.dns.checkpoint().await?; return Ok(()); }
+            _ = shutdown.recv() => return running.shutdown(&[&prepared.dns]).await,
             result = prepare(&paths, Some(&prepared.dns)) => result,
         };
         let mut candidate = match candidate {
@@ -428,17 +445,22 @@ pub async fn run(paths: Vec<String>, dry_run: bool, no_reload: bool) -> io::Resu
             }
         };
         running.stop().await;
-        prepared.dns.checkpoint().await?;
+        if let Err(error) = prepared.dns.checkpoint().await {
+            log::warn!("Reload Fake DNS checkpoint failed; continuing reload: {error}");
+        }
         tokio::select! {
             biased;
-            _ = shutdown.recv() => return Ok(()),
-            result = running.quic_retirements.wait() => result?,
+            _ = shutdown.recv() => return running.shutdown(&[&prepared.dns, &candidate.dns]).await,
+            result = running.quic_retirements.wait() => if let Err(error) = result {
+                let _ = running.shutdown(&[&prepared.dns, &candidate.dns]).await;
+                return Err(error);
+            },
         }
         let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
         loop {
             let result = tokio::select! {
                 biased;
-                _ = shutdown.recv() => { running.stop().await; return Ok(()); }
+                _ = shutdown.recv() => return running.shutdown(&[&prepared.dns, &candidate.dns]).await,
                 result = running.start(&mut candidate) => result,
             };
             match result {
@@ -449,16 +471,22 @@ pub async fn run(paths: Vec<String>, dry_run: bool, no_reload: bool) -> io::Resu
                 {
                     tokio::select! {
                         biased;
-                        _ = shutdown.recv() => return Ok(()),
-                        result = running.quic_retirements.wait() => result?,
+                        _ = shutdown.recv() => return running.shutdown(&[&prepared.dns, &candidate.dns]).await,
+                        result = running.quic_retirements.wait() => if let Err(error) = result {
+                            let _ = running.shutdown(&[&prepared.dns, &candidate.dns]).await;
+                            return Err(error);
+                        },
                     }
                     tokio::select! {
                         biased;
-                        _ = shutdown.recv() => return Ok(()),
+                        _ = shutdown.recv() => return running.shutdown(&[&prepared.dns, &candidate.dns]).await,
                         _ = tokio::time::sleep(Duration::from_millis(50)) => {},
                     }
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    let _ = running.shutdown(&[&prepared.dns, &candidate.dns]).await;
+                    return Err(error);
+                }
             }
         }
         drop(std::mem::replace(&mut prepared, candidate));
@@ -468,6 +496,58 @@ pub async fn run(paths: Vec<String>, dry_run: bool, no_reload: bool) -> io::Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn fake_dns_terminal_shutdown_closes_all_registries_after_checkpoint_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut registries = Vec::new();
+        let mut contexts = Vec::new();
+        for index in 0..2 {
+            let path = directory.path().join(format!("config-{index}.yaml"));
+            let state = directory.path().join(format!("state-{index}.json"));
+            std::fs::write(
+                &path,
+                serde_json::json!([
+                    {"dns_group":"fake", "dns_servers":"system", "fake_ip":{"state_file":state}}
+                ])
+                .to_string(),
+            )
+            .unwrap();
+            let prepared = prepare(&[path.to_str().unwrap().to_owned()], None)
+                .await
+                .unwrap();
+            let context = prepared
+                .dns
+                .get_by_name("fake")
+                .unwrap()
+                .fake_dns_context()
+                .unwrap();
+            context.allocate("before.example", false).unwrap();
+            contexts.push(context);
+            registries.push(prepared);
+        }
+        let failed_state = directory.path().join("state-0.json");
+        std::fs::remove_file(&failed_state).unwrap();
+        std::fs::create_dir(&failed_state).unwrap();
+        let marker = std::sync::Arc::new(());
+        let owned = marker.clone();
+        let mut running = RunningServers::default();
+        running.listeners.push(tokio::spawn(async move {
+            let _owned = owned;
+            std::future::pending::<()>().await;
+        }));
+        assert!(
+            running
+                .shutdown(&[&registries[0].dns, &registries[1].dns])
+                .await
+                .is_err()
+        );
+        assert_eq!(std::sync::Arc::strong_count(&marker), 1);
+        for context in contexts {
+            assert!(context.allocate("after.example", false).is_err());
+        }
+        assert!(directory.path().join("state-1.json").is_file());
+    }
 
     #[cfg(unix)]
     #[tokio::test]

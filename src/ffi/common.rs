@@ -78,6 +78,17 @@ pub fn spawn_service(
 
 struct ServerTasks(Vec<JoinHandle<()>>);
 
+impl ServerTasks {
+    async fn stop(&mut self) {
+        for task in &self.0 {
+            task.abort();
+        }
+        for task in self.0.drain(..) {
+            let _ = task.await;
+        }
+    }
+}
+
 impl Drop for ServerTasks {
     fn drop(&mut self) {
         for task in &self.0 {
@@ -279,6 +290,7 @@ pub async fn start_from_config(
         .await
     {
         wireguard_running.stop().await;
+        let _ = dns_registry.shutdown_checkpoint().await;
         return Err(error);
     }
 
@@ -290,8 +302,10 @@ pub async fn start_from_config(
         match start_servers(Config::Server(server_config), resolver).await {
             Ok(tasks) => join_handles.0.extend(tasks),
             Err(error) => {
+                join_handles.stop().await;
                 #[cfg(unix)]
                 wireguard_running.stop().await;
+                let _ = dns_registry.shutdown_checkpoint().await;
                 return Err(error);
             }
         }
@@ -310,12 +324,12 @@ pub async fn start_from_config(
     ));
 
     // Cleanup any servers when TUN stops
-    drop(join_handles);
+    join_handles.stop().await;
     #[cfg(unix)]
     wireguard_running.stop().await;
 
     drop(dns_snapshots);
-    dns_registry.checkpoint().await?;
+    dns_registry.shutdown_checkpoint().await?;
 
     result
 }
