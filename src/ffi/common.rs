@@ -290,7 +290,9 @@ pub async fn start_from_config(
         .await
     {
         wireguard_running.stop().await;
-        let _ = dns_registry.shutdown_checkpoint().await;
+        if let Err(error) = dns_registry.shutdown_checkpoint().await {
+            log::warn!("Final Fake DNS checkpoint failed: {error}");
+        }
         return Err(error);
     }
 
@@ -305,7 +307,9 @@ pub async fn start_from_config(
                 join_handles.stop().await;
                 #[cfg(unix)]
                 wireguard_running.stop().await;
-                let _ = dns_registry.shutdown_checkpoint().await;
+                if let Err(error) = dns_registry.shutdown_checkpoint().await {
+                    log::warn!("Final Fake DNS checkpoint failed: {error}");
+                }
                 return Err(error);
             }
         }

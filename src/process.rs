@@ -586,7 +586,17 @@ mod tests {
         for context in contexts {
             assert!(context.allocate("after.example", false).is_err());
         }
-        assert!(directory.path().join("state-1.json").is_file());
+        let snapshot: serde_json::Value = serde_json::from_reader(
+            std::fs::File::open(directory.path().join("state-1.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            snapshot["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry[0] == "before.example")
+        );
     }
 
     #[cfg(unix)]
