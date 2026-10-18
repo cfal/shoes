@@ -34,8 +34,23 @@ impl ClientRegistry {
         if !client.protocol.is_wireguard() {
             return Ok(());
         }
+        // Compares effective carrier socket defaults without rewriting ordinary clients.
+        let mut settings = client.clone();
+        visit_client(&mut settings, &mut |carrier| {
+            if carrier.bind_interface.is_unspecified() {
+                carrier.bind_interface = NoneOrOne::None;
+            }
+            if carrier
+                .tcp_settings
+                .as_ref()
+                .is_some_and(|tcp| tcp.no_delay)
+            {
+                carrier.tcp_settings = None;
+            }
+            Ok(())
+        })?;
         // Serialization excludes generation-local IDs and prepared connectors.
-        let settings = serde_yaml::to_value(&*client)
+        let settings = serde_yaml::to_value(settings)
             .map_err(|_| invalid("cannot compare WireGuard client settings"))?;
         let ClientProxyConfig::Wireguard(config) = &mut client.protocol else {
             unreachable!("checked WireGuard protocol")
@@ -133,7 +148,7 @@ fn normalize_cidrs(prefixes: &mut Vec<String>, routes: bool) -> io::Result<()> {
                 .map_err(io::Error::other)?
                 .to_string()
         } else {
-            network.to_string()
+            IpNetwork::from(network.ip()).to_string()
         };
     }
     prefixes.sort();
@@ -468,6 +483,57 @@ mod tests {
                     .contains("conflicting")
             );
         }
+    }
+
+    #[test]
+    fn copied_clients_share_with_equivalent_carrier_socket_defaults() {
+        let mut first = client();
+        first["protocol"]["peer_client_chain"] = json!("direct");
+        for chain in [
+            json!("direct"),
+            json!("relay"),
+            json!([{"protocol": {"type": "direct"}}]),
+            json!([{"protocol": {"type": "direct"}, "bind_interface": null}]),
+            json!([{"protocol": {"type": "direct"}, "tcp_settings": {}}]),
+            json!([{"protocol": {"type": "direct"}, "tcp_settings": {"no_delay": true}}]),
+            json!([{"pool": [{"protocol": {"type": "direct"}, "tcp_settings": {}}]}]),
+        ] {
+            let mut second = client();
+            second["protocol"]["peer_client_chain"] = chain.clone();
+            let configs = json!([
+                {"client_group": "one", "client_proxies": [first]},
+                {"client_group": "relay", "client_proxies": [{"protocol": {"type": "direct"}}]},
+                {"address": "0.0.0.0:1080", "protocol": {"type": "socks"},
+                 "rules": [{"masks": "0.0.0.0/0", "action": "allow",
+                            "client_chain": [{"pool": ["one", second]}]}]},
+            ]);
+            let validated =
+                validate(configs.clone()).unwrap_or_else(|error| panic!("{chain}: {error}"));
+            assert_eq!(validated.wireguard_endpoints.len(), 1);
+
+            let mut conflict = configs;
+            conflict[2]["rules"][0]["client_chain"][0]["pool"][1]["protocol"]["peer_client_chain"] =
+                json!([{"protocol": {"type": "direct"}, "tcp_settings": {"no_delay": false}}]);
+            assert!(
+                validate(conflict)
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .contains("conflicting")
+            );
+        }
+    }
+
+    #[test]
+    fn copied_clients_share_local_addresses_with_different_prefix_lengths() {
+        let mut second = client();
+        second["protocol"]["addresses"] = json!(["10.77.0.2/24", "fd77::2/64"]);
+        let validated = validate(copies(second)).unwrap();
+        assert_eq!(validated.wireguard_endpoints.len(), 1);
+        assert_eq!(
+            validated.wireguard_endpoints[0].addresses,
+            ["10.77.0.2/32", "fd77::2/128"]
+        );
     }
 
     #[test]

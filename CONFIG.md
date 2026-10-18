@@ -180,8 +180,11 @@ needs operator tuning; UDP-over-TCP can introduce head-of-line blocking.
 Identical clients share one device per configuration generation, even when copied
 between different groups or inline locations. Identity is the configured peer
 address, derived client public key, and server public key, not a resolved or
-roaming address. Defaults and equivalent encodings are normalized before
-comparison. Conflicting addresses, routes, PSKs, MTUs, limits, interfaces, or peer
+roaming address. WireGuard defaults and equivalent key/address/route encodings,
+plus carrier interface and TCP socket defaults, are normalized before comparison.
+Local address prefixes are canonicalized to host prefixes; routing prefixes retain
+their meaning. Other carrier protocol settings are compared as configured.
+Conflicting addresses, routes, PSKs, MTUs, limits, interfaces, or peer
 chains for the same identity reject rather than silently merging. Different
 identities and servers remain separate. Unused client groups open no sockets.
 
