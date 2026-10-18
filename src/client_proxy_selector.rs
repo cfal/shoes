@@ -232,10 +232,6 @@ pub(crate) struct PreparedDestination {
 }
 
 impl PreparedDestination {
-    pub(crate) fn wire_destination(&self) -> &NetLocation {
-        &self.wire_destination
-    }
-
     pub(crate) fn is_fake_dns(&self) -> bool {
         self.source == DestinationSource::FakeDns
     }

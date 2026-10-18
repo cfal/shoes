@@ -21,6 +21,7 @@ pub struct FakeDnsContext {
 }
 
 impl FakeDnsContext {
+    #[cfg(test)]
     pub fn new(options: FakeIpOptions, real: Arc<dyn Resolver>) -> io::Result<Self> {
         options.validate()?;
         let pool = Arc::new(FakeIpPool::new(&options)?);
@@ -46,6 +47,7 @@ impl FakeDnsContext {
         self.responder.pool.contains(address)
     }
 
+    #[cfg(test)]
     pub fn allocate(&self, name: &str, ipv6: bool) -> io::Result<IpAddr> {
         self.responder.pool.allocate(name, ipv6)
     }
