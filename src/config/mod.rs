@@ -14,6 +14,7 @@
 //! - [`singbox::convert_singbox_config`]: Convert sing-box configs to shoes format
 
 mod client_visit;
+mod fake_dns;
 mod pem;
 mod types;
 mod validate;
