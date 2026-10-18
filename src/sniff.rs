@@ -16,7 +16,7 @@ pub(crate) struct SniffResult {
 
 pub(crate) struct TlsProbe {
     prefix: Vec<u8>,
-    acceptor: Option<Acceptor>,
+    acceptor: Option<Box<Acceptor>>,
     fed: usize,
     finished: bool,
     server_name: Option<String>,
@@ -48,7 +48,7 @@ impl TlsProbe {
             return;
         }
         let limit = self.prefix.len().min(MAX_INSPECTED_BYTES);
-        let acceptor = self.acceptor.get_or_insert_with(Acceptor::default);
+        let acceptor = self.acceptor.get_or_insert_with(Box::default);
         while self.fed < limit {
             // An exhausted slice signals EOF to rustls, not a temporary read boundary.
             match acceptor.read_tls(&mut &self.prefix[self.fed..limit]) {
@@ -88,8 +88,11 @@ impl TlsProbe {
         budget: Duration,
     ) -> io::Result<SniffResult> {
         let deadline = Instant::now() + budget;
-        let mut buf = [0u8; 4096];
+        let mut buf = Vec::new();
         while self.needs_more() && Instant::now() < deadline {
+            if buf.is_empty() {
+                buf.resize(4096, 0);
+            }
             let capacity = buf.len().min(MAX_INSPECTED_BYTES - self.prefix.len());
             // The timed read borrows scratch storage; retained bytes outlive its cancellation.
             match timeout_at(deadline, reader.read(&mut buf[..capacity])).await {
@@ -113,6 +116,15 @@ pub(crate) mod tests {
     use std::sync::Arc;
     use std::task::{Context, Poll};
     use tokio::io::{AsyncWriteExt, ReadBuf};
+
+    #[test]
+    fn probe_and_capture_future_do_not_embed_large_buffers() {
+        assert!(std::mem::size_of::<TlsProbe>() < 256);
+        let probe = TlsProbe::from_prefix(Vec::new());
+        let mut reader = tokio::io::empty();
+        let future = probe.finish(&mut reader, SNIFF_TIMEOUT);
+        assert!(std::mem::size_of_val(&future) < 1024);
+    }
 
     pub(crate) fn hello(version: &'static rustls::SupportedProtocolVersion, sni: bool) -> Vec<u8> {
         let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(
@@ -281,6 +293,90 @@ pub(crate) mod tests {
             .finish(&mut Failed, SNIFF_TIMEOUT)
             .await;
         assert!(matches!(result, Err(e) if e.kind() == io::ErrorKind::ConnectionReset));
+        let bytes = hello(&rustls::version::TLS13, true);
+        let mut reader = (&bytes[..8]).chain(Failed);
+        let result = TlsProbe::from_prefix(Vec::new())
+            .finish(&mut reader, SNIFF_TIMEOUT)
+            .await;
+        assert!(matches!(result, Err(e) if e.kind() == io::ErrorKind::ConnectionReset));
+    }
+
+    #[tokio::test]
+    async fn rustls_and_capture_caps_preserve_complete_prefixes() {
+        let base = hello(&rustls::version::TLS13, true);
+        for wire_len in [
+            MAX_INSPECTED_BYTES - 1,
+            MAX_INSPECTED_BYTES,
+            MAX_INSPECTED_BYTES + 1,
+        ] {
+            let padding_size = wire_len - base.len() - 15 - 4;
+            let mut extension = vec![0xff, 0xa5];
+            extension.extend_from_slice(&(padding_size as u16).to_be_bytes());
+            extension.resize(padding_size + 4, 0);
+            let bytes = extend_hello(base.clone(), &extension);
+            assert_eq!(bytes.len(), wire_len);
+            let probe = TlsProbe::from_prefix(bytes.clone());
+            assert!(!probe.needs_more());
+            let result = probe.finish(&mut NoRead, SNIFF_TIMEOUT).await.unwrap();
+            assert_eq!(
+                result.server_name.as_deref(),
+                // rustls's incomplete-handshake buffer itself is limited to 0xffff.
+                (wire_len < MAX_INSPECTED_BYTES).then_some("sniff.example")
+            );
+            assert_eq!(result.prefix, bytes);
+        }
+    }
+
+    #[tokio::test]
+    async fn coalesced_capture_replays_hello_and_trailing_traffic_exactly_once() {
+        let mut bytes = hello(&rustls::version::TLS13, true);
+        bytes.extend_from_slice(&vec![42; 8192]);
+        let mut reader = bytes.as_slice();
+        let mut result = TlsProbe::from_prefix(Vec::new())
+            .finish(&mut reader, SNIFF_TIMEOUT)
+            .await
+            .unwrap();
+        assert_eq!(result.server_name.as_deref(), Some("sniff.example"));
+        assert!(!reader.is_empty());
+        result.prefix.extend_from_slice(reader);
+        assert_eq!(result.prefix, bytes);
+    }
+
+    #[tokio::test]
+    async fn rejected_legacy_duplicate_and_invalid_sni_are_terminal_misses() {
+        let bytes = hello(&rustls::version::TLS12, true);
+        let mut offset = 5 + 4 + 2 + 32;
+        offset += 1 + bytes[offset] as usize;
+        offset += 2 + u16::from_be_bytes([bytes[offset], bytes[offset + 1]]) as usize;
+        offset += 1 + bytes[offset] as usize;
+        offset += 2;
+        let mut legacy = bytes.clone();
+        let mut duplicate = None;
+        while offset < bytes.len() {
+            let kind = u16::from_be_bytes([bytes[offset], bytes[offset + 1]]);
+            let end =
+                offset + 4 + u16::from_be_bytes([bytes[offset + 2], bytes[offset + 3]]) as usize;
+            if kind == 13 {
+                legacy[offset..offset + 2].copy_from_slice(&[0xff, 0xa5]);
+            }
+            if kind == 0 {
+                duplicate = Some(extend_hello(bytes.clone(), &bytes[offset..end]));
+            }
+            offset = end;
+        }
+        let mut invalid = bytes.clone();
+        let name = invalid
+            .windows(b"sniff.example".len())
+            .position(|s| s == b"sniff.example")
+            .unwrap();
+        invalid[name] = b'/';
+        for bytes in [legacy, duplicate.unwrap(), invalid] {
+            let probe = TlsProbe::from_prefix(bytes.clone());
+            assert!(!probe.needs_more());
+            let result = probe.finish(&mut NoRead, SNIFF_TIMEOUT).await.unwrap();
+            assert_eq!(result.server_name, None);
+            assert_eq!(result.prefix, bytes);
+        }
     }
 
     #[tokio::test]
