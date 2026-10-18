@@ -8,13 +8,13 @@ use shoes_test_support::wireguard::EchoTargets;
 use std::{
     io,
     net::SocketAddr,
-    os::{fd::AsRawFd, unix::net::UnixDatagram},
-    pin::Pin,
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
+    os::{
+        fd::{AsRawFd, BorrowedFd},
+        unix::net::UnixDatagram,
     },
-    time::Duration,
+    pin::Pin,
+    sync::{Arc, atomic::Ordering, mpsc},
+    time::{Duration, Instant},
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, ReadBuf},
@@ -55,7 +55,12 @@ async fn bridge(wire: UnixDatagram, framed: bool) -> io::Result<(PacketStack, Jo
                 bytes.extend(header(packet[0] >> 4 == 6));
             }
             bytes.extend_from_slice(&packet);
-            outgoing.send(&bytes).await.unwrap();
+            match outgoing.send(&bytes).await {
+                Ok(length) => assert_eq!(length, bytes.len()),
+                // macOS reports a full datagram queue as ENOBUFS, not WouldBlock.
+                Err(error) if error.raw_os_error() == Some(libc::ENOBUFS) => {}
+                Err(error) => panic!("failed to send TUN packet: {error}"),
+            }
         }
     });
     tasks.spawn(async move {
@@ -85,10 +90,16 @@ async fn bridge(wire: UnixDatagram, framed: bool) -> io::Result<(PacketStack, Jo
 fn raw_fd_wireguard_service_forwards_and_restarts_without_leaks() {
     const CHILD: &str = "SHOES_FFI_WIREGUARD_LIFECYCLE_CHILD";
     if std::env::var_os(CHILD).is_none() {
-        let status = std::process::Command::new(std::env::current_exe().unwrap())
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "ffi::common::wireguard_tests::raw_fd_wireguard_service_forwards_and_restarts_without_leaks", "--nocapture"])
-            .env(CHILD, "1").status().unwrap();
-        assert!(status.success());
+            .env(CHILD, "1").output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("test result: ok. 1 passed;"),
+            "FFI child did not run successfully: {}\n{stdout}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr),
+        );
         return;
     }
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -100,6 +111,11 @@ fn raw_fd_wireguard_service_forwards_and_restarts_without_leaks() {
     drop(reservation);
     for framed in [false, true] {
         let (wire, tun) = UnixDatagram::pair().unwrap();
+        for socket in [&wire, &tun] {
+            let socket = socket2::SockRef::from(socket);
+            socket.set_send_buffer_size(256 * 1024).unwrap();
+            socket.set_recv_buffer_size(256 * 1024).unwrap();
+        }
         let mut server = config::server(port);
         server["wireguard"] = json!("server");
         let configs = json!([
@@ -108,15 +124,35 @@ fn raw_fd_wireguard_service_forwards_and_restarts_without_leaks() {
              "rules": [{"masks": ["0.0.0.0/0", "::/0"], "action": "allow",
                         "client_chain": [{"protocol": {"type": "wireguard", "endpoint": "wg"}}]}]},
         ]);
-        let calls = Arc::new(AtomicUsize::new(0));
-        let protected = calls.clone();
+        let (protected, calls) = mpsc::channel();
         let protector = Arc::new(crate::tun::FnSocketProtector::new(move |fd| {
-            assert!(unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0);
-            protected.fetch_add(1, Ordering::SeqCst);
+            let fd = unsafe { BorrowedFd::borrow_raw(fd) };
+            let socket = socket2::SockRef::from(&fd);
+            let info = (socket.r#type()?, socket.local_addr()?.as_socket().unwrap());
+            let _ = protected.send(info);
             Ok(())
         }));
         let (running, service) =
             start_test_service(serde_yaml::to_string(&configs).unwrap(), protector);
+        // Only WireGuard opens sockets before the first forwarded packet.
+        let startup: Vec<_> = (0..2)
+            .map(|_| {
+                calls
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("WireGuard socket was not protected")
+            })
+            .collect();
+        assert!(
+            startup
+                .iter()
+                .all(|(kind, _)| *kind == socket2::Type::DGRAM)
+        );
+        assert!(startup.iter().any(|(_, address)| address.port() == port));
+        assert!(
+            startup
+                .iter()
+                .any(|(_, address)| address.port() != 0 && address.port() != port)
+        );
         let (stack, mut tasks) = runtime.block_on(bridge(wire, framed)).unwrap();
         let _active = runtime.block_on(async {
             timeout(Duration::from_secs(30), async {
@@ -180,12 +216,13 @@ fn raw_fd_wireguard_service_forwards_and_restarts_without_leaks() {
             .await
             .expect("FFI WireGuard forwarding stalled")
         });
-        assert!(
-            calls.load(Ordering::SeqCst) >= 2,
-            "WireGuard sockets were not protected"
-        );
         assert!(is_service_running());
+        let stopping = Instant::now();
         assert!(stop_service());
+        assert!(
+            stopping.elapsed() < Duration::from_secs(4),
+            "service required forced shutdown"
+        );
         assert!(service.is_finished());
         assert!(!running.load(Ordering::SeqCst));
         assert!(!is_service_running());
