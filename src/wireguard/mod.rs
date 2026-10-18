@@ -1,6 +1,9 @@
 mod detour;
 mod io;
 #[cfg(test)]
+#[path = "../../tests/cases/wireguard_support.rs"]
+pub(crate) mod test_support;
+#[cfg(test)]
 mod tests;
 
 use async_trait::async_trait;

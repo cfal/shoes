@@ -1,3 +1,4 @@
+use super::test_support as config;
 use super::*;
 use crate::async_stream::{AsyncReadMessage, AsyncWriteMessage};
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -6,9 +7,6 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, ReadBuf},
     net::{TcpListener, UdpSocket},
 };
-
-#[path = "../../tests/cases/wireguard_support.rs"]
-mod config;
 
 const CLIENT: usize = 0;
 const SERVER: usize = 1;

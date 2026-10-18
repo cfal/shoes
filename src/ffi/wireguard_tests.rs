@@ -2,6 +2,7 @@ use super::{is_service_running, stop_service, tests::start_test_service};
 use crate::{
     async_stream::{AsyncReadMessage, AsyncWriteMessage},
     ip_stack::{driver::PacketStack, packet::PacketBuffer},
+    wireguard::test_support as config,
 };
 use serde_json::json;
 use shoes_test_support::wireguard::EchoTargets;
@@ -21,10 +22,6 @@ use tokio::{
     task::JoinSet,
     time::timeout,
 };
-
-#[path = "../../tests/cases/wireguard_support.rs"]
-#[allow(dead_code)]
-mod config;
 
 fn header(ipv6: bool) -> [u8; 4] {
     #[cfg(any(target_os = "macos", target_os = "ios"))]
