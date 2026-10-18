@@ -9,7 +9,6 @@ use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -579,6 +578,7 @@ mod lifecycle_tests {
     use crate::async_stream::{
         AsyncFlushMessage, AsyncPing, AsyncReadMessage, AsyncShutdownMessage, AsyncWriteMessage,
     };
+    use std::pin::Pin;
     use std::sync::atomic::{AtomicU8, Ordering};
     use std::task::{Context, Poll};
 

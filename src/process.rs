@@ -28,6 +28,9 @@ struct PreparedServers {
 
 async fn prepare(paths: &[String], previous: Option<&DnsRegistry>) -> io::Result<PreparedServers> {
     let mut validated = load_validated(paths).await?;
+    if let Some(previous) = previous {
+        validated.validate_network_endpoints(previous.forbidden_ranges())?;
+    }
     #[cfg(unix)]
     let wireguard = if let Some(previous) = previous {
         crate::wireguard::Prepared::with_forbidden(&mut validated, previous.forbidden_ranges())
