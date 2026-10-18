@@ -18,7 +18,7 @@ fn reject(ranges: &[IpNetwork], ip: IpAddr, label: &str) -> io::Result<()> {
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("{label} overlaps an active fake IP range: {ip}"),
+            format!("{label} overlaps an active fake IP range or TUN endpoint: {ip}"),
         ));
     }
     Ok(())
@@ -128,7 +128,7 @@ pub(super) fn validate(config: &mut ValidatedConfigs) -> io::Result<()> {
                 [tun.address, tun.destination]
                     .into_iter()
                     .flatten()
-                    .map(IpNetwork::from),
+                    .map(|ip| IpNetwork::from(ip.to_canonical())),
             );
         }
     }
@@ -197,9 +197,8 @@ impl ValidatedConfigs {
         for endpoint in &self.wireguard_endpoints {
             for peer in &endpoint.peers {
                 if let Some(address) = &peer.endpoint {
-                    if let Ok(address) = address.parse::<std::net::SocketAddr>() {
-                        reject(ranges, address.ip(), "WireGuard endpoint")?;
-                    }
+                    let address = NetLocation::from_str(address, None)?;
+                    target(ranges, &address, "WireGuard endpoint")?;
                 }
             }
         }

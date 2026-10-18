@@ -450,17 +450,18 @@ async fn wireguard_bind_selects_a_compatible_hostname_address() {
 #[tokio::test]
 async fn fake_dns_guards_wireguard_peer_and_outer_proxy_hostnames() {
     use serde_json::json;
-    for tun_endpoint in [false, true] {
+    for tun_address in [None, Some("127.0.0.1"), Some("::ffff:127.0.0.1")] {
+        let tun_endpoint = tun_address.is_some();
         let mut raw: serde_json::Value = serde_yaml::from_str(&pair_config(51820)).unwrap();
         raw[1]["peers"][0]["endpoint"] = json!("localhost:51820");
         raw.as_array_mut().unwrap().push(json!({
             "dns_group":"fake", "dns_servers":"system",
             "fake_ip":{"ipv4_range":if tun_endpoint { "198.18.0.0/15" } else { "127.0.0.0/8" }}
         }));
-        if tun_endpoint {
+        if let Some(address) = tun_address {
             raw.as_array_mut()
                 .unwrap()
-                .push(json!({"device_name":"unused", "address":"127.0.0.1"}));
+                .push(json!({"device_name":"unused", "address":address}));
         }
         let mut configs = validate(&raw.to_string()).unwrap();
         assert_eq!(
@@ -553,6 +554,27 @@ async fn fake_dns_guards_wireguard_peer_and_outer_proxy_hostnames() {
                 stdio::ErrorKind::InvalidInput
             );
         }
+    }
+}
+
+#[test]
+fn fake_dns_rejects_unbracketed_wireguard_literals() {
+    use serde_json::json;
+    for endpoint in ["::ffff:198.18.0.5:51820", "2001:2::5:51820"] {
+        let mut raw: serde_json::Value = serde_yaml::from_str(&pair_config(51820)).unwrap();
+        raw[1]["peers"][0]["endpoint"] = json!(endpoint);
+        raw.as_array_mut().unwrap().push(json!({
+            "dns_group":"fake", "dns_servers":"system",
+            "fake_ip":{"ipv6_range":"2001:2::/48"}
+        }));
+        let error = validate(&raw.to_string()).err().unwrap();
+        assert_eq!(error.kind(), stdio::ErrorKind::InvalidInput);
+        assert!(
+            error.to_string().contains("WireGuard endpoint overlaps"),
+            "{error}"
+        );
+        raw[2]["fake_ip"] = false.into();
+        validate(&raw.to_string()).unwrap();
     }
 }
 

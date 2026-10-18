@@ -222,7 +222,7 @@ impl Prepared {
                         [tun.address, tun.destination]
                             .into_iter()
                             .flatten()
-                            .map(IpNetwork::from),
+                            .map(|ip| IpNetwork::from(ip.to_canonical())),
                     );
                 }
             }
