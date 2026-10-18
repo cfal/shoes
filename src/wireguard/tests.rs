@@ -7,6 +7,12 @@ use tokio::{
     net::{TcpListener, UdpSocket},
 };
 
+#[path = "../../tests/cases/wireguard_support.rs"]
+mod config;
+
+const CLIENT: usize = 0;
+const SERVER: usize = 1;
+
 fn key(byte: u8) -> String {
     STANDARD.encode([byte; 32])
 }
@@ -15,36 +21,14 @@ fn public(byte: u8) -> String {
 }
 
 fn pair_config(port: u16) -> String {
-    format!(
-        r#"
-- wireguard: server
-  private_key: '{}'
-  addresses: ['10.77.0.1/32', 'fd77::1/128']
-  listen: '0.0.0.0:{port}'
-  peers:
-    - public_key: '{}'
-      pre_shared_key: '{}'
-      allowed_ips: ['10.77.0.2/32', 'fd77::2/128']
-  inbound:
-    rules:
-      - masks: ['0.0.0.0/0', '::/0']
-        action: allow
-- wireguard: client
-  private_key: '{}'
-  addresses: ['10.77.0.2/32', 'fd77::2/128']
-  peers:
-    - public_key: '{}'
-      pre_shared_key: '{}'
-      endpoint: '127.0.0.1:{port}'
-      allowed_ips: ['0.0.0.0/0', '::/0']
-"#,
-        key(41),
-        public(42),
-        key(43),
-        key(42),
-        public(41),
-        key(43)
-    )
+    use serde_json::json;
+    let mut server = config::server(port);
+    server["rules"] = json!([{"masks": ["0.0.0.0/0", "::/0"], "action": "allow"}]);
+    let mut client = config::client(port);
+    client["client_group"] = json!("client");
+    let mut socks = config::socks(0);
+    socks["rules"][0]["client_chain"] = json!("client");
+    serde_yaml::to_string(&json!([server, client, socks])).unwrap()
 }
 fn validate(yaml: &str) -> stdio::Result<ValidatedConfigs> {
     crate::config::create_server_configs(serde_yaml::from_str(yaml).map_err(stdio::Error::other)?)
@@ -171,7 +155,7 @@ async fn wireguard_tcp_udp_both_families_empty_outer_and_reload_rebind() {
         let mut configs = validate(&pair_config(port)).unwrap();
         let prepared = Prepared::new(&mut configs).await.unwrap();
         drop(reservation);
-        let connector = prepared.endpoints[1].connector.clone();
+        let connector = prepared.endpoints[CLIENT].connector.clone();
         assert!(connector.handle().is_err());
         let mut dns = DnsRegistry::new();
         let mut running = Running::default();
@@ -199,8 +183,8 @@ async fn wireguard_mapped_ipv4_destinations_use_the_ipv4_tunnel() {
     tokio::time::timeout(Duration::from_secs(5), async {
         let reservation = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
         let mut configs = validate(&pair_config(reservation.local_addr().unwrap().port())).unwrap();
-        configs.wireguard_endpoints[1].addresses = vec!["10.77.0.2/32".into()];
-        configs.wireguard_endpoints[1].peers[0].allowed_ips = vec!["0.0.0.0/0".into()];
+        configs.wireguard_endpoints[CLIENT].addresses = vec!["10.77.0.2/32".into()];
+        configs.wireguard_endpoints[CLIENT].peers[0].allowed_ips = vec!["0.0.0.0/0".into()];
         let prepared = Prepared::new(&mut configs).await.unwrap();
         drop(reservation);
         let mut running = start_prepared(&prepared).await;
@@ -209,7 +193,7 @@ async fn wireguard_mapped_ipv4_destinations_use_the_ipv4_tunnel() {
             SocketAddr::new("::ffff:127.0.0.1".parse().unwrap(), address.port())
         };
         check_echo(
-            prepared.endpoints[1].connector.as_ref(),
+            prepared.endpoints[CLIENT].connector.as_ref(),
             mapped(tcp),
             mapped(udp),
         )
@@ -231,7 +215,7 @@ async fn wireguard_concurrent_tcp_transfers_preserve_all_data() {
         let (tcp, _, _echoes) = echo_servers(false).await;
         let mut flows = JoinSet::new();
         for id in 0..16u8 {
-            let connector = prepared.endpoints[1].connector.clone();
+            let connector = prepared.endpoints[CLIENT].connector.clone();
             flows.spawn(async move {
                 let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
                 let target = NetLocation::from_ip_addr(tcp.ip(), tcp.port()).into();
@@ -271,18 +255,18 @@ async fn wireguard_mapped_ipv4_outer_endpoint_uses_ipv4_transport() {
             let reservation = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
             let port = reservation.local_addr().unwrap().port();
             let mut configs = validate(&pair_config(port)).unwrap();
-            let client = &mut configs.wireguard_endpoints[1];
+            let client = &mut configs.wireguard_endpoints[CLIENT];
             client.listen = listen.map(|address| address.parse().unwrap());
             client.peers[0].endpoint = Some(format!("[::ffff:127.0.0.1]:{port}"));
             let prepared = Prepared::new(&mut configs).await.unwrap();
             assert_eq!(
-                prepared.endpoints[1].peers[0].endpoints,
+                prepared.endpoints[CLIENT].peers[0].endpoints,
                 vec![SocketAddr::from(([127, 0, 0, 1], port))]
             );
             drop(reservation);
             let mut running = start_prepared(&prepared).await;
             let (tcp, udp, _echoes) = echo_servers(false).await;
-            check_echo(prepared.endpoints[1].connector.as_ref(), tcp, udp).await;
+            check_echo(prepared.endpoints[CLIENT].connector.as_ref(), tcp, udp).await;
             running.stop().await;
         }
     })
@@ -296,14 +280,14 @@ async fn wireguard_ipv6_outer_transport() {
         let reservation = std::net::UdpSocket::bind("[::]:0").unwrap();
         let port = reservation.local_addr().unwrap().port();
         let mut configs = validate(&pair_config(port)).unwrap();
-        configs.wireguard_endpoints[0].listen = Some(format!("[::]:{port}").parse().unwrap());
-        configs.wireguard_endpoints[1].peers[0].endpoint = Some(format!("[::1]:{port}"));
+        configs.wireguard_endpoints[SERVER].listen = Some(format!("[::]:{port}").parse().unwrap());
+        configs.wireguard_endpoints[CLIENT].peers[0].endpoint = Some(format!("[::1]:{port}"));
         let prepared = Prepared::new(&mut configs).await.unwrap();
         drop(reservation);
         let mut running = start_prepared(&prepared).await;
         for v6 in [false, true] {
             let (tcp, udp, _echoes) = echo_servers(v6).await;
-            check_echo(prepared.endpoints[1].connector.as_ref(), tcp, udp).await;
+            check_echo(prepared.endpoints[CLIENT].connector.as_ref(), tcp, udp).await;
         }
         running.stop().await;
         std::net::UdpSocket::bind(("::", port)).unwrap();
@@ -331,7 +315,7 @@ async fn wireguard_dual_stack_connect_falls_back_without_waiting_for_blackholed_
         let reservation = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
         let mut configs = validate(&pair_config(reservation.local_addr().unwrap().port())).unwrap();
         // Authenticated IPv6 packets are dropped by the remote peer's allowed_ips check.
-        configs.wireguard_endpoints[0].peers[0].allowed_ips = vec!["10.77.0.2/32".into()];
+        configs.wireguard_endpoints[SERVER].peers[0].allowed_ips = vec!["10.77.0.2/32".into()];
         let prepared = Prepared::new(&mut configs).await.unwrap();
         drop(reservation);
         let mut running = start_prepared(&prepared).await;
@@ -343,7 +327,7 @@ async fn wireguard_dual_stack_connect_falls_back_without_waiting_for_blackholed_
         let target = NetLocation::from_str(&format!("dual.test:{}", tcp.port()), None)
             .unwrap()
             .into();
-        let mut stream = prepared.endpoints[1]
+        let mut stream = prepared.endpoints[CLIENT]
             .connector
             .connect(&resolver, &target)
             .await
@@ -362,12 +346,12 @@ async fn wireguard_dual_stack_connect_falls_back_without_waiting_for_blackholed_
 #[tokio::test]
 async fn wireguard_bind_selects_a_compatible_hostname_address() {
     let mut configs = validate(&pair_config(51820)).unwrap();
-    configs.wireguard_endpoints[1].peers[0].endpoint = Some("localhost:51820".into());
+    configs.wireguard_endpoints[CLIENT].peers[0].endpoint = Some("localhost:51820".into());
     for listen in ["0.0.0.0:0", "[::1]:0"] {
         let listen: SocketAddr = listen.parse().unwrap();
-        configs.wireguard_endpoints[1].listen = Some(listen);
+        configs.wireguard_endpoints[CLIENT].listen = Some(listen);
         let prepared = Prepared::new(&mut configs).await.unwrap();
-        for endpoint in &prepared.endpoints[1].peers[0].endpoints {
+        for endpoint in &prepared.endpoints[CLIENT].peers[0].endpoints {
             assert_eq!(endpoint.is_ipv4(), listen.is_ipv4(), "listen: {listen}");
         }
     }
@@ -382,7 +366,7 @@ async fn wireguard_ipv4_fallback_selects_a_compatible_resolved_peer() {
     assert!(local.is_ipv4());
     let ipv6: SocketAddr = "[::1]:51820".parse().unwrap();
     let ipv4: SocketAddr = "127.0.0.1:51820".parse().unwrap();
-    let client = &mut prepared.endpoints[1];
+    let client = &mut prepared.endpoints[CLIENT];
     assert!(client.config.listen.is_none());
     client.peers[0].endpoints = vec![ipv6, ipv4];
     assert_eq!(
@@ -400,7 +384,9 @@ async fn wireguard_ipv4_fallback_selects_a_compatible_resolved_peer() {
         stdio::ErrorKind::AddrNotAvailable,
     );
     assert!(
-        prepared.endpoints[0].peers_for_socket(Some(local)).unwrap()[0]
+        prepared.endpoints[SERVER]
+            .peers_for_socket(Some(local))
+            .unwrap()[0]
             .endpoint
             .is_none()
     );
@@ -411,7 +397,7 @@ async fn wireguard_ipv4_fallback_selects_a_compatible_resolved_peer() {
 #[test]
 fn wireguard_bind_validates_peer_address_families() {
     let mut configs = validate(&pair_config(51820)).unwrap();
-    let client = &mut configs.wireguard_endpoints[1];
+    let client = &mut configs.wireguard_endpoints[CLIENT];
     for (listen, endpoint, compatible) in [
         ("0.0.0.0:0", "[::1]:51820", false),
         ("[::1]:0", "127.0.0.1:51820", false),
@@ -432,23 +418,19 @@ fn wireguard_bind_validates_peer_address_families() {
 }
 
 #[tokio::test]
-async fn wireguard_references_share_a_connector_and_are_not_direct() {
-    let mut configs = validate(&format!(
-        r#"{}
-- address: '0.0.0.0:1080'
-  protocol: {{type: socks}}
-  rules:
-    - masks: '0.0.0.0/0'
-      action: allow
-      client_chain:
-        - protocol: {{type: wireguard, endpoint: client}}
-"#,
-        pair_config(10001)
-    ))
-    .unwrap();
-    configs.configs.push(configs.configs[0].clone());
+async fn wireguard_copied_clients_share_a_connector_only_within_their_generation() {
+    use serde_json::{Value, json};
+    let mut raw: Value = serde_yaml::from_str(&pair_config(10001)).unwrap();
+    let mut duplicate = raw[1].clone();
+    duplicate["client_group"] = json!("copy");
+    raw[2]["rules"][0]["client_chain"] = json!([{"pool": [
+        "client", "copy", raw[1]["client_proxies"][0],
+    ]}]);
+    raw.as_array_mut().unwrap().push(duplicate);
+    let mut configs = validate(&serde_yaml::to_string(&raw).unwrap()).unwrap();
     let prepared = Prepared::new(&mut configs).await.unwrap();
-    let expected: Arc<dyn SocketConnector> = prepared.endpoints[1].connector.clone();
+    assert_eq!(prepared.endpoints.len(), 2);
+    let expected: Arc<dyn SocketConnector> = prepared.endpoints[CLIENT].connector.clone();
     let mut first = None;
     let mut references = 0;
     configs
@@ -464,7 +446,10 @@ async fn wireguard_references_share_a_connector_and_are_not_direct() {
             Ok(())
         })
         .unwrap();
-    assert_eq!(references, 2);
+    assert_eq!(references, 3);
+    let next = Prepared::new(&mut configs).await.unwrap();
+    let next_connector: Arc<dyn SocketConnector> = next.endpoints[CLIENT].connector.clone();
+    assert!(!Arc::ptr_eq(&expected, &next_connector));
     let connector = first.unwrap();
     let chain = crate::client_proxy_chain::ClientProxyChain::new(
         vec![crate::client_proxy_chain::InitialHopEntry::Wireguard(
@@ -477,34 +462,35 @@ async fn wireguard_references_share_a_connector_and_are_not_direct() {
 
 #[test]
 fn wireguard_validation_rejects_unsafe_or_ambiguous_configs() {
+    use serde_json::{Value, json};
     let base = pair_config(10001);
-    for invalid in [
-        base.replace("  listen:", "  mtu: 9000\n  listen:"),
-        base.replace("wireguard: client", "wireguard: server"),
-        base.replace("['10.77.0.1/32', 'fd77::1/128']", "[]"),
-        base.replace("10.77.0.1/32", "255.255.255.255/32"),
-        base.replace("fd77::1/128", "::ffff:10.77.0.9/128"),
-        base.replace(
-            "allowed_ips: ['10.77.0.2/32', 'fd77::2/128']",
-            "allowed_ips: []",
-        ),
-        base.replace(
-            "  inbound:\n    rules:\n      - masks: ['0.0.0.0/0', '::/0']\n        action: allow",
-            "  inbound: {rules: []}",
-        ),
-        base.replace(
-            &format!("public_key: '{}'", public(42)),
-            &format!("public_key: '{}'", public(41)),
-        ),
-        format!(
-            "{base}\n- address: '0.0.0.0:1080'\n  protocol: {{type: socks}}\n  rules:\n    - masks: '0.0.0.0/0'\n      client_chain:\n        - protocol: {{type: wireguard, endpoint: missing}}\n"
-        ),
+    for (pointer, value) in [
+        ("/0/protocol/mtu", json!(9000)),
+        ("/0/protocol/addresses", json!([])),
+        ("/0/protocol/addresses", json!(["255.255.255.255/32"])),
+        ("/0/protocol/addresses", json!(["::ffff:10.77.0.9/128"])),
+        ("/0/protocol/peers/0/allowed_ips", json!([])),
+        ("/0/protocol/peers/0/public_key", json!(public(41))),
+        ("/0/rules", json!([])),
+        ("/0/rules", Value::Null),
+        ("/1/client_proxies/0/address", json!("127.0.0.1:0")),
+        ("/1/client_proxies/0/protocol/addresses", json!([])),
+        ("/1/client_proxies/0/protocol/allowed_ips", json!([])),
     ] {
+        let mut invalid: Value = serde_yaml::from_str(&base).unwrap();
+        if pointer.ends_with("/mtu") {
+            invalid[0]["protocol"]["mtu"] = value;
+        } else {
+            *invalid.pointer_mut(pointer).unwrap() = value;
+        }
         assert!(
-            validate(&invalid).is_err(),
-            "accepted invalid WireGuard config"
+            validate(&serde_yaml::to_string(&invalid).unwrap()).is_err(),
+            "accepted invalid WireGuard config at {pointer}"
         );
     }
+    let mut missing_rules: Value = serde_yaml::from_str(&base).unwrap();
+    missing_rules[0].as_object_mut().unwrap().remove("rules");
+    assert!(validate(&serde_yaml::to_string(&missing_rules).unwrap()).is_err());
     let roundtrip =
         serde_yaml::to_string(&serde_yaml::from_str::<Vec<crate::config::Config>>(&base).unwrap())
             .unwrap();
@@ -527,7 +513,7 @@ fn wireguard_rejects_non_contributory_peer_keys() {
     minus_one[31] = 0x7f;
     for bytes in [[0; 32], low_order, minus_one] {
         let mut configs = validate(&pair_config(51820)).unwrap();
-        let endpoint = &mut configs.wireguard_endpoints[1];
+        let endpoint = &mut configs.wireguard_endpoints[CLIENT];
         endpoint.peers[0].public_key = crate::config::wireguard::WireguardKey(bytes);
         for psk in [Some(crate::config::wireguard::WireguardKey([7; 32])), None] {
             endpoint.peers[0].pre_shared_key = psk;
@@ -543,7 +529,7 @@ fn wireguard_dns_and_chain_constraints() {
     let base = pair_config(10001);
     let dns = |url: &str, extra: &str| {
         format!(
-            "{base}\n- dns_group: tunnel\n  dns_servers:\n    - url: '{url}'\n      client_chain:\n        - protocol: {{type: wireguard, endpoint: client}}\n      {extra}\n"
+            "{base}\n- dns_group: tunnel\n  dns_servers:\n    - url: '{url}'\n      client_chain: client\n      {extra}\n"
         )
     };
     for url in [
@@ -562,26 +548,26 @@ fn wireguard_dns_and_chain_constraints() {
     }
     assert!(validate(&dns("tcp://1.1.1.1", "bootstrap_url: udp://8.8.8.8")).is_err());
     assert!(validate(&format!("{}\n- dns_group: dependent\n  dns_servers:\n    - url: https://dns.example/dns-query\n      bootstrap_url: tunnel\n", dns("tcp://1.1.1.1", ""))).is_err());
-    let rule = |chain: &str| {
-        format!(
-            "{base}\n- address: '0.0.0.0:1080'\n  protocol: {{type: socks}}\n  rules:\n    - masks: '0.0.0.0/0'\n      action: allow\n      client_chain: {chain}\n"
-        )
-    };
-    for chain in [
-        "[{protocol: {type: socks}, address: '127.0.0.1:1081'}, {protocol: {type: wireguard, endpoint: client}}]",
-        "[{protocol: {type: tls, protocol: {type: wireguard, endpoint: client}}}]",
-        "[{protocol: {type: wireguard, endpoint: client}, transport: quic}]",
-        "[{protocol: {type: wireguard, endpoint: client}, address: '127.0.0.1:9'}]",
-        "[{protocol: {type: wireguard, endpoint: client}, bind_interface: lo}]",
-    ] {
-        assert!(validate(&rule(chain)).is_err(), "accepted {chain}");
-    }
-    assert!(validate(&base.replace("  listen:", "  unknown: true\n  listen:")).is_err());
+    use serde_json::{Value, json};
+    let mut raw: Value = serde_yaml::from_str(&base).unwrap();
+    raw[2]["rules"][0]["client_chain"] = json!([
+        {"address": "127.0.0.1:1081", "protocol": {"type": "socks"}}, "client",
+    ]);
+    let error = validate(&serde_yaml::to_string(&raw).unwrap())
+        .err()
+        .unwrap();
+    assert!(error.to_string().contains("hop 0"));
+    let client_protocol = raw[1]["client_proxies"][0]["protocol"].clone();
+    raw[2]["rules"][0]["client_chain"] = json!([{
+        "address": "127.0.0.1:443", "protocol": {"type": "tls", "protocol": client_protocol},
+    }]);
+    assert!(validate(&serde_yaml::to_string(&raw).unwrap()).is_err());
     assert!(validate(&base.replace("10.77.0.1/32", "invalid CIDR")).is_err());
     for example in [
         include_str!("../../examples/wireguard_client.yaml"),
         include_str!("../../examples/wireguard_server.yaml"),
         include_str!("../../examples/wireguard_outer_chain.yaml"),
+        include_str!("../../examples/wireguard_proxied_server.yaml"),
     ] {
         validate(example).unwrap();
     }
@@ -590,7 +576,7 @@ fn wireguard_dns_and_chain_constraints() {
 #[test]
 fn wireguard_rejects_duplicate_peers_and_cross_peer_route_overlaps() {
     let configs = validate(&pair_config(10001)).unwrap();
-    let mut server = configs.wireguard_endpoints[0].clone();
+    let mut server = configs.wireguard_endpoints[SERVER].clone();
     server.peers.push(server.peers[0].clone());
     assert!(server.validate().is_err());
     server.peers[1].public_key = serde_yaml::from_str(&public(44)).unwrap();
@@ -608,64 +594,92 @@ fn wireguard_outer_chain_validation_and_roundtrip() {
     let direct = json!({"protocol": {"type": "direct"}});
     let check = |value: &serde_json::Value| validate(&serde_yaml::to_string(value).unwrap());
     let mut valid = base.clone();
-    valid[1]["outer_client_chain"] = json!([direct]);
+    valid[1]["client_proxies"][0]["protocol"]["peer_client_chain"] = json!([direct]);
     check(&valid).unwrap();
     let raw: Vec<crate::config::Config> =
         serde_yaml::from_str(&serde_yaml::to_string(&valid).unwrap()).unwrap();
     validate(&serde_yaml::to_string(&raw).unwrap()).unwrap();
     for (field, value) in [
         ("listen", json!("0.0.0.0:0")),
-        ("bind_interface", json!("lo")),
-        ("outer_client_chain", json!([])),
-        ("outer_client_chain", json!("missing-group")),
+        ("peer_client_chain", json!([])),
+        ("peer_client_chain", json!("missing-group")),
         (
-            "outer_client_chain",
+            "peer_client_chain",
             json!([{"protocol": {"type": "wireguard", "endpoint": "missing"}}]),
         ),
     ] {
         let mut invalid = valid.clone();
-        invalid[1][field] = value;
+        invalid[1]["client_proxies"][0]["protocol"][field] = value;
         assert!(check(&invalid).is_err(), "accepted {field}");
     }
+    let mut bound = valid.clone();
+    bound[1]["client_proxies"][0]["bind_interface"] = json!("lo");
+    assert!(check(&bound).is_err());
     let mut missing_peer = valid.clone();
-    missing_peer[1]["peers"][0]
+    missing_peer[1]["client_proxies"][0]
         .as_object_mut()
         .unwrap()
-        .remove("endpoint");
+        .remove("address");
     assert!(check(&missing_peer).is_err());
 
     let mut nested = base.clone();
-    nested[1]["mtu"] = json!(1280);
-    nested[1]["outer_client_chain"] =
-        json!([{"protocol": {"type": "wireguard", "endpoint": "server"}}]);
+    let mut carrier = base[1].clone();
+    carrier["client_group"] = json!("carrier");
+    carrier["client_proxies"][0]["address"] = json!("127.0.0.1:51821");
+    nested.as_array_mut().unwrap().push(carrier);
+    nested[1]["client_proxies"][0]["protocol"]["mtu"] = json!(1280);
+    nested[1]["client_proxies"][0]["protocol"]["peer_client_chain"] = json!("carrier");
     nested.as_array_mut().unwrap().reverse();
     let sorted = check(&nested).unwrap();
-    assert_eq!(sorted.wireguard_endpoints[0].wireguard, "server");
-    nested[0]["mtu"] = json!(1408);
+    assert_eq!(
+        sorted.wireguard_endpoints[0].peers[0].endpoint.as_deref(),
+        Some("127.0.0.1:51821")
+    );
+    assert_eq!(
+        sorted.wireguard_endpoints[1].peers[0].endpoint.as_deref(),
+        Some("127.0.0.1:51820")
+    );
+    nested[2]["client_proxies"][0]["protocol"]["mtu"] = json!(1408);
     assert!(check(&nested).err().unwrap().to_string().contains("MTU"));
 
-    // A TCP proxy after the carrier segments datagrams, so MTU alone cannot detect cycles.
-    let cycle_chain = |endpoint| {
+    let cycle_chain = |group| {
         json!([
-            {"protocol": {"type": "wireguard", "endpoint": endpoint}},
-            {"address": "127.0.0.1:443", "protocol": {"type": "vless", "user_id": "b85798ef-e9dc-46a4-9a87-8da4499d36d0"}},
+            group,
+            {"address": "127.0.0.1:443", "protocol": config::vless_protocol()},
         ])
     };
     let mut cyclic = valid.clone();
-    cyclic[1]["outer_client_chain"] = cycle_chain("client");
-    assert!(check(&cyclic).err().unwrap().to_string().contains("cycle"));
-    cyclic[1]["outer_client_chain"] = cycle_chain("server");
-    cyclic[0].as_object_mut().unwrap().remove("listen");
-    cyclic[0]["peers"][0]["endpoint"] = json!("127.0.0.1:51820");
-    cyclic[0]["outer_client_chain"] = cycle_chain("client");
-    assert!(check(&cyclic).err().unwrap().to_string().contains("cycle"));
-    cyclic[1]["outer_client_chain"][0] = json!({"pool": [
-        direct,
-        {"protocol": {"type": "wireguard", "endpoint": "server"}},
-    ]});
-    assert!(check(&cyclic).err().unwrap().to_string().contains("cycle"));
+    cyclic[1]["client_proxies"][0]["protocol"]["peer_client_chain"] = cycle_chain("client");
+    assert!(
+        check(&cyclic)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("Circular dependency")
+    );
+    let mut carrier = base[1].clone();
+    carrier["client_group"] = json!("carrier");
+    carrier["client_proxies"][0]["protocol"]["peer_client_chain"] = cycle_chain("client");
+    cyclic.as_array_mut().unwrap().push(carrier);
+    cyclic[1]["client_proxies"][0]["protocol"]["peer_client_chain"] = cycle_chain("carrier");
+    assert!(
+        check(&cyclic)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("Circular dependency")
+    );
+    cyclic[1]["client_proxies"][0]["protocol"]["peer_client_chain"][0] =
+        json!({"pool": [direct, "carrier"]});
+    assert!(
+        check(&cyclic)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("Circular dependency")
+    );
 
-    valid[1]["outer_client_chain"] = json!("outer");
+    valid[1]["client_proxies"][0]["protocol"]["peer_client_chain"] = json!("outer");
     valid
         .as_array_mut()
         .unwrap()
@@ -681,16 +695,16 @@ async fn wireguard_outer_chain_requires_udp_before_starting() {
         "{type: vless, user_id: b85798ef-e9dc-46a4-9a87-8da4499d36d0, udp_enabled: false}",
     ] {
         let mut raw: serde_json::Value = serde_yaml::from_str(&pair_config(51820)).unwrap();
-        raw[1]["outer_client_chain"] = serde_yaml::from_str(&format!(
-            "[{{address: 'unresolvable.invalid:9', protocol: {protocol}}}]"
-        ))
+        raw[1]["client_proxies"][0]["protocol"]["peer_client_chain"] = serde_yaml::from_str(
+            &format!("[{{address: 'unresolvable.invalid:9', protocol: {protocol}}}]"),
+        )
         .unwrap();
         let error = validate(&serde_yaml::to_string(&raw).unwrap())
             .err()
             .unwrap();
         assert!(error.to_string().contains("does not support UDP"));
         let mut configs = validate(&pair_config(51820)).unwrap();
-        configs.wireguard_endpoints[1].outer_client_chain = Some(
+        configs.wireguard_endpoints[CLIENT].peer_client_chain = Some(
             serde_yaml::from_str(&format!(
                 "[{{address: '127.0.0.1:9', protocol: {protocol}}}]"
             ))
@@ -700,7 +714,7 @@ async fn wireguard_outer_chain_requires_udp_before_starting() {
         assert!(error.to_string().contains("does not support UDP"));
     }
     let mut configs = validate(&pair_config(51820)).unwrap();
-    configs.wireguard_endpoints[1].outer_client_chain = Some(
+    configs.wireguard_endpoints[CLIENT].peer_client_chain = Some(
         serde_yaml::from_str(
             r#"
       - address: '127.0.0.1:9'
@@ -725,25 +739,26 @@ async fn wireguard_nested_outer_chain_and_reload() {
         let inner_port = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
         let mut carrier: Vec<Value> =
             serde_yaml::from_str(&pair_config(carrier_port.local_addr().unwrap().port())).unwrap();
-        carrier[0]["wireguard"] = json!("carrier-server");
-        carrier[1]["wireguard"] = json!("carrier-client");
+        carrier[1]["client_group"] = json!("carrier-client");
+        carrier[2]["rules"][0]["client_chain"] = json!("carrier-client");
         let mut inner: Vec<Value> =
             serde_yaml::from_str(&pair_config(inner_port.local_addr().unwrap().port())).unwrap();
-        inner[1]["mtu"] = json!(1280);
-        inner[1]["outer_client_chain"] =
-            json!([{"protocol": {"type": "wireguard", "endpoint": "carrier-client"}}]);
+        inner[1]["client_proxies"][0]["protocol"]["mtu"] = json!(1280);
+        inner[1]["client_proxies"][0]["protocol"]["peer_client_chain"] = json!("carrier-client");
         inner.extend(carrier);
         let mut configs = validate(&serde_yaml::to_string(&inner).unwrap()).unwrap();
         let prepared = Prepared::new(&mut configs).await.unwrap();
-        let find = |name| {
+        let find = |port| {
             prepared
                 .endpoints
                 .iter()
-                .find(|endpoint| endpoint.config.wireguard == name)
+                .find(|endpoint| {
+                    endpoint.config.peers[0].endpoint == Some(format!("127.0.0.1:{port}"))
+                })
                 .unwrap()
         };
-        let client = find("client");
-        let carrier = find("carrier-client");
+        let client = find(inner_port.local_addr().unwrap().port());
+        let carrier = find(carrier_port.local_addr().unwrap().port());
         assert!(Arc::strong_count(&carrier.connector) > 1);
         drop((carrier_port, inner_port));
         let mut running = Running::default();
@@ -770,18 +785,16 @@ async fn wireguard_detoured_endpoint_keeps_encrypted_peers_separate() {
         let first = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
         let second = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
         let mut configs = validate(&pair_config(first.local_addr().unwrap().port())).unwrap();
-        let mut other_server = configs.wireguard_endpoints[0].clone();
-        other_server.wireguard = "other-server".into();
+        let mut other_server = configs.wireguard_endpoints[SERVER].clone();
+        other_server.id = "other-server".into();
         other_server.private_key = crate::config::wireguard::WireguardKey([44; 32]);
         other_server.listen = Some(second.local_addr().unwrap());
-        other_server.inbound = Some(
-            serde_yaml::from_str(
-                "rules: [{masks: '198.18.0.2/32', action: allow, override_address: '127.0.0.1:0'}]",
-            )
-            .unwrap(),
-        );
-        let client = &mut configs.wireguard_endpoints[1];
-        client.outer_client_chain = Some(crate::config::ClientChain::default());
+        other_server.inbound.as_mut().unwrap().rules = serde_yaml::from_str(
+            "[{masks: '198.18.0.2/32', action: allow, override_address: '127.0.0.1:0'}]",
+        )
+        .unwrap();
+        let client = &mut configs.wireguard_endpoints[CLIENT];
+        client.peer_client_chain = Some(crate::config::ClientChain::default());
         client.peers[0].allowed_ips = vec!["127.0.0.1/32".into()];
         let mut other_peer = client.peers[0].clone();
         other_peer.public_key = serde_yaml::from_str(&public(44)).unwrap();
@@ -794,7 +807,7 @@ async fn wireguard_detoured_endpoint_keeps_encrypted_peers_separate() {
         let mut running = start_prepared(&prepared).await;
         let (tcp, udp, _servers) = echo_servers(false).await;
         let second_ip = "198.18.0.2".parse().unwrap();
-        let connector = prepared.endpoints[1].connector.as_ref();
+        let connector = prepared.endpoints[CLIENT].connector.as_ref();
         tokio::join!(
             check_echo(connector, tcp, udp),
             check_echo(
@@ -811,6 +824,7 @@ async fn wireguard_detoured_endpoint_keeps_encrypted_peers_separate() {
 
 #[tokio::test]
 async fn wireguard_chains_load_client_certificate_paths_before_validation() {
+    use serde_json::{Value, json};
     let directory = tempfile::tempdir().unwrap();
     let cert_path = directory.path().join("client.crt");
     let key_path = directory.path().join("client.key");
@@ -823,9 +837,9 @@ async fn wireguard_chains_load_client_certificate_paths_before_validation() {
     }]);
     for outer in [false, true] {
         if outer {
-            config[1]["outer_client_chain"] = chain.clone();
+            config[1]["client_proxies"][0]["protocol"]["peer_client_chain"] = chain.clone();
         } else {
-            config[0]["inbound"]["rules"][0]["client_chain"] = chain.clone();
+            config[0]["rules"][0]["client_chain"] = chain.clone();
         }
         let configs = serde_yaml::from_str(&serde_yaml::to_string(&config).unwrap()).unwrap();
         let (configs, count) = crate::config::convert_cert_paths(configs).await.unwrap();
@@ -833,6 +847,65 @@ async fn wireguard_chains_load_client_certificate_paths_before_validation() {
         crate::config::create_server_configs(configs).unwrap();
         config = serde_yaml::from_str(&pair_config(10001)).unwrap();
     }
+    let mut carrier = config[1]["client_proxies"][0].clone();
+    carrier["address"] = json!("127.0.0.1:10002");
+    carrier["protocol"]["peer_client_chain"] = chain;
+    let mut nested = config[1]["client_proxies"][0].clone();
+    nested["protocol"]["mtu"] = json!(1280);
+    nested["protocol"]["peer_client_chain"] = json!([carrier]);
+    let rule = json!({"masks": "0.0.0.0/0", "action": "allow", "client_chain": [nested]});
+    let dns = json!({"url": "tcp://192.0.2.53", "client_chain": [nested]});
+    for root in [
+        json!({"dns_group": "tunnel", "dns_servers": [dns]}),
+        json!({"address": "0.0.0.0:1080", "protocol": {"type": "socks"}, "dns": {"servers": [dns]}}),
+        json!({"device_fd": 7, "rules": [rule]}),
+    ] {
+        let raw: Vec<crate::config::Config> =
+            serde_yaml::from_str(&serde_yaml::to_string(&json!([root])).unwrap()).unwrap();
+        let (raw, count) = crate::config::convert_cert_paths(raw).await.unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(
+            crate::config::create_server_configs(raw)
+                .unwrap()
+                .wireguard_endpoints
+                .len(),
+            2
+        );
+    }
+    let raw: Vec<crate::config::Config> = serde_yaml::from_str(
+        &serde_yaml::to_string(&json!([
+            {"rule_group": "tunnel", "rules": [rule]},
+            {"address": "0.0.0.0:1080", "protocol": {"type": "socks"}, "rules": "tunnel"},
+        ]))
+        .unwrap(),
+    )
+    .unwrap();
+    let (raw, count) = crate::config::convert_cert_paths(raw).await.unwrap();
+    assert_eq!(count, 2);
+    assert_eq!(
+        crate::config::create_server_configs(raw)
+            .unwrap()
+            .wireguard_endpoints
+            .len(),
+        2
+    );
+
+    let mut server: Value = config[0].clone();
+    server.as_object_mut().unwrap().remove("address");
+    server["protocol"]["mtu"] = json!(1280);
+    server["protocol"]["peers"][0]["endpoint"] = json!("127.0.0.1:10003");
+    server["protocol"]["peers"][0]["persistent_keepalive"] = json!(1);
+    server["protocol"]["peer_client_chain"] = json!([carrier]);
+    let raw = serde_yaml::from_str(&serde_yaml::to_string(&json!([server])).unwrap()).unwrap();
+    let (raw, count) = crate::config::convert_cert_paths(raw).await.unwrap();
+    assert_eq!(count, 2);
+    assert_eq!(
+        crate::config::create_server_configs(raw)
+            .unwrap()
+            .wireguard_endpoints
+            .len(),
+        2
+    );
 }
 
 #[tokio::test]
@@ -873,7 +946,8 @@ async fn wireguard_replay_corruption_and_authenticated_endpoint_roaming() {
             }
         });
         let mut configs = validate(&pair_config(port)).unwrap();
-        configs.wireguard_endpoints[1].peers[0].endpoint = Some(format!("127.0.0.1:{front_port}"));
+        configs.wireguard_endpoints[CLIENT].peers[0].endpoint =
+            Some(format!("127.0.0.1:{front_port}"));
         for config in &mut configs.wireguard_endpoints {
             config.peers[0].pre_shared_key = None;
         }
@@ -885,7 +959,7 @@ async fn wireguard_replay_corruption_and_authenticated_endpoint_roaming() {
             "127.0.0.1".parse().unwrap(),
             target.local_addr().unwrap().port(),
         );
-        let mut stream = prepared.endpoints[1]
+        let mut stream = prepared.endpoints[CLIENT]
             .connector
             .handle()
             .unwrap()
@@ -955,7 +1029,7 @@ async fn wireguard_outer_socket_protection_failure_prevents_binding() {
         stdio::ErrorKind::PermissionDenied
     );
     running.stop().await;
-    assert!(prepared.endpoints[0].connector.handle().is_err());
+    assert!(prepared.endpoints[SERVER].connector.handle().is_err());
     std::net::UdpSocket::bind(("0.0.0.0", port)).unwrap();
 }
 
@@ -968,11 +1042,13 @@ async fn wireguard_rejects_wrong_psk_spoofed_sources_and_unsolicited_flows() {
             let mut configs = validate(&pair_config(port)).unwrap();
             match failure {
                 "psk" => {
-                    configs.wireguard_endpoints[1].peers[0].pre_shared_key =
+                    configs.wireguard_endpoints[CLIENT].peers[0].pre_shared_key =
                         Some(crate::config::wireguard::WireguardKey([44; 32]))
                 }
-                "source" => configs.wireguard_endpoints[1].addresses = vec!["10.77.0.99/32".into()],
-                "inbound" => configs.wireguard_endpoints[0].inbound = None,
+                "source" => {
+                    configs.wireguard_endpoints[CLIENT].addresses = vec!["10.77.0.99/32".into()]
+                }
+                "inbound" => configs.wireguard_endpoints[SERVER].inbound = None,
                 _ => unreachable!(),
             }
             let prepared = Prepared::new(&mut configs).await.unwrap();
@@ -983,7 +1059,7 @@ async fn wireguard_rejects_wrong_psk_spoofed_sources_and_unsolicited_flows() {
                 "127.0.0.1".parse().unwrap(),
                 target.local_addr().unwrap().port(),
             );
-            let mut stream = prepared.endpoints[1]
+            let mut stream = prepared.endpoints[CLIENT]
                 .connector
                 .handle()
                 .unwrap()
@@ -1016,12 +1092,12 @@ async fn wireguard_multiple_peers_share_a_bind_without_cross_delivering_replies(
         let reservation = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
         let port = reservation.local_addr().unwrap().port();
         let mut configs = validate(&pair_config(port)).unwrap();
-        let mut peer = configs.wireguard_endpoints[0].peers[0].clone();
+        let mut peer = configs.wireguard_endpoints[SERVER].peers[0].clone();
         peer.public_key = serde_yaml::from_str(&public(44)).unwrap();
         peer.allowed_ips = vec!["10.77.0.3/32".into(), "fd77::3/128".into()];
-        configs.wireguard_endpoints[0].peers.push(peer);
-        let mut client = configs.wireguard_endpoints[1].clone();
-        client.wireguard = "second-client".into();
+        configs.wireguard_endpoints[SERVER].peers.push(peer);
+        let mut client = configs.wireguard_endpoints[CLIENT].clone();
+        client.id = "second-client".into();
         client.private_key = crate::config::wireguard::WireguardKey([44; 32]);
         client.addresses = vec!["10.77.0.3/32".into(), "fd77::3/128".into()];
         configs.wireguard_endpoints.push(client);
@@ -1031,7 +1107,7 @@ async fn wireguard_multiple_peers_share_a_bind_without_cross_delivering_replies(
         for v6 in [false, true] {
             let (tcp, udp, _echoes) = echo_servers(v6).await;
             tokio::join!(
-                check_echo(prepared.endpoints[1].connector.as_ref(), tcp, udp),
+                check_echo(prepared.endpoints[CLIENT].connector.as_ref(), tcp, udp),
                 check_echo(prepared.endpoints[2].connector.as_ref(), tcp, udp)
             );
         }
@@ -1054,10 +1130,10 @@ async fn wireguard_dns_tcp_dot_doh_use_the_tunnel_and_fail_closed_after_stop() {
     tokio::time::timeout(Duration::from_secs(20), async {
         let reservation = std::net::UdpSocket::bind("[::]:0").unwrap();
         let port = reservation.local_addr().unwrap().port();
-        let yaml = pair_config(port)
-            .replace(&format!("0.0.0.0:{port}"), &format!("[::]:{port}"))
-            .replace(&format!("127.0.0.1:{port}"), &format!("[::1]:{port}"));
-        let mut configs = validate(&yaml).unwrap();
+        let mut raw: serde_json::Value = serde_yaml::from_str(&pair_config(port)).unwrap();
+        raw[0]["address"] = serde_json::json!(format!("[::]:{port}"));
+        raw[1]["client_proxies"][0]["address"] = serde_json::json!(format!("[::1]:{port}"));
+        let mut configs = validate(&serde_yaml::to_string(&raw).unwrap()).unwrap();
         let prepared = Prepared::new(&mut configs).await.unwrap();
         drop(reservation);
         let mut dns = DnsRegistry::new();
@@ -1066,7 +1142,7 @@ async fn wireguard_dns_tcp_dot_doh_use_the_tunnel_and_fail_closed_after_stop() {
         let provider = crate::dns::ProxyRuntimeProvider::with_bootstrap(
             Arc::new(ClientChainGroup::new(vec![ClientProxyChain::new(
                 vec![InitialHopEntry::Wireguard(
-                    prepared.endpoints[1].connector.clone(),
+                    prepared.endpoints[CLIENT].connector.clone(),
                 )],
                 vec![],
             )])),
@@ -1196,8 +1272,7 @@ async fn wireguard_dns_registry_prepares_inactive_generation_handles() {
   dns_servers:
     - url: tcp://127.0.0.1:{dns_port}
       ip_strategy: ipv4_only
-      client_chain:
-        - protocol: {{type: wireguard, endpoint: client}}
+      client_chain: client
 "#,
             pair_config(port)
         );

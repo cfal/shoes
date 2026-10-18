@@ -122,18 +122,19 @@ fn raw_fd_wireguard_service_forwards_and_restarts_without_leaks() {
             socket.set_send_buffer_size(256 * 1024).unwrap();
             socket.set_recv_buffer_size(256 * 1024).unwrap();
         }
-        let mut server = config::server(port);
-        server["wireguard"] = json!("server");
+        let mut duplicate = config::client(port);
+        duplicate["client_group"] = json!("copy");
         let configs = json!([
-            server,
+            config::server(port),
             config::client(port),
+            duplicate,
             {
                 "device_fd": tun.as_raw_fd(),
                 "packet_information": framed,
                 "rules": [{
                     "masks": ["0.0.0.0/0", "::/0"],
                     "action": "allow",
-                    "client_chain": [{"protocol": {"type": "wireguard", "endpoint": "wg"}}],
+                    "client_chain": [{"pool": ["wg", "copy"]}],
                 }],
             },
         ]);

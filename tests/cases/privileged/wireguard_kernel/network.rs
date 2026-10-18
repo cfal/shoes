@@ -14,9 +14,9 @@ fn tun_routes_tcp_and_udp_through_wireguard_to_a_kernel_peer() -> io::Result<()>
                     "segmentation_offload": offload,
                     "rules": [
                         {"masks": "198.18.0.77/32", "action": "allow", "override_address": "10.77.0.1:0",
-                         "client_chain": [{"protocol": {"type": "wireguard", "endpoint": "wg"}}]},
+                         "client_chain": "wg"},
                         {"masks": "fd88::77/128", "action": "allow", "override_address": "[fd77::1]:0",
-                         "client_chain": [{"protocol": {"type": "wireguard", "endpoint": "wg"}}]},
+                         "client_chain": "wg"},
                     ],
                 });
                 let (_process, _config) = start_shoes_server(
@@ -119,16 +119,20 @@ fn native_ipv6_outer_transport_interoperates_with_kernel_in_both_roles() -> io::
                     config::client(kernel.port()?)
                 };
                 if shoes_server {
-                    endpoint["listen"] = json!(format!("[::1]:{port}"));
+                    endpoint["address"] = json!(format!("[::1]:{port}"));
                 } else {
-                    endpoint["peers"][0]["endpoint"] = json!(format!("[::1]:{}", kernel.port()?));
+                    endpoint["client_proxies"][0]["address"] =
+                        json!(format!("[::1]:{}", kernel.port()?));
                 }
                 let mut ports = PortHelper::new();
                 let (_, entry) = ports.get_localhost_listener_port();
+                let mut socks = config::socks(entry);
+                if shoes_server {
+                    socks["rules"] = json!("allow-all-direct");
+                }
                 drop(reservation);
-                let (_process, _config) = start_shoes_server(
-                    &serde_yaml::to_string(&json!([endpoint, config::socks(entry)])).unwrap(),
-                )?;
+                let (_process, _config) =
+                    start_shoes_server(&serde_yaml::to_string(&json!([endpoint, socks])).unwrap())?;
                 ports.wait_for_all_ports().await?;
                 for ipv6 in [false, true] {
                     let echo = EchoTargets::new(ipv6).await?;

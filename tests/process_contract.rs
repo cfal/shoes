@@ -40,10 +40,9 @@ fn wireguard_check_validates_outer_udp_without_dns_or_listeners() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("config.yaml");
     let occupied = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
-    let mut server = wireguard_support::server(occupied.local_addr().unwrap().port());
-    server["wireguard"] = json!("occupied-listener");
+    let server = wireguard_support::server(occupied.local_addr().unwrap().port());
     let mut endpoint = wireguard_support::client(51820);
-    endpoint["peers"][0]["endpoint"] = json!("unresolvable.invalid:51820");
+    endpoint["client_proxies"][0]["address"] = json!("unresolvable.invalid:51820");
     for mode in ["check", "--dry-run"] {
         for (protocol, valid) in [
             (json!({"type": "socks"}), false),
@@ -54,7 +53,7 @@ fn wireguard_check_validates_outer_udp_without_dns_or_listeners() {
             ),
             (wireguard_support::vless_protocol(), true),
         ] {
-            endpoint["outer_client_chain"] = json!([{
+            endpoint["client_proxies"][0]["protocol"]["peer_client_chain"] = json!([{
                 "address": "unresolvable.invalid:443", "protocol": protocol,
                 "transport": "quic",
             }]);
@@ -63,7 +62,7 @@ fn wireguard_check_validates_outer_udp_without_dns_or_listeners() {
                 target_os = "fuchsia",
                 target_os = "linux"
             )) {
-                endpoint["outer_client_chain"][0]["bind_interface"] =
+                endpoint["client_proxies"][0]["protocol"]["peer_client_chain"][0]["bind_interface"] =
                     json!("shoes-missing-interface");
             }
             let config = json!([server, endpoint]);
@@ -80,7 +79,7 @@ fn wireguard_check_validates_outer_udp_without_dns_or_listeners() {
             }
         }
         let mut invalid = wireguard_support::server(51820);
-        invalid["addresses"] = json!(["255.255.255.255/32"]);
+        invalid["protocol"]["addresses"] = json!(["255.255.255.255/32"]);
         std::fs::write(&path, serde_yaml::to_string(&json!([invalid])).unwrap()).unwrap();
         let output = Command::new(env!("CARGO_BIN_EXE_shoes"))
             .args([mode, "-t", "1"])
@@ -107,8 +106,8 @@ async fn wireguard_reload(detour: bool) {
     if detour {
         let (_, outer_port) = ports.get_localhost_listener_port();
         let protocol = wireguard_support::vless_protocol();
-        endpoint["peers"][0]["endpoint"] = json!(format!("192.0.2.200:{port}"));
-        endpoint["outer_client_chain"] =
+        endpoint["client_proxies"][0]["address"] = json!(format!("192.0.2.200:{port}"));
+        endpoint["client_proxies"][0]["protocol"]["peer_client_chain"] =
             json!([{"address": format!("127.0.0.1:{outer_port}"), "protocol": protocol}]);
         servers.push(json!({
             "address": format!("0.0.0.0:{outer_port}"), "protocol": protocol,
@@ -133,9 +132,10 @@ async fn wireguard_reload(detour: bool) {
         .unwrap();
     roundtrip(&mut active).await;
     if detour {
-        client_configs[0]["outer_client_chain"][0]["protocol"]["udp_enabled"] = json!(false);
+        client_configs[0]["client_proxies"][0]["protocol"]["peer_client_chain"][0]["protocol"]["udp_enabled"] =
+            json!(false);
     } else {
-        client_configs[1]["rules"][0]["client_chain"][0]["protocol"]["endpoint"] = json!("missing");
+        client_configs[1]["rules"][0]["client_chain"] = json!("missing");
     }
     let invalid = serde_yaml::to_string(&client_configs).unwrap();
     assert_ne!(invalid, client_config);
@@ -198,7 +198,7 @@ async fn wireguard_reload(detour: bool) {
         .await
         .unwrap();
     roundtrip(&mut old_stream).await;
-    servers[0]["peers"][0]["public_key"] = json!(wireguard_support::public(44));
+    servers[0]["protocol"]["peers"][0]["public_key"] = json!(wireguard_support::public(44));
     std::fs::write(&server_path, serde_yaml::to_string(&servers).unwrap()).unwrap();
     server.signal(libc::SIGHUP);
     server.wait_for("Servers ready").await;
@@ -246,7 +246,7 @@ async fn wireguard_reload(detour: bool) {
         Ok(Ok(_))
     ));
     let mut rotated: serde_json::Value = serde_yaml::from_str(&client_config).unwrap();
-    rotated[0]["private_key"] = json!(wireguard_support::key(44));
+    rotated[0]["client_proxies"][0]["protocol"]["private_key"] = json!(wireguard_support::key(44));
     std::fs::write(&client_path, serde_yaml::to_string(&rotated).unwrap()).unwrap();
     client.signal(libc::SIGHUP);
     client.wait_for("Servers ready").await;
@@ -267,8 +267,7 @@ async fn wireguard_partial_startup_releases_previously_started_endpoint() {
     let socket = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
     let port = socket.local_addr().unwrap().port();
     let occupied = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
-    let mut second = wireguard_support::server(occupied.local_addr().unwrap().port());
-    second["wireguard"] = json!("second");
+    let second = wireguard_support::server(occupied.local_addr().unwrap().port());
     std::fs::write(
         &path,
         serde_yaml::to_string(&json!([wireguard_support::server(port), second])).unwrap(),

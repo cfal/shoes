@@ -202,14 +202,14 @@ async fn run_rekey(detour: bool) -> io::Result<()> {
         let mut ports = PortHelper::new();
         let (_, entry) = ports.get_localhost_listener_port();
         let mut client = config::client(relay_port);
-        client["mtu"] = json!(1280);
-        client["peers"][0].as_object_mut().unwrap().remove("pre_shared_key");
+        client["client_proxies"][0]["protocol"]["mtu"] = json!(1280);
+        client["client_proxies"][0]["protocol"].as_object_mut().unwrap().remove("pre_shared_key");
         let mut shoes_config = Vec::new();
         if detour {
             let (_, outer_port) = ports.get_localhost_listener_port();
             let protocol = config::vless_protocol();
-            client["peers"][0]["endpoint"] = json!(format!("192.0.2.200:{relay_port}"));
-            client["outer_client_chain"] = json!([{"address": format!("127.0.0.1:{outer_port}"), "protocol": protocol}]);
+            client["client_proxies"][0]["address"] = json!(format!("192.0.2.200:{relay_port}"));
+            client["client_proxies"][0]["protocol"]["peer_client_chain"] = json!([{"address": format!("127.0.0.1:{outer_port}"), "protocol": protocol}]);
             shoes_config.push(json!({
                 "address": format!("0.0.0.0:{outer_port}"), "protocol": protocol,
                 "rules": [{"masks": "192.0.2.200/32", "action": "allow", "override_address": "127.0.0.1:0"}],

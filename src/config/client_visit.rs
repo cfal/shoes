@@ -1,8 +1,8 @@
 use std::io;
 
 use super::{
-    ClientChainHop, ClientConfig, Config, ConfigSelection, RuleActionConfig, RuleConfig,
-    ServerProxyConfig, ShadowTlsServerHandshakeConfig, ValidatedConfigs,
+    ClientChainHop, ClientConfig, ClientProxyConfig, Config, ConfigSelection, RuleActionConfig,
+    RuleConfig, ServerProxyConfig, ShadowTlsServerHandshakeConfig, ValidatedConfigs,
 };
 use crate::option_util::NoneOrSome;
 
@@ -10,14 +10,25 @@ type Visitor<'a> = dyn FnMut(&mut ClientConfig) -> io::Result<()> + 'a;
 
 pub(crate) fn visit_hop(hop: &mut ClientChainHop, visitor: &mut Visitor<'_>) -> io::Result<()> {
     match hop {
-        ClientChainHop::Single(selection) => visitor(selection.unwrap_config_mut()),
+        ClientChainHop::Single(selection) => visit_client(selection.unwrap_config_mut(), visitor),
         ClientChainHop::Pool(selections) => {
             for selection in selections.iter_mut() {
-                visitor(selection.unwrap_config_mut())?;
+                visit_client(selection.unwrap_config_mut(), visitor)?;
             }
             Ok(())
         }
     }
+}
+
+pub(crate) fn visit_client(client: &mut ClientConfig, visitor: &mut Visitor<'_>) -> io::Result<()> {
+    if let ClientProxyConfig::Wireguard(config) = &mut client.protocol
+        && let Some(chain) = &mut config.peer_client_chain
+    {
+        for hop in chain.hops.iter_mut() {
+            visit_hop(hop, visitor)?;
+        }
+    }
+    visitor(client)
 }
 
 fn visit_rules(
@@ -39,6 +50,13 @@ fn visit_rules(
 
 fn visit_protocol(protocol: &mut ServerProxyConfig, visitor: &mut Visitor<'_>) -> io::Result<()> {
     match protocol {
+        ServerProxyConfig::Wireguard(config) => {
+            if let Some(chain) = &mut config.peer_client_chain {
+                for hop in chain.hops.iter_mut() {
+                    visit_hop(hop, visitor)?;
+                }
+            }
+        }
         ServerProxyConfig::Tls {
             tls_targets,
             default_tls_target,
@@ -95,7 +113,7 @@ impl ValidatedConfigs {
             }
         }
         for endpoint in &mut self.wireguard_endpoints {
-            if let Some(chain) = &mut endpoint.outer_client_chain {
+            if let Some(chain) = &mut endpoint.peer_client_chain {
                 for hop in chain.hops.iter_mut() {
                     visit_hop(hop, visitor)?;
                 }

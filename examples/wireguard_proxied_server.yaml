@@ -1,0 +1,26 @@
+# Demonstration keys and credentials only. Replace them and both remote addresses.
+- client_group: relay
+  client_proxies:
+    - address: "relay.example:443"
+      protocol:
+        type: tls
+        protocol:
+          type: vless
+          user_id: "b85798ef-e9dc-46a4-9a87-8da4499d36d0"
+          udp_enabled: true
+
+# No local UDP listener: keepalive establishes the proxy's return mapping.
+- protocol:
+    type: wireguard
+    private_key: "KSkpKSkpKSkpKSkpKSkpKSkpKSkpKSkpKSkpKSkpKSk="
+    addresses: ["10.77.0.1/32", "fd77::1/128"]
+    mtu: 1280
+    peer_client_chain: relay
+    peers:
+      - public_key: "B6r/Pp/BZydVRPTDpqF82Dfy7G54zYpXsePfs8wDWnY="
+        endpoint: "peer.example:51820"
+        allowed_ips: ["10.77.0.2/32", "fd77::2/128"]
+        persistent_keepalive: 25
+  rules:
+    - masks: ["192.168.10.0/24"]
+      action: allow
