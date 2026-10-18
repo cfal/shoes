@@ -12,6 +12,23 @@ pub(crate) struct UdpSetup {
     pub reply_identity: NetLocation,
 }
 
+#[derive(Debug)]
+struct PolicyBlock;
+
+impl std::fmt::Display for PolicyBlock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Destination blocked by routing rules")
+    }
+}
+
+impl std::error::Error for PolicyBlock {}
+
+pub(crate) fn is_policy_block(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|cause| cause.is::<PolicyBlock>())
+}
+
 pub(crate) enum UdpRoute<'a> {
     Local(UdpSetup),
     Forward {
@@ -119,10 +136,7 @@ async fn route_prepared_udp<'a>(
                 reply_identity,
             })
         }
-        ConnectDecision::Block => Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "Destination blocked by routing rules",
-        )),
+        ConnectDecision::Block => Err(io::Error::new(io::ErrorKind::PermissionDenied, PolicyBlock)),
     }
 }
 
@@ -137,6 +151,26 @@ mod tests {
     use hickory_resolver::proto::rr::{Name, RecordType};
     use std::pin::Pin;
     use tokio::io::ReadBuf;
+
+    #[tokio::test]
+    async fn policy_block_is_distinct_from_transport_permission_denial() {
+        let resolver: Arc<dyn Resolver> = Arc::new(RealDns);
+        let selector = ClientProxySelector::new(Vec::new());
+        let blocked = route_udp(
+            &selector,
+            NetLocation::from_str("192.0.2.1:443", None).unwrap(),
+            &resolver,
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(blocked.kind(), io::ErrorKind::PermissionDenied);
+        assert!(is_policy_block(&blocked));
+        assert!(!is_policy_block(&io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "outbound handshake rejected"
+        )));
+    }
 
     #[derive(Debug)]
     struct RealDns;

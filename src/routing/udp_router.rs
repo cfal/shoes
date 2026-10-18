@@ -1128,12 +1128,13 @@ impl<'a> UdpRouter<'a> {
                 true
             }
             Err(e) => {
-                if e.kind() == std::io::ErrorKind::PermissionDenied {
+                let policy_block = super::ingress::is_policy_block(&e);
+                if policy_block {
                     debug!("Blocked UDP session for {}: {}", destination, e);
                 } else {
                     warn!("Failed to create session for {}: {}", destination, e);
                 }
-                if cache_policy_failure && e.kind() == std::io::ErrorKind::PermissionDenied {
+                if cache_policy_failure && policy_block {
                     // Mark as blocked
                     self.blocked.put(destination.clone(), ());
                 }
