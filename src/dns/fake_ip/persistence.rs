@@ -195,6 +195,7 @@ impl SnapshotStore {
                     serde_json::from_reader(BufReader::new(file.take(limit + 1)))
                         .map_err(invalid_json)?;
                 snapshot.restore(state)?;
+                state.checkpoint_revision = Some(state.revision);
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => (),
             Err(error) => return Err(error),
@@ -264,6 +265,90 @@ mod tests {
             ipv6_range: Some("2001:2::/112".into()),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn unchanged_checkpoint_does_not_rewrite_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.json");
+        let options = options(&path);
+        let pool = FakeIpPool::with_seed(&options, 0).unwrap();
+        pool.allocate("a.test", false).unwrap();
+        pool.checkpoint().unwrap();
+        let old_time = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1);
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(old_time))
+            .unwrap();
+        pool.checkpoint().unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            old_time
+        );
+        drop(pool);
+        let pool = FakeIpPool::with_seed(&options, 0).unwrap();
+        pool.checkpoint().unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            old_time
+        );
+        pool.allocate("b.test", false).unwrap();
+        pool.checkpoint().unwrap();
+        assert_ne!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            old_time
+        );
+        let snapshot: Snapshot = serde_json::from_reader(File::open(path).unwrap()).unwrap();
+        assert!(snapshot.entries.iter().any(|(name, _)| name == "b.test"));
+    }
+
+    #[test]
+    fn cache_hits_and_restores_checkpoint_lru_order() {
+        for restore in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("state.json");
+            let mut options = options(&path);
+            options.max_entries = 2;
+            let pool = FakeIpPool::with_seed(&options, 0).unwrap();
+            let first = pool.allocate("first.test", false).unwrap();
+            let second = pool.allocate("second.test", false).unwrap();
+            pool.checkpoint().unwrap();
+            if restore {
+                assert_eq!(pool.restore(first).unwrap().as_deref(), Some("first.test"));
+            } else {
+                assert_eq!(pool.allocate("first.test", false).unwrap(), first);
+            }
+            pool.checkpoint().unwrap();
+            drop(pool);
+            let pool = FakeIpPool::with_seed(&options, 0).unwrap();
+            pool.allocate("third.test", false).unwrap();
+            assert!(pool.restore(second).is_err());
+            assert_eq!(pool.restore(first).unwrap().as_deref(), Some("first.test"));
+        }
+    }
+
+    #[test]
+    fn failed_checkpoint_keeps_changes_pending() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.json");
+        let options = options(&path);
+        let pool = FakeIpPool::with_seed(&options, 0).unwrap();
+        pool.allocate("first.test", false).unwrap();
+        pool.checkpoint().unwrap();
+        let second = pool.allocate("second.test", false).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(pool.checkpoint().is_err());
+        std::fs::remove_dir(&path).unwrap();
+        pool.checkpoint().unwrap();
+        drop(pool);
+        let pool = FakeIpPool::with_seed(&options, 0).unwrap();
+        assert_eq!(
+            pool.restore(second).unwrap().as_deref(),
+            Some("second.test")
+        );
     }
 
     #[test]

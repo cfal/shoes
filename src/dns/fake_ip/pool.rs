@@ -93,6 +93,8 @@ struct State {
     v6: Option<Range>,
     v4_reserved: usize,
     v6_reserved: usize,
+    revision: u64,
+    checkpoint_revision: Option<u64>,
     misses: u64,
     evictions: u64,
     wraps: u64,
@@ -186,6 +188,8 @@ impl FakeIpPool {
             v6,
             v4_reserved: 0,
             v6_reserved: 0,
+            revision: 0,
+            checkpoint_revision: None,
             misses: 0,
             evictions: 0,
             wraps: 0,
@@ -202,15 +206,23 @@ impl FakeIpPool {
         })
     }
 
-    pub(super) fn persistent(&self) -> bool {
+    pub(crate) fn persistent(&self) -> bool {
         self.store.is_some()
     }
 
     pub(crate) fn checkpoint(&self) -> io::Result<()> {
         if let Some(store) = &self.store {
             let _serial = store.serial.lock();
-            let snapshot = persistence::Snapshot::from_state(&self.state.lock());
+            let state = self.state.lock();
+            if state.checkpoint_revision == Some(state.revision) {
+                return Ok(());
+            }
+            let revision = state.revision;
+            let snapshot = persistence::Snapshot::from_state(&state);
+            drop(state);
             store.write(&snapshot)?;
+            // Cache hits can change LRU order while the snapshot is being written.
+            self.state.lock().checkpoint_revision = Some(revision);
         }
         Ok(())
     }
@@ -221,10 +233,13 @@ impl FakeIpPool {
         state.closed = true;
         state.v4_reserved = 0;
         state.v6_reserved = 0;
+        state.revision = state.revision.wrapping_add(1);
         if let Some(store) = &self.store {
+            let revision = state.revision;
             let snapshot = persistence::Snapshot::from_state(&state);
             drop(state);
             store.write(&snapshot)?;
+            self.state.lock().checkpoint_revision = Some(revision);
         }
         Ok(())
     }
@@ -252,6 +267,7 @@ impl FakeIpPool {
         let mut state = self.state.lock();
         if let Some(name) = state.reverse.get(&ip).cloned() {
             state.forward.get(&name);
+            state.revision = state.revision.wrapping_add(1);
             return Ok(Some(name));
         }
         if [state.v4.as_ref(), state.v6.as_ref()]
@@ -275,10 +291,12 @@ impl FakeIpPool {
             if state.closed {
                 return Err(io::ErrorKind::BrokenPipe.into());
             }
-            if let Some(entry) = state.forward.get(&name)
-                && let Some(ip) = if ipv6 { entry.v6 } else { entry.v4 }
-            {
-                return Ok(ip);
+            if let Some(entry) = state.forward.get(&name) {
+                let ip = if ipv6 { entry.v6 } else { entry.v4 };
+                state.revision = state.revision.wrapping_add(1);
+                if let Some(ip) = ip {
+                    return Ok(ip);
+                }
             }
         }
         let _serial = self.store.as_ref().map(|store| store.serial.lock());
@@ -286,10 +304,12 @@ impl FakeIpPool {
         if state.closed {
             return Err(io::ErrorKind::BrokenPipe.into());
         }
-        if let Some(entry) = state.forward.get(&name)
-            && let Some(ip) = if ipv6 { entry.v6 } else { entry.v4 }
-        {
-            return Ok(ip);
+        if let Some(entry) = state.forward.get(&name) {
+            let ip = if ipv6 { entry.v6 } else { entry.v4 };
+            state.revision = state.revision.wrapping_add(1);
+            if let Some(ip) = ip {
+                return Ok(ip);
+            }
         }
         if let Some(store) = &self.store {
             let remaining = if ipv6 {
@@ -357,6 +377,7 @@ impl FakeIpPool {
             entry.v4 = Some(ip);
         }
         state.reverse.insert(ip, name);
+        state.revision = state.revision.wrapping_add(1);
         Ok(ip)
     }
 }

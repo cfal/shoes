@@ -132,8 +132,15 @@ impl DnsRegistry {
     }
 
     pub fn snapshot_task(&self) -> DnsSnapshotTask {
-        let pools = self.pool_handles();
-        DnsSnapshotTask(tokio::spawn(async move {
+        let pools: Vec<_> = self
+            .pool_handles()
+            .into_iter()
+            .filter(|pool| pool.persistent())
+            .collect();
+        if pools.is_empty() {
+            return DnsSnapshotTask(None);
+        }
+        DnsSnapshotTask(Some(tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(60)).await;
                 let pools = pools.clone();
@@ -143,7 +150,7 @@ impl DnsRegistry {
                     failure => log::warn!("Fake DNS snapshot failed: {failure:?}"),
                 }
             }
-        }))
+        })))
     }
 }
 
@@ -158,11 +165,13 @@ fn checkpoint_pools(pools: Vec<Arc<FakeIpPool>>) -> std::io::Result<()> {
     error.map_or(Ok(()), Err)
 }
 
-pub struct DnsSnapshotTask(tokio::task::JoinHandle<()>);
+pub struct DnsSnapshotTask(Option<tokio::task::JoinHandle<()>>);
 
 impl Drop for DnsSnapshotTask {
     fn drop(&mut self) {
-        self.0.abort();
+        if let Some(task) = &self.0 {
+            task.abort();
+        }
     }
 }
 
@@ -1041,6 +1050,21 @@ mod tests {
         std::fs::create_dir(directory.path().join("0.json")).unwrap();
         assert!(checkpoint_pools(pools).is_err());
         assert!(directory.path().join("1.json").is_file());
+    }
+
+    #[test]
+    fn snapshot_task_needs_persistent_pools() {
+        let mut registry = DnsRegistry::new();
+        assert!(registry.snapshot_task().0.is_none());
+        let options = FakeIpOptions::default();
+        registry.pools.insert(
+            "memory".into(),
+            PoolState {
+                pool: Arc::new(FakeIpPool::new(&options).unwrap()),
+                options,
+            },
+        );
+        assert!(registry.snapshot_task().0.is_none());
     }
 
     #[tokio::test]
