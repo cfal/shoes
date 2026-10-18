@@ -25,6 +25,14 @@ struct Upstream {
     connection: Mutex<Option<Connection>>,
 }
 
+impl Upstream {
+    fn same_endpoint(&self, other: &Self) -> bool {
+        self.ip == other.ip
+            && self.config.port == other.config.port
+            && self.config.bind_addr == other.config.bind_addr
+    }
+}
+
 /// Uses transport handles directly: the lookup pool can coalesce requests and
 /// turn negative DNS messages into lookup errors, losing wire-level semantics.
 pub(super) struct RawDnsExchange {
@@ -130,9 +138,7 @@ impl RawDnsExchange {
                 .filter(|(_, candidate)| {
                     !matches!(candidate.config.protocol, ProtocolConfig::Tcp)
                         || !self.upstreams.iter().any(|udp| {
-                            udp.ip == candidate.ip
-                                && udp.config.port == candidate.config.port
-                                && udp.config.bind_addr == candidate.config.bind_addr
+                            udp.same_endpoint(candidate)
                                 && matches!(udp.config.protocol, ProtocolConfig::Udp)
                         })
                 })
@@ -200,9 +206,7 @@ impl RawDnsExchange {
         if answer.metadata.truncation && matches!(upstream.config.protocol, ProtocolConfig::Udp) {
             // Only use explicitly configured TCP, including system-discovered UDP+TCP pairs.
             if let Some(tcp) = self.upstreams.iter().find(|candidate| {
-                candidate.ip == upstream.ip
-                    && candidate.config.port == upstream.config.port
-                    && candidate.config.bind_addr == upstream.config.bind_addr
+                candidate.same_endpoint(upstream)
                     && matches!(candidate.config.protocol, ProtocolConfig::Tcp)
             }) {
                 return self.send_upstream(tcp, message, setups).await;
@@ -323,6 +327,32 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn endpoint_pairing_requires_equal_ip_port_and_bind_address() {
+        let upstream = |ip, config| Upstream {
+            ip,
+            config,
+            connection: Mutex::new(None),
+        };
+        let mut udp = upstream("192.0.2.1".parse().unwrap(), ConnectionConfig::udp());
+        let mut tcp = upstream(udp.ip, ConnectionConfig::tcp());
+        assert!(udp.same_endpoint(&tcp));
+        assert!(tcp.same_endpoint(&udp));
+
+        tcp.ip = "192.0.2.2".parse().unwrap();
+        assert!(!udp.same_endpoint(&tcp));
+        tcp.ip = udp.ip;
+        tcp.config.port = udp.config.port + 1;
+        assert!(!udp.same_endpoint(&tcp));
+        tcp.config.port = udp.config.port;
+        tcp.config.bind_addr = Some("127.0.0.1:0".parse().unwrap());
+        assert!(!udp.same_endpoint(&tcp));
+        udp.config.bind_addr = tcp.config.bind_addr;
+        assert!(udp.same_endpoint(&tcp));
+        tcp.config.bind_addr = Some("127.0.0.2:0".parse().unwrap());
+        assert!(!udp.same_endpoint(&tcp));
+    }
 
     fn exchange(addr: std::net::SocketAddr, tcp: bool) -> RawDnsExchange {
         let resolver = Arc::new(crate::resolver::NativeResolver::new());
