@@ -2,6 +2,8 @@
 mod anytls;
 #[path = "cases/integration/anytls_uot_integration.rs"]
 mod anytls_uot;
+#[path = "cases/integration/fake_dns.rs"]
+mod fake_dns;
 #[path = "cases/integration/h2mux_integration.rs"]
 mod h2mux;
 #[path = "cases/integration/h2mux_backpressure.rs"]
