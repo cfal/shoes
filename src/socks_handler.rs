@@ -504,36 +504,27 @@ async fn monitor_tcp_close(stream: &mut Box<dyn AsyncStream>) -> std::io::Result
 
 #[derive(Debug)]
 pub struct SocksTcpClientHandler {
-    prefix_data: Vec<u8>,
-    has_auth: bool,
+    method: u8,
+    auth_request: Option<Vec<u8>>,
 }
 
 impl SocksTcpClientHandler {
     pub fn new(auth_info: Option<(String, String)>) -> Self {
-        let mut data = vec![
-            VER_SOCKS5,
-            1, // number of methods,
-            if auth_info.is_some() {
+        let auth_request = auth_info.map(|(username, password)| {
+            let mut request = vec![VER_AUTH, username.len() as u8];
+            request.extend_from_slice(username.as_bytes());
+            request.push(password.len() as u8);
+            request.extend_from_slice(password.as_bytes());
+            request
+        });
+
+        Self {
+            method: if auth_request.is_some() {
                 METHOD_USERNAME
             } else {
                 METHOD_NONE
             },
-        ];
-        if let Some((username, password)) = auth_info.as_ref() {
-            data.extend(&[VER_AUTH, username.len() as u8]);
-            data.extend_from_slice(username.as_bytes());
-            data.push(password.len() as u8);
-            data.extend_from_slice(password.as_bytes());
-        }
-        data.extend(&[
-            VER_SOCKS5,
-            CMD_CONNECT,
-            0x0, // reserved
-        ]);
-
-        Self {
-            prefix_data: data,
-            has_auth: auth_info.is_some(),
+            auth_request,
         }
     }
 }
@@ -545,9 +536,10 @@ impl TcpClientHandler for SocksTcpClientHandler {
         mut client_stream: Box<dyn AsyncStream>,
         remote_location: ResolvedLocation,
     ) -> std::io::Result<TcpClientSetupResult> {
-        write_all(&mut client_stream, &self.prefix_data).await?;
-        let location_bytes = write_location_to_vec(remote_location.location());
-        write_all(&mut client_stream, &location_bytes).await?;
+        // Each request waits for the previous reply. RFC 1928 only sends the request once
+        // method negotiation completes, and some servers (eg. Cloudflare WARP) drop bytes
+        // that arrive early.
+        write_all(&mut client_stream, &[VER_SOCKS5, 1, self.method]).await?;
         client_stream.flush().await?;
 
         let mut stream_reader = StreamReader::new_with_buffer_size(400);
@@ -567,8 +559,17 @@ impl TcpClientHandler for SocksTcpClientHandler {
                 "SOCKS server rejected auth method",
             ));
         }
+        if auth_method != self.method {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("SOCKS server selected auth method {auth_method}, which was not offered"),
+            ));
+        }
 
-        if self.has_auth {
+        if let Some(auth_request) = &self.auth_request {
+            write_all(&mut client_stream, auth_request).await?;
+            client_stream.flush().await?;
+
             let auth_version = stream_reader.read_u8(&mut client_stream).await?;
             if auth_version != VER_AUTH {
                 return Err(std::io::Error::new(
@@ -585,6 +586,15 @@ impl TcpClientHandler for SocksTcpClientHandler {
                 ));
             }
         }
+
+        let mut connect_request = vec![
+            VER_SOCKS5,
+            CMD_CONNECT,
+            0x0, // reserved
+        ];
+        connect_request.extend(write_location_to_vec(remote_location.location()));
+        write_all(&mut client_stream, &connect_request).await?;
+        client_stream.flush().await?;
 
         let socks_version = stream_reader.read_u8(&mut client_stream).await?;
         if socks_version != VER_SOCKS5 {
@@ -796,6 +806,8 @@ mod tests {
     const AUTH_REQUEST: &[u8] = b"\x01\x04user\x04pass";
     /// CONNECT request for `destination()`.
     const CONNECT_REQUEST: &[u8] = b"\x05\x01\x00\x03\x0bexample.com\x01\xbb";
+    /// CONNECT success reply with bound address 127.0.0.1:0.
+    const CONNECT_REPLY: &[u8] = b"\x05\x00\x00\x01\x7f\x00\x00\x01\x00\x00";
 
     fn credentials() -> Option<(String, String)> {
         Some(("user".to_string(), "pass".to_string()))
@@ -924,5 +936,162 @@ mod tests {
             build_error_response(REPLY_GENERAL_FAILURE)
         );
         assert!(bounded(setup).await.unwrap().is_err());
+    }
+
+    fn spawn_client(
+        auth_info: Option<(String, String)>,
+        stream: Box<dyn AsyncStream>,
+    ) -> tokio::task::JoinHandle<io::Result<TcpClientSetupResult>> {
+        tokio::spawn(async move {
+            SocksTcpClientHandler::new(auth_info)
+                .setup_client_tcp_stream(stream, destination().into())
+                .await
+        })
+    }
+
+    async fn assert_nothing_sent(stream: &mut DuplexStream) {
+        let mut byte = [0; 1];
+        let read = tokio::time::timeout(Duration::from_millis(50), stream.read(&mut byte)).await;
+        assert!(read.is_err(), "client sent data before the previous reply");
+    }
+
+    #[tokio::test]
+    async fn client_waits_for_each_negotiation_reply() {
+        for auth_info in [None, credentials()] {
+            let with_auth = auth_info.is_some();
+            let (client_stream, mut server) = tokio::io::duplex(1024);
+            let setup = spawn_client(auth_info, Box::new(client_stream));
+
+            let method = if with_auth {
+                METHOD_USERNAME
+            } else {
+                METHOD_NONE
+            };
+            assert_eq!(read_bytes(&mut server, 3).await, [VER_SOCKS5, 1, method]);
+            assert_nothing_sent(&mut server).await;
+            server.write_all(&[VER_SOCKS5, method]).await.unwrap();
+
+            if with_auth {
+                assert_eq!(
+                    read_bytes(&mut server, AUTH_REQUEST.len()).await,
+                    AUTH_REQUEST
+                );
+                assert_nothing_sent(&mut server).await;
+                server.write_all(&[VER_AUTH, RESULT_SUCCESS]).await.unwrap();
+            }
+
+            assert_eq!(
+                read_bytes(&mut server, CONNECT_REQUEST.len()).await,
+                CONNECT_REQUEST
+            );
+            // Bytes after the CONNECT reply belong to the tunnel.
+            server
+                .write_all(&[CONNECT_REPLY, b"banner"].concat())
+                .await
+                .unwrap();
+
+            let result = bounded(setup).await.unwrap().unwrap();
+            assert_eq!(result.early_data.as_deref(), Some(&b"banner"[..]));
+        }
+    }
+
+    #[tokio::test]
+    async fn client_rejects_unoffered_methods_without_sending_more() {
+        for (auth_info, selected_method) in [
+            (None, METHOD_INVALID),
+            (None, METHOD_USERNAME),
+            (credentials(), METHOD_INVALID),
+            (credentials(), METHOD_NONE),
+        ] {
+            let (client_stream, mut server) = tokio::io::duplex(1024);
+            let setup = spawn_client(auth_info, Box::new(client_stream));
+
+            read_bytes(&mut server, 3).await;
+            server
+                .write_all(&[VER_SOCKS5, selected_method])
+                .await
+                .unwrap();
+
+            let error = bounded(setup).await.unwrap().err().unwrap();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            let mut rest = Vec::new();
+            bounded(server.read_to_end(&mut rest)).await.unwrap();
+            assert!(rest.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn client_stops_after_rejected_credentials() {
+        let (client_stream, mut server) = tokio::io::duplex(1024);
+        let setup = spawn_client(credentials(), Box::new(client_stream));
+
+        read_bytes(&mut server, 3).await;
+        server
+            .write_all(&[VER_SOCKS5, METHOD_USERNAME])
+            .await
+            .unwrap();
+        read_bytes(&mut server, AUTH_REQUEST.len()).await;
+        server.write_all(&[VER_AUTH, 0x01]).await.unwrap();
+
+        let error = bounded(setup).await.unwrap().err().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        let mut rest = Vec::new();
+        bounded(server.read_to_end(&mut rest)).await.unwrap();
+        assert!(
+            rest.is_empty(),
+            "client sent CONNECT after failed authentication"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_reads_replies_split_across_writes() {
+        let (client_stream, mut server) = tokio::io::duplex(1024);
+        let setup = spawn_client(credentials(), Box::new(client_stream));
+
+        for (request_len, reply) in [
+            (3, &[VER_SOCKS5, METHOD_USERNAME][..]),
+            (AUTH_REQUEST.len(), &[VER_AUTH, RESULT_SUCCESS][..]),
+            (CONNECT_REQUEST.len(), CONNECT_REPLY),
+        ] {
+            read_bytes(&mut server, request_len).await;
+            for byte in reply {
+                server.write_all(&[*byte]).await.unwrap();
+                tokio::task::yield_now().await;
+            }
+        }
+
+        let result = bounded(setup).await.unwrap().unwrap();
+        assert!(result.early_data.is_none());
+    }
+
+    #[tokio::test]
+    async fn client_and_server_handshake_over_flush_gated_transport() {
+        for auth_info in [None, credentials()] {
+            let (client_stream, server_stream) = tokio::io::duplex(1024);
+            let client = spawn_client(
+                auth_info.clone(),
+                Box::new(FlushGatedStream::new(client_stream)),
+            );
+            let handler = server_handler(auth_info);
+            let server =
+                handler.setup_server_stream(Box::new(FlushGatedStream::new(server_stream)));
+
+            let TcpServerSetupResult::TcpForward {
+                remote_location,
+                stream: mut tunnel,
+                connection_success_response: Some(response),
+                ..
+            } = bounded(server).await.unwrap()
+            else {
+                panic!("expected TCP forwarding with a deferred CONNECT reply");
+            };
+            assert_eq!(remote_location, destination());
+
+            // The TCP server sends the CONNECT reply once the upstream connection is set up.
+            tunnel.write_all(&response).await.unwrap();
+            tunnel.flush().await.unwrap();
+            let result = bounded(client).await.unwrap().unwrap();
+            assert!(result.early_data.is_none());
+        }
     }
 }
