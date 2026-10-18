@@ -34,13 +34,24 @@ impl Resolver for CompositeResolver {
         Box::pin(async move {
             let mut last =
                 std::io::Error::new(std::io::ErrorKind::NotFound, "no DNS resolvers configured");
+            let mut retained_setup = false;
             for resolver in resolvers {
                 match resolver.exchange(request.clone()).await {
                     Ok(response) => return Ok(response),
-                    Err(error) => last = error,
+                    Err(error) => {
+                        retained_setup |= crate::resolver::dns_setup_pending(&error);
+                        last = error;
+                    }
                 }
             }
-            Err(last)
+            if retained_setup {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    crate::resolver::DnsSetupPending,
+                ))
+            } else {
+                Err(last)
+            }
         })
     }
 
@@ -144,6 +155,30 @@ mod tests {
             })
             .collect();
         (CompositeResolver::new(resolvers), calls)
+    }
+
+    #[tokio::test]
+    async fn later_exchange_failure_preserves_retained_setup_retry() {
+        #[derive(Debug)]
+        struct PendingSetup;
+        impl Resolver for PendingSetup {
+            fn resolve_location(&self, _: &NetLocation) -> crate::resolver::ResolveFuture {
+                unreachable!()
+            }
+            fn exchange(&self, _: Vec<u8>) -> crate::resolver::DnsExchangeFuture {
+                Box::pin(async {
+                    Err(io::Error::new(
+                        ErrorKind::TimedOut,
+                        crate::resolver::DnsSetupPending,
+                    ))
+                })
+            }
+        }
+        let fallback = composite(vec![Err(ErrorKind::TimedOut)]).0;
+        let resolver = CompositeResolver::new(vec![Arc::new(PendingSetup), Arc::new(fallback)]);
+        assert!(crate::resolver::dns_setup_pending(
+            &resolver.exchange(Vec::new()).await.unwrap_err()
+        ));
     }
 
     #[tokio::test]
