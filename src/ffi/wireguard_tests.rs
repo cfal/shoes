@@ -91,8 +91,14 @@ fn raw_fd_wireguard_service_forwards_and_restarts_without_leaks() {
     const CHILD: &str = "SHOES_FFI_WIREGUARD_LIFECYCLE_CHILD";
     if std::env::var_os(CHILD).is_none() {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "ffi::common::wireguard_tests::raw_fd_wireguard_service_forwards_and_restarts_without_leaks", "--nocapture"])
-            .env(CHILD, "1").output().unwrap();
+            .args([
+                "--exact",
+                "ffi::common::wireguard_tests::raw_fd_wireguard_service_forwards_and_restarts_without_leaks",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
             output.status.success() && stdout.contains("test result: ok. 1 passed;"),
@@ -119,37 +125,48 @@ fn raw_fd_wireguard_service_forwards_and_restarts_without_leaks() {
         let mut server = config::server(port);
         server["wireguard"] = json!("server");
         let configs = json!([
-            server, config::client(port),
-            {"device_fd": tun.as_raw_fd(), "packet_information": framed,
-             "rules": [{"masks": ["0.0.0.0/0", "::/0"], "action": "allow",
-                        "client_chain": [{"protocol": {"type": "wireguard", "endpoint": "wg"}}]}]},
+            server,
+            config::client(port),
+            {
+                "device_fd": tun.as_raw_fd(),
+                "packet_information": framed,
+                "rules": [{
+                    "masks": ["0.0.0.0/0", "::/0"],
+                    "action": "allow",
+                    "client_chain": [{"protocol": {"type": "wireguard", "endpoint": "wg"}}],
+                }],
+            },
         ]);
-        let (protected, calls) = mpsc::channel();
+        let (protected_tx, protected_rx) = mpsc::channel();
         let protector = Arc::new(crate::tun::FnSocketProtector::new(move |fd| {
             let fd = unsafe { BorrowedFd::borrow_raw(fd) };
             let socket = socket2::SockRef::from(&fd);
             let info = (socket.r#type()?, socket.local_addr()?.as_socket().unwrap());
-            let _ = protected.send(info);
+            let _ = protected_tx.send(info);
             Ok(())
         }));
         let (running, service) =
             start_test_service(serde_yaml::to_string(&configs).unwrap(), protector);
         // Only WireGuard opens sockets before the first forwarded packet.
-        let startup: Vec<_> = (0..2)
+        let protected_sockets: Vec<_> = (0..2)
             .map(|_| {
-                calls
+                protected_rx
                     .recv_timeout(Duration::from_secs(5))
                     .expect("WireGuard socket was not protected")
             })
             .collect();
         assert!(
-            startup
+            protected_sockets
                 .iter()
                 .all(|(kind, _)| *kind == socket2::Type::DGRAM)
         );
-        assert!(startup.iter().any(|(_, address)| address.port() == port));
         assert!(
-            startup
+            protected_sockets
+                .iter()
+                .any(|(_, address)| address.port() == port)
+        );
+        assert!(
+            protected_sockets
                 .iter()
                 .any(|(_, address)| address.port() != 0 && address.port() != port)
         );
