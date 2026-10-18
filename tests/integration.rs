@@ -36,6 +36,8 @@ mod shadowsocks_uot;
 mod shadowsocks_uot_edge_cases;
 #[path = "cases/integration/snell_integration.rs"]
 mod snell;
+#[path = "cases/integration/sni_sniffing.rs"]
+mod sni_sniffing;
 #[path = "cases/integration/socks_integration.rs"]
 mod socks;
 #[path = "cases/integration/socks5_udp_associate_test.rs"]

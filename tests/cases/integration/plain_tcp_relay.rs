@@ -14,7 +14,12 @@ async fn headers(socket: &mut TcpStream) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-async fn request(socket: &mut TcpStream, protocol: &str, port: u16, data: &[u8]) -> io::Result<()> {
+pub(super) async fn request(
+    socket: &mut TcpStream,
+    protocol: &str,
+    port: u16,
+    data: &[u8],
+) -> io::Result<()> {
     let mut request = match protocol {
         "socks" => {
             socket.write_all(&[5, 1, 0]).await?;
