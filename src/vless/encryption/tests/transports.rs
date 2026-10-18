@@ -17,7 +17,7 @@ use crate::{
 const UUID: &str = "550e8400-e29b-41d4-a716-446655440000";
 const LIMIT: Duration = Duration::from_secs(10);
 
-struct Tasks(Vec<JoinHandle<()>>);
+pub(super) struct Tasks(pub(super) Vec<JoinHandle<()>>);
 impl Drop for Tasks {
     fn drop(&mut self) {
         for task in &self.0 {
@@ -26,7 +26,7 @@ impl Drop for Tasks {
     }
 }
 impl Tasks {
-    async fn stop(&mut self) {
+    pub(super) async fn stop(&mut self) {
         for task in self.0.drain(..) {
             task.abort();
             let _ = task.await;
@@ -34,7 +34,7 @@ impl Tasks {
     }
 }
 
-async fn echo() -> (u16, Tasks) {
+pub(super) async fn echo() -> (u16, Tasks) {
     let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let task = tokio::spawn(async move {
@@ -55,7 +55,207 @@ async fn echo() -> (u16, Tasks) {
     (port, Tasks(vec![task]))
 }
 
-fn request(port: u16, command: u8, flow: bool) -> Vec<u8> {
+#[tokio::test]
+async fn native_vision_rejects_h2mux_before_opening_a_stream() {
+    use crate::{
+        client_proxy_selector::ClientProxySelector,
+        h2mux::{MUX_DESTINATION_HOST, MUX_DESTINATION_PORT},
+        tcp::tcp_handler::TcpServerHandler,
+        vless::{encryption::ServerEncryption, vless_server_handler::VlessTcpServerHandler},
+    };
+    use shoes_test_support::vless::{VlessDestination, encode_vless_udp_request, parse_uuid};
+
+    let (encryption, decryption) = fixture_settings("random", true, &[32]);
+    let handler = VlessTcpServerHandler::new(
+        UUID,
+        true,
+        Arc::new(ClientProxySelector::new(Vec::new())),
+        Arc::new(NativeResolver::new()),
+        None,
+        Some(Arc::new(
+            ServerEncryption::new(&decryption, Default::default()).unwrap(),
+        )),
+        true,
+    )
+    .unwrap();
+    let (a, b) = tokio::io::duplex(8192);
+    let (result, _client) = timeout(LIMIT, async {
+        tokio::join!(handler.setup_server_stream(Box::new(b)), async {
+            let mut client = ClientEncryption::new(&encryption)
+                .unwrap()
+                .handshake(a)
+                .await
+                .unwrap();
+            let mut request = encode_vless_udp_request(
+                parse_uuid(UUID).unwrap(),
+                &VlessDestination::Domain(MUX_DESTINATION_HOST.into(), MUX_DESTINATION_PORT),
+            )
+            .unwrap();
+            request[18] = 1;
+            request[17] = 18;
+            request.splice(18..18, b"\x0a\x10xtls-rprx-vision".iter().copied());
+            client.write_all(&request).await.unwrap();
+            client.flush().await.unwrap();
+            client
+        })
+    })
+    .await
+    .unwrap();
+    let error = result.err().expect("native Vision accepted H2MUX");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert_eq!(
+        error.to_string(),
+        "Native VLESS Vision does not support H2MUX"
+    );
+}
+
+#[tokio::test]
+async fn legacy_and_native_address_forms_and_empty_udp_responses() {
+    use crate::async_stream::AsyncStream;
+    use shoes_test_support::{
+        test_servers::{start_tcp_stream_echo_server, start_udp_response_server},
+        vless::{
+            VlessDestination, VlessUdpClient, XUDP_OPTION_DATA, XUDP_STATUS_NEW, XudpClient,
+            XudpFrame, encode_vless_udp_request, parse_uuid,
+        },
+    };
+
+    let udp_response = |payload: &[u8], _| {
+        if payload == b"empty reply" {
+            vec![]
+        } else {
+            payload.to_vec()
+        }
+    };
+    let udp = start_udp_response_server("0.0.0.0", 0, udp_response)
+        .await
+        .unwrap();
+    let (tcp_port, mut target) = echo().await;
+    // Separate listeners serve either localhost address without requiring dual-stack sockets.
+    let ipv6_targets = match TcpListener::bind("[::1]:0").await {
+        Ok(_probe) => Some((
+            start_tcp_stream_echo_server("::1", tcp_port).await.unwrap(),
+            start_udp_response_server("::1", udp.local_addr().port(), udp_response)
+                .await
+                .unwrap(),
+        )),
+        Err(error) => {
+            eprintln!("IPv6 loopback unavailable; skipping IPv6 cases: {error}");
+            None
+        }
+    };
+    for (native, vision) in [(false, false), (true, false), (true, true)] {
+        let (encryption, decryption) = fixture_settings("random", true, &[32]);
+        let client = ClientEncryption::new(&encryption).unwrap();
+        let port = TcpListener::bind("0.0.0.0:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let config: ServerConfig = serde_json::from_value(json!({
+            "address":format!("0.0.0.0:{port}"),
+            "protocol":{"type":"vless","user_id":UUID,"udp_enabled":true,
+                "decryption":if native {decryption.as_str()} else {"none"},"vision":vision}
+        }))
+        .unwrap();
+        let mut listeners = Tasks(
+            crate::tcp::tcp_server::start_servers(
+                crate::config::Config::Server(config),
+                Arc::new(NativeResolver::new()),
+            )
+            .await
+            .unwrap(),
+        );
+        let connect = || async {
+            let socket = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+            let stream: Box<dyn AsyncStream> = if native {
+                Box::new(client.handshake(socket).await.unwrap())
+            } else {
+                Box::new(socket)
+            };
+            stream
+        };
+        timeout(LIMIT, async {
+            let destinations = |port, ipv6: Option<SocketAddr>| {
+                let mut destinations = vec![
+                    VlessDestination::Ip(SocketAddr::from(([127, 0, 0, 1], port))),
+                    VlessDestination::Domain("localhost".into(), port),
+                ];
+                if let Some(address) = ipv6 {
+                    destinations.push(VlessDestination::Ip(address));
+                }
+                destinations
+            };
+            for _ in 0..2 {
+                if !vision {
+                    for destination in destinations(
+                        tcp_port,
+                        ipv6_targets.as_ref().map(|(tcp, _)| tcp.local_addr()),
+                    ) {
+                        let mut stream = connect().await;
+                        let mut request =
+                            encode_vless_udp_request(parse_uuid(UUID).unwrap(), &destination)
+                                .unwrap();
+                        request[18] = 1;
+                        stream.write_all(&request).await.unwrap();
+                        stream.write_all(b"address roundtrip").await.unwrap();
+                        stream.flush().await.unwrap();
+                        let mut reply = [0; 19];
+                        stream.read_exact(&mut reply).await.unwrap();
+                        assert_eq!(&reply[..2], &[0, 0]);
+                        assert_eq!(&reply[2..], b"address roundtrip");
+                    }
+                }
+                for destination in destinations(
+                    udp.local_addr().port(),
+                    ipv6_targets.as_ref().map(|(_, udp)| udp.local_addr()),
+                ) {
+                    let stream = connect().await;
+                    let mut udp = VlessUdpClient::connect(
+                        stream,
+                        parse_uuid(UUID).unwrap(),
+                        destination.clone(),
+                    )
+                    .await
+                    .unwrap();
+                    for (payload, expected) in [
+                        (b"empty reply".as_slice(), b"".as_slice()),
+                        (
+                            b"nonempty after empty".as_slice(),
+                            b"nonempty after empty".as_slice(),
+                        ),
+                    ] {
+                        udp.send_packet(payload).await.unwrap();
+                        let reply = udp.recv_packet(LIMIT).await.unwrap();
+                        assert_eq!(reply, expected);
+                    }
+                    let mut xudp = XudpClient::connect(connect().await, parse_uuid(UUID).unwrap())
+                        .await
+                        .unwrap();
+                    xudp.send_frame(&XudpFrame {
+                        session_id: 17,
+                        status: XUDP_STATUS_NEW,
+                        options: XUDP_OPTION_DATA,
+                        destination: Some(destination),
+                        payload: Some(b"xudp address".to_vec()),
+                    })
+                    .await
+                    .unwrap();
+                    let reply = xudp.recv_frame(LIMIT).await.unwrap();
+                    assert_eq!(reply.session_id, 17);
+                    assert_eq!(reply.payload.unwrap(), b"xudp address");
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|e| panic!("native={native}, vision={vision}: {e}"));
+        listeners.stop().await;
+    }
+    target.stop().await;
+}
+
+pub(super) fn request(port: u16, command: u8, flow: bool) -> Vec<u8> {
     let mut request = vec![0];
     request.extend(crate::uuid_util::parse_uuid(UUID).unwrap());
     if flow {

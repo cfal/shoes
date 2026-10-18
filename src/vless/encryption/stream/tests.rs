@@ -7,6 +7,54 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 mod liveness;
 mod resumption;
 
+#[tokio::test]
+async fn maximum_native_record_keeps_direct_command_in_second_vision_read_and_raw_tail() {
+    use crate::vless::vision_stream::VisionStream;
+    for masked in [false, true] {
+        for cipher in [Cipher::Aes256Gcm, Cipher::ChaCha20Poly1305] {
+            let first = vec![41; 9000];
+            let second = vec![42; 7596];
+            let mut plain = vec![0, 0];
+            plain.extend_from_slice(&[7; 16]);
+            plain.push(0);
+            plain.extend_from_slice(&(first.len() as u16).to_be_bytes());
+            plain.extend_from_slice(&[0, 0]);
+            plain.extend_from_slice(&first);
+            plain.push(2);
+            plain.extend_from_slice(&(second.len() as u16).to_be_bytes());
+            plain.extend_from_slice(&[0, 0]);
+            plain.extend_from_slice(&second);
+            assert_eq!(plain.len(), 16624);
+            let mut peer = Aead::new(b"context", &[7; 96], cipher).unwrap();
+            let mut wire = peer.seal_record(&plain, &[7; 96]).unwrap();
+            wire.extend_from_slice(b"\x17\x03\x03\x00\x04tail");
+            if masked {
+                HeaderMask::new(&[7; 96], &[8; 16], 0)
+                    .unwrap()
+                    .apply_write(&mut wire)
+                    .unwrap();
+            }
+            let mut stream = stream(
+                Scripted {
+                    input: wire.into(),
+                    eof: true,
+                    ..Default::default()
+                },
+                true,
+                masked,
+            );
+            stream.read_aead = Some(Aead::new(b"context", &[7; 96], cipher).unwrap());
+            let mut vision = VisionStream::new_client(stream, [7; 16]).unwrap();
+            let mut received = Vec::new();
+            vision.read_to_end(&mut received).await.unwrap();
+            assert_eq!(
+                received,
+                [first, second, b"\x17\x03\x03\x00\x04tail".to_vec()].concat()
+            );
+        }
+    }
+}
+
 #[derive(Default)]
 struct Scripted {
     input: VecDeque<u8>,

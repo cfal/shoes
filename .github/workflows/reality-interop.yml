@@ -16,8 +16,8 @@ jobs:
         include:
           - name: v26.10.10
             revision: 701af60772cda123492f86e383e1fdba066614a9
-          - name: main-2026-10-14
-            revision: 0888beb38a9ba45440557175e71ce21cf8ba3b13
+          - name: v26.10.17
+            revision: 92ccc939aaf4f8965f369cf0b142e005aeaa11d5
     name: Xray ${{ matrix.name }}
     env:
       CARGO_BUILD_JOBS: 1

@@ -13,7 +13,7 @@ use tokio::{
 
 fn start_xray(config: serde_json::Value) -> io::Result<(ProcessGuard, tempfile::NamedTempFile)> {
     let binary = std::env::var_os("SHOES_TEST_XRAY_BIN").unwrap_or_else(|| "xray".into());
-    let mut file = tempfile::NamedTempFile::new()?;
+    let mut file = tempfile::Builder::new().suffix(".json").tempfile()?;
     file.write_all(config.to_string().as_bytes())?;
     file.flush()?;
     let child = Command::new(binary)

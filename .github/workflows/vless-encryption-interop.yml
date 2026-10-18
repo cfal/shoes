@@ -25,7 +25,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: XTLS/Xray-core
-          ref: 0f3d884786f9ec73d3be8899cb6b9e1e6dd3c41e
+          ref: 92ccc939aaf4f8965f369cf0b142e005aeaa11d5
           path: peers/xray
       - uses: actions/checkout@v4
         with:
@@ -69,6 +69,7 @@ jobs:
         env:
           XRAY_BINARY: ${{ runner.temp }}/xray
           MIHOMO_BINARY: ${{ runner.temp }}/mihomo
+          SHOES_TEST_SING_BOX_BIN: ${{ runner.temp }}/sing-box
         run: cargo test --locked --features optional-peer-tests --test vless_encryption_interop -- --test-threads=1
       - name: Cross-language cryptography vectors
         run: |

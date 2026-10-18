@@ -8,7 +8,7 @@ mod session;
 mod stream;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 use std::{fmt, io, sync::Arc};
 

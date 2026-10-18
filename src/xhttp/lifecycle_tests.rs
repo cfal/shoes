@@ -212,6 +212,73 @@ async fn delayed_headers_half_close_and_pool_isolation() {
 }
 
 #[tokio::test]
+async fn h2_streaming_early_responses_preserve_download_tails() {
+    for mode in [XhttpMode::StreamOne, XhttpMode::StreamUp] {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+            let address = ([127, 0, 0, 1], listener.local_addr().unwrap().port()).into();
+            let tasks = Tasks::new();
+            let expected: Vec<_> = (0..96 * 1024).map(|i| (i % 251) as u8).collect();
+            let response_bytes = expected.clone();
+            tasks.spawn(async move {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut connection = h2::server::Builder::new()
+                    .initial_window_size(1024)
+                    .handshake(socket)
+                    .await
+                    .unwrap();
+                let requests = Tasks::new();
+                let uploaded = tokio_util::sync::CancellationToken::new();
+                while let Some(Ok((request, mut respond))) = connection.accept().await {
+                    let uploaded = uploaded.clone();
+                    let response_bytes = response_bytes.clone();
+                    requests.spawn(async move {
+                        let post = request.method() == http::Method::POST;
+                        let mut incoming = request.into_body();
+                        if post {
+                            assert_eq!(incoming.data().await.unwrap().unwrap(), &[7; 1024][..]);
+                            uploaded.cancel();
+                        } else {
+                            uploaded.cancelled().await;
+                        }
+                        let upload_only = post && mode == XhttpMode::StreamUp;
+                        let mut send = respond
+                            .send_response(Response::new(()), upload_only)
+                            .unwrap();
+                        if !upload_only {
+                            send.send_data(Bytes::from(response_bytes), true).unwrap();
+                        }
+                        // Dropping the unread POST queues NO_ERROR after its response.
+                    });
+                }
+            });
+            let config = serde_json::from_value(serde_json::json!({
+                "limits":{"max_buffered_bytes":65536,"max_session_buffered_bytes":65536},
+                "protocol":{"type":"socks"}
+            }))
+            .unwrap();
+            let client = configured_client(config, XhttpVersion::H2, mode);
+            let dialer = Arc::new(Dialer {
+                address,
+                key: RouteKey(vec![1]),
+                opens: AtomicUsize::new(0),
+            });
+            let mut stream = client.open(dialer.clone()).await.unwrap();
+            stream.write_all(&[7; 2048]).await.unwrap();
+            stream.write.closed().await;
+            let mut actual = Vec::new();
+            stream.read_to_end(&mut actual).await.unwrap();
+            assert_eq!(actual, expected);
+            stream._tasks.wait().await;
+            assert!(stream.write_all(b"after response").await.is_err());
+            assert_eq!(dialer.opens.load(Ordering::Relaxed), 1);
+        })
+        .await
+        .unwrap();
+    }
+}
+
+#[tokio::test]
 async fn idle_routes_are_evicted_and_failed_dials_do_not_fill_the_pool() {
     let (address, _server) = echo_peer(XhttpVersion::H2, false).await;
     let client = client(XhttpVersion::H2);

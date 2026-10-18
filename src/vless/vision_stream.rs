@@ -858,7 +858,10 @@ impl<S: VisionTransport> AsyncStream for VisionStream<S> {
 #[cfg(test)]
 mod tests {
     mod decisions;
+    mod native_decisions;
     mod native_errors;
+    #[cfg(target_os = "linux")]
+    mod native_splice;
     #[cfg(target_os = "linux")]
     mod splice;
 
