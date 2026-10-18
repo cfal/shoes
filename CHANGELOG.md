@@ -2,9 +2,9 @@
 
 ## Unreleased
 
-- Added named, userspace WireGuard endpoints using GotaTun 0.10.1. Endpoints support inbound TCP/UDP forwarding, outbound proxy chains, IPv4/IPv6, multiple static peers, PSKs, keepalives, and authenticated roaming on Unix.
-- WireGuard references are supported only at the first chain hop. TCP DNS transports can use them; unsupported UDP/H3 DNS routes and tunnel-dependent bootstrap configurations are rejected instead of bypassing the tunnel.
-- Added endpoint `outer_client_chain` for proxies before WireGuard, including nested endpoint dependencies and optional inner proxy suffixes. Detours use fixed peer destinations, require a UDP-capable final outer hop, and never fall back to direct UDP. They do not accept unsolicited public peers or support arbitrary peer roaming.
+- Added userspace WireGuard client and server protocols using GotaTun 0.10.1. They support inbound TCP/UDP forwarding, outbound proxy chains, IPv4/IPv6, multiple server peers, PSKs, keepalives, and authenticated roaming on Unix. Identical client configurations share devices automatically; conflicting settings for the same endpoint and key pair reject.
+- WireGuard clients are supported only at the first chain hop. TCP DNS transports can use them; unsupported UDP/H3 DNS routes and tunnel-dependent bootstrap configurations are rejected instead of bypassing the tunnel.
+- Added protocol `peer_client_chain` for proxies before WireGuard, including nested WireGuard clients and optional inner proxy suffixes. Detours use fixed peer destinations, require a UDP-capable final carrier hop, and never fall back to direct UDP. Proxied servers omit their listen address and initiate peer associations using keepalive. Detours do not accept unsolicited public peers or support arbitrary peer roaming.
 - WireGuard reloads disconnect existing flows and explicitly release endpoint sockets before rebinding. Initial limitations include no IP fragmentation/reassembly, ICMP forwarding, or OS route management.
 - Shared TUN and WireGuard TCP streams complete write-half shutdown after queuing FIN, without waiting for the remote read half to close. Dropping a drained stream allows the FIN exchange to finish, bounded by a 60-second orphan deadline.
 

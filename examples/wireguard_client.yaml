@@ -1,17 +1,18 @@
 # Demonstration keys only. Replace both keys and the peer endpoint before deployment.
-- wireguard: wg-out
-  private_key: "KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKio="
-  addresses: ["10.77.0.2/32", "fd77::2/128"]
-  peers:
-    - public_key: "F9firNML9eGdhhroCYjRf66PZi9dgLAFP2zHPNqx0mQ="
-      endpoint: "127.0.0.1:51820"
-      allowed_ips: ["0.0.0.0/0", "::/0"]
-      persistent_keepalive: 25
+- client_group: vpn
+  client_proxies:
+    - address: "127.0.0.1:51820"
+      protocol:
+        type: wireguard
+        private_key: "KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKio="
+        public_key: "F9firNML9eGdhhroCYjRf66PZi9dgLAFP2zHPNqx0mQ="
+        addresses: ["10.77.0.2/32", "fd77::2/128"]
+        allowed_ips: ["0.0.0.0/0", "::/0"]
+        persistent_keepalive: 25
 
 - address: "0.0.0.0:1080"
   protocol: {type: socks}
   rules:
     - masks: ["0.0.0.0/0", "::/0"]
       action: allow
-      client_chain:
-        - protocol: {type: wireguard, endpoint: wg-out}
+      client_chain: vpn

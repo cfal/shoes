@@ -341,6 +341,17 @@ impl From<NetLocation> for NetLocationPortRange {
 }
 
 impl NetLocationPortRange {
+    pub(crate) fn literal_socket_addr(&self) -> Option<SocketAddr> {
+        let &[port] = self.ports.as_slice() else {
+            return None;
+        };
+        match &self.address {
+            Address::Ipv4(ip) => Some(SocketAddr::new(IpAddr::V4(*ip), port)),
+            Address::Ipv6(ip) => Some(SocketAddr::new(IpAddr::V6(*ip), port)),
+            Address::Hostname(host) => format!("{host}:{port}").parse().ok(),
+        }
+    }
+
     pub fn new(address: Address, mut ports: Vec<u16>) -> std::io::Result<Self> {
         ports.sort_unstable();
         ports.dedup();

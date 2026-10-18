@@ -17,6 +17,8 @@ mod client_visit;
 mod pem;
 mod types;
 mod validate;
+#[cfg(unix)]
+mod wireguard_devices;
 
 pub use pem::convert_cert_paths;
 pub use types::*;

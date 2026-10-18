@@ -2,6 +2,7 @@ use super::{is_service_running, stop_service, tests::start_test_service};
 use crate::{
     async_stream::{AsyncReadMessage, AsyncWriteMessage},
     ip_stack::{driver::PacketStack, packet::PacketBuffer},
+    wireguard::test_support as config,
 };
 use serde_json::json;
 use shoes_test_support::wireguard::EchoTargets;
@@ -21,10 +22,6 @@ use tokio::{
     task::JoinSet,
     time::timeout,
 };
-
-#[path = "../../tests/cases/wireguard_support.rs"]
-#[allow(dead_code)]
-mod config;
 
 fn header(ipv6: bool) -> [u8; 4] {
     #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -122,18 +119,19 @@ fn raw_fd_wireguard_service_forwards_and_restarts_without_leaks() {
             socket.set_send_buffer_size(256 * 1024).unwrap();
             socket.set_recv_buffer_size(256 * 1024).unwrap();
         }
-        let mut server = config::server(port);
-        server["wireguard"] = json!("server");
+        let mut duplicate = config::client(port);
+        duplicate["client_group"] = json!("copy");
         let configs = json!([
-            server,
+            config::server(port),
             config::client(port),
+            duplicate,
             {
                 "device_fd": tun.as_raw_fd(),
                 "packet_information": framed,
                 "rules": [{
                     "masks": ["0.0.0.0/0", "::/0"],
                     "action": "allow",
-                    "client_chain": [{"protocol": {"type": "wireguard", "endpoint": "wg"}}],
+                    "client_chain": [{"pool": ["wg", "copy"]}],
                 }],
             },
         ]);

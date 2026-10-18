@@ -301,8 +301,7 @@ where
     Ok((fields.password, fields.sni_hostname, fields.protocol))
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ClientConfig {
     #[serde(default, skip_serializing_if = "NoneOrOne::is_unspecified")]
     pub bind_interface: NoneOrOne<String>,
@@ -318,6 +317,45 @@ pub struct ClientConfig {
     pub tcp_settings: Option<TcpConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quic_settings: Option<ClientQuicConfig>,
+}
+
+impl<'de> Deserialize<'de> for ClientConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        fn explicit_transport<'de, D: serde::Deserializer<'de>>(
+            deserializer: D,
+        ) -> Result<Option<Transport>, D::Error> {
+            Transport::deserialize(deserializer).map(Some)
+        }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Fields {
+            #[serde(default)]
+            bind_interface: NoneOrOne<String>,
+            #[serde(default = "unspecified_address")]
+            address: NetLocation,
+            protocol: ClientProxyConfig,
+            #[serde(default, deserialize_with = "explicit_transport")]
+            transport: Option<Transport>,
+            tcp_settings: Option<TcpConfig>,
+            quic_settings: Option<ClientQuicConfig>,
+        }
+        let fields = Fields::deserialize(deserializer)?;
+        let transport = fields.transport.unwrap_or_else(|| {
+            if fields.protocol.is_wireguard() {
+                Transport::Udp
+            } else {
+                Transport::Tcp
+            }
+        });
+        Ok(Self {
+            bind_interface: fields.bind_interface,
+            address: fields.address,
+            protocol: fields.protocol,
+            transport,
+            tcp_settings: fields.tcp_settings,
+            quic_settings: fields.quic_settings,
+        })
+    }
 }
 
 impl Default for ClientConfig {
@@ -363,7 +401,7 @@ pub enum HttpVersion {
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ClientProxyConfig {
     Direct,
-    Wireguard(super::wireguard::WireguardReference),
+    Wireguard(Box<super::wireguard::WireguardClientConfig>),
     Http {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         username: Option<String>,

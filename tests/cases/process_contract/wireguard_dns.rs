@@ -118,7 +118,7 @@ async fn wireguard_dns_reload_uses_the_new_resolver_and_outages_never_bypass_the
         let server_path = directory.path().join("server.yaml");
         let client_path = directory.path().join("client.yaml");
         let mut server_config = config::server(port);
-        server_config["inbound"]["rules"].as_array_mut().unwrap().insert(
+        server_config["rules"].as_array_mut().unwrap().insert(
             0,
             json!({
                 "masks": "::1/128",
@@ -144,7 +144,7 @@ async fn wireguard_dns_reload_uses_the_new_resolver_and_outages_never_bypass_the
                         "timeout_secs": 1,
                         "connect_timeout_secs": 1,
                         "attempts": 1,
-                        "client_chain": [{"protocol": {"type": "wireguard", "endpoint": "wg"}}],
+                        "client_chain": "wg",
                     }],
                 },
             ])

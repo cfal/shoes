@@ -188,10 +188,19 @@ async fn run_rekey(detour: bool) -> io::Result<()> {
                         if let Ok(WgKind::Data(packet)) = Packet::copy_from(&outbound[..len]).try_into_wg() {
                             observed.lock().unwrap().insert(packet.header.receiver_idx.get());
                         }
-                        back.send(&outbound[..len]).await?;
+                        if let Err(error) = back.send(&outbound[..len]).await
+                            && error.kind() != io::ErrorKind::ConnectionRefused
+                        {
+                            return Err(error);
+                        }
                     }
                     packet = back.recv(&mut inbound) => {
-                        let len = packet?;
+                        // The first handshake can precede the peer's UDP bind.
+                        let len = match packet {
+                            Ok(len) => len,
+                            Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => continue,
+                            Err(error) => return Err(error),
+                        };
                         front.send_to(&inbound[..len], client.unwrap()).await?;
                     }
                 }
@@ -202,14 +211,14 @@ async fn run_rekey(detour: bool) -> io::Result<()> {
         let mut ports = PortHelper::new();
         let (_, entry) = ports.get_localhost_listener_port();
         let mut client = config::client(relay_port);
-        client["mtu"] = json!(1280);
-        client["peers"][0].as_object_mut().unwrap().remove("pre_shared_key");
+        client["client_proxies"][0]["protocol"]["mtu"] = json!(1280);
+        client["client_proxies"][0]["protocol"].as_object_mut().unwrap().remove("pre_shared_key");
         let mut shoes_config = Vec::new();
         if detour {
             let (_, outer_port) = ports.get_localhost_listener_port();
             let protocol = config::vless_protocol();
-            client["peers"][0]["endpoint"] = json!(format!("192.0.2.200:{relay_port}"));
-            client["outer_client_chain"] = json!([{"address": format!("127.0.0.1:{outer_port}"), "protocol": protocol}]);
+            client["client_proxies"][0]["address"] = json!(format!("192.0.2.200:{relay_port}"));
+            client["client_proxies"][0]["protocol"]["peer_client_chain"] = json!([{"address": format!("127.0.0.1:{outer_port}"), "protocol": protocol}]);
             shoes_config.push(json!({
                 "address": format!("0.0.0.0:{outer_port}"), "protocol": protocol,
                 "rules": [{"masks": "192.0.2.200/32", "action": "allow", "override_address": "127.0.0.1:0"}],
@@ -226,7 +235,12 @@ async fn run_rekey(detour: bool) -> io::Result<()> {
         let echoes = EchoTargets::new(false).await?;
         let mut target = echoes.tcp();
         target.set_ip("198.18.0.1".parse().unwrap());
-        let mut stream = shoes_test_support::wireguard::connect(entry, target).await?;
+        let mut stream = tokio::select! {
+            result = shoes_test_support::wireguard::connect(entry, target) => result?,
+            result = tasks.join_next() => {
+                return Err(io::Error::other(format!("WireGuard observer stopped before connection: {result:?}")));
+            }
+        };
         let udp = shoes_test_support::socks5::Socks5UdpAssociation::connect("127.0.0.1", entry).await?;
         let udp_target = std::net::SocketAddr::new(target.ip(), echoes.udp().port());
         assert_eq!(udp.send_to(udp_target, b"before rekey").await?, b"before rekey");

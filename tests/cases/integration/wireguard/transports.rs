@@ -31,8 +31,8 @@ async fn named_outer_chains_carry_wireguard_over_each_supported_stream_protocol(
                 }}}), json!({"type": "tls", "sni_hostname": "localhost", "verify": false, "protocol": protocol}))
             } else { (protocol.clone(), protocol) };
             let mut client = config::client(port);
-            client["peers"][0]["endpoint"] = json!(format!("192.0.2.200:{port}"));
-            client["outer_client_chain"] = json!("outer");
+            client["client_proxies"][0]["address"] = json!(format!("192.0.2.200:{port}"));
+            client["client_proxies"][0]["protocol"]["peer_client_chain"] = json!("outer");
             let server = json!([
                 config::server(port),
                 {"address": format!("0.0.0.0:{outer}"), "protocol": server_protocol,
@@ -63,12 +63,11 @@ async fn nested_endpoints_start_in_dependency_order_in_a_real_process() -> io::R
         let mut ports = PortHelper::new();
         let (_, entry) = ports.get_localhost_listener_port();
         let mut carrier = config::client(carrier_port);
-        carrier["wireguard"] = json!("carrier");
+        carrier["client_group"] = json!("carrier");
         let mut inner = config::client(inner_port);
-        inner["mtu"] = json!(1280);
-        inner["peers"][0]["endpoint"] = json!(format!("198.18.0.1:{inner_port}"));
-        inner["outer_client_chain"] =
-            json!([{"protocol": {"type": "wireguard", "endpoint": "carrier"}}]);
+        inner["client_proxies"][0]["protocol"]["mtu"] = json!(1280);
+        inner["client_proxies"][0]["address"] = json!(format!("198.18.0.1:{inner_port}"));
+        inner["client_proxies"][0]["protocol"]["peer_client_chain"] = json!("carrier");
         drop((carrier_socket, inner_socket));
         let _carrier = start(&json!([config::server(carrier_port)]))?;
         let _inner = start(&json!([config::server(inner_port)]))?;
@@ -104,8 +103,8 @@ async fn outer_pool_reconnects_through_an_alternate_member_without_restarting_fl
             "rules": [{"masks": "192.0.2.200/32", "action": "allow", "override_address": "127.0.0.1:0"}],
         }]);
         let mut client = config::client(port);
-        client["peers"][0]["endpoint"] = json!(format!("192.0.2.200:{port}"));
-        client["outer_client_chain"] = json!([{"pool": ["primary", "backup"]}]);
+        client["client_proxies"][0]["address"] = json!(format!("192.0.2.200:{port}"));
+        client["client_proxies"][0]["protocol"]["peer_client_chain"] = json!([{"pool": ["primary", "backup"]}]);
         let group = |name, port| json!({"client_group": name, "client_proxies": [{
             "address": format!("127.0.0.1:{port}"), "protocol": config::vless_protocol(),
         }]});
