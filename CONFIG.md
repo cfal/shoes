@@ -299,8 +299,8 @@ path: "/tmp/shoes.sock"
 # Protocol configuration (required)
 protocol: ServerProxyConfig
 
-# Transport layer (default: tcp; WireGuard defaults to and requires udp)
-transport: tcp | quic | udp
+# Transport layer (default: tcp)
+transport: tcp | quic          # WireGuard only: udp (default, required)
 
 # TCP settings (only when transport: tcp)
 tcp_settings:
@@ -608,7 +608,7 @@ Used in rules to specify upstream proxies.
 ```yaml
 address: string                # Proxy server address (e.g., "proxy.example.com:1080")
 protocol: ClientProxyConfig
-transport: tcp | quic | udp    # Default: tcp; WireGuard defaults to and requires udp
+transport: tcp | quic          # Default: tcp; WireGuard only: udp (default, required)
 bind_interface: string         # Optional, Linux/Android/Fuchsia only
 
 tcp_settings:
