@@ -687,6 +687,10 @@ pub fn parse_validated_server_hello(
 #[path = "tests/server_hello.rs"]
 mod server_hello_tests;
 
+#[cfg(test)]
+#[path = "tests/local_handshake.rs"]
+mod local_handshake_tests;
+
 #[allow(clippy::too_many_arguments)]
 #[inline]
 async fn setup_remote_handshake(
@@ -1107,6 +1111,8 @@ async fn setup_local_handshake(
                 server_data_end_index -= TLS_HEADER_LEN + server_payload_size;
             };
         }
+        // The client needs the whole server flight before it sends its next record.
+        server_stream.flush().await?;
 
         let client_header_bytes = client_reader
             .read_slice(&mut server_stream, 5)
