@@ -306,7 +306,7 @@ pub struct XhttpServerConfig {
     #[serde(default)]
     pub path: String,
     #[serde(default)]
-    pub close_on_error: bool,
+    pub close_on_http1_error: bool,
     #[serde(default)]
     pub host: Option<String>,
     #[serde(default)]
@@ -540,8 +540,8 @@ mod tests {
         }))
         .unwrap();
         assert!(config.matching_headers.is_empty());
-        assert!(!config.close_on_error);
-        config.close_on_error = true;
+        assert!(!config.close_on_http1_error);
+        config.close_on_http1_error = true;
         config
             .matching_headers
             .insert("X-Token".into(), "Secret".into());
@@ -549,10 +549,11 @@ mod tests {
             .matching_headers
             .insert("X-Empty".into(), String::new());
         config.validate().unwrap();
-        let decoded: XhttpServerConfig =
-            serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
+        let encoded = serde_json::to_value(&config).unwrap();
+        assert_eq!(encoded["close_on_http1_error"], true);
+        let decoded: XhttpServerConfig = serde_json::from_value(encoded).unwrap();
         assert_eq!(decoded.matching_headers, config.matching_headers);
-        assert!(decoded.close_on_error);
+        assert!(decoded.close_on_http1_error);
         decoded.validate().unwrap();
     }
 
