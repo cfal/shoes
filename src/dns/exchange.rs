@@ -17,6 +17,7 @@ use super::proxy_runtime::ProxyRuntimeProvider;
 
 type Connection =
     Shared<BoxFuture<'static, Result<DnsExchange<ProxyRuntimeProvider>, Arc<io::Error>>>>;
+type SetupWaits = parking_lot::Mutex<Vec<Option<Connection>>>;
 
 struct Upstream {
     ip: IpAddr,
@@ -87,7 +88,11 @@ impl RawDnsExchange {
         if result
             .as_ref()
             .is_err_and(|error| error.kind() == io::ErrorKind::TimedOut)
-            && setups.lock().iter().any(|setup| setup.peek().is_none())
+            && setups
+                .lock()
+                .iter()
+                .flatten()
+                .any(|setup| !matches!(setup.peek(), Some(Err(_))))
         {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
@@ -97,11 +102,7 @@ impl RawDnsExchange {
         result
     }
 
-    async fn exchange_inner(
-        &self,
-        bytes: Vec<u8>,
-        setups: &parking_lot::Mutex<Vec<Connection>>,
-    ) -> io::Result<Vec<u8>> {
+    async fn exchange_inner(&self, bytes: Vec<u8>, setups: &SetupWaits) -> io::Result<Vec<u8>> {
         let mut request = super::message::decode(&bytes)?;
         if request.metadata.message_type != MessageType::Query
             || request.metadata.op_code != OpCode::Query
@@ -173,7 +174,7 @@ impl RawDnsExchange {
         upstream: &'a Upstream,
         request: &'a Message,
         timeout: std::time::Duration,
-        setups: &'a parking_lot::Mutex<Vec<Connection>>,
+        setups: &'a SetupWaits,
     ) -> BoxFuture<'a, io::Result<Message>> {
         Box::pin(async move {
             tokio::time::timeout(timeout, self.send(upstream, request.clone(), setups))
@@ -191,7 +192,7 @@ impl RawDnsExchange {
         &self,
         upstream: &Upstream,
         message: Message,
-        setups: &parking_lot::Mutex<Vec<Connection>>,
+        setups: &SetupWaits,
     ) -> io::Result<Message> {
         let answer = self
             .send_upstream(upstream, message.clone(), setups)
@@ -214,7 +215,7 @@ impl RawDnsExchange {
         &self,
         upstream: &Upstream,
         message: Message,
-        setups: &parking_lot::Mutex<Vec<Connection>>,
+        setups: &SetupWaits,
     ) -> io::Result<Message> {
         for reconnect in 0..2 {
             let (setup, reused) = {
@@ -230,14 +231,16 @@ impl RawDnsExchange {
                 }
                 (cached.as_ref().unwrap().clone(), reused)
             };
-            // Retain only this query's setup identities, including canceled slot waits.
-            {
+            // Only canceled waits remain, even if another query completes their setup.
+            let wait_index = {
                 let mut setups = setups.lock();
-                if !setups.iter().any(|current| current.ptr_eq(&setup)) {
-                    setups.push(setup.clone());
-                }
-            }
-            let result = match setup.clone().await {
+                let index = setups.len();
+                setups.push(Some(setup.clone()));
+                index
+            };
+            let connection = setup.clone().await;
+            setups.lock()[wait_index] = None;
+            let result = match connection {
                 Ok(connection) => send_message(&connection, message.clone()).await,
                 Err(error) => Err(io::Error::new(error.kind(), error.to_string())),
             };
@@ -559,6 +562,15 @@ mod tests {
 
     #[tokio::test]
     async fn slow_connection_setup_survives_refreshing_resolver_timeout() {
+        assert_slow_setup_survives(false).await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_query_completing_setup_preserves_canceled_wait_retry() {
+        assert_slow_setup_survives(true).await;
+    }
+
+    async fn assert_slow_setup_survives(concurrent: bool) {
         use crate::resolver::{
             DnsExchangeFuture, RefreshPolicy, RefreshingResolver, ResolveFuture, Resolver,
             ResolverFactory,
@@ -604,7 +616,7 @@ mod tests {
         }
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
-            for _ in 0..3 {
+            for _ in 0..3 + usize::from(concurrent) {
                 let answer = read_tcp(&mut stream).await.into_response();
                 write_tcp(&mut stream, answer).await;
             }
@@ -629,11 +641,26 @@ mod tests {
         )
         .await
         .unwrap();
-        for _ in 0..3 {
-            resolver
-                .exchange(request().to_vec().unwrap())
-                .await
-                .unwrap();
+        let requests = async {
+            for _ in 0..3 {
+                resolver
+                    .exchange(request().to_vec().unwrap())
+                    .await
+                    .unwrap();
+            }
+        };
+        if concurrent {
+            let second = async {
+                // Wait until the first query has canceled its TCP setup wait.
+                silent.recv_from(&mut [0; 2048]).await.unwrap();
+                resolver
+                    .exchange(request().to_vec().unwrap())
+                    .await
+                    .unwrap();
+            };
+            tokio::join!(requests, second);
+        } else {
+            requests.await;
         }
         assert_eq!(builds.load(Ordering::SeqCst), 1);
         server.await.unwrap();

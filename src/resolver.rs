@@ -838,6 +838,69 @@ mod tests {
         NetLocation::new(Address::Hostname(format!("host-{index}.example")), 443)
     }
 
+    #[tokio::test]
+    async fn concurrent_setup_retries_do_not_attempt_again_after_generation_changes() {
+        #[derive(Debug, Default)]
+        struct SetupFailureResolver(AtomicUsize);
+        impl Resolver for SetupFailureResolver {
+            fn resolve_location(&self, _: &NetLocation) -> ResolveFuture {
+                unreachable!()
+            }
+
+            fn exchange(&self, _: Vec<u8>) -> DnsExchangeFuture {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                Box::pin(async {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        DnsSetupPending,
+                    ))
+                })
+            }
+        }
+        let initial = Arc::new(SetupFailureResolver::default());
+        let fresh = Arc::new(MockResolver::with_addrs(vec![]));
+        let builds = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let factory: ResolverFactory = {
+            let (initial, fresh, builds, gate) =
+                (initial.clone(), fresh.clone(), builds.clone(), gate.clone());
+            Arc::new(move || {
+                let generation = builds.fetch_add(1, Ordering::Relaxed);
+                let (initial, fresh, gate) = (initial.clone(), fresh.clone(), gate.clone());
+                Box::pin(async move {
+                    if generation == 0 {
+                        Ok(initial as Arc<dyn Resolver>)
+                    } else {
+                        let _permit = gate.acquire().await.unwrap();
+                        Ok(fresh as Arc<dyn Resolver>)
+                    }
+                })
+            })
+        };
+        let resolver = RefreshingResolver::new(
+            factory,
+            RefreshPolicy {
+                max_idle: Duration::from_secs(60),
+                retry_once_after_refresh: true,
+            },
+            "concurrent retained setup retries".into(),
+        )
+        .await
+        .unwrap();
+        let mut first = resolver.exchange(vec![]);
+        let mut second = resolver.exchange(vec![]);
+        assert!(futures::poll!(&mut first).is_pending());
+        assert!(futures::poll!(&mut second).is_pending());
+        assert_eq!(initial.0.load(Ordering::Relaxed), 4);
+        assert_eq!(builds.load(Ordering::Relaxed), 2);
+        gate.add_permits(1);
+        assert!(dns_setup_pending(&first.await.unwrap_err()));
+        assert!(dns_setup_pending(&second.await.unwrap_err()));
+        assert_eq!(initial.0.load(Ordering::Relaxed), 4);
+        assert_eq!(fresh.call_count.load(Ordering::Relaxed), 0);
+        assert_eq!(builds.load(Ordering::Relaxed), 2);
+    }
+
     #[test]
     fn test_caching_native_resolver_cache_is_bounded() {
         let resolver = CachingNativeResolver::new();
