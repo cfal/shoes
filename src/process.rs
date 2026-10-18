@@ -29,7 +29,14 @@ struct PreparedServers {
 async fn prepare(paths: &[String], previous: Option<&DnsRegistry>) -> io::Result<PreparedServers> {
     let mut validated = load_validated(paths).await?;
     if let Some(previous) = previous {
-        validated.validate_network_endpoints(previous.forbidden_ranges())?;
+        validated
+            .validate_network_endpoints(previous.forbidden_ranges())
+            .map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("{error}; guard retained from the running configuration until restart"),
+                )
+            })?;
     }
     #[cfg(unix)]
     let wireguard = if let Some(previous) = previous {
@@ -530,9 +537,12 @@ mod tests {
         )
         .unwrap();
         load_validated(&paths).await.unwrap();
-        assert_eq!(
-            prepare(&paths, Some(&live.dns)).await.err().unwrap().kind(),
-            io::ErrorKind::InvalidInput
+        let error = prepare(&paths, Some(&live.dns)).await.err().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            error
+                .to_string()
+                .contains("running configuration until restart")
         );
         context.allocate("after.example", false).unwrap();
     }
