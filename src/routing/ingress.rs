@@ -12,6 +12,120 @@ pub(crate) struct UdpSetup {
     pub reply_identity: NetLocation,
 }
 
+pub(crate) enum UdpRoute<'a> {
+    Local(UdpSetup),
+    Forward {
+        chain: &'a ClientChainGroup,
+        target: ResolvedLocation,
+        reply_identity: NetLocation,
+    },
+}
+
+impl UdpRoute<'_> {
+    pub(crate) async fn connect(self, resolver: &Arc<dyn Resolver>) -> io::Result<UdpSetup> {
+        match self {
+            Self::Local(setup) => Ok(setup),
+            Self::Forward {
+                chain,
+                target,
+                reply_identity,
+            } => Ok(UdpSetup {
+                stream: chain.connect_udp_bidirectional(resolver, target).await?,
+                reply_identity,
+            }),
+        }
+    }
+}
+
+pub(crate) async fn route_udp<'a>(
+    selector: &'a ClientProxySelector,
+    destination: NetLocation,
+    resolver: &Arc<dyn Resolver>,
+) -> io::Result<UdpRoute<'a>> {
+    route_prepared_udp(
+        selector,
+        selector.prepare(destination.into())?,
+        resolver,
+        false,
+    )
+    .await
+}
+
+pub(crate) async fn connect_udp(
+    selector: &ClientProxySelector,
+    destination: NetLocation,
+    resolver: &Arc<dyn Resolver>,
+) -> io::Result<Box<dyn AsyncMessageStream>> {
+    let target = selector.prepare(destination.into())?;
+    Ok(connect_prepared_udp(selector, target, resolver, false)
+        .await?
+        .stream)
+}
+
+pub(crate) async fn connect_prepared_udp(
+    selector: &ClientProxySelector,
+    target: IngressTarget,
+    resolver: &Arc<dyn Resolver>,
+    legacy_hostname_reply: bool,
+) -> io::Result<UdpSetup> {
+    route_prepared_udp(selector, target, resolver, legacy_hostname_reply)
+        .await?
+        .connect(resolver)
+        .await
+}
+
+async fn route_prepared_udp<'a>(
+    selector: &'a ClientProxySelector,
+    target: IngressTarget,
+    resolver: &Arc<dyn Resolver>,
+    legacy_hostname_reply: bool,
+) -> io::Result<UdpRoute<'a>> {
+    let target = match target {
+        IngressTarget::LocalDns {
+            wire_destination,
+            context,
+        } => {
+            let reply_identity =
+                if legacy_hostname_reply && wire_destination.address().hostname().is_some() {
+                    let address = resolve_location(&mut wire_destination.into(), resolver).await?;
+                    NetLocation::from_ip_addr(address.ip(), address.port())
+                } else {
+                    wire_destination
+                };
+            return Ok(UdpRoute::Local(UdpSetup {
+                stream: context.udp_stream(),
+                reply_identity,
+            }));
+        }
+        IngressTarget::Forward(target) => target,
+    };
+    let routed = selector.judge_prepared(target, None, resolver).await?;
+    match routed.decision {
+        ConnectDecision::Allow {
+            chain_group,
+            mut remote_location,
+        } => {
+            let reply_identity = if legacy_hostname_reply
+                && routed.wire_destination.address().hostname().is_some()
+            {
+                let address = resolve_location(&mut remote_location, resolver).await?;
+                NetLocation::from_ip_addr(address.ip(), address.port())
+            } else {
+                routed.wire_destination
+            };
+            Ok(UdpRoute::Forward {
+                chain: chain_group,
+                target: remote_location,
+                reply_identity,
+            })
+        }
+        ConnectDecision::Block => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Destination blocked by routing rules",
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,119 +267,5 @@ mod tests {
             selector.prepare(wire.into()).unwrap_err().kind(),
             io::ErrorKind::NotFound
         );
-    }
-}
-
-pub(crate) enum UdpRoute<'a> {
-    Local(UdpSetup),
-    Forward {
-        chain: &'a ClientChainGroup,
-        target: ResolvedLocation,
-        reply_identity: NetLocation,
-    },
-}
-
-impl UdpRoute<'_> {
-    pub(crate) async fn connect(self, resolver: &Arc<dyn Resolver>) -> io::Result<UdpSetup> {
-        match self {
-            Self::Local(setup) => Ok(setup),
-            Self::Forward {
-                chain,
-                target,
-                reply_identity,
-            } => Ok(UdpSetup {
-                stream: chain.connect_udp_bidirectional(resolver, target).await?,
-                reply_identity,
-            }),
-        }
-    }
-}
-
-pub(crate) async fn route_udp<'a>(
-    selector: &'a ClientProxySelector,
-    destination: NetLocation,
-    resolver: &Arc<dyn Resolver>,
-) -> io::Result<UdpRoute<'a>> {
-    route_prepared_udp(
-        selector,
-        selector.prepare(destination.into())?,
-        resolver,
-        false,
-    )
-    .await
-}
-
-pub(crate) async fn connect_udp(
-    selector: &ClientProxySelector,
-    destination: NetLocation,
-    resolver: &Arc<dyn Resolver>,
-) -> io::Result<Box<dyn AsyncMessageStream>> {
-    let target = selector.prepare(destination.into())?;
-    Ok(connect_prepared_udp(selector, target, resolver, false)
-        .await?
-        .stream)
-}
-
-pub(crate) async fn connect_prepared_udp(
-    selector: &ClientProxySelector,
-    target: IngressTarget,
-    resolver: &Arc<dyn Resolver>,
-    legacy_hostname_reply: bool,
-) -> io::Result<UdpSetup> {
-    route_prepared_udp(selector, target, resolver, legacy_hostname_reply)
-        .await?
-        .connect(resolver)
-        .await
-}
-
-async fn route_prepared_udp<'a>(
-    selector: &'a ClientProxySelector,
-    target: IngressTarget,
-    resolver: &Arc<dyn Resolver>,
-    legacy_hostname_reply: bool,
-) -> io::Result<UdpRoute<'a>> {
-    let target = match target {
-        IngressTarget::LocalDns {
-            wire_destination,
-            context,
-        } => {
-            let reply_identity =
-                if legacy_hostname_reply && wire_destination.address().hostname().is_some() {
-                    let address = resolve_location(&mut wire_destination.into(), resolver).await?;
-                    NetLocation::from_ip_addr(address.ip(), address.port())
-                } else {
-                    wire_destination
-                };
-            return Ok(UdpRoute::Local(UdpSetup {
-                stream: context.udp_stream(),
-                reply_identity,
-            }));
-        }
-        IngressTarget::Forward(target) => target,
-    };
-    let routed = selector.judge_prepared(target, None, resolver).await?;
-    match routed.decision {
-        ConnectDecision::Allow {
-            chain_group,
-            mut remote_location,
-        } => {
-            let reply_identity = if legacy_hostname_reply
-                && routed.wire_destination.address().hostname().is_some()
-            {
-                let address = resolve_location(&mut remote_location, resolver).await?;
-                NetLocation::from_ip_addr(address.ip(), address.port())
-            } else {
-                routed.wire_destination
-            };
-            Ok(UdpRoute::Forward {
-                chain: chain_group,
-                target: remote_location,
-                reply_identity,
-            })
-        }
-        ConnectDecision::Block => Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "Destination blocked by routing rules",
-        )),
     }
 }

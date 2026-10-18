@@ -327,16 +327,16 @@ impl FakeIpPool {
             );
         }
 
-        if let Some(previous) = state.reverse.remove(&ip) {
-            if let Some(entry) = state.forward.peek_mut(&previous) {
-                if ipv6 {
-                    entry.v6 = None;
-                } else {
-                    entry.v4 = None;
-                }
-                if entry.v4.is_none() && entry.v6.is_none() {
-                    state.forward.pop(&previous);
-                }
+        if let Some(previous) = state.reverse.remove(&ip)
+            && let Some(entry) = state.forward.peek_mut(&previous)
+        {
+            if ipv6 {
+                entry.v6 = None;
+            } else {
+                entry.v4 = None;
+            }
+            if entry.v4.is_none() && entry.v6.is_none() {
+                state.forward.pop(&previous);
             }
         }
         if !state.forward.contains(&name) {

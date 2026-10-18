@@ -493,7 +493,7 @@ fn create_tls_server_target(
             .into_vec();
         Arc::new(
             create_tcp_client_proxy_selector(rules, resolver.clone())?
-                .inherit_inbound_policy(&client_proxy_selector)?,
+                .inherit_inbound_policy(client_proxy_selector)?,
         )
     } else {
         client_proxy_selector.clone()
@@ -587,7 +587,7 @@ fn create_shadow_tls_server_target(
             .into_vec();
         Arc::new(
             create_tcp_client_proxy_selector(rules, resolver.clone())?
-                .inherit_inbound_policy(&client_proxy_selector)?,
+                .inherit_inbound_policy(client_proxy_selector)?,
         )
     } else {
         client_proxy_selector.clone()
@@ -649,7 +649,7 @@ fn create_reality_server_target(
             .into_vec();
         Arc::new(
             create_tcp_client_proxy_selector(rules, resolver.clone())?
-                .inherit_inbound_policy(&client_proxy_selector)?,
+                .inherit_inbound_policy(client_proxy_selector)?,
         )
     } else {
         client_proxy_selector.clone()
@@ -748,7 +748,7 @@ fn create_websocket_server_target(
             .into_vec();
         Arc::new(
             create_tcp_client_proxy_selector(rules, resolver.clone())?
-                .inherit_inbound_policy(&client_proxy_selector)?,
+                .inherit_inbound_policy(client_proxy_selector)?,
         )
     } else {
         client_proxy_selector.clone()

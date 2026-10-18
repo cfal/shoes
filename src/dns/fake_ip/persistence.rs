@@ -113,12 +113,11 @@ impl Snapshot {
                 return Err(invalid("invalid fake DNS snapshot domain"));
             }
             for (ip, range) in [(entry.v4, &state.v4), (entry.v6, &state.v6)] {
-                if let Some(ip) = ip {
-                    if !range.as_ref().is_some_and(|range| allocatable(range, ip))
-                        || state.reverse.insert(ip, name.clone()).is_some()
-                    {
-                        return Err(invalid("invalid or duplicated fake DNS snapshot address"));
-                    }
+                if let Some(ip) = ip
+                    && (!range.as_ref().is_some_and(|range| allocatable(range, ip))
+                        || state.reverse.insert(ip, name.clone()).is_some())
+                {
+                    return Err(invalid("invalid or duplicated fake DNS snapshot address"));
                 }
             }
             state.forward.put(name, entry);
@@ -210,7 +209,8 @@ impl SnapshotStore {
             state.v4.clone()
         }
         .ok_or_else(|| invalid("fake IP family disabled"))?;
-        let count = RESERVATION_SIZE.min((range.last - range.first + 1) / 2) as usize;
+        let capacity = range.last - range.first + 1;
+        let count = RESERVATION_SIZE.min(capacity / 2) as usize;
         let mut snapshot = Snapshot::from_state(state);
         snapshot.reserve(range, count);
         Ok((snapshot, count))

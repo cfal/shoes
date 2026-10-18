@@ -114,6 +114,20 @@ fn filter_endpoints(config: &mut ResolverConfig, forbidden: &[IpNetwork]) -> io:
     Ok(())
 }
 
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn discover() -> io::Result<(hickory_resolver::config::ResolverConfig, ResolverOpts)> {
+    hickory_resolver::system_conf::read_system_conf()
+        .map_err(|error| io::Error::other(error.to_string()))
+}
+
+#[cfg(any(target_os = "android", target_os = "ios"))]
+fn discover() -> io::Result<(hickory_resolver::config::ResolverConfig, ResolverOpts)> {
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        "mobile host must supply underlying DNS via dns.servers; VPN system discovery is unsafe",
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,18 +147,4 @@ mod tests {
         assert_eq!(config.name_servers[0].ip.to_string(), "127.0.0.53");
         assert!(filter_endpoints(&mut config, &["127.0.0.0/8".parse().unwrap()]).is_err());
     }
-}
-
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
-fn discover() -> io::Result<(hickory_resolver::config::ResolverConfig, ResolverOpts)> {
-    hickory_resolver::system_conf::read_system_conf()
-        .map_err(|error| io::Error::other(error.to_string()))
-}
-
-#[cfg(any(target_os = "android", target_os = "ios"))]
-fn discover() -> io::Result<(hickory_resolver::config::ResolverConfig, ResolverOpts)> {
-    Err(io::Error::new(
-        io::ErrorKind::NotFound,
-        "mobile host must supply underlying DNS via dns.servers; VPN system discovery is unsafe",
-    ))
 }

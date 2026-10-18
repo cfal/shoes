@@ -16,6 +16,116 @@ pub(crate) struct PreparedTcp {
     probe: Option<TlsProbe>,
 }
 
+pub(crate) struct RoutedTcp {
+    pub wire_destination: NetLocation,
+    pub setup: Option<TcpClientSetupResult>,
+    pub prefix: Vec<u8>,
+}
+
+pub(crate) struct TcpRoute<'a> {
+    wire_destination: NetLocation,
+    prefix: Vec<u8>,
+    target: TcpRouteTarget<'a>,
+}
+
+enum TcpRouteTarget<'a> {
+    LocalDns(Arc<crate::dns::fake_ip::FakeDnsContext>),
+    Forward(ConnectDecision<'a>),
+}
+
+impl TcpRoute<'_> {
+    pub(crate) async fn connect(self, resolver: &Arc<dyn Resolver>) -> io::Result<RoutedTcp> {
+        let setup = match self.target {
+            TcpRouteTarget::LocalDns(context) => Some(TcpClientSetupResult {
+                client_stream: context.tcp_stream(),
+                early_data: None,
+            }),
+            TcpRouteTarget::Forward(ConnectDecision::Allow {
+                chain_group,
+                remote_location,
+            }) => Some(chain_group.connect_tcp(remote_location, resolver).await?),
+            TcpRouteTarget::Forward(ConnectDecision::Block) => None,
+        };
+        Ok(RoutedTcp {
+            wire_destination: self.wire_destination,
+            setup,
+            prefix: self.prefix,
+        })
+    }
+}
+
+impl PreparedTcp {
+    pub(crate) fn new(
+        selector: &ClientProxySelector,
+        target: NetLocation,
+        mut prefix: Vec<u8>,
+    ) -> io::Result<Self> {
+        let target = selector.prepare(target.into())?;
+        let probe = match &target {
+            IngressTarget::Forward(target) if selector.should_sniff(target) => {
+                Some(TlsProbe::from_prefix(std::mem::take(&mut prefix)))
+            }
+            _ => None,
+        };
+        Ok(Self {
+            target,
+            prefix,
+            probe,
+        })
+    }
+
+    pub(crate) fn needs_sniff_read(&self) -> bool {
+        self.probe.as_ref().is_some_and(TlsProbe::needs_more)
+    }
+
+    // Protocol adapters send any required optimistic reply before calling this method.
+    pub(crate) async fn connect<R: AsyncRead + Unpin + ?Sized>(
+        self,
+        inbound: &mut R,
+        selector: &ClientProxySelector,
+        resolver: &Arc<dyn Resolver>,
+    ) -> io::Result<RoutedTcp> {
+        self.route(inbound, selector, resolver)
+            .await?
+            .connect(resolver)
+            .await
+    }
+
+    pub(crate) async fn route<'a, R: AsyncRead + Unpin + ?Sized>(
+        self,
+        inbound: &mut R,
+        selector: &'a ClientProxySelector,
+        resolver: &Arc<dyn Resolver>,
+    ) -> io::Result<TcpRoute<'a>> {
+        let (server_name, prefix) = if let Some(probe) = self.probe {
+            let result = probe.finish(inbound, SNIFF_TIMEOUT).await?;
+            (result.server_name, result.prefix)
+        } else {
+            (None, self.prefix)
+        };
+        let (wire_destination, target) = match self.target {
+            IngressTarget::LocalDns {
+                wire_destination,
+                context,
+            } => (wire_destination, TcpRouteTarget::LocalDns(context)),
+            IngressTarget::Forward(target) => {
+                let routed = selector
+                    .judge_prepared(target, server_name.as_deref(), resolver)
+                    .await?;
+                (
+                    routed.wire_destination,
+                    TcpRouteTarget::Forward(routed.decision),
+                )
+            }
+        };
+        Ok(TcpRoute {
+            wire_destination,
+            target,
+            prefix,
+        })
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -160,115 +270,5 @@ pub(crate) mod tests {
             .unwrap();
         assert!(routed.setup.is_none());
         assert_eq!(routed.prefix, hello);
-    }
-}
-
-pub(crate) struct RoutedTcp {
-    pub wire_destination: NetLocation,
-    pub setup: Option<TcpClientSetupResult>,
-    pub prefix: Vec<u8>,
-}
-
-pub(crate) struct TcpRoute<'a> {
-    wire_destination: NetLocation,
-    prefix: Vec<u8>,
-    target: TcpRouteTarget<'a>,
-}
-
-enum TcpRouteTarget<'a> {
-    LocalDns(Arc<crate::dns::fake_ip::FakeDnsContext>),
-    Forward(ConnectDecision<'a>),
-}
-
-impl TcpRoute<'_> {
-    pub(crate) async fn connect(self, resolver: &Arc<dyn Resolver>) -> io::Result<RoutedTcp> {
-        let setup = match self.target {
-            TcpRouteTarget::LocalDns(context) => Some(TcpClientSetupResult {
-                client_stream: context.tcp_stream(),
-                early_data: None,
-            }),
-            TcpRouteTarget::Forward(ConnectDecision::Allow {
-                chain_group,
-                remote_location,
-            }) => Some(chain_group.connect_tcp(remote_location, resolver).await?),
-            TcpRouteTarget::Forward(ConnectDecision::Block) => None,
-        };
-        Ok(RoutedTcp {
-            wire_destination: self.wire_destination,
-            setup,
-            prefix: self.prefix,
-        })
-    }
-}
-
-impl PreparedTcp {
-    pub(crate) fn new(
-        selector: &ClientProxySelector,
-        target: NetLocation,
-        mut prefix: Vec<u8>,
-    ) -> io::Result<Self> {
-        let target = selector.prepare(target.into())?;
-        let probe = match &target {
-            IngressTarget::Forward(target) if selector.should_sniff(target) => {
-                Some(TlsProbe::from_prefix(std::mem::take(&mut prefix)))
-            }
-            _ => None,
-        };
-        Ok(Self {
-            target,
-            prefix,
-            probe,
-        })
-    }
-
-    pub(crate) fn needs_sniff_read(&self) -> bool {
-        self.probe.as_ref().is_some_and(TlsProbe::needs_more)
-    }
-
-    // Protocol adapters send any required optimistic reply before calling this method.
-    pub(crate) async fn connect<R: AsyncRead + Unpin + ?Sized>(
-        self,
-        inbound: &mut R,
-        selector: &ClientProxySelector,
-        resolver: &Arc<dyn Resolver>,
-    ) -> io::Result<RoutedTcp> {
-        self.route(inbound, selector, resolver)
-            .await?
-            .connect(resolver)
-            .await
-    }
-
-    pub(crate) async fn route<'a, R: AsyncRead + Unpin + ?Sized>(
-        self,
-        inbound: &mut R,
-        selector: &'a ClientProxySelector,
-        resolver: &Arc<dyn Resolver>,
-    ) -> io::Result<TcpRoute<'a>> {
-        let (server_name, prefix) = if let Some(probe) = self.probe {
-            let result = probe.finish(inbound, SNIFF_TIMEOUT).await?;
-            (result.server_name, result.prefix)
-        } else {
-            (None, self.prefix)
-        };
-        let (wire_destination, target) = match self.target {
-            IngressTarget::LocalDns {
-                wire_destination,
-                context,
-            } => (wire_destination, TcpRouteTarget::LocalDns(context)),
-            IngressTarget::Forward(target) => {
-                let routed = selector
-                    .judge_prepared(target, server_name.as_deref(), resolver)
-                    .await?;
-                (
-                    routed.wire_destination,
-                    TcpRouteTarget::Forward(routed.decision),
-                )
-            }
-        };
-        Ok(TcpRoute {
-            wire_destination,
-            target,
-            prefix,
-        })
     }
 }
