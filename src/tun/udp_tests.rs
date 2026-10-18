@@ -206,6 +206,7 @@ impl Resolver for FakeDnsTestResolver {
 
     fn exchange(&self, bytes: Vec<u8>) -> crate::resolver::DnsExchangeFuture {
         Box::pin(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
             let mut message = hickory_resolver::proto::op::Message::from_vec(&bytes)
                 .unwrap()
                 .into_response();
@@ -244,7 +245,7 @@ async fn raw_fd_fake_dns_and_restored_application_udp_preserve_sources() {
         let dns_target = "198.18.0.1:53".parse().unwrap();
         let mut packet = [0; 4096];
         let mut synthetic = None;
-        for kind in [RecordType::A, RecordType::TXT] {
+        for kind in [RecordType::TXT, RecordType::A] {
             let mut query = Message::query();
             query.metadata.id = 13;
             query.add_query(Query::query(
@@ -259,6 +260,8 @@ async fn raw_fd_fake_dns_and_restored_application_udp_preserve_sources() {
             ))
             .await
             .unwrap();
+        }
+        for kind in [RecordType::TXT, RecordType::A] {
             let n = wire.recv(&mut packet).await.unwrap();
             let answer_bytes = &packet[28..n];
             check_reply(&packet[..n], dns_target, source, answer_bytes, false);
