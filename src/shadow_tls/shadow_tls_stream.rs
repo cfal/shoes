@@ -1,5 +1,5 @@
 use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, ready};
 use subtle::ConstantTimeEq;
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -235,6 +235,24 @@ impl ShadowTlsStream {
 
         Ok(DeframeState::Success)
     }
+
+    fn poll_drain_write_buf(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        while self.write_buf_pos < self.write_buf_end {
+            let remaining = &self.write_buf[self.write_buf_pos..self.write_buf_end];
+            let n = ready!(Pin::new(&mut self.stream).poll_write(cx, remaining))?;
+            if n == 0 {
+                return Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "Failed to write pending data",
+                )));
+            }
+            self.write_buf_pos += n;
+        }
+
+        self.write_buf_pos = 0;
+        self.write_buf_end = 0;
+        Poll::Ready(Ok(()))
+    }
 }
 
 enum DeframeState {
@@ -315,27 +333,14 @@ impl AsyncWrite for ShadowTlsStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        let this = self.get_mut();
-
-        while this.write_buf_pos < this.write_buf_end {
-            let remaining = &this.write_buf[this.write_buf_pos..this.write_buf_end];
-            match Pin::new(&mut this.stream).poll_write(cx, remaining) {
-                Poll::Ready(Ok(n)) => {
-                    if n == 0 {
-                        return Poll::Ready(Err(std::io::Error::new(
-                            std::io::ErrorKind::WriteZero,
-                            "Failed to write pending data",
-                        )));
-                    }
-                    this.write_buf_pos += n;
-                }
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-            }
+        // A record without payload would be sent at once, and readers panic on it.
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
         }
 
-        this.write_buf_pos = 0;
-        this.write_buf_end = 0;
+        let this = self.get_mut();
+
+        ready!(this.poll_drain_write_buf(cx))?;
 
         let consumed_buf_len = std::cmp::min(buf.len(), MAX_WRITE_PAYLOAD_LEN);
         let consumed_buf = &buf[0..consumed_buf_len];
@@ -355,32 +360,18 @@ impl AsyncWrite for ShadowTlsStream {
 
         this.write_buf_end = TLS_HEADER_LEN + frame_len;
 
+        // Sends the frame now rather than on the next write or flush, matching the other
+        // transports, so peers waiting for it are not stalled. The frame is already part of
+        // the HMAC chain, so the bytes count as written even if sending stalls or fails here;
+        // the next write, flush, or shutdown sends the rest or reports the error.
+        let _ = this.poll_drain_write_buf(cx);
+
         Poll::Ready(Ok(consumed_buf_len))
     }
 
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        let this = self.as_mut().get_mut();
-
-        while this.write_buf_pos < this.write_buf_end {
-            let remaining = &this.write_buf[this.write_buf_pos..this.write_buf_end];
-            match Pin::new(&mut this.stream).poll_write(cx, remaining) {
-                Poll::Ready(Ok(n)) => {
-                    if n == 0 {
-                        return Poll::Ready(Err(std::io::Error::new(
-                            std::io::ErrorKind::WriteZero,
-                            "Failed to flush pending data",
-                        )));
-                    }
-                    this.write_buf_pos += n;
-                }
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-            }
-        }
-
-        this.write_buf_pos = 0;
-        this.write_buf_end = 0;
-
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        ready!(this.poll_drain_write_buf(cx))?;
         Pin::new(&mut this.stream).poll_flush(cx)
     }
 
@@ -409,3 +400,88 @@ impl AsyncPing for ShadowTlsStream {
 }
 
 impl AsyncStream for ShadowTlsStream {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
+
+    fn hmac(label: &[u8]) -> ShadowTlsHmac {
+        let key =
+            aws_lc_rs::hmac::Key::new(aws_lc_rs::hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY, b"test");
+        let mut hmac = ShadowTlsHmac::new(&key);
+        hmac.update(label);
+        hmac
+    }
+
+    fn client_stream(io: DuplexStream) -> ShadowTlsStream {
+        ShadowTlsStream::new(Box::new(io), &[], hmac(b"S"), hmac(b"C"), None).unwrap()
+    }
+
+    fn server_stream(io: DuplexStream) -> ShadowTlsStream {
+        ShadowTlsStream::new(Box::new(io), &[], hmac(b"C"), hmac(b"S"), None).unwrap()
+    }
+
+    fn stream_pair(pipe_capacity: usize) -> (ShadowTlsStream, ShadowTlsStream) {
+        let (client_io, server_io) = tokio::io::duplex(pipe_capacity);
+        (client_stream(client_io), server_stream(server_io))
+    }
+
+    #[tokio::test]
+    async fn written_frame_is_sent_without_flush() {
+        let (mut client, mut server) = stream_pair(1024);
+        client.write_all(b"hello").await.unwrap();
+
+        let mut received = [0; 5];
+        tokio::time::timeout(Duration::from_secs(1), server.read_exact(&mut received))
+            .await
+            .expect("frame was not sent")
+            .unwrap();
+        assert_eq!(&received, b"hello");
+    }
+
+    #[tokio::test]
+    async fn large_writes_survive_partial_inner_writes() {
+        // A pipe smaller than one frame forces partial and pending inner writes.
+        let (mut client, mut server) = stream_pair(1000);
+        let data: Vec<u8> = (0..100_000u32).map(|i| i as u8).collect();
+        let expected = data.clone();
+        let writer = tokio::spawn(async move {
+            client.write_all(&data).await.unwrap();
+            client.shutdown().await.unwrap();
+        });
+
+        let mut received = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), server.read_to_end(&mut received))
+            .await
+            .expect("transfer stalled")
+            .unwrap();
+        assert_eq!(received, expected);
+        writer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn empty_write_sends_no_record() {
+        let (client_io, mut peer) = tokio::io::duplex(1024);
+        let mut client = client_stream(client_io);
+        assert_eq!(client.write(&[]).await.unwrap(), 0);
+        client.flush().await.unwrap();
+
+        let mut byte = [0; 1];
+        let read = tokio::time::timeout(Duration::from_millis(50), peer.read(&mut byte)).await;
+        assert!(read.is_err(), "empty write produced a record");
+    }
+
+    #[tokio::test]
+    async fn send_error_after_framing_surfaces_on_flush() {
+        let (client_io, peer) = tokio::io::duplex(1024);
+        drop(peer);
+        let mut client = client_stream(client_io);
+        assert_eq!(client.write(b"hello").await.unwrap(), 5);
+        assert_eq!(
+            client.flush().await.unwrap_err().kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
+    }
+}

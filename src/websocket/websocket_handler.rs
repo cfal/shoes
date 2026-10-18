@@ -38,6 +38,55 @@ impl WebsocketTcpServerHandler {
 #[cfg(test)]
 mod request_tests {
     use super::*;
+    use crate::async_stream::test_streams::FlushGatedStream;
+    use crate::client_proxy_selector::ClientProxySelector;
+    use crate::resolver::NativeResolver;
+    use crate::socks_handler::SocksTcpServerHandler;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn upgrade_response_is_flushed_before_inner_handshake() {
+        let handler = WebsocketTcpServerHandler::new(vec![WebsocketServerTarget {
+            matching_path: None,
+            matching_headers: None,
+            ping_type: WebsocketPingType::Disabled,
+            // SOCKS reads the client's greeting before writing anything.
+            handler: Box::new(SocksTcpServerHandler::new(
+                None,
+                false,
+                "0.0.0.0".parse().unwrap(),
+                Arc::new(ClientProxySelector::new(vec![])),
+                Arc::new(NativeResolver::new()),
+            )),
+        }]);
+        let (mut client, server) = tokio::io::duplex(1024);
+        let setup = tokio::spawn(async move {
+            handler
+                .setup_server_stream(Box::new(FlushGatedStream::new(server)))
+                .await
+        });
+
+        let request = concat!(
+            "GET / HTTP/1.1\r\n",
+            "Host: example.com\r\n",
+            "Upgrade: websocket\r\n",
+            "Connection: Upgrade\r\n",
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n",
+            "Sec-WebSocket-Version: 13\r\n",
+            "\r\n"
+        );
+        client.write_all(request.as_bytes()).await.unwrap();
+
+        let mut status = [0; 12];
+        tokio::time::timeout(Duration::from_secs(1), client.read_exact(&mut status))
+            .await
+            .expect("upgrade response was not flushed")
+            .unwrap();
+        assert_eq!(&status, b"HTTP/1.1 101");
+        setup.abort();
+    }
 
     #[tokio::test]
     async fn malformed_request_targets_are_errors_not_panics() {
@@ -146,6 +195,8 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
             );
 
             server_stream.write_all(http_response.as_bytes()).await?;
+            // Clients wait for the 101 before sending frames, and inner handlers read first.
+            server_stream.flush().await?;
 
             let websocket_stream = Box::new(WebsocketStream::new(
                 server_stream,
