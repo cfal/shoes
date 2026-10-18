@@ -16,7 +16,8 @@ use tokio::sync::{Mutex as AsyncMutex, RwLock};
 
 use crate::address::{NetLocation, ResolvedLocation};
 
-type ResolveFuture = Pin<Box<dyn Future<Output = std::io::Result<Vec<SocketAddr>>> + Send>>;
+pub type ResolveFuture = Pin<Box<dyn Future<Output = std::io::Result<Vec<SocketAddr>>> + Send>>;
+pub type DnsExchangeFuture = Pin<Box<dyn Future<Output = std::io::Result<Vec<u8>>> + Send>>;
 
 const CACHING_NATIVE_RESOLVER_CACHE_CAPACITY: usize = 10_000;
 const RESOLVER_CACHE_CAPACITY: usize = 1_024;
@@ -30,6 +31,19 @@ fn bounded_lru<K: Hash + Eq, V>(capacity: usize) -> LruCache<K, V> {
 
 pub trait Resolver: Send + Sync + Debug {
     fn resolve_location(&self, location: &NetLocation) -> ResolveFuture;
+
+    fn fake_dns_context(&self) -> Option<Arc<crate::dns::fake_ip::FakeDnsContext>> {
+        None
+    }
+
+    fn exchange(&self, _request: Vec<u8>) -> DnsExchangeFuture {
+        Box::pin(async {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "resolver does not support DNS message exchange",
+            ))
+        })
+    }
 }
 
 /// Resolver wrapper that enforces a timeout on DNS resolution.
