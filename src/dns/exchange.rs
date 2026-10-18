@@ -2,6 +2,7 @@ use std::fmt;
 use std::io;
 use std::net::IpAddr;
 
+use futures::StreamExt;
 use hickory_resolver::config::{ConnectionConfig, NameServerConfig, ProtocolConfig, ResolverOpts};
 use hickory_resolver::net::NetError;
 use hickory_resolver::net::xfer::{DnsExchange, DnsHandle, FirstAnswer};
@@ -97,18 +98,38 @@ impl RawDnsExchange {
         }
         let mut error = io::Error::new(io::ErrorKind::NotFound, "no real DNS upstreams configured");
         for _ in 0..self.context.options.attempts.max(1) {
-            for upstream in &self.upstreams {
-                let result = tokio::time::timeout(
-                    self.context.options.timeout,
-                    self.send(upstream, request.clone()),
-                )
-                .await
-                .unwrap_or_else(|_| {
-                    Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "DNS upstream deadline exceeded",
-                    ))
-                });
+            let upstreams: Vec<_> = self
+                .upstreams
+                .iter()
+                .filter(|candidate| {
+                    !matches!(candidate.config.protocol, ProtocolConfig::Tcp)
+                        || !self.upstreams.iter().any(|udp| {
+                            udp.ip == candidate.ip
+                                && udp.config.port == candidate.config.port
+                                && udp.config.bind_addr == candidate.config.bind_addr
+                                && matches!(udp.config.protocol, ProtocolConfig::Udp)
+                        })
+                })
+                .collect();
+            let concurrency = self.context.options.num_concurrent_reqs.max(1);
+            let waves = upstreams.len().div_ceil(concurrency).max(1);
+            let slot_timeout = self.context.options.timeout / waves.min(u32::MAX as usize) as u32;
+            let mut jobs: Vec<futures::future::BoxFuture<'_, io::Result<Message>>> = Vec::new();
+            for upstream in upstreams {
+                let message = request.clone();
+                jobs.push(Box::pin(async move {
+                    tokio::time::timeout(slot_timeout, self.send(upstream, message))
+                        .await
+                        .unwrap_or_else(|_| {
+                            Err(io::Error::new(
+                                io::ErrorKind::TimedOut,
+                                "DNS upstream deadline exceeded",
+                            ))
+                        })
+                }));
+            }
+            let mut answers = futures::stream::iter(jobs).buffer_unordered(concurrency);
+            while let Some(result) = answers.next().await {
                 match result {
                     Ok(mut answer) => {
                         if answer.metadata.message_type != MessageType::Response
@@ -361,6 +382,55 @@ mod tests {
         let reply = raw.exchange(request().to_vec().unwrap()).await.unwrap();
         assert!(Message::from_vec(&reply).unwrap().metadata.truncation);
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn silent_first_server_does_not_starve_healthy_second_server() {
+        for (system_pair, extra_silent) in [(false, false), (true, false), (true, true)] {
+            let silent = tokio::net::UdpSocket::bind("0.0.0.0:0").await.unwrap();
+            let second_silent = tokio::net::UdpSocket::bind("0.0.0.0:0").await.unwrap();
+            let healthy = tokio::net::UdpSocket::bind("0.0.0.0:0").await.unwrap();
+            let mut raw = exchange(silent.local_addr().unwrap(), false);
+            raw.context.options.timeout = Duration::from_millis(200);
+            if system_pair {
+                let mut config = ConnectionConfig::tcp();
+                config.port = silent.local_addr().unwrap().port();
+                raw.upstreams.push(Upstream {
+                    ip: "127.0.0.1".parse().unwrap(),
+                    config,
+                    connection: Mutex::new(None),
+                });
+            }
+            raw.upstreams[0].ip = "127.0.0.1".parse().unwrap();
+            if extra_silent {
+                let mut config = ConnectionConfig::udp();
+                config.port = second_silent.local_addr().unwrap().port();
+                raw.upstreams.push(Upstream {
+                    ip: "127.0.0.1".parse().unwrap(),
+                    config,
+                    connection: Mutex::new(None),
+                });
+            }
+            let mut config = ConnectionConfig::udp();
+            config.port = healthy.local_addr().unwrap().port();
+            raw.upstreams.push(Upstream {
+                ip: "127.0.0.1".parse().unwrap(),
+                config,
+                connection: Mutex::new(None),
+            });
+            let server = tokio::spawn(async move {
+                let mut bytes = [0; 2048];
+                let (len, peer) = healthy.recv_from(&mut bytes).await.unwrap();
+                let reply = Message::from_vec(&bytes[..len]).unwrap().into_response();
+                healthy
+                    .send_to(&reply.to_vec().unwrap(), peer)
+                    .await
+                    .unwrap();
+            });
+            let answer = raw.exchange(request().to_vec().unwrap()).await.unwrap();
+            assert_eq!(Message::from_vec(&answer).unwrap().metadata.id, 17);
+            server.await.unwrap();
+        }
     }
 
     #[tokio::test]

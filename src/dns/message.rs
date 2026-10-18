@@ -1,10 +1,20 @@
 use std::io;
 
 use hickory_resolver::proto::op::Message;
-use hickory_resolver::proto::rr::RecordType;
+use hickory_resolver::proto::rr::{RData, RecordType};
 use hickory_resolver::proto::serialize::binary::{BinDecodable, BinDecoder};
 
 pub(super) const UDP_PAYLOAD_LIMIT: u16 = 1232;
+
+pub(super) fn addresses(message: &Message) -> impl Iterator<Item = std::net::IpAddr> + '_ {
+    message
+        .all_sections()
+        .filter_map(|record| match record.data {
+            RData::A(ip) => Some(ip.0.into()),
+            RData::AAAA(ip) => Some(ip.0.into()),
+            _ => None,
+        })
+}
 
 pub(super) fn decode(bytes: &[u8]) -> io::Result<Message> {
     if bytes.len() < 12 || bytes.len() > u16::MAX as usize {

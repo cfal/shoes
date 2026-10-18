@@ -21,6 +21,8 @@ mod parsed;
 mod proxy_runtime;
 mod system;
 
+pub(crate) use guard::real_only;
+
 #[allow(unused_imports)]
 pub use builder::{
     DnsRegistry, DnsSnapshotTask, build_dns_registry, build_dns_registry_for_runtime,
