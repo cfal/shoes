@@ -19,10 +19,68 @@ pub(crate) struct PreparedTcp {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::address::{NetLocationMask, ResolvedLocation};
+    use crate::async_stream::{AsyncMessageStream, AsyncStream};
+    use crate::client_proxy_chain::{ClientChainGroup, ClientProxyChain, InitialHopEntry};
+    use crate::client_proxy_selector::{ConnectAction, ConnectRule};
+    use crate::tcp::socket_connector::SocketConnector;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::task::JoinSet;
 
     pub(crate) const TARGET: &str = "203.0.113.1:443";
+
+    #[derive(Debug)]
+    struct FailedConnector;
+
+    #[async_trait::async_trait]
+    impl SocketConnector for FailedConnector {
+        async fn connect(
+            &self,
+            _: &Arc<dyn Resolver>,
+            _: &ResolvedLocation,
+        ) -> io::Result<Box<dyn AsyncStream>> {
+            Err(io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                "test dial failure",
+            ))
+        }
+
+        async fn connect_udp_bidirectional(
+            &self,
+            _: &Arc<dyn Resolver>,
+            _: ResolvedLocation,
+        ) -> io::Result<Box<dyn AsyncMessageStream>> {
+            unreachable!()
+        }
+
+        fn bind_interface(&self) -> Option<&str> {
+            None
+        }
+    }
+
+    pub(crate) fn failure_selector(sniff: bool, blocked: bool) -> Arc<ClientProxySelector> {
+        let action = if blocked {
+            ConnectAction::Block
+        } else {
+            ConnectAction::new_allow(
+                None,
+                ClientChainGroup::new(vec![ClientProxyChain::new(
+                    vec![InitialHopEntry::Direct(Arc::new(FailedConnector))],
+                    vec![],
+                )]),
+            )
+        };
+        Arc::new(
+            ClientProxySelector::new(vec![ConnectRule::new(
+                vec![
+                    NetLocationMask::from("sniff.example").unwrap(),
+                    NetLocationMask::ANY,
+                ],
+                action,
+            )])
+            .with_sniff(sniff),
+        )
+    }
 
     pub(crate) async fn socks_target(
         expected: Vec<u8>,

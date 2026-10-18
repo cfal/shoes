@@ -849,6 +849,76 @@ mod lifetime_tests {
     }
 
     #[tokio::test]
+    async fn sniff_failures_close_socks_and_connect_without_a_second_reply() {
+        use super::super::ingress::tests::{TARGET, failure_selector};
+        use tokio::io::AsyncReadExt;
+        for socks in [true, false] {
+            for blocked in [true, false] {
+                timeout(Duration::from_secs(5), async {
+                    let selector = failure_selector(true, blocked);
+                    let resolver: Arc<dyn Resolver> =
+                        Arc::new(crate::resolver::NativeResolver::new());
+                    let handler: Arc<dyn TcpServerHandler> = if socks {
+                        Arc::new(crate::socks_handler::SocksTcpServerHandler::new(
+                            None,
+                            false,
+                            "0.0.0.0".parse().unwrap(),
+                            selector,
+                            resolver.clone(),
+                        ))
+                    } else {
+                        Arc::new(crate::http_handler::HttpTcpServerHandler::new(
+                            None,
+                            selector,
+                            resolver.clone(),
+                        ))
+                    };
+                    let (server, mut peer) = tokio::io::duplex(8192);
+                    let server = tokio::spawn(process_stream(server, handler, resolver));
+                    if socks {
+                        peer.write_all(&[5, 1, 0]).await.unwrap();
+                        let mut method = [0; 2];
+                        peer.read_exact(&mut method).await.unwrap();
+                        assert_eq!(method, [5, 0]);
+                        peer.write_all(&[5, 1, 0, 1, 203, 0, 113, 1, 1, 187])
+                            .await
+                            .unwrap();
+                        let mut reply = [0; 10];
+                        peer.read_exact(&mut reply).await.unwrap();
+                        assert_eq!(&reply[..4], &[5, 0, 0, 1]);
+                    } else {
+                        peer.write_all(
+                            format!("CONNECT {TARGET} HTTP/1.1\r\nHost: {TARGET}\r\n\r\n")
+                                .as_bytes(),
+                        )
+                        .await
+                        .unwrap();
+                        let mut reply = Vec::new();
+                        while !reply.ends_with(b"\r\n\r\n") {
+                            reply.push(peer.read_u8().await.unwrap());
+                        }
+                        assert!(reply.starts_with(b"HTTP/1.1 200"));
+                    }
+                    peer.write_all(&crate::sniff::tests::hello(&rustls::version::TLS13, true))
+                        .await
+                        .unwrap();
+                    let mut reply = Vec::new();
+                    peer.read_to_end(&mut reply).await.unwrap();
+                    assert!(reply.is_empty(), "second reply after optimistic success");
+                    let result = server.await.unwrap();
+                    if blocked {
+                        result.unwrap();
+                    } else {
+                        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::ConnectionRefused);
+                    }
+                })
+                .await
+                .unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn tcp_bind_failure_releases_all_prepared_listeners() {
         let first = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let first_addr = first.local_addr().unwrap();

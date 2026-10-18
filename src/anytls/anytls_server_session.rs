@@ -1007,6 +1007,77 @@ mod tests {
     use tokio::time::{Duration, timeout};
 
     #[tokio::test]
+    async fn sniff_failures_send_one_synack_then_fin() {
+        for sniff in [false, true] {
+            for blocked in [false, true] {
+                timeout(Duration::from_secs(5), async {
+                    let (server, mut peer) = duplex(8192);
+                    let session = AnyTlsSession::new_server_with_initial_data(
+                        server,
+                        PaddingFactory::default_factory(),
+                        Arc::new(crate::resolver::NativeResolver::new()),
+                        crate::tcp::ingress::tests::failure_selector(sniff, blocked),
+                        false,
+                        "test".into(),
+                        None,
+                    );
+                    session
+                        .received_client_settings
+                        .store(true, Ordering::Relaxed);
+                    session.peer_version.store(2, Ordering::Relaxed);
+                    let runner = session.clone();
+                    let server = tokio::spawn(async move { runner.run().await });
+                    peer.write_all(&Frame::control(Command::Syn, 1).encode())
+                        .await
+                        .unwrap();
+                    peer.write_all(
+                        &Frame::data(1, Bytes::from_static(&[1, 203, 0, 113, 1, 1, 187])).encode(),
+                    )
+                    .await
+                    .unwrap();
+                    let mut header = [0; 7];
+                    peer.read_exact(&mut header).await.unwrap();
+                    assert_eq!(
+                        &header[..5],
+                        &Frame::control(Command::SynAck, 1).encode()[..5]
+                    );
+                    let mut error = vec![0; u16::from_be_bytes([header[5], header[6]]) as usize];
+                    peer.read_exact(&mut error).await.unwrap();
+                    if sniff {
+                        assert!(error.is_empty());
+                        let hello = crate::sniff::tests::hello(&rustls::version::TLS13, true);
+                        peer.write_all(&Frame::data(1, Bytes::from(hello)).encode())
+                            .await
+                            .unwrap();
+                    } else {
+                        let error = String::from_utf8(error).unwrap();
+                        assert!(error.starts_with(if blocked {
+                            "blocked by rules:"
+                        } else {
+                            "connect failed:"
+                        }));
+                    }
+                    peer.read_exact(&mut header).await.unwrap();
+                    assert_eq!(&header, &Frame::control(Command::Fin, 1).encode()[..]);
+                    while !session.stream_tasks.lock().is_empty() {
+                        tokio::task::yield_now().await;
+                    }
+                    session.close().await;
+                    server.await.unwrap().unwrap();
+                    let mut extra = Vec::new();
+                    peer.read_to_end(&mut extra).await.unwrap();
+                    assert!(
+                        extra.is_empty(),
+                        "duplicate status or FIN after stream completion"
+                    );
+                })
+                .await
+                .unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn sniff_v2_synack_precedes_payload_and_preserves_early_data() {
         for version in [1, 2] {
             timeout(Duration::from_secs(5), async {

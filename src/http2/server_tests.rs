@@ -46,6 +46,58 @@ impl Drop for Peer {
     }
 }
 
+#[tokio::test]
+async fn sniff_failures_reset_after_success_without_a_second_response() {
+    for sniff in [false, true] {
+        for blocked in [false, true] {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let (client, transport) = tokio::io::duplex(8192);
+                let server = tokio::spawn(serve(
+                    Box::new(transport),
+                    None,
+                    crate::tcp::ingress::tests::failure_selector(sniff, blocked),
+                    Arc::new(NativeResolver::new()),
+                ));
+                let mut session = H2ClientSession::new(Box::new(client)).await.unwrap();
+                let (response, mut stream) = session
+                    .open(connect(crate::tcp::ingress::tests::TARGET))
+                    .await
+                    .unwrap();
+                let mut reply = Vec::new();
+                if sniff {
+                    assert_eq!(response.status, StatusCode::OK);
+                    stream
+                        .write_all(&crate::sniff::tests::hello(&rustls::version::TLS13, true))
+                        .await
+                        .unwrap();
+                    let error = stream.read_to_end(&mut reply).await.unwrap_err();
+                    let reset = error
+                        .get_ref()
+                        .unwrap()
+                        .downcast_ref::<h2::Error>()
+                        .unwrap();
+                    assert_eq!(reset.reason(), Some(h2::Reason::CANCEL));
+                } else {
+                    assert_eq!(
+                        response.status,
+                        if blocked {
+                            StatusCode::FORBIDDEN
+                        } else {
+                            StatusCode::BAD_GATEWAY
+                        }
+                    );
+                    stream.read_to_end(&mut reply).await.unwrap();
+                }
+                assert!(reply.is_empty());
+                server.abort();
+                let _ = server.await;
+            })
+            .await
+            .unwrap();
+        }
+    }
+}
+
 async fn peer(auth: bool, mixed: bool, resolver: Arc<dyn Resolver>, blocked: bool) -> Peer {
     let selector = Arc::new(if blocked {
         ClientProxySelector::new(vec![])
