@@ -774,20 +774,26 @@ async fn wireguard_detoured_endpoint_keeps_encrypted_peers_separate() {
         other_server.wireguard = "other-server".into();
         other_server.private_key = crate::config::wireguard::WireguardKey([44; 32]);
         other_server.listen = Some(second.local_addr().unwrap());
+        other_server.inbound = Some(
+            serde_yaml::from_str(
+                "rules: [{masks: '198.18.0.2/32', action: allow, override_address: '127.0.0.1:0'}]",
+            )
+            .unwrap(),
+        );
         let client = &mut configs.wireguard_endpoints[1];
         client.outer_client_chain = Some(crate::config::ClientChain::default());
         client.peers[0].allowed_ips = vec!["127.0.0.1/32".into()];
         let mut other_peer = client.peers[0].clone();
         other_peer.public_key = serde_yaml::from_str(&public(44)).unwrap();
         other_peer.endpoint = Some(format!("127.0.0.1:{}", second.local_addr().unwrap().port()));
-        other_peer.allowed_ips = vec!["127.0.0.2/32".into()];
+        other_peer.allowed_ips = vec!["198.18.0.2/32".into()];
         client.peers.push(other_peer);
         configs.wireguard_endpoints.push(other_server);
         let prepared = Prepared::new(&mut configs).await.unwrap();
         drop((first, second));
         let mut running = start_prepared(&prepared).await;
         let (tcp, udp, _servers) = echo_servers(false).await;
-        let second_ip = "127.0.0.2".parse().unwrap();
+        let second_ip = "198.18.0.2".parse().unwrap();
         let connector = prepared.endpoints[1].connector.as_ref();
         tokio::join!(
             check_echo(connector, tcp, udp),
