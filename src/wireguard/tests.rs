@@ -448,6 +448,60 @@ async fn wireguard_bind_selects_a_compatible_hostname_address() {
 }
 
 #[tokio::test]
+async fn fake_dns_guards_wireguard_peer_and_outer_proxy_hostnames() {
+    use serde_json::json;
+    for tun_endpoint in [false, true] {
+        let mut raw: serde_json::Value = serde_yaml::from_str(&pair_config(51820)).unwrap();
+        raw[1]["peers"][0]["endpoint"] = json!("localhost:51820");
+        raw.as_array_mut().unwrap().push(json!({
+            "dns_group":"fake", "dns_servers":"system",
+            "fake_ip":{"ipv4_range":if tun_endpoint { "198.18.0.0/15" } else { "127.0.0.0/8" }}
+        }));
+        if tun_endpoint {
+            raw.as_array_mut()
+                .unwrap()
+                .push(json!({"device_name":"unused", "address":"127.0.0.1"}));
+        }
+        let mut configs = validate(&raw.to_string()).unwrap();
+        assert_eq!(
+            Prepared::new(&mut configs).await.err().unwrap().kind(),
+            stdio::ErrorKind::InvalidData
+        );
+
+        raw[1]["peers"][0]["endpoint"] = json!("127.0.0.1:51820");
+        assert!(validate(&raw.to_string()).is_err());
+
+        raw[1]["peers"][0]["endpoint"] = json!("192.0.2.1:51820");
+        raw[1]["outer_client_chain"] = json!([{
+            "address":"localhost:443", "protocol":{"type":"vless", "user_id":"b85798ef-e9dc-46a4-9a87-8da4499d36d0"}
+        }]);
+        let mut configs = validate(&raw.to_string()).unwrap();
+        let prepared = Prepared::new(&mut configs).await.unwrap();
+        let endpoint = &prepared.endpoints[1];
+        let chain = endpoint
+            .build_outer_chain(&endpoint.outer_resolver)
+            .unwrap()
+            .unwrap();
+        let error = chain
+            .connect_udp_bidirectional(
+                &endpoint.outer_resolver,
+                NetLocation::from_str("192.0.2.1:51820", None)
+                    .unwrap()
+                    .into(),
+            )
+            .await
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("synthetic address"), "{error}");
+
+        raw[2]["fake_ip"] = false.into();
+        raw[1]["peers"][0]["endpoint"] = json!("localhost:51820");
+        let mut configs = validate(&raw.to_string()).unwrap();
+        Prepared::new(&mut configs).await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn wireguard_ipv4_fallback_selects_a_compatible_resolved_peer() {
     let mut configs = validate(&pair_config(51820)).unwrap();
     let mut prepared = Prepared::new(&mut configs).await.unwrap();

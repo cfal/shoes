@@ -187,6 +187,7 @@ struct PreparedEndpoint {
     peers: Vec<PreparedPeer>,
     connector: Arc<Connector>,
     global_limits: crate::config::GlobalLimits,
+    outer_resolver: Arc<dyn Resolver>,
 }
 
 #[derive(Default)]
@@ -198,7 +199,27 @@ impl Prepared {
     pub async fn new(validated: &mut ValidatedConfigs) -> stdio::Result<Self> {
         let mut pending = Vec::new();
         let mut connectors = HashMap::new();
-        let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+        let ranges: Result<Vec<IpNetwork>, _> = validated
+            .dns_groups
+            .iter()
+            .filter_map(|group| group.fake_ip.as_ref())
+            .flat_map(|options| options.ipv4_range.iter().chain(options.ipv6_range.iter()))
+            .map(|range| range.parse())
+            .collect();
+        let mut ranges = ranges.map_err(stdio::Error::other)?;
+        if !ranges.is_empty() {
+            for config in &validated.configs {
+                if let crate::config::Config::TunServer(tun) = config {
+                    ranges.extend(
+                        [tun.address, tun.destination]
+                            .into_iter()
+                            .flatten()
+                            .map(IpNetwork::from),
+                    );
+                }
+            }
+        }
+        let resolver = crate::dns::real_only(Arc::new(NativeResolver::new()), ranges.into());
         for config in &validated.wireguard_endpoints {
             config.validate()?;
             let mut peers = Vec::new();
@@ -247,6 +268,7 @@ impl Prepared {
                 peers,
                 connector,
                 global_limits: validated.global_limits,
+                outer_resolver: resolver.clone(),
             };
             endpoint.build_outer_chain(&resolver)?;
             endpoints.push(endpoint);
@@ -364,7 +386,7 @@ impl PreparedEndpoint {
             inbound.is_some(),
             limits.clone(),
         )?;
-        let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+        let resolver = self.outer_resolver.clone();
         // Rebuilding after preflight gives each start fresh pool indices and handler lifetimes.
         let (udp, released, peers) = if let Some(chain) = self.build_outer_chain(&resolver)? {
             let peers = self.peers_for_socket(None)?;
