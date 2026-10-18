@@ -1,8 +1,10 @@
 use std::fmt;
 use std::io;
 use std::net::IpAddr;
+use std::sync::Arc;
 
-use futures::StreamExt;
+use futures::future::{BoxFuture, Shared};
+use futures::{FutureExt, StreamExt};
 use hickory_resolver::config::{ConnectionConfig, NameServerConfig, ProtocolConfig, ResolverOpts};
 use hickory_resolver::net::NetError;
 use hickory_resolver::net::xfer::{DnsExchange, DnsHandle, FirstAnswer};
@@ -13,10 +15,13 @@ use tokio::sync::{Mutex, Semaphore};
 
 use super::proxy_runtime::ProxyRuntimeProvider;
 
+type Connection =
+    Shared<BoxFuture<'static, Result<DnsExchange<ProxyRuntimeProvider>, Arc<io::Error>>>>;
+
 struct Upstream {
     ip: IpAddr,
     config: ConnectionConfig,
-    connection: Mutex<Option<DnsExchange<ProxyRuntimeProvider>>>,
+    connection: Mutex<Option<Connection>>,
 }
 
 /// Uses transport handles directly: the lookup pool can coalesce requests and
@@ -101,7 +106,8 @@ impl RawDnsExchange {
             let upstreams: Vec<_> = self
                 .upstreams
                 .iter()
-                .filter(|candidate| {
+                .enumerate()
+                .filter(|(_, candidate)| {
                     !matches!(candidate.config.protocol, ProtocolConfig::Tcp)
                         || !self.upstreams.iter().any(|udp| {
                             udp.ip == candidate.ip
@@ -110,25 +116,14 @@ impl RawDnsExchange {
                                 && matches!(udp.config.protocol, ProtocolConfig::Udp)
                         })
                 })
+                .map(|(index, _)| index)
                 .collect();
             let concurrency = self.context.options.num_concurrent_reqs.max(1);
             let waves = upstreams.len().div_ceil(concurrency).max(1);
             let slot_timeout = self.context.options.timeout / waves.min(u32::MAX as usize) as u32;
-            let mut jobs: Vec<futures::future::BoxFuture<'_, io::Result<Message>>> = Vec::new();
-            for upstream in upstreams {
-                let message = request.clone();
-                jobs.push(Box::pin(async move {
-                    tokio::time::timeout(slot_timeout, self.send(upstream, message))
-                        .await
-                        .unwrap_or_else(|_| {
-                            Err(io::Error::new(
-                                io::ErrorKind::TimedOut,
-                                "DNS upstream deadline exceeded",
-                            ))
-                        })
-                }));
-            }
-            let mut answers = futures::stream::iter(jobs).buffer_unordered(concurrency);
+            let jobs = futures::stream::iter(upstreams)
+                .map(|index| self.upstream_job(&self.upstreams[index], &request, slot_timeout));
+            let mut answers = jobs.buffer_unordered(concurrency);
             while let Some(result) = answers.next().await {
                 match result {
                     Ok(mut answer) => {
@@ -153,6 +148,24 @@ impl RawDnsExchange {
         Err(error)
     }
 
+    fn upstream_job<'a>(
+        &'a self,
+        upstream: &'a Upstream,
+        request: &'a Message,
+        timeout: std::time::Duration,
+    ) -> BoxFuture<'a, io::Result<Message>> {
+        Box::pin(async move {
+            tokio::time::timeout(timeout, self.send(upstream, request.clone()))
+                .await
+                .unwrap_or_else(|_| {
+                    Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "DNS upstream deadline exceeded",
+                    ))
+                })
+        })
+    }
+
     async fn send(&self, upstream: &Upstream, message: Message) -> io::Result<Message> {
         let answer = self.send_upstream(upstream, message.clone()).await?;
         if answer.metadata.truncation && matches!(upstream.config.protocol, ProtocolConfig::Udp) {
@@ -171,7 +184,7 @@ impl RawDnsExchange {
 
     async fn send_upstream(&self, upstream: &Upstream, message: Message) -> io::Result<Message> {
         for reconnect in 0..2 {
-            let (connection, reused) = {
+            let (setup, reused) = {
                 let mut cached = upstream.connection.lock().await;
                 let reused = cached.is_some();
                 if cached.is_none() {
@@ -179,15 +192,26 @@ impl RawDnsExchange {
                         .provider
                         .new_connection(upstream.ip, &upstream.config, &self.context)
                         .map_err(net_error)?;
-                    *cached = Some(future.await.map_err(net_error)?);
+                    let deadline = tokio::time::Instant::now() + self.context.options.timeout;
+                    *cached = Some(connection_setup(future, deadline));
                 }
                 (cached.as_ref().unwrap().clone(), reused)
             };
-            let result = send_message(&connection, message.clone()).await;
+            let result = match setup.clone().await {
+                Ok(connection) => send_message(&connection, message.clone()).await,
+                Err(error) => Err(io::Error::new(error.kind(), error.to_string())),
+            };
             match result {
                 Ok(answer) => return Ok(answer),
                 Err(error) => {
-                    *upstream.connection.lock().await = None;
+                    let mut cached = upstream.connection.lock().await;
+                    if cached
+                        .as_ref()
+                        .is_some_and(|current| current.ptr_eq(&setup))
+                    {
+                        *cached = None;
+                    }
+                    drop(cached);
                     if reused && reconnect == 0 {
                         continue;
                     }
@@ -197,6 +221,30 @@ impl RawDnsExchange {
         }
         unreachable!()
     }
+}
+
+fn connection_setup(
+    future: BoxFuture<'static, Result<DnsExchange<ProxyRuntimeProvider>, NetError>>,
+    deadline: tokio::time::Instant,
+) -> Connection {
+    // A losing query must not cancel a shared handshake. Dropping its cache owner still does.
+    let task = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+        tokio::time::timeout_at(deadline, future)
+            .await
+            .map_err(|_| {
+                Arc::new(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "DNS connection deadline exceeded",
+                ))
+            })?
+            .map_err(|error| Arc::new(net_error(error)))
+    }));
+    async move {
+        task.await
+            .map_err(|error| Arc::new(io::Error::other(error)))?
+    }
+    .boxed()
+    .shared()
 }
 
 async fn send_message(
@@ -431,6 +479,73 @@ mod tests {
             assert_eq!(Message::from_vec(&answer).unwrap().metadata.id, 17);
             server.await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn slow_connection_setup_survives_query_slot_timeout() {
+        let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let mut address = listener.local_addr().unwrap();
+        address.set_ip("127.0.0.1".parse().unwrap());
+        let mut raw = exchange(address, true);
+        raw.context.options.timeout = Duration::from_millis(300);
+        raw.context.options.num_concurrent_reqs = 1;
+        let future = raw
+            .provider
+            .new_connection(address.ip(), &raw.upstreams[0].config, &raw.context)
+            .unwrap();
+        *raw.upstreams[0].connection.lock().await = Some(connection_setup(
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                future.await
+            }),
+            tokio::time::Instant::now() + Duration::from_millis(300),
+        ));
+        let silent = tokio::net::UdpSocket::bind("0.0.0.0:0").await.unwrap();
+        for _ in 0..2 {
+            let mut config = ConnectionConfig::udp();
+            config.port = silent.local_addr().unwrap().port();
+            raw.upstreams.push(Upstream {
+                ip: address.ip(),
+                config,
+                connection: Mutex::new(None),
+            });
+        }
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            for _ in 0..3 {
+                let answer = read_tcp(&mut stream).await.into_response();
+                write_tcp(&mut stream, answer).await;
+            }
+        });
+        assert_eq!(
+            raw.exchange(request().to_vec().unwrap())
+                .await
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+        for _ in 0..3 {
+            raw.exchange(request().to_vec().unwrap()).await.unwrap();
+        }
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dropping_connection_cache_cancels_pending_setup() {
+        let marker = Arc::new(());
+        let owned = marker.clone();
+        let setup = connection_setup(
+            Box::pin(async move {
+                let _owned = owned;
+                futures::future::pending().await
+            }),
+            tokio::time::Instant::now() + Duration::from_secs(30),
+        );
+        tokio::task::yield_now().await;
+        assert_eq!(Arc::strong_count(&marker), 2);
+        drop(setup);
+        tokio::task::yield_now().await;
+        assert_eq!(Arc::strong_count(&marker), 1);
     }
 
     #[tokio::test]
