@@ -951,6 +951,8 @@ fake-enabled groups requires an explicit policy on the composed group.
 Compatible reloads retain mappings, including explicit disable/re-enable under
 the same group/inline identity. Pool ranges, capacity, or state-file ownership
 changes require restart. Without `state_file`, restart loses the mappings.
+Previously active synthetic ranges and endpoints remain excluded from real DNS
+and carrier resolution until restart, including after a context is removed.
 With a state file, snapshots are private, atomically replaced, locked against
 multiple writers, and checked for pool and context identity compatibility. Create its parent directory
 before startup; protect it because the file records queried domains. Cursor

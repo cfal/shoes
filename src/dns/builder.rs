@@ -68,6 +68,10 @@ impl DnsRegistry {
         self.groups.get(name).cloned()
     }
 
+    pub(crate) fn forbidden_ranges(&self) -> &[IpNetwork] {
+        &self.forbidden
+    }
+
     /// Get or create the default resolver (CachingNativeResolver).
     /// Used when a server has no `dns` field configured.
     pub fn get_or_create_default(&mut self) -> Arc<dyn Resolver> {
@@ -647,8 +651,20 @@ pub async fn build_dns_registry_for_runtime(
         .map(|range| range.parse())
         .collect();
     let mut forbidden = forbidden.map_err(std::io::Error::other)?;
+    if let Some(previous) = previous {
+        for range in previous.forbidden_ranges() {
+            if !forbidden.contains(range) {
+                forbidden.push(*range);
+            }
+        }
+    }
     if !forbidden.is_empty() {
-        forbidden.extend(synthetic_endpoints.iter().copied().map(IpNetwork::from));
+        for endpoint in synthetic_endpoints {
+            let range = IpNetwork::from(*endpoint);
+            if !forbidden.contains(&range) {
+                forbidden.push(range);
+            }
+        }
     }
     let mut registry = DnsRegistry {
         limits,
@@ -1016,6 +1032,53 @@ mod tests {
             old.allocate("after.test", false).unwrap_err().kind(),
             std::io::ErrorKind::BrokenPipe
         );
+    }
+
+    #[tokio::test]
+    async fn disabling_and_removing_contexts_retains_real_only_guards() {
+        let mut groups = fake_groups(true);
+        groups[0].specs = vec![make_spec("udp://192.0.2.53")];
+        let initial = build_dns_registry_for_runtime(
+            groups,
+            crate::resources::limits(),
+            None,
+            &["10.99.0.1".parse().unwrap()],
+        )
+        .await
+        .unwrap();
+        let disabled =
+            build_dns_registry_reusing(fake_groups(false), initial.limits, Some(&initial))
+                .await
+                .unwrap();
+        let mut removed = build_dns_registry_reusing(Vec::new(), initial.limits, Some(&disabled))
+            .await
+            .unwrap();
+        assert_eq!(initial.forbidden_ranges(), removed.forbidden_ranges());
+        let resolver = removed.get_or_create_default();
+        for address in ["198.18.0.5:443", "10.99.0.1:443"] {
+            assert_eq!(
+                resolver
+                    .resolve_location(
+                        &crate::address::NetLocation::from_str(address, None).unwrap()
+                    )
+                    .await
+                    .unwrap_err()
+                    .kind(),
+                std::io::ErrorKind::InvalidData
+            );
+        }
+        for endpoint in ["udp://198.18.0.5", "udp://10.99.0.1"] {
+            let mut groups = fake_groups(false);
+            groups[0].specs = vec![make_spec(endpoint)];
+            assert_eq!(
+                build_dns_registry_reusing(groups, initial.limits, Some(&removed))
+                    .await
+                    .err()
+                    .unwrap()
+                    .kind(),
+                std::io::ErrorKind::InvalidInput
+            );
+        }
     }
 
     #[tokio::test]
