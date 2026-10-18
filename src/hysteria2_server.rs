@@ -31,8 +31,8 @@ use crate::quic_stream::QuicStream;
 use crate::resolver::Resolver;
 use crate::routing::udp_relay::UdpRelay;
 use crate::stream_reader::StreamReader;
+use crate::tcp::ingress::PreparedTcp;
 use crate::tcp::tcp_handler::TcpClientSetupResult;
-use crate::tcp::tcp_server::setup_client_tcp_stream;
 use crate::udp_fragments::UdpFragments;
 use crate::util::{timeout_stream_setup, write_all};
 
@@ -658,17 +658,28 @@ fn tcp_response(success: bool, message: &str) -> Vec<u8> {
     response
 }
 
+#[cfg(test)]
 async fn complete_tcp_setup(
     server: &mut Box<dyn AsyncStream>,
     setup: impl std::future::Future<Output = std::io::Result<Option<TcpClientSetupResult>>>,
 ) -> std::io::Result<Option<Box<dyn AsyncStream>>> {
-    match timeout_stream_setup(setup).await {
+    finish_tcp_setup(server, timeout_stream_setup(setup).await, false).await
+}
+
+async fn finish_tcp_setup(
+    server: &mut Box<dyn AsyncStream>,
+    result: std::io::Result<Option<TcpClientSetupResult>>,
+    success_sent: bool,
+) -> std::io::Result<Option<Box<dyn AsyncStream>>> {
+    match result {
         Ok(Some(TcpClientSetupResult {
             client_stream,
             early_data,
         })) => {
             timeout_stream_setup(async {
-                write_all(server, &tcp_response(true, "")).await?;
+                if !success_sent {
+                    write_all(server, &tcp_response(true, "")).await?;
+                }
                 if let Some(data) = early_data {
                     write_all(server, &data).await?;
                 }
@@ -688,11 +699,13 @@ async fn complete_tcp_setup(
                 }
                 _ => "connection failed",
             };
-            let _ = timeout(crate::util::SHUTDOWN_TIMEOUT, async {
-                write_all(server, &tcp_response(false, message)).await?;
-                server.flush().await
-            })
-            .await;
+            if !success_sent {
+                let _ = timeout(crate::util::SHUTDOWN_TIMEOUT, async {
+                    write_all(server, &tcp_response(false, message)).await?;
+                    server.flush().await
+                })
+                .await;
+            }
             crate::util::shutdown_stream(server).await;
             result.map(|_| None)
         }
@@ -714,32 +727,64 @@ async fn process_tcp_stream(
             }
         };
 
-    let mut server_stream: Box<dyn AsyncStream> = Box::new(QuicStream::from(send, recv));
-
-    let Some(mut client_stream) = complete_tcp_setup(
-        &mut server_stream,
-        setup_client_tcp_stream(client_proxy_selector, resolver, remote_location.clone()),
+    relay_tcp_stream(
+        Box::new(QuicStream::from(send, recv)),
+        remote_location,
+        stream_reader.into_unparsed_data(),
+        client_proxy_selector,
+        resolver,
     )
     .await
-    .map_err(|error| {
-        std::io::Error::new(
-            error.kind(),
-            format!("TCP setup for {remote_location} failed: {error}"),
-        )
-    })?
+}
+
+async fn relay_tcp_stream(
+    mut server_stream: Box<dyn AsyncStream>,
+    remote_location: NetLocation,
+    initial_data: Vec<u8>,
+    client_proxy_selector: Arc<ClientProxySelector>,
+    resolver: Arc<dyn Resolver>,
+) -> std::io::Result<()> {
+    let mut success_sent = false;
+    let mut prefix = Vec::new();
+    let setup = timeout_stream_setup(async {
+        let prepared = PreparedTcp::new(
+            &client_proxy_selector,
+            remote_location.clone(),
+            initial_data,
+        )?;
+        if prepared.needs_sniff_read() {
+            // A partial success write must never be followed by a failure frame.
+            success_sent = true;
+            write_all(&mut server_stream, &tcp_response(true, "")).await?;
+            server_stream.flush().await?;
+        }
+        let routed = prepared
+            .connect(&mut server_stream, &client_proxy_selector, &resolver)
+            .await?;
+        prefix = routed.prefix;
+        Ok(routed.setup)
+    })
+    .await;
+    let Some(mut client_stream) = finish_tcp_setup(&mut server_stream, setup, success_sent)
+        .await
+        .map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!("TCP setup for {remote_location} failed: {error}"),
+            )
+        })?
     else {
         return Ok(());
     };
 
-    let unparsed_data = stream_reader.unparsed_data();
-    if !unparsed_data.is_empty() {
+    if !prefix.is_empty() {
         timeout_stream_setup(async {
-            write_all(&mut client_stream, unparsed_data).await?;
+            write_all(&mut client_stream, &prefix).await?;
             client_stream.flush().await
         })
         .await?;
     }
-    drop(stream_reader);
+    drop(prefix);
 
     // Use 32KB buffers to match hysteria2/sing-box reference implementations
     let copy_result = copy_bidirectional_with_sizes(
@@ -932,6 +977,52 @@ mod datagram_tests {
 mod tcp_tests {
     use super::*;
     use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn sniff_reply_gates_payload_and_is_not_repeated() {
+        timeout(Duration::from_secs(5), async {
+            let mut tasks = tokio::task::JoinSet::new();
+            let hello = crate::sniff::tests::hello(&rustls::version::TLS13, true);
+            let (selector, resolver) =
+                crate::tcp::ingress::tests::socks_target(hello.clone(), &mut tasks).await;
+            let target = NetLocation::from_str(crate::tcp::ingress::tests::TARGET, None).unwrap();
+            let (server, mut peer) = tokio::io::duplex(8192);
+            let prefix = hello[..5].to_vec();
+            tasks.spawn(async move {
+                relay_tcp_stream(Box::new(server), target, prefix, selector, resolver)
+                    .await
+                    .unwrap();
+            });
+            assert_eq!(peer.read_u8().await.unwrap(), 0);
+            assert_eq!(peer.read_u8().await.unwrap(), 0);
+            let padding = peer.read_u8().await.unwrap() as usize;
+            peer.read_exact(&mut vec![0; padding]).await.unwrap();
+            peer.write_all(&hello[5..]).await.unwrap();
+            peer.shutdown().await.unwrap();
+            let mut response = Vec::new();
+            peer.read_to_end(&mut response).await.unwrap();
+            assert_eq!(response, b"greetinglater");
+            while let Some(result) = tasks.join_next().await {
+                result.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn optimistic_success_is_not_followed_by_a_failure_status() {
+        for failure in [Ok(None), Err(std::io::ErrorKind::ConnectionRefused.into())] {
+            let (server, mut peer) = tokio::io::duplex(512);
+            let mut server: Box<dyn AsyncStream> = Box::new(server);
+            server.write_all(&tcp_response(true, "")).await.unwrap();
+            let _ = finish_tcp_setup(&mut server, failure, true).await;
+            let mut response = Vec::new();
+            peer.read_to_end(&mut response).await.unwrap();
+            assert_eq!(&response[..2], &[0, 0]);
+            assert_eq!(response.len(), 3 + response[2] as usize);
+        }
+    }
 
     #[tokio::test]
     async fn success_follows_dial_and_precedes_target_bytes() {

@@ -238,6 +238,16 @@ impl StreamReader {
         }
     }
 
+    pub(crate) fn into_unparsed_data(self) -> Vec<u8> {
+        if self.start_offset == self.end_offset {
+            return Vec::new();
+        }
+        let mut bytes = self.buf.into_vec();
+        bytes.copy_within(self.start_offset..self.end_offset, 0);
+        bytes.truncate(self.end_offset - self.start_offset);
+        bytes
+    }
+
     async fn read<T: AsyncReadExt + Unpin + ?Sized>(
         &mut self,
         stream: &mut T,
