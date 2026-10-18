@@ -179,6 +179,9 @@ impl<S: AsyncStream> AsyncReadTargetedMessage for PacketAddrStream<S> {
             this.read_buf.maybe_compact(4096);
 
             if this.read_buf.remaining_capacity() == 0 {
+                this.read_buf.compact();
+            }
+            if this.read_buf.remaining_capacity() == 0 {
                 return Poll::Ready(Err(std::io::Error::other(
                     "packet-address read buffer full but no complete packet",
                 )));
@@ -357,12 +360,40 @@ mod tests {
         addr: &NetLocation,
         payload: &[u8],
     ) -> Vec<u8> {
-        let mut frame = vec![0u8; 64 + payload.len()];
+        let mut frame = vec![0u8; BUFFER_SIZE];
         let addr_len = write_addr(&mut frame, addr).unwrap();
         frame[addr_len..addr_len + 2].copy_from_slice(&(payload.len() as u16).to_be_bytes());
         frame[addr_len + 2..addr_len + 2 + payload.len()].copy_from_slice(payload);
         frame.truncate(addr_len + 2 + payload.len());
         frame
+    }
+
+    #[tokio::test]
+    async fn coalesced_small_frame_does_not_starve_maximum_frame() {
+        for socks in [false, true] {
+            let source = NetLocation::new(crate::address::Address::Hostname("h".repeat(255)), 9001);
+            let payload = vec![7; u16::MAX as usize];
+            let codec = if socks {
+                &SOCKS_ADDR_CODEC
+            } else {
+                &UOT_ADDR_CODEC
+            };
+            let mut frames = encode_packet(codec.write, &NetLocation::UNSPECIFIED, b"first");
+            frames.extend_from_slice(&encode_packet(codec.write, &source, &payload));
+            let (left, mut right) = tcp_pair().await.unwrap();
+            let mut reader = PacketAddrStream::new_with_codec(left, codec);
+            reader.feed_initial_data(&frames[..BUFFER_SIZE]);
+            right.write_all(&frames[BUFFER_SIZE..]).await.unwrap();
+            assert_eq!(read_packet(&mut reader).await.unwrap().1, b"first");
+            let mut bytes = vec![0; payload.len()];
+            let mut buf = ReadBuf::new(&mut bytes);
+            let target =
+                poll_fn(|cx| Pin::new(&mut reader).poll_read_targeted_message(cx, &mut buf))
+                    .await
+                    .unwrap();
+            assert_eq!(target, source);
+            assert_eq!(buf.filled(), payload);
+        }
     }
 
     #[tokio::test]
