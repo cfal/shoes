@@ -110,10 +110,9 @@ impl FakeDnsContext {
                     let exchange =
                         tokio::time::timeout(EXCHANGE_TIMEOUT, self.real.exchange(bytes)).await;
                     match exchange {
-                        Ok(Ok(reply)) => match self.check_response(&request, &reply) {
-                            Ok(answer) => answer,
-                            Err(_) => response(&request, ResponseCode::ServFail),
-                        },
+                        Ok(Ok(reply)) => self
+                            .check_response(&request, &reply)
+                            .unwrap_or_else(|_| response(&request, ResponseCode::ServFail)),
                         Ok(Err(err)) if err.kind() == io::ErrorKind::Unsupported => {
                             response(&request, ResponseCode::Refused)
                         }
@@ -123,19 +122,20 @@ impl FakeDnsContext {
             }
         };
         let mut encoded = answer.to_vec().map_err(io::Error::other)?;
-        if !tcp && encoded.len() > request.max_payload().min(UDP_PAYLOAD_LIMIT) as usize {
+        let udp_payload_limit = request.max_payload().min(UDP_PAYLOAD_LIMIT);
+        if !tcp && encoded.len() > usize::from(udp_payload_limit) {
             let mut truncated = answer.truncate();
             truncated.metadata.authentic_data = false;
             if let Some(edns) = &mut truncated.edns {
                 *edns.options_mut() = Default::default();
-                edns.set_max_payload(request.max_payload().min(UDP_PAYLOAD_LIMIT));
+                edns.set_max_payload(udp_payload_limit);
             }
             encoded = truncated.to_vec().map_err(io::Error::other)?;
-            if encoded.len() > request.max_payload().min(UDP_PAYLOAD_LIMIT) as usize {
+            if encoded.len() > usize::from(udp_payload_limit) {
                 truncated.queries.clear();
                 encoded = truncated.to_vec().map_err(io::Error::other)?;
             }
-            if encoded.len() > request.max_payload().min(UDP_PAYLOAD_LIMIT) as usize {
+            if encoded.len() > usize::from(udp_payload_limit) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "DNS reply exceeds UDP limit",
