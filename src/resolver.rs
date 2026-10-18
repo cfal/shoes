@@ -80,6 +80,20 @@ impl<T: Resolver> Debug for TimeoutResolver<T> {
 }
 
 impl<T: Resolver> Resolver for TimeoutResolver<T> {
+    fn fake_dns_context(&self) -> Option<Arc<crate::dns::fake_ip::FakeDnsContext>> {
+        self.inner.fake_dns_context()
+    }
+
+    fn exchange(&self, request: Vec<u8>) -> DnsExchangeFuture {
+        let future = self.inner.exchange(request);
+        let timeout = self.timeout;
+        Box::pin(async move {
+            tokio::time::timeout(timeout, future).await.map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "DNS exchange timed out")
+            })?
+        })
+    }
+
     fn resolve_location(&self, location: &NetLocation) -> ResolveFuture {
         // Fast path: if already an IP address, no resolution needed
         if location.to_socket_addr_nonblocking().is_some() {
@@ -177,15 +191,15 @@ impl RefreshingResolver {
                 | std::io::ErrorKind::NotConnected
         )
     }
-}
-
-impl Resolver for RefreshingResolver {
-    fn resolve_location(&self, location: &NetLocation) -> ResolveFuture {
-        if let Some(socket_addr) = location.to_socket_addr_nonblocking() {
-            return Box::pin(async move { Ok(vec![socket_addr]) });
-        }
-
-        let location = location.clone();
+    fn execute<T: Send + 'static>(
+        &self,
+        operation: impl Fn(
+            Arc<dyn Resolver>,
+        ) -> Pin<Box<dyn Future<Output = std::io::Result<T>> + Send>>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Pin<Box<dyn Future<Output = std::io::Result<T>> + Send>> {
         let inner = self.inner.clone();
         let refresh_lock = self.refresh_lock.clone();
         let factory = self.factory.clone();
@@ -225,7 +239,7 @@ impl Resolver for RefreshingResolver {
 
             let current_generation = refresh_state.lock().generation;
             let current = inner.read().await.clone();
-            match current.resolve_location(&location).await {
+            match operation(current).await {
                 Ok(addrs) => {
                     refresh_state.lock().last_activity_at = Some(Instant::now());
                     Ok(addrs)
@@ -237,15 +251,14 @@ impl Resolver for RefreshingResolver {
                     let _guard = refresh_lock.lock().await;
                     if refresh_state.lock().generation != current_generation {
                         let current = inner.read().await.clone();
-                        let addrs = current.resolve_location(&location).await?;
+                        let addrs = operation(current).await?;
                         refresh_state.lock().last_activity_at = Some(Instant::now());
                         return Ok(addrs);
                     }
                     log::info!(
-                        "RefreshingResolver ({}): refresh-on-error ({}) for {}",
+                        "RefreshingResolver ({}): refresh-on-error ({})",
                         description,
-                        err.kind(),
-                        location
+                        err.kind()
                     );
                     match factory().await {
                         Ok(fresh) => {
@@ -254,7 +267,7 @@ impl Resolver for RefreshingResolver {
                                 let mut state = refresh_state.lock();
                                 state.generation = state.generation.wrapping_add(1);
                             }
-                            let addrs = fresh.resolve_location(&location).await?;
+                            let addrs = operation(fresh).await?;
                             refresh_state.lock().last_activity_at = Some(Instant::now());
                             Ok(addrs)
                         }
@@ -271,6 +284,20 @@ impl Resolver for RefreshingResolver {
                 Err(err) => Err(err),
             }
         })
+    }
+}
+
+impl Resolver for RefreshingResolver {
+    fn resolve_location(&self, location: &NetLocation) -> ResolveFuture {
+        if let Some(socket_addr) = location.to_socket_addr_nonblocking() {
+            return Box::pin(async move { Ok(vec![socket_addr]) });
+        }
+        let location = location.clone();
+        self.execute(move |resolver| resolver.resolve_location(&location))
+    }
+
+    fn exchange(&self, request: Vec<u8>) -> DnsExchangeFuture {
+        self.execute(move |resolver| resolver.exchange(request.clone()))
     }
 }
 
@@ -587,6 +614,17 @@ mod tests {
     }
 
     impl Resolver for MockResolver {
+        fn exchange(&self, request: Vec<u8>) -> DnsExchangeFuture {
+            self.call_count.fetch_add(1, Ordering::Relaxed);
+            let error = self.error_kind;
+            Box::pin(async move {
+                match error {
+                    Some(kind) => Err(std::io::Error::new(kind, "mock exchange error")),
+                    None => Ok(request),
+                }
+            })
+        }
+
         fn resolve_location(&self, _location: &NetLocation) -> ResolveFuture {
             self.call_count.fetch_add(1, Ordering::Relaxed);
             let addrs = self.addrs.clone();
@@ -637,6 +675,45 @@ mod tests {
 
     fn test_location() -> NetLocation {
         NetLocation::new(Address::Hostname("example.com".to_string()), 80)
+    }
+
+    #[tokio::test]
+    async fn exchange_propagates_timeout_and_refreshes_once() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let builds = calls.clone();
+        let factory: ResolverFactory = Arc::new(move || {
+            let generation = builds.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async move {
+                let resolver = if generation == 0 {
+                    MockResolver::with_error(std::io::ErrorKind::TimedOut)
+                } else {
+                    MockResolver::with_addrs(vec![])
+                };
+                Ok(Arc::new(resolver) as Arc<dyn Resolver>)
+            })
+        });
+        let resolver = RefreshingResolver::new(
+            factory,
+            RefreshPolicy {
+                max_idle: Duration::from_secs(60),
+                retry_once_after_refresh: true,
+            },
+            "exchange".into(),
+        )
+        .await
+        .unwrap();
+        let resolver = TimeoutResolver::with_timeout(resolver, Duration::from_secs(1));
+        assert_eq!(resolver.exchange(vec![1, 2]).await.unwrap(), vec![1, 2]);
+        assert_eq!(resolver.exchange(vec![3]).await.unwrap(), vec![3]);
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert!(
+            resolver
+                .inner
+                .refresh_state
+                .lock()
+                .last_activity_at
+                .is_some()
+        );
     }
 
     fn test_addrs() -> Vec<SocketAddr> {

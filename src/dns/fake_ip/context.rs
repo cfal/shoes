@@ -16,15 +16,24 @@ const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug)]
 pub struct FakeDnsContext {
-    responder: FakeDnsResponder,
+    responder: Arc<FakeDnsResponder>,
     real: Arc<dyn Resolver>,
 }
 
 impl FakeDnsContext {
     pub fn new(options: FakeIpOptions, real: Arc<dyn Resolver>) -> io::Result<Self> {
+        options.validate()?;
         let pool = Arc::new(FakeIpPool::new(&options)?);
+        Self::with_pool(options, real, pool)
+    }
+
+    pub(crate) fn with_pool(
+        options: FakeIpOptions,
+        real: Arc<dyn Resolver>,
+        pool: Arc<FakeIpPool>,
+    ) -> io::Result<Self> {
         Ok(Self {
-            responder: FakeDnsResponder::new(options, pool)?,
+            responder: Arc::new(FakeDnsResponder::new(options, pool)?),
             real,
         })
     }
@@ -50,16 +59,25 @@ impl FakeDnsContext {
     }
 
     pub async fn exchange(&self, bytes: Vec<u8>, tcp: bool) -> io::Result<Option<Vec<u8>>> {
-        let request = match Message::from_vec(&bytes) {
+        let request = match crate::dns::message::decode(&bytes) {
             Ok(request) => request,
             Err(_) => return Ok(None),
         };
-        let answer = match self.responder.decide(&request) {
+        let decision = if self.responder.pool.persistent() {
+            let responder = self.responder.clone();
+            let request = request.clone();
+            tokio::task::spawn_blocking(move || responder.decide(&request))
+                .await
+                .map_err(io::Error::other)?
+        } else {
+            self.responder.decide(&request)
+        };
+        let answer = match decision {
             DnsDecision::Drop => return Ok(None),
             DnsDecision::Answer(answer) => answer,
             DnsDecision::Forward => {
                 // Our upstream handles may rewrite IDs and wire encoding; TSIG cannot survive that.
-                if request.signature().is_some() {
+                if crate::dns::message::is_signed(&request) {
                     response(&request, ResponseCode::Refused)
                 } else {
                     let exchange =
@@ -79,7 +97,13 @@ impl FakeDnsContext {
         };
         let mut encoded = answer.to_vec().map_err(io::Error::other)?;
         if !tcp && encoded.len() > request.max_payload().min(UDP_PAYLOAD_LIMIT) as usize {
-            encoded = answer.truncate().to_vec().map_err(io::Error::other)?;
+            let mut truncated = answer.truncate();
+            truncated.metadata.authentic_data = false;
+            encoded = truncated.to_vec().map_err(io::Error::other)?;
+            if encoded.len() > request.max_payload().min(UDP_PAYLOAD_LIMIT) as usize {
+                truncated.queries.clear();
+                encoded = truncated.to_vec().map_err(io::Error::other)?;
+            }
         }
         if encoded.len() > u16::MAX as usize {
             return Err(io::Error::new(
@@ -91,7 +115,7 @@ impl FakeDnsContext {
     }
 
     fn check_response(&self, request: &Message, bytes: &[u8]) -> io::Result<Message> {
-        let response = Message::from_vec(bytes).map_err(io::Error::other)?;
+        let response = crate::dns::message::decode(bytes)?;
         if response.metadata.message_type != MessageType::Response
             || response.metadata.id != request.metadata.id
             || response.metadata.op_code != request.metadata.op_code

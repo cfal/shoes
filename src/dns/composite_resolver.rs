@@ -29,6 +29,21 @@ impl CompositeResolver {
 }
 
 impl Resolver for CompositeResolver {
+    fn exchange(&self, request: Vec<u8>) -> crate::resolver::DnsExchangeFuture {
+        let resolvers = self.resolvers.clone();
+        Box::pin(async move {
+            let mut last =
+                std::io::Error::new(std::io::ErrorKind::NotFound, "no DNS resolvers configured");
+            for resolver in resolvers {
+                match resolver.exchange(request.clone()).await {
+                    Ok(response) => return Ok(response),
+                    Err(error) => last = error,
+                }
+            }
+            Err(last)
+        })
+    }
+
     fn resolve_location(
         &self,
         location: &NetLocation,
@@ -96,6 +111,15 @@ mod tests {
     }
 
     impl Resolver for RecordingResolver {
+        fn exchange(&self, _request: Vec<u8>) -> crate::resolver::DnsExchangeFuture {
+            let result = self.result.clone();
+            Box::pin(async move {
+                result
+                    .map(|_| vec![])
+                    .map_err(|kind| io::Error::new(kind, "exchange failure"))
+            })
+        }
+
         fn resolve_location(
             &self,
             location: &NetLocation,
@@ -146,6 +170,16 @@ mod tests {
                     .collect::<Vec<_>>()
             );
         }
+    }
+
+    #[tokio::test]
+    async fn exchange_stops_at_any_success_even_with_empty_answers() {
+        let (resolver, _) = composite(vec![
+            Err(ErrorKind::TimedOut),
+            Ok(vec![]),
+            Err(ErrorKind::PermissionDenied),
+        ]);
+        assert_eq!(resolver.exchange(vec![]).await.unwrap(), Vec::<u8>::new());
     }
 
     #[tokio::test]

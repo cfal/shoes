@@ -26,7 +26,7 @@ struct PreparedServers {
     wireguard: crate::wireguard::Prepared,
 }
 
-async fn prepare(paths: &[String]) -> io::Result<PreparedServers> {
+async fn prepare(paths: &[String], previous: Option<&DnsRegistry>) -> io::Result<PreparedServers> {
     let mut validated = load_validated(paths).await?;
     #[cfg(unix)]
     let wireguard = crate::wireguard::Prepared::new(&mut validated).await?;
@@ -67,9 +67,24 @@ async fn prepare(paths: &[String]) -> io::Result<PreparedServers> {
         }
         server.bind_location = BindLocation::Address(OneOrSome::Some(resolved));
     }
-    let dns = dns::build_dns_registry_with_limits(
+    let synthetic_endpoints: Vec<_> = validated
+        .configs
+        .iter()
+        .filter_map(|config| {
+            if let Config::TunServer(tun) = config {
+                Some([tun.address, tun.destination])
+            } else {
+                None
+            }
+        })
+        .flatten()
+        .flatten()
+        .collect();
+    let dns = dns::build_dns_registry_for_runtime(
         std::mem::take(&mut validated.dns_groups),
         validated.global_limits,
+        previous,
+        &synthetic_endpoints,
     )
     .await
     .map_err(|error| {
@@ -95,6 +110,7 @@ async fn prepare(paths: &[String]) -> io::Result<PreparedServers> {
 struct RunningServers {
     listeners: Vec<JoinHandle<()>>,
     reporter: Option<resources::ResourceReporter>,
+    dns_snapshots: Option<dns::DnsSnapshotTask>,
     quic_retirements: crate::listener_tasks::QuicRetirements,
     #[cfg(unix)]
     wireguard: crate::wireguard::Running,
@@ -111,11 +127,13 @@ impl RunningServers {
         #[cfg(unix)]
         self.wireguard.stop().await;
         self.reporter = None;
+        self.dns_snapshots = None;
     }
 
     async fn start(&mut self, prepared: &mut PreparedServers) -> io::Result<()> {
         resources::configure(prepared.validated.global_limits)?;
         self.reporter = Some(resources::ResourceReporter::start());
+        self.dns_snapshots = Some(prepared.dns.snapshot_task());
         #[cfg(unix)]
         if let Err(error) = prepared
             .wireguard
@@ -366,25 +384,25 @@ pub async fn run(paths: Vec<String>, dry_run: bool, no_reload: bool) -> io::Resu
     let mut prepared = tokio::select! {
         biased;
         _ = shutdown.recv() => return Ok(()),
-        result = prepare(&paths) => result?,
+        result = prepare(&paths, None) => result?,
     };
     let mut running = RunningServers::default();
     tokio::select! {
         biased;
-        _ = shutdown.recv() => { running.stop().await; return Ok(()); }
+        _ = shutdown.recv() => { running.stop().await; prepared.dns.checkpoint().await?; return Ok(()); }
         result = running.start(&mut prepared) => result?,
     }
     loop {
         let debounce = tokio::select! {
             biased;
-            _ = shutdown.recv() => { running.stop().await; return Ok(()); }
+            _ = shutdown.recv() => { running.stop().await; prepared.dns.checkpoint().await?; return Ok(()); }
             _ = reload.recv() => false,
             _ = changes.recv() => true,
         };
         if debounce {
             tokio::select! {
                 biased;
-                _ = shutdown.recv() => { running.stop().await; return Ok(()); }
+                _ = shutdown.recv() => { running.stop().await; prepared.dns.checkpoint().await?; return Ok(()); }
                 _ = reload.recv() => {}
                 _ = tokio::time::sleep(Duration::from_secs(3)) => {}
             }
@@ -399,8 +417,8 @@ pub async fn run(paths: Vec<String>, dry_run: bool, no_reload: bool) -> io::Resu
         }
         let candidate = tokio::select! {
             biased;
-            _ = shutdown.recv() => { running.stop().await; return Ok(()); }
-            result = prepare(&paths) => result,
+            _ = shutdown.recv() => { running.stop().await; prepared.dns.checkpoint().await?; return Ok(()); }
+            result = prepare(&paths, Some(&prepared.dns)) => result,
         };
         let mut candidate = match candidate {
             Ok(candidate) => candidate,
@@ -410,6 +428,7 @@ pub async fn run(paths: Vec<String>, dry_run: bool, no_reload: bool) -> io::Resu
             }
         };
         running.stop().await;
+        prepared.dns.checkpoint().await?;
         tokio::select! {
             biased;
             _ = shutdown.recv() => return Ok(()),
@@ -496,7 +515,9 @@ mod tests {
             "- address: '[fe80::1%2]:8080-8081'\n  protocol: {type: http}\n",
         )
         .unwrap();
-        let prepared = prepare(&[path.to_str().unwrap().to_owned()]).await.unwrap();
+        let prepared = prepare(&[path.to_str().unwrap().to_owned()], None)
+            .await
+            .unwrap();
         let Config::Server(server) = &prepared.validated.configs[0] else {
             panic!()
         };

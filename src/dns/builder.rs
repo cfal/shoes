@@ -3,7 +3,27 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use ipnetwork::IpNetwork;
 use rustc_hash::FxHashMap;
+
+use super::fake_ip::{FakeDnsContext, FakeDnsResolver, FakeIpOptions, FakeIpPool};
+use super::guard::real_only;
+use super::system::SystemResolver;
+
+#[derive(Clone)]
+struct PoolState {
+    options: FakeIpOptions,
+    pool: Arc<FakeIpPool>,
+}
+
+impl PoolState {
+    fn compatible(&self, options: &FakeIpOptions) -> bool {
+        self.options.ipv4_range == options.ipv4_range
+            && self.options.ipv6_range == options.ipv6_range
+            && self.options.max_entries == options.max_entries
+            && self.options.state_file == options.state_file
+    }
+}
 
 use crate::config::{DnsConfig, ExpandedDnsGroup, ExpandedDnsSpec, GlobalLimits};
 use crate::dns::composite_resolver::CompositeResolver;
@@ -22,6 +42,8 @@ pub struct DnsRegistry {
     groups: FxHashMap<String, Arc<dyn Resolver>>,
     /// Default resolver, created lazily only if needed.
     default_resolver: Option<Arc<dyn Resolver>>,
+    forbidden: Arc<[IpNetwork]>,
+    pools: FxHashMap<String, PoolState>,
 }
 
 impl DnsRegistry {
@@ -31,6 +53,8 @@ impl DnsRegistry {
             limits: crate::resources::limits(),
             groups: FxHashMap::default(),
             default_resolver: None,
+            forbidden: Arc::from([]),
+            pools: FxHashMap::default(),
         }
     }
 
@@ -47,8 +71,18 @@ impl DnsRegistry {
     /// Get or create the default resolver (CachingNativeResolver).
     /// Used when a server has no `dns` field configured.
     pub fn get_or_create_default(&mut self) -> Arc<dyn Resolver> {
+        let forbidden = self.forbidden.clone();
         self.default_resolver
-            .get_or_insert_with(|| Arc::new(CachingNativeResolver::new()))
+            .get_or_insert_with(|| {
+                real_only(
+                    Arc::new(SystemResolver::new(
+                        Arc::new(CachingNativeResolver::new()),
+                        forbidden.clone(),
+                        Duration::from_secs(5),
+                    )),
+                    forbidden,
+                )
+            })
             .clone()
     }
 
@@ -63,6 +97,55 @@ impl DnsRegistry {
                 .expect("dns group should exist (validated)"),
             None => self.get_or_create_default(),
         }
+    }
+
+    pub async fn checkpoint(&self) -> std::io::Result<()> {
+        let pools: Vec<_> = self
+            .pools
+            .values()
+            .map(|state| state.pool.clone())
+            .collect();
+        tokio::task::spawn_blocking(move || {
+            for pool in pools {
+                pool.checkpoint()?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(std::io::Error::other)?
+    }
+
+    pub fn snapshot_task(&self) -> DnsSnapshotTask {
+        let pools: Vec<_> = self
+            .pools
+            .values()
+            .map(|state| state.pool.clone())
+            .collect();
+        DnsSnapshotTask(tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                let pools = pools.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    for pool in pools {
+                        pool.checkpoint()?;
+                    }
+                    Ok::<_, std::io::Error>(())
+                })
+                .await;
+                match result {
+                    Ok(Ok(())) => (),
+                    failure => log::warn!("Fake DNS snapshot failed: {failure:?}"),
+                }
+            }
+        }))
+    }
+}
+
+pub struct DnsSnapshotTask(tokio::task::JoinHandle<()>);
+
+impl Drop for DnsSnapshotTask {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
@@ -384,12 +467,13 @@ fn server_to_ns_config(
 /// into a single hickory resolver instead of using CompositeResolver.
 #[cfg(test)]
 pub fn build_resolver(entries: Vec<ParsedDnsServerEntry>) -> std::io::Result<Arc<dyn Resolver>> {
-    build_resolver_with_limits(entries, crate::resources::limits())
+    build_resolver_with_limits(entries, crate::resources::limits(), Arc::from([]))
 }
 
 fn build_resolver_with_limits(
     entries: Vec<ParsedDnsServerEntry>,
     limits: GlobalLimits,
+    forbidden: Arc<[IpNetwork]>,
 ) -> std::io::Result<Arc<dyn Resolver>> {
     if entries.is_empty() {
         return Err(std::io::Error::other("no DNS servers configured"));
@@ -415,7 +499,14 @@ fn build_resolver_with_limits(
         };
 
         let resolver: Arc<dyn Resolver> = match entry.server {
-            ParsedDnsServer::System => wrap_resolver(NativeResolver::new(), timeout_secs),
+            ParsedDnsServer::System => wrap_resolver(
+                SystemResolver::new(
+                    Arc::new(NativeResolver::new()),
+                    forbidden.clone(),
+                    options.request_timeout.unwrap_or(Duration::from_secs(5)),
+                ),
+                timeout_secs,
+            ),
             server => build_hickory_from_server(
                 server,
                 entry.client_chain,
@@ -513,13 +604,83 @@ pub async fn build_dns_registry_with_limits(
     groups: Vec<ExpandedDnsGroup>,
     limits: GlobalLimits,
 ) -> std::io::Result<DnsRegistry> {
+    build_dns_registry_reusing(groups, limits, None).await
+}
+
+pub async fn build_dns_registry_reusing(
+    groups: Vec<ExpandedDnsGroup>,
+    limits: GlobalLimits,
+    previous: Option<&DnsRegistry>,
+) -> std::io::Result<DnsRegistry> {
+    build_dns_registry_for_runtime(groups, limits, previous, &[]).await
+}
+
+pub async fn build_dns_registry_for_runtime(
+    groups: Vec<ExpandedDnsGroup>,
+    limits: GlobalLimits,
+    previous: Option<&DnsRegistry>,
+    synthetic_endpoints: &[std::net::IpAddr],
+) -> std::io::Result<DnsRegistry> {
+    let forbidden: Result<Vec<IpNetwork>, _> = groups
+        .iter()
+        .filter_map(|group| group.fake_ip.as_ref())
+        .flat_map(|options| options.ipv4_range.iter().chain(options.ipv6_range.iter()))
+        .map(|range| range.parse())
+        .collect();
+    let mut forbidden = forbidden.map_err(std::io::Error::other)?;
+    if !forbidden.is_empty() {
+        forbidden.extend(synthetic_endpoints.iter().copied().map(IpNetwork::from));
+    }
     let mut registry = DnsRegistry {
         limits,
+        forbidden: forbidden.into(),
         ..DnsRegistry::new()
     };
 
     for group in groups {
         let resolver = build_resolver_from_specs(&group.specs, &registry, &group.name).await?;
+        let real = real_only(resolver, registry.forbidden.clone());
+        let old = previous.and_then(|previous| previous.pools.get(&group.name));
+        let resolver: Arc<dyn Resolver> = if let Some(options) = group.fake_ip {
+            options.validate()?;
+            let pool = if let Some(old) = old {
+                if !old.compatible(&options) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "DNS group '{}' changes fake IP pool ownership/range/capacity; explicit restart required",
+                            group.name
+                        ),
+                    ));
+                }
+                old.pool.clone()
+            } else {
+                let options = options.clone();
+                Arc::new(
+                    tokio::task::spawn_blocking(move || FakeIpPool::new(&options))
+                        .await
+                        .map_err(std::io::Error::other)??,
+                )
+            };
+            registry.pools.insert(
+                group.name.clone(),
+                PoolState {
+                    options: options.clone(),
+                    pool: pool.clone(),
+                },
+            );
+            let context = Arc::new(FakeDnsContext::with_pool(options, real.clone(), pool)?);
+            Arc::new(FakeDnsResolver::new(real, context))
+        } else {
+            if let Some(old) = old {
+                log::warn!(
+                    "Fake DNS disabled for '{}'; cached fake addresses may fail",
+                    group.name
+                );
+                registry.pools.insert(group.name.clone(), old.clone());
+            }
+            real
+        };
         registry.register(group.name, resolver);
     }
 
@@ -570,7 +731,7 @@ async fn build_resolver_from_specs(
         let refreshing = RefreshingResolver::new(factory, policy, description).await?;
         Ok(Arc::new(refreshing))
     } else {
-        build_resolver_with_limits(entries, registry.limits)
+        build_resolver_with_limits(entries, registry.limits, registry.forbidden.clone())
     }
 }
 
@@ -585,7 +746,7 @@ async fn build_entry_and_plan(
         .map_err(|e| std::io::Error::other(e.to_string()))?;
 
     // Build client chain group
-    let chain_resolver = Arc::new(NativeResolver::new());
+    let chain_resolver = real_only(Arc::new(NativeResolver::new()), registry.forbidden.clone());
     let chain_group = if spec.client_chains.is_empty() {
         Arc::new(build_direct_chain_group(chain_resolver))
     } else {
@@ -620,7 +781,7 @@ async fn build_entry_and_plan(
                     .to_parsed_server(None)
                     .map_err(|e| std::io::Error::other(e.to_string()))?;
 
-                let native = Arc::new(NativeResolver::new());
+                let native = real_only(Arc::new(NativeResolver::new()), registry.forbidden.clone());
                 let direct_chain = Arc::new(build_direct_chain_group(native.clone()));
                 // Bootstrap resolvers use default timeout (10s) and 2 attempts
                 let bootstrap_entry = ParsedDnsServerEntry::new(
@@ -632,10 +793,17 @@ async fn build_entry_and_plan(
                     5,  // Default connect timeout for bootstrap
                     2,  // Default attempts for bootstrap
                 );
-                build_resolver_with_limits(vec![bootstrap_entry], registry.limits)?
+                real_only(
+                    build_resolver_with_limits(
+                        vec![bootstrap_entry],
+                        registry.limits,
+                        registry.forbidden.clone(),
+                    )?,
+                    registry.forbidden.clone(),
+                )
             }
         }
-        None => Arc::new(NativeResolver::new()),
+        None => real_only(Arc::new(NativeResolver::new()), registry.forbidden.clone()),
     };
 
     let timeout_secs = spec.timeout_secs;
@@ -750,6 +918,130 @@ mod tests {
             connect_timeout_secs: 5,
             attempts: 1,
         }
+    }
+
+    fn fake_groups(enabled: bool) -> Vec<ExpandedDnsGroup> {
+        vec![ExpandedDnsGroup {
+            name: "fake".into(),
+            specs: vec![make_spec("system")],
+            fake_ip: enabled.then(FakeIpOptions::default),
+        }]
+    }
+
+    #[tokio::test]
+    async fn fake_context_reload_sharing_disable_and_reenable_keep_pool_identity() {
+        let initial = build_dns_registry(fake_groups(true)).await.unwrap();
+        let context = initial
+            .get_by_name("fake")
+            .unwrap()
+            .fake_dns_context()
+            .unwrap();
+        let ip = context.allocate("stable.test", false).unwrap();
+        assert!(Arc::ptr_eq(
+            &context,
+            &initial
+                .get_by_name("fake")
+                .unwrap()
+                .fake_dns_context()
+                .unwrap()
+        ));
+        let mut updated = fake_groups(true);
+        updated[0]
+            .fake_ip
+            .as_mut()
+            .unwrap()
+            .bypass_domains
+            .push("new.test".into());
+        let next = build_dns_registry_reusing(updated, initial.limits, Some(&initial))
+            .await
+            .unwrap();
+        assert_eq!(
+            next.get_by_name("fake")
+                .unwrap()
+                .fake_dns_context()
+                .unwrap()
+                .restore(ip)
+                .unwrap()
+                .as_deref(),
+            Some("stable.test")
+        );
+        let disabled = build_dns_registry_reusing(fake_groups(false), initial.limits, Some(&next))
+            .await
+            .unwrap();
+        assert!(
+            disabled
+                .get_by_name("fake")
+                .unwrap()
+                .fake_dns_context()
+                .is_none()
+        );
+        let enabled =
+            build_dns_registry_reusing(fake_groups(true), initial.limits, Some(&disabled))
+                .await
+                .unwrap();
+        assert_eq!(
+            enabled
+                .get_by_name("fake")
+                .unwrap()
+                .fake_dns_context()
+                .unwrap()
+                .restore(ip)
+                .unwrap()
+                .as_deref(),
+            Some("stable.test")
+        );
+        let mut incompatible = fake_groups(true);
+        incompatible[0].fake_ip.as_mut().unwrap().max_entries -= 1;
+        assert!(
+            build_dns_registry_reusing(incompatible, initial.limits, Some(&enabled))
+                .await
+                .is_err()
+        );
+        assert_eq!(context.restore(ip).unwrap().as_deref(), Some("stable.test"));
+    }
+
+    #[tokio::test]
+    async fn named_fake_dns_fallback_uses_configured_exchange_and_refresh_wrapper() {
+        use hickory_resolver::proto::op::{Message, Query, ResponseCode};
+        use hickory_resolver::proto::rr::{Name, RecordType};
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut groups = fake_groups(true);
+        groups[0].specs = vec![make_spec(&format!(
+            "udp://{}",
+            socket.local_addr().unwrap()
+        ))];
+        let registry = build_dns_registry(groups).await.unwrap();
+        let server = tokio::spawn(async move {
+            let mut bytes = [0; 2048];
+            let (len, peer) = socket.recv_from(&mut bytes).await.unwrap();
+            let mut answer = Message::from_vec(&bytes[..len]).unwrap().into_response();
+            assert_eq!(answer.queries[0].query_type, RecordType::MX);
+            answer.metadata.response_code = ResponseCode::NXDomain;
+            socket
+                .send_to(&answer.to_vec().unwrap(), peer)
+                .await
+                .unwrap();
+        });
+        let context = registry
+            .get_by_name("fake")
+            .unwrap()
+            .fake_dns_context()
+            .unwrap();
+        let mut request = Message::query();
+        request.add_query(Query::query(
+            Name::from_ascii("mail.test").unwrap(),
+            RecordType::MX,
+        ));
+        let reply = context
+            .exchange(request.to_vec().unwrap(), true)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            Message::from_vec(&reply).unwrap().metadata.response_code,
+            ResponseCode::NXDomain
+        );
+        server.await.unwrap();
     }
 
     #[tokio::test]

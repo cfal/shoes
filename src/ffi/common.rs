@@ -12,7 +12,7 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 use crate::config::{Config, convert_cert_paths, create_server_configs, load_config_str};
-use crate::dns::build_dns_registry;
+use crate::dns::build_dns_registry_for_runtime;
 use crate::tcp::tcp_server::start_servers;
 #[cfg(unix)]
 use crate::tun::run_tun_from_config;
@@ -214,7 +214,22 @@ pub async fn start_from_config(
     let _resource_reporter = crate::resources::ResourceReporter::start();
 
     // Build DNS registry from expanded groups
-    let mut dns_registry = build_dns_registry(dns_groups).await?;
+    let synthetic_endpoints: Vec<_> = validated_configs
+        .iter()
+        .filter_map(|config| {
+            if let Config::TunServer(tun) = config {
+                Some([tun.address, tun.destination])
+            } else {
+                None
+            }
+        })
+        .flatten()
+        .flatten()
+        .collect();
+    let mut dns_registry =
+        build_dns_registry_for_runtime(dns_groups, global_limits, None, &synthetic_endpoints)
+            .await?;
+    let dns_snapshots = dns_registry.snapshot_task();
 
     // Separate TUN config from server configs, validate exactly one TUN with device_fd
     let mut tun_config = None;
@@ -298,6 +313,9 @@ pub async fn start_from_config(
     drop(join_handles);
     #[cfg(unix)]
     wireguard_running.stop().await;
+
+    drop(dns_snapshots);
+    dns_registry.checkpoint().await?;
 
     result
 }

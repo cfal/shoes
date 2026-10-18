@@ -55,6 +55,29 @@ fn query(kind: RecordType) -> Vec<u8> {
     query.to_vec().unwrap()
 }
 
+#[test]
+fn mapped_ipv4_cannot_bypass_restoration_or_unknown_rejection() {
+    let (context, _) = context();
+    let std::net::IpAddr::V4(ip) = context.allocate("mapped.test", false).unwrap() else {
+        panic!()
+    };
+    assert!(context.contains(ip.to_ipv6_mapped().into()));
+    assert_eq!(
+        context
+            .restore(ip.to_ipv6_mapped().into())
+            .unwrap()
+            .as_deref(),
+        Some("mapped.test")
+    );
+    assert_eq!(
+        context
+            .restore("::ffff:198.18.0.1".parse().unwrap())
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::NotFound
+    );
+}
+
 #[tokio::test]
 async fn context_separates_synthesis_real_exchange_and_malformed_input() {
     let (context, real) = context();

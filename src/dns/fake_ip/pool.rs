@@ -6,6 +6,11 @@ use std::num::NonZeroUsize;
 use ipnetwork::IpNetwork;
 use lru::LruCache;
 use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
+
+#[path = "persistence.rs"]
+mod persistence;
+use persistence::SnapshotStore;
 
 use super::FakeIpOptions;
 use super::options::invalid;
@@ -27,6 +32,14 @@ impl Range {
             return Err(invalid(
                 "fake IP range must have the specified family and no host bits",
             ));
+        }
+        if let IpNetwork::V6(range) = network {
+            let mapped: ipnetwork::Ipv6Network = "::ffff:0:0/96".parse().unwrap();
+            if range.contains(mapped.network()) || mapped.contains(range.network()) {
+                return Err(invalid(
+                    "fake IPv6 range must not overlap IPv4-mapped addresses",
+                ));
+            }
         }
         let (base, last) = match network {
             IpNetwork::V4(net) => (
@@ -64,7 +77,7 @@ impl Range {
     }
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 struct Entry {
     v4: Option<IpAddr>,
     v6: Option<IpAddr>,
@@ -76,12 +89,29 @@ struct State {
     reverse: HashMap<IpAddr, String>,
     v4: Option<Range>,
     v6: Option<Range>,
+    v4_reserved: usize,
+    v6_reserved: usize,
+    misses: u64,
+    evictions: u64,
+    wraps: u64,
 }
 
 /// Bounded mappings with a cursor independent of LRU eviction.
-#[derive(Debug)]
 pub struct FakeIpPool {
     state: Mutex<State>,
+    store: Option<SnapshotStore>,
+}
+
+impl std::fmt::Debug for FakeIpPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let state = self.state.lock();
+        f.debug_struct("FakeIpPool")
+            .field("entries", &state.forward.len())
+            .field("misses", &state.misses)
+            .field("evictions", &state.evictions)
+            .field("wraps", &state.wraps)
+            .finish()
+    }
 }
 
 impl FakeIpPool {
@@ -124,17 +154,46 @@ impl FakeIpPool {
         let (v4, v6) = Self::ranges(options, seed)?;
         let mut forward = LruCache::unbounded();
         forward.resize(NonZeroUsize::new(options.max_entries).unwrap());
+        let mut state = State {
+            forward,
+            reverse: HashMap::new(),
+            v4,
+            v6,
+            v4_reserved: 0,
+            v6_reserved: 0,
+            misses: 0,
+            evictions: 0,
+            wraps: 0,
+        };
+        let store = options
+            .state_file
+            .as_ref()
+            .map(|path| SnapshotStore::open(path, &mut state))
+            .transpose()?;
         Ok(Self {
-            state: Mutex::new(State {
-                forward,
-                reverse: HashMap::new(),
-                v4,
-                v6,
-            }),
+            state: Mutex::new(state),
+            store,
         })
     }
 
+    pub(super) fn persistent(&self) -> bool {
+        self.store.is_some()
+    }
+
+    pub(crate) fn checkpoint(&self) -> io::Result<()> {
+        if let Some(store) = &self.store {
+            let _serial = store.serial.lock();
+            let snapshot = persistence::Snapshot::from_state(&self.state.lock());
+            store.write(&snapshot)?;
+            let mut state = self.state.lock();
+            state.v4_reserved = 0;
+            state.v6_reserved = 0;
+        }
+        Ok(())
+    }
+
     pub fn contains(&self, ip: IpAddr) -> bool {
+        let ip = ip.to_canonical();
         let state = self.state.lock();
         [state.v4.as_ref(), state.v6.as_ref()]
             .iter()
@@ -152,6 +211,7 @@ impl FakeIpPool {
     }
 
     pub fn restore(&self, ip: IpAddr) -> io::Result<Option<String>> {
+        let ip = ip.to_canonical();
         let mut state = self.state.lock();
         if let Some(name) = state.reverse.get(&ip).cloned() {
             state.forward.get(&name);
@@ -162,6 +222,7 @@ impl FakeIpPool {
             .flatten()
             .any(|r| r.network.contains(ip))
         {
+            state.misses = state.misses.saturating_add(1);
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 "unknown fake IP address",
@@ -172,17 +233,50 @@ impl FakeIpPool {
 
     pub fn allocate(&self, name: &str, ipv6: bool) -> io::Result<IpAddr> {
         let name = canonical_hostname(name).ok_or_else(|| invalid("invalid fake DNS hostname"))?;
+        let _serial = self.store.as_ref().map(|store| store.serial.lock());
         let mut state = self.state.lock();
         if let Some(entry) = state.forward.get(&name)
             && let Some(ip) = if ipv6 { entry.v6 } else { entry.v4 }
         {
             return Ok(ip);
         }
+        if let Some(store) = &self.store {
+            let remaining = if ipv6 {
+                state.v6_reserved
+            } else {
+                state.v4_reserved
+            };
+            if remaining == 0 {
+                let (snapshot, count) = store.reservation(&state, ipv6)?;
+                drop(state);
+                store.write(&snapshot)?;
+                state = self.state.lock();
+                if ipv6 {
+                    state.v6_reserved = count;
+                    state.v4_reserved = 0;
+                } else {
+                    state.v4_reserved = count;
+                    state.v6_reserved = 0;
+                }
+            }
+            if ipv6 {
+                state.v6_reserved -= 1;
+            } else {
+                state.v4_reserved -= 1;
+            }
+        }
         let range = if ipv6 { &mut state.v6 } else { &mut state.v4 };
-        let ip = range
+        let range = range
             .as_mut()
-            .ok_or_else(|| invalid("fake IP family disabled"))?
-            .take();
+            .ok_or_else(|| invalid("fake IP family disabled"))?;
+        let wrapped = range.cursor == range.last;
+        let ip = range.take();
+        if wrapped {
+            state.wraps = state.wraps.saturating_add(1);
+            log::warn!(
+                "Fake IP allocation wrapped its configured range; stale addresses may be reused"
+            );
+        }
 
         if let Some(previous) = state.reverse.remove(&ip) {
             if let Some(entry) = state.forward.peek_mut(&previous) {
@@ -200,6 +294,7 @@ impl FakeIpPool {
             if state.forward.len() == state.forward.cap().get()
                 && let Some((_, entry)) = state.forward.pop_lru()
             {
+                state.evictions = state.evictions.saturating_add(1);
                 for address in [entry.v4, entry.v6].into_iter().flatten() {
                     state.reverse.remove(&address);
                 }
@@ -358,7 +453,7 @@ mod tests {
         assert!(
             FakeIpPool::validate(&FakeIpOptions {
                 ipv4_range: None,
-                ipv6_range: Some("::/0".into()),
+                ipv6_range: Some("8000::/1".into()),
                 max_entries: usize::MAX,
                 ..Default::default()
             })

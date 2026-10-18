@@ -8,9 +8,9 @@ use hickory_resolver::proto::rr::{DNSClass, RData, Record, RecordType, rdata};
 
 use super::pool::canonical_hostname;
 use super::{FakeIpOptions, FakeIpPool, HttpsRecords, MissingFamily};
+pub(super) use crate::dns::message::UDP_PAYLOAD_LIMIT;
 
 pub const SYNTHETIC_TTL: u32 = 60;
-pub const UDP_PAYLOAD_LIMIT: u16 = 1232;
 
 #[derive(Debug)]
 pub enum DnsDecision {
@@ -38,6 +38,12 @@ impl FakeDnsResponder {
         if request.metadata.op_code != OpCode::Query {
             return DnsDecision::Answer(response(request, ResponseCode::Refused));
         }
+        if crate::dns::message::is_signed(request) {
+            return DnsDecision::Answer(response(request, ResponseCode::Refused));
+        }
+        if request.queries.len() != 1 {
+            return DnsDecision::Answer(response(request, ResponseCode::FormErr));
+        }
         if request.version() != 0 {
             return DnsDecision::Answer(response(request, ResponseCode::BADVERS));
         }
@@ -48,9 +54,7 @@ impl FakeDnsResponder {
         {
             return DnsDecision::Answer(response(request, ResponseCode::Refused));
         }
-        if request.signature().is_some()
-            || request.queries.len() != 1
-            || !request.answers.is_empty()
+        if !request.answers.is_empty()
             || !request.authorities.is_empty()
             || !request.additionals.is_empty()
             || request.metadata.truncation
@@ -102,7 +106,10 @@ impl FakeDnsResponder {
         }
         let address = match self.pool.allocate(&name, ipv6) {
             Ok(address) => address,
-            Err(_) => return DnsDecision::Answer(response(request, ResponseCode::ServFail)),
+            Err(error) => {
+                log::warn!("Fake DNS allocation failed: {error}");
+                return DnsDecision::Answer(response(request, ResponseCode::ServFail));
+            }
         };
         let mut answer = response(request, ResponseCode::NoError);
         let data = match address {
@@ -230,7 +237,10 @@ mod tests {
             Name::from_ascii("second.test").unwrap(),
             RecordType::A,
         ));
-        assert!(matches!(responder.decide(&multiple), DnsDecision::Forward));
+        let DnsDecision::Answer(answer) = responder.decide(&multiple) else {
+            panic!()
+        };
+        assert_eq!(answer.metadata.response_code, ResponseCode::FormErr);
         multiple.metadata.message_type = MessageType::Response;
         assert!(matches!(responder.decide(&multiple), DnsDecision::Drop));
     }
