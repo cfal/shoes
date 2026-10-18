@@ -187,6 +187,8 @@ their meaning. Other carrier protocol settings are compared as configured.
 Conflicting addresses, routes, PSKs, MTUs, limits, interfaces, or peer
 chains for the same identity reject rather than silently merging. Different
 identities and servers remain separate. Unused client groups open no sockets.
+Unreferenced WireGuard-routed DNS groups are validated but not prepared; selecting
+the group through a server or TUN `dns` field activates its devices.
 
 DNS remains independently configured. Merely defining a WireGuard client
 does not tunnel the application's default native DNS. Explicit TCP DNS,

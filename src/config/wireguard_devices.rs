@@ -202,9 +202,28 @@ pub(super) fn collect_devices(
             visit_client(client, &mut |client| clients.register(client))?;
         }
     }
+    validated.visit_clients(&mut |client| clients.register(client))?;
+    let referenced_dns: HashSet<_> = validated
+        .configs
+        .iter()
+        .filter_map(|config| match config {
+            Config::Server(server) => server.dns.as_ref(),
+            Config::TunServer(tun) => tun.dns.as_ref(),
+            _ => None,
+        })
+        .filter_map(|dns| dns.resolved_group())
+        .collect();
+    // WireGuard-routed DNS cannot be a bootstrap dependency; only listeners and TUNs activate it.
+    validated.dns_groups.retain(|group| {
+        referenced_dns.contains(group.name.as_str())
+            || !group.specs.iter().any(|spec| {
+                spec.client_chains
+                    .iter()
+                    .any(super::validate::chain_uses_wireguard)
+            })
+    });
     let mut used = HashSet::new();
     validated.visit_clients(&mut |client| {
-        clients.register(client)?;
         if let ClientProxyConfig::Wireguard(config) = &client.protocol {
             used.insert(config.endpoint_id.clone());
         }
@@ -627,6 +646,66 @@ mod tests {
         let mut invalid = configs;
         invalid[0]["client_proxies"][0]["protocol"]["mtu"] = json!(9000);
         assert!(validate(invalid).is_err());
+    }
+
+    #[test]
+    fn unused_wireguard_dns_groups_validate_without_starting_devices() {
+        let configs = json!([
+            {"dns_group": "unused", "dns_servers": [{"url": "tcp://192.0.2.53", "client_chain": [client()]}]},
+            {"dns_group": "direct", "dns_servers": ["system"]},
+            {"address": "0.0.0.0:1080", "protocol": {"type": "socks"}},
+        ]);
+        let validated = validate(configs.clone()).unwrap();
+        assert!(validated.wireguard_endpoints.is_empty());
+        assert_eq!(validated.dns_groups.len(), 1);
+        assert_eq!(validated.dns_groups[0].name, "direct");
+
+        let mut invalid = configs.clone();
+        invalid[0]["dns_servers"][0]["client_chain"][0]["protocol"]["mtu"] = json!(9000);
+        assert!(validate(invalid).is_err());
+
+        let mut conflict = configs.clone();
+        let mut second = client();
+        second["protocol"]["pre_shared_key"] = json!(key(99));
+        conflict[0]["dns_servers"][0]["client_chain"] =
+            json!({"chain": [{"pool": [client(), second]}]});
+        let error = validate(conflict).err().unwrap();
+        assert!(error.to_string().contains("conflicting"), "{error}");
+
+        for root in [
+            json!({"address": "0.0.0.0:1080", "protocol": {"type": "socks"}}),
+            json!({"device_fd": 7, "rules": "block-all"}),
+            server(),
+        ] {
+            let mut referenced = configs.clone();
+            referenced[2] = root;
+            referenced[2]["dns"] = json!({"servers": "unused"});
+            let validated = validate(referenced).unwrap();
+            assert!(
+                validated
+                    .dns_groups
+                    .iter()
+                    .any(|group| group.name == "unused")
+            );
+            assert!(
+                validated
+                    .wireguard_endpoints
+                    .iter()
+                    .any(|device| device.inbound.is_none())
+            );
+        }
+
+        let mut composed = configs;
+        composed[2]["dns"] = json!({"servers": ["unused", "direct"]});
+        let validated = validate(composed).unwrap();
+        assert_eq!(validated.wireguard_endpoints.len(), 1);
+        assert_eq!(validated.dns_groups.len(), 2);
+        assert!(
+            validated
+                .dns_groups
+                .iter()
+                .all(|group| group.name != "unused")
+        );
     }
 
     #[test]

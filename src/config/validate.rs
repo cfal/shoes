@@ -736,7 +736,7 @@ fn hop_uses_wireguard(hop: &ClientChainHop) -> bool {
     }
 }
 
-fn chain_uses_wireguard(chain: &ClientChain) -> bool {
+pub(super) fn chain_uses_wireguard(chain: &ClientChain) -> bool {
     chain.hops.iter().any(hop_uses_wireguard)
 }
 

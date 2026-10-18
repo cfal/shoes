@@ -853,13 +853,16 @@ async fn wireguard_chains_load_client_certificate_paths_before_validation() {
     nested["protocol"]["peer_client_chain"] = json!([carrier]);
     let rule = json!({"masks": "0.0.0.0/0", "action": "allow", "client_chain": [nested]});
     let dns = json!({"url": "tcp://192.0.2.53", "client_chain": [nested]});
-    for root in [
-        json!({"dns_group": "tunnel", "dns_servers": [dns]}),
-        json!({"address": "0.0.0.0:1080", "protocol": {"type": "socks"}, "dns": {"servers": [dns]}}),
-        json!({"device_fd": 7, "rules": [rule]}),
+    for roots in [
+        json!([
+            {"dns_group": "tunnel", "dns_servers": [dns]},
+            {"address": "0.0.0.0:1080", "protocol": {"type": "socks"}, "dns": {"servers": "tunnel"}},
+        ]),
+        json!([{"address": "0.0.0.0:1080", "protocol": {"type": "socks"}, "dns": {"servers": [dns]}}]),
+        json!([{"device_fd": 7, "rules": [rule]}]),
     ] {
         let raw: Vec<crate::config::Config> =
-            serde_yaml::from_str(&serde_yaml::to_string(&json!([root])).unwrap()).unwrap();
+            serde_yaml::from_str(&serde_yaml::to_string(&roots).unwrap()).unwrap();
         let (raw, count) = crate::config::convert_cert_paths(raw).await.unwrap();
         assert_eq!(count, 2);
         assert_eq!(
@@ -1258,23 +1261,69 @@ async fn wireguard_dns_tcp_dot_doh_use_the_tunnel_and_fail_closed_after_stop() {
 }
 
 #[tokio::test]
+async fn wireguard_unused_dns_groups_do_not_contact_peers() {
+    use serde_json::json;
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut client = config::client(peer.local_addr().unwrap().port());
+        client["client_proxies"][0]["protocol"]["persistent_keepalive"] = json!(1);
+        let mut raw = json!([
+            client,
+            {"dns_group": "tunnel", "dns_servers": [{"url": "tcp://192.0.2.53", "client_chain": "wg"}]},
+            {"address": "0.0.0.0:1080", "protocol": {"type": "socks"}},
+        ]);
+        let mut configs = validate(&serde_yaml::to_string(&raw).unwrap()).unwrap();
+        assert!(configs.wireguard_endpoints.is_empty());
+        let prepared = Prepared::new(&mut configs).await.unwrap();
+        let mut dns = crate::dns::build_dns_registry(configs.dns_groups).await.unwrap();
+        let mut running = Running::default();
+        prepared.start(&mut dns, &mut running).await.unwrap();
+        let mut packet = [0; 2048];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1100), peer.recv(&mut packet))
+                .await
+                .is_err()
+        );
+        running.stop().await;
+
+        raw[2]["dns"] = json!({"servers": "tunnel"});
+        let mut configs = validate(&serde_yaml::to_string(&raw).unwrap()).unwrap();
+        let prepared = Prepared::new(&mut configs).await.unwrap();
+        let mut dns = crate::dns::build_dns_registry(configs.dns_groups).await.unwrap();
+        prepared.start(&mut dns, &mut running).await.unwrap();
+        let length = tokio::time::timeout(Duration::from_secs(3), peer.recv(&mut packet))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(length, 148);
+        assert_eq!(&packet[..4], &[1, 0, 0, 0]);
+        running.stop().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn wireguard_dns_registry_prepares_inactive_generation_handles() {
+    use serde_json::json;
+
     tokio::time::timeout(Duration::from_secs(10), async {
         let reservation = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
         let port = reservation.local_addr().unwrap().port();
         let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
         let dns_port = listener.local_addr().unwrap().port();
-        let yaml = format!(
-            r#"{}
-- dns_group: tunnel
-  dns_servers:
-    - url: tcp://127.0.0.1:{dns_port}
-      ip_strategy: ipv4_only
-      client_chain: client
-"#,
-            pair_config(port)
-        );
-        let mut configs = validate(&yaml).unwrap();
+        let mut raw: serde_json::Value = serde_yaml::from_str(&pair_config(port)).unwrap();
+        raw[2]["dns"] = json!({"servers": "tunnel"});
+        raw.as_array_mut().unwrap().push(json!({
+            "dns_group": "tunnel",
+            "dns_servers": [{
+                "url": format!("tcp://127.0.0.1:{dns_port}"),
+                "ip_strategy": "ipv4_only",
+                "client_chain": "client",
+            }],
+        }));
+        let mut configs = validate(&serde_yaml::to_string(&raw).unwrap()).unwrap();
         let prepared = Prepared::new(&mut configs).await.unwrap();
         let mut dns = crate::dns::build_dns_registry(configs.dns_groups.clone())
             .await
