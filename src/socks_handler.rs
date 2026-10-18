@@ -158,6 +158,9 @@ pub async fn setup_socks_server_stream_inner(
     }
 
     write_all(&mut server_stream, &[VER_SOCKS5, supported_method]).await?;
+    // Clients may wait for each reply before sending more, so replies cannot wait for
+    // the final flush.
+    server_stream.flush().await?;
 
     if let Some((target_username, target_password)) = auth_info {
         let auth_version = stream_reader.read_u8(&mut server_stream).await?;
@@ -208,6 +211,7 @@ pub async fn setup_socks_server_stream_inner(
         }
 
         write_all(&mut server_stream, &[VER_AUTH, RESULT_SUCCESS]).await?;
+        server_stream.flush().await?;
     }
 
     let connection_request = stream_reader.read_slice(&mut server_stream, 3).await?;
@@ -224,6 +228,7 @@ pub async fn setup_socks_server_stream_inner(
             None => {
                 let response = build_error_response(REPLY_COMMAND_NOT_SUPPORTED);
                 write_all(&mut server_stream, &response).await?;
+                server_stream.flush().await?;
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::Unsupported,
                     "UDP ASSOCIATE not enabled",
@@ -392,6 +397,7 @@ async fn handle_udp_associate(
                 log::error!("Failed to bind UDP socket: {}", e);
                 let response = build_error_response(REPLY_GENERAL_FAILURE);
                 write_all(&mut server_stream, &response).await?;
+                server_stream.flush().await?;
                 return Err(e);
             }
         };
@@ -775,4 +781,148 @@ pub fn write_location_to_vec(location: &NetLocation) -> Vec<u8> {
     vec.push((port >> 8) as u8);
     vec.push((port & 0xff) as u8);
     vec
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::async_stream::test_streams::FlushGatedStream;
+    use crate::resolver::NativeResolver;
+    use std::io;
+    use std::time::Duration;
+    use tokio::io::DuplexStream;
+
+    /// RFC 1929 request carrying `credentials()`.
+    const AUTH_REQUEST: &[u8] = b"\x01\x04user\x04pass";
+    /// CONNECT request for `destination()`.
+    const CONNECT_REQUEST: &[u8] = b"\x05\x01\x00\x03\x0bexample.com\x01\xbb";
+
+    fn credentials() -> Option<(String, String)> {
+        Some(("user".to_string(), "pass".to_string()))
+    }
+
+    fn destination() -> NetLocation {
+        NetLocation::from_str("example.com:443", None).unwrap()
+    }
+
+    fn server_handler(auth_info: Option<(String, String)>) -> SocksTcpServerHandler {
+        SocksTcpServerHandler::new(
+            auth_info,
+            false,
+            "0.0.0.0".parse().unwrap(),
+            Arc::new(ClientProxySelector::new(vec![])),
+            Arc::new(NativeResolver::new()),
+        )
+    }
+
+    /// Fails the test instead of hanging when a handshake step stalls.
+    async fn bounded<F: std::future::Future>(future: F) -> F::Output {
+        tokio::time::timeout(Duration::from_secs(1), future)
+            .await
+            .expect("handshake step stalled")
+    }
+
+    async fn read_bytes(stream: &mut DuplexStream, len: usize) -> Vec<u8> {
+        let mut bytes = vec![0; len];
+        bounded(stream.read_exact(&mut bytes)).await.unwrap();
+        bytes
+    }
+
+    #[tokio::test]
+    async fn server_flushes_each_negotiation_reply() {
+        for auth_info in [None, credentials()] {
+            let with_auth = auth_info.is_some();
+            let (mut client, server_stream) = tokio::io::duplex(1024);
+            let setup = tokio::spawn(async move {
+                server_handler(auth_info)
+                    .setup_server_stream(Box::new(FlushGatedStream::new(server_stream)))
+                    .await
+            });
+
+            let method = if with_auth {
+                METHOD_USERNAME
+            } else {
+                METHOD_NONE
+            };
+            client.write_all(&[VER_SOCKS5, 1, method]).await.unwrap();
+            assert_eq!(read_bytes(&mut client, 2).await, [VER_SOCKS5, method]);
+            if with_auth {
+                client.write_all(AUTH_REQUEST).await.unwrap();
+                assert_eq!(read_bytes(&mut client, 2).await, [VER_AUTH, RESULT_SUCCESS]);
+            }
+            client.write_all(CONNECT_REQUEST).await.unwrap();
+
+            let TcpServerSetupResult::TcpForward {
+                remote_location, ..
+            } = bounded(setup).await.unwrap().unwrap()
+            else {
+                panic!("expected TCP forwarding");
+            };
+            assert_eq!(remote_location, destination());
+        }
+    }
+
+    #[tokio::test]
+    async fn server_flushes_command_not_supported_reply() {
+        let (mut client, server_stream) = tokio::io::duplex(1024);
+        let setup = tokio::spawn(async move {
+            server_handler(None)
+                .setup_server_stream(Box::new(FlushGatedStream::new(server_stream)))
+                .await
+        });
+
+        client
+            .write_all(&[VER_SOCKS5, 1, METHOD_NONE])
+            .await
+            .unwrap();
+        read_bytes(&mut client, 2).await;
+        client
+            .write_all(&[VER_SOCKS5, CMD_UDP_ASSOCIATE, 0])
+            .await
+            .unwrap();
+        assert_eq!(
+            read_bytes(&mut client, 10).await,
+            build_error_response(REPLY_COMMAND_NOT_SUPPORTED)
+        );
+        let error = bounded(setup).await.unwrap().err().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+    }
+
+    #[tokio::test]
+    async fn server_flushes_udp_bind_failure_reply() {
+        // Binding the UDP relay to TEST-NET-1 fails unless the host assigns it or allows
+        // non-local binds.
+        if std::net::UdpSocket::bind("192.0.2.1:0").is_ok() {
+            eprintln!("skipping: 192.0.2.1 is bindable on this host");
+            return;
+        }
+
+        let (mut client, server_stream) = tokio::io::duplex(1024);
+        let setup = tokio::spawn(async move {
+            SocksTcpServerHandler::new(
+                None,
+                true,
+                "192.0.2.1".parse().unwrap(),
+                Arc::new(ClientProxySelector::new(vec![])),
+                Arc::new(NativeResolver::new()),
+            )
+            .setup_server_stream(Box::new(FlushGatedStream::new(server_stream)))
+            .await
+        });
+
+        client
+            .write_all(&[VER_SOCKS5, 1, METHOD_NONE])
+            .await
+            .unwrap();
+        read_bytes(&mut client, 2).await;
+        client
+            .write_all(b"\x05\x03\x00\x01\x00\x00\x00\x00\x00\x00")
+            .await
+            .unwrap();
+        assert_eq!(
+            read_bytes(&mut client, 10).await,
+            build_error_response(REPLY_GENERAL_FAILURE)
+        );
+        assert!(bounded(setup).await.unwrap().is_err());
+    }
 }
