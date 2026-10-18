@@ -210,7 +210,7 @@ impl SnapshotStore {
             state.v4.clone()
         }
         .ok_or_else(|| invalid("fake IP family disabled"))?;
-        let count = RESERVATION_SIZE.min(range.last - range.first) as usize;
+        let count = RESERVATION_SIZE.min((range.last - range.first + 1) / 2) as usize;
         let mut snapshot = Snapshot::from_state(state);
         snapshot.reserve(range, count);
         Ok((snapshot, count))
@@ -386,6 +386,39 @@ mod tests {
             ..options(&directory.path().join("one.json"))
         };
         assert!(FakeIpPool::new(&options).is_err());
+    }
+
+    #[test]
+    fn restart_after_a_full_window_does_not_immediately_recycle_recent_answers() {
+        for prefix in [24, 25, 26, 27, 28, 29] {
+            for clean in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let options = FakeIpOptions {
+                    ipv4_range: Some(format!("198.18.0.0/{prefix}")),
+                    ipv6_range: None,
+                    max_entries: (1usize << (32 - prefix)) - 3,
+                    ..options(&directory.path().join("state.json"))
+                };
+                let pool = FakeIpPool::with_seed(&options, 0).unwrap();
+                let count = ((1usize << (32 - prefix)) - 3) / 2;
+                let issued: Vec<_> = (0..=count)
+                    .map(|i| pool.allocate(&format!("n{i}.test"), false).unwrap())
+                    .collect();
+                if clean {
+                    pool.shutdown_checkpoint().unwrap();
+                }
+                drop(pool);
+                let pool = FakeIpPool::new(&options).unwrap();
+                let next = pool.allocate("after.test", false).unwrap();
+                assert!(!issued.iter().rev().take(count).any(|ip| *ip == next));
+                if clean {
+                    let IpAddr::V4(previous) = issued.last().unwrap() else {
+                        panic!()
+                    };
+                    assert_eq!(next, IpAddr::V4((u32::from(*previous) + 1).into()));
+                }
+            }
+        }
     }
 
     #[test]

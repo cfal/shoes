@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hickory_resolver::proto::op::{Message, MessageType, ResponseCode};
+use hickory_resolver::proto::rr::RecordType;
 
 use crate::async_stream::{AsyncMessageStream, AsyncStream};
 use crate::resolver::Resolver;
@@ -64,7 +65,15 @@ impl FakeDnsContext {
             Ok(request) => request,
             Err(_) => return Ok(None),
         };
-        let decision = if self.responder.pool.persistent() {
+        if request.metadata.message_type != MessageType::Query {
+            return Ok(None);
+        }
+        let may_allocate = request.queries.len() == 1
+            && matches!(
+                request.queries[0].query_type,
+                RecordType::A | RecordType::AAAA
+            );
+        let decision = if self.responder.pool.persistent() && may_allocate {
             let responder = self.responder.clone();
             let request = request.clone();
             let failure = response(&request, ResponseCode::ServFail);

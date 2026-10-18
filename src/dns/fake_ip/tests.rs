@@ -3,6 +3,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use futures::future::poll_fn;
 use hickory_resolver::proto::op::{Message, Query, ResponseCode};
@@ -119,6 +120,36 @@ async fn persistent_work_waits_for_admission_with_a_deadline() {
         pool.clone(),
     )
     .unwrap();
+    let response_packet = Message::from_vec(&query(RecordType::A))
+        .unwrap()
+        .into_response()
+        .to_vec()
+        .unwrap();
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(1),
+            context.exchange(response_packet, false)
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .is_none()
+    );
+    let forwarded = tokio::time::timeout(
+        Duration::from_millis(1),
+        context.exchange(query(RecordType::TXT), false),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        Message::from_vec(&forwarded)
+            .unwrap()
+            .metadata
+            .response_code,
+        ResponseCode::NXDomain
+    );
     let response = context
         .exchange(query(RecordType::A), false)
         .await

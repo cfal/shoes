@@ -219,6 +219,8 @@ impl FakeIpPool {
         let _serial = self.store.as_ref().map(|store| store.serial.lock());
         let mut state = self.state.lock();
         state.closed = true;
+        state.v4_reserved = 0;
+        state.v6_reserved = 0;
         if let Some(store) = &self.store {
             let snapshot = persistence::Snapshot::from_state(&state);
             drop(state);
