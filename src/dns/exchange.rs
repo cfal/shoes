@@ -20,6 +20,7 @@ type Connection =
 type SetupWaits = parking_lot::Mutex<Vec<Option<Connection>>>;
 
 struct Upstream {
+    server_index: usize,
     ip: IpAddr,
     config: ConnectionConfig,
     connection: Mutex<Option<Connection>>,
@@ -59,8 +60,10 @@ impl RawDnsExchange {
         Self {
             upstreams: servers
                 .into_iter()
-                .flat_map(|server| {
+                .enumerate()
+                .flat_map(|(server_index, server)| {
                     server.connections.into_iter().map(move |config| Upstream {
+                        server_index,
                         ip: server.ip,
                         config,
                         connection: Mutex::new(None),
@@ -138,7 +141,8 @@ impl RawDnsExchange {
                 .filter(|(_, candidate)| {
                     !matches!(candidate.config.protocol, ProtocolConfig::Tcp)
                         || !self.upstreams.iter().any(|udp| {
-                            udp.same_endpoint(candidate)
+                            udp.server_index == candidate.server_index
+                                && udp.same_endpoint(candidate)
                                 && matches!(udp.config.protocol, ProtocolConfig::Udp)
                         })
                 })
@@ -331,6 +335,7 @@ mod tests {
     #[test]
     fn endpoint_pairing_requires_equal_ip_port_and_bind_address() {
         let upstream = |ip, config| Upstream {
+            server_index: 0,
             ip,
             config,
             connection: Mutex::new(None),
@@ -506,6 +511,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn separately_configured_tcp_remains_a_primary_when_udp_is_silent() {
+        for system_pair in [true, false] {
+            let tcp = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+            let mut address = tcp.local_addr().unwrap();
+            address.set_ip("127.0.0.1".parse().unwrap());
+            let _udp = tokio::net::UdpSocket::bind(address).await.unwrap();
+            let mut udp_config = ConnectionConfig::udp();
+            udp_config.port = address.port();
+            let mut tcp_config = ConnectionConfig::tcp();
+            tcp_config.port = address.port();
+            let servers = if system_pair {
+                vec![NameServerConfig::new(
+                    address.ip(),
+                    true,
+                    vec![udp_config, tcp_config],
+                )]
+            } else {
+                vec![
+                    NameServerConfig::new(address.ip(), true, vec![udp_config]),
+                    NameServerConfig::new(address.ip(), true, vec![tcp_config]),
+                ]
+            };
+            let mut options = ResolverOpts::default();
+            options.timeout = Duration::from_millis(100);
+            options.attempts = 1;
+            let raw = RawDnsExchange::new(servers, exchange(address, false).provider, options);
+            if system_pair {
+                assert_eq!(
+                    raw.exchange(request().to_vec().unwrap())
+                        .await
+                        .unwrap_err()
+                        .kind(),
+                    io::ErrorKind::TimedOut
+                );
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(20), tcp.accept())
+                        .await
+                        .is_err()
+                );
+            } else {
+                let server = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+                    let (mut stream, _) = tcp.accept().await.unwrap();
+                    let answer = read_tcp(&mut stream).await.into_response();
+                    write_tcp(&mut stream, answer).await;
+                }));
+                let answer = raw.exchange(request().to_vec().unwrap()).await.unwrap();
+                assert_eq!(Message::from_vec(&answer).unwrap().metadata.id, 17);
+                server.await.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn silent_first_server_does_not_starve_healthy_second_server() {
         for (system_pair, extra_silent) in [(false, false), (true, false), (true, true)] {
             let silent = tokio::net::UdpSocket::bind("0.0.0.0:0").await.unwrap();
@@ -517,6 +575,7 @@ mod tests {
                 let mut config = ConnectionConfig::tcp();
                 config.port = silent.local_addr().unwrap().port();
                 raw.upstreams.push(Upstream {
+                    server_index: 0,
                     ip: "127.0.0.1".parse().unwrap(),
                     config,
                     connection: Mutex::new(None),
@@ -527,6 +586,7 @@ mod tests {
                 let mut config = ConnectionConfig::udp();
                 config.port = second_silent.local_addr().unwrap().port();
                 raw.upstreams.push(Upstream {
+                    server_index: 1,
                     ip: "127.0.0.1".parse().unwrap(),
                     config,
                     connection: Mutex::new(None),
@@ -535,6 +595,7 @@ mod tests {
             let mut config = ConnectionConfig::udp();
             config.port = healthy.local_addr().unwrap().port();
             raw.upstreams.push(Upstream {
+                server_index: 2,
                 ip: "127.0.0.1".parse().unwrap(),
                 config,
                 connection: Mutex::new(None),
@@ -580,6 +641,7 @@ mod tests {
             }
             assert!(setup.peek().is_none());
             raw.upstreams.push(Upstream {
+                server_index: 0,
                 ip: address.ip(),
                 config,
                 connection: Mutex::new(Some(setup)),
@@ -639,6 +701,7 @@ mod tests {
             let mut config = ConnectionConfig::udp();
             config.port = silent.local_addr().unwrap().port();
             raw.upstreams.push(Upstream {
+                server_index: raw.upstreams.len(),
                 ip: address.ip(),
                 config,
                 connection: Mutex::new(None),
@@ -774,6 +837,7 @@ mod tests {
         let mut config = ConnectionConfig::tcp();
         config.port = addr.port();
         raw.upstreams.push(Upstream {
+            server_index: 0,
             ip: addr.ip(),
             config,
             connection: Mutex::new(None),
