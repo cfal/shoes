@@ -227,6 +227,9 @@ async fn run_rekey(detour: bool) -> io::Result<()> {
         let mut target = echoes.tcp();
         target.set_ip("198.18.0.1".parse().unwrap());
         let mut stream = shoes_test_support::wireguard::connect(entry, target).await?;
+        let udp = shoes_test_support::socks5::Socks5UdpAssociation::connect("127.0.0.1", entry).await?;
+        let udp_target = std::net::SocketAddr::new(target.ip(), echoes.udp().port());
+        assert_eq!(udp.send_to(udp_target, b"before rekey").await?, b"before rekey");
         let mut tick = tokio::time::interval(Duration::from_secs(1));
         let mut sequence = 0u64;
         loop {
@@ -238,6 +241,7 @@ async fn run_rekey(detour: bool) -> io::Result<()> {
                 let mut received = [0; 8];
                 stream.read_exact(&mut received).await?;
                 assert_eq!(received, payload);
+                assert_eq!(udp.send_to(udp_target, &payload).await?, payload);
                 Ok::<_, io::Error>(())
             }).await??;
             if rekeyed {

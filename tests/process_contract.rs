@@ -18,6 +18,10 @@ struct Process {
 mod wireguard_support;
 
 #[cfg(unix)]
+#[path = "cases/process_contract/wireguard_dns.rs"]
+mod wireguard_dns;
+
+#[cfg(unix)]
 #[tokio::test]
 async fn wireguard_reload_retains_invalid_candidates_rebinds_and_releases_on_exit() {
     wireguard_reload(false).await;
@@ -52,8 +56,16 @@ fn wireguard_check_validates_outer_udp_without_dns_or_listeners() {
         ] {
             endpoint["outer_client_chain"] = json!([{
                 "address": "unresolvable.invalid:443", "protocol": protocol,
-                "transport": "quic", "bind_interface": "shoes-missing-interface",
+                "transport": "quic",
             }]);
+            if cfg!(any(
+                target_os = "android",
+                target_os = "fuchsia",
+                target_os = "linux"
+            )) {
+                endpoint["outer_client_chain"][0]["bind_interface"] =
+                    json!("shoes-missing-interface");
+            }
             let config = json!([server, endpoint]);
             std::fs::write(&path, serde_yaml::to_string(&config).unwrap()).unwrap();
             let output = Command::new(env!("CARGO_BIN_EXE_shoes"))
@@ -139,9 +151,103 @@ async fn wireguard_reload(detour: bool) {
         timeout(Duration::from_secs(3), active.read(&mut byte)).await,
         Ok(Ok(1)) | Err(_)
     ));
+    let udp = shoes_test_support::socks5::Socks5UdpAssociation::connect("127.0.0.1", entry)
+        .await
+        .unwrap();
+    assert_eq!(
+        udp.send_to(echo.udp(), b"before server reload")
+            .await
+            .unwrap(),
+        b"before server reload"
+    );
     server.signal(libc::SIGHUP);
     server.wait_for("Servers ready").await;
-    // A fresh client generation has no stale handshake state from the retired server.
+    // The unchanged client must replace its stale handshake without operator intervention.
+    timeout(Duration::from_secs(45), async {
+        loop {
+            match udp
+                .send_to_with_timeout(
+                    shoes_test_support::socks5::SocksDestination::Ip(echo.udp()),
+                    b"after server reload",
+                    Duration::from_secs(1),
+                )
+                .await
+            {
+                Ok(bytes) => {
+                    assert_eq!(bytes, b"after server reload");
+                    break;
+                }
+                Err(error) => assert_eq!(error.kind(), io::ErrorKind::TimedOut),
+            }
+        }
+    })
+    .await
+    .unwrap();
+    echo.check(entry, None).await.unwrap();
+
+    // A new association excludes delayed recovery replies from the revocation check.
+    drop(udp);
+    let udp = shoes_test_support::socks5::Socks5UdpAssociation::connect("127.0.0.1", entry)
+        .await
+        .unwrap();
+    assert_eq!(
+        udp.send_to(echo.udp(), b"old key").await.unwrap(),
+        b"old key"
+    );
+    let mut old_stream = shoes_test_support::wireguard::connect(entry, echo.tcp())
+        .await
+        .unwrap();
+    roundtrip(&mut old_stream).await;
+    servers[0]["peers"][0]["public_key"] = json!(wireguard_support::public(44));
+    std::fs::write(&server_path, serde_yaml::to_string(&servers).unwrap()).unwrap();
+    server.signal(libc::SIGHUP);
+    server.wait_for("Servers ready").await;
+    assert!(
+        udp.send_to_with_timeout(
+            shoes_test_support::socks5::SocksDestination::Ip(echo.udp()),
+            b"revoked key",
+            Duration::from_secs(2),
+        )
+        .await
+        .is_err()
+    );
+    let old_flow = async {
+        old_stream.write_all(b"revoked key").await?;
+        old_stream.read_exact(&mut [0; 11]).await
+    };
+    assert!(!matches!(
+        timeout(Duration::from_secs(2), old_flow).await,
+        Ok(Ok(_))
+    ));
+    // A fresh old-key device distinguishes revocation from a stale handshake after reload.
+    client.signal(libc::SIGHUP);
+    client.wait_for("Servers ready").await;
+    let revoked = shoes_test_support::socks5::Socks5UdpAssociation::connect("127.0.0.1", entry)
+        .await
+        .unwrap();
+    assert_eq!(
+        revoked
+            .send_to_with_timeout(
+                shoes_test_support::socks5::SocksDestination::Ip(echo.udp()),
+                b"fresh revoked key",
+                Duration::from_secs(3),
+            )
+            .await
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::TimedOut
+    );
+    assert!(!matches!(
+        timeout(
+            Duration::from_secs(3),
+            shoes_test_support::wireguard::connect(entry, echo.tcp())
+        )
+        .await,
+        Ok(Ok(_))
+    ));
+    let mut rotated: serde_json::Value = serde_yaml::from_str(&client_config).unwrap();
+    rotated[0]["private_key"] = json!(wireguard_support::key(44));
+    std::fs::write(&client_path, serde_yaml::to_string(&rotated).unwrap()).unwrap();
     client.signal(libc::SIGHUP);
     client.wait_for("Servers ready").await;
     echo.check(entry, None).await.unwrap();

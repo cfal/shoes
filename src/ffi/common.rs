@@ -303,6 +303,10 @@ pub async fn start_from_config(
 }
 
 #[cfg(all(test, unix))]
+#[path = "wireguard_tests.rs"]
+mod wireguard_tests;
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::fd::AsRawFd;
@@ -324,7 +328,7 @@ mod tests {
         assert!(is_lifecycle_thread());
     }
 
-    fn start_test_service(
+    pub(super) fn start_test_service(
         config: String,
         protector: Arc<dyn crate::tun::SocketProtector>,
     ) -> (Arc<AtomicBool>, tokio::task::AbortHandle) {

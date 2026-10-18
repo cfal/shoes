@@ -25,6 +25,13 @@ use tokio::{
 
 const TCP_BYTES: usize = 512_007;
 const PARENT_NETNS: &str = "SHOES_TEST_WG_PARENT_NETNS";
+const PARENT_MOUNTNS: &str = "SHOES_TEST_WG_PARENT_MOUNTNS";
+
+#[path = "wireguard_kernel/network.rs"]
+mod network;
+
+#[path = "wireguard_kernel/resolution.rs"]
+mod resolution;
 
 fn run(program: impl AsRef<OsStr>, args: &[&str]) -> io::Result<String> {
     let output = Command::new(program.as_ref()).args(args).output()?;
@@ -67,17 +74,32 @@ fn isolated_test(name: &str, cases: impl Future<Output = io::Result<()>>) -> io:
     let output = Command::new("sudo")
         .args(["-n", "-E", "--"])
         .args(["timeout", "--kill-after=5s", "210s"])
-        .args(["unshare", "--net", "--pid", "--fork", "--kill-child", "--"])
+        .args([
+            "unshare",
+            "--net",
+            "--mount",
+            "--propagation",
+            "private",
+            "--pid",
+            "--fork",
+            "--kill-child",
+            "--",
+        ])
         .arg("env")
         .arg(format!("{PARENT_NETNS}={}", namespace.display()))
+        .arg(format!(
+            "{PARENT_MOUNTNS}={}",
+            std::fs::read_link("/proc/self/ns/mnt")?.display()
+        ))
         .arg(std::env::current_exe()?)
         .args(["--exact", name, "--nocapture", "--test-threads=1"])
         .output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        output.status.success(),
+        output.status.success() && stdout.contains("test result: ok. 1 passed;"),
         "isolated kernel WireGuard test failed: {}\n{}\n{}",
         output.status,
-        String::from_utf8_lossy(&output.stdout),
+        stdout,
         String::from_utf8_lossy(&output.stderr),
     );
     Ok(())
@@ -602,9 +624,13 @@ async fn run_recovery_case() -> io::Result<()> {
     stream.read_exact(&mut bytes).await?;
     assert_eq!(&bytes, b"before outage");
 
-    drop(outer);
     let udp_target = SocketAddr::new("10.77.0.1".parse().unwrap(), echo.udp().port());
     let udp = Socks5UdpAssociation::connect("127.0.0.1", socks_port).await?;
+    assert_eq!(
+        udp.send_to(udp_target, b"before outage").await?,
+        b"before outage"
+    );
+    drop(outer);
     for _ in 0..8 {
         assert!(
             timeout(
@@ -615,13 +641,11 @@ async fn run_recovery_case() -> io::Result<()> {
             .is_err()
         );
     }
-    drop(udp);
     let _outer = start_shoes_server(&outer_config)?;
     let before = kernel.counters()?;
     // TCP retransmission and a fresh outer association recover the existing inner flow.
     timeout(Duration::from_secs(20), bulk_echo(stream)).await??;
     kernel.assert_transfer(before, TCP_BYTES)?;
-    let udp = Socks5UdpAssociation::connect("127.0.0.1", socks_port).await?;
     assert_eq!(
         udp.send_to(udp_target, b"after recovery").await?,
         b"after recovery"
@@ -630,9 +654,9 @@ async fn run_recovery_case() -> io::Result<()> {
 }
 
 #[test]
-fn kernel_detour_recovers_existing_tcp_without_direct_fallback() -> io::Result<()> {
+fn kernel_detour_recovers_existing_tcp_and_udp_without_direct_fallback() -> io::Result<()> {
     isolated_test(
-        "wireguard_kernel::kernel_detour_recovers_existing_tcp_without_direct_fallback",
+        "wireguard_kernel::kernel_detour_recovers_existing_tcp_and_udp_without_direct_fallback",
         run_recovery_case(),
     )
 }
@@ -652,6 +676,12 @@ async fn run_rekey_case() -> io::Result<()> {
     let mut stream = connect(socks_port, target).await?;
     kernel.wait_for_handshake().await?;
     let first_handshake = kernel.handshake()?;
+    let udp = Socks5UdpAssociation::connect("127.0.0.1", socks_port).await?;
+    let udp_target = SocketAddr::new(target.ip(), echo.udp().port());
+    assert_eq!(
+        udp.send_to(udp_target, b"before rekey").await?,
+        b"before rekey"
+    );
     let started = tokio::time::Instant::now();
     timeout(Duration::from_secs(150), async {
         let mut tick = tokio::time::interval(Duration::from_secs(1));
@@ -663,6 +693,7 @@ async fn run_rekey_case() -> io::Result<()> {
             let mut response = [0; 8];
             stream.read_exact(&mut response).await?;
             assert_eq!(response, payload);
+            assert_eq!(udp.send_to(udp_target, &payload).await?, payload);
             if kernel.handshake()? > first_handshake {
                 assert!(
                     started.elapsed() >= Duration::from_secs(100),
@@ -677,9 +708,10 @@ async fn run_rekey_case() -> io::Result<()> {
     let before = kernel.counters()?;
     timeout(Duration::from_secs(20), bulk_echo(stream)).await??;
     kernel.assert_transfer(before, TCP_BYTES)?;
-    let udp = Socks5UdpAssociation::connect("127.0.0.1", socks_port).await?;
-    let target = SocketAddr::new(target.ip(), echo.udp().port());
-    assert_eq!(udp.send_to(target, b"after rekey").await?, b"after rekey");
+    assert_eq!(
+        udp.send_to(udp_target, b"after rekey").await?,
+        b"after rekey"
+    );
     Ok(())
 }
 
