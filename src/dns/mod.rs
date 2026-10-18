@@ -12,6 +12,7 @@
 
 mod builder;
 mod composite_resolver;
+pub mod fake_ip;
 mod hickory_resolver;
 mod parsed;
 mod proxy_runtime;
