@@ -7,6 +7,8 @@
 - Added endpoint `outer_client_chain` for proxies before WireGuard, including nested endpoint dependencies and optional inner proxy suffixes. Detours use fixed peer destinations, require a UDP-capable final outer hop, and never fall back to direct UDP. They do not accept unsolicited public peers or support arbitrary peer roaming.
 - WireGuard reloads disconnect existing flows and explicitly release endpoint sockets before rebinding. Initial limitations include no IP fragmentation/reassembly, ICMP forwarding, or OS route management.
 - Shared TUN and WireGuard TCP streams complete write-half shutdown after queuing FIN, without waiting for the remote read half to close. Dropping a drained stream allows the FIN exchange to finish, bounded by a 60-second orphan deadline.
+- SOCKS5 outbounds now wait for each server reply during negotiation instead of sending the CONNECT request ahead, fixing timeouts with servers that drop early data, such as Cloudflare WARP's local proxy. Setup through a SOCKS5 upstream takes one more round trip, or two with username/password. Servers that select an authentication method the client did not offer are rejected.
+- SOCKS5, mixed, and WebSocket inbounds flush each handshake reply, and ShadowTLS sends records without waiting for a flush, so clients that wait for each reply, such as sing-box and now Shoes, no longer stall when these inbounds run inside ShadowTLS. Upgrade Shoes servers running SOCKS or mixed inbounds inside ShadowTLS before or together with clients; updated clients stall against older servers.
 
 ## v0.3.3
 
