@@ -1,6 +1,6 @@
 //! Server configuration types.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, net::SocketAddr};
 
 use serde::{Deserialize, Serialize};
 
@@ -226,9 +226,27 @@ impl<'de> serde::de::Deserialize<'de> for ServerConfig {
                 serde_yaml::from_value(v.clone())
                     .map_err(|e| Error::custom(format!("invalid protocol: {e}")))
             })?;
+        let is_wireguard = matches!(protocol, ServerProxyConfig::Wireguard(_));
+        if is_wireguard
+            && ["address", "addresses", "path"]
+                .into_iter()
+                .filter(|field| map.contains_key(*field))
+                .count()
+                > 1
+        {
+            return Err(Error::custom(
+                "WireGuard server must specify only one of address, addresses, or path",
+            ));
+        }
 
         // Parse bind_location (flattened - either address or path)
         let bind_location = if let Some(v) = map.get("address").or_else(|| map.get("addresses")) {
+            if is_wireguard {
+                // Checks literal syntax before range parsing can collapse duplicate ports.
+                let _: OneOrSome<SocketAddr> = serde_yaml::from_value(v.clone()).map_err(|_| {
+                    Error::custom("WireGuard server requires one literal UDP socket address")
+                })?;
+            }
             serde_yaml::from_value(v.clone())
                 .map(BindLocation::Address)
                 .map_err(|e| Error::custom(format!("invalid address: {e}")))?
@@ -236,7 +254,7 @@ impl<'de> serde::de::Deserialize<'de> for ServerConfig {
             serde_yaml::from_value(v.clone())
                 .map(BindLocation::Path)
                 .map_err(|e| Error::custom(format!("invalid path: {e}")))?
-        } else if matches!(protocol, ServerProxyConfig::Wireguard(_)) {
+        } else if is_wireguard {
             BindLocation::Unspecified {}
         } else {
             return Err(Error::custom(
@@ -251,7 +269,7 @@ impl<'de> serde::de::Deserialize<'de> for ServerConfig {
             .transpose()
             .map_err(|e| Error::custom(format!("invalid transport: {e}")))?
             .unwrap_or_else(|| {
-                if matches!(protocol, ServerProxyConfig::Wireguard(_)) {
+                if is_wireguard {
                     Transport::Udp
                 } else {
                     Transport::default()
@@ -283,7 +301,7 @@ impl<'de> serde::de::Deserialize<'de> for ServerConfig {
             .transpose()
             .map_err(|e| Error::custom(format!("invalid rules: {e}")))?
             .unwrap_or_else(|| {
-                if matches!(protocol, ServerProxyConfig::Wireguard(_)) {
+                if is_wireguard {
                     NoneOrSome::None
                 } else {
                     direct_allow_rule()

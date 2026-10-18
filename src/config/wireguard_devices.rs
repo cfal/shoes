@@ -322,9 +322,44 @@ mod tests {
         let mut config = server();
         config.as_object_mut().unwrap().remove("rules");
         assert!(validate(json!([config])).is_err());
-        let mut config = server();
-        config["rules"] = json!("empty");
-        assert!(validate(json!([config, {"rule_group":"empty", "rules":[]}])).is_err());
+    }
+
+    #[test]
+    fn empty_rule_groups_are_rejected_during_deserialization() {
+        let error = serde_yaml::from_str::<super::super::groups::RuleConfigGroup>(
+            "rule_group: empty\nrules: []\n",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("OneOrSome"), "{error}");
+    }
+
+    #[test]
+    fn servers_reject_conflicting_bind_fields() {
+        for fields in [
+            json!({"address": "127.0.0.1:51820", "addresses": ["[::]:51820", "127.0.0.1:51821"]}),
+            json!({"address": "127.0.0.1:51820", "path": "/unused.sock"}),
+            json!({"addresses": ["[::]:51820"], "path": "/unused.sock"}),
+        ] {
+            let mut config = server();
+            let object = config.as_object_mut().unwrap();
+            object.remove("address");
+            object.extend(fields.as_object().unwrap().clone());
+            assert!(validate(json!([config])).is_err(), "accepted {fields}");
+        }
+    }
+
+    #[test]
+    fn servers_reject_port_range_syntax_for_a_single_distinct_port() {
+        for address in [
+            "127.0.0.1:51820-51820",
+            "127.0.0.1:51820,51820",
+            "[::]:51820-51820",
+            "[fe80::1%3]:51820,51820",
+        ] {
+            let mut config = server();
+            config["address"] = json!(address);
+            assert!(validate(json!([config])).is_err(), "accepted {address}");
+        }
     }
 
     #[test]
