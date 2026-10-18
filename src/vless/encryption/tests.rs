@@ -8,6 +8,7 @@ use super::{
 };
 
 mod lifecycle;
+mod listeners;
 mod transports;
 
 pub(super) fn fixtures() -> Value {
@@ -164,7 +165,7 @@ pub(super) fn fixture_settings(mode: &str, resume: bool, keys: &[usize]) -> (Str
     )
 }
 
-pub(super) fn fixture_pair(
+pub(crate) fn fixture_pair(
     mode: &str,
     resume: bool,
     keys: &[usize],

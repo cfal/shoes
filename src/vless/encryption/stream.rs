@@ -131,7 +131,7 @@ pub(super) struct StreamKeys {
 
 impl<S: AsyncStream> EncryptionStream<S> {
     #[cfg(test)]
-    pub(super) fn is_resumed(&self) -> bool {
+    pub(crate) fn is_resumed(&self) -> bool {
         self.resume.is_some()
     }
     pub(super) fn new(inner: S, client: bool, keys: StreamKeys, initial: InitialRead) -> Self {

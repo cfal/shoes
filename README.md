@@ -557,14 +557,14 @@ covering all three modes and HTTP versions. `type: splithttp` is an alias for
   transport setup (or the shorter configured setup timeout). H1 keep-alive idle
   periods and subsequent partial headers have no deadline. For exposed listeners,
   set `global_limits.max_connections` and `global_limits.max_connections_per_ip`.
-- Xray 26.10.10's H1 packet-up uploader can lose pipelined requests when Go GC
-  discards pooled connections with unread responses. Sustained uploads to slow
-  destinations can therefore fail despite bounded server backpressure. Prefer
-  H2/H3 or a streaming mode for these clients; disabling GC is not a production fix.
+- Xray's H1 packet-up uploader (observed on 26.10.10) can lose pipelined requests
+  when Go GC discards pooled connections with unread responses. Sustained uploads
+  to slow destinations can therefore fail despite bounded server backpressure.
+  Prefer H2/H3 or a streaming mode for these clients; disabling GC is not a production fix.
 - Advanced placement/padding obfuscation, custom session IDs, separate downloads,
-  full XMUX policy, and Vision over XHTTP are not supported. Unsupported options
-  are rejected rather than silently ignored. Public CDN compatibility is not implied.
-- REALITY XHTTP interoperates with Xray 26.10.10 in both directions over H2,
+  full XMUX policy, and legacy Vision over XHTTP are not supported. Unsupported
+  options are rejected rather than silently ignored. Public CDN compatibility is not implied.
+- REALITY XHTTP interoperates with Xray 26.10.17 in both directions over H2,
   including all three modes and `auto`. REALITY prefers X25519MLKEM768 with
   X25519 fallback according to the cover target. Optional `mldsa65_seed` and
   `mldsa65_verify` apply to the outer REALITY configuration, independently of

@@ -5,9 +5,9 @@ use tokio::time::{Duration, timeout};
 
 type LegacyVision = VisionStream<CryptoTlsStream<DuplexStream>>;
 
-const APPLICATION: &[u8] = b"\x17\x03\x03\x00\x03app";
+pub(super) const APPLICATION: &[u8] = b"\x17\x03\x03\x00\x03app";
 const CHANGE_CIPHER_SPEC: &[u8] = b"\x14\x03\x03\x00\x01\x01";
-const TLS13_VERSION: &[u8] = b"\x00\x2b\x00\x02\x03\x04";
+pub(super) const TLS13_VERSION: &[u8] = b"\x00\x2b\x00\x02\x03\x04";
 
 fn record(content_type: u8, body: &[u8]) -> Vec<u8> {
     let mut bytes = vec![content_type, 3, 3];
@@ -16,14 +16,14 @@ fn record(content_type: u8, body: &[u8]) -> Vec<u8> {
     bytes
 }
 
-fn client_hello() -> Vec<u8> {
+pub(super) fn client_hello() -> Vec<u8> {
     let (mut client, _) = new_connections(Backend::Tls13);
     let mut flight = Vec::new();
     client.write_tls(&mut flight).unwrap();
     flight
 }
 
-fn server_hello(cipher: u16, session_id_len: u8, extensions: &[u8]) -> Vec<u8> {
+pub(super) fn server_hello(cipher: u16, session_id_len: u8, extensions: &[u8]) -> Vec<u8> {
     let mut body = vec![3, 3];
     body.extend_from_slice(&[42; 32]);
     body.push(session_id_len);
@@ -69,7 +69,11 @@ async fn pair(backend: Backend) -> (LegacyVision, LegacyVision) {
     )
 }
 
-async fn transfer(sender: &mut LegacyVision, receiver: &mut LegacyVision, data: &[u8]) {
+pub(super) async fn transfer<S: VisionTransport>(
+    sender: &mut VisionStream<S>,
+    receiver: &mut VisionStream<S>,
+    data: &[u8],
+) {
     timeout(Duration::from_secs(2), async {
         sender.write_all(data).await.unwrap();
         sender.flush().await.unwrap();
@@ -100,9 +104,9 @@ fn assert_terminal_write<S: VisionTransport>(stream: &VisionStream<S>, direct: b
     }
 }
 
-async fn assert_decision(
-    client: &mut LegacyVision,
-    server: &mut LegacyVision,
+pub(super) async fn assert_decision<S: VisionTransport>(
+    client: &mut VisionStream<S>,
+    server: &mut VisionStream<S>,
     direct: bool,
     server_first: bool,
 ) {

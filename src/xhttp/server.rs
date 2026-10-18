@@ -375,15 +375,23 @@ mod tests {
                     state.close(suffix);
                 }
                 let mut data = Vec::new();
-                let _ =
+                let result =
                     tokio::time::timeout(Duration::from_secs(1), response.read_to_end(&mut data))
                         .await
                         .unwrap();
                 assert!(data.is_empty());
-                // H3's idle sender observes STOP_SENDING on its ten-second probe.
-                tokio::time::timeout(Duration::from_secs(12), upload.cancel.cancelled())
-                    .await
-                    .unwrap();
+                if version == XhttpVersion::H2 {
+                    result.unwrap();
+                    tokio::time::timeout(Duration::from_secs(1), upload.wait())
+                        .await
+                        .unwrap();
+                    assert!(!upload.cancel.is_cancelled());
+                } else {
+                    // H3's idle sender observes STOP_SENDING on its ten-second probe.
+                    tokio::time::timeout(Duration::from_secs(12), upload.cancel.cancelled())
+                        .await
+                        .unwrap();
+                }
                 let next = Tasks::new();
                 let response = tokio::time::timeout(
                     Duration::from_secs(2),

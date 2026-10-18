@@ -23,14 +23,21 @@ const LIMIT: Duration = Duration::from_secs(10);
 
 #[path = "vless_encryption/benchmarks.rs"]
 mod benchmarks;
+#[path = "vless_encryption/chained.rs"]
+mod chained;
+#[path = "vless_encryption/composition.rs"]
+mod composition;
 #[path = "vless_encryption/legacy.rs"]
 mod legacy;
+#[path = "vless_encryption/lifecycle.rs"]
+mod lifecycle;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
     Shoes,
     Xray,
     Mihomo,
+    SingBox,
 }
 
 impl Kind {
@@ -45,6 +52,12 @@ impl Kind {
             Self::Mihomo => std::env::var_os("MIHOMO_BINARY")
                 .expect("MIHOMO_BINARY must name the pinned Mihomo binary; no silent skips")
                 .into(),
+            Self::SingBox => {
+                std::env::var_os("SHOES_TEST_SING_BOX_BIN").expect(
+                    "SHOES_TEST_SING_BOX_BIN must name the pinned sing-box binary; no silent skips",
+                );
+                shoes_test_support::process::find_singbox_binary().unwrap()
+            }
         }
     }
 }
@@ -70,6 +83,20 @@ impl Peer {
     fn logs(&self) -> String {
         std::fs::read_to_string(self.directory.path().join("peer.log")).unwrap_or_default()
     }
+
+    fn assert_handshakes(&self, expected: &[&str]) {
+        let logs = self.logs();
+        let actual: Vec<_> = logs
+            .lines()
+            .filter_map(|line| {
+                let (_, handshake) = line
+                    .split_once("VLESS encryption client: ")
+                    .or_else(|| line.split_once("VLESS encryption server: "))?;
+                handshake.strip_suffix(" handshake")
+            })
+            .collect();
+        assert_eq!(actual, expected, "{logs}");
+    }
 }
 
 fn pair_logs(client: &Peer, server: &Peer) -> String {
@@ -88,7 +115,17 @@ async fn start(kind: Kind, port: u16, config: Value) -> Peer {
     start_binary(kind, port, config, kind.binary()).await
 }
 
-async fn start_binary(kind: Kind, port: u16, mut config: Value, binary: PathBuf) -> Peer {
+async fn start_binary(kind: Kind, port: u16, config: Value, binary: PathBuf) -> Peer {
+    start_options(kind, port, config, binary, None).await
+}
+
+async fn start_options(
+    kind: Kind,
+    port: u16,
+    mut config: Value,
+    binary: PathBuf,
+    go_debug: Option<&str>,
+) -> Peer {
     // Mihomo opens listeners before its tunnel becomes Running. A separate
     // direct route probes readiness without warming any native ticket cache.
     let mut readiness = if kind == Kind::Mihomo {
@@ -118,14 +155,18 @@ async fn start_binary(kind: Kind, port: u16, mut config: Value, binary: PathBuf)
     let mut command = Command::new(binary);
     match kind {
         Kind::Shoes => {
-            command.args(["--threads", "1", "--no-reload"]).arg(&path);
+            command.args(["--threads", "1", "--no-reload"]);
+            command.arg(&path);
         }
-        Kind::Xray => {
+        Kind::Xray | Kind::SingBox => {
             command.args(["run", "-c"]).arg(&path);
         }
         Kind::Mihomo => {
             command.arg("-d").arg(directory.path()).arg("-f").arg(&path);
         }
+    }
+    if let Some(value) = go_debug {
+        command.env("GODEBUG", value);
     }
     let child = command
         .env("GOMAXPROCS", "1")
@@ -175,12 +216,33 @@ async fn start_binary(kind: Kind, port: u16, mut config: Value, binary: PathBuf)
 }
 
 async fn free_port() -> u16 {
-    TcpListener::bind("0.0.0.0:0")
-        .await
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    static ALLOCATED: Mutex<Vec<u16>> = Mutex::new(Vec::new());
+    for _ in 0..100 {
+        let tcp = TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let port = tcp.local_addr().unwrap().port();
+        // SOCKS and QUIC peers also bind UDP on this port.
+        match tokio::net::UdpSocket::bind(("0.0.0.0", port)).await {
+            Ok(_udp) => {
+                let mut allocated = ALLOCATED.lock().unwrap();
+                if allocated.contains(&port) {
+                    continue;
+                }
+                allocated.push(port);
+                return port;
+            }
+            Err(error) if error.kind() == io::ErrorKind::AddrInUse => continue,
+            Err(error) => panic!("reserve UDP port: {error}"),
+        }
+    }
+    panic!("could not find a free TCP/UDP port");
+}
+
+#[tokio::test]
+async fn allocated_peer_ports_are_not_reused_before_listeners_start() {
+    let mut ports = std::collections::HashSet::new();
+    for _ in 0..512 {
+        assert!(ports.insert(free_port().await));
+    }
 }
 
 fn credentials(mode: &str, auth: &[&str]) -> (String, String, usize) {
@@ -231,6 +293,11 @@ fn server_config(kind: Kind, port: u16, decryption: &str, vision: bool) -> Value
             "listeners": [{"name": "encrypted", "type": "vless", "listen": "0.0.0.0", "port": port,
                 "decryption": decryption, "users": [{"username": "test", "uuid": USER, "flow": flow}]}],
         }),
+        Kind::SingBox => {
+            assert_eq!(decryption, "none");
+            json!({"log":{"level":"debug"},"inbounds":[{"type":"vless","listen":"0.0.0.0","listen_port":port,
+                "users":[{"uuid":USER,"flow":flow}]}],"outbounds":[{"type":"direct"}]})
+        }
     }
 }
 
@@ -255,6 +322,11 @@ fn client_config(kind: Kind, port: u16, server_port: u16, encryption: &str, visi
                 "uuid": USER, "encryption": encryption, "flow": flow, "udp": true, "packet-encoding": "packetaddr"}],
             "mode": "rule", "rules": ["MATCH,encrypted"],
         }),
+        Kind::SingBox => {
+            assert_eq!(encryption, "none");
+            json!({"log":{"level":"debug"},"inbounds":[{"type":"socks","listen":"0.0.0.0","listen_port":port}],
+                "outbounds":[{"type":"vless","server":"127.0.0.1","server_port":server_port,"uuid":USER,"flow":flow}]})
+        }
     }
 }
 
@@ -596,7 +668,13 @@ enum Transport {
     Raw,
     Tls,
     Websocket,
+    Wss,
     Xhttp,
+    XhttpMode {
+        version: &'static str,
+        mode: &'static str,
+    },
+    Quic,
     Reality,
 }
 
@@ -616,6 +694,21 @@ fn xray_endpoint_mut(config: &mut Value, server: bool) -> &mut Value {
     }
 }
 
+fn reality_keys() -> (String, String) {
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+
+    let private = [42; 32];
+    let public =
+        aws_lc_rs::agreement::PrivateKey::from_private_key(&aws_lc_rs::agreement::X25519, &private)
+            .unwrap()
+            .compute_public_key()
+            .unwrap();
+    (
+        URL_SAFE_NO_PAD.encode(private),
+        URL_SAFE_NO_PAD.encode(public.as_ref()),
+    )
+}
+
 fn wrap(
     kind: Kind,
     mut config: Value,
@@ -626,6 +719,64 @@ fn wrap(
     cover_port: u16,
 ) -> Value {
     match (kind, transport) {
+        (Kind::SingBox, _) => {
+            return legacy::wrap_singbox(config, server, transport, cert, key, cover_port);
+        }
+        (_, Transport::Wss) => {
+            config = wrap(
+                kind,
+                config,
+                server,
+                Transport::Websocket,
+                cert,
+                key,
+                cover_port,
+            );
+            // TLS wraps the WebSocket stream, not the inner VLESS stream.
+            let ws = if kind == Kind::Xray {
+                Some(xray_endpoint_mut(&mut config, server)["streamSettings"].clone())
+            } else {
+                None
+            };
+            config = wrap(kind, config, server, Transport::Tls, cert, key, cover_port);
+            if let Some(ws) = ws {
+                let stream = &mut xray_endpoint_mut(&mut config, server)["streamSettings"];
+                stream["network"] = ws["network"].clone();
+                stream["wsSettings"] = ws["wsSettings"].clone();
+            }
+        }
+        (_, Transport::XhttpMode { version, mode }) => {
+            return composition::wrap_xhttp(
+                kind,
+                config,
+                server,
+                (version, mode),
+                cert,
+                key,
+                cover_port,
+            );
+        }
+        (Kind::Shoes, Transport::Quic) => {
+            let endpoint = if server {
+                &mut config[0]
+            } else {
+                &mut config[0]["rules"][0]["client_chain"]
+            };
+            endpoint["transport"] = json!("quic");
+            endpoint["quic_settings"] = if server {
+                json!({"cert": cert, "key": key})
+            } else {
+                json!({"verify": false, "sni_hostname": "localhost"})
+            };
+            if server {
+                let address = config[0]["address"].clone();
+                config
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({"address":address,"protocol":{"type":"socks"}}));
+            }
+        }
+        (_, Transport::Quic) => unreachable!("raw QUIC is a Shoes transport"),
         (_, Transport::Raw) => {}
         (Kind::Shoes, Transport::Tls) => {
             let field = shoes_protocol_mut(&mut config, server);
@@ -694,17 +845,7 @@ fn wrap(
             field["streamSettings"] = json!({"network": "xhttp", "security": "none", "xhttpSettings": {"path": "/native", "host": "localhost", "mode": "packet-up"}});
         }
         (Kind::Shoes | Kind::Xray, Transport::Reality) => {
-            use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-            let private = [42; 32];
-            let public = aws_lc_rs::agreement::PrivateKey::from_private_key(
-                &aws_lc_rs::agreement::X25519,
-                &private,
-            )
-            .unwrap()
-            .compute_public_key()
-            .unwrap();
-            let public = URL_SAFE_NO_PAD.encode(public.as_ref());
-            let private = URL_SAFE_NO_PAD.encode(private);
+            let (private, public) = reality_keys();
             if kind == Kind::Shoes {
                 let field = shoes_protocol_mut(&mut config, server);
                 let inner = field.take();
@@ -724,8 +865,31 @@ fn wrap(
                     json!({"network": "raw", "security": "reality", "realitySettings": reality});
             }
         }
-        (Kind::Mihomo, Transport::Xhttp | Transport::Reality) => {
-            unreachable!("targeted Xray-only transport cases")
+        (Kind::Mihomo, Transport::Xhttp) => {
+            return composition::wrap_xhttp(
+                kind,
+                config,
+                server,
+                ("plain", "packet-up"),
+                cert,
+                key,
+                cover_port,
+            );
+        }
+        (Kind::Mihomo, Transport::Reality) => {
+            let (private, public) = reality_keys();
+            if server {
+                config["listeners"][0]["reality-config"] = json!({
+                    "dest":format!("localhost:{cover_port}"), "server-names":["localhost"],
+                    "private-key":private, "short-id":["0123456789abcdef"]
+                });
+            } else {
+                let proxy = &mut config["proxies"][0];
+                proxy["tls"] = json!(true);
+                proxy["servername"] = json!("localhost");
+                proxy["client-fingerprint"] = json!("chrome");
+                proxy["reality-opts"] = json!({"public-key":public, "short-id":"0123456789abcdef"});
+            }
         }
     }
     config
@@ -797,6 +961,10 @@ async fn direct_case(peer: Kind, peer_client: bool, transport: Transport, mode: 
                     );
                 }
             }
+            // WebSocket and Mihomo's masked native wrapper can close both transport halves.
+            tls.get_mut().1.send_close_notify();
+            tls.flush().await?;
+            assert_eq!(tls.read(&mut [0]).await?, 0, "data after TLS close");
         }
         Ok::<_, io::Error>(())
     })
@@ -805,14 +973,17 @@ async fn direct_case(peer: Kind, peer_client: bool, transport: Transport, mode: 
         panic!("{result:?}\n{}", pair_logs(&client, &server));
     }
     let shoes = if peer_client { &server } else { &client };
-    assert_eq!(
-        shoes
-            .logs()
-            .contains("VISION WRITE: Switching to direct copy mode"),
-        !tls12,
-        "{}",
-        shoes.logs()
-    );
+    shoes.assert_handshakes(&["fresh", "resumed"]);
+    for direction in ["READ", "WRITE"] {
+        assert_eq!(
+            shoes.logs().contains(&format!(
+                "VISION {direction}: Switching to direct copy mode"
+            )),
+            !tls12,
+            "{}",
+            shoes.logs()
+        );
+    }
     drop((client, server));
     tap_task.stop().await;
     target_task.stop().await;
@@ -1014,6 +1185,9 @@ async fn wrong_uuid_and_key_order_have_no_destination_side_effects() {
                                 [0]["id"]
                         }
                         Kind::Mihomo => &mut config["proxies"][0]["uuid"],
+                        Kind::SingBox => {
+                            unreachable!("sing-box does not implement native encryption")
+                        }
                     };
                     *user = json!("c85798ef-e9dc-46a4-9a87-8da4499d36d0");
                 } else {
