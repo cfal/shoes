@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use hickory_resolver::config::LookupIpStrategy;
 use serde::{Deserialize, Serialize};
-use url::Url;
+use url::{Host, Url};
 
 use crate::client_proxy_chain::ClientChainGroup;
 use crate::resolver::Resolver;
@@ -186,20 +186,24 @@ impl ParsedDnsUrl {
             .map_err(|e| DnsConfigError::InvalidUrl(url_str.to_string(), e.to_string()))?;
 
         let scheme = url.scheme();
-        let host_str = url
-            .host_str()
+        let url_host = url
+            .host()
             .ok_or_else(|| DnsConfigError::MissingHost(url_str.to_string()))?;
-
-        // Parse host as IP or keep as hostname
-        let host = match host_str.parse::<IpAddr>() {
-            Ok(ip) => DnsHost::Ip(ip),
-            Err(_) => DnsHost::Hostname(host_str.to_string()),
-        };
 
         // server_name defaults to the host string from URL
         let server_name = server_name_override
             .map(String::from)
-            .unwrap_or_else(|| host_str.to_string());
+            .unwrap_or_else(|| url_host.to_string());
+
+        let host = match url_host {
+            Host::Ipv4(ip) => DnsHost::Ip(ip.into()),
+            Host::Ipv6(ip) => DnsHost::Ip(ip.into()),
+            // Non-special schemes such as tcp report IPv4 literals as domains.
+            Host::Domain(host) => match host.parse::<IpAddr>() {
+                Ok(ip) => DnsHost::Ip(ip),
+                Err(_) => DnsHost::Hostname(host.to_string()),
+            },
+        };
 
         match scheme {
             "udp" => {
@@ -408,6 +412,60 @@ mod tests {
                 assert_eq!(addr.port(), 53);
             }
             _ => panic!("expected Tcp"),
+        }
+    }
+
+    #[test]
+    fn test_parse_ipv6_literals_without_bootstrap() {
+        for ip in ["::1", "2001:db8::53", "::ffff:192.0.2.53"] {
+            let ip: IpAddr = ip.parse().unwrap();
+            for (scheme, default_port) in [
+                ("udp", 53),
+                ("tcp", 53),
+                ("tls", 853),
+                ("https", 443),
+                ("h3", 443),
+            ] {
+                for custom_port in [None, Some(5353)] {
+                    let authority = match custom_port {
+                        Some(port) => format!("[{ip}]:{port}"),
+                        None => format!("[{ip}]"),
+                    };
+                    let url = ParsedDnsUrl::parse(&format!("{scheme}://{authority}")).unwrap();
+                    assert!(!url.has_hostname(), "{scheme}://{authority}");
+                    let addr = match url.to_parsed_server(None).unwrap() {
+                        ParsedDnsServer::Udp { addr }
+                        | ParsedDnsServer::Tcp { addr }
+                        | ParsedDnsServer::Tls { addr, .. }
+                        | ParsedDnsServer::Https { addr, .. }
+                        | ParsedDnsServer::H3 { addr, .. } => addr,
+                        ParsedDnsServer::System => panic!("expected an upstream address"),
+                    };
+                    assert_eq!(
+                        addr,
+                        SocketAddr::new(ip, custom_port.unwrap_or(default_port))
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_ipv6_with_server_name_override() {
+        for scheme in ["tls", "https", "h3"] {
+            let url = ParsedDnsUrl::parse_with_server_name(
+                &format!("{scheme}://[2001:db8::53]/dns-query"),
+                Some("dns.example.com"),
+            )
+            .unwrap();
+            match url.to_parsed_server(None).unwrap() {
+                ParsedDnsServer::Tls { server_name, .. }
+                | ParsedDnsServer::Https { server_name, .. }
+                | ParsedDnsServer::H3 { server_name, .. } => {
+                    assert_eq!(&*server_name, "dns.example.com");
+                }
+                _ => panic!("expected an encrypted DNS upstream"),
+            }
         }
     }
 
