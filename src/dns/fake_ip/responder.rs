@@ -3,7 +3,6 @@ use std::net::IpAddr;
 use std::sync::Arc;
 
 use hickory_resolver::proto::op::{Edns, Message, MessageType, OpCode, ResponseCode};
-use hickory_resolver::proto::rr::rdata::opt::EdnsCode;
 use hickory_resolver::proto::rr::{DNSClass, RData, Record, RecordType, rdata};
 
 use super::pool::canonical_hostname;
@@ -60,15 +59,6 @@ impl FakeDnsResponder {
             || request.metadata.truncation
             || request.metadata.response_code != ResponseCode::NoError
         {
-            return DnsDecision::Forward;
-        }
-        if request.edns.as_ref().is_some_and(|edns| {
-            edns.options()
-                .as_ref()
-                .iter()
-                .any(|(code, _)| *code != EdnsCode::Padding)
-        }) {
-            // Do not invent cookies, ECS scope, or other upstream option semantics.
             return DnsDecision::Forward;
         }
         let query = &request.queries[0];
@@ -178,6 +168,24 @@ mod tests {
     fn responder(options: FakeIpOptions) -> FakeDnsResponder {
         let pool = Arc::new(FakeIpPool::new(&options).unwrap());
         FakeDnsResponder::new(options, pool).unwrap()
+    }
+
+    #[test]
+    fn request_options_do_not_bypass_synthesis_or_get_echoed() {
+        use hickory_resolver::proto::rr::rdata::opt::EdnsOption;
+        let responder = responder(FakeIpOptions::default());
+        let mut query = request("cookie.example.", RecordType::A);
+        let mut edns = Edns::new();
+        edns.options_mut()
+            .insert(EdnsOption::Unknown(10, vec![0; 8]));
+        edns.options_mut()
+            .insert(EdnsOption::Unknown(65001, vec![1; 20]));
+        query.edns = Some(edns);
+        let DnsDecision::Answer(answer) = responder.decide(&query) else {
+            panic!()
+        };
+        assert_eq!(answer.answers.len(), 1);
+        assert!(answer.edns.unwrap().options().as_ref().is_empty());
     }
 
     #[test]

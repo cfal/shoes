@@ -4,7 +4,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hickory_resolver::proto::op::{Message, MessageType, ResponseCode};
-use hickory_resolver::proto::rr::RData;
 
 use crate::async_stream::{AsyncMessageStream, AsyncStream};
 use crate::resolver::Resolver;
@@ -68,9 +67,26 @@ impl FakeDnsContext {
         let decision = if self.responder.pool.persistent() {
             let responder = self.responder.clone();
             let request = request.clone();
-            tokio::task::spawn_blocking(move || responder.decide(&request))
+            let failure = response(&request, ResponseCode::ServFail);
+            let decision = async move {
+                let permit = responder
+                    .pool
+                    .persistence_admission
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .map_err(io::Error::other)?;
+                tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
+                    responder.decide(&request)
+                })
                 .await
-                .map_err(io::Error::other)?
+                .map_err(io::Error::other)
+            };
+            match tokio::time::timeout(EXCHANGE_TIMEOUT, decision).await {
+                Ok(Ok(decision)) => decision,
+                _ => DnsDecision::Answer(failure),
+            }
         } else {
             self.responder.decide(&request)
         };
@@ -101,10 +117,20 @@ impl FakeDnsContext {
         if !tcp && encoded.len() > request.max_payload().min(UDP_PAYLOAD_LIMIT) as usize {
             let mut truncated = answer.truncate();
             truncated.metadata.authentic_data = false;
+            if let Some(edns) = &mut truncated.edns {
+                *edns.options_mut() = Default::default();
+                edns.set_max_payload(request.max_payload().min(UDP_PAYLOAD_LIMIT));
+            }
             encoded = truncated.to_vec().map_err(io::Error::other)?;
             if encoded.len() > request.max_payload().min(UDP_PAYLOAD_LIMIT) as usize {
                 truncated.queries.clear();
                 encoded = truncated.to_vec().map_err(io::Error::other)?;
+            }
+            if encoded.len() > request.max_payload().min(UDP_PAYLOAD_LIMIT) as usize {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "DNS reply exceeds UDP limit",
+                ));
             }
         }
         if encoded.len() > u16::MAX as usize {
@@ -128,18 +154,11 @@ impl FakeDnsContext {
                 "unassociated DNS response",
             ));
         }
-        for record in response.all_sections() {
-            let ip = match record.data {
-                RData::A(ip) => Some(IpAddr::V4(ip.0)),
-                RData::AAAA(ip) => Some(IpAddr::V6(ip.0)),
-                _ => None,
-            };
-            if ip.is_some_and(|ip| self.contains(ip)) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "real DNS returned a synthetic address",
-                ));
-            }
+        if crate::dns::message::addresses(&response).any(|ip| self.contains(ip)) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "real DNS returned a synthetic address",
+            ));
         }
         Ok(response)
     }

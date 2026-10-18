@@ -85,6 +85,8 @@ struct Entry {
 
 #[derive(Debug)]
 struct State {
+    owner: String,
+    closed: bool,
     forward: LruCache<String, Entry>,
     reverse: HashMap<IpAddr, String>,
     v4: Option<Range>,
@@ -100,6 +102,7 @@ struct State {
 pub struct FakeIpPool {
     state: Mutex<State>,
     store: Option<SnapshotStore>,
+    pub(super) persistence_admission: std::sync::Arc<tokio::sync::Semaphore>,
 }
 
 impl std::fmt::Debug for FakeIpPool {
@@ -117,6 +120,16 @@ impl std::fmt::Debug for FakeIpPool {
 impl FakeIpPool {
     pub fn validate(options: &FakeIpOptions) -> io::Result<()> {
         let (v4, v6) = Self::ranges(options, 0)?;
+        if options.state_file.is_some()
+            && [v4.as_ref(), v6.as_ref()]
+                .into_iter()
+                .flatten()
+                .any(|range| range.first == range.last)
+        {
+            return Err(invalid(
+                "persistent fake IP families require at least two addresses",
+            ));
+        }
         let capacity = [v4, v6].iter().flatten().fold(0u128, |total, range| {
             total.saturating_add(range.last - range.first + 1)
         });
@@ -145,16 +158,28 @@ impl FakeIpPool {
         Ok((v4, v6))
     }
 
+    #[cfg(test)]
     pub fn new(options: &FakeIpOptions) -> io::Result<Self> {
         Self::with_seed(options, rand::random())
     }
 
+    #[cfg(test)]
     fn with_seed(options: &FakeIpOptions, seed: u128) -> io::Result<Self> {
+        Self::with_owner(options, seed, "")
+    }
+
+    pub(crate) fn new_scoped(options: &FakeIpOptions, owner: &str) -> io::Result<Self> {
+        Self::with_owner(options, rand::random(), owner)
+    }
+
+    fn with_owner(options: &FakeIpOptions, seed: u128, owner: &str) -> io::Result<Self> {
         Self::validate(options)?;
         let (v4, v6) = Self::ranges(options, seed)?;
         let mut forward = LruCache::unbounded();
         forward.resize(NonZeroUsize::new(options.max_entries).unwrap());
         let mut state = State {
+            owner: owner.into(),
+            closed: false,
             forward,
             reverse: HashMap::new(),
             v4,
@@ -173,6 +198,7 @@ impl FakeIpPool {
         Ok(Self {
             state: Mutex::new(state),
             store,
+            persistence_admission: std::sync::Arc::new(tokio::sync::Semaphore::new(16)),
         })
     }
 
@@ -185,9 +211,18 @@ impl FakeIpPool {
             let _serial = store.serial.lock();
             let snapshot = persistence::Snapshot::from_state(&self.state.lock());
             store.write(&snapshot)?;
-            let mut state = self.state.lock();
-            state.v4_reserved = 0;
-            state.v6_reserved = 0;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn shutdown_checkpoint(&self) -> io::Result<()> {
+        let _serial = self.store.as_ref().map(|store| store.serial.lock());
+        let mut state = self.state.lock();
+        state.closed = true;
+        if let Some(store) = &self.store {
+            let snapshot = persistence::Snapshot::from_state(&state);
+            drop(state);
+            store.write(&snapshot)?;
         }
         Ok(())
     }
@@ -233,8 +268,22 @@ impl FakeIpPool {
 
     pub fn allocate(&self, name: &str, ipv6: bool) -> io::Result<IpAddr> {
         let name = canonical_hostname(name).ok_or_else(|| invalid("invalid fake DNS hostname"))?;
+        {
+            let mut state = self.state.lock();
+            if state.closed {
+                return Err(io::ErrorKind::BrokenPipe.into());
+            }
+            if let Some(entry) = state.forward.get(&name)
+                && let Some(ip) = if ipv6 { entry.v6 } else { entry.v4 }
+            {
+                return Ok(ip);
+            }
+        }
         let _serial = self.store.as_ref().map(|store| store.serial.lock());
         let mut state = self.state.lock();
+        if state.closed {
+            return Err(io::ErrorKind::BrokenPipe.into());
+        }
         if let Some(entry) = state.forward.get(&name)
             && let Some(ip) = if ipv6 { entry.v6 } else { entry.v4 }
         {
@@ -253,10 +302,8 @@ impl FakeIpPool {
                 state = self.state.lock();
                 if ipv6 {
                     state.v6_reserved = count;
-                    state.v4_reserved = 0;
                 } else {
                     state.v4_reserved = count;
-                    state.v6_reserved = 0;
                 }
             }
             if ipv6 {

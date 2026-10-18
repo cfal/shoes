@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
@@ -21,6 +21,7 @@ pub(super) struct SnapshotStore {
 #[serde(deny_unknown_fields)]
 pub(super) struct Snapshot {
     version: u32,
+    owner: String,
     ipv4_range: Option<String>,
     ipv6_range: Option<String>,
     max_entries: usize,
@@ -35,8 +36,9 @@ fn cursor(range: &Option<Range>) -> Option<IpAddr> {
 
 impl Snapshot {
     pub(super) fn from_state(state: &State) -> Self {
-        Self {
-            version: 1,
+        let mut snapshot = Self {
+            version: 2,
+            owner: state.owner.clone(),
             ipv4_range: state.v4.as_ref().map(|range| range.network.to_string()),
             ipv6_range: state.v6.as_ref().map(|range| range.network.to_string()),
             max_entries: state.forward.cap().get(),
@@ -48,12 +50,42 @@ impl Snapshot {
                 .rev()
                 .map(|(name, entry)| (name.clone(), entry.clone()))
                 .collect(),
+        };
+        for (range, count) in [
+            (&state.v4, state.v4_reserved),
+            (&state.v6, state.v6_reserved),
+        ] {
+            if let Some(range) = range {
+                snapshot.reserve(range.clone(), count);
+            }
         }
+        snapshot
+    }
+
+    fn reserve(&mut self, mut range: Range, count: usize) {
+        let reserved: HashSet<IpAddr> = (0..count).map(|_| range.take()).collect();
+        if range.network.is_ipv6() {
+            self.cursor_v6 = cursor(&Some(range));
+        } else {
+            self.cursor_v4 = cursor(&Some(range));
+        }
+        // Persisted old owners must disappear before their addresses can be reused.
+        for (_, entry) in &mut self.entries {
+            if entry.v4.is_some_and(|ip| reserved.contains(&ip)) {
+                entry.v4 = None;
+            }
+            if entry.v6.is_some_and(|ip| reserved.contains(&ip)) {
+                entry.v6 = None;
+            }
+        }
+        self.entries
+            .retain(|(_, entry)| entry.v4.is_some() || entry.v6.is_some());
     }
 
     fn restore(self, state: &mut State) -> io::Result<()> {
         let expected = Self::from_state(state);
-        if self.version != 1
+        if self.version != 2
+            || self.owner != expected.owner
             || self.ipv4_range != expected.ipv4_range
             || self.ipv6_range != expected.ipv6_range
             || self.max_entries != expected.max_entries
@@ -161,47 +193,27 @@ impl SnapshotStore {
                     }
                 }
                 let snapshot: Snapshot =
-                    serde_json::from_reader(file.take(limit + 1)).map_err(invalid_json)?;
+                    serde_json::from_reader(BufReader::new(file.take(limit + 1)))
+                        .map_err(invalid_json)?;
                 snapshot.restore(state)?;
             }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => store.checkpoint(state)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => (),
             Err(error) => return Err(error),
         }
         Ok(store)
     }
 
     pub(super) fn reservation(&self, state: &State, ipv6: bool) -> io::Result<(Snapshot, usize)> {
-        let mut range = if ipv6 {
+        let range = if ipv6 {
             state.v6.clone()
         } else {
             state.v4.clone()
         }
         .ok_or_else(|| invalid("fake IP family disabled"))?;
-        let count = RESERVATION_SIZE.min(range.last - range.first + 1) as usize;
-        let reserved: HashSet<IpAddr> = (0..count).map(|_| range.take()).collect();
+        let count = RESERVATION_SIZE.min(range.last - range.first) as usize;
         let mut snapshot = Snapshot::from_state(state);
-        if ipv6 {
-            snapshot.cursor_v6 = cursor(&Some(range));
-        } else {
-            snapshot.cursor_v4 = cursor(&Some(range));
-        }
-        // Before reuse, invalidate persisted old owners as well as reserving the cursor.
-        for (_, entry) in &mut snapshot.entries {
-            if entry.v4.is_some_and(|ip| reserved.contains(&ip)) {
-                entry.v4 = None;
-            }
-            if entry.v6.is_some_and(|ip| reserved.contains(&ip)) {
-                entry.v6 = None;
-            }
-        }
-        snapshot
-            .entries
-            .retain(|(_, entry)| entry.v4.is_some() || entry.v6.is_some());
+        snapshot.reserve(range, count);
         Ok((snapshot, count))
-    }
-
-    pub(super) fn checkpoint(&self, state: &State) -> io::Result<()> {
-        self.write(&Snapshot::from_state(state))
     }
 
     pub(super) fn write(&self, snapshot: &Snapshot) -> io::Result<()> {
@@ -219,8 +231,10 @@ impl SnapshotStore {
         }
         let mut file = options.open(&path)?;
         let result = (|| {
-            serde_json::to_writer(&mut file, snapshot).map_err(invalid_json)?;
-            file.flush()?;
+            let mut writer = BufWriter::new(&mut file);
+            serde_json::to_writer(&mut writer, snapshot).map_err(invalid_json)?;
+            writer.flush()?;
+            drop(writer);
             file.sync_all()?;
             std::fs::rename(&path, &self.path)?;
             #[cfg(unix)]
@@ -253,7 +267,7 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_restores_dual_family_maps_and_exact_cursor() {
+    fn checkpoint_restores_dual_family_maps_and_reserved_cursors() {
         let directory = tempfile::tempdir().unwrap();
         let options = options(&directory.path().join("state.json"));
         let pool = FakeIpPool::with_seed(&options, 0).unwrap();
@@ -266,11 +280,11 @@ mod tests {
         assert_eq!(pool.restore(v6).unwrap().as_deref(), Some("a.test"));
         assert_eq!(
             pool.allocate("b.test", false).unwrap().to_string(),
-            "198.18.0.3"
+            "198.18.1.2"
         );
         assert_eq!(
             pool.allocate("b.test", true).unwrap().to_string(),
-            "2001:2::3"
+            "2001:2::102"
         );
     }
 
@@ -291,7 +305,7 @@ mod tests {
         );
         assert_eq!(
             pool.allocate("after.test", false).unwrap().to_string(),
-            "198.18.1.3"
+            "198.18.1.2"
         );
     }
 
@@ -326,11 +340,70 @@ mod tests {
         let mut options = options(&path);
         let pool = FakeIpPool::new(&options).unwrap();
         assert!(FakeIpPool::new(&options).is_err());
+        pool.checkpoint().unwrap();
         drop(pool);
         options.max_entries -= 1;
         assert!(FakeIpPool::new(&options).is_err());
         std::fs::write(&path, b"{}").unwrap();
         assert!(FakeIpPool::new(&options).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), b"{}");
+    }
+
+    #[test]
+    fn preparation_is_nonwriting_and_snapshot_owner_is_checked() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.json");
+        let options = options(&path);
+        let pool = FakeIpPool::new_scoped(&options, "owner-a").unwrap();
+        assert!(!path.exists());
+        pool.checkpoint().unwrap();
+        drop(pool);
+        assert!(FakeIpPool::new_scoped(&options, "owner-b").is_err());
+        assert!(FakeIpPool::new_scoped(&options, "owner-a").is_ok());
+    }
+
+    #[test]
+    fn small_persistent_ranges_skip_instead_of_reserving_a_full_cycle() {
+        for prefix in [24, 25, 26, 27, 28, 29] {
+            let directory = tempfile::tempdir().unwrap();
+            let options = FakeIpOptions {
+                ipv4_range: Some(format!("198.18.0.0/{prefix}")),
+                ipv6_range: None,
+                max_entries: 1,
+                ..options(&directory.path().join("state.json"))
+            };
+            let pool = FakeIpPool::with_seed(&options, 0).unwrap();
+            let first = pool.allocate("first.test", false).unwrap();
+            drop(pool);
+            let pool = FakeIpPool::new(&options).unwrap();
+            assert_ne!(pool.allocate("second.test", false).unwrap(), first);
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let options = FakeIpOptions {
+            ipv4_range: Some("198.18.0.0/30".into()),
+            ipv6_range: None,
+            max_entries: 1,
+            ..options(&directory.path().join("one.json"))
+        };
+        assert!(FakeIpPool::new(&options).is_err());
+    }
+
+    #[test]
+    fn alternating_families_keep_both_reservations_and_shutdown_freezes_allocation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.json");
+        let options = options(&path);
+        let pool = FakeIpPool::with_seed(&options, 0).unwrap();
+        pool.allocate("a.test", false).unwrap();
+        pool.allocate("a.test", true).unwrap();
+        let saved = std::fs::read(&path).unwrap();
+        for i in 0..10 {
+            pool.allocate(&format!("b{i}.test"), false).unwrap();
+            pool.allocate(&format!("b{i}.test"), true).unwrap();
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), saved);
+        pool.shutdown_checkpoint().unwrap();
+        assert!(pool.allocate("a.test", false).is_err());
+        assert!(pool.allocate("after.test", true).is_err());
     }
 }

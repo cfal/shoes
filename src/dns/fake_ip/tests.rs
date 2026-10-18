@@ -79,6 +79,61 @@ fn mapped_ipv4_cannot_bypass_restoration_or_unknown_rejection() {
 }
 
 #[tokio::test]
+async fn forwarded_udp_answer_discards_oversized_edns_options() {
+    let (context, _) = context();
+    let mut request = Message::from_vec(&query(RecordType::TXT)).unwrap();
+    let mut edns = hickory_resolver::proto::op::Edns::new();
+    edns.set_max_payload(512);
+    edns.options_mut()
+        .insert(EdnsOption::Unknown(12, vec![0; 2000]));
+    request.edns = Some(edns);
+    let reply = context
+        .exchange(request.to_vec().unwrap(), false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(reply.len() <= 512);
+    let reply = Message::from_vec(&reply).unwrap();
+    assert!(reply.metadata.truncation);
+    assert!(!reply.metadata.authentic_data);
+    assert!(reply.edns.unwrap().options().as_ref().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn persistent_work_waits_for_admission_with_a_deadline() {
+    let directory = tempfile::tempdir().unwrap();
+    let options = FakeIpOptions {
+        state_file: Some(directory.path().join("state.json")),
+        ..Default::default()
+    };
+    let pool = Arc::new(super::FakeIpPool::new(&options).unwrap());
+    let permits = pool
+        .persistence_admission
+        .clone()
+        .acquire_many_owned(16)
+        .await
+        .unwrap();
+    let context = FakeDnsContext::with_pool(
+        options,
+        Arc::new(Arc::new(RecordingResolver::default())),
+        pool.clone(),
+    )
+    .unwrap();
+    let response = context
+        .exchange(query(RecordType::A), false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        Message::from_vec(&response).unwrap().metadata.response_code,
+        ResponseCode::ServFail
+    );
+    assert_eq!(pool.persistence_admission.available_permits(), 0);
+    drop(permits);
+    assert_eq!(pool.persistence_admission.available_permits(), 16);
+}
+
+#[tokio::test]
 async fn context_separates_synthesis_real_exchange_and_malformed_input() {
     let (context, real) = context();
     let a = context
