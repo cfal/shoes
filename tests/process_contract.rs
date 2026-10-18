@@ -56,8 +56,16 @@ fn wireguard_check_validates_outer_udp_without_dns_or_listeners() {
         ] {
             endpoint["outer_client_chain"] = json!([{
                 "address": "unresolvable.invalid:443", "protocol": protocol,
-                "transport": "quic", "bind_interface": "shoes-missing-interface",
+                "transport": "quic",
             }]);
+            if cfg!(any(
+                target_os = "android",
+                target_os = "fuchsia",
+                target_os = "linux"
+            )) {
+                endpoint["outer_client_chain"][0]["bind_interface"] =
+                    json!("shoes-missing-interface");
+            }
             let config = json!([server, endpoint]);
             std::fs::write(&path, serde_yaml::to_string(&config).unwrap()).unwrap();
             let output = Command::new(env!("CARGO_BIN_EXE_shoes"))
