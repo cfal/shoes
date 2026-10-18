@@ -7,7 +7,7 @@ use ipnetwork::IpNetwork;
 use rustc_hash::FxHashMap;
 
 use super::fake_ip::{FakeDnsContext, FakeDnsResolver, FakeIpOptions, FakeIpPool};
-use super::guard::real_only;
+use super::real_only;
 use super::system::SystemResolver;
 
 #[derive(Clone)]
@@ -110,6 +110,25 @@ impl DnsRegistry {
                 pool.checkpoint()?;
             }
             Ok(())
+        })
+        .await
+        .map_err(std::io::Error::other)?
+    }
+
+    pub async fn shutdown_checkpoint(&self) -> std::io::Result<()> {
+        let pools: Vec<_> = self
+            .pools
+            .values()
+            .map(|state| state.pool.clone())
+            .collect();
+        tokio::task::spawn_blocking(move || {
+            let mut error = None;
+            for pool in pools {
+                if let Err(failure) = pool.shutdown_checkpoint() {
+                    error = Some(failure);
+                }
+            }
+            error.map_or(Ok(()), Err)
         })
         .await
         .map_err(std::io::Error::other)?
@@ -634,11 +653,45 @@ pub async fn build_dns_registry_for_runtime(
     let mut registry = DnsRegistry {
         limits,
         forbidden: forbidden.into(),
+        pools: previous
+            .map(|registry| registry.pools.clone())
+            .unwrap_or_default(),
         ..DnsRegistry::new()
     };
 
     for group in groups {
-        let resolver = build_resolver_from_specs(&group.specs, &registry, &group.name).await?;
+        for spec in &group.specs {
+            for endpoint in std::iter::once(spec.url.as_str()).chain(spec.bootstrap_url.as_deref())
+            {
+                if let Ok(url) = url::Url::parse(endpoint) {
+                    let ip = match url.host() {
+                        Some(url::Host::Ipv4(ip)) => Some(std::net::IpAddr::V4(ip)),
+                        Some(url::Host::Ipv6(ip)) => Some(std::net::IpAddr::V6(ip)),
+                        Some(url::Host::Domain(host)) => host.parse().ok(),
+                        None => None,
+                    };
+                    if ip.is_some_and(|ip| {
+                        registry
+                            .forbidden
+                            .iter()
+                            .any(|range| range.contains(ip.to_canonical()))
+                    }) {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "DNS/bootstrap endpoint overlaps a synthetic endpoint",
+                        ));
+                    }
+                }
+            }
+        }
+        if group.fake_ip.is_some() && group.specs.iter().any(|spec| spec.url == "system") {
+            SystemResolver::check_configuration(registry.forbidden.clone()).await?;
+        }
+        let resolver = if group.use_default_resolver {
+            registry.get_or_create_default()
+        } else {
+            build_resolver_from_specs(&group.specs, &registry, &group.name).await?
+        };
         let real = real_only(resolver, registry.forbidden.clone());
         let old = previous.and_then(|previous| previous.pools.get(&group.name));
         let resolver: Arc<dyn Resolver> = if let Some(options) = group.fake_ip {
@@ -656,8 +709,9 @@ pub async fn build_dns_registry_for_runtime(
                 old.pool.clone()
             } else {
                 let options = options.clone();
+                let owner = group.name.clone();
                 Arc::new(
-                    tokio::task::spawn_blocking(move || FakeIpPool::new(&options))
+                    tokio::task::spawn_blocking(move || FakeIpPool::new_scoped(&options, &owner))
                         .await
                         .map_err(std::io::Error::other)??,
                 )
@@ -925,7 +979,59 @@ mod tests {
             name: "fake".into(),
             specs: vec![make_spec("system")],
             fake_ip: enabled.then(FakeIpOptions::default),
+            use_default_resolver: false,
         }]
+    }
+
+    #[tokio::test]
+    async fn omitted_servers_keeps_default_cache_and_retired_pools_freeze_on_shutdown() {
+        let configs = crate::config::create_server_configs(
+            serde_yaml::from_str(
+                "- address: '0.0.0.0:1080'\n  protocol: {type: socks}\n  dns: {fake_ip: false}\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(configs.dns_groups[0].use_default_resolver);
+        let name = configs.dns_groups[0].name.clone();
+        let mut registry = build_dns_registry(configs.dns_groups).await.unwrap();
+        assert!(Arc::ptr_eq(
+            &registry.get_by_name(&name).unwrap(),
+            &registry.get_or_create_default()
+        ));
+
+        let initial = build_dns_registry(fake_groups(true)).await.unwrap();
+        let old = initial
+            .get_by_name("fake")
+            .unwrap()
+            .fake_dns_context()
+            .unwrap();
+        old.allocate("before.test", false).unwrap();
+        let removed = build_dns_registry_reusing(Vec::new(), initial.limits, Some(&initial))
+            .await
+            .unwrap();
+        assert_eq!(removed.pools.len(), 1);
+        removed.shutdown_checkpoint().await.unwrap();
+        assert_eq!(
+            old.allocate("after.test", false).unwrap_err().kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
+    }
+
+    #[tokio::test]
+    async fn literal_upstreams_cannot_target_tun_endpoints_outside_the_pool() {
+        let mut groups = fake_groups(true);
+        groups[0].specs = vec![make_spec("udp://10.99.0.1:53")];
+        let failure = build_dns_registry_for_runtime(
+            groups,
+            crate::resources::limits(),
+            None,
+            &["10.99.0.1".parse().unwrap()],
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(failure.kind(), std::io::ErrorKind::InvalidInput);
     }
 
     #[tokio::test]

@@ -27,6 +27,15 @@ pub(super) struct SystemResolver {
 }
 
 impl SystemResolver {
+    pub(super) async fn check_configuration(forbidden: Arc<[IpNetwork]>) -> io::Result<()> {
+        tokio::task::spawn_blocking(move || {
+            let (mut config, _) = discover()?;
+            filter_endpoints(&mut config, &forbidden)
+        })
+        .await
+        .map_err(io::Error::other)?
+    }
+
     pub fn new(lookup: Arc<dyn Resolver>, forbidden: Arc<[IpNetwork]>, timeout: Duration) -> Self {
         Self {
             lookup,

@@ -155,6 +155,7 @@ pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Valida
     // Extract inline DNS configs from server/tun configs into dns_groups.
     // This replaces inline specs with group name references.
     let mut inline_dns_counter = 0u32;
+    let mut default_dns_groups = HashSet::new();
     for config in server_configs.iter_mut() {
         let identity = match &config.protocol {
             #[cfg(unix)]
@@ -172,6 +173,7 @@ pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Valida
             &mut dns_groups,
             &mut inline_dns_counter,
             &identity,
+            &mut default_dns_groups,
         )?;
     }
     for config in tun_configs.iter_mut() {
@@ -181,6 +183,7 @@ pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Valida
             &mut dns_groups,
             &mut inline_dns_counter,
             &identity,
+            &mut default_dns_groups,
         )?;
     }
 
@@ -244,6 +247,7 @@ pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Valida
         )?;
         final_dns_groups.push(ExpandedDnsGroup {
             fake_ip: fake_policies.remove(&name).flatten(),
+            use_default_resolver: default_dns_groups.contains(&name),
             name,
             specs: expanded_specs,
         });
@@ -608,6 +612,7 @@ fn extract_inline_dns(
     dns_groups: &mut HashMap<String, DnsConfigGroup>,
     counter: &mut u32,
     identity: &str,
+    default_dns_groups: &mut HashSet<String>,
 ) -> std::io::Result<()> {
     let Some(config) = dns else {
         return Ok(());
@@ -642,6 +647,9 @@ fn extract_inline_dns(
         ));
     }
     let servers = std::mem::replace(&mut config.servers, NoneOrSome::Unspecified);
+    if servers.is_empty() {
+        default_dns_groups.insert(generated_name.clone());
+    }
 
     let group = DnsConfigGroup {
         fake_ip: config.fake_ip.take(),

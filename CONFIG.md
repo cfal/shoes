@@ -952,20 +952,28 @@ Compatible reloads retain mappings, including explicit disable/re-enable under
 the same group/inline identity. Pool ranges, capacity, or state-file ownership
 changes require restart. Without `state_file`, restart loses the mappings.
 With a state file, snapshots are private, atomically replaced, locked against
-multiple writers, and checked for compatibility. Create its parent directory
+multiple writers, and checked for pool and context identity compatibility. Create its parent directory
 before startup; protect it because the file records queried domains. Cursor
 reservations are persisted before issuance; a crash can lose recent mappings,
 which then fail closed rather than restoring an obsolete owner. Back up or
 explicitly remove incompatible state before changing its pool configuration.
+Persistent families need at least two allocatable addresses. Reservations may
+skip unused addresses after restart; Windows power-loss durability and state-file
+ACLs require platform-specific verification.
 
 Omitted `servers` uses system DNS. Desktop discovery is a periodically refreshed
 endpoint snapshot, not the OS's complete split/scoped DNS policy. Keep discovered
 resolvers and any loopback stub's own upstream traffic outside TUN capture to
 avoid recursive interception. Android/iOS hosts must supply underlying real
 `dns.servers` explicitly; automatic VPN system discovery is not supported.
-Missing/unusable upstreams produce DNS failure, not a public-provider fallback.
+Host-local TUN deployments should configure explicit real upstreams: native
+hostname lookups can otherwise re-enter the host's intercepted resolver.
+Fake-enabled system configurations fail startup if no usable endpoints can be
+discovered. Later upstream failures produce DNS failure, not a public-provider fallback.
 UDP and HTTP/3 upstreams remain direct-only; TCP/TLS/HTTPS can use client chains.
 UDP truncation retries TCP only when that transport is explicitly configured.
+Local UDP DNS peers process one query at a time with bounded backpressure; a
+forwarded query can delay subsequent synthetic answers until its deadline.
 
 SOCKS, UoT, H2MUX, XUDP, Hysteria2, and TUIC preserve the original logical reply
 address. Snell's reply format supports only IP addresses: hostname-addressed

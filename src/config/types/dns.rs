@@ -226,6 +226,7 @@ pub struct ExpandedDnsGroup {
     pub name: String,
     pub specs: Vec<ExpandedDnsSpec>,
     pub fake_ip: Option<crate::dns::fake_ip::FakeIpOptions>,
+    pub use_default_resolver: bool,
 }
 
 #[cfg(test)]
