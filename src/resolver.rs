@@ -208,6 +208,7 @@ impl RefreshingResolver {
                 | std::io::ErrorKind::NotConnected
         )
     }
+
     fn execute<T: Send + 'static>(
         &self,
         operation: impl Fn(
@@ -262,57 +263,54 @@ impl RefreshingResolver {
             if retried_setup {
                 result = operation(current).await;
             }
-            match result {
-                Ok(addrs) => {
+            let error = match result {
+                Ok(value) => {
                     refresh_state.lock().last_activity_at = Some(Instant::now());
-                    Ok(addrs)
+                    return Ok(value);
                 }
-                Err(err)
-                    if policy.retry_once_after_refresh
-                        && RefreshingResolver::should_refresh_for_error(&err) =>
-                {
-                    let _guard = refresh_lock.lock().await;
-                    if refresh_state.lock().generation != current_generation {
-                        if retried_setup {
-                            return Err(err);
-                        }
-                        let current = inner.read().await.clone();
-                        let addrs = operation(current).await?;
-                        refresh_state.lock().last_activity_at = Some(Instant::now());
-                        return Ok(addrs);
-                    }
-                    log::info!(
-                        "RefreshingResolver ({}): refresh-on-error ({})",
-                        description,
-                        err.kind()
-                    );
-                    match factory().await {
-                        Ok(fresh) => {
-                            *inner.write().await = fresh.clone();
-                            {
-                                let mut state = refresh_state.lock();
-                                state.generation = state.generation.wrapping_add(1);
-                            }
-                            // A retained setup gets one retry, then refreshes only for future calls.
-                            if retried_setup {
-                                return Err(err);
-                            }
-                            let addrs = operation(fresh).await?;
-                            refresh_state.lock().last_activity_at = Some(Instant::now());
-                            Ok(addrs)
-                        }
-                        Err(factory_err) => {
-                            log::warn!(
-                                "RefreshingResolver ({}): error-refresh factory failed: {}",
-                                description,
-                                factory_err
-                            );
-                            Err(err)
-                        }
-                    }
-                }
-                Err(err) => Err(err),
+                Err(error) => error,
+            };
+            if !policy.retry_once_after_refresh || !Self::should_refresh_for_error(&error) {
+                return Err(error);
             }
+
+            let _guard = refresh_lock.lock().await;
+            let retry_resolver = if refresh_state.lock().generation != current_generation {
+                if retried_setup {
+                    return Err(error);
+                }
+                inner.read().await.clone()
+            } else {
+                log::info!(
+                    "RefreshingResolver ({}): refresh-on-error ({})",
+                    description,
+                    error.kind()
+                );
+                let fresh = match factory().await {
+                    Ok(fresh) => fresh,
+                    Err(factory_err) => {
+                        log::warn!(
+                            "RefreshingResolver ({}): error-refresh factory failed: {}",
+                            description,
+                            factory_err
+                        );
+                        return Err(error);
+                    }
+                };
+                *inner.write().await = fresh.clone();
+                {
+                    let mut state = refresh_state.lock();
+                    state.generation = state.generation.wrapping_add(1);
+                }
+                // A retained setup gets one retry, then refreshes only for future calls.
+                if retried_setup {
+                    return Err(error);
+                }
+                fresh
+            };
+            let value = operation(retry_resolver).await?;
+            refresh_state.lock().last_activity_at = Some(Instant::now());
+            Ok(value)
         })
     }
 }
@@ -819,6 +817,7 @@ mod tests {
             .unwrap();
             let error = resolver.exchange(vec![]).await.unwrap_err();
             assert_eq!(initial.calls.load(Ordering::Relaxed), 2);
+            assert!(resolver.refresh_state.lock().last_activity_at.is_none());
             assert_eq!(dns_setup_pending(&error), second_error.is_none());
             assert_eq!(
                 error.kind(),
