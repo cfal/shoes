@@ -178,24 +178,36 @@ pub(crate) async fn process_stream_with_permit<AS: AsyncStream + 'static>(
             stream: mut server_stream,
             need_initial_flush: server_need_initial_flush,
             proxy_selector,
-            connection_success_response,
+            mut connection_success_response,
             initial_remote_data,
         } => {
-            let setup_client_stream_future = timeout(
-                setup_timeout,
-                setup_client_tcp_stream(proxy_selector, resolver, remote_location.clone()),
-            );
-
-            let TcpClientSetupResult {
-                mut client_stream,
-                early_data,
-            } = match setup_client_stream_future.await {
-                Ok(Ok(Some(s))) => s,
-                Ok(Ok(None)) => {
-                    // Must have been blocked.
-                    crate::util::shutdown_stream(&mut server_stream).await;
-                    return Ok(());
+            let setup_client_stream_future = timeout(setup_timeout, async {
+                let prepared = super::ingress::PreparedTcp::new(
+                    &proxy_selector,
+                    remote_location.clone(),
+                    initial_remote_data.map_or_else(Vec::new, |data| data.into_vec()),
+                )?;
+                if prepared.needs_sniff_read() {
+                    crate::util::timeout_stream_setup(async {
+                        let response = connection_success_response.take();
+                        let flush = response.is_some() || server_need_initial_flush;
+                        if let Some(data) = response {
+                            write_all(&mut server_stream, &data).await?;
+                        }
+                        if flush {
+                            server_stream.flush().await?;
+                        }
+                        Ok(())
+                    })
+                    .await?;
                 }
+                prepared
+                    .connect(&mut server_stream, &proxy_selector, &resolver)
+                    .await
+            });
+
+            let routed = match setup_client_stream_future.await {
+                Ok(Ok(routed)) => routed,
                 Ok(Err(e)) => {
                     crate::util::shutdown_stream(&mut server_stream).await;
                     return Err(std::io::Error::new(
@@ -211,6 +223,15 @@ pub(crate) async fn process_stream_with_permit<AS: AsyncStream + 'static>(
                     ));
                 }
             };
+            let Some(TcpClientSetupResult {
+                mut client_stream,
+                early_data,
+            }) = routed.setup
+            else {
+                crate::util::shutdown_stream(&mut server_stream).await;
+                return Ok(());
+            };
+            log::debug!("TCP setup completed for {}", routed.wire_destination);
 
             crate::util::timeout_stream_setup(async {
                 let flush_server = server_need_initial_flush || early_data.is_some();
@@ -223,13 +244,14 @@ pub(crate) async fn process_stream_with_permit<AS: AsyncStream + 'static>(
                 if flush_server {
                     server_stream.flush().await?;
                 }
-                if let Some(data) = initial_remote_data {
-                    write_all(&mut client_stream, &data).await?;
+                if !routed.prefix.is_empty() {
+                    write_all(&mut client_stream, &routed.prefix).await?;
                     client_stream.flush().await?;
                 }
                 Ok(())
             })
             .await?;
+            drop(routed.prefix);
 
             let copy_result =
                 copy_bidirectional(&mut server_stream, &mut client_stream, false, false).await;
@@ -318,27 +340,6 @@ pub(crate) async fn process_stream_with_permit<AS: AsyncStream + 'static>(
     }
 }
 
-pub async fn setup_client_tcp_stream(
-    client_proxy_selector: Arc<ClientProxySelector>,
-    resolver: Arc<dyn Resolver>,
-    remote_location: NetLocation,
-) -> std::io::Result<Option<TcpClientSetupResult>> {
-    let action = client_proxy_selector
-        .judge(remote_location.into(), &resolver)
-        .await?;
-
-    match action {
-        ConnectDecision::Allow {
-            chain_group,
-            remote_location,
-        } => chain_group
-            .connect_tcp(remote_location, &resolver)
-            .await
-            .map(Some),
-        ConnectDecision::Block => Ok(None),
-    }
-}
-
 /// Unified function to run the appropriate UDP copy based on the setup result.
 /// Copy messages bidirectionally between server and client message streams.
 ///
@@ -424,6 +425,7 @@ async fn start_tcp_servers(
         tcp_settings,
         protocol,
         rules,
+        sniff,
         ..
     } = config;
 
@@ -435,10 +437,9 @@ async fn start_tcp_servers(
 
     let tcp_config = tcp_settings.unwrap_or_else(TcpConfig::default);
 
-    let client_proxy_selector = Arc::new(create_tcp_client_proxy_selector(
-        rules.clone(),
-        resolver.clone(),
-    )?);
+    let client_proxy_selector = Arc::new(
+        create_tcp_client_proxy_selector(rules.clone(), resolver.clone())?.with_sniff(sniff),
+    );
 
     let mut handles = vec![];
 
@@ -556,6 +557,62 @@ mod lifetime_tests {
 
     #[derive(Debug)]
     struct ReadyConnector(std::sync::Mutex<Option<FlushStream>>);
+
+    #[derive(Debug)]
+    struct FlushOnlyHandler(Arc<ClientProxySelector>);
+
+    #[async_trait]
+    impl TcpServerHandler for FlushOnlyHandler {
+        async fn setup_server_stream(
+            &self,
+            stream: Box<dyn AsyncStream>,
+        ) -> io::Result<TcpServerSetupResult> {
+            Ok(TcpServerSetupResult::TcpForward {
+                remote_location: NetLocation::from_str(super::super::ingress::tests::TARGET, None)?,
+                stream,
+                need_initial_flush: true,
+                proxy_selector: self.0.clone(),
+                connection_success_response: None,
+                initial_remote_data: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn sniff_flushes_buffered_inbound_without_an_explicit_reply() {
+        use tokio::io::AsyncReadExt;
+        timeout(Duration::from_secs(5), async {
+            let mut tasks = tokio::task::JoinSet::new();
+            let hello = crate::sniff::tests::hello(&rustls::version::TLS13, true);
+            let (selector, resolver) =
+                super::super::ingress::tests::socks_target(hello.clone(), &mut tasks).await;
+            let (server, mut peer) = tokio::io::duplex(8192);
+            let flushes = Arc::new(AtomicUsize::new(0));
+            let server = FlushStream {
+                inner: server,
+                stalled: false,
+                flushes: flushes.clone(),
+            };
+            tasks.spawn(async move {
+                process_stream(server, Arc::new(FlushOnlyHandler(selector)), resolver)
+                    .await
+                    .unwrap();
+            });
+            while flushes.load(Ordering::Relaxed) == 0 {
+                tokio::task::yield_now().await;
+            }
+            peer.write_all(&hello).await.unwrap();
+            peer.shutdown().await.unwrap();
+            let mut reply = Vec::new();
+            peer.read_to_end(&mut reply).await.unwrap();
+            assert_eq!(reply, b"greetinglater");
+            while let Some(result) = tasks.join_next().await {
+                result.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+    }
 
     #[derive(Debug)]
     struct FlushStream {
@@ -728,6 +785,72 @@ mod lifetime_tests {
             .unwrap()
         {
             result.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn reply_gated_socks_and_connect_sniff_route_and_preserve_proxy_ip() {
+        use super::super::ingress::tests::{TARGET, socks_target};
+        use tokio::io::AsyncReadExt;
+        for socks in [true, false] {
+            timeout(Duration::from_secs(5), async {
+                let mut tasks = tokio::task::JoinSet::new();
+                let hello = crate::sniff::tests::hello(&rustls::version::TLS13, true);
+                let (selector, resolver) = socks_target(hello.clone(), &mut tasks).await;
+                let handler: Arc<dyn TcpServerHandler> = if socks {
+                    Arc::new(crate::socks_handler::SocksTcpServerHandler::new(
+                        None,
+                        false,
+                        "0.0.0.0".parse().unwrap(),
+                        selector,
+                        resolver.clone(),
+                    ))
+                } else {
+                    Arc::new(crate::http_handler::HttpTcpServerHandler::new(
+                        None,
+                        selector,
+                        resolver.clone(),
+                    ))
+                };
+                let (server, mut peer) = tokio::io::duplex(8192);
+                tasks.spawn(async move {
+                    process_stream(server, handler, resolver).await.unwrap();
+                });
+                if socks {
+                    peer.write_all(&[5, 1, 0]).await.unwrap();
+                    let mut method = [0; 2];
+                    peer.read_exact(&mut method).await.unwrap();
+                    assert_eq!(method, [5, 0]);
+                    peer.write_all(&[5, 1, 0, 1, 203, 0, 113, 1, 1, 187])
+                        .await
+                        .unwrap();
+                    let mut reply = [0; 10];
+                    peer.read_exact(&mut reply).await.unwrap();
+                    assert_eq!(&reply[..4], &[5, 0, 0, 1]);
+                } else {
+                    peer.write_all(
+                        format!("CONNECT {TARGET} HTTP/1.1\r\nHost: {TARGET}\r\n\r\n").as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                    let mut reply = Vec::new();
+                    while !reply.ends_with(b"\r\n\r\n") {
+                        reply.push(peer.read_u8().await.unwrap());
+                    }
+                    assert!(reply.starts_with(b"HTTP/1.1 200"));
+                }
+                // No application bytes are sent until the actual protocol success.
+                peer.write_all(&hello).await.unwrap();
+                peer.shutdown().await.unwrap();
+                let mut reply = Vec::new();
+                peer.read_to_end(&mut reply).await.unwrap();
+                assert_eq!(reply, b"greetinglater");
+                while let Some(result) = tasks.join_next().await {
+                    result.unwrap();
+                }
+            })
+            .await
+            .unwrap();
         }
     }
 
