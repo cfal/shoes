@@ -9,6 +9,16 @@ use rustc_hash::FxHashMap;
 use super::fake_ip::{FakeDnsContext, FakeDnsResolver, FakeIpOptions, FakeIpPool};
 use super::real_only;
 use super::system::SystemResolver;
+use crate::config::{DnsConfig, ExpandedDnsGroup, ExpandedDnsSpec, GlobalLimits};
+use crate::dns::composite_resolver::CompositeResolver;
+use crate::dns::hickory_resolver::{HickoryResolver, HickoryResolverOptions};
+use crate::dns::parsed::{ParsedDnsServer, ParsedDnsServerEntry, ParsedDnsUrl};
+use crate::option_util::NoneOrSome;
+use crate::resolver::{
+    CachingNativeResolver, NativeResolver, RefreshPolicy, RefreshingResolver, Resolver,
+    ResolverFactory, TimeoutResolver,
+};
+use crate::tcp::chain_builder::{build_client_chain_group_with_limits, build_direct_chain_group};
 
 #[derive(Clone)]
 struct PoolState {
@@ -24,17 +34,6 @@ impl PoolState {
             && self.options.state_file == options.state_file
     }
 }
-
-use crate::config::{DnsConfig, ExpandedDnsGroup, ExpandedDnsSpec, GlobalLimits};
-use crate::dns::composite_resolver::CompositeResolver;
-use crate::dns::hickory_resolver::{HickoryResolver, HickoryResolverOptions};
-use crate::dns::parsed::{ParsedDnsServer, ParsedDnsServerEntry, ParsedDnsUrl};
-use crate::option_util::NoneOrSome;
-use crate::resolver::{
-    CachingNativeResolver, NativeResolver, RefreshPolicy, RefreshingResolver, Resolver,
-    ResolverFactory, TimeoutResolver,
-};
-use crate::tcp::chain_builder::{build_client_chain_group_with_limits, build_direct_chain_group};
 
 /// Registry of resolved DNS groups with lazy default resolver.
 pub struct DnsRegistry {
@@ -72,7 +71,7 @@ impl DnsRegistry {
         &self.forbidden
     }
 
-    /// Get or create the default resolver (CachingNativeResolver).
+    /// Get or create the guarded system resolver with cached native lookups.
     /// Used when a server has no `dns` field configured.
     pub fn get_or_create_default(&mut self) -> Arc<dyn Resolver> {
         let forbidden = self.forbidden.clone();
@@ -103,23 +102,22 @@ impl DnsRegistry {
         }
     }
 
-    pub async fn checkpoint(&self) -> std::io::Result<()> {
-        let pools: Vec<_> = self
-            .pools
+    fn pool_handles(&self) -> Vec<Arc<FakeIpPool>> {
+        self.pools
             .values()
             .map(|state| state.pool.clone())
-            .collect();
+            .collect()
+    }
+
+    pub async fn checkpoint(&self) -> std::io::Result<()> {
+        let pools = self.pool_handles();
         tokio::task::spawn_blocking(move || checkpoint_pools(pools))
             .await
             .map_err(std::io::Error::other)?
     }
 
     pub async fn shutdown_checkpoint(&self) -> std::io::Result<()> {
-        let pools: Vec<_> = self
-            .pools
-            .values()
-            .map(|state| state.pool.clone())
-            .collect();
+        let pools = self.pool_handles();
         tokio::task::spawn_blocking(move || {
             let mut error = None;
             for pool in pools {
@@ -134,11 +132,7 @@ impl DnsRegistry {
     }
 
     pub fn snapshot_task(&self) -> DnsSnapshotTask {
-        let pools: Vec<_> = self
-            .pools
-            .values()
-            .map(|state| state.pool.clone())
-            .collect();
+        let pools = self.pool_handles();
         DnsSnapshotTask(tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(60)).await;
@@ -742,12 +736,11 @@ pub async fn build_dns_registry_for_runtime(
             let context = Arc::new(FakeDnsContext::with_pool(options, real.clone(), pool)?);
             Arc::new(FakeDnsResolver::new(real, context))
         } else {
-            if let Some(old) = old {
+            if old.is_some() {
                 log::warn!(
                     "Fake DNS disabled for '{}'; cached fake addresses may fail",
                     group.name
                 );
-                registry.pools.insert(group.name.clone(), old.clone());
             }
             real
         };
