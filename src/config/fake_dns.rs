@@ -6,7 +6,7 @@ use ipnetwork::IpNetwork;
 
 use super::{
     Config, ConfigSelection, DnsConfig, RuleActionConfig, RuleConfig, ServerProxyConfig,
-    ValidatedConfigs,
+    ShadowTlsServerHandshakeConfig, ValidatedConfigs,
 };
 use crate::address::NetLocation;
 use crate::option_util::NoneOrSome;
@@ -66,13 +66,31 @@ fn protocol(ranges: &[IpNetwork], config: &ServerProxyConfig) -> io::Result<()> 
                 rules(ranges, &target.override_rules)?;
                 protocol(ranges, &target.protocol)?;
             }
-            for target in shadowtls_targets.values() {
-                rules(ranges, &target.override_rules)?;
-                protocol(ranges, &target.protocol)?;
+            for server in shadowtls_targets.values() {
+                if let ShadowTlsServerHandshakeConfig::Remote(handshake) = &server.handshake {
+                    target(
+                        ranges,
+                        &handshake.address,
+                        "ShadowTLS handshake destination",
+                    )?;
+                }
+                rules(ranges, &server.override_rules)?;
+                protocol(ranges, &server.protocol)?;
             }
-            for target in reality_targets.values() {
-                rules(ranges, &target.override_rules)?;
-                protocol(ranges, &target.protocol)?;
+            for server in reality_targets.values() {
+                target(ranges, &server.dest, "Reality fallback destination")?;
+                rules(ranges, &server.override_rules)?;
+                protocol(ranges, &server.protocol)?;
+            }
+        }
+        ServerProxyConfig::Vless { fallback, .. } | ServerProxyConfig::Anytls { fallback, .. } => {
+            if let Some(address) = fallback {
+                target(ranges, address, "authentication fallback destination")?;
+            }
+        }
+        ServerProxyConfig::PortForward { targets } => {
+            for address in targets.iter() {
+                target(ranges, address, "port-forward destination")?;
             }
         }
         ServerProxyConfig::Websocket { targets } => {
@@ -103,7 +121,17 @@ pub(super) fn validate(config: &mut ValidatedConfigs) -> io::Result<()> {
     if contexts.is_empty() {
         return Ok(());
     }
-    let all: Vec<IpNetwork> = contexts.values().flatten().copied().collect();
+    let mut all: Vec<IpNetwork> = contexts.values().flatten().copied().collect();
+    for server in &config.configs {
+        if let Config::TunServer(tun) = server {
+            all.extend(
+                [tun.address, tun.destination]
+                    .into_iter()
+                    .flatten()
+                    .map(IpNetwork::from),
+            );
+        }
+    }
     let effective = |dns: &Option<DnsConfig>| -> &[IpNetwork] {
         dns.as_ref()
             .and_then(DnsConfig::resolved_group)
@@ -255,5 +283,51 @@ mod tests {
             assert_eq!(config.fake_ip, decoded.fake_ip);
         }
         assert!(serde_yaml::from_str::<DnsConfig>("{fake_ip: {surprise: true}}").is_err());
+    }
+
+    #[test]
+    fn server_owned_destinations_follow_effective_fake_ranges() {
+        use serde_json::json;
+        for address in [
+            "198.18.0.5:443",
+            "[::ffff:198.18.0.5]:443",
+            "[2001:2::5]:443",
+        ] {
+            let protocols = [
+                json!({"type":"forward", "targets":["192.0.2.1:443", address]}),
+                json!({"type":"vless", "user_id":"b85798ef-e9dc-46a4-9a87-8da4499d36d0", "fallback":address}),
+                json!({"type":"anytls", "users":[{"password":"test"}], "fallback":address}),
+                json!({"type":"tls", "reality_targets":{"cover.example":{
+                    "private_key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "dest":address, "protocol":{"type":"socks"}
+                }}}),
+                json!({"type":"tls", "shadowtls_targets":{"cover.example":{
+                    "password":"test", "handshake":{"address":address}, "protocol":{"type":"socks"}
+                }}}),
+            ];
+            for protocol in protocols {
+                for nested in [false, true] {
+                    let protocol = if nested {
+                        json!({"type":"websocket", "targets":[{"protocol":protocol}]})
+                    } else {
+                        protocol.clone()
+                    };
+                    let mut config = json!([
+                        {"dns_group":"fake", "dns_servers":"system", "fake_ip":{"ipv6_range":"2001:2::/48"}},
+                        {"address":"0.0.0.0:1080", "protocol":protocol, "dns":{"servers":"fake"}},
+                    ]);
+                    let error = validate_yaml(&config.to_string()).err().unwrap();
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("overlaps an active fake IP range"),
+                        "{error}"
+                    );
+                    config[1]["dns"]["fake_ip"] = false.into();
+                    validate_yaml(&config.to_string()).unwrap();
+                    config[1]["dns"] = json!({"servers":"system"});
+                    validate_yaml(&config.to_string()).unwrap();
+                }
+            }
+        }
     }
 }
