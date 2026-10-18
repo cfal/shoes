@@ -108,8 +108,8 @@ async fn wireguard_dns_reload_uses_the_new_resolver_and_outages_never_bypass_the
     timeout(Duration::from_secs(60), async {
         let mut old_dns = DnsPeer::start().await?;
         let mut new_dns = DnsPeer::start().await?;
-        let forbidden_tcp = TcpListener::bind(("127.0.0.2", new_dns.port)).await?;
-        let forbidden_udp = UdpSocket::bind(("127.0.0.2", new_dns.port)).await?;
+        let forbidden_tcp = TcpListener::bind(("::1", new_dns.port)).await?;
+        let forbidden_udp = UdpSocket::bind(("::1", new_dns.port)).await?;
         let reservation = std::net::UdpSocket::bind("0.0.0.0:0")?;
         let port = reservation.local_addr()?.port();
         let mut ports = PortHelper::new();
@@ -117,9 +117,18 @@ async fn wireguard_dns_reload_uses_the_new_resolver_and_outages_never_bypass_the
         let directory = tempfile::tempdir()?;
         let server_path = directory.path().join("server.yaml");
         let client_path = directory.path().join("client.yaml");
+        let mut server_config = config::server(port);
+        server_config["inbound"]["rules"].as_array_mut().unwrap().insert(
+            0,
+            json!({
+                "masks": "::1/128",
+                "action": "allow",
+                "override_address": "127.0.0.1:0",
+            }),
+        );
         std::fs::write(
             &server_path,
-            serde_yaml::to_string(&json!([config::server(port)])).unwrap(),
+            serde_yaml::to_string(&json!([server_config])).unwrap(),
         )?;
         let mut socks = config::socks(entry);
         socks["dns"] = json!({"servers": "tunneled"});
@@ -130,7 +139,7 @@ async fn wireguard_dns_reload_uses_the_new_resolver_and_outages_never_bypass_the
                 {
                     "dns_group": "tunneled",
                     "dns_servers": [{
-                        "url": format!("tcp://127.0.0.2:{dns_port}"),
+                        "url": format!("tcp://[::1]:{dns_port}"),
                         "ip_strategy": "ipv4_only",
                         "timeout_secs": 1,
                         "connect_timeout_secs": 1,
