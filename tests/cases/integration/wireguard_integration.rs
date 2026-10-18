@@ -4,6 +4,19 @@ use shoes_test_support::{
     port_helper::PortHelper, test_fixture::start_shoes_server, wireguard::EchoTargets,
 };
 
+#[path = "wireguard/datagrams.rs"]
+mod datagrams;
+#[path = "wireguard/impairment.rs"]
+mod impairment;
+#[path = "wireguard/load.rs"]
+mod load;
+#[path = "wireguard/policy.rs"]
+mod policy;
+#[path = "wireguard/support.rs"]
+mod support;
+#[path = "wireguard/transports.rs"]
+mod transports;
+
 #[tokio::test]
 async fn wireguard_server_client_tcp_udp_and_stream_chain() -> std::io::Result<()> {
     tokio::time::timeout(std::time::Duration::from_secs(60), async {
@@ -14,7 +27,8 @@ async fn wireguard_server_client_tcp_udp_and_stream_chain() -> std::io::Result<(
         let protocol = config::vless_protocol();
         let server = json!([
             config::server(port),
-            {"address": format!("0.0.0.0:{proxy}"), "protocol": protocol}
+            {"address": format!("0.0.0.0:{proxy}"), "protocol": protocol,
+             "rules": config::server(port)["inbound"]["rules"]}
         ]);
         drop(reservation);
         let _server = start_shoes_server(&serde_yaml::to_string(&server).unwrap())?;
@@ -32,7 +46,11 @@ async fn wireguard_server_client_tcp_udp_and_stream_chain() -> std::io::Result<(
             )?;
             ports.wait_for_all_ports().await?;
             for ipv6 in [false, true] {
-                EchoTargets::new(ipv6).await?.check(entry, None).await?;
+                let target = if ipv6 { "fd88::1" } else { "198.18.0.1" };
+                EchoTargets::new(ipv6)
+                    .await?
+                    .check(entry, Some(target.parse().unwrap()))
+                    .await?;
             }
         }
         Ok(())

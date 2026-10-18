@@ -96,6 +96,8 @@ jobs:
         "$HOME/.cache/shoes-wireguard/sing-box" version
         "$HOME/.cache/shoes-wireguard/xray" version
     - name: Test both roles, inner address families, and real rekey
+      env:
+        RUST_LOG: warn
       run: >-
         cargo test -p shoes --locked --features optional-peer-tests
         --test optional_peer wireguard -- --ignored --test-threads=1
@@ -163,6 +165,10 @@ jobs:
     - name: Run raw-FD and packet tests without a TUN device
       run: >-
         cargo test -p shoes --locked --lib --features ffi tun:: -- --test-threads=1
+
+    - name: Run rootless WireGuard, FFI, and process lifecycle tests
+      run: >-
+        cargo test -p shoes --locked --lib --test process_contract --features ffi wireguard -- --test-threads=1
 
   integration-tests:
     name: Integration (${{ matrix.name }})
@@ -358,6 +364,7 @@ jobs:
     - name: Run integration tests
       env:
         TEST_FILTERS: ${{ matrix.filters }}
+        RUST_LOG: warn
       run: |
         if [ -z "$TEST_FILTERS" ]; then
           cargo test -p shoes --locked \
