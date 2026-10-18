@@ -11,9 +11,7 @@ use tokio::time::timeout;
 use super::tcp_client_handler_factory::create_tcp_client_proxy_selector;
 use super::tcp_server_handler_factory::create_tcp_server_handler;
 
-use crate::address::NetLocation;
 use crate::async_stream::{AsyncMessageStream, AsyncStream};
-use crate::client_proxy_selector::{ClientProxySelector, ConnectDecision};
 use crate::config::{BindLocation, Config, ConfigSelection, ServerConfig, TcpConfig, Transport};
 use crate::copy_bidirectional::copy_bidirectional;
 use crate::copy_bidirectional_message::copy_bidirectional_message;
@@ -271,23 +269,18 @@ pub(crate) async fn process_stream_with_permit<AS: AsyncStream + 'static>(
             proxy_selector,
         } => {
             let setup = crate::util::timeout_stream_setup(async {
-                match proxy_selector
-                    .judge(remote_location.into(), &resolver)
-                    .await?
-                {
-                    ConnectDecision::Allow {
-                        chain_group,
-                        remote_location,
-                    } => {
-                        chain_group
-                            .connect_udp_bidirectional(&resolver, remote_location)
-                            .await
-                    }
-                    ConnectDecision::Block => Err(std::io::Error::new(
-                        std::io::ErrorKind::ConnectionRefused,
-                        "Blocked bidirectional udp forward",
-                    )),
-                }
+                crate::routing::ingress::connect_udp(&proxy_selector, remote_location, &resolver)
+                    .await
+                    .map_err(|error| {
+                        if error.kind() == std::io::ErrorKind::PermissionDenied {
+                            std::io::Error::new(
+                                std::io::ErrorKind::ConnectionRefused,
+                                "Blocked bidirectional udp forward",
+                            )
+                        } else {
+                            error
+                        }
+                    })
             })
             .await;
             let client_stream = match setup {
@@ -529,11 +522,12 @@ mod lifetime_tests {
     use std::task::{Context, Poll};
     use tokio::io::ReadBuf;
 
+    use crate::address::NetLocation;
     use crate::async_stream::{
         AsyncFlushMessage, AsyncPing, AsyncReadMessage, AsyncShutdownMessage, AsyncWriteMessage,
     };
     use crate::client_proxy_chain::{ClientChainGroup, ClientProxyChain, InitialHopEntry};
-    use crate::client_proxy_selector::{ConnectAction, ConnectRule};
+    use crate::client_proxy_selector::{ClientProxySelector, ConnectAction, ConnectRule};
     use crate::tcp::socket_connector::SocketConnector;
 
     #[derive(Debug)]

@@ -7,8 +7,8 @@ use crate::address::{Address, NetLocation};
 use crate::anytls::anytls_padding::{CHECK_MARK, PaddingFactory};
 use crate::anytls::anytls_stream::{AnyTlsStream, STREAM_CHANNEL_BUFFER};
 use crate::anytls::anytls_types::{Command, FRAME_HEADER_SIZE, Frame, FrameCodec, StringMap};
-use crate::async_stream::{AsyncMessageStream, AsyncTargetedMessageStream};
-use crate::client_proxy_selector::{ClientProxySelector, ConnectDecision};
+use crate::async_stream::AsyncTargetedMessageStream;
+use crate::client_proxy_selector::ClientProxySelector;
 use crate::copy_bidirectional::copy_bidirectional;
 use crate::resolver::Resolver;
 use crate::routing::{ServerStream, run_udp_routing};
@@ -925,76 +925,42 @@ impl AnyTlsSession {
     ) -> io::Result<()> {
         let stream_id = stream.id();
 
-        // Use ClientProxySelector for routing
-        let action = setup_timeout(
-            self.proxy_provider
-                .judge(destination.clone().into(), &self.resolver),
-        )
-        .await?;
-
-        match action {
-            ConnectDecision::Allow {
-                chain_group,
-                remote_location,
-            } => {
-                log::debug!(
-                    "AnyTLS stream {} UoT V2 connect: routing {} through chain",
-                    stream_id,
-                    remote_location
-                );
-
-                // Wrap AnyTlsStream as AsyncMessageStream (VlessMessageStream for length-prefixed)
-                let server_stream: Box<dyn AsyncMessageStream> =
-                    Box::new(VlessMessageStream::new(stream));
-
-                // Connect through the proxy chain
-                let client_stream = match setup_timeout(
-                    chain_group.connect_udp_bidirectional(&self.resolver, remote_location),
-                )
-                .await
-                {
-                    Ok(result) => result,
-                    Err(e) => {
-                        // Send SYNACK with error (protocol v2)
-                        let error_msg = format!("UDP connect failed: {}", e);
-                        let _ = self.send_synack(stream_id, Some(&error_msg)).await;
-                        return Err(e);
-                    }
-                };
-
-                // Send successful SYNACK (protocol v2)
-                let _ = self.send_synack(stream_id, None).await;
-
-                log::debug!("AnyTLS stream {} UoT V2 connect: connected", stream_id);
-
-                // Run UDP copy
-                let result = run_udp_copy(server_stream, client_stream, false, false).await;
-
-                if let Err(e) = &result {
-                    log::debug!("AnyTLS stream {} UoT V2 connect ended: {}", stream_id, e);
-                } else {
-                    log::debug!("AnyTLS stream {} UoT V2 connect completed", stream_id);
-                }
-
-                result
-            }
-            ConnectDecision::Block => {
-                // Send SYNACK with error (protocol v2)
+        let route = match setup_timeout(crate::routing::ingress::route_udp(
+            &self.proxy_provider,
+            destination,
+            &self.resolver,
+        ))
+        .await
+        {
+            Ok(route) => route,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
                 let _ = self
                     .send_synack(stream_id, Some("UDP blocked by rules"))
                     .await;
-
-                log::warn!(
-                    "AnyTLS stream {} UoT V2 connect blocked by rules: {}",
-                    stream_id,
-                    destination
-                );
-                Err(io::Error::new(
+                return Err(io::Error::new(
                     io::ErrorKind::ConnectionRefused,
                     "UDP blocked by rules",
-                ))
+                ));
             }
-        }
+            Err(error) => return Err(error),
+        };
+        let setup = match setup_timeout(route.connect(&self.resolver)).await {
+            Ok(setup) => setup,
+            Err(error) => {
+                let _ = self
+                    .send_synack(stream_id, Some(&format!("UDP connect failed: {error}")))
+                    .await;
+                return Err(error);
+            }
+        };
+        self.send_synack(stream_id, None).await?;
+        run_udp_copy(
+            Box::new(VlessMessageStream::new(stream)),
+            setup.stream,
+            false,
+            false,
+        )
+        .await
     }
 
     /// Handle UoT multi-destination mode (V1 and V2 non-connect)

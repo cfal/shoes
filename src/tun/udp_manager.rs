@@ -22,7 +22,7 @@ use tokio::time::{Instant, interval};
 
 use crate::address::{Address, NetLocation};
 use crate::async_stream::AsyncMessageStream;
-use crate::client_proxy_selector::{ClientProxySelector, ConnectDecision};
+use crate::client_proxy_selector::ClientProxySelector;
 use crate::config::tun::TunResourceLimits;
 use crate::resolver::Resolver;
 use crate::resources::{Budget, BudgetPermit};
@@ -556,23 +556,7 @@ async fn create_connection(
     proxy_selector: &Arc<ClientProxySelector>,
     resolver: &Arc<dyn Resolver>,
 ) -> io::Result<Box<dyn AsyncMessageStream>> {
-    let decision = proxy_selector.judge(dest.into(), resolver).await?;
-
-    match decision {
-        ConnectDecision::Allow {
-            chain_group,
-            remote_location,
-        } => {
-            let stream = chain_group
-                .connect_udp_bidirectional(resolver, remote_location)
-                .await?;
-            Ok(stream)
-        }
-        ConnectDecision::Block => Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "destination blocked",
-        )),
-    }
+    crate::routing::ingress::connect_udp(proxy_selector, dest.clone(), resolver).await
 }
 
 /// Send a UDP message through a stream.

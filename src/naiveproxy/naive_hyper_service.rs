@@ -24,7 +24,7 @@ use tokio::task::JoinSet;
 use tokio_util::io::ReaderStream;
 
 use crate::address::{Address, NetLocation};
-use crate::async_stream::{AsyncMessageStream, AsyncStream};
+use crate::async_stream::AsyncStream;
 use crate::client_proxy_selector::ClientProxySelector;
 use crate::copy_bidirectional::copy_bidirectional_with_sizes;
 use crate::crypto::CryptoTlsStream;
@@ -656,8 +656,6 @@ async fn handle_naive_stream<S: AsyncStream + 'static>(
     udp_enabled: bool,
     user_name: &str,
 ) -> io::Result<()> {
-    use crate::client_proxy_selector::ConnectDecision;
-
     if let Address::Hostname(host) = remote_location.address() {
         if host == UOT_V1_MAGIC_ADDRESS {
             if !udp_enabled {
@@ -701,36 +699,21 @@ async fn handle_naive_stream<S: AsyncStream + 'static>(
             if is_connect == 1 {
                 let uot_v2_stream = UotV2Stream::new(stream);
 
-                let action = crate::util::timeout_stream_setup(
-                    proxy_selector.judge(destination.clone().into(), &resolver),
-                )
-                .await?;
-
-                match action {
-                    ConnectDecision::Allow {
-                        chain_group,
-                        remote_location,
-                    } => {
-                        let client_stream = crate::util::timeout_stream_setup(
-                            chain_group.connect_udp_bidirectional(&resolver, remote_location),
-                        )
-                        .await?;
-
-                        return run_udp_copy(
-                            Box::new(uot_v2_stream) as Box<dyn AsyncMessageStream>,
-                            client_stream,
-                            false,
-                            false,
-                        )
-                        .await;
+                let route = crate::util::timeout_stream_setup(crate::routing::ingress::route_udp(
+                    &proxy_selector,
+                    destination,
+                    &resolver,
+                ))
+                .await
+                .map_err(|error| {
+                    if error.kind() == io::ErrorKind::PermissionDenied {
+                        io::Error::new(io::ErrorKind::ConnectionRefused, "UDP blocked by rules")
+                    } else {
+                        error
                     }
-                    ConnectDecision::Block => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::ConnectionRefused,
-                            "UDP blocked by rules",
-                        ));
-                    }
-                }
+                })?;
+                let setup = crate::util::timeout_stream_setup(route.connect(&resolver)).await?;
+                return run_udp_copy(Box::new(uot_v2_stream), setup.stream, false, false).await;
             } else {
                 // V2 non-connect mode (same as V1)
                 let uot_stream = UotV1ServerStream::new_uot(stream);

@@ -15,7 +15,7 @@ use tokio::sync::mpsc;
 use tokio::task::{AbortHandle, JoinSet};
 use tokio::time::{Duration, interval, timeout};
 
-use crate::client_proxy_selector::{ClientProxySelector, ConnectDecision};
+use crate::client_proxy_selector::ClientProxySelector;
 use crate::copy_bidirectional::copy_bidirectional;
 use crate::resolver::Resolver;
 use crate::routing::{ServerStream, run_udp_routing};
@@ -540,31 +540,26 @@ async fn handle_h2mux_udp(
 ) -> io::Result<()> {
     debug!("H2MUX UDP fixed: {}", destination);
 
-    let action = timeout_stream_setup(proxy_selector.judge(destination.into(), &resolver)).await?;
-
-    match action {
-        ConnectDecision::Allow {
-            chain_group,
-            remote_location,
-        } => {
-            let client_stream = timeout_stream_setup(
-                chain_group.connect_udp_bidirectional(&resolver, remote_location),
-            )
-            .await?;
-
-            // Wrap in VlessMessageStream for length-prefixed packets
-            let server_stream = VlessMessageStream::new(Box::new(stream));
-
-            run_udp_copy(Box::new(server_stream), client_stream, false, false).await
-        }
-        ConnectDecision::Block => {
+    let route = match timeout_stream_setup(crate::routing::ingress::route_udp(
+        &proxy_selector,
+        destination,
+        &resolver,
+    ))
+    .await
+    {
+        Ok(route) => route,
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
             reject_h2mux_stream(&mut stream, "Connection blocked by rules").await;
-            Err(io::Error::new(
+            return Err(io::Error::new(
                 io::ErrorKind::ConnectionRefused,
                 "UDP connection blocked by rules",
-            ))
+            ));
         }
-    }
+        Err(error) => return Err(error),
+    };
+    let setup = timeout_stream_setup(route.connect(&resolver)).await?;
+    let server_stream = VlessMessageStream::new(Box::new(stream));
+    run_udp_copy(Box::new(server_stream), setup.stream, false, false).await
 }
 
 /// Handle UDP stream with per-packet addressing (packet_addr mode)
