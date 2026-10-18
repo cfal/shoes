@@ -900,9 +900,11 @@ async fn check_alias_and_validation_exit_codes() {
         "- address: '{}'\n  protocol: {{type: http}}\n",
         occupied.local_addr().unwrap()
     );
+    let empty_dns = format!("{valid}  dns: {{servers: []}}\n");
     for option in ["--dry-run", "check"] {
         for (config, expected) in [
             (valid.as_str(), 0),
+            (empty_dns.as_str(), 0),
             (
                 "- address: '127.0.0.1:1'\n  transport: udp\n  protocol: {type: http}\n",
                 1,

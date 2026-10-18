@@ -543,7 +543,7 @@ fn topological_sort_dns_groups_by_bootstrap(
 
 /// Extracts inline DNS specs from a config into dns_groups with a generated name.
 /// Replaces config.dns.servers with a single group name reference.
-/// If servers is already a single group reference or empty, does nothing.
+/// Normalizes empty selections to None so they use the default resolver.
 fn extract_inline_dns(
     dns: &mut Option<DnsConfig>,
     dns_groups: &mut HashMap<String, DnsConfigGroup>,
@@ -555,6 +555,7 @@ fn extract_inline_dns(
 
     // Empty means use default resolver - nothing to extract
     if config.servers.is_empty() {
+        config.servers = NoneOrSome::None;
         return Ok(());
     }
 
@@ -3706,6 +3707,28 @@ mod tests {
             "composition with bootstrap should work: {:?}",
             result.err()
         );
+    }
+
+    #[tokio::test]
+    async fn test_empty_dns_lists_use_default_resolver() {
+        use serde_json::json;
+
+        let configs = serde_json::from_value(json!([
+            {"address": "127.0.0.1:1080", "protocol": {"type": "socks"}, "dns": {"servers": []}},
+            {"device_fd": 42, "dns": {"servers": []}},
+        ]))
+        .unwrap();
+        let configs = validate_configs_test(configs).await.unwrap();
+        assert_eq!(configs.len(), 2);
+        for config in configs {
+            let dns = match config {
+                Config::Server(server) => server.dns.unwrap(),
+                Config::TunServer(tun) => tun.dns.unwrap(),
+                _ => unreachable!(),
+            };
+            assert!(matches!(dns.servers, NoneOrSome::None));
+            assert_eq!(dns.resolved_group(), None);
+        }
     }
 
     #[tokio::test]
