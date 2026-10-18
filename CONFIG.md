@@ -249,7 +249,7 @@ A configuration file is a YAML array containing one or more configuration entrie
 - **Named PEM** - Defines reusable certificate/key data
 
 ```yaml
-# Server configs have 'address' or 'path'
+# Server configs have 'address' or 'path', except proxied WireGuard servers
 - address: "0.0.0.0:8080"
   protocol: ...
 
@@ -273,6 +273,10 @@ A configuration file is a YAML array containing one or more configuration entrie
 
 ## Server Config
 
+WireGuard servers require one literal UDP address with a nonzero port, or omit
+the bind location when `peer_client_chain` is configured. They do not support
+port ranges, multiple bind addresses, or Unix socket paths. See [WireGuard](#wireguard).
+
 ```yaml
 # Bind to IP address and port
 address: "0.0.0.0:8080"        # IPv4
@@ -290,8 +294,8 @@ path: "/tmp/shoes.sock"
 # Protocol configuration (required)
 protocol: ServerProxyConfig
 
-# Transport layer (default: tcp)
-transport: tcp | quic
+# Transport layer (default: tcp; WireGuard defaults to and requires udp)
+transport: tcp | quic | udp
 
 # TCP settings (only when transport: tcp)
 tcp_settings:
@@ -307,7 +311,7 @@ quic_settings:
   num_endpoints: int           # Optional, 0 = auto (based on thread count)
   key_exchange_groups: [X25519MLKEM768] # Optional; see TLS Key Exchange below
 
-# Routing rules (default: allow-all-direct)
+# Routing rules (default: allow-all-direct; WireGuard requires explicit nonempty rules)
 rules: string | [RuleConfig]
 ```
 
@@ -599,7 +603,7 @@ Used in rules to specify upstream proxies.
 ```yaml
 address: string                # Proxy server address (e.g., "proxy.example.com:1080")
 protocol: ClientProxyConfig
-transport: tcp | quic          # Default: tcp
+transport: tcp | quic | udp    # Default: tcp; WireGuard defaults to and requires udp
 bind_interface: string         # Optional, Linux/Android/Fuchsia only
 
 tcp_settings:
@@ -614,6 +618,9 @@ quic_settings:
   key: string                  # Client key for mTLS
   key_exchange_groups: [X25519MLKEM768] # Optional; see TLS Key Exchange below
 ```
+
+WireGuard clients use `address` for their peer endpoint and reject TCP/QUIC
+socket settings. See [WireGuard](#wireguard) for their protocol fields.
 
 ## Client Protocols
 
