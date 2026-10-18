@@ -608,6 +608,43 @@ async fn serve_fallback(
     }
 }
 
+#[cfg(test)]
+mod sniff_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn padding_is_removed_before_sniff_and_early_data_is_preserved() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut tasks = tokio::task::JoinSet::new();
+            let hello = crate::sniff::tests::hello(&rustls::version::TLS13, true);
+            let (selector, resolver) =
+                crate::tcp::ingress::tests::socks_target(hello.clone(), &mut tasks).await;
+            let target = NetLocation::from_str(crate::tcp::ingress::tests::TARGET, None).unwrap();
+            let (server, peer) = tokio::io::duplex(8192);
+            let server =
+                NaivePaddingStream::new(server, PaddingDirection::Server, PaddingType::Variant1);
+            let mut peer =
+                NaivePaddingStream::new(peer, PaddingDirection::Client, PaddingType::Variant1);
+            tasks.spawn(async move {
+                handle_naive_stream(server, target, resolver, selector, false, "test")
+                    .await
+                    .unwrap();
+            });
+            peer.write_all(&hello).await.unwrap();
+            peer.shutdown().await.unwrap();
+            let mut response = Vec::new();
+            peer.read_to_end(&mut response).await.unwrap();
+            assert_eq!(response, b"greetinglater");
+            while let Some(result) = tasks.join_next().await {
+                result.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+    }
+}
+
 /// Handle a single NaiveProxy stream after setup
 ///
 /// This handles both TCP and UDP-over-TCP (UoT) connections.
@@ -714,28 +751,37 @@ async fn handle_naive_stream<S: AsyncStream + 'static>(
         user_name, remote_location
     );
 
-    let action = crate::util::timeout_stream_setup(
-        proxy_selector.judge(remote_location.clone().into(), &resolver),
-    )
-    .await?;
-
-    let mut client_stream: Box<dyn AsyncStream> = match action {
-        ConnectDecision::Allow {
-            chain_group,
-            remote_location,
-        } => {
-            let result = crate::util::timeout_stream_setup(
-                chain_group.connect_tcp(remote_location, &resolver),
-            )
+    let prepared =
+        crate::tcp::ingress::PreparedTcp::new(&proxy_selector, remote_location, Vec::new())?;
+    let route =
+        crate::util::timeout_stream_setup(prepared.route(&mut stream, &proxy_selector, &resolver))
             .await?;
+    let routed = crate::util::timeout_stream_setup(route.connect(&resolver)).await?;
+    let mut client_stream: Box<dyn AsyncStream> = match routed.setup {
+        Some(result) => {
+            if let Some(data) = result.early_data {
+                crate::util::timeout_stream_setup(async {
+                    tokio::io::AsyncWriteExt::write_all(&mut stream, &data).await?;
+                    tokio::io::AsyncWriteExt::flush(&mut stream).await
+                })
+                .await?;
+            }
             result.client_stream
         }
-        ConnectDecision::Block => {
+        None => {
             debug!("NaiveProxy: connection blocked by rules");
             return Ok(());
         }
     };
+    if !routed.prefix.is_empty() {
+        crate::util::timeout_stream_setup(async {
+            tokio::io::AsyncWriteExt::write_all(&mut client_stream, &routed.prefix).await?;
+            tokio::io::AsyncWriteExt::flush(&mut client_stream).await
+        })
+        .await?;
+    }
 
+    drop(routed.prefix);
     // Use larger buffers for better throughput (default 8KB is too small)
     const COPY_BUF_SIZE: usize = 32 * 1024;
     let result = copy_bidirectional_with_sizes(

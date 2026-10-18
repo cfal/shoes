@@ -766,44 +766,56 @@ impl AnyTlsSession {
     ) -> io::Result<()> {
         let stream_id = stream.id();
 
-        let action = setup_timeout(
-            self.proxy_provider
-                .judge(destination.clone().into(), &self.resolver),
-        )
-        .await?;
+        let prepared = crate::tcp::ingress::PreparedTcp::new(
+            &self.proxy_provider,
+            destination.clone(),
+            Vec::new(),
+        )?;
+        let optimistic = prepared.needs_sniff_read();
+        if optimistic {
+            self.send_synack(stream_id, None).await?;
+        }
+        let setup = async {
+            let route =
+                setup_timeout(prepared.route(&mut stream, &self.proxy_provider, &self.resolver))
+                    .await?;
+            setup_timeout(route.connect(&self.resolver)).await
+        };
+        let routed = match setup.await {
+            Ok(result) => result,
+            Err(error) => {
+                if !optimistic {
+                    let message = format!("connect failed: {error}");
+                    let _ = self.send_synack(stream_id, Some(&message)).await;
+                }
+                let _ = tokio::time::timeout(CONTROL_FRAME_TIMEOUT, stream.shutdown()).await;
+                return Err(error);
+            }
+        };
 
-        match action {
-            ConnectDecision::Allow {
-                chain_group,
-                remote_location,
-            } => {
-                log::debug!(
-                    "AnyTLS stream {} routing {} through chain",
-                    stream_id,
-                    remote_location
-                );
-
-                // Connect through the proxy chain
-                let client_result =
-                    match setup_timeout(chain_group.connect_tcp(remote_location, &self.resolver))
-                        .await
-                    {
-                        Ok(result) => result,
-                        Err(e) => {
-                            // Send SYNACK with error message (protocol v2)
-                            let error_msg = format!("connect failed: {}", e);
-                            let _ = self.send_synack(stream_id, Some(&error_msg)).await;
-                            return Err(e);
-                        }
-                    };
+        match routed.setup {
+            Some(client_result) => {
                 let mut client_stream = client_result.client_stream;
 
-                // Send successful SYNACK (protocol v2)
-                if let Err(e) = self.send_synack(stream_id, None).await {
-                    log::debug!("Failed to send SYNACK for stream {}: {}", stream_id, e);
-                    // Continue anyway - client may be v1
+                if !optimistic {
+                    self.send_synack(stream_id, None).await?;
+                }
+                if let Some(data) = client_result.early_data {
+                    setup_timeout(async {
+                        stream.write_all(&data).await?;
+                        stream.flush().await
+                    })
+                    .await?;
+                }
+                if !routed.prefix.is_empty() {
+                    setup_timeout(async {
+                        client_stream.write_all(&routed.prefix).await?;
+                        client_stream.flush().await
+                    })
+                    .await?;
                 }
 
+                drop(routed.prefix);
                 log::debug!("AnyTLS stream {} connected to destination", stream_id);
 
                 // Bidirectional copy
@@ -824,10 +836,11 @@ impl AnyTlsSession {
 
                 result
             }
-            ConnectDecision::Block => {
-                // Send SYNACK with error (protocol v2)
-                let error_msg = format!("blocked by rules: {}", destination);
-                let _ = self.send_synack(stream_id, Some(&error_msg)).await;
+            None => {
+                if !optimistic {
+                    let error_msg = format!("blocked by rules: {}", destination);
+                    let _ = self.send_synack(stream_id, Some(&error_msg)).await;
+                }
 
                 log::debug!("AnyTLS stream {} blocked by rules", stream_id);
                 let _ = tokio::time::timeout(CONTROL_FRAME_TIMEOUT, stream.shutdown()).await;
@@ -1026,6 +1039,74 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
     use tokio::time::{Duration, timeout};
+
+    #[tokio::test]
+    async fn sniff_v2_synack_precedes_payload_and_preserves_early_data() {
+        for version in [1, 2] {
+            timeout(Duration::from_secs(5), async {
+                let mut tasks = tokio::task::JoinSet::new();
+                let hello = crate::sniff::tests::hello(&rustls::version::TLS13, true);
+                let (selector, resolver) =
+                    crate::tcp::ingress::tests::socks_target(hello.clone(), &mut tasks).await;
+                let (server, mut peer) = duplex(8192);
+                let session = AnyTlsSession::new_server_with_initial_data(
+                    server,
+                    PaddingFactory::default_factory(),
+                    resolver,
+                    selector,
+                    false,
+                    "test".into(),
+                    None,
+                );
+                session
+                    .received_client_settings
+                    .store(true, Ordering::Relaxed);
+                session.peer_version.store(version, Ordering::Relaxed);
+                let runner = session.clone();
+                let server = tokio::spawn(async move { runner.run().await });
+                peer.write_all(&Frame::control(Command::Syn, 1).encode())
+                    .await
+                    .unwrap();
+                peer.write_all(
+                    &Frame::data(1, Bytes::from_static(&[1, 203, 0, 113, 1, 1, 187])).encode(),
+                )
+                .await
+                .unwrap();
+                if version == 2 {
+                    let mut reply = [0; 7];
+                    peer.read_exact(&mut reply).await.unwrap();
+                    assert_eq!(&reply, &Frame::control(Command::SynAck, 1).encode()[..]);
+                }
+                peer.write_all(&Frame::data(1, Bytes::from(hello)).encode())
+                    .await
+                    .unwrap();
+                peer.write_all(&Frame::control(Command::Fin, 1).encode())
+                    .await
+                    .unwrap();
+                let mut response = Vec::new();
+                loop {
+                    let mut header = [0; 7];
+                    peer.read_exact(&mut header).await.unwrap();
+                    let len = u16::from_be_bytes([header[5], header[6]]) as usize;
+                    let mut data = vec![0; len];
+                    peer.read_exact(&mut data).await.unwrap();
+                    if header[0] == Command::Fin as u8 {
+                        break;
+                    }
+                    assert_eq!(header[0], Command::Psh as u8);
+                    response.extend(data);
+                }
+                assert_eq!(response, b"greetinglater");
+                while let Some(result) = tasks.join_next().await {
+                    result.unwrap();
+                }
+                session.close().await;
+                server.await.unwrap().unwrap();
+            })
+            .await
+            .unwrap();
+        }
+    }
 
     #[tokio::test(start_paused = true)]
     async fn setup_timeout_does_not_limit_established_stream_lifetime() {

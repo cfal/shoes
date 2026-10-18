@@ -10,6 +10,36 @@ struct Peer {
     server: tokio::task::JoinHandle<()>,
 }
 
+#[tokio::test]
+async fn reply_gated_sniff_routes_and_replays_after_early_data() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut tasks = JoinSet::new();
+        let hello = crate::sniff::tests::hello(&rustls::version::TLS13, true);
+        let (selector, resolver) =
+            crate::tcp::ingress::tests::socks_target(hello.clone(), &mut tasks).await;
+        let (client, transport) = tokio::io::duplex(8192);
+        let server = tokio::spawn(serve(Box::new(transport), None, selector, resolver));
+        let mut session = H2ClientSession::new(Box::new(client)).await.unwrap();
+        let (response, mut stream) = session
+            .open(connect(crate::tcp::ingress::tests::TARGET))
+            .await
+            .unwrap();
+        assert_eq!(response.status, StatusCode::OK);
+        stream.write_all(&hello).await.unwrap();
+        stream.shutdown().await.unwrap();
+        let mut reply = Vec::new();
+        stream.read_to_end(&mut reply).await.unwrap();
+        assert_eq!(reply, b"greetinglater");
+        while let Some(result) = tasks.join_next().await {
+            result.unwrap();
+        }
+        server.abort();
+        let _ = server.await;
+    })
+    .await
+    .unwrap();
+}
+
 impl Drop for Peer {
     fn drop(&mut self) {
         self.server.abort();
@@ -726,6 +756,74 @@ async fn reset_and_connection_teardown_cancel_pending_setup() {
             std::time::Duration::from_secs(1),
             resolver.dropped.notified(),
         )
+        .await
+        .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn reset_cancels_both_sniff_probe_and_post_sniff_dial() {
+    for during_dial in [false, true] {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let resolver = Arc::new(PendingResolver {
+                started: Arc::new(tokio::sync::Notify::new()),
+                dropped: Arc::new(tokio::sync::Notify::new()),
+            });
+            let rule = serde_yaml::from_str(
+                "masks: sniff.example\naction: allow\noverride_address: pending.test:443",
+            )
+            .unwrap();
+            let selector = Arc::new(
+                create_tcp_client_proxy_selector(vec![rule], resolver.clone())
+                    .unwrap()
+                    .with_sniff(true),
+            );
+            let (client, transport) = tokio::io::duplex(8192);
+            let (done, finished) = tokio::sync::oneshot::channel();
+            let resolver_clone = resolver.clone();
+            let mut drivers = JoinSet::new();
+            drivers.spawn(async move {
+                let mut connection = h2::server::handshake(transport).await.unwrap();
+                let (request, respond) = connection.accept().await.unwrap().unwrap();
+                let mut tunnels = JoinSet::new();
+                tunnels.spawn(async move {
+                    tunnel(
+                        request,
+                        respond,
+                        NetLocation::from_str(crate::tcp::ingress::tests::TARGET, None).unwrap(),
+                        selector,
+                        resolver_clone,
+                    )
+                    .await
+                    .unwrap();
+                    done.send(()).unwrap();
+                });
+                while connection.accept().await.is_some() {}
+            });
+            let mut session = H2ClientSession::new(Box::new(client)).await.unwrap();
+            let (response, mut stream) = session
+                .open(connect(crate::tcp::ingress::tests::TARGET))
+                .await
+                .unwrap();
+            assert_eq!(response.status, StatusCode::OK);
+            if during_dial {
+                stream
+                    .write_all(&crate::sniff::tests::hello(&rustls::version::TLS13, true))
+                    .await
+                    .unwrap();
+                resolver.started.notified().await;
+            }
+            drop(stream);
+            tokio::time::timeout(Duration::from_millis(100), finished)
+                .await
+                .unwrap()
+                .unwrap();
+            if during_dial {
+                resolver.dropped.notified().await;
+            }
+            assert!(session.is_ready());
+            drivers.shutdown().await;
+        })
         .await
         .unwrap();
     }

@@ -10,7 +10,7 @@ use crate::async_stream::AsyncStream;
 use crate::client_proxy_selector::ClientProxySelector;
 use crate::resolver::Resolver;
 use crate::resources::{self, Budget};
-use crate::tcp::tcp_server::setup_client_tcp_stream;
+use crate::tcp::ingress::PreparedTcp;
 
 use super::stream::H2MultiStream;
 
@@ -166,16 +166,41 @@ async fn tunnel(
     selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
 ) -> io::Result<()> {
+    let prepared = match PreparedTcp::new(&selector, target, Vec::new()) {
+        Ok(prepared) => prepared,
+        Err(_) => return reject(&mut respond, StatusCode::BAD_GATEWAY),
+    };
+    if prepared.needs_sniff_read() {
+        let send = respond
+            .send_response(Response::new(()), false)
+            .map_err(io::Error::other)?;
+        let mut stream = H2MultiStream::new(send, request.into_body());
+        let reset = stream.reset();
+        let routed = tokio::select! {
+            biased;
+            _ = reset => return Ok(()),
+            result = crate::util::timeout_stream_setup(
+                prepared.connect(&mut stream, &selector, &resolver),
+            ) => result?,
+        };
+        let Some(upstream) = routed.setup else {
+            return Ok(());
+        };
+        return relay_with_prefix(stream, upstream, routed.prefix).await;
+    }
+    let mut no_read = tokio::io::empty();
     let result = tokio::select! {
         biased;
         _ = std::future::poll_fn(|cx| respond.poll_reset(cx)) => return Ok(()),
         result = crate::util::timeout_stream_setup(
-            setup_client_tcp_stream(selector, resolver, target),
+            prepared.connect(&mut no_read, &selector, &resolver),
         ) => result,
     };
     let upstream = match result {
-        Ok(Some(upstream)) => upstream,
-        Ok(None) => return reject(&mut respond, StatusCode::FORBIDDEN),
+        Ok(routed) => match routed.setup {
+            Some(upstream) => upstream,
+            None => return reject(&mut respond, StatusCode::FORBIDDEN),
+        },
         Err(error) => {
             let status = if error.kind() == io::ErrorKind::TimedOut {
                 StatusCode::GATEWAY_TIMEOUT
@@ -192,17 +217,34 @@ async fn tunnel(
 }
 
 async fn relay(
+    stream: H2MultiStream,
+    upstream: crate::tcp::tcp_handler::TcpClientSetupResult,
+) -> io::Result<()> {
+    relay_with_prefix(stream, upstream, Vec::new()).await
+}
+
+async fn relay_with_prefix(
     mut stream: H2MultiStream,
     mut upstream: crate::tcp::tcp_handler::TcpClientSetupResult,
+    prefix: Vec<u8>,
 ) -> io::Result<()> {
     let reset = stream.reset();
     tokio::select! {
         biased;
         _ = reset => Ok(()),
         result = async {
-            if let Some(data) = upstream.early_data.take() {
-                stream.write_all(&data).await?;
-            }
+            crate::util::timeout_stream_setup(async {
+                if let Some(data) = upstream.early_data.take() {
+                    stream.write_all(&data).await?;
+                    stream.flush().await?;
+                }
+                if !prefix.is_empty() {
+                    upstream.client_stream.write_all(&prefix).await?;
+                    upstream.client_stream.flush().await?;
+                }
+                Ok(())
+            }).await?;
+            drop(prefix);
             let result = crate::copy_bidirectional::copy_bidirectional(
                 &mut stream,
                 &mut upstream.client_stream,
