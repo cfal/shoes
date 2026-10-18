@@ -666,7 +666,8 @@ impl TcpServerHandler for VmessTcpServerHandler {
                 }
 
                 // Wrap VmessStream with XudpMessageStream for session multiplexing
-                let xudp_stream = XudpMessageStream::new(Box::new(vmess_stream));
+                let xudp_stream = XudpMessageStream::new(Box::new(vmess_stream))
+                    .with_legacy_resolution(!self.proxy_selector.fake_dns_enabled());
 
                 // No unparsed data to feed since VmessStream already consumed it
                 // (XUDP framing starts after VMess header)

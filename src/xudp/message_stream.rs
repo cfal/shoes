@@ -6,6 +6,7 @@ use bytes::{Buf, BufMut, BytesMut};
 use futures::ready;
 use std::collections::{HashMap, VecDeque};
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
@@ -16,6 +17,7 @@ use crate::async_stream::{
 };
 
 use super::frame::{FrameMetadata, FrameOption, SessionStatus, TargetNetwork};
+use crate::resolver::{NativeResolver, ResolverCache};
 
 pub(crate) const MAX_XUDP_ROUTES: usize = 1024;
 
@@ -42,6 +44,7 @@ pub struct XudpMessageStream {
 
     /// Buffered incoming message that did not fit the caller's buffer.
     incoming_message: Option<(Vec<u8>, NetLocation, u16)>,
+    resolver_cache: Option<ResolverCache>,
 
     /// EOF flag
     is_eof: bool,
@@ -68,7 +71,28 @@ impl XudpMessageStream {
             routes: HashMap::new(),
             closed_routes: VecDeque::new(),
             incoming_message: None,
+            resolver_cache: None,
             is_eof: false,
+        }
+    }
+
+    pub(crate) fn with_legacy_resolution(mut self, enabled: bool) -> Self {
+        if enabled {
+            self.resolver_cache = Some(ResolverCache::new(Arc::new(NativeResolver::new())));
+        }
+        self
+    }
+
+    fn poll_routing_destination(
+        &mut self,
+        cx: &mut Context<'_>,
+        destination: &NetLocation,
+    ) -> Poll<std::io::Result<NetLocation>> {
+        if let Some(resolver) = &mut self.resolver_cache {
+            let address = ready!(resolver.poll_resolve_location(cx, destination))?;
+            Poll::Ready(Ok(NetLocation::from_ip_addr(address.ip(), address.port())))
+        } else {
+            Poll::Ready(Ok(destination.clone()))
         }
     }
 
@@ -361,8 +385,15 @@ impl AsyncReadSessionMessage for XudpMessageStream {
             if let Some(session_id) =
                 this.get_or_create_route(wire_session_id, &original_destination)?
             {
+                let target = match this.poll_routing_destination(cx, &original_destination) {
+                    Poll::Ready(target) => target?,
+                    Poll::Pending => {
+                        this.incoming_message = Some((data, original_destination, wire_session_id));
+                        return Poll::Pending;
+                    }
+                };
                 buf.put_slice(&data);
-                return Poll::Ready(Ok((session_id, original_destination)));
+                return Poll::Ready(Ok((session_id, target)));
             }
         }
 
@@ -387,6 +418,14 @@ impl AsyncReadSessionMessage for XudpMessageStream {
                         continue;
                     };
 
+                    let target = match this.poll_routing_destination(cx, &destination) {
+                        Poll::Ready(target) => target?,
+                        Poll::Pending => {
+                            this.incoming_message = Some((data, destination, wire_session_id));
+                            return Poll::Pending;
+                        }
+                    };
+
                     // Successfully decoded a frame
                     if data.len() > buf.remaining() {
                         // Keep the logical destination for the next read
@@ -404,7 +443,7 @@ impl AsyncReadSessionMessage for XudpMessageStream {
                         session_id,
                         destination
                     );
-                    return Poll::Ready(Ok((session_id, destination)));
+                    return Poll::Ready(Ok((session_id, target)));
                 }
                 None => {
                     // Buffer doesn't have a complete frame, need to read more data
@@ -587,6 +626,39 @@ mod tests {
     }
 
     impl AsyncStream for PendingOnceWriter {}
+
+    #[test]
+    fn disabled_fake_dns_keeps_ip_routing_and_logical_reply_identity() {
+        #[derive(Debug)]
+        struct FixedResolver;
+        impl crate::resolver::Resolver for FixedResolver {
+            fn resolve_location(&self, _: &NetLocation) -> crate::resolver::ResolveFuture {
+                Box::pin(async { Ok(vec!["203.0.113.9:443".parse().unwrap()]) })
+            }
+        }
+        let original = NetLocation::from_str("original.example:443", None).unwrap();
+        let inner = PendingOnceWriter {
+            output: Arc::new(Mutex::new(Vec::new())),
+            pending: false,
+        };
+        let mut stream = XudpMessageStream::new(Box::new(inner)).with_legacy_resolution(true);
+        stream.resolver_cache = Some(ResolverCache::new(Arc::new(FixedResolver)));
+        stream.start_wire_session(3, original.clone());
+        stream.incoming_message = Some((vec![1], original.clone(), 3));
+        let mut data = [0; 8];
+        let mut buf = ReadBuf::new(&mut data);
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let Poll::Ready(Ok((id, target))) =
+            Pin::new(&mut stream).poll_read_session_message(&mut cx, &mut buf)
+        else {
+            panic!()
+        };
+        assert_eq!(
+            target,
+            NetLocation::from_str("203.0.113.9:443", None).unwrap()
+        );
+        assert_eq!(stream.routes[&id].original_destination, original);
+    }
 
     #[test]
     fn hostname_destination_reaches_router_without_native_resolution() {
