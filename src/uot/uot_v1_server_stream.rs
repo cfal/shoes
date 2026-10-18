@@ -27,7 +27,7 @@ use crate::slide_buffer::SlideBuffer;
 use crate::util::allocate_vec;
 
 /// Buffer size for reading and writing packet-address frames.
-const BUFFER_SIZE: usize = 65535;
+const BUFFER_SIZE: usize = u16::MAX as usize + 1 + 1 + u8::MAX as usize + 2 + 2;
 
 type ParseFn = fn(&[u8]) -> std::io::Result<Option<(NetLocation, usize)>>;
 
@@ -363,6 +363,39 @@ mod tests {
         frame[addr_len + 2..addr_len + 2 + payload.len()].copy_from_slice(payload);
         frame.truncate(addr_len + 2 + payload.len());
         frame
+    }
+
+    #[tokio::test]
+    async fn maximum_payload_with_hostname_overhead_roundtrips() {
+        for socks in [false, true] {
+            let source = NetLocation::new(crate::address::Address::Hostname("h".repeat(255)), 9001);
+            let payload = vec![7; u16::MAX as usize];
+            let (left, right) = tcp_pair().await.unwrap();
+            let mut writer = if socks {
+                PacketAddrStream::new_socks(left)
+            } else {
+                PacketAddrStream::new_uot(left)
+            };
+            let mut reader = if socks {
+                PacketAddrStream::new_socks(right)
+            } else {
+                PacketAddrStream::new_uot(right)
+            };
+            let mut bytes = vec![0; payload.len()];
+            let mut read_buf = ReadBuf::new(&mut bytes);
+            let (write, read) = tokio::join!(
+                write_packet(&mut writer, &payload, &source),
+                poll_fn(|cx| Pin::new(&mut reader).poll_read_targeted_message(cx, &mut read_buf))
+            );
+            write.unwrap();
+            assert_eq!(read.unwrap(), source);
+            assert_eq!(read_buf.filled(), payload);
+            let error = poll_fn(|cx| {
+                Pin::new(&mut writer).poll_write_sourced_message(cx, &vec![0; 65536], &source)
+            })
+            .await;
+            assert!(error.is_err());
+        }
     }
 
     #[tokio::test]
