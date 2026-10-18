@@ -2,13 +2,14 @@ use log::{debug, error};
 use lru::LruCache;
 use parking_lot::RwLock;
 use std::hash::Hash;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use crate::address::{Address, NetLocation, ResolvedLocation};
 use crate::address::{AddressMask, NetLocationMask};
 use crate::client_proxy_chain::ClientChainGroup;
+use crate::dns::fake_ip::FakeDnsContext;
 use crate::resolver::{Resolver, resolve_location};
 
 /// Cache key for routing decisions.
@@ -203,6 +204,57 @@ pub struct ClientProxySelector {
     cache: Option<RoutingCache>,
     has_ip_rules: bool,
     has_hostname_rules: bool,
+    sniff_enabled: bool,
+    fake_dns: Option<Arc<FakeDnsContext>>,
+}
+
+#[derive(Debug)]
+pub(crate) enum IngressTarget {
+    LocalDns {
+        wire_destination: NetLocation,
+        context: Arc<FakeDnsContext>,
+    },
+    Forward(PreparedDestination),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum DestinationSource {
+    SuppliedHostname,
+    LiteralIp,
+    FakeDns,
+}
+
+#[derive(Debug)]
+pub(crate) struct PreparedDestination {
+    wire_destination: NetLocation,
+    connection_target: ResolvedLocation,
+    source: DestinationSource,
+}
+
+impl PreparedDestination {
+    pub(crate) fn wire_destination(&self) -> &NetLocation {
+        &self.wire_destination
+    }
+
+    pub(crate) fn is_fake_dns(&self) -> bool {
+        self.source == DestinationSource::FakeDns
+    }
+
+    pub(crate) fn sniffable_real_ip(&self) -> Option<SocketAddr> {
+        (self.source == DestinationSource::LiteralIp)
+            .then(|| {
+                self.connection_target
+                    .location()
+                    .to_socket_addr_nonblocking()
+            })
+            .flatten()
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct RoutedDestination<'a> {
+    pub wire_destination: NetLocation,
+    pub decision: ConnectDecision<'a>,
 }
 
 #[derive(Debug)]
@@ -278,7 +330,141 @@ impl ClientProxySelector {
             cache,
             has_ip_rules,
             has_hostname_rules,
+            sniff_enabled: false,
+            fake_dns: None,
         }
+    }
+
+    pub(crate) fn with_sniff(mut self, enabled: bool) -> Self {
+        self.sniff_enabled = enabled;
+        self
+    }
+
+    pub(crate) fn inherit_inbound_policy(mut self, parent: &Self) -> std::io::Result<Self> {
+        self.sniff_enabled = parent.sniff_enabled;
+        self.with_fake_dns_context(parent.fake_dns.clone())
+    }
+
+    pub(crate) fn with_fake_dns_context(
+        mut self,
+        context: Option<Arc<FakeDnsContext>>,
+    ) -> std::io::Result<Self> {
+        self.fake_dns = context;
+        for rule in &self.rules {
+            if let ConnectAction::Allow {
+                override_address: Some(target),
+                ..
+            } = &rule.action
+            {
+                self.validate_real_target(&target.clone().into())?;
+            }
+        }
+        Ok(self)
+    }
+
+    fn validate_real_target(&self, target: &ResolvedLocation) -> std::io::Result<()> {
+        if let Some(context) = &self.fake_dns {
+            for addr in [
+                target.location().to_socket_addr_nonblocking(),
+                target.resolved_addr(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if context.contains(addr.ip()) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "synthetic address cannot be an outbound target",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn prepare(&self, location: ResolvedLocation) -> std::io::Result<IngressTarget> {
+        let wire_destination = location.location().clone();
+        if let Some(context) = &self.fake_dns {
+            if wire_destination.port() == 53 {
+                return Ok(IngressTarget::LocalDns {
+                    wire_destination,
+                    context: context.clone(),
+                });
+            }
+            if let Some(addr) = wire_destination.to_socket_addr_nonblocking()
+                && let Some(name) = context.restore(addr.ip())?
+            {
+                return Ok(IngressTarget::Forward(PreparedDestination {
+                    wire_destination,
+                    connection_target: NetLocation::new(Address::Hostname(name), addr.port())
+                        .into(),
+                    source: DestinationSource::FakeDns,
+                }));
+            }
+            self.validate_real_target(&location)?;
+        }
+        let source = if wire_destination.address().hostname().is_some() {
+            DestinationSource::SuppliedHostname
+        } else {
+            DestinationSource::LiteralIp
+        };
+        Ok(IngressTarget::Forward(PreparedDestination {
+            wire_destination,
+            connection_target: location,
+            source,
+        }))
+    }
+
+    pub(crate) fn should_sniff(&self, target: &PreparedDestination) -> bool {
+        self.sniff_enabled && self.has_hostname_rules && target.sniffable_real_ip().is_some()
+    }
+
+    pub(crate) async fn judge_prepared<'a>(
+        &'a self,
+        target: PreparedDestination,
+        server_name: Option<&str>,
+        resolver: &Arc<dyn Resolver>,
+    ) -> std::io::Result<RoutedDestination<'a>> {
+        let real_ip = target.sniffable_real_ip();
+        let decision = if let Some(name) = server_name {
+            let addr = real_ip.ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "SNI requires a prepared literal-IP destination",
+                )
+            })?;
+            let mut matching = ResolvedLocation::with_resolved(
+                NetLocation::new(Address::Hostname(name.to_owned()), addr.port()),
+                addr,
+            );
+            match match_rule(
+                &self.rules,
+                &mut matching,
+                Some(ip_to_u128(addr.ip())),
+                resolver,
+                false,
+            )
+            .await?
+            {
+                Some(index) => self.rules[index]
+                    .action
+                    .to_decision(target.connection_target),
+                None => ConnectDecision::Block,
+            }
+        } else {
+            self.judge_ordinary(target.connection_target, resolver)
+                .await?
+        };
+        if let ConnectDecision::Allow {
+            remote_location, ..
+        } = &decision
+        {
+            self.validate_real_target(remote_location)?;
+        }
+        Ok(RoutedDestination {
+            wire_destination: target.wire_destination,
+            decision,
+        })
     }
 
     /// Judge a connection request, using the cache for faster repeated lookups.
@@ -293,6 +479,22 @@ impl ClientProxySelector {
     /// more than 16 rules. For simple configurations, direct rule matching is faster.
     #[inline]
     pub async fn judge<'a>(
+        &'a self,
+        location: ResolvedLocation,
+        resolver: &Arc<dyn Resolver>,
+    ) -> std::io::Result<ConnectDecision<'a>> {
+        match self.prepare(location)? {
+            IngressTarget::Forward(target) => {
+                Ok(self.judge_prepared(target, None, resolver).await?.decision)
+            }
+            IngressTarget::LocalDns { .. } => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "local DNS request bypassed ingress dispatch",
+            )),
+        }
+    }
+
+    async fn judge_ordinary<'a>(
         &'a self,
         location: ResolvedLocation,
         resolver: &Arc<dyn Resolver>,
@@ -350,7 +552,7 @@ impl ClientProxySelector {
 
     /// Judge without using the cache. Useful for testing or when cache bypass is needed.
     #[inline]
-    pub async fn judge_uncached<'a>(
+    async fn judge_uncached<'a>(
         &'a self,
         location: ResolvedLocation,
         resolved_ip: Option<u128>,
@@ -595,6 +797,253 @@ mod tests {
     use std::future::Future;
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
     use std::pin::Pin;
+
+    #[derive(Debug)]
+    struct NoDns;
+
+    impl Resolver for NoDns {
+        fn resolve_location(&self, _: &NetLocation) -> crate::resolver::ResolveFuture {
+            panic!("unexpected DNS lookup");
+        }
+    }
+
+    fn prepared(selector: &ClientProxySelector, location: &str) -> PreparedDestination {
+        match selector
+            .prepare(NetLocation::from_str(location, None).unwrap().into())
+            .unwrap()
+        {
+            IngressTarget::Forward(target) => target,
+            _ => panic!("expected forwarding target"),
+        }
+    }
+
+    #[tokio::test]
+    async fn sniff_preserves_real_ip_and_order_without_dns() {
+        let resolver: Arc<dyn Resolver> = Arc::new(NoDns);
+        for ip_first in [true, false] {
+            let mut rules = vec![
+                block_rule(vec!["127.0.0.0/8"]),
+                allow_rule(vec!["allowed.example"], "direct"),
+            ];
+            if !ip_first {
+                rules.swap(0, 1);
+            }
+            let selector = ClientProxySelector::new(rules).with_sniff(true);
+            for destination in ["127.0.0.1:443", "203.0.113.7:443", "[2001:db8::7]:443"] {
+                let target = prepared(&selector, destination);
+                assert!(selector.should_sniff(&target));
+                let routed = selector
+                    .judge_prepared(target, Some("allowed.example"), &resolver)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    routed.wire_destination,
+                    NetLocation::from_str(destination, None).unwrap()
+                );
+                if ip_first && destination.starts_with("127.") {
+                    assert!(matches!(routed.decision, ConnectDecision::Block));
+                } else {
+                    let ConnectDecision::Allow {
+                        remote_location, ..
+                    } = routed.decision
+                    else {
+                        panic!()
+                    };
+                    assert_eq!(
+                        remote_location.location(),
+                        &NetLocation::from_str(destination, None).unwrap()
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn sniff_bypasses_warmed_allow_and_block_caches() {
+        let resolver: Arc<dyn Resolver> = Arc::new(NoDns);
+        let mut rules = vec![
+            block_rule(vec!["blocked.example"]),
+            allow_rule(vec!["allowed.example"], "direct"),
+            block_rule(vec!["203.0.113.8"]),
+        ];
+        rules.extend((0..17).map(|_| block_rule(vec!["irrelevant.example"])));
+        rules.push(allow_rule(vec!["0.0.0.0/0"], "direct"));
+        let selector = ClientProxySelector::new(rules).with_sniff(true);
+        for (destination, ordinary_allowed, name) in [
+            ("203.0.113.7:443", true, "blocked.example"),
+            ("203.0.113.8:443", false, "allowed.example"),
+        ] {
+            let location = NetLocation::from_str(destination, None).unwrap();
+            assert_eq!(
+                matches!(
+                    selector
+                        .judge(location.clone().into(), &resolver)
+                        .await
+                        .unwrap(),
+                    ConnectDecision::Allow { .. }
+                ),
+                ordinary_allowed
+            );
+            let cache_len = selector.cache.as_ref().unwrap().inner.read().len();
+            let decision = selector
+                .judge_prepared(prepared(&selector, destination), Some(name), &resolver)
+                .await
+                .unwrap()
+                .decision;
+            assert_eq!(
+                matches!(decision, ConnectDecision::Allow { .. }),
+                !ordinary_allowed
+            );
+            assert_eq!(
+                selector.cache.as_ref().unwrap().inner.read().len(),
+                cache_len
+            );
+            assert_eq!(
+                matches!(
+                    selector.judge(location.into(), &resolver).await.unwrap(),
+                    ConnectDecision::Allow { .. }
+                ),
+                ordinary_allowed
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn sniff_override_preserves_wire_identity_and_inherits_port() {
+        let selector = ClientProxySelector::new(vec![allow_rule_with_override(
+            vec!["allowed.example"],
+            "direct",
+            "192.0.2.9",
+        )]);
+        let resolver: Arc<dyn Resolver> = Arc::new(NoDns);
+        let routed = selector
+            .judge_prepared(
+                prepared(&selector, "203.0.113.7:8443"),
+                Some("allowed.example"),
+                &resolver,
+            )
+            .await
+            .unwrap();
+        assert_eq!(routed.wire_destination.to_string(), "203.0.113.7:8443");
+        let ConnectDecision::Allow {
+            remote_location, ..
+        } = routed.decision
+        else {
+            panic!()
+        };
+        assert_eq!(remote_location.location().to_string(), "192.0.2.9:8443");
+    }
+
+    #[tokio::test]
+    async fn prepared_fake_names_survive_recycling_and_reject_sni() {
+        use crate::dns::fake_ip::FakeIpOptions;
+        let resolver: Arc<dyn Resolver> = Arc::new(NoDns);
+        let context = Arc::new(
+            FakeDnsContext::new(
+                FakeIpOptions {
+                    ipv4_range: Some("198.18.0.0/29".into()),
+                    max_entries: 1,
+                    ..Default::default()
+                },
+                resolver.clone(),
+            )
+            .unwrap(),
+        );
+        let selector = ClientProxySelector::new(vec![
+            allow_rule(vec!["first.example"], "direct"),
+            allow_rule(vec!["third.example"], "direct"),
+        ])
+        .with_sniff(true)
+        .with_fake_dns_context(Some(context.clone()))
+        .unwrap();
+        let first = context.allocate("first.example", false).unwrap();
+        let wire = format!("{first}:443");
+        let frozen = prepared(&selector, &wire);
+        assert!(frozen.is_fake_dns());
+        assert!(!selector.should_sniff(&frozen));
+        let error = selector
+            .judge_prepared(
+                prepared(&selector, &wire),
+                Some("allowed.example"),
+                &resolver,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        context.allocate("second.example", false).unwrap();
+        let error = selector
+            .prepare(NetLocation::from_str(&wire, None).unwrap().into())
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        let routed = selector
+            .judge_prepared(frozen, None, &resolver)
+            .await
+            .unwrap();
+        assert_eq!(routed.wire_destination.to_string(), wire);
+        let ConnectDecision::Allow {
+            remote_location, ..
+        } = routed.decision
+        else {
+            panic!()
+        };
+        assert_eq!(remote_location.location().to_string(), "first.example:443");
+        for index in 0..3 {
+            context
+                .allocate(&format!("unused{index}.example"), false)
+                .unwrap();
+        }
+        assert_eq!(context.allocate("third.example", false).unwrap(), first);
+        assert!(matches!(
+            selector
+                .judge_prepared(prepared(&selector, &wire), None, &resolver)
+                .await
+                .unwrap()
+                .decision,
+            ConnectDecision::Allow { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn preparation_precedes_dns_dispatch_and_nested_rule_gates() {
+        let resolver: Arc<dyn Resolver> = Arc::new(NoDns);
+        let context = Arc::new(FakeDnsContext::new(Default::default(), resolver.clone()).unwrap());
+        let parent = ClientProxySelector::new(vec![allow_rule(vec!["parent.example"], "direct")])
+            .with_sniff(true)
+            .with_fake_dns_context(Some(context.clone()))
+            .unwrap();
+        let child = ClientProxySelector::new(vec![allow_rule(vec!["0.0.0.0/0"], "direct")])
+            .inherit_inbound_policy(&parent)
+            .unwrap();
+        assert!(Arc::ptr_eq(child.fake_dns.as_ref().unwrap(), &context));
+        assert!(parent.should_sniff(&prepared(&parent, "203.0.113.7:443")));
+        assert!(!child.should_sniff(&prepared(&child, "203.0.113.7:443")));
+        assert!(!parent.should_sniff(&prepared(&parent, "supplied.example:443")));
+        for target in ["198.18.0.9:53", "resolver.invalid:53"] {
+            let location = NetLocation::from_str(target, None).unwrap();
+            assert!(matches!(
+                child.prepare(location.clone().into()).unwrap(),
+                IngressTarget::LocalDns { .. }
+            ));
+            assert_eq!(
+                child
+                    .judge(location.into(), &resolver)
+                    .await
+                    .unwrap_err()
+                    .kind(),
+                std::io::ErrorKind::InvalidInput
+            );
+        }
+        let override_selector = ClientProxySelector::new(vec![allow_rule_with_override(
+            vec!["0.0.0.0/0"],
+            "direct",
+            "198.18.0.9:53",
+        )]);
+        assert!(
+            override_selector
+                .with_fake_dns_context(Some(context))
+                .is_err()
+        );
+    }
 
     #[tokio::test]
     async fn cached_route_rechecks_changed_ip() {

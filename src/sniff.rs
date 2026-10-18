@@ -107,14 +107,14 @@ impl TlsProbe {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::pin::Pin;
     use std::sync::Arc;
     use std::task::{Context, Poll};
     use tokio::io::{AsyncWriteExt, ReadBuf};
 
-    fn hello(version: &'static rustls::SupportedProtocolVersion, sni: bool) -> Vec<u8> {
+    pub(crate) fn hello(version: &'static rustls::SupportedProtocolVersion, sni: bool) -> Vec<u8> {
         let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(
             rustls::crypto::aws_lc_rs::default_provider(),
         ))
