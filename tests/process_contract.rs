@@ -211,6 +211,32 @@ async fn wireguard_reload(detour: bool) {
         timeout(Duration::from_secs(2), old_flow).await,
         Ok(Ok(_))
     ));
+    // A fresh old-key device distinguishes revocation from a stale handshake after reload.
+    client.signal(libc::SIGHUP);
+    client.wait_for("Servers ready").await;
+    let revoked = shoes_test_support::socks5::Socks5UdpAssociation::connect("127.0.0.1", entry)
+        .await
+        .unwrap();
+    assert_eq!(
+        revoked
+            .send_to_with_timeout(
+                shoes_test_support::socks5::SocksDestination::Ip(echo.udp()),
+                b"fresh revoked key",
+                Duration::from_secs(3),
+            )
+            .await
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::TimedOut
+    );
+    assert!(!matches!(
+        timeout(
+            Duration::from_secs(3),
+            shoes_test_support::wireguard::connect(entry, echo.tcp())
+        )
+        .await,
+        Ok(Ok(_))
+    ));
     let mut rotated: serde_json::Value = serde_yaml::from_str(&client_config).unwrap();
     rotated[0]["private_key"] = json!(wireguard_support::key(44));
     std::fs::write(&client_path, serde_yaml::to_string(&rotated).unwrap()).unwrap();
