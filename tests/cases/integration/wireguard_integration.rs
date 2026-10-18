@@ -28,7 +28,7 @@ async fn wireguard_server_client_tcp_udp_and_stream_chain() -> std::io::Result<(
         let server = json!([
             config::server(port),
             {"address": format!("0.0.0.0:{proxy}"), "protocol": protocol,
-             "rules": config::server(port)["inbound"]["rules"]}
+             "rules": config::server(port)["rules"]}
         ]);
         drop(reservation);
         let _server = start_shoes_server(&serde_yaml::to_string(&server).unwrap())?;

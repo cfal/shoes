@@ -139,7 +139,8 @@ async fn udp_connection_burst_and_quota_release_preserve_service() -> io::Result
         }
         drop(pair);
         let pair = Pair::start(false, |_, client| {
-            client["resource_limits"] = json!({"max_tcp_connections": 1, "max_udp_sessions": 1});
+            client["client_proxies"][0]["protocol"]["resource_limits"] =
+                json!({"max_tcp_connections": 1, "max_udp_sessions": 1});
         })
         .await?;
         let mut first = connect(pair.entry, target(false, echo.tcp().port())).await?;

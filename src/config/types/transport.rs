@@ -15,6 +15,8 @@ pub enum BindLocation {
     #[serde(alias = "addresses")]
     Address(OneOrSome<NetLocationPortRange>),
     Path(PathBuf),
+    #[serde(untagged)]
+    Unspecified {},
 }
 
 impl std::fmt::Display for BindLocation {
@@ -30,6 +32,7 @@ impl std::fmt::Display for BindLocation {
                 Ok(())
             }
             BindLocation::Path(p) => write!(f, "{}", p.display()),
+            BindLocation::Unspecified {} => f.write_str("no listener"),
         }
     }
 }

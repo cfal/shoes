@@ -141,6 +141,9 @@ pub async fn start_quic_servers(
     assert!(!rules.is_empty());
 
     let bind_addresses = match bind_location {
+        BindLocation::Unspecified {} => {
+            return Err(std::io::Error::other("QUIC listener requires an address"));
+        }
         // TODO: switch to non-blocking resolve?
         BindLocation::Address(addresses) => {
             let mut bind_addresses = Vec::new();

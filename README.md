@@ -31,7 +31,7 @@ All server protocols plus:
 - **XTLS Vision** (for VLESS)
 
 ### TUN/VPN Mode
-- **WireGuard endpoints** - Userspace TCP/UDP server and client using GotaTun, without root, an OS TUN, or host route changes (Unix only). See [WireGuard configuration](CONFIG.md#wireguard-endpoints).
+- **WireGuard** - Userspace TCP/UDP server and client protocols using GotaTun, without root, an OS TUN, or host route changes (Unix only). See [WireGuard configuration](CONFIG.md#wireguard).
 - **TUN device support** - Layer 3 VPN for transparent proxying
 - Supported platforms: Linux, Android, iOS
 

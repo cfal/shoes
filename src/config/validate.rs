@@ -28,7 +28,7 @@ pub struct ValidatedConfigs {
     pub configs: Vec<Config>,
     /// Expanded DNS groups in topological order (bootstrap deps first).
     pub dns_groups: Vec<ExpandedDnsGroup>,
-    pub wireguard_endpoints: Vec<super::types::wireguard::WireguardConfig>,
+    pub wireguard_endpoints: Vec<super::types::wireguard::WireguardDeviceConfig>,
 }
 
 /// Validates configs and returns startable server configs with expanded DNS groups.
@@ -71,8 +71,6 @@ pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Valida
 
     let mut server_configs: Vec<ServerConfig> = vec![];
     let mut tun_configs: Vec<TunConfig> = vec![];
-    let mut wireguard_endpoints = Vec::new();
-    let mut endpoint_names = HashSet::new();
     let mut named_pems: HashMap<String, String> = HashMap::new();
     let mut dns_groups: HashMap<String, DnsConfigGroup> = HashMap::new();
 
@@ -114,15 +112,6 @@ pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Valida
             }
             Config::TunServer(tun_config) => {
                 tun_configs.push(tun_config);
-            }
-            Config::Wireguard(endpoint) => {
-                endpoint.validate()?;
-                if !endpoint_names.insert(endpoint.wireguard.clone()) {
-                    return Err(super::types::wireguard::invalid(
-                        "duplicate WireGuard endpoint name",
-                    ));
-                }
-                wireguard_endpoints.push(endpoint);
             }
             Config::NamedPem(pem) => {
                 let pem_data = match pem.source {
@@ -172,11 +161,6 @@ pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Valida
     for config in tun_configs.iter_mut() {
         extract_inline_dns(&mut config.dns, &mut dns_groups, &mut inline_dns_counter)?;
     }
-    for endpoint in &mut wireguard_endpoints {
-        if let Some(inbound) = &mut endpoint.inbound {
-            extract_inline_dns(&mut inbound.dns, &mut dns_groups, &mut inline_dns_counter)?;
-        }
-    }
 
     // Expand DNS group composition references for ALL groups (named + inline).
     let expanded_dns_groups = expand_dns_groups_composition(dns_groups)?;
@@ -219,65 +203,35 @@ pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Valida
 
     // Validate TUN configs.
     for config in tun_configs.iter_mut() {
-        validate_tun_config(config, &client_groups, &rule_groups, global_limits)?;
+        validate_tun_config(
+            config,
+            &client_groups,
+            &rule_groups,
+            &named_pems,
+            global_limits,
+        )?;
         validate_dns_group_ref(&config.dns, &group_names)?;
-    }
-
-    for endpoint in &mut wireguard_endpoints {
-        if let Some(chain) = &mut endpoint.outer_client_chain {
-            validate_client_chain(
-                &mut chain.hops,
-                0,
-                &client_groups,
-                &named_pems,
-                global_limits,
-            )?;
-            if !crate::tcp::chain_builder::supports_udp_offline(chain)? {
-                return Err(super::types::wireguard::invalid(format!(
-                    "WireGuard endpoint {} outer_client_chain does not support UDP",
-                    endpoint.wireguard,
-                )));
-            }
-        }
-        if let Some(inbound) = &mut endpoint.inbound {
-            ConfigSelection::replace_none_or_some_groups(&mut inbound.rules, &rule_groups)?;
-            if inbound.rules.is_empty() {
-                return Err(super::types::wireguard::invalid(
-                    "WireGuard inbound requires nonempty rules",
-                ));
-            }
-            for rule in inbound.rules.iter_mut() {
-                validate_rule_config(
-                    rule.unwrap_config_mut(),
-                    &client_groups,
-                    &named_pems,
-                    global_limits,
-                )?;
-            }
-            validate_dns_group_ref(&inbound.dns, &group_names)?;
-        }
     }
 
     // Combine into Config list (only Server and TunServer variants)
     let mut result: Vec<Config> = server_configs.into_iter().map(Config::Server).collect();
     result.extend(tun_configs.into_iter().map(Config::TunServer));
 
-    let mut validated = ValidatedConfigs {
+    let validated = ValidatedConfigs {
         global_limits,
         configs: result,
         dns_groups: final_dns_groups,
-        wireguard_endpoints,
+        wireguard_endpoints: Vec::new(),
     };
-    validate_wireguard_references(&mut validated, &mut client_groups, &endpoint_names)?;
-    order_wireguard_endpoints(&mut validated.wireguard_endpoints)?;
+    validate_wireguard_dns(&validated)?;
+    #[cfg(unix)]
+    let mut validated = validated;
+    #[cfg(unix)]
+    super::wireguard_devices::collect_devices(&mut validated, &mut client_groups)?;
     Ok(validated)
 }
 
-fn validate_wireguard_references(
-    validated: &mut ValidatedConfigs,
-    client_groups: &mut HashMap<String, Vec<ClientConfig>>,
-    endpoint_names: &HashSet<String>,
-) -> std::io::Result<()> {
+fn validate_wireguard_dns(validated: &ValidatedConfigs) -> std::io::Result<()> {
     let tunnel_dns: HashSet<_> = validated
         .dns_groups
         .iter()
@@ -302,76 +256,6 @@ fn validate_wireguard_references(
             }
         }
     }
-    let mut check_reference = |client: &mut ClientConfig| {
-        if let ClientProxyConfig::Wireguard(reference) = &client.protocol
-            && !endpoint_names.contains(&reference.endpoint)
-        {
-            return Err(super::types::wireguard::invalid(format!(
-                "unknown WireGuard endpoint: {}",
-                reference.endpoint
-            )));
-        }
-        Ok(())
-    };
-    for group in client_groups.values_mut() {
-        for client in group {
-            check_reference(client)?;
-        }
-    }
-    validated.visit_clients(&mut check_reference)
-}
-
-fn order_wireguard_endpoints(
-    endpoints: &mut Vec<super::types::wireguard::WireguardConfig>,
-) -> std::io::Result<()> {
-    use super::types::wireguard::invalid;
-    let mtus: HashMap<_, _> = endpoints
-        .iter()
-        .map(|endpoint| (endpoint.wireguard.clone(), endpoint.mtu))
-        .collect();
-    let mut dependencies = HashMap::new();
-    for endpoint in endpoints.iter_mut() {
-        let mut names = HashSet::new();
-        if let Some(chain) = &mut endpoint.outer_client_chain {
-            let datagram_carrier = chain.hops.iter().count() == 1;
-            for hop in chain.hops.iter_mut() {
-                super::client_visit::visit_hop(hop, &mut |client| {
-                    if let ClientProxyConfig::Wireguard(reference) = &client.protocol {
-                        let carrier_mtu = mtus.get(&reference.endpoint).ok_or_else(|| {
-                            invalid(format!(
-                                "unknown WireGuard endpoint: {}",
-                                reference.endpoint
-                            ))
-                        })?;
-                        // IPv6 UDP plus WireGuard header, tag and worst-case padding.
-                        let required_mtu = endpoint.mtu.next_multiple_of(16) + 80;
-                        if datagram_carrier && required_mtu > *carrier_mtu {
-                            return Err(invalid(format!(
-                                "WireGuard endpoint {} requires carrier {} MTU >= {required_mtu}",
-                                endpoint.wireguard, reference.endpoint,
-                            )));
-                        }
-                        names.insert(reference.endpoint.clone());
-                    }
-                    Ok(())
-                })?;
-            }
-        }
-        dependencies.insert(endpoint.wireguard.clone(), names);
-    }
-    let mut pending = std::mem::take(endpoints);
-    let mut ready = HashSet::new();
-    while !pending.is_empty() {
-        let Some(index) = pending
-            .iter()
-            .position(|endpoint| dependencies[&endpoint.wireguard].is_subset(&ready))
-        else {
-            return Err(invalid("WireGuard outer_client_chain dependency cycle"));
-        };
-        let endpoint = pending.remove(index);
-        ready.insert(endpoint.wireguard.clone());
-        endpoints.push(endpoint);
-    }
     Ok(())
 }
 
@@ -390,9 +274,7 @@ fn resolve_client_groups_topologically(
     for (group_name, selections) in &raw_groups {
         let mut deps = vec![];
         for selection in selections.iter() {
-            if let ConfigSelection::GroupName(ref_name) = selection {
-                deps.push(ref_name.clone());
-            }
+            collect_client_dependencies(selection, &mut deps);
         }
         dependencies.insert(group_name.clone(), deps);
     }
@@ -424,7 +306,9 @@ fn resolve_client_groups_topologically(
         for selection in selections.iter() {
             match selection {
                 ConfigSelection::Config(config) => {
-                    expanded_configs.push(config.clone());
+                    let mut config = config.clone();
+                    expand_peer_chains(&mut config, &resolved)?;
+                    expanded_configs.push(config);
                 }
                 ConfigSelection::GroupName(ref_name) => {
                     // This group should already be resolved (due to topological order)
@@ -446,6 +330,57 @@ fn resolve_client_groups_topologically(
     }
 
     Ok(resolved)
+}
+
+fn collect_client_dependencies(
+    selection: &ConfigSelection<ClientConfig>,
+    dependencies: &mut Vec<String>,
+) {
+    match selection {
+        ConfigSelection::GroupName(name) => dependencies.push(name.clone()),
+        ConfigSelection::Config(client) => {
+            if let ClientProxyConfig::Wireguard(config) = &client.protocol
+                && let Some(chain) = &config.peer_client_chain
+            {
+                for hop in chain.hops.iter() {
+                    match hop {
+                        ClientChainHop::Single(selection) => {
+                            collect_client_dependencies(selection, dependencies)
+                        }
+                        ClientChainHop::Pool(selections) => {
+                            for selection in selections.iter() {
+                                collect_client_dependencies(selection, dependencies);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn expand_peer_chains(
+    client: &mut ClientConfig,
+    groups: &HashMap<String, Vec<ClientConfig>>,
+) -> std::io::Result<()> {
+    if let ClientProxyConfig::Wireguard(config) = &mut client.protocol
+        && let Some(chain) = &mut config.peer_client_chain
+    {
+        expand_client_chain(&mut chain.hops, groups)?;
+        for hop in chain.hops.iter_mut() {
+            match hop {
+                ClientChainHop::Single(selection) => {
+                    expand_peer_chains(selection.unwrap_config_mut(), groups)?
+                }
+                ClientChainHop::Pool(selections) => {
+                    for selection in selections.iter_mut() {
+                        expand_peer_chains(selection.unwrap_config_mut(), groups)?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Performs topological sort on a dependency graph using Kahn's algorithm.
@@ -608,7 +543,7 @@ fn topological_sort_dns_groups_by_bootstrap(
 
 /// Extracts inline DNS specs from a config into dns_groups with a generated name.
 /// Replaces config.dns.servers with a single group name reference.
-/// If servers is already a single group reference or empty, does nothing.
+/// Normalizes empty selections to None so they use the default resolver.
 fn extract_inline_dns(
     dns: &mut Option<DnsConfig>,
     dns_groups: &mut HashMap<String, DnsConfigGroup>,
@@ -620,6 +555,7 @@ fn extract_inline_dns(
 
     // Empty means use default resolver - nothing to extract
     if config.servers.is_empty() {
+        config.servers = NoneOrSome::None;
         return Ok(());
     }
 
@@ -801,7 +737,7 @@ fn hop_uses_wireguard(hop: &ClientChainHop) -> bool {
     }
 }
 
-fn chain_uses_wireguard(chain: &ClientChain) -> bool {
+pub(super) fn chain_uses_wireguard(chain: &ClientChain) -> bool {
     chain.hops.iter().any(hop_uses_wireguard)
 }
 
@@ -834,6 +770,50 @@ fn validate_server_config(
     named_pems: &HashMap<String, String>,
     global_limits: GlobalLimits,
 ) -> std::io::Result<()> {
+    if let ServerProxyConfig::Wireguard(config) = &server_config.protocol {
+        if server_config.transport != Transport::Udp
+            || server_config.tcp_settings.is_some()
+            || server_config.quic_settings.is_some()
+        {
+            return Err(super::types::wireguard::invalid(
+                "WireGuard requires UDP transport without TCP/QUIC socket settings",
+            ));
+        }
+        config.device(server_config)?.validate()?;
+        if let ServerProxyConfig::Wireguard(config) = &mut server_config.protocol
+            && let Some(chain) = &mut config.peer_client_chain
+        {
+            validate_client_chain(&mut chain.hops, 0, client_groups, named_pems, global_limits)?;
+            if !crate::tcp::chain_builder::supports_udp_offline(chain)? {
+                return Err(super::types::wireguard::invalid(
+                    "WireGuard peer_client_chain does not support UDP",
+                ));
+            }
+        }
+        ConfigSelection::replace_none_or_some_groups(&mut server_config.rules, rule_groups)?;
+        if server_config.rules.is_empty() {
+            return Err(super::types::wireguard::invalid(
+                "WireGuard server requires nonempty explicit rules",
+            ));
+        }
+        for rule in server_config.rules.iter_mut() {
+            validate_rule_config(
+                rule.unwrap_config_mut(),
+                client_groups,
+                named_pems,
+                global_limits,
+            )?;
+        }
+        return Ok(());
+    }
+    if matches!(
+        server_config.bind_location,
+        super::BindLocation::Unspecified {}
+    ) {
+        return Err(super::types::wireguard::invalid(
+            "server requires an address or path",
+        ));
+    }
     super::types::xhttp::validate_server_transport(
         &server_config.protocol,
         &server_config.transport,
@@ -1140,16 +1120,35 @@ fn validate_client_config(
     global_limits: GlobalLimits,
 ) -> std::io::Result<()> {
     client_config.validate_quic_key_exchange(true)?;
-    if client_config.protocol.is_wireguard()
-        && (client_config.address != ClientConfig::default().address
-            || client_config.bind_interface.is_one()
-            || client_config.transport != Transport::Tcp
+    if let ClientProxyConfig::Wireguard(config) = &mut client_config.protocol {
+        if client_config.transport != Transport::Udp
             || client_config.tcp_settings.is_some()
-            || client_config.quic_settings.is_some())
-    {
-        return Err(super::types::wireguard::invalid(
-            "WireGuard references cannot set address, bind_interface, transport, or socket settings",
-        ));
+            || client_config.quic_settings.is_some()
+        {
+            return Err(super::types::wireguard::invalid(
+                "WireGuard requires UDP transport without TCP/QUIC socket settings",
+            ));
+        }
+        config
+            .device(
+                &client_config.address,
+                client_config.bind_interface.clone().into_option(),
+            )
+            .validate()?;
+        if let Some(chain) = &mut config.peer_client_chain {
+            validate_client_chain(
+                &mut chain.hops,
+                0,
+                &HashMap::new(),
+                named_pems,
+                global_limits,
+            )?;
+            if !crate::tcp::chain_builder::supports_udp_offline(chain)? {
+                return Err(super::types::wireguard::invalid(
+                    "WireGuard peer_client_chain does not support UDP",
+                ));
+            }
+        }
     }
     if client_config.transport != Transport::Tcp && client_config.tcp_settings.is_some() {
         return Err(std::io::Error::new(
@@ -1515,6 +1514,11 @@ fn validate_server_proxy_config(
 ) -> std::io::Result<()> {
     validate_server_auth(server_proxy_config)?;
     match server_proxy_config {
+        ServerProxyConfig::Wireguard(_) => {
+            return Err(super::types::wireguard::invalid(
+                "WireGuard requires a top-level server protocol",
+            ));
+        }
         ServerProxyConfig::Hysteria2 { .. } | ServerProxyConfig::TuicV5 { .. }
             if context != ServerProtocolContext::Quic =>
         {
@@ -1871,6 +1875,7 @@ fn validate_tun_config(
     config: &mut TunConfig,
     client_groups: &HashMap<String, Vec<ClientConfig>>,
     rule_groups: &HashMap<String, Vec<RuleConfig>>,
+    named_pems: &HashMap<String, String>,
     global_limits: GlobalLimits,
 ) -> std::io::Result<()> {
     config.resource_limits.validate()?;
@@ -1928,7 +1933,7 @@ fn validate_tun_config(
     // Validate rules
     for rule in config.rules.iter_mut() {
         let rule = rule.unwrap_config_mut();
-        validate_rule_config(rule, client_groups, &HashMap::new(), global_limits)?;
+        validate_rule_config(rule, client_groups, named_pems, global_limits)?;
     }
 
     Ok(())
@@ -1999,7 +2004,7 @@ fn validate_connector_positions(
 
         if hop_uses_wireguard(hop) {
             return Err(super::types::wireguard::invalid(
-                "WireGuard is only supported at hop 0; configure outer_client_chain on the endpoint for preceding proxies",
+                "WireGuard is only supported at hop 0; configure peer_client_chain in the protocol for preceding proxies",
             ));
         }
 
@@ -2079,6 +2084,7 @@ fn validate_and_expand_selection(
 ) -> std::io::Result<()> {
     match selection {
         ConfigSelection::Config(client_config) => {
+            expand_peer_chains(client_config, client_groups)?;
             validate_client_config(client_config, named_pems, global_limits)?;
         }
         ConfigSelection::GroupName(group_name) => {
@@ -3701,6 +3707,28 @@ mod tests {
             "composition with bootstrap should work: {:?}",
             result.err()
         );
+    }
+
+    #[tokio::test]
+    async fn test_empty_dns_lists_use_default_resolver() {
+        use serde_json::json;
+
+        let configs = serde_json::from_value(json!([
+            {"address": "127.0.0.1:1080", "protocol": {"type": "socks"}, "dns": {"servers": []}},
+            {"device_fd": 42, "dns": {"servers": []}},
+        ]))
+        .unwrap();
+        let configs = validate_configs_test(configs).await.unwrap();
+        assert_eq!(configs.len(), 2);
+        for config in configs {
+            let dns = match config {
+                Config::Server(server) => server.dns.unwrap(),
+                Config::TunServer(tun) => tun.dns.unwrap(),
+                _ => unreachable!(),
+            };
+            assert!(matches!(dns.servers, NoneOrSome::None));
+            assert_eq!(dns.resolved_group(), None);
+        }
     }
 
     #[tokio::test]

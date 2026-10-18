@@ -79,22 +79,46 @@ pub async fn convert_cert_paths(all_configs: Vec<Config>) -> std::io::Result<(Ve
     }
 
     for config in &mut other_configs {
-        let Config::Wireguard(endpoint) = config else {
-            continue;
-        };
-        if let Some(chain) = &mut endpoint.outer_client_chain {
-            for hop in chain.hops.iter_mut() {
-                gather_pem_file_paths_from_chain_hop(
-                    hop,
+        match config {
+            Config::TunServer(tun) => {
+                for rule in tun.rules.iter_mut() {
+                    gather_pem_file_paths_from_rule(
+                        rule,
+                        &path_pem_configs,
+                        &mut unknown_pem_paths,
+                    );
+                }
+                if let Some(dns) = &mut tun.dns {
+                    gather_dns_pem_paths(
+                        &mut dns.servers,
+                        &path_pem_configs,
+                        &mut unknown_pem_paths,
+                    );
+                }
+            }
+            Config::DnsConfigGroup(group) => {
+                gather_dns_pem_paths(
+                    &mut group.dns_servers,
                     &path_pem_configs,
                     &mut unknown_pem_paths,
                 );
             }
-        }
-        if let Some(inbound) = &mut endpoint.inbound {
-            for rule in inbound.rules.iter_mut() {
-                gather_pem_file_paths_from_rule(rule, &path_pem_configs, &mut unknown_pem_paths);
+            Config::RuleConfigGroup(group) => {
+                for rule in group.rules.iter_mut() {
+                    if let RuleActionConfig::Allow { client_chains, .. } = &mut rule.action {
+                        for chain in client_chains.iter_mut() {
+                            for hop in chain.hops.iter_mut() {
+                                gather_pem_file_paths_from_chain_hop(
+                                    hop,
+                                    &path_pem_configs,
+                                    &mut unknown_pem_paths,
+                                );
+                            }
+                        }
+                    }
+                }
             }
+            _ => {}
         }
     }
 
@@ -157,7 +181,32 @@ fn gather_pem_file_paths_from_server_config(
     for rule in server_config.rules.iter_mut() {
         gather_pem_file_paths_from_rule(rule, known_pem_paths, unknown_pem_paths);
     }
+    if let Some(dns) = &mut server_config.dns {
+        gather_dns_pem_paths(&mut dns.servers, known_pem_paths, unknown_pem_paths);
+    }
     Ok(())
+}
+
+fn gather_dns_pem_paths(
+    specs: &mut crate::option_util::NoneOrSome<super::DnsServerSpec>,
+    known_pem_paths: &HashMap<String, NamedPem>,
+    unknown_pem_paths: &mut HashMap<String, String>,
+) {
+    for spec in specs.iter_mut() {
+        if let super::DnsServerSpec::WithOptions { client_chain, .. } = spec {
+            for selection in client_chain.iter_mut() {
+                if let ConfigSelection::Config(chain) = selection {
+                    for hop in chain.hops.iter_mut() {
+                        gather_pem_file_paths_from_chain_hop(
+                            hop,
+                            known_pem_paths,
+                            unknown_pem_paths,
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn gather_pem_file_paths_from_client_config_group(
@@ -210,6 +259,13 @@ fn gather_pem_file_paths_from_server_proxy(
     unknown_pem_paths: &mut HashMap<String, String>,
 ) -> std::io::Result<()> {
     match server_proxy {
+        ServerProxyConfig::Wireguard(config) => {
+            if let Some(chain) = &mut config.peer_client_chain {
+                for hop in chain.hops.iter_mut() {
+                    gather_pem_file_paths_from_chain_hop(hop, known_pem_paths, unknown_pem_paths);
+                }
+            }
+        }
         ServerProxyConfig::Tls {
             tls_targets,
             default_tls_target,
@@ -426,6 +482,13 @@ fn gather_pem_file_paths_from_client_proxy(
     unknown_pem_paths: &mut HashMap<String, String>,
 ) {
     match client_proxy {
+        ClientProxyConfig::Wireguard(config) => {
+            if let Some(chain) = &mut config.peer_client_chain {
+                for hop in chain.hops.iter_mut() {
+                    gather_pem_file_paths_from_chain_hop(hop, known_pem_paths, unknown_pem_paths);
+                }
+            }
+        }
         ClientProxyConfig::Tls(tls_config) => {
             process_optional_pem_path(&mut tls_config.cert, known_pem_paths, unknown_pem_paths);
             process_optional_pem_path(&mut tls_config.key, known_pem_paths, unknown_pem_paths);

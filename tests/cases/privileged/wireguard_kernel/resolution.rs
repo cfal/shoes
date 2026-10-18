@@ -83,7 +83,7 @@ fn ipv6_first_peer_hostname_falls_back_when_ipv6_udp_is_unavailable() -> io::Res
             );
             assert!(candidates.iter().any(SocketAddr::is_ipv4));
             let mut endpoint = config::client(port);
-            endpoint["peers"][0]["endpoint"] = json!(format!("peer.wireguard.test:{port}"));
+            endpoint["client_proxies"][0]["address"] = json!(format!("peer.wireguard.test:{port}"));
             let mut ports = PortHelper::new();
             let (_, entry) = ports.get_localhost_listener_port();
             let (_process, _config) = start_shoes_server(
@@ -112,14 +112,14 @@ fn peer_hostname_is_resolved_again_on_process_reload() -> io::Result<()> {
             let port = reservation.local_addr()?.port();
             let second = std::net::UdpSocket::bind(("127.0.0.2", port))?;
             let mut server = config::server(port);
-            server["listen"] = json!(format!("127.0.0.1:{port}"));
+            server["address"] = json!(format!("127.0.0.1:{port}"));
             drop(reservation);
             let first = start_shoes_server(&serde_yaml::to_string(&json!([server])).unwrap())?;
-            server["listen"] = json!(format!("127.0.0.2:{port}"));
+            server["address"] = json!(format!("127.0.0.2:{port}"));
             drop(second);
             let _second = start_shoes_server(&serde_yaml::to_string(&json!([server])).unwrap())?;
             let mut endpoint = config::client(port);
-            endpoint["peers"][0]["endpoint"] = json!(format!("peer.wireguard.test:{port}"));
+            endpoint["client_proxies"][0]["address"] = json!(format!("peer.wireguard.test:{port}"));
             let mut ports = PortHelper::new();
             let (_, entry) = ports.get_localhost_listener_port();
             let (process, _config) = start_shoes_server(

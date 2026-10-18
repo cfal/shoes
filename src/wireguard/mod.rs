@@ -1,6 +1,9 @@
 mod detour;
 mod io;
 #[cfg(test)]
+#[path = "../../tests/cases/wireguard_support.rs"]
+pub(crate) mod test_support;
+#[cfg(test)]
 mod tests;
 
 use async_trait::async_trait;
@@ -26,7 +29,7 @@ use crate::{
     client_proxy_selector::ClientProxySelector,
     config::{
         ClientProxyConfig, ValidatedConfigs,
-        wireguard::{WireguardConfig, WireguardPeer},
+        wireguard::{WireguardDeviceConfig, WireguardPeer},
     },
     dns::DnsRegistry,
     ip_stack::driver::{PacketStack, StackHandle},
@@ -131,7 +134,7 @@ struct PreparedPeer {
 
 impl PreparedPeer {
     async fn resolve(
-        config: &WireguardConfig,
+        config: &WireguardDeviceConfig,
         peer_config: &WireguardPeer,
         resolver: &Arc<dyn Resolver>,
     ) -> stdio::Result<Self> {
@@ -180,7 +183,7 @@ impl PreparedPeer {
 }
 
 struct PreparedEndpoint {
-    config: WireguardConfig,
+    config: WireguardDeviceConfig,
     peers: Vec<PreparedPeer>,
     connector: Arc<Connector>,
     global_limits: crate::config::GlobalLimits,
@@ -213,7 +216,7 @@ impl Prepared {
                 })
                 .collect::<stdio::Result<_>>()?;
             let connector = Arc::new(Connector {
-                name: config.wireguard.clone(),
+                name: config.id.clone(),
                 active: Mutex::new(None),
                 addresses,
                 routes: peers
@@ -221,14 +224,14 @@ impl Prepared {
                     .flat_map(|peer| peer.config.allowed_ips.iter().copied())
                     .collect(),
             });
-            connectors.insert(config.wireguard.clone(), connector.clone());
+            connectors.insert(config.id.clone(), connector.clone());
             pending.push((peers, connector));
         }
         validated.visit_clients(&mut |client| {
             if let ClientProxyConfig::Wireguard(reference) = &mut client.protocol {
                 reference.connector = Some(
                     connectors
-                        .get(&reference.endpoint)
+                        .get(&reference.endpoint_id)
                         .ok_or_else(|| stdio::Error::other("unknown WireGuard endpoint"))?
                         .clone(),
                 );
@@ -317,7 +320,7 @@ impl PreparedEndpoint {
         &self,
         resolver: &Arc<dyn Resolver>,
     ) -> stdio::Result<Option<Arc<crate::client_proxy_chain::ClientProxyChain>>> {
-        let Some(config) = &self.config.outer_client_chain else {
+        let Some(config) = &self.config.peer_client_chain else {
             return Ok(None);
         };
         let chain = crate::tcp::chain_builder::build_client_proxy_chain_with_limits(
@@ -327,8 +330,8 @@ impl PreparedEndpoint {
         )?;
         if !chain.supports_udp() {
             return Err(crate::config::wireguard::invalid(format!(
-                "WireGuard endpoint {} outer_client_chain does not support UDP",
-                self.config.wireguard,
+                "WireGuard endpoint {} peer_client_chain does not support UDP",
+                self.config.id,
             )));
         }
         Ok(Some(Arc::new(chain)))
@@ -365,25 +368,19 @@ impl PreparedEndpoint {
         let (udp, released, peers) = if let Some(chain) = self.build_outer_chain(&resolver)? {
             let peers = self.peers_for_socket(None)?;
             let (sender, receiver, released) = detour::start(
-                config.wireguard.clone(),
+                config.id.clone(),
                 chain,
                 resolver,
                 peers.iter().map(|peer| peer.endpoint.unwrap()),
                 stack.drops.clone(),
             );
-            log::info!(
-                "WireGuard endpoint {} using outer_client_chain",
-                config.wireguard
-            );
+            log::info!("WireGuard endpoint {} using peer_client_chain", config.id);
             (io::Factory::detour(sender, receiver), released, peers)
         } else {
             let (udp, released, local) =
                 io::Factory::new(config.listen, config.bind_interface.clone())?;
             let peers = self.peers_for_socket(Some(local))?;
-            log::info!(
-                "WireGuard endpoint {} listening on {local}",
-                config.wireguard
-            );
+            log::info!("WireGuard endpoint {} listening on {local}", config.id);
             (udp, released, peers)
         };
         let mut device = DeviceBuilder::new()
@@ -409,7 +406,7 @@ impl PreparedEndpoint {
             })?;
         *self.connector.active.lock() = Some(stack.handle.clone());
         let connector = self.connector.clone();
-        let name = config.wireguard.clone();
+        let name = config.id.clone();
         let cancel = CancellationToken::new();
         let shutdown = cancel.clone();
         let task = tokio::spawn(async move {

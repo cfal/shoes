@@ -443,6 +443,9 @@ async fn start_tcp_servers(
     let mut handles = vec![];
 
     match bind_location {
+        BindLocation::Unspecified {} => {
+            return Err(std::io::Error::other("TCP listener requires an address"));
+        }
         BindLocation::Address(addresses) => {
             // Shares protocol state across ports without reusing an interface-specific UDP bind IP.
             let mut handlers: HashMap<IpAddr, Arc<dyn TcpServerHandler>> = HashMap::new();

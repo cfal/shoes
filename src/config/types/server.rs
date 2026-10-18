@@ -1,6 +1,6 @@
 //! Server configuration types.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, net::SocketAddr};
 
 use serde::{Deserialize, Serialize};
 
@@ -219,22 +219,6 @@ impl<'de> serde::de::Deserialize<'de> for ServerConfig {
             }
         }
 
-        // Parse bind_location (flattened - either address or path)
-        let bind_location = if let Some(v) = map.get("address").or_else(|| map.get("addresses")) {
-            serde_yaml::from_value(v.clone())
-                .map(BindLocation::Address)
-                .map_err(|e| Error::custom(format!("invalid address: {e}")))?
-        } else if let Some(v) = map.get("path") {
-            serde_yaml::from_value(v.clone())
-                .map(BindLocation::Path)
-                .map_err(|e| Error::custom(format!("invalid path: {e}")))?
-        } else {
-            return Err(Error::custom(
-                "server config must have 'address', 'addresses', or 'path' field",
-            ));
-        };
-
-        // Parse protocol (required)
         let protocol: ServerProxyConfig = map
             .get("protocol")
             .ok_or_else(|| Error::custom("missing 'protocol' field in server config"))
@@ -242,6 +226,41 @@ impl<'de> serde::de::Deserialize<'de> for ServerConfig {
                 serde_yaml::from_value(v.clone())
                     .map_err(|e| Error::custom(format!("invalid protocol: {e}")))
             })?;
+        let is_wireguard = matches!(protocol, ServerProxyConfig::Wireguard(_));
+        if is_wireguard
+            && ["address", "addresses", "path"]
+                .into_iter()
+                .filter(|field| map.contains_key(*field))
+                .count()
+                > 1
+        {
+            return Err(Error::custom(
+                "WireGuard server must specify only one of address, addresses, or path",
+            ));
+        }
+
+        // Parse bind_location (flattened - either address or path)
+        let bind_location = if let Some(v) = map.get("address").or_else(|| map.get("addresses")) {
+            if is_wireguard {
+                // Checks literal syntax before range parsing can collapse duplicate ports.
+                let _: OneOrSome<SocketAddr> = serde_yaml::from_value(v.clone()).map_err(|_| {
+                    Error::custom("WireGuard server requires one literal UDP socket address")
+                })?;
+            }
+            serde_yaml::from_value(v.clone())
+                .map(BindLocation::Address)
+                .map_err(|e| Error::custom(format!("invalid address: {e}")))?
+        } else if let Some(v) = map.get("path") {
+            serde_yaml::from_value(v.clone())
+                .map(BindLocation::Path)
+                .map_err(|e| Error::custom(format!("invalid path: {e}")))?
+        } else if is_wireguard {
+            BindLocation::Unspecified {}
+        } else {
+            return Err(Error::custom(
+                "server config must have 'address', 'addresses', or 'path' field",
+            ));
+        };
 
         // Parse transport (optional, default)
         let transport: Transport = map
@@ -249,7 +268,13 @@ impl<'de> serde::de::Deserialize<'de> for ServerConfig {
             .map(|v| serde_yaml::from_value(v.clone()))
             .transpose()
             .map_err(|e| Error::custom(format!("invalid transport: {e}")))?
-            .unwrap_or_default();
+            .unwrap_or_else(|| {
+                if is_wireguard {
+                    Transport::Udp
+                } else {
+                    Transport::default()
+                }
+            });
 
         // Parse tcp_settings (optional, skip if null)
         let tcp_settings: Option<TcpConfig> = map
@@ -275,7 +300,13 @@ impl<'de> serde::de::Deserialize<'de> for ServerConfig {
             .map(|v| serde_yaml::from_value(v.clone()))
             .transpose()
             .map_err(|e| Error::custom(format!("invalid rules: {e}")))?
-            .unwrap_or_else(direct_allow_rule);
+            .unwrap_or_else(|| {
+                if is_wireguard {
+                    NoneOrSome::None
+                } else {
+                    direct_allow_rule()
+                }
+            });
 
         // Parse dns (optional)
         let dns: Option<DnsConfig> = map
@@ -646,6 +677,7 @@ impl WebsocketPingType {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ServerProxyConfig {
+    Wireguard(Box<super::wireguard::WireguardServerConfig>),
     #[serde(alias = "splithttp")]
     Xhttp(super::xhttp::XhttpServerConfig),
     Http {
@@ -811,6 +843,7 @@ pub enum ServerProxyConfig {
 impl std::fmt::Display for ServerProxyConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Wireguard(_) => write!(f, "WireGuard"),
             Self::Http { .. } => write!(f, "HTTP"),
             Self::Socks { .. } => write!(f, "SOCKS"),
             Self::Shadowsocks { .. } => write!(f, "Shadowsocks"),
