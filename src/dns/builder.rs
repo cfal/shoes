@@ -109,14 +109,9 @@ impl DnsRegistry {
             .values()
             .map(|state| state.pool.clone())
             .collect();
-        tokio::task::spawn_blocking(move || {
-            for pool in pools {
-                pool.checkpoint()?;
-            }
-            Ok(())
-        })
-        .await
-        .map_err(std::io::Error::other)?
+        tokio::task::spawn_blocking(move || checkpoint_pools(pools))
+            .await
+            .map_err(std::io::Error::other)?
     }
 
     pub async fn shutdown_checkpoint(&self) -> std::io::Result<()> {
@@ -148,13 +143,7 @@ impl DnsRegistry {
             loop {
                 tokio::time::sleep(Duration::from_secs(60)).await;
                 let pools = pools.clone();
-                let result = tokio::task::spawn_blocking(move || {
-                    for pool in pools {
-                        pool.checkpoint()?;
-                    }
-                    Ok::<_, std::io::Error>(())
-                })
-                .await;
+                let result = tokio::task::spawn_blocking(move || checkpoint_pools(pools)).await;
                 match result {
                     Ok(Ok(())) => (),
                     failure => log::warn!("Fake DNS snapshot failed: {failure:?}"),
@@ -162,6 +151,17 @@ impl DnsRegistry {
             }
         }))
     }
+}
+
+fn checkpoint_pools(pools: Vec<Arc<FakeIpPool>>) -> std::io::Result<()> {
+    let mut error = None;
+    for pool in pools {
+        if let Err(failure) = pool.checkpoint() {
+            log::warn!("Fake DNS pool checkpoint failed: {failure}");
+            error = Some(failure);
+        }
+    }
+    error.map_or(Ok(()), Err)
 }
 
 pub struct DnsSnapshotTask(tokio::task::JoinHandle<()>);
@@ -660,7 +660,7 @@ pub async fn build_dns_registry_for_runtime(
     }
     if !forbidden.is_empty() {
         for endpoint in synthetic_endpoints {
-            let range = IpNetwork::from(*endpoint);
+            let range = IpNetwork::from(endpoint.to_canonical());
             if !forbidden.contains(&range) {
                 forbidden.push(range);
             }
@@ -1035,6 +1035,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_pool_checkpoint_does_not_skip_other_pools() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut pools = Vec::new();
+        for index in 0..2 {
+            let options = FakeIpOptions {
+                state_file: Some(directory.path().join(format!("{index}.json"))),
+                ..Default::default()
+            };
+            pools.push(Arc::new(FakeIpPool::new(&options).unwrap()));
+        }
+        std::fs::create_dir(directory.path().join("0.json")).unwrap();
+        assert!(checkpoint_pools(pools).is_err());
+        assert!(directory.path().join("1.json").is_file());
+    }
+
+    #[tokio::test]
     async fn disabling_and_removing_contexts_retains_real_only_guards() {
         let mut groups = fake_groups(true);
         groups[0].specs = vec![make_spec("udp://192.0.2.53")];
@@ -1083,18 +1099,20 @@ mod tests {
 
     #[tokio::test]
     async fn literal_upstreams_cannot_target_tun_endpoints_outside_the_pool() {
-        let mut groups = fake_groups(true);
-        groups[0].specs = vec![make_spec("udp://10.99.0.1:53")];
-        let failure = build_dns_registry_for_runtime(
-            groups,
-            crate::resources::limits(),
-            None,
-            &["10.99.0.1".parse().unwrap()],
-        )
-        .await
-        .err()
-        .unwrap();
-        assert_eq!(failure.kind(), std::io::ErrorKind::InvalidInput);
+        for endpoint in ["10.99.0.1", "::ffff:10.99.0.1"] {
+            let mut groups = fake_groups(true);
+            groups[0].specs = vec![make_spec("udp://10.99.0.1:53")];
+            let failure = build_dns_registry_for_runtime(
+                groups,
+                crate::resources::limits(),
+                None,
+                &[endpoint.parse().unwrap()],
+            )
+            .await
+            .err()
+            .unwrap();
+            assert_eq!(failure.kind(), std::io::ErrorKind::InvalidInput);
+        }
     }
 
     #[tokio::test]
