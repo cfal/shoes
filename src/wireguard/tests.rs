@@ -498,6 +498,61 @@ async fn fake_dns_guards_wireguard_peer_and_outer_proxy_hostnames() {
         raw[1]["peers"][0]["endpoint"] = json!("localhost:51820");
         let mut configs = validate(&raw.to_string()).unwrap();
         Prepared::new(&mut configs).await.unwrap();
+
+        let inherited = [if tun_endpoint {
+            "127.0.0.1/32"
+        } else {
+            "127.0.0.0/8"
+        }
+        .parse()
+        .unwrap()];
+        for remove_group in [false, true] {
+            let mut candidate = raw.clone();
+            if remove_group {
+                candidate.as_array_mut().unwrap().remove(2);
+            }
+            let mut configs = validate(&candidate.to_string()).unwrap();
+            assert_eq!(
+                Prepared::with_forbidden(&mut configs, &inherited)
+                    .await
+                    .err()
+                    .unwrap()
+                    .kind(),
+                stdio::ErrorKind::InvalidData
+            );
+            candidate[1]["peers"][0]["endpoint"] = json!("127.0.0.1:51820");
+            let mut configs = validate(&candidate.to_string()).unwrap();
+            assert_eq!(
+                Prepared::with_forbidden(&mut configs, &inherited)
+                    .await
+                    .err()
+                    .unwrap()
+                    .kind(),
+                stdio::ErrorKind::InvalidInput
+            );
+            candidate[1]["peers"][0]["endpoint"] = json!("192.0.2.1:51820");
+            let mut configs = validate(&candidate.to_string()).unwrap();
+            let prepared = Prepared::with_forbidden(&mut configs, &inherited)
+                .await
+                .unwrap();
+            assert!(
+                prepared.endpoints[1]
+                    .outer_resolver
+                    .resolve_location(&NetLocation::from_str("localhost:443", None).unwrap())
+                    .await
+                    .is_err()
+            );
+            candidate[1]["outer_client_chain"][0]["address"] = json!("127.0.0.1:443");
+            let mut configs = validate(&candidate.to_string()).unwrap();
+            assert_eq!(
+                Prepared::with_forbidden(&mut configs, &inherited)
+                    .await
+                    .err()
+                    .unwrap()
+                    .kind(),
+                stdio::ErrorKind::InvalidInput
+            );
+        }
     }
 }
 

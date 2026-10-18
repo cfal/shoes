@@ -197,6 +197,13 @@ pub(crate) struct Prepared {
 
 impl Prepared {
     pub async fn new(validated: &mut ValidatedConfigs) -> stdio::Result<Self> {
+        Self::with_forbidden(validated, &[]).await
+    }
+
+    pub async fn with_forbidden(
+        validated: &mut ValidatedConfigs,
+        inherited: &[IpNetwork],
+    ) -> stdio::Result<Self> {
         let mut pending = Vec::new();
         let mut connectors = HashMap::new();
         let ranges: Result<Vec<IpNetwork>, _> = validated
@@ -207,6 +214,7 @@ impl Prepared {
             .map(|range| range.parse())
             .collect();
         let mut ranges = ranges.map_err(stdio::Error::other)?;
+        ranges.extend_from_slice(inherited);
         if !ranges.is_empty() {
             for config in &validated.configs {
                 if let crate::config::Config::TunServer(tun) = config {
@@ -218,6 +226,7 @@ impl Prepared {
                     );
                 }
             }
+            validated.validate_network_endpoints(&ranges)?;
         }
         let resolver = crate::dns::real_only(Arc::new(NativeResolver::new()), ranges.into());
         for config in &validated.wireguard_endpoints {

@@ -29,7 +29,12 @@ struct PreparedServers {
 async fn prepare(paths: &[String], previous: Option<&DnsRegistry>) -> io::Result<PreparedServers> {
     let mut validated = load_validated(paths).await?;
     #[cfg(unix)]
-    let wireguard = crate::wireguard::Prepared::new(&mut validated).await?;
+    let wireguard = if let Some(previous) = previous {
+        crate::wireguard::Prepared::with_forbidden(&mut validated, previous.forbidden_ranges())
+            .await?
+    } else {
+        crate::wireguard::Prepared::new(&mut validated).await?
+    };
     for config in &mut validated.configs {
         let Config::Server(server) = config else {
             continue;
@@ -496,6 +501,38 @@ pub async fn run(paths: Vec<String>, dry_run: bool, no_reload: bool) -> io::Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fake_dns_rejected_reload_keeps_inherited_guards_without_freezing_live_pool() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.yaml");
+        let paths = [path.to_str().unwrap().to_owned()];
+        std::fs::write(
+            &path,
+            r#"[{"dns_group":"fake","dns_servers":"udp://127.0.0.1:9","fake_ip":true}]"#,
+        )
+        .unwrap();
+        let live = prepare(&paths, None).await.unwrap();
+        let context = live
+            .dns
+            .get_by_name("fake")
+            .unwrap()
+            .fake_dns_context()
+            .unwrap();
+        context.allocate("before.example", false).unwrap();
+        std::fs::write(
+            &path,
+            r#"[{"dns_group":"ordinary","dns_servers":"udp://198.18.0.5:53"}]"#,
+        )
+        .unwrap();
+        load_validated(&paths).await.unwrap();
+        assert_eq!(
+            prepare(&paths, Some(&live.dns)).await.err().unwrap().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        context.allocate("after.example", false).unwrap();
+    }
 
     #[tokio::test]
     async fn fake_dns_terminal_shutdown_closes_all_registries_after_checkpoint_error() {

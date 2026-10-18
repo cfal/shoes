@@ -166,36 +166,45 @@ pub(super) fn validate(config: &mut ValidatedConfigs) -> io::Result<()> {
             _ => {}
         }
     }
-    for group in &config.dns_groups {
-        for spec in &group.specs {
-            for value in std::iter::once(spec.url.as_str()).chain(spec.bootstrap_url.as_deref()) {
-                if let Ok(url) = url::Url::parse(value) {
-                    let ip = match url.host() {
-                        Some(url::Host::Ipv4(ip)) => Some(IpAddr::V4(ip)),
-                        Some(url::Host::Ipv6(ip)) => Some(IpAddr::V6(ip)),
-                        Some(url::Host::Domain(host)) => host.parse::<IpAddr>().ok(),
-                        _ => None,
-                    };
-                    if let Some(ip) = ip {
-                        reject(&all, ip, "DNS/bootstrap endpoint")?;
-                    }
-                }
-            }
-        }
-    }
     for endpoint in &config.wireguard_endpoints {
         if let Some(inbound) = &endpoint.inbound {
             rules(effective(&inbound.dns), &inbound.rules)?;
         }
-        for peer in &endpoint.peers {
-            if let Some(address) = &peer.endpoint {
-                if let Ok(address) = address.parse::<std::net::SocketAddr>() {
-                    reject(&all, address.ip(), "WireGuard endpoint")?;
+    }
+    config.validate_network_endpoints(&all)
+}
+
+impl ValidatedConfigs {
+    pub(crate) fn validate_network_endpoints(&mut self, ranges: &[IpNetwork]) -> io::Result<()> {
+        for group in &self.dns_groups {
+            for spec in &group.specs {
+                for value in std::iter::once(spec.url.as_str()).chain(spec.bootstrap_url.as_deref())
+                {
+                    if let Ok(url) = url::Url::parse(value) {
+                        let ip = match url.host() {
+                            Some(url::Host::Ipv4(ip)) => Some(IpAddr::V4(ip)),
+                            Some(url::Host::Ipv6(ip)) => Some(IpAddr::V6(ip)),
+                            Some(url::Host::Domain(host)) => host.parse::<IpAddr>().ok(),
+                            _ => None,
+                        };
+                        if let Some(ip) = ip {
+                            reject(ranges, ip, "DNS/bootstrap endpoint")?;
+                        }
+                    }
                 }
             }
         }
+        for endpoint in &self.wireguard_endpoints {
+            for peer in &endpoint.peers {
+                if let Some(address) = &peer.endpoint {
+                    if let Ok(address) = address.parse::<std::net::SocketAddr>() {
+                        reject(ranges, address.ip(), "WireGuard endpoint")?;
+                    }
+                }
+            }
+        }
+        self.visit_clients(&mut |client| target(ranges, &client.address, "proxy endpoint"))
     }
-    config.visit_clients(&mut |client| target(&all, &client.address, "proxy endpoint"))
 }
 
 #[cfg(test)]
