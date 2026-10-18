@@ -6,8 +6,16 @@
     password: "replace-this-password"
   sniff: true
   rules:
-    # Mandatory IP restrictions must precede client-controlled hostname rules.
-    - masks: ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+    # Block local/private destinations before client-controlled hostname rules.
+    - masks:
+        - "10.0.0.0/8"
+        - "172.16.0.0/12"
+        - "192.168.0.0/16"
+        - "127.0.0.0/8"
+        - "169.254.0.0/16"
+        - "::1/128"
+        - "fc00::/7"
+        - "fe80::/10"
       action: block
     - masks: "example.com"
       action: allow

@@ -260,7 +260,8 @@ pub(crate) async fn handle_tcp_connection(
     resolver: Arc<dyn Resolver>,
 ) -> std::io::Result<()> {
     let _permit = crate::resources::try_stream().ok_or_else(crate::resources::exhausted)?;
-    let prepared = crate::tcp::ingress::PreparedTcp::new(&proxy_selector, target, Vec::new())?;
+    let prepared =
+        crate::tcp::ingress::PreparedTcp::new(&proxy_selector, target.clone(), Vec::new())?;
     let route = tokio::time::timeout(
         std::time::Duration::from_secs(30),
         prepared.route(&mut connection, &proxy_selector, &resolver),
@@ -285,7 +286,9 @@ pub(crate) async fn handle_tcp_connection(
         Ok::<_, std::io::Error>(Some((setup.client_stream, routed.wire_destination)))
     })
     .await
-    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "TUN TCP setup timed out"))??;
+    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "TUN TCP setup timed out"))
+    .and_then(|result| result)
+    .inspect_err(|error| warn!("Failed to connect to {}: {}", target, error))?;
 
     let Some((mut remote, wire_destination)) = connected else {
         debug!("TCP connection blocked by rules");
