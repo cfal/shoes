@@ -21,7 +21,7 @@ use tokio::{
 struct DnsPeer {
     port: u16,
     queries: mpsc::UnboundedReceiver<String>,
-    closed: mpsc::UnboundedReceiver<()>,
+    closed: mpsc::UnboundedReceiver<Vec<String>>,
     task: tokio_util::task::AbortOnDropHandle<()>,
 }
 
@@ -40,17 +40,20 @@ impl DnsPeer {
                         let queries = queries.clone();
                         let closed = closed.clone();
                         connections.spawn(async move {
+                            let mut names = Vec::new();
                             while let Ok(length) = stream.read_u16().await {
                                 let mut bytes = vec![0; length as usize];
                                 if stream.read_exact(&mut bytes).await.is_err() { break; }
                                 let mut message = Message::from_vec(&bytes).unwrap();
-                                queries.send(message.queries[0].name().to_string()).unwrap();
+                                let name = message.queries[0].name().to_string();
+                                queries.send(name.clone()).unwrap();
+                                names.push(name);
                                 message.metadata.message_type = MessageType::Response;
                                 message.add_answer(Record::from_rdata(message.queries[0].name().clone(), 0, RData::A(A::new(198, 18, 0, 1))));
                                 let bytes = message.to_vec().unwrap();
                                 if stream.write_u16(bytes.len() as u16).await.is_err() || stream.write_all(&bytes).await.is_err() { break; }
                             }
-                            let _ = closed.send(());
+                            let _ = closed.send(names);
                         });
                     }
                     result = connections.join_next(), if !connections.is_empty() => { result.unwrap().unwrap(); }
@@ -63,6 +66,19 @@ impl DnsPeer {
             closed: closed_rx,
             task: tokio_util::task::AbortOnDropHandle::new(task),
         })
+    }
+
+    async fn wait_closed(&mut self, query: &str) -> io::Result<()> {
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let names = self.closed.recv().await.expect("DNS responder stopped");
+                if names.iter().any(|name| name == query) {
+                    break;
+                }
+            }
+        })
+        .await?;
+        Ok(())
     }
 }
 
@@ -112,6 +128,8 @@ async fn wireguard_dns_reload_uses_the_new_resolver_and_outages_never_bypass_the
         assert_eq!(new_dns.queries.recv().await.unwrap(), "after.wireguard.test.");
         server.signal(libc::SIGTERM);
         assert!(server.exit().await.success());
+        old_dns.wait_closed("before.wireguard.test.").await?;
+        new_dns.wait_closed("after.wireguard.test.").await?;
 
         let denied = association.send_to_with_timeout(
             SocksDestination::Hostname("outage.wireguard.test".into(), echo.udp().port()), b"no bypass", Duration::from_secs(3),
@@ -135,9 +153,7 @@ async fn wireguard_dns_reload_uses_the_new_resolver_and_outages_never_bypass_the
         assert!(client.exit().await.success());
         server.signal(libc::SIGTERM);
         assert!(server.exit().await.success());
-        // Retiring the remote endpoint closes forwarding sockets even if the client vanished.
-        timeout(Duration::from_secs(5), old_dns.closed.recv()).await?.unwrap();
-        timeout(Duration::from_secs(5), new_dns.closed.recv()).await?.unwrap();
+        new_dns.wait_closed("restored.wireguard.test.").await?;
         assert!(!old_dns.task.is_finished());
         assert!(!new_dns.task.is_finished());
         Ok(())
