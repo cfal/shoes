@@ -19,6 +19,23 @@ use crate::address::{NetLocation, ResolvedLocation};
 pub type ResolveFuture = Pin<Box<dyn Future<Output = std::io::Result<Vec<SocketAddr>>> + Send>>;
 pub type DnsExchangeFuture = Pin<Box<dyn Future<Output = std::io::Result<Vec<u8>>> + Send>>;
 
+#[derive(Debug)]
+pub(crate) struct DnsSetupPending;
+
+impl std::fmt::Display for DnsSetupPending {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DNS exchange timed out with retained connection setup")
+    }
+}
+
+impl std::error::Error for DnsSetupPending {}
+
+pub(crate) fn dns_setup_pending(error: &std::io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|cause| cause.is::<DnsSetupPending>())
+}
+
 const CACHING_NATIVE_RESOLVER_CACHE_CAPACITY: usize = 10_000;
 const RESOLVER_CACHE_CAPACITY: usize = 1_024;
 
@@ -239,10 +256,15 @@ impl RefreshingResolver {
 
             let current_generation = refresh_state.lock().generation;
             let current = inner.read().await.clone();
-            match operation(current).await {
+            match operation(current.clone()).await {
                 Ok(addrs) => {
                     refresh_state.lock().last_activity_at = Some(Instant::now());
                     Ok(addrs)
+                }
+                Err(err) if policy.retry_once_after_refresh && dns_setup_pending(&err) => {
+                    let result = operation(current).await?;
+                    refresh_state.lock().last_activity_at = Some(Instant::now());
+                    Ok(result)
                 }
                 Err(err)
                     if policy.retry_once_after_refresh

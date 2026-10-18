@@ -75,11 +75,30 @@ impl RawDnsExchange {
             .options
             .timeout
             .saturating_mul(self.context.options.attempts.max(1).min(u32::MAX as usize) as u32);
-        tokio::time::timeout(deadline, self.exchange_inner(bytes))
+        let result = tokio::time::timeout(deadline, self.exchange_inner(bytes))
             .await
-            .map_err(|_| {
-                io::Error::new(io::ErrorKind::TimedOut, "DNS exchange deadline exceeded")
-            })?
+            .unwrap_or_else(|_| {
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "DNS exchange deadline exceeded",
+                ))
+            });
+        if result
+            .as_ref()
+            .is_err_and(|error| error.kind() == io::ErrorKind::TimedOut)
+            && self.upstreams.iter().any(|upstream| {
+                upstream
+                    .connection
+                    .try_lock()
+                    .is_ok_and(|cached| cached.as_ref().is_some_and(|setup| setup.peek().is_none()))
+            })
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                crate::resolver::DnsSetupPending,
+            ));
+        }
+        result
     }
 
     async fn exchange_inner(&self, bytes: Vec<u8>) -> io::Result<Vec<u8>> {
@@ -482,7 +501,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn slow_connection_setup_survives_query_slot_timeout() {
+    async fn slow_connection_setup_survives_refreshing_resolver_timeout() {
+        use crate::resolver::{
+            DnsExchangeFuture, RefreshPolicy, RefreshingResolver, ResolveFuture, Resolver,
+            ResolverFactory,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        #[derive(Debug)]
+        struct RawResolver(Arc<RawDnsExchange>);
+        impl Resolver for RawResolver {
+            fn resolve_location(&self, _: &crate::address::NetLocation) -> ResolveFuture {
+                unreachable!()
+            }
+            fn exchange(&self, request: Vec<u8>) -> DnsExchangeFuture {
+                let raw = self.0.clone();
+                Box::pin(async move { raw.exchange(request).await })
+            }
+        }
         let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
         let mut address = listener.local_addr().unwrap();
         address.set_ip("127.0.0.1".parse().unwrap());
@@ -517,16 +552,33 @@ mod tests {
                 write_tcp(&mut stream, answer).await;
             }
         });
-        assert_eq!(
-            raw.exchange(request().to_vec().unwrap())
-                .await
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::TimedOut
-        );
+        let raw = Arc::new(raw);
+        let builds = Arc::new(AtomicUsize::new(0));
+        let factory: ResolverFactory = {
+            let builds = builds.clone();
+            Arc::new(move || {
+                builds.fetch_add(1, Ordering::SeqCst);
+                let resolver: Arc<dyn Resolver> = Arc::new(RawResolver(raw.clone()));
+                Box::pin(async { Ok(resolver) })
+            })
+        };
+        let resolver = RefreshingResolver::new(
+            factory,
+            RefreshPolicy {
+                max_idle: Duration::from_secs(60),
+                retry_once_after_refresh: true,
+            },
+            "slow multi-upstream setup".into(),
+        )
+        .await
+        .unwrap();
         for _ in 0..3 {
-            raw.exchange(request().to_vec().unwrap()).await.unwrap();
+            resolver
+                .exchange(request().to_vec().unwrap())
+                .await
+                .unwrap();
         }
+        assert_eq!(builds.load(Ordering::SeqCst), 1);
         server.await.unwrap();
     }
 

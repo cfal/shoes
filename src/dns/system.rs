@@ -84,7 +84,10 @@ impl Resolver for SystemResolver {
                 current.as_ref().unwrap().exchange.clone()
             };
             let result = exchange.exchange(request).await;
-            if result.is_err() {
+            if result
+                .as_ref()
+                .is_err_and(|error| !crate::resolver::dns_setup_pending(error))
+            {
                 let mut current = snapshot.lock().await;
                 if current
                     .as_ref()
