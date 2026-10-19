@@ -148,11 +148,12 @@ fn state_path(path: &Path) -> io::Result<PathBuf> {
     let parent = path
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    Ok(parent.canonicalize()?.join(
-        path.file_name()
-            .ok_or_else(|| invalid("invalid fake DNS state path"))?,
-    ))
+        .unwrap_or(Path::new("."))
+        .canonicalize()?;
+    let filename = path
+        .file_name()
+        .ok_or_else(|| invalid("invalid fake DNS state path"))?;
+    Ok(parent.join(filename))
 }
 
 impl SnapshotStore {

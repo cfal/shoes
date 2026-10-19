@@ -28,21 +28,20 @@ struct PoolState {
 
 impl PoolState {
     fn compatible(&self, options: &FakeIpOptions) -> std::io::Result<bool> {
-        let network = |range: &Option<String>| {
+        let parse_network = |range: &Option<String>| {
             range
                 .as_deref()
                 .map(str::parse::<IpNetwork>)
                 .transpose()
                 .map_err(std::io::Error::other)
         };
-        Ok(
-            network(&self.options.ipv4_range)? == network(&options.ipv4_range)?
-                && network(&self.options.ipv6_range)? == network(&options.ipv6_range)?
-                && self.options.max_entries == options.max_entries
-                && self
-                    .pool
-                    .state_file_matches(options.state_file.as_deref())?,
-        )
+        if parse_network(&self.options.ipv4_range)? != parse_network(&options.ipv4_range)?
+            || parse_network(&self.options.ipv6_range)? != parse_network(&options.ipv6_range)?
+            || self.options.max_entries != options.max_entries
+        {
+            return Ok(false);
+        }
+        self.pool.state_file_matches(options.state_file.as_deref())
     }
 }
 
@@ -658,19 +657,19 @@ pub async fn build_dns_registry_for_runtime(
     previous: Option<&DnsRegistry>,
     synthetic_endpoints: &[std::net::IpAddr],
 ) -> std::io::Result<DnsRegistry> {
-    let forbidden: Result<Vec<IpNetwork>, _> = groups
-        .iter()
-        .filter_map(|group| group.fake_ip.as_ref())
-        .chain(
-            previous
-                .into_iter()
-                .flat_map(|registry| registry.pools.values().map(|state| &state.options)),
-        )
+    let active_options = groups.iter().filter_map(|group| group.fake_ip.as_ref());
+    let retained_options = previous
+        .into_iter()
+        .flat_map(|registry| registry.pools.values().map(|state| &state.options));
+    let pool_ranges: Result<Vec<IpNetwork>, _> = active_options
+        .chain(retained_options)
         .flat_map(|options| options.ipv4_range.iter().chain(options.ipv6_range.iter()))
         .map(|range| range.parse())
         .collect();
-    let mut forbidden = forbidden.map_err(std::io::Error::other)?;
-    crate::config::validate_tun_endpoints(synthetic_endpoints.iter().copied(), &forbidden)?;
+    let pool_ranges = pool_ranges.map_err(std::io::Error::other)?;
+    crate::config::validate_tun_endpoints(synthetic_endpoints.iter().copied(), &pool_ranges)?;
+
+    let mut forbidden = pool_ranges;
     if let Some(previous) = previous {
         for range in previous.forbidden_ranges() {
             if !forbidden.contains(range) {
@@ -1253,22 +1252,23 @@ mod tests {
                 Some("stable.test")
             );
         }
+        let options = groups[0].fake_ip.as_ref().unwrap();
         for incompatible in [
             FakeIpOptions {
                 ipv4_range: Some("198.19.0.0/16".into()),
-                ..groups[0].fake_ip.clone().unwrap()
+                ..options.clone()
             },
             FakeIpOptions {
                 ipv6_range: Some("fd01::/64".into()),
-                ..groups[0].fake_ip.clone().unwrap()
+                ..options.clone()
             },
             FakeIpOptions {
                 ipv6_range: None,
-                ..groups[0].fake_ip.clone().unwrap()
+                ..options.clone()
             },
             FakeIpOptions {
                 max_entries: 32,
-                ..groups[0].fake_ip.clone().unwrap()
+                ..options.clone()
             },
         ] {
             let mut candidate = groups.clone();

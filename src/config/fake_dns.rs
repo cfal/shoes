@@ -146,20 +146,23 @@ fn protocol(ranges: &[IpNetwork], config: &ServerProxyConfig) -> io::Result<()> 
 }
 
 pub(super) fn validate(config: &mut ValidatedConfigs) -> io::Result<()> {
-    let ranges: Result<Vec<IpNetwork>, _> = config
+    let pool_ranges: Result<Vec<IpNetwork>, _> = config
         .dns_groups
         .iter()
         .filter_map(|group| group.fake_ip.as_ref())
         .flat_map(|options| options.ipv4_range.iter().chain(options.ipv6_range.iter()))
         .map(|range| range.parse())
         .collect();
-    let mut all = ranges.map_err(io::Error::other)?;
-    if all.is_empty() {
+    let pool_ranges = pool_ranges.map_err(io::Error::other)?;
+    if pool_ranges.is_empty() {
         return Ok(());
     }
-    validate_tun_endpoints(tun_endpoint_ips(&config.configs), &all)?;
-    all.extend(tun_endpoint_ips(&config.configs).map(|ip| IpNetwork::from(ip.to_canonical())));
-    config.validate_network_endpoints(&all)
+    validate_tun_endpoints(tun_endpoint_ips(&config.configs), &pool_ranges)?;
+
+    let mut forbidden = pool_ranges;
+    forbidden
+        .extend(tun_endpoint_ips(&config.configs).map(|ip| IpNetwork::from(ip.to_canonical())));
+    config.validate_network_endpoints(&forbidden)
 }
 
 impl ValidatedConfigs {
