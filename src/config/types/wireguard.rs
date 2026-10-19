@@ -109,6 +109,8 @@ pub struct WireguardClientConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct WireguardServerConfig {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub wireguard_name: String,
     pub private_key: WireguardKey,
     pub addresses: Vec<String>,
     pub peers: Vec<WireguardPeer>,
@@ -154,6 +156,18 @@ impl WireguardClientConfig {
 }
 
 impl WireguardServerConfig {
+    #[cfg(unix)]
+    pub(crate) fn server_id(&self) -> String {
+        if self.wireguard_name.is_empty() {
+            use gotatun::x25519::{PublicKey, StaticSecret};
+
+            let public_key = PublicKey::from(&StaticSecret::from(self.private_key.0));
+            format!("server:key:{}", STANDARD.encode(public_key.as_bytes()))
+        } else {
+            format!("server:name:{}", self.wireguard_name)
+        }
+    }
+
     pub(crate) fn device(&self, server: &super::ServerConfig) -> io::Result<WireguardDeviceConfig> {
         let listen = match &server.bind_location {
             super::BindLocation::Unspecified {} if self.peer_client_chain.is_some() => None,

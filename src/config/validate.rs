@@ -156,15 +156,19 @@ pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Valida
     // This replaces inline specs with group name references.
     let mut inline_dns_counter = 0u32;
     let mut default_dns_groups = HashSet::new();
+    #[cfg(unix)]
+    let mut wireguard_server_ids = HashSet::new();
     for config in server_configs.iter_mut() {
         let identity = match &config.protocol {
             #[cfg(unix)]
             ServerProxyConfig::Wireguard(protocol) => {
-                use base64::{Engine, engine::general_purpose::STANDARD};
-                use gotatun::x25519::{PublicKey, StaticSecret};
-
-                let public_key = PublicKey::from(&StaticSecret::from(protocol.private_key.0));
-                format!("wireguard:{}", STANDARD.encode(public_key.as_bytes()))
+                let id = protocol.server_id();
+                if !wireguard_server_ids.insert(id.clone()) {
+                    return Err(super::types::wireguard::invalid(
+                        "duplicate WireGuard server identity; set a distinct wireguard_name for each server",
+                    ));
+                }
+                format!("wireguard:{id}")
             }
             _ => format!("server:{:?}:{}", config.transport, config.bind_location),
         };

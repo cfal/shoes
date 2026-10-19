@@ -70,6 +70,7 @@ Omit `endpoint` for a peer that initiates toward a directly listening server:
 - address: "0.0.0.0:51820"
   protocol:
     type: wireguard
+    wireguard_name: gateway
     private_key: "<server-private-key>"
     addresses: ["10.77.0.1/32"]
     peers:
@@ -98,6 +99,14 @@ route, firewall rule, or NAT rule is created.
 
 Servers require explicit nonempty top-level `rules` and may specify top-level
 `dns` and `sniff`. Missing, null, or empty rules reject; `rules: block-all` is valid.
+`protocol.wireguard_name` gives a server a stable, case-sensitive identity. When
+omitted or empty, the server's public key supplies its identity instead. Duplicate
+names or duplicate unnamed public-key identities reject configuration, even with
+different listen addresses. Name-based and key-based identities are separate.
+Client deduplication is unchanged. Reordering servers or adding clients does not
+change server identity or private Fake DNS ownership. Use an explicit name to
+preserve that ownership across key rotation; changing the effective identity
+creates a different context and existing state files reject the new owner.
 Rules use the normal destination masks, overrides, and client chains. Clients
 accept replies to their outgoing flows, not unsolicited inbound flows. Per-peer authorization
 beyond cryptokey source validation is not supplied by destination rules.
