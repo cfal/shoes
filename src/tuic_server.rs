@@ -430,16 +430,23 @@ async fn relay_tcp_stream(
     client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
 ) -> std::io::Result<()> {
-    let setup_client_stream_future = timeout(Duration::from_secs(60), async {
-        let prepared = PreparedTcp::new(
-            &client_proxy_selector,
-            remote_location.clone(),
-            initial_data,
-        )?;
-        prepared
-            .connect(&mut server_stream, &client_proxy_selector, &resolver)
-            .await
-    });
+    let setup_client_stream_future = async {
+        let route = timeout(Duration::from_secs(60), async {
+            let prepared = PreparedTcp::new(
+                &client_proxy_selector,
+                remote_location.clone(),
+                initial_data,
+            )?;
+            prepared
+                .route(&mut server_stream, &client_proxy_selector, &resolver)
+                .await
+        })
+        .await?;
+        match route {
+            Ok(route) => timeout(Duration::from_secs(60), route.connect(&resolver)).await,
+            Err(error) => Ok(Err(error)),
+        }
+    };
 
     let routed = match setup_client_stream_future.await {
         Ok(Ok(routed)) => routed,

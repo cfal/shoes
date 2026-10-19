@@ -750,24 +750,28 @@ async fn relay_tcp_stream(
 ) -> std::io::Result<()> {
     let mut success_sent = false;
     let mut prefix = Vec::new();
-    let setup = timeout_stream_setup(async {
-        let prepared = PreparedTcp::new(
-            &client_proxy_selector,
-            remote_location.clone(),
-            initial_data,
-        )?;
-        if prepared.needs_sniff_read() {
-            // A partial success write must never be followed by a failure frame.
-            success_sent = true;
-            write_all(&mut server_stream, &tcp_response(true, "")).await?;
-            server_stream.flush().await?;
-        }
-        let routed = prepared
-            .connect(&mut server_stream, &client_proxy_selector, &resolver)
-            .await?;
+    let setup = async {
+        let route = timeout_stream_setup(async {
+            let prepared = PreparedTcp::new(
+                &client_proxy_selector,
+                remote_location.clone(),
+                initial_data,
+            )?;
+            if prepared.needs_sniff_read() {
+                // A partial success write must never be followed by a failure frame.
+                success_sent = true;
+                write_all(&mut server_stream, &tcp_response(true, "")).await?;
+                server_stream.flush().await?;
+            }
+            prepared
+                .route(&mut server_stream, &client_proxy_selector, &resolver)
+                .await
+        })
+        .await?;
+        let routed = timeout_stream_setup(route.connect(&resolver)).await?;
         prefix = routed.prefix;
         Ok(routed.setup)
-    })
+    }
     .await;
     let Some(mut client_stream) = finish_tcp_setup(&mut server_stream, setup, success_sent)
         .await

@@ -214,6 +214,24 @@ async fn udp_case(protocol: &str) -> Result<()> {
     assert_eq!(exchanges.load(Ordering::SeqCst), 1);
     // SOCKS itself must retain a hostname DNS destination without trying native DNS first.
     if protocol == "native" {
+        let SocksDestination::Ip(first) = &fake_addresses[0] else {
+            unreachable!()
+        };
+        assert_eq!(
+            send(
+                &association,
+                SocksDestination::Hostname(first.ip().to_string(), first.port()),
+                b"encoded"
+            )
+            .await?,
+            b"encoded [FIRST]"
+        );
+        let mut invalid = vec![0, 0, 0, 3, 0, 0, 53];
+        invalid.extend_from_slice(&question("first.example.", RecordType::A));
+        association
+            .socket()
+            .send_to(&invalid, association.relay_addr())
+            .await?;
         let reply = send(
             &association,
             SocksDestination::Hostname("unresolvable.invalid".into(), 53),

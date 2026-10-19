@@ -18,6 +18,7 @@ pub(crate) struct PreparedTcp {
 
 pub(crate) struct RoutedTcp {
     pub wire_destination: NetLocation,
+    pub is_local_dns: bool,
     pub setup: Option<TcpClientSetupResult>,
     pub prefix: Vec<u8>,
 }
@@ -35,6 +36,7 @@ enum TcpRouteTarget<'a> {
 
 impl TcpRoute<'_> {
     pub(crate) async fn connect(self, resolver: &Arc<dyn Resolver>) -> io::Result<RoutedTcp> {
+        let is_local_dns = matches!(&self.target, TcpRouteTarget::LocalDns(_));
         let setup = match self.target {
             TcpRouteTarget::LocalDns(context) => Some(TcpClientSetupResult {
                 client_stream: context.tcp_stream(),
@@ -48,6 +50,7 @@ impl TcpRoute<'_> {
         };
         Ok(RoutedTcp {
             wire_destination: self.wire_destination,
+            is_local_dns,
             setup,
             prefix: self.prefix,
         })
@@ -78,7 +81,7 @@ impl PreparedTcp {
         self.probe.as_ref().is_some_and(TlsProbe::needs_more)
     }
 
-    // Protocol adapters send any required optimistic reply before calling this method.
+    #[cfg(test)]
     pub(crate) async fn connect<R: AsyncRead + Unpin + ?Sized>(
         self,
         inbound: &mut R,
@@ -91,6 +94,7 @@ impl PreparedTcp {
             .await
     }
 
+    // Protocol adapters send any required optimistic reply before calling this method.
     pub(crate) async fn route<'a, R: AsyncRead + Unpin + ?Sized>(
         self,
         inbound: &mut R,

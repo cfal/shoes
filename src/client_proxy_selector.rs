@@ -378,8 +378,19 @@ impl ClientProxySelector {
         Ok(())
     }
 
-    pub(crate) fn prepare(&self, location: ResolvedLocation) -> std::io::Result<IngressTarget> {
+    pub(crate) fn prepare(&self, mut location: ResolvedLocation) -> std::io::Result<IngressTarget> {
         let wire_destination = location.location().clone();
+        if let Some(hostname) = wire_destination.address().hostname() {
+            if hostname.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "empty destination hostname",
+                ));
+            }
+            if let Ok(ip) = hostname.parse() {
+                location = NetLocation::from_ip_addr(ip, wire_destination.port()).into();
+            }
+        }
         if let Some(context) = &self.fake_dns {
             if wire_destination.port() == 53 {
                 return Ok(IngressTarget::LocalDns {
@@ -387,7 +398,7 @@ impl ClientProxySelector {
                     context: context.clone(),
                 });
             }
-            if let Some(addr) = wire_destination.to_socket_addr_nonblocking()
+            if let Some(addr) = location.location().to_socket_addr_nonblocking()
                 && let Some(name) = context.restore(addr.ip())?
             {
                 return Ok(IngressTarget::Forward(PreparedDestination {
@@ -399,7 +410,7 @@ impl ClientProxySelector {
             }
             self.validate_real_target(&location)?;
         }
-        let source = if wire_destination.address().hostname().is_some() {
+        let source = if location.address().hostname().is_some() {
             DestinationSource::SuppliedHostname
         } else {
             DestinationSource::LiteralIp
@@ -1001,6 +1012,57 @@ mod tests {
                 .decision,
             ConnectDecision::Allow { .. }
         ));
+    }
+
+    #[test]
+    fn domain_encoded_ips_restore_without_changing_wire_identity() {
+        let context = Arc::new(FakeDnsContext::new(Default::default(), Arc::new(NoDns)).unwrap());
+        let selector = ClientProxySelector::new(vec![])
+            .with_fake_dns_context(Some(context.clone()))
+            .unwrap();
+        let ip = context.allocate("encoded.example", false).unwrap();
+        for text in [ip.to_string(), format!("::ffff:{ip}")] {
+            let wire = NetLocation::new(Address::Hostname(text), 443);
+            let IngressTarget::Forward(target) = selector.prepare(wire.clone().into()).unwrap()
+            else {
+                panic!("not a forward target");
+            };
+            assert!(target.is_fake_dns());
+            assert_eq!(target.wire_destination, wire);
+            assert_eq!(
+                target.connection_target.address().hostname(),
+                Some("encoded.example")
+            );
+        }
+        assert!(
+            selector
+                .prepare(NetLocation::new(Address::Hostname("198.18.0.1".into()), 443).into())
+                .is_err()
+        );
+        for port in [53, 443] {
+            assert!(
+                selector
+                    .prepare(NetLocation::new(Address::Hostname(String::new()), port).into())
+                    .is_err()
+            );
+        }
+        let wire = NetLocation::new(Address::Hostname("192.0.2.1".into()), 443);
+        let IngressTarget::Forward(target) = selector.prepare(wire.clone().into()).unwrap() else {
+            panic!("not a forward target");
+        };
+        assert_eq!(target.wire_destination, wire);
+        assert_eq!(
+            target.sniffable_real_ip(),
+            Some("192.0.2.1:443".parse().unwrap())
+        );
+        let wire = NetLocation::new(Address::Hostname(ip.to_string()), 53);
+        let IngressTarget::LocalDns {
+            wire_destination, ..
+        } = selector.prepare(wire.clone().into()).unwrap()
+        else {
+            panic!("not intercepted DNS");
+        };
+        assert_eq!(wire_destination, wire);
     }
 
     #[tokio::test]

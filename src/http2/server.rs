@@ -179,9 +179,10 @@ async fn tunnel(
         let routed = tokio::select! {
             biased;
             _ = reset => return Ok(()),
-            result = crate::util::timeout_stream_setup(
-                prepared.connect(&mut stream, &selector, &resolver),
-            ) => result?,
+            result = async {
+                let route = crate::util::timeout_stream_setup(prepared.route(&mut stream, &selector, &resolver)).await?;
+                crate::util::timeout_stream_setup(route.connect(&resolver)).await
+            } => result?,
         };
         let Some(upstream) = routed.setup else {
             return Ok(());
@@ -192,9 +193,10 @@ async fn tunnel(
     let result = tokio::select! {
         biased;
         _ = std::future::poll_fn(|cx| respond.poll_reset(cx)) => return Ok(()),
-        result = crate::util::timeout_stream_setup(
-            prepared.connect(&mut no_read, &selector, &resolver),
-        ) => result,
+        result = async {
+            let route = crate::util::timeout_stream_setup(prepared.route(&mut no_read, &selector, &resolver)).await?;
+            crate::util::timeout_stream_setup(route.connect(&resolver)).await
+        } => result,
     };
     let upstream = match result {
         Ok(routed) => match routed.setup {

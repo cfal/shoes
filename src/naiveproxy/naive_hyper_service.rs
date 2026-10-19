@@ -440,6 +440,23 @@ async fn naive_service(
             .unwrap());
     };
 
+    let prepared = match destination.address().hostname() {
+        Some(UOT_V1_MAGIC_ADDRESS | UOT_V2_MAGIC_ADDRESS) => None,
+        _ => match crate::tcp::ingress::PreparedTcp::new(
+            &config.proxy_selector,
+            destination.clone(),
+            Vec::new(),
+        ) {
+            Ok(prepared) => Some(prepared),
+            Err(_) => {
+                return Ok(Response::builder()
+                    .status(StatusCode::BAD_GATEWAY)
+                    .body(empty_body())
+                    .unwrap());
+            }
+        },
+    };
+
     // Get upgrade future before moving the request
     let on_upgrade = hyper::upgrade::on(&mut req);
     let resolver = config.resolver.clone();
@@ -458,6 +475,7 @@ async fn naive_service(
                     if let Err(e) = handle_naive_stream(
                         stream,
                         destination,
+                        prepared,
                         resolver,
                         proxy_selector,
                         udp_enabled,
@@ -470,6 +488,7 @@ async fn naive_service(
                 } else if let Err(e) = handle_naive_stream(
                     io,
                     destination,
+                    prepared,
                     resolver,
                     proxy_selector,
                     udp_enabled,
@@ -614,6 +633,65 @@ mod sniff_tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[tokio::test]
+    async fn connect_validates_fake_destination_before_success() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
+            let context = Arc::new(
+                crate::dns::fake_ip::FakeDnsContext::new(Default::default(), resolver.clone())
+                    .unwrap(),
+            );
+            let known = context.allocate("known.example", false).unwrap();
+            let selector = Arc::new(
+                ClientProxySelector::new(vec![])
+                    .with_fake_dns_context(Some(context))
+                    .unwrap(),
+            );
+            for (destination, status) in [
+                ("198.18.0.1:443".to_string(), "502"),
+                (format!("{known}:443"), "200"),
+                ("198.18.0.1:53".into(), "200"),
+            ] {
+                let tasks = Arc::new(Mutex::new(JoinSet::new()));
+                let config = Arc::new(NaiveServiceConfig {
+                    users: Arc::new(UserLookup::new(vec![(
+                        "test".into(), "user".into(), "pass".into(),
+                    )])),
+                    fallback_path: None,
+                    resolver: resolver.clone(),
+                    proxy_selector: selector.clone(),
+                    udp_enabled: false,
+                    padding_enabled: false,
+                    executor: ConnectionExecutor(Arc::downgrade(&tasks)),
+                    slots: Arc::new(crate::resources::Budget::new(None)),
+                });
+                let (server, mut peer) = tokio::io::duplex(8192);
+                let _server = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+                    let service = hyper::service::service_fn(move |req| {
+                        naive_service(req, config.clone())
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(server), service)
+                        .with_upgrades()
+                        .await;
+                }));
+                let request = format!(
+                    "CONNECT {destination} HTTP/1.1\r\nHost: {destination}\r\nProxy-Authorization: Basic dXNlcjpwYXNz\r\n\r\n"
+                );
+                peer.write_all(request.as_bytes()).await.unwrap();
+                let mut header = Vec::new();
+                while !header.ends_with(b"\r\n\r\n") {
+                    header.push(peer.read_u8().await.unwrap());
+                }
+                assert!(
+                    String::from_utf8(header).unwrap().starts_with(&format!("HTTP/1.1 {status}"))
+                );
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
     async fn padding_is_removed_before_sniff_and_early_data_is_preserved() {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             let mut tasks = tokio::task::JoinSet::new();
@@ -621,15 +699,26 @@ mod sniff_tests {
             let (selector, resolver) =
                 crate::tcp::ingress::tests::socks_target(hello.clone(), &mut tasks).await;
             let target = NetLocation::from_str(crate::tcp::ingress::tests::TARGET, None).unwrap();
+            let prepared =
+                crate::tcp::ingress::PreparedTcp::new(&selector, target.clone(), Vec::new())
+                    .unwrap();
             let (server, peer) = tokio::io::duplex(8192);
             let server =
                 NaivePaddingStream::new(server, PaddingDirection::Server, PaddingType::Variant1);
             let mut peer =
                 NaivePaddingStream::new(peer, PaddingDirection::Client, PaddingType::Variant1);
             tasks.spawn(async move {
-                handle_naive_stream(server, target, resolver, selector, false, "test")
-                    .await
-                    .unwrap();
+                handle_naive_stream(
+                    server,
+                    target,
+                    Some(prepared),
+                    resolver,
+                    selector,
+                    false,
+                    "test",
+                )
+                .await
+                .unwrap();
             });
             peer.write_all(&hello).await.unwrap();
             peer.shutdown().await.unwrap();
@@ -651,6 +740,7 @@ mod sniff_tests {
 async fn handle_naive_stream<S: AsyncStream + 'static>(
     mut stream: S,
     remote_location: NetLocation,
+    prepared: Option<crate::tcp::ingress::PreparedTcp>,
     resolver: Arc<dyn Resolver>,
     proxy_selector: Arc<ClientProxySelector>,
     udp_enabled: bool,
@@ -734,8 +824,7 @@ async fn handle_naive_stream<S: AsyncStream + 'static>(
         user_name, remote_location
     );
 
-    let prepared =
-        crate::tcp::ingress::PreparedTcp::new(&proxy_selector, remote_location, Vec::new())?;
+    let prepared = prepared.expect("TCP destination must be prepared before upgrade");
     let route =
         crate::util::timeout_stream_setup(prepared.route(&mut stream, &proxy_selector, &resolver))
             .await?;

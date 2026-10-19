@@ -179,30 +179,37 @@ pub(crate) async fn process_stream_with_permit<AS: AsyncStream + 'static>(
             mut connection_success_response,
             initial_remote_data,
         } => {
-            let setup_client_stream_future = timeout(setup_timeout, async {
-                let prepared = super::ingress::PreparedTcp::new(
-                    &proxy_selector,
-                    remote_location.clone(),
-                    initial_remote_data.map_or_else(Vec::new, |data| data.into_vec()),
-                )?;
-                if prepared.needs_sniff_read() {
-                    crate::util::timeout_stream_setup(async {
-                        let response = connection_success_response.take();
-                        let flush = response.is_some() || server_need_initial_flush;
-                        if let Some(data) = response {
-                            write_all(&mut server_stream, &data).await?;
-                        }
-                        if flush {
-                            server_stream.flush().await?;
-                        }
-                        Ok(())
-                    })
-                    .await?;
+            let setup_client_stream_future = async {
+                let route = timeout(setup_timeout, async {
+                    let prepared = super::ingress::PreparedTcp::new(
+                        &proxy_selector,
+                        remote_location.clone(),
+                        initial_remote_data.map_or_else(Vec::new, |data| data.into_vec()),
+                    )?;
+                    if prepared.needs_sniff_read() {
+                        crate::util::timeout_stream_setup(async {
+                            let response = connection_success_response.take();
+                            let flush = response.is_some() || server_need_initial_flush;
+                            if let Some(data) = response {
+                                write_all(&mut server_stream, &data).await?;
+                            }
+                            if flush {
+                                server_stream.flush().await?;
+                            }
+                            Ok(())
+                        })
+                        .await?;
+                    }
+                    prepared
+                        .route(&mut server_stream, &proxy_selector, &resolver)
+                        .await
+                })
+                .await?;
+                match route {
+                    Ok(route) => timeout(setup_timeout, route.connect(&resolver)).await,
+                    Err(error) => Ok(Err(error)),
                 }
-                prepared
-                    .connect(&mut server_stream, &proxy_selector, &resolver)
-                    .await
-            });
+            };
 
             let routed = match setup_client_stream_future.await {
                 Ok(Ok(routed)) => routed,
@@ -242,14 +249,22 @@ pub(crate) async fn process_stream_with_permit<AS: AsyncStream + 'static>(
                 if flush_server {
                     server_stream.flush().await?;
                 }
-                if !routed.prefix.is_empty() {
+                if !routed.is_local_dns && !routed.prefix.is_empty() {
                     write_all(&mut client_stream, &routed.prefix).await?;
                     client_stream.flush().await?;
                 }
                 Ok(())
             })
             .await?;
-            drop(routed.prefix);
+            // Local DNS can produce replies before it consumes a pipelined prefix.
+            if routed.is_local_dns {
+                server_stream = Box::new(crate::prepend_stream::PrependStream::new(
+                    server_stream,
+                    Some(routed.prefix.into_boxed_slice()),
+                ));
+            } else {
+                drop(routed.prefix);
+            }
 
             let copy_result =
                 copy_bidirectional(&mut server_stream, &mut client_stream, false, false).await;
@@ -846,6 +861,132 @@ mod lifetime_tests {
             .await
             .unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn coalesced_connect_dns_pipeline_drains_replies_during_prefix_replay() {
+        use hickory_resolver::proto::op::{Message, Query};
+        use hickory_resolver::proto::rr::{Name, RecordType};
+        use tokio::io::AsyncReadExt;
+
+        timeout(Duration::from_secs(5), async {
+            let resolver: Arc<dyn Resolver> = Arc::new(PendingResolver);
+            let context = Arc::new(
+                crate::dns::fake_ip::FakeDnsContext::new(Default::default(), resolver.clone())
+                    .unwrap(),
+            );
+            let selector = Arc::new(
+                ClientProxySelector::new(vec![])
+                    .with_fake_dns_context(Some(context))
+                    .unwrap(),
+            );
+            let handler = Arc::new(crate::http_handler::HttpTcpServerHandler::new(
+                None,
+                selector,
+                resolver.clone(),
+            ));
+            let (server, mut peer) = tokio::io::duplex(65536);
+            let mut prefix =
+                b"CONNECT 192.0.2.1:53 HTTP/1.1\r\nHost: 192.0.2.1:53\r\n\r\n".to_vec();
+            for id in 0..1200 {
+                let mut query = Message::query();
+                query.metadata.id = id;
+                query.add_query(Query::query(
+                    Name::from_ascii("a.test").unwrap(),
+                    RecordType::A,
+                ));
+                let bytes = query.to_vec().unwrap();
+                prefix.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
+                prefix.extend_from_slice(&bytes);
+            }
+            assert!(prefix.len() > 30 * 1024 && prefix.len() < 32 * 1024);
+            peer.write_all(&prefix).await.unwrap();
+            peer.shutdown().await.unwrap();
+            let task = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(process_stream(
+                server, handler, resolver,
+            )));
+            let mut header = Vec::new();
+            while !header.ends_with(b"\r\n\r\n") {
+                header.push(peer.read_u8().await.unwrap());
+            }
+            assert!(header.starts_with(b"HTTP/1.1 200"));
+            for id in 0..1200 {
+                let length = peer.read_u16().await.unwrap() as usize;
+                let mut bytes = vec![0; length];
+                peer.read_exact(&mut bytes).await.unwrap();
+                let answer = Message::from_vec(&bytes).unwrap();
+                assert_eq!(answer.metadata.id, id);
+                assert_eq!(answer.answers.len(), 1);
+            }
+            task.await.unwrap().unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sniff_wait_does_not_consume_outbound_connect_budget() {
+        use tokio::io::AsyncReadExt;
+        #[derive(Debug)]
+        struct DelayedConnector(std::sync::Mutex<Option<tokio::io::DuplexStream>>);
+        #[async_trait]
+        impl SocketConnector for DelayedConnector {
+            async fn connect(
+                &self,
+                _: &Arc<dyn Resolver>,
+                _: &crate::address::ResolvedLocation,
+            ) -> io::Result<Box<dyn AsyncStream>> {
+                tokio::time::sleep(Duration::from_millis(900)).await;
+                Ok(Box::new(self.0.lock().unwrap().take().unwrap()))
+            }
+            async fn connect_udp_bidirectional(
+                &self,
+                _: &Arc<dyn Resolver>,
+                _: crate::address::ResolvedLocation,
+            ) -> io::Result<Box<dyn AsyncMessageStream>> {
+                unreachable!()
+            }
+            fn bind_interface(&self) -> Option<&str> {
+                None
+            }
+        }
+        let (outbound, mut target) = tokio::io::duplex(64);
+        target.write_all(b"ready").await.unwrap();
+        target.shutdown().await.unwrap();
+        let selector = Arc::new(
+            ClientProxySelector::new(vec![ConnectRule::new(
+                vec![
+                    crate::address::NetLocationMask::from("sniff.example").unwrap(),
+                    crate::address::NetLocationMask::ANY,
+                ],
+                ConnectAction::new_allow(
+                    None,
+                    ClientChainGroup::new(vec![ClientProxyChain::new(
+                        vec![InitialHopEntry::Direct(Arc::new(DelayedConnector(
+                            std::sync::Mutex::new(Some(outbound)),
+                        )))],
+                        vec![],
+                    )]),
+                ),
+            )])
+            .with_sniff(true),
+        );
+        let (server, mut peer) = tokio::io::duplex(64);
+        let started = tokio::time::Instant::now();
+        let task =
+            tokio_util::task::AbortOnDropHandle::new(tokio::spawn(process_stream_with_permit(
+                server,
+                Arc::new(FlushOnlyHandler(selector)),
+                Arc::new(PendingResolver),
+                crate::resources::try_stream().unwrap(),
+                Duration::from_secs(1),
+            )));
+        let mut bytes = [0; 5];
+        peer.read_exact(&mut bytes).await.unwrap();
+        assert_eq!(&bytes, b"ready");
+        assert!(started.elapsed() >= Duration::from_millis(1200));
+        peer.shutdown().await.unwrap();
+        task.await.unwrap().unwrap();
     }
 
     #[tokio::test]
