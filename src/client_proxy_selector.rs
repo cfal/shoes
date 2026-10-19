@@ -237,13 +237,12 @@ impl PreparedDestination {
     }
 
     pub(crate) fn sniffable_real_ip(&self) -> Option<SocketAddr> {
-        (self.source == DestinationSource::LiteralIp)
-            .then(|| {
-                self.connection_target
-                    .location()
-                    .to_socket_addr_nonblocking()
-            })
-            .flatten()
+        if self.source != DestinationSource::LiteralIp {
+            return None;
+        }
+        self.connection_target
+            .location()
+            .to_socket_addr_nonblocking()
     }
 }
 
