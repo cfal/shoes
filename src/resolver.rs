@@ -138,10 +138,10 @@ impl<T: Resolver> Resolver for TimeoutResolver<T> {
         request: Vec<u8>,
         deadline: tokio::time::Instant,
     ) -> DnsExchangeFuture {
-        self.inner.exchange_with_deadline(
-            request,
-            deadline.min(tokio::time::Instant::now() + self.timeout),
-        )
+        let deadline = tokio::time::Instant::now()
+            .checked_add(self.timeout)
+            .map_or(deadline, |configured| deadline.min(configured));
+        self.inner.exchange_with_deadline(request, deadline)
     }
 
     fn resolve_location(&self, location: &NetLocation) -> ResolveFuture {
@@ -244,6 +244,7 @@ impl RefreshingResolver {
 
     fn execute<T: Send + 'static>(
         &self,
+        deadline: Option<tokio::time::Instant>,
         operation: impl Fn(
             Arc<dyn Resolver>,
         ) -> Pin<Box<dyn Future<Output = std::io::Result<T>> + Send>>
@@ -262,7 +263,7 @@ impl RefreshingResolver {
             // Refreshes if idle too long using double-checked locking.
             if matches!(refresh_state.lock().last_activity_at, Some(last) if last.elapsed() > policy.max_idle)
             {
-                let _guard = refresh_lock.lock().await;
+                let _guard = Self::refresh_wait(deadline, refresh_lock.lock()).await?;
                 if matches!(refresh_state.lock().last_activity_at, Some(last) if last.elapsed() > policy.max_idle)
                 {
                     log::info!(
@@ -270,9 +271,9 @@ impl RefreshingResolver {
                         description,
                         policy.max_idle
                     );
-                    match factory().await {
+                    match Self::refresh_wait(deadline, factory()).await? {
                         Ok(fresh) => {
-                            *inner.write().await = fresh;
+                            *Self::refresh_wait(deadline, inner.write()).await? = fresh;
                             let mut state = refresh_state.lock();
                             state.last_activity_at = Some(Instant::now());
                             state.generation = state.generation.wrapping_add(1);
@@ -289,10 +290,11 @@ impl RefreshingResolver {
             }
 
             let current_generation = refresh_state.lock().generation;
-            let current = inner.read().await.clone();
+            let current = Self::refresh_wait(deadline, inner.read()).await?.clone();
             let mut result = operation(current.clone()).await;
-            let retried_setup =
-                policy.retry_once_after_refresh && result.as_ref().is_err_and(dns_setup_pending);
+            let retried_setup = policy.retry_once_after_refresh
+                && result.as_ref().is_err_and(dns_setup_pending)
+                && deadline.is_none_or(|limit| tokio::time::Instant::now() < limit);
             if retried_setup {
                 result = operation(current).await;
             }
@@ -303,23 +305,26 @@ impl RefreshingResolver {
                 }
                 Err(error) => error,
             };
-            if !policy.retry_once_after_refresh || !Self::should_refresh_for_error(&error) {
+            if !policy.retry_once_after_refresh
+                || !Self::should_refresh_for_error(&error)
+                || deadline.is_some_and(|limit| tokio::time::Instant::now() >= limit)
+            {
                 return Err(error);
             }
 
-            let _guard = refresh_lock.lock().await;
+            let _guard = Self::refresh_wait(deadline, refresh_lock.lock()).await?;
             let retry_resolver = if refresh_state.lock().generation != current_generation {
                 if retried_setup {
                     return Err(error);
                 }
-                inner.read().await.clone()
+                Self::refresh_wait(deadline, inner.read()).await?.clone()
             } else {
                 log::info!(
                     "RefreshingResolver ({}): refresh-on-error ({})",
                     description,
                     error.kind()
                 );
-                let fresh = match factory().await {
+                let fresh = match Self::refresh_wait(deadline, factory()).await? {
                     Ok(fresh) => fresh,
                     Err(factory_err) => {
                         log::warn!(
@@ -330,7 +335,7 @@ impl RefreshingResolver {
                         return Err(error);
                     }
                 };
-                *inner.write().await = fresh.clone();
+                *Self::refresh_wait(deadline, inner.write()).await? = fresh.clone();
                 {
                     let mut state = refresh_state.lock();
                     state.generation = state.generation.wrapping_add(1);
@@ -346,6 +351,20 @@ impl RefreshingResolver {
             Ok(value)
         })
     }
+
+    async fn refresh_wait<T>(
+        deadline: Option<tokio::time::Instant>,
+        future: impl Future<Output = T>,
+    ) -> std::io::Result<T> {
+        match deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline, future)
+                .await
+                .map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::TimedOut, "DNS exchange timed out")
+                }),
+            None => Ok(future.await),
+        }
+    }
 }
 
 impl Resolver for RefreshingResolver {
@@ -354,11 +373,11 @@ impl Resolver for RefreshingResolver {
             return Box::pin(async move { Ok(vec![socket_addr]) });
         }
         let location = location.clone();
-        self.execute(move |resolver| resolver.resolve_location(&location))
+        self.execute(None, move |resolver| resolver.resolve_location(&location))
     }
 
     fn exchange(&self, request: Vec<u8>) -> DnsExchangeFuture {
-        self.execute(move |resolver| resolver.exchange(request.clone()))
+        self.execute(None, move |resolver| resolver.exchange(request.clone()))
     }
 
     fn exchange_with_deadline(
@@ -366,10 +385,10 @@ impl Resolver for RefreshingResolver {
         request: Vec<u8>,
         deadline: tokio::time::Instant,
     ) -> DnsExchangeFuture {
-        let future = self
-            .execute(move |resolver| resolver.exchange_with_deadline(request.clone(), deadline));
-        // The operation observes the deadline; the outer bound also covers refresh locks/factories.
-        dns_exchange_until(future, deadline)
+        // A second timer around the operation could beat its retained reply's timer wake.
+        self.execute(Some(deadline), move |resolver| {
+            resolver.exchange_with_deadline(request.clone(), deadline)
+        })
     }
 }
 
@@ -786,6 +805,83 @@ mod tests {
                 .last_activity_at
                 .is_some()
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exchange_deadline_handles_an_unbounded_configured_timeout() {
+        let resolver =
+            TimeoutResolver::with_timeout(MockResolver::with_addrs(vec![]), Duration::MAX);
+        assert_eq!(
+            resolver
+                .exchange_with_deadline(
+                    vec![1],
+                    tokio::time::Instant::now() + Duration::from_secs(1)
+                )
+                .await
+                .unwrap(),
+            vec![1]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn exchange_deadline_completion_is_not_raced_by_a_refresh_timer() {
+        #[derive(Debug)]
+        struct DeadlineReply(bool);
+        impl Resolver for DeadlineReply {
+            fn resolve_location(&self, _: &NetLocation) -> ResolveFuture {
+                unreachable!()
+            }
+            fn exchange_with_deadline(
+                &self,
+                request: Vec<u8>,
+                deadline: tokio::time::Instant,
+            ) -> DnsExchangeFuture {
+                let fail = self.0;
+                Box::pin(async move {
+                    tokio::time::sleep_until(deadline).await;
+                    // Model a leaf timer wake delivered after an enclosing timer's wake batch.
+                    tokio::task::yield_now().await;
+                    if fail {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            DnsSetupPending,
+                        ))
+                    } else {
+                        Ok(request)
+                    }
+                })
+            }
+        }
+        for fail in [false, true] {
+            let builds = Arc::new(AtomicUsize::new(0));
+            let calls = builds.clone();
+            let factory: ResolverFactory = Arc::new(move || {
+                calls.fetch_add(1, Ordering::Relaxed);
+                Box::pin(async move { Ok(Arc::new(DeadlineReply(fail)) as Arc<dyn Resolver>) })
+            });
+            let resolver = RefreshingResolver::new(
+                factory,
+                RefreshPolicy {
+                    max_idle: Duration::from_secs(60),
+                    retry_once_after_refresh: true,
+                },
+                "deadline completion".into(),
+            )
+            .await
+            .unwrap();
+            let reply = resolver
+                .exchange_with_deadline(
+                    vec![1],
+                    tokio::time::Instant::now() + Duration::from_millis(10),
+                )
+                .await;
+            if fail {
+                assert!(dns_setup_pending(&reply.unwrap_err()));
+            } else {
+                assert_eq!(reply.unwrap(), vec![1]);
+            }
+            assert_eq!(builds.load(Ordering::Relaxed), 1);
+        }
     }
 
     #[tokio::test(start_paused = true)]
