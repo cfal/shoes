@@ -1,11 +1,10 @@
-use std::collections::HashMap;
 use std::io;
 use std::net::IpAddr;
 
 use ipnetwork::IpNetwork;
 
 use super::{
-    Config, ConfigSelection, DnsConfig, RuleActionConfig, RuleConfig, ServerProxyConfig,
+    Config, ConfigSelection, RuleActionConfig, RuleConfig, ServerProxyConfig,
     ShadowTlsServerHandshakeConfig, ValidatedConfigs,
 };
 use crate::address::NetLocation;
@@ -20,6 +19,36 @@ pub(crate) fn tun_endpoint_ips(configs: &[Config]) -> impl Iterator<Item = IpAdd
         })
         .flatten()
         .flatten()
+}
+
+pub(crate) fn validate_tun_endpoints(
+    endpoints: impl IntoIterator<Item = IpAddr>,
+    pool_ranges: &[IpNetwork],
+) -> io::Result<()> {
+    for ip in endpoints {
+        let ip = ip.to_canonical();
+        for range in pool_ranges.iter().filter(|range| range.contains(ip)) {
+            // base+1 must be reserved in every overlapping pool, not just one.
+            let reserved = match (range.network(), ip) {
+                (IpAddr::V4(base), IpAddr::V4(ip)) => {
+                    u32::from(base).checked_add(1) == Some(u32::from(ip))
+                }
+                (IpAddr::V6(base), IpAddr::V6(ip)) => {
+                    u128::from(base).checked_add(1) == Some(u128::from(ip))
+                }
+                _ => false,
+            };
+            if !reserved {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "TUN interface/gateway overlaps an active or retained fake IP pool: {ip}"
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn reject(ranges: &[IpNetwork], ip: IpAddr, label: &str) -> io::Result<()> {
@@ -117,48 +146,19 @@ fn protocol(ranges: &[IpNetwork], config: &ServerProxyConfig) -> io::Result<()> 
 }
 
 pub(super) fn validate(config: &mut ValidatedConfigs) -> io::Result<()> {
-    let mut contexts = HashMap::new();
-    for group in &config.dns_groups {
-        if let Some(options) = &group.fake_ip {
-            let ranges: Result<Vec<IpNetwork>, _> = options
-                .ipv4_range
-                .iter()
-                .chain(options.ipv6_range.iter())
-                .map(|range| range.parse())
-                .collect();
-            contexts.insert(group.name.clone(), ranges.map_err(io::Error::other)?);
-        }
-    }
-    if contexts.is_empty() {
+    let ranges: Result<Vec<IpNetwork>, _> = config
+        .dns_groups
+        .iter()
+        .filter_map(|group| group.fake_ip.as_ref())
+        .flat_map(|options| options.ipv4_range.iter().chain(options.ipv6_range.iter()))
+        .map(|range| range.parse())
+        .collect();
+    let mut all = ranges.map_err(io::Error::other)?;
+    if all.is_empty() {
         return Ok(());
     }
-    let mut all: Vec<IpNetwork> = contexts.values().flatten().copied().collect();
+    validate_tun_endpoints(tun_endpoint_ips(&config.configs), &all)?;
     all.extend(tun_endpoint_ips(&config.configs).map(|ip| IpNetwork::from(ip.to_canonical())));
-    let effective = |dns: &Option<DnsConfig>| -> &[IpNetwork] {
-        dns.as_ref()
-            .and_then(DnsConfig::resolved_group)
-            .and_then(|name| contexts.get(name))
-            .map_or(&[], Vec::as_slice)
-    };
-    for server in &config.configs {
-        if let Config::TunServer(tun) = server {
-            let ranges = effective(&tun.dns);
-            for ip in [tun.address, tun.destination].into_iter().flatten() {
-                // The conventional virtual endpoint is already reserved by the allocator.
-                if !ranges.iter().any(|range| match (range.network(), ip) {
-                    (IpAddr::V4(base), IpAddr::V4(ip)) => {
-                        u32::from(ip) == u32::from(base).saturating_add(1)
-                    }
-                    (IpAddr::V6(base), IpAddr::V6(ip)) => {
-                        u128::from(ip) == u128::from(base).saturating_add(1)
-                    }
-                    _ => false,
-                }) {
-                    reject(ranges, ip, "TUN interface/gateway")?;
-                }
-            }
-        }
-    }
     config.validate_network_endpoints(&all)
 }
 
@@ -210,6 +210,7 @@ impl ValidatedConfigs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::DnsConfig;
 
     fn validate_yaml(yaml: &str) -> io::Result<ValidatedConfigs> {
         super::super::create_server_configs(serde_yaml::from_str(yaml).map_err(io::Error::other)?)
@@ -241,6 +242,75 @@ mod tests {
         .map(|ip| ip.parse().unwrap())
         .collect();
         assert_eq!(tun_endpoint_ips(&configs).collect::<Vec<_>>(), expected);
+    }
+
+    #[test]
+    fn tun_endpoints_reject_every_active_pool_regardless_of_selected_context() {
+        use serde_json::json;
+
+        for field in ["address", "destination"] {
+            for (ip, allowed) in [
+                ("198.18.0.5", false),
+                ("::ffff:198.18.0.5", false),
+                ("2001:2::5", false),
+                ("198.18.0.1", true),
+                ("::ffff:198.18.0.1", true),
+                ("2001:2::1", true),
+                ("10.99.0.1", true),
+            ] {
+                for dns in [None, Some("fake"), Some("other")] {
+                    let mut tun = json!({"device_name":"tun0", "device_fd":42});
+                    tun[field] = ip.into();
+                    if let Some(dns) = dns {
+                        tun["dns"] = json!({"servers":dns});
+                    }
+                    let configs = json!([
+                        {"dns_group":"fake", "dns_servers":"udp://127.0.0.1:9", "fake_ip":{
+                            "ipv4_range":"198.18.0.0/29", "ipv6_range":"2001:2::/125", "max_entries":5
+                        }},
+                        {"dns_group":"other", "dns_servers":"udp://127.0.0.1:9", "fake_ip":{
+                            "ipv4_range":"198.19.0.0/29", "max_entries":5
+                        }},
+                        tun,
+                    ]);
+                    let result = validate_yaml(&configs.to_string());
+                    if allowed {
+                        result.unwrap();
+                    } else {
+                        let error = result.err().expect("allocatable TUN endpoint accepted");
+                        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+                        assert!(
+                            error.to_string().contains("TUN interface/gateway"),
+                            "{error}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tun_reserved_endpoint_must_be_reserved_in_every_overlapping_pool() {
+        for (wide, narrow, ip) in [
+            ("198.18.0.0/28", "198.18.0.8/29", "198.18.0.9"),
+            ("2001:2::/124", "2001:2::8/125", "2001:2::9"),
+        ] {
+            let field = if ip.contains(':') {
+                "ipv6_range"
+            } else {
+                "ipv4_range"
+            };
+            let configs = serde_json::json!([
+                {"dns_group":"wide", "dns_servers":"udp://127.0.0.1:9", "fake_ip":{field:wide, "max_entries":5}},
+                {"dns_group":"narrow", "dns_servers":"udp://127.0.0.1:9", "fake_ip":{field:narrow, "max_entries":5}},
+                {"device_name":"tun0", "device_fd":42, "address":ip, "dns":{"servers":"narrow"}},
+            ]);
+            let error = validate_yaml(&configs.to_string()).err().unwrap();
+            assert!(
+                error.to_string().contains("TUN interface/gateway"),
+                "{error}"
+            );
+        }
     }
 
     #[test]

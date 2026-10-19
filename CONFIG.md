@@ -934,6 +934,9 @@ fake_ip:
   forwarding/fallback targets, and literal rule-override addresses cannot be
   inside any active or retained fake range. These checks apply even to inbounds
   without Fake DNS or with it explicitly disabled.
+- TUN interface and gateway addresses cannot overlap any active or retained
+  pool, except its reserved base+1 address. An address inside overlapping pools
+  must be reserved in every one of them, regardless of the TUN's DNS context.
 - `max_entries` bounds retained domain mappings, not the allocation range.
   Least-recently-used domains are evicted; sequential allocation traverses the
   entire range before reuse. Synthetic answers have a 60-second TTL. This is

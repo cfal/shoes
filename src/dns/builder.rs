@@ -650,10 +650,16 @@ pub async fn build_dns_registry_for_runtime(
     let forbidden: Result<Vec<IpNetwork>, _> = groups
         .iter()
         .filter_map(|group| group.fake_ip.as_ref())
+        .chain(
+            previous
+                .into_iter()
+                .flat_map(|registry| registry.pools.values().map(|state| &state.options)),
+        )
         .flat_map(|options| options.ipv4_range.iter().chain(options.ipv6_range.iter()))
         .map(|range| range.parse())
         .collect();
     let mut forbidden = forbidden.map_err(std::io::Error::other)?;
+    crate::config::validate_tun_endpoints(synthetic_endpoints.iter().copied(), &forbidden)?;
     if let Some(previous) = previous {
         for range in previous.forbidden_ranges() {
             if !forbidden.contains(range) {

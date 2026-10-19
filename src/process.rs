@@ -571,6 +571,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fake_dns_retained_pools_reject_tun_endpoint_reload_collisions() {
+        use serde_json::json;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.yaml");
+        let paths = [path.to_str().unwrap().to_owned()];
+        std::fs::write(
+            &path,
+            json!([
+                {"dns_group":"fake", "dns_servers":"udp://127.0.0.1:9", "fake_ip":{
+                    "ipv4_range":"198.18.0.0/29", "ipv6_range":"2001:2::/125", "max_entries":5
+                }},
+                {"device_name":"tun0", "device_fd":42, "address":"10.99.0.1"},
+            ])
+            .to_string(),
+        )
+        .unwrap();
+        let live = prepare(&paths, None).await.unwrap();
+        let context = live
+            .dns
+            .get_by_name("fake")
+            .unwrap()
+            .fake_dns_context()
+            .unwrap();
+        let ip = context.allocate("before.example", false).unwrap();
+        for config in [
+            json!([{ "dns_group":"fake", "dns_servers":"udp://127.0.0.1:9", "fake_ip":false }]),
+            json!([]),
+        ] {
+            std::fs::write(&path, config.to_string()).unwrap();
+            let retained = prepare(&paths, Some(&live.dns)).await.unwrap();
+            for field in ["address", "destination"] {
+                for (endpoint, allowed) in [
+                    ("198.18.0.5", false),
+                    ("::ffff:198.18.0.5", false),
+                    ("2001:2::5", false),
+                    ("198.18.0.1", true),
+                    ("::ffff:198.18.0.1", true),
+                    ("2001:2::1", true),
+                    ("10.99.0.1", true),
+                ] {
+                    let mut tun = json!({"device_name":"tun0", "device_fd":42});
+                    tun[field] = endpoint.into();
+                    std::fs::write(&path, json!([tun]).to_string()).unwrap();
+                    load_validated(&paths).await.unwrap();
+                    let result = prepare(&paths, Some(&retained.dns)).await;
+                    if allowed {
+                        result.unwrap();
+                    } else {
+                        let error = result.err().expect("retained TUN collision accepted");
+                        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+                        assert!(
+                            error.to_string().contains("TUN interface/gateway"),
+                            "{error}"
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            context.restore(ip).unwrap().as_deref(),
+            Some("before.example")
+        );
+        context.allocate("after.example", false).unwrap();
+    }
+
+    #[tokio::test]
     async fn fake_dns_terminal_shutdown_closes_all_registries_after_checkpoint_error() {
         let directory = tempfile::tempdir().unwrap();
         let mut registries = Vec::new();
