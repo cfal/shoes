@@ -2,7 +2,7 @@ use log::{debug, error};
 use lru::LruCache;
 use parking_lot::RwLock;
 use std::hash::Hash;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
@@ -236,13 +236,8 @@ impl PreparedDestination {
         self.source == DestinationSource::FakeDns
     }
 
-    pub(crate) fn sniffable_real_ip(&self) -> Option<SocketAddr> {
-        if self.source != DestinationSource::LiteralIp {
-            return None;
-        }
-        self.connection_target
-            .location()
-            .to_socket_addr_nonblocking()
+    fn is_sniffable(&self) -> bool {
+        self.source != DestinationSource::SuppliedHostname
     }
 }
 
@@ -422,7 +417,7 @@ impl ClientProxySelector {
     }
 
     pub(crate) fn should_sniff(&self, target: &PreparedDestination) -> bool {
-        self.sniff_enabled && self.has_hostname_rules && target.sniffable_real_ip().is_some()
+        self.sniff_enabled && self.has_hostname_rules && target.is_sniffable()
     }
 
     pub(crate) fn fake_dns_enabled(&self) -> bool {
@@ -435,30 +430,29 @@ impl ClientProxySelector {
         server_name: Option<&str>,
         resolver: &Arc<dyn Resolver>,
     ) -> std::io::Result<RoutedDestination<'a>> {
-        let real_ip = target.sniffable_real_ip();
         let decision = if let Some(name) = server_name {
-            let addr = real_ip.ok_or_else(|| {
-                std::io::Error::new(
+            if !target.is_sniffable() {
+                return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
-                    "SNI requires a prepared literal-IP destination",
-                )
-            })?;
-            let mut matching = ResolvedLocation::with_resolved(
-                NetLocation::new(Address::Hostname(name.to_owned()), addr.port()),
-                addr,
-            );
+                    "SNI requires a prepared IP-origin destination",
+                ));
+            }
+            let mut connection_target = target.connection_target;
+            let resolved_ip = connection_target
+                .location()
+                .to_socket_addr_nonblocking()
+                .map(|addr| ip_to_u128(addr.ip()));
             match match_rule(
                 &self.rules,
-                &mut matching,
-                Some(ip_to_u128(addr.ip())),
+                &mut connection_target,
+                resolved_ip,
                 resolver,
                 false,
+                Some(name),
             )
             .await?
             {
-                Some(index) => self.rules[index]
-                    .action
-                    .to_decision(target.connection_target),
+                Some(index) => self.rules[index].action.to_decision(connection_target),
                 None => ConnectDecision::Block,
             }
         } else {
@@ -544,6 +538,7 @@ impl ClientProxySelector {
             resolved_ip,
             resolver,
             self.resolve_rule_hostnames,
+            None,
         )
         .await?
         {
@@ -575,6 +570,7 @@ impl ClientProxySelector {
             resolved_ip,
             resolver,
             self.resolve_rule_hostnames,
+            None,
         )
         .await?
         {
@@ -665,6 +661,7 @@ async fn match_rule(
     mut resolved_ip: Option<u128>,
     resolver: &Arc<dyn Resolver>,
     resolve_rule_hostnames: bool,
+    sniffed_hostname: Option<&str>,
 ) -> std::io::Result<Option<usize>> {
     for (rule_index, rule) in rules.iter().enumerate() {
         for mask in rule.masks.iter() {
@@ -674,6 +671,7 @@ async fn match_rule(
                 &mut resolved_ip,
                 resolver,
                 resolve_rule_hostnames,
+                sniffed_hostname,
             )
             .await
             {
@@ -724,6 +722,7 @@ async fn match_mask(
     resolved_ip: &mut Option<u128>,
     resolver: &Arc<dyn Resolver>,
     resolve_rule_hostnames: bool,
+    sniffed_hostname: Option<&str>,
 ) -> std::result::Result<bool, MatchMaskError> {
     let NetLocationMask {
         address_mask: AddressMask { address, netmask },
@@ -742,7 +741,9 @@ async fn match_mask(
     }
 
     if let Some(hostname) = address.hostname() {
-        if let Some(remote_hostname) = location.location().address().hostname() {
+        if let Some(remote_hostname) =
+            sniffed_hostname.or_else(|| location.location().address().hostname())
+        {
             return Ok(matches_domain(hostname, remote_hostname));
         }
 
@@ -945,7 +946,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepared_fake_names_survive_recycling_and_reject_sni() {
+    async fn prepared_fake_names_survive_recycling_with_and_without_sni() {
         use crate::dns::fake_ip::FakeIpOptions;
         let resolver: Arc<dyn Resolver> = Arc::new(NoDns);
         let context = Arc::new(
@@ -969,34 +970,29 @@ mod tests {
         let first = context.allocate("first.example", false).unwrap();
         let wire = format!("{first}:443");
         let frozen = prepared(&selector, &wire);
+        let frozen_with_sni = prepared(&selector, &wire);
         assert!(frozen.is_fake_dns());
-        assert!(!selector.should_sniff(&frozen));
-        let error = selector
-            .judge_prepared(
-                prepared(&selector, &wire),
-                Some("allowed.example"),
-                &resolver,
-            )
-            .await
-            .unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(selector.should_sniff(&frozen));
         context.allocate("second.example", false).unwrap();
         let error = selector
             .prepare(NetLocation::from_str(&wire, None).unwrap().into())
             .unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
-        let routed = selector
-            .judge_prepared(frozen, None, &resolver)
-            .await
-            .unwrap();
-        assert_eq!(routed.wire_destination.to_string(), wire);
-        let ConnectDecision::Allow {
-            remote_location, ..
-        } = routed.decision
-        else {
-            panic!()
-        };
-        assert_eq!(remote_location.location().to_string(), "first.example:443");
+        for (target, name) in [(frozen, None), (frozen_with_sni, Some("third.example"))] {
+            let routed = selector
+                .judge_prepared(target, name, &resolver)
+                .await
+                .unwrap();
+            assert_eq!(routed.wire_destination.to_string(), wire);
+            let ConnectDecision::Allow {
+                remote_location, ..
+            } = routed.decision
+            else {
+                panic!()
+            };
+            assert_eq!(remote_location.location().to_string(), "first.example:443");
+            assert_eq!(remote_location.resolved_addr(), None);
+        }
         for index in 0..3 {
             context
                 .allocate(&format!("unused{index}.example"), false)
@@ -1011,6 +1007,150 @@ mod tests {
                 .decision,
             ConnectDecision::Allow { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn fake_dns_sni_bypasses_cached_hostname_rules_without_resolving() {
+        let resolver: Arc<dyn Resolver> = Arc::new(NoDns);
+        let context = Arc::new(
+            FakeDnsContext::new(
+                crate::dns::fake_ip::FakeIpOptions {
+                    ipv6_range: Some("2001:2::/48".into()),
+                    ..Default::default()
+                },
+                resolver.clone(),
+            )
+            .unwrap(),
+        );
+        let mut rules = vec![
+            block_rule(vec!["restored.example"]),
+            allow_rule(vec!["sniff.example"], "direct"),
+        ];
+        rules.extend((0..17).map(|_| block_rule(vec!["irrelevant.example"])));
+        let selector = ClientProxySelector::new(rules)
+            .with_sniff(true)
+            .with_fake_dns_context(Some(context.clone()))
+            .unwrap();
+        for ipv6 in [false, true] {
+            let ip = context.allocate("restored.example", ipv6).unwrap();
+            for address in [
+                Address::from(&ip.to_string()).unwrap(),
+                Address::Hostname(ip.to_string()),
+            ] {
+                let wire = NetLocation::new(address, 443);
+                assert!(matches!(
+                    selector
+                        .judge(wire.clone().into(), &resolver)
+                        .await
+                        .unwrap(),
+                    ConnectDecision::Block
+                ));
+                let cache_len = selector.cache_size();
+                let IngressTarget::Forward(target) = selector.prepare(wire.clone().into()).unwrap()
+                else {
+                    panic!()
+                };
+                assert!(selector.should_sniff(&target));
+                let routed = selector
+                    .judge_prepared(target, Some("sniff.example"), &resolver)
+                    .await
+                    .unwrap();
+                assert_eq!(routed.wire_destination, wire);
+                let ConnectDecision::Allow {
+                    remote_location, ..
+                } = routed.decision
+                else {
+                    panic!()
+                };
+                assert_eq!(
+                    remote_location.location().to_string(),
+                    "restored.example:443"
+                );
+                assert_eq!(remote_location.resolved_addr(), None);
+                assert_eq!(selector.cache_size(), cache_len);
+                assert!(matches!(
+                    selector.judge(wire.into(), &resolver).await.unwrap(),
+                    ConnectDecision::Block
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn fake_dns_sni_ip_rules_resolve_only_the_restored_target_in_rule_order() {
+        for ip_first in [false, true] {
+            for blocked in [false, true] {
+                let mut resolver = MockResolver::new();
+                let resolved = if blocked {
+                    "127.0.0.1:443"
+                } else {
+                    "192.0.2.1:443"
+                };
+                resolver.mappings.insert(
+                    "restored.example:443".into(),
+                    vec![resolved.parse().unwrap()],
+                );
+                let resolver: Arc<dyn Resolver> = if ip_first {
+                    Arc::new(resolver)
+                } else {
+                    Arc::new(NoDns)
+                };
+                let context =
+                    Arc::new(FakeDnsContext::new(Default::default(), resolver.clone()).unwrap());
+                let mut rules = vec![
+                    block_rule(vec!["127.0.0.0/8"]),
+                    allow_rule(vec!["sniff.example"], "direct"),
+                ];
+                if !ip_first {
+                    rules.swap(0, 1);
+                }
+                let selector = ClientProxySelector::new(rules)
+                    .with_sniff(true)
+                    .with_fake_dns_context(Some(context.clone()))
+                    .unwrap();
+                let ip = context.allocate("restored.example", false).unwrap();
+                let routed = selector
+                    .judge_prepared(
+                        prepared(&selector, &format!("{ip}:443")),
+                        Some("sniff.example"),
+                        &resolver,
+                    )
+                    .await
+                    .unwrap();
+                if ip_first && blocked {
+                    assert!(matches!(routed.decision, ConnectDecision::Block));
+                } else {
+                    let ConnectDecision::Allow {
+                        remote_location, ..
+                    } = routed.decision
+                    else {
+                        panic!()
+                    };
+                    assert_eq!(
+                        remote_location.location().to_string(),
+                        "restored.example:443"
+                    );
+                    assert_eq!(
+                        remote_location.resolved_addr(),
+                        ip_first.then(|| resolved.parse().unwrap())
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn supplied_hostnames_remain_ineligible_for_sniffing() {
+        let selector = ClientProxySelector::new(vec![allow_rule(vec!["sniff.example"], "direct")])
+            .with_sniff(true);
+        let resolver: Arc<dyn Resolver> = Arc::new(NoDns);
+        let target = prepared(&selector, "supplied.example:443");
+        assert!(!selector.should_sniff(&target));
+        let error = selector
+            .judge_prepared(target, Some("sniff.example"), &resolver)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
     }
 
     #[test]
@@ -1051,7 +1191,10 @@ mod tests {
         };
         assert_eq!(target.wire_destination, wire);
         assert_eq!(
-            target.sniffable_real_ip(),
+            target
+                .connection_target
+                .location()
+                .to_socket_addr_nonblocking(),
             Some("192.0.2.1:443".parse().unwrap())
         );
         let wire = NetLocation::new(Address::Hostname(ip.to_string()), 53);

@@ -52,7 +52,7 @@ same cipher and run v0.3.3 or newer for AES-256 or ChaCha20.
 
 - **Multi-transport**: TCP or QUIC for all protocols
 - **TLS with SNI routing**: Select the outer TLS handler by Server Name Indication
-- **Opt-in TLS payload sniffing**: Match inner SNI without changing the destination IP ([example](examples/sni_sniffing.yaml), [semantics](CONFIG.md#tls-sni-routing))
+- **Opt-in TLS payload sniffing**: Match inner SNI without changing the connection destination ([example](examples/sni_sniffing.yaml), [semantics](CONFIG.md#tls-sni-routing))
 - **Upstream proxy chaining**: Multi-hop chains with load balancing
 - **Rule-based routing**: Route by IP/CIDR or hostname masks
 - **Named PEM certificates**: Define once, reference everywhere
