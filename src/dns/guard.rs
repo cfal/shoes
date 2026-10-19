@@ -82,6 +82,113 @@ mod tests {
     use super::*;
 
     #[derive(Debug)]
+    struct HintReply(std::net::IpAddr);
+
+    impl Resolver for HintReply {
+        fn resolve_location(&self, _: &NetLocation) -> ResolveFuture {
+            unreachable!()
+        }
+
+        fn exchange(&self, request: Vec<u8>) -> DnsExchangeFuture {
+            let ip = self.0;
+            Box::pin(async move {
+                use hickory_resolver::proto::rr::{
+                    RData, Record, RecordType,
+                    rdata::{
+                        A, AAAA, HTTPS, SVCB,
+                        svcb::{IpHint, SvcParamKey, SvcParamValue},
+                    },
+                };
+                let mut answer = super::super::message::decode(&request)?.into_response();
+                let hint = match ip {
+                    std::net::IpAddr::V4(ip) => (
+                        SvcParamKey::Ipv4Hint,
+                        SvcParamValue::Ipv4Hint(IpHint(vec![A(ip)])),
+                    ),
+                    std::net::IpAddr::V6(ip) => (
+                        SvcParamKey::Ipv6Hint,
+                        SvcParamValue::Ipv6Hint(IpHint(vec![AAAA(ip)])),
+                    ),
+                };
+                let svcb = SVCB::new(1, answer.queries[0].name.clone(), vec![hint]);
+                let data = if answer.queries[0].query_type == RecordType::HTTPS {
+                    RData::HTTPS(HTTPS(svcb))
+                } else {
+                    RData::SVCB(svcb)
+                };
+                answer.add_answer(Record::from_rdata(answer.queries[0].name.clone(), 60, data));
+                answer.to_vec().map_err(io::Error::other)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn service_binding_hints_obey_global_and_context_address_guards() {
+        use crate::dns::fake_ip::{FakeDnsContext, FakeIpOptions};
+        use hickory_resolver::proto::{
+            op::{Message, Query, ResponseCode},
+            rr::{Name, RecordType},
+        };
+
+        for kind in [RecordType::HTTPS, RecordType::SVCB] {
+            let mut request = Message::query();
+            request.add_query(Query::query(Name::from_ascii("hint.test.").unwrap(), kind));
+            let bytes = request.to_vec().unwrap();
+            for (ip, forbidden) in [
+                ("198.18.0.5", "198.18.0.0/15"),
+                ("::ffff:198.19.0.5", "198.19.0.0/24"),
+                ("2001:2::5", "2001:2::/48"),
+                ("192.0.2.1", "192.0.2.1/32"),
+            ] {
+                let reply: Arc<dyn Resolver> = Arc::new(HintReply(ip.parse().unwrap()));
+                let real = real_only(reply, vec![forbidden.parse().unwrap()].into());
+                assert_eq!(
+                    real.exchange(bytes.clone()).await.unwrap_err().kind(),
+                    io::ErrorKind::InvalidData
+                );
+            }
+            for ip in [
+                "198.18.0.5",
+                "::ffff:198.18.0.5",
+                "2001:2::5",
+                "192.0.2.5",
+                "2001:db8::5",
+            ] {
+                let reply: Arc<dyn Resolver> = Arc::new(HintReply(ip.parse().unwrap()));
+                let options = FakeIpOptions {
+                    ipv6_range: Some("2001:2::/48".into()),
+                    ..Default::default()
+                };
+                let context = FakeDnsContext::new(options, reply.clone()).unwrap();
+                let response = context
+                    .exchange(bytes.clone(), true)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let response = Message::from_vec(&response).unwrap();
+                if context.contains(ip.parse().unwrap()) {
+                    assert_eq!(response.metadata.response_code, ResponseCode::ServFail);
+                } else {
+                    let guarded = real_only(
+                        reply.clone(),
+                        vec![
+                            "198.18.0.0/15".parse().unwrap(),
+                            "2001:2::/48".parse().unwrap(),
+                        ]
+                        .into(),
+                    );
+                    assert_eq!(
+                        guarded.exchange(bytes.clone()).await.unwrap(),
+                        reply.exchange(bytes.clone()).await.unwrap()
+                    );
+                    assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+                    assert_eq!(response.answers.len(), 1);
+                }
+            }
+        }
+    }
+
+    #[derive(Debug)]
     struct Reply;
 
     impl Resolver for Reply {

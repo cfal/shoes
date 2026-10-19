@@ -1,19 +1,43 @@
 use std::io;
 
 use hickory_resolver::proto::op::Message;
+use hickory_resolver::proto::rr::rdata::svcb::SvcParamValue;
 use hickory_resolver::proto::rr::{RData, RecordType};
 use hickory_resolver::proto::serialize::binary::{BinDecodable, BinDecoder};
 
 pub(super) const UDP_PAYLOAD_LIMIT: u16 = 1232;
 
 pub(super) fn addresses(message: &Message) -> impl Iterator<Item = std::net::IpAddr> + '_ {
-    message
-        .all_sections()
-        .filter_map(|record| match record.data {
+    message.all_sections().flat_map(|record| {
+        let address = match record.data {
             RData::A(ip) => Some(ip.0.into()),
             RData::AAAA(ip) => Some(ip.0.into()),
             _ => None,
-        })
+        };
+        let binding = match &record.data {
+            RData::HTTPS(https) => Some(&https.0),
+            RData::SVCB(svcb) => Some(svcb),
+            _ => None,
+        };
+        address.into_iter().chain(
+            binding
+                .into_iter()
+                .flat_map(|binding| &binding.svc_params)
+                .flat_map(|(_, value)| {
+                    let v4 = match value {
+                        SvcParamValue::Ipv4Hint(hint) => hint.0.as_slice(),
+                        _ => &[],
+                    };
+                    let v6 = match value {
+                        SvcParamValue::Ipv6Hint(hint) => hint.0.as_slice(),
+                        _ => &[],
+                    };
+                    v4.iter()
+                        .map(|ip| ip.0.into())
+                        .chain(v6.iter().map(|ip| ip.0.into()))
+                }),
+        )
+    })
 }
 
 pub(super) fn decode(bytes: &[u8]) -> io::Result<Message> {
