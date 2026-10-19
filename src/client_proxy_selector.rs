@@ -971,6 +971,7 @@ mod tests {
         let wire = format!("{first}:443");
         let frozen = prepared(&selector, &wire);
         let frozen_with_sni = prepared(&selector, &wire);
+        let frozen_unmatched = prepared(&selector, &wire);
         assert!(frozen.is_fake_dns());
         assert!(selector.should_sniff(&frozen));
         context.allocate("second.example", false).unwrap();
@@ -978,6 +979,14 @@ mod tests {
             .prepare(NetLocation::from_str(&wire, None).unwrap().into())
             .unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert!(matches!(
+            selector
+                .judge_prepared(frozen_unmatched, Some("unmatched.example"), &resolver)
+                .await
+                .unwrap()
+                .decision,
+            ConnectDecision::Block
+        ));
         for (target, name) in [(frozen, None), (frozen_with_sni, Some("third.example"))] {
             let routed = selector
                 .judge_prepared(target, name, &resolver)
@@ -1222,6 +1231,10 @@ mod tests {
         assert!(parent.should_sniff(&prepared(&parent, "203.0.113.7:443")));
         assert!(!child.should_sniff(&prepared(&child, "203.0.113.7:443")));
         assert!(!parent.should_sniff(&prepared(&parent, "supplied.example:443")));
+        let fake = context.allocate("parent.example", false).unwrap();
+        let target = format!("{fake}:443");
+        assert!(parent.should_sniff(&prepared(&parent, &target)));
+        assert!(!child.should_sniff(&prepared(&child, &target)));
         for target in ["198.18.0.9:53", "resolver.invalid:53"] {
             let location = NetLocation::from_str(target, None).unwrap();
             assert!(matches!(

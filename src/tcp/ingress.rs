@@ -237,7 +237,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn local_dns_is_ready_without_a_query_and_fake_names_are_not_probed() {
+    async fn local_dns_is_ready_without_a_query_and_fake_names_are_probed() {
         use crate::dns::fake_ip::{FakeDnsContext, FakeIpOptions};
         let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
         let context =
@@ -265,6 +265,11 @@ pub(crate) mod tests {
         assert!(routed.setup.is_some());
         let ip = context.allocate("restored.example", false).unwrap();
         let target = NetLocation::from_str(&format!("{ip}:443"), None).unwrap();
+        assert!(
+            PreparedTcp::new(&selector, target.clone(), Vec::new())
+                .unwrap()
+                .needs_sniff_read()
+        );
         let hello = crate::sniff::tests::hello(&rustls::version::TLS13, true);
         let prepared = PreparedTcp::new(&selector, target, hello.clone()).unwrap();
         assert!(!prepared.needs_sniff_read());

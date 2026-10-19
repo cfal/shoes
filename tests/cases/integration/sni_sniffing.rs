@@ -60,6 +60,7 @@ async fn fake_dns_sniff_routes_without_rewriting_restored_targets() -> io::Resul
                 (true, true, true),
                 (true, true, false),
                 (true, false, true),
+                (true, false, false),
             ] {
                 let exit = TcpListener::bind("0.0.0.0:0").await?;
                 let exit_port = exit.local_addr()?.port();

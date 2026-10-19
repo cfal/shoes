@@ -97,7 +97,7 @@ Outer sockets retain mobile socket protection and interface binding. Optional
 route, firewall rule, or NAT rule is created.
 
 Servers require explicit nonempty top-level `rules` and may specify top-level
-`dns`. Missing, null, or empty rules reject; `rules: block-all` is valid.
+`dns` and `sniff`. Missing, null, or empty rules reject; `rules: block-all` is valid.
 Rules use the normal destination masks, overrides, and client chains. Clients
 accept replies to their outgoing flows, not unsolicited inbound flows. Per-peer authorization
 beyond cryptokey source validation is not supplied by destination rules.
@@ -896,7 +896,10 @@ An explicit rule override to port 53 is ordinary forwarding, not interception.
 A/AAAA synthesis creates scoped mappings. Later connections to those addresses
 restore the hostname before routing or SNI sniffing. A restored hostname is
 resolved normally when a rule or direct connection needs a real IP; a proxy can
-receive the hostname instead. Sniffed SNI cannot replace a restored name.
+receive the hostname instead. With `sniff: true`, visible TLS SNI takes precedence
+for hostname rules only; the restored name remains the connection target and is
+what IP rules resolve. SNI is client-controlled, so a different SNI can bypass a
+hostname deny rule on the restored name.
 Unmapped addresses inside the receiving context's ranges fail closed. Addresses
 from another context's non-overlapping range are not recognized and are routed
 as ordinary IPs. Overlapping ranges may map to an unrelated hostname in the
@@ -1023,6 +1026,9 @@ failure closes or resets the stream rather than sending another status.
 SNI is client-controlled, not authenticated identity or a domain firewall. Put
 mandatory IP deny rules before hostname allows. With ECH, only the visible outer
 name is available, not the encrypted inner hostname.
+For Fake DNS flows, that outer name takes precedence over the restored hostname
+for hostname rules. Disable `sniff` when routing must follow the restored name,
+or configure rules for the ECH public names.
 
 ### Rule Config
 ```yaml
