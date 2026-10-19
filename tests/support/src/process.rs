@@ -712,6 +712,13 @@ fn validate_mihomo_binary(path: &Path) -> io::Result<String> {
 pub async fn start_mihomo_server(
     config: &str,
 ) -> io::Result<(ProcessGuard, tempfile::NamedTempFile)> {
+    start_mihomo_server_with_env(config, &[]).await
+}
+
+pub async fn start_mihomo_server_with_env(
+    config: &str,
+    environment: &[(&str, &str)],
+) -> io::Result<(ProcessGuard, tempfile::NamedTempFile)> {
     let mut config_file = tempfile::NamedTempFile::new()?;
     config_file.write_all(config.as_bytes())?;
     config_file.flush()?;
@@ -732,6 +739,7 @@ pub async fn start_mihomo_server(
     };
     // Mihomo accepts SOCKS connections before enabling routing; post-up runs afterward.
     let child = Command::new(find_mihomo_binary()?)
+        .envs(environment.iter().copied())
         .arg("-f")
         .arg(config_file.path())
         .args(["-post-up", post_up])
