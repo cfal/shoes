@@ -653,7 +653,7 @@ mod sniff_tests {
                         executor: ConnectionExecutor(Arc::downgrade(&streams)),
                         slots: Arc::new(crate::resources::Budget::new(None)),
                     });
-                    let (server, mut peer) = tokio::io::duplex(8192);
+                    let (server, mut peer) = tokio::io::duplex(32);
                     let _server = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
                         let service = hyper::service::service_fn(move |req| naive_service(req, config.clone()));
                         hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(server), service).with_upgrades().await.unwrap();
@@ -665,6 +665,7 @@ mod sniff_tests {
                     let mut peer = NaivePaddingStream::new(peer, PaddingDirection::Client, PaddingType::Variant1);
                     peer.write_all(&fixture.uot_header(fixed)).await.unwrap();
                     peer.write_all(&fixture.request(mode)).await.unwrap();
+                    peer.flush().await.unwrap();
                     fixture.read_reply(&mut peer, mode).await;
                     while let Some(result) = tasks.join_next().await {
                         result.unwrap();
