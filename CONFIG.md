@@ -897,10 +897,10 @@ A/AAAA synthesis creates scoped mappings. Later connections to those addresses
 restore the hostname before routing or SNI sniffing. A restored hostname is
 resolved normally when a rule or direct connection needs a real IP; a proxy can
 receive the hostname instead. Sniffed SNI cannot replace a restored name.
-Synthetic addresses absent from the receiving context fail closed. Independent
-contexts with overlapping ranges cannot distinguish cross-use: an address may
-already map to an unrelated hostname in the receiving context. Use one shared
-named DNS group or non-overlapping ranges for inbounds serving the same clients.
+Unmapped addresses inside the receiving context's ranges fail closed. Addresses
+from another context's non-overlapping range are not recognized and are routed
+as ordinary IPs. Overlapping ranges may map to an unrelated hostname in the
+receiving context. Use one shared named DNS group for inbounds serving the same clients.
 Established flows keep their chosen target.
 
 `false` disables the feature. An options object enables it with these defaults:
@@ -962,7 +962,8 @@ before startup; protect it because the file records queried domains. Cursor
 reservations are persisted before issuance; a crash can lose recent mappings,
 which then fail closed rather than restoring an obsolete owner. Back up or
 explicitly remove incompatible state before changing its pool configuration.
-Persistent families need at least two allocatable addresses. Reservations may
+Persistent families need at least two allocatable addresses, and persistent pools
+are limited to 383,473 entries to fit the snapshot read limit. Reservations may
 skip unused addresses after restart; Windows power-loss durability and state-file
 ACLs require platform-specific verification.
 
@@ -977,6 +978,8 @@ Fake-enabled system configurations fail startup if no usable endpoints can be
 discovered. Later upstream failures produce DNS failure, not a public-provider fallback.
 UDP and HTTP/3 upstreams remain direct-only; TCP/TLS/HTTPS can use client chains.
 UDP truncation retries TCP only when that transport is explicitly configured.
+Groups with mixed upstream settings try their remaining configured resolvers for
+a complete reply before returning a truncated answer.
 Local UDP DNS peers process one query at a time with bounded backpressure; a
 forwarded query can delay subsequent synthetic answers until its deadline.
 
