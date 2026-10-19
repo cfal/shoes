@@ -2,6 +2,8 @@
 mod anytls;
 #[path = "cases/integration/anytls_uot_integration.rs"]
 mod anytls_uot;
+#[path = "cases/integration/fake_dns.rs"]
+mod fake_dns;
 #[path = "cases/integration/h2mux_integration.rs"]
 mod h2mux;
 #[path = "cases/integration/h2mux_backpressure.rs"]
@@ -36,6 +38,8 @@ mod shadowsocks_uot;
 mod shadowsocks_uot_edge_cases;
 #[path = "cases/integration/snell_integration.rs"]
 mod snell;
+#[path = "cases/integration/sni_sniffing.rs"]
+mod sni_sniffing;
 #[path = "cases/integration/socks_integration.rs"]
 mod socks;
 #[path = "cases/integration/socks5_udp_associate_test.rs"]

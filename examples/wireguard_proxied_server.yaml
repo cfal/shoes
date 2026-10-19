@@ -12,6 +12,7 @@
 # No local UDP listener: keepalive establishes the proxy's return mapping.
 - protocol:
     type: wireguard
+    wireguard_name: proxied-gateway
     private_key: "KSkpKSkpKSkpKSkpKSkpKSkpKSkpKSkpKSkpKSkpKSk="
     addresses: ["10.77.0.1/32", "fd77::1/128"]
     mtu: 1280

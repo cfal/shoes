@@ -107,11 +107,15 @@ pub trait AsyncReadSourcedMessage {
 }
 
 pub trait AsyncWriteSourcedMessage {
+    fn supports_hostname_source(&self) -> bool {
+        true
+    }
+
     fn poll_write_sourced_message(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
-        source: &SocketAddr,
+        source: &NetLocation,
     ) -> Poll<std::io::Result<()>>;
 }
 
@@ -124,7 +128,7 @@ pub trait AsyncReadSessionMessage {
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<(MessageSessionId, SocketAddr)>>;
+    ) -> Poll<std::io::Result<(MessageSessionId, NetLocation)>>;
 
     fn take_closed_session(&mut self) -> Option<MessageSessionId> {
         None
@@ -139,7 +143,7 @@ pub trait AsyncWriteSessionMessage {
         cx: &mut Context<'_>,
         session_id: MessageSessionId,
         buf: &[u8],
-        target: &SocketAddr,
+        target: &NetLocation,
     ) -> Poll<std::io::Result<()>>;
 }
 
@@ -484,22 +488,30 @@ impl<T: ?Sized + AsyncReadSourcedMessage + Unpin> AsyncReadSourcedMessage for &m
 }
 
 impl<T: ?Sized + AsyncWriteSourcedMessage + Unpin> AsyncWriteSourcedMessage for Box<T> {
+    fn supports_hostname_source(&self) -> bool {
+        (**self).supports_hostname_source()
+    }
+
     fn poll_write_sourced_message(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
-        source: &SocketAddr,
+        source: &NetLocation,
     ) -> Poll<std::io::Result<()>> {
         Pin::new(&mut **self).poll_write_sourced_message(cx, buf, source)
     }
 }
 
 impl<T: ?Sized + AsyncWriteSourcedMessage + Unpin> AsyncWriteSourcedMessage for &mut T {
+    fn supports_hostname_source(&self) -> bool {
+        (**self).supports_hostname_source()
+    }
+
     fn poll_write_sourced_message(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
-        source: &SocketAddr,
+        source: &NetLocation,
     ) -> Poll<std::io::Result<()>> {
         Pin::new(&mut **self).poll_write_sourced_message(cx, buf, source)
     }
@@ -540,7 +552,7 @@ impl<T: ?Sized + AsyncReadSessionMessage + Unpin> AsyncReadSessionMessage for Bo
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<(MessageSessionId, SocketAddr)>> {
+    ) -> Poll<std::io::Result<(MessageSessionId, NetLocation)>> {
         Pin::new(&mut **self).poll_read_session_message(cx, buf)
     }
 
@@ -554,7 +566,7 @@ impl<T: ?Sized + AsyncReadSessionMessage + Unpin> AsyncReadSessionMessage for &m
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<(MessageSessionId, SocketAddr)>> {
+    ) -> Poll<std::io::Result<(MessageSessionId, NetLocation)>> {
         Pin::new(&mut **self).poll_read_session_message(cx, buf)
     }
 
@@ -569,7 +581,7 @@ impl<T: ?Sized + AsyncWriteSessionMessage + Unpin> AsyncWriteSessionMessage for 
         cx: &mut Context<'_>,
         session_id: MessageSessionId,
         buf: &[u8],
-        target: &SocketAddr,
+        target: &NetLocation,
     ) -> Poll<std::io::Result<()>> {
         Pin::new(&mut **self).poll_write_session_message(cx, session_id, buf, target)
     }
@@ -581,7 +593,7 @@ impl<T: ?Sized + AsyncWriteSessionMessage + Unpin> AsyncWriteSessionMessage for 
         cx: &mut Context<'_>,
         session_id: MessageSessionId,
         buf: &[u8],
-        target: &SocketAddr,
+        target: &NetLocation,
     ) -> Poll<std::io::Result<()>> {
         Pin::new(&mut **self).poll_write_session_message(cx, session_id, buf, target)
     }

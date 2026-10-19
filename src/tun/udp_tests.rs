@@ -190,3 +190,116 @@ async fn framed_raw_fd_ipv4_udp_roundtrips() {
 async fn framed_raw_fd_ipv6_udp_roundtrips() {
     roundtrips(true, true).await;
 }
+
+#[derive(Debug)]
+struct FakeDnsTestResolver;
+
+impl Resolver for FakeDnsTestResolver {
+    fn resolve_location(
+        &self,
+        location: &crate::address::NetLocation,
+    ) -> crate::resolver::ResolveFuture {
+        assert_eq!(location.address().hostname(), Some("raw-fd.example"));
+        let port = location.port();
+        Box::pin(async move { Ok(vec![SocketAddr::from(([127, 0, 0, 1], port))]) })
+    }
+
+    fn exchange(&self, bytes: Vec<u8>) -> crate::resolver::DnsExchangeFuture {
+        Box::pin(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let mut message = hickory_resolver::proto::op::Message::from_vec(&bytes)
+                .unwrap()
+                .into_response();
+            message.metadata.response_code = hickory_resolver::proto::op::ResponseCode::NXDomain;
+            Ok(message.to_vec().unwrap())
+        })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn raw_fd_fake_dns_and_restored_application_udp_preserve_sources() {
+    use crate::dns::fake_ip::{FakeDnsContext, FakeDnsResolver};
+    use hickory_resolver::proto::op::{Message, Query, ResponseCode};
+    use hickory_resolver::proto::rr::{Name, RData, RecordType};
+    let (wire, tun) = UnixDatagram::pair().unwrap();
+    wire.set_nonblocking(true).unwrap();
+    let wire = AsyncDatagram::from_std(wire).unwrap();
+    let config = TunServerConfig::new()
+        .raw_fd(tun.as_raw_fd())
+        .close_fd_on_drop(false);
+    let real: Arc<dyn Resolver> = Arc::new(FakeDnsTestResolver);
+    let context = Arc::new(FakeDnsContext::new(Default::default(), real.clone()).unwrap());
+    let resolver: Arc<dyn Resolver> = Arc::new(FakeDnsResolver::new(real, context));
+    let selector = Arc::new(
+        create_tcp_client_proxy_selector(
+            vec![crate::config::RuleConfig::default()],
+            resolver.clone(),
+        )
+        .unwrap(),
+    );
+    let (shutdown, shutdown_rx) = oneshot::channel();
+    let mut tasks = JoinSet::new();
+    tasks.spawn(run_tun_server(config, selector, resolver, shutdown_rx));
+    let outcome = AssertUnwindSafe(timeout(TEST_TIMEOUT, async {
+        let source = "10.23.0.2:12001".parse().unwrap();
+        let dns_target = "198.18.0.1:53".parse().unwrap();
+        let mut packet = [0; 4096];
+        let mut synthetic = None;
+        for kind in [RecordType::TXT, RecordType::A] {
+            let mut query = Message::query();
+            query.metadata.id = 13;
+            query.add_query(Query::query(
+                Name::from_ascii("raw-fd.example.").unwrap(),
+                kind,
+            ));
+            wire.send(&request(
+                source,
+                dns_target,
+                &query.to_vec().unwrap(),
+                false,
+            ))
+            .await
+            .unwrap();
+        }
+        for kind in [RecordType::TXT, RecordType::A] {
+            let n = wire.recv(&mut packet).await.unwrap();
+            let answer_bytes = &packet[28..n];
+            check_reply(&packet[..n], dns_target, source, answer_bytes, false);
+            let answer = Message::from_vec(answer_bytes).unwrap();
+            assert_eq!(answer.metadata.id, 13);
+            if kind == RecordType::A {
+                let RData::A(address) = answer.answers[0].data else {
+                    panic!()
+                };
+                synthetic = Some(address.0);
+            } else {
+                assert_eq!(answer.metadata.response_code, ResponseCode::NXDomain);
+            }
+        }
+        let echo = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+        let target = SocketAddr::new(synthetic.unwrap().into(), echo.local_addr().unwrap().port());
+        wire.send(&request(source, target, b"request", false))
+            .await
+            .unwrap();
+        let mut payload = [0; 64];
+        let (n, peer) = echo.recv_from(&mut payload).await.unwrap();
+        assert_eq!(&payload[..n], b"request");
+        echo.send_to(b"response", peer).await.unwrap();
+        let n = wire.recv(&mut packet).await.unwrap();
+        check_reply(&packet[..n], target, source, b"response", false);
+    }))
+    .catch_unwind()
+    .await;
+    let _ = shutdown.send(());
+    timeout(TEST_TIMEOUT, tasks.join_next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    match outcome {
+        Ok(result) => result.expect("Fake DNS raw-FD pipeline stalled"),
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
+    assert!(unsafe { libc::fcntl(tun.as_raw_fd(), libc::F_GETFD) } >= 0);
+}

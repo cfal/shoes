@@ -304,7 +304,8 @@ impl TcpServerHandler for VlessTcpServerHandler {
                 // MUX/XUDP: Destination comes in XUDP frames, not VLESS header
                 let unparsed_data = stream_reader.unparsed_data();
                 write_all(&mut server_stream, SERVER_RESPONSE_HEADER).await?;
-                let mut xudp_stream = XudpMessageStream::new(server_stream);
+                let mut xudp_stream = XudpMessageStream::new(server_stream)
+                    .with_legacy_resolution(!self.proxy_selector.fake_dns_enabled());
                 if !unparsed_data.is_empty() {
                     xudp_stream.feed_initial_read_data(unparsed_data)?;
                 }
@@ -491,7 +492,8 @@ async fn setup_vision_vless_server_stream<S: VisionTransport + 'static>(
                     .with_write_error_policy(policy);
 
                 // Wrap VISION stream in XUDP stream
-                let xudp_stream = XudpMessageStream::new(Box::new(vision_stream));
+                let xudp_stream = XudpMessageStream::new(Box::new(vision_stream))
+                    .with_legacy_resolution(!proxy_selector.fake_dns_enabled());
 
                 Ok(TcpServerSetupResult::SessionBasedUdp {
                     stream: Box::new(xudp_stream),
@@ -508,7 +510,8 @@ async fn setup_vision_vless_server_stream<S: VisionTransport + 'static>(
                 write_all(&mut tls_stream, SERVER_RESPONSE_HEADER).await?;
 
                 // Wrap TLS stream in XUDP stream
-                let mut xudp_stream = XudpMessageStream::new(Box::new(tls_stream));
+                let mut xudp_stream = XudpMessageStream::new(Box::new(tls_stream))
+                    .with_legacy_resolution(!proxy_selector.fake_dns_enabled());
 
                 // Feed any unparsed data to XUDP stream
                 if !unparsed_data.is_empty() {

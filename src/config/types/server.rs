@@ -7,7 +7,9 @@ use serde::{Deserialize, Serialize};
 use crate::address::NetLocation;
 use crate::option_util::{NoneOrSome, OneOrSome};
 
-use super::common::{default_reality_server_short_ids, default_reality_time_diff, default_true};
+use super::common::{
+    default_reality_server_short_ids, default_reality_time_diff, default_true, is_false,
+};
 use super::dns::DnsConfig;
 use super::rules::{ClientChainHop, RuleConfig};
 use super::selection::ConfigSelection;
@@ -156,6 +158,8 @@ pub fn direct_allow_rule() -> NoneOrSome<ConfigSelection<RuleConfig>> {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ServerConfig {
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub sniff: bool,
     #[serde(flatten)]
     pub bind_location: BindLocation,
     pub protocol: ServerProxyConfig,
@@ -204,6 +208,7 @@ impl<'de> serde::de::Deserialize<'de> for ServerConfig {
             "rules",
             "rule",
             "dns",
+            "sniff",
         ];
 
         // Check for unknown fields
@@ -316,7 +321,15 @@ impl<'de> serde::de::Deserialize<'de> for ServerConfig {
             .transpose()
             .map_err(|e| Error::custom(format!("invalid dns: {e}")))?;
 
+        let sniff = map
+            .get("sniff")
+            .map(|v| serde_yaml::from_value(v.clone()))
+            .transpose()
+            .map_err(|e| Error::custom(format!("invalid sniff: {e}")))?
+            .unwrap_or(false);
+
         Ok(ServerConfig {
+            sniff,
             bind_location,
             protocol,
             transport,
@@ -897,8 +910,48 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::path::PathBuf;
 
+    #[test]
+    fn sniff_config_defaults_and_round_trips() {
+        fn check<T: serde::de::DeserializeOwned + serde::Serialize>(base: &str) {
+            let config: T = serde_yaml::from_str(base).unwrap();
+            let value = serde_yaml::to_value(config).unwrap();
+            assert!(value.get("sniff").is_none());
+            for enabled in [false, true] {
+                let yaml = format!("{base}\nsniff: {enabled}\n");
+                let config: T = serde_yaml::from_str(&yaml).unwrap();
+                let value = serde_yaml::to_value(config).unwrap();
+                assert_eq!(
+                    value.get("sniff").and_then(|v| v.as_bool()),
+                    enabled.then_some(true)
+                );
+                let round_trip: T = serde_yaml::from_value(value).unwrap();
+                assert_eq!(
+                    serde_yaml::to_value(round_trip)
+                        .unwrap()
+                        .get("sniff")
+                        .and_then(|v| v.as_bool()),
+                    enabled.then_some(true)
+                );
+            }
+            for value in ["null", "1", "{}", "[tls]", "'true'"] {
+                assert!(serde_yaml::from_str::<T>(&format!("{base}\nsniff: {value}\n")).is_err());
+            }
+            assert!(serde_yaml::from_str::<T>(&format!("{base}\nsnif: true\n")).is_err());
+        }
+        check::<ServerConfig>("address: '127.0.0.1:1080'\nprotocol: {type: socks}");
+        check::<super::super::tun::TunConfig>("mtu: 1500");
+        check::<ServerConfig>(
+            "address: '127.0.0.1:51820'\nprotocol: {type: wireguard, private_key: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=', addresses: [], peers: []}\nrules: []",
+        );
+        crate::config::create_server_configs(
+            serde_yaml::from_str(include_str!("../../../examples/sni_sniffing.yaml")).unwrap(),
+        )
+        .unwrap();
+    }
+
     fn create_test_server_config_http() -> ServerConfig {
         ServerConfig {
+            sniff: false,
             bind_location: NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080)
                 .into(),
             protocol: ServerProxyConfig::Http {
@@ -915,6 +968,7 @@ mod tests {
 
     fn create_test_server_config_socks() -> ServerConfig {
         ServerConfig {
+            sniff: false,
             bind_location: NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 1080)
                 .into(),
             protocol: ServerProxyConfig::Socks {
@@ -932,6 +986,7 @@ mod tests {
 
     fn create_test_server_config_shadowsocks() -> ServerConfig {
         ServerConfig {
+            sniff: false,
             bind_location: BindLocation::Path(PathBuf::from("/tmp/ss.sock")),
             protocol: ServerProxyConfig::Shadowsocks {
                 config: ShadowsocksConfig::Legacy {
@@ -950,6 +1005,7 @@ mod tests {
 
     fn create_test_server_config_vless() -> ServerConfig {
         ServerConfig {
+            sniff: false,
             bind_location: NetLocation::from_ip_addr(
                 IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)),
                 443,
@@ -982,6 +1038,7 @@ mod tests {
 
     fn create_test_server_config_trojan() -> ServerConfig {
         ServerConfig {
+            sniff: false,
             bind_location: NetLocation::from_ip_addr(
                 IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
                 443,
@@ -1025,6 +1082,7 @@ mod tests {
         ServerConfig {
             bind_location: NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 8443)
                 .into(),
+            sniff: false,
             protocol: ServerProxyConfig::Tls {
                 tls_targets,
                 default_tls_target: Some(Box::new(TlsServerConfig {
@@ -1055,6 +1113,7 @@ mod tests {
 
     fn create_test_server_config_vmess() -> ServerConfig {
         ServerConfig {
+            sniff: false,
             bind_location: NetLocation::from_ip_addr(
                 IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1)),
                 10086,
@@ -1075,6 +1134,7 @@ mod tests {
 
     fn create_test_server_config_websocket() -> ServerConfig {
         ServerConfig {
+            sniff: false,
             bind_location: NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080)
                 .into(),
             protocol: ServerProxyConfig::Websocket {
@@ -1099,6 +1159,7 @@ mod tests {
 
     fn create_test_server_config_port_forward() -> ServerConfig {
         ServerConfig {
+            sniff: false,
             bind_location: NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 9090)
                 .into(),
             protocol: ServerProxyConfig::PortForward {
@@ -1117,6 +1178,7 @@ mod tests {
 
     fn create_test_server_config_hysteria2() -> ServerConfig {
         ServerConfig {
+            sniff: false,
             bind_location: NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 443)
                 .into(),
             protocol: ServerProxyConfig::Hysteria2 {
@@ -1141,6 +1203,7 @@ mod tests {
 
     fn create_test_server_config_tuic() -> ServerConfig {
         ServerConfig {
+            sniff: false,
             bind_location: NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8443)
                 .into(),
             protocol: ServerProxyConfig::TuicV5 {

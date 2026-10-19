@@ -20,7 +20,7 @@ use crate::quic_stream::QuicStream;
 use crate::resolver::Resolver;
 use crate::routing::udp_relay::UdpRelay;
 use crate::stream_reader::StreamReader;
-use crate::tcp::tcp_server::setup_client_tcp_stream;
+use crate::tcp::ingress::PreparedTcp;
 use crate::udp_fragments::UdpFragments;
 use crate::util::write_all;
 
@@ -387,26 +387,6 @@ fn serialize_address(location: &NetLocation) -> Vec<u8> {
     address_bytes
 }
 
-fn serialize_socket_addr(addr: &SocketAddr) -> Vec<u8> {
-    let mut res = match addr {
-        SocketAddr::V4(addr_v4) => {
-            let mut res = Vec::with_capacity(1 + 4 + 2);
-            res.push(0x01); // address type for IPv4
-            res.extend_from_slice(&addr_v4.ip().octets());
-            res
-        }
-        SocketAddr::V6(addr_v6) => {
-            let mut res = Vec::with_capacity(1 + 16 + 2);
-            res.push(0x02); // address type for IPv6
-            res.extend_from_slice(&addr_v6.ip().octets());
-            res
-        }
-    };
-
-    res.extend_from_slice(&addr.port().to_be_bytes());
-    res
-}
-
 async fn process_tcp_stream(
     client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
@@ -433,22 +413,43 @@ async fn process_tcp_stream(
         .await?
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "empty address"))?;
 
-    let mut server_stream: Box<dyn AsyncStream> = Box::new(QuicStream::from(send, recv));
-    let setup_client_stream_future = timeout(
-        Duration::from_secs(60),
-        setup_client_tcp_stream(client_proxy_selector, resolver, remote_location.clone()),
-    );
+    relay_tcp_stream(
+        Box::new(QuicStream::from(send, recv)),
+        remote_location,
+        stream_reader.into_unparsed_data(),
+        client_proxy_selector,
+        resolver,
+    )
+    .await
+}
 
-    let crate::tcp::tcp_handler::TcpClientSetupResult {
-        mut client_stream,
-        early_data,
-    } = match setup_client_stream_future.await {
-        Ok(Ok(Some(s))) => s,
-        Ok(Ok(None)) => {
-            // Must have been blocked.
-            crate::util::shutdown_stream(&mut server_stream).await;
-            return Ok(());
+async fn relay_tcp_stream(
+    mut server_stream: Box<dyn AsyncStream>,
+    remote_location: NetLocation,
+    initial_data: Vec<u8>,
+    client_proxy_selector: Arc<ClientProxySelector>,
+    resolver: Arc<dyn Resolver>,
+) -> std::io::Result<()> {
+    let setup_client_stream_future = async {
+        let route = timeout(Duration::from_secs(60), async {
+            let prepared = PreparedTcp::new(
+                &client_proxy_selector,
+                remote_location.clone(),
+                initial_data,
+            )?;
+            prepared
+                .route(&mut server_stream, &client_proxy_selector, &resolver)
+                .await
+        })
+        .await?;
+        match route {
+            Ok(route) => timeout(Duration::from_secs(60), route.connect(&resolver)).await,
+            Err(error) => Ok(Err(error)),
         }
+    };
+
+    let routed = match setup_client_stream_future.await {
+        Ok(Ok(routed)) => routed,
         Ok(Err(e)) => {
             crate::util::shutdown_stream(&mut server_stream).await;
             return Err(std::io::Error::new(
@@ -464,21 +465,28 @@ async fn process_tcp_stream(
             ));
         }
     };
+    let Some(crate::tcp::tcp_handler::TcpClientSetupResult {
+        mut client_stream,
+        early_data,
+    }) = routed.setup
+    else {
+        crate::util::shutdown_stream(&mut server_stream).await;
+        return Ok(());
+    };
 
     crate::util::timeout_stream_setup(async {
         if let Some(data) = early_data {
             write_all(&mut server_stream, &data).await?;
             server_stream.flush().await?;
         }
-        let unparsed_data = stream_reader.unparsed_data();
-        if !unparsed_data.is_empty() {
-            write_all(&mut client_stream, unparsed_data).await?;
+        if !routed.prefix.is_empty() {
+            write_all(&mut client_stream, &routed.prefix).await?;
             client_stream.flush().await?;
         }
         Ok(())
     })
     .await?;
-    drop(stream_reader);
+    drop(routed.prefix);
 
     // Use 32KB buffers to match reference implementations
     let copy_result = copy_bidirectional_with_sizes(
@@ -633,7 +641,7 @@ async fn run_udp_remote_to_local_stream_loop(
 
         let address_bytes = match original_address_bytes {
             Some(ref a) => a.clone(),
-            None => serialize_socket_addr(&src_addr).into(),
+            None => serialize_address(&src_addr).into(),
         };
 
         let mut frame = BytesMut::with_capacity(MAX_HEADER_LEN + payload_len);
@@ -687,7 +695,7 @@ async fn run_udp_remote_to_local_datagram_loop(
 
         let address_bytes: Bytes = match &original_address_bytes {
             Some(a) => a.clone(),
-            None => serialize_socket_addr(&src_addr).into(),
+            None => serialize_address(&src_addr).into(),
         };
         let address_bytes_len = address_bytes.len();
 
@@ -983,33 +991,38 @@ async fn process_udp_packet(
                         "TUIC UDP session limit reached",
                     )
                 })?;
-                let action = client_proxy_selector
-                    .judge(remote_location.clone().into(), resolver)
-                    .await;
-
-                let (_chain_group, updated_location) = match action {
-                    Ok(ConnectDecision::Allow {
-                        chain_group,
-                        remote_location,
-                    }) => (chain_group, remote_location),
-                    Ok(ConnectDecision::Block) => {
-                        return Err(std::io::Error::other(format!(
-                            "Blocked UDP forward to {remote_location}"
-                        )));
-                    }
-                    Err(e) => {
-                        return Err(std::io::Error::other(format!(
-                            "Failed to judge UDP forward to {remote_location}: {e}"
-                        )));
-                    }
-                };
-
-                let pinned_location = if remote_location.address().hostname().is_some()
-                    || updated_location.location() != &remote_location
-                {
-                    Some(remote_location.clone())
-                } else {
+                let pinned_location = if client_proxy_selector.fake_dns_enabled() {
+                    // The shared router prepares and routes each destination once.
                     None
+                } else {
+                    let action = client_proxy_selector
+                        .judge(remote_location.clone().into(), resolver)
+                        .await;
+
+                    let (_chain_group, updated_location) = match action {
+                        Ok(ConnectDecision::Allow {
+                            chain_group,
+                            remote_location,
+                        }) => (chain_group, remote_location),
+                        Ok(ConnectDecision::Block) => {
+                            return Err(std::io::Error::other(format!(
+                                "Blocked UDP forward to {remote_location}"
+                            )));
+                        }
+                        Err(e) => {
+                            return Err(std::io::Error::other(format!(
+                                "Failed to judge UDP forward to {remote_location}: {e}"
+                            )));
+                        }
+                    };
+
+                    if remote_location.address().hostname().is_some()
+                        || updated_location.location() != &remote_location
+                    {
+                        Some(remote_location.clone())
+                    } else {
+                        None
+                    }
                 };
                 let client_socket = UdpRelay::new(client_proxy_selector.clone(), resolver.clone())?;
 
@@ -1311,6 +1324,75 @@ pub async fn start_tuic_server(
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn fake_dns_adapter_contract() {
+        use crate::tcp::ingress::tests::FakeTcpCase;
+        use tokio::io::AsyncReadExt;
+        timeout(Duration::from_secs(10), async {
+            for case in [
+                FakeTcpCase::Dns,
+                FakeTcpCase::Tls,
+                FakeTcpCase::Plain,
+                FakeTcpCase::Unknown,
+            ] {
+                let mut tasks = JoinSet::new();
+                let (selector, resolver, target, payload) = case.fixture(&mut tasks).await;
+                let split = payload.len().min(5);
+                let prefix = payload[..split].to_vec();
+                let (server, mut peer) = tokio::io::duplex(8192);
+                tasks.spawn(async move {
+                    let result =
+                        relay_tcp_stream(Box::new(server), target, prefix, selector, resolver)
+                            .await;
+                    assert_eq!(result.is_err(), case == FakeTcpCase::Unknown);
+                });
+                peer.write_all(&payload[split..]).await.unwrap();
+                peer.shutdown().await.unwrap();
+                let mut reply = Vec::new();
+                peer.read_to_end(&mut reply).await.unwrap();
+                if case == FakeTcpCase::Unknown {
+                    assert!(reply.is_empty());
+                } else {
+                    case.assert_reply(&reply);
+                }
+                while let Some(result) = tasks.join_next().await {
+                    result.unwrap();
+                }
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn sniff_replays_header_tail_without_an_ack_frame() {
+        use tokio::io::AsyncReadExt;
+        timeout(Duration::from_secs(5), async {
+            let mut tasks = JoinSet::new();
+            let hello = crate::sniff::tests::hello(&rustls::version::TLS13, true);
+            let (selector, resolver) =
+                crate::tcp::ingress::tests::socks_target(hello.clone(), &mut tasks).await;
+            let target = NetLocation::from_str(crate::tcp::ingress::tests::TARGET, None).unwrap();
+            let (server, mut peer) = tokio::io::duplex(8192);
+            let prefix = hello[..5].to_vec();
+            tasks.spawn(async move {
+                relay_tcp_stream(Box::new(server), target, prefix, selector, resolver)
+                    .await
+                    .unwrap();
+            });
+            peer.write_all(&hello[5..]).await.unwrap();
+            peer.shutdown().await.unwrap();
+            let mut response = Vec::new();
+            peer.read_to_end(&mut response).await.unwrap();
+            assert_eq!(response, b"greetinglater");
+            while let Some(result) = tasks.join_next().await {
+                result.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+    }
 
     #[test]
     fn truncated_payload_with_absent_address_is_rejected() {

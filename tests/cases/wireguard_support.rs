@@ -18,6 +18,7 @@ pub fn server(port: u16) -> Value {
         "address": format!("0.0.0.0:{port}"),
         "protocol": {
             "type": "wireguard",
+            "wireguard_name": format!("test-server-{port}"),
             "private_key": key(41),
             "addresses": ["10.77.0.1/32", "fd77::1/128"],
             "peers": [{

@@ -202,6 +202,172 @@ async fn wireguard_mapped_ipv4_destinations_use_the_ipv4_tunnel() {
     .unwrap();
 }
 
+#[tokio::test]
+async fn wireguard_fake_dns_restores_tcp_and_udp_in_both_families() {
+    use hickory_resolver::proto::{
+        op::{Message, Query},
+        rr::{Name, RData, RecordType},
+    };
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let reservation = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+        let mut documents: Vec<serde_yaml::Value> =
+            serde_yaml::from_str(&pair_config(reservation.local_addr().unwrap().port())).unwrap();
+        let inbound: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+dns:
+  servers: udp://127.0.0.1:9
+  fake_ip:
+    ipv6_range: fd18::/64
+rules:
+  - mask: wireguard.example
+    action: allow
+    override_address: '127.0.0.1:0'
+  - masks: ['0.0.0.0/0', '::/0']
+    action: block
+"#,
+        )
+        .unwrap();
+        documents[0]["dns"] = inbound["dns"].clone();
+        documents[0]["rules"] = inbound["rules"].clone();
+        let mut configs = validate(&serde_yaml::to_string(&documents).unwrap()).unwrap();
+        let prepared = Prepared::new(&mut configs).await.unwrap();
+        let mut dns = crate::dns::build_dns_registry(configs.dns_groups.clone())
+            .await
+            .unwrap();
+        drop(reservation);
+        let mut running = Running::default();
+        prepared.start(&mut dns, &mut running).await.unwrap();
+        let connector = prepared.endpoints[CLIENT].connector.as_ref();
+        let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+        let (tcp, udp, _echoes) = echo_servers(false).await;
+        for (target, kind) in [
+            ("198.18.0.1:53", RecordType::A),
+            ("[fd18::1]:53", RecordType::AAAA),
+        ] {
+            let location = NetLocation::from_str(target, None).unwrap().into();
+            let mut query = Message::query();
+            query.metadata.id = 73;
+            query.add_query(Query::query(
+                Name::from_ascii("wireguard.example.").unwrap(),
+                kind,
+            ));
+            let query = query.to_vec().unwrap();
+            let response = if kind == RecordType::A {
+                let mut stream = connector
+                    .connect_udp_bidirectional(&resolver, location)
+                    .await
+                    .unwrap();
+                futures::future::poll_fn(|cx| Pin::new(&mut stream).poll_write_message(cx, &query))
+                    .await
+                    .unwrap();
+                let mut bytes = [0; 512];
+                let mut buf = ReadBuf::new(&mut bytes);
+                futures::future::poll_fn(|cx| {
+                    Pin::new(&mut stream).poll_read_message(cx, &mut buf)
+                })
+                .await
+                .unwrap();
+                Message::from_vec(buf.filled()).unwrap()
+            } else {
+                let mut stream = connector.connect(&resolver, &location).await.unwrap();
+                stream.write_u16(query.len() as u16).await.unwrap();
+                stream.write_all(&query).await.unwrap();
+                let length = stream.read_u16().await.unwrap();
+                let mut bytes = vec![0; length as usize];
+                stream.read_exact(&mut bytes).await.unwrap();
+                Message::from_vec(&bytes).unwrap()
+            };
+            assert_eq!(response.metadata.id, 73);
+            let ip = match response.answers[0].data {
+                RData::A(ip) => IpAddr::V4(ip.0),
+                RData::AAAA(ip) => IpAddr::V6(ip.0),
+                _ => panic!("missing synthetic address"),
+            };
+            check_echo(
+                connector,
+                SocketAddr::new(ip, tcp.port()),
+                SocketAddr::new(ip, udp.port()),
+            )
+            .await;
+        }
+        running.stop().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn wireguard_config_sniffs_literal_and_restored_targets_without_rewriting() {
+    use hickory_resolver::proto::{
+        op::{Message, Query},
+        rr::{Name, RData, RecordType},
+    };
+    use serde_json::json;
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let reservation = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+        let exit = TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let mut documents: Vec<serde_json::Value> = serde_yaml::from_str(&pair_config(reservation.local_addr().unwrap().port())).unwrap();
+        documents[0]["sniff"] = json!(true);
+        documents[0]["dns"] = json!({"servers":"udp://127.0.0.1:9", "fake_ip":true});
+        documents[0]["rules"] = json!([{"mask":"sniff.example", "client_chain":"exit"}]);
+        documents.push(json!({"client_group":"exit", "client_proxies":[{
+            "address":format!("127.0.0.1:{}", exit.local_addr().unwrap().port()), "protocol":{"type":"socks"}
+        }]}));
+        let mut configs = validate(&serde_yaml::to_string(&documents).unwrap()).unwrap();
+        let prepared = Prepared::new(&mut configs).await.unwrap();
+        let mut dns = crate::dns::build_dns_registry(configs.dns_groups.clone()).await.unwrap();
+        drop(reservation);
+        let mut running = Running::default();
+        prepared.start(&mut dns, &mut running).await.unwrap();
+        let connector = prepared.endpoints[CLIENT].connector.as_ref();
+        let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+        let mut query = Message::query();
+        query.metadata.id = 93;
+        query.add_query(Query::query(Name::from_ascii("restored.example.").unwrap(), RecordType::A));
+        let mut stream = connector.connect(&resolver, &NetLocation::from_str("198.18.0.1:53", None).unwrap().into()).await.unwrap();
+        let query = query.to_vec().unwrap();
+        stream.write_u16(query.len() as u16).await.unwrap();
+        stream.write_all(&query).await.unwrap();
+        let len = stream.read_u16().await.unwrap();
+        let mut response = vec![0; len as usize];
+        stream.read_exact(&mut response).await.unwrap();
+        let response = Message::from_vec(&response).unwrap();
+        assert_eq!(response.metadata.id, 93);
+        let RData::A(ip) = response.answers[0].data else { panic!("missing synthetic address") };
+        drop(stream);
+        for (target, expected) in [
+            (NetLocation::from_str("192.0.2.9:443", None).unwrap(), NetLocation::from_str("192.0.2.9:443", None).unwrap()),
+            (NetLocation::from_ip_addr(ip.0.into(), 443), NetLocation::from_str("restored.example:443", None).unwrap()),
+        ] {
+            let hello = crate::sniff::tests::hello(&rustls::version::TLS13, true);
+            let upstream = async {
+                let (mut stream, _) = exit.accept().await.unwrap();
+                let mut greeting = [0; 3];
+                stream.read_exact(&mut greeting).await.unwrap();
+                assert_eq!(greeting, [5, 1, 0]);
+                stream.write_all(&[5, 0]).await.unwrap();
+                stream.read_exact(&mut greeting).await.unwrap();
+                assert_eq!(greeting, [5, 1, 0]);
+                assert_eq!(crate::socks_handler::read_location_direct(&mut stream).await.unwrap(), expected);
+                stream.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).await.unwrap();
+                let mut bytes = vec![0; hello.len()];
+                stream.read_exact(&mut bytes).await.unwrap();
+                assert_eq!(bytes, hello);
+                stream.write_all(b"sniffed").await.unwrap();
+            };
+            let client = async {
+                let mut stream = connector.connect(&resolver, &target.into()).await.unwrap();
+                stream.write_all(&hello).await.unwrap();
+                let mut response = [0; 7];
+                stream.read_exact(&mut response).await.unwrap();
+                assert_eq!(&response, b"sniffed");
+            };
+            tokio::join!(upstream, client);
+        }
+        running.stop().await;
+    }).await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wireguard_concurrent_tcp_transfers_preserve_all_data() {
     tokio::time::timeout(Duration::from_secs(20), async {
@@ -352,6 +518,135 @@ async fn wireguard_bind_selects_a_compatible_hostname_address() {
         for endpoint in &prepared.endpoints[CLIENT].peers[0].endpoints {
             assert_eq!(endpoint.is_ipv4(), listen.is_ipv4(), "listen: {listen}");
         }
+    }
+}
+
+#[tokio::test]
+async fn fake_dns_guards_wireguard_peer_and_outer_proxy_hostnames() {
+    use serde_json::json;
+    for tun_address in [None, Some("127.0.0.1"), Some("::ffff:127.0.0.1")] {
+        let tun_endpoint = tun_address.is_some();
+        let mut raw: serde_json::Value = serde_yaml::from_str(&pair_config(51820)).unwrap();
+        raw[1]["client_proxies"][0]["address"] = json!("localhost:51820");
+        raw.as_array_mut().unwrap().push(json!({
+            "dns_group":"fake", "dns_servers":"system",
+            "fake_ip":{"ipv4_range":if tun_endpoint { "198.18.0.0/15" } else { "127.0.0.0/8" }}
+        }));
+        if let Some(address) = tun_address {
+            raw.as_array_mut()
+                .unwrap()
+                .push(json!({"device_name":"unused", "address":address}));
+        }
+        let mut configs = validate(&raw.to_string()).unwrap();
+        assert_eq!(
+            Prepared::new(&mut configs).await.err().unwrap().kind(),
+            stdio::ErrorKind::InvalidData
+        );
+
+        raw[1]["client_proxies"][0]["address"] = json!("127.0.0.1:51820");
+        assert!(validate(&raw.to_string()).is_err());
+
+        raw[1]["client_proxies"][0]["address"] = json!("192.0.2.1:51820");
+        raw[1]["client_proxies"][0]["protocol"]["peer_client_chain"] = json!([{
+            "address":"localhost:443", "protocol":{"type":"vless", "user_id":"b85798ef-e9dc-46a4-9a87-8da4499d36d0"}
+        }]);
+        let mut configs = validate(&raw.to_string()).unwrap();
+        let prepared = Prepared::new(&mut configs).await.unwrap();
+        let endpoint = &prepared.endpoints[CLIENT];
+        let chain = endpoint.build_outer_chain().unwrap().unwrap();
+        let error = chain
+            .connect_udp_bidirectional(
+                &endpoint.outer_resolver,
+                NetLocation::from_str("192.0.2.1:51820", None)
+                    .unwrap()
+                    .into(),
+            )
+            .await
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("synthetic address"), "{error}");
+
+        raw[3]["fake_ip"] = false.into();
+        raw[1]["client_proxies"][0]["address"] = json!("localhost:51820");
+        let mut configs = validate(&raw.to_string()).unwrap();
+        Prepared::new(&mut configs).await.unwrap();
+
+        let inherited = [if tun_endpoint {
+            "127.0.0.1/32"
+        } else {
+            "127.0.0.0/8"
+        }
+        .parse()
+        .unwrap()];
+        for remove_group in [false, true] {
+            let mut candidate = raw.clone();
+            if remove_group {
+                candidate.as_array_mut().unwrap().remove(3);
+            }
+            let mut configs = validate(&candidate.to_string()).unwrap();
+            assert_eq!(
+                Prepared::with_forbidden(&mut configs, &inherited)
+                    .await
+                    .err()
+                    .unwrap()
+                    .kind(),
+                stdio::ErrorKind::InvalidData
+            );
+            candidate[1]["client_proxies"][0]["address"] = json!("127.0.0.1:51820");
+            let mut configs = validate(&candidate.to_string()).unwrap();
+            assert_eq!(
+                Prepared::with_forbidden(&mut configs, &inherited)
+                    .await
+                    .err()
+                    .unwrap()
+                    .kind(),
+                stdio::ErrorKind::InvalidInput
+            );
+            candidate[1]["client_proxies"][0]["address"] = json!("192.0.2.1:51820");
+            let mut configs = validate(&candidate.to_string()).unwrap();
+            let prepared = Prepared::with_forbidden(&mut configs, &inherited)
+                .await
+                .unwrap();
+            assert!(
+                prepared.endpoints[CLIENT]
+                    .outer_resolver
+                    .resolve_location(&NetLocation::from_str("localhost:443", None).unwrap())
+                    .await
+                    .is_err()
+            );
+            candidate[1]["client_proxies"][0]["protocol"]["peer_client_chain"][0]["address"] =
+                json!("127.0.0.1:443");
+            let mut configs = validate(&candidate.to_string()).unwrap();
+            assert_eq!(
+                Prepared::with_forbidden(&mut configs, &inherited)
+                    .await
+                    .err()
+                    .unwrap()
+                    .kind(),
+                stdio::ErrorKind::InvalidInput
+            );
+        }
+    }
+}
+
+#[test]
+fn fake_dns_rejects_unbracketed_wireguard_literals() {
+    use serde_json::json;
+    for endpoint in ["::ffff:198.18.0.5:51820", "2001:2::5:51820"] {
+        let mut raw: serde_json::Value = serde_yaml::from_str(&pair_config(51820)).unwrap();
+        raw[1]["client_proxies"][0]["address"] = json!(endpoint);
+        raw.as_array_mut().unwrap().push(json!({
+            "dns_group":"fake", "dns_servers":"system",
+            "fake_ip":{"ipv6_range":"2001:2::/48"}
+        }));
+        let error = validate(&raw.to_string()).err().unwrap();
+        assert_eq!(error.kind(), stdio::ErrorKind::InvalidInput);
+        assert!(
+            error.to_string().contains("WireGuard endpoint overlaps"),
+            "{error}"
+        );
+        raw[3]["fake_ip"] = false.into();
+        validate(&raw.to_string()).unwrap();
     }
 }
 

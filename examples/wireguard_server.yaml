@@ -2,6 +2,7 @@
 - address: "0.0.0.0:51820"
   protocol:
     type: wireguard
+    wireguard_name: gateway
     private_key: "KSkpKSkpKSkpKSkpKSkpKSkpKSkpKSkpKSkpKSkpKSk="
     addresses: ["10.77.0.1/32", "fd77::1/128"]
     peers:

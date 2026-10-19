@@ -260,75 +260,49 @@ pub(crate) async fn handle_tcp_connection(
     resolver: Arc<dyn Resolver>,
 ) -> std::io::Result<()> {
     let _permit = crate::resources::try_stream().ok_or_else(crate::resources::exhausted)?;
-    let decision = tokio::time::timeout(
+    let prepared =
+        crate::tcp::ingress::PreparedTcp::new(&proxy_selector, target.clone(), Vec::new())?;
+    let route = tokio::time::timeout(
         std::time::Duration::from_secs(30),
-        proxy_selector.judge(target.into(), &resolver),
+        prepared.route(&mut connection, &proxy_selector, &resolver),
     )
     .await
     .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "TUN routing timed out"))??;
-
-    match decision {
-        crate::client_proxy_selector::ConnectDecision::Allow {
-            chain_group,
-            remote_location,
-        } => {
-            debug!(
-                "TCP: connecting to {} via chain",
-                remote_location.location()
-            );
-
-            match tokio::time::timeout(std::time::Duration::from_secs(30), async {
-                let setup = chain_group
-                    .connect_tcp(remote_location.clone(), &resolver)
-                    .await?;
-                if let Some(data) = setup.early_data {
-                    tokio::io::AsyncWriteExt::write_all(&mut connection, &data).await?;
-                }
-                Ok::<_, std::io::Error>(setup.client_stream)
-            })
-            .await
-            .map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::TimedOut, "TUN TCP setup timed out")
-            })? {
-                Ok(mut remote) => {
-                    debug!(
-                        "TCP: connected to {}, starting bidirectional copy",
-                        remote_location.location()
-                    );
-
-                    let result = tokio::io::copy_bidirectional(&mut connection, &mut remote).await;
-
-                    match result {
-                        Ok((client_to_remote, remote_to_client)) => {
-                            debug!(
-                                "TCP connection to {} completed: {} bytes sent, {} bytes received",
-                                remote_location.location(),
-                                client_to_remote,
-                                remote_to_client
-                            );
-                        }
-                        Err(e) => {
-                            debug!(
-                                "TCP connection to {} error: {}",
-                                remote_location.location(),
-                                e
-                            );
-                        }
-                    }
-
-                    Ok(())
-                }
-                Err(e) => {
-                    warn!("Failed to connect to {}: {}", remote_location.location(), e);
-                    Err(e)
-                }
-            }
+    let connected = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        use tokio::io::AsyncWriteExt;
+        let routed = route.connect(&resolver).await?;
+        let Some(mut setup) = routed.setup else {
+            return Ok(None);
+        };
+        if let Some(data) = setup.early_data.take() {
+            connection.write_all(&data).await?;
+            connection.flush().await?;
         }
-        crate::client_proxy_selector::ConnectDecision::Block => {
-            debug!("TCP connection blocked by rules");
-            Ok(())
+        if !routed.prefix.is_empty() {
+            setup.client_stream.write_all(&routed.prefix).await?;
+            setup.client_stream.flush().await?;
         }
+        drop(routed.prefix);
+        Ok::<_, std::io::Error>(Some((setup.client_stream, routed.wire_destination)))
+    })
+    .await
+    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "TUN TCP setup timed out"))
+    .and_then(|result| result)
+    .inspect_err(|error| warn!("Failed to connect to {}: {}", target, error))?;
+
+    let Some((mut remote, wire_destination)) = connected else {
+        debug!("TCP connection blocked by rules");
+        return Ok(());
+    };
+    let result = tokio::io::copy_bidirectional(&mut connection, &mut remote).await;
+    match result {
+        Ok((sent, received)) => debug!(
+            "TCP connection to {} completed: {} bytes sent, {} bytes received",
+            wire_destination, sent, received,
+        ),
+        Err(error) => debug!("TCP connection to {} error: {}", wire_destination, error),
     }
+    Ok(())
 }
 
 /// Handle UDP packets from the stack thread.
@@ -440,8 +414,9 @@ async fn run_tun_from_config_inner(
     }
 
     let rules = config.rules.map(ConfigSelection::unwrap_config).into_vec();
-    let client_proxy_selector =
-        Arc::new(create_tcp_client_proxy_selector(rules, resolver.clone())?);
+    let client_proxy_selector = Arc::new(
+        create_tcp_client_proxy_selector(rules, resolver.clone())?.with_sniff(config.sniff),
+    );
 
     run_tun_server_inner(
         tun_server_config,
@@ -527,6 +502,96 @@ mod tests {
         release.send(()).unwrap();
         receive_tun_bytes(&control, &mut received, b"greetinglater").await;
         tasks.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn sniffed_ip_routes_and_replays_through_the_stack_connection() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut tasks = JoinSet::new();
+            let hello = crate::sniff::tests::hello(&rustls::version::TLS13, true);
+            let (selector, resolver) =
+                crate::tcp::ingress::tests::socks_target(hello.clone(), &mut tasks).await;
+            let target = NetLocation::from_str(crate::tcp::ingress::tests::TARGET, None).unwrap();
+            let control = Arc::new(tcp_conn::TcpConnectionControl::new(8192, 8192));
+            let (wake, _wake_rx) = wake::Wake::new().unwrap();
+            let connection = tcp_conn::TcpConnection::new(control.clone(), wake);
+            assert_eq!(control.enqueue_recv_data(&hello), hello.len());
+            control.set_recv_state(tcp_conn::TcpSocketState::Closed);
+            tasks.spawn(async move {
+                handle_tcp_connection(connection, target, selector, resolver)
+                    .await
+                    .unwrap();
+            });
+            let mut received = Vec::new();
+            receive_tun_bytes(&control, &mut received, b"greetinglater").await;
+            control.set_send_state(tcp_conn::TcpSocketState::Closing);
+            control.wake_sender();
+            while let Some(result) = tasks.join_next().await {
+                result.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn fake_dns_adapter_contract() {
+        use crate::tcp::ingress::tests::FakeTcpCase;
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            for case in [
+                FakeTcpCase::Dns,
+                FakeTcpCase::Tls,
+                FakeTcpCase::Plain,
+                FakeTcpCase::Unknown,
+            ] {
+                let mut tasks = JoinSet::new();
+                let (selector, resolver, target, payload) = case.fixture(&mut tasks).await;
+                let control = Arc::new(tcp_conn::TcpConnectionControl::new(8192, 8192));
+                let (wake, _wake_rx) = wake::Wake::new().unwrap();
+                let connection = tcp_conn::TcpConnection::new(control.clone(), wake);
+                assert_eq!(control.enqueue_recv_data(&payload), payload.len());
+                control.set_recv_state(tcp_conn::TcpSocketState::Closed);
+                let mut task = tokio::spawn(handle_tcp_connection(
+                    connection, target, selector, resolver,
+                ));
+                let mut received = Vec::new();
+                loop {
+                    let mut bytes = [0; 2048];
+                    let count = control.dequeue_send_data(&mut bytes);
+                    received.extend_from_slice(&bytes[..count]);
+                    control.wake_sender();
+                    if task.is_finished() {
+                        break;
+                    }
+                    if case != FakeTcpCase::Unknown && !received.is_empty() {
+                        let complete = if case == FakeTcpCase::Dns {
+                            received.len() >= 2
+                                && received.len()
+                                    == 2 + u16::from_be_bytes([received[0], received[1]]) as usize
+                        } else {
+                            received == b"greetinglater"
+                        };
+                        if complete {
+                            control.set_send_state(tcp_conn::TcpSocketState::Closing);
+                            control.wake_sender();
+                        }
+                    }
+                    tokio::task::yield_now().await;
+                }
+                let result = (&mut task).await.unwrap();
+                assert_eq!(result.is_err(), case == FakeTcpCase::Unknown);
+                if case == FakeTcpCase::Unknown {
+                    assert!(received.is_empty());
+                } else {
+                    case.assert_reply(&received);
+                }
+                while let Some(result) = tasks.join_next().await {
+                    result.unwrap();
+                }
+            }
+        })
+        .await
+        .unwrap();
     }
 
     async fn receive_tun_bytes(

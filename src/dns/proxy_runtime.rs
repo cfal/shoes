@@ -112,7 +112,12 @@ impl RuntimeProvider for ProxyRuntimeProvider {
                         server_addr,
                         started.elapsed()
                     );
-                    Ok(AsyncIoTokioAsStd(result.client_stream))
+                    let stream: Box<dyn AsyncStream> =
+                        Box::new(crate::prepend_stream::PrependStream::new(
+                            result.client_stream,
+                            result.early_data.map(Vec::into_boxed_slice),
+                        ));
+                    Ok(AsyncIoTokioAsStd(stream))
                 }
                 Ok(Err(e)) => {
                     log::warn!(

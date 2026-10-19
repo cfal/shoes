@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Added opt-in `dns.fake_ip` with shared DNS-group mappings, TCP/UDP port-53 interception, hostname restoration, and optional persistent state. Other DNS records use the configured real upstreams; Android/iOS require explicit `dns.servers` rather than VPN system discovery.
+- Added opt-in `sniff: true` for route-only TLS SNI matching on logical TCP streams. SNI takes precedence over Fake-DNS-restored names for hostname rules without replacing the connection target; explicitly supplied hostnames are not sniffed. HTTP Host and QUIC datagram sniffing are not included.
+- Preserved original UDP reply identities across Fake DNS restoration and fixed early-data delivery in AnyTLS, H2MUX, and Naive TCP adapters.
 - Added userspace WireGuard client and server protocols using GotaTun 0.10.1. They support inbound TCP/UDP forwarding, outbound proxy chains, IPv4/IPv6, multiple server peers, PSKs, keepalives, and authenticated roaming on Unix. Identical client configurations share devices automatically; conflicting settings for the same endpoint and key pair reject.
 - WireGuard clients are supported only at the first chain hop. TCP DNS transports can use them; unsupported UDP/H3 DNS routes and tunnel-dependent bootstrap configurations are rejected instead of bypassing the tunnel.
 - Added protocol `peer_client_chain` for proxies before WireGuard, including nested WireGuard clients and optional inner proxy suffixes. Detours use fixed peer destinations, require a UDP-capable final carrier hop, and never fall back to direct UDP. Proxied servers omit their listen address and initiate peer associations using keepalive. Detours do not accept unsolicited public peers or support arbitrary peer roaming.

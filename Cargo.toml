@@ -108,6 +108,7 @@ http-body-util = "*"
 hyper = { version = "*", features = ["client", "server", "http1", "http2"] }
 hyper-util = { version = "*", features = ["tokio", "server"] }
 indexmap = "*"
+ipnetwork = "0.21"
 libc = "*"
 log = { version = "*", features = ["std", "release_max_level_info"] }
 lru = "*"
@@ -126,6 +127,7 @@ rust-argon2 = "*"
 rustc-hash = "*"
 rustls = "*"
 serde = { version = "*", features = ["derive", "std"] }
+serde_json = "*"
 serde_yaml = "*"
 shake = "*"
 smoltcp = { version = "*", default-features = false, features = ["std", "log", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-icmp", "auto-icmp-echo-reply", "socket-udp", "socket-tcp", "socket-tcp-cubic", "phy-tuntap_interface", "assembler-max-segment-count-32", "segmentation-offload"] }
@@ -152,14 +154,15 @@ zeroize = "*"
 tokio = { version = "*", features = ["test-util"] }
 rcgen = { version = "*", default-features = false, features = ["aws_lc_rs", "pem"] }
 rustls-pemfile = "*"
-serde_json = "*"
 shoes-test-support = { path = "tests/support" }
 tempfile = "*"
 tokio-rustls = "*"
 
 [target.'cfg(unix)'.dependencies]
 gotatun = { version = "=0.10.1", default-features = false, features = ["device", "aws-lc-rs"] }
-ipnetwork = "0.21"
+
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+hickory-resolver = { version = "*", default-features = false, features = ["system-config"] }
 
 # jemalloc for better memory performance (not supported on Windows MSVC, iOS, or Android)
 [target.'cfg(not(any(target_env = "msvc", target_os = "ios", target_os = "android")))'.dependencies]

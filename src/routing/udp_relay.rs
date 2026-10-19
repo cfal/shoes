@@ -1,5 +1,4 @@
 use std::io;
-use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, ready};
@@ -20,7 +19,7 @@ use crate::resolver::Resolver;
 use super::{ServerStream, run_udp_routing};
 
 const QUEUE_SIZE: usize = 4;
-type Reply = (Vec<u8>, SocketAddr);
+type Reply = (Vec<u8>, NetLocation);
 
 /// Channel transport for QUIC associations using the shared routing and proxy-chain machinery.
 pub struct UdpRelay {
@@ -137,11 +136,11 @@ impl AsyncWriteSourcedMessage for ChannelStream {
         self: Pin<&mut Self>,
         _cx: &mut Context<'_>,
         data: &[u8],
-        source: &SocketAddr,
+        source: &NetLocation,
     ) -> Poll<io::Result<()>> {
         Poll::Ready(match self.output.try_reserve() {
             Ok(permit) => {
-                permit.send((data.to_vec(), *source));
+                permit.send((data.to_vec(), source.clone()));
                 Ok(())
             }
             Err(mpsc::error::TrySendError::Full(_)) => Ok(()),
@@ -177,6 +176,7 @@ mod tests {
     use super::*;
     use crate::client_proxy_selector::{ConnectAction, ConnectRule};
     use std::future::Future;
+    use std::net::SocketAddr;
 
     #[derive(Debug)]
     struct NoHostnameResolver;
@@ -229,7 +229,7 @@ mod tests {
         let (_tx, input) = mpsc::channel(QUEUE_SIZE);
         let (output, mut rx) = mpsc::channel(QUEUE_SIZE);
         let mut stream = ChannelStream { input, output };
-        let source = "[::1]:53".parse().unwrap();
+        let source = NetLocation::from_str("[::1]:53", None).unwrap();
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         for i in 0..=QUEUE_SIZE {
             assert!(matches!(
@@ -239,7 +239,7 @@ mod tests {
         }
         assert_eq!(rx.len(), QUEUE_SIZE);
         for i in 0..QUEUE_SIZE {
-            assert_eq!(rx.try_recv().unwrap(), (vec![i as u8], source));
+            assert_eq!(rx.try_recv().unwrap(), (vec![i as u8], source.clone()));
         }
         drop(rx);
         assert!(matches!(
@@ -286,7 +286,7 @@ mod tests {
                     .unwrap()
                     .unwrap();
             assert_eq!(reply, payload);
-            assert_eq!(source, "192.0.2.1:53".parse().unwrap());
+            assert_eq!(source, original);
         }
         let task = relay.task.clone();
         drop(relay);
@@ -322,7 +322,7 @@ mod tests {
                 socket.send_to(b"answer", peer).await.unwrap();
                 let (reply, source) = relay.recv().await.unwrap();
                 assert_eq!(reply, b"answer");
-                assert_eq!(source, address);
+                assert_eq!(source.to_socket_addr_nonblocking(), Some(address));
             })
             .await
             .expect("an overridden hostname must not require its own DNS record");

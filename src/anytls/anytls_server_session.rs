@@ -7,8 +7,8 @@ use crate::address::{Address, NetLocation};
 use crate::anytls::anytls_padding::{CHECK_MARK, PaddingFactory};
 use crate::anytls::anytls_stream::{AnyTlsStream, STREAM_CHANNEL_BUFFER};
 use crate::anytls::anytls_types::{Command, FRAME_HEADER_SIZE, Frame, FrameCodec, StringMap};
-use crate::async_stream::{AsyncMessageStream, AsyncTargetedMessageStream};
-use crate::client_proxy_selector::{ClientProxySelector, ConnectDecision};
+use crate::async_stream::AsyncTargetedMessageStream;
+use crate::client_proxy_selector::ClientProxySelector;
 use crate::copy_bidirectional::copy_bidirectional;
 use crate::resolver::Resolver;
 use crate::routing::{ServerStream, run_udp_routing};
@@ -766,44 +766,64 @@ impl AnyTlsSession {
     ) -> io::Result<()> {
         let stream_id = stream.id();
 
-        let action = setup_timeout(
-            self.proxy_provider
-                .judge(destination.clone().into(), &self.resolver),
-        )
-        .await?;
+        let prepared = match crate::tcp::ingress::PreparedTcp::new(
+            &self.proxy_provider,
+            destination.clone(),
+            Vec::new(),
+        ) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let message = format!("connect failed: {error}");
+                let _ = self.send_synack(stream_id, Some(&message)).await;
+                let _ = tokio::time::timeout(CONTROL_FRAME_TIMEOUT, stream.shutdown()).await;
+                return Err(error);
+            }
+        };
+        let optimistic = prepared.needs_sniff_read();
+        if optimistic {
+            self.send_synack(stream_id, None).await?;
+        }
+        let setup = async {
+            let route =
+                setup_timeout(prepared.route(&mut stream, &self.proxy_provider, &self.resolver))
+                    .await?;
+            setup_timeout(route.connect(&self.resolver)).await
+        };
+        let routed = match setup.await {
+            Ok(result) => result,
+            Err(error) => {
+                if !optimistic {
+                    let message = format!("connect failed: {error}");
+                    let _ = self.send_synack(stream_id, Some(&message)).await;
+                }
+                let _ = tokio::time::timeout(CONTROL_FRAME_TIMEOUT, stream.shutdown()).await;
+                return Err(error);
+            }
+        };
 
-        match action {
-            ConnectDecision::Allow {
-                chain_group,
-                remote_location,
-            } => {
-                log::debug!(
-                    "AnyTLS stream {} routing {} through chain",
-                    stream_id,
-                    remote_location
-                );
-
-                // Connect through the proxy chain
-                let client_result =
-                    match setup_timeout(chain_group.connect_tcp(remote_location, &self.resolver))
-                        .await
-                    {
-                        Ok(result) => result,
-                        Err(e) => {
-                            // Send SYNACK with error message (protocol v2)
-                            let error_msg = format!("connect failed: {}", e);
-                            let _ = self.send_synack(stream_id, Some(&error_msg)).await;
-                            return Err(e);
-                        }
-                    };
+        match routed.setup {
+            Some(client_result) => {
                 let mut client_stream = client_result.client_stream;
 
-                // Send successful SYNACK (protocol v2)
-                if let Err(e) = self.send_synack(stream_id, None).await {
-                    log::debug!("Failed to send SYNACK for stream {}: {}", stream_id, e);
-                    // Continue anyway - client may be v1
+                if !optimistic {
+                    self.send_synack(stream_id, None).await?;
+                }
+                if let Some(data) = client_result.early_data {
+                    setup_timeout(async {
+                        stream.write_all(&data).await?;
+                        stream.flush().await
+                    })
+                    .await?;
+                }
+                if !routed.prefix.is_empty() {
+                    setup_timeout(async {
+                        client_stream.write_all(&routed.prefix).await?;
+                        client_stream.flush().await
+                    })
+                    .await?;
                 }
 
+                drop(routed.prefix);
                 log::debug!("AnyTLS stream {} connected to destination", stream_id);
 
                 // Bidirectional copy
@@ -824,10 +844,11 @@ impl AnyTlsSession {
 
                 result
             }
-            ConnectDecision::Block => {
-                // Send SYNACK with error (protocol v2)
-                let error_msg = format!("blocked by rules: {}", destination);
-                let _ = self.send_synack(stream_id, Some(&error_msg)).await;
+            None => {
+                if !optimistic {
+                    let error_msg = format!("blocked by rules: {}", destination);
+                    let _ = self.send_synack(stream_id, Some(&error_msg)).await;
+                }
 
                 log::debug!("AnyTLS stream {} blocked by rules", stream_id);
                 let _ = tokio::time::timeout(CONTROL_FRAME_TIMEOUT, stream.shutdown()).await;
@@ -912,76 +933,47 @@ impl AnyTlsSession {
     ) -> io::Result<()> {
         let stream_id = stream.id();
 
-        // Use ClientProxySelector for routing
-        let action = setup_timeout(
-            self.proxy_provider
-                .judge(destination.clone().into(), &self.resolver),
-        )
-        .await?;
-
-        match action {
-            ConnectDecision::Allow {
-                chain_group,
-                remote_location,
-            } => {
-                log::debug!(
-                    "AnyTLS stream {} UoT V2 connect: routing {} through chain",
-                    stream_id,
-                    remote_location
-                );
-
-                // Wrap AnyTlsStream as AsyncMessageStream (VlessMessageStream for length-prefixed)
-                let server_stream: Box<dyn AsyncMessageStream> =
-                    Box::new(VlessMessageStream::new(stream));
-
-                // Connect through the proxy chain
-                let client_stream = match setup_timeout(
-                    chain_group.connect_udp_bidirectional(&self.resolver, remote_location),
-                )
-                .await
-                {
-                    Ok(result) => result,
-                    Err(e) => {
-                        // Send SYNACK with error (protocol v2)
-                        let error_msg = format!("UDP connect failed: {}", e);
-                        let _ = self.send_synack(stream_id, Some(&error_msg)).await;
-                        return Err(e);
-                    }
-                };
-
-                // Send successful SYNACK (protocol v2)
-                let _ = self.send_synack(stream_id, None).await;
-
-                log::debug!("AnyTLS stream {} UoT V2 connect: connected", stream_id);
-
-                // Run UDP copy
-                let result = run_udp_copy(server_stream, client_stream, false, false).await;
-
-                if let Err(e) = &result {
-                    log::debug!("AnyTLS stream {} UoT V2 connect ended: {}", stream_id, e);
-                } else {
-                    log::debug!("AnyTLS stream {} UoT V2 connect completed", stream_id);
-                }
-
-                result
-            }
-            ConnectDecision::Block => {
-                // Send SYNACK with error (protocol v2)
+        let route = match setup_timeout(crate::routing::ingress::route_udp(
+            &self.proxy_provider,
+            destination,
+            &self.resolver,
+        ))
+        .await
+        {
+            Ok(route) => route,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
                 let _ = self
                     .send_synack(stream_id, Some("UDP blocked by rules"))
                     .await;
-
-                log::warn!(
-                    "AnyTLS stream {} UoT V2 connect blocked by rules: {}",
-                    stream_id,
-                    destination
-                );
-                Err(io::Error::new(
+                return Err(io::Error::new(
                     io::ErrorKind::ConnectionRefused,
                     "UDP blocked by rules",
-                ))
+                ));
             }
-        }
+            Err(error) => {
+                let _ = self
+                    .send_synack(stream_id, Some(&format!("UDP connect failed: {error}")))
+                    .await;
+                return Err(error);
+            }
+        };
+        let setup = match setup_timeout(route.connect(&self.resolver)).await {
+            Ok(setup) => setup,
+            Err(error) => {
+                let _ = self
+                    .send_synack(stream_id, Some(&format!("UDP connect failed: {error}")))
+                    .await;
+                return Err(error);
+            }
+        };
+        self.send_synack(stream_id, None).await?;
+        run_udp_copy(
+            Box::new(VlessMessageStream::new(stream)),
+            setup.stream,
+            false,
+            false,
+        )
+        .await
     }
 
     /// Handle UoT multi-destination mode (V1 and V2 non-connect)
@@ -1026,6 +1018,409 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
     use tokio::time::{Duration, timeout};
+
+    #[tokio::test]
+    async fn fake_dns_udp_modes() {
+        use crate::routing::ingress::tests::{PacketMode, UdpFixture};
+        timeout(Duration::from_secs(10), async {
+            for fixed in [false, true] {
+                for dns in [false, true] {
+                    let mut tasks = tokio::task::JoinSet::new();
+                    let fixture = UdpFixture::new(dns, &mut tasks).await;
+                    let mode = if fixed {
+                        PacketMode::Fixed
+                    } else {
+                        PacketMode::Uot
+                    };
+                    let (server, mut peer) = duplex(8192);
+                    let session = AnyTlsSession::new_server_with_initial_data(
+                        server,
+                        PaddingFactory::default_factory(),
+                        fixture.resolver.clone(),
+                        fixture.selector.clone(),
+                        true,
+                        "test".into(),
+                        None,
+                    );
+                    session
+                        .received_client_settings
+                        .store(true, Ordering::Relaxed);
+                    session.peer_version.store(2, Ordering::Relaxed);
+                    let runner = session.clone();
+                    let server =
+                        tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+                            runner.run().await
+                        }));
+                    for id in [2, 3] {
+                        peer.write_all(&Frame::control(Command::Syn, id).encode())
+                            .await
+                            .unwrap();
+                        let magic = NetLocation::from_str(UOT_V2_MAGIC_ADDRESS, Some(0)).unwrap();
+                        let mut header = crate::socks_handler::write_location_to_vec(&magic);
+                        header.extend(fixture.uot_header(fixed));
+                        peer.write_all(&Frame::data(id, Bytes::from(header)).encode())
+                            .await
+                            .unwrap();
+                        let mut status = [0; 7];
+                        loop {
+                            peer.read_exact(&mut status).await.unwrap();
+                            if status[0] != Command::Fin as u8 {
+                                break;
+                            }
+                            assert_eq!(&status, &Frame::control(Command::Fin, id - 1).encode()[..]);
+                        }
+                        assert_eq!(&status, &Frame::control(Command::SynAck, id).encode()[..]);
+                        // The second stream proves the session survives; DNS supports repeated queries.
+                        if id == 2 || dns {
+                            peer.write_all(
+                                &Frame::data(id, Bytes::from(fixture.request(mode))).encode(),
+                            )
+                            .await
+                            .unwrap();
+                            let mut reply = Vec::new();
+                            loop {
+                                peer.read_exact(&mut status).await.unwrap();
+                                if status[0] == Command::Fin as u8 {
+                                    assert_eq!(
+                                        &status,
+                                        &Frame::control(Command::Fin, id - 1).encode()[..]
+                                    );
+                                    continue;
+                                }
+                                assert_eq!(status[0], Command::Psh as u8);
+                                assert_eq!(&status[1..5], &id.to_be_bytes());
+                                let len = u16::from_be_bytes([status[5], status[6]]) as usize;
+                                let mut bytes = vec![0; len];
+                                peer.read_exact(&mut bytes).await.unwrap();
+                                reply.extend(bytes);
+                                if let Some(payload) = mode.reply(&fixture.target, &reply) {
+                                    fixture.assert_reply(payload);
+                                    break;
+                                }
+                            }
+                        }
+                        peer.write_all(&Frame::control(Command::Fin, id).encode())
+                            .await
+                            .unwrap();
+                        assert!(!session.is_closed.load(Ordering::Relaxed));
+                    }
+                    while let Some(result) = tasks.join_next().await {
+                        result.unwrap();
+                    }
+                    session.close().await;
+                    server.await.unwrap().unwrap();
+                }
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn fake_dns_adapter_contract() {
+        use crate::tcp::ingress::tests::FakeTcpCase;
+        timeout(Duration::from_secs(10), async {
+            for version in [1, 2] {
+                for case in [FakeTcpCase::Dns, FakeTcpCase::Tls, FakeTcpCase::Plain] {
+                    let mut tasks = tokio::task::JoinSet::new();
+                    let (selector, resolver, target, payload) = case.fixture(&mut tasks).await;
+                    let (server, mut peer) = duplex(8192);
+                    let session = AnyTlsSession::new_server_with_initial_data(
+                        server,
+                        PaddingFactory::default_factory(),
+                        resolver,
+                        selector,
+                        true,
+                        "test".into(),
+                        None,
+                    );
+                    session
+                        .received_client_settings
+                        .store(true, Ordering::Relaxed);
+                    session.peer_version.store(version, Ordering::Relaxed);
+                    let runner = session.clone();
+                    let server =
+                        tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+                            runner.run().await
+                        }));
+                    peer.write_all(&Frame::control(Command::Syn, 2).encode())
+                        .await
+                        .unwrap();
+                    peer.write_all(
+                        &Frame::data(
+                            2,
+                            Bytes::from(crate::socks_handler::write_location_to_vec(&target)),
+                        )
+                        .encode(),
+                    )
+                    .await
+                    .unwrap();
+                    if version == 2 {
+                        let mut status = [0; 7];
+                        peer.read_exact(&mut status).await.unwrap();
+                        assert_eq!(
+                            status.as_slice(),
+                            Frame::control(Command::SynAck, 2).encode().as_ref()
+                        );
+                    }
+                    peer.write_all(&Frame::data(2, Bytes::from(payload)).encode())
+                        .await
+                        .unwrap();
+                    peer.write_all(&Frame::control(Command::Fin, 2).encode())
+                        .await
+                        .unwrap();
+                    let mut reply = Vec::new();
+                    loop {
+                        let mut header = [0; 7];
+                        peer.read_exact(&mut header).await.unwrap();
+                        assert_eq!(&header[1..5], &2u32.to_be_bytes());
+                        let length = u16::from_be_bytes([header[5], header[6]]) as usize;
+                        let mut data = vec![0; length];
+                        peer.read_exact(&mut data).await.unwrap();
+                        if header[0] == Command::Fin as u8 {
+                            assert_eq!(length, 0);
+                            break;
+                        }
+                        assert_eq!(header[0], Command::Psh as u8);
+                        reply.extend(data);
+                    }
+                    case.assert_reply(&reply);
+                    assert!(!session.is_closed.load(Ordering::Relaxed));
+                    while let Some(result) = tasks.join_next().await {
+                        result.unwrap();
+                    }
+                    session.close().await;
+                    server.await.unwrap().unwrap();
+                }
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn unknown_fake_destinations_send_error_synack_then_fin() {
+        for udp in [false, true] {
+            timeout(Duration::from_secs(5), async {
+                let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
+                let context = Arc::new(
+                    crate::dns::fake_ip::FakeDnsContext::new(Default::default(), resolver.clone())
+                        .unwrap(),
+                );
+                let selector =
+                    ClientProxySelector::new(vec![crate::client_proxy_selector::ConnectRule::new(
+                        vec![crate::address::NetLocationMask::from("sniff.example").unwrap()],
+                        crate::client_proxy_selector::ConnectAction::Block,
+                    )])
+                    .with_sniff(true)
+                    .with_fake_dns_context(Some(context))
+                    .unwrap();
+                let (server, mut peer) = duplex(8192);
+                let session = AnyTlsSession::new_server_with_initial_data(
+                    server,
+                    PaddingFactory::default_factory(),
+                    resolver,
+                    Arc::new(selector),
+                    true,
+                    "test".into(),
+                    None,
+                );
+                session
+                    .received_client_settings
+                    .store(true, Ordering::Relaxed);
+                session.peer_version.store(2, Ordering::Relaxed);
+                let runner = session.clone();
+                let server = tokio::spawn(async move { runner.run().await });
+                for id in [2, 3] {
+                    peer.write_all(&Frame::control(Command::Syn, id).encode())
+                        .await
+                        .unwrap();
+                    let mut payload = Vec::new();
+                    if udp {
+                        payload.extend_from_slice(&[3, UOT_V2_MAGIC_ADDRESS.len() as u8]);
+                        payload.extend_from_slice(UOT_V2_MAGIC_ADDRESS.as_bytes());
+                        payload.extend_from_slice(&[0, 0, 1]);
+                    }
+                    payload.extend_from_slice(&[1, 198, 18, 0, 5, 1, 187]);
+                    peer.write_all(&Frame::data(id, Bytes::from(payload)).encode())
+                        .await
+                        .unwrap();
+                    let mut header = [0; 7];
+                    peer.read_exact(&mut header).await.unwrap();
+                    assert_eq!(
+                        &header[..5],
+                        &Frame::control(Command::SynAck, id).encode()[..5]
+                    );
+                    let mut message = vec![0; u16::from_be_bytes([header[5], header[6]]) as usize];
+                    peer.read_exact(&mut message).await.unwrap();
+                    let message = String::from_utf8(message).unwrap();
+                    assert!(
+                        message.starts_with(if udp {
+                            "UDP connect failed:"
+                        } else {
+                            "connect failed:"
+                        }),
+                        "{message}"
+                    );
+                    peer.read_exact(&mut header).await.unwrap();
+                    assert_eq!(&header, &Frame::control(Command::Fin, id).encode()[..]);
+                    assert!(!session.is_closed.load(Ordering::Relaxed));
+                }
+                while !session.stream_tasks.lock().is_empty() {
+                    tokio::task::yield_now().await;
+                }
+                session.close().await;
+                server.await.unwrap().unwrap();
+                let mut extra = Vec::new();
+                peer.read_to_end(&mut extra).await.unwrap();
+                assert!(
+                    extra.is_empty(),
+                    "duplicate status or FIN after stream completion"
+                );
+            })
+            .await
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn sniff_failures_send_one_synack_then_fin() {
+        for sniff in [false, true] {
+            for blocked in [false, true] {
+                timeout(Duration::from_secs(5), async {
+                    let (server, mut peer) = duplex(8192);
+                    let session = AnyTlsSession::new_server_with_initial_data(
+                        server,
+                        PaddingFactory::default_factory(),
+                        Arc::new(crate::resolver::NativeResolver::new()),
+                        crate::tcp::ingress::tests::failure_selector(sniff, blocked),
+                        false,
+                        "test".into(),
+                        None,
+                    );
+                    session
+                        .received_client_settings
+                        .store(true, Ordering::Relaxed);
+                    session.peer_version.store(2, Ordering::Relaxed);
+                    let runner = session.clone();
+                    let server = tokio::spawn(async move { runner.run().await });
+                    peer.write_all(&Frame::control(Command::Syn, 1).encode())
+                        .await
+                        .unwrap();
+                    peer.write_all(
+                        &Frame::data(1, Bytes::from_static(&[1, 203, 0, 113, 1, 1, 187])).encode(),
+                    )
+                    .await
+                    .unwrap();
+                    let mut header = [0; 7];
+                    peer.read_exact(&mut header).await.unwrap();
+                    assert_eq!(
+                        &header[..5],
+                        &Frame::control(Command::SynAck, 1).encode()[..5]
+                    );
+                    let mut error = vec![0; u16::from_be_bytes([header[5], header[6]]) as usize];
+                    peer.read_exact(&mut error).await.unwrap();
+                    if sniff {
+                        assert!(error.is_empty());
+                        let hello = crate::sniff::tests::hello(&rustls::version::TLS13, true);
+                        peer.write_all(&Frame::data(1, Bytes::from(hello)).encode())
+                            .await
+                            .unwrap();
+                    } else {
+                        let error = String::from_utf8(error).unwrap();
+                        assert!(error.starts_with(if blocked {
+                            "blocked by rules:"
+                        } else {
+                            "connect failed:"
+                        }));
+                    }
+                    peer.read_exact(&mut header).await.unwrap();
+                    assert_eq!(&header, &Frame::control(Command::Fin, 1).encode()[..]);
+                    while !session.stream_tasks.lock().is_empty() {
+                        tokio::task::yield_now().await;
+                    }
+                    session.close().await;
+                    server.await.unwrap().unwrap();
+                    let mut extra = Vec::new();
+                    peer.read_to_end(&mut extra).await.unwrap();
+                    assert!(
+                        extra.is_empty(),
+                        "duplicate status or FIN after stream completion"
+                    );
+                })
+                .await
+                .unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn sniff_v2_synack_precedes_payload_and_preserves_early_data() {
+        for version in [1, 2] {
+            timeout(Duration::from_secs(5), async {
+                let mut tasks = tokio::task::JoinSet::new();
+                let hello = crate::sniff::tests::hello(&rustls::version::TLS13, true);
+                let (selector, resolver) =
+                    crate::tcp::ingress::tests::socks_target(hello.clone(), &mut tasks).await;
+                let (server, mut peer) = duplex(8192);
+                let session = AnyTlsSession::new_server_with_initial_data(
+                    server,
+                    PaddingFactory::default_factory(),
+                    resolver,
+                    selector,
+                    false,
+                    "test".into(),
+                    None,
+                );
+                session
+                    .received_client_settings
+                    .store(true, Ordering::Relaxed);
+                session.peer_version.store(version, Ordering::Relaxed);
+                let runner = session.clone();
+                let server = tokio::spawn(async move { runner.run().await });
+                peer.write_all(&Frame::control(Command::Syn, 1).encode())
+                    .await
+                    .unwrap();
+                peer.write_all(
+                    &Frame::data(1, Bytes::from_static(&[1, 203, 0, 113, 1, 1, 187])).encode(),
+                )
+                .await
+                .unwrap();
+                if version == 2 {
+                    let mut reply = [0; 7];
+                    peer.read_exact(&mut reply).await.unwrap();
+                    assert_eq!(&reply, &Frame::control(Command::SynAck, 1).encode()[..]);
+                }
+                peer.write_all(&Frame::data(1, Bytes::from(hello)).encode())
+                    .await
+                    .unwrap();
+                peer.write_all(&Frame::control(Command::Fin, 1).encode())
+                    .await
+                    .unwrap();
+                let mut response = Vec::new();
+                loop {
+                    let mut header = [0; 7];
+                    peer.read_exact(&mut header).await.unwrap();
+                    let len = u16::from_be_bytes([header[5], header[6]]) as usize;
+                    let mut data = vec![0; len];
+                    peer.read_exact(&mut data).await.unwrap();
+                    if header[0] == Command::Fin as u8 {
+                        break;
+                    }
+                    assert_eq!(header[0], Command::Psh as u8);
+                    response.extend(data);
+                }
+                assert_eq!(response, b"greetinglater");
+                while let Some(result) = tasks.join_next().await {
+                    result.unwrap();
+                }
+                session.close().await;
+                server.await.unwrap().unwrap();
+            })
+            .await
+            .unwrap();
+        }
+    }
 
     #[tokio::test(start_paused = true)]
     async fn setup_timeout_does_not_limit_established_stream_lifetime() {

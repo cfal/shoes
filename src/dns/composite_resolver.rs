@@ -6,6 +6,8 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use hickory_resolver::proto::op::ResponseCode;
+
 use crate::address::NetLocation;
 use crate::resolver::Resolver;
 
@@ -26,9 +28,80 @@ impl CompositeResolver {
     pub fn new(resolvers: Vec<Arc<dyn Resolver>>) -> Self {
         Self { resolvers }
     }
+
+    fn exchange_inner(
+        &self,
+        request: Vec<u8>,
+        deadline: Option<tokio::time::Instant>,
+    ) -> crate::resolver::DnsExchangeFuture {
+        let resolvers = self.resolvers.clone();
+        Box::pin(async move {
+            let mut last =
+                std::io::Error::new(std::io::ErrorKind::NotFound, "no DNS resolvers configured");
+            let mut retained_setup = false;
+            let mut truncated = None;
+            for resolver in resolvers {
+                if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+                    last =
+                        std::io::Error::new(std::io::ErrorKind::TimedOut, "DNS exchange timed out");
+                    break;
+                }
+                let exchange = match deadline {
+                    Some(deadline) => resolver.exchange_with_deadline(request.clone(), deadline),
+                    None => resolver.exchange(request.clone()),
+                };
+                match exchange.await {
+                    Ok(response) => {
+                        let message = super::message::decode(&response);
+                        if message
+                            .as_ref()
+                            .is_ok_and(|message| message.metadata.truncation)
+                        {
+                            truncated.get_or_insert(response);
+                        } else if truncated.is_none()
+                            || message.is_ok_and(|message| {
+                                matches!(
+                                    message.metadata.response_code,
+                                    ResponseCode::NoError | ResponseCode::NXDomain
+                                )
+                            })
+                        {
+                            return Ok(response);
+                        }
+                    }
+                    Err(error) => {
+                        retained_setup |= crate::resolver::dns_setup_pending(&error);
+                        last = error;
+                    }
+                }
+            }
+            if let Some(response) = truncated {
+                Ok(response)
+            } else if retained_setup {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    crate::resolver::DnsSetupPending,
+                ))
+            } else {
+                Err(last)
+            }
+        })
+    }
 }
 
 impl Resolver for CompositeResolver {
+    fn exchange(&self, request: Vec<u8>) -> crate::resolver::DnsExchangeFuture {
+        self.exchange_inner(request, None)
+    }
+
+    fn exchange_with_deadline(
+        &self,
+        request: Vec<u8>,
+        deadline: tokio::time::Instant,
+    ) -> crate::resolver::DnsExchangeFuture {
+        self.exchange_inner(request, Some(deadline))
+    }
+
     fn resolve_location(
         &self,
         location: &NetLocation,
@@ -96,6 +169,15 @@ mod tests {
     }
 
     impl Resolver for RecordingResolver {
+        fn exchange(&self, _request: Vec<u8>) -> crate::resolver::DnsExchangeFuture {
+            let result = self.result.clone();
+            Box::pin(async move {
+                result
+                    .map(|_| vec![])
+                    .map_err(|kind| io::Error::new(kind, "exchange failure"))
+            })
+        }
+
         fn resolve_location(
             &self,
             location: &NetLocation,
@@ -123,6 +205,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn later_exchange_failure_preserves_retained_setup_retry() {
+        #[derive(Debug)]
+        struct PendingSetup;
+        impl Resolver for PendingSetup {
+            fn resolve_location(&self, _: &NetLocation) -> crate::resolver::ResolveFuture {
+                unreachable!()
+            }
+            fn exchange(&self, _: Vec<u8>) -> crate::resolver::DnsExchangeFuture {
+                Box::pin(async {
+                    Err(io::Error::new(
+                        ErrorKind::TimedOut,
+                        crate::resolver::DnsSetupPending,
+                    ))
+                })
+            }
+        }
+        let fallback = composite(vec![Err(ErrorKind::TimedOut)]).0;
+        let resolver = CompositeResolver::new(vec![Arc::new(PendingSetup), Arc::new(fallback)]);
+        assert!(crate::resolver::dns_setup_pending(
+            &resolver.exchange(Vec::new()).await.unwrap_err()
+        ));
+    }
+
+    #[tokio::test]
     async fn fallback_is_ordered_and_stops_at_first_nonempty_result() {
         let location = NetLocation::from_str("example.com:8443", None).unwrap();
         let addresses = vec![
@@ -146,6 +252,75 @@ mod tests {
                     .collect::<Vec<_>>()
             );
         }
+    }
+
+    #[tokio::test]
+    async fn exchange_stops_at_any_success_even_with_empty_answers() {
+        let (resolver, _) = composite(vec![
+            Err(ErrorKind::TimedOut),
+            Ok(vec![]),
+            Err(ErrorKind::PermissionDenied),
+        ]);
+        assert_eq!(resolver.exchange(vec![]).await.unwrap(), Vec::<u8>::new());
+    }
+
+    #[tokio::test]
+    async fn truncated_exchange_tries_fallback_and_preserves_first_partial_answer() {
+        use hickory_resolver::proto::op::{Message, ResponseCode};
+
+        #[derive(Debug)]
+        struct WireReply(Result<Vec<u8>, ErrorKind>);
+        impl Resolver for WireReply {
+            fn resolve_location(&self, _: &NetLocation) -> crate::resolver::ResolveFuture {
+                unreachable!()
+            }
+            fn exchange(&self, _: Vec<u8>) -> crate::resolver::DnsExchangeFuture {
+                let result = self.0.clone();
+                Box::pin(async move { result.map_err(io::Error::from) })
+            }
+        }
+
+        let mut response = Message::query().into_response();
+        response.metadata.truncation = true;
+        let first = response.to_vec().unwrap();
+        response.metadata.id = 1;
+        let second = response.to_vec().unwrap();
+        response.metadata.truncation = false;
+        let complete = response.to_vec().unwrap();
+        let mut cases = vec![
+            (Ok(complete.clone()), complete),
+            (Ok(second), first.clone()),
+            (Err(ErrorKind::TimedOut), first.clone()),
+        ];
+        for code in [
+            ResponseCode::NXDomain,
+            ResponseCode::ServFail,
+            ResponseCode::Refused,
+            ResponseCode::FormErr,
+            ResponseCode::NotImp,
+        ] {
+            response.metadata.response_code = code;
+            let fallback = response.to_vec().unwrap();
+            let expected = if code == ResponseCode::NXDomain {
+                fallback.clone()
+            } else {
+                first.clone()
+            };
+            cases.push((Ok(fallback), expected));
+        }
+        for (fallback, expected) in cases {
+            let resolver = CompositeResolver::new(vec![
+                Arc::new(WireReply(Ok(first.clone()))),
+                Arc::new(WireReply(fallback)),
+            ]);
+            assert_eq!(resolver.exchange(vec![]).await.unwrap(), expected);
+        }
+        let resolver =
+            CompositeResolver::new(vec![Arc::new(WireReply(Ok(response.to_vec().unwrap())))]);
+        assert_eq!(
+            resolver.exchange(vec![]).await.unwrap(),
+            response.to_vec().unwrap()
+        );
     }
 
     #[tokio::test]
