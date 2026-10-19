@@ -766,11 +766,19 @@ impl AnyTlsSession {
     ) -> io::Result<()> {
         let stream_id = stream.id();
 
-        let prepared = crate::tcp::ingress::PreparedTcp::new(
+        let prepared = match crate::tcp::ingress::PreparedTcp::new(
             &self.proxy_provider,
             destination.clone(),
             Vec::new(),
-        )?;
+        ) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let message = format!("connect failed: {error}");
+                let _ = self.send_synack(stream_id, Some(&message)).await;
+                let _ = tokio::time::timeout(CONTROL_FRAME_TIMEOUT, stream.shutdown()).await;
+                return Err(error);
+            }
+        };
         let optimistic = prepared.needs_sniff_read();
         if optimistic {
             self.send_synack(stream_id, None).await?;
@@ -942,7 +950,12 @@ impl AnyTlsSession {
                     "UDP blocked by rules",
                 ));
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                let _ = self
+                    .send_synack(stream_id, Some(&format!("UDP connect failed: {error}")))
+                    .await;
+                return Err(error);
+            }
         };
         let setup = match setup_timeout(route.connect(&self.resolver)).await {
             Ok(setup) => setup,
@@ -1005,6 +1018,91 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
     use tokio::time::{Duration, timeout};
+
+    #[tokio::test]
+    async fn unknown_fake_destinations_send_error_synack_then_fin() {
+        for udp in [false, true] {
+            timeout(Duration::from_secs(5), async {
+                let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
+                let context = Arc::new(
+                    crate::dns::fake_ip::FakeDnsContext::new(Default::default(), resolver.clone())
+                        .unwrap(),
+                );
+                let selector =
+                    ClientProxySelector::new(vec![crate::client_proxy_selector::ConnectRule::new(
+                        vec![crate::address::NetLocationMask::from("sniff.example").unwrap()],
+                        crate::client_proxy_selector::ConnectAction::Block,
+                    )])
+                    .with_sniff(true)
+                    .with_fake_dns_context(Some(context))
+                    .unwrap();
+                let (server, mut peer) = duplex(8192);
+                let session = AnyTlsSession::new_server_with_initial_data(
+                    server,
+                    PaddingFactory::default_factory(),
+                    resolver,
+                    Arc::new(selector),
+                    true,
+                    "test".into(),
+                    None,
+                );
+                session
+                    .received_client_settings
+                    .store(true, Ordering::Relaxed);
+                session.peer_version.store(2, Ordering::Relaxed);
+                let runner = session.clone();
+                let server = tokio::spawn(async move { runner.run().await });
+                for id in [2, 3] {
+                    peer.write_all(&Frame::control(Command::Syn, id).encode())
+                        .await
+                        .unwrap();
+                    let mut payload = Vec::new();
+                    if udp {
+                        payload.extend_from_slice(&[3, UOT_V2_MAGIC_ADDRESS.len() as u8]);
+                        payload.extend_from_slice(UOT_V2_MAGIC_ADDRESS.as_bytes());
+                        payload.extend_from_slice(&[0, 0, 1]);
+                    }
+                    payload.extend_from_slice(&[1, 198, 18, 0, 5, 1, 187]);
+                    peer.write_all(&Frame::data(id, Bytes::from(payload)).encode())
+                        .await
+                        .unwrap();
+                    let mut header = [0; 7];
+                    peer.read_exact(&mut header).await.unwrap();
+                    assert_eq!(
+                        &header[..5],
+                        &Frame::control(Command::SynAck, id).encode()[..5]
+                    );
+                    let mut message = vec![0; u16::from_be_bytes([header[5], header[6]]) as usize];
+                    peer.read_exact(&mut message).await.unwrap();
+                    let message = String::from_utf8(message).unwrap();
+                    assert!(
+                        message.starts_with(if udp {
+                            "UDP connect failed:"
+                        } else {
+                            "connect failed:"
+                        }),
+                        "{message}"
+                    );
+                    peer.read_exact(&mut header).await.unwrap();
+                    assert_eq!(&header, &Frame::control(Command::Fin, id).encode()[..]);
+                    assert!(!session.is_closed.load(Ordering::Relaxed));
+                }
+                while !session.stream_tasks.lock().is_empty() {
+                    tokio::task::yield_now().await;
+                }
+                session.close().await;
+                server.await.unwrap().unwrap();
+                let mut extra = Vec::new();
+                peer.read_to_end(&mut extra).await.unwrap();
+                assert!(
+                    extra.is_empty(),
+                    "duplicate status or FIN after stream completion"
+                );
+            })
+            .await
+            .unwrap();
+        }
+    }
 
     #[tokio::test]
     async fn sniff_failures_send_one_synack_then_fin() {
