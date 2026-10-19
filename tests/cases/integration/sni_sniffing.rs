@@ -9,13 +9,18 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::time::timeout;
 
 fn hello() -> Vec<u8> {
-    let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+    hello_with_sni(true)
+}
+
+fn hello_with_sni(sni: bool) -> Vec<u8> {
+    let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(
         rustls::crypto::aws_lc_rs::default_provider(),
     ))
     .with_protocol_versions(&[&rustls::version::TLS13])
     .unwrap()
     .with_root_certificates(rustls::RootCertStore::empty())
     .with_no_client_auth();
+    config.enable_sni = sni;
     let mut client =
         rustls::ClientConnection::new(Arc::new(config), "sniff.invalid".try_into().unwrap())
             .unwrap();
@@ -55,12 +60,17 @@ async fn fake_dns_sniff_routes_without_rewriting_restored_targets() -> io::Resul
 
     timeout(Duration::from_secs(30), async {
         for protocol in ["socks", "http"] {
-            for (sniff, tls, pipelined) in [
-                (false, true, true),
-                (true, true, true),
-                (true, true, false),
-                (true, false, true),
-                (true, false, false),
+            for (sniff, kind, pipelined) in [
+                (false, "tls", true),
+                (true, "tls", true),
+                (true, "tls", false),
+                (true, "plain", true),
+                (true, "plain", false),
+                (true, "no-sni", true),
+                (true, "no-sni", false),
+                (true, "partial", false),
+                (true, "server-first", false),
+                (true, "supplied-hostname", false),
             ] {
                 let exit = TcpListener::bind("0.0.0.0:0").await?;
                 let exit_port = exit.local_addr()?.port();
@@ -68,7 +78,7 @@ async fn fake_dns_sniff_routes_without_rewriting_restored_targets() -> io::Resul
                 let dns_port = real_dns.local_addr()?.port();
                 let mut ports = PortHelper::new();
                 let (_, port) = ports.get_localhost_listener_port();
-                let (restored_action, sniff_action) = if sniff && tls {
+                let (restored_action, sniff_action) = if sniff && kind == "tls" {
                     ("action: block", "client_chain: exit")
                 } else {
                     ("client_chain: exit", "action: block")
@@ -148,7 +158,12 @@ async fn fake_dns_sniff_routes_without_rewriting_restored_targets() -> io::Resul
                 }
                 dns.shutdown().await?;
                 let fake_target = SocketAddrV4::new(fake_ip.unwrap(), 443);
-                let payload = if tls { hello() } else { b"not TLS".to_vec() };
+                let payload = match kind {
+                    "tls" | "supplied-hostname" => hello(),
+                    "no-sni" => hello_with_sni(false),
+                    "partial" => hello()[..5].to_vec(),
+                    _ => b"not TLS".to_vec(),
+                };
                 let expected = payload.clone();
                 let upstream = async {
                     let (mut socket, _) = exit.accept().await?;
@@ -175,18 +190,46 @@ async fn fake_dns_sniff_routes_without_rewriting_restored_targets() -> io::Resul
                 };
                 let client = async {
                     let mut client = TcpStream::connect(("127.0.0.1", port)).await?;
-                    request_to(
-                        &mut client,
-                        protocol,
-                        fake_target,
-                        if pipelined { &payload } else { &[] },
-                    )
-                    .await?;
-                    if !pipelined {
+                    if kind == "supplied-hostname" {
+                        if protocol == "http" {
+                            client.write_all(b"CONNECT restored.invalid:443 HTTP/1.1\r\nHost: restored.invalid:443\r\n\r\n").await?;
+                            let mut headers = Vec::new();
+                            while !headers.ends_with(b"\r\n\r\n") {
+                                headers.push(client.read_u8().await?);
+                            }
+                            assert!(headers.starts_with(b"HTTP/1.1 200"));
+                        } else {
+                            client.write_all(&[5, 1, 0]).await?;
+                            let mut method = [0; 2];
+                            client.read_exact(&mut method).await?;
+                            assert_eq!(method, [5, 0]);
+                            client.write_all(b"\x05\x01\x00\x03\x10restored.invalid\x01\xbb").await?;
+                            let mut reply = [0; 10];
+                            client.read_exact(&mut reply).await?;
+                            assert_eq!(&reply[..4], &[5, 0, 0, 1]);
+                        }
+                    } else {
+                        request_to(
+                            &mut client,
+                            protocol,
+                            fake_target,
+                            if pipelined { &payload } else { &[] },
+                        )
+                        .await?;
+                    }
+                    if !pipelined && kind != "server-first" {
                         client.write_all(&payload).await?;
                     }
-                    client.shutdown().await?;
                     let mut response = Vec::new();
+                    if matches!(kind, "server-first" | "partial") {
+                        response.resize(8, 0);
+                        client.read_exact(&mut response).await?;
+                        assert_eq!(response, b"greeting");
+                        if kind == "server-first" {
+                            client.write_all(&payload).await?;
+                        }
+                    }
+                    client.shutdown().await?;
                     client.read_to_end(&mut response).await?;
                     assert_eq!(response, b"greetingafter half-close");
                     io::Result::Ok(())

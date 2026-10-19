@@ -282,3 +282,71 @@ async fn anytls_udp_fake_dns() -> Result<()> {
 async fn h2mux_udp_fake_dns() -> Result<()> {
     udp_case("h2mux").await
 }
+
+#[tokio::test]
+async fn port_53_interception_does_not_probe_or_forward_non_dns() -> Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    tokio::time::timeout(Duration::from_secs(20), async {
+        for enabled in [false, true] {
+            let tcp = tokio::net::TcpListener::bind("0.0.0.0:0").await?;
+            let echo_port = tcp.local_addr()?.port();
+            let udp = tokio::net::UdpSocket::bind(("0.0.0.0", echo_port)).await?;
+            let upstream = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut tasks = tokio::task::JoinSet::new();
+            let count = calls.clone();
+            tasks.spawn(async move {
+                loop {
+                    let (mut stream, _) = tcp.accept().await.unwrap();
+                    count.fetch_add(1, Ordering::SeqCst);
+                    let mut bytes = Vec::new();
+                    stream.read_to_end(&mut bytes).await.unwrap();
+                    stream.write_all(&bytes).await.unwrap();
+                }
+            });
+            let count = calls.clone();
+            tasks.spawn(async move {
+                let mut bytes = [0; 2048];
+                loop {
+                    let (length, peer) = udp.recv_from(&mut bytes).await.unwrap();
+                    count.fetch_add(1, Ordering::SeqCst);
+                    udp.send_to(&bytes[..length], peer).await.unwrap();
+                }
+            });
+            let mut ports = PortHelper::new();
+            let (_, port) = ports.get_localhost_listener_port();
+            let config = json!([{
+                "address": format!("0.0.0.0:{port}"),
+                "protocol": {"type":"socks", "udp_enabled":true},
+                "sniff":true,
+                "dns":{"fake_ip":enabled, "servers":format!("udp://127.0.0.1:{}", upstream.local_addr()?.port())},
+                "rules":[
+                    {"mask":"sniff.invalid", "action":"block"},
+                    {"mask":"0.0.0.0/0", "action":"allow", "override_address":format!("127.0.0.1:{echo_port}")}
+                ]
+            }]);
+            let (_process, _config) = start_shoes_server(&config.to_string())?;
+            ports.wait_for_all_ports().await?;
+            let payload = [0, 3, 1, 2, 3];
+            let mut tcp = tokio::net::TcpStream::connect(("127.0.0.1", port)).await?;
+            super::plain_tcp_relay::request_to(&mut tcp, "socks", "127.0.0.1:53".parse()?, &payload).await?;
+            tcp.shutdown().await?;
+            let mut reply = Vec::new();
+            tcp.read_to_end(&mut reply).await?;
+            assert_eq!(reply, if enabled { vec![] } else { payload.to_vec() });
+
+            let association = Socks5UdpAssociation::connect("127.0.0.1", port).await?;
+            let target = SocksDestination::Ip("127.0.0.1:53".parse()?);
+            if enabled {
+                association.socket().send_to(&encode_udp_datagram(&target, &payload)?, association.relay_addr()).await?;
+                let reply = send(&association, target, &question("recovered.example", RecordType::A)).await?;
+                assert_eq!(Message::from_vec(&reply)?.answers.len(), 1);
+            } else {
+                assert_eq!(send(&association, target, &payload).await?, payload);
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), if enabled { 0 } else { 2 });
+            assert!(tokio::time::timeout(Duration::from_millis(20), upstream.recv(&mut [0; 2048])).await.is_err());
+        }
+        Result::Ok(())
+    }).await?
+}

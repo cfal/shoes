@@ -373,6 +373,63 @@ async fn udp_has_backpressure_and_keeps_synthesizing_after_forwarding() {
     ));
 }
 
+#[tokio::test(start_paused = true)]
+async fn non_dns_streams_never_forward_and_udp_recovers_after_a_bad_packet() {
+    let (context, real) = context();
+    let mut udp = context.udp_stream();
+    for payload in [
+        vec![1, 2, 3],
+        crate::sniff::tests::hello(&rustls::version::TLS13, true),
+    ] {
+        poll_fn(|cx| Pin::new(&mut udp).poll_write_message(cx, &payload))
+            .await
+            .unwrap();
+        let mut bytes = [0; 2048];
+        let mut buf = ReadBuf::new(&mut bytes);
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(1),
+                poll_fn(|cx| Pin::new(&mut udp).poll_read_message(cx, &mut buf)),
+            )
+            .await
+            .is_err()
+        );
+        let query = query(RecordType::A);
+        poll_fn(|cx| Pin::new(&mut udp).poll_write_message(cx, &query))
+            .await
+            .unwrap();
+        poll_fn(|cx| Pin::new(&mut udp).poll_read_message(cx, &mut buf))
+            .await
+            .unwrap();
+        assert_eq!(Message::from_vec(buf.filled()).unwrap().answers.len(), 1);
+    }
+    for (payload, elapsed) in [
+        (vec![0, 0], 0),
+        (vec![0, 3, 1, 2, 3], 0),
+        (vec![0, 10, 1], 30),
+        (vec![0], 60),
+        (
+            crate::sniff::tests::hello(&rustls::version::TLS13, true),
+            30,
+        ),
+    ] {
+        let mut tcp = context.tcp_stream();
+        let start = tokio::time::Instant::now();
+        tcp.write_all(&payload).await.unwrap();
+        let mut reply = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(61),
+            tcp.read_to_end(&mut reply),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(reply.is_empty());
+        assert_eq!(start.elapsed(), std::time::Duration::from_secs(elapsed));
+    }
+    assert_eq!(real.exchanges.load(Ordering::SeqCst), 0);
+}
+
 #[tokio::test]
 async fn tcp_ready_before_query_fragmentation_and_pipelining() {
     let (context, real) = context();
