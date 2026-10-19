@@ -102,6 +102,7 @@ async fn route_prepared_udp<'a>(
             wire_destination,
             context,
         } => {
+            let wire_destination = reply_destination(wire_destination, legacy_hostname_reply);
             let reply_identity =
                 if legacy_hostname_reply && wire_destination.address().hostname().is_some() {
                     let address = resolve_location(&mut wire_destination.into(), resolver).await?;
@@ -122,14 +123,15 @@ async fn route_prepared_udp<'a>(
             chain_group,
             mut remote_location,
         } => {
-            let reply_identity = if legacy_hostname_reply
-                && routed.wire_destination.address().hostname().is_some()
-            {
-                let address = resolve_location(&mut remote_location, resolver).await?;
-                NetLocation::from_ip_addr(address.ip(), address.port())
-            } else {
-                routed.wire_destination
-            };
+            let wire_destination =
+                reply_destination(routed.wire_destination, legacy_hostname_reply);
+            let reply_identity =
+                if legacy_hostname_reply && wire_destination.address().hostname().is_some() {
+                    let address = resolve_location(&mut remote_location, resolver).await?;
+                    NetLocation::from_ip_addr(address.ip(), address.port())
+                } else {
+                    wire_destination
+                };
             Ok(UdpRoute::Forward {
                 chain: chain_group,
                 target: remote_location,
@@ -138,6 +140,16 @@ async fn route_prepared_udp<'a>(
         }
         ConnectDecision::Block => Err(io::Error::new(io::ErrorKind::PermissionDenied, PolicyBlock)),
     }
+}
+
+fn reply_destination(wire_destination: NetLocation, ip_only: bool) -> NetLocation {
+    if ip_only
+        && let Some(hostname) = wire_destination.address().hostname()
+        && let Ok(ip) = hostname.parse()
+    {
+        return NetLocation::from_ip_addr(ip, wire_destination.port());
+    }
+    wire_destination
 }
 
 #[cfg(test)]
@@ -255,6 +267,52 @@ mod tests {
                 .is_err(),
             "IP-only reply protocols must resolve a hostname or fail explicitly"
         );
+    }
+
+    #[tokio::test]
+    async fn legacy_replies_preserve_domain_encoded_fake_ips_without_resolution() {
+        let real: Arc<dyn Resolver> = Arc::new(RealDns);
+        let context = Arc::new(FakeDnsContext::new(Default::default(), real.clone()).unwrap());
+        let selector = ClientProxySelector::new(vec![ConnectRule::new(
+            vec![NetLocationMask::from("encoded.example").unwrap()],
+            ConnectAction::new_allow(
+                None,
+                crate::tcp::chain_builder::build_direct_chain_group(real.clone()),
+            ),
+        )])
+        .with_fake_dns_context(Some(context.clone()))
+        .unwrap();
+        let fake = context.allocate("encoded.example", false).unwrap();
+        for text in [fake.to_string(), format!("::ffff:{fake}")] {
+            for port in [53, 443] {
+                let wire = NetLocation::new(crate::address::Address::Hostname(text.clone()), port);
+                let expected = NetLocation::from_ip_addr(text.parse().unwrap(), port);
+                let route = route_prepared_udp(
+                    &selector,
+                    selector.prepare(wire.into()).unwrap(),
+                    &real,
+                    true,
+                )
+                .await
+                .unwrap();
+                match route {
+                    UdpRoute::Local(setup) => {
+                        assert_eq!(port, 53);
+                        assert_eq!(setup.reply_identity, expected);
+                    }
+                    UdpRoute::Forward {
+                        target,
+                        reply_identity,
+                        ..
+                    } => {
+                        assert_eq!(port, 443);
+                        assert_eq!(reply_identity, expected);
+                        assert_eq!(target.address().hostname(), Some("encoded.example"));
+                        assert!(target.location().to_socket_addr_nonblocking().is_none());
+                    }
+                }
+            }
+        }
     }
 
     #[tokio::test]
