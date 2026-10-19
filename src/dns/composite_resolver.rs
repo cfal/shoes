@@ -35,8 +35,15 @@ impl Resolver for CompositeResolver {
             let mut last =
                 std::io::Error::new(std::io::ErrorKind::NotFound, "no DNS resolvers configured");
             let mut retained_setup = false;
+            let mut truncated = None;
             for resolver in resolvers {
                 match resolver.exchange(request.clone()).await {
+                    Ok(response)
+                        if super::message::decode(&response)
+                            .is_ok_and(|message| message.metadata.truncation) =>
+                    {
+                        truncated.get_or_insert(response);
+                    }
                     Ok(response) => return Ok(response),
                     Err(error) => {
                         retained_setup |= crate::resolver::dns_setup_pending(&error);
@@ -44,7 +51,9 @@ impl Resolver for CompositeResolver {
                     }
                 }
             }
-            if retained_setup {
+            if let Some(response) = truncated {
+                Ok(response)
+            } else if retained_setup {
                 Err(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
                     crate::resolver::DnsSetupPending,
@@ -215,6 +224,42 @@ mod tests {
             Err(ErrorKind::PermissionDenied),
         ]);
         assert_eq!(resolver.exchange(vec![]).await.unwrap(), Vec::<u8>::new());
+    }
+
+    #[tokio::test]
+    async fn truncated_exchange_tries_fallback_and_preserves_first_partial_answer() {
+        use hickory_resolver::proto::op::Message;
+
+        #[derive(Debug)]
+        struct WireReply(Result<Vec<u8>, ErrorKind>);
+        impl Resolver for WireReply {
+            fn resolve_location(&self, _: &NetLocation) -> crate::resolver::ResolveFuture {
+                unreachable!()
+            }
+            fn exchange(&self, _: Vec<u8>) -> crate::resolver::DnsExchangeFuture {
+                let result = self.0.clone();
+                Box::pin(async move { result.map_err(io::Error::from) })
+            }
+        }
+
+        let mut response = Message::query().into_response();
+        response.metadata.truncation = true;
+        let first = response.to_vec().unwrap();
+        response.metadata.id = 1;
+        let second = response.to_vec().unwrap();
+        response.metadata.truncation = false;
+        let complete = response.to_vec().unwrap();
+        for (fallback, expected) in [
+            (Ok(complete.clone()), complete),
+            (Ok(second), first.clone()),
+            (Err(ErrorKind::TimedOut), first.clone()),
+        ] {
+            let resolver = CompositeResolver::new(vec![
+                Arc::new(WireReply(Ok(first.clone()))),
+                Arc::new(WireReply(fallback)),
+            ]);
+            assert_eq!(resolver.exchange(vec![]).await.unwrap(), expected);
+        }
     }
 
     #[tokio::test]

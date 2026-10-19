@@ -1249,6 +1249,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn heterogeneous_group_retries_truncated_udp_over_configured_tcp() {
+        use hickory_resolver::proto::op::{Message, Query, ResponseCode};
+        use hickory_resolver::proto::rr::{Name, RecordType};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let tcp = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let mut address = tcp.local_addr().unwrap();
+        address.set_ip("127.0.0.1".parse().unwrap());
+        let udp = tokio::net::UdpSocket::bind(address).await.unwrap();
+        let mut groups = fake_groups(true);
+        let mut tcp_spec = make_spec(&format!("tcp://{address}"));
+        tcp_spec.attempts = 2;
+        groups[0].specs = vec![make_spec(&format!("udp://{address}")), tcp_spec];
+        let registry = build_dns_registry(groups).await.unwrap();
+        let server = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+            let mut bytes = [0; 2048];
+            let (length, peer) = udp.recv_from(&mut bytes).await.unwrap();
+            let mut answer = Message::from_vec(&bytes[..length]).unwrap().into_response();
+            answer.metadata.truncation = true;
+            udp.send_to(&answer.to_vec().unwrap(), peer).await.unwrap();
+
+            let (mut stream, _) = tcp.accept().await.unwrap();
+            let length = stream.read_u16().await.unwrap() as usize;
+            let mut bytes = vec![0; length];
+            stream.read_exact(&mut bytes).await.unwrap();
+            let mut answer = Message::from_vec(&bytes).unwrap().into_response();
+            answer.metadata.response_code = ResponseCode::NXDomain;
+            let bytes = answer.to_vec().unwrap();
+            stream.write_u16(bytes.len() as u16).await.unwrap();
+            stream.write_all(&bytes).await.unwrap();
+        }));
+        let context = registry
+            .get_by_name("fake")
+            .unwrap()
+            .fake_dns_context()
+            .unwrap();
+        let mut request = Message::query();
+        request.add_query(Query::query(
+            Name::from_ascii("mail.test").unwrap(),
+            RecordType::MX,
+        ));
+        let bytes = context
+            .exchange(request.to_vec().unwrap(), true)
+            .await
+            .unwrap()
+            .unwrap();
+        let response = Message::from_vec(&bytes).unwrap();
+        assert!(!response.metadata.truncation);
+        assert_eq!(response.metadata.response_code, ResponseCode::NXDomain);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn dns_bootstrap_uses_live_quic_admission_before_activation() {
         if std::env::var_os("SHOES_DNS_ADMISSION_TEST_CHILD").is_none() {
             let status = std::process::Command::new(std::env::current_exe().unwrap())
