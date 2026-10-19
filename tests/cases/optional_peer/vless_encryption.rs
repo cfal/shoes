@@ -126,6 +126,12 @@ async fn start_options(
     binary: PathBuf,
     go_debug: Option<&str>,
 ) -> Peer {
+    let port_reservation = match take_port_reservation(port) {
+        Some(reservation) => reservation,
+        None => reserve_peer_port(port)
+            .await
+            .unwrap_or_else(|error| panic!("reserve peer port {port}: {error}")),
+    };
     // Mihomo opens listeners before its tunnel becomes Running. A separate
     // direct route probes readiness without warming any native ticket cache.
     let mut readiness = if kind == Kind::Mihomo {
@@ -145,6 +151,9 @@ async fn start_options(
     } else {
         None
     };
+    let socks_reservation = readiness
+        .as_ref()
+        .and_then(|(socks, _, _)| take_port_reservation(*socks));
     let directory = tempfile::Builder::new()
         .prefix("vless-peer-")
         .tempdir_in(std::env::var_os("HOME").unwrap())
@@ -168,14 +177,15 @@ async fn start_options(
     if let Some(value) = go_debug {
         command.env("GODEBUG", value);
     }
-    let child = command
+    command
         .env("GOMAXPROCS", "1")
         .env("RUST_LOG", "shoes=debug")
         .stdin(Stdio::null())
         .stdout(log.try_clone().unwrap())
-        .stderr(log)
-        .spawn()
-        .unwrap();
+        .stderr(log);
+    // Keep readiness listeners from claiming peer ports before the child starts.
+    drop((port_reservation, socks_reservation));
+    let child = command.spawn().unwrap();
     let mut peer = Peer {
         process: ProcessGuard::new(child, format!("vless-{kind:?}")),
         directory,
@@ -215,34 +225,90 @@ async fn start_options(
     peer
 }
 
+type PortReservation = (std::net::TcpListener, std::net::UdpSocket);
+
+struct PeerPort {
+    port: u16,
+    reservation: Option<PortReservation>,
+}
+
+static PEER_PORTS: Mutex<Vec<PeerPort>> = Mutex::new(Vec::new());
+
+async fn reserve_peer_port(port: u16) -> io::Result<PortReservation> {
+    let tcp = TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, port)).await?;
+    let port = tcp.local_addr()?.port();
+    // SOCKS and QUIC peers also bind UDP on this port.
+    let udp = tokio::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, port)).await?;
+    Ok((tcp.into_std()?, udp.into_std()?))
+}
+
+fn take_port_reservation(port: u16) -> Option<PortReservation> {
+    PEER_PORTS
+        .lock()
+        .unwrap()
+        .iter_mut()
+        .find(|allocated| allocated.port == port)
+        .and_then(|allocated| allocated.reservation.take())
+}
+
 async fn free_port() -> u16 {
-    static ALLOCATED: Mutex<Vec<u16>> = Mutex::new(Vec::new());
     for _ in 0..100 {
-        let tcp = TcpListener::bind("0.0.0.0:0").await.unwrap();
-        let port = tcp.local_addr().unwrap().port();
-        // SOCKS and QUIC peers also bind UDP on this port.
-        match tokio::net::UdpSocket::bind(("0.0.0.0", port)).await {
-            Ok(_udp) => {
-                let mut allocated = ALLOCATED.lock().unwrap();
-                if allocated.contains(&port) {
+        match reserve_peer_port(0).await {
+            Ok(reservation) => {
+                let port = reservation.0.local_addr().unwrap().port();
+                let mut allocated = PEER_PORTS.lock().unwrap();
+                if allocated.iter().any(|allocated| allocated.port == port) {
                     continue;
                 }
-                allocated.push(port);
+                allocated.push(PeerPort {
+                    port,
+                    reservation: Some(reservation),
+                });
                 return port;
             }
             Err(error) if error.kind() == io::ErrorKind::AddrInUse => continue,
-            Err(error) => panic!("reserve UDP port: {error}"),
+            Err(error) => panic!("reserve peer port: {error}"),
         }
     }
     panic!("could not find a free TCP/UDP port");
 }
 
 #[tokio::test]
-async fn allocated_peer_ports_are_not_reused_before_listeners_start() {
+async fn allocated_peer_ports_are_not_reused_after_reservations_are_released() {
     let mut ports = std::collections::HashSet::new();
     for _ in 0..512 {
-        assert!(ports.insert(free_port().await));
+        let port = free_port().await;
+        assert!(ports.insert(port));
+        drop(take_port_reservation(port).unwrap());
     }
+}
+
+#[tokio::test]
+async fn allocated_peer_ports_stay_reserved_during_readiness_setup() {
+    let port = free_port().await;
+    let other_port = free_port().await;
+    let (target, _, mut task) = echo().await;
+    assert_ne!(port, target);
+    assert_ne!(other_port, target);
+    let address = (std::net::Ipv4Addr::UNSPECIFIED, port);
+    assert_eq!(
+        std::net::TcpListener::bind(address).unwrap_err().kind(),
+        io::ErrorKind::AddrInUse
+    );
+    assert_eq!(
+        std::net::UdpSocket::bind(address).unwrap_err().kind(),
+        io::ErrorKind::AddrInUse
+    );
+    drop(take_port_reservation(port).unwrap());
+    let _peer = reserve_peer_port(port).await.unwrap();
+    assert_eq!(
+        std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, other_port))
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::AddrInUse
+    );
+    drop(take_port_reservation(other_port).unwrap());
+    task.stop().await;
 }
 
 fn credentials(mode: &str, auth: &[&str]) -> (String, String, usize) {
