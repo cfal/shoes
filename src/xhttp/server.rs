@@ -601,33 +601,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejected_requests_close_carriers_without_a_response() {
+    async fn unknown_paths_close_only_http1_carriers() {
         tokio::time::timeout(Duration::from_secs(10), async {
             for version in [XhttpVersion::H1, XhttpVersion::H2, XhttpVersion::H3] {
                 for method in ["OPTIONS", "GET", "POST"] {
-                    for (path, values) in [
-                        ("/t/session/0", vec![]),
-                        ("/t/session/0", vec!["wrong"]),
-                        ("/t/session/0", vec!["secret", "secret"]),
-                        ("/wrong", vec!["secret"]),
-                        ("/t/%FF", vec!["secret"]),
-                    ] {
+                    for path in ["/wrong", "/%FF/t/"] {
                         let mut state = service();
                         let config = &mut Arc::get_mut(&mut state).unwrap().config;
-                        config.close_on_error = true;
+                        config.close_on_http1_error = true;
                         config.matching_headers = [("X-Token".into(), "secret".into())].into();
                         let (carrier, server, _endpoint) =
-                            streaming_carrier(state.clone(), version).await;
+                            streaming_carrier_with_h3_limit(state.clone(), version, 2).await;
                         let memory = Memory::new(Arc::new(Budget::new(Some(1024))), 1024);
                         let tasks = Tasks::new();
-                        let valid = Request::builder()
-                            .method("OPTIONS")
-                            .uri("https://localhost/t/")
-                            .header("x-token", "secret")
-                            .body(Body::Empty)
-                            .unwrap();
+                        let valid = || {
+                            Request::builder()
+                                .method("OPTIONS")
+                                .uri("https://localhost/t/")
+                                .header("x-token", "secret")
+                                .body(Body::Empty)
+                                .unwrap()
+                        };
                         let response = carrier
-                            .request(valid, memory.clone(), &tasks, Duration::from_secs(1))
+                            .request(valid(), memory.clone(), &tasks, Duration::from_secs(1))
                             .await
                             .unwrap();
                         assert_eq!(response.status(), StatusCode::OK);
@@ -640,10 +636,8 @@ mod tests {
                         let mut invalid = Request::builder()
                             .method(method)
                             .uri(format!("https://localhost{path}"))
+                            .header("x-token", "secret")
                             .header("referer", format!("/?x_padding={}", "X".repeat(100)));
-                        for value in values {
-                            invalid = invalid.header("x-token", value);
-                        }
                         let (_writer, body) = pipe(memory.clone());
                         let body = if method == "POST" {
                             invalid = invalid.header("content-length", "16");
@@ -654,22 +648,48 @@ mod tests {
                         let result = carrier
                             .request(
                                 invalid.body(body).unwrap(),
-                                memory,
+                                memory.clone(),
                                 &tasks,
                                 Duration::from_secs(1),
                             )
                             .await;
-                        match result {
-                            Ok(response) => panic!(
-                                "{version:?} {method}: unexpected HTTP {}",
-                                response.status()
-                            ),
-                            Err(error) => assert_ne!(error.kind(), io::ErrorKind::TimedOut),
+                        if version == XhttpVersion::H1 {
+                            match result {
+                                Ok(response) => panic!(
+                                    "{version:?} {method}: unexpected HTTP {}",
+                                    response.status()
+                                ),
+                                Err(error) => assert_ne!(error.kind(), io::ErrorKind::TimedOut),
+                            }
+                            while !carrier.closed() || state.requests.snapshot().active != 0 {
+                                tokio::task::yield_now().await;
+                            }
+                            server.wait().await;
+                        } else {
+                            let response = result.unwrap();
+                            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+                            assert!(!response.headers().contains_key("x-padding"));
+                            assert!(
+                                !response
+                                    .headers()
+                                    .contains_key("access-control-allow-origin")
+                            );
+                            assert_eq!(
+                                response
+                                    .into_body()
+                                    .read_to_end(&mut Vec::new())
+                                    .await
+                                    .unwrap(),
+                                0
+                            );
+                            assert!(!carrier.closed());
+                            let next = Tasks::new();
+                            let response = carrier
+                                .request(valid(), memory, &next, Duration::from_secs(1))
+                                .await
+                                .unwrap();
+                            assert_eq!(response.status(), StatusCode::OK);
                         }
-                        while !carrier.closed() || state.requests.snapshot().active != 0 {
-                            tokio::task::yield_now().await;
-                        }
-                        server.wait().await;
                         assert!(state.sessions.lock().is_empty());
                         assert_eq!(state.admission.snapshot().peak, 0);
                         assert_eq!(state.memory.snapshot().peak, 0);
@@ -682,36 +702,158 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejection_closes_sibling_downloads_and_releases_server_resources() {
-        #[derive(Clone, Copy, PartialEq, Eq)]
+    async fn header_rejections_are_silent_only_on_http1_when_enabled() {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            for version in [XhttpVersion::H1, XhttpVersion::H2, XhttpVersion::H3] {
+                for close_on_http1_error in [false, true] {
+                    let silently_closes = version == XhttpVersion::H1 && close_on_http1_error;
+                    for method in ["OPTIONS", "GET", "POST"] {
+                        for values in [vec![], vec!["wrong"], vec!["secret", "secret"]] {
+                            let mut state = service();
+                            let config = &mut Arc::get_mut(&mut state).unwrap().config;
+                            config.close_on_http1_error = close_on_http1_error;
+                            config.matching_headers = [("x-token".into(), "secret".into())].into();
+                            // The unfinished rejected upload still occupies a QUIC stream
+                            // until the client observes STOP_SENDING on its idle probe.
+                            let (carrier, _server, _endpoint) =
+                                streaming_carrier_with_h3_limit(state.clone(), version, 2).await;
+                            let memory = Memory::new(Arc::new(Budget::new(Some(1024))), 1024);
+                            let tasks = Tasks::new();
+                            let mut request = Request::builder()
+                                .method(method)
+                                .uri("https://localhost/t/session/0")
+                                .header("origin", "https://probe.test");
+                            for value in values {
+                                request = request.header("x-token", value);
+                            }
+                            let (_writer, body) = pipe(memory.clone());
+                            let body = if method == "POST" {
+                                request = request.header("content-length", "16");
+                                Body::stream(body)
+                            } else {
+                                Body::Empty
+                            };
+                            let result = carrier
+                                .request(
+                                    request.body(body).unwrap(),
+                                    memory.clone(),
+                                    &tasks,
+                                    Duration::from_secs(1),
+                                )
+                                .await;
+                            if silently_closes {
+                                match result {
+                                    Ok(response) => panic!("unexpected HTTP {}", response.status()),
+                                    Err(error) => assert_ne!(error.kind(), io::ErrorKind::TimedOut),
+                                }
+                                while !carrier.closed() || state.requests.snapshot().active != 0 {
+                                    tokio::task::yield_now().await;
+                                }
+                            } else {
+                                let response = result.unwrap();
+                                assert_eq!(response.status(), StatusCode::NOT_FOUND);
+                                for name in [
+                                    "access-control-allow-origin",
+                                    "access-control-allow-methods",
+                                    "access-control-allow-headers",
+                                    "content-type",
+                                    "x-padding",
+                                    "x-accel-buffering",
+                                    "cache-control",
+                                ] {
+                                    assert!(!response.headers().contains_key(name), "{name}");
+                                }
+                                assert_eq!(
+                                    response
+                                        .into_body()
+                                        .read_to_end(&mut Vec::new())
+                                        .await
+                                        .unwrap(),
+                                    0
+                                );
+                            }
+                            assert!(state.sessions.lock().is_empty());
+                            assert_eq!(state.admission.snapshot().peak, 0);
+                            assert_eq!(state.memory.snapshot().peak, 0);
+                            if !silently_closes && (version != XhttpVersion::H1 || method != "POST")
+                            {
+                                let next = Tasks::new();
+                                let valid = Request::builder()
+                                    .method("OPTIONS")
+                                    .uri("https://localhost/t/")
+                                    .header("x-token", "secret")
+                                    .body(Body::Empty)
+                                    .unwrap();
+                                let response = carrier
+                                    .request(valid, memory, &next, Duration::from_secs(1))
+                                    .await
+                                    .unwrap();
+                                assert_eq!(response.status(), StatusCode::OK);
+                            }
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn header_rejection_precedes_body_polling_and_session_admission() {
+        let mut state = service();
+        Arc::get_mut(&mut state).unwrap().config.matching_headers =
+            [("x-token".into(), "secret".into())].into();
+        let _admission = state.admission.acquire(2).unwrap();
+        for values in [vec![], vec!["wrong"], vec!["secret", "secret"]] {
+            let mut request = Request::post("https://localhost/t/session/0")
+                .header("referer", format!("/?x_padding={}", "X".repeat(100)))
+                .header("content-length", "16");
+            for value in values {
+                request = request.header("x-token", value);
+            }
+            let (_writer, mut body) = pipe(state.new_memory());
+            let started = body.defer();
+            let response = tokio::time::timeout(
+                Duration::from_secs(1),
+                state.handle(request.body(()).unwrap(), body),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            assert!(response.headers().is_empty());
+            assert!(started.await.is_err());
+            assert!(state.sessions.lock().is_empty());
+            assert_eq!(state.admission.snapshot().active, 2);
+            assert_eq!(state.memory.snapshot().peak, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_requests_preserve_h2_h3_sibling_downloads() {
         enum Case {
             MissingHeader,
+            WrongHeader,
+            DuplicateHeader,
+            MalformedSuffix,
             UnmatchedPath,
-            MissingPadding,
-            DuplicateDownload,
-            RequestLimit,
-            PacketLimit,
         }
 
         tokio::time::timeout(Duration::from_secs(10), async {
             for version in [XhttpVersion::H2, XhttpVersion::H3] {
                 for case in [
                     Case::MissingHeader,
+                    Case::WrongHeader,
+                    Case::DuplicateHeader,
+                    Case::MalformedSuffix,
                     Case::UnmatchedPath,
-                    Case::MissingPadding,
-                    Case::DuplicateDownload,
-                    Case::RequestLimit,
-                    Case::PacketLimit,
                 ] {
                     let mut state = service();
                     let service = Arc::get_mut(&mut state).unwrap();
-                    service.config.close_on_error = case != Case::MissingHeader;
+                    service.config.close_on_http1_error = true;
                     service.config.matching_headers = [("x-token".into(), "secret".into())].into();
-                    if case == Case::RequestLimit {
-                        service.requests = Arc::new(Budget::new(Some(1)));
-                    }
                     service.config.limits.max_requests_per_session = 2;
-                    let (carrier, server, _endpoint) =
+                    let (carrier, _server, _endpoint) =
                         streaming_carrier_with_h3_limit(state.clone(), version, 2).await;
                     let memory = Memory::new(Arc::new(Budget::new(Some(1024))), 1024);
                     let tasks = Tasks::new();
@@ -751,53 +893,170 @@ mod tests {
                     assert_eq!(state.admission.snapshot().active, 1);
                     assert_eq!(state.memory.snapshot().active, 4);
 
-                    let packet_permit = if case == Case::PacketLimit {
-                        Some(
-                            state
-                                .session("session")
-                                .unwrap()
-                                .packet_requests
-                                .acquire(1)
-                                .unwrap(),
-                        )
-                    } else {
-                        None
-                    };
                     let invalid = match case {
                         Case::MissingHeader => Request::get("https://localhost/t/session/0"),
+                        Case::WrongHeader => {
+                            Request::get("https://localhost/t/session/0").header("x-token", "wrong")
+                        }
+                        Case::DuplicateHeader => {
+                            make("GET", "/t/session/0").header("x-token", "secret")
+                        }
+                        Case::MalformedSuffix => make("GET", "/t/%FF"),
                         Case::UnmatchedPath => make("GET", "/wrong"),
-                        Case::MissingPadding => Request::get("https://localhost/t/session/0")
-                            .header("x-token", "secret"),
-                        Case::DuplicateDownload => make("GET", "/t/session"),
-                        Case::RequestLimit => make("GET", "/t/other"),
-                        Case::PacketLimit => make("POST", "/t/session/2"),
                     };
+                    let response = carrier
+                        .request(
+                            invalid.body(Body::Empty).unwrap(),
+                            memory.clone(),
+                            &tasks,
+                            Duration::from_secs(1),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(response.status(), StatusCode::NOT_FOUND);
                     assert!(
-                        carrier
-                            .request(
-                                invalid.body(Body::Empty).unwrap(),
-                                memory,
-                                &tasks,
-                                Duration::from_secs(1),
-                            )
-                            .await
-                            .is_err()
+                        !response
+                            .headers()
+                            .contains_key("access-control-allow-origin")
                     );
-                    assert!(download.read(&mut [0]).await.is_err());
-                    server.wait().await;
-                    state.tasks.wait().await;
-                    drop(packet_permit);
-                    assert_eq!(state.requests.snapshot().active, 0);
-                    assert_eq!(state.admission.snapshot().active, 0);
-                    assert_eq!(state.memory.snapshot().active, 0);
-                    assert!(
-                        state
-                            .sessions
-                            .lock()
-                            .values()
-                            .all(|entry| matches!(entry, Entry::Closed { .. }))
-                    );
+                    response
+                        .into_body()
+                        .read_to_end(&mut Vec::new())
+                        .await
+                        .unwrap();
+                    let response = carrier
+                        .request(
+                            make("POST", "/t/session/0")
+                                .body(Body::Chunks([Bytes::from_static(b"live")].into()))
+                                .unwrap(),
+                            memory,
+                            &tasks,
+                            Duration::from_secs(1),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(response.status(), StatusCode::OK);
+                    response
+                        .into_body()
+                        .read_to_end(&mut Vec::new())
+                        .await
+                        .unwrap();
+                    let mut echoed = [0; 8];
+                    download.read_exact(&mut echoed).await.unwrap();
+                    assert_eq!(&echoed, b"liveheld");
+                    assert!(!carrier.closed());
                 }
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn session_teardown_errors_preserve_sibling_downloads_on_another_carrier() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            for version in [XhttpVersion::H2, XhttpVersion::H3] {
+                let mut state = service();
+                let config = &mut Arc::get_mut(&mut state).unwrap().config;
+                config.close_on_http1_error = true;
+                config.matching_headers = [("x-token".into(), "secret".into())].into();
+                let (original_carrier, _original_server, _original_endpoint) =
+                    streaming_carrier(state.clone(), version).await;
+                let (shared_carrier, _shared_server, _shared_endpoint) =
+                    streaming_carrier_with_h3_limit(state.clone(), version, 2).await;
+                let memory = Memory::new(Arc::new(Budget::new(Some(1024))), 1024);
+                let tasks = Tasks::new();
+                let request = |method: &str, path: &str, data: &'static [u8]| {
+                    Request::builder()
+                        .method(method)
+                        .uri(format!("https://localhost/t/{path}"))
+                        .header("x-token", "secret")
+                        .header("referer", format!("/?x_padding={}", "X".repeat(100)))
+                        .body(if data.is_empty() {
+                            Body::Empty
+                        } else {
+                            Body::Chunks([Bytes::from_static(data)].into())
+                        })
+                        .unwrap()
+                };
+                let retired = original_carrier
+                    .request(
+                        request("GET", "retired", b""),
+                        memory.clone(),
+                        &tasks,
+                        Duration::from_secs(2),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(retired.status(), StatusCode::OK);
+                let healthy = shared_carrier
+                    .request(
+                        request("GET", "healthy", b""),
+                        memory.clone(),
+                        &tasks,
+                        Duration::from_secs(2),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(healthy.status(), StatusCode::OK);
+                let mut download = healthy.into_body();
+
+                let session = state.session("retired").unwrap();
+                let parked = shared_carrier.request(
+                    request("POST", "retired/100", b""),
+                    memory.clone(),
+                    &tasks,
+                    Duration::from_secs(2),
+                );
+                tokio::pin!(parked);
+                tokio::select! {
+                    _ = &mut parked => panic!("far packet should wait for admission"),
+                    _ = async {
+                        while session.packet_requests.snapshot().active == 0 {
+                            tokio::task::yield_now().await;
+                        }
+                    } => {},
+                }
+                state.close("retired");
+                let response = parked.await.unwrap();
+                assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+                response
+                    .into_body()
+                    .read_to_end(&mut Vec::new())
+                    .await
+                    .unwrap();
+                drop(retired);
+
+                let late = shared_carrier
+                    .request(
+                        request("POST", "retired/0", b"late"),
+                        memory.clone(),
+                        &tasks,
+                        Duration::from_secs(2),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(late.status(), StatusCode::CONFLICT);
+                late.into_body().read_to_end(&mut Vec::new()).await.unwrap();
+                let response = shared_carrier
+                    .request(
+                        request("POST", "healthy/0", b"alive"),
+                        memory.clone(),
+                        &tasks,
+                        Duration::from_secs(2),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                response
+                    .into_body()
+                    .read_to_end(&mut Vec::new())
+                    .await
+                    .unwrap();
+                let mut echoed = [0; 5];
+                download.read_exact(&mut echoed).await.unwrap();
+                assert_eq!(&echoed, b"alive");
+                assert!(!shared_carrier.closed());
             }
         })
         .await
@@ -864,7 +1123,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn error_responses_close_carriers_only_when_enabled() {
+    async fn known_path_errors_return_http_responses_even_when_close_on_http1_error_is_enabled() {
         tokio::time::timeout(Duration::from_secs(30), async {
             for version in [XhttpVersion::H1, XhttpVersion::H2, XhttpVersion::H3] {
                 for close in [false, true] {
@@ -879,7 +1138,7 @@ mod tests {
                     ] {
                         let mut state = service();
                         let config = &mut Arc::get_mut(&mut state).unwrap().config;
-                        config.close_on_error = close;
+                        config.close_on_http1_error = close;
                         config.host = Some("localhost".into());
                         config.limits.packet_timeout_secs = 1;
                         let admission = if status == StatusCode::SERVICE_UNAVAILABLE {
@@ -896,7 +1155,7 @@ mod tests {
                         } else {
                             None
                         };
-                        let (carrier, server, _endpoint) =
+                        let (carrier, _server, _endpoint) =
                             streaming_carrier(state.clone(), version).await;
                         let memory = Memory::new(Arc::new(Budget::new(Some(1024))), 1024);
                         let tasks = Tasks::new();
@@ -927,34 +1186,23 @@ mod tests {
                             }
                             _ => Body::Empty,
                         };
-                        let result = carrier
+                        let response = carrier
                             .request(
                                 request.body(body).unwrap(),
                                 memory,
                                 &tasks,
                                 Duration::from_secs(3),
                             )
-                            .await;
-                        if close {
-                            match result {
-                                Ok(response) => panic!(
-                                    "{version:?} {status}: unexpected HTTP {}",
-                                    response.status()
-                                ),
-                                Err(error) => assert_ne!(error.kind(), io::ErrorKind::TimedOut),
-                            }
-                            server.wait().await;
-                            while !carrier.closed() {
-                                tokio::task::yield_now().await;
-                            }
-                        } else {
-                            let response = result.unwrap();
-                            assert_eq!(response.status(), status, "{version:?}");
-                            response
-                                .into_body()
-                                .read_to_end(&mut Vec::new())
-                                .await
-                                .unwrap();
+                            .await
+                            .unwrap();
+                        assert_eq!(response.status(), status, "{version:?}, close={close}");
+                        response
+                            .into_body()
+                            .read_to_end(&mut Vec::new())
+                            .await
+                            .unwrap();
+                        if version != XhttpVersion::H1 {
+                            assert!(!carrier.closed());
                         }
                         drop(admission);
                         while state.requests.snapshot().active != 0 {
@@ -971,31 +1219,52 @@ mod tests {
     }
 
     #[test]
-    fn close_on_error_applies_to_all_error_statuses() {
+    fn http1_path_filter_preserves_known_prefixes() {
         let mut state = service();
         for close in [false, true] {
-            Arc::get_mut(&mut state).unwrap().config.close_on_error = close;
-            for code in 100..600 {
-                let status = StatusCode::from_u16(code).unwrap();
+            Arc::get_mut(&mut state)
+                .unwrap()
+                .config
+                .close_on_http1_error = close;
+            for (path, known) in [
+                ("/t/", true),
+                ("/t/session/0", true),
+                ("/%74/session/0?query=ignored", true),
+                ("/t%2Fsession/0", true),
+                ("/t/session/not-a-number", true),
+                ("/t/%FF", true),
+                ("/%74/%FF", true),
+                ("/wrong", false),
+                ("/t", false),
+                ("/test/session", false),
+                ("/%FF/t/", false),
+            ] {
+                let request = Request::get(format!("https://localhost{path}"))
+                    .body(())
+                    .unwrap();
                 assert_eq!(
-                    state.check_response_status(status).is_err(),
-                    close && code >= 400
+                    state.check_http1_request(&request).is_err(),
+                    close && !known,
+                    "{path}, close={close}"
                 );
             }
         }
     }
 
     #[tokio::test]
-    async fn aggregate_overflow_closes_carriers_when_enabled() {
+    async fn aggregate_overflow_does_not_silently_close_known_paths() {
         tokio::time::timeout(Duration::from_secs(10), async {
             for version in [XhttpVersion::H1, XhttpVersion::H2, XhttpVersion::H3] {
                 let mut state = service();
-                Arc::get_mut(&mut state).unwrap().config.close_on_error = true;
+                Arc::get_mut(&mut state)
+                    .unwrap()
+                    .config
+                    .close_on_http1_error = true;
                 let held = state
                     .requests
                     .acquire(state.config.limits.max_requests)
                     .unwrap();
-                let (carrier, server, _endpoint) = streaming_carrier(state.clone(), version).await;
+                let (carrier, _server, _endpoint) = streaming_carrier(state.clone(), version).await;
                 let memory = Memory::new(Arc::new(Budget::new(Some(1024))), 1024);
                 let tasks = Tasks::new();
                 let request = Request::builder()
@@ -1004,21 +1273,36 @@ mod tests {
                     .body(Body::Empty)
                     .unwrap();
                 match carrier
-                    .request(request, memory, &tasks, Duration::from_secs(1))
+                    .request(request, memory.clone(), &tasks, Duration::from_secs(1))
                     .await
                 {
-                    Ok(response) => panic!("{version:?}: unexpected HTTP {}", response.status()),
-                    Err(error) => assert_ne!(error.kind(), io::ErrorKind::TimedOut),
-                }
-                server.wait().await;
-                while !carrier.closed() {
-                    tokio::task::yield_now().await;
+                    Ok(response) => {
+                        assert_eq!(version, XhttpVersion::H1);
+                        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+                    }
+                    Err(error) => {
+                        assert_ne!(version, XhttpVersion::H1);
+                        assert_ne!(error.kind(), io::ErrorKind::TimedOut);
+                    }
                 }
                 drop(held);
                 assert!(state.sessions.lock().is_empty());
                 assert_eq!(state.requests.snapshot().active, 0);
                 assert_eq!(state.admission.snapshot().peak, 0);
                 assert_eq!(state.memory.snapshot().peak, 0);
+                if version != XhttpVersion::H1 {
+                    assert!(!carrier.closed());
+                    let probe = Request::builder()
+                        .method("OPTIONS")
+                        .uri("https://localhost/t/")
+                        .body(Body::Empty)
+                        .unwrap();
+                    let response = carrier
+                        .request(probe, memory, &tasks, Duration::from_secs(1))
+                        .await
+                        .unwrap();
+                    assert_eq!(response.status(), StatusCode::OK);
+                }
             }
         })
         .await
@@ -1026,7 +1310,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn h3_required_headers_fail_closed_when_admission_is_full() {
+    async fn h3_required_headers_preserve_carrier_when_admission_is_full() {
         tokio::time::timeout(Duration::from_secs(10), async {
             for connection_limit in [false, true] {
                 for matching in [false, true] {
@@ -1038,8 +1322,8 @@ mod tests {
                     } else {
                         service.requests = Arc::new(Budget::new(Some(1)));
                     }
-                    assert!(!service.config.close_on_error);
-                    let (carrier, server, _endpoint) =
+                    assert!(!service.config.close_on_http1_error);
+                    let (carrier, _server, _endpoint) =
                         streaming_carrier_with_h3_limit(state.clone(), XhttpVersion::H3, 2).await;
                     let memory = Memory::new(Arc::new(Budget::new(Some(1024))), 1024);
                     let tasks = Tasks::new();
@@ -1063,20 +1347,43 @@ mod tests {
                         carrier
                             .request(
                                 probe.body(Body::Empty).unwrap(),
-                                memory,
+                                memory.clone(),
                                 &tasks,
                                 Duration::from_secs(2)
                             )
                             .await
                             .is_err()
                     );
-                    assert!(download.read(&mut [0]).await.is_err());
-                    server.wait().await;
-                    state.tasks.wait().await;
-                    assert!(carrier.closed());
-                    assert_eq!(state.requests.snapshot().active, 0);
-                    assert_eq!(state.admission.snapshot().active, 0);
-                    assert_eq!(state.memory.snapshot().active, 0);
+                    assert!(!carrier.closed());
+                    assert_eq!(state.requests.snapshot().active, 1);
+                    assert_eq!(state.admission.snapshot().active, 1);
+                    let session = state.session("session").unwrap();
+                    let mut writer = session.state.lock().writer.take().unwrap();
+                    writer.write_all(b"alive").await.unwrap();
+                    let mut echoed = [0; 5];
+                    download.read_exact(&mut echoed).await.unwrap();
+                    assert_eq!(&echoed, b"alive");
+                    // Explicit teardown avoids waiting for the idle H3 cancellation probe.
+                    state.close("session");
+                    assert!(download.read_to_end(&mut Vec::new()).await.is_err());
+                    while state.requests.snapshot().active != 0 {
+                        tokio::task::yield_now().await;
+                    }
+                    let response = carrier
+                        .request(
+                            Request::builder()
+                                .method("OPTIONS")
+                                .uri("https://localhost/t/")
+                                .header("x-token", "secret")
+                                .body(Body::Empty)
+                                .unwrap(),
+                            memory,
+                            &tasks,
+                            Duration::from_secs(2),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(response.status(), StatusCode::OK);
                 }
             }
         })
@@ -1085,27 +1392,72 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn h1_mismatched_headers_close_without_reading_the_body() {
+    async fn h1_rejection_never_reads_the_body_or_discloses_xhttp_headers() {
         tokio::time::timeout(Duration::from_secs(2), async {
-            let mut state = service();
-            Arc::get_mut(&mut state).unwrap().config.matching_headers =
-                [("x-token".into(), "secret".into())].into();
-            let (mut client, server) = tokio::io::duplex(8192);
-            let serving = state.clone().serve_h1(
-                Box::new(server),
-                tokio::time::Instant::now() + Duration::from_secs(1),
-            );
-            let probe = async {
-                client.write_all(b"POST /t/session/0 HTTP/1.1\r\nHost: localhost\r\nContent-Length: 16\r\nExpect: 100-continue\r\n\r\n").await.unwrap();
-                let mut response = Vec::new();
-                client.read_to_end(&mut response).await.unwrap();
-                assert!(response.is_empty());
-            };
-            let (result, ()) = tokio::join!(serving, probe);
-            assert!(result.is_err());
-            assert!(state.sessions.lock().is_empty());
-            assert_eq!(state.requests.snapshot().peak, 0);
-            assert_eq!(state.memory.snapshot().peak, 0);
+            for close_on_http1_error in [false, true] {
+                for request_limit_reached in [false, true] {
+                    for (path, token_header) in
+                        [("/t/session/0", ""), ("/wrong", "X-Token: secret\r\n")]
+                    {
+                        let mut state = service();
+                        let config = &mut Arc::get_mut(&mut state).unwrap().config;
+                        config.close_on_http1_error = close_on_http1_error;
+                        config.matching_headers = [("x-token".into(), "secret".into())].into();
+                        let held = if request_limit_reached {
+                            Some(
+                                state
+                                    .requests
+                                    .acquire(state.config.limits.max_requests)
+                                    .unwrap(),
+                            )
+                        } else {
+                            None
+                        };
+                        let (mut client, server) = tokio::io::duplex(8192);
+                        let serving = state.clone().serve_h1(
+                            Box::new(server),
+                            tokio::time::Instant::now() + Duration::from_secs(1),
+                        );
+                        let probe = async {
+                            let request = format!(
+                                "POST {path} HTTP/1.1\r\n\
+                                 Host: localhost\r\n\
+                                 {token_header}Content-Length: 16\r\n\
+                                 Expect: 100-continue\r\n\r\n"
+                            );
+                            client.write_all(request.as_bytes()).await.unwrap();
+                            let mut response = Vec::new();
+                            client.read_to_end(&mut response).await.unwrap();
+                            if close_on_http1_error {
+                                assert!(response.is_empty());
+                            } else if request_limit_reached {
+                                assert!(
+                                    response.starts_with(b"HTTP/1.1 503 Service Unavailable\r\n")
+                                );
+                            } else {
+                                assert!(response.starts_with(b"HTTP/1.1 404 Not Found\r\n"));
+                            }
+                            let response =
+                                String::from_utf8(response).unwrap().to_ascii_lowercase();
+                            for forbidden in [
+                                "100 continue",
+                                "x-padding:",
+                                "access-control-",
+                                "cache-control:",
+                                "x-accel-buffering:",
+                            ] {
+                                assert!(!response.contains(forbidden), "{forbidden}");
+                            }
+                        };
+                        let (result, ()) = tokio::join!(serving, probe);
+                        assert_eq!(result.is_err(), close_on_http1_error);
+                        drop(held);
+                        assert!(state.sessions.lock().is_empty());
+                        assert_eq!(state.requests.snapshot().active, 0);
+                        assert_eq!(state.memory.snapshot().peak, 0);
+                    }
+                }
+            }
         })
         .await
         .unwrap();
@@ -1438,7 +1790,10 @@ mod tests {
     async fn reset_upload_keeps_strict_carrier_usable(version: XhttpVersion) {
         tokio::time::timeout(Duration::from_secs(10), async {
             let mut state = service();
-            Arc::get_mut(&mut state).unwrap().config.close_on_error = true;
+            Arc::get_mut(&mut state)
+                .unwrap()
+                .config
+                .close_on_http1_error = true;
             let (carrier, _server, _endpoint) = streaming_carrier(state.clone(), version).await;
             let memory = Memory::new(Arc::new(Budget::new(Some(1024))), 1024);
             for sequence in 0..32 {
@@ -1494,7 +1849,10 @@ mod tests {
     async fn h2_library_body_resets_remain_stream_local_in_strict_mode() {
         tokio::time::timeout(Duration::from_secs(5), async {
             let mut state = service();
-            Arc::get_mut(&mut state).unwrap().config.close_on_error = true;
+            Arc::get_mut(&mut state)
+                .unwrap()
+                .config
+                .close_on_http1_error = true;
             let (client, server) = tokio::io::duplex(8192);
             let tasks = Tasks::new();
             let serving = state.clone();
@@ -2893,24 +3251,10 @@ impl XhttpServer {
                 None
             };
             let Some(request_permit) = request_permit else {
-                if !self.state.config.matching_headers.is_empty() {
-                    close_h3(&connection);
-                    return Err(io::Error::other(
-                        "XHTTP request limit reached before header validation",
-                    ));
-                }
-                if let Err(error) = self
-                    .state
-                    .check_response_status(StatusCode::SERVICE_UNAVAILABLE)
-                {
-                    close_h3(&connection);
-                    return Err(error);
-                }
                 drop(resolver);
                 continue;
             };
             let state = self.state.clone();
-            let connection = connection.clone();
             requests.spawn(async move {
                 let _request_permit = request_permit;
                 let Ok(Ok((request, stream))) = tokio::time::timeout(
@@ -2921,11 +3265,6 @@ impl XhttpServer {
                 else {
                     return;
                 };
-                if let Err(error) = wire::check_matching_headers(&state.config, request.headers()) {
-                    log::debug!("XHTTP request rejected: {error}");
-                    close_h3(&connection);
-                    return;
-                }
                 let (mut send, mut receive) = stream.split();
                 let workers = Tasks::new();
                 let memory = state.new_memory();
@@ -2964,13 +3303,8 @@ impl XhttpServer {
                     Ok(Kind::One | Kind::Upload(_))
                 );
                 let response = state.handle(request, reader).await;
-                if state.config.close_on_error && peer_reset.is_cancelled() {
+                if peer_reset.is_cancelled() {
                     send.stop_stream(h3::error::Code::H3_REQUEST_CANCELLED);
-                    return;
-                }
-                if let Err(error) = state.check_response_status(response.status()) {
-                    log::debug!("{error}");
-                    close_h3(&connection);
                     return;
                 }
                 let keep_upload = streaming_upload && response.status() == StatusCode::OK;
@@ -3015,13 +3349,6 @@ impl XhttpServer {
             });
         }
     }
-}
-
-fn close_h3(connection: &quinn::Connection) {
-    connection.close(
-        quinn::VarInt::from_u32(h3::error::Code::H3_NO_ERROR.value() as u32),
-        b"",
-    );
 }
 
 #[async_trait]
@@ -3254,6 +3581,9 @@ impl State {
         request: &Request<()>,
         body: Reader,
     ) -> Result<(Body, bool), Rejection> {
+        wire::check_matching_headers(&self.config, request.headers())
+            .inspect_err(|error| log::debug!("XHTTP request rejected: {error}"))
+            .map_err(|_| StatusCode::NOT_FOUND)?;
         match wire::classify(&self.config, &self.path, request)? {
             Kind::Options => Ok((Body::Empty, false)),
             Kind::One => self.stream_one(body).map_err(Into::into),
@@ -3722,11 +4052,16 @@ impl State {
         response
     }
 
-    fn check_response_status(&self, status: StatusCode) -> io::Result<()> {
-        if self.config.close_on_error && (status.is_client_error() || status.is_server_error()) {
-            return Err(io::Error::other(format!(
-                "XHTTP request rejected: {status}"
-            )));
+    fn check_http1_request<B>(&self, request: &Request<B>) -> io::Result<()> {
+        if !self.config.close_on_http1_error {
+            return Ok(());
+        }
+        wire::check_matching_headers(&self.config, request.headers())?;
+        if !percent_encoding::percent_decode_str(request.uri().path())
+            .take(self.path.base.len())
+            .eq(self.path.base.bytes())
+        {
+            return Err(io::Error::other("XHTTP request path does not match"));
         }
         Ok(())
     }
@@ -3743,18 +4078,17 @@ impl State {
             received_header.notify_one();
             let state = self.clone();
             async move {
-                wire::check_matching_headers(&state.config, request.headers())
+                state
+                    .check_http1_request(&request)
                     .inspect_err(|error| log::debug!("XHTTP request rejected: {error}"))?;
                 let Some(request_permit) = state.requests.acquire(1) else {
-                    state
-                        .check_response_status(StatusCode::SERVICE_UNAVAILABLE)
-                        .inspect_err(|error| log::debug!("{error}"))?;
-                    let mut response =
-                        state.response(StatusCode::SERVICE_UNAVAILABLE, Body::Empty, false);
-                    response
-                        .headers_mut()
-                        .insert("connection", http::HeaderValue::from_static("close"));
-                    return Ok::<_, io::Error>(response);
+                    return Ok::<_, io::Error>(
+                        Response::builder()
+                            .status(StatusCode::SERVICE_UNAVAILABLE)
+                            .header("connection", "close")
+                            .body(Body::Empty)
+                            .unwrap(),
+                    );
                 };
                 let (parts, body) = request.into_parts();
                 let request = Request::from_parts(parts, ());
@@ -3779,9 +4113,6 @@ impl State {
                     .handle(request, reader)
                     .await
                     .map(|body| body.with_guard(request_permit));
-                state
-                    .check_response_status(response.status())
-                    .inspect_err(|error| log::debug!("{error}"))?;
                 if streaming_upload && response.status() == StatusCode::OK {
                     return Ok::<_, io::Error>(response.map(|body| body.with_guard(tasks)));
                 }
@@ -3826,11 +4157,9 @@ impl State {
         .await?
         .map_err(io::Error::other)?;
         let mut requests = tokio::task::JoinSet::new();
-        let rejected = CancellationToken::new();
         loop {
             let request = tokio::select! {
                 biased;
-                _ = rejected.cancelled() => return Err(io::Error::other("XHTTP request rejected")),
                 request = connection.accept() => request,
                 _ = requests.join_next(), if !requests.is_empty() => continue,
             };
@@ -3838,7 +4167,6 @@ impl State {
                 return Ok(());
             };
             let (request, mut respond) = request.map_err(io::Error::other)?;
-            wire::check_matching_headers(&self.config, request.headers())?;
             while requests.try_join_next().is_some() {}
             let request_permit = if requests.len() < self.config.limits.request_limit() {
                 self.requests.acquire(1)
@@ -3846,12 +4174,10 @@ impl State {
                 None
             };
             let Some(request_permit) = request_permit else {
-                self.check_response_status(StatusCode::SERVICE_UNAVAILABLE)?;
                 respond.send_reset(h2::Reason::REFUSED_STREAM);
                 continue;
             };
             let state = self.clone();
-            let rejected = rejected.clone();
             requests.spawn(async move {
                 let _request_permit = request_permit;
                 let (parts, body) = request.into_parts();
@@ -3885,11 +4211,6 @@ impl State {
                 // A reset can arrive after select polls it but before handle completes.
                 if futures::poll!(futures::future::poll_fn(|cx| respond.poll_reset(cx))).is_ready()
                 {
-                    return;
-                }
-                if let Err(error) = state.check_response_status(response.status()) {
-                    log::debug!("{error}");
-                    rejected.cancel();
                     return;
                 }
                 if response.extensions().get::<Refused>().is_some() {
