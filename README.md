@@ -88,6 +88,12 @@ The `nix` patch pins an [upstream commit](https://github.com/nix-rust/nix/commit
 containing [nix #2821](https://github.com/nix-rust/nix/pull/2821) for iOS socket
 compatibility. Retain it until adopting a registry release containing that fix.
 
+The `smoltcp` patch pins a commit from our [fork's main branch](https://github.com/cfal/smoltcp/tree/a80fa50dce926117669ef061f55f4d6bdad0904a)
+to preserve TCP ACK sequencing during partial retransmission in TUN and WireGuard.
+Retain it until adopting a registry release with equivalent loss-recovery fixes.
+When updating the pin, run the fork's `socket::tcp::test::` regressions with Reno
+and CUBIC enabled, plus Shoes' rootless TUN and WireGuard suites.
+
 GitHub releases and checkout builds retain these patches. Crates.io publishing
 remains disabled because Cargo removes workspace patches from published packages.
 Remove the H3 patches only after adopting fixed registry versions that pass the
