@@ -250,6 +250,15 @@ impl ShoesResolver for HickoryResolver {
         Box::pin(async move { exchange.exchange(request).await })
     }
 
+    fn exchange_with_deadline(
+        &self,
+        request: Vec<u8>,
+        deadline: tokio::time::Instant,
+    ) -> crate::resolver::DnsExchangeFuture {
+        let exchange = self.exchange.clone();
+        Box::pin(async move { exchange.exchange_with_deadline(request, deadline).await })
+    }
+
     fn resolve_location(
         &self,
         location: &NetLocation,

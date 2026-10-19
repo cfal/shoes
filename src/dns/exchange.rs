@@ -18,6 +18,7 @@ use super::proxy_runtime::ProxyRuntimeProvider;
 type Connection =
     Shared<BoxFuture<'static, Result<DnsExchange<ProxyRuntimeProvider>, Arc<io::Error>>>>;
 type SetupWaits = parking_lot::Mutex<Vec<Option<Connection>>>;
+type PartialAnswer = parking_lot::Mutex<Option<Message>>;
 
 struct Upstream {
     server_index: usize,
@@ -82,20 +83,60 @@ impl RawDnsExchange {
     }
 
     pub async fn exchange(&self, bytes: Vec<u8>) -> io::Result<Vec<u8>> {
-        let deadline = self
+        self.exchange_until(bytes, None).await
+    }
+
+    pub async fn exchange_with_deadline(
+        &self,
+        bytes: Vec<u8>,
+        deadline: tokio::time::Instant,
+    ) -> io::Result<Vec<u8>> {
+        self.exchange_until(bytes, Some(deadline)).await
+    }
+
+    async fn exchange_until(
+        &self,
+        bytes: Vec<u8>,
+        deadline: Option<tokio::time::Instant>,
+    ) -> io::Result<Vec<u8>> {
+        let mut request = super::message::decode(&bytes)?;
+        if request.metadata.message_type != MessageType::Query
+            || request.metadata.op_code != OpCode::Query
+            || request.queries.len() != 1
+            || super::message::is_signed(&request)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "raw DNS exchange requires one unsigned standard question",
+            ));
+        }
+        let id = request.metadata.id;
+        request.metadata.id = rand::random();
+        if let Some(edns) = &mut request.edns {
+            edns.set_max_payload(edns.max_payload().min(super::message::UDP_PAYLOAD_LIMIT));
+            edns.options_mut().remove(EdnsCode::Cookie);
+        }
+        let timeout = self
             .context
             .options
             .timeout
             .saturating_mul(self.context.options.attempts.max(1).min(u32::MAX as usize) as u32);
+        let timeout = deadline.map_or(timeout, |deadline| {
+            timeout.min(deadline.saturating_duration_since(tokio::time::Instant::now()))
+        });
         let setups = parking_lot::Mutex::new(Vec::new());
-        let result = tokio::time::timeout(deadline, self.exchange_inner(bytes, &setups))
-            .await
-            .unwrap_or_else(|_| {
-                Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "DNS exchange deadline exceeded",
-                ))
-            });
+        // A validated UDP partial must survive cancellation of its TCP retry.
+        let partial = parking_lot::Mutex::new(None);
+        let result =
+            tokio::time::timeout(timeout, self.exchange_inner(&request, &setups, &partial))
+                .await
+                .unwrap_or_else(|_| {
+                    Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "DNS exchange deadline exceeded",
+                    ))
+                })
+                .or_else(|error| partial.into_inner().ok_or(error));
         if result.is_err()
             && setups
                 .lock()
@@ -108,28 +149,19 @@ impl RawDnsExchange {
                 crate::resolver::DnsSetupPending,
             ));
         }
-        result
+        let mut answer = result?;
+        answer.metadata.id = id;
+        answer.queries.clone_from(&request.queries);
+        answer.to_vec().map_err(io::Error::other)
     }
 
-    async fn exchange_inner(&self, bytes: Vec<u8>, setups: &SetupWaits) -> io::Result<Vec<u8>> {
-        let mut request = super::message::decode(&bytes)?;
-        if request.metadata.message_type != MessageType::Query
-            || request.metadata.op_code != OpCode::Query
-            || request.queries.len() != 1
-            || super::message::is_signed(&request)
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "raw DNS exchange requires one unsigned standard question",
-            ));
-        }
+    async fn exchange_inner(
+        &self,
+        request: &Message,
+        setups: &SetupWaits,
+        partial: &PartialAnswer,
+    ) -> io::Result<Message> {
         let _permit = self.admission.acquire().await.map_err(io::Error::other)?;
-        let id = request.metadata.id;
-        request.metadata.id = rand::random();
-        if let Some(edns) = &mut request.edns {
-            edns.set_max_payload(edns.max_payload().min(super::message::UDP_PAYLOAD_LIMIT));
-            edns.options_mut().remove(EdnsCode::Cookie);
-        }
         let mut error = io::Error::new(io::ErrorKind::NotFound, "no real DNS upstreams configured");
         for _ in 0..self.context.options.attempts.max(1) {
             let upstreams: Vec<_> = self
@@ -150,26 +182,18 @@ impl RawDnsExchange {
             let waves = upstreams.len().div_ceil(concurrency).max(1);
             let slot_timeout = self.context.options.timeout / waves.min(u32::MAX as usize) as u32;
             let jobs = futures::stream::iter(upstreams).map(|index| {
-                self.upstream_job(&self.upstreams[index], &request, slot_timeout, setups)
+                self.upstream_job(
+                    &self.upstreams[index],
+                    request,
+                    slot_timeout,
+                    setups,
+                    partial,
+                )
             });
             let mut answers = jobs.buffer_unordered(concurrency);
             while let Some(result) = answers.next().await {
                 match result {
-                    Ok(mut answer) => {
-                        if answer.metadata.message_type != MessageType::Response
-                            || answer.metadata.op_code != request.metadata.op_code
-                            || answer.queries != request.queries
-                        {
-                            error = io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                "DNS reply question mismatch",
-                            );
-                            continue;
-                        }
-                        answer.metadata.id = id;
-                        answer.queries.clone_from(&request.queries);
-                        return answer.to_vec().map_err(io::Error::other);
-                    }
+                    Ok(answer) => return Ok(answer),
                     Err(failure) => error = failure,
                 }
             }
@@ -183,16 +207,20 @@ impl RawDnsExchange {
         request: &'a Message,
         timeout: std::time::Duration,
         setups: &'a SetupWaits,
+        partial: &'a PartialAnswer,
     ) -> BoxFuture<'a, io::Result<Message>> {
         Box::pin(async move {
-            tokio::time::timeout(timeout, self.send(upstream, request.clone(), setups))
-                .await
-                .unwrap_or_else(|_| {
-                    Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "DNS upstream deadline exceeded",
-                    ))
-                })
+            tokio::time::timeout(
+                timeout,
+                self.send(upstream, request.clone(), setups, partial),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "DNS upstream deadline exceeded",
+                ))
+            })
         })
     }
 
@@ -201,17 +229,22 @@ impl RawDnsExchange {
         upstream: &Upstream,
         message: Message,
         setups: &SetupWaits,
+        partial: &PartialAnswer,
     ) -> io::Result<Message> {
         let answer = self
             .send_upstream(upstream, message.clone(), setups)
             .await?;
+        check_answer(&answer, &message)?;
         if answer.metadata.truncation && matches!(upstream.config.protocol, ProtocolConfig::Udp) {
             // Only use explicitly configured TCP, including system-discovered UDP+TCP pairs.
             if let Some(tcp) = self.upstreams.iter().find(|candidate| {
                 candidate.same_endpoint(upstream)
                     && matches!(candidate.config.protocol, ProtocolConfig::Tcp)
             }) {
-                return self.send_upstream(tcp, message, setups).await;
+                partial.lock().get_or_insert_with(|| answer.clone());
+                let answer = self.send_upstream(tcp, message.clone(), setups).await?;
+                check_answer(&answer, &message)?;
+                return Ok(answer);
             }
         }
         Ok(answer)
@@ -270,6 +303,19 @@ impl RawDnsExchange {
         }
         unreachable!()
     }
+}
+
+fn check_answer(answer: &Message, request: &Message) -> io::Result<()> {
+    if answer.metadata.message_type != MessageType::Response
+        || answer.metadata.op_code != request.metadata.op_code
+        || answer.queries != request.queries
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "DNS reply question mismatch",
+        ));
+    }
+    Ok(())
 }
 
 fn connection_setup(
@@ -832,6 +878,107 @@ mod tests {
         assert_eq!(response.queries[0].name.to_ascii(), "Case.Example.");
         assert_eq!(response.authorities.len(), 1);
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn truncated_udp_survives_failed_or_timed_out_tcp_fallback() {
+        use crate::dns::hickory_resolver::{HickoryResolver, HickoryResolverOptions};
+        use crate::resolver::Resolver;
+
+        for silent in [false, true] {
+            for caller_deadline in [false, true] {
+                for synthetic in [false, true] {
+                    let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let addr = tcp.local_addr().unwrap();
+                    let udp = tokio::net::UdpSocket::bind(addr).await.unwrap();
+                    let tcp = if silent {
+                        Some(tcp)
+                    } else {
+                        drop(tcp);
+                        None
+                    };
+                    let server = tokio::spawn(async move {
+                        let mut bytes = [0; 2048];
+                        let (len, peer) = udp.recv_from(&mut bytes).await.unwrap();
+                        let mut response =
+                            Message::from_vec(&bytes[..len]).unwrap().into_response();
+                        response.metadata.truncation = true;
+                        response.add_answer(Record::from_rdata(
+                            response.queries[0].name.clone(),
+                            42,
+                            RData::TXT(rdata::TXT::new(vec!["partial".into()])),
+                        ));
+                        if synthetic {
+                            response.add_additional(Record::from_rdata(
+                                response.queries[0].name.clone(),
+                                42,
+                                RData::A(rdata::A("198.18.0.5".parse().unwrap())),
+                            ));
+                        }
+                        udp.send_to(&response.to_vec().unwrap(), peer)
+                            .await
+                            .unwrap();
+                        if let Some(tcp) = tcp {
+                            let (mut stream, _) = tcp.accept().await.unwrap();
+                            read_tcp(&mut stream).await;
+                            std::future::pending::<()>().await;
+                        }
+                    });
+                    let bootstrap: Arc<dyn Resolver> =
+                        Arc::new(crate::resolver::NativeResolver::new());
+                    let mut udp_config = ConnectionConfig::udp();
+                    udp_config.port = addr.port();
+                    let mut tcp_config = ConnectionConfig::tcp();
+                    tcp_config.port = addr.port();
+                    let resolver = HickoryResolver::build_pooled(
+                        vec![(addr.ip(), udp_config), (addr.ip(), tcp_config)],
+                        Arc::new(crate::tcp::chain_builder::build_direct_chain_group(
+                            bootstrap.clone(),
+                        )),
+                        bootstrap,
+                        HickoryResolverOptions {
+                            request_timeout: Some(Duration::from_millis(300)),
+                            attempts: 1,
+                            ..Default::default()
+                        },
+                        "partial reply test".into(),
+                    )
+                    .unwrap();
+                    let resolver = super::super::guard::real_only(
+                        Arc::new(resolver),
+                        vec!["198.18.0.0/15".parse().unwrap()].into(),
+                    );
+                    let query = request();
+                    let start = tokio::time::Instant::now();
+                    let result = if caller_deadline {
+                        resolver.exchange_with_deadline(
+                            query.to_vec().unwrap(),
+                            start + Duration::from_millis(150),
+                        )
+                    } else {
+                        resolver.exchange(query.to_vec().unwrap())
+                    };
+                    let result = tokio::time::timeout(Duration::from_secs(2), result)
+                        .await
+                        .unwrap();
+                    if synthetic {
+                        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+                    } else {
+                        let response = Message::from_vec(&result.unwrap()).unwrap();
+                        assert!(response.metadata.truncation);
+                        assert_eq!(response.metadata.id, query.metadata.id);
+                        assert_eq!(response.queries, query.queries);
+                        assert_eq!(response.answers.len(), 1);
+                    }
+                    assert!(
+                        start.elapsed()
+                            < Duration::from_millis(if caller_deadline { 250 } else { 600 })
+                    );
+                    server.abort();
+                    let _ = server.await;
+                }
+            }
+        }
     }
 
     #[tokio::test]
