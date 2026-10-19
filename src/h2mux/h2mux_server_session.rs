@@ -603,6 +603,58 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[tokio::test]
+    async fn fake_dns_adapter_contract() {
+        use crate::tcp::ingress::tests::FakeTcpCase;
+        timeout(Duration::from_secs(10), async {
+            for case in [
+                FakeTcpCase::Dns,
+                FakeTcpCase::Tls,
+                FakeTcpCase::Plain,
+                FakeTcpCase::Unknown,
+            ] {
+                let mut tasks = JoinSet::new();
+                let (selector, resolver, target, payload) = case.fixture(&mut tasks).await;
+                let (client, server) = tokio::io::duplex(65536);
+                let options = H2MuxOptions::default();
+                let (client, server) = tokio::join!(
+                    H2MuxClientSession::new(client, &options),
+                    H2MuxServerSession::new(server)
+                );
+                let mut client = client.unwrap();
+                let mut server = server.unwrap();
+                let mut stream = client.open_tcp(&target).await.unwrap();
+                stream
+                    .write_all(if case == FakeTcpCase::Unknown {
+                        b"x"
+                    } else {
+                        &payload
+                    })
+                    .await
+                    .unwrap();
+                stream.shutdown().await.unwrap();
+                let inbound = server.accept().await.unwrap();
+                tasks.spawn(async move {
+                    let result = handle_h2mux_tcp(inbound.stream, target, selector, resolver).await;
+                    assert_eq!(result.is_err(), case == FakeTcpCase::Unknown);
+                });
+                let mut reply = Vec::new();
+                let result = stream.read_to_end(&mut reply).await;
+                if case == FakeTcpCase::Unknown {
+                    assert!(reply.is_empty());
+                } else {
+                    result.unwrap();
+                    case.assert_reply(&reply);
+                }
+                while let Some(result) = tasks.join_next().await {
+                    result.unwrap();
+                }
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
     async fn sniffed_stream_preserves_lazy_status_early_data_and_half_close() {
         timeout(Duration::from_secs(5), async {
             let mut tasks = JoinSet::new();

@@ -534,6 +534,66 @@ mod tests {
         .unwrap();
     }
 
+    #[tokio::test]
+    async fn fake_dns_adapter_contract() {
+        use crate::tcp::ingress::tests::FakeTcpCase;
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            for case in [
+                FakeTcpCase::Dns,
+                FakeTcpCase::Tls,
+                FakeTcpCase::Plain,
+                FakeTcpCase::Unknown,
+            ] {
+                let mut tasks = JoinSet::new();
+                let (selector, resolver, target, payload) = case.fixture(&mut tasks).await;
+                let control = Arc::new(tcp_conn::TcpConnectionControl::new(8192, 8192));
+                let (wake, _wake_rx) = wake::Wake::new().unwrap();
+                let connection = tcp_conn::TcpConnection::new(control.clone(), wake);
+                assert_eq!(control.enqueue_recv_data(&payload), payload.len());
+                control.set_recv_state(tcp_conn::TcpSocketState::Closed);
+                let mut task = tokio::spawn(handle_tcp_connection(
+                    connection, target, selector, resolver,
+                ));
+                let mut received = Vec::new();
+                loop {
+                    let mut bytes = [0; 2048];
+                    let count = control.dequeue_send_data(&mut bytes);
+                    received.extend_from_slice(&bytes[..count]);
+                    control.wake_sender();
+                    if task.is_finished() {
+                        break;
+                    }
+                    if case != FakeTcpCase::Unknown && !received.is_empty() {
+                        let complete = if case == FakeTcpCase::Dns {
+                            received.len() >= 2
+                                && received.len()
+                                    == 2 + u16::from_be_bytes([received[0], received[1]]) as usize
+                        } else {
+                            received == b"greetinglater"
+                        };
+                        if complete {
+                            control.set_send_state(tcp_conn::TcpSocketState::Closing);
+                            control.wake_sender();
+                        }
+                    }
+                    tokio::task::yield_now().await;
+                }
+                let result = (&mut task).await.unwrap();
+                assert_eq!(result.is_err(), case == FakeTcpCase::Unknown);
+                if case == FakeTcpCase::Unknown {
+                    assert!(received.is_empty());
+                } else {
+                    case.assert_reply(&received);
+                }
+                while let Some(result) = tasks.join_next().await {
+                    result.unwrap();
+                }
+            }
+        })
+        .await
+        .unwrap();
+    }
+
     async fn receive_tun_bytes(
         control: &tcp_conn::TcpConnectionControl,
         received: &mut Vec<u8>,

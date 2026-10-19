@@ -11,6 +11,54 @@ struct Peer {
 }
 
 #[tokio::test]
+async fn fake_dns_adapter_contract() {
+    use crate::tcp::ingress::tests::FakeTcpCase;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        for case in [
+            FakeTcpCase::Dns,
+            FakeTcpCase::Tls,
+            FakeTcpCase::Plain,
+            FakeTcpCase::Unknown,
+        ] {
+            let mut tasks = JoinSet::new();
+            let (selector, resolver, target, payload) = case.fixture(&mut tasks).await;
+            let (client, transport) = tokio::io::duplex(8192);
+            let _server = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(serve(
+                Box::new(transport),
+                None,
+                selector,
+                resolver,
+            )));
+            let mut session = H2ClientSession::new(Box::new(client)).await.unwrap();
+            let (response, mut stream) = session.open(connect(&target.to_string())).await.unwrap();
+            if case == FakeTcpCase::Unknown {
+                assert_eq!(response.status, StatusCode::BAD_GATEWAY);
+                let payload = FakeTcpCase::Dns.fixture(&mut tasks).await.3;
+                let (response, mut next) = session.open(connect("198.18.0.1:53")).await.unwrap();
+                assert_eq!(response.status, StatusCode::OK);
+                next.write_all(&payload).await.unwrap();
+                next.shutdown().await.unwrap();
+                let mut reply = Vec::new();
+                next.read_to_end(&mut reply).await.unwrap();
+                FakeTcpCase::Dns.assert_reply(&reply);
+            } else {
+                assert_eq!(response.status, StatusCode::OK);
+                stream.write_all(&payload).await.unwrap();
+                stream.shutdown().await.unwrap();
+                let mut reply = Vec::new();
+                stream.read_to_end(&mut reply).await.unwrap();
+                case.assert_reply(&reply);
+            }
+            while let Some(result) = tasks.join_next().await {
+                result.unwrap();
+            }
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn reply_gated_sniff_routes_and_replays_after_early_data() {
     tokio::time::timeout(Duration::from_secs(5), async {
         let mut tasks = JoinSet::new();

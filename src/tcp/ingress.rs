@@ -200,9 +200,18 @@ pub(crate) mod tests {
         expected: Vec<u8>,
         tasks: &mut JoinSet<()>,
     ) -> (Arc<ClientProxySelector>, Arc<dyn Resolver>) {
+        socks_target_at(expected, TARGET, "sniff.example", tasks).await
+    }
+
+    async fn socks_target_at(
+        expected: Vec<u8>,
+        target: &str,
+        mask: &str,
+        tasks: &mut JoinSet<()>,
+    ) -> (Arc<ClientProxySelector>, Arc<dyn Resolver>) {
         let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
         let rule = serde_yaml::from_str(&format!(
-            "masks: sniff.example\nclient_proxy:\n  address: '127.0.0.1:{}'\n  protocol: {{type: socks}}\n",
+            "masks: {mask}\nclient_proxy:\n  address: '127.0.0.1:{}'\n  protocol: {{type: socks}}\n",
             listener.local_addr().unwrap().port(),
         ))
         .unwrap();
@@ -215,15 +224,22 @@ pub(crate) mod tests {
             .unwrap()
             .with_sniff(true),
         );
+        let target = NetLocation::from_str(target, None).unwrap();
         tasks.spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut greeting = [0; 3];
             socket.read_exact(&mut greeting).await.unwrap();
             assert_eq!(greeting, [5, 1, 0]);
             socket.write_all(&[5, 0]).await.unwrap();
-            let mut request = [0; 10];
+            let mut request = [0; 3];
             socket.read_exact(&mut request).await.unwrap();
-            assert_eq!(request, [5, 1, 0, 1, 203, 0, 113, 1, 1, 187]);
+            assert_eq!(request, [5, 1, 0]);
+            assert_eq!(
+                crate::socks_handler::read_location_direct(&mut socket)
+                    .await
+                    .unwrap(),
+                target
+            );
             socket
                 .write_all(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00greeting")
                 .await
@@ -234,6 +250,106 @@ pub(crate) mod tests {
             socket.write_all(b"later").await.unwrap();
         });
         (selector, resolver)
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum FakeTcpCase {
+        Dns,
+        Tls,
+        Plain,
+        Unknown,
+    }
+
+    impl FakeTcpCase {
+        pub(crate) async fn fixture(
+            self,
+            tasks: &mut JoinSet<()>,
+        ) -> (
+            Arc<ClientProxySelector>,
+            Arc<dyn Resolver>,
+            NetLocation,
+            Vec<u8>,
+        ) {
+            let payload = match self {
+                Self::Tls => crate::sniff::tests::hello(&rustls::version::TLS13, true),
+                Self::Plain => b"not TLS".to_vec(),
+                Self::Dns => {
+                    use hickory_resolver::proto::{
+                        op::{Message, Query},
+                        rr::{Name, RecordType},
+                    };
+                    let mut query = Message::query();
+                    query.metadata.id = 71;
+                    query.add_query(Query::query(
+                        Name::from_ascii("adapter.example.").unwrap(),
+                        RecordType::A,
+                    ));
+                    let bytes = query.to_vec().unwrap();
+                    let mut framed = (bytes.len() as u16).to_be_bytes().to_vec();
+                    framed.extend(bytes);
+                    framed
+                }
+                Self::Unknown => Vec::new(),
+            };
+            let (selector, resolver) = if matches!(self, Self::Tls | Self::Plain) {
+                socks_target_at(
+                    payload.clone(),
+                    "restored.example:443",
+                    if self == Self::Tls {
+                        "sniff.example"
+                    } else {
+                        "restored.example"
+                    },
+                    tasks,
+                )
+                .await
+            } else {
+                (
+                    failure_selector(true, true),
+                    Arc::new(crate::resolver::NativeResolver::new()) as Arc<dyn Resolver>,
+                )
+            };
+            let context = Arc::new(
+                crate::dns::fake_ip::FakeDnsContext::new(Default::default(), resolver.clone())
+                    .unwrap(),
+            );
+            let target = match self {
+                Self::Dns => NetLocation::from_str("198.18.0.1:53", None).unwrap(),
+                Self::Unknown => NetLocation::from_str("198.18.0.1:443", None).unwrap(),
+                _ => NetLocation::from_ip_addr(
+                    context.allocate("restored.example", false).unwrap(),
+                    443,
+                ),
+            };
+            let selector = Arc::new(
+                Arc::try_unwrap(selector)
+                    .unwrap()
+                    .with_fake_dns_context(Some(context))
+                    .unwrap(),
+            );
+            (selector, resolver, target, payload)
+        }
+
+        pub(crate) fn assert_reply(self, bytes: &[u8]) {
+            if self == Self::Dns {
+                use hickory_resolver::proto::{op::Message, rr::RData};
+                assert!(bytes.len() >= 2);
+                assert_eq!(
+                    u16::from_be_bytes([bytes[0], bytes[1]]) as usize,
+                    bytes.len() - 2
+                );
+                let response = Message::from_vec(&bytes[2..]).unwrap();
+                assert_eq!(response.metadata.id, 71);
+                assert_eq!(response.answers.len(), 1);
+                let RData::A(ip) = response.answers[0].data else {
+                    panic!("not a synthetic answer")
+                };
+                assert_eq!(ip.0.octets()[0], 198);
+                assert_eq!(ip.0.octets()[1] & 254, 18);
+            } else {
+                assert_eq!(bytes, b"greetinglater");
+            }
+        }
     }
 
     #[tokio::test]

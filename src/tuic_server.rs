@@ -1326,6 +1326,46 @@ mod lifecycle_tests {
     use super::*;
 
     #[tokio::test]
+    async fn fake_dns_adapter_contract() {
+        use crate::tcp::ingress::tests::FakeTcpCase;
+        use tokio::io::AsyncReadExt;
+        timeout(Duration::from_secs(10), async {
+            for case in [
+                FakeTcpCase::Dns,
+                FakeTcpCase::Tls,
+                FakeTcpCase::Plain,
+                FakeTcpCase::Unknown,
+            ] {
+                let mut tasks = JoinSet::new();
+                let (selector, resolver, target, payload) = case.fixture(&mut tasks).await;
+                let split = payload.len().min(5);
+                let prefix = payload[..split].to_vec();
+                let (server, mut peer) = tokio::io::duplex(8192);
+                tasks.spawn(async move {
+                    let result =
+                        relay_tcp_stream(Box::new(server), target, prefix, selector, resolver)
+                            .await;
+                    assert_eq!(result.is_err(), case == FakeTcpCase::Unknown);
+                });
+                peer.write_all(&payload[split..]).await.unwrap();
+                peer.shutdown().await.unwrap();
+                let mut reply = Vec::new();
+                peer.read_to_end(&mut reply).await.unwrap();
+                if case == FakeTcpCase::Unknown {
+                    assert!(reply.is_empty());
+                } else {
+                    case.assert_reply(&reply);
+                }
+                while let Some(result) = tasks.join_next().await {
+                    result.unwrap();
+                }
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
     async fn sniff_replays_header_tail_without_an_ack_frame() {
         use tokio::io::AsyncReadExt;
         timeout(Duration::from_secs(5), async {

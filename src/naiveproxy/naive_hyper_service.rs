@@ -633,6 +633,46 @@ mod sniff_tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[tokio::test]
+    async fn fake_dns_adapter_contract() {
+        use crate::tcp::ingress::tests::FakeTcpCase;
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            for padded in [false, true] {
+                for case in [FakeTcpCase::Dns, FakeTcpCase::Tls, FakeTcpCase::Plain, FakeTcpCase::Unknown] {
+                    let mut upstreams = JoinSet::new();
+                    let (selector, resolver, target, payload) = case.fixture(&mut upstreams).await;
+                    let tasks = Arc::new(Mutex::new(JoinSet::new()));
+                    let config = Arc::new(NaiveServiceConfig {
+                        users: Arc::new(UserLookup::new(vec![("test".into(), "user".into(), "pass".into())])),
+                        fallback_path: None, resolver, proxy_selector: selector,
+                        udp_enabled: true, padding_enabled: padded,
+                        executor: ConnectionExecutor(Arc::downgrade(&tasks)),
+                        slots: Arc::new(crate::resources::Budget::new(None)),
+                    });
+                    let (server, mut peer) = tokio::io::duplex(8192);
+                    let _server = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+                        let service = hyper::service::service_fn(move |req| naive_service(req, config.clone()));
+                        hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(server), service).with_upgrades().await.unwrap();
+                    }));
+                    let padding = if padded { "Padding: test\r\nPadding-Type-Request: 1\r\n" } else { "" };
+                    peer.write_all(format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\nProxy-Authorization: Basic dXNlcjpwYXNz\r\n{padding}\r\n").as_bytes()).await.unwrap();
+                    let mut header = Vec::new();
+                    while !header.ends_with(b"\r\n\r\n") { header.push(peer.read_u8().await.unwrap()); }
+                    let status = if case == FakeTcpCase::Unknown { "502" } else { "200" };
+                    assert!(String::from_utf8(header).unwrap().starts_with(&format!("HTTP/1.1 {status}")));
+                    if case == FakeTcpCase::Unknown { continue; }
+                    let mut peer = NaivePaddingStream::new(peer, PaddingDirection::Client, if padded { PaddingType::Variant1 } else { PaddingType::None });
+                    peer.write_all(&payload).await.unwrap();
+                    peer.shutdown().await.unwrap();
+                    let mut reply = Vec::new();
+                    peer.read_to_end(&mut reply).await.unwrap();
+                    case.assert_reply(&reply);
+                    while let Some(result) = upstreams.join_next().await { result.unwrap(); }
+                }
+            }
+        }).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn connect_validates_fake_destination_before_success() {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());

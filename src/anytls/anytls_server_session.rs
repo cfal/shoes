@@ -1020,6 +1020,88 @@ mod tests {
     use tokio::time::{Duration, timeout};
 
     #[tokio::test]
+    async fn fake_dns_adapter_contract() {
+        use crate::tcp::ingress::tests::FakeTcpCase;
+        timeout(Duration::from_secs(10), async {
+            for version in [1, 2] {
+                for case in [FakeTcpCase::Dns, FakeTcpCase::Tls, FakeTcpCase::Plain] {
+                    let mut tasks = tokio::task::JoinSet::new();
+                    let (selector, resolver, target, payload) = case.fixture(&mut tasks).await;
+                    let (server, mut peer) = duplex(8192);
+                    let session = AnyTlsSession::new_server_with_initial_data(
+                        server,
+                        PaddingFactory::default_factory(),
+                        resolver,
+                        selector,
+                        true,
+                        "test".into(),
+                        None,
+                    );
+                    session
+                        .received_client_settings
+                        .store(true, Ordering::Relaxed);
+                    session.peer_version.store(version, Ordering::Relaxed);
+                    let runner = session.clone();
+                    let server =
+                        tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+                            runner.run().await
+                        }));
+                    peer.write_all(&Frame::control(Command::Syn, 2).encode())
+                        .await
+                        .unwrap();
+                    peer.write_all(
+                        &Frame::data(
+                            2,
+                            Bytes::from(crate::socks_handler::write_location_to_vec(&target)),
+                        )
+                        .encode(),
+                    )
+                    .await
+                    .unwrap();
+                    if version == 2 {
+                        let mut status = [0; 7];
+                        peer.read_exact(&mut status).await.unwrap();
+                        assert_eq!(
+                            status.as_slice(),
+                            Frame::control(Command::SynAck, 2).encode().as_ref()
+                        );
+                    }
+                    peer.write_all(&Frame::data(2, Bytes::from(payload)).encode())
+                        .await
+                        .unwrap();
+                    peer.write_all(&Frame::control(Command::Fin, 2).encode())
+                        .await
+                        .unwrap();
+                    let mut reply = Vec::new();
+                    loop {
+                        let mut header = [0; 7];
+                        peer.read_exact(&mut header).await.unwrap();
+                        assert_eq!(&header[1..5], &2u32.to_be_bytes());
+                        let length = u16::from_be_bytes([header[5], header[6]]) as usize;
+                        let mut data = vec![0; length];
+                        peer.read_exact(&mut data).await.unwrap();
+                        if header[0] == Command::Fin as u8 {
+                            assert_eq!(length, 0);
+                            break;
+                        }
+                        assert_eq!(header[0], Command::Psh as u8);
+                        reply.extend(data);
+                    }
+                    case.assert_reply(&reply);
+                    assert!(!session.is_closed.load(Ordering::Relaxed));
+                    while let Some(result) = tasks.join_next().await {
+                        result.unwrap();
+                    }
+                    session.close().await;
+                    server.await.unwrap().unwrap();
+                }
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
     async fn unknown_fake_destinations_send_error_synack_then_fin() {
         for udp in [false, true] {
             timeout(Duration::from_secs(5), async {

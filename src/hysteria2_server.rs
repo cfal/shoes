@@ -987,6 +987,55 @@ mod tcp_tests {
     use tokio::io::AsyncReadExt;
 
     #[tokio::test]
+    async fn fake_dns_adapter_contract() {
+        use crate::tcp::ingress::tests::FakeTcpCase;
+        timeout(Duration::from_secs(10), async {
+            for case in [
+                FakeTcpCase::Dns,
+                FakeTcpCase::Tls,
+                FakeTcpCase::Plain,
+                FakeTcpCase::Unknown,
+            ] {
+                let mut tasks = tokio::task::JoinSet::new();
+                let (selector, resolver, target, payload) = case.fixture(&mut tasks).await;
+                let split = payload.len().min(5);
+                let prefix = payload[..split].to_vec();
+                let (server, mut peer) = tokio::io::duplex(8192);
+                tasks.spawn(async move {
+                    let result =
+                        relay_tcp_stream(Box::new(server), target, prefix, selector, resolver)
+                            .await;
+                    assert_eq!(result.is_err(), case == FakeTcpCase::Unknown);
+                });
+                assert_eq!(
+                    peer.read_u8().await.unwrap(),
+                    u8::from(case == FakeTcpCase::Unknown)
+                );
+                let message = peer.read_u8().await.unwrap() as usize;
+                peer.read_exact(&mut vec![0; message]).await.unwrap();
+                let padding = peer.read_u8().await.unwrap() as usize;
+                peer.read_exact(&mut vec![0; padding]).await.unwrap();
+                if case != FakeTcpCase::Unknown {
+                    peer.write_all(&payload[split..]).await.unwrap();
+                    peer.shutdown().await.unwrap();
+                }
+                let mut reply = Vec::new();
+                peer.read_to_end(&mut reply).await.unwrap();
+                if case == FakeTcpCase::Unknown {
+                    assert!(reply.is_empty());
+                } else {
+                    case.assert_reply(&reply);
+                }
+                while let Some(result) = tasks.join_next().await {
+                    result.unwrap();
+                }
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
     async fn sniff_reply_gates_payload_and_is_not_repeated() {
         timeout(Duration::from_secs(5), async {
             let mut tasks = tokio::task::JoinSet::new();
