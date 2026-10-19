@@ -55,6 +55,109 @@ fn dns_query(id: u16, max_frame: bool) -> Vec<u8> {
 }
 
 #[tokio::test]
+async fn nested_tls_connect_inherits_fake_dns_and_sniff_but_uses_child_rules() -> io::Result<()> {
+    use serde_json::json;
+    timeout(Duration::from_secs(20), async {
+        let cert = rcgen::generate_simple_self_signed(vec!["outer.example".into(), "sniff.invalid".into()]).map_err(io::Error::other)?;
+        let files = tempfile::tempdir()?;
+        let cert_path = files.path().join("cert.pem");
+        let key_path = files.path().join("key.pem");
+        std::fs::write(&cert_path, cert.cert.pem())?;
+        std::fs::write(&key_path, cert.signing_key.serialize_pem())?;
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert.cert.der().clone()).map_err(io::Error::other)?;
+        let client_tls = rustls::ClientConfig::builder_with_provider(provider.clone()).with_safe_default_protocol_versions().unwrap()
+            .with_root_certificates(roots).with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_tls));
+        let server_tls = rustls::ServerConfig::builder_with_provider(provider).with_safe_default_protocol_versions().unwrap()
+            .with_no_client_auth().with_single_cert(vec![cert.cert.der().clone()], rustls::pki_types::PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()).into()).map_err(io::Error::other)?;
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_tls));
+        for fake in [false, true] {
+            let exit = TcpListener::bind("0.0.0.0:0").await?;
+            let mut ports = PortHelper::new();
+            let (_, port) = ports.get_localhost_listener_port();
+            let config = json!([
+                {"client_group":"exit", "client_proxies":[{"address":format!("127.0.0.1:{}", exit.local_addr()?.port()), "protocol":{"type":"socks"}}]},
+                {"address":format!("0.0.0.0:{port}"), "sniff":true,
+                 "dns":{"fake_ip":fake, "servers":"udp://127.0.0.1:9"},
+                 "rules":[{"mask":"0.0.0.0/0", "action":"block"}],
+                 "protocol":{"type":"tls", "tls_targets":{"outer.example":{
+                     "cert":cert_path, "key":key_path, "protocol":{"type":"http"},
+                     "override_rules":[{"mask":"sniff.invalid", "client_chain":"exit"}]
+                 }}}}
+            ]);
+            let (_process, _config) = start_shoes_server(&config.to_string())?;
+            ports.wait_for_all_ports().await?;
+            let target = if fake {
+                let tcp = TcpStream::connect(("127.0.0.1", port)).await?;
+                let mut dns = connector.connect("outer.example".try_into().unwrap(), tcp).await?;
+                dns.write_all(b"CONNECT dns.invalid:53 HTTP/1.1\r\nHost: dns.invalid:53\r\n\r\n").await?;
+                let mut headers = Vec::new();
+                while !headers.ends_with(b"\r\n\r\n") { headers.push(dns.read_u8().await?); }
+                assert!(headers.starts_with(b"HTTP/1.1 200"));
+                dns.write_all(&dns_query(88, false)).await?;
+                let length = dns.read_u16().await?;
+                let mut bytes = vec![0; length as usize];
+                dns.read_exact(&mut bytes).await?;
+                let reply = Message::from_vec(&bytes).map_err(io::Error::other)?;
+                assert_eq!(reply.metadata.id, 88);
+                let RData::A(ip) = reply.answers[0].data else { panic!("missing fake address") };
+                dns.shutdown().await?;
+                format!("{}:443", ip.0)
+            } else { "192.0.2.9:443".into() };
+            let upstream = async {
+                let (mut stream, _) = exit.accept().await?;
+                let mut greeting = [0; 3];
+                stream.read_exact(&mut greeting).await?;
+                assert_eq!(greeting, [5, 1, 0]);
+                stream.write_all(&[5, 0]).await?;
+                let mut header = [0; 4];
+                stream.read_exact(&mut header).await?;
+                assert_eq!(&header[..3], &[5, 1, 0]);
+                if fake {
+                    assert_eq!(header[3], 3);
+                    let len = stream.read_u8().await?;
+                    let mut name = vec![0; len as usize];
+                    stream.read_exact(&mut name).await?;
+                    assert_eq!(name, b"restored.invalid");
+                } else {
+                    assert_eq!(header[3], 1);
+                    let mut ip = [0; 4];
+                    stream.read_exact(&mut ip).await?;
+                    assert_eq!(ip, [192, 0, 2, 9]);
+                }
+                assert_eq!(stream.read_u16().await?, 443);
+                stream.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
+                let mut tls = acceptor.accept(stream).await?;
+                assert_eq!(tls.get_ref().1.server_name(), Some("sniff.invalid"));
+                let mut payload = [0; 12];
+                tls.read_exact(&mut payload).await?;
+                assert_eq!(&payload, b"nested hello");
+                tls.write_all(b"nested reply").await?;
+                tls.shutdown().await
+            };
+            let client = async {
+                let tcp = TcpStream::connect(("127.0.0.1", port)).await?;
+                let mut outer = connector.connect("outer.example".try_into().unwrap(), tcp).await?;
+                outer.write_all(format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n").as_bytes()).await?;
+                let mut headers = Vec::new();
+                while !headers.ends_with(b"\r\n\r\n") { headers.push(outer.read_u8().await?); }
+                assert!(headers.starts_with(b"HTTP/1.1 200"));
+                let mut inner = connector.connect("sniff.invalid".try_into().unwrap(), outer).await?;
+                inner.write_all(b"nested hello").await?;
+                let mut response = [0; 12];
+                inner.read_exact(&mut response).await?;
+                assert_eq!(&response, b"nested reply");
+                inner.shutdown().await
+            };
+            tokio::try_join!(upstream, client)?;
+        }
+        Ok(())
+    }).await?
+}
+
+#[tokio::test]
 async fn fake_dns_sniff_routes_without_rewriting_restored_targets() -> io::Result<()> {
     use super::plain_tcp_relay::{request_to, send_request_to};
 

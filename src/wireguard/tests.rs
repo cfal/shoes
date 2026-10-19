@@ -296,6 +296,78 @@ rules:
     .unwrap();
 }
 
+#[tokio::test]
+async fn wireguard_config_sniffs_literal_and_restored_targets_without_rewriting() {
+    use hickory_resolver::proto::{
+        op::{Message, Query},
+        rr::{Name, RData, RecordType},
+    };
+    use serde_json::json;
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let reservation = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+        let exit = TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let mut documents: Vec<serde_json::Value> = serde_yaml::from_str(&pair_config(reservation.local_addr().unwrap().port())).unwrap();
+        documents[0]["sniff"] = json!(true);
+        documents[0]["dns"] = json!({"servers":"udp://127.0.0.1:9", "fake_ip":true});
+        documents[0]["rules"] = json!([{"mask":"sniff.example", "client_chain":"exit"}]);
+        documents.push(json!({"client_group":"exit", "client_proxies":[{
+            "address":format!("127.0.0.1:{}", exit.local_addr().unwrap().port()), "protocol":{"type":"socks"}
+        }]}));
+        let mut configs = validate(&serde_yaml::to_string(&documents).unwrap()).unwrap();
+        let prepared = Prepared::new(&mut configs).await.unwrap();
+        let mut dns = crate::dns::build_dns_registry(configs.dns_groups.clone()).await.unwrap();
+        drop(reservation);
+        let mut running = Running::default();
+        prepared.start(&mut dns, &mut running).await.unwrap();
+        let connector = prepared.endpoints[CLIENT].connector.as_ref();
+        let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+        let mut query = Message::query();
+        query.metadata.id = 93;
+        query.add_query(Query::query(Name::from_ascii("restored.example.").unwrap(), RecordType::A));
+        let mut stream = connector.connect(&resolver, &NetLocation::from_str("198.18.0.1:53", None).unwrap().into()).await.unwrap();
+        let query = query.to_vec().unwrap();
+        stream.write_u16(query.len() as u16).await.unwrap();
+        stream.write_all(&query).await.unwrap();
+        let len = stream.read_u16().await.unwrap();
+        let mut response = vec![0; len as usize];
+        stream.read_exact(&mut response).await.unwrap();
+        let response = Message::from_vec(&response).unwrap();
+        assert_eq!(response.metadata.id, 93);
+        let RData::A(ip) = response.answers[0].data else { panic!("missing synthetic address") };
+        drop(stream);
+        for (target, expected) in [
+            (NetLocation::from_str("192.0.2.9:443", None).unwrap(), NetLocation::from_str("192.0.2.9:443", None).unwrap()),
+            (NetLocation::from_ip_addr(ip.0.into(), 443), NetLocation::from_str("restored.example:443", None).unwrap()),
+        ] {
+            let hello = crate::sniff::tests::hello(&rustls::version::TLS13, true);
+            let upstream = async {
+                let (mut stream, _) = exit.accept().await.unwrap();
+                let mut greeting = [0; 3];
+                stream.read_exact(&mut greeting).await.unwrap();
+                assert_eq!(greeting, [5, 1, 0]);
+                stream.write_all(&[5, 0]).await.unwrap();
+                stream.read_exact(&mut greeting).await.unwrap();
+                assert_eq!(greeting, [5, 1, 0]);
+                assert_eq!(crate::socks_handler::read_location_direct(&mut stream).await.unwrap(), expected);
+                stream.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).await.unwrap();
+                let mut bytes = vec![0; hello.len()];
+                stream.read_exact(&mut bytes).await.unwrap();
+                assert_eq!(bytes, hello);
+                stream.write_all(b"sniffed").await.unwrap();
+            };
+            let client = async {
+                let mut stream = connector.connect(&resolver, &target.into()).await.unwrap();
+                stream.write_all(&hello).await.unwrap();
+                let mut response = [0; 7];
+                stream.read_exact(&mut response).await.unwrap();
+                assert_eq!(&response, b"sniffed");
+            };
+            tokio::join!(upstream, client);
+        }
+        running.stop().await;
+    }).await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wireguard_concurrent_tcp_transfers_preserve_all_data() {
     tokio::time::timeout(Duration::from_secs(20), async {
