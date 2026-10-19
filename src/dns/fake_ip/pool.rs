@@ -122,6 +122,13 @@ impl std::fmt::Debug for FakeIpPool {
 impl FakeIpPool {
     pub fn validate(options: &FakeIpOptions) -> io::Result<()> {
         let (v4, v6) = Self::ranges(options, 0)?;
+        if options.state_file.is_some() && options.max_entries > persistence::MAX_PERSISTENT_ENTRIES
+        {
+            return Err(invalid(format!(
+                "persistent fake IP max_entries must not exceed {}",
+                persistence::MAX_PERSISTENT_ENTRIES
+            )));
+        }
         if options.state_file.is_some()
             && [v4.as_ref(), v6.as_ref()]
                 .into_iter()
@@ -540,5 +547,20 @@ mod tests {
         }
         assert!(FakeIpPool::validate(&options(0)).is_err());
         assert!(FakeIpPool::validate(&options(6)).is_err());
+    }
+
+    #[test]
+    fn persistent_capacity_fits_snapshot_read_limit() {
+        let mut options = FakeIpOptions {
+            ipv6_range: Some("2001:2::/64".into()),
+            state_file: Some("state.json".into()),
+            max_entries: (256 * 1024 * 1024 - 4096) / 700,
+            ..Default::default()
+        };
+        assert!(FakeIpPool::validate(&options).is_ok());
+        options.max_entries += 1;
+        assert!(FakeIpPool::validate(&options).is_err());
+        options.state_file = None;
+        assert!(FakeIpPool::validate(&options).is_ok());
     }
 }
