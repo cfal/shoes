@@ -187,7 +187,7 @@ async fn tunnel(
         let Some(upstream) = routed.setup else {
             return Ok(());
         };
-        return relay_with_prefix(stream, upstream, routed.prefix).await;
+        return relay(stream, upstream, routed.prefix).await;
     }
     let mut no_read = tokio::io::empty();
     let result = tokio::select! {
@@ -215,17 +215,15 @@ async fn tunnel(
     let send = respond
         .send_response(Response::new(()), false)
         .map_err(io::Error::other)?;
-    relay(H2MultiStream::new(send, request.into_body()), upstream).await
+    relay(
+        H2MultiStream::new(send, request.into_body()),
+        upstream,
+        Vec::new(),
+    )
+    .await
 }
 
 async fn relay(
-    stream: H2MultiStream,
-    upstream: crate::tcp::tcp_handler::TcpClientSetupResult,
-) -> io::Result<()> {
-    relay_with_prefix(stream, upstream, Vec::new()).await
-}
-
-async fn relay_with_prefix(
     mut stream: H2MultiStream,
     mut upstream: crate::tcp::tcp_handler::TcpClientSetupResult,
     prefix: Vec<u8>,

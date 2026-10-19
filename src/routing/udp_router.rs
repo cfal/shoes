@@ -315,26 +315,18 @@ impl ServerStream {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<InboundPacket>> {
         match self {
-            ServerStream::Targeted(stream) => {
-                match Pin::new(stream).poll_read_targeted_message(cx, buf) {
-                    Poll::Ready(Ok(dest)) => Poll::Ready(Ok(InboundPacket {
-                        destination: dest,
-                        session_id: 0,
-                    })),
-                    Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-                    Poll::Pending => Poll::Pending,
-                }
-            }
-            ServerStream::Session(stream) => {
-                match Pin::new(stream).poll_read_session_message(cx, buf) {
-                    Poll::Ready(Ok((session_id, addr))) => Poll::Ready(Ok(InboundPacket {
-                        destination: addr,
-                        session_id,
-                    })),
-                    Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-                    Poll::Pending => Poll::Pending,
-                }
-            }
+            ServerStream::Targeted(stream) => Pin::new(stream)
+                .poll_read_targeted_message(cx, buf)
+                .map_ok(|destination| InboundPacket {
+                    destination,
+                    session_id: 0,
+                }),
+            ServerStream::Session(stream) => Pin::new(stream)
+                .poll_read_session_message(cx, buf)
+                .map_ok(|(session_id, destination)| InboundPacket {
+                    destination,
+                    session_id,
+                }),
         }
     }
 
@@ -1197,12 +1189,12 @@ impl<'a> UdpRouter<'a> {
 
         let selector = Arc::clone(&self.selector);
         let resolver = Arc::clone(&self.resolver);
-        let legacy_hostname_reply =
+        let require_ip_reply =
             !selector.fake_dns_enabled() || !self.server.supports_hostname_source();
 
         let future: SessionCreateFuture = Box::pin(async move {
             let setup =
-                connect_prepared_udp(&selector, prepared, &resolver, legacy_hostname_reply).await?;
+                connect_prepared_udp(&selector, prepared, &resolver, require_ip_reply).await?;
             Ok(SessionCreateResult {
                 permit,
                 remote: setup.stream,

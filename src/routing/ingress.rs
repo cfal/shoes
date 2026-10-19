@@ -83,9 +83,9 @@ pub(crate) async fn connect_prepared_udp(
     selector: &ClientProxySelector,
     target: IngressTarget,
     resolver: &Arc<dyn Resolver>,
-    legacy_hostname_reply: bool,
+    require_ip_reply: bool,
 ) -> io::Result<UdpSetup> {
-    route_prepared_udp(selector, target, resolver, legacy_hostname_reply)
+    route_prepared_udp(selector, target, resolver, require_ip_reply)
         .await?
         .connect(resolver)
         .await
@@ -95,16 +95,16 @@ async fn route_prepared_udp<'a>(
     selector: &'a ClientProxySelector,
     target: IngressTarget,
     resolver: &Arc<dyn Resolver>,
-    legacy_hostname_reply: bool,
+    require_ip_reply: bool,
 ) -> io::Result<UdpRoute<'a>> {
     let target = match target {
         IngressTarget::LocalDns {
             wire_destination,
             context,
         } => {
-            let wire_destination = reply_destination(wire_destination, legacy_hostname_reply);
+            let wire_destination = reply_destination(wire_destination, require_ip_reply);
             let reply_identity =
-                if legacy_hostname_reply && wire_destination.address().hostname().is_some() {
+                if require_ip_reply && wire_destination.address().hostname().is_some() {
                     let address = resolve_location(&mut wire_destination.into(), resolver).await?;
                     NetLocation::from_ip_addr(address.ip(), address.port())
                 } else {
@@ -123,10 +123,9 @@ async fn route_prepared_udp<'a>(
             chain_group,
             mut remote_location,
         } => {
-            let wire_destination =
-                reply_destination(routed.wire_destination, legacy_hostname_reply);
+            let wire_destination = reply_destination(routed.wire_destination, require_ip_reply);
             let reply_identity =
-                if legacy_hostname_reply && wire_destination.address().hostname().is_some() {
+                if require_ip_reply && wire_destination.address().hostname().is_some() {
                     let address = resolve_location(&mut remote_location, resolver).await?;
                     NetLocation::from_ip_addr(address.ip(), address.port())
                 } else {
@@ -142,8 +141,8 @@ async fn route_prepared_udp<'a>(
     }
 }
 
-fn reply_destination(wire_destination: NetLocation, ip_only: bool) -> NetLocation {
-    if ip_only
+fn reply_destination(wire_destination: NetLocation, require_ip_reply: bool) -> NetLocation {
+    if require_ip_reply
         && let Some(hostname) = wire_destination.address().hostname()
         && let Ok(ip) = hostname.parse()
     {

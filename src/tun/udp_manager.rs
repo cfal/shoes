@@ -9,7 +9,9 @@ use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::Duration;
 
 use futures::StreamExt;
@@ -473,28 +475,29 @@ async fn destination_task(
             Timeout,
         }
 
+        let io = std::future::poll_fn(|cx| {
+            // Local DNS writes can depend on the read side finishing an exchange.
+            if let Some(packet) = &pending {
+                if !flushing {
+                    match Pin::new(&mut *stream).poll_write_message(cx, &packet.payload) {
+                        Poll::Ready(Ok(())) => flushing = true,
+                        Poll::Ready(Err(error)) => return Poll::Ready(Action::Written(Err(error))),
+                        Poll::Pending => (),
+                    }
+                }
+                if flushing
+                    && let Poll::Ready(result) = Pin::new(&mut *stream).poll_flush_message(cx)
+                {
+                    return Poll::Ready(Action::Written(result));
+                }
+            }
+            if let Poll::Ready(result) = Pin::new(&mut *stream).poll_read_message(cx, &mut buf) {
+                return Poll::Ready(Action::Read(result));
+            }
+            Poll::Pending
+        });
         let action = tokio::select! {
-            action = std::future::poll_fn(|cx| {
-                // Local DNS writes can depend on the read side finishing an exchange.
-                if let Some(packet) = &pending {
-                    if !flushing {
-                        match Pin::new(&mut *stream).poll_write_message(cx, &packet.payload) {
-                            std::task::Poll::Ready(Ok(())) => flushing = true,
-                            std::task::Poll::Ready(Err(error)) => return std::task::Poll::Ready(Action::Written(Err(error))),
-                            std::task::Poll::Pending => (),
-                        }
-                    }
-                    if flushing
-                        && let std::task::Poll::Ready(result) = Pin::new(&mut *stream).poll_flush_message(cx)
-                    {
-                        return std::task::Poll::Ready(Action::Written(result));
-                    }
-                }
-                if let std::task::Poll::Ready(result) = Pin::new(&mut *stream).poll_read_message(cx, &mut buf) {
-                    return std::task::Poll::Ready(Action::Read(result));
-                }
-                std::task::Poll::Pending
-            }) => action,
+            action = io => action,
             msg = write_rx.recv(), if pending.is_none() => Action::Write(msg),
             _ = &mut write_timeout, if pending.is_some() => Action::Timeout,
             _ = &mut sleep => Action::Timeout,
@@ -578,9 +581,8 @@ mod lifecycle_tests {
     use crate::async_stream::{
         AsyncFlushMessage, AsyncPing, AsyncReadMessage, AsyncShutdownMessage, AsyncWriteMessage,
     };
-    use std::pin::Pin;
     use std::sync::atomic::{AtomicU8, Ordering};
-    use std::task::{Context, Poll};
+    use std::task::Context;
 
     #[derive(Default)]
     struct FlushState {

@@ -411,6 +411,7 @@ async fn reset_cancels_a_relay_blocked_on_upstream() {
             client_stream: Box::new(upstream),
             early_data: None,
         },
+        Vec::new(),
     ));
     assert!(
         tokio::time::timeout(
