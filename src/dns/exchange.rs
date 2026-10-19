@@ -440,6 +440,155 @@ mod tests {
         message
     }
 
+    #[tokio::test]
+    async fn fake_dns_raw_forwarding_over_verified_tls_preserves_and_guards_answers() {
+        use crate::resolver::{DnsExchangeFuture, ResolveFuture, Resolver};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Debug)]
+        struct Encrypted(Arc<RawDnsExchange>);
+        impl Resolver for Encrypted {
+            fn resolve_location(&self, _: &crate::address::NetLocation) -> ResolveFuture {
+                panic!("Fake DNS forwarding must use raw exchange, not lookup")
+            }
+            fn exchange(&self, bytes: Vec<u8>) -> DnsExchangeFuture {
+                let raw = self.0.clone();
+                Box::pin(async move { raw.exchange(bytes).await })
+            }
+            fn exchange_with_deadline(
+                &self,
+                bytes: Vec<u8>,
+                deadline: tokio::time::Instant,
+            ) -> DnsExchangeFuture {
+                let raw = self.0.clone();
+                Box::pin(async move { raw.exchange_with_deadline(bytes, deadline).await })
+            }
+        }
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let cert = rcgen::generate_simple_self_signed(vec!["dns.example".into()]).unwrap();
+            let mut roots = rustls::RootCertStore::empty();
+            roots.add(cert.cert.der().clone()).unwrap();
+            let mut server_tls = rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(
+                    vec![cert.cert.der().clone()],
+                    rustls::pki_types::PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der())
+                        .into(),
+                )
+                .unwrap();
+            server_tls.alpn_protocols = vec![b"dot".to_vec()];
+            let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_tls));
+            let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+            let address =
+                std::net::SocketAddr::from(([127, 0, 0, 1], listener.local_addr().unwrap().port()));
+            let mut raw = exchange(address, true);
+            let mut config = ConnectionConfig::tls("dns.example".into());
+            config.port = address.port();
+            raw.upstreams[0].config = config;
+            raw.context = PoolContext::new(
+                ResolverOpts::default(),
+                TlsConfig {
+                    config: rustls::ClientConfig::builder()
+                        .with_root_certificates(roots)
+                        .with_no_client_auth(),
+                },
+            );
+            let calls = Arc::new(AtomicUsize::new(0));
+            let exchanges = calls.clone();
+            let (stop, stopped) = tokio::sync::oneshot::channel();
+            let server = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let mut stream = acceptor.accept(tcp).await.unwrap();
+                for _ in 0..6 {
+                    let len = stream.read_u16().await.unwrap();
+                    let mut bytes = vec![0; len as usize];
+                    stream.read_exact(&mut bytes).await.unwrap();
+                    let query = Message::from_vec(&bytes).unwrap();
+                    assert_eq!(query.queries[0].query_type, RecordType::TXT);
+                    let name = query.queries[0].name().clone();
+                    let mut reply = query.into_response();
+                    match name.to_ascii().as_str() {
+                        "text.example." => {
+                            reply.add_answer(Record::from_rdata(
+                                name,
+                                30,
+                                RData::TXT(rdata::TXT::new(vec!["encrypted answer".into()])),
+                            ));
+                        }
+                        "missing.example." => reply.metadata.response_code = ResponseCode::NXDomain,
+                        "poison.example." => {
+                            reply.add_additional(Record::from_rdata(
+                                name,
+                                30,
+                                RData::A(rdata::A::new(198, 18, 0, 9)),
+                            ));
+                        }
+                        name => panic!("unexpected forwarded name {name}"),
+                    }
+                    exchanges.fetch_add(1, Ordering::SeqCst);
+                    let bytes = reply.to_vec().unwrap();
+                    stream.write_u16(bytes.len() as u16).await.unwrap();
+                    stream.write_all(&bytes).await.unwrap();
+                    stream.flush().await.unwrap();
+                }
+                stopped.await.unwrap();
+            }));
+            let context = crate::dns::fake_ip::FakeDnsContext::new(
+                Default::default(),
+                Arc::new(Encrypted(Arc::new(raw))),
+            )
+            .unwrap();
+            for tcp in [false, true] {
+                for (index, (name, kind, expected)) in [
+                    ("synth.example.", RecordType::A, ResponseCode::NoError),
+                    ("text.example.", RecordType::TXT, ResponseCode::NoError),
+                    ("missing.example.", RecordType::TXT, ResponseCode::NXDomain),
+                    ("poison.example.", RecordType::TXT, ResponseCode::ServFail),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    let before = calls.load(Ordering::SeqCst);
+                    let mut request = Message::query();
+                    request.metadata.id = 90 + index as u16;
+                    request.add_query(Query::query(Name::from_ascii(name).unwrap(), kind));
+                    let bytes = context
+                        .exchange(request.to_vec().unwrap(), tcp)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    let reply = Message::from_vec(&bytes).unwrap();
+                    assert_eq!(reply.metadata.id, request.metadata.id);
+                    assert_eq!(reply.queries, request.queries);
+                    assert_eq!(reply.metadata.response_code, expected);
+                    assert_eq!(
+                        calls.load(Ordering::SeqCst),
+                        before + usize::from(kind != RecordType::A)
+                    );
+                    if kind == RecordType::A {
+                        let RData::A(ip) = reply.answers[0].data else {
+                            panic!("missing synthetic A")
+                        };
+                        assert!(context.contains(ip.0.into()));
+                    } else if expected == ResponseCode::NoError {
+                        assert_eq!(
+                            reply.answers[0].data,
+                            RData::TXT(rdata::TXT::new(vec!["encrypted answer".into()]))
+                        );
+                    } else {
+                        assert!(reply.answers.is_empty());
+                        assert!(reply.additionals.is_empty());
+                    }
+                }
+            }
+            stop.send(()).unwrap();
+            server.await.unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
     async fn read_tcp(stream: &mut tokio::net::TcpStream) -> Message {
         let len = stream.read_u16().await.unwrap();
         let mut bytes = vec![0; len as usize];
