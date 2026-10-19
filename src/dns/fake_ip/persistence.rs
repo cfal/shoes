@@ -484,6 +484,32 @@ mod tests {
     }
 
     #[test]
+    fn state_files_cannot_use_reserved_lock_suffix() {
+        let directory = tempfile::tempdir().unwrap();
+        let original = options(&directory.path().join("state.json"));
+        for name in [
+            "state.json.lock",
+            "state.json.LOCK",
+            ".lock",
+            "state.lock.lock",
+        ] {
+            let path = directory.path().join(name);
+            let colliding = options(&path);
+            for error in [
+                FakeIpPool::validate(&colliding).unwrap_err(),
+                FakeIpPool::new(&colliding).unwrap_err(),
+            ] {
+                assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+                assert!(error.to_string().contains("suffix .lock is reserved"));
+            }
+            assert!(!path.exists());
+        }
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+        let _original_pool = FakeIpPool::new(&original).unwrap();
+        assert!(FakeIpPool::new(&original).is_err());
+    }
+
+    #[test]
     fn preparation_is_nonwriting_and_snapshot_owner_is_checked() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("state.json");

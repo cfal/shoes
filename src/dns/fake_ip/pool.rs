@@ -136,6 +136,19 @@ impl std::fmt::Debug for FakeIpPool {
 impl FakeIpPool {
     pub fn validate(options: &FakeIpOptions) -> io::Result<()> {
         let (v4, v6) = Self::ranges(options, 0)?;
+        if options
+            .state_file
+            .as_ref()
+            .and_then(|path| path.file_name())
+            .is_some_and(|name| {
+                let bytes = name.as_encoded_bytes();
+                bytes[bytes.len().saturating_sub(5)..].eq_ignore_ascii_case(b".lock")
+            })
+        {
+            return Err(invalid(
+                "fake DNS state_file suffix .lock is reserved for ownership locks",
+            ));
+        }
         if options.state_file.is_some() && options.max_entries > persistence::MAX_PERSISTENT_ENTRIES
         {
             return Err(invalid(format!(

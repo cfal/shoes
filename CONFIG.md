@@ -980,7 +980,8 @@ carrier resolution, and configured forwarding/override targets until restart,
 including after a context is removed.
 With a state file, snapshots are private, atomically replaced, locked against
 multiple writers, and checked for pool and context identity compatibility. Create its parent directory
-before startup; protect it because the file records queried domains. Cursor
+before startup; protect it because the file records queried domains. State filenames
+must not end in `.lock` (case-insensitive); that suffix is reserved for ownership locks. Cursor
 reservations are persisted before issuance; a crash can lose recent mappings,
 which then fail closed rather than restoring an obsolete owner. Back up or
 explicitly remove incompatible state before changing its pool configuration.
