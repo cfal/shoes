@@ -603,6 +603,70 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[tokio::test]
+    async fn fake_dns_udp_modes() {
+        use crate::routing::ingress::tests::{PacketMode, UdpFixture};
+        timeout(Duration::from_secs(10), async {
+            for packet_addr in [false, true] {
+                for dns in [false, true] {
+                    let mut tasks = JoinSet::new();
+                    let fixture = UdpFixture::new(dns, &mut tasks).await;
+                    let mode = if packet_addr {
+                        PacketMode::Socks
+                    } else {
+                        PacketMode::Fixed
+                    };
+                    let (mut peer, server) = tokio::io::duplex(65536);
+                    SessionRequest::new(MuxProtocol::H2Mux, false)
+                        .write(&mut peer)
+                        .await
+                        .unwrap();
+                    let (client, server) =
+                        tokio::join!(h2::client::handshake(peer), H2MuxServerSession::new(server));
+                    let (mut client, connection) = client.unwrap();
+                    let mut server = server.unwrap();
+                    let _driver =
+                        tokio_util::task::AbortOnDropHandle::new(tokio::spawn(connection));
+                    let request = http::Request::builder()
+                        .method("CONNECT")
+                        .uri("mux.example:443")
+                        .body(())
+                        .unwrap();
+                    let (response, mut send) = client.send_request(request, false).unwrap();
+                    let mut bytes = StreamRequest::udp(fixture.target.clone(), packet_addr)
+                        .encode()
+                        .unwrap();
+                    bytes.extend(fixture.request(mode));
+                    send.send_data(Bytes::from(bytes), false).unwrap();
+                    let inbound = server.accept().await.unwrap();
+                    assert_eq!(inbound.request.packet_addr, packet_addr);
+                    assert!(inbound.request.is_udp());
+                    let _handler = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(
+                        handle_h2mux_stream(
+                            inbound,
+                            true,
+                            fixture.selector.clone(),
+                            fixture.resolver.clone(),
+                        ),
+                    ));
+                    let response = response.await.unwrap();
+                    assert_eq!(response.status(), http::StatusCode::OK);
+                    let mut peer = H2MuxStream::new(send, response.into_body());
+                    assert_eq!(
+                        peer.read_u8().await.unwrap(),
+                        super::super::h2mux_protocol::STATUS_SUCCESS
+                    );
+                    fixture.read_reply(&mut peer, mode).await;
+                    while let Some(result) = tasks.join_next().await {
+                        result.unwrap();
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
     async fn fake_dns_adapter_contract() {
         use crate::tcp::ingress::tests::FakeTcpCase;
         timeout(Duration::from_secs(10), async {

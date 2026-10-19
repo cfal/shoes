@@ -1020,6 +1020,103 @@ mod tests {
     use tokio::time::{Duration, timeout};
 
     #[tokio::test]
+    async fn fake_dns_udp_modes() {
+        use crate::routing::ingress::tests::{PacketMode, UdpFixture};
+        timeout(Duration::from_secs(10), async {
+            for fixed in [false, true] {
+                for dns in [false, true] {
+                    let mut tasks = tokio::task::JoinSet::new();
+                    let fixture = UdpFixture::new(dns, &mut tasks).await;
+                    let mode = if fixed {
+                        PacketMode::Fixed
+                    } else {
+                        PacketMode::Uot
+                    };
+                    let (server, mut peer) = duplex(8192);
+                    let session = AnyTlsSession::new_server_with_initial_data(
+                        server,
+                        PaddingFactory::default_factory(),
+                        fixture.resolver.clone(),
+                        fixture.selector.clone(),
+                        true,
+                        "test".into(),
+                        None,
+                    );
+                    session
+                        .received_client_settings
+                        .store(true, Ordering::Relaxed);
+                    session.peer_version.store(2, Ordering::Relaxed);
+                    let runner = session.clone();
+                    let server =
+                        tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+                            runner.run().await
+                        }));
+                    for id in [2, 3] {
+                        peer.write_all(&Frame::control(Command::Syn, id).encode())
+                            .await
+                            .unwrap();
+                        let magic = NetLocation::from_str(UOT_V2_MAGIC_ADDRESS, Some(0)).unwrap();
+                        let mut header = crate::socks_handler::write_location_to_vec(&magic);
+                        header.extend(fixture.uot_header(fixed));
+                        peer.write_all(&Frame::data(id, Bytes::from(header)).encode())
+                            .await
+                            .unwrap();
+                        let mut status = [0; 7];
+                        loop {
+                            peer.read_exact(&mut status).await.unwrap();
+                            if status[0] != Command::Fin as u8 {
+                                break;
+                            }
+                            assert_eq!(&status, &Frame::control(Command::Fin, id - 1).encode()[..]);
+                        }
+                        assert_eq!(&status, &Frame::control(Command::SynAck, id).encode()[..]);
+                        // The second stream proves the session survives; DNS supports repeated queries.
+                        if id == 2 || dns {
+                            peer.write_all(
+                                &Frame::data(id, Bytes::from(fixture.request(mode))).encode(),
+                            )
+                            .await
+                            .unwrap();
+                            let mut reply = Vec::new();
+                            loop {
+                                peer.read_exact(&mut status).await.unwrap();
+                                if status[0] == Command::Fin as u8 {
+                                    assert_eq!(
+                                        &status,
+                                        &Frame::control(Command::Fin, id - 1).encode()[..]
+                                    );
+                                    continue;
+                                }
+                                assert_eq!(status[0], Command::Psh as u8);
+                                assert_eq!(&status[1..5], &id.to_be_bytes());
+                                let len = u16::from_be_bytes([status[5], status[6]]) as usize;
+                                let mut bytes = vec![0; len];
+                                peer.read_exact(&mut bytes).await.unwrap();
+                                reply.extend(bytes);
+                                if let Some(payload) = mode.reply(&fixture.target, &reply) {
+                                    fixture.assert_reply(payload);
+                                    break;
+                                }
+                            }
+                        }
+                        peer.write_all(&Frame::control(Command::Fin, id).encode())
+                            .await
+                            .unwrap();
+                        assert!(!session.is_closed.load(Ordering::Relaxed));
+                    }
+                    while let Some(result) = tasks.join_next().await {
+                        result.unwrap();
+                    }
+                    session.close().await;
+                    server.await.unwrap().unwrap();
+                }
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
     async fn fake_dns_adapter_contract() {
         use crate::tcp::ingress::tests::FakeTcpCase;
         timeout(Duration::from_secs(10), async {

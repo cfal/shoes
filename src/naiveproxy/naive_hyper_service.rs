@@ -633,6 +633,50 @@ mod sniff_tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[tokio::test]
+    async fn fake_dns_udp_modes() {
+        use crate::routing::ingress::tests::{PacketMode, UdpFixture};
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            for fixed in [false, true] {
+                for dns in [false, true] {
+                    let mut tasks = JoinSet::new();
+                    let fixture = UdpFixture::new(dns, &mut tasks).await;
+                    let mode = if fixed {
+                        PacketMode::Fixed
+                    } else {
+                        PacketMode::Uot
+                    };
+                    let streams = Arc::new(Mutex::new(JoinSet::new()));
+                    let config = Arc::new(NaiveServiceConfig {
+                        users: Arc::new(UserLookup::new(vec![("test".into(), "user".into(), "pass".into())])),
+                        fallback_path: None, resolver: fixture.resolver.clone(), proxy_selector: fixture.selector.clone(),
+                        udp_enabled: true, padding_enabled: true,
+                        executor: ConnectionExecutor(Arc::downgrade(&streams)),
+                        slots: Arc::new(crate::resources::Budget::new(None)),
+                    });
+                    let (server, mut peer) = tokio::io::duplex(8192);
+                    let _server = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+                        let service = hyper::service::service_fn(move |req| naive_service(req, config.clone()));
+                        hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(server), service).with_upgrades().await.unwrap();
+                    }));
+                    peer.write_all(format!("CONNECT {UOT_V2_MAGIC_ADDRESS}:0 HTTP/1.1\r\nHost: {UOT_V2_MAGIC_ADDRESS}:0\r\nProxy-Authorization: Basic dXNlcjpwYXNz\r\nPadding: test\r\nPadding-Type-Request: 1\r\n\r\n").as_bytes()).await.unwrap();
+                    let mut headers = Vec::new();
+                    while !headers.ends_with(b"\r\n\r\n") { headers.push(peer.read_u8().await.unwrap()); }
+                    assert!(headers.starts_with(b"HTTP/1.1 200"));
+                    let mut peer = NaivePaddingStream::new(peer, PaddingDirection::Client, PaddingType::Variant1);
+                    peer.write_all(&fixture.uot_header(fixed)).await.unwrap();
+                    peer.write_all(&fixture.request(mode)).await.unwrap();
+                    fixture.read_reply(&mut peer, mode).await;
+                    while let Some(result) = tasks.join_next().await {
+                        result.unwrap();
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
     async fn fake_dns_adapter_contract() {
         use crate::tcp::ingress::tests::FakeTcpCase;
         tokio::time::timeout(std::time::Duration::from_secs(10), async {

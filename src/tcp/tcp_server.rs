@@ -545,6 +545,59 @@ mod lifetime_tests {
     use crate::client_proxy_selector::{ClientProxySelector, ConnectAction, ConnectRule};
     use crate::tcp::socket_connector::SocketConnector;
 
+    #[tokio::test]
+    async fn fake_dns_udp_modes() {
+        use crate::routing::ingress::tests::{PacketMode, UdpFixture};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        timeout(Duration::from_secs(10), async {
+            for fixed in [false, true] {
+                for dns in [false, true] {
+                    let mut tasks = tokio::task::JoinSet::new();
+                    let fixture = UdpFixture::new(dns, &mut tasks).await;
+                    let mode = if fixed {
+                        PacketMode::Fixed
+                    } else {
+                        PacketMode::Uot
+                    };
+                    let handler = Arc::new(crate::socks_handler::SocksTcpServerHandler::new(
+                        None,
+                        true,
+                        "127.0.0.1".parse().unwrap(),
+                        fixture.selector.clone(),
+                        fixture.resolver.clone(),
+                    ));
+                    let (server, mut peer) = tokio::io::duplex(8192);
+                    let _server = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(
+                        process_stream(server, handler, fixture.resolver.clone()),
+                    ));
+                    peer.write_all(&[5, 1, 0]).await.unwrap();
+                    let mut auth = [0; 2];
+                    peer.read_exact(&mut auth).await.unwrap();
+                    assert_eq!(auth, [5, 0]);
+                    let magic =
+                        NetLocation::from_str(crate::uot::UOT_V2_MAGIC_ADDRESS, Some(0)).unwrap();
+                    let mut request = vec![5, 1, 0];
+                    request.extend(crate::socks_handler::write_location_to_vec(&magic));
+                    peer.write_all(&request).await.unwrap();
+                    let mut status = [0; 3];
+                    peer.read_exact(&mut status).await.unwrap();
+                    assert_eq!(status, [5, 0, 0]);
+                    crate::socks_handler::read_location_direct(&mut peer)
+                        .await
+                        .unwrap();
+                    peer.write_all(&fixture.uot_header(fixed)).await.unwrap();
+                    peer.write_all(&fixture.request(mode)).await.unwrap();
+                    fixture.read_reply(&mut peer, mode).await;
+                    while let Some(result) = tasks.join_next().await {
+                        result.unwrap();
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+    }
+
     #[derive(Debug)]
     struct Handler(Arc<ClientProxySelector>);
     #[async_trait]

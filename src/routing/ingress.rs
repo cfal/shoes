@@ -152,7 +152,7 @@ fn reply_destination(wire_destination: NetLocation, require_ip_reply: bool) -> N
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::address::NetLocationMask;
     use crate::client_proxy_selector::{ConnectAction, ConnectRule};
@@ -162,6 +162,172 @@ mod tests {
     use hickory_resolver::proto::rr::{Name, RecordType};
     use std::pin::Pin;
     use tokio::io::ReadBuf;
+
+    #[derive(Clone, Copy)]
+    pub(crate) enum PacketMode {
+        Fixed,
+        Uot,
+        Socks,
+    }
+
+    impl PacketMode {
+        fn address(self, target: &NetLocation) -> Vec<u8> {
+            match self {
+                Self::Fixed => Vec::new(),
+                Self::Socks => crate::socks_handler::write_location_to_vec(target),
+                Self::Uot => {
+                    let mut bytes = vec![0; 260];
+                    let len =
+                        crate::uot::uot_common::write_uot_address(&mut bytes, target).unwrap();
+                    bytes.truncate(len);
+                    bytes
+                }
+            }
+        }
+
+        pub(crate) fn packet(self, target: &NetLocation, payload: &[u8]) -> Vec<u8> {
+            let mut bytes = self.address(target);
+            bytes.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+            bytes.extend_from_slice(payload);
+            bytes
+        }
+
+        pub(crate) fn reply<'a>(self, target: &NetLocation, bytes: &'a [u8]) -> Option<&'a [u8]> {
+            let address = self.address(target);
+            if bytes.len() < address.len() + 2 {
+                return None;
+            }
+            assert_eq!(
+                &bytes[..address.len()],
+                address,
+                "wire reply identity changed"
+            );
+            let offset = address.len();
+            let len = u16::from_be_bytes([bytes[offset], bytes[offset + 1]]) as usize;
+            if bytes.len() < offset + 2 + len {
+                return None;
+            }
+            assert_eq!(bytes.len(), offset + 2 + len, "unexpected extra datagram");
+            Some(&bytes[offset + 2..])
+        }
+    }
+
+    pub(crate) struct UdpFixture {
+        pub selector: Arc<ClientProxySelector>,
+        pub resolver: Arc<dyn Resolver>,
+        pub target: NetLocation,
+        dns: bool,
+        payload: Vec<u8>,
+    }
+
+    impl UdpFixture {
+        pub(crate) async fn new(dns: bool, tasks: &mut tokio::task::JoinSet<()>) -> Self {
+            let resolver: Arc<dyn Resolver> = Arc::new(RealDns);
+            let context =
+                Arc::new(FakeDnsContext::new(Default::default(), resolver.clone()).unwrap());
+            let payload = if dns {
+                query(RecordType::A)
+            } else {
+                crate::sniff::tests::hello(&rustls::version::TLS13, true)
+            };
+            let mut rules = Vec::new();
+            let target = if dns {
+                NetLocation::from_str("unresolvable.invalid:53", None).unwrap()
+            } else {
+                let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await.unwrap();
+                let destination = NetLocation::from_str(
+                    &format!("127.0.0.1:{}", socket.local_addr().unwrap().port()),
+                    None,
+                )
+                .unwrap();
+                let expected = payload.clone();
+                tasks.spawn(async move {
+                    let mut bytes = [0; 4096];
+                    let (len, peer) = socket.recv_from(&mut bytes).await.unwrap();
+                    assert_eq!(&bytes[..len], expected);
+                    socket.send_to(&bytes[..len], peer).await.unwrap();
+                });
+                rules.push(ConnectRule::new(
+                    vec![NetLocationMask::from("restored.example").unwrap()],
+                    ConnectAction::new_allow(
+                        Some(destination),
+                        crate::tcp::chain_builder::build_direct_chain_group(resolver.clone()),
+                    ),
+                ));
+                NetLocation::from_ip_addr(context.allocate("restored.example", false).unwrap(), 443)
+            };
+            // A TCP ClientHello would select this block, not the restored hostname.
+            rules.insert(
+                0,
+                ConnectRule::new(
+                    vec![NetLocationMask::from("sniff.example").unwrap()],
+                    ConnectAction::Block,
+                ),
+            );
+            let selector = Arc::new(
+                ClientProxySelector::new(rules)
+                    .with_sniff(true)
+                    .with_fake_dns_context(Some(context))
+                    .unwrap(),
+            );
+            Self {
+                selector,
+                resolver,
+                target,
+                dns,
+                payload,
+            }
+        }
+
+        pub(crate) fn request(&self, mode: PacketMode) -> Vec<u8> {
+            let mut bytes = Vec::new();
+            if self.dns {
+                bytes.extend(mode.packet(&self.target, b"not DNS"));
+            }
+            bytes.extend(mode.packet(&self.target, &self.payload));
+            bytes
+        }
+
+        pub(crate) fn uot_header(&self, fixed: bool) -> Vec<u8> {
+            let mut bytes = vec![u8::from(fixed)];
+            bytes.extend(crate::socks_handler::write_location_to_vec(&self.target));
+            bytes
+        }
+
+        pub(crate) fn assert_reply(&self, payload: &[u8]) {
+            if self.dns {
+                let reply = Message::from_vec(payload).unwrap();
+                assert_eq!(reply.metadata.id, 42);
+                assert_eq!(
+                    reply.queries,
+                    Message::from_vec(&self.payload).unwrap().queries
+                );
+                assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+                assert!(matches!(
+                    reply.answers[0].data,
+                    hickory_resolver::proto::rr::RData::A(_)
+                ));
+            } else {
+                assert_eq!(payload, self.payload);
+            }
+        }
+
+        pub(crate) async fn read_reply(
+            &self,
+            peer: &mut (impl tokio::io::AsyncRead + Unpin),
+            mode: PacketMode,
+        ) {
+            use tokio::io::AsyncReadExt;
+            let mut bytes = Vec::new();
+            loop {
+                bytes.push(peer.read_u8().await.unwrap());
+                if let Some(payload) = mode.reply(&self.target, &bytes) {
+                    self.assert_reply(payload);
+                    break;
+                }
+            }
+        }
+    }
 
     #[tokio::test]
     async fn policy_block_is_distinct_from_transport_permission_denial() {
@@ -266,6 +432,75 @@ mod tests {
                 .is_err(),
             "IP-only reply protocols must resolve a hostname or fail explicitly"
         );
+    }
+
+    #[tokio::test]
+    async fn snell_dns_hostname_replies_are_resolved_before_ip_only_framing() {
+        use crate::async_stream::{
+            AsyncFlushMessage, AsyncReadSourcedMessage, AsyncWriteTargetedMessage,
+        };
+        use crate::snell::snell_udp_stream::{SnellUdpClientStream, SnellUdpStream};
+        use futures::future::poll_fn;
+
+        #[derive(Debug)]
+        struct DnsAddress;
+        impl Resolver for DnsAddress {
+            fn resolve_location(&self, location: &NetLocation) -> ResolveFuture {
+                assert_eq!(location.to_string(), "dns.example:53");
+                Box::pin(async { Ok(vec!["192.0.2.53:53".parse().unwrap()]) })
+            }
+        }
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let resolver: Arc<dyn Resolver> = Arc::new(DnsAddress);
+            let context =
+                Arc::new(FakeDnsContext::new(Default::default(), resolver.clone()).unwrap());
+            let selector = Arc::new(
+                ClientProxySelector::new(vec![])
+                    .with_fake_dns_context(Some(context))
+                    .unwrap(),
+            );
+            let (client, server) = tokio::io::duplex(8192);
+            let server = SnellUdpStream::new(
+                Box::new(crate::vless::VlessMessageStream::new(Box::new(server))),
+                4096,
+            );
+            let _server = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(
+                crate::routing::run_udp_routing(
+                    crate::routing::ServerStream::Targeted(Box::new(server)),
+                    selector,
+                    resolver,
+                    false,
+                ),
+            ));
+            let mut client = SnellUdpClientStream::new(
+                Box::new(crate::vless::VlessMessageStream::new(Box::new(client))),
+                4096,
+            );
+            let target = NetLocation::from_str("dns.example:53", None).unwrap();
+            for payload in [b"not DNS".to_vec(), query(RecordType::A)] {
+                poll_fn(|cx| {
+                    Pin::new(&mut client).poll_write_targeted_message(cx, &payload, &target)
+                })
+                .await
+                .unwrap();
+                poll_fn(|cx| Pin::new(&mut client).poll_flush_message(cx))
+                    .await
+                    .unwrap();
+            }
+            let mut bytes = [0; 4096];
+            let mut buf = ReadBuf::new(&mut bytes);
+            let source =
+                poll_fn(|cx| Pin::new(&mut client).poll_read_sourced_message(cx, &mut buf))
+                    .await
+                    .unwrap();
+            assert_eq!(source, "192.0.2.53:53".parse().unwrap());
+            let response = Message::from_vec(buf.filled()).unwrap();
+            assert_eq!(response.metadata.id, 42);
+            assert_eq!(response.answers.len(), 1);
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
