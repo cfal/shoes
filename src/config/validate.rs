@@ -2,6 +2,9 @@
 
 use std::collections::{HashMap, HashSet};
 
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
 use crate::address::NetLocationMask;
 use crate::dns::ParsedDnsUrl;
 use crate::option_util::{NoneOrOne, NoneOrSome, OneOrSome};
@@ -11,12 +14,12 @@ use crate::uuid_util::parse_uuid;
 
 use super::pem::{embed_optional_pem_from_map, embed_pem_from_map};
 use super::types::{
-    ClientChain, ClientChainHop, ClientConfig, ClientProxyConfig, Config, ConfigSelection,
-    DEFAULT_REALITY_SHORT_ID, DnsConfig, DnsConfigGroup, DnsServerSpec, ExpandedDnsGroup,
-    ExpandedDnsSpec, GlobalLimits, PemSource, RuleActionConfig, RuleConfig, ServerConfig,
-    ServerProxyConfig, ServerQuicConfig, ShadowTlsServerConfig, ShadowTlsServerHandshakeConfig,
-    ShadowsocksConfig, TlsServerConfig, Transport, TunConfig, WebsocketServerConfig,
-    direct_allow_rule,
+    BindLocation, ClientChain, ClientChainHop, ClientConfig, ClientProxyConfig, Config,
+    ConfigSelection, DEFAULT_REALITY_SHORT_ID, DnsConfig, DnsConfigGroup, DnsServerSpec,
+    ExpandedDnsGroup, ExpandedDnsSpec, GlobalLimits, PemSource, RuleActionConfig, RuleConfig,
+    ServerConfig, ServerProxyConfig, ServerQuicConfig, ShadowTlsServerConfig,
+    ShadowTlsServerHandshakeConfig, ShadowsocksConfig, TlsServerConfig, Transport, TunConfig,
+    WebsocketServerConfig, direct_allow_rule,
 };
 
 const MIN_TLS_BUFFER_SIZE: usize = 16 * 1024;
@@ -170,7 +173,20 @@ pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Valida
                 }
                 format!("wireguard:{id}")
             }
-            _ => format!("server:{:?}:{}", config.transport, config.bind_location),
+            _ => {
+                let bind = match &config.bind_location {
+                    BindLocation::Path(path) => format!(
+                        "path:{}",
+                        URL_SAFE_NO_PAD.encode(path.as_os_str().as_encoded_bytes())
+                    ),
+                    BindLocation::Address(_) => format!(
+                        "address:{}",
+                        URL_SAFE_NO_PAD.encode(config.bind_location.to_string())
+                    ),
+                    BindLocation::Unspecified {} => "no-listener".into(),
+                };
+                format!("server:{:?}:{bind}", config.transport)
+            }
         };
         extract_inline_dns(
             &mut config.dns,
@@ -181,7 +197,10 @@ pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Valida
         )?;
     }
     for config in tun_configs.iter_mut() {
-        let identity = format!("tun:{}", config.device_name.as_deref().unwrap_or("default"));
+        let identity = format!(
+            "tun:{}",
+            URL_SAFE_NO_PAD.encode(config.device_name.as_deref().unwrap_or("default"))
+        );
         extract_inline_dns(
             &mut config.dns,
             &mut dns_groups,

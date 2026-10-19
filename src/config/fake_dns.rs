@@ -261,6 +261,72 @@ mod tests {
     }
 
     #[test]
+    fn private_identities_remain_group_references_with_url_like_paths_and_names() {
+        let mut names = std::collections::HashSet::new();
+        for fake_ip in [true, false] {
+            for path in [
+                "//tmp/shoes.sock",
+                "/tmp/region://shoes.sock",
+                "/tmp/%2F.sock",
+            ] {
+                let configs = validate_yaml(&format!(
+                    "- path: '{path}'\n  protocol: {{type: http}}\n  dns: {{fake_ip: {fake_ip}}}\n"
+                ))
+                .unwrap();
+                let Config::Server(server) = &configs.configs[0] else {
+                    panic!()
+                };
+                let group = server.dns.as_ref().unwrap().resolved_group().unwrap();
+                assert_eq!(group, configs.dns_groups[0].name);
+                if fake_ip {
+                    assert!(names.insert(group.to_owned()));
+                } else {
+                    assert!(names.contains(group));
+                }
+            }
+            let configs = validate_yaml(&format!(
+                "- device_name: 'tun://edge'\n  device_fd: 42\n  dns: {{fake_ip: {fake_ip}}}\n"
+            ))
+            .unwrap();
+            let Config::TunServer(tun) = &configs.configs[0] else {
+                panic!()
+            };
+            let group = tun.dns.as_ref().unwrap().resolved_group().unwrap();
+            assert_eq!(group, configs.dns_groups[0].name);
+            if fake_ip {
+                assert!(names.insert(group.to_owned()));
+            } else {
+                assert!(names.contains(group));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_socket_identities_preserve_non_utf8_path_bytes() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let mut configs: Vec<Config> = serde_yaml::from_str(
+            "- path: /tmp/first.sock\n  protocol: {type: http}\n  dns: {fake_ip: true}\n\
+             - path: /tmp/second.sock\n  protocol: {type: http}\n  dns: {fake_ip: true}\n",
+        )
+        .unwrap();
+        for (config, byte) in configs.iter_mut().zip([0xfe, 0xff]) {
+            let Config::Server(server) = config else {
+                panic!()
+            };
+            let mut path = b"/tmp/shoes-".to_vec();
+            path.push(byte);
+            server.bind_location =
+                super::super::BindLocation::Path(OsString::from_vec(path).into());
+        }
+        let configs = super::super::create_server_configs(configs).unwrap();
+        assert_eq!(configs.dns_groups.len(), 2);
+        assert_ne!(configs.dns_groups[0].name, configs.dns_groups[1].name);
+    }
+
+    #[test]
     fn group_reference_shares_but_override_derives() {
         let configs = validate_yaml("- dns_group: shared\n  dns_servers: system\n  fake_ip: true\n- address: 127.0.0.1:1080\n  protocol: {type: socks}\n  dns: {servers: shared}\n- address: 127.0.0.1:1081\n  protocol: {type: socks}\n  dns: {servers: shared, fake_ip: false}\n").unwrap();
         assert_eq!(configs.dns_groups.len(), 2);

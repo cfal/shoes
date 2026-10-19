@@ -963,6 +963,13 @@ Inline `fake_ip` creates a private context, even when `servers` references a
 named group. Omit the inline override to share the group's mappings. Combining
 fake-enabled groups requires an explicit policy on the composed group.
 
+Private context identity uses the server transport and configured listen addresses
+(including their order), or the Unix socket path. TUN contexts use `device_name`
+(`default` when omitted); WireGuard contexts use the name/public-key identity
+described above. Changing these inputs changes private pool and snapshot ownership.
+Use a named `dns_group` when ownership must survive listener changes or address
+reordering. An existing state file with a different owner is rejected.
+
 Compatible reloads retain mappings, including explicit disable/re-enable under
 the same group/inline identity. Pool ranges, capacity, or state-file ownership
 changes require restart. Without `state_file`, restart loses the mappings.

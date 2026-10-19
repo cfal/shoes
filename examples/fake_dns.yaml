@@ -18,7 +18,6 @@
     udp_enabled: true
   dns:
     servers: shared-fake
-  sniff: true
 
 - address: "0.0.0.0:8080"
   protocol:
