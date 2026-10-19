@@ -985,7 +985,8 @@ reservations are persisted before issuance; a crash can lose recent mappings,
 which then fail closed rather than restoring an obsolete owner. Back up or
 explicitly remove incompatible state before changing its pool configuration.
 Persistent families need at least two allocatable addresses, and persistent pools
-are limited to 383,473 entries to fit the snapshot read limit. Reservations may
+are limited to 383,473 entries to fit the snapshot read limit; unusually long
+context names reduce the available snapshot capacity. Reservations may
 skip unused addresses after restart; Windows power-loss durability and state-file
 ACLs require platform-specific verification.
 

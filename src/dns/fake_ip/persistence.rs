@@ -144,6 +144,23 @@ fn allocatable(range: &Range, ip: IpAddr) -> bool {
 
 impl SnapshotStore {
     pub(super) fn open(path: &Path, state: &mut State) -> io::Result<Self> {
+        let limit = state
+            .forward
+            .cap()
+            .get()
+            .saturating_mul(SNAPSHOT_ENTRY_BYTES)
+            .saturating_add(SNAPSHOT_BASE_BYTES)
+            .saturating_add(
+                serde_json::to_vec(&state.owner)
+                    .map_err(invalid_json)?
+                    .len(),
+            );
+        if limit > MAX_SNAPSHOT_BYTES {
+            return Err(invalid(
+                "fake DNS snapshot owner and capacity exceed size bound",
+            ));
+        }
+        let limit = limit as u64;
         let parent = path
             .parent()
             .filter(|path| !path.as_os_str().is_empty())
@@ -177,13 +194,6 @@ impl SnapshotStore {
         };
         match File::open(&store.path) {
             Ok(file) => {
-                let limit = state
-                    .forward
-                    .cap()
-                    .get()
-                    .saturating_mul(SNAPSHOT_ENTRY_BYTES)
-                    .saturating_add(SNAPSHOT_BASE_BYTES)
-                    .min(MAX_SNAPSHOT_BYTES) as u64;
                 if file.metadata()?.len() > limit {
                     return Err(invalid("fake DNS snapshot exceeds configured bound"));
                 }
@@ -270,6 +280,40 @@ mod tests {
             ipv6_range: Some("2001:2::/112".into()),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn long_snapshot_owner_can_reopen_after_checkpoint() {
+        let directory = tempfile::tempdir().unwrap();
+        let options = FakeIpOptions {
+            max_entries: 1,
+            ..options(&directory.path().join("state.json"))
+        };
+        let owner = "a\n\"".repeat(4096);
+        let pool = FakeIpPool::new_scoped(&options, &owner).unwrap();
+        let ip = pool.allocate("a.test", false).unwrap();
+        pool.checkpoint().unwrap();
+        drop(pool);
+        let pool = FakeIpPool::new_scoped(&options, &owner).unwrap();
+        assert_eq!(pool.restore(ip).unwrap().as_deref(), Some("a.test"));
+    }
+
+    #[test]
+    fn snapshot_owner_and_capacity_must_fit_before_writing() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.json");
+        let options = FakeIpOptions {
+            ipv4_range: Some("198.0.0.0/8".into()),
+            max_entries: MAX_PERSISTENT_ENTRIES,
+            ..options(&path)
+        };
+        let error = FakeIpPool::new_scoped(&options, &"a".repeat(8192)).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("owner and capacity exceed size bound")
+        );
+        assert!(!path.exists());
     }
 
     #[test]
