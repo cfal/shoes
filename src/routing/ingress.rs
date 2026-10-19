@@ -308,7 +308,7 @@ mod tests {
                         assert_eq!(port, 443);
                         assert_eq!(reply_identity, expected);
                         assert_eq!(target.address().hostname(), Some("encoded.example"));
-                        assert!(target.location().to_socket_addr_nonblocking().is_none());
+                        assert!(target.resolved_addr().is_none());
                     }
                 }
             }
