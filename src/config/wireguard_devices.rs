@@ -327,6 +327,12 @@ mod tests {
             validate(json!([unnamed])).unwrap().wireguard_endpoints[0].id,
             original
         );
+        let mut blank = server();
+        blank["protocol"]["wireguard_name"] = Value::Null;
+        assert_eq!(
+            validate(json!([blank])).unwrap().wireguard_endpoints[0].id,
+            original
+        );
 
         let mut named = server();
         named["address"] = json!("[::]:51821");
@@ -348,6 +354,65 @@ mod tests {
         assert_eq!(protocol.server_id(), expected);
         let validated = validate(json!([named])).unwrap();
         assert_eq!(validated.wireguard_endpoints[0].id, expected);
+    }
+
+    #[test]
+    fn server_identities_cannot_turn_private_dns_references_into_urls() {
+        let mut identities = HashSet::new();
+        for name in [
+            "region://gateway",
+            "//edge",
+            "/",
+            "%2F",
+            "gateway",
+            "Gateway",
+        ] {
+            for fake_ip in [false, true] {
+                let mut config = server();
+                config["protocol"]["wireguard_name"] = json!(name);
+                config["dns"] = json!({"fake_ip": fake_ip});
+                let validated = validate(json!([config])).unwrap();
+                let device = &validated.wireguard_endpoints[0];
+                assert!(!device.id.contains('/'));
+                if fake_ip {
+                    assert!(identities.insert(device.id.clone()));
+                }
+                assert_eq!(
+                    device
+                        .inbound
+                        .as_ref()
+                        .unwrap()
+                        .dns
+                        .as_ref()
+                        .unwrap()
+                        .resolved_group(),
+                    Some(format!("__inline_fake_dns:wireguard:{}", device.id).as_str())
+                );
+            }
+        }
+        for fake_ip in [false, true] {
+            let mut config = server();
+            config["protocol"]["private_key"] =
+                json!("CCUAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=");
+            config["dns"] = json!({"fake_ip": fake_ip});
+            let validated = validate(json!([config])).unwrap();
+            let device = &validated.wireguard_endpoints[0];
+            assert_eq!(
+                device.id,
+                "server:key:__326N9SoT-V7q8es5GvY-Pop9oC_6MG7LMYJCNWgTs"
+            );
+            assert_eq!(
+                device
+                    .inbound
+                    .as_ref()
+                    .unwrap()
+                    .dns
+                    .as_ref()
+                    .unwrap()
+                    .resolved_group(),
+                Some(format!("__inline_fake_dns:wireguard:{}", device.id).as_str())
+            );
+        }
     }
 
     #[test]
@@ -460,7 +525,12 @@ mod tests {
                     .unwrap()
                     .resolved_group()
                     .unwrap();
-                assert!(group_names.iter().any(|expected| expected == group));
+                let index = match device.listen.unwrap().port() {
+                    51820 => 0,
+                    51821 => 1,
+                    port => panic!("unexpected server port {port}"),
+                };
+                assert_eq!(group, group_names[index]);
                 assert_eq!(group, format!("__inline_fake_dns:wireguard:{}", device.id));
             }
             let next = build_dns_registry_reusing(
@@ -503,8 +573,8 @@ mod tests {
         first["protocol"]["wireguard_name"] = json!("first");
         second["protocol"]["wireguard_name"] = json!("second");
         let validated = validate(json!([first, second])).unwrap();
-        assert_eq!(validated.wireguard_endpoints[0].id, "server:name:first");
-        assert_eq!(validated.wireguard_endpoints[1].id, "server:name:second");
+        assert_eq!(validated.wireguard_endpoints[0].id, "server:name:Zmlyc3Q");
+        assert_eq!(validated.wireguard_endpoints[1].id, "server:name:c2Vjb25k");
     }
 
     #[test]

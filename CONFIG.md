@@ -100,9 +100,9 @@ route, firewall rule, or NAT rule is created.
 Servers require explicit nonempty top-level `rules` and may specify top-level
 `dns` and `sniff`. Missing, null, or empty rules reject; `rules: block-all` is valid.
 `protocol.wireguard_name` gives a server a stable, case-sensitive identity. When
-omitted or empty, the server's public key supplies its identity instead. Duplicate
-names or duplicate unnamed public-key identities reject configuration, even with
-different listen addresses. Name-based and key-based identities are separate.
+omitted, null, or empty, the server's public key supplies its identity instead.
+Duplicate names or duplicate unnamed public-key identities reject configuration,
+even with different listen addresses. Name-based and key-based identities are separate.
 Client deduplication is unchanged. Reordering servers or adding clients does not
 change server identity or private Fake DNS ownership. Use an explicit name to
 preserve that ownership across key rotation; changing the effective identity

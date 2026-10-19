@@ -109,8 +109,8 @@ pub struct WireguardClientConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct WireguardServerConfig {
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub wireguard_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wireguard_name: Option<String>,
     pub private_key: WireguardKey,
     pub addresses: Vec<String>,
     pub peers: Vec<WireguardPeer>,
@@ -158,13 +158,22 @@ impl WireguardClientConfig {
 impl WireguardServerConfig {
     #[cfg(unix)]
     pub(crate) fn server_id(&self) -> String {
-        if self.wireguard_name.is_empty() {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+        if let Some(name) = self
+            .wireguard_name
+            .as_deref()
+            .filter(|name| !name.is_empty())
+        {
+            format!("server:name:{}", URL_SAFE_NO_PAD.encode(name))
+        } else {
             use gotatun::x25519::{PublicKey, StaticSecret};
 
             let public_key = PublicKey::from(&StaticSecret::from(self.private_key.0));
-            format!("server:key:{}", STANDARD.encode(public_key.as_bytes()))
-        } else {
-            format!("server:name:{}", self.wireguard_name)
+            format!(
+                "server:key:{}",
+                URL_SAFE_NO_PAD.encode(public_key.as_bytes())
+            )
         }
     }
 
