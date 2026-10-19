@@ -10,7 +10,10 @@ use super::{Entry, Range, State, canonical_hostname, invalid};
 
 const RESERVATION_SIZE: u128 = 256;
 const MAX_SNAPSHOT_BYTES: usize = 256 * 1024 * 1024;
-pub(super) const MAX_PERSISTENT_ENTRIES: usize = (MAX_SNAPSHOT_BYTES - 4096) / 700;
+const SNAPSHOT_ENTRY_BYTES: usize = 700;
+const SNAPSHOT_BASE_BYTES: usize = 4096;
+pub(super) const MAX_PERSISTENT_ENTRIES: usize =
+    (MAX_SNAPSHOT_BYTES - SNAPSHOT_BASE_BYTES) / SNAPSHOT_ENTRY_BYTES;
 
 #[derive(Debug)]
 pub(super) struct SnapshotStore {
@@ -178,8 +181,8 @@ impl SnapshotStore {
                     .forward
                     .cap()
                     .get()
-                    .saturating_mul(700)
-                    .saturating_add(4096)
+                    .saturating_mul(SNAPSHOT_ENTRY_BYTES)
+                    .saturating_add(SNAPSHOT_BASE_BYTES)
                     .min(MAX_SNAPSHOT_BYTES) as u64;
                 if file.metadata()?.len() > limit {
                     return Err(invalid("fake DNS snapshot exceeds configured bound"));

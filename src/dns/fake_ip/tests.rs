@@ -22,7 +22,7 @@ struct RecordingResolver {
     exchanges: AtomicUsize,
 }
 
-impl Resolver for Arc<RecordingResolver> {
+impl Resolver for RecordingResolver {
     fn resolve_location(&self, _: &NetLocation) -> ResolveFuture {
         panic!("client DNS must not use address-only resolution")
     }
@@ -41,8 +41,7 @@ impl Resolver for Arc<RecordingResolver> {
 
 fn context() -> (Arc<FakeDnsContext>, Arc<RecordingResolver>) {
     let real = Arc::new(RecordingResolver::default());
-    let context =
-        Arc::new(FakeDnsContext::new(FakeIpOptions::default(), Arc::new(real.clone())).unwrap());
+    let context = Arc::new(FakeDnsContext::new(FakeIpOptions::default(), real.clone()).unwrap());
     (context, real)
 }
 
@@ -54,6 +53,49 @@ fn query(kind: RecordType) -> Vec<u8> {
         kind,
     ));
     query.to_vec().unwrap()
+}
+
+#[tokio::test]
+async fn signed_requests_are_refused_without_forwarding() {
+    use hickory_resolver::proto::rr::{RData, Record, rdata::TSIG, rdata::tsig::TsigAlgorithm};
+
+    for persistent in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let options = FakeIpOptions {
+            state_file: persistent.then(|| directory.path().join("state.json")),
+            ..Default::default()
+        };
+        let real = Arc::new(RecordingResolver::default());
+        let context = FakeDnsContext::new(options, real.clone()).unwrap();
+        for kind in [RecordType::A, RecordType::TXT] {
+            let mut request = Message::from_vec(&query(kind)).unwrap();
+            request.add_additional(Record::from_rdata(
+                Name::from_ascii("key.test.").unwrap(),
+                0,
+                RData::TSIG(TSIG::new(
+                    TsigAlgorithm::HmacSha256,
+                    0,
+                    300,
+                    vec![0; 32],
+                    42,
+                    None,
+                    vec![],
+                )),
+            ));
+            for tcp in [false, true] {
+                let reply = context
+                    .exchange(request.to_vec().unwrap(), tcp)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let reply = Message::from_vec(&reply).unwrap();
+                assert_eq!(reply.metadata.response_code, ResponseCode::Refused);
+                assert!(reply.answers.is_empty());
+                assert!(reply.signature().is_none());
+            }
+        }
+        assert_eq!(real.exchanges.load(Ordering::SeqCst), 0);
+    }
 }
 
 #[test]
@@ -217,7 +259,7 @@ async fn persistent_work_waits_for_admission_with_a_deadline() {
         .unwrap();
     let context = FakeDnsContext::with_pool(
         options,
-        Arc::new(Arc::new(RecordingResolver::default())),
+        Arc::new(RecordingResolver::default()),
         pool.clone(),
     )
     .unwrap();

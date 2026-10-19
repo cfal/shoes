@@ -103,21 +103,16 @@ impl FakeDnsContext {
             DnsDecision::Drop => return Ok(None),
             DnsDecision::Answer(answer) => answer,
             DnsDecision::Forward => {
-                // Our upstream handles may rewrite IDs and wire encoding; TSIG cannot survive that.
-                if crate::dns::message::is_signed(&request) {
-                    response(&request, ResponseCode::Refused)
-                } else {
-                    let deadline = tokio::time::Instant::now() + EXCHANGE_TIMEOUT;
-                    let exchange = self.real.exchange_with_deadline(bytes, deadline).await;
-                    match exchange {
-                        Ok(reply) => self
-                            .check_response(&request, &reply)
-                            .unwrap_or_else(|_| response(&request, ResponseCode::ServFail)),
-                        Err(err) if err.kind() == io::ErrorKind::Unsupported => {
-                            response(&request, ResponseCode::Refused)
-                        }
-                        _ => response(&request, ResponseCode::ServFail),
+                let deadline = tokio::time::Instant::now() + EXCHANGE_TIMEOUT;
+                let exchange = self.real.exchange_with_deadline(bytes, deadline).await;
+                match exchange {
+                    Ok(reply) => self
+                        .check_response(&request, &reply)
+                        .unwrap_or_else(|_| response(&request, ResponseCode::ServFail)),
+                    Err(err) if err.kind() == io::ErrorKind::Unsupported => {
+                        response(&request, ResponseCode::Refused)
                     }
+                    _ => response(&request, ResponseCode::ServFail),
                 }
             }
         };

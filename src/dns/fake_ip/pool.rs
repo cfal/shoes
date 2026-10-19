@@ -100,6 +100,20 @@ struct State {
     wraps: u64,
 }
 
+impl State {
+    fn cached_allocation(&mut self, name: &str, ipv6: bool) -> io::Result<Option<IpAddr>> {
+        if self.closed {
+            return Err(io::ErrorKind::BrokenPipe.into());
+        }
+        let Some(entry) = self.forward.get(name) else {
+            return Ok(None);
+        };
+        let ip = if ipv6 { entry.v6 } else { entry.v4 };
+        self.revision = self.revision.wrapping_add(1);
+        Ok(ip)
+    }
+}
+
 /// Bounded mappings with a cursor independent of LRU eviction.
 pub struct FakeIpPool {
     state: Mutex<State>,
@@ -295,28 +309,14 @@ impl FakeIpPool {
         let name = canonical_hostname(name).ok_or_else(|| invalid("invalid fake DNS hostname"))?;
         {
             let mut state = self.state.lock();
-            if state.closed {
-                return Err(io::ErrorKind::BrokenPipe.into());
-            }
-            if let Some(entry) = state.forward.get(&name) {
-                let ip = if ipv6 { entry.v6 } else { entry.v4 };
-                state.revision = state.revision.wrapping_add(1);
-                if let Some(ip) = ip {
-                    return Ok(ip);
-                }
+            if let Some(ip) = state.cached_allocation(&name, ipv6)? {
+                return Ok(ip);
             }
         }
         let _serial = self.store.as_ref().map(|store| store.serial.lock());
         let mut state = self.state.lock();
-        if state.closed {
-            return Err(io::ErrorKind::BrokenPipe.into());
-        }
-        if let Some(entry) = state.forward.get(&name) {
-            let ip = if ipv6 { entry.v6 } else { entry.v4 };
-            state.revision = state.revision.wrapping_add(1);
-            if let Some(ip) = ip {
-                return Ok(ip);
-            }
+        if let Some(ip) = state.cached_allocation(&name, ipv6)? {
+            return Ok(ip);
         }
         if let Some(store) = &self.store {
             let remaining = if ipv6 {
@@ -431,6 +431,32 @@ mod tests {
             }
         }
         assert_eq!(count, state.reverse.len());
+    }
+
+    #[test]
+    fn cache_checks_track_missing_families_but_do_not_touch_closed_pools() {
+        let pool = FakeIpPool::with_seed(&options(2), 0).unwrap();
+        pool.allocate("a.example", false).unwrap();
+        pool.allocate("b.example", false).unwrap();
+        let revision = pool.state.lock().revision;
+        assert_eq!(
+            pool.allocate("a.example", true).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        {
+            let state = pool.state.lock();
+            assert_eq!(state.revision, revision + 2);
+            assert_eq!(state.forward.peek_mru().unwrap().0, "a.example");
+        }
+        pool.shutdown_checkpoint().unwrap();
+        let revision = pool.state.lock().revision;
+        assert_eq!(
+            pool.allocate("b.example", false).unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        let state = pool.state.lock();
+        assert_eq!(state.revision, revision);
+        assert_eq!(state.forward.peek_mru().unwrap().0, "a.example");
     }
 
     #[test]

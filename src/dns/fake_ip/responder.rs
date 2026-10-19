@@ -37,6 +37,7 @@ impl FakeDnsResponder {
         if request.metadata.op_code != OpCode::Query {
             return DnsDecision::Answer(response(request, ResponseCode::Refused));
         }
+        // Upstream handles may rewrite IDs and wire encoding; signatures cannot survive that.
         if crate::dns::message::is_signed(request) {
             return DnsDecision::Answer(response(request, ResponseCode::Refused));
         }
