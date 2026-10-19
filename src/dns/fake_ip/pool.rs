@@ -244,6 +244,14 @@ impl FakeIpPool {
         self.store.is_some()
     }
 
+    pub(crate) fn state_file_matches(&self, path: Option<&std::path::Path>) -> io::Result<bool> {
+        match (&self.store, path) {
+            (Some(store), Some(path)) => store.matches_path(path),
+            (None, None) => Ok(true),
+            _ => Ok(false),
+        }
+    }
+
     pub(crate) fn checkpoint(&self) -> io::Result<()> {
         if let Some(store) = &self.store {
             let _serial = store.serial.lock();

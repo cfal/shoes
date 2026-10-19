@@ -142,7 +142,24 @@ fn allocatable(range: &Range, ip: IpAddr) -> bool {
     range.network.contains(ip) && numeric(ip) >= range.first && numeric(ip) <= range.last
 }
 
+fn state_path(path: &Path) -> io::Result<PathBuf> {
+    // Resolve the parent only: atomic replacement and locking use this filename,
+    // not the target of a snapshot-file symlink.
+    let parent = path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    Ok(parent.canonicalize()?.join(
+        path.file_name()
+            .ok_or_else(|| invalid("invalid fake DNS state path"))?,
+    ))
+}
+
 impl SnapshotStore {
+    pub(super) fn matches_path(&self, path: &Path) -> io::Result<bool> {
+        Ok(self.path == state_path(path)?)
+    }
+
     pub(super) fn open(path: &Path, state: &mut State) -> io::Result<Self> {
         let limit = state
             .forward
@@ -161,14 +178,7 @@ impl SnapshotStore {
             ));
         }
         let limit = limit as u64;
-        let parent = path
-            .parent()
-            .filter(|path| !path.as_os_str().is_empty())
-            .unwrap_or(Path::new("."));
-        let path = parent.canonicalize()?.join(
-            path.file_name()
-                .ok_or_else(|| invalid("invalid fake DNS state path"))?,
-        );
+        let path = state_path(path)?;
         let lock_path = path.with_file_name(format!(
             "{}.lock",
             path.file_name().unwrap().to_string_lossy()

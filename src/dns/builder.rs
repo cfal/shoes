@@ -27,11 +27,22 @@ struct PoolState {
 }
 
 impl PoolState {
-    fn compatible(&self, options: &FakeIpOptions) -> bool {
-        self.options.ipv4_range == options.ipv4_range
-            && self.options.ipv6_range == options.ipv6_range
-            && self.options.max_entries == options.max_entries
-            && self.options.state_file == options.state_file
+    fn compatible(&self, options: &FakeIpOptions) -> std::io::Result<bool> {
+        let network = |range: &Option<String>| {
+            range
+                .as_deref()
+                .map(str::parse::<IpNetwork>)
+                .transpose()
+                .map_err(std::io::Error::other)
+        };
+        Ok(
+            network(&self.options.ipv4_range)? == network(&options.ipv4_range)?
+                && network(&self.options.ipv6_range)? == network(&options.ipv6_range)?
+                && self.options.max_entries == options.max_entries
+                && self
+                    .pool
+                    .state_file_matches(options.state_file.as_deref())?,
+        )
     }
 }
 
@@ -722,7 +733,7 @@ pub async fn build_dns_registry_for_runtime(
         let resolver: Arc<dyn Resolver> = if let Some(options) = group.fake_ip {
             options.validate()?;
             let pool = if let Some(old) = old {
-                if !old.compatible(&options) {
+                if !old.compatible(&options)? {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
                         format!(
@@ -1208,6 +1219,123 @@ mod tests {
                 .is_err()
         );
         assert_eq!(context.restore(ip).unwrap().as_deref(), Some("stable.test"));
+    }
+
+    #[tokio::test]
+    async fn equivalent_pool_ranges_reuse_live_mappings_on_reload() {
+        let mut groups = fake_groups(true);
+        groups[0].specs = vec![make_spec("udp://127.0.0.1:9")];
+        groups[0].fake_ip.as_mut().unwrap().ipv6_range = Some("fd00::/64".into());
+        let initial = build_dns_registry(groups.clone()).await.unwrap();
+        let context = initial
+            .get_by_name("fake")
+            .unwrap()
+            .fake_dns_context()
+            .unwrap();
+        let v4 = context.allocate("stable.test", false).unwrap();
+        let v6 = context.allocate("stable.test", true).unwrap();
+        groups[0].fake_ip.as_mut().unwrap().ipv6_range = Some("FD00:0::/64".into());
+        let next = build_dns_registry_reusing(groups.clone(), initial.limits, Some(&initial))
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(
+            &initial.pools["fake"].pool,
+            &next.pools["fake"].pool
+        ));
+        let next_context = next
+            .get_by_name("fake")
+            .unwrap()
+            .fake_dns_context()
+            .unwrap();
+        for ip in [v4, v6] {
+            assert_eq!(
+                next_context.restore(ip).unwrap().as_deref(),
+                Some("stable.test")
+            );
+        }
+        for incompatible in [
+            FakeIpOptions {
+                ipv4_range: Some("198.19.0.0/16".into()),
+                ..groups[0].fake_ip.clone().unwrap()
+            },
+            FakeIpOptions {
+                ipv6_range: Some("fd01::/64".into()),
+                ..groups[0].fake_ip.clone().unwrap()
+            },
+            FakeIpOptions {
+                ipv6_range: None,
+                ..groups[0].fake_ip.clone().unwrap()
+            },
+            FakeIpOptions {
+                max_entries: 32,
+                ..groups[0].fake_ip.clone().unwrap()
+            },
+        ] {
+            let mut candidate = groups.clone();
+            candidate[0].fake_ip = Some(incompatible);
+            let error = build_dns_registry_reusing(candidate, next.limits, Some(&next))
+                .await
+                .err()
+                .unwrap();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(error.to_string().contains("explicit restart required"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn equivalent_snapshot_parent_paths_reuse_the_open_store_on_reload() {
+        let directory = tempfile::tempdir().unwrap();
+        let parent = directory.path().join("parent");
+        let alias = directory.path().join("alias");
+        std::fs::create_dir(&parent).unwrap();
+        std::os::unix::fs::symlink(&parent, &alias).unwrap();
+        let path = parent.join("state.json");
+        let mut groups = fake_groups(true);
+        groups[0].specs = vec![make_spec("udp://127.0.0.1:9")];
+        groups[0].fake_ip.as_mut().unwrap().state_file = Some(path.clone());
+        let initial = build_dns_registry(groups.clone()).await.unwrap();
+        let context = initial
+            .get_by_name("fake")
+            .unwrap()
+            .fake_dns_context()
+            .unwrap();
+        let ip = context.allocate("stable.test", false).unwrap();
+        groups[0].fake_ip.as_mut().unwrap().state_file = Some(alias.join("state.json"));
+        let next = build_dns_registry_reusing(groups.clone(), initial.limits, Some(&initial))
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(
+            &initial.pools["fake"].pool,
+            &next.pools["fake"].pool
+        ));
+
+        let file_alias = parent.join("alias.json");
+        std::os::unix::fs::symlink(&path, &file_alias).unwrap();
+        for state_file in [None, Some(parent.join("different.json")), Some(file_alias)] {
+            let mut candidate = groups.clone();
+            candidate[0].fake_ip.as_mut().unwrap().state_file = state_file;
+            let error = build_dns_registry_reusing(candidate, next.limits, Some(&next))
+                .await
+                .err()
+                .unwrap();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(error.to_string().contains("explicit restart required"));
+        }
+
+        let other = directory.path().join("other");
+        std::fs::create_dir(&other).unwrap();
+        std::fs::remove_file(&alias).unwrap();
+        std::os::unix::fs::symlink(&other, &alias).unwrap();
+        assert!(
+            build_dns_registry_reusing(groups, next.limits, Some(&next))
+                .await
+                .is_err()
+        );
+        assert_eq!(context.restore(ip).unwrap().as_deref(), Some("stable.test"));
+        next.checkpoint().await.unwrap();
+        assert!(path.is_file());
+        assert!(!other.join("state.json").exists());
     }
 
     #[tokio::test]
