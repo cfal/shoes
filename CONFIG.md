@@ -930,8 +930,10 @@ fake_ip:
 
 - Pools must be CIDRs with usable addresses; reserve non-conflicting ranges
   and route them through the same ingress. The base and base+1 addresses are
-  reserved, as is IPv4 broadcast. Real upstream, bootstrap, proxy, and literal
-  rule-override addresses cannot be inside active fake ranges.
+  reserved, as is IPv4 broadcast. Real upstream, bootstrap, proxy, configured
+  forwarding/fallback targets, and literal rule-override addresses cannot be
+  inside any active or retained fake range. These checks apply even to inbounds
+  without Fake DNS or with it explicitly disabled.
 - `max_entries` bounds retained domain mappings, not the allocation range.
   Least-recently-used domains are evicted; sequential allocation traverses the
   entire range before reuse. Synthetic answers have a 60-second TTL. This is
@@ -973,8 +975,9 @@ reordering. An existing state file with a different owner is rejected.
 Compatible reloads retain mappings, including explicit disable/re-enable under
 the same group/inline identity. Pool ranges, capacity, or state-file ownership
 changes require restart. Without `state_file`, restart loses the mappings.
-Previously active synthetic ranges and endpoints remain excluded from real DNS
-and carrier resolution until restart, including after a context is removed.
+Previously active synthetic ranges and endpoints remain excluded from real DNS,
+carrier resolution, and configured forwarding/override targets until restart,
+including after a context is removed.
 With a state file, snapshots are private, atomically replaced, locked against
 multiple writers, and checked for pool and context identity compatibility. Create its parent directory
 before startup; protect it because the file records queried domains. Cursor

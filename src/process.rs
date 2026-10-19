@@ -536,6 +536,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fake_dns_removed_context_rejects_forwarding_and_override_reload_targets() {
+        use serde_json::json;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.yaml");
+        let paths = [path.to_str().unwrap().to_owned()];
+        std::fs::write(
+            &path,
+            r#"[{"dns_group":"fake","dns_servers":"udp://127.0.0.1:9","fake_ip":true}]"#,
+        )
+        .unwrap();
+        let live = prepare(&paths, None).await.unwrap();
+        std::fs::write(&path, "[]").unwrap();
+        let removed = prepare(&paths, Some(&live.dns)).await.unwrap();
+        assert!(!removed.dns.forbidden_ranges().is_empty());
+
+        for server in [
+            json!({"address":"127.0.0.1:1080", "protocol":{"type":"forward", "targets":["198.18.0.5:443"]}}),
+            json!({"address":"127.0.0.1:1080", "protocol":{"type":"socks"}, "rules":[{
+                "masks":"0.0.0.0/0", "action":"allow", "override_address":"198.18.0.5:443"
+            }]}),
+        ] {
+            std::fs::write(&path, json!([server]).to_string()).unwrap();
+            load_validated(&paths).await.unwrap();
+            let error = prepare(&paths, Some(&removed.dns)).await.err().unwrap();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert!(
+                error
+                    .to_string()
+                    .contains("running configuration until restart")
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn fake_dns_terminal_shutdown_closes_all_registries_after_checkpoint_error() {
         let directory = tempfile::tempdir().unwrap();
         let mut registries = Vec::new();

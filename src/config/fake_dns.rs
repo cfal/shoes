@@ -141,36 +141,22 @@ pub(super) fn validate(config: &mut ValidatedConfigs) -> io::Result<()> {
             .map_or(&[], Vec::as_slice)
     };
     for server in &config.configs {
-        match server {
-            Config::Server(server) => {
-                let ranges = effective(&server.dns);
-                rules(ranges, &server.rules)?;
-                protocol(ranges, &server.protocol)?;
-            }
-            Config::TunServer(tun) => {
-                let ranges = effective(&tun.dns);
-                rules(ranges, &tun.rules)?;
-                for ip in [tun.address, tun.destination].into_iter().flatten() {
-                    // The conventional virtual endpoint is already reserved by the allocator.
-                    if !ranges.iter().any(|range| match (range.network(), ip) {
-                        (IpAddr::V4(base), IpAddr::V4(ip)) => {
-                            u32::from(ip) == u32::from(base).saturating_add(1)
-                        }
-                        (IpAddr::V6(base), IpAddr::V6(ip)) => {
-                            u128::from(ip) == u128::from(base).saturating_add(1)
-                        }
-                        _ => false,
-                    }) {
-                        reject(ranges, ip, "TUN interface/gateway")?;
+        if let Config::TunServer(tun) = server {
+            let ranges = effective(&tun.dns);
+            for ip in [tun.address, tun.destination].into_iter().flatten() {
+                // The conventional virtual endpoint is already reserved by the allocator.
+                if !ranges.iter().any(|range| match (range.network(), ip) {
+                    (IpAddr::V4(base), IpAddr::V4(ip)) => {
+                        u32::from(ip) == u32::from(base).saturating_add(1)
                     }
+                    (IpAddr::V6(base), IpAddr::V6(ip)) => {
+                        u128::from(ip) == u128::from(base).saturating_add(1)
+                    }
+                    _ => false,
+                }) {
+                    reject(ranges, ip, "TUN interface/gateway")?;
                 }
             }
-            _ => {}
-        }
-    }
-    for endpoint in &config.wireguard_endpoints {
-        if let Some(inbound) = &endpoint.inbound {
-            rules(effective(&inbound.dns), &inbound.rules)?;
         }
     }
     config.validate_network_endpoints(&all)
@@ -178,6 +164,16 @@ pub(super) fn validate(config: &mut ValidatedConfigs) -> io::Result<()> {
 
 impl ValidatedConfigs {
     pub(crate) fn validate_network_endpoints(&mut self, ranges: &[IpNetwork]) -> io::Result<()> {
+        for config in &self.configs {
+            match config {
+                Config::Server(server) => {
+                    rules(ranges, &server.rules)?;
+                    protocol(ranges, &server.protocol)?;
+                }
+                Config::TunServer(tun) => rules(ranges, &tun.rules)?,
+                _ => {}
+            }
+        }
         for group in &self.dns_groups {
             for spec in &group.specs {
                 for value in std::iter::once(spec.url.as_str()).chain(spec.bootstrap_url.as_deref())
@@ -197,6 +193,9 @@ impl ValidatedConfigs {
             }
         }
         for endpoint in &self.wireguard_endpoints {
+            if let Some(inbound) = &endpoint.inbound {
+                rules(ranges, &inbound.rules)?;
+            }
             for peer in &endpoint.peers {
                 if let Some(address) = &peer.endpoint {
                     let address = NetLocation::from_str(address, None)?;
@@ -390,7 +389,7 @@ mod tests {
     }
 
     #[test]
-    fn server_owned_destinations_follow_effective_fake_ranges() {
+    fn server_owned_destinations_reject_all_active_fake_ranges() {
         use serde_json::json;
         for address in [
             "198.18.0.5:443",
@@ -427,10 +426,51 @@ mod tests {
                         "{error}"
                     );
                     config[1]["dns"]["fake_ip"] = false.into();
-                    validate_yaml(&config.to_string()).unwrap();
+                    assert!(validate_yaml(&config.to_string()).is_err());
                     config[1]["dns"] = json!({"servers":"system"});
+                    assert!(validate_yaml(&config.to_string()).is_err());
+                    config[1].as_object_mut().unwrap().remove("dns");
+                    assert!(validate_yaml(&config.to_string()).is_err());
+                    config[0]["fake_ip"] = false.into();
                     validate_yaml(&config.to_string()).unwrap();
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn rule_overrides_reject_all_active_and_retained_fake_ranges() {
+        use serde_json::json;
+
+        for address in [
+            "198.18.0.5:443",
+            "[::ffff:198.18.0.5]:443",
+            "[2001:2::5]:443",
+        ] {
+            let rules =
+                json!([{"masks":"0.0.0.0/0", "action":"allow", "override_address":address}]);
+            for inbound in [
+                json!({"address":"127.0.0.1:1080", "protocol":{"type":"socks"}, "rules":rules}),
+                json!({"device_name":"tun0", "device_fd":42, "rules":rules}),
+                json!({"address":"127.0.0.1:1080", "protocol":{"type":"websocket", "targets":[{
+                    "protocol":{"type":"socks"}, "override_rules":rules
+                }]}}),
+            ] {
+                let mut configs = json!([
+                    {"dns_group":"fake", "dns_servers":"system", "fake_ip":{"ipv6_range":"2001:2::/48"}},
+                    inbound,
+                ]);
+                let error = validate_yaml(&configs.to_string()).err().unwrap();
+                assert!(error.to_string().contains("rule override"), "{error}");
+                configs[0]["fake_ip"] = false.into();
+                let mut validated = validate_yaml(&configs.to_string()).unwrap();
+                let error = validated
+                    .validate_network_endpoints(&[
+                        "198.18.0.0/15".parse().unwrap(),
+                        "2001:2::/48".parse().unwrap(),
+                    ])
+                    .unwrap_err();
+                assert!(error.to_string().contains("rule override"), "{error}");
             }
         }
     }

@@ -731,6 +731,26 @@ mod tests {
         assert_eq!(validate(configs).unwrap().wireguard_endpoints.len(), 2);
     }
 
+    #[test]
+    fn server_overrides_reject_other_active_and_retained_fake_ranges() {
+        let mut inbound = server();
+        inbound["rules"] = json!([{
+            "masks":"0.0.0.0/0", "action":"allow", "override_address":"198.18.0.5:443"
+        }]);
+        let mut config = json!([
+            {"dns_group":"fake", "dns_servers":"system", "fake_ip":true},
+            inbound,
+        ]);
+        let error = validate(config.clone()).err().unwrap();
+        assert!(error.to_string().contains("rule override"), "{error}");
+        config[0]["fake_ip"] = false.into();
+        let mut validated = validate(config).unwrap();
+        let error = validated
+            .validate_network_endpoints(&["198.18.0.0/15".parse().unwrap()])
+            .unwrap_err();
+        assert!(error.to_string().contains("rule override"), "{error}");
+    }
+
     fn validate(values: Value) -> io::Result<ValidatedConfigs> {
         super::super::create_server_configs(
             serde_yaml::from_str(&serde_yaml::to_string(&values).unwrap())
