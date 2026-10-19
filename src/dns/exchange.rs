@@ -96,9 +96,7 @@ impl RawDnsExchange {
                     "DNS exchange deadline exceeded",
                 ))
             });
-        if result
-            .as_ref()
-            .is_err_and(|error| error.kind() == io::ErrorKind::TimedOut)
+        if result.is_err()
             && setups
                 .lock()
                 .iter()
@@ -654,15 +652,20 @@ mod tests {
 
     #[tokio::test]
     async fn slow_connection_setup_survives_refreshing_resolver_timeout() {
-        assert_slow_setup_survives(false).await;
+        assert_slow_setup_survives(false, false).await;
     }
 
     #[tokio::test]
     async fn concurrent_query_completing_setup_preserves_canceled_wait_retry() {
-        assert_slow_setup_survives(true).await;
+        assert_slow_setup_survives(true, false).await;
     }
 
-    async fn assert_slow_setup_survives(concurrent: bool) {
+    #[tokio::test]
+    async fn later_bind_failure_preserves_canceled_setup_retry() {
+        assert_slow_setup_survives(false, true).await;
+    }
+
+    async fn assert_slow_setup_survives(concurrent: bool, fail_last: bool) {
         use crate::resolver::{
             DnsExchangeFuture, RefreshPolicy, RefreshingResolver, ResolveFuture, Resolver,
             ResolverFactory,
@@ -697,9 +700,12 @@ mod tests {
             tokio::time::Instant::now() + Duration::from_millis(300),
         ));
         let silent = tokio::net::UdpSocket::bind("0.0.0.0:0").await.unwrap();
-        for _ in 0..2 {
+        for index in 0..2 {
             let mut config = ConnectionConfig::udp();
             config.port = silent.local_addr().unwrap().port();
+            if fail_last && index == 1 {
+                config.bind_addr = Some(silent.local_addr().unwrap());
+            }
             raw.upstreams.push(Upstream {
                 server_index: raw.upstreams.len(),
                 ip: address.ip(),
