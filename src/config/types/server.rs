@@ -940,7 +940,9 @@ mod tests {
         }
         check::<ServerConfig>("address: '127.0.0.1:1080'\nprotocol: {type: socks}");
         check::<super::super::tun::TunConfig>("mtu: 1500");
-        check::<super::super::wireguard::WireguardInbound>("rules: []");
+        check::<ServerConfig>(
+            "address: '127.0.0.1:51820'\nprotocol: {type: wireguard, private_key: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=', addresses: [], peers: []}\nrules: []",
+        );
         crate::config::create_server_configs(
             serde_yaml::from_str(include_str!("../../../examples/sni_sniffing.yaml")).unwrap(),
         )

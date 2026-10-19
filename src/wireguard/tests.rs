@@ -212,7 +212,7 @@ async fn wireguard_fake_dns_restores_tcp_and_udp_in_both_families() {
         let reservation = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
         let mut documents: Vec<serde_yaml::Value> =
             serde_yaml::from_str(&pair_config(reservation.local_addr().unwrap().port())).unwrap();
-        documents[0]["inbound"] = serde_yaml::from_str(
+        let inbound: serde_yaml::Value = serde_yaml::from_str(
             r#"
 dns:
   servers: udp://127.0.0.1:9
@@ -227,6 +227,8 @@ rules:
 "#,
         )
         .unwrap();
+        documents[0]["dns"] = inbound["dns"].clone();
+        documents[0]["rules"] = inbound["rules"].clone();
         let mut configs = validate(&serde_yaml::to_string(&documents).unwrap()).unwrap();
         let prepared = Prepared::new(&mut configs).await.unwrap();
         let mut dns = crate::dns::build_dns_registry(configs.dns_groups.clone())
@@ -235,7 +237,7 @@ rules:
         drop(reservation);
         let mut running = Running::default();
         prepared.start(&mut dns, &mut running).await.unwrap();
-        let connector = prepared.endpoints[1].connector.as_ref();
+        let connector = prepared.endpoints[CLIENT].connector.as_ref();
         let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
         let (tcp, udp, _echoes) = echo_servers(false).await;
         for (target, kind) in [
@@ -453,7 +455,7 @@ async fn fake_dns_guards_wireguard_peer_and_outer_proxy_hostnames() {
     for tun_address in [None, Some("127.0.0.1"), Some("::ffff:127.0.0.1")] {
         let tun_endpoint = tun_address.is_some();
         let mut raw: serde_json::Value = serde_yaml::from_str(&pair_config(51820)).unwrap();
-        raw[1]["peers"][0]["endpoint"] = json!("localhost:51820");
+        raw[1]["client_proxies"][0]["address"] = json!("localhost:51820");
         raw.as_array_mut().unwrap().push(json!({
             "dns_group":"fake", "dns_servers":"system",
             "fake_ip":{"ipv4_range":if tun_endpoint { "198.18.0.0/15" } else { "127.0.0.0/8" }}
@@ -469,16 +471,16 @@ async fn fake_dns_guards_wireguard_peer_and_outer_proxy_hostnames() {
             stdio::ErrorKind::InvalidData
         );
 
-        raw[1]["peers"][0]["endpoint"] = json!("127.0.0.1:51820");
+        raw[1]["client_proxies"][0]["address"] = json!("127.0.0.1:51820");
         assert!(validate(&raw.to_string()).is_err());
 
-        raw[1]["peers"][0]["endpoint"] = json!("192.0.2.1:51820");
-        raw[1]["outer_client_chain"] = json!([{
+        raw[1]["client_proxies"][0]["address"] = json!("192.0.2.1:51820");
+        raw[1]["client_proxies"][0]["protocol"]["peer_client_chain"] = json!([{
             "address":"localhost:443", "protocol":{"type":"vless", "user_id":"b85798ef-e9dc-46a4-9a87-8da4499d36d0"}
         }]);
         let mut configs = validate(&raw.to_string()).unwrap();
         let prepared = Prepared::new(&mut configs).await.unwrap();
-        let endpoint = &prepared.endpoints[1];
+        let endpoint = &prepared.endpoints[CLIENT];
         let chain = endpoint.build_outer_chain().unwrap().unwrap();
         let error = chain
             .connect_udp_bidirectional(
@@ -492,8 +494,8 @@ async fn fake_dns_guards_wireguard_peer_and_outer_proxy_hostnames() {
             .unwrap();
         assert!(error.to_string().contains("synthetic address"), "{error}");
 
-        raw[2]["fake_ip"] = false.into();
-        raw[1]["peers"][0]["endpoint"] = json!("localhost:51820");
+        raw[3]["fake_ip"] = false.into();
+        raw[1]["client_proxies"][0]["address"] = json!("localhost:51820");
         let mut configs = validate(&raw.to_string()).unwrap();
         Prepared::new(&mut configs).await.unwrap();
 
@@ -507,7 +509,7 @@ async fn fake_dns_guards_wireguard_peer_and_outer_proxy_hostnames() {
         for remove_group in [false, true] {
             let mut candidate = raw.clone();
             if remove_group {
-                candidate.as_array_mut().unwrap().remove(2);
+                candidate.as_array_mut().unwrap().remove(3);
             }
             let mut configs = validate(&candidate.to_string()).unwrap();
             assert_eq!(
@@ -518,7 +520,7 @@ async fn fake_dns_guards_wireguard_peer_and_outer_proxy_hostnames() {
                     .kind(),
                 stdio::ErrorKind::InvalidData
             );
-            candidate[1]["peers"][0]["endpoint"] = json!("127.0.0.1:51820");
+            candidate[1]["client_proxies"][0]["address"] = json!("127.0.0.1:51820");
             let mut configs = validate(&candidate.to_string()).unwrap();
             assert_eq!(
                 Prepared::with_forbidden(&mut configs, &inherited)
@@ -528,19 +530,20 @@ async fn fake_dns_guards_wireguard_peer_and_outer_proxy_hostnames() {
                     .kind(),
                 stdio::ErrorKind::InvalidInput
             );
-            candidate[1]["peers"][0]["endpoint"] = json!("192.0.2.1:51820");
+            candidate[1]["client_proxies"][0]["address"] = json!("192.0.2.1:51820");
             let mut configs = validate(&candidate.to_string()).unwrap();
             let prepared = Prepared::with_forbidden(&mut configs, &inherited)
                 .await
                 .unwrap();
             assert!(
-                prepared.endpoints[1]
+                prepared.endpoints[CLIENT]
                     .outer_resolver
                     .resolve_location(&NetLocation::from_str("localhost:443", None).unwrap())
                     .await
                     .is_err()
             );
-            candidate[1]["outer_client_chain"][0]["address"] = json!("127.0.0.1:443");
+            candidate[1]["client_proxies"][0]["protocol"]["peer_client_chain"][0]["address"] =
+                json!("127.0.0.1:443");
             let mut configs = validate(&candidate.to_string()).unwrap();
             assert_eq!(
                 Prepared::with_forbidden(&mut configs, &inherited)
@@ -559,7 +562,7 @@ fn fake_dns_rejects_unbracketed_wireguard_literals() {
     use serde_json::json;
     for endpoint in ["::ffff:198.18.0.5:51820", "2001:2::5:51820"] {
         let mut raw: serde_json::Value = serde_yaml::from_str(&pair_config(51820)).unwrap();
-        raw[1]["peers"][0]["endpoint"] = json!(endpoint);
+        raw[1]["client_proxies"][0]["address"] = json!(endpoint);
         raw.as_array_mut().unwrap().push(json!({
             "dns_group":"fake", "dns_servers":"system",
             "fake_ip":{"ipv6_range":"2001:2::/48"}
@@ -570,7 +573,7 @@ fn fake_dns_rejects_unbracketed_wireguard_literals() {
             error.to_string().contains("WireGuard endpoint overlaps"),
             "{error}"
         );
-        raw[2]["fake_ip"] = false.into();
+        raw[3]["fake_ip"] = false.into();
         validate(&raw.to_string()).unwrap();
     }
 }

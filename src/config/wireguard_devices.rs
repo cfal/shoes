@@ -297,6 +297,17 @@ mod tests {
     }
 
     #[test]
+    fn servers_keep_inbound_sniff_setting() {
+        for sniff in [false, true] {
+            let mut config = server();
+            config["sniff"] = json!(sniff);
+            let validated = validate(json!([config])).unwrap();
+            let inbound = validated.wireguard_endpoints[0].inbound.as_ref().unwrap();
+            assert_eq!(inbound.sniff, sniff);
+        }
+    }
+
+    #[test]
     fn servers_parse_literal_binds_and_reject_duplicates_and_implicit_policy() {
         for address in ["0.0.0.0:51820", "[::]:51820", "[fe80::1%3]:51820"] {
             let mut config = server();

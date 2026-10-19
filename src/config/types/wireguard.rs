@@ -190,6 +190,7 @@ impl WireguardServerConfig {
             peer_client_chain: self.peer_client_chain.clone(),
             mtu: self.mtu,
             inbound: Some(WireguardInbound {
+                sniff: server.sniff,
                 rules: server.rules.clone(),
                 dns: server.dns.clone(),
             }),

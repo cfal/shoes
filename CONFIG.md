@@ -879,7 +879,7 @@ quiet CONNECT tunnel; connection-level PINGs do not reset that timeout.
 
 ## Fake DNS
 
-Fake DNS is opt-in on a server, TUN configuration, or WireGuard `inbound`:
+Fake DNS is opt-in on a server (including WireGuard) or TUN configuration:
 
 ```yaml
 dns:
@@ -998,7 +998,7 @@ Rules determine how incoming connections are routed.
 
 ### TLS SNI Routing
 
-Set `sniff: true` on a server, TUN configuration, or WireGuard `inbound` to use
+Set `sniff: true` on a server (including WireGuard) or TUN configuration to use
 visible TLS ClientHello SNI for hostname rules. The default is `false`. The option
 applies to logical TCP streams, including multiplexed and QUIC-carried TCP, not
 UDP/QUIC Initial packets, HTTP Host headers, or the outer TLS carrier handshake.
