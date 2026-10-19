@@ -19,6 +19,19 @@ use crate::address::{NetLocation, ResolvedLocation};
 pub type ResolveFuture = Pin<Box<dyn Future<Output = std::io::Result<Vec<SocketAddr>>> + Send>>;
 pub type DnsExchangeFuture = Pin<Box<dyn Future<Output = std::io::Result<Vec<u8>>> + Send>>;
 
+fn dns_exchange_until(
+    future: DnsExchangeFuture,
+    deadline: tokio::time::Instant,
+) -> DnsExchangeFuture {
+    Box::pin(async move {
+        tokio::time::timeout_at(deadline, future)
+            .await
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "DNS exchange timed out")
+            })?
+    })
+}
+
 #[derive(Debug)]
 pub(crate) struct DnsSetupPending;
 
@@ -60,6 +73,15 @@ pub trait Resolver: Send + Sync + Debug {
                 "resolver does not support DNS message exchange",
             ))
         })
+    }
+
+    /// Completes by the deadline; wrappers forward it so fallbacks can return a retained partial.
+    fn exchange_with_deadline(
+        &self,
+        request: Vec<u8>,
+        deadline: tokio::time::Instant,
+    ) -> DnsExchangeFuture {
+        dns_exchange_until(self.exchange(request), deadline)
     }
 }
 
@@ -109,6 +131,17 @@ impl<T: Resolver> Resolver for TimeoutResolver<T> {
                 std::io::Error::new(std::io::ErrorKind::TimedOut, "DNS exchange timed out")
             })?
         })
+    }
+
+    fn exchange_with_deadline(
+        &self,
+        request: Vec<u8>,
+        deadline: tokio::time::Instant,
+    ) -> DnsExchangeFuture {
+        self.inner.exchange_with_deadline(
+            request,
+            deadline.min(tokio::time::Instant::now() + self.timeout),
+        )
     }
 
     fn resolve_location(&self, location: &NetLocation) -> ResolveFuture {
@@ -326,6 +359,17 @@ impl Resolver for RefreshingResolver {
 
     fn exchange(&self, request: Vec<u8>) -> DnsExchangeFuture {
         self.execute(move |resolver| resolver.exchange(request.clone()))
+    }
+
+    fn exchange_with_deadline(
+        &self,
+        request: Vec<u8>,
+        deadline: tokio::time::Instant,
+    ) -> DnsExchangeFuture {
+        let future = self
+            .execute(move |resolver| resolver.exchange_with_deadline(request.clone(), deadline));
+        // The operation observes the deadline; the outer bound also covers refresh locks/factories.
+        dns_exchange_until(future, deadline)
     }
 }
 
@@ -742,6 +786,51 @@ mod tests {
                 .last_activity_at
                 .is_some()
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exchange_deadline_also_bounds_refresh_factory_and_lock_waits() {
+        for hold_lock in [false, true] {
+            let builds = Arc::new(AtomicUsize::new(0));
+            let calls = builds.clone();
+            let factory: ResolverFactory = Arc::new(move || {
+                let generation = calls.fetch_add(1, Ordering::Relaxed);
+                Box::pin(async move {
+                    if generation > 0 {
+                        std::future::pending::<()>().await;
+                    }
+                    Ok(Arc::new(MockResolver::with_error(
+                        std::io::ErrorKind::ConnectionReset,
+                    )) as Arc<dyn Resolver>)
+                })
+            });
+            let resolver = RefreshingResolver::new(
+                factory,
+                RefreshPolicy {
+                    max_idle: Duration::from_secs(60),
+                    retry_once_after_refresh: true,
+                },
+                "deadline".into(),
+            )
+            .await
+            .unwrap();
+            let _guard = if hold_lock {
+                Some(resolver.refresh_lock.lock().await)
+            } else {
+                None
+            };
+            let started = tokio::time::Instant::now();
+            let error = resolver
+                .exchange_with_deadline(vec![], started + Duration::from_secs(1))
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+            assert_eq!(started.elapsed(), Duration::from_secs(1));
+            assert_eq!(
+                builds.load(Ordering::Relaxed),
+                if hold_lock { 1 } else { 2 }
+            );
+        }
     }
 
     fn test_addrs() -> Vec<SocketAddr> {

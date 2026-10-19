@@ -101,6 +101,107 @@ async fn forwarded_udp_answer_discards_oversized_edns_options() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn truncated_fallback_survives_deadlines_without_bypassing_guards() {
+    use crate::dns::composite_resolver::CompositeResolver;
+    use crate::resolver::{RefreshPolicy, RefreshingResolver, ResolverFactory, TimeoutResolver};
+
+    #[derive(Debug)]
+    struct PartialReply {
+        delay: Duration,
+        forbidden_answer: bool,
+    }
+    impl Resolver for PartialReply {
+        fn resolve_location(&self, _: &NetLocation) -> ResolveFuture {
+            unreachable!()
+        }
+        fn exchange(&self, request: Vec<u8>) -> DnsExchangeFuture {
+            let delay = self.delay;
+            let forbidden_answer = self.forbidden_answer;
+            Box::pin(async move {
+                tokio::time::sleep(delay).await;
+                let mut response = Message::from_vec(&request).unwrap().into_response();
+                response.metadata.truncation = true;
+                if forbidden_answer {
+                    use hickory_resolver::proto::rr::{RData, Record, rdata::A};
+                    response.add_answer(Record::from_rdata(
+                        response.queries[0].name().clone(),
+                        60,
+                        RData::A(A("203.0.113.1".parse().unwrap())),
+                    ));
+                }
+                response.to_vec().map_err(io::Error::other)
+            })
+        }
+    }
+    #[derive(Debug)]
+    struct Stalled;
+    impl Resolver for Stalled {
+        fn resolve_location(&self, _: &NetLocation) -> ResolveFuture {
+            unreachable!()
+        }
+        fn exchange(&self, _: Vec<u8>) -> DnsExchangeFuture {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    for (timeout, delay, forbidden_answer) in [
+        (60, 0, false),
+        (60, 29, false),
+        (2, 0, false),
+        (60, 0, true),
+    ] {
+        let composite: Arc<dyn Resolver> = Arc::new(CompositeResolver::new(vec![Arc::new(
+            CompositeResolver::new(vec![
+                Arc::new(PartialReply {
+                    delay: Duration::from_secs(delay),
+                    forbidden_answer,
+                }),
+                Arc::new(Stalled),
+            ]),
+        )]));
+        let factory: ResolverFactory = Arc::new(move || {
+            let composite = composite.clone();
+            Box::pin(async move { Ok(composite) })
+        });
+        let refreshing = RefreshingResolver::new(
+            factory,
+            RefreshPolicy {
+                max_idle: Duration::from_secs(60),
+                retry_once_after_refresh: true,
+            },
+            "partial deadline".into(),
+        )
+        .await
+        .unwrap();
+        let real = crate::dns::guard::real_only(
+            Arc::new(TimeoutResolver::with_timeout(
+                refreshing,
+                Duration::from_secs(timeout),
+            )),
+            vec!["203.0.113.0/24".parse().unwrap()].into(),
+        );
+        let context = FakeDnsContext::new(Default::default(), real).unwrap();
+        let started = tokio::time::Instant::now();
+        let reply = context
+            .exchange(query(RecordType::TXT), true)
+            .await
+            .unwrap()
+            .unwrap();
+        let reply = Message::from_vec(&reply).unwrap();
+        assert_eq!(reply.metadata.truncation, !forbidden_answer);
+        assert_eq!(
+            reply.metadata.response_code,
+            if forbidden_answer {
+                ResponseCode::ServFail
+            } else {
+                ResponseCode::NoError
+            }
+        );
+        assert_eq!(started.elapsed(), Duration::from_secs(timeout.min(30)));
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn persistent_work_waits_for_admission_with_a_deadline() {
     let directory = tempfile::tempdir().unwrap();
     let options = FakeIpOptions {

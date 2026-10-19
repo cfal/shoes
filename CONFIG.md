@@ -979,7 +979,9 @@ discovered. Later upstream failures produce DNS failure, not a public-provider f
 UDP and HTTP/3 upstreams remain direct-only; TCP/TLS/HTTPS can use client chains.
 UDP truncation retries TCP only when that transport is explicitly configured.
 Groups with mixed upstream settings try their remaining configured resolvers for
-a complete reply before returning a truncated answer.
+a complete successful or negative reply before returning a truncated answer.
+The retained truncated reply is returned if fallback fails or reaches the
+forwarding deadline; it still passes the real-address guards.
 Local UDP DNS peers process one query at a time with bounded backpressure; a
 forwarded query can delay subsequent synthetic answers until its deadline.
 

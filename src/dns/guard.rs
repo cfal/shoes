@@ -44,7 +44,20 @@ impl Resolver for RealResolver {
     }
 
     fn exchange(&self, request: Vec<u8>) -> DnsExchangeFuture {
-        let future = self.inner.exchange(request);
+        self.check_exchange(self.inner.exchange(request))
+    }
+
+    fn exchange_with_deadline(
+        &self,
+        request: Vec<u8>,
+        deadline: tokio::time::Instant,
+    ) -> DnsExchangeFuture {
+        self.check_exchange(self.inner.exchange_with_deadline(request, deadline))
+    }
+}
+
+impl RealResolver {
+    fn check_exchange(&self, future: DnsExchangeFuture) -> DnsExchangeFuture {
         let forbidden = self.forbidden.clone();
         Box::pin(async move {
             let bytes = future.await?;

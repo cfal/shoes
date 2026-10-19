@@ -107,13 +107,13 @@ impl FakeDnsContext {
                 if crate::dns::message::is_signed(&request) {
                     response(&request, ResponseCode::Refused)
                 } else {
-                    let exchange =
-                        tokio::time::timeout(EXCHANGE_TIMEOUT, self.real.exchange(bytes)).await;
+                    let deadline = tokio::time::Instant::now() + EXCHANGE_TIMEOUT;
+                    let exchange = self.real.exchange_with_deadline(bytes, deadline).await;
                     match exchange {
-                        Ok(Ok(reply)) => self
+                        Ok(reply) => self
                             .check_response(&request, &reply)
                             .unwrap_or_else(|_| response(&request, ResponseCode::ServFail)),
-                        Ok(Err(err)) if err.kind() == io::ErrorKind::Unsupported => {
+                        Err(err) if err.kind() == io::ErrorKind::Unsupported => {
                             response(&request, ResponseCode::Refused)
                         }
                         _ => response(&request, ResponseCode::ServFail),
@@ -211,5 +211,13 @@ impl Resolver for FakeDnsResolver {
 
     fn exchange(&self, request: Vec<u8>) -> crate::resolver::DnsExchangeFuture {
         self.real.exchange(request)
+    }
+
+    fn exchange_with_deadline(
+        &self,
+        request: Vec<u8>,
+        deadline: tokio::time::Instant,
+    ) -> crate::resolver::DnsExchangeFuture {
+        self.real.exchange_with_deadline(request, deadline)
     }
 }
