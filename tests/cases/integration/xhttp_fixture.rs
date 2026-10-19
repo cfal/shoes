@@ -2,7 +2,7 @@ use std::{io, net::SocketAddr, path::PathBuf};
 
 use serde_json::{Value, json};
 use shoes_test_support::{
-    process::{ProcessGuard, start_mihomo_server},
+    process::{ProcessGuard, start_mihomo_server_with_env},
     test_fixture::{generate_reality_keypair, start_shoes_server},
     xray,
 };
@@ -543,8 +543,15 @@ impl Fixture {
             Peer::Shoes => {}
             Peer::Xray => pair._xray = Some(xray::start(peer_config).await?),
             Peer::Mihomo => {
-                pair._mihomo =
-                    Some(start_mihomo_server(&serde_yaml::to_string(&peer_config)?).await?)
+                // Independent loopback connections can share source IP/port across
+                // different destinations, which Mihomo mistakes for a routing loop.
+                pair._mihomo = Some(
+                    start_mihomo_server_with_env(
+                        &serde_yaml::to_string(&peer_config)?,
+                        &[("DISABLE_LOOPBACK_DETECTOR", "true")],
+                    )
+                    .await?,
+                )
             }
         }
         xray::wait_socks(socks)

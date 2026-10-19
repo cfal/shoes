@@ -70,6 +70,11 @@ Mihomo has no XHTTP H3 listener or Trojan/XHTTP adapter. Its client supports H3;
 its REALITY fixture permits classical X25519 as well as hybrid key exchange.
 Mihomo uses a simple path because its normalization treats query syntax as path
 text. Shoes/Xray retain the escaped-path/query interoperability fixture.
+The XHTTP fixture disables Mihomo's loopback detector only in its peer subprocess.
+The detector compares inbound source IP/port against outbound local IP/port without
+considering the destination; independent connections in this all-loopback topology
+can share that pair and trigger a false routing-loop rejection during churn.
+Other Mihomo fixtures retain their existing environment and loop detection.
 
 Xray client H2C is not included. Packet-up does not signal upload FIN. A completely
 stalled session can retain shared-carrier flow-control credit, so the pressure
