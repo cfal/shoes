@@ -216,16 +216,10 @@ impl Prepared {
         let mut ranges = ranges.map_err(stdio::Error::other)?;
         ranges.extend_from_slice(inherited);
         if !ranges.is_empty() {
-            for config in &validated.configs {
-                if let crate::config::Config::TunServer(tun) = config {
-                    ranges.extend(
-                        [tun.address, tun.destination]
-                            .into_iter()
-                            .flatten()
-                            .map(|ip| IpNetwork::from(ip.to_canonical())),
-                    );
-                }
-            }
+            ranges.extend(
+                crate::config::tun_endpoint_ips(&validated.configs)
+                    .map(|ip| IpNetwork::from(ip.to_canonical())),
+            );
             validated.validate_network_endpoints(&ranges)?;
         }
         let resolver = crate::dns::real_only(Arc::new(NativeResolver::new()), ranges.into());
@@ -279,7 +273,7 @@ impl Prepared {
                 global_limits: validated.global_limits,
                 outer_resolver: resolver.clone(),
             };
-            endpoint.build_outer_chain(&resolver)?;
+            endpoint.build_outer_chain()?;
             endpoints.push(endpoint);
         }
         Ok(Self { endpoints })
@@ -349,14 +343,13 @@ impl PreparedEndpoint {
 
     fn build_outer_chain(
         &self,
-        resolver: &Arc<dyn Resolver>,
     ) -> stdio::Result<Option<Arc<crate::client_proxy_chain::ClientProxyChain>>> {
         let Some(config) = &self.config.peer_client_chain else {
             return Ok(None);
         };
         let chain = crate::tcp::chain_builder::build_client_proxy_chain_with_limits(
             config.hops.clone(),
-            resolver.clone(),
+            self.outer_resolver.clone(),
             self.global_limits,
         )?;
         if !chain.supports_udp() {
@@ -397,7 +390,7 @@ impl PreparedEndpoint {
         )?;
         let resolver = self.outer_resolver.clone();
         // Rebuilding after preflight gives each start fresh pool indices and handler lifetimes.
-        let (udp, released, peers) = if let Some(chain) = self.build_outer_chain(&resolver)? {
+        let (udp, released, peers) = if let Some(chain) = self.build_outer_chain()? {
             let peers = self.peers_for_socket(None)?;
             let (sender, receiver, released) = detour::start(
                 config.id.clone(),

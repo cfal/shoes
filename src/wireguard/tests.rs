@@ -479,10 +479,7 @@ async fn fake_dns_guards_wireguard_peer_and_outer_proxy_hostnames() {
         let mut configs = validate(&raw.to_string()).unwrap();
         let prepared = Prepared::new(&mut configs).await.unwrap();
         let endpoint = &prepared.endpoints[1];
-        let chain = endpoint
-            .build_outer_chain(&endpoint.outer_resolver)
-            .unwrap()
-            .unwrap();
+        let chain = endpoint.build_outer_chain().unwrap().unwrap();
         let error = chain
             .connect_udp_bidirectional(
                 &endpoint.outer_resolver,

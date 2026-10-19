@@ -11,6 +11,17 @@ use super::{
 use crate::address::NetLocation;
 use crate::option_util::NoneOrSome;
 
+pub(crate) fn tun_endpoint_ips(configs: &[Config]) -> impl Iterator<Item = IpAddr> + '_ {
+    configs
+        .iter()
+        .filter_map(|config| match config {
+            Config::TunServer(tun) => Some([tun.address, tun.destination]),
+            _ => None,
+        })
+        .flatten()
+        .flatten()
+}
+
 fn reject(ranges: &[IpNetwork], ip: IpAddr, label: &str) -> io::Result<()> {
     if ranges
         .iter()
@@ -122,16 +133,7 @@ pub(super) fn validate(config: &mut ValidatedConfigs) -> io::Result<()> {
         return Ok(());
     }
     let mut all: Vec<IpNetwork> = contexts.values().flatten().copied().collect();
-    for server in &config.configs {
-        if let Config::TunServer(tun) = server {
-            all.extend(
-                [tun.address, tun.destination]
-                    .into_iter()
-                    .flatten()
-                    .map(|ip| IpNetwork::from(ip.to_canonical())),
-            );
-        }
-    }
+    all.extend(tun_endpoint_ips(&config.configs).map(|ip| IpNetwork::from(ip.to_canonical())));
     let effective = |dns: &Option<DnsConfig>| -> &[IpNetwork] {
         dns.as_ref()
             .and_then(DnsConfig::resolved_group)
@@ -212,6 +214,34 @@ mod tests {
 
     fn validate_yaml(yaml: &str) -> io::Result<ValidatedConfigs> {
         super::super::create_server_configs(serde_yaml::from_str(yaml).map_err(io::Error::other)?)
+    }
+
+    #[test]
+    fn tun_endpoint_iteration_preserves_order_duplicates_and_address_form() {
+        let configs = serde_yaml::from_str::<Vec<Config>>(
+            r#"
+- device_name: first
+  address: '::ffff:198.18.0.1'
+  destination: '198.18.0.2'
+- address: '127.0.0.1:1080'
+  protocol: {type: socks}
+- device_name: second
+  destination: '198.18.0.2'
+- device_name: third
+  address: '2001:db8::1'
+"#,
+        )
+        .unwrap();
+        let expected: Vec<IpAddr> = [
+            "::ffff:198.18.0.1",
+            "198.18.0.2",
+            "198.18.0.2",
+            "2001:db8::1",
+        ]
+        .into_iter()
+        .map(|ip| ip.parse().unwrap())
+        .collect();
+        assert_eq!(tun_endpoint_ips(&configs).collect::<Vec<_>>(), expected);
     }
 
     #[test]

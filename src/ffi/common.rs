@@ -225,18 +225,7 @@ pub async fn start_from_config(
     let _resource_reporter = crate::resources::ResourceReporter::start();
 
     // Build DNS registry from expanded groups
-    let synthetic_endpoints: Vec<_> = validated_configs
-        .iter()
-        .filter_map(|config| {
-            if let Config::TunServer(tun) = config {
-                Some([tun.address, tun.destination])
-            } else {
-                None
-            }
-        })
-        .flatten()
-        .flatten()
-        .collect();
+    let synthetic_endpoints: Vec<_> = crate::config::tun_endpoint_ips(&validated_configs).collect();
     let mut dns_registry =
         build_dns_registry_for_runtime(dns_groups, global_limits, None, &synthetic_endpoints)
             .await?;

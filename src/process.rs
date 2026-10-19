@@ -82,19 +82,7 @@ async fn prepare(paths: &[String], previous: Option<&DnsRegistry>) -> io::Result
         }
         server.bind_location = BindLocation::Address(OneOrSome::Some(resolved));
     }
-    let synthetic_endpoints: Vec<_> = validated
-        .configs
-        .iter()
-        .filter_map(|config| {
-            if let Config::TunServer(tun) = config {
-                Some([tun.address, tun.destination])
-            } else {
-                None
-            }
-        })
-        .flatten()
-        .flatten()
-        .collect();
+    let synthetic_endpoints: Vec<_> = crate::config::tun_endpoint_ips(&validated.configs).collect();
     let dns = dns::build_dns_registry_for_runtime(
         std::mem::take(&mut validated.dns_groups),
         validated.global_limits,
