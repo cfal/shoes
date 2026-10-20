@@ -6,6 +6,7 @@ use crate::address::NetLocation;
 
 const MAX_HEADERS: usize = 128;
 
+#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
 pub(super) enum Inspection {
     NeedMore,
     Finished(Option<String>),
@@ -17,6 +18,16 @@ pub(super) struct HttpProbe {
     line_start: usize,
     request_line_complete: bool,
     method_end: Option<usize>,
+    #[cfg(test)]
+    work: ProbeWork,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct ProbeWork {
+    scanned_bytes: usize,
+    request_line_parses: usize,
+    head_parses: usize,
 }
 
 impl HttpProbe {
@@ -24,6 +35,10 @@ impl HttpProbe {
         // Scan each byte once, then parse the completed head once. Tiny TCP fragments
         // must not repeatedly reparse an ever-growing header section.
         for index in self.scanned..prefix.len() {
+            #[cfg(test)]
+            {
+                self.work.scanned_bytes += 1;
+            }
             let byte = prefix[index];
             if (index > 0 && prefix[index - 1] == b'\r' && byte != b'\n')
                 || (byte == b'\n' && (index == 0 || prefix[index - 1] != b'\r'))
@@ -51,12 +66,20 @@ impl HttpProbe {
             }
             let end = index + 1;
             if !self.request_line_complete {
+                #[cfg(test)]
+                {
+                    self.work.request_line_parses += 1;
+                }
                 let mut request = httparse::Request::new(&mut []);
                 if request.parse(&prefix[..end]).is_err() || !supported_request(&request) {
                     return Inspection::Finished(None);
                 }
                 self.request_line_complete = true;
             } else if end - self.line_start == 2 {
+                #[cfg(test)]
+                {
+                    self.work.head_parses += 1;
+                }
                 return Inspection::Finished(parse_host(&prefix[..end]));
             }
             self.line_start = end;
@@ -130,8 +153,39 @@ fn parse_host(bytes: &[u8]) -> Option<String> {
 mod tests {
     use super::*;
 
+    fn fragmented(bytes: &[u8], chunk_size: usize) -> Inspection {
+        let mut probe = HttpProbe::default();
+        let mut result = Inspection::NeedMore;
+        for end in (chunk_size..bytes.len())
+            .step_by(chunk_size)
+            .chain([bytes.len()])
+        {
+            result = probe.inspect(&bytes[..end]);
+            if matches!(result, Inspection::Finished(_)) {
+                break;
+            }
+        }
+        result
+    }
+
     fn inspect(bytes: &[u8]) -> Option<String> {
-        match HttpProbe::default().inspect(bytes) {
+        let expected = HttpProbe::default().inspect(bytes);
+        for split in 0..=bytes.len() {
+            let mut probe = HttpProbe::default();
+            let mut result = probe.inspect(&bytes[..split]);
+            if matches!(result, Inspection::NeedMore) {
+                result = probe.inspect(bytes);
+            }
+            assert_eq!(result, expected, "split {split}: {bytes:?}");
+        }
+        for chunk_size in [1, 3, 17] {
+            assert_eq!(
+                fragmented(bytes, chunk_size),
+                expected,
+                "chunk {chunk_size}: {bytes:?}"
+            );
+        }
+        match expected {
             Inspection::Finished(name) => name,
             Inspection::NeedMore => panic!("expected completed inspection: {bytes:?}"),
         }
@@ -143,6 +197,7 @@ mod tests {
             "GET / HTTP/1.0",
             "POST /path?q=yes HTTP/1.1",
             "GET /a%20b/%2F?q=%FF&next=/a?b HTTP/1.1",
+            "GET /a%2fb?q=%ff HTTP/1.1",
             "GET /AZaz09-._~!$&'()*+,;=:@/? HTTP/1.1",
             "CUSTOM / HTTP/1.1",
             "OPTIONS * HTTP/1.1",
@@ -178,6 +233,8 @@ mod tests {
             "Host: example.com:\r\n",
             "Host: 192.0.2.1\r\n",
             "Host: 192.0.2.1.:80\r\n",
+            "Host: 127.1\r\n",
+            "Host: 0177.0.0.1\r\n",
             "Host: [::1]\r\n",
             "Host: [::1]:80\r\n",
             "Host: ::1\r\n",
@@ -235,6 +292,41 @@ mod tests {
             request.push_str("\r\n");
             assert_eq!(inspect(request.as_bytes()).is_some(), count <= MAX_HEADERS);
         }
+        for duplicate_at in [MAX_HEADERS - 1, MAX_HEADERS, MAX_HEADERS + 1] {
+            let mut request = "GET / HTTP/1.1\r\nHost: example.com\r\n".to_owned();
+            request.push_str(&"X: y\r\n".repeat(duplicate_at - 2));
+            request.push_str("hOsT: other.example\r\n\r\n");
+            assert_eq!(inspect(request.as_bytes()), None, "header {duplicate_at}");
+        }
+    }
+
+    #[test]
+    fn bounded_mutations_are_independent_of_fragment_boundaries() {
+        for seed in [
+            &b"GET /a%2fb?q=yes HTTP/1.1\r\nHost: Example.com.:80\r\n\r\nbody"[..],
+            &b"OPTIONS * HTTP/1.0\r\nHost: first.example\r\nHost: second.example\r\n\r\n"[..],
+            &b"GET / HTTP/1.1\r\nHost: example.com\r\n"[..],
+        ] {
+            for index in 0..seed.len() {
+                for replacement in [0, b'\r', b'\n', b'\t', b' ', b'%', b':', 0xff] {
+                    let mut bytes = seed.to_vec();
+                    bytes[index] = replacement;
+                    let expected = HttpProbe::default().inspect(&bytes);
+                    for chunk_size in [1, 3, 17, 4096] {
+                        assert_eq!(
+                            fragmented(&bytes, chunk_size),
+                            expected,
+                            "index {index}, byte {replacement}, chunk {chunk_size}"
+                        );
+                    }
+                    if let Inspection::Finished(Some(name)) = expected {
+                        assert_eq!(name, name.to_ascii_lowercase());
+                        assert!(!name.ends_with('.'));
+                        assert!(name.parse::<IpAddr>().is_err());
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -256,6 +348,7 @@ mod tests {
             "GET / HTTP/1.1\r\nHost: example.com\r\nX: {}\r\n\r\n",
             "a".repeat(60000)
         );
+        let request_line_end = request.find("\r\n").unwrap() + 2;
         let mut probe = HttpProbe::default();
         for end in 1..request.len() {
             assert!(matches!(
@@ -263,10 +356,19 @@ mod tests {
                 Inspection::NeedMore
             ));
             assert_eq!(probe.scanned, end);
+            assert_eq!(probe.work.scanned_bytes, end);
+            assert_eq!(
+                probe.work.request_line_parses,
+                usize::from(end >= request_line_end)
+            );
+            assert_eq!(probe.work.head_parses, 0);
         }
         assert!(matches!(
             probe.inspect(request.as_bytes()),
             Inspection::Finished(Some(_))
         ));
+        assert_eq!(probe.work.scanned_bytes, request.len());
+        assert_eq!(probe.work.request_line_parses, 1);
+        assert_eq!(probe.work.head_parses, 1);
     }
 }
