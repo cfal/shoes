@@ -72,9 +72,52 @@ fn supported_request(request: &httparse::Request<'_, '_>) -> bool {
     }
     match request.path {
         Some("*") => request.method == Some("OPTIONS"),
-        Some(path) => path.starts_with('/') && !path.contains('#'),
+        Some(path) => valid_origin_form(path),
         None => false,
     }
+}
+
+fn valid_origin_form(target: &str) -> bool {
+    if !target.starts_with('/') {
+        return false;
+    }
+    // httparse checks request-line syntax, not RFC 3986 path/query characters.
+    let mut bytes = target.bytes();
+    while let Some(byte) = bytes.next() {
+        match byte {
+            b'%' => {
+                if !bytes.next().is_some_and(|byte| byte.is_ascii_hexdigit())
+                    || !bytes.next().is_some_and(|byte| byte.is_ascii_hexdigit())
+                {
+                    return false;
+                }
+            }
+            b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'-'
+            | b'.'
+            | b'_'
+            | b'~'
+            | b'!'
+            | b'$'
+            | b'&'
+            | b'\''
+            | b'('
+            | b')'
+            | b'*'
+            | b'+'
+            | b','
+            | b';'
+            | b'='
+            | b':'
+            | b'@'
+            | b'/'
+            | b'?' => {}
+            _ => return false,
+        }
+    }
+    true
 }
 
 fn parse_host(bytes: &[u8]) -> Option<String> {
@@ -122,6 +165,8 @@ mod tests {
         for line in [
             "GET / HTTP/1.0",
             "POST /path?q=yes HTTP/1.1",
+            "GET /a%20b/%2F?q=%FF&next=/a?b HTTP/1.1",
+            "GET /AZaz09-._~!$&'()*+,;=:@/? HTTP/1.1",
             "CUSTOM / HTTP/1.1",
             "OPTIONS * HTTP/1.1",
         ] {
@@ -176,6 +221,15 @@ mod tests {
             "GET https://example.com/ HTTP/1.1",
             "GET * HTTP/1.1",
             "GET /#fragment HTTP/1.1",
+            "GET /bad\\path HTTP/1.1",
+            "GET /bad%zz HTTP/1.1",
+            "GET /bad% HTTP/1.1",
+            "GET /bad%2 HTTP/1.1",
+            "GET /bad|path HTTP/1.1",
+            "GET /bad[path] HTTP/1.1",
+            "GET /bad{path} HTTP/1.1",
+            "GET /path?q=%zz HTTP/1.1",
+            "GET /path?q=\\ HTTP/1.1",
             "GET / HTTP/2.0",
             "GET / HTTP/1.2",
             "GET / HTTP/0.9",

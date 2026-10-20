@@ -192,6 +192,7 @@ async fn fake_dns_sniff_routes_without_rewriting_restored_targets() -> io::Resul
                 (true, "http", true),
                 (true, "http", false),
                 (true, "http-duplicate", false),
+                (true, "http-invalid-target", false),
                 (true, "http-missing", false),
                 (true, "http-partial", false),
                 (true, "supplied-hostname-http", false),
@@ -294,6 +295,7 @@ async fn fake_dns_sniff_routes_without_rewriting_restored_targets() -> io::Resul
                 let payload = match kind {
                     "http" | "supplied-hostname-http" => http_request(),
                     "http-duplicate" => b"GET / HTTP/1.1\r\nHost: sniff.invalid\r\nHost: other.invalid\r\n\r\n".to_vec(),
+                    "http-invalid-target" => b"GET /bad%zz HTTP/1.1\r\nHost: sniff.invalid\r\n\r\n".to_vec(),
                     "http-missing" => b"GET / HTTP/1.1\r\n\r\n".to_vec(),
                     "http-partial" => b"GET / HTTP/1.1\r\nHost: sniff.invalid\r\n".to_vec(),
                     "tls" | "supplied-hostname" => hello(),
