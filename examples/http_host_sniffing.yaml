@@ -1,0 +1,9 @@
+# Host selects the initial route, never a replacement destination or port.
+# Later requests on the same stream keep that route, even if Host changes.
+- address: '0.0.0.0:1080'
+  protocol:
+    type: socks
+  sniff: true
+  rules:
+    - masks: example.com
+      action: allow

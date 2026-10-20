@@ -947,6 +947,11 @@ mod tests {
             serde_yaml::from_str(include_str!("../../../examples/sni_sniffing.yaml")).unwrap(),
         )
         .unwrap();
+        crate::config::create_server_configs(
+            serde_yaml::from_str(include_str!("../../../examples/http_host_sniffing.yaml"))
+                .unwrap(),
+        )
+        .unwrap();
     }
 
     fn create_test_server_config_http() -> ServerConfig {
